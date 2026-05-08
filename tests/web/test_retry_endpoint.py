@@ -644,6 +644,32 @@ def test_retry_frontmatter_write_failure_returns_503(
     assert "metrics:retry_count:example__alpha:PR-283" not in app.state.redis.store
 
 
+def test_retry_frontmatter_parse_failure_rolls_back_counter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _RetryRedis()
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+    monkeypatch.setattr(
+        repo_control,
+        "write_frontmatter_status",
+        lambda task_path, status: (_ for _ in ()).throw(RuntimeError("bad yaml")),
+    )
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+
+    assert response.status_code == 503
+    assert "Failed to update task status" in response.text
+    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
+
+
 def test_retry_rejects_resolved_task_outside_repo(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -821,7 +847,8 @@ def test_retry_git_failure_returns_503(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _write_config_and_task(tmp_path, monkeypatch)
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(_RetryRedis()))
+    redis_client = _RetryRedis({"metrics:retry_count:example__alpha:PR-283": "2"})
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
 
     def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         raise subprocess.CalledProcessError(1, args)
@@ -833,7 +860,7 @@ def test_retry_git_failure_returns_503(
 
     assert response.status_code == 503
     assert "Failed to commit retry change" in response.text
-    assert "metrics:retry_count:example__alpha:PR-283" not in app.state.redis.store
+    assert redis_client.store["metrics:retry_count:example__alpha:PR-283"] == "2"
     assert "status: ERROR" in (
         tmp_path / "repos" / "example__alpha" / "tasks" / "PR-283.md"
     ).read_text(encoding="utf-8")

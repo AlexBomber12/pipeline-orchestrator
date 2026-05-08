@@ -991,20 +991,16 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
                 relative_task,
             )
         except subprocess.CalledProcessError:
-            await _release_retry_reservation(redis_client, name, pr_id)
             return HTMLResponse("Failed to commit retry change", status_code=503)
         if not task_path.is_file():
-            await _release_retry_reservation(redis_client, name, pr_id)
             return HTMLResponse("Task file not found", status_code=404)
 
         try:
             current_status = _read_task_frontmatter_status(task_path)
             retry_fingerprint = _task_retry_fingerprint(task_path)
         except (OSError, UnicodeError):
-            await _release_retry_reservation(redis_client, name, pr_id)
             return HTMLResponse("Failed to read task status", status_code=503)
         if current_status not in {TaskStatus.ERROR, TaskStatus.TODO}:
-            await _release_retry_reservation(redis_client, name, pr_id)
             return HTMLResponse("Task is not in ERROR", status_code=409)
         rewrote_status = current_status == TaskStatus.ERROR
 
@@ -1027,7 +1023,7 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
         try:
             if current_status == TaskStatus.ERROR:
                 write_frontmatter_status(task_path, "TODO")
-        except (OSError, ValueError):
+        except Exception:
             await _release_retry_reservation(redis_client, name, pr_id)
             return HTMLResponse("Failed to update task status", status_code=503)
 
