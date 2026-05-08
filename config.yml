@@ -17,6 +17,9 @@ daemon:
   # PR-231: Operator-confirmed production cap on FIX iterations.
   fix_iteration_cap: 25
   fix_no_push_cap: 3
+  # Per-task operator Retry button attempts before requiring a spec edit/delete.
+  # Default: 3. Valid range: 1-20.
+  # retry_button_cap: 3
   fix_poll_interval_sec: 30
   coder_terminate_grace_sec: 5
   # PR-231: Production-tuned (default was 900s/15min). Foundation Sprint tasks

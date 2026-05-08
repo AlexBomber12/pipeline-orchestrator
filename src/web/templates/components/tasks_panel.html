@@ -22,6 +22,29 @@
         <span class="font-mono text-[11px] text-gray-500 sm:text-right">{{ task.branch }}</span>
         {% endif %}
     </button>
+    {% if status_key == 'error' %}
+    {% set next_retry = task.retry_count + 1 %}
+    <div class="mt-2 flex items-center justify-end gap-2">
+        {% if task.retry_count < retry_cap %}
+        <button type="button"
+                class="secondary-interactive rounded border border-fail/30 px-2 py-1 text-xs font-medium text-fail hover:border-fail/50 hover:bg-fail/10"
+                title="Retry count {{ task.retry_count }}/{{ retry_cap }}"
+                hx-post="/repos/{{ repo_name }}/tasks/{{ task.pr_id }}/retry"
+                hx-target="#repo-tasks-panel-{{ repo_name }}"
+                hx-swap="outerHTML"
+                hx-confirm="Retry {{ task.pr_id }}? Counter will increment to {{ next_retry }}/{{ retry_cap }}.">
+            Retry
+        </button>
+        {% else %}
+        <button type="button"
+                class="cursor-not-allowed rounded border border-white/10 px-2 py-1 text-xs font-medium text-gray-500"
+                title="Retry count {{ task.retry_count }}/{{ retry_cap }}. Edit task spec or delete to proceed."
+                disabled>
+            Retry
+        </button>
+        {% endif %}
+    </div>
+    {% endif %}
     <div id="{{ target_id }}" class="mt-2 empty:hidden"></div>
 </li>
 {%- endmacro %}

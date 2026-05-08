@@ -300,6 +300,7 @@ class PipelineRunner(
         # task-file status commit failed. Unlike crashed tasks, these
         # must stay parked even if their old PR remains visible.
         self._status_write_failed_task_pr_ids: set[str] = set()
+        self._status_write_failed_task_pr_ids_persist_failed = False
         self._user_pause_logged = False
         self._pending_repo_config: RepoConfig | None = None
         self._pending_app_config: AppConfig | None = None
@@ -1330,7 +1331,9 @@ class PipelineRunner(
                 )
             else:
                 await self.redis.delete(key)
+            self._status_write_failed_task_pr_ids_persist_failed = False
         except Exception as exc:
+            self._status_write_failed_task_pr_ids_persist_failed = True
             self.log_event(
                 f"[INFRA] Warning: failed to persist status-write "
                 f"fallback markers: {exc}."
@@ -1338,13 +1341,25 @@ class PipelineRunner(
 
     async def _hydrate_status_write_failed_task_pr_ids(self) -> None:
         """Load status-write fallback markers persisted by a prior process."""
-        decoded = await self._read_status_write_failed_task_ids(
+        decoded_ok, decoded_found, decoded = await self._read_status_write_failed_task_ids(
             status_write_failed_tasks(self.name)
         )
-        legacy_decoded = await self._read_status_write_failed_task_ids(
+        (
+            legacy_ok,
+            legacy_found,
+            legacy_decoded,
+        ) = await self._read_status_write_failed_task_ids(
             legacy_recovered_tasks(self.name)
         )
-        self._status_write_failed_task_pr_ids.update(decoded | legacy_decoded)
+        if (decoded_ok and decoded_found) or (legacy_ok and legacy_found):
+            self._status_write_failed_task_pr_ids = decoded | legacy_decoded
+            self._status_write_failed_task_pr_ids_persist_failed = False
+        elif (
+            decoded_ok
+            and legacy_ok
+            and not self._status_write_failed_task_pr_ids_persist_failed
+        ):
+            self._status_write_failed_task_pr_ids = set()
 
     async def _clear_status_write_failed_task_ids(
         self,
@@ -1370,23 +1385,27 @@ class PipelineRunner(
                 f"fallback markers: {exc}."
             )
 
-    async def _read_status_write_failed_task_ids(self, key: str) -> set[str]:
+    async def _read_status_write_failed_task_ids(
+        self, key: str
+    ) -> tuple[bool, bool, set[str]]:
         """Return a persisted fallback marker set from one Redis key."""
         try:
             raw = await self.redis.get(key)
         except Exception:
-            return set()
+            return False, False, set()
+        if raw is None:
+            return True, False, set()
         if not raw:
-            return set()
+            return True, True, set()
         try:
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8")
             decoded = json.loads(raw)
         except (TypeError, ValueError, json.JSONDecodeError):
-            return set()
+            return True, True, set()
         if not isinstance(decoded, list):
-            return set()
-        return {
+            return True, True, set()
+        return True, True, {
             item for item in decoded if isinstance(item, str) and item
         }
 

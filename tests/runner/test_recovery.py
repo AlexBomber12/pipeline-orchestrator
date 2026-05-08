@@ -33,7 +33,6 @@ Tests do not change production behavior; they only assert it.
 from __future__ import annotations
 
 import asyncio
-import json
 
 # PR-224a: imports needed by tests moved from tests/test_runner.py
 import random  # noqa: F401
@@ -476,6 +475,7 @@ def test_select_next_task_from_dag_status_write_fallback_beats_visible_pr(
     ]
     runner._idle_merged_prs = []
     runner._status_write_failed_task_pr_ids.add("PR-001")
+    runner.redis.store[status_write_failed_tasks(runner.name)] = '["PR-001"]'
 
     task = asyncio.run(runner._select_next_task_from_dag())
 
@@ -525,11 +525,67 @@ def test_select_next_task_from_dag_clears_status_write_fallback_when_done(
     runner._idle_open_prs = []
     runner._idle_merged_prs = []
     runner._status_write_failed_task_pr_ids.add("PR-001")
+    runner.redis.store[status_write_failed_tasks(runner.name)] = '["PR-001"]'
 
     task = asyncio.run(runner._select_next_task_from_dag())
 
     assert task is None
     assert runner._idle_dag_statuses == {"PR-001": TaskStatus.DONE}
+    assert runner._status_write_failed_task_pr_ids == set()
+
+
+def test_select_next_task_from_dag_syncs_cleared_status_write_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Operator retry clears persisted marker and unblocks stale daemon memory."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Retried status-write fallback\n\n"
+        "Branch: pr-001-retried\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+    (tasks_dir / "PR-002.md").write_text(
+        "# PR-002: Later task\n\n"
+        "Branch: pr-002-later\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 2\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        idle_module,
+        "_resolve_merged_state",
+        lambda *args, **kwargs: _merged_state(),
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+    runner._status_write_failed_task_pr_ids.add("PR-001")
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-001"
+    assert task.status == TaskStatus.TODO
     assert runner._status_write_failed_task_pr_ids == set()
 
 

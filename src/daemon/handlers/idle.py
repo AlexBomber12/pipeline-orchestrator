@@ -277,6 +277,13 @@ class IdleMixin:
             if current_task_pr_id in stopped_task_pr_ids:
                 current_task_pr_id = None
             crashed_task_pr_ids = getattr(self, "_crashed_task_pr_ids", set())
+            hydrate_status_write_failed = getattr(
+                self,
+                "_hydrate_status_write_failed_task_pr_ids",
+                None,
+            )
+            if hydrate_status_write_failed is not None:
+                await hydrate_status_write_failed()
             status_write_failed_task_pr_ids = getattr(
                 self,
                 "_status_write_failed_task_pr_ids",
@@ -291,6 +298,9 @@ class IdleMixin:
                     current_task_pr_id=current_task_pr_id,
                 )
                 for header in headers
+            }
+            frontmatter_statuses = {
+                header.pr_id: header.frontmatter_status for header in headers
             }
             # PR-186: Recovery marks DOING-without-PR tasks crashed before
             # transitioning to IDLE. Override their derived status to
@@ -307,6 +317,9 @@ class IdleMixin:
             # treats the task as live again.
             for pr_id in list(statuses.keys()):
                 if pr_id not in crashed_task_pr_ids:
+                    continue
+                if frontmatter_statuses.get(pr_id) == "todo":
+                    crashed_task_pr_ids.discard(pr_id)
                     continue
                 if statuses[pr_id] in (TaskStatus.DONE, TaskStatus.DOING):
                     crashed_task_pr_ids.discard(pr_id)

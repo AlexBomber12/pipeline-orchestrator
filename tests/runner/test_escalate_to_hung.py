@@ -191,6 +191,7 @@ def test_persist_status_write_failed_task_ids_logs_redis_failure() -> None:
 
     asyncio.run(runner._persist_status_write_failed_task_pr_ids())
 
+    assert runner._status_write_failed_task_pr_ids_persist_failed is True
     assert any(
         "failed to persist status-write fallback markers: redis down"
         in entry["event"]
@@ -202,6 +203,7 @@ def test_persist_status_write_failed_task_ids_logs_redis_failure() -> None:
     "raw",
     [
         b'["PR-001", "", 12, "PR-002"]',
+        "",
         "{not json",
         '{"not":"a list"}',
     ],
@@ -218,6 +220,40 @@ def test_hydrate_status_write_failed_task_ids_handles_stored_shapes(
         assert runner._status_write_failed_task_pr_ids == {"PR-001", "PR-002"}
     else:
         assert runner._status_write_failed_task_pr_ids == set()
+
+
+def test_hydrate_status_write_failed_task_ids_replaces_stale_memory() -> None:
+    runner = h._make_runner()
+    runner._status_write_failed_task_pr_ids = {"PR-OLD"}
+    runner.redis.store[status_write_failed_tasks(runner.name)] = '["PR-NEW"]'
+
+    asyncio.run(runner._hydrate_status_write_failed_task_pr_ids())
+
+    assert runner._status_write_failed_task_pr_ids == {"PR-NEW"}
+
+
+def test_hydrate_status_write_failed_task_ids_keeps_memory_on_missing_keys() -> None:
+    runner = h._make_runner()
+    runner._status_write_failed_task_pr_ids = {"PR-OLD"}
+    runner._status_write_failed_task_pr_ids_persist_failed = True
+
+    asyncio.run(runner._hydrate_status_write_failed_task_pr_ids())
+
+    assert runner._status_write_failed_task_pr_ids == {"PR-OLD"}
+
+
+def test_hydrate_status_write_failed_task_ids_keeps_memory_on_redis_failure() -> None:
+    runner = h._make_runner()
+    runner._status_write_failed_task_pr_ids = {"PR-OLD"}
+
+    async def fail_get(key: str) -> str | None:
+        raise RuntimeError("redis down")
+
+    runner.redis.get = fail_get  # type: ignore[method-assign]
+
+    asyncio.run(runner._hydrate_status_write_failed_task_pr_ids())
+
+    assert runner._status_write_failed_task_pr_ids == {"PR-OLD"}
 
 
 def test_clear_status_write_failed_task_ids_logs_legacy_delete_failure() -> None:

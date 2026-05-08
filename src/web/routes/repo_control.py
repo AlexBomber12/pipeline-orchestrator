@@ -8,7 +8,12 @@ reads-only paths (rendering, JSON status, partials) live in
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import inspect
+import json
 import re
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -17,9 +22,16 @@ import redis.asyncio as aioredis
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
+from src.cancellation.storage import delete_cancellation_cause
 from src.config import load_config
-from src.keyspace import control_stop, pipeline_state
+from src.keyspace import (
+    control_stop,
+    legacy_recovered_tasks,
+    pipeline_state,
+    status_write_failed_tasks,
+)
 from src.models import PipelineState, QueueTask, RepoState, TaskStatus
+from src.queue_parser import write_frontmatter_status
 from src.web.services.coder import _effective_coder_name
 from src.web.services.repo_state import (
     _default_repo_state,
@@ -35,6 +47,9 @@ _QUEUE_NOT_READY_FRAGMENT = (
     "daemon syncing.</p>"
 )
 _QUEUE_NOT_READY_JSON = {"error": "Queue not yet computed"}
+_RETRY_TTL_SECONDS = 30 * 24 * 3600
+_RETRY_RESERVATION_TTL_SECONDS = 30 * 60
+_RETRY_GIT_TIMEOUT_SECONDS = 60
 
 _DEFERRED_CODER_SWITCH_STATES = {
     PipelineState.CODING,
@@ -44,16 +59,26 @@ _DEFERRED_CODER_SWITCH_STATES = {
     PipelineState.PAUSED,
 }
 _ACTIVE_RUN_STATES = {
+    PipelineState.PREFLIGHT,
     PipelineState.CODING,
     PipelineState.WATCH,
     PipelineState.FIX,
     PipelineState.MERGE,
+    PipelineState.PAUSED,
+}
+_RETRY_BUSY_STATES = (_ACTIVE_RUN_STATES - {PipelineState.PAUSED}) | {
+    PipelineState.ERROR
 }
 _CODER_LABELS = {
     "any": "Any (bandit picks per-PR)",
     "claude": "Claude CLI",
     "codex": "Codex CLI",
 }
+_PAUSE_CONTROL_EVENT_PREFIXES = (
+    "Pause requested.",
+    "Resume requested.",
+    "Stop requested.",
+)
 
 _QueueSource = Literal["snapshot"]
 
@@ -118,6 +143,513 @@ class _RepoStateMutationError(Exception):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
+
+
+class _RetryCapExceeded(Exception):
+    """Raised when the operator retry counter has reached its configured cap."""
+
+    def __init__(self, current: int, cap: int) -> None:
+        super().__init__("retry cap reached")
+        self.current = current
+        self.cap = cap
+
+
+class _TaskNotRetryable(Exception):
+    """Raised when a retry request targets a task that is not retryable."""
+
+
+def _retry_count_key(repo_slug: str, task_id: str) -> str:
+    return f"metrics:retry_count:{repo_slug}:{task_id}"
+
+
+def _retry_fingerprint_key(repo_slug: str, task_id: str) -> str:
+    return f"metrics:retry_fingerprint:{repo_slug}:{task_id}"
+
+
+def _retry_reservation_key(repo_slug: str) -> str:
+    return f"control:retry_reservation:{repo_slug}"
+
+
+def _repo_busy_for_retry(state: RepoState) -> bool:
+    if state.user_paused:
+        return True
+    if state.state in _RETRY_BUSY_STATES:
+        return True
+    return state.state == PipelineState.PAUSED
+
+
+def _decode_retry_count(raw: object) -> int:
+    if raw is None:
+        return 0
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _get_retry_count(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    task_id: str,
+    fingerprint: str | None = None,
+) -> int:
+    try:
+        raw = await redis_client.get(_retry_count_key(repo_slug, task_id))
+        if fingerprint is not None:
+            stored_fingerprint = _decode_redis_text(
+                await redis_client.get(_retry_fingerprint_key(repo_slug, task_id))
+            )
+            if stored_fingerprint is not None and stored_fingerprint != fingerprint:
+                return 0
+    except Exception:
+        return 0
+    return _decode_retry_count(raw)
+
+
+def _decode_redis_text(raw: object) -> str | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8")
+    return str(raw)
+
+
+def _task_retry_fingerprint(task_path: Path) -> str:
+    lines = task_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    first_content_index = next(
+        (index for index, raw_line in enumerate(lines) if raw_line.strip()),
+        None,
+    )
+    if first_content_index is None or lines[first_content_index].rstrip() != "---":
+        normalized = lines
+    else:
+        normalized = []
+        in_frontmatter = True
+        for index, raw_line in enumerate(lines):
+            if index > first_content_index and in_frontmatter and raw_line.rstrip() == "---":
+                in_frontmatter = False
+            if in_frontmatter and re.match(r"^status:\s*", raw_line.rstrip()):
+                continue
+            normalized.append(raw_line)
+    return hashlib.sha256("".join(normalized).encode("utf-8")).hexdigest()
+
+
+async def _await_if_needed(result: Any) -> Any:
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+async def _reserve_repo_for_retry(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    repo_url: str,
+) -> bool:
+    """Atomically pause an inactive repo while retry rewrites its worktree."""
+    state_key = pipeline_state(repo_slug)
+    reservation_key = _retry_reservation_key(repo_slug)
+    reservation_started_at = datetime.now(timezone.utc).isoformat()
+    acquired = await _await_if_needed(
+        redis_client.set(
+            reservation_key,
+            reservation_started_at,
+            ex=_RETRY_RESERVATION_TTL_SECONDS,
+            nx=True,
+        )
+    )
+    if not acquired:
+        raise _RepoStateMutationError(
+            "Repository retry already in progress; retry later.",
+            status_code=409,
+        )
+
+    async def _transaction(pipe: Any) -> bool:
+        raw = await pipe.get(state_key)
+        if raw is None:
+            state = _default_repo_state(repo_slug, repo_url)
+        else:
+            try:
+                state = RepoState.model_validate_json(raw)
+            except Exception as exc:
+                raise _RepoStateMutationError("Failed to read repository state") from exc
+        if _repo_busy_for_retry(state):
+            raise _RepoStateMutationError(
+                "Repository is busy; retry later.",
+                status_code=409,
+            )
+        previous_user_paused = state.user_paused
+        state.user_paused = True
+        pipe.multi()
+        await _await_if_needed(pipe.set(state_key, state.model_dump_json()))
+        return previous_user_paused
+
+    try:
+        return await redis_client.transaction(
+            _transaction,
+            state_key,
+            value_from_callable=True,
+        )
+    except Exception:
+        await _await_if_needed(redis_client.delete(reservation_key))
+        raise
+
+
+def _has_pause_control_after_reservation(
+    state: RepoState,
+    reservation_started_at: str | None,
+) -> bool:
+    if reservation_started_at is None:
+        return False
+    try:
+        reservation_time = datetime.fromisoformat(reservation_started_at)
+    except ValueError:
+        return False
+    for entry in reversed(state.history):
+        event = str(entry.get("event", ""))
+        if not event.startswith(_PAUSE_CONTROL_EVENT_PREFIXES):
+            continue
+        raw_time = entry.get("last_seen_at") or entry.get("time")
+        if raw_time is None:
+            continue
+        try:
+            event_time = datetime.fromisoformat(str(raw_time))
+        except ValueError:
+            continue
+        return event_time > reservation_time
+    return False
+
+
+async def _release_repo_retry_reservation(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    previous_user_paused: bool,
+) -> None:
+    """Restore the pre-retry pause bit unless a daemon has become active."""
+    state_key = pipeline_state(repo_slug)
+    reservation_key = _retry_reservation_key(repo_slug)
+    try:
+        reservation_started_at = _decode_redis_text(await redis_client.get(reservation_key))
+    except Exception:
+        reservation_started_at = None
+
+    async def _transaction(pipe: Any) -> None:
+        raw = await pipe.get(state_key)
+        if raw is None:
+            return
+        try:
+            state = RepoState.model_validate_json(raw)
+        except Exception:
+            return
+        if state.state in _ACTIVE_RUN_STATES:
+            return
+        if _has_pause_control_after_reservation(state, reservation_started_at):
+            return
+        state.user_paused = previous_user_paused
+        pipe.multi()
+        await _await_if_needed(pipe.set(state_key, state.model_dump_json()))
+
+    try:
+        await redis_client.transaction(_transaction, state_key)
+    except Exception:
+        pass
+    finally:
+        try:
+            await _await_if_needed(redis_client.delete(reservation_key))
+        except Exception:
+            pass
+
+
+async def _increment_retry_count(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    task_id: str,
+    cap: int,
+    fingerprint: str | None = None,
+) -> int:
+    key = _retry_count_key(repo_slug, task_id)
+    fingerprint_key = _retry_fingerprint_key(repo_slug, task_id)
+
+    async def _transaction(pipe: Any) -> int:
+        stored_fingerprint = (
+            _decode_redis_text(await pipe.get(fingerprint_key)) if fingerprint is not None else None
+        )
+        current = _decode_retry_count(await pipe.get(key))
+        if (
+            fingerprint is not None
+            and stored_fingerprint is not None
+            and stored_fingerprint != fingerprint
+        ):
+            current = 0
+        if current >= cap:
+            raise _RetryCapExceeded(current, cap)
+        next_count = current + 1
+        pipe.multi()
+        if fingerprint is not None:
+            pipe.set(fingerprint_key, fingerprint, ex=_RETRY_TTL_SECONDS)
+        pipe.set(key, str(next_count), ex=_RETRY_TTL_SECONDS)
+        return next_count
+
+    return await redis_client.transaction(
+        _transaction,
+        key,
+        fingerprint_key,
+        value_from_callable=True,
+    )
+
+
+async def _decrement_retry_count(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    task_id: str,
+) -> None:
+    key = _retry_count_key(repo_slug, task_id)
+
+    async def _transaction(pipe: Any) -> None:
+        current = _decode_retry_count(await pipe.get(key))
+        pipe.multi()
+        if current <= 1:
+            result = pipe.delete(key)
+        else:
+            result = pipe.set(key, str(current - 1), ex=_RETRY_TTL_SECONDS)
+        if inspect.isawaitable(result):
+            await result
+
+    await redis_client.transaction(_transaction, key)
+
+
+async def _release_retry_reservation(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    task_id: str,
+) -> None:
+    try:
+        await _decrement_retry_count(redis_client, repo_slug, task_id)
+    except Exception:
+        pass
+
+
+async def _clear_status_write_failed_retry_marker(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    task_id: str,
+) -> None:
+    """Remove a successfully retried task from the status-write-failed set."""
+    keys = (status_write_failed_tasks(repo_slug), legacy_recovered_tasks(repo_slug))
+    try:
+        for key in keys:
+            decoded = _decode_redis_text(await redis_client.get(key))
+            if decoded is None:
+                continue
+            task_ids = json.loads(decoded)
+            if not isinstance(task_ids, list):
+                continue
+            if all(str(item) != task_id for item in task_ids):
+                continue
+            remaining = sorted({str(item) for item in task_ids if str(item) != task_id})
+            if remaining:
+                await _await_if_needed(redis_client.set(key, json.dumps(remaining)))
+            else:
+                await _await_if_needed(redis_client.delete(key))
+    except Exception:
+        pass
+
+
+def _is_nothing_to_commit(exc: subprocess.CalledProcessError) -> bool:
+    output = "\n".join(str(part) for part in (exc.stdout, exc.stderr) if part)
+    return "nothing to commit" in output.lower()
+
+
+def _git_output(result: subprocess.CompletedProcess[str]) -> str:
+    return "\n".join(str(part) for part in (result.stdout, result.stderr) if part)
+
+
+def _called_process_output(exc: subprocess.CalledProcessError) -> str:
+    return "\n".join(str(part) for part in (exc.stdout, exc.stderr) if part)
+
+
+def _is_missing_task_pathspec(exc: subprocess.CalledProcessError) -> bool:
+    output = _called_process_output(exc).lower()
+    return "pathspec" in output and "did not match any file" in output
+
+
+def _run_retry_git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=_RETRY_GIT_TIMEOUT_SECONDS,
+    )
+
+
+def _read_task_frontmatter_status(task_path: Path) -> TaskStatus | None:
+    lines = task_path.read_text(encoding="utf-8").splitlines()
+    first_content_index = next(
+        (index for index, raw_line in enumerate(lines) if raw_line.strip()),
+        None,
+    )
+    if first_content_index is None or lines[first_content_index].rstrip() != "---":
+        return None
+
+    for raw_line in lines[first_content_index + 1 :]:
+        if raw_line.rstrip() == "---":
+            return None
+        status_match = re.match(r"^status:\s*(.+?)\s*$", raw_line.rstrip())
+        if status_match is None:
+            continue
+        raw_status = status_match.group(1).split("#", 1)[0].strip().strip("\"'")
+        try:
+            return TaskStatus(raw_status.upper())
+        except ValueError:
+            return None
+    return None
+
+
+def _task_status_from_snapshot(
+    tasks: list[QueueTask] | None,
+    pr_id: str,
+) -> TaskStatus | None:
+    if tasks is None:
+        return None
+    for task in tasks:
+        if task.pr_id == pr_id:
+            return task.status
+    return None
+
+
+def _is_retryable_task_status(
+    frontmatter_status: TaskStatus | None,
+    snapshot_status: TaskStatus | None,
+) -> bool:
+    if frontmatter_status in {TaskStatus.ERROR, TaskStatus.TODO}:
+        return True
+    return frontmatter_status is None and snapshot_status in {
+        TaskStatus.ERROR,
+        TaskStatus.TODO,
+    }
+
+
+def _head_commit_subject(repo_root: Path) -> str:
+    result = _run_retry_git(repo_root, "log", "-1", "--pretty=%s")
+    return result.stdout.strip()
+
+
+def _restore_retry_error_status(task_path: Path) -> None:
+    try:
+        write_frontmatter_status(task_path, "ERROR")
+    except (OSError, ValueError):
+        pass
+
+
+def _checkout_retry_base_task(
+    repo_root: Path,
+    base_branch: str,
+    relative_task: Path,
+) -> None:
+    _run_retry_git(repo_root, "fetch", "origin", base_branch)
+    _run_retry_git(repo_root, "checkout", "-f", base_branch)
+    _run_retry_git(repo_root, "reset", "--hard", f"origin/{base_branch}")
+    _run_retry_git(
+        repo_root,
+        "checkout",
+        f"origin/{base_branch}",
+        "--",
+        relative_task.as_posix(),
+    )
+
+
+def _commit_and_push_retry_reset(
+    repo_root: Path,
+    relative_task: Path,
+    commit_subject: str,
+    base_branch: str,
+) -> None:
+    replayed_existing_commit = False
+    _run_retry_git(repo_root, "add", relative_task.as_posix())
+    try:
+        _run_retry_git(
+            repo_root,
+            "commit",
+            "-m",
+            commit_subject,
+            "-m",
+            "[skip ci]",
+            "--",
+            relative_task.as_posix(),
+        )
+    except subprocess.CalledProcessError as exc:
+        if not _is_nothing_to_commit(exc):
+            raise
+        if _head_commit_subject(repo_root) != commit_subject:
+            raise _TaskNotRetryable
+        replayed_existing_commit = True
+
+    push_result = _run_retry_git(repo_root, "push", "origin", f"HEAD:{base_branch}")
+    if replayed_existing_commit and "everything up-to-date" in _git_output(
+        push_result
+    ).lower():
+        raise _TaskNotRetryable
+
+
+def _reset_retry_worktree(repo_root: Path, base_branch: str) -> None:
+    _run_retry_git(repo_root, "reset", "--hard", f"origin/{base_branch}")
+
+
+async def _task_view(
+    task: QueueTask,
+    repo_name: str,
+    redis_client: aioredis.Redis | None,
+) -> dict[str, object]:
+    retry_count = 0
+    if task.status == TaskStatus.ERROR and redis_client is not None:
+        retry_fingerprint = None
+        resolved = await _resolve_repo_task_path(repo_name, task.pr_id)
+        if resolved is not None:
+            task_path, _task_filename = resolved
+            try:
+                retry_fingerprint = _task_retry_fingerprint(task_path)
+            except (OSError, UnicodeError):
+                retry_fingerprint = None
+        retry_count = await _get_retry_count(
+            redis_client,
+            repo_name,
+            task.pr_id,
+            retry_fingerprint,
+        )
+    return {
+        **task.model_dump(mode="json"),
+        "retry_count": retry_count,
+    }
+
+
+async def _build_tasks_panel_context(
+    name: str,
+    tasks: list[QueueTask],
+    *,
+    redis_client: aioredis.Redis | None,
+    retry_cap: int,
+) -> dict[str, object]:
+    async def _views_for(status: TaskStatus) -> list[dict[str, object]]:
+        return [
+            await _task_view(task, name, redis_client)
+            for task in tasks
+            if task.status == status
+        ]
+
+    grouped = {
+        "doing": await _views_for(TaskStatus.DOING),
+        "todo": await _views_for(TaskStatus.TODO),
+        "done": await _views_for(TaskStatus.DONE),
+        "error": await _views_for(TaskStatus.ERROR),
+    }
+    return {
+        "repo_name": name,
+        "tasks_by_status": grouped,
+        "tasks_total": len(tasks),
+        "retry_cap": retry_cap,
+    }
 
 
 async def _apply_repo_control_update(
@@ -454,21 +986,194 @@ async def list_repo_tasks(request: Request, name: str) -> Response:
             _QUEUE_NOT_READY_FRAGMENT,
             status_code=503,
         )
-    grouped = {
-        "doing": [t for t in tasks if t.status == TaskStatus.DOING],
-        "todo": [t for t in tasks if t.status == TaskStatus.TODO],
-        "done": [t for t in tasks if t.status == TaskStatus.DONE],
-        "error": [t for t in tasks if t.status == TaskStatus.ERROR],
-    }
     return _app.templates.TemplateResponse(
         request,
         "components/tasks_panel.html",
-        {
-            "repo_name": name,
-            "tasks_by_status": grouped,
-            "tasks_total": len(tasks),
-        },
+        await _build_tasks_panel_context(
+            name,
+            tasks,
+            redis_client=getattr(request.app.state, "redis", None),
+            retry_cap=cfg.daemon.retry_button_cap,
+        ),
     )
+
+
+@router.post("/repos/{name}/tasks/{pr_id}/retry", response_class=HTMLResponse)
+async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
+    """Reset an ERROR task to queued when an operator requests a retry."""
+    if not _TASK_PR_ID_PATTERN.match(pr_id):
+        return HTMLResponse("Invalid task identifier", status_code=400)
+
+    cfg = load_config(_app.CONFIG_PATH)
+    repo_config = _find_repo_config_by_name(cfg, name)
+    if repo_config is None:
+        return HTMLResponse("Repository not found", status_code=404)
+
+    resolved = await _resolve_repo_task_path(name, pr_id)
+    if resolved is None:
+        return HTMLResponse("Task file not found", status_code=404)
+    task_path, _task_filename = resolved
+
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        return HTMLResponse("Redis unavailable", status_code=503)
+
+    repo_root = Path(_app.REPOS_DIR) / name
+    try:
+        relative_task = task_path.relative_to(repo_root)
+    except ValueError:
+        return HTMLResponse("Task file not found", status_code=404)
+
+    cap = cfg.daemon.retry_button_cap
+    try:
+        current_status = _read_task_frontmatter_status(task_path)
+    except (OSError, UnicodeError):
+        return HTMLResponse("Failed to read task status", status_code=503)
+    snapshot_tasks, _snapshot_at = await _load_current_queue_snapshot(name)
+    snapshot_status = _task_status_from_snapshot(snapshot_tasks, pr_id)
+    if not _is_retryable_task_status(current_status, snapshot_status):
+        return HTMLResponse("Task is not in ERROR", status_code=409)
+
+    retry_reserved = True
+    try:
+        previous_user_paused = await _reserve_repo_for_retry(
+            redis_client,
+            name,
+            repo_config.url,
+        )
+    except _RepoStateMutationError as exc:
+        return HTMLResponse(exc.message, status_code=exc.status_code)
+    except Exception:
+        return HTMLResponse("Failed to read repository state", status_code=503)
+
+    try:
+        try:
+            await asyncio.to_thread(
+                _checkout_retry_base_task,
+                repo_root,
+                repo_config.branch,
+                relative_task,
+            )
+        except subprocess.CalledProcessError as exc:
+            if _is_missing_task_pathspec(exc):
+                return HTMLResponse("Task file not found", status_code=404)
+            return HTMLResponse("Failed to commit retry change", status_code=503)
+        except subprocess.TimeoutExpired:
+            return HTMLResponse("Failed to commit retry change", status_code=503)
+        if not task_path.is_file():
+            return HTMLResponse("Task file not found", status_code=404)
+
+        try:
+            current_status = _read_task_frontmatter_status(task_path)
+            retry_fingerprint = _task_retry_fingerprint(task_path)
+        except (OSError, UnicodeError):
+            return HTMLResponse("Failed to read task status", status_code=503)
+        if not _is_retryable_task_status(current_status, snapshot_status):
+            return HTMLResponse("Task is not in ERROR", status_code=409)
+        rewrote_status = current_status != TaskStatus.TODO
+
+        try:
+            next_count = await _increment_retry_count(
+                redis_client,
+                name,
+                pr_id,
+                cap,
+                retry_fingerprint,
+            )
+        except _RetryCapExceeded:
+            return HTMLResponse(
+                "Retry cap reached. Edit task spec or delete to proceed.",
+                status_code=409,
+            )
+        except Exception:
+            return HTMLResponse("Failed to update retry counter", status_code=503)
+
+        try:
+            if current_status != TaskStatus.TODO:
+                write_frontmatter_status(task_path, "TODO")
+        except Exception:
+            await _release_retry_reservation(redis_client, name, pr_id)
+            return HTMLResponse("Failed to update task status", status_code=503)
+
+        commit_subject = f"[RETRY] {pr_id} cleared by operator (attempt {next_count}/{cap})"
+        try:
+            await asyncio.to_thread(
+                _commit_and_push_retry_reset,
+                repo_root,
+                relative_task,
+                commit_subject,
+                repo_config.branch,
+            )
+        except _TaskNotRetryable:
+            if rewrote_status:
+                _restore_retry_error_status(task_path)
+            if retry_reserved:
+                await _release_retry_reservation(redis_client, name, pr_id)
+            return HTMLResponse("Task is not in ERROR", status_code=409)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            reset_failed = False
+            try:
+                await asyncio.to_thread(
+                    _reset_retry_worktree,
+                    repo_root,
+                    repo_config.branch,
+                )
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                reset_failed = True
+            if rewrote_status and reset_failed:
+                _restore_retry_error_status(task_path)
+            if retry_reserved:
+                await _release_retry_reservation(redis_client, name, pr_id)
+            return HTMLResponse("Failed to commit retry change", status_code=503)
+
+        try:
+            await delete_cancellation_cause(redis_client, name, pr_id)
+        except Exception:
+            pass
+        await _clear_status_write_failed_retry_marker(redis_client, name, pr_id)
+        try:
+            await _app.publish_wake(redis_client, name, "retry")
+        except Exception:
+            _app.logger.warning(
+                "publish_wake failed for %s; daemon will pick up retry on next tick",
+                name,
+                exc_info=True,
+            )
+
+        tasks, _snapshot_at = await _load_current_queue_snapshot(name)
+        if tasks is None:
+            tasks = [
+                QueueTask(
+                    pr_id=pr_id,
+                    title=pr_id,
+                    status=TaskStatus.TODO,
+                    task_file=relative_task.as_posix(),
+                )
+            ]
+        else:
+            tasks = [
+                task.model_copy(update={"status": TaskStatus.TODO})
+                if task.pr_id == pr_id
+                else task
+                for task in tasks
+            ]
+
+        return _app.templates.TemplateResponse(
+            request,
+            "components/tasks_panel.html",
+            await _build_tasks_panel_context(
+                name,
+                tasks,
+                redis_client=redis_client,
+                retry_cap=cap,
+            ),
+        )
+    finally:
+        await _release_repo_retry_reservation(
+            redis_client,
+            name,
+            previous_user_paused,
+        )
 
 
 @router.get("/api/repo/{name}/queue", response_class=JSONResponse)
