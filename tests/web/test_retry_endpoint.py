@@ -679,6 +679,48 @@ def test_retry_not_retryable_after_status_rewrite_restores_error(
     )
 
 
+def test_retry_releases_counter_when_error_status_restore_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _RetryRedis()
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    def fake_commit_and_push(*args: Any, **kwargs: Any) -> None:
+        raise subprocess.CalledProcessError(1, ["git", "push"], stderr="rejected")
+
+    original_write_frontmatter_status = repo_control.write_frontmatter_status
+
+    def fake_write_frontmatter_status(task_path: Path, status: str) -> None:
+        if status == "ERROR":
+            raise OSError("cannot restore")
+        original_write_frontmatter_status(task_path, status)
+
+    monkeypatch.setattr(
+        repo_control,
+        "_commit_and_push_retry_reset",
+        fake_commit_and_push,
+    )
+    monkeypatch.setattr(
+        repo_control,
+        "write_frontmatter_status",
+        fake_write_frontmatter_status,
+    )
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+
+    assert response.status_code == 503
+    assert "Failed to commit retry change" in response.text
+    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
+
+
 def test_retry_rejects_already_pushed_retry_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

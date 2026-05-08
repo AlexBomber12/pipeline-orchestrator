@@ -267,6 +267,13 @@ def _head_commit_subject(repo_root: Path) -> str:
     return result.stdout.strip()
 
 
+def _restore_retry_error_status(task_path: Path) -> None:
+    try:
+        write_frontmatter_status(task_path, "ERROR")
+    except (OSError, ValueError):
+        pass
+
+
 def _checkout_retry_base_task(
     repo_root: Path,
     base_branch: str,
@@ -830,13 +837,13 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
         )
     except _TaskNotRetryable:
         if rewrote_status:
-            write_frontmatter_status(task_path, "ERROR")
+            _restore_retry_error_status(task_path)
         if retry_reserved:
             await _release_retry_reservation(redis_client, name, pr_id)
         return HTMLResponse("Task is not in ERROR", status_code=409)
     except subprocess.CalledProcessError:
         if rewrote_status:
-            write_frontmatter_status(task_path, "ERROR")
+            _restore_retry_error_status(task_path)
         if retry_reserved:
             await _release_retry_reservation(redis_client, name, pr_id)
         return HTMLResponse("Failed to commit retry change", status_code=503)
