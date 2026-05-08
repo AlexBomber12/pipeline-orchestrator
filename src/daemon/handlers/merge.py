@@ -234,6 +234,20 @@ class MergeMixin:
             )
             return
 
+        current_task = self.state.current_task
+        if current_task is not None and current_task.task_file:
+            try:
+                await self._commit_task_status_change(
+                    current_task,
+                    "DONE",
+                    "PR merged",
+                )
+            except Exception as exc:
+                self.log_event(
+                    f"[ERROR] Failed to write status:DONE to "
+                    f"{current_task.task_file}: {exc}"
+                )
+
         self._mark_task_done_in_snapshot()
 
         await self._save_current_run_record(

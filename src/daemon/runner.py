@@ -101,6 +101,7 @@ from src.queue_parser import (
     TYPE_SYNONYMS,
     QueueValidationError,
     parse_task_header,
+    write_frontmatter_status,
 )
 from src.usage import UsageProvider
 from src.utils import repo_slug_from_url
@@ -1196,6 +1197,18 @@ class PipelineRunner(
                 ),
                 log=self.log_event,
             )
+            if set_pr_escalated_flag and current_task.task_file:
+                try:
+                    await self._commit_task_status_change(
+                        current_task,
+                        "ERROR",
+                        message,
+                    )
+                except Exception as exc:
+                    self.log_event(
+                        f"[ERROR] Failed to write status:ERROR to "
+                        f"{current_task.task_file}: {exc}"
+                    )
 
         if target_state == PipelineState.IDLE and current_task is not None:
             self._recovered_task_pr_ids.add(current_task.pr_id)
@@ -1212,6 +1225,84 @@ class PipelineRunner(
         self.log_event(f"[ESCALATE] {log_body}")
         await self.publish_state()
         return label_applied
+
+    async def _commit_task_status_change(
+        self,
+        current_task: Any,
+        status: str,
+        reason: str,
+    ) -> None:
+        """Best-effort commit of daemon-written task frontmatter status."""
+        task_file = getattr(current_task, "task_file", None)
+        pr_id = getattr(current_task, "pr_id", "")
+        if not task_file:
+            return
+
+        task_path = Path(task_file)
+        if task_path.is_absolute() or ".." in task_path.parts:
+            self.log_event(
+                f"[INFRA] Warning: refusing to commit unsafe task path "
+                f"{task_file!r}."
+            )
+            return
+        repo_root = Path(self.repo_path).resolve()
+        resolved_task_path = (repo_root / task_path).resolve()
+        try:
+            resolved_task_path.relative_to(repo_root)
+        except ValueError:
+            self.log_event(
+                f"[INFRA] Warning: refusing to commit task path outside repo "
+                f"{task_file!r}."
+            )
+            return
+
+        short_reason = " ".join(reason.split())
+        if len(short_reason) > 80:
+            short_reason = f"{short_reason[:77]}..."
+        display_pr_id = pr_id if str(pr_id).startswith("PR-") else f"PR-{pr_id}"
+        subject = f"[STATUS] {display_pr_id} marked {status}: {short_reason}"
+        message = f"{subject}\n\n[skip ci]"
+        base = self.repo_config.branch
+
+        try:
+            git_ops._git(self.repo_path, "fetch", "origin", base, timeout=60)
+            git_ops._git(self.repo_path, "checkout", "-f", base, timeout=60)
+            git_ops._git(
+                self.repo_path,
+                "reset",
+                "--hard",
+                f"origin/{base}",
+                timeout=60,
+            )
+            write_frontmatter_status(Path(self.repo_path) / task_file, status)
+            git_ops._git(self.repo_path, "add", "--", task_file, timeout=30)
+            diff = git_ops._git(
+                self.repo_path,
+                "diff",
+                "--cached",
+                "--quiet",
+                "--",
+                task_file,
+                check=False,
+            )
+            if diff.returncode == 0:
+                self.log_event(
+                    f"[MERGE] No task status change to commit for {task_file}."
+                )
+                return
+            git_ops._git(
+                self.repo_path,
+                "commit",
+                "-m",
+                message,
+                timeout=60,
+            )
+            git_ops._git(self.repo_path, "push", "origin", base, timeout=60)
+        except Exception as exc:
+            self.log_event(
+                f"[INFRA] Warning: failed to commit {status} status for "
+                f"{task_file}: {exc}."
+            )
 
     def _track_current_coder_process(
         self, proc: asyncio.subprocess.Process

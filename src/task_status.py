@@ -75,13 +75,13 @@ def derive_task_status(
     current_task_pr_id: str | None = None,
 ) -> TaskStatus:
     """Derive task status from git state."""
-    if task_header.frontmatter_status == "merged":
+    if task_header.frontmatter_status in ("merged", "done"):
         return TaskStatus.DONE
     if task_header.frontmatter_status in ("in_progress", "in_review"):
         return TaskStatus.DOING
-    if task_header.frontmatter_status in ("blocked", "canceled"):
+    if task_header.frontmatter_status in ("blocked", "canceled", "error"):
         return TaskStatus.CANCELED
-    if task_header.frontmatter_status == "queued":
+    if task_header.frontmatter_status in ("queued", "todo"):
         return TaskStatus.TODO
     if (
         task_header.branch
