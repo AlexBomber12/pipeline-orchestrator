@@ -245,15 +245,41 @@ def test_task_spec_content_hash_ignores_frontmatter_status() -> None:
     todo_text = "---\nstatus: TODO\n---\n\nBody\n"
     changed_text = "---\nstatus: TODO\n---\n\nChanged\n"
     plain_text = "status: ERROR\n\nBody\n"
+    no_frontmatter_text = "Body\n"
 
     assert storage.task_spec_content_hash(error_text) == storage.task_spec_content_hash(
         todo_text
+    )
+    assert storage.task_spec_content_hash(error_text) == storage.task_spec_content_hash(
+        no_frontmatter_text
     )
     assert storage.task_spec_content_hash(changed_text) != storage.task_spec_content_hash(
         error_text
     )
     assert storage.task_spec_content_hash(plain_text) != storage.task_spec_content_hash(
         error_text
+    )
+
+
+def test_task_spec_content_hash_preserves_non_status_frontmatter() -> None:
+    metadata_text = "---\nstatus: ERROR\nowner: ops\n---\n\nBody\n"
+    changed_status_text = "---\nstatus: TODO\nowner: ops\n---\n\nBody\n"
+    no_metadata_text = "Body\n"
+
+    assert storage.task_spec_content_hash(metadata_text) == storage.task_spec_content_hash(
+        changed_status_text
+    )
+    assert storage.task_spec_content_hash(metadata_text) != storage.task_spec_content_hash(
+        no_metadata_text
+    )
+
+
+def test_task_spec_content_hash_preserves_unclosed_frontmatter() -> None:
+    malformed_text = "---\nstatus: ERROR\nBody\n"
+    plain_text = "Body\n"
+
+    assert storage.task_spec_content_hash(malformed_text) != storage.task_spec_content_hash(
+        plain_text
     )
 
 

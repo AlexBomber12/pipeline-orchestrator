@@ -77,14 +77,33 @@ def task_spec_content_hash(task_text: str) -> str:
     if first_content_index is None or lines[first_content_index].rstrip() != "---":
         normalized = lines
     else:
-        normalized = []
-        in_frontmatter = True
-        for index, raw_line in enumerate(lines):
-            if index > first_content_index and in_frontmatter and raw_line.rstrip() == "---":
-                in_frontmatter = False
-            if in_frontmatter and re.match(r"^status:\s*", raw_line.rstrip()):
-                continue
-            normalized.append(raw_line)
+        closing_index = next(
+            (
+                index
+                for index, raw_line in enumerate(lines[first_content_index + 1 :], start=first_content_index + 1)
+                if raw_line.rstrip() == "---"
+            ),
+            None,
+        )
+        if closing_index is None:
+            normalized = lines
+        else:
+            frontmatter = [
+                raw_line
+                for raw_line in lines[first_content_index + 1 : closing_index]
+                if not re.match(r"^status:\s*", raw_line.rstrip())
+            ]
+            if any(raw_line.strip() for raw_line in frontmatter):
+                normalized = (
+                    lines[: first_content_index + 1]
+                    + frontmatter
+                    + lines[closing_index:]
+                )
+            else:
+                body_start = closing_index + 1
+                if body_start < len(lines) and not lines[body_start].strip():
+                    body_start += 1
+                normalized = lines[:first_content_index] + lines[body_start:]
     return hashlib.sha256("".join(normalized).encode("utf-8")).hexdigest()
 
 
