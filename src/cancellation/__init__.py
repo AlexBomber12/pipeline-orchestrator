@@ -83,7 +83,10 @@ async def safe_record_cancellation_cause(
         return
 
     try:
-        await error_rate_tracker.record(redis_client, repo_slug, cause.created_at)
+        tracker_created_at = datetime.fromisoformat(cause.created_at)
+        await error_rate_tracker.record(
+            redis_client, repo_slug, tracker_created_at
+        )
     except Exception as exc:
         msg = (
             f"[ERROR] Failed to record ERROR-rate event "
