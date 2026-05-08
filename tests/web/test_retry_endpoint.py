@@ -31,10 +31,19 @@ class _RetryRedis:
     def multi(self) -> None:
         return None
 
-    def set(self, key: str, value: str, ex: int | None = None) -> None:
+    def set(
+        self,
+        key: str,
+        value: str,
+        ex: int | None = None,
+        nx: bool = False,
+    ) -> bool:
+        if nx and key in self.store:
+            return False
         self.store[key] = value
         if ex is not None:
             self.expiries[key] = ex
+        return True
 
     async def delete(self, key: str) -> int:
         self.deleted.append(key)
@@ -145,7 +154,8 @@ def test_retry_increments_counter_clears_cause_writes_queued(
     assert redis_client.store["metrics:retry_count:example__alpha:PR-283"] == "1"
     assert redis_client.expiries["metrics:retry_count:example__alpha:PR-283"] == 30 * 24 * 3600
     assert cause_key("example__alpha", "PR-283") not in redis_client.store
-    assert redis_client.deleted == [cause_key("example__alpha", "PR-283")]
+    assert cause_key("example__alpha", "PR-283") in redis_client.deleted
+    assert "control:retry_reservation:example__alpha" in redis_client.deleted
     assert redis_client.zremmed == [(index_key("example__alpha"), ("PR-283",))]
     assert "status: TODO" in (repo_dir / "tasks" / "PR-283.md").read_text(encoding="utf-8")
     assert ["git", "-C", str(repo_dir), "add", "tasks/PR-283.md"] in git_calls
@@ -325,8 +335,14 @@ async def test_decrement_retry_count_preserves_remaining_attempts() -> None:
 @pytest.mark.asyncio
 async def test_decrement_retry_count_awaits_async_set() -> None:
     class _AsyncSetRedis(_RetryRedis):
-        async def set(self, key: str, value: str, ex: int | None = None) -> None:  # type: ignore[override]
-            super().set(key, value, ex=ex)
+        async def set(  # type: ignore[override]
+            self,
+            key: str,
+            value: str,
+            ex: int | None = None,
+            nx: bool = False,
+        ) -> bool:
+            return super().set(key, value, ex=ex, nx=nx)
 
     redis_client = _AsyncSetRedis({"metrics:retry_count:repo:PR-1": "2"})
 
@@ -350,8 +366,14 @@ async def test_release_retry_reservation_swallows_cleanup_failure(
 @pytest.mark.asyncio
 async def test_repo_retry_reservation_handles_async_set_and_release_edges() -> None:
     class _AsyncSetRedis(_RetryRedis):
-        async def set(self, key: str, value: str, ex: int | None = None) -> None:  # type: ignore[override]
-            super().set(key, value, ex=ex)
+        async def set(  # type: ignore[override]
+            self,
+            key: str,
+            value: str,
+            ex: int | None = None,
+            nx: bool = False,
+        ) -> bool:
+            return super().set(key, value, ex=ex, nx=nx)
 
     idle_state = _state_snapshot(PipelineState.IDLE)
     redis_client = _AsyncSetRedis({"pipeline:repo": idle_state})
@@ -365,6 +387,18 @@ async def test_repo_retry_reservation_handles_async_set_and_release_edges() -> N
     reserved_state = RepoState.model_validate_json(redis_client.store["pipeline:repo"])
     assert previous_user_paused is False
     assert reserved_state.user_paused is True
+    assert redis_client.store["control:retry_reservation:repo"] == "1"
+
+    await repo_control._release_repo_retry_reservation(
+        redis_client,
+        "repo",
+        previous_user_paused=previous_user_paused,
+    )
+    assert "control:retry_reservation:repo" not in redis_client.store
+    assert (
+        RepoState.model_validate_json(redis_client.store["pipeline:repo"]).user_paused
+        is False
+    )
 
     await repo_control._release_repo_retry_reservation(
         _RetryRedis(),
@@ -398,6 +432,28 @@ async def test_repo_retry_reservation_handles_async_set_and_release_edges() -> N
         "repo",
         previous_user_paused=False,
     )
+
+
+@pytest.mark.asyncio
+async def test_repo_retry_reservation_rejects_concurrent_retry() -> None:
+    redis_client = _RetryRedis(
+        {
+            "pipeline:repo": _state_snapshot(PipelineState.IDLE),
+            "control:retry_reservation:repo": "1",
+        }
+    )
+
+    with pytest.raises(repo_control._RepoStateMutationError) as exc:
+        await repo_control._reserve_repo_for_retry(
+            redis_client,
+            "repo",
+            "https://github.com/example/repo.git",
+        )
+
+    assert exc.value.status_code == 409
+    assert "already in progress" in exc.value.message
+    stored_state = RepoState.model_validate_json(redis_client.store["pipeline:repo"])
+    assert stored_state.user_paused is False
 
 
 @pytest.mark.parametrize(

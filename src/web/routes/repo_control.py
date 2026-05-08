@@ -42,6 +42,7 @@ _QUEUE_NOT_READY_FRAGMENT = (
 )
 _QUEUE_NOT_READY_JSON = {"error": "Queue not yet computed"}
 _RETRY_TTL_SECONDS = 30 * 24 * 3600
+_RETRY_RESERVATION_TTL_SECONDS = 30 * 60
 
 _DEFERRED_CODER_SWITCH_STATES = {
     PipelineState.CODING,
@@ -150,6 +151,10 @@ def _retry_fingerprint_key(repo_slug: str, task_id: str) -> str:
     return f"metrics:retry_fingerprint:{repo_slug}:{task_id}"
 
 
+def _retry_reservation_key(repo_slug: str) -> str:
+    return f"control:retry_reservation:{repo_slug}"
+
+
 def _decode_retry_count(raw: object) -> int:
     if raw is None:
         return 0
@@ -221,6 +226,20 @@ async def _reserve_repo_for_retry(
 ) -> bool:
     """Atomically pause an inactive repo while retry rewrites its worktree."""
     state_key = pipeline_state(repo_slug)
+    reservation_key = _retry_reservation_key(repo_slug)
+    acquired = await _await_if_needed(
+        redis_client.set(
+            reservation_key,
+            "1",
+            ex=_RETRY_RESERVATION_TTL_SECONDS,
+            nx=True,
+        )
+    )
+    if not acquired:
+        raise _RepoStateMutationError(
+            "Repository retry already in progress; retry later.",
+            status_code=409,
+        )
 
     async def _transaction(pipe: Any) -> bool:
         raw = await pipe.get(state_key)
@@ -242,11 +261,15 @@ async def _reserve_repo_for_retry(
         await _await_if_needed(pipe.set(state_key, state.model_dump_json()))
         return previous_user_paused
 
-    return await redis_client.transaction(
-        _transaction,
-        state_key,
-        value_from_callable=True,
-    )
+    try:
+        return await redis_client.transaction(
+            _transaction,
+            state_key,
+            value_from_callable=True,
+        )
+    except Exception:
+        await _await_if_needed(redis_client.delete(reservation_key))
+        raise
 
 
 async def _release_repo_retry_reservation(
@@ -256,6 +279,7 @@ async def _release_repo_retry_reservation(
 ) -> None:
     """Restore the pre-retry pause bit unless a daemon has become active."""
     state_key = pipeline_state(repo_slug)
+    reservation_key = _retry_reservation_key(repo_slug)
 
     async def _transaction(pipe: Any) -> None:
         raw = await pipe.get(state_key)
@@ -275,6 +299,11 @@ async def _release_repo_retry_reservation(
         await redis_client.transaction(_transaction, state_key)
     except Exception:
         pass
+    finally:
+        try:
+            await _await_if_needed(redis_client.delete(reservation_key))
+        except Exception:
+            pass
 
 
 async def _increment_retry_count(
