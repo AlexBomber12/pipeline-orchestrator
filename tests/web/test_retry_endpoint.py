@@ -108,11 +108,17 @@ def _snapshot(tasks: list[QueueTask]) -> str:
     return state.model_dump_json()
 
 
-def _state_snapshot(state: PipelineState, tasks: list[QueueTask] | None = None) -> str:
+def _state_snapshot(
+    state: PipelineState,
+    tasks: list[QueueTask] | None = None,
+    *,
+    user_paused: bool = False,
+) -> str:
     repo_state = RepoState(
         url="https://github.com/example/alpha.git",
         name="example__alpha",
         state=state,
+        user_paused=user_paused,
         current_queue=tasks or [],
     )
     return repo_state.model_dump_json()
@@ -988,6 +994,67 @@ def test_retry_rejects_while_repo_active_before_git(
     assert response.status_code == 409
     assert "Repository is busy" in response.text
     assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
+    assert git_called is False
+
+
+def test_retry_allows_operator_paused_repo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _RetryRedis(
+        {
+            "pipeline:example__alpha": _state_snapshot(
+                PipelineState.PAUSED,
+                user_paused=True,
+            )
+        }
+    )
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+
+    assert response.status_code == 200
+    stored_state = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
+    assert stored_state.state == PipelineState.PAUSED
+    assert stored_state.user_paused is True
+
+
+def test_retry_rejects_rate_limit_paused_repo_before_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _RetryRedis(
+        {
+            "pipeline:example__alpha": _state_snapshot(
+                PipelineState.PAUSED,
+                user_paused=False,
+            )
+        }
+    )
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    git_called = False
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal git_called
+        git_called = True
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+
+    assert response.status_code == 409
+    assert "Repository is busy" in response.text
     assert git_called is False
 
 

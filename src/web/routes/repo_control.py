@@ -60,6 +60,7 @@ _ACTIVE_RUN_STATES = {
     PipelineState.MERGE,
     PipelineState.PAUSED,
 }
+_RETRY_BUSY_STATES = _ACTIVE_RUN_STATES - {PipelineState.PAUSED}
 _CODER_LABELS = {
     "any": "Any (bandit picks per-PR)",
     "claude": "Claude CLI",
@@ -154,6 +155,12 @@ def _retry_fingerprint_key(repo_slug: str, task_id: str) -> str:
 
 def _retry_reservation_key(repo_slug: str) -> str:
     return f"control:retry_reservation:{repo_slug}"
+
+
+def _repo_busy_for_retry(state: RepoState) -> bool:
+    if state.state in _RETRY_BUSY_STATES:
+        return True
+    return state.state == PipelineState.PAUSED and not state.user_paused
 
 
 def _decode_retry_count(raw: object) -> int:
@@ -251,7 +258,7 @@ async def _reserve_repo_for_retry(
                 state = RepoState.model_validate_json(raw)
             except Exception as exc:
                 raise _RepoStateMutationError("Failed to read repository state") from exc
-        if state.state in _ACTIVE_RUN_STATES:
+        if _repo_busy_for_retry(state):
             raise _RepoStateMutationError(
                 "Repository is busy; retry later.",
                 status_code=409,
