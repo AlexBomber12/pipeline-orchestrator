@@ -7,7 +7,8 @@
       "depends_on": [],
       "priority": 3,
       "type": "bugfix",
-      "complexity": "low"
+      "complexity": "low",
+      "frontmatter_status": "ERROR"
     }
   ],
   "open_prs": [
@@ -20,6 +21,5 @@
   ],
   "merged_pr_ids_via_git_log": [],
   "merged_branches_via_api": [],
-  "crashed_task_pr_ids": [],
-  "recovered_task_pr_ids": ["PR-247"]
+  "crashed_task_pr_ids": []
 }

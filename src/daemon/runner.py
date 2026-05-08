@@ -91,8 +91,9 @@ from src.keyspace import (
     cli_log_latest,
     control_config_dirty,
     control_stop,
+    legacy_recovered_tasks,
     pipeline_state,
-    recovered_tasks,
+    status_write_failed_tasks,
     upload_pending,
 )
 from src.metrics import MetricsStore, RunRecord
@@ -295,12 +296,10 @@ class PipelineRunner(
         # task is not re-picked into a crash loop. Cleared when the user
         # re-uploads the task file.
         self._crashed_task_pr_ids: set[str] = set()
-        # PR-247 follow-up: Tasks the operator explicitly error via the
-        # HUNG recover button. Distinct from ``_crashed_task_pr_ids``
-        # because this set must NOT be discarded when the task derives
-        # back to ``DOING`` from a still-open PR — that PR is the stuck
-        # work item the operator just abandoned. Cleared on task re-upload.
-        self._recovered_task_pr_ids: set[str] = set()
+        # Tasks explicitly escalated/canceled where the best-effort
+        # task-file status commit failed. Unlike crashed tasks, these
+        # must stay parked even if their old PR remains visible.
+        self._status_write_failed_task_pr_ids: set[str] = set()
         self._user_pause_logged = False
         self._pending_repo_config: RepoConfig | None = None
         self._pending_app_config: AppConfig | None = None
@@ -1183,23 +1182,33 @@ class PipelineRunner(
         prior_state = self.state.state
         current_task = self.state.current_task
         if current_task is not None:
-            await safe_record_cancellation_cause(
-                self.redis,
-                self.name,
-                current_task.pr_id,
-                CancellationCause(
-                    category="ESCALATE",
-                    payload={
-                        "subsource": "daemon",
-                        "reason_text": message,
-                        "previous_state": prior_state.value,
-                    },
-                ),
-                log=self.log_event,
-            )
-            if set_pr_escalated_flag and current_task.task_file:
+            existing_cause: CancellationCause | None
+            try:
+                existing_cause = await get_cancellation_cause(
+                    self.redis,
+                    self.name,
+                    current_task.pr_id,
+                )
+            except Exception:
+                existing_cause = None
+            if existing_cause is None:
+                await safe_record_cancellation_cause(
+                    self.redis,
+                    self.name,
+                    current_task.pr_id,
+                    CancellationCause(
+                        category="ESCALATE",
+                        payload={
+                            "subsource": "daemon",
+                            "reason_text": message,
+                            "previous_state": prior_state.value,
+                        },
+                    ),
+                    log=self.log_event,
+                )
+            if set_pr_escalated_flag:
                 try:
-                    await self._commit_task_status_change(
+                    status_written = await self._commit_task_status_change(
                         current_task,
                         "ERROR",
                         message,
@@ -1209,10 +1218,11 @@ class PipelineRunner(
                         f"[ERROR] Failed to write status:ERROR to "
                         f"{current_task.task_file}: {exc}"
                     )
+                    status_written = False
+                if not status_written:
+                    await self._mark_status_write_failed_task(current_task)
 
         if target_state == PipelineState.IDLE and current_task is not None:
-            self._recovered_task_pr_ids.add(current_task.pr_id)
-            await self._persist_recovered_task_pr_ids()
             self.state.current_task = None
             self._reset_runner_local_task_counters()
 
@@ -1231,12 +1241,12 @@ class PipelineRunner(
         current_task: Any,
         status: str,
         reason: str,
-    ) -> None:
+    ) -> bool:
         """Best-effort commit of daemon-written task frontmatter status."""
         task_file = getattr(current_task, "task_file", None)
         pr_id = getattr(current_task, "pr_id", "")
         if not task_file:
-            return
+            return False
 
         task_path = Path(task_file)
         if task_path.is_absolute() or ".." in task_path.parts:
@@ -1244,7 +1254,7 @@ class PipelineRunner(
                 f"[INFRA] Warning: refusing to commit unsafe task path "
                 f"{task_file!r}."
             )
-            return
+            return False
         repo_root = Path(self.repo_path).resolve()
         resolved_task_path = (repo_root / task_path).resolve()
         try:
@@ -1254,7 +1264,7 @@ class PipelineRunner(
                 f"[INFRA] Warning: refusing to commit task path outside repo "
                 f"{task_file!r}."
             )
-            return
+            return False
 
         short_reason = " ".join(reason.split())
         if len(short_reason) > 80:
@@ -1289,7 +1299,7 @@ class PipelineRunner(
                 self.log_event(
                     f"[MERGE] No task status change to commit for {task_file}."
                 )
-                return
+                return True
             git_ops._git(
                 self.repo_path,
                 "commit",
@@ -1298,11 +1308,99 @@ class PipelineRunner(
                 timeout=60,
             )
             git_ops._git(self.repo_path, "push", "origin", base, timeout=60)
+            return True
         except Exception as exc:
             self.log_event(
                 f"[INFRA] Warning: failed to commit {status} status for "
                 f"{task_file}: {exc}."
             )
+            return False
+
+    async def _persist_status_write_failed_task_pr_ids(self) -> None:
+        """Persist status-write fallback markers across daemon restarts."""
+        key = status_write_failed_tasks(self.name)
+        try:
+            if self._status_write_failed_task_pr_ids:
+                await self.redis.set(
+                    key,
+                    json.dumps(
+                        sorted(self._status_write_failed_task_pr_ids),
+                        separators=(",", ":"),
+                    ),
+                )
+            else:
+                await self.redis.delete(key)
+        except Exception as exc:
+            self.log_event(
+                f"[INFRA] Warning: failed to persist status-write "
+                f"fallback markers: {exc}."
+            )
+
+    async def _hydrate_status_write_failed_task_pr_ids(self) -> None:
+        """Load status-write fallback markers persisted by a prior process."""
+        decoded = await self._read_status_write_failed_task_ids(
+            status_write_failed_tasks(self.name)
+        )
+        legacy_decoded = await self._read_status_write_failed_task_ids(
+            legacy_recovered_tasks(self.name)
+        )
+        self._status_write_failed_task_pr_ids.update(decoded | legacy_decoded)
+
+    async def _clear_status_write_failed_task_ids(
+        self,
+        uploaded_pr_ids: set[str],
+    ) -> None:
+        """Clear fallback markers for task files the operator re-uploaded."""
+        await self._hydrate_status_write_failed_task_pr_ids()
+        self._status_write_failed_task_pr_ids.difference_update(uploaded_pr_ids)
+        await self._persist_status_write_failed_task_pr_ids()
+        legacy_key = legacy_recovered_tasks(self.name)
+        try:
+            await self.redis.set(
+                legacy_key,
+                json.dumps(
+                    sorted(self._status_write_failed_task_pr_ids),
+                    separators=(",", ":"),
+                ),
+            )
+            await self.redis.delete(legacy_key)
+        except Exception as exc:
+            self.log_event(
+                f"[INFRA] Warning: failed to clear legacy status-write "
+                f"fallback markers: {exc}."
+            )
+
+    async def _read_status_write_failed_task_ids(self, key: str) -> set[str]:
+        """Return a persisted fallback marker set from one Redis key."""
+        try:
+            raw = await self.redis.get(key)
+        except Exception:
+            return set()
+        if not raw:
+            return set()
+        try:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            decoded = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return set()
+        if not isinstance(decoded, list):
+            return set()
+        return {
+            item for item in decoded if isinstance(item, str) and item
+        }
+
+    async def _mark_status_write_failed_task(self, current_task: Any) -> None:
+        """Keep an explicitly parked task skipped when status commit fails."""
+        pr_id = getattr(current_task, "pr_id", "")
+        if not pr_id:
+            return
+        self._status_write_failed_task_pr_ids.add(pr_id)
+        self.log_event(
+            f"[INFRA] Warning: using in-memory ERROR fallback for "
+            f"{pr_id}; task file re-upload is required to retry."
+        )
+        await self._persist_status_write_failed_task_pr_ids()
 
     def _track_current_coder_process(
         self, proc: asyncio.subprocess.Process
@@ -1323,67 +1421,6 @@ class PipelineRunner(
         except Exception:
             return
         self.state.user_paused = persisted.user_paused
-
-    async def _persist_recovered_task_pr_ids(self) -> None:
-        """Snapshot ``_recovered_task_pr_ids`` to Redis (best-effort).
-
-        PR-247 follow-up: the operator-recovery contract is "abandon
-        the trapped task until the user re-uploads the task file." A
-        daemon restart between the recover click and the re-upload
-        would otherwise lose the in-memory marker; ``recover_state``
-        would then read the ERROR row from QUEUE.md, rehydrate it
-        into ``_crashed_task_pr_ids`` (whose IDLE-selector override
-        intentionally discards on a still-open PR re-deriving DOING),
-        and reattach the runner to WATCH on the same stuck PR. Storing
-        the set in Redis lets ``recover_state`` hydrate the stricter
-        ``_recovered_task_pr_ids`` override across restarts so the
-        abandon contract holds.
-
-        Best-effort: a Redis failure here logs but does not raise. The
-        in-memory transition still completes; only the cross-restart
-        guarantee is forfeited for that one failure, and the next
-        recover/upload write will retry the snapshot.
-        """
-        key = recovered_tasks(self.name)
-        try:
-            if self._recovered_task_pr_ids:
-                payload = json.dumps(sorted(self._recovered_task_pr_ids))
-                await self.redis.set(key, payload)
-            else:
-                await self.redis.delete(key)
-        except Exception as exc:
-            logger.warning(
-                "%s: failed to persist recovered_task_pr_ids: %s",
-                self.name, exc,
-            )
-
-    async def _load_recovered_task_pr_ids(self) -> None:
-        """Hydrate ``_recovered_task_pr_ids`` from Redis on startup.
-
-        Called by ``recover_state`` before the queue rehydrate so the
-        IDLE selector's stricter ``_recovered_task_pr_ids`` override
-        applies to PR-IDs the operator abandoned in a prior daemon
-        lifetime (PR-247 follow-up).
-        """
-        key = recovered_tasks(self.name)
-        try:
-            raw = await self.redis.get(key)
-        except Exception as exc:
-            logger.warning(
-                "%s: failed to load recovered_task_pr_ids: %s",
-                self.name, exc,
-            )
-            return
-        if not raw:
-            return
-        try:
-            loaded = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return
-        if isinstance(loaded, list):
-            self._recovered_task_pr_ids.update(
-                str(pr_id) for pr_id in loaded if isinstance(pr_id, str)
-            )
 
     async def _pop_stop_request(self) -> bool:
         """Return True when a pending stop control signal exists."""

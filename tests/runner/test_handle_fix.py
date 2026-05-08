@@ -642,7 +642,7 @@ def test_handle_fix_three_no_push_cycles_cancel_to_idle(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
     assert runner.state.current_pr is None
-    assert "PR-217" in runner._recovered_task_pr_ids
+    assert not hasattr(runner, "_recovered_task_pr_ids")
     assert posted == []
     assert any(
         "PR #217 no-push deadlock after 3 attempts; canceling task"
@@ -1935,7 +1935,6 @@ def test_handle_fix_external_close_during_coder_skips_with_crash_cause(
 ) -> None:
     """A polling task that detects CLOSED while the coder runs skips to IDLE."""
     recorded: list[tuple[str, str, str, dict[str, object]]] = []
-    persisted: list[set[str]] = []
 
     async def fake_safe_record(redis_client, repo_slug, task_id, cause, *, log=None):
         recorded.append((repo_slug, task_id, cause.category, cause.payload))
@@ -1956,11 +1955,6 @@ def test_handle_fix_external_close_during_coder_skips_with_crash_cause(
         status=TaskStatus.DOING,
         branch="pr-078",
     )
-
-    async def fake_persist_recovered() -> None:
-        persisted.append(set(runner._recovered_task_pr_ids))
-
-    runner._persist_recovered_task_pr_ids = fake_persist_recovered  # type: ignore[method-assign]
 
     async def fake_poll(
         self: object,
@@ -1987,8 +1981,7 @@ def test_handle_fix_external_close_during_coder_skips_with_crash_cause(
 
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
-    assert "PR-078" in runner._recovered_task_pr_ids
-    assert persisted == [{"PR-078"}]
+    assert not hasattr(runner, "_recovered_task_pr_ids")
     assert recorded == [
         (
             runner.name,

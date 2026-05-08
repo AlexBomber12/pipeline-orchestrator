@@ -45,6 +45,9 @@ class _FakeRedis:
             raise self.delete_error
         self.store.pop(key, None)
 
+    async def zrem(self, key: str, *members: str) -> int:
+        return 0
+
     async def eval(self, script: str, numkeys: int, *args: Any) -> Any:
         del script, numkeys
         if self.eval_error is not None:
@@ -68,18 +71,33 @@ class _Runner(repo_ops.RepoOpsMixin):
         self.name = "demo"
         self.events: list[str] = []
         self._crashed_task_pr_ids: set[str] = set()
-        self._recovered_task_pr_ids: set[str] = set()
-        self._recovered_persist_calls: list[frozenset[str]] = []
+        self._status_write_failed_task_pr_ids: set[str] = set()
+        self.cleared_status_write_failed_calls = 0
         self.state = SimpleNamespace(current_queue=None)
 
     def log_event(self, message: str) -> None:
         self.events.append(message)
 
-    async def _persist_recovered_task_pr_ids(self) -> None:
-        self._recovered_persist_calls.append(
-            frozenset(self._recovered_task_pr_ids)
-        )
-
+    async def _clear_status_write_failed_task_ids(
+        self,
+        uploaded_pr_ids: set[str],
+    ) -> None:
+        self.cleared_status_write_failed_calls += 1
+        for key in ("status_write_failed_tasks:demo", "recovered_tasks:demo"):
+            raw = self.redis.store.get(key)
+            if raw:
+                self._status_write_failed_task_pr_ids.update(json.loads(raw))
+        self._status_write_failed_task_pr_ids.difference_update(uploaded_pr_ids)
+        if self._status_write_failed_task_pr_ids:
+            self.redis.store["status_write_failed_tasks:demo"] = json.dumps(
+                sorted(self._status_write_failed_task_pr_ids)
+            )
+        else:
+            self.redis.store.pop("status_write_failed_tasks:demo", None)
+        try:
+            await self.redis.delete("recovered_tasks:demo")
+        except Exception:
+            pass
 
 def _run(coro: Any) -> Any:
     return asyncio.run(coro)
@@ -559,7 +577,7 @@ def test_process_pending_uploads_counts_unique_task_filenames_in_log_event(
     )
 
 
-def test_process_pending_uploads_clears_crashed_pr_ids_on_reupload(
+def test_process_pending_uploads_clears_crashed_pr_ids_on_reupload_with_sibling(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -586,18 +604,14 @@ def test_process_pending_uploads_clears_crashed_pr_ids_on_reupload(
     assert runner._crashed_task_pr_ids == {"PR-999"}
 
 
-def test_process_pending_uploads_clears_recovered_pr_ids_on_reupload(
+def test_process_pending_uploads_clears_status_write_fallback_on_reupload(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """PR-247 follow-up: Re-uploading a task file the operator error
-    via the HUNG recover button is the user's signal to retry. The
-    recovered-pr-ids set must be cleared for any uploaded PR-id so the
-    next IDLE cycle no longer forces it ERROR, mirroring the PR-186
-    contract for the crashed-pr-ids set. Other recovered entries that
-    were not re-uploaded must remain intact."""
+    """Re-uploading a task clears the in-memory status-write fallback."""
     runner = _Runner(tmp_path)
-    runner._recovered_task_pr_ids.update({"PR-001", "PR-999"})
+    runner._status_write_failed_task_pr_ids.update({"PR-001", "PR-999"})
+    runner.redis.store["recovered_tasks:demo"] = '["PR-001"]'
     Path(runner.repo_path).mkdir(parents=True)
     staging = tmp_path / "uploads" / "demo"
     staging.mkdir(parents=True)
@@ -611,11 +625,107 @@ def test_process_pending_uploads_clears_recovered_pr_ids_on_reupload(
     monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
 
     assert _run(runner.process_pending_uploads()) is True
-    assert runner._recovered_task_pr_ids == {"PR-999"}
-    # PR-247 follow-up: the trimmed recovered-task set must be persisted
-    # so a daemon restart immediately after upload does not rehydrate
-    # the stale set from Redis and re-cancel the freshly retried task.
-    assert runner._recovered_persist_calls == [frozenset({"PR-999"})]
+    assert runner._status_write_failed_task_pr_ids == {"PR-999"}
+    assert runner.cleared_status_write_failed_calls == 1
+    assert "recovered_tasks:demo" not in runner.redis.store
+
+
+def test_process_pending_uploads_ignores_legacy_recovered_delete_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Legacy marker cleanup is best-effort during re-upload."""
+    runner = _Runner(tmp_path)
+    runner._status_write_failed_task_pr_ids.add("PR-001")
+    runner.redis.store["recovered_tasks:demo"] = '["PR-001"]'
+    runner.redis.delete_error = RuntimeError("redis down")
+    Path(runner.repo_path).mkdir(parents=True)
+    staging = tmp_path / "uploads" / "demo"
+    staging.mkdir(parents=True)
+    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
+    key = f"upload:{runner.name}:pending"
+    manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
+    runner.redis.store[key] = manifest
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess())
+    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
+    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
+
+    assert _run(runner.process_pending_uploads()) is True
+    assert runner._status_write_failed_task_pr_ids == set()
+    assert runner.cleared_status_write_failed_calls == 1
+
+
+def test_process_pending_uploads_clears_persisted_status_fallback_before_hydrate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Re-upload clears persisted fallback state even before recovery hydrates it."""
+    runner = _Runner(tmp_path)
+    runner.redis.store["status_write_failed_tasks:demo"] = '["PR-001", "PR-999"]'
+    Path(runner.repo_path).mkdir(parents=True)
+    staging = tmp_path / "uploads" / "demo"
+    staging.mkdir(parents=True)
+    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
+    key = f"upload:{runner.name}:pending"
+    manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
+    runner.redis.store[key] = manifest
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess())
+    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
+    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
+
+    assert _run(runner.process_pending_uploads()) is True
+    assert runner._status_write_failed_task_pr_ids == {"PR-999"}
+    assert json.loads(runner.redis.store["status_write_failed_tasks:demo"]) == [
+        "PR-999"
+    ]
+
+
+def test_process_pending_uploads_clears_cancellation_cause_on_reupload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Re-uploading a task clears stale cancellation cause attribution."""
+    runner = _Runner(tmp_path)
+    runner.redis.store["cancellation:demo:PR-001"] = "{}"
+    Path(runner.repo_path).mkdir(parents=True)
+    staging = tmp_path / "uploads" / "demo"
+    staging.mkdir(parents=True)
+    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
+    key = f"upload:{runner.name}:pending"
+    manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
+    runner.redis.store[key] = manifest
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess())
+    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
+    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
+
+    assert _run(runner.process_pending_uploads()) is True
+    assert "cancellation:demo:PR-001" not in runner.redis.store
+
+
+def test_process_pending_uploads_clears_crashed_pr_ids_on_reupload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Re-uploading an errored task file is the user's retry signal."""
+    runner = _Runner(tmp_path)
+    runner._crashed_task_pr_ids.update({"PR-001", "PR-999"})
+    Path(runner.repo_path).mkdir(parents=True)
+    staging = tmp_path / "uploads" / "demo"
+    staging.mkdir(parents=True)
+    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
+    key = f"upload:{runner.name}:pending"
+    manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
+    runner.redis.store[key] = manifest
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess())
+    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
+    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
+
+    assert _run(runner.process_pending_uploads()) is True
+    assert runner._crashed_task_pr_ids == {"PR-999"}
 
 
 def test_process_pending_uploads_flips_canceled_to_todo_in_snapshot(

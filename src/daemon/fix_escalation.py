@@ -180,8 +180,20 @@ async def escalate_fix_no_push_deadlock(
 
     current_pr.no_push_fix_count = 0
     if current_task is not None:
-        runner._recovered_task_pr_ids.add(current_task.pr_id)
-        await runner._persist_recovered_task_pr_ids()
+        try:
+            status_written = await runner._commit_task_status_change(
+                current_task,
+                "ERROR",
+                "FIX no-push deadlock",
+            )
+        except Exception as exc:  # pragma: no cover - defensive status-write logging.
+            runner.log_event(
+                f"[ERROR] Failed to write status:ERROR to "
+                f"{current_task.task_file}: {exc}"
+            )
+            status_written = False
+        if not status_written:
+            await runner._mark_status_write_failed_task(current_task)
 
     runner.state.current_task = None
     runner._reset_runner_local_task_counters()

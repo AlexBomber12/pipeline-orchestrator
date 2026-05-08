@@ -19,9 +19,18 @@ def _write_task_file(task_dir: Path, task: dict[str, Any]) -> None:
         return
     depends_on = task.get("depends_on", [])
     depends_value = ", ".join(depends_on) if depends_on else "none"
+    frontmatter = []
+    if task.get("frontmatter_status"):
+        frontmatter = [
+            "---",
+            f"status: {task['frontmatter_status']}",
+            "---",
+            "",
+        ]
     path.write_text(
         "\n".join(
-            [
+            frontmatter
+            + [
                 f"# {task['pr_id']}: {task['title']}",
                 "",
                 f"Branch: {task['branch']}",
@@ -73,7 +82,6 @@ def _runner_for_fixture(
         PRInfo(**pr) for pr in before.get("open_prs", [])
     ]
     runner._crashed_task_pr_ids = set(before.get("crashed_task_pr_ids", []))
-    runner._recovered_task_pr_ids = set(before.get("recovered_task_pr_ids", []))
     if before.get("current_task_pr_id"):
         runner.state.current_task = QueueTask(
             pr_id=before["current_task_pr_id"],

@@ -277,6 +277,11 @@ class IdleMixin:
             if current_task_pr_id in stopped_task_pr_ids:
                 current_task_pr_id = None
             crashed_task_pr_ids = getattr(self, "_crashed_task_pr_ids", set())
+            status_write_failed_task_pr_ids = getattr(
+                self,
+                "_status_write_failed_task_pr_ids",
+                set(),
+            )
             statuses = {
                 header.pr_id: derive_task_status(
                     header,
@@ -307,23 +312,15 @@ class IdleMixin:
                     crashed_task_pr_ids.discard(pr_id)
                     continue
                 statuses[pr_id] = TaskStatus.ERROR
-            # PR-247 follow-up: Operator-initiated HUNG recovery records
-            # the trapped task in ``_recovered_task_pr_ids``. Force its
-            # status to ERROR unconditionally (except DONE — a real
-            # merge wins) so the still-open PR cannot re-derive DOING and
-            # bounce the runner back into WATCH on the same stuck work
-            # item. This is intentionally stronger than the PR-186
-            # crashed-task override above: there the open PR may be a
-            # stale-API artifact worth honoring; here it is the trapped
-            # PR the operator just abandoned.
-            recovered_task_pr_ids = getattr(
-                self, "_recovered_task_pr_ids", set()
-            )
+            # If an explicit escalation/cancel path could not write the
+            # durable task-file status, keep the task parked in memory
+            # until the operator re-uploads it. A still-open PR must not
+            # make the task live again.
             for pr_id in list(statuses.keys()):
-                if pr_id not in recovered_task_pr_ids:
+                if pr_id not in status_write_failed_task_pr_ids:
                     continue
                 if statuses[pr_id] == TaskStatus.DONE:
-                    recovered_task_pr_ids.discard(pr_id)
+                    status_write_failed_task_pr_ids.discard(pr_id)
                     continue
                 statuses[pr_id] = TaskStatus.ERROR
             eligible = get_eligible_tasks(dag_headers, statuses)

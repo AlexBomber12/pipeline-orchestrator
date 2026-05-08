@@ -105,7 +105,6 @@ class RecoveryMixin:
         if current_task_pr_id in stopped_task_pr_ids:
             current_task_pr_id = None
         crashed_task_pr_ids = set(getattr(self, "_crashed_task_pr_ids", set()))
-        recovered_task_pr_ids = set(getattr(self, "_recovered_task_pr_ids", set()))
 
         tasks: list[QueueTask] = []
         for header in headers:
@@ -116,8 +115,6 @@ class RecoveryMixin:
                 merged_prs,
                 current_task_pr_id=current_task_pr_id,
             )
-            if header.pr_id in recovered_task_pr_ids and status != TaskStatus.DONE:
-                status = TaskStatus.ERROR
             if (
                 header.pr_id in crashed_task_pr_ids
                 and status in (TaskStatus.TODO, TaskStatus.ERROR)
@@ -214,16 +211,6 @@ class RecoveryMixin:
         # CODING through the DOING-with-matching-PR path the next handle
         # cycle rewrites the marker before invoking the coder.
         self._cleanup_expected_branch()
-        # PR-247 follow-up: hydrate the operator-recovered task set from
-        # Redis before any DOING-task decision. The HUNG recover button
-        # writes through ``_persist_recovered_task_pr_ids``; without this
-        # load the marker is process-local and a daemon restart between
-        # the click and the user's task re-upload would lose it,
-        # collapsing the stronger "abandon until re-upload" override
-        # back into the PR-186 crashed-task path which intentionally
-        # discards on a still-open PR re-deriving DOING.
-        await self._load_recovered_task_pr_ids()
-
         return await self._recover_state_headers()
 
     async def _hydrate_current_task_from_persisted_state(self) -> None:
@@ -315,6 +302,7 @@ class RecoveryMixin:
         # outage during recovery still surfaces as ERROR with no
         # current_task.
         await self._hydrate_current_task_from_persisted_state()
+        await self._hydrate_status_write_failed_task_pr_ids()
         # The helper consults ``_idle_open_prs`` to derive each task's
         # status from the live PR set. Populate it from the recovery
         # fetch and reset on exit so ``handle_idle`` does not later read
@@ -386,6 +374,28 @@ class RecoveryMixin:
             if queued.status == TaskStatus.ERROR:
                 self._crashed_task_pr_ids.add(queued.pr_id)
 
+        status_write_failed_task_pr_ids = getattr(
+            self,
+            "_status_write_failed_task_pr_ids",
+            set(),
+        )
+        if status_write_failed_task_pr_ids:
+            changed = False
+            for index, queued in enumerate(tasks):
+                if queued.pr_id not in status_write_failed_task_pr_ids:
+                    continue
+                if queued.status == TaskStatus.DONE:
+                    status_write_failed_task_pr_ids.discard(queued.pr_id)
+                    changed = True
+                    continue
+                if queued.status != TaskStatus.ERROR:
+                    tasks[index] = queued.model_copy(
+                        update={"status": TaskStatus.ERROR}
+                    )
+                    changed = True
+            if changed:
+                await self._persist_status_write_failed_task_pr_ids()
+
         doing = next((t for t in tasks if t.status == TaskStatus.DOING), None)
 
         # Record any outstanding queue-sync PR before any DOING-path early
@@ -410,27 +420,6 @@ class RecoveryMixin:
                 f"[INFRA] Recovered pending queue-sync branch: "
                 f"{pending_sync.branch}."
             )
-
-        # PR-247 follow-up: a DOING entry whose PR-ID is in the operator-
-        # recovered set is one the operator already abandoned via the
-        # HUNG recover button. The IDLE cycle that would have rewritten
-        # the QUEUE.md row to ERROR never ran (or its snapshot was
-        # not yet visible), so the row still reads DOING. Treat it the
-        # same as no DOING entry — staying IDLE — so neither the WATCH
-        # re-attach nor the PR-186 crashed-task path runs against the
-        # abandoned task. The IDLE selector's stricter override will
-        # surface ERROR on the next cycle.
-        if doing is not None and doing.pr_id in self._recovered_task_pr_ids:
-            ctx = BranchContext.from_runner(self)
-            self.log_event(
-                f"[INFRA] Operator-recovered task {doing.pr_id} still DOING "
-                f"in queue; staying IDLE pending re-upload. "
-                f"({ctx.log_summary()})"
-            )
-            self.state.current_task = None
-            self._reset_runner_local_task_counters()
-            self.state.state = PipelineState.IDLE
-            return
 
         if doing is not None:
             self.state.current_task = doing

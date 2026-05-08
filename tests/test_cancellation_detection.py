@@ -248,7 +248,7 @@ def test_escalate_wiring_writes_reason_text(
 
     escalate_writes = [c for c in captured if c.category == "ESCALATE"]
     assert [c.payload for c in escalate_writes] == [
-        {"reason_text": "cannot resolve"},
+        {"subsource": "coder", "reason_text": "cannot resolve"},
         {
             "subsource": "daemon",
             "reason_text": "FIX coder ESCALATE on PR #304: cannot resolve. Moving to IDLE.",

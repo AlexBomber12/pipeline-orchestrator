@@ -40,27 +40,19 @@ def control_recover(repo_name: str) -> str:
     return f"control:{repo_name}:recover"
 
 
-def recovered_tasks(repo_name: str) -> str:
-    """Persisted PR-IDs the operator abandoned via the HUNG recover button.
-
-    JSON-encoded sorted list of PR-IDs. The daemon hydrates the
-    in-memory ``_recovered_task_pr_ids`` set from this key in
-    ``recover_state`` and adds to it from
-    ``_perform_operator_recovery``; ``process_pending_uploads`` removes
-    any uploaded PR-IDs and rewrites the snapshot. Without this
-    persistence a daemon restart between the recover click and the
-    user's task re-upload would lose the marker, ``recover_state`` would
-    rehydrate the ERROR row into ``_crashed_task_pr_ids`` instead,
-    and the IDLE selector would discard the override on the still-open
-    PR deriving back to ``DOING`` — defeating the recover button's
-    "abandon until re-upload" contract (PR-247 follow-up).
-    """
-    return f"recovered_tasks:{repo_name}"
-
-
 def upload_pending(repo_name: str) -> str:
     """Key for the pending-upload manifest consumed by the daemon."""
     return f"upload:{repo_name}:pending"
+
+
+def status_write_failed_tasks(repo_name: str) -> str:
+    """PR IDs parked after status:ERROR could not be committed."""
+    return f"status_write_failed_tasks:{repo_name}"
+
+
+def legacy_recovered_tasks(repo_name: str) -> str:
+    """Legacy PR IDs parked by pre-PR-281 recovery fallback state."""
+    return f"recovered_tasks:{repo_name}"
 
 
 def upload_pending_pattern() -> str:

@@ -14,6 +14,8 @@ from typing import Any
 
 import pytest
 from src.cancellation import CancellationCause
+from src.cancellation.storage import cause_key
+from src.keyspace import status_write_failed_tasks
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 
 from tests.runner import _helpers as h
@@ -122,6 +124,124 @@ def test_default_args_skip_to_idle_apply_label_no_comment(
     assert ["pr", "edit", "500", "--add-label", "escalated"] in gh_calls
     assert any(e["event"] == "[ESCALATE] park me" for e in runner.state.history)
     assert publish_calls == [None]
+
+
+def test_escalate_and_skip_sets_status_write_fallback_when_commit_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed task status write must still park the task until re-upload."""
+    _patch_label_calls(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=501, branch="pr-501")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-501",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-501",
+        task_file="tasks/PR-501.md",
+    )
+    _install_publish_state_spy(runner)
+
+    async def fake_commit(*args: Any, **kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", fake_commit)
+
+    asyncio.run(runner._escalate_and_skip("park after write failure"))
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner._status_write_failed_task_pr_ids == {"PR-501"}
+    assert runner.redis.store[status_write_failed_tasks(runner.name)] == (
+        '["PR-501"]'
+    )
+    assert any(
+        "using in-memory ERROR fallback for PR-501" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_mark_status_write_failed_task_ignores_missing_pr_id() -> None:
+    runner = h._make_runner()
+
+    asyncio.run(runner._mark_status_write_failed_task(object()))
+
+    assert runner._status_write_failed_task_pr_ids == set()
+    assert runner.state.history == []
+
+
+def test_persist_status_write_failed_task_ids_deletes_empty_set() -> None:
+    runner = h._make_runner()
+    key = status_write_failed_tasks(runner.name)
+    runner.redis.store[key] = '["PR-001"]'
+
+    asyncio.run(runner._persist_status_write_failed_task_pr_ids())
+
+    assert key not in runner.redis.store
+    assert key in runner.redis.deleted
+
+
+def test_persist_status_write_failed_task_ids_logs_redis_failure() -> None:
+    runner = h._make_runner()
+
+    async def fail_delete(key: str) -> int:
+        raise RuntimeError("redis down")
+
+    runner.redis.delete = fail_delete  # type: ignore[method-assign]
+
+    asyncio.run(runner._persist_status_write_failed_task_pr_ids())
+
+    assert any(
+        "failed to persist status-write fallback markers: redis down"
+        in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'["PR-001", "", 12, "PR-002"]',
+        "{not json",
+        '{"not":"a list"}',
+    ],
+)
+def test_hydrate_status_write_failed_task_ids_handles_stored_shapes(
+    raw: bytes | str,
+) -> None:
+    runner = h._make_runner()
+    runner.redis.store[status_write_failed_tasks(runner.name)] = raw  # type: ignore[assignment]
+
+    asyncio.run(runner._hydrate_status_write_failed_task_pr_ids())
+
+    if isinstance(raw, bytes):
+        assert runner._status_write_failed_task_pr_ids == {"PR-001", "PR-002"}
+    else:
+        assert runner._status_write_failed_task_pr_ids == set()
+
+
+def test_clear_status_write_failed_task_ids_logs_legacy_delete_failure() -> None:
+    runner = h._make_runner()
+    runner._status_write_failed_task_pr_ids.add("PR-001")
+    legacy_key = status_write_failed_tasks(runner.name).replace(
+        "status_write_failed_tasks:",
+        "recovered_tasks:",
+    )
+
+    async def fail_delete(key: str) -> int:
+        raise RuntimeError("redis down")
+
+    runner.redis.delete = fail_delete  # type: ignore[method-assign]
+
+    asyncio.run(runner._clear_status_write_failed_task_ids({"PR-001"}))
+
+    assert runner._status_write_failed_task_pr_ids == set()
+    assert runner.redis.store[legacy_key] == "[]"
+    assert any(
+        "failed to clear legacy status-write fallback markers: redis down"
+        in entry["event"]
+        for entry in runner.state.history
+    )
 
 
 def test_target_state_error_transitions_to_error(
@@ -396,18 +516,79 @@ def test_records_cause_before_state_transition(
     }
 
 
-def test_idle_escalation_clears_current_task_and_marks_recovered(
+def test_escalate_and_skip_preserves_existing_coder_escalate_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Coder-authored ESCALATE attribution must not be overwritten."""
+    _patch_label_calls(monkeypatch)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.FIX
+    runner.state.current_task = QueueTask(
+        pr_id="PR-602",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-602",
+    )
+    runner.state.current_pr = PRInfo(number=602, branch="pr-602")
+    coder_cause = CancellationCause(
+        category="ESCALATE",
+        payload={"subsource": "coder", "reason_text": "blocked"},
+    )
+    coder_cause.task_id = "PR-602"
+    coder_cause.repo_slug = runner.name
+    runner.redis.store[cause_key(runner.name, "PR-602")] = coder_cause.to_redis()
+    _install_publish_state_spy(runner)
+
+    asyncio.run(runner._escalate_and_skip("daemon wrapper"))
+
+    stored = CancellationCause.from_redis(
+        runner.redis.store[cause_key(runner.name, "PR-602")]
+    )
+    assert stored.payload == {"subsource": "coder", "reason_text": "blocked"}
+
+
+def test_escalate_and_skip_records_cause_when_existing_read_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation-cause read failure should not block escalation telemetry."""
+    _patch_label_calls(monkeypatch)
+    recorded: list[str] = []
+
+    async def fail_get(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("redis read failed")
+
+    async def fake_safe_record(redis_client, repo_slug, task_id, cause, *, log=None):
+        recorded.append(task_id)
+
+    monkeypatch.setattr("src.daemon.runner.get_cancellation_cause", fail_get)
+    monkeypatch.setattr(
+        "src.daemon.runner.safe_record_cancellation_cause",
+        fake_safe_record,
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.FIX
+    runner.state.current_task = QueueTask(
+        pr_id="PR-603",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-603",
+    )
+    runner.state.current_pr = PRInfo(number=603, branch="pr-603")
+    _install_publish_state_spy(runner)
+
+    asyncio.run(runner._escalate_and_skip("daemon wrapper"))
+
+    assert recorded == ["PR-603"]
+
+
+def test_idle_escalation_clears_current_task(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """IDLE escalation abandons the task so IDLE selection cannot reattach it."""
     _patch_label_calls(monkeypatch)
-    persist_calls: list[set[str]] = []
-
-    async def fake_persist() -> None:
-        persist_calls.append(set(runner._recovered_task_pr_ids))
 
     runner = h._make_runner()
-    runner._persist_recovered_task_pr_ids = fake_persist  # type: ignore[method-assign]
     runner._error_skip_active = True
     runner._idle_dispatch_deferred = True
     runner.state.state = PipelineState.CODING
@@ -431,8 +612,7 @@ def test_idle_escalation_clears_current_task_and_marks_recovered(
     assert runner.state.current_task is None
     assert runner.state.current_pr is None
     assert runner.state.error_message is None
-    assert "PR-601" in runner._recovered_task_pr_ids
-    assert persist_calls == [{"PR-601"}]
+    assert not hasattr(runner, "_recovered_task_pr_ids")
     assert runner._error_skip_active is False
     assert runner._idle_dispatch_deferred is False
 
@@ -442,13 +622,7 @@ def test_error_escalation_preserves_current_task(
 ) -> None:
     """Non-IDLE escalation can still park with the active task attached."""
     _patch_label_calls(monkeypatch)
-    persist_calls: list[None] = []
-
-    async def fake_persist() -> None:
-        persist_calls.append(None)
-
     runner = h._make_runner()
-    runner._persist_recovered_task_pr_ids = fake_persist  # type: ignore[method-assign]
     task = QueueTask(
         pr_id="PR-602",
         title="t",
@@ -468,8 +642,7 @@ def test_error_escalation_preserves_current_task(
 
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.current_task == task
-    assert "PR-602" not in runner._recovered_task_pr_ids
-    assert persist_calls == []
+    assert not hasattr(runner, "_recovered_task_pr_ids")
 
 
 def test_escalate_and_skip_writes_status_error_to_file(
@@ -482,13 +655,14 @@ def test_escalate_and_skip_writes_status_error_to_file(
     runner.repo_path = str(repo)
     runner.state.state = PipelineState.FIX
     runner.state.current_pr = PRInfo(number=700, branch="pr-test")
-    runner.state.current_task = QueueTask(
+    task = QueueTask(
         pr_id="PR-700",
         title="t",
         status=TaskStatus.DOING,
         branch="pr-test",
         task_file="tasks/PR-700.md",
     )
+    runner.state.current_task = task
     _install_publish_state_spy(runner)
 
     asyncio.run(runner._escalate_and_skip("final failure"))
@@ -514,13 +688,14 @@ def test_escalate_status_commit_ignores_divergent_pr_branch_task_file(
     runner.repo_path = str(repo)
     runner.state.state = PipelineState.FIX
     runner.state.current_pr = PRInfo(number=700, branch="pr-test")
-    runner.state.current_task = QueueTask(
+    task = QueueTask(
         pr_id="PR-700",
         title="t",
         status=TaskStatus.DOING,
         branch="pr-test",
         task_file="tasks/PR-700.md",
     )
+    runner.state.current_task = task
     _install_publish_state_spy(runner)
 
     asyncio.run(runner._escalate_and_skip("final failure"))
@@ -565,20 +740,21 @@ def test_escalate_logs_status_commit_exception(
     )
 
 
-def test_escalate_skips_status_commit_for_recoverable_escalation(
+def test_escalate_skips_status_error_for_recoverable_escalation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_label_calls(monkeypatch)
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=700, branch="pr-test")
-    runner.state.current_task = QueueTask(
+    task = QueueTask(
         pr_id="PR-700",
         title="t",
         status=TaskStatus.DOING,
         branch="pr-test",
         task_file="tasks/PR-700.md",
     )
+    runner.state.current_task = task
     _install_publish_state_spy(runner)
     commit_calls: list[tuple[Any, ...]] = []
 
