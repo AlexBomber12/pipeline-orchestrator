@@ -22,6 +22,7 @@ def _install_task(runner: Any, pr_id: str = "PR-286") -> None:
     ("state", "exit_reason", "outcome", "cause", "phase"),
     [
         (PipelineState.MERGE, "success_merged", "merged", None, "merge"),
+        (PipelineState.WATCH, "coding_complete", "superseded", None, "coding"),
         (PipelineState.WATCH, "closed_unmerged", "superseded", None, "fix"),
         (PipelineState.CODING, "error", "failed", "CRASH", "coding"),
         (PipelineState.CODING, "timeout", "failed", "TIMEOUT", "coding"),

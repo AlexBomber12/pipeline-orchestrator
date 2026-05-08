@@ -1104,6 +1104,8 @@ class PipelineRunner(
             return "merge"
         if self.state.state == PipelineState.CODING:
             return "coding"
+        if exit_reason == "coding_complete":
+            return "coding"
         if exit_reason == "success_merged":
             return "merge"
         if self.state.current_pr is not None:
