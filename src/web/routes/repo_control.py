@@ -205,13 +205,18 @@ async def _decrement_retry_count(
     task_id: str,
 ) -> None:
     key = _retry_count_key(repo_slug, task_id)
-    current = _decode_retry_count(await redis_client.get(key))
-    if current <= 1:
-        await redis_client.delete(key)
-        return
-    result = redis_client.set(key, str(current - 1), ex=_RETRY_TTL_SECONDS)
-    if inspect.isawaitable(result):
-        await result
+
+    async def _transaction(pipe: Any) -> None:
+        current = _decode_retry_count(await pipe.get(key))
+        pipe.multi()
+        if current <= 1:
+            result = pipe.delete(key)
+        else:
+            result = pipe.set(key, str(current - 1), ex=_RETRY_TTL_SECONDS)
+        if inspect.isawaitable(result):
+            await result
+
+    await redis_client.transaction(_transaction, key)
 
 
 async def _release_retry_reservation(

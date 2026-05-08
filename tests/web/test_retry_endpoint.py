@@ -251,12 +251,31 @@ async def test_increment_retry_count_rejects_cap() -> None:
 
 @pytest.mark.asyncio
 async def test_decrement_retry_count_preserves_remaining_attempts() -> None:
-    redis_client = _RetryRedis({"metrics:retry_count:repo:PR-1": "2"})
+    class _TransactionRedis(_RetryRedis):
+        def __init__(self, store: dict[str, str]) -> None:
+            super().__init__(store)
+            self.transaction_keys: tuple[str, ...] | None = None
+
+        async def transaction(
+            self,
+            callback: Any,
+            *keys: str,
+            value_from_callable: bool = False,
+        ) -> Any:
+            self.transaction_keys = keys
+            return await super().transaction(
+                callback,
+                *keys,
+                value_from_callable=value_from_callable,
+            )
+
+    redis_client = _TransactionRedis({"metrics:retry_count:repo:PR-1": "2"})
 
     await repo_control._decrement_retry_count(redis_client, "repo", "PR-1")
 
     assert redis_client.store["metrics:retry_count:repo:PR-1"] == "1"
     assert redis_client.expiries["metrics:retry_count:repo:PR-1"] == 30 * 24 * 3600
+    assert redis_client.transaction_keys == ("metrics:retry_count:repo:PR-1",)
 
 
 @pytest.mark.asyncio
