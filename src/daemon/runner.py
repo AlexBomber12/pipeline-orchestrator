@@ -455,6 +455,7 @@ class PipelineRunner(
 
     async def _auto_pause_repo(self, reason: str) -> None:
         """Pause the repo until an operator explicitly resumes it."""
+        await error_rate_tracker.mark_auto_pause(self.redis, self.name)
         self.state.state = PipelineState.PAUSED
         self.state.user_paused = True
         self.state.error_message = None
@@ -496,6 +497,11 @@ class PipelineRunner(
             )
             return False
         if count < cfg.error_rate_threshold:
+            return False
+        if not await error_rate_tracker.has_records_after_last_auto_pause(
+            self.redis,
+            self.name,
+        ):
             return False
         await self._auto_pause_repo(
             f"{count}/{cfg.error_rate_threshold} in "

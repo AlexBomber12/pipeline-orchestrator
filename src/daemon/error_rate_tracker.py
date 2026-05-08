@@ -13,6 +13,10 @@ def key(repo_slug: str) -> str:
     return f"error_rate:{repo_slug}"
 
 
+def last_auto_pause_key(repo_slug: str) -> str:
+    return f"error_rate_last_auto_pause:{repo_slug}"
+
+
 def _timestamp(ts: datetime | float | int | None = None) -> float:
     if ts is None:
         return datetime.now(timezone.utc).timestamp()
@@ -32,17 +36,17 @@ async def record(
     score = _timestamp(ts)
     member = f"{score:.6f}:{uuid.uuid4().hex}"
     await redis_client.zadd(key(repo_slug), {member: score})
-    await prune(redis_client, repo_slug)
 
 
 async def prune(
     redis_client: Any,
     repo_slug: str,
     *,
+    retain_for: timedelta = STALE_AFTER,
     now: datetime | float | int | None = None,
 ) -> int:
-    """Remove entries older than 24 hours to keep the sorted set bounded."""
-    cutoff = _timestamp(now) - STALE_AFTER.total_seconds()
+    """Remove entries outside the retained history window."""
+    cutoff = _timestamp(now) - retain_for.total_seconds()
     return int(await redis_client.zremrangebyscore(key(repo_slug), "-inf", cutoff))
 
 
@@ -55,6 +59,40 @@ async def count_recent(
 ) -> int:
     """Return ERROR records inside the trailing ``window_min`` minutes."""
     now_ts = _timestamp(now)
-    await prune(redis_client, repo_slug, now=now_ts)
+    await prune(
+        redis_client,
+        repo_slug,
+        retain_for=timedelta(minutes=window_min),
+        now=now_ts,
+    )
     since = now_ts - (window_min * 60)
     return int(await redis_client.zcount(key(repo_slug), since, "+inf"))
+
+
+async def mark_auto_pause(
+    redis_client: Any,
+    repo_slug: str,
+    *,
+    now: datetime | float | int | None = None,
+) -> None:
+    """Remember when ERROR-rate auto-pause last stopped this repo."""
+    await redis_client.set(last_auto_pause_key(repo_slug), str(_timestamp(now)))
+
+
+async def has_records_after_last_auto_pause(
+    redis_client: Any,
+    repo_slug: str,
+) -> bool:
+    """Return True when any ERROR event is newer than the last auto-pause."""
+    raw = await redis_client.get(last_auto_pause_key(repo_slug))
+    if raw is None:
+        return True
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    try:
+        last_pause = float(raw)
+    except (TypeError, ValueError):
+        return True
+    return int(
+        await redis_client.zcount(key(repo_slug), f"({last_pause}", "+inf")
+    ) > 0

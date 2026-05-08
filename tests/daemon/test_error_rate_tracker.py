@@ -39,6 +39,21 @@ async def test_count_excludes_outside_window() -> None:
 
 
 @pytest.mark.asyncio
+async def test_count_honors_windows_longer_than_24_hours() -> None:
+    redis = _FakeRedis()
+    now = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
+
+    await error_rate_tracker.record(redis, "octo__demo", now - timedelta(hours=36))
+
+    assert (
+        await error_rate_tracker.count_recent(
+            redis, "octo__demo", 48 * 60, now=now
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
 async def test_prune_removes_24h_old_entries() -> None:
     redis = _FakeRedis()
     now = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
@@ -59,3 +74,67 @@ async def test_record_accepts_default_and_naive_timestamps() -> None:
     await error_rate_tracker.record(redis, "octo__demo", naive)
 
     assert len(redis.zsets[error_rate_tracker.key("octo__demo")]) == 2
+
+
+@pytest.mark.asyncio
+async def test_last_auto_pause_marker_requires_newer_records() -> None:
+    redis = _FakeRedis()
+    now = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
+
+    await error_rate_tracker.record(redis, "octo__demo", now)
+    await error_rate_tracker.mark_auto_pause(redis, "octo__demo", now=now)
+
+    assert (
+        await error_rate_tracker.has_records_after_last_auto_pause(
+            redis, "octo__demo"
+        )
+        is False
+    )
+
+    await error_rate_tracker.record(
+        redis,
+        "octo__demo",
+        now + timedelta(seconds=1),
+    )
+
+    assert (
+        await error_rate_tracker.has_records_after_last_auto_pause(
+            redis, "octo__demo"
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_last_auto_pause_marker_accepts_bytes() -> None:
+    redis = _FakeRedis()
+    now = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
+    redis.store[error_rate_tracker.last_auto_pause_key("octo__demo")] = (
+        str(now.timestamp()).encode("utf-8")
+    )
+
+    await error_rate_tracker.record(
+        redis,
+        "octo__demo",
+        now + timedelta(seconds=1),
+    )
+
+    assert (
+        await error_rate_tracker.has_records_after_last_auto_pause(
+            redis, "octo__demo"
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_last_auto_pause_marker_fails_open_when_invalid() -> None:
+    redis = _FakeRedis()
+    redis.store[error_rate_tracker.last_auto_pause_key("octo__demo")] = "invalid"
+
+    assert (
+        await error_rate_tracker.has_records_after_last_auto_pause(
+            redis, "octo__demo"
+        )
+        is True
+    )

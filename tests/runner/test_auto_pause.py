@@ -63,6 +63,39 @@ async def test_auto_pause_triggers_in_available_mode_at_threshold(
 
 
 @pytest.mark.asyncio
+async def test_auto_pause_does_not_retrigger_after_resume_without_new_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner(error_rate_threshold=5, error_rate_window_min=60)
+    runner.redis.store["operator_override"] = "AVAILABLE"
+    now = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
+    current = now
+
+    await _record_errors(runner, 5, now=now)
+    monkeypatch.setattr(
+        error_rate_tracker,
+        "_timestamp",
+        lambda ts=None: current.timestamp()
+        if ts is None
+        else ts.timestamp()
+        if isinstance(ts, datetime)
+        else float(ts),
+    )
+
+    assert await runner._maybe_auto_pause_for_error_rate() is True
+
+    runner.state.state = PipelineState.IDLE
+    runner.state.user_paused = False
+    assert await runner._maybe_auto_pause_for_error_rate() is False
+    assert runner.state.state is PipelineState.IDLE
+
+    current = now + timedelta(seconds=1)
+    await error_rate_tracker.record(runner.redis, runner.name, current)
+
+    assert await runner._maybe_auto_pause_for_error_rate() is True
+
+
+@pytest.mark.asyncio
 async def test_no_auto_pause_in_away_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
