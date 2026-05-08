@@ -726,12 +726,6 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
 
     try:
         if current_status == TaskStatus.ERROR:
-            await delete_cancellation_cause(redis_client, name, pr_id)
-    except Exception:
-        return HTMLResponse("Failed to clear cancellation cause", status_code=503)
-
-    try:
-        if current_status == TaskStatus.ERROR:
             write_frontmatter_status(task_path, "TODO")
     except (OSError, ValueError):
         return HTMLResponse("Failed to update task status", status_code=503)
@@ -756,13 +750,13 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
 
     try:
         await _increment_retry_count(redis_client, name, pr_id, cap)
-    except _RetryCapExceeded:
-        return HTMLResponse(
-            "Retry cap reached. Edit task spec or delete to proceed.",
-            status_code=409,
-        )
     except Exception:
-        return HTMLResponse("Failed to update retry counter", status_code=503)
+        pass
+
+    try:
+        await delete_cancellation_cause(redis_client, name, pr_id)
+    except Exception:
+        pass
 
     tasks, _snapshot_at = await _load_current_queue_snapshot(name)
     if tasks is None:

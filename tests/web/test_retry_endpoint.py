@@ -307,24 +307,32 @@ def test_retry_counter_failure_returns_503(
     assert "Failed to update retry counter" in response.text
 
 
-def test_retry_cause_clear_failure_returns_503(
+def test_retry_cause_clear_failure_after_push_is_best_effort(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
+    repo_dir = _write_config_and_task(tmp_path, monkeypatch)
 
     class _BoomDeleteRedis(_RetryRedis):
         async def delete(self, key: str) -> int:
             raise RuntimeError("boom")
 
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(_BoomDeleteRedis()))
+    redis_client = _BoomDeleteRedis()
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+    )
 
     with TestClient(app) as client:
         response = client.post("/repos/example__alpha/tasks/PR-283/retry")
 
-    assert response.status_code == 503
-    assert "Failed to clear cancellation cause" in response.text
-    assert "metrics:retry_count:example__alpha:PR-283" not in app.state.redis.store
+    assert response.status_code == 200
+    assert redis_client.store["metrics:retry_count:example__alpha:PR-283"] == "1"
+    assert "status: TODO" in (repo_dir / "tasks" / "PR-283.md").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_retry_frontmatter_write_failure_returns_503(
@@ -654,7 +662,7 @@ def test_retry_pushes_configured_base_branch_and_commits_only_task_path(
     assert ["git", "-C", str(repo_dir), "push", "origin", "HEAD:develop"] in git_calls
 
 
-def test_retry_post_push_counter_cap_returns_409(
+def test_retry_post_push_counter_cap_is_best_effort(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -679,11 +687,11 @@ def test_retry_post_push_counter_cap_returns_409(
     with TestClient(app) as client:
         response = client.post("/repos/example__alpha/tasks/PR-283/retry")
 
-    assert response.status_code == 409
-    assert "Edit task spec or delete to proceed" in response.text
+    assert response.status_code == 200
+    assert "TODO" in response.text
 
 
-def test_retry_post_push_counter_failure_returns_503(
+def test_retry_post_push_counter_failure_is_best_effort(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -708,8 +716,8 @@ def test_retry_post_push_counter_failure_returns_503(
     with TestClient(app) as client:
         response = client.post("/repos/example__alpha/tasks/PR-283/retry")
 
-    assert response.status_code == 503
-    assert "Failed to update retry counter" in response.text
+    assert response.status_code == 200
+    assert "TODO" in response.text
 
 
 def test_retry_success_without_snapshot_returns_single_todo_fragment(
