@@ -248,6 +248,7 @@ def _commit_and_push_retry_reset(
     repo_root: Path,
     relative_task: Path,
     commit_subject: str,
+    base_branch: str,
     *,
     allow_existing_retry_commit: bool,
 ) -> None:
@@ -268,6 +269,8 @@ def _commit_and_push_retry_reset(
                 commit_subject,
                 "-m",
                 "[skip ci]",
+                "--",
+                relative_task.as_posix(),
             ],
             check=True,
             capture_output=True,
@@ -283,7 +286,7 @@ def _commit_and_push_retry_reset(
             raise _TaskNotRetryable
 
     push_result = subprocess.run(
-        ["git", "-C", str(repo_root), "push", "origin", "HEAD:main"],
+        ["git", "-C", str(repo_root), "push", "origin", f"HEAD:{base_branch}"],
         check=True,
         capture_output=True,
         text=True,
@@ -689,7 +692,8 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
         return HTMLResponse("Invalid task identifier", status_code=400)
 
     cfg = load_config(_app.CONFIG_PATH)
-    if _find_repo_config_by_name(cfg, name) is None:
+    repo_config = _find_repo_config_by_name(cfg, name)
+    if repo_config is None:
         return HTMLResponse("Repository not found", status_code=404)
 
     resolved = await _resolve_repo_task_path(name, pr_id)
@@ -742,6 +746,7 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
             repo_root,
             relative_task,
             commit_subject,
+            repo_config.branch,
             allow_existing_retry_commit=allow_existing_retry_commit,
         )
     except _TaskNotRetryable:

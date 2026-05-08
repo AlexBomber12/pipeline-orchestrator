@@ -66,11 +66,13 @@ def _write_config_and_task(
     *,
     task_name: str = "PR-283",
     status: str = "ERROR",
+    branch: str = "main",
 ) -> Path:
     cfg = tmp_path / "config.yml"
     cfg.write_text(
         "repositories:\n"
         "  - url: https://github.com/example/alpha.git\n"
+        f"    branch: {branch}\n"
         "daemon:\n"
         "  retry_button_cap: 3\n",
         encoding="utf-8",
@@ -146,6 +148,8 @@ def test_retry_increments_counter_clears_cause_writes_queued(
         "[RETRY] PR-283 cleared by operator (attempt 1/3)",
         "-m",
         "[skip ci]",
+        "--",
+        "tasks/PR-283.md",
     ] in git_calls
     assert ["git", "-C", str(repo_dir), "push", "origin", "HEAD:main"] in git_calls
     assert "TODO" in response.text
@@ -542,6 +546,7 @@ def test_retry_noop_commit_without_replay_permission_is_not_retryable(
             repo_dir,
             Path("tasks/PR-283.md"),
             "[RETRY] PR-283 cleared by operator (attempt 1/3)",
+            "main",
             allow_existing_retry_commit=False,
         )
 
@@ -578,10 +583,45 @@ def test_retry_git_commands_run_in_thread(
                 repo_dir,
                 Path("tasks/PR-283.md"),
                 "[RETRY] PR-283 cleared by operator (attempt 1/3)",
+                "main",
             ),
             {"allow_existing_retry_commit": False},
         )
     ]
+
+
+def test_retry_pushes_configured_base_branch_and_commits_only_task_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_dir = _write_config_and_task(tmp_path, monkeypatch, branch="develop")
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(_RetryRedis()))
+
+    git_calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        git_calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+
+    assert response.status_code == 200
+    assert [
+        "git",
+        "-C",
+        str(repo_dir),
+        "commit",
+        "-m",
+        "[RETRY] PR-283 cleared by operator (attempt 1/3)",
+        "-m",
+        "[skip ci]",
+        "--",
+        "tasks/PR-283.md",
+    ] in git_calls
+    assert ["git", "-C", str(repo_dir), "push", "origin", "HEAD:develop"] in git_calls
 
 
 def test_retry_post_push_counter_cap_returns_409(
