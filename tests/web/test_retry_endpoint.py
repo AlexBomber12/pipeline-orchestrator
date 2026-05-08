@@ -387,6 +387,9 @@ def test_retry_git_failure_returns_503(
     assert response.status_code == 503
     assert "Failed to commit retry change" in response.text
     assert "metrics:retry_count:example__alpha:PR-283" not in app.state.redis.store
+    assert "status: ERROR" in (
+        tmp_path / "repos" / "example__alpha" / "tasks" / "PR-283.md"
+    ).read_text(encoding="utf-8")
 
 
 def test_retry_commit_failure_returns_503_without_increment(
@@ -487,6 +490,34 @@ def test_retry_rejects_task_not_in_error(
     assert git_called is False
 
 
+def test_retry_not_retryable_after_status_rewrite_restores_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_dir = _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _RetryRedis()
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    def fake_commit_and_push(*args: Any, **kwargs: Any) -> None:
+        raise repo_control._TaskNotRetryable
+
+    monkeypatch.setattr(
+        repo_control,
+        "_commit_and_push_retry_reset",
+        fake_commit_and_push,
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+
+    assert response.status_code == 409
+    assert "Task is not in ERROR" in response.text
+    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
+    assert "status: ERROR" in (repo_dir / "tasks" / "PR-283.md").read_text(
+        encoding="utf-8"
+    )
+
+
 def test_retry_rejects_already_pushed_retry_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -547,7 +578,6 @@ def test_retry_noop_commit_without_replay_permission_is_not_retryable(
             Path("tasks/PR-283.md"),
             "[RETRY] PR-283 cleared by operator (attempt 1/3)",
             "main",
-            allow_existing_retry_commit=False,
         )
 
 
@@ -585,7 +615,7 @@ def test_retry_git_commands_run_in_thread(
                 "[RETRY] PR-283 cleared by operator (attempt 1/3)",
                 "main",
             ),
-            {"allow_existing_retry_commit": False},
+            {},
         )
     ]
 

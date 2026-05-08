@@ -249,9 +249,8 @@ def _commit_and_push_retry_reset(
     relative_task: Path,
     commit_subject: str,
     base_branch: str,
-    *,
-    allow_existing_retry_commit: bool,
 ) -> None:
+    replayed_existing_commit = False
     subprocess.run(
         ["git", "-C", str(repo_root), "add", relative_task.as_posix()],
         check=True,
@@ -279,11 +278,9 @@ def _commit_and_push_retry_reset(
     except subprocess.CalledProcessError as exc:
         if not _is_nothing_to_commit(exc):
             raise
-        if (
-            not allow_existing_retry_commit
-            or _head_commit_subject(repo_root) != commit_subject
-        ):
+        if _head_commit_subject(repo_root) != commit_subject:
             raise _TaskNotRetryable
+        replayed_existing_commit = True
 
     push_result = subprocess.run(
         ["git", "-C", str(repo_root), "push", "origin", f"HEAD:{base_branch}"],
@@ -291,7 +288,7 @@ def _commit_and_push_retry_reset(
         capture_output=True,
         text=True,
     )
-    if allow_existing_retry_commit and "everything up-to-date" in _git_output(
+    if replayed_existing_commit and "everything up-to-date" in _git_output(
         push_result
     ).lower():
         raise _TaskNotRetryable
@@ -723,9 +720,9 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
         return HTMLResponse("Failed to update retry counter", status_code=503)
 
     current_status = _read_task_frontmatter_status(task_path)
-    allow_existing_retry_commit = current_status == TaskStatus.TODO
     if current_status not in {TaskStatus.ERROR, TaskStatus.TODO}:
         return HTMLResponse("Task is not in ERROR", status_code=409)
+    rewrote_status = current_status == TaskStatus.ERROR
 
     try:
         if current_status == TaskStatus.ERROR:
@@ -747,11 +744,14 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
             relative_task,
             commit_subject,
             repo_config.branch,
-            allow_existing_retry_commit=allow_existing_retry_commit,
         )
     except _TaskNotRetryable:
+        if rewrote_status:
+            write_frontmatter_status(task_path, "ERROR")
         return HTMLResponse("Task is not in ERROR", status_code=409)
     except subprocess.CalledProcessError:
+        if rewrote_status:
+            write_frontmatter_status(task_path, "ERROR")
         return HTMLResponse("Failed to commit retry change", status_code=503)
 
     try:
