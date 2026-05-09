@@ -71,9 +71,11 @@ async def monitor_fix_idle(
                 if latest_push_at is not None:
                     last_known_push = time.monotonic()
         except gh_prs.GitHubPollError as exc:
-            runner.log_event(
-                f"[FIX] GitHub API poll failed: {exc}, preserving deadline."
-            )
+            msg = str(exc)
+            if "HTTP 304" not in msg:
+                runner.log_event(
+                    f"[FIX] GitHub API poll failed: {exc}, preserving deadline."
+                )
             latest_push_at = None
         if latest_push_at is not None and latest_push_at > last_known_push:
             last_known_push = latest_push_at
