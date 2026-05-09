@@ -55,13 +55,19 @@ def _normalize_hash(raw: Any) -> dict[str, Any]:
     return {str(_decode(key)): _decode(value) for key, value in raw.items()}
 
 
-def _extract_repo_and_record_id(key: str | bytes) -> tuple[str, str] | None:
+def _extract_repo_and_record_id(key: str | bytes) -> tuple[str | None, str] | None:
     normalized = _decode(key)
     if not isinstance(normalized, str):
         return None
     parts = normalized.split(":", 3)
-    if len(parts) != 4 or parts[0] != "metrics" or parts[1] != "run":
+    if len(parts) not in {3, 4} or parts[0] != "metrics" or parts[1] != "run":
         return None
+    if len(parts) == 3:
+        record_id = parts[2]
+        if not record_id:
+            return None
+        return None, record_id
+
     repo, record_id = parts[2], parts[3]
     if not repo or not record_id:
         return None
@@ -111,6 +117,7 @@ async def migrate_run_records_to_outcome_cause(
             counts["records_skipped_malformed"] += 1
             _warn(log, f"[MIGRATION] Skipping run record {key}: missing task_id")
             continue
+        repo_scope = repo or str(record.get("repo_name") or "global")
 
         exit_reason = str(record.get("exit_reason") or "")
         mapped = _EXIT_REASON_TO_OUTCOME_CAUSE.get(exit_reason)
@@ -126,8 +133,10 @@ async def migrate_run_records_to_outcome_cause(
         await _maybe_await(
             redis_client.hset(key, mapping={"outcome": outcome, "cause": cause})
         )
+        task_runs_key = f"metrics:task_runs:{repo_scope}:{task_id}"
+        await _maybe_await(redis_client.sadd(task_runs_key, record_id))
         await _maybe_await(
-            redis_client.sadd(f"metrics:task_runs:{repo}:{task_id}", record_id)
+            redis_client.expire(task_runs_key, RUN_RECORD_TTL_SECONDS)
         )
         await _maybe_await(redis_client.expire(key, RUN_RECORD_TTL_SECONDS))
         counts["records_migrated"] += 1

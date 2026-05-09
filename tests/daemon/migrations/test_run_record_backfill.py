@@ -95,6 +95,23 @@ def _record(
     return key
 
 
+def _canonical_record(
+    redis: _FakeRedis,
+    record_id: str,
+    exit_reason: str,
+    *,
+    task_id: str = "PR-287",
+    repo_name: str = "repo",
+) -> str:
+    key = f"metrics:run:{record_id}"
+    redis.hashes[key] = {
+        "exit_reason": exit_reason,
+        "task_id": task_id,
+        "repo_name": repo_name,
+    }
+    return key
+
+
 async def test_backfill_maps_exit_reason_to_outcome_cause() -> None:
     redis = _FakeRedis()
     expected = {
@@ -137,6 +154,40 @@ async def test_backfill_populates_task_runs_index() -> None:
     await migrate_run_records_to_outcome_cause(redis, logging.getLogger(__name__))
 
     assert redis.sets["metrics:task_runs:repo:PR-1"] == {"run-a", "run-b"}
+    assert redis.ttls["metrics:task_runs:repo:PR-1"] == RUN_RECORD_TTL_SECONDS
+
+
+async def test_backfill_supports_canonical_run_record_keys() -> None:
+    redis = _FakeRedis()
+    key = _canonical_record(
+        redis,
+        "run-canonical",
+        "success_merged",
+        task_id="PR-1",
+        repo_name="repo",
+    )
+
+    counts = await migrate_run_records_to_outcome_cause(
+        redis,
+        logging.getLogger(__name__),
+    )
+
+    assert counts["records_migrated"] == 1
+    assert redis.hashes[key]["outcome"] == "merged"
+    assert redis.hashes[key]["cause"] == NULL_CAUSE_VALUE
+    assert redis.sets["metrics:task_runs:repo:PR-1"] == {"run-canonical"}
+    assert redis.ttls["metrics:task_runs:repo:PR-1"] == RUN_RECORD_TTL_SECONDS
+
+
+async def test_backfill_canonical_key_without_repo_name_uses_global_scope() -> None:
+    redis = _FakeRedis()
+    key = _canonical_record(redis, "run-global", "timeout", task_id="PR-1")
+    del redis.hashes[key]["repo_name"]
+
+    await migrate_run_records_to_outcome_cause(redis, logging.getLogger(__name__))
+
+    assert redis.sets["metrics:task_runs:global:PR-1"] == {"run-global"}
+    assert redis.ttls["metrics:task_runs:global:PR-1"] == RUN_RECORD_TTL_SECONDS
 
 
 async def test_backfill_extends_ttl_to_365d() -> None:
@@ -219,7 +270,7 @@ async def test_backfill_supports_sync_redis_bytes_and_callable_logger() -> None:
 async def test_backfill_callable_logger_warns_for_malformed_keys() -> None:
     redis = _SyncRedis(
         {
-            "metrics:run:missing-record-id": {"task_id": "PR-1"},
+            "metrics:run:": {"task_id": "PR-1"},
             "metrics:run::run-id": {"task_id": "PR-1"},
             "metrics:run:repo:": {"task_id": "PR-1"},
         }
@@ -254,3 +305,7 @@ async def test_backfill_skips_non_hash_records(
 
 def test_extract_repo_and_record_id_rejects_non_string_key() -> None:
     assert _extract_repo_and_record_id(123) is None  # type: ignore[arg-type]
+
+
+def test_extract_repo_and_record_id_rejects_non_run_key() -> None:
+    assert _extract_repo_and_record_id("metrics:repo:repo:PR") is None
