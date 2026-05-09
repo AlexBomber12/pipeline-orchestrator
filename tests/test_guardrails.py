@@ -182,6 +182,37 @@ def test_scan_stdout_force_push_tracks_checkout_away_from_main_before_push() -> 
     assert scan_stdout(stdout, current_branch="main") == []
 
 
+def test_scan_stdout_force_push_tracks_switch_dash_to_previous_branch() -> None:
+    stdout = "git switch main\ngit switch -\ngit push --force origin\n"
+
+    assert scan_stdout(stdout, current_branch="feature/xyz") == []
+
+
+def test_scan_stdout_force_push_keeps_branch_when_switch_dash_has_no_previous() -> None:
+    stdout = "git switch -\ngit push --force origin\n"
+
+    violations = scan_stdout(stdout, current_branch="main")
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "error: pathspec 'main' did not match any file(s) known to git",
+        "fatal: invalid reference: main",
+        "error: Your local changes would be overwritten; not switching branches",
+    ],
+)
+def test_scan_stdout_force_push_ignores_failed_switch_before_push(
+    failure: str,
+) -> None:
+    stdout = f"git switch main\n{failure}\ngit push --force origin\n"
+
+    assert scan_stdout(stdout, current_branch="feature/xyz") == []
+
+
 @pytest.mark.parametrize("branch_command", ["git switch -c", "git checkout -b"])
 def test_scan_stdout_force_push_tracks_branch_create_away_from_main_before_push(
     branch_command: str,
@@ -364,6 +395,23 @@ def test_scan_stdout_direct_commit_tracks_switch_away_from_main_before_push() ->
     stdout = "git commit -m guardrail\ngit switch feature/xyz\ngit push origin\n"
 
     assert scan_stdout(stdout, current_branch="main") == []
+
+
+def test_scan_stdout_direct_commit_tracks_checkout_dash_to_previous_branch() -> None:
+    stdout = "git commit -m guardrail\ngit checkout main\ngit checkout -\ngit push origin\n"
+
+    assert scan_stdout(stdout, current_branch="feature/xyz") == []
+
+
+def test_scan_stdout_direct_commit_ignores_failed_checkout_before_push() -> None:
+    stdout = (
+        "git commit -m guardrail\n"
+        "git checkout main\n"
+        "error: pathspec 'main' did not match any file(s) known to git\n"
+        "git push origin\n"
+    )
+
+    assert scan_stdout(stdout, current_branch="feature/xyz") == []
 
 
 @pytest.mark.parametrize("branch_command", ["git switch -c", "git checkout -b"])

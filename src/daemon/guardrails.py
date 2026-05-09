@@ -124,6 +124,7 @@ _GH_PR_CREATE_RE = re.compile(
 _GH_PR_CREATE_NO_CREATE_FLAG_RE = re.compile(
     r"(?<!\S)(?:--dry-run(?:=[^\s]+)?|--help|-h)(?!\S)",
 )
+_GIT_COMMAND_RE = re.compile(_COMMAND_PREFIX_RE + r"git\b", re.IGNORECASE)
 _GIT_PUSH_LINE_RE = re.compile(
     _COMMAND_PREFIX_RE
     + r"git push\b"
@@ -135,7 +136,8 @@ _GIT_PUSH_LINE_RE = re.compile(
 _GIT_BRANCH_CHANGE_RE = re.compile(
     _COMMAND_PREFIX_RE
     + r"git[^\S\r\n]+(?:"
-    r"(?:checkout|switch)[^\S\r\n]+(?!-)(?P<branch>[^\s,;|&#]+)"
+    r"(?:checkout|switch)[^\S\r\n]+(?P<previous>-)"
+    r"|(?:checkout|switch)[^\S\r\n]+(?!-)(?P<branch>[^\s,;|&#]+)"
     r"|switch[^\S\r\n]+(?:-c|-C)[^\S\r\n]+(?P<switch_create>[^\s,;|&#]+)"
     r"|checkout[^\S\r\n]+(?:-b|-B)[^\S\r\n]+(?P<checkout_create>[^\s,;|&#]+)"
     r")"
@@ -151,6 +153,9 @@ _GIT_PUSH_PROTECTED_BRANCH_RE = re.compile(
     rf"{_PROTECTED_BRANCH_POSITIONAL_RE}"
     r")",
     re.IGNORECASE,
+)
+_GIT_BRANCH_CHANGE_FAILURE_RE = re.compile(
+    r"(?i)(?:^error:|^fatal:|not switching branches|pathspec .* did not match)"
 )
 
 
@@ -182,15 +187,31 @@ def _git_push_line_info(line: str) -> tuple[bool, bool]:
     return has_force_flag, not has_non_branch_mode and has_no_explicit_refspec
 
 
-def _branch_after_command(line: str, current_branch: str | None) -> str | None:
+def _branch_after_command(
+    line: str,
+    current_branch: str | None,
+    previous_branch: str | None,
+) -> str | None:
     match = _GIT_BRANCH_CHANGE_RE.search(line)
     if not match:
-        return current_branch
+        return None
+    if match.group("previous"):
+        return previous_branch or current_branch
     return (
         match.group("branch")
         or match.group("switch_create")
         or match.group("checkout_create")
     )
+
+
+def _apply_branch_change(
+    current_branch: str | None,
+    previous_branch: str | None,
+    new_branch: str | None,
+) -> tuple[str | None, str | None]:
+    if new_branch == current_branch:
+        return current_branch, previous_branch
+    return new_branch, current_branch
 
 
 def _line_contexts(
@@ -199,12 +220,29 @@ def _line_contexts(
 ) -> list[tuple[int, str, int, int, str | None]]:
     contexts: list[tuple[int, str, int, int, str | None]] = []
     current_branch = initial_branch
+    previous_branch: str | None = None
+    pending_branch: str | None = None
     start = 0
     for index, raw_line in enumerate(stdout.splitlines(keepends=True)):
         line = raw_line.rstrip("\r\n")
         end = start + len(line)
+        if pending_branch is not None and _GIT_BRANCH_CHANGE_FAILURE_RE.search(line):
+            pending_branch = None
+        if pending_branch is not None and _GIT_COMMAND_RE.search(line):
+            current_branch, previous_branch = _apply_branch_change(
+                current_branch,
+                previous_branch,
+                pending_branch,
+            )
+            pending_branch = None
         contexts.append((index, line, start, end, current_branch))
-        current_branch = _branch_after_command(line, current_branch)
+        branch_after_command = _branch_after_command(
+            line,
+            current_branch,
+            previous_branch,
+        )
+        if branch_after_command is not None:
+            pending_branch = branch_after_command
         start += len(raw_line)
     return contexts
 
