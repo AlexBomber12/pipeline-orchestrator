@@ -103,6 +103,7 @@ def _patch_main(
     runner_cls: type = _FakeRunner,
     sleep_iterations: int = 1,
     migration: Any | None = None,
+    run_record_backfill: Any | None = None,
 ) -> dict[str, Any]:
     """Wire up the common monkeypatches used by every test."""
     _reset_fake_runner()
@@ -122,6 +123,21 @@ def _patch_main(
             return 0
 
     monkeypatch.setattr(main_module, "migrate_hung_to_idle_on_startup", migration)
+    if run_record_backfill is None:
+        async def run_record_backfill(*_args: Any, **_kwargs: Any) -> dict[str, int]:
+            return {
+                "records_scanned": 0,
+                "records_migrated": 0,
+                "records_skipped_already_migrated": 0,
+                "records_skipped_non_hash": 0,
+                "records_skipped_malformed": 0,
+            }
+
+    monkeypatch.setattr(
+        main_module,
+        "migrate_run_records_to_outcome_cause",
+        run_record_backfill,
+    )
 
     clock = [0.0]
 
@@ -175,7 +191,7 @@ def test_main_creates_one_runner_per_repo(
     assert ctx["sleep_calls"] == [1]
 
 
-def test_main_calls_migration_before_run_cycle(
+def test_main_calls_migrations_before_run_cycle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
@@ -189,6 +205,16 @@ def test_main_calls_migration_before_run_cycle(
         calls.append("migration")
         return 1
 
+    async def run_record_backfill(*_args: Any, **_kwargs: Any) -> dict[str, int]:
+        calls.append("run_record_backfill")
+        return {
+            "records_scanned": 1,
+            "records_migrated": 1,
+            "records_skipped_already_migrated": 0,
+            "records_skipped_non_hash": 0,
+            "records_skipped_malformed": 0,
+        }
+
     config = AppConfig(
         repositories=[_repo("https://github.com/octo/alpha.git")],
         daemon=DaemonConfig(poll_interval_sec=1),
@@ -198,12 +224,13 @@ def test_main_calls_migration_before_run_cycle(
         config,
         runner_cls=_TrackingRunner,
         migration=migration,
+        run_record_backfill=run_record_backfill,
     )
 
     with pytest.raises(_StopLoop):
         asyncio.run(main_module.main())
 
-    assert calls == ["migration", "run_cycle:octo__alpha"]
+    assert calls == ["migration", "run_record_backfill", "run_cycle:octo__alpha"]
 
 
 def test_main_warns_when_no_repos_configured(
