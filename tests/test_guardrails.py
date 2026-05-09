@@ -33,6 +33,16 @@ def test_scan_stdout_repo_delete_pattern_matches() -> None:
     assert violations[0].category == "repo_delete"
 
 
+def test_scan_stdout_repo_delete_pattern_ignores_help_and_prose() -> None:
+    stdout = (
+        "gh repo --help\n"
+        "  gh repo delete [<repository>] [flags]\n"
+        "Do not run gh repo delete for this task.\n"
+    )
+
+    assert scan_stdout(stdout) == []
+
+
 def test_scan_stdout_repo_create_pattern_allows_horizontal_whitespace() -> None:
     violations = scan_stdout("$ gh\trepo\tcreate octo/demo\n")
 
@@ -159,6 +169,13 @@ def test_scan_stdout_branch_delete_default_via_dash_d_flag() -> None:
     assert violations[0].category == "branch_delete_main"
 
 
+def test_scan_stdout_branch_delete_default_remote_first_flag() -> None:
+    violations = scan_stdout("git push origin --delete main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
 def test_scan_stdout_branch_delete_feature_not_flagged() -> None:
     stdout = "git push --delete origin feature/xyz\n"
 
@@ -212,10 +229,16 @@ def test_scan_stdout_multiple_distinct_violations_returns_all() -> None:
     ]
 
 
-def test_scan_stdout_repo_delete_negation_does_not_suppress() -> None:
-    stdout = "Never run this manually: gh repo delete octo/demo\n"
+def test_scan_stdout_repo_delete_command_line_negation_does_not_suppress() -> None:
+    stdout = "gh repo delete octo/demo # I would never do this intentionally\n"
 
     violations = scan_stdout(stdout)
 
     assert len(violations) == 1
     assert violations[0].category == "repo_delete"
+
+
+def test_scan_stdout_repo_delete_prose_not_flagged() -> None:
+    stdout = "Never run this manually: gh repo delete octo/demo\n"
+
+    assert scan_stdout(stdout) == []

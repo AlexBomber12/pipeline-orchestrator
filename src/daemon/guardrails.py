@@ -43,7 +43,7 @@ _TIER1_PATTERNS: dict[str, re.Pattern[str]] = {
         re.IGNORECASE,
     ),
     "repo_delete": re.compile(
-        r"\bgh[^\S\r\n]+repo[^\S\r\n]+delete\b",
+        _COMMAND_PREFIX_RE + r"gh[^\S\r\n]+repo[^\S\r\n]+delete\b",
         re.IGNORECASE,
     ),
     "force_push_main": re.compile(
@@ -86,8 +86,6 @@ _TIER1_PATTERNS: dict[str, re.Pattern[str]] = {
         r"(?="
         r"(?:[ \t]+[^\s,;|&#]+)*?"
         r"[ \t]+(?:--delete|-d)(?![\w-])"
-        r"(?:[ \t]+[^\s,;|&#]+)*?"
-        r"[ \t]+(?![-+])[^\s,;|&#]+"
         r"(?:[ \t]+[^\s,;|&#]+)*?"
         r"[ \t]+"
         rf"(?:refs/heads/)?{_PROTECTED_DEFAULT_BRANCH_RE}"
