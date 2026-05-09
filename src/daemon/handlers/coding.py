@@ -596,7 +596,7 @@ class CodingMixin:
         await self._save_cli_log(
             stdout, stderr, f"PLANNED PR output [{coder_name}]"
         )
-        violations = scan_stdout(stdout)
+        violations = scan_stdout(f"{stdout}\n{stderr}")
         if violations:
             first = violations[0]
             cause = f"GUARDRAIL: {first.category}: {first.excerpt}"
