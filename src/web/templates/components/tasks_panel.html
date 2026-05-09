@@ -17,7 +17,14 @@
             hx-target="[id='{{ target_id }}']"
             hx-swap="innerHTML">
         <span class="font-mono text-gray-200">{{ task.pr_id }}</span>
-        <span class="break-words text-gray-300 sm:flex-1">{{ task.title }}</span>
+        <span class="break-words text-gray-300 sm:flex-1">
+            {{ task.title }}
+            {% if status_key == 'todo' and task.unresolved_deps %}
+            <span class="ml-0 inline-flex rounded border border-fail/40 bg-fail/10 px-1.5 py-0.5 text-[11px] font-medium text-fail sm:ml-2">
+                Blocked by: {{ task.unresolved_deps | join(', ') }}
+            </span>
+            {% endif %}
+        </span>
         {% if task.branch %}
         <span class="font-mono text-[11px] text-gray-500 sm:text-right">{{ task.branch }}</span>
         {% endif %}

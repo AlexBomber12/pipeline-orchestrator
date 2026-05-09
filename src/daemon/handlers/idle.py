@@ -20,6 +20,7 @@ from src.onboarding.markdown_sections import MarkerError
 from src.onboarding.reconciliation import reconcile_agents_md
 from src.queue_parser import (
     QueueValidationError,
+    TaskHeader,
     parse_task_header,
 )
 from src.task_status import (
@@ -159,36 +160,32 @@ class IdleMixin:
         skipped_legacy_pr_ids: set[str],
         task_dir: Path,
         merged_pr_ids: set[str],
-    ) -> list:
-        blocked_pr_ids: set[str] = set()
+    ) -> tuple[list, dict[str, list[str]]]:
+        unresolved_deps_map: dict[str, list[str]] = {}
         structured_pr_ids = {header.pr_id for header in headers}
 
         changed = True
         while changed:
             changed = False
-            available_pr_ids = structured_pr_ids - blocked_pr_ids
             for header in headers:
-                if header.pr_id in blocked_pr_ids:
-                    continue
+                unresolved_deps = set(unresolved_deps_map.get(header.pr_id, ()))
                 for dependency in header.depends_on:
-                    if dependency in available_pr_ids:
-                        continue
                     if dependency in merged_pr_ids:
                         continue
-                    if dependency in blocked_pr_ids:
-                        blocked_pr_ids.add(header.pr_id)
-                        changed = True
-                        break
                     if dependency in skipped_legacy_pr_ids:
-                        blocked_pr_ids.add(header.pr_id)
-                        changed = True
-                        break
-                    if not (task_dir / f"{dependency}.md").exists():
-                        blocked_pr_ids.add(header.pr_id)
-                        changed = True
-                        break
+                        unresolved_deps.add(dependency)
+                        continue
+                    if dependency not in structured_pr_ids:
+                        if not (task_dir / f"{dependency}.md").exists():
+                            unresolved_deps.add(dependency)
+                        continue
+                    unresolved_deps.update(unresolved_deps_map.get(dependency, ()))
+                next_unresolved = sorted(unresolved_deps)
+                if next_unresolved != unresolved_deps_map.get(header.pr_id, []):
+                    unresolved_deps_map[header.pr_id] = next_unresolved
+                    changed = True
 
-        return [header for header in headers if header.pr_id not in blocked_pr_ids]
+        return headers, unresolved_deps_map
 
     async def _select_next_task_from_dag(self) -> QueueTask | None:
         """Pick the next eligible task from structured task headers."""
@@ -242,14 +239,12 @@ class IdleMixin:
             )
             self._idle_degraded_done_check_logged = True
         merged_pr_ids = state.merged_pr_ids
-        headers = self._filter_dag_headers_with_available_dependencies(
+        headers, unresolved_deps_map = self._filter_dag_headers_with_available_dependencies(
             headers,
             skipped_legacy_pr_ids,
             task_dir,
             merged_pr_ids,
         )
-        if not headers:
-            return None
 
         try:
             dag_headers = [
@@ -263,6 +258,37 @@ class IdleMixin:
                 )
                 for header in headers
             ]
+            eligibility_dag_headers = [
+                replace(
+                    header,
+                    depends_on=list(unresolved_deps_map[header.pr_id]),
+                )
+                if header.pr_id in unresolved_deps_map
+                else header
+                for header in dag_headers
+            ]
+            dag_header_ids = {header.pr_id for header in dag_headers}
+            synthetic_blocker_headers = [
+                TaskHeader(
+                    pr_id=dependency,
+                    title=f"Missing dependency {dependency}",
+                    branch="",
+                    task_type="feature",
+                    complexity="low",
+                    depends_on=[],
+                    priority=9999,
+                    coder="any",
+                )
+                for dependency in sorted(
+                    {
+                        dependency
+                        for unresolved_deps in unresolved_deps_map.values()
+                        for dependency in unresolved_deps
+                        if dependency not in dag_header_ids
+                    }
+                )
+            ]
+            eligibility_headers = [*eligibility_dag_headers, *synthetic_blocker_headers]
             merged_pr_ids = {
                 pr_id for pr_id in merged_pr_ids if pr_id in {header.pr_id for header in headers}
             }
@@ -299,6 +325,12 @@ class IdleMixin:
                 )
                 for header in headers
             }
+            statuses.update(
+                {
+                    header.pr_id: TaskStatus.ERROR
+                    for header in synthetic_blocker_headers
+                }
+            )
             frontmatter_statuses = {
                 header.pr_id: header.frontmatter_status for header in headers
             }
@@ -336,7 +368,11 @@ class IdleMixin:
                     status_write_failed_task_pr_ids.discard(pr_id)
                     continue
                 statuses[pr_id] = TaskStatus.ERROR
-            eligible = get_eligible_tasks(dag_headers, statuses)
+            eligible = [
+                header
+                for header in get_eligible_tasks(eligibility_headers, statuses)
+                if header.pr_id in dag_header_ids
+            ]
             stopped_eligible = [
                 header
                 for header in eligible
@@ -353,7 +389,12 @@ class IdleMixin:
         self._idle_dag_headers = list(dag_headers)
         self._idle_dag_statuses = dict(statuses)
         self._idle_dag_tasks = [
-            self._queue_task_from_header(header, statuses[header.pr_id], task_files)
+            self._queue_task_from_header(
+                header,
+                statuses[header.pr_id],
+                task_files,
+                unresolved_deps_map.get(header.pr_id, []),
+            )
             for header in dag_headers
         ]
         doing_tasks = [
@@ -367,11 +408,21 @@ class IdleMixin:
         if eligible:
             stopped_task_pr_ids.clear()
             picked = eligible[0]
-            return self._queue_task_from_header(picked, TaskStatus.TODO, task_files)
+            return self._queue_task_from_header(
+                picked,
+                TaskStatus.TODO,
+                task_files,
+                unresolved_deps_map.get(picked.pr_id, []),
+            )
         if stopped_eligible:
             stopped_task_pr_ids.clear()
             picked = stopped_eligible[0]
-            return self._queue_task_from_header(picked, TaskStatus.TODO, task_files)
+            return self._queue_task_from_header(
+                picked,
+                TaskStatus.TODO,
+                task_files,
+                unresolved_deps_map.get(picked.pr_id, []),
+            )
         return None
 
     def _queue_task_from_header(
@@ -379,6 +430,7 @@ class IdleMixin:
         header,
         status: TaskStatus,
         task_files: dict[str, str],
+        unresolved_deps: list[str] | None = None,
     ) -> QueueTask:
         return QueueTask(
             pr_id=header.pr_id,
@@ -386,6 +438,7 @@ class IdleMixin:
             status=status,
             task_file=task_files[header.pr_id],
             depends_on=list(header.depends_on),
+            unresolved_deps=list(unresolved_deps or []),
             branch=header.branch,
         )
 

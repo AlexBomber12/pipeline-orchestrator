@@ -2671,11 +2671,11 @@ def test_select_next_task_from_dag_returns_none_when_no_headers_present(
     assert task is None
 
 
-def test_select_next_task_from_dag_returns_none_when_dependency_filter_clears_all(
+def test_picker_does_not_pick_task_with_unresolved_deps(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """All headers are blocked by missing-file deps ⇒ filter empty ⇒ None."""
+    """Missing-file deps stay visible in the snapshot but are not picked."""
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         idle_module.IdleMixin,
@@ -2704,6 +2704,82 @@ def test_select_next_task_from_dag_returns_none_when_dependency_filter_clears_al
     task = asyncio.run(runner._select_next_task_from_dag())
 
     assert task is None
+    assert runner._idle_dag_tasks == [
+        QueueTask(
+            pr_id="PR-001",
+            title="Blocked",
+            status=TaskStatus.TODO,
+            task_file="tasks/PR-001.md",
+            depends_on=["PR-MISSING"],
+            unresolved_deps=["PR-MISSING"],
+            branch="pr-001",
+        )
+    ]
+
+
+def test_picker_keeps_unresolved_cycle_idle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Unresolved blocked tasks stay visible without triggering cycle errors."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: First blocked\n\n"
+        "Branch: pr-001\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: PR-002\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+    (tasks_dir / "PR-002.md").write_text(
+        "# PR-002: Second blocked\n\n"
+        "Branch: pr-002\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: PR-001, PR-MISSING\n"
+        "- Priority: 2\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is None
+    assert runner._idle_dag_tasks == [
+        QueueTask(
+            pr_id="PR-001",
+            title="First blocked",
+            status=TaskStatus.TODO,
+            task_file="tasks/PR-001.md",
+            depends_on=["PR-002"],
+            unresolved_deps=["PR-MISSING"],
+            branch="pr-001",
+        ),
+        QueueTask(
+            pr_id="PR-002",
+            title="Second blocked",
+            status=TaskStatus.TODO,
+            task_file="tasks/PR-002.md",
+            depends_on=["PR-001", "PR-MISSING"],
+            unresolved_deps=["PR-MISSING"],
+            branch="pr-002",
+        ),
+    ]
 
 
 def test_filter_dag_headers_blocks_tasks_with_transitively_blocked_dependencies(
@@ -2732,14 +2808,49 @@ def test_filter_dag_headers_blocks_tasks_with_transitively_blocked_dependencies(
         ),
     ]
 
-    filtered = idle_module.IdleMixin._filter_dag_headers_with_available_dependencies(
-        headers,
-        {"PR-LEGACY"},
-        tmp_path,
-        set(),
+    retained, unresolved_deps_map = (
+        idle_module.IdleMixin._filter_dag_headers_with_available_dependencies(
+            headers,
+            {"PR-LEGACY"},
+            tmp_path,
+            set(),
+        )
     )
 
-    assert filtered == []
+    assert retained == headers
+    assert unresolved_deps_map == {
+        "PR-001": ["PR-LEGACY"],
+        "PR-002": ["PR-LEGACY"],
+    }
+
+
+def test_filter_retains_headers_with_missing_deps(
+    tmp_path: Path,
+) -> None:
+    headers = [
+        TaskHeader(
+            pr_id="PR-002",
+            title="Depends on missing",
+            branch="pr-002",
+            task_type="feature",
+            complexity="low",
+            depends_on=["PR-MISSING"],
+            priority=1,
+            coder="any",
+        ),
+    ]
+
+    retained, unresolved_deps_map = (
+        idle_module.IdleMixin._filter_dag_headers_with_available_dependencies(
+            headers,
+            set(),
+            tmp_path,
+            merged_pr_ids=set(),
+        )
+    )
+
+    assert retained == headers
+    assert unresolved_deps_map == {"PR-002": ["PR-MISSING"]}
 
 
 def test_filter_dag_headers_keeps_task_when_dependency_is_merged(
@@ -2760,21 +2871,24 @@ def test_filter_dag_headers_keeps_task_when_dependency_is_merged(
         ),
     ]
 
-    filtered = idle_module.IdleMixin._filter_dag_headers_with_available_dependencies(
-        headers,
-        set(),
-        tmp_path,
-        merged_pr_ids={"PR-MERGED"},
+    retained, unresolved_deps_map = (
+        idle_module.IdleMixin._filter_dag_headers_with_available_dependencies(
+            headers,
+            set(),
+            tmp_path,
+            merged_pr_ids={"PR-MERGED"},
+        )
     )
 
-    assert [h.pr_id for h in filtered] == ["PR-002"]
+    assert [h.pr_id for h in retained] == ["PR-002"]
+    assert unresolved_deps_map == {}
 
 
-def test_filter_dag_headers_blocks_when_dependency_file_missing(
+def test_filter_dag_headers_keeps_task_when_dependency_file_missing(
     tmp_path: Path,
 ) -> None:
     """A dependency that is neither structured, merged, nor a known
-    legacy file blocks the dependent header."""
+    legacy file is surfaced as unresolved metadata."""
     headers = [
         TaskHeader(
             pr_id="PR-002",
@@ -2788,14 +2902,47 @@ def test_filter_dag_headers_blocks_when_dependency_file_missing(
         ),
     ]
 
-    filtered = idle_module.IdleMixin._filter_dag_headers_with_available_dependencies(
-        headers,
-        set(),
-        tmp_path,
-        merged_pr_ids=set(),
+    retained, unresolved_deps_map = (
+        idle_module.IdleMixin._filter_dag_headers_with_available_dependencies(
+            headers,
+            set(),
+            tmp_path,
+            merged_pr_ids=set(),
+        )
     )
 
-    assert filtered == []
+    assert retained == headers
+    assert unresolved_deps_map == {"PR-002": ["PR-MISSING"]}
+
+
+def test_filter_dag_headers_keeps_task_when_dependency_file_exists(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "PR-001.md").write_text("legacy content\n", encoding="utf-8")
+    headers = [
+        TaskHeader(
+            pr_id="PR-002",
+            title="Depends on existing legacy file",
+            branch="pr-002",
+            task_type="feature",
+            complexity="low",
+            depends_on=["PR-001"],
+            priority=1,
+            coder="any",
+        ),
+    ]
+
+    retained, unresolved_deps_map = (
+        idle_module.IdleMixin._filter_dag_headers_with_available_dependencies(
+            headers,
+            set(),
+            tmp_path,
+            merged_pr_ids=set(),
+        )
+    )
+
+    assert retained == headers
+    assert unresolved_deps_map == {}
 
 
 def test_select_next_task_from_dag_wraps_dag_cycle_errors(

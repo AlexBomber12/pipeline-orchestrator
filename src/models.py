@@ -59,6 +59,7 @@ class QueueTask(BaseModel):
     status: TaskStatus
     task_file: str | None = None
     depends_on: list[str] = Field(default_factory=list)
+    unresolved_deps: list[str] = Field(default_factory=list)
     branch: str | None = None
     priority: int = 3
 
