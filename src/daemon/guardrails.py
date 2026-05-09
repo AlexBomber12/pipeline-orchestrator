@@ -254,6 +254,12 @@ def _line_contexts(
         end = start + len(line)
         if pending_branch is not None and _GIT_BRANCH_CHANGE_FAILURE_RE.search(line):
             pending_branch = None
+        if (
+            pending_branch is not None
+            and _GIT_COMMAND_RE.search(line)
+            and _GIT_BRANCH_CHANGE_FAILURE_RE.search(stdout, end)
+        ):
+            pending_branch = None
         if pending_branch is not None and pending_branch[1]:
             success = _GIT_CHECKOUT_BRANCH_SUCCESS_RE.search(line)
             if success:

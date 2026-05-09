@@ -276,6 +276,16 @@ def test_scan_stdout_force_push_ignores_failed_switch_before_push(
     assert scan_stdout(stdout, current_branch="feature/xyz") == []
 
 
+def test_scan_stdout_force_push_ignores_delayed_failed_switch_stderr() -> None:
+    stdout_then_stderr = (
+        "git switch main\n"
+        "git push --force origin\n"
+        "error: pathspec 'main' did not match any file(s) known to git\n"
+    )
+
+    assert scan_stdout(stdout_then_stderr, current_branch="feature/xyz") == []
+
+
 @pytest.mark.parametrize("branch_command", ["git switch -c", "git checkout -b"])
 def test_scan_stdout_force_push_tracks_branch_create_away_from_main_before_push(
     branch_command: str,
