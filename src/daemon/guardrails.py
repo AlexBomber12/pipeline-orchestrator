@@ -29,15 +29,6 @@ _REPO_DELETE = re.compile(r"\bgh\s+repo\s+delete\b", re.IGNORECASE)
 _GH_PR_CREATE = re.compile(r"\bgh\s+pr\s+create\b", re.IGNORECASE)
 _GIT_COMMIT = re.compile(r"\bgit\s+commit\b", re.IGNORECASE)
 _GIT_PUSH = re.compile(r"\bgit\s+push\b", re.IGNORECASE)
-_BRANCH_DELETE_COLON = re.compile(
-    r"\bgit\s+push\s+origin\s+:[a-zA-Z0-9_/.-]*\b",
-    re.IGNORECASE,
-)
-_BRANCH_DELETE_FLAG = re.compile(
-    r"\bgit\s+push\s+(?:--delete|-d)\s+origin\s+[a-zA-Z0-9_/.-]+\b",
-    re.IGNORECASE,
-)
-
 # Design parallel copied from src/mcp/scans.py:_ANTI_PATTERNS. Keep local for
 # now so runtime stdout guardrails do not refactor task-spec validation.
 _FORCE_PUSH_MAIN = re.compile(
@@ -102,16 +93,7 @@ def _command_tokens_after_git_push(line: str) -> list[str]:
     return command_tail.split()
 
 
-def _refspec_targets_default_branch(refspec: str) -> bool:
-    refspec = refspec.lstrip("+")
-    if ":" in refspec:
-        refspec = refspec.rsplit(":", 1)[1]
-    refspec = refspec.removeprefix("refs/heads/")
-    return refspec == _DEFAULT_BRANCH
-
-
-def _push_targets_default_branch(line: str) -> bool:
-    tokens = _command_tokens_after_git_push(line)
+def _git_push_positionals(tokens: list[str]) -> list[str]:
     positionals: list[str] = []
     skip_next = False
     flags_with_values = {"--repo", "--receive-pack", "--exec"}
@@ -127,25 +109,44 @@ def _push_targets_default_branch(line: str) -> bool:
         if token.startswith("-"):
             continue
         positionals.append(token)
+    return positionals
+
+
+def _refspec_targets_default_branch(refspec: str) -> bool:
+    refspec = refspec.lstrip("+")
+    if ":" in refspec:
+        refspec = refspec.rsplit(":", 1)[1]
+    refspec = refspec.removeprefix("refs/heads/")
+    return refspec == _DEFAULT_BRANCH
+
+
+def _push_targets_default_branch(line: str) -> bool:
+    tokens = _command_tokens_after_git_push(line)
+    positionals = _git_push_positionals(tokens)
     if len(positionals) < 2:
         return False
     return any(_refspec_targets_default_branch(token) for token in positionals[1:])
 
 
+def _is_delete_flag(token: str) -> bool:
+    return token in {"--delete", "-d"}
+
+
+def _is_delete_refspec_to_default_branch(refspec: str) -> bool:
+    return refspec.startswith(":") and _refspec_targets_default_branch(refspec)
+
+
 def _is_branch_delete_default(line: str) -> bool:
-    if _BRANCH_DELETE_COLON.search(line) and _push_targets_default_branch(line):
+    tokens = _command_tokens_after_git_push(line)
+    positionals = _git_push_positionals(tokens)
+    if len(positionals) < 2:
+        return False
+    refspecs = positionals[1:]
+    if any(_is_delete_refspec_to_default_branch(token) for token in refspecs):
         return True
-    if _BRANCH_DELETE_FLAG.search(line):
-        tokens = _command_tokens_after_git_push(line)
-        try:
-            origin_index = tokens.index("origin")
-        except ValueError:
-            return False
-        return any(
-            _refspec_targets_default_branch(token)
-            for token in tokens[origin_index + 1 :]
-        )
-    return False
+    return any(_is_delete_flag(token) for token in tokens) and any(
+        _refspec_targets_default_branch(token) for token in refspecs
+    )
 
 
 def _has_direct_commit_to_default_branch(lines: list[str], commit_index: int) -> bool:
