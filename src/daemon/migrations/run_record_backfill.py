@@ -21,11 +21,11 @@ _EXIT_REASON_TO_OUTCOME_CAUSE: dict[str, tuple[str, str]] = {
     "rate_limit": ("paused", NULL_CAUSE_VALUE),
     "crash": ("failed", "CRASH"),
     "timeout": ("failed", "TIMEOUT"),
-    "error": ("failed", "INFRA"),
+    "error": ("failed", "CRASH"),
     "escalated": ("failed", "ESCALATE"),
     "paused": ("paused", NULL_CAUSE_VALUE),
     "stopped": ("paused", NULL_CAUSE_VALUE),
-    "cancelled": ("failed", "ESCALATE"),
+    "cancelled": ("paused", NULL_CAUSE_VALUE),
 }
 
 
@@ -103,6 +103,7 @@ async def migrate_run_records_to_outcome_cause(
         "records_scanned": 0,
         "records_migrated": 0,
         "records_skipped_already_migrated": 0,
+        "records_skipped_non_hash": 0,
         "records_skipped_malformed": 0,
     }
 
@@ -117,8 +118,7 @@ async def migrate_run_records_to_outcome_cause(
 
         redis_type = await _key_type(redis_client, key)
         if redis_type not in {None, "hash"}:
-            counts["records_skipped_malformed"] += 1
-            _warn(log, f"[MIGRATION] Skipping non-hash run-record key {key}")
+            counts["records_skipped_non_hash"] += 1
             continue
 
         raw_record = await _maybe_await(redis_client.hgetall(key))

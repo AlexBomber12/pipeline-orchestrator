@@ -125,11 +125,11 @@ async def test_backfill_maps_exit_reason_to_outcome_cause() -> None:
         "rate_limit": ("paused", NULL_CAUSE_VALUE),
         "crash": ("failed", "CRASH"),
         "timeout": ("failed", "TIMEOUT"),
-        "error": ("failed", "INFRA"),
+        "error": ("failed", "CRASH"),
         "escalated": ("failed", "ESCALATE"),
         "paused": ("paused", NULL_CAUSE_VALUE),
         "stopped": ("paused", NULL_CAUSE_VALUE),
-        "cancelled": ("failed", "ESCALATE"),
+        "cancelled": ("paused", NULL_CAUSE_VALUE),
     }
     keys = {
         exit_reason: _record(redis, "repo", f"run-{index}", exit_reason)
@@ -145,6 +145,7 @@ async def test_backfill_maps_exit_reason_to_outcome_cause() -> None:
         "records_scanned": 11,
         "records_migrated": 11,
         "records_skipped_already_migrated": 0,
+        "records_skipped_non_hash": 0,
         "records_skipped_malformed": 0,
     }
     for exit_reason, (outcome, cause) in expected.items():
@@ -223,6 +224,7 @@ async def test_backfill_idempotent_skip_already_migrated() -> None:
         "records_scanned": 1,
         "records_migrated": 0,
         "records_skipped_already_migrated": 1,
+        "records_skipped_non_hash": 0,
         "records_skipped_malformed": 0,
     }
 
@@ -309,9 +311,7 @@ async def test_backfill_skips_non_hash_records(
     assert any("Skipping malformed run-record hash" in rec.getMessage() for rec in caplog.records)
 
 
-async def test_backfill_skips_typed_non_hash_keys_before_hgetall(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+async def test_backfill_skips_typed_non_hash_keys_before_hgetall() -> None:
     class _StringRedis(_FakeRedis):
         async def type(self, key: str | bytes) -> bytes:
             return b"string"
@@ -321,13 +321,14 @@ async def test_backfill_skips_typed_non_hash_keys_before_hgetall(
 
     redis = _StringRedis()
     redis.hashes["metrics:run:run-string"] = {"task_id": "PR-1"}
-    log = logging.getLogger("test_run_record_backfill")
 
-    with caplog.at_level(logging.WARNING, logger=log.name):
-        counts = await migrate_run_records_to_outcome_cause(redis, log)
+    counts = await migrate_run_records_to_outcome_cause(
+        redis,
+        logging.getLogger("test_run_record_backfill"),
+    )
 
-    assert counts["records_skipped_malformed"] == 1
-    assert any("Skipping non-hash run-record key" in rec.getMessage() for rec in caplog.records)
+    assert counts["records_skipped_non_hash"] == 1
+    assert counts["records_skipped_malformed"] == 0
 
 
 async def test_key_type_handles_none_response() -> None:

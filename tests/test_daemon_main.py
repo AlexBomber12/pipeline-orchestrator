@@ -129,6 +129,7 @@ def _patch_main(
                 "records_scanned": 0,
                 "records_migrated": 0,
                 "records_skipped_already_migrated": 0,
+                "records_skipped_non_hash": 0,
                 "records_skipped_malformed": 0,
             }
 
@@ -210,6 +211,7 @@ def test_main_calls_migrations_before_run_cycle(
             "records_scanned": 1,
             "records_migrated": 1,
             "records_skipped_already_migrated": 0,
+            "records_skipped_non_hash": 0,
             "records_skipped_malformed": 0,
         }
 
