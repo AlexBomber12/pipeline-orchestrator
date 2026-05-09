@@ -121,6 +121,10 @@ _GH_PR_CREATE_RE = re.compile(
     _COMMAND_PREFIX_RE + r"gh[^\S\r\n]+pr[^\S\r\n]+create\b",
     re.IGNORECASE,
 )
+_GH_PR_CREATE_INLINE_RE = re.compile(
+    r"\bgh[^\S\r\n]+pr[^\S\r\n]+create\b",
+    re.IGNORECASE,
+)
 _GH_PR_CREATE_NO_CREATE_FLAG_RE = re.compile(
     r"(?<!\S)(?:--dry-run(?:=[^\s]+)?|--help|-h)(?!\S)",
 )
@@ -220,7 +224,7 @@ def _looks_like_checkout_pathspec(target: str) -> bool:
         target in {".", ".."}
         or target.startswith(("./", "../", "/", ":"))
         or target.endswith("/")
-        or "." in target
+        or ("." in target and "/" not in target)
     )
 
 
@@ -326,6 +330,12 @@ def _is_pr_create_command(line: str) -> bool:
     )
 
 
+def _contains_pr_create_command(text: str) -> bool:
+    return bool(_GH_PR_CREATE_INLINE_RE.search(text)) and not bool(
+        _GH_PR_CREATE_NO_CREATE_FLAG_RE.search(text)
+    )
+
+
 def _line_excerpt(coder_stdout: str, start: int, end: int) -> str:
     line_start = coder_stdout.rfind("\n", 0, start) + 1
     line_end = coder_stdout.find("\n", end)
@@ -361,11 +371,19 @@ def _detect_direct_commit_main(
         same_line_push = (
             same_line_push_match.group(0) if same_line_push_match else ""
         )
+        same_line_before_push = (
+            same_line_after_commit[: same_line_push_match.start()]
+            if same_line_push_match
+            else ""
+        )
         if (
-            _GIT_PUSH_PROTECTED_BRANCH_RE.search(same_line_push)
-            or _is_current_branch_push_to_protected(
-                same_line_push,
-                branch_by_line.get(commit_index),
+            not _contains_pr_create_command(same_line_before_push)
+            and (
+                _GIT_PUSH_PROTECTED_BRANCH_RE.search(same_line_push)
+                or _is_current_branch_push_to_protected(
+                    same_line_push,
+                    branch_by_line.get(commit_index),
+                )
             )
         ):
             violations.append(

@@ -222,10 +222,16 @@ def test_scan_stdout_force_push_discards_checkout_path_before_switch() -> None:
 
 def test_scan_stdout_force_push_tracks_confirmed_checkout_pathlike_branch() -> None:
     stdout = (
-        "git checkout release/v1.2\n"
-        "Switched to branch 'release/v1.2'\n"
+        "git checkout README.md\n"
+        "Already on 'README.md'\n"
         "git push --force origin\n"
     )
+
+    assert scan_stdout(stdout, current_branch="main") == []
+
+
+def test_scan_stdout_force_push_tracks_quiet_dotted_branch_without_feedback() -> None:
+    stdout = "git checkout -q release/v1.2\ngit push --force origin\n"
 
     assert scan_stdout(stdout, current_branch="main") == []
 
@@ -373,6 +379,23 @@ def test_scan_stdout_direct_commit_same_line_no_refspec_push_flagged() -> None:
     stdout = "git commit -m guardrail && git push origin\n"
 
     violations = scan_stdout(stdout, current_branch="main")
+
+    assert len(violations) == 1
+    assert violations[0].category == "direct_commit_main"
+
+
+def test_scan_stdout_direct_commit_same_line_pr_create_before_push_not_flagged() -> None:
+    stdout = "git commit -m guardrail && gh pr create --fill && git push origin main\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_direct_commit_same_line_pr_create_dry_run_still_flagged() -> None:
+    stdout = (
+        "git commit -m guardrail && gh pr create --dry-run && git push origin main\n"
+    )
+
+    violations = scan_stdout(stdout)
 
     assert len(violations) == 1
     assert violations[0].category == "direct_commit_main"
