@@ -167,6 +167,27 @@ def test_scan_stdout_force_push_feature_current_branch_without_refspec_not_flagg
     assert scan_stdout(stdout, current_branch="feature/xyz") == []
 
 
+def test_scan_stdout_force_push_tracks_checkout_to_main_before_no_refspec_push() -> None:
+    stdout = "git checkout main\ngit push --force origin\n"
+
+    violations = scan_stdout(stdout, current_branch="feature/xyz")
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
+def test_scan_stdout_force_push_tracks_checkout_away_from_main_before_push() -> None:
+    stdout = "git checkout feature/xyz\ngit push --force origin\n"
+
+    assert scan_stdout(stdout, current_branch="main") == []
+
+
+def test_scan_stdout_force_push_tags_mode_on_main_not_flagged() -> None:
+    stdout = "git push --force --tags\n"
+
+    assert scan_stdout(stdout, current_branch="main") == []
+
+
 def test_scan_stdout_force_push_main_prose_not_flagged() -> None:
     stdout = "Reminder: do not run git push --force origin main\n"
 
@@ -300,6 +321,27 @@ def test_scan_stdout_direct_commit_feature_branch_without_refspec_not_flagged() 
     stdout = "git commit -m guardrail\ngit push origin\n"
 
     assert scan_stdout(stdout, current_branch="feature/xyz") == []
+
+
+def test_scan_stdout_direct_commit_tracks_switch_to_main_before_no_refspec_push() -> None:
+    stdout = "git commit -m guardrail\ngit switch main\ngit push origin\n"
+
+    violations = scan_stdout(stdout, current_branch="feature/xyz")
+
+    assert len(violations) == 1
+    assert violations[0].category == "direct_commit_main"
+
+
+def test_scan_stdout_direct_commit_tracks_switch_away_from_main_before_push() -> None:
+    stdout = "git commit -m guardrail\ngit switch feature/xyz\ngit push origin\n"
+
+    assert scan_stdout(stdout, current_branch="main") == []
+
+
+def test_scan_stdout_direct_commit_tags_mode_on_main_not_flagged() -> None:
+    stdout = "git commit -m guardrail\ngit push --tags\n"
+
+    assert scan_stdout(stdout, current_branch="main") == []
 
 
 def test_scan_stdout_direct_commit_main_ignores_non_push_followup() -> None:

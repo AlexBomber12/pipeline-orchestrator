@@ -132,6 +132,13 @@ _GIT_PUSH_LINE_RE = re.compile(
     r"[ \t]*(?=$|[,;|&#])",
     re.IGNORECASE,
 )
+_GIT_BRANCH_CHANGE_RE = re.compile(
+    _COMMAND_PREFIX_RE
+    + r"git[^\S\r\n]+(?:checkout|switch)[^\S\r\n]+"
+    r"(?!-)(?P<branch>[^\s,;|&#]+)"
+    r"[ \t]*(?=$|[,;|&#])",
+    re.IGNORECASE,
+)
 _GIT_PUSH_PROTECTED_BRANCH_RE = re.compile(
     _COMMAND_PREFIX_RE
     + r"git push\b"
@@ -154,14 +161,40 @@ def _git_push_line_info(line: str) -> tuple[bool, bool]:
         return False, False
 
     has_force_flag = False
+    has_non_branch_mode = False
     positionals: list[str] = []
     for token in match.group("args").split():
         if token.startswith("-"):
             if re.fullmatch(r"--force(?:-with-lease(?:=.*)?)?|-f", token):
                 has_force_flag = True
+            if token in {"--all", "--mirror", "--tags"}:
+                has_non_branch_mode = True
             continue
         positionals.append(token)
-    return has_force_flag, len(positionals) <= 1
+    return has_force_flag, not has_non_branch_mode and len(positionals) <= 1
+
+
+def _branch_after_command(line: str, current_branch: str | None) -> str | None:
+    match = _GIT_BRANCH_CHANGE_RE.search(line)
+    if not match:
+        return current_branch
+    return match.group("branch")
+
+
+def _line_contexts(
+    stdout: str,
+    initial_branch: str | None,
+) -> list[tuple[int, str, int, int, str | None]]:
+    contexts: list[tuple[int, str, int, int, str | None]] = []
+    current_branch = initial_branch
+    start = 0
+    for index, raw_line in enumerate(stdout.splitlines(keepends=True)):
+        line = raw_line.rstrip("\r\n")
+        end = start + len(line)
+        contexts.append((index, line, start, end, current_branch))
+        current_branch = _branch_after_command(line, current_branch)
+        start += len(raw_line)
+    return contexts
 
 
 def _is_current_branch_push_to_protected(line: str, current_branch: str | None) -> bool:
@@ -175,13 +208,14 @@ def _detect_force_push_current_branch(
     stdout: str,
     current_branch: str | None,
 ) -> list[GuardrailViolation]:
-    if not _is_protected_current_branch(current_branch):
-        return []
-
     violations: list[GuardrailViolation] = []
-    for match in _GIT_PUSH_LINE_RE.finditer(stdout):
+    for _index, line, start, end, branch in _line_contexts(stdout, current_branch):
+        if not _is_protected_current_branch(branch):
+            continue
+        if not _GIT_PUSH_LINE_RE.search(line):
+            continue
         has_force_flag, has_no_explicit_refspec = _git_push_line_info(
-            match.group(0)
+            line
         )
         if not has_force_flag or not has_no_explicit_refspec:
             continue
@@ -189,7 +223,7 @@ def _detect_force_push_current_branch(
             GuardrailViolation(
                 tier=1,
                 category="force_push_main",
-                excerpt=_line_excerpt(stdout, match.start(), match.end()),
+                excerpt=_line_excerpt(stdout, start, end),
                 rule=_TIER1_RULES["force_push_main"],
             )
         )
@@ -217,6 +251,13 @@ def _detect_direct_commit_main(
     """Detect commit then push to default branch without an intervening PR."""
     violations: list[GuardrailViolation] = []
     lines = stdout.splitlines()
+    branch_by_line = {
+        index: branch
+        for index, _line, _start, _end, branch in _line_contexts(
+            stdout,
+            current_branch,
+        )
+    }
 
     for commit_index, commit_line in enumerate(lines):
         if not _TIER1_PATTERNS[_DIRECT_COMMIT_CATEGORY].search(commit_line):
@@ -228,7 +269,10 @@ def _detect_direct_commit_main(
             push_line = lines[push_index]
             if not (
                 _GIT_PUSH_PROTECTED_BRANCH_RE.search(push_line)
-                or _is_current_branch_push_to_protected(push_line, current_branch)
+                or _is_current_branch_push_to_protected(
+                    push_line,
+                    branch_by_line.get(push_index),
+                )
             ):
                 continue
             intermediate_lines = lines[commit_index + 1 : push_index]
