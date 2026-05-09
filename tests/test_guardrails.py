@@ -26,6 +26,13 @@ def test_scan_stdout_repo_create_pattern_matches() -> None:
     assert violations[0].category == "repo_create"
 
 
+def test_scan_stdout_repo_delete_pattern_matches() -> None:
+    violations = scan_stdout("gh repo delete octo/demo\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "repo_delete"
+
+
 def test_scan_stdout_repo_create_pattern_allows_horizontal_whitespace() -> None:
     violations = scan_stdout("$ gh\trepo\tcreate octo/demo\n")
 
@@ -116,3 +123,12 @@ def test_scan_stdout_negation_does_not_suppress() -> None:
 
     assert len(violations) == 1
     assert violations[0].category == "repo_create"
+
+
+def test_scan_stdout_repo_delete_negation_does_not_suppress() -> None:
+    stdout = "gh repo delete octo/demo # I would never do this intentionally\n"
+
+    violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "repo_delete"
