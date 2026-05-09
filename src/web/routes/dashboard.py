@@ -61,10 +61,12 @@ _CANCELLATIONS_WINDOW_DAYS = 7
 _CANCELLATIONS_MAX = 50
 
 _ACTIVE_RUN_STATES = {
+    PipelineState.PREFLIGHT,
     PipelineState.CODING,
     PipelineState.WATCH,
     PipelineState.FIX,
     PipelineState.MERGE,
+    PipelineState.PAUSED,
 }
 
 

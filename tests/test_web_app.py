@@ -1893,6 +1893,12 @@ def test_active_repo_coder_requires_active_task_and_run_state() -> None:
     state.state = PipelineState.CODING
     assert _active_repo_coder(state) == "codex"
 
+    state.state = PipelineState.PREFLIGHT
+    assert _active_repo_coder(state) == "codex"
+
+    state.state = PipelineState.PAUSED
+    assert _active_repo_coder(state) == "codex"
+
 
 def test_partial_repo_detail_returns_html_fragment(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
