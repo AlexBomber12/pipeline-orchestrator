@@ -15,6 +15,14 @@ repositories:
   allow_merge_without_checks: false
   allow_merge_without_review: false
   coder: codex
+- url: https://github.com/AlexBomber12/sms-gateway-v2
+  branch: main
+  auto_merge: true
+  active: true
+  poll_interval_sec: 60
+  allow_merge_without_checks: false
+  allow_merge_without_review: false
+  coder: codex
 daemon:
   poll_interval_sec: 60
   review_timeout_min: 20
