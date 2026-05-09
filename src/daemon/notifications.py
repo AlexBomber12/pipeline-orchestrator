@@ -29,4 +29,5 @@ async def send_spend_ceiling_warning(
         ),
     }
     async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-        await client.post(webhook_url, json=payload)
+        response = await client.post(webhook_url, json=payload)
+        response.raise_for_status()

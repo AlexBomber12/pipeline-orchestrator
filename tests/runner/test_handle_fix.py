@@ -73,8 +73,7 @@ def test_handle_fix_skipped_when_spend_ceiling_exceeded(
 
     assert called == []
     assert runner.state.state == PipelineState.PAUSED
-    assert runner.state.error_message is not None
-    assert runner.state.error_message.startswith("SPEND_CEILING:")
+    assert runner.state.error_message is None
 
 
 def test_handle_fix_posts_codex_review_after_push(

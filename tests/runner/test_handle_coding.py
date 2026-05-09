@@ -49,8 +49,7 @@ def test_handle_coding_skipped_when_spend_ceiling_exceeded(
 
     assert called == []
     assert runner.state.state == PipelineState.PAUSED
-    assert runner.state.error_message is not None
-    assert runner.state.error_message.startswith("SPEND_CEILING:")
+    assert runner.state.error_message is None
 
 
 def test_dispatch_persists_task_spec_hash(

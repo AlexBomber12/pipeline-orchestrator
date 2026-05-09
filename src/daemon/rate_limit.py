@@ -79,11 +79,7 @@ class RateLimitMixin:
         """Transition to PAUSED using the same reset machinery as rate limits."""
         until = datetime.fromtimestamp(resets_at, tz=timezone.utc)
         self._record_rate_limit(coder_name, until, reactive=False)
-        self.state.error_message = (
-            f"SPEND_CEILING: {coder_name} {limit_kind} usage at "
-            f"{current_percent}% (cap: {cap_percent}%); resuming after "
-            f"{resets_at}"
-        )
+        self.state.error_message = None
         self.state.state = PipelineState.PAUSED
         self.log_event(
             f"[RATE-LIMIT] [SPEND-CEILING] {coder_name} {limit_kind} cap reached "
@@ -145,6 +141,13 @@ class RateLimitMixin:
                     timeout_seconds=config.guardrail_notification_timeout_seconds,
                 )
             except Exception as exc:
+                try:
+                    await self.redis.delete(dedup_key)
+                except Exception as cleanup_exc:
+                    self.log_event(
+                        "[RATE-LIMIT] [SPEND-CEILING] warn dedup cleanup failed: "
+                        f"{cleanup_exc}"
+                    )
                 self.log_event(
                     f"[RATE-LIMIT] [SPEND-CEILING] warn notification failed: {exc}"
                 )

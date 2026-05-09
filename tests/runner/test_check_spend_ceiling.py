@@ -69,9 +69,11 @@ def test_check_spend_ceiling_cap_exceeded_returns_false(
 
     assert asyncio.run(runner._check_spend_ceiling("claude")) is False
     assert runner.state.state == PipelineState.PAUSED
-    assert runner.state.error_message is not None
-    assert runner.state.error_message.startswith("SPEND_CEILING:")
-    assert f"{expected} usage" in runner.state.error_message
+    assert runner.state.error_message is None
+    assert any(
+        f"[SPEND-CEILING] claude {expected} cap reached" in event["event"]
+        for event in runner.state.history
+    )
 
 
 def test_check_spend_ceiling_below_caps_returns_true(
@@ -202,6 +204,37 @@ def test_maybe_send_ceiling_warning_logs_notification_failure(
 
     asyncio.run(runner._maybe_send_ceiling_warning("claude", _snapshot(session_percent=80)))
 
+    dedup_key = "warn:spend_ceiling:claude:session:1900000000"
+    assert dedup_key not in runner.redis.store
+    assert runner.redis.deleted == [dedup_key]
+    assert any(
+        "[SPEND-CEILING] warn notification failed: webhook down" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_maybe_send_ceiling_warning_swallows_dedup_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CleanupFailingRedis(h._FakeRedis):
+        async def delete(self, key: str) -> int:
+            raise RuntimeError("redis delete down")
+
+    runner = h._make_runner()
+    runner.redis = CleanupFailingRedis()
+    _enable_warning_webhook(runner)
+
+    async def fake_send(**kwargs: Any) -> None:
+        raise RuntimeError("webhook down")
+
+    monkeypatch.setattr("src.daemon.rate_limit.send_spend_ceiling_warning", fake_send)
+
+    asyncio.run(runner._maybe_send_ceiling_warning("claude", _snapshot(session_percent=80)))
+
+    assert any(
+        "[SPEND-CEILING] warn dedup cleanup failed: redis delete down" in entry["event"]
+        for entry in runner.state.history
+    )
     assert any(
         "[SPEND-CEILING] warn notification failed: webhook down" in entry["event"]
         for entry in runner.state.history
@@ -223,8 +256,13 @@ def test_send_spend_ceiling_warning_payload_shape(
         async def __aexit__(self, *args: object) -> None:
             return None
 
-        async def post(self, webhook_url: str, json: dict[str, Any]) -> None:
+        async def post(self, webhook_url: str, json: dict[str, Any]) -> "FakeResponse":
             posted.append((webhook_url, json, self.timeout))
+            return FakeResponse()
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
 
     monkeypatch.setattr("src.daemon.notifications.httpx.AsyncClient", FakeClient)
 
@@ -244,3 +282,39 @@ def test_send_spend_ceiling_warning_payload_shape(
     assert posted[0][1]["event"] == "spend_ceiling_warning"
     assert posted[0][1]["text"].startswith("SPEND CEILING WARNING: claude session")
     assert posted[0][2] == 3.0
+
+
+def test_send_spend_ceiling_warning_raises_for_non_success_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeClient:
+        def __init__(self, timeout: float) -> None:
+            self.timeout = timeout
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def post(self, webhook_url: str, json: dict[str, Any]) -> "FakeResponse":
+            return FakeResponse()
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            raise RuntimeError("server error")
+
+    monkeypatch.setattr("src.daemon.notifications.httpx.AsyncClient", FakeClient)
+
+    with pytest.raises(RuntimeError, match="server error"):
+        asyncio.run(
+            send_spend_ceiling_warning(
+                webhook_url="https://example.test/hook",
+                coder_name="claude",
+                limit_kind="session",
+                current_percent=64,
+                cap_percent=80,
+                warning_percent=80,
+                timeout_seconds=3.0,
+            )
+        )
