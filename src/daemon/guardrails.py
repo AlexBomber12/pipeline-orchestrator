@@ -254,19 +254,21 @@ def _line_contexts(
         end = start + len(line)
         if pending_branch is not None and _GIT_BRANCH_CHANGE_FAILURE_RE.search(line):
             pending_branch = None
+        if pending_branch is not None:
+            success = _GIT_CHECKOUT_BRANCH_SUCCESS_RE.search(line)
+            if success:
+                current_branch, previous_branch = _apply_branch_change(
+                    current_branch,
+                    previous_branch,
+                    success.group("switched") or success.group("already"),
+                )
+                pending_branch = None
         if (
             pending_branch is not None
             and _GIT_COMMAND_RE.search(line)
             and _GIT_BRANCH_CHANGE_FAILURE_RE.search(stdout, end)
         ):
             pending_branch = None
-        if pending_branch is not None and pending_branch[1]:
-            success = _GIT_CHECKOUT_BRANCH_SUCCESS_RE.search(line)
-            if success:
-                pending_branch = (
-                    success.group("switched") or success.group("already"),
-                    False,
-                )
         if pending_branch is not None and _GIT_COMMAND_RE.search(line):
             if pending_branch[1]:
                 pending_branch = None
@@ -361,6 +363,17 @@ def _is_pr_create_command(line: str) -> bool:
     return bool(_GH_PR_CREATE_RE.search(line)) and not bool(
         _GH_PR_CREATE_NO_CREATE_FLAG_RE.search(line)
     )
+
+
+def _has_successful_pr_create(lines: list[str]) -> bool:
+    pr_create_seen = False
+    for line in lines:
+        if _is_pr_create_command(line):
+            pr_create_seen = True
+            continue
+        if pr_create_seen and _GIT_BRANCH_CHANGE_FAILURE_RE.search(line):
+            return False
+    return pr_create_seen
 
 
 def _split_shell_segments(text: str) -> list[str]:
@@ -469,7 +482,7 @@ def _detect_direct_commit_main(
             ):
                 continue
             intermediate_lines = lines[commit_index + 1 : push_index]
-            if any(_is_pr_create_command(line) for line in intermediate_lines):
+            if _has_successful_pr_create(intermediate_lines):
                 break
             violations.append(
                 GuardrailViolation(

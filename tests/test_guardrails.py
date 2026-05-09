@@ -192,6 +192,20 @@ def test_scan_stdout_force_push_tracks_same_line_switch_to_main() -> None:
     assert violations[0].category == "force_push_main"
 
 
+def test_scan_stdout_force_push_keeps_confirmed_switch_before_later_error() -> None:
+    stdout = (
+        "git switch main\n"
+        "Switched to branch 'main'\n"
+        "git push --force origin\n"
+        "fatal: unrelated later failure\n"
+    )
+
+    violations = scan_stdout(stdout, current_branch="feature/xyz")
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
 def test_scan_stdout_force_push_tracks_checkout_away_from_main_before_push() -> None:
     stdout = (
         "git checkout feature/xyz\n"
@@ -471,6 +485,20 @@ def test_scan_stdout_direct_commit_with_pr_create_between() -> None:
     stdout = "git commit -m guardrail\ngh pr create --fill\ngit push origin main\n"
 
     assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_direct_commit_with_failed_pr_create_still_flagged() -> None:
+    stdout = (
+        "git commit -m guardrail\n"
+        "gh pr create --fill\n"
+        "error: failed to create pull request\n"
+        "git push origin main\n"
+    )
+
+    violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "direct_commit_main"
 
 
 def test_scan_stdout_direct_commit_with_pr_create_dry_run_still_flagged() -> None:
