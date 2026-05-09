@@ -26,8 +26,7 @@ _PROTECTED_DEFAULT_BRANCH = "main"
 
 _TIER1_PATTERNS: dict[str, re.Pattern[str]] = {
     "repo_create": re.compile(
-        r"(?m)^(?:[^\S\r\n]*(?:[$>]|[+]{2,})[^\S\r\n]*)?"
-        r"gh[^\S\r\n]+repo[^\S\r\n]+create\b",
+        r"\bgh\b[^\S\r\n]+\brepo\b[^\S\r\n]+\bcreate\b",
         re.IGNORECASE,
     ),
 }
@@ -37,14 +36,6 @@ _TIER1_RULES: dict[str, str] = {
 }
 
 _EXCERPT_LIMIT = 200
-
-
-def _line_excerpt(coder_stdout: str, start: int, end: int) -> str:
-    line_start = coder_stdout.rfind("\n", 0, start) + 1
-    line_end = coder_stdout.find("\n", end)
-    if line_end == -1:
-        line_end = len(coder_stdout)
-    return coder_stdout[line_start:line_end].strip()[:_EXCERPT_LIMIT]
 
 
 def scan_stdout(coder_stdout: str) -> list[GuardrailViolation]:
@@ -57,7 +48,7 @@ def scan_stdout(coder_stdout: str) -> list[GuardrailViolation]:
                 GuardrailViolation(
                     tier=1,
                     category=category,
-                    excerpt=_line_excerpt(coder_stdout, match.start(), match.end()),
+                    excerpt=match.group(0)[:_EXCERPT_LIMIT],
                     rule=_TIER1_RULES[category],
                 )
             )

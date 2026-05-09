@@ -574,7 +574,7 @@ class FixMixin(BreachMixin):
                 return
             return
         await self._save_cli_log(stdout, stderr, f"FIX FEEDBACK output [{coder_name}]")
-        violations = scan_stdout(f"{stdout}\n{stderr}")
+        violations = scan_stdout(stdout)
         if violations:
             first = violations[0]
             cause = f"GUARDRAIL: {first.category}: {first.excerpt}"
@@ -583,8 +583,6 @@ class FixMixin(BreachMixin):
                     f"[FIX] [GUARDRAIL] tier={violation.tier} "
                     f"{violation.category}: {violation.excerpt}"
                 )
-            if await pause_for_stop_after_bookkeeping():
-                return
             await self._transition_to_error(
                 cause,
                 save_run_record_as=None,

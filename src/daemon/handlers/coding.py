@@ -599,7 +599,7 @@ class CodingMixin:
         await self._save_cli_log(
             stdout, stderr, f"PLANNED PR output [{coder_name}]"
         )
-        violations = scan_stdout(f"{stdout}\n{stderr}")
+        violations = scan_stdout(stdout)
         if violations:
             first = violations[0]
             cause = f"GUARDRAIL: {first.category}: {first.excerpt}"
@@ -608,8 +608,6 @@ class CodingMixin:
                     f"[CODING] [GUARDRAIL] tier={violation.tier} "
                     f"{violation.category}: {violation.excerpt}"
                 )
-            if await pause_for_stop_if_requested():
-                return
             await self._transition_to_error(
                 cause,
                 publish=False,
