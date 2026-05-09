@@ -27,7 +27,12 @@ class GuardrailViolation:
 _REPO_CREATE = re.compile(r"\bgh\s+repo\s+create\b", re.IGNORECASE)
 _REPO_DELETE = re.compile(r"\bgh\s+repo\s+delete\b", re.IGNORECASE)
 _GH_PR_CREATE = re.compile(r"\bgh\s+pr\s+create\b", re.IGNORECASE)
-_GH_PR_CREATE_COMMAND = re.compile(r"^\s*(?:[$+]\s*)?gh\s+pr\s+create\b", re.IGNORECASE)
+_GH_PR_CREATE_COMMAND = re.compile(
+    r"^\s*(?:[$+]\s*)?"
+    r"(?:(?:timeout\s+\S+\s+)|(?:env\s+(?:\S+=\S+\s+)*))?"
+    r"gh\s+pr\s+create\b",
+    re.IGNORECASE,
+)
 _GIT_COMMIT = re.compile(r"\bgit\s+commit\b", re.IGNORECASE)
 _GIT_PUSH = re.compile(r"\bgit\s+push\b", re.IGNORECASE)
 # Design parallel to src/mcp/scans.py:_ANTI_PATTERNS. Keep local for now so
@@ -112,11 +117,16 @@ def _refspec_targets_default_branch(refspec: str, default_branch: str) -> bool:
     return refspec == default_branch
 
 
-def _push_targets_default_branch(line: str, default_branch: str) -> bool:
+def _push_targets_default_branch(
+    line: str,
+    default_branch: str,
+    *,
+    allow_implicit: bool = False,
+) -> bool:
     tokens = _command_tokens_after_git_push(line)
     positionals = _git_push_positionals(tokens)
     if len(positionals) < 2:
-        return False
+        return allow_implicit
     return any(
         _refspec_targets_default_branch(token, default_branch)
         for token in positionals[1:]
@@ -195,7 +205,11 @@ def _has_direct_commit_to_default_branch(
         push_line = lines[push_index]
         if not _GIT_PUSH.search(push_line):
             continue
-        if not _push_targets_default_branch(push_line, default_branch):
+        if not _push_targets_default_branch(
+            push_line,
+            default_branch,
+            allow_implicit=True,
+        ):
             continue
         between = lines[commit_index + 1 : push_index]
         return not any(_GH_PR_CREATE_COMMAND.search(line) for line in between)
