@@ -1840,7 +1840,7 @@ def test_coders_table_omits_unknown_selected_model(
     assert "(default)" in body
 
 
-def test_repo_detail_coder_selector_renders(
+def test_repo_detail_coder_display_renders_readonly(
     one_repo_config: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1851,14 +1851,15 @@ def test_repo_detail_coder_selector_renders(
 
     assert response.status_code == 200
     body = response.text
-    assert 'hx-post="/repos/example__alpha/coder"' in body
-    assert 'name="coder"' in body
-    assert "Any (bandit picks per-PR)" in body
-    assert "Claude CLI" in body
-    assert "Codex CLI" in body
+    assert 'data-coder-display' in body
+    assert '<select name="coder"' not in body
+    assert 'hx-post="/repos/example__alpha/coder"' not in body
+    assert "Any (bandit)" in body
+    assert "inherits Claude" in body
+    assert 'href="/settings"' in body
 
 
-def test_repo_detail_selector_marks_repo_override_selected(
+def test_repo_detail_coder_display_shows_repo_override(
     one_repo_config: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1880,7 +1881,8 @@ def test_repo_detail_selector_marks_repo_override_selected(
 
     assert response.status_code == 200
     body = response.text
-    assert '<option value="codex" selected>' in body
+    assert '<select name="coder"' not in body
+    assert "Codex" in body
     assert "inherits Claude" not in body
 
 
@@ -2104,7 +2106,8 @@ def test_put_repo_detail_coder_still_updates_summary_fragment(
         )
 
     assert response.status_code == 200
-    assert 'hx-post="/repos/example__alpha/coder"' in response.text
+    assert 'data-coder-display' in response.text
+    assert 'hx-post="/repos/example__alpha/coder"' not in response.text
     cfg = load_config(str(one_repo_config))
     assert cfg.repositories[0].coder is not None
     assert cfg.repositories[0].coder.value == "codex"

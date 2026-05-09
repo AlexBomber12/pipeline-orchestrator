@@ -101,6 +101,17 @@ def _repo_coder_form_value(repo_config: RepoConfig | None) -> str:
     return repo_config.coder.value
 
 
+def _repo_coder_label(coder: str | None) -> str:
+    """Return the repo-header display label for a coder selection."""
+    if coder == "any":
+        return "Any (bandit)"
+    if coder == "claude":
+        return "Claude CLI"
+    if coder == "codex":
+        return "Codex"
+    return coder or ""
+
+
 def _active_rate_limit_coder(
     state: RepoState, effective_coder: str
 ) -> str | None:
@@ -293,6 +304,7 @@ async def _repo_template_context(
     recent_graphql_burns = await _build_recent_graphql_burns_view(
         redis_client, name
     )
+    selected_repo_coder = _repo_coder_form_value(repo_config)
     return {
         "repo": state,
         "recent_graphql_burns": recent_graphql_burns,
@@ -305,7 +317,9 @@ async def _repo_template_context(
             "Claude" if active_rate_limit_coder == "claude" else "Codex"
         ),
         "show_rate_limit_badge": show_rate_limit_badge,
-        "selected_repo_coder": _repo_coder_form_value(repo_config),
+        "selected_repo_coder": selected_repo_coder,
+        "selected_repo_coder_label": _repo_coder_label(selected_repo_coder),
+        "active_repo_coder_label": _repo_coder_label(state.coder),
         "inherit_coder": _daemon_default_coder_name(config),
         "coder_update_message": coder_update_message,
         "metrics_records": (

@@ -1524,9 +1524,9 @@ def test_repo_detail_route_renders_full_page(
     )
     assert "Current Task" in body
     assert "Current PR" in body
-    assert 'hx-post="/repos/example__alpha/coder"' in body
-    assert 'name="coder"' in body
-    assert "Any (bandit picks per-PR)" in body
+    assert 'data-coder-display' in body
+    assert 'href="/settings"' in body
+    assert "Any (bandit)" in body
     assert "Recent PRs" not in body
     assert "Event log" in body
     # Pause/resume/stop publish history_updated; the SSE consumer must
@@ -3720,31 +3720,89 @@ def test_repo_controls_resume_button_has_spinner(
     assert "animate-spin" in rendered
 
 
-def test_repo_coder_selector_form_has_spinner(
-    two_repo_config: Path,
-) -> None:
-    """The per-repo coder dropdown form on the repo detail page must render
-    a `hx-indicator` plus the shared spinner partial so users see feedback
-    while the coder change is being persisted."""
-    now = datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc)
+def _repo_header_coder_fragment(rendered: str) -> str:
+    start = rendered.index("data-coder-display")
+    end = rendered.index("</div>", start)
+    return rendered[start:end]
+
+
+def _render_repo_header_coder(
+    config_path: Path,
+    *,
+    selected: str = "any",
+    active: str | None = None,
+) -> str:
+    if selected != "any":
+        config_path.write_text(
+            "daemon:\n"
+            "  coder: codex\n"
+            "repositories:\n"
+            "  - url: https://github.com/example/alpha.git\n"
+            f"    coder: {selected}\n"
+            "  - url: https://github.com/example/beta\n",
+            encoding="utf-8",
+        )
     stored = RepoState(
         url="https://github.com/example/alpha.git",
         name="example__alpha",
-        state=PipelineState.IDLE,
-        last_updated=now,
+        state=PipelineState.CODING if active else PipelineState.IDLE,
+        last_updated=datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc),
+        coder=active,
     )
     fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
-
     context = asyncio.run(web_app._repo_template_context("example__alpha", fake))
     rendered = web_app.templates.get_template(
         "components/repo_summary.html"
     ).render(context)
+    return _repo_header_coder_fragment(rendered)
 
-    assert 'hx-indicator="#coder-spinner-example__alpha"' in rendered
-    assert 'id="coder-spinner-example__alpha"' in rendered
-    assert "Saving..." in rendered
-    assert "htmx-indicator" in rendered
-    assert "animate-spin" in rendered
+
+def test_repo_header_coder_renders_readonly_when_configured_claude(
+    two_repo_config: Path,
+) -> None:
+    coder_fragment = _render_repo_header_coder(
+        two_repo_config,
+        selected="claude",
+        active="claude",
+    )
+
+    assert "<select" not in coder_fragment
+    assert "<form" not in coder_fragment
+    assert "Claude CLI" in coder_fragment
+    assert "Active:" not in coder_fragment
+
+
+def test_repo_header_coder_shows_runtime_override_when_divergent(
+    two_repo_config: Path,
+) -> None:
+    coder_fragment = _render_repo_header_coder(
+        two_repo_config,
+        selected="claude",
+        active="codex",
+    )
+
+    assert "Claude CLI" in coder_fragment
+    assert "Active: Codex" in coder_fragment
+    assert "via spec pin or bandit" in coder_fragment
+
+
+def test_repo_header_coder_any_with_runtime_pick(
+    two_repo_config: Path,
+) -> None:
+    coder_fragment = _render_repo_header_coder(two_repo_config, active="claude")
+
+    assert "Any (bandit) → Claude CLI" in coder_fragment
+    assert "inherits Claude" in coder_fragment
+    assert "Active:" not in coder_fragment
+
+
+def test_repo_header_coder_link_to_settings(
+    two_repo_config: Path,
+) -> None:
+    coder_fragment = _render_repo_header_coder(two_repo_config)
+
+    assert 'href="/settings"' in coder_fragment
+    assert "Edit in Settings" in coder_fragment
 
 
 @pytest.mark.parametrize(
