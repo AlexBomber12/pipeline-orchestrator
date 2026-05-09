@@ -28,34 +28,30 @@
             {{ repo.state.value }}
         </span>
     </span>
-    <form hx-post="/repos/{{ repo.name }}/coder"
-          hx-target="closest [data-repo-summary]"
-          hx-swap="outerHTML"
-          hx-indicator="#coder-spinner-{{ css_escape(repo.name) }}"
-          class="flex w-full flex-wrap items-center gap-2 rounded border border-white/10 bg-surface-3 px-2 py-1 text-xs sm:w-auto sm:flex-nowrap">
-        <label for="repo-coder-{{ repo.name }}" class="font-mono text-gray-400">Coder</label>
-        <select id="repo-coder-{{ repo.name }}"
-                name="coder"
-                class="min-w-0 bg-transparent text-gray-300 font-mono outline-none"
-                onchange="this.form.requestSubmit()">
-            <option value="any" {% if selected_repo_coder == 'any' %}selected{% endif %}>
-                Any (bandit picks per-PR)
-            </option>
-            {% for c in coders %}
-            <option value="{{ c.name }}" {% if selected_repo_coder == c.name %}selected{% endif %}>
-                {{ 'Claude CLI' if c.name == 'claude' else c.display_name }}
-            </option>
-            {% endfor %}
-        </select>
-        {% with spinner_id="coder-spinner-" ~ repo.name, spinner_label="Saving..." %}
-        {% include "components/_spinner.html" %}
-        {% endwith %}
+    <div class="flex w-full flex-wrap items-center gap-2 rounded border border-white/10 bg-surface-3 px-2 py-1 text-xs sm:w-auto sm:flex-nowrap"
+         data-coder-display>
+        <span class="font-mono text-gray-400">Coder</span>
+        <span class="font-mono text-gray-300">
+            {% if selected_repo_coder == 'any' and active_repo_coder %}
+            {{ selected_repo_coder_label }} → {{ active_repo_coder_label }}
+            {% else %}
+            {{ selected_repo_coder_label }}
+            {% endif %}
+        </span>
+        {% if active_repo_coder and selected_repo_coder != 'any' and active_repo_coder != selected_repo_coder %}
+        <span class="text-[11px] text-gray-500">
+            → Active: {{ active_repo_coder_label }} (via spec pin or bandit)
+        </span>
+        {% endif %}
         {% if selected_repo_coder == 'any' %}
         <span class="text-[11px] text-gray-500">
             inherits {{ inherit_coder|capitalize }}
         </span>
         {% endif %}
-    </form>
+        <a href="/settings" class="font-mono text-[11px] text-accent hover:text-accent/80">
+            Edit in Settings
+        </a>
+    </div>
     {{ repo_controls(repo, 'w-full justify-start sm:w-auto') }}
     <span class="font-mono text-xs text-gray-500 sm:ml-auto">
         updated <span data-ts="{{ repo.last_updated.isoformat() if repo.last_updated else '' }}">{{ repo.last_updated.strftime('%Y-%m-%d %H:%M:%S') }}</span>

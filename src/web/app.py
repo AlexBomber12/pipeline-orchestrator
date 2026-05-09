@@ -129,6 +129,7 @@ from src.web.services.repo_state import (  # noqa: E402,F401
 
 _DASHBOARD_REEXPORTS = frozenset(
     {
+        "_active_repo_coder",
         "_active_rate_limit_coder",
         "_alert_reference_time",
         "_budget_chip",
