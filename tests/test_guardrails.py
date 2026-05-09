@@ -44,6 +44,15 @@ def test_scan_stdout_gh_repo_create_returns_repo_create_violation() -> None:
         ("git push upstream -d refs/heads/main", ["branch_delete_main"]),
         ("git push -d upstream main", ["branch_delete_main"]),
         ("git commit -m foo\ngit push origin main", ["direct_commit_main"]),
+        ("git commit --amend -m foo\ngit push origin main", ["direct_commit_main"]),
+        (
+            "git checkout main\ngit commit -m foo\ngit push origin",
+            ["direct_commit_main"],
+        ),
+        (
+            "git switch refs/heads/main\ngit commit -m foo\ngit push",
+            ["direct_commit_main"],
+        ),
         ("git commit -m foo\ngit push -- origin main", ["direct_commit_main"]),
         ("git commit -m foo\ngit push -u origin main", ["direct_commit_main"]),
         ("git commit -m foo\ngit push --repo origin main", ["direct_commit_main"]),

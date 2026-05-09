@@ -119,11 +119,16 @@ def _refspec_targets_default_branch(
     return refspec == default_branch
 
 
-def _push_targets_default_branch(line: str, default_branch: str) -> bool:
+def _push_targets_default_branch(
+    line: str,
+    default_branch: str,
+    *,
+    allow_implicit: bool = False,
+) -> bool:
     tokens = _command_tokens_after_git_push(line)
     positionals = _git_push_positionals(tokens)
     if len(positionals) < 2:
-        return False
+        return allow_implicit
     return any(
         _refspec_targets_default_branch(token, default_branch)
         for token in positionals[1:]
@@ -246,6 +251,16 @@ def _is_gh_pr_create_command(line: str) -> bool:
     return len(tokens) >= 3 and tokens[:3] == ["gh", "pr", "create"]
 
 
+def _line_checks_out_default_branch(line: str, default_branch: str) -> bool:
+    escaped = re.escape(default_branch)
+    return (
+        re.search(rf"\bgit\s+checkout\s+(?:refs/heads/)?{escaped}\b", line)
+        is not None
+        or re.search(rf"\bgit\s+switch\s+(?:refs/heads/)?{escaped}\b", line)
+        is not None
+    )
+
+
 def _has_direct_commit_to_default_branch(
     lines: list[str],
     commit_index: int,
@@ -255,7 +270,15 @@ def _has_direct_commit_to_default_branch(
         push_line = lines[push_index]
         if not _GIT_PUSH.search(push_line):
             continue
-        if not _push_targets_default_branch(push_line, default_branch):
+        allow_implicit = any(
+            _line_checks_out_default_branch(line, default_branch)
+            for line in lines[:push_index]
+        )
+        if not _push_targets_default_branch(
+            push_line,
+            default_branch,
+            allow_implicit=allow_implicit,
+        ):
             continue
         between = lines[commit_index + 1 : push_index]
         return not any(_is_gh_pr_create_command(line) for line in between)
@@ -284,7 +307,6 @@ def scan_stdout(
         if (
             not direct_commit_recorded
             and _GIT_COMMIT.search(line)
-            and "--amend" not in line
             and _has_direct_commit_to_default_branch(lines, index, default_branch)
         ):
             violations.append(_violation("direct_commit_main", line))
