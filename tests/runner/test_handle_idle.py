@@ -3616,7 +3616,40 @@ def test_run_cycle_pending_upload_retries_keep_polling_fast(
     assert runner._idle_streak == 0
 
 
-def test_idle_does_not_invoke_agents_scan(
+def test_idle_cycle_does_not_emit_agents_scan_events(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs", lambda repo, **kw: []
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_merged_prs",
+        lambda repo, branch, refresh=False: [],
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-009.md").write_text(
+        "# PR-009: Old spec\n\nSkip CI on this branch.\n",
+        encoding="utf-8",
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+
+    asyncio.run(runner.handle_idle())
+
+    scan_events = [
+        entry["event"]
+        for entry in runner.state.history
+        if entry["event"].startswith("[AGENTS-SCAN]")
+    ]
+    assert scan_events == []
+
+
+def test_idle_cycle_does_not_call_scan_method(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._patch_subprocess(monkeypatch)
