@@ -219,7 +219,10 @@ def _strip_command_wrappers(tokens: list[str]) -> list[str]:
             tokens = tokens[1:]
             while tokens and tokens[0].startswith("-"):
                 option = tokens[0]
-                tokens = tokens[2:] if option == "-k" and len(tokens) >= 2 else tokens[1:]
+                if option in {"-k", "-s", "--signal"} and len(tokens) >= 2:
+                    tokens = tokens[2:]
+                else:
+                    tokens = tokens[1:]
             tokens = tokens[1:] if tokens else tokens
             continue
         break

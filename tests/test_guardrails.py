@@ -74,6 +74,12 @@ def test_scan_stdout_forbidden_patterns(
         "git commit -m foo\ncommand gh pr create\ngit push origin main",
         "git commit -m foo\nenv -u GH_TOKEN gh pr create\ngit push origin main",
         "git commit -m foo\ntimeout -k 5 30 gh pr create\ngit push origin main",
+        (
+            "git commit -m foo\n"
+            "timeout --signal KILL 30 gh pr create\n"
+            "git push origin main"
+        ),
+        "git commit -m foo\ntimeout --foreground 30 gh pr create\ngit push origin main",
         "git commit -m foo\ngh pr create \"unterminated\ngit push origin main",
         (
             "git commit -m foo\n"
