@@ -28,20 +28,20 @@
     {% set last_seen = entry.get('last_seen_at', first_seen) %}
     <li class="flex flex-col gap-1 px-1 py-2.5 sm:flex-row sm:items-start sm:gap-2 sm:px-0 sm:py-2">
         <div class="flex items-center gap-2 text-xs">
+            <span class="text-[10px] font-medium min-w-[4.5rem] text-center px-1.5 py-0.5 rounded border {{ entry_style.badge }} shrink-0">
+                {{ entry_state }}
+            </span>
             {% if entry_count > 1 %}
-            <span class="order-2 text-gray-500 shrink-0 whitespace-nowrap sm:order-1">
-                <span data-ts="{{ first_seen }}">{{ first_seen or '--:--:--' }}</span>
-                <span aria-hidden="true"> -&gt; </span>
-                <span data-ts="{{ last_seen }}">{{ last_seen or '--:--:--' }}</span>
+            <span class="w-24 text-gray-500 shrink-0 whitespace-nowrap"
+                  data-ts="{{ last_seen }}"
+                  title="{{ first_seen or '--:--:--' }} → {{ last_seen or '--:--:--' }}">
+                {{ last_seen or '--:--:--' }}
             </span>
             {% else %}
-            <span class="order-2 text-gray-500 shrink-0 whitespace-nowrap sm:order-1" data-ts="{{ first_seen }}">
+            <span class="w-24 text-gray-500 shrink-0 whitespace-nowrap" data-ts="{{ first_seen }}">
                 {{ first_seen or '--:--:--' }}
             </span>
             {% endif %}
-            <span class="order-1 text-[10px] font-medium min-w-[4.5rem] text-center px-1.5 py-0.5 rounded border {{ entry_style.badge }} shrink-0 sm:order-2">
-                {{ entry_state }}
-            </span>
         </div>
         <span class="min-w-0 text-gray-300 break-words">
             {{ entry.get('event', '') }}

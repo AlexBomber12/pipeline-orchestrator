@@ -76,6 +76,12 @@ def _write_config(tmp_path: Path, urls: list[str]) -> Path:
     return cfg
 
 
+def _render_event_list(events: list[dict[str, object]]) -> str:
+    return web_app.templates.get_template("components/event_list.html").render(
+        {"events": events, "repo": {"name": "example__alpha"}}
+    )
+
+
 def _coding_state(
     name: str,
     url: str,
@@ -649,8 +655,8 @@ def test_partial_repo_events_renders_deduplicated_entry(
     assert "event-dedup-badge" in body
     assert 'title="repeated 9 times"' in body
     assert "&times;9" in body
-    assert "-&gt;" in body
-    assert body.count('data-ts="') == 2
+    assert "-&gt;" not in body
+    assert body.count('data-ts="') == 1
 
 
 def test_partial_repo_events_omits_dedup_badge_for_single_count(
@@ -685,6 +691,51 @@ def test_partial_repo_events_omits_dedup_badge_for_single_count(
     assert "&times;" not in body
 
 
+def test_event_list_dedup_entry_shows_last_seen_only() -> None:
+    body = _render_event_list(
+        [{"time": "10:00:00", "last_seen_at": "10:05:00", "count": 3}]
+    )
+
+    assert 'data-ts="10:05:00"' in body
+    assert 'title="10:00:00 → 10:05:00"' in body
+    visible_body = body.replace('title="10:00:00 → 10:05:00"', "")
+    assert "10:05:00" in visible_body
+    assert "10:00:00" not in visible_body
+
+
+def test_event_list_single_entry_unchanged() -> None:
+    body = _render_event_list(
+        [{"time": "10:00:00", "last_seen_at": "10:05:00", "count": 1}]
+    )
+
+    assert 'data-ts="10:00:00"' in body
+    assert "10:00:00" in body
+    assert "10:05:00" not in body
+    assert "title=" not in body
+
+
+def test_event_list_badge_column_fixed_width_renders() -> None:
+    body = _render_event_list(
+        [
+            {"time": "just now"},
+            {"time": "1 day ago", "state": "CODING"},
+        ]
+    )
+
+    rows = [part.split("</li>", 1)[0] for part in body.split("<li ")[1:]]
+    assert len(rows) == 2
+    for row in rows:
+        controls = row.split('<span class="min-w-0', 1)[0]
+        badge_index = controls.index(
+            '<span class="text-[10px] font-medium min-w-[4.5rem]'
+        )
+        time_index = controls.index(
+            '<span class="w-24 text-gray-500 shrink-0 whitespace-nowrap"'
+        )
+        assert badge_index < time_index
+    assert body.count("w-24 text-gray-500 shrink-0 whitespace-nowrap") == 2
+
+
 def test_partial_repo_events_uses_mobile_stacked_layout_without_truncation(
     observability_config: Path,
 ) -> None:
@@ -716,8 +767,9 @@ def test_partial_repo_events_uses_mobile_stacked_layout_without_truncation(
     assert "sm:flex-row sm:items-start sm:gap-2" in body
     assert "px-1 py-2.5" in body
     assert "sm:px-0 sm:py-2" in body
-    assert "order-2 text-gray-500 shrink-0 whitespace-nowrap sm:order-1" in body
-    assert "order-1 text-[10px]" in body
+    assert "w-24 text-gray-500 shrink-0 whitespace-nowrap" in body
+    assert "text-[10px] font-medium min-w-[4.5rem]" in body
+    assert "sm:order-" not in body
     assert "min-w-0 text-gray-300 break-words" in body
     assert "truncate" not in body
     assert "event-dedup-badge" in body
