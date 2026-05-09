@@ -161,6 +161,13 @@ def test_scan_stdout_force_push_main_prose_not_flagged() -> None:
     assert scan_stdout(stdout) == []
 
 
+@pytest.mark.parametrize("dry_run_flag", ["--dry-run", "-n"])
+def test_scan_stdout_force_push_main_dry_run_not_flagged(dry_run_flag: str) -> None:
+    stdout = f"git push {dry_run_flag} --force origin main\n"
+
+    assert scan_stdout(stdout) == []
+
+
 def test_scan_stdout_branch_delete_default_via_colon_refspec() -> None:
     violations = scan_stdout("git push origin :main\n")
 
@@ -190,6 +197,15 @@ def test_scan_stdout_branch_delete_feature_not_flagged() -> None:
 
 def test_scan_stdout_branch_delete_main_prose_not_flagged() -> None:
     stdout = "Reminder: do not run git push origin :main\n"
+
+    assert scan_stdout(stdout) == []
+
+
+@pytest.mark.parametrize("dry_run_flag", ["--dry-run", "-n"])
+def test_scan_stdout_branch_delete_main_dry_run_not_flagged(
+    dry_run_flag: str,
+) -> None:
+    stdout = f"git push {dry_run_flag} origin :main\n"
 
     assert scan_stdout(stdout) == []
 
@@ -258,6 +274,15 @@ def test_scan_stdout_direct_commit_main_checklist_not_flagged() -> None:
         "2. Run tests\n"
         "3. Run git push origin main\n"
     )
+
+    assert scan_stdout(stdout) == []
+
+
+@pytest.mark.parametrize("dry_run_flag", ["--dry-run", "-n"])
+def test_scan_stdout_direct_commit_main_dry_run_push_not_flagged(
+    dry_run_flag: str,
+) -> None:
+    stdout = f"git commit -m guardrail\ngit push {dry_run_flag} origin main\n"
 
     assert scan_stdout(stdout) == []
 

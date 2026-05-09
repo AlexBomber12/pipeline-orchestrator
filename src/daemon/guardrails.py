@@ -25,6 +25,9 @@ class GuardrailViolation:
 _PROTECTED_DEFAULT_BRANCH = "main"
 _PROTECTED_DEFAULT_BRANCH_RE = re.escape(_PROTECTED_DEFAULT_BRANCH)
 _COMMAND_PREFIX_RE = r"(?m)^(?:[^\S\r\n]*(?:[$>]|[+]{2,})[^\S\r\n]*)?"
+_GIT_PUSH_NOT_DRY_RUN_RE = (
+    r"(?!(?:[ \t]+[^\s,;|&#]+)*?[ \t]+(?:--dry-run|-n)(?![\w-]))"
+)
 _PROTECTED_BRANCH_REFSPEC_RE = (
     rf"(?:[^\s:,;|&#]+:)?(?:refs/heads/)?{_PROTECTED_DEFAULT_BRANCH_RE}"
     r"(?![\w/:-]|\.\w)"
@@ -53,7 +56,8 @@ _TIER1_PATTERNS: dict[str, re.Pattern[str]] = {
         # collisions such as ``git push main feature-branch``.
         _COMMAND_PREFIX_RE
         + r"git push\b"
-        r"(?:"
+        + _GIT_PUSH_NOT_DRY_RUN_RE
+        + r"(?:"
         r"(?="
         r"(?:[ \t]+[^\s,;|&#]+)*?"
         r"[ \t]+"
@@ -75,7 +79,8 @@ _TIER1_PATTERNS: dict[str, re.Pattern[str]] = {
     "branch_delete_main": re.compile(
         _COMMAND_PREFIX_RE
         + r"git push\b"
-        r"(?:"
+        + _GIT_PUSH_NOT_DRY_RUN_RE
+        + r"(?:"
         r"(?="
         r"(?:[ \t]+[^\s,;|&#]+)*?"
         r"[ \t]+(?![-+])[^\s,;|&#]+"
@@ -122,7 +127,8 @@ _GH_PR_CREATE_NO_CREATE_FLAG_RE = re.compile(
 _GIT_PUSH_PROTECTED_BRANCH_RE = re.compile(
     _COMMAND_PREFIX_RE
     + r"git push\b"
-    r"(?="
+    + _GIT_PUSH_NOT_DRY_RUN_RE
+    + r"(?="
     rf"{_PROTECTED_BRANCH_POSITIONAL_RE}"
     r")",
     re.IGNORECASE,
