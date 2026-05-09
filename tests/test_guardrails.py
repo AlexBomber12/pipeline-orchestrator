@@ -214,6 +214,15 @@ def test_scan_stdout_force_push_does_not_treat_checkout_path_as_branch() -> None
     assert violations[0].category == "force_push_main"
 
 
+def test_scan_stdout_force_push_does_not_treat_slash_path_as_branch() -> None:
+    stdout = "git checkout src/daemon/guardrails.py\ngit push --force origin\n"
+
+    violations = scan_stdout(stdout, current_branch="main")
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
 def test_scan_stdout_force_push_discards_checkout_path_before_switch() -> None:
     stdout = "git checkout README.md\ngit switch feature/xyz\ngit push --force origin\n"
 
@@ -365,7 +374,7 @@ def test_scan_stdout_direct_commit_default_no_pr_create() -> None:
     assert violations[0].category == "direct_commit_main"
 
 
-@pytest.mark.parametrize("separator", ["&&", ";"])
+@pytest.mark.parametrize("separator", ["&&", ";", "||"])
 def test_scan_stdout_direct_commit_main_same_line_push_flagged(separator: str) -> None:
     stdout = f"git commit -m guardrail {separator} git push origin main\n"
 

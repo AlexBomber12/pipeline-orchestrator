@@ -206,7 +206,13 @@ def _branch_after_command(
         return (previous_branch or current_branch, False)
     checkout_target = match.group("checkout_target")
     if checkout_target:
-        return (checkout_target, _looks_like_checkout_pathspec(checkout_target))
+        quiet_checkout = bool(
+            re.search(r"(?i)\bcheckout[^\S\r\n]+(?:-q|--quiet)[^\S\r\n]+", line)
+        )
+        return (
+            checkout_target,
+            False if quiet_checkout else _looks_like_checkout_pathspec(checkout_target),
+        )
     branch = (
         match.group("branch")
         or match.group("switch_create")
@@ -220,7 +226,7 @@ def _looks_like_checkout_pathspec(target: str) -> bool:
         target in {".", ".."}
         or target.startswith(("./", "../", "/", ":"))
         or target.endswith("/")
-        or ("." in target and "/" not in target)
+        or "." in target
     )
 
 
@@ -351,9 +357,9 @@ def _split_shell_segments(text: str) -> list[str]:
             quote = char
             index += 1
             continue
-        if char == ";" or text.startswith("&&", index):
+        if char == ";" or text.startswith("&&", index) or text.startswith("||", index):
             segments.append(text[start:index])
-            index += 2 if char == "&" else 1
+            index += 2 if char in {"&", "|"} else 1
             start = index
             continue
         index += 1
