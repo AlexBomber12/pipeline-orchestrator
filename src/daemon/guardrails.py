@@ -156,7 +156,7 @@ _GIT_PUSH_PROTECTED_BRANCH_RE = re.compile(
     re.IGNORECASE,
 )
 _GIT_BRANCH_CHANGE_FAILURE_RE = re.compile(
-    r"(?i)(?:^error:|^fatal:|not switching branches|pathspec .* did not match)"
+    r"(?im)(?:^error:|^fatal:|not switching branches|pathspec .* did not match)"
 )
 _GIT_CHECKOUT_BRANCH_SUCCESS_RE = re.compile(
     r"(?i)(?:"
@@ -312,23 +312,48 @@ def _detect_force_push_current_branch(
 ) -> list[GuardrailViolation]:
     violations: list[GuardrailViolation] = []
     for _index, line, start, end, branch in _line_contexts(stdout, current_branch):
-        if not _is_protected_current_branch(branch):
-            continue
-        if not _GIT_PUSH_LINE_RE.search(line):
-            continue
-        has_force_flag, has_no_explicit_refspec = _git_push_line_info(
-            line
-        )
-        if not has_force_flag or not has_no_explicit_refspec:
-            continue
-        violations.append(
-            GuardrailViolation(
-                tier=1,
-                category="force_push_main",
-                excerpt=_line_excerpt(stdout, start, end),
-                rule=_TIER1_RULES["force_push_main"],
+        segment_branch = branch
+        previous_branch: str | None = None
+        for segment in _split_shell_segments(line):
+            command = segment.strip()
+            if command != line.strip() and _TIER1_PATTERNS["force_push_main"].search(command):
+                violations.append(
+                    GuardrailViolation(
+                        tier=1,
+                        category="force_push_main",
+                        excerpt=_line_excerpt(stdout, start, end),
+                        rule=_TIER1_RULES["force_push_main"],
+                    )
+                )
+                break
+            if (
+                _is_protected_current_branch(segment_branch)
+                and _GIT_PUSH_LINE_RE.search(command)
+            ):
+                has_force_flag, has_no_explicit_refspec = _git_push_line_info(
+                    command
+                )
+                if has_force_flag and has_no_explicit_refspec:
+                    violations.append(
+                        GuardrailViolation(
+                            tier=1,
+                            category="force_push_main",
+                            excerpt=_line_excerpt(stdout, start, end),
+                            rule=_TIER1_RULES["force_push_main"],
+                        )
+                    )
+                    break
+            branch_after_command = _branch_after_command(
+                command,
+                segment_branch,
+                previous_branch,
             )
-        )
+            if branch_after_command is not None and not branch_after_command[1]:
+                segment_branch, previous_branch = _apply_branch_change(
+                    segment_branch,
+                    previous_branch,
+                    branch_after_command[0],
+                )
     return violations
 
 

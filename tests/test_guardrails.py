@@ -141,6 +141,13 @@ def test_scan_stdout_force_push_main_standard_form() -> None:
     assert violations[0].category == "force_push_main"
 
 
+def test_scan_stdout_force_push_main_same_line_chain_flagged() -> None:
+    violations = scan_stdout("echo ok && git push --force origin main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
 def test_scan_stdout_force_with_lease_main_flagged() -> None:
     violations = scan_stdout("git push origin main --force-with-lease\n")
 
@@ -169,6 +176,15 @@ def test_scan_stdout_force_push_feature_current_branch_without_refspec_not_flagg
 
 def test_scan_stdout_force_push_tracks_checkout_to_main_before_no_refspec_push() -> None:
     stdout = "git checkout main\ngit push --force origin\n"
+
+    violations = scan_stdout(stdout, current_branch="feature/xyz")
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
+def test_scan_stdout_force_push_tracks_same_line_switch_to_main() -> None:
+    stdout = "git switch main && git push --force origin\n"
 
     violations = scan_stdout(stdout, current_branch="feature/xyz")
 
@@ -281,6 +297,16 @@ def test_scan_stdout_force_push_ignores_delayed_failed_switch_stderr() -> None:
         "git switch main\n"
         "git push --force origin\n"
         "error: pathspec 'main' did not match any file(s) known to git\n"
+    )
+
+    assert scan_stdout(stdout_then_stderr, current_branch="feature/xyz") == []
+
+
+def test_scan_stdout_force_push_ignores_delayed_fatal_switch_stderr() -> None:
+    stdout_then_stderr = (
+        "git switch main\n"
+        "git push --force origin\n"
+        "fatal: invalid reference: main\n"
     )
 
     assert scan_stdout(stdout_then_stderr, current_branch="feature/xyz") == []
