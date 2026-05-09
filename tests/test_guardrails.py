@@ -177,7 +177,26 @@ def test_scan_stdout_force_push_tracks_checkout_to_main_before_no_refspec_push()
 
 
 def test_scan_stdout_force_push_tracks_checkout_away_from_main_before_push() -> None:
-    stdout = "git checkout feature/xyz\ngit push --force origin\n"
+    stdout = (
+        "git checkout feature/xyz\n"
+        "Switched to branch 'feature/xyz'\n"
+        "git push --force origin\n"
+    )
+
+    assert scan_stdout(stdout, current_branch="main") == []
+
+
+def test_scan_stdout_force_push_does_not_treat_checkout_path_as_branch() -> None:
+    stdout = "git checkout README.md\ngit push --force origin\n"
+
+    violations = scan_stdout(stdout, current_branch="main")
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
+def test_scan_stdout_force_push_discards_checkout_path_before_switch() -> None:
+    stdout = "git checkout README.md\ngit switch feature/xyz\ngit push --force origin\n"
 
     assert scan_stdout(stdout, current_branch="main") == []
 
@@ -395,6 +414,15 @@ def test_scan_stdout_direct_commit_tracks_switch_away_from_main_before_push() ->
     stdout = "git commit -m guardrail\ngit switch feature/xyz\ngit push origin\n"
 
     assert scan_stdout(stdout, current_branch="main") == []
+
+
+def test_scan_stdout_direct_commit_does_not_treat_checkout_path_as_branch() -> None:
+    stdout = "git commit -m guardrail\ngit checkout README.md\ngit push origin\n"
+
+    violations = scan_stdout(stdout, current_branch="main")
+
+    assert len(violations) == 1
+    assert violations[0].category == "direct_commit_main"
 
 
 def test_scan_stdout_direct_commit_tracks_checkout_dash_to_previous_branch() -> None:

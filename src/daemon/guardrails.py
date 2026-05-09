@@ -137,7 +137,8 @@ _GIT_BRANCH_CHANGE_RE = re.compile(
     _COMMAND_PREFIX_RE
     + r"git[^\S\r\n]+(?:"
     r"(?:checkout|switch)[^\S\r\n]+(?P<previous>-)"
-    r"|(?:checkout|switch)[^\S\r\n]+(?!-)(?P<branch>[^\s,;|&#]+)"
+    r"|switch[^\S\r\n]+(?!-)(?P<branch>[^\s,;|&#]+)"
+    r"|checkout[^\S\r\n]+(?!-)(?P<checkout_target>[^\s,;|&#]+)"
     r"|switch[^\S\r\n]+(?:-c|-C)[^\S\r\n]+(?P<switch_create>[^\s,;|&#]+)"
     r"|checkout[^\S\r\n]+(?:-b|-B)[^\S\r\n]+(?P<checkout_create>[^\s,;|&#]+)"
     r")"
@@ -156,6 +157,12 @@ _GIT_PUSH_PROTECTED_BRANCH_RE = re.compile(
 )
 _GIT_BRANCH_CHANGE_FAILURE_RE = re.compile(
     r"(?i)(?:^error:|^fatal:|not switching branches|pathspec .* did not match)"
+)
+_GIT_CHECKOUT_BRANCH_SUCCESS_RE = re.compile(
+    r"(?i)(?:"
+    r"^Switched to (?:a new )?branch '(?P<switched>[^']+)'"
+    r"|^Already on '(?P<already>[^']+)'"
+    r")"
 )
 
 
@@ -191,17 +198,21 @@ def _branch_after_command(
     line: str,
     current_branch: str | None,
     previous_branch: str | None,
-) -> str | None:
+) -> tuple[str | None, bool] | None:
     match = _GIT_BRANCH_CHANGE_RE.search(line)
     if not match:
         return None
     if match.group("previous"):
-        return previous_branch or current_branch
-    return (
+        return (previous_branch or current_branch, False)
+    checkout_target = match.group("checkout_target")
+    if checkout_target:
+        return (checkout_target, checkout_target != _PROTECTED_DEFAULT_BRANCH)
+    branch = (
         match.group("branch")
         or match.group("switch_create")
         or match.group("checkout_create")
     )
+    return (branch, False)
 
 
 def _apply_branch_change(
@@ -221,18 +232,38 @@ def _line_contexts(
     contexts: list[tuple[int, str, int, int, str | None]] = []
     current_branch = initial_branch
     previous_branch: str | None = None
-    pending_branch: str | None = None
+    pending_branch: tuple[str | None, bool] | None = None
     start = 0
     for index, raw_line in enumerate(stdout.splitlines(keepends=True)):
         line = raw_line.rstrip("\r\n")
         end = start + len(line)
         if pending_branch is not None and _GIT_BRANCH_CHANGE_FAILURE_RE.search(line):
             pending_branch = None
+        if pending_branch is not None and pending_branch[1]:
+            success = _GIT_CHECKOUT_BRANCH_SUCCESS_RE.search(line)
+            if success:
+                pending_branch = (
+                    success.group("switched") or success.group("already"),
+                    False,
+                )
         if pending_branch is not None and _GIT_COMMAND_RE.search(line):
+            if pending_branch[1]:
+                pending_branch = None
+            if pending_branch is None:
+                contexts.append((index, line, start, end, current_branch))
+                branch_after_command = _branch_after_command(
+                    line,
+                    current_branch,
+                    previous_branch,
+                )
+                if branch_after_command is not None:
+                    pending_branch = branch_after_command
+                start += len(raw_line)
+                continue
             current_branch, previous_branch = _apply_branch_change(
                 current_branch,
                 previous_branch,
-                pending_branch,
+                pending_branch[0],
             )
             pending_branch = None
         contexts.append((index, line, start, end, current_branch))
