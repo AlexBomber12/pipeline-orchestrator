@@ -136,11 +136,11 @@ _GIT_PUSH_LINE_RE = re.compile(
 _GIT_BRANCH_CHANGE_RE = re.compile(
     _COMMAND_PREFIX_RE
     + r"git[^\S\r\n]+(?:"
-    r"(?:checkout|switch)[^\S\r\n]+(?P<previous>-)"
-    r"|switch[^\S\r\n]+(?!-)(?P<branch>[^\s,;|&#]+)"
-    r"|checkout[^\S\r\n]+(?!-)(?P<checkout_target>[^\s,;|&#]+)"
-    r"|switch[^\S\r\n]+(?:-c|-C)[^\S\r\n]+(?P<switch_create>[^\s,;|&#]+)"
-    r"|checkout[^\S\r\n]+(?:-b|-B)[^\S\r\n]+(?P<checkout_create>[^\s,;|&#]+)"
+    r"(?:checkout|switch)[^\S\r\n]+(?:(?:-q|--quiet)[^\S\r\n]+)*(?P<previous>-)"
+    r"|switch[^\S\r\n]+(?:(?:-q|--quiet)[^\S\r\n]+)*(?!-)(?P<branch>[^\s,;|&#]+)"
+    r"|checkout[^\S\r\n]+(?:(?:-q|--quiet)[^\S\r\n]+)*(?!-)(?P<checkout_target>[^\s,;|&#]+)"
+    r"|switch[^\S\r\n]+(?:(?:-q|--quiet)[^\S\r\n]+)*(?:-c|-C)[^\S\r\n]+(?P<switch_create>[^\s,;|&#]+)"
+    r"|checkout[^\S\r\n]+(?:(?:-q|--quiet)[^\S\r\n]+)*(?:-b|-B)[^\S\r\n]+(?P<checkout_create>[^\s,;|&#]+)"
     r")"
     r"(?:[ \t]+[^\s,;|&#]+)*"
     r"[ \t]*(?=$|[,;|&#])",
@@ -350,9 +350,32 @@ def _detect_direct_commit_main(
     }
 
     for commit_index, commit_line in enumerate(lines):
-        if not _TIER1_PATTERNS[_DIRECT_COMMIT_CATEGORY].search(commit_line):
+        commit_match = _TIER1_PATTERNS[_DIRECT_COMMIT_CATEGORY].search(commit_line)
+        if not commit_match:
             continue
         if re.search(r"(?<!\S)--amend(?!\S)", commit_line):
+            continue
+
+        same_line_after_commit = commit_line[commit_match.end() :]
+        same_line_push_match = re.search(r"\bgit[^\S\r\n]+push\b.*", same_line_after_commit)
+        same_line_push = (
+            same_line_push_match.group(0) if same_line_push_match else ""
+        )
+        if (
+            _GIT_PUSH_PROTECTED_BRANCH_RE.search(same_line_push)
+            or _is_current_branch_push_to_protected(
+                same_line_push,
+                branch_by_line.get(commit_index),
+            )
+        ):
+            violations.append(
+                GuardrailViolation(
+                    tier=1,
+                    category=_DIRECT_COMMIT_CATEGORY,
+                    excerpt=commit_line.strip()[:_EXCERPT_LIMIT],
+                    rule=_TIER1_RULES[_DIRECT_COMMIT_CATEGORY],
+                )
+            )
             continue
 
         for push_index in range(commit_index + 1, len(lines)):

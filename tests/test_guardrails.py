@@ -186,6 +186,15 @@ def test_scan_stdout_force_push_tracks_checkout_away_from_main_before_push() -> 
     assert scan_stdout(stdout, current_branch="main") == []
 
 
+@pytest.mark.parametrize("branch_command", ["git switch -q", "git checkout --quiet"])
+def test_scan_stdout_force_push_tracks_quiet_branch_change_away_from_main(
+    branch_command: str,
+) -> None:
+    stdout = f"{branch_command} feature/xyz\ngit push --force origin\n"
+
+    assert scan_stdout(stdout, current_branch="main") == []
+
+
 def test_scan_stdout_force_push_tracks_checkout_before_delayed_stderr_feedback() -> None:
     stdout_then_stderr = (
         "git checkout feature/xyz\n"
@@ -345,6 +354,25 @@ def test_scan_stdout_direct_commit_default_no_pr_create() -> None:
     stdout = "git commit -m guardrail\npython -m pytest -q\ngit push origin main\n"
 
     violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "direct_commit_main"
+
+
+@pytest.mark.parametrize("separator", ["&&", ";"])
+def test_scan_stdout_direct_commit_main_same_line_push_flagged(separator: str) -> None:
+    stdout = f"git commit -m guardrail {separator} git push origin main\n"
+
+    violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "direct_commit_main"
+
+
+def test_scan_stdout_direct_commit_same_line_no_refspec_push_flagged() -> None:
+    stdout = "git commit -m guardrail && git push origin\n"
+
+    violations = scan_stdout(stdout, current_branch="main")
 
     assert len(violations) == 1
     assert violations[0].category == "direct_commit_main"
