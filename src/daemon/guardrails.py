@@ -134,8 +134,12 @@ _GIT_PUSH_LINE_RE = re.compile(
 )
 _GIT_BRANCH_CHANGE_RE = re.compile(
     _COMMAND_PREFIX_RE
-    + r"git[^\S\r\n]+(?:checkout|switch)[^\S\r\n]+"
-    r"(?!-)(?P<branch>[^\s,;|&#]+)"
+    + r"git[^\S\r\n]+(?:"
+    r"(?:checkout|switch)[^\S\r\n]+(?!-)(?P<branch>[^\s,;|&#]+)"
+    r"|switch[^\S\r\n]+(?:-c|-C)[^\S\r\n]+(?P<switch_create>[^\s,;|&#]+)"
+    r"|checkout[^\S\r\n]+(?:-b|-B)[^\S\r\n]+(?P<checkout_create>[^\s,;|&#]+)"
+    r")"
+    r"(?:[ \t]+[^\s,;|&#]+)*"
     r"[ \t]*(?=$|[,;|&#])",
     re.IGNORECASE,
 )
@@ -182,7 +186,11 @@ def _branch_after_command(line: str, current_branch: str | None) -> str | None:
     match = _GIT_BRANCH_CHANGE_RE.search(line)
     if not match:
         return current_branch
-    return match.group("branch")
+    return (
+        match.group("branch")
+        or match.group("switch_create")
+        or match.group("checkout_create")
+    )
 
 
 def _line_contexts(

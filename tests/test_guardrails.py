@@ -182,6 +182,27 @@ def test_scan_stdout_force_push_tracks_checkout_away_from_main_before_push() -> 
     assert scan_stdout(stdout, current_branch="main") == []
 
 
+@pytest.mark.parametrize("branch_command", ["git switch -c", "git checkout -b"])
+def test_scan_stdout_force_push_tracks_branch_create_away_from_main_before_push(
+    branch_command: str,
+) -> None:
+    stdout = f"{branch_command} feature/xyz\ngit push --force origin\n"
+
+    assert scan_stdout(stdout, current_branch="main") == []
+
+
+@pytest.mark.parametrize("branch_command", ["git switch -C", "git checkout -B"])
+def test_scan_stdout_force_push_tracks_branch_create_to_main_before_push(
+    branch_command: str,
+) -> None:
+    stdout = f"{branch_command} main\ngit push --force origin\n"
+
+    violations = scan_stdout(stdout, current_branch="feature/xyz")
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
 def test_scan_stdout_force_push_main_current_branch_head_refspec_flagged() -> None:
     violations = scan_stdout("git push --force origin HEAD\n", current_branch="main")
 
@@ -341,6 +362,15 @@ def test_scan_stdout_direct_commit_tracks_switch_to_main_before_no_refspec_push(
 
 def test_scan_stdout_direct_commit_tracks_switch_away_from_main_before_push() -> None:
     stdout = "git commit -m guardrail\ngit switch feature/xyz\ngit push origin\n"
+
+    assert scan_stdout(stdout, current_branch="main") == []
+
+
+@pytest.mark.parametrize("branch_command", ["git switch -c", "git checkout -b"])
+def test_scan_stdout_direct_commit_tracks_branch_create_away_from_main_before_push(
+    branch_command: str,
+) -> None:
+    stdout = f"git commit -m guardrail\n{branch_command} feature/xyz\ngit push origin\n"
 
     assert scan_stdout(stdout, current_branch="main") == []
 
