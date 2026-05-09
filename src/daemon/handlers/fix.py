@@ -226,6 +226,8 @@ class FixMixin(BreachMixin):
         coder_name, plugin = self._get_coder(allow_exploration=False)
         if not await self._check_rate_limit(proactive_coder=coder_name):
             return
+        if not await self._check_spend_ceiling(coder_name):
+            return
 
         if (
             self.state.current_pr is not None

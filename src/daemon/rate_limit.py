@@ -11,13 +11,143 @@ from __future__ import annotations
 import asyncio
 import math
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
+from src.daemon.notifications import send_spend_ceiling_warning
 from src.models import PipelineState
+from src.usage import UsageSnapshot
 
 
 class RateLimitMixin:
     """Rate-limit detection and proactive usage checks."""
+
+    async def _fetch_usage_snapshot(self, coder_name: str) -> UsageSnapshot | None:
+        provider = (
+            self._claude_usage_provider
+            if coder_name == "claude"
+            else self._codex_usage_provider
+        )
+        return await asyncio.to_thread(provider.fetch)
+
+    async def _check_spend_ceiling(self, coder_name: str) -> bool:
+        """Return True if dispatch may proceed under configured spend ceilings."""
+        config = self.app_config.daemon
+        session_cap = config.spend_ceiling_session_percent
+        weekly_cap = config.spend_ceiling_weekly_percent
+        if session_cap is None and weekly_cap is None:
+            return True
+
+        snapshot = await self._fetch_usage_snapshot(coder_name)
+        if snapshot is None:
+            return True
+
+        if (
+            session_cap is not None
+            and snapshot.session_percent >= session_cap
+        ):
+            await self._enter_spend_ceiling_paused(
+                coder_name=coder_name,
+                limit_kind="session",
+                current_percent=snapshot.session_percent,
+                cap_percent=session_cap,
+                resets_at=snapshot.session_resets_at,
+            )
+            return False
+        if weekly_cap is not None and snapshot.weekly_percent >= weekly_cap:
+            await self._enter_spend_ceiling_paused(
+                coder_name=coder_name,
+                limit_kind="weekly",
+                current_percent=snapshot.weekly_percent,
+                cap_percent=weekly_cap,
+                resets_at=snapshot.weekly_resets_at,
+            )
+            return False
+
+        await self._maybe_send_ceiling_warning(coder_name, snapshot)
+        return True
+
+    async def _enter_spend_ceiling_paused(
+        self,
+        *,
+        coder_name: str,
+        limit_kind: str,
+        current_percent: int,
+        cap_percent: int,
+        resets_at: int,
+    ) -> None:
+        """Transition to PAUSED using the same reset machinery as rate limits."""
+        until = datetime.fromtimestamp(resets_at, tz=timezone.utc)
+        self._record_rate_limit(coder_name, until, reactive=False)
+        self.state.error_message = (
+            f"SPEND_CEILING: {coder_name} {limit_kind} usage at "
+            f"{current_percent}% (cap: {cap_percent}%); resuming after "
+            f"{resets_at}"
+        )
+        self.state.state = PipelineState.PAUSED
+        self.log_event(
+            f"[RATE-LIMIT] [SPEND-CEILING] {coder_name} {limit_kind} cap reached "
+            f"({current_percent}%/{cap_percent}%); paused until reset."
+        )
+        await self.publish_state()
+
+    async def _maybe_send_ceiling_warning(
+        self,
+        coder_name: str,
+        snapshot: UsageSnapshot,
+    ) -> None:
+        """Send a best-effort warning once per coder/kind/reset window."""
+        config = self.app_config.daemon
+        warning_pct = config.spend_ceiling_warning_percent
+        webhook_url = config.guardrail_notification_webhook_url
+        if not webhook_url:
+            return
+
+        for kind, current, cap, resets_at in (
+            (
+                "session",
+                snapshot.session_percent,
+                config.spend_ceiling_session_percent,
+                snapshot.session_resets_at,
+            ),
+            (
+                "weekly",
+                snapshot.weekly_percent,
+                config.spend_ceiling_weekly_percent,
+                snapshot.weekly_resets_at,
+            ),
+        ):
+            if cap is None:
+                continue
+            if current * 100 < cap * warning_pct:
+                continue
+            dedup_key = f"warn:spend_ceiling:{coder_name}:{kind}:{resets_at}"
+            ttl_seconds = max(60, resets_at - int(time.time()))
+            try:
+                ok = await self.redis.set(
+                    dedup_key,
+                    "1",
+                    ex=ttl_seconds,
+                    nx=True,
+                )
+            except Exception:
+                ok = False
+            if not ok:
+                continue
+            try:
+                await send_spend_ceiling_warning(
+                    webhook_url=webhook_url,
+                    coder_name=coder_name,
+                    limit_kind=kind,
+                    current_percent=current,
+                    cap_percent=cap,
+                    warning_percent=warning_pct,
+                    timeout_seconds=config.guardrail_notification_timeout_seconds,
+                )
+            except Exception as exc:
+                self.log_event(
+                    f"[RATE-LIMIT] [SPEND-CEILING] warn notification failed: {exc}"
+                )
 
     def _record_rate_limit(
         self,

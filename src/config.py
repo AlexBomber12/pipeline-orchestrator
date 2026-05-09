@@ -52,6 +52,9 @@ _DAEMON_FIELDS = {
     "planned_pr_timeout_sec",
     "rate_limit_session_pause_percent",
     "rate_limit_weekly_pause_percent",
+    "spend_ceiling_session_percent",
+    "spend_ceiling_weekly_percent",
+    "spend_ceiling_warning_percent",
     "strict_queue_validation",
     "upload_staging_max_age_hours",
     "usage_api_user_agent",
@@ -79,6 +82,8 @@ _DAEMON_FIELDS = {
     "operator_active_hours_start",
     "operator_active_hours_end",
     "operator_timezone",
+    "guardrail_notification_webhook_url",
+    "guardrail_notification_timeout_seconds",
 }
 
 _DAEMON_ENV_OVERRIDES = {
@@ -134,6 +139,9 @@ class DaemonConfig(BaseModel):
     planned_pr_timeout_sec: int = Field(default=3600, ge=60)
     rate_limit_session_pause_percent: int = Field(default=95, ge=0, le=100)
     rate_limit_weekly_pause_percent: int = Field(default=100, ge=0, le=100)
+    spend_ceiling_session_percent: int | None = Field(default=None, ge=1, le=100)
+    spend_ceiling_weekly_percent: int | None = Field(default=None, ge=1, le=100)
+    spend_ceiling_warning_percent: int = Field(default=80, ge=1, le=100)
     strict_queue_validation: bool = True
     upload_staging_max_age_hours: int = Field(default=24, ge=1)
     usage_api_user_agent: str = "claude-code/2.1.104"
@@ -166,6 +174,8 @@ class DaemonConfig(BaseModel):
     operator_active_hours_start: int = Field(default=9, ge=0, le=23)
     operator_active_hours_end: int = Field(default=21, ge=1, le=24)
     operator_timezone: str = "Europe/Rome"
+    guardrail_notification_webhook_url: str | None = Field(default=None)
+    guardrail_notification_timeout_seconds: float = Field(default=5.0, ge=1.0, le=30.0)
 
 
 class WebConfig(BaseModel):

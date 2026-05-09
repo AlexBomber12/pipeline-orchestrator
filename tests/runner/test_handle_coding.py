@@ -8,8 +8,49 @@ from pathlib import Path
 import pytest
 from src.cancellation import task_spec_content_hash, task_spec_hash_key
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
+from src.usage import UsageSnapshot
 
 from tests.runner import _helpers as h
+
+
+def test_handle_coding_skipped_when_spend_ceiling_exceeded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    called: list[str] = []
+
+    async def fake_auto_pr(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        called.append("run_auto_pr")
+        return (0, "ok", "")
+
+    monkeypatch.setattr(h.claude_cli, "run_auto_pr_async", fake_auto_pr)
+
+    runner = h._make_runner()
+    runner.app_config.daemon.spend_ceiling_session_percent = 70
+    runner._claude_usage_provider = h._FakeUsageProvider(
+        snapshot=UsageSnapshot(
+            session_percent=75,
+            session_resets_at=1_900_000_000,
+            weekly_percent=10,
+            weekly_resets_at=1_900_000_600,
+            fetched_at=0,
+        )
+    )
+    runner.state.state = PipelineState.CODING
+    runner.state.current_task = QueueTask(
+        pr_id="PR-309",
+        title="Spend ceiling",
+        status=TaskStatus.DOING,
+        branch="pr-309-token-spend-ceiling",
+        task_file="tasks/PR-309.md",
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert called == []
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.error_message is not None
+    assert runner.state.error_message.startswith("SPEND_CEILING:")
 
 
 def test_dispatch_persists_task_spec_hash(

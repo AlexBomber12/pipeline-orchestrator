@@ -175,6 +175,9 @@ class CodingMixin:
         if not await self._check_rate_limit(proactive_coder=coder_name):
             await self._save_current_run_record("rate_limit")
             return
+        if not await self._check_spend_ceiling(coder_name):
+            await self._save_current_run_record("rate_limit")
+            return
 
         target_branch = (
             self.state.current_task.branch if self.state.current_task else None

@@ -19,11 +19,11 @@ import pytest
 from src import codex_cli
 from src.coders import claude as claude_plugin_module
 from src.config import AppConfig, CoderType, DaemonConfig
+from src.daemon import fix_escalation as fix_escalation_module
+from src.daemon import fix_supervision as fix_supervision_module
 from src.daemon import git_ops as git_ops_module
 from src.daemon import recovery_policy as recovery_policy_module
 from src.daemon import runner as runner_module
-from src.daemon import fix_escalation as fix_escalation_module
-from src.daemon import fix_supervision as fix_supervision_module
 from src.daemon.handlers import fix as fix_module
 from src.daemon.handlers import hung as hung_module
 from src.daemon.runner import PipelineRunner
@@ -36,10 +36,45 @@ from src.models import (
     ReviewStatus,
     TaskStatus,
 )
+from src.usage import UsageSnapshot
 
 from tests.runner import _helpers as h
 
 claude_cli = claude_plugin_module.claude_cli
+
+
+def test_handle_fix_skipped_when_spend_ceiling_exceeded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    called: list[str] = []
+
+    async def fake_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        called.append("fix_review")
+        return (0, "", "")
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+
+    runner = h._make_runner()
+    runner.app_config.daemon.spend_ceiling_session_percent = 70
+    runner._claude_usage_provider = h._FakeUsageProvider(
+        snapshot=UsageSnapshot(
+            session_percent=75,
+            session_resets_at=1_900_000_000,
+            weekly_percent=10,
+            weekly_resets_at=1_900_000_600,
+            fetched_at=0,
+        )
+    )
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-309-token-spend-ceiling")
+
+    asyncio.run(runner.handle_fix())
+
+    assert called == []
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.error_message is not None
+    assert runner.state.error_message.startswith("SPEND_CEILING:")
 
 
 def test_handle_fix_posts_codex_review_after_push(
