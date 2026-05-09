@@ -111,7 +111,7 @@ def test_fix_post_coder_guardrail_violation_scans_stderr(
     monkeypatch.setattr(
         claude_cli,
         "fix_review_async",
-        h._async_cli_result(0, "ordinary stdout\n", "+ gh repo create octo/demo\n"),
+        h._async_cli_result(0, "ordinary stdout\n", "++ gh repo create octo/demo\n"),
     )
     transition_calls: list[str] = []
     posted: list[tuple[str, int, str]] = []

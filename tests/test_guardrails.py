@@ -50,12 +50,11 @@ def test_scan_stdout_repo_create_pattern_ignores_help_and_prose() -> None:
 
 
 def test_scan_stdout_repo_create_pattern_accepts_shell_prompts() -> None:
-    stdout = "$ gh repo create first\n> gh repo create second\n+ gh repo create third\n"
+    stdout = "$ gh repo create first\n> gh repo create second\n"
 
     violations = scan_stdout(stdout)
 
     assert [violation.category for violation in violations] == [
-        "repo_create",
         "repo_create",
         "repo_create",
     ]
@@ -66,6 +65,12 @@ def test_scan_stdout_repo_create_pattern_accepts_repeated_xtrace_prefix() -> Non
 
     assert len(violations) == 1
     assert violations[0].category == "repo_create"
+
+
+def test_scan_stdout_repo_create_pattern_ignores_diff_added_lines() -> None:
+    stdout = "+gh repo create octo/demo\n+ gh repo create octo/demo\n"
+
+    assert scan_stdout(stdout) == []
 
 
 def test_scan_stdout_no_match_returns_empty_list() -> None:
@@ -92,7 +97,7 @@ def test_scan_stdout_multiple_matches_in_one_input_returns_all() -> None:
     stdout = (
         "gh repo create first\n"
         "GH   REPO   CREATE second\n"
-        "+ gh repo create third suffix\n"
+        "++ gh repo create third suffix\n"
     )
 
     violations = scan_stdout(stdout)

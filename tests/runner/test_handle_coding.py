@@ -294,7 +294,7 @@ def test_coding_post_coder_guardrail_violation_scans_stderr(
             "claude",
             0,
             "ordinary stdout\n",
-            "+ gh repo create octo/demo\n",
+            "++ gh repo create octo/demo\n",
             target_branch="pr-289a",
             current_pr_id="PR-289a",
         )

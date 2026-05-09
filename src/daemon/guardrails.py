@@ -26,7 +26,7 @@ _PROTECTED_DEFAULT_BRANCH = "main"
 
 _TIER1_PATTERNS: dict[str, re.Pattern[str]] = {
     "repo_create": re.compile(
-        r"(?m)^(?:[^\S\r\n]*(?:[$>]|[+]+)[^\S\r\n]*)?"
+        r"(?m)^(?:[^\S\r\n]*(?:[$>]|[+]{2,})[^\S\r\n]*)?"
         r"gh[^\S\r\n]+repo[^\S\r\n]+create\b",
         re.IGNORECASE,
     ),
