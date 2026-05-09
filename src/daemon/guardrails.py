@@ -116,6 +116,10 @@ _GH_PR_CREATE_RE = re.compile(
     _COMMAND_PREFIX_RE + r"gh[^\S\r\n]+pr[^\S\r\n]+create\b",
     re.IGNORECASE,
 )
+_GH_PR_CREATE_NO_CREATE_FLAG_RE = re.compile(
+    r"(?<!\S)(?:--dry-run(?:=[^\s]+)?|--help|-h)(?!\S)",
+    re.IGNORECASE,
+)
 _GIT_PUSH_PROTECTED_BRANCH_RE = re.compile(
     _COMMAND_PREFIX_RE
     + r"git push\b"
@@ -124,6 +128,12 @@ _GIT_PUSH_PROTECTED_BRANCH_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+
+def _is_pr_create_command(line: str) -> bool:
+    return bool(_GH_PR_CREATE_RE.search(line)) and not bool(
+        _GH_PR_CREATE_NO_CREATE_FLAG_RE.search(line)
+    )
 
 
 def _line_excerpt(coder_stdout: str, start: int, end: int) -> str:
@@ -149,7 +159,7 @@ def _detect_direct_commit_main(stdout: str) -> list[GuardrailViolation]:
             if not _GIT_PUSH_PROTECTED_BRANCH_RE.search(lines[push_index]):
                 continue
             intermediate_lines = lines[commit_index + 1 : push_index]
-            if any(_GH_PR_CREATE_RE.search(line) for line in intermediate_lines):
+            if any(_is_pr_create_command(line) for line in intermediate_lines):
                 break
             violations.append(
                 GuardrailViolation(

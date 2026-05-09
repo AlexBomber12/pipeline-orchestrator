@@ -209,6 +209,24 @@ def test_scan_stdout_direct_commit_with_pr_create_between() -> None:
     assert scan_stdout(stdout) == []
 
 
+def test_scan_stdout_direct_commit_with_pr_create_dry_run_still_flagged() -> None:
+    stdout = "git commit -m guardrail\ngh pr create --dry-run\ngit push origin main\n"
+
+    violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "direct_commit_main"
+
+
+def test_scan_stdout_direct_commit_with_pr_create_help_still_flagged() -> None:
+    stdout = "git commit -m guardrail\ngh pr create --help\ngit push origin main\n"
+
+    violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "direct_commit_main"
+
+
 def test_scan_stdout_direct_commit_amend_excluded() -> None:
     stdout = "git commit --amend --no-edit\ngit push origin main\n"
 
