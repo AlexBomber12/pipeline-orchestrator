@@ -104,11 +104,18 @@ def _git_push_positionals(tokens: list[str]) -> list[str]:
     return positionals
 
 
-def _refspec_targets_default_branch(refspec: str, default_branch: str) -> bool:
+def _refspec_targets_default_branch(
+    refspec: str,
+    default_branch: str,
+    *,
+    head_targets_default: bool = False,
+) -> bool:
     refspec = refspec.lstrip("+")
     if ":" in refspec:
         refspec = refspec.rsplit(":", 1)[1]
     refspec = refspec.removeprefix("refs/heads/")
+    if head_targets_default and refspec == "HEAD":
+        return True
     return refspec == default_branch
 
 
@@ -131,7 +138,7 @@ def _is_force_flag(token: str) -> bool:
 
 def _is_force_refspec_to_default_branch(refspec: str, default_branch: str) -> bool:
     return refspec.startswith("+") and _refspec_targets_default_branch(
-        refspec, default_branch
+        refspec, default_branch, head_targets_default=True
     )
 
 
@@ -156,7 +163,12 @@ def _is_force_push_default(line: str, default_branch: str) -> bool:
     ):
         return True
     return any(_is_force_flag(token) for token in tokens) and any(
-        _refspec_targets_default_branch(token, default_branch) for token in refspecs
+        _refspec_targets_default_branch(
+            token,
+            default_branch,
+            head_targets_default=True,
+        )
+        for token in refspecs
     )
 
 

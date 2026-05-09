@@ -19,11 +19,11 @@ import pytest
 from src import codex_cli
 from src.coders import claude as claude_plugin_module
 from src.config import AppConfig, CoderType, DaemonConfig
+from src.daemon import fix_escalation as fix_escalation_module
+from src.daemon import fix_supervision as fix_supervision_module
 from src.daemon import git_ops as git_ops_module
 from src.daemon import recovery_policy as recovery_policy_module
 from src.daemon import runner as runner_module
-from src.daemon import fix_escalation as fix_escalation_module
-from src.daemon import fix_supervision as fix_supervision_module
 from src.daemon.handlers import fix as fix_module
 from src.daemon.handlers import hung as hung_module
 from src.daemon.runner import PipelineRunner
@@ -71,6 +71,36 @@ def test_fix_post_coder_guardrail_violation_transitions_to_error(
     assert transition_calls[0].startswith("GUARDRAIL: repo_create:")
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.push_count == 0
+
+
+def test_handle_fix_coder_escalate_preempts_guardrail_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted, _ = h._patch_fix_with_stdout(
+        monkeypatch,
+        stdout=(
+            "cannot safely continue\n"
+            "ESCALATE: out of scope because it mentions gh repo create\n"
+        ),
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=306, branch="pr-306")
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.is_escalated is True
+    assert posted == [
+        (
+            runner.owner_repo,
+            306,
+            "Coder explicitly escalated this PR. Reason: out of scope because "
+            "it mentions gh repo create. Manual review required.",
+        )
+    ]
 
 
 def test_handle_fix_posts_codex_review_after_push(
