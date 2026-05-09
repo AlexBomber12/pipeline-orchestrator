@@ -115,8 +115,10 @@ def _refspec_targets_default_branch(refspec: str, default_branch: str) -> bool:
 def _push_targets_default_branch(line: str, default_branch: str) -> bool:
     tokens = _command_tokens_after_git_push(line)
     positionals = _git_push_positionals(tokens)
-    if len(positionals) < 2:
+    if not positionals:
         return False
+    if len(positionals) == 1:
+        return True
     return any(
         _refspec_targets_default_branch(token, default_branch)
         for token in positionals[1:]
@@ -147,8 +149,10 @@ def _is_force_push_default(line: str, default_branch: str) -> bool:
         return True
     tokens = _command_tokens_after_git_push(line)
     positionals = _git_push_positionals(tokens)
-    if len(positionals) < 2:
+    if not positionals:
         return False
+    if len(positionals) == 1:
+        return any(_is_force_flag(token) for token in tokens)
     refspecs = positionals[1:]
     if any(
         _is_force_refspec_to_default_branch(token, default_branch)
