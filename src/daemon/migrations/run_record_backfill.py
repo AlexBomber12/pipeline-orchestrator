@@ -14,6 +14,19 @@ from typing import Any
 
 RUN_RECORD_TTL_SECONDS = 365 * 86400
 NULL_CAUSE_VALUE = ""
+_INT_FIELDS = {
+    "attempt_index",
+    "diff_lines_added",
+    "diff_lines_deleted",
+    "files_touched_count",
+    "fix_iterations",
+    "tokens_in",
+    "tokens_out",
+}
+_OPTIONAL_INT_FIELDS = {"duration_ms"}
+_BOOL_FIELDS = {"had_merge_conflict", "operator_intervention"}
+_FLOAT_FIELDS = {"test_file_ratio"}
+_LIST_FIELDS = {"languages_touched"}
 
 _EXIT_REASON_TO_OUTCOME_CAUSE: dict[str, tuple[str, str]] = {
     "success_merged": ("merged", NULL_CAUSE_VALUE),
@@ -55,7 +68,69 @@ def _decode(value: Any) -> Any:
 def _normalize_hash(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return {}
-    return {str(_decode(key)): _decode(value) for key, value in raw.items()}
+    record = {str(_decode(key)): _decode(value) for key, value in raw.items()}
+    _coerce_legacy_hash_types(record)
+    return record
+
+
+def _coerce_legacy_hash_types(record: dict[str, Any]) -> None:
+    for field in _INT_FIELDS:
+        if field in record:
+            record[field] = _coerce_int(record[field], optional=False)
+    for field in _OPTIONAL_INT_FIELDS:
+        if field in record:
+            record[field] = _coerce_int(record[field], optional=True)
+    for field in _BOOL_FIELDS:
+        if field in record:
+            record[field] = _coerce_bool(record[field])
+    for field in _FLOAT_FIELDS:
+        if field in record:
+            record[field] = _coerce_float(record[field])
+    for field in _LIST_FIELDS:
+        if field in record:
+            record[field] = _coerce_list(record[field])
+
+
+def _coerce_int(value: Any, *, optional: bool) -> Any:
+    if optional and (value is None or value == ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _coerce_float(value: Any) -> Any:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _coerce_bool(value: Any) -> Any:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes"}:
+            return True
+        if normalized in {"", "0", "false", "no"}:
+            return False
+    return value
+
+
+def _coerce_list(value: Any) -> Any:
+    if isinstance(value, list):
+        return value
+    if not isinstance(value, str):
+        return value
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return parsed if isinstance(parsed, list) else value
 
 
 def _normalize_json_record(raw: Any) -> dict[str, Any]:

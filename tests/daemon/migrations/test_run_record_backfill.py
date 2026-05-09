@@ -10,6 +10,11 @@ import pytest
 from src.daemon.migrations.run_record_backfill import (
     NULL_CAUSE_VALUE,
     RUN_RECORD_TTL_SECONDS,
+    _coerce_bool,
+    _coerce_float,
+    _coerce_int,
+    _coerce_legacy_hash_types,
+    _coerce_list,
     _extract_repo_and_record_id,
     _key_type,
     _normalize_json_record,
@@ -222,6 +227,33 @@ async def test_backfill_copies_legacy_repo_key_to_canonical_record_key() -> None
     assert payload["repo_name"] == "repo"
     assert payload["task_id"] == "PR-1"
     assert redis.ttls["metrics:run:run-a"] == RUN_RECORD_TTL_SECONDS
+
+
+async def test_backfill_coerces_legacy_hash_types_in_canonical_payload() -> None:
+    redis = _FakeRedis()
+    _record(
+        redis,
+        "repo",
+        "run-typed",
+        "success_merged",
+        task_id="PR-1",
+        extra={
+            "duration_ms": "60000",
+            "fix_iterations": "2",
+            "operator_intervention": "true",
+            "test_file_ratio": "0.25",
+            "languages_touched": '["python"]',
+        },
+    )
+
+    await migrate_run_records_to_outcome_cause(redis, logging.getLogger(__name__))
+
+    payload = json.loads(str(redis.strings["metrics:run:run-typed"]))
+    assert payload["duration_ms"] == 60000
+    assert payload["fix_iterations"] == 2
+    assert payload["operator_intervention"] is True
+    assert payload["test_file_ratio"] == 0.25
+    assert payload["languages_touched"] == ["python"]
 
 
 async def test_backfill_supports_canonical_run_record_keys() -> None:
@@ -501,6 +533,37 @@ def test_normalize_json_record_rejects_non_string_payloads() -> None:
 
 def test_normalize_json_record_rejects_non_object_json() -> None:
     assert _normalize_json_record("[]") == {}
+
+
+def test_coerce_legacy_hash_types_handles_supported_fields() -> None:
+    record: dict[str, Any] = {
+        "attempt_index": "2",
+        "duration_ms": "",
+        "had_merge_conflict": "no",
+        "languages_touched": "python, shell",
+        "test_file_ratio": "0.5",
+    }
+
+    _coerce_legacy_hash_types(record)
+
+    assert record == {
+        "attempt_index": 2,
+        "duration_ms": None,
+        "had_merge_conflict": False,
+        "languages_touched": ["python", "shell"],
+        "test_file_ratio": 0.5,
+    }
+
+
+def test_coerce_helpers_preserve_unparseable_values() -> None:
+    assert _coerce_int("not-int", optional=False) == "not-int"
+    assert _coerce_float("not-float") == "not-float"
+    assert _coerce_bool(True) is True
+    assert _coerce_bool("maybe") == "maybe"
+    assert _coerce_list(["python"]) == ["python"]
+    assert _coerce_list(1) == 1
+    assert _coerce_list("") == []
+    assert _coerce_list('"python"') == '"python"'
 
 
 async def test_key_type_handles_none_response() -> None:
