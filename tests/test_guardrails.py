@@ -26,6 +26,19 @@ def test_scan_stdout_repo_create_pattern_matches() -> None:
     assert violations[0].category == "repo_create"
 
 
+def test_scan_stdout_repo_create_pattern_allows_horizontal_whitespace() -> None:
+    violations = scan_stdout("running command: gh\trepo\tcreate octo/demo\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "repo_create"
+
+
+def test_scan_stdout_repo_create_pattern_does_not_cross_newlines() -> None:
+    stdout = "wrapped prose:\ngh\nrepo\ncreate octo/demo\n"
+
+    assert scan_stdout(stdout) == []
+
+
 def test_scan_stdout_no_match_returns_empty_list() -> None:
     stdout = (
         "python -m ruff check .\n"
