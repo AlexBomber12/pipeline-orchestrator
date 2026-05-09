@@ -27,6 +27,7 @@ class GuardrailViolation:
 _REPO_CREATE = re.compile(r"\bgh\s+repo\s+create\b", re.IGNORECASE)
 _REPO_DELETE = re.compile(r"\bgh\s+repo\s+delete\b", re.IGNORECASE)
 _GH_PR_CREATE = re.compile(r"\bgh\s+pr\s+create\b", re.IGNORECASE)
+_GH_PR_CREATE_COMMAND = re.compile(r"^\s*(?:[$+]\s*)?gh\s+pr\s+create\b", re.IGNORECASE)
 _GIT_COMMIT = re.compile(r"\bgit\s+commit\b", re.IGNORECASE)
 _GIT_PUSH = re.compile(r"\bgit\s+push\b", re.IGNORECASE)
 # Design parallel to src/mcp/scans.py:_ANTI_PATTERNS. Keep local for now so
@@ -69,18 +70,30 @@ def _command_tokens_after_git_push(line: str) -> list[str]:
 def _git_push_positionals(tokens: list[str]) -> list[str]:
     positionals: list[str] = []
     skip_next = False
+    repo_value_next = False
     flags_with_values = {
         "--exec",
         "--push-option",
         "--receive-pack",
-        "--repo",
         "-o",
     }
     for token in tokens:
         if skip_next:
             skip_next = False
             continue
+        if repo_value_next:
+            repo_value_next = False
+            positionals.append(token)
+            continue
         if token == "--":
+            continue
+        if token == "--repo":
+            repo_value_next = True
+            continue
+        if token.startswith("--repo="):
+            repo = token.partition("=")[2]
+            if repo:
+                positionals.append(repo)
             continue
         if token in flags_with_values:
             skip_next = True
@@ -184,8 +197,8 @@ def _has_direct_commit_to_default_branch(
             continue
         if not _push_targets_default_branch(push_line, default_branch):
             continue
-        between = "\n".join(lines[commit_index + 1 : push_index])
-        return _GH_PR_CREATE.search(between) is None
+        between = lines[commit_index + 1 : push_index]
+        return not any(_GH_PR_CREATE_COMMAND.search(line) for line in between)
     return False
 
 

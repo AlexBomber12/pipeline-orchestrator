@@ -45,6 +45,15 @@ def test_scan_stdout_gh_repo_create_returns_repo_create_violation() -> None:
         ("git commit -m foo\ngit push origin main", ["direct_commit_main"]),
         ("git commit -m foo\ngit push -- origin main", ["direct_commit_main"]),
         ("git commit -m foo\ngit push -u origin main", ["direct_commit_main"]),
+        ("git commit -m foo\ngit push --repo origin main", ["direct_commit_main"]),
+        ("git commit -m foo\ngit push --repo=origin main", ["direct_commit_main"]),
+        ("git commit -m foo\n# gh pr create\ngit push origin main", ["direct_commit_main"]),
+        (
+            "git commit -m foo\necho gh pr create\ngit push origin main",
+            ["direct_commit_main"],
+        ),
+        ("git push --force --repo=origin main", ["force_push_main"]),
+        ("git push --repo=origin --delete main", ["branch_delete_main"]),
     ],
 )
 def test_scan_stdout_forbidden_patterns(
@@ -62,12 +71,12 @@ def test_scan_stdout_forbidden_patterns(
         "git push --force origin feature/thing",
         "git push --force main feature/thing",
         "git commit -m foo\ngit push origin feature/thing",
+        "git commit -m foo\ngit push origin",
         "git commit -m foo\npython -m pytest -q",
         "git push origin --delete feature/thing",
         "git push upstream :feature/thing",
         "git commit -m foo\ngit push origin -o main feature/thing",
         "git commit -m foo\ngit push origin --push-option main feature/thing",
-        "git commit -m foo\ngit push --repo origin main",
     ],
 )
 def test_scan_stdout_clean_or_non_default_branch_output_returns_empty(
