@@ -19,11 +19,11 @@ import pytest
 from src import codex_cli
 from src.coders import claude as claude_plugin_module
 from src.config import AppConfig, CoderType, DaemonConfig
+from src.daemon import fix_escalation as fix_escalation_module
+from src.daemon import fix_supervision as fix_supervision_module
 from src.daemon import git_ops as git_ops_module
 from src.daemon import recovery_policy as recovery_policy_module
 from src.daemon import runner as runner_module
-from src.daemon import fix_escalation as fix_escalation_module
-from src.daemon import fix_supervision as fix_supervision_module
 from src.daemon.handlers import fix as fix_module
 from src.daemon.handlers import hung as hung_module
 from src.daemon.runner import PipelineRunner
@@ -102,6 +102,42 @@ def test_fix_post_coder_guardrail_violation_transitions_to_error(
     assert transition_calls[0][0].startswith("GUARDRAIL: repo_create:")
     assert transition_calls[0][1] == "[FIX]"
     assert posted == []
+
+
+def test_fix_post_coder_guardrail_continues_when_branch_probe_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "fix_review_async",
+        h._async_cli_result(0, "gh repo create octo/demo\n", ""),
+    )
+    real_git = git_ops_module._git
+
+    def fake_git(repo_path: str, *args: str, **kwargs: object) -> object:
+        if args == ("branch", "--show-current"):
+            raise subprocess.SubprocessError("branch probe failed")
+        return real_git(repo_path, *args, **kwargs)  # type: ignore[arg-type]
+
+    transition_calls: list[str] = []
+
+    async def fake_transition_to_error(
+        message: str,
+        **kwargs: object,
+    ) -> None:
+        transition_calls.append(message)
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-019")
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(runner, "_transition_to_error", fake_transition_to_error)
+
+    asyncio.run(runner.handle_fix())
+
+    assert transition_calls
+    assert transition_calls[0].startswith("GUARDRAIL: repo_create:")
 
 
 def test_fix_post_coder_guardrail_force_push_transitions_to_error(

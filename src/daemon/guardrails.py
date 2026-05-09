@@ -122,7 +122,15 @@ _GH_PR_CREATE_RE = re.compile(
     re.IGNORECASE,
 )
 _GH_PR_CREATE_NO_CREATE_FLAG_RE = re.compile(
-    r"(?<!\S)(?:--dry-run(?:=[^\s]+)?|--help|--web|-h|-w)(?!\S)",
+    r"(?<!\S)(?:--dry-run(?:=[^\s]+)?|--help|-h)(?!\S)",
+)
+_GIT_PUSH_LINE_RE = re.compile(
+    _COMMAND_PREFIX_RE
+    + r"git push\b"
+    + _GIT_PUSH_NOT_DRY_RUN_RE
+    + r"(?P<args>(?:[ \t]+[^\s,;|&#]+)*)"
+    r"[ \t]*(?=$|[,;|&#])",
+    re.IGNORECASE,
 )
 _GIT_PUSH_PROTECTED_BRANCH_RE = re.compile(
     _COMMAND_PREFIX_RE
@@ -133,6 +141,59 @@ _GIT_PUSH_PROTECTED_BRANCH_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+
+def _is_protected_current_branch(current_branch: str | None) -> bool:
+    return current_branch == _PROTECTED_DEFAULT_BRANCH
+
+
+def _git_push_line_info(line: str) -> tuple[bool, bool]:
+    """Return ``(has_force_flag, has_no_explicit_refspec)`` for a push line."""
+    match = _GIT_PUSH_LINE_RE.search(line)
+    if not match:
+        return False, False
+
+    has_force_flag = False
+    positionals: list[str] = []
+    for token in match.group("args").split():
+        if token.startswith("-"):
+            if re.fullmatch(r"--force(?:-with-lease(?:=.*)?)?|-f", token):
+                has_force_flag = True
+            continue
+        positionals.append(token)
+    return has_force_flag, len(positionals) <= 1
+
+
+def _is_current_branch_push_to_protected(line: str, current_branch: str | None) -> bool:
+    if not _is_protected_current_branch(current_branch):
+        return False
+    _has_force_flag, has_no_explicit_refspec = _git_push_line_info(line)
+    return has_no_explicit_refspec
+
+
+def _detect_force_push_current_branch(
+    stdout: str,
+    current_branch: str | None,
+) -> list[GuardrailViolation]:
+    if not _is_protected_current_branch(current_branch):
+        return []
+
+    violations: list[GuardrailViolation] = []
+    for match in _GIT_PUSH_LINE_RE.finditer(stdout):
+        has_force_flag, has_no_explicit_refspec = _git_push_line_info(
+            match.group(0)
+        )
+        if not has_force_flag or not has_no_explicit_refspec:
+            continue
+        violations.append(
+            GuardrailViolation(
+                tier=1,
+                category="force_push_main",
+                excerpt=_line_excerpt(stdout, match.start(), match.end()),
+                rule=_TIER1_RULES["force_push_main"],
+            )
+        )
+    return violations
 
 
 def _is_pr_create_command(line: str) -> bool:
@@ -149,7 +210,10 @@ def _line_excerpt(coder_stdout: str, start: int, end: int) -> str:
     return coder_stdout[line_start:line_end].strip()[:_EXCERPT_LIMIT]
 
 
-def _detect_direct_commit_main(stdout: str) -> list[GuardrailViolation]:
+def _detect_direct_commit_main(
+    stdout: str,
+    current_branch: str | None,
+) -> list[GuardrailViolation]:
     """Detect commit then push to default branch without an intervening PR."""
     violations: list[GuardrailViolation] = []
     lines = stdout.splitlines()
@@ -161,7 +225,11 @@ def _detect_direct_commit_main(stdout: str) -> list[GuardrailViolation]:
             continue
 
         for push_index in range(commit_index + 1, len(lines)):
-            if not _GIT_PUSH_PROTECTED_BRANCH_RE.search(lines[push_index]):
+            push_line = lines[push_index]
+            if not (
+                _GIT_PUSH_PROTECTED_BRANCH_RE.search(push_line)
+                or _is_current_branch_push_to_protected(push_line, current_branch)
+            ):
                 continue
             intermediate_lines = lines[commit_index + 1 : push_index]
             if any(_is_pr_create_command(line) for line in intermediate_lines):
@@ -179,12 +247,16 @@ def _detect_direct_commit_main(stdout: str) -> list[GuardrailViolation]:
     return violations
 
 
-def scan_stdout(coder_stdout: str) -> list[GuardrailViolation]:
+def scan_stdout(
+    coder_stdout: str,
+    *,
+    current_branch: str | None = None,
+) -> list[GuardrailViolation]:
     """Return guardrail violations found in captured coder stdout."""
     violations: list[GuardrailViolation] = []
     for category in sorted(_TIER1_PATTERNS):
         if category == _DIRECT_COMMIT_CATEGORY:
-            violations.extend(_detect_direct_commit_main(coder_stdout))
+            violations.extend(_detect_direct_commit_main(coder_stdout, current_branch))
             continue
         pattern = _TIER1_PATTERNS[category]
         for match in pattern.finditer(coder_stdout):
@@ -195,5 +267,9 @@ def scan_stdout(coder_stdout: str) -> list[GuardrailViolation]:
                     excerpt=_line_excerpt(coder_stdout, match.start(), match.end()),
                     rule=_TIER1_RULES[category],
                 )
+            )
+        if category == "force_push_main":
+            violations.extend(
+                _detect_force_push_current_branch(coder_stdout, current_branch)
             )
     return violations

@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 
 import pytest
-
 from src.daemon.guardrails import GuardrailViolation, scan_stdout
 
 
@@ -155,6 +154,19 @@ def test_scan_stdout_force_push_to_feature_branch_not_flagged() -> None:
     assert scan_stdout(stdout) == []
 
 
+def test_scan_stdout_force_push_main_current_branch_without_refspec_flagged() -> None:
+    violations = scan_stdout("git push --force origin\n", current_branch="main")
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
+def test_scan_stdout_force_push_feature_current_branch_without_refspec_not_flagged() -> None:
+    stdout = "git push --force origin\n"
+
+    assert scan_stdout(stdout, current_branch="feature/xyz") == []
+
+
 def test_scan_stdout_force_push_main_prose_not_flagged() -> None:
     stdout = "Reminder: do not run git push --force origin main\n"
 
@@ -244,15 +256,12 @@ def test_scan_stdout_direct_commit_with_pr_create_help_still_flagged() -> None:
 
 
 @pytest.mark.parametrize("web_flag", ["--web", "-w"])
-def test_scan_stdout_direct_commit_with_pr_create_web_still_flagged(
+def test_scan_stdout_direct_commit_with_pr_create_web_not_flagged(
     web_flag: str,
 ) -> None:
     stdout = f"git commit -m guardrail\ngh pr create {web_flag}\ngit push origin main\n"
 
-    violations = scan_stdout(stdout)
-
-    assert len(violations) == 1
-    assert violations[0].category == "direct_commit_main"
+    assert scan_stdout(stdout) == []
 
 
 def test_scan_stdout_direct_commit_with_pr_create_head_flag_not_flagged() -> None:
@@ -276,6 +285,27 @@ def test_scan_stdout_direct_commit_main_checklist_not_flagged() -> None:
     )
 
     assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_direct_commit_main_current_branch_without_refspec_flagged() -> None:
+    stdout = "git commit -m guardrail\ngit push origin\n"
+
+    violations = scan_stdout(stdout, current_branch="main")
+
+    assert len(violations) == 1
+    assert violations[0].category == "direct_commit_main"
+
+
+def test_scan_stdout_direct_commit_feature_branch_without_refspec_not_flagged() -> None:
+    stdout = "git commit -m guardrail\ngit push origin\n"
+
+    assert scan_stdout(stdout, current_branch="feature/xyz") == []
+
+
+def test_scan_stdout_direct_commit_main_ignores_non_push_followup() -> None:
+    stdout = "git commit -m guardrail\npython -m pytest -q\n"
+
+    assert scan_stdout(stdout, current_branch="main") == []
 
 
 @pytest.mark.parametrize("dry_run_flag", ["--dry-run", "-n"])

@@ -572,7 +572,21 @@ class FixMixin(BreachMixin):
                 return
             return
         await self._save_cli_log(stdout, stderr, f"FIX FEEDBACK output [{coder_name}]")
-        violations = scan_stdout(f"{stdout}\n{stderr}")
+        try:
+            branch_probe = git_ops._git(
+                self.repo_path,
+                "branch",
+                "--show-current",
+                timeout=5,
+                check=False,
+            )
+            current_branch = branch_probe.stdout.strip() or None
+        except (subprocess.SubprocessError, OSError):
+            current_branch = None
+        violations = scan_stdout(
+            f"{stdout}\n{stderr}",
+            current_branch=current_branch,
+        )
         if violations:
             first = violations[0]
             cause = f"GUARDRAIL: {first.category}: {first.excerpt}"
