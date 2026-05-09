@@ -43,8 +43,6 @@ def test_scan_stdout_gh_repo_create_returns_repo_create_violation() -> None:
         ("git push upstream -d refs/heads/main", ["branch_delete_main"]),
         ("git push -d upstream main", ["branch_delete_main"]),
         ("git commit -m foo\ngit push origin main", ["direct_commit_main"]),
-        ("git commit -m foo\ngit push origin", ["direct_commit_main"]),
-        ("git commit -m foo\ngit push", ["direct_commit_main"]),
         ("git commit -m foo\ngit push -- origin main", ["direct_commit_main"]),
         ("git commit -m foo\ngit push -u origin main", ["direct_commit_main"]),
         ("git commit -m foo\ngit push --repo origin main", ["direct_commit_main"]),
@@ -72,10 +70,22 @@ def test_scan_stdout_forbidden_patterns(
         "git commit -m foo\ngh pr create\ngit push origin main",
         "git commit -m foo\ntimeout 30 gh pr create\ngit push origin main",
         "git commit -m foo\nenv GH_TOKEN=x gh pr create\ngit push origin main",
+        "git commit -m foo\nGH_TOKEN=x gh pr create\ngit push origin main",
+        "git commit -m foo\ncommand gh pr create\ngit push origin main",
+        "git commit -m foo\nenv -u GH_TOKEN gh pr create\ngit push origin main",
+        "git commit -m foo\ntimeout -k 5 30 gh pr create\ngit push origin main",
+        "git commit -m foo\ngh pr create \"unterminated\ngit push origin main",
+        (
+            "git commit -m foo\n"
+            "timeout 30 env GH_TOKEN=x gh pr create\n"
+            "git push origin main"
+        ),
         "git push --force origin feature/thing",
         "git push --force origin",
         "git push --force main feature/thing",
         "git commit -m foo\ngit push origin feature/thing",
+        "git commit -m foo\ngit push origin",
+        "git commit -m foo\ngit push",
         "git commit -m foo\npython -m pytest -q",
         "git push origin --delete feature/thing",
         "git push upstream :feature/thing",

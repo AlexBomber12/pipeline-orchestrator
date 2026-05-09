@@ -10,6 +10,7 @@ when nearby prose says not to run it.
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass
 
 _DEFAULT_BRANCH = "main"
@@ -27,12 +28,6 @@ class GuardrailViolation:
 _REPO_CREATE = re.compile(r"\bgh\s+repo\s+create\b", re.IGNORECASE)
 _REPO_DELETE = re.compile(r"\bgh\s+repo\s+delete\b", re.IGNORECASE)
 _GH_PR_CREATE = re.compile(r"\bgh\s+pr\s+create\b", re.IGNORECASE)
-_GH_PR_CREATE_COMMAND = re.compile(
-    r"^\s*(?:[$+]\s*)?"
-    r"(?:(?:timeout\s+\S+\s+)|(?:env\s+(?:\S+=\S+\s+)*))?"
-    r"gh\s+pr\s+create\b",
-    re.IGNORECASE,
-)
 _GIT_COMMIT = re.compile(r"\bgit\s+commit\b", re.IGNORECASE)
 _GIT_PUSH = re.compile(r"\bgit\s+push\b", re.IGNORECASE)
 # Design parallel to src/mcp/scans.py:_ANTI_PATTERNS. Keep local for now so
@@ -117,16 +112,11 @@ def _refspec_targets_default_branch(refspec: str, default_branch: str) -> bool:
     return refspec == default_branch
 
 
-def _push_targets_default_branch(
-    line: str,
-    default_branch: str,
-    *,
-    allow_implicit: bool = False,
-) -> bool:
+def _push_targets_default_branch(line: str, default_branch: str) -> bool:
     tokens = _command_tokens_after_git_push(line)
     positionals = _git_push_positionals(tokens)
     if len(positionals) < 2:
-        return allow_implicit
+        return False
     return any(
         _refspec_targets_default_branch(token, default_branch)
         for token in positionals[1:]
@@ -196,6 +186,51 @@ def _is_branch_delete_default(line: str, default_branch: str) -> bool:
     )
 
 
+def _line_command_tokens(line: str) -> list[str]:
+    command = re.sub(r"^\s*(?:[$+]\s*)?", "", line)
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return command.split()
+
+
+def _is_env_assignment(token: str) -> bool:
+    return re.match(r"[A-Za-z_][A-Za-z0-9_]*=", token) is not None
+
+
+def _strip_command_wrappers(tokens: list[str]) -> list[str]:
+    while tokens:
+        if _is_env_assignment(tokens[0]):
+            tokens = tokens[1:]
+            continue
+        if tokens[0] == "command":
+            tokens = tokens[1:]
+            continue
+        if tokens[0] == "env":
+            tokens = tokens[1:]
+            while tokens and (
+                _is_env_assignment(tokens[0]) or tokens[0] in {"-i", "-0"}
+            ):
+                tokens = tokens[1:]
+            if len(tokens) >= 2 and tokens[0] == "-u":
+                tokens = tokens[2:]
+            continue
+        if tokens[0] == "timeout":
+            tokens = tokens[1:]
+            while tokens and tokens[0].startswith("-"):
+                option = tokens[0]
+                tokens = tokens[2:] if option == "-k" and len(tokens) >= 2 else tokens[1:]
+            tokens = tokens[1:] if tokens else tokens
+            continue
+        break
+    return tokens
+
+
+def _is_gh_pr_create_command(line: str) -> bool:
+    tokens = _strip_command_wrappers(_line_command_tokens(line))
+    return len(tokens) >= 3 and tokens[:3] == ["gh", "pr", "create"]
+
+
 def _has_direct_commit_to_default_branch(
     lines: list[str],
     commit_index: int,
@@ -205,14 +240,10 @@ def _has_direct_commit_to_default_branch(
         push_line = lines[push_index]
         if not _GIT_PUSH.search(push_line):
             continue
-        if not _push_targets_default_branch(
-            push_line,
-            default_branch,
-            allow_implicit=True,
-        ):
+        if not _push_targets_default_branch(push_line, default_branch):
             continue
         between = lines[commit_index + 1 : push_index]
-        return not any(_GH_PR_CREATE_COMMAND.search(line) for line in between)
+        return not any(_is_gh_pr_create_command(line) for line in between)
     return False
 
 
