@@ -2,12 +2,13 @@
 
 PR-286 added normalized run-record fields for new writes. This startup
 migration fills the fields that can be derived from legacy ``exit_reason``
-values and rebuilds the per-task run index for existing Redis hashes.
+values and rebuilds the per-task run index for existing Redis records.
 """
 
 from __future__ import annotations
 
 import inspect
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -57,6 +58,19 @@ def _normalize_hash(raw: Any) -> dict[str, Any]:
     return {str(_decode(key)): _decode(value) for key, value in raw.items()}
 
 
+def _normalize_json_record(raw: Any) -> dict[str, Any]:
+    decoded = _decode(raw)
+    if not isinstance(decoded, str):
+        return {}
+    try:
+        record = json.loads(decoded)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(record, dict):
+        return {}
+    return {str(key): value for key, value in record.items()}
+
+
 async def _key_type(redis_client: Any, key: str | bytes) -> str | None:
     type_method = getattr(redis_client, "type", None)
     if type_method is None:
@@ -66,6 +80,44 @@ async def _key_type(redis_client: Any, key: str | bytes) -> str | None:
     if decoded is None:
         return None
     return str(decoded)
+
+
+async def _load_record(
+    redis_client: Any,
+    key: str | bytes,
+    redis_type: str | None,
+) -> tuple[dict[str, Any], str]:
+    if redis_type == "string":
+        raw_record = await _maybe_await(redis_client.get(key))
+        return _normalize_json_record(raw_record), "string"
+
+    raw_record = await _maybe_await(redis_client.hgetall(key))
+    return _normalize_hash(raw_record), "hash"
+
+
+async def _write_outcome_cause(
+    redis_client: Any,
+    key: str | bytes,
+    record: dict[str, Any],
+    storage: str,
+    outcome: str,
+    cause: str,
+) -> None:
+    if storage == "string":
+        record["outcome"] = outcome
+        record["cause"] = cause or None
+        await _maybe_await(
+            redis_client.set(
+                key,
+                json.dumps(record, sort_keys=True),
+                ex=RUN_RECORD_TTL_SECONDS,
+            )
+        )
+        return
+
+    await _maybe_await(
+        redis_client.hset(key, mapping={"outcome": outcome, "cause": cause})
+    )
 
 
 def _extract_repo_and_record_id(key: str | bytes) -> tuple[str | None, str] | None:
@@ -98,7 +150,7 @@ async def migrate_run_records_to_outcome_cause(
     redis_client: Any,
     log: Any,
 ) -> dict[str, int]:
-    """Populate derivable PR-286 fields on legacy ``metrics:run:*`` hashes."""
+    """Populate derivable PR-286 fields on legacy ``metrics:run:*`` records."""
     counts = {
         "records_scanned": 0,
         "records_migrated": 0,
@@ -117,18 +169,14 @@ async def migrate_run_records_to_outcome_cause(
         repo, record_id = parsed
 
         redis_type = await _key_type(redis_client, key)
-        if redis_type not in {None, "hash"}:
+        if redis_type not in {None, "hash", "string"}:
             counts["records_skipped_non_hash"] += 1
             continue
 
-        raw_record = await _maybe_await(redis_client.hgetall(key))
-        record = _normalize_hash(raw_record)
+        record, storage = await _load_record(redis_client, key, redis_type)
         if not record:
             counts["records_skipped_malformed"] += 1
-            _warn(log, f"[MIGRATION] Skipping malformed run-record hash {key}")
-            continue
-        if "outcome" in record:
-            counts["records_skipped_already_migrated"] += 1
+            _warn(log, f"[MIGRATION] Skipping malformed run-record {key}")
             continue
 
         task_id = record.get("task_id")
@@ -138,26 +186,34 @@ async def migrate_run_records_to_outcome_cause(
             continue
         repo_scope = repo or str(record.get("repo_name") or "global")
 
-        exit_reason = str(record.get("exit_reason") or "")
-        mapped = _EXIT_REASON_TO_OUTCOME_CAUSE.get(exit_reason)
-        if mapped is None:
-            mapped = ("failed", NULL_CAUSE_VALUE)
-            _warn(
-                log,
-                "[MIGRATION] Unknown run-record exit_reason "
-                f"{exit_reason!r} for {key}; defaulting to failed",
+        if "outcome" in record:
+            counts["records_skipped_already_migrated"] += 1
+        else:
+            exit_reason = str(record.get("exit_reason") or "")
+            mapped = _EXIT_REASON_TO_OUTCOME_CAUSE.get(exit_reason)
+            if mapped is None:
+                mapped = ("failed", NULL_CAUSE_VALUE)
+                _warn(
+                    log,
+                    "[MIGRATION] Unknown run-record exit_reason "
+                    f"{exit_reason!r} for {key}; defaulting to failed",
+                )
+            outcome, cause = mapped
+            await _write_outcome_cause(
+                redis_client,
+                key,
+                record,
+                storage,
+                outcome,
+                cause,
             )
-        outcome, cause = mapped
+            counts["records_migrated"] += 1
 
-        await _maybe_await(
-            redis_client.hset(key, mapping={"outcome": outcome, "cause": cause})
-        )
         task_runs_key = f"metrics:task_runs:{repo_scope}:{task_id}"
         await _maybe_await(redis_client.sadd(task_runs_key, record_id))
         await _maybe_await(
             redis_client.expire(task_runs_key, RUN_RECORD_TTL_SECONDS)
         )
         await _maybe_await(redis_client.expire(key, RUN_RECORD_TTL_SECONDS))
-        counts["records_migrated"] += 1
 
     return counts

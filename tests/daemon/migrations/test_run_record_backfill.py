@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -11,6 +12,7 @@ from src.daemon.migrations.run_record_backfill import (
     RUN_RECORD_TTL_SECONDS,
     _extract_repo_and_record_id,
     _key_type,
+    _normalize_json_record,
     migrate_run_records_to_outcome_cause,
 )
 
@@ -18,12 +20,13 @@ from src.daemon.migrations.run_record_backfill import (
 class _FakeRedis:
     def __init__(self) -> None:
         self.hashes: dict[str | bytes, dict[Any, Any]] = {}
+        self.strings: dict[str | bytes, str | bytes] = {}
         self.sets: dict[str, set[str]] = {}
         self.ttls: dict[str | bytes, int] = {}
 
     async def scan_iter(self, match: str):
         prefix = match.removesuffix("*")
-        for key in list(self.hashes):
+        for key in [*self.hashes, *self.strings]:
             normalized = key.decode("utf-8") if isinstance(key, bytes) else key
             if normalized.startswith(prefix):
                 yield key
@@ -32,7 +35,20 @@ class _FakeRedis:
         return dict(self.hashes.get(key, {}))
 
     async def type(self, key: str | bytes) -> bytes:
-        return b"hash" if key in self.hashes else b"none"
+        if key in self.hashes:
+            return b"hash"
+        if key in self.strings:
+            return b"string"
+        return b"none"
+
+    async def get(self, key: str | bytes) -> str | bytes | None:
+        return self.strings.get(key)
+
+    async def set(self, key: str | bytes, value: str, ex: int | None = None) -> bool:
+        self.strings[key] = value
+        if ex is not None:
+            self.ttls[key] = ex
+        return True
 
     async def hset(self, key: str | bytes, mapping: dict[str, str]) -> int:
         self.hashes.setdefault(key, {}).update(mapping)
@@ -116,6 +132,27 @@ def _canonical_record(
     return key
 
 
+def _string_record(
+    redis: _FakeRedis,
+    record_id: str,
+    exit_reason: str,
+    *,
+    task_id: str = "PR-287",
+    repo_name: str = "repo",
+    extra: dict[str, Any] | None = None,
+) -> str:
+    key = f"metrics:run:{record_id}"
+    payload: dict[str, Any] = {
+        "exit_reason": exit_reason,
+        "task_id": task_id,
+        "repo_name": repo_name,
+    }
+    if extra:
+        payload.update(extra)
+    redis.strings[key] = json.dumps(payload)
+    return key
+
+
 async def test_backfill_maps_exit_reason_to_outcome_cause() -> None:
     redis = _FakeRedis()
     expected = {
@@ -195,6 +232,51 @@ async def test_backfill_canonical_key_without_repo_name_uses_global_scope() -> N
 
     assert redis.sets["metrics:task_runs:global:PR-1"] == {"run-global"}
     assert redis.ttls["metrics:task_runs:global:PR-1"] == RUN_RECORD_TTL_SECONDS
+
+
+async def test_backfill_supports_string_json_run_record_keys() -> None:
+    redis = _FakeRedis()
+    key = _string_record(
+        redis,
+        "run-json",
+        "success_merged",
+        task_id="PR-1",
+        repo_name="repo",
+    )
+
+    counts = await migrate_run_records_to_outcome_cause(
+        redis,
+        logging.getLogger(__name__),
+    )
+
+    payload = json.loads(str(redis.strings[key]))
+    assert counts["records_migrated"] == 1
+    assert payload["outcome"] == "merged"
+    assert payload["cause"] is None
+    assert redis.sets["metrics:task_runs:repo:PR-1"] == {"run-json"}
+    assert redis.ttls["metrics:task_runs:repo:PR-1"] == RUN_RECORD_TTL_SECONDS
+    assert redis.ttls[key] == RUN_RECORD_TTL_SECONDS
+
+
+async def test_backfill_string_json_already_migrated_rebuilds_index() -> None:
+    redis = _FakeRedis()
+    _string_record(
+        redis,
+        "run-json-done",
+        "success_merged",
+        task_id="PR-1",
+        repo_name="repo",
+        extra={"outcome": "merged", "cause": None},
+    )
+
+    counts = await migrate_run_records_to_outcome_cause(
+        redis,
+        logging.getLogger(__name__),
+    )
+
+    assert counts["records_migrated"] == 0
+    assert counts["records_skipped_already_migrated"] == 1
+    assert redis.sets["metrics:task_runs:repo:PR-1"] == {"run-json-done"}
 
 
 async def test_backfill_extends_ttl_to_365d() -> None:
@@ -308,18 +390,18 @@ async def test_backfill_skips_non_hash_records(
         counts = await migrate_run_records_to_outcome_cause(redis, log)
 
     assert counts["records_skipped_malformed"] == 1
-    assert any("Skipping malformed run-record hash" in rec.getMessage() for rec in caplog.records)
+    assert any("Skipping malformed run-record" in rec.getMessage() for rec in caplog.records)
 
 
-async def test_backfill_skips_typed_non_hash_keys_before_hgetall() -> None:
-    class _StringRedis(_FakeRedis):
+async def test_backfill_skips_unsupported_typed_keys_before_hgetall() -> None:
+    class _ListRedis(_FakeRedis):
         async def type(self, key: str | bytes) -> bytes:
-            return b"string"
+            return b"list"
 
         async def hgetall(self, key: str | bytes) -> dict[Any, Any]:
-            raise AssertionError("hgetall should not be called for string keys")
+            raise AssertionError("hgetall should not be called for list keys")
 
-    redis = _StringRedis()
+    redis = _ListRedis()
     redis.hashes["metrics:run:run-string"] = {"task_id": "PR-1"}
 
     counts = await migrate_run_records_to_outcome_cause(
@@ -329,6 +411,28 @@ async def test_backfill_skips_typed_non_hash_keys_before_hgetall() -> None:
 
     assert counts["records_skipped_non_hash"] == 1
     assert counts["records_skipped_malformed"] == 0
+
+
+async def test_backfill_skips_malformed_string_json_records(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    redis = _FakeRedis()
+    redis.strings["metrics:run:bad-json"] = "{"
+    log = logging.getLogger("test_run_record_backfill")
+
+    with caplog.at_level(logging.WARNING, logger=log.name):
+        counts = await migrate_run_records_to_outcome_cause(redis, log)
+
+    assert counts["records_skipped_malformed"] == 1
+    assert any("Skipping malformed run-record" in rec.getMessage() for rec in caplog.records)
+
+
+def test_normalize_json_record_rejects_non_string_payloads() -> None:
+    assert _normalize_json_record(None) == {}
+
+
+def test_normalize_json_record_rejects_non_object_json() -> None:
+    assert _normalize_json_record("[]") == {}
 
 
 async def test_key_type_handles_none_response() -> None:
