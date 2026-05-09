@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from pathlib import Path
 
 import pytest
 from src.cancellation import task_spec_content_hash, task_spec_hash_key
+from src.daemon import git_ops as git_ops_module
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 
 from tests.runner import _helpers as h
@@ -302,6 +304,91 @@ def test_coding_post_coder_guardrail_force_push_transitions_to_error(
 
     assert transition_calls
     assert transition_calls[0].startswith("GUARDRAIL: force_push_main:")
+
+
+def test_coding_guardrail_uses_start_branch_for_no_refspec_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    runner.state.state = PipelineState.CODING
+    transition_calls: list[str] = []
+
+    async def fake_transition_to_error(
+        message: str,
+        **kwargs: object,
+    ) -> None:
+        transition_calls.append(message)
+
+    async def fake_save_cli_log(*args: object, **kwargs: object) -> None:
+        return None
+
+    def fail_get_open_prs(*args: object, **kwargs: object) -> list[PRInfo]:
+        raise AssertionError("PR lookup should not run after guardrail violation")
+
+    monkeypatch.setattr(runner, "_transition_to_error", fake_transition_to_error)
+    monkeypatch.setattr(runner, "_save_cli_log", fake_save_cli_log)
+    monkeypatch.setattr("src.daemon.handlers.coding.gh_prs.get_open_prs", fail_get_open_prs)
+
+    asyncio.run(
+        runner._post_coder_resolution(
+            "claude",
+            0,
+            "git commit -m guardrail\ngit push origin\ngit switch feature/xyz\n",
+            "",
+            target_branch="pr-289b",
+            current_pr_id="PR-289b",
+            guardrail_start_branch="main",
+        )
+    )
+
+    assert transition_calls
+    assert transition_calls[0].startswith("GUARDRAIL: direct_commit_main:")
+
+
+def test_coding_guardrail_continues_when_start_branch_probe_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+
+    async def fake_auto_pr(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        return (0, "gh repo create octo/demo\n", "")
+
+    def fail_get_open_prs(*args: object, **kwargs: object) -> list[PRInfo]:
+        raise AssertionError("PR lookup should not run after guardrail violation")
+
+    real_git = git_ops_module._git
+
+    def fake_git(repo_path: str, *args: str, **kwargs: object) -> object:
+        if args == ("branch", "--show-current"):
+            raise subprocess.SubprocessError("branch probe failed")
+        return real_git(repo_path, *args, **kwargs)  # type: ignore[arg-type]
+
+    transition_calls: list[str] = []
+
+    async def fake_transition_to_error(
+        message: str,
+        **kwargs: object,
+    ) -> None:
+        transition_calls.append(message)
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.CODING
+    runner.state.current_task = QueueTask(
+        pr_id="PR-289b",
+        title="Guardrail",
+        status=TaskStatus.DOING,
+        branch="pr-289b",
+        task_file="tasks/PR-289b.md",
+    )
+    monkeypatch.setattr(h.claude_cli, "run_auto_pr_async", fake_auto_pr)
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(runner, "_transition_to_error", fake_transition_to_error)
+    monkeypatch.setattr("src.daemon.handlers.coding.gh_prs.get_open_prs", fail_get_open_prs)
+
+    asyncio.run(runner.handle_coding())
+
+    assert transition_calls
+    assert transition_calls[0].startswith("GUARDRAIL: repo_create:")
 
 
 def test_coding_post_coder_guardrail_violation_scans_stderr(

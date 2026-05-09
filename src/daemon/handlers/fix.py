@@ -345,6 +345,17 @@ class FixMixin(BreachMixin):
             )
             if extra_context is not None:
                 fix_kwargs["extra_context"] = extra_context
+        try:
+            branch_probe = git_ops._git(
+                self.repo_path,
+                "branch",
+                "--show-current",
+                timeout=5,
+                check=False,
+            )
+            guardrail_start_branch = branch_probe.stdout.strip() or None
+        except (subprocess.SubprocessError, OSError):
+            guardrail_start_branch = None
         claude_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
             plugin.fix_review(
                 self.repo_path,
@@ -572,20 +583,9 @@ class FixMixin(BreachMixin):
                 return
             return
         await self._save_cli_log(stdout, stderr, f"FIX FEEDBACK output [{coder_name}]")
-        try:
-            branch_probe = git_ops._git(
-                self.repo_path,
-                "branch",
-                "--show-current",
-                timeout=5,
-                check=False,
-            )
-            current_branch = branch_probe.stdout.strip() or None
-        except (subprocess.SubprocessError, OSError):
-            current_branch = None
         violations = scan_stdout(
             f"{stdout}\n{stderr}",
-            current_branch=current_branch,
+            current_branch=guardrail_start_branch,
         )
         if violations:
             first = violations[0]

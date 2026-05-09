@@ -174,6 +174,60 @@ def test_fix_post_coder_guardrail_force_push_transitions_to_error(
     assert posted == []
 
 
+def test_fix_guardrail_uses_start_branch_for_no_refspec_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "fix_review_async",
+        h._async_cli_result(
+            0,
+            "git commit -m guardrail\ngit push origin\ngit switch feature/xyz\n",
+            "",
+        ),
+    )
+    real_git = git_ops_module._git
+    branch_calls = {"n": 0}
+
+    def fake_git(repo_path: str, *args: str, **kwargs: object) -> object:
+        if args == ("branch", "--show-current"):
+            branch_calls["n"] += 1
+            branch = "main" if branch_calls["n"] == 1 else "feature/xyz"
+            return subprocess.CompletedProcess(
+                args=list(args),
+                returncode=0,
+                stdout=f"{branch}\n",
+                stderr="",
+            )
+        return real_git(repo_path, *args, **kwargs)  # type: ignore[arg-type]
+
+    transition_calls: list[str] = []
+    posted: list[tuple[str, int, str]] = []
+
+    async def fake_transition_to_error(
+        message: str,
+        **kwargs: object,
+    ) -> None:
+        transition_calls.append(message)
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-019")
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(runner, "_transition_to_error", fake_transition_to_error)
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
+
+    asyncio.run(runner.handle_fix())
+
+    assert transition_calls
+    assert transition_calls[0].startswith("GUARDRAIL: direct_commit_main:")
+    assert posted == []
+
+
 def test_fix_post_coder_guardrail_violation_scans_stderr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

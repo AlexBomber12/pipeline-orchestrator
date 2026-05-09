@@ -255,6 +255,17 @@ class CodingMixin:
 
         self._write_active_pr_runtime_file(pr_id)
         self._write_expected_branch(target_branch)
+        try:
+            branch_probe = git_ops._git(
+                self.repo_path,
+                "branch",
+                "--show-current",
+                timeout=5,
+                check=False,
+            )
+            guardrail_start_branch = branch_probe.stdout.strip() or None
+        except (subprocess.SubprocessError, OSError):
+            guardrail_start_branch = None
         # Expected-branch cleanup belongs in a finally so the pre-push
         # hook does not reject later operator or daemon pushes whose HEAD
         # no longer matches this dispatch branch.
@@ -280,6 +291,7 @@ class CodingMixin:
                 stderr,
                 target_branch=target_branch,
                 current_pr_id=current_pr_id,
+                guardrail_start_branch=guardrail_start_branch,
             )
         finally:
             self._cleanup_expected_branch()
@@ -560,6 +572,7 @@ class CodingMixin:
         *,
         target_branch: str,
         current_pr_id: str | None,
+        guardrail_start_branch: str | None = None,
     ) -> None:
         """CLI log save, exit classification, PR lookup, WATCH handoff.
 
@@ -596,20 +609,9 @@ class CodingMixin:
         await self._save_cli_log(
             stdout, stderr, f"PLANNED PR output [{coder_name}]"
         )
-        try:
-            branch_probe = git_ops._git(
-                self.repo_path,
-                "branch",
-                "--show-current",
-                timeout=5,
-                check=False,
-            )
-            current_branch = branch_probe.stdout.strip() or None
-        except (subprocess.SubprocessError, OSError):
-            current_branch = None
         violations = scan_stdout(
             f"{stdout}\n{stderr}",
-            current_branch=current_branch,
+            current_branch=guardrail_start_branch,
         )
         if violations:
             first = violations[0]
