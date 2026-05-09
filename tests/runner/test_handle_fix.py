@@ -104,6 +104,40 @@ def test_fix_post_coder_guardrail_violation_transitions_to_error(
     assert posted == []
 
 
+def test_fix_post_coder_guardrail_force_push_transitions_to_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "fix_review_async",
+        h._async_cli_result(0, "git push --force origin main\n", ""),
+    )
+    transition_calls: list[str] = []
+    posted: list[tuple[str, int, str]] = []
+
+    async def fake_transition_to_error(
+        message: str,
+        **kwargs: object,
+    ) -> None:
+        transition_calls.append(message)
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-019")
+    monkeypatch.setattr(runner, "_transition_to_error", fake_transition_to_error)
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
+
+    asyncio.run(runner.handle_fix())
+
+    assert transition_calls
+    assert transition_calls[0].startswith("GUARDRAIL: force_push_main:")
+    assert posted == []
+
+
 def test_fix_post_coder_guardrail_violation_scans_stderr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

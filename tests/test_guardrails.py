@@ -26,6 +26,13 @@ def test_scan_stdout_repo_create_pattern_matches() -> None:
     assert violations[0].category == "repo_create"
 
 
+def test_scan_stdout_repo_delete_pattern_matches() -> None:
+    violations = scan_stdout("gh repo delete octo/demo\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "repo_delete"
+
+
 def test_scan_stdout_repo_create_pattern_allows_horizontal_whitespace() -> None:
     violations = scan_stdout("$ gh\trepo\tcreate octo/demo\n")
 
@@ -116,3 +123,99 @@ def test_scan_stdout_negation_does_not_suppress() -> None:
 
     assert len(violations) == 1
     assert violations[0].category == "repo_create"
+
+
+def test_scan_stdout_force_push_main_standard_form() -> None:
+    violations = scan_stdout("git push --force origin main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
+def test_scan_stdout_force_with_lease_main_flagged() -> None:
+    violations = scan_stdout("git push origin main --force-with-lease\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
+def test_scan_stdout_force_push_to_feature_branch_not_flagged() -> None:
+    stdout = "git push --force origin feature/xyz\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_branch_delete_default_via_colon_refspec() -> None:
+    violations = scan_stdout("git push origin :main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_default_via_dash_d_flag() -> None:
+    violations = scan_stdout("git push -d origin main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_feature_not_flagged() -> None:
+    stdout = "git push --delete origin feature/xyz\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_direct_commit_default_no_pr_create() -> None:
+    stdout = "git commit -m guardrail\npython -m pytest -q\ngit push origin main\n"
+
+    violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "direct_commit_main"
+
+
+def test_scan_stdout_direct_commit_with_pr_create_between() -> None:
+    stdout = "git commit -m guardrail\ngh pr create --fill\ngit push origin main\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_direct_commit_amend_excluded() -> None:
+    stdout = "git commit --amend --no-edit\ngit push origin main\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_direct_commit_amend_with_force_push_caught_by_force_rule() -> None:
+    stdout = "git commit --amend --no-edit\ngit push --force origin main\n"
+
+    violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
+def test_scan_stdout_remote_named_main_not_misclassified() -> None:
+    stdout = "git push main feature-branch\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_multiple_distinct_violations_returns_all() -> None:
+    stdout = "gh repo create octo/demo\ngit push --force origin main\n"
+
+    violations = scan_stdout(stdout)
+
+    assert [violation.category for violation in violations] == [
+        "force_push_main",
+        "repo_create",
+    ]
+
+
+def test_scan_stdout_repo_delete_negation_does_not_suppress() -> None:
+    stdout = "Never run this manually: gh repo delete octo/demo\n"
+
+    violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "repo_delete"
