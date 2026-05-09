@@ -142,6 +142,10 @@ async def _write_canonical_record_key(
     )
 
 
+async def _canonical_string_exists(redis_client: Any, record_id: str) -> bool:
+    return await _key_type(redis_client, f"metrics:run:{record_id}") == "string"
+
+
 def _extract_repo_and_record_id(key: str | bytes) -> tuple[str | None, str] | None:
     normalized = _decode(key)
     if not isinstance(normalized, str):
@@ -200,6 +204,9 @@ async def migrate_run_records_to_outcome_cause(
             counts["records_skipped_malformed"] += 1
             _warn(log, f"[MIGRATION] Skipping malformed run-record {key}")
             continue
+        if "outcome" in record and storage == "string":
+            counts["records_skipped_already_migrated"] += 1
+            continue
 
         task_id = record.get("task_id")
         if not task_id:
@@ -210,6 +217,8 @@ async def migrate_run_records_to_outcome_cause(
 
         if "outcome" in record:
             counts["records_skipped_already_migrated"] += 1
+            if await _canonical_string_exists(redis_client, record_id):
+                continue
         else:
             exit_reason = str(record.get("exit_reason") or "")
             mapped = _EXIT_REASON_TO_OUTCOME_CAUSE.get(exit_reason)

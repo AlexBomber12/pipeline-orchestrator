@@ -285,7 +285,7 @@ async def test_backfill_supports_string_json_run_record_keys() -> None:
     assert redis.ttls[key] == RUN_RECORD_TTL_SECONDS
 
 
-async def test_backfill_string_json_already_migrated_rebuilds_index() -> None:
+async def test_backfill_string_json_already_migrated_is_quiet_skip() -> None:
     redis = _FakeRedis()
     _string_record(
         redis,
@@ -303,7 +303,37 @@ async def test_backfill_string_json_already_migrated_rebuilds_index() -> None:
 
     assert counts["records_migrated"] == 0
     assert counts["records_skipped_already_migrated"] == 1
-    assert redis.sets["metrics:task_runs:repo:PR-1"] == {"run-json-done"}
+    assert redis.sets == {}
+
+
+async def test_backfill_legacy_hash_skip_when_canonical_string_exists() -> None:
+    redis = _FakeRedis()
+    _record(
+        redis,
+        "repo",
+        "run-done",
+        "success_merged",
+        task_id="PR-1",
+        extra={"outcome": "merged", "cause": ""},
+    )
+    redis.strings["metrics:run:run-done"] = json.dumps(
+        {
+            "exit_reason": "success_merged",
+            "task_id": "PR-1",
+            "repo_name": "repo",
+            "outcome": "merged",
+            "cause": None,
+        }
+    )
+
+    counts = await migrate_run_records_to_outcome_cause(
+        redis,
+        logging.getLogger(__name__),
+    )
+
+    assert counts["records_migrated"] == 0
+    assert counts["records_skipped_already_migrated"] == 2
+    assert redis.sets == {}
 
 
 async def test_backfill_extends_ttl_to_365d() -> None:
