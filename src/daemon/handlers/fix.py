@@ -20,6 +20,7 @@ from src.daemon import (
     fix_supervision,
     git_ops,
 )
+from src.daemon.guardrails import scan_stdout
 from src.daemon.handlers.breach import BreachMixin
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
 from src.github import comments as gh_comments
@@ -571,6 +572,21 @@ class FixMixin(BreachMixin):
                 return
             return
         await self._save_cli_log(stdout, stderr, f"FIX FEEDBACK output [{coder_name}]")
+        guardrail_violations = scan_stdout(stdout)
+        if guardrail_violations:
+            guardrail_prefix = "[GUARDRAIL]"
+            for violation in guardrail_violations:
+                self.log_event(
+                    f"{guardrail_prefix} {{tier={violation.tier}}} "
+                    f"{violation.category}: {violation.excerpt}"
+                )
+            first = guardrail_violations[0]
+            await self._transition_to_error(
+                f"GUARDRAIL: {first.category}: {first.excerpt}",
+                publish=False,
+                log_prefix="[FIX]",
+            )
+            return
         await capture_stop_requested_after_exit()
         escalate_reason = fix_escalation.parse_escalate_marker(stdout)
         if escalate_reason is not None and self.state.current_pr is not None:

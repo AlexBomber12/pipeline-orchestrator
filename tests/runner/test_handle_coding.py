@@ -12,6 +12,78 @@ from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 from tests.runner import _helpers as h
 
 
+def _runner_with_current_task() -> h.PipelineRunner:
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="Sample",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    return runner
+
+
+def test_coding_post_coder_guardrail_violation_transitions_to_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_current_task()
+    transition_calls: list[str] = []
+    pr_lookup_called = False
+
+    async def fake_transition(cause: str, **kwargs: object) -> None:
+        transition_calls.append(cause)
+        runner.state.state = PipelineState.ERROR
+
+    def fake_get_open_prs(*args: object, **kwargs: object) -> list[PRInfo]:
+        nonlocal pr_lookup_called
+        pr_lookup_called = True
+        return []
+
+    monkeypatch.setattr(runner, "_transition_to_error", fake_transition)
+    monkeypatch.setattr("src.github.prs.get_open_prs", fake_get_open_prs)
+
+    asyncio.run(
+        runner._post_coder_resolution(
+            "claude",
+            0,
+            "starting\ngh repo create test\nfinished",
+            "",
+            target_branch="pr-001",
+            current_pr_id="PR-001",
+        )
+    )
+
+    assert transition_calls[0].startswith("GUARDRAIL: repo_create:")
+    assert pr_lookup_called is False
+
+
+def test_coding_post_coder_clean_stdout_proceeds_normally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_current_task()
+    runner._post_codex_review = lambda pr_number: True  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda *args, **kwargs: [PRInfo(number=42, branch="pr-001")],
+    )
+
+    asyncio.run(
+        runner._post_coder_resolution(
+            "claude",
+            0,
+            "python -m pytest -q",
+            "",
+            target_branch="pr-001",
+            current_pr_id="PR-001",
+        )
+    )
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 42
+
+
 def test_dispatch_persists_task_spec_hash(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

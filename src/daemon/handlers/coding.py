@@ -23,6 +23,7 @@ from src.cancellation import (
 )
 from src.coder_registry import CoderPlugin
 from src.daemon import git_ops
+from src.daemon.guardrails import scan_stdout
 from src.daemon.handlers import CoderUnavailable
 from src.github import cache as gh_cache
 from src.github import gh_runner
@@ -595,6 +596,21 @@ class CodingMixin:
         await self._save_cli_log(
             stdout, stderr, f"PLANNED PR output [{coder_name}]"
         )
+        guardrail_violations = scan_stdout(stdout)
+        if guardrail_violations:
+            guardrail_prefix = "[GUARDRAIL]"
+            for violation in guardrail_violations:
+                self.log_event(
+                    f"{guardrail_prefix} {{tier={violation.tier}}} "
+                    f"{violation.category}: {violation.excerpt}"
+                )
+            first = guardrail_violations[0]
+            await self._transition_to_error(
+                f"GUARDRAIL: {first.category}: {first.excerpt}",
+                publish=False,
+                log_prefix="[CODING]",
+            )
+            return
         if not await pause_for_stop_if_requested():
             await self._refresh_user_paused_from_redis()
             if self.state.user_paused:

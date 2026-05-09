@@ -42,6 +42,37 @@ from tests.runner import _helpers as h
 claude_cli = claude_plugin_module.claude_cli
 
 
+def test_fix_post_coder_guardrail_violation_transitions_to_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "fix_review_async",
+        h._async_cli_result(0, "starting\ngh repo create test\nfinished", ""),
+    )
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda *args, **kwargs: pytest.fail("post-coder flow should stop"),
+    )
+    transition_calls: list[str] = []
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-019")
+
+    async def fake_transition(cause: str, **kwargs: object) -> None:
+        transition_calls.append(cause)
+        runner.state.state = PipelineState.ERROR
+
+    monkeypatch.setattr(runner, "_transition_to_error", fake_transition)
+
+    asyncio.run(runner.handle_fix())
+
+    assert transition_calls[0].startswith("GUARDRAIL: repo_create:")
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.push_count == 0
+
+
 def test_handle_fix_posts_codex_review_after_push(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
