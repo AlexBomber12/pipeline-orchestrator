@@ -22,6 +22,7 @@ from src.models import (
 )
 from src.web import app as web_app
 from src.web.app import (
+    _active_repo_coder,
     _active_rate_limit_coder,
     _build_recent_graphql_burns_view,
     _build_resources_view,
@@ -1870,6 +1871,27 @@ def test_active_rate_limit_coder_hides_any_without_active_pick() -> None:
     )
 
     assert _active_rate_limit_coder(state, "any") is None
+
+
+def test_active_repo_coder_requires_active_task_and_run_state() -> None:
+    state = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        coder="codex",
+    )
+
+    assert _active_repo_coder(state) is None
+
+    state.current_task = QueueTask(
+        pr_id="PR-293",
+        title="Runtime badge",
+        status=TaskStatus.DOING,
+    )
+    assert _active_repo_coder(state) is None
+
+    state.state = PipelineState.CODING
+    assert _active_repo_coder(state) == "codex"
 
 
 def test_partial_repo_detail_returns_html_fragment(
@@ -3731,6 +3753,7 @@ def _render_repo_header_coder(
     *,
     selected: str = "any",
     active: str | None = None,
+    state: PipelineState | None = None,
 ) -> str:
     if selected != "any":
         config_path.write_text(
@@ -3745,10 +3768,22 @@ def _render_repo_header_coder(
     stored = RepoState(
         url="https://github.com/example/alpha.git",
         name="example__alpha",
-        state=PipelineState.CODING if active else PipelineState.IDLE,
+        state=state or (PipelineState.CODING if active else PipelineState.IDLE),
         last_updated=datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc),
         coder=active,
     )
+    active_run_states = {
+        PipelineState.CODING,
+        PipelineState.WATCH,
+        PipelineState.FIX,
+        PipelineState.MERGE,
+    }
+    if active and stored.state in active_run_states:
+        stored.current_task = QueueTask(
+            pr_id="PR-293",
+            title="Runtime badge",
+            status=TaskStatus.DOING,
+        )
     fake = _FakeRedis({"pipeline:example__alpha": stored.model_dump_json()})
     context = asyncio.run(web_app._repo_template_context("example__alpha", fake))
     rendered = web_app.templates.get_template(
@@ -3794,6 +3829,21 @@ def test_repo_header_coder_any_with_runtime_pick(
     assert "Any (bandit) → Claude CLI" in coder_fragment
     assert "inherits Claude" in coder_fragment
     assert "Active:" not in coder_fragment
+
+
+def test_repo_header_coder_ignores_persisted_idle_coder(
+    two_repo_config: Path,
+) -> None:
+    coder_fragment = _render_repo_header_coder(
+        two_repo_config,
+        active="codex",
+        state=PipelineState.IDLE,
+    )
+
+    assert "Any (bandit) →" not in coder_fragment
+    assert "Active:" not in coder_fragment
+    assert "Any (bandit)" in coder_fragment
+    assert "inherits Claude" in coder_fragment
 
 
 def test_repo_header_coder_link_to_settings(

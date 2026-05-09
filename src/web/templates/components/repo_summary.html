@@ -32,13 +32,13 @@
          data-coder-display>
         <span class="font-mono text-gray-400">Coder</span>
         <span class="font-mono text-gray-300">
-            {% if selected_repo_coder == 'any' and repo.coder %}
+            {% if selected_repo_coder == 'any' and active_repo_coder %}
             {{ selected_repo_coder_label }} → {{ active_repo_coder_label }}
             {% else %}
             {{ selected_repo_coder_label }}
             {% endif %}
         </span>
-        {% if repo.coder and selected_repo_coder != 'any' and repo.coder != selected_repo_coder %}
+        {% if active_repo_coder and selected_repo_coder != 'any' and active_repo_coder != selected_repo_coder %}
         <span class="text-[11px] text-gray-500">
             → Active: {{ active_repo_coder_label }} (via spec pin or bandit)
         </span>

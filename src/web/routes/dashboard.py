@@ -125,6 +125,13 @@ def _active_rate_limit_coder(
     return effective_coder
 
 
+def _active_repo_coder(state: RepoState) -> str | None:
+    """Return the runtime coder only while a repo is actively executing work."""
+    if state.current_task is None or state.state not in _ACTIVE_RUN_STATES:
+        return None
+    return state.coder
+
+
 def _coder_rate_limit_supported(coder: str | None) -> bool:
     """Return whether ``coder`` has meaningful rate-limit usage data."""
     return coder in {"claude", "codex"}
@@ -305,6 +312,7 @@ async def _repo_template_context(
         redis_client, name
     )
     selected_repo_coder = _repo_coder_form_value(repo_config)
+    active_repo_coder = _active_repo_coder(state)
     return {
         "repo": state,
         "recent_graphql_burns": recent_graphql_burns,
@@ -319,7 +327,8 @@ async def _repo_template_context(
         "show_rate_limit_badge": show_rate_limit_badge,
         "selected_repo_coder": selected_repo_coder,
         "selected_repo_coder_label": _repo_coder_label(selected_repo_coder),
-        "active_repo_coder_label": _repo_coder_label(state.coder),
+        "active_repo_coder": active_repo_coder,
+        "active_repo_coder_label": _repo_coder_label(active_repo_coder),
         "inherit_coder": _daemon_default_coder_name(config),
         "coder_update_message": coder_update_message,
         "metrics_records": (
