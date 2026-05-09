@@ -254,7 +254,7 @@ def test_coding_post_coder_guardrail_violation_transitions_to_error(
         runner._post_coder_resolution(
             "claude",
             0,
-            "created unrelated repo with gh repo create octo/demo\n",
+            "gh repo create octo/demo\n",
             "",
             target_branch="pr-289a",
             current_pr_id="PR-289a",
@@ -294,7 +294,7 @@ def test_coding_post_coder_guardrail_violation_honors_deferred_stop(
         runner._post_coder_resolution(
             "claude",
             0,
-            "created unrelated repo with gh repo create octo/demo\n",
+            "gh repo create octo/demo\n",
             "",
             target_branch="pr-289a",
             current_pr_id="PR-289a",

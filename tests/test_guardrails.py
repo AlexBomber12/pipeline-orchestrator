@@ -20,14 +20,14 @@ def test_guardrail_violation_dataclass_frozen() -> None:
 
 
 def test_scan_stdout_repo_create_pattern_matches() -> None:
-    violations = scan_stdout("running command: gh repo create octo/demo\n")
+    violations = scan_stdout("gh repo create octo/demo\n")
 
     assert len(violations) == 1
     assert violations[0].category == "repo_create"
 
 
 def test_scan_stdout_repo_create_pattern_allows_horizontal_whitespace() -> None:
-    violations = scan_stdout("running command: gh\trepo\tcreate octo/demo\n")
+    violations = scan_stdout("$ gh\trepo\tcreate octo/demo\n")
 
     assert len(violations) == 1
     assert violations[0].category == "repo_create"
@@ -37,6 +37,28 @@ def test_scan_stdout_repo_create_pattern_does_not_cross_newlines() -> None:
     stdout = "wrapped prose:\ngh\nrepo\ncreate octo/demo\n"
 
     assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_repo_create_pattern_ignores_help_and_prose() -> None:
+    stdout = (
+        "gh repo --help\n"
+        "  gh repo create [<name>] [flags]\n"
+        "Do not run gh repo create for this task.\n"
+    )
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_repo_create_pattern_accepts_shell_prompts() -> None:
+    stdout = "$ gh repo create first\n> gh repo create second\n+ gh repo create third\n"
+
+    violations = scan_stdout(stdout)
+
+    assert [violation.category for violation in violations] == [
+        "repo_create",
+        "repo_create",
+        "repo_create",
+    ]
 
 
 def test_scan_stdout_no_match_returns_empty_list() -> None:
@@ -63,7 +85,7 @@ def test_scan_stdout_multiple_matches_in_one_input_returns_all() -> None:
     stdout = (
         "gh repo create first\n"
         "GH   REPO   CREATE second\n"
-        "prefix gh repo create third suffix\n"
+        "+ gh repo create third suffix\n"
     )
 
     violations = scan_stdout(stdout)
@@ -76,7 +98,7 @@ def test_scan_stdout_multiple_matches_in_one_input_returns_all() -> None:
 
 
 def test_scan_stdout_negation_does_not_suppress() -> None:
-    stdout = "# I would never use gh repo create for this task\n"
+    stdout = "gh repo create octo/demo # I would never do this intentionally\n"
 
     violations = scan_stdout(stdout)
 

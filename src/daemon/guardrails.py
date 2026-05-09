@@ -25,7 +25,11 @@ class GuardrailViolation:
 _PROTECTED_DEFAULT_BRANCH = "main"
 
 _TIER1_PATTERNS: dict[str, re.Pattern[str]] = {
-    "repo_create": re.compile(r"\bgh[^\S\r\n]+repo[^\S\r\n]+create\b", re.IGNORECASE),
+    "repo_create": re.compile(
+        r"(?m)^(?:[^\S\r\n]*(?:[$>]|[+])[^\S\r\n]*)?"
+        r"gh[^\S\r\n]+repo[^\S\r\n]+create\b",
+        re.IGNORECASE,
+    ),
 }
 
 _TIER1_RULES: dict[str, str] = {

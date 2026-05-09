@@ -76,7 +76,7 @@ def test_fix_post_coder_guardrail_violation_transitions_to_error(
     monkeypatch.setattr(
         claude_cli,
         "fix_review_async",
-        h._async_cli_result(0, "created repo: gh repo create octo/demo\n", ""),
+        h._async_cli_result(0, "gh repo create octo/demo\n", ""),
     )
     transition_calls: list[tuple[str, str | None]] = []
     posted: list[tuple[str, int, str]] = []
@@ -111,7 +111,7 @@ def test_fix_post_coder_guardrail_violation_honors_deferred_stop(
     monkeypatch.setattr(
         claude_cli,
         "fix_review_async",
-        h._async_cli_result(0, "created repo: gh repo create octo/demo\n", ""),
+        h._async_cli_result(0, "gh repo create octo/demo\n", ""),
     )
     transition_calls: list[str] = []
 
