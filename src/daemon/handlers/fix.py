@@ -581,6 +581,8 @@ class FixMixin(BreachMixin):
                     f"[FIX] [GUARDRAIL] tier={violation.tier} "
                     f"{violation.category}: {violation.excerpt}"
                 )
+            if await pause_for_stop_after_bookkeeping():
+                return
             await self._transition_to_error(
                 cause,
                 save_run_record_as=None,
@@ -591,8 +593,6 @@ class FixMixin(BreachMixin):
                     payload={"subsource": "guardrail", "reason_text": cause},
                 ),
             )
-            if await pause_for_stop_after_bookkeeping():
-                return
             return
         await capture_stop_requested_after_exit()
         escalate_reason = fix_escalation.parse_escalate_marker(stdout)

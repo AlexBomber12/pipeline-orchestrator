@@ -266,6 +266,48 @@ def test_coding_post_coder_guardrail_violation_transitions_to_error(
     assert transition_calls[0][1] == "[CODING]"
 
 
+def test_coding_post_coder_guardrail_violation_honors_deferred_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    runner.state.state = PipelineState.CODING
+    runner.redis.store[f"control:{runner.name}:stop"] = "1"
+    transition_calls: list[str] = []
+
+    async def fake_transition_to_error(
+        message: str,
+        **kwargs: object,
+    ) -> None:
+        transition_calls.append(message)
+
+    async def fake_save_cli_log(*args: object, **kwargs: object) -> None:
+        return None
+
+    def fail_get_open_prs(*args: object, **kwargs: object) -> list[PRInfo]:
+        raise AssertionError("PR lookup should not run after deferred stop")
+
+    monkeypatch.setattr(runner, "_transition_to_error", fake_transition_to_error)
+    monkeypatch.setattr(runner, "_save_cli_log", fake_save_cli_log)
+    monkeypatch.setattr("src.daemon.handlers.coding.gh_prs.get_open_prs", fail_get_open_prs)
+
+    asyncio.run(
+        runner._post_coder_resolution(
+            "claude",
+            0,
+            "created unrelated repo with gh repo create octo/demo\n",
+            "",
+            target_branch="pr-289a",
+            current_pr_id="PR-289a",
+        )
+    )
+
+    assert transition_calls == []
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.user_paused is True
+    assert runner.state.error_message is None
+    assert "PR-289a" in runner._user_stopped_task_pr_ids
+
+
 def test_coding_post_coder_clean_stdout_proceeds_normally(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

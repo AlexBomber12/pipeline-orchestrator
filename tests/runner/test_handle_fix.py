@@ -137,8 +137,7 @@ def test_fix_post_coder_guardrail_violation_honors_deferred_stop(
 
     asyncio.run(runner.handle_fix())
 
-    assert transition_calls
-    assert transition_calls[0].startswith("GUARDRAIL: repo_create:")
+    assert transition_calls == []
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.user_paused is True
     assert runner.state.error_message is None

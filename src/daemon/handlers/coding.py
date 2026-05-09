@@ -605,6 +605,8 @@ class CodingMixin:
                     f"[CODING] [GUARDRAIL] tier={violation.tier} "
                     f"{violation.category}: {violation.excerpt}"
                 )
+            if await pause_for_stop_if_requested():
+                return
             await self._transition_to_error(
                 cause,
                 publish=False,
