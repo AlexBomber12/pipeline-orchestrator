@@ -2,84 +2,69 @@ repositories:
 - url: https://github.com/AlexBomber12/pipeline-orchestrator.git
   branch: main
   auto_merge: true
+  active: true
   poll_interval_sec: 60
+  allow_merge_without_checks: false
+  allow_merge_without_review: false
+  coder: codex
+- url: https://github.com/AlexBomber12/megaraid-dashboard
+  branch: main
+  auto_merge: true
+  active: true
+  poll_interval_sec: 60
+  allow_merge_without_checks: false
+  allow_merge_without_review: false
+  coder: codex
 daemon:
   poll_interval_sec: 60
-  # PR-231: Production-tuned (default was 60min). Operator observed reviews
-  # almost always arrive within 20min; longer timeout just delays HUNG escalation.
   review_timeout_min: 20
+  stale_review_threshold_min: 10
   stale_review_threshold_eyes_min: 5
-  auto_fallback: true
   hung_fallback_codex_review: true
   error_handler_use_ai: true
   claude_model: opus
   fix_idle_timeout_sec: 1800
-  # PR-231: Operator-confirmed production cap on FIX iterations.
   fix_iteration_cap: 25
   fix_no_push_cap: 3
-  # Per-task operator Retry button attempts before requiring a spec edit/delete.
-  # Default: 3. Valid range: 1-20.
-  # retry_button_cap: 3
+  retry_button_cap: 3
   fix_poll_interval_sec: 30
   coder_terminate_grace_sec: 5
-  # PR-231: Production-tuned (default was 900s/15min). Foundation Sprint tasks
-  # regularly need 20-40min for complex PLANNED PRs; 1 hour is the operator-
-  # validated upper bound that prevents premature subprocess kills.
   planned_pr_timeout_sec: 3600
+  rate_limit_session_pause_percent: 95
+  rate_limit_weekly_pause_percent: 100
+  strict_queue_validation: true
+  upload_staging_max_age_hours: 24
+  usage_api_user_agent: claude-code/2.1.104
+  usage_api_beta_header: oauth-2025-04-20
+  usage_api_cache_ttl_sec: 60
+  install_statusline_hook: true
+  auto_fallback: true
   coder_priority:
     codex: 81
     claude: 76
   exploration_epsilon: 0.15
-  rate_limit_pause_percent: 90
-  # PR-231: Operator-confirmed production rate limit thresholds.
-  # 95% session pause keeps coder from hitting hard 5h cap.
-  # 100% weekly pause means run until Anthropic returns rate-limit response.
-  rate_limit_session_pause_percent: 95
-  rate_limit_weekly_pause_percent: 100
+  coder: claude
+  codex_model: ''
   github_api_pause_threshold_percent: 5
   github_api_slowdown_threshold_percent: 20
   github_api_slowdown_multiplier: 5
   idle_extended_poll_interval_sec: 300
   idle_extended_after_cycles: 3
-  # PR-202 WATCH adaptive polling. Codex Review (~2-7 min) and CI
-  # (~5-15 min) rarely respond in the first 5 minutes; slow polling
-  # there saves GitHub quota on a scheduled wait. After the window
-  # opens we poll fast since the result may arrive any second.
   watch_slow_window_sec: 300
   watch_slow_poll_interval_sec: 300
   watch_fast_poll_interval_sec: 45
-  # PR-249 OBS-BL: cap WATCH<->HUNG retrigger cycles. After N retriggers
-  # with no fresh review activity (codex EYES, comment, push), escalate
-  # to HUNG with the ``escalated`` label instead of looping. Default 3 =
-  # ride out genuine codex hiccups before paging the operator.
   watch_retrigger_cap: 3
-  # PR-250 OBS-BM: reclassify CI as FAILURE once a check-run has been
-  # PENDING on the same head SHA for this many minutes. Catches the
-  # GitHub Actions "queued/in_progress forever" failure mode where the
-  # runner died and no terminal state ever arrives.
   ci_pending_max_min: 30
-  # PR-285: AVAILABLE mode auto-pauses the repo when recorded ERROR
-  # cancellations reach this count inside the configured window. AWAY
-  # mode keeps skip-and-record behavior without auto-pause so the
-  # operator can batch-triage on return.
   error_rate_threshold: 5
   error_rate_window_min: 60
   error_rate_auto_pause_enabled: true
-  # PR-255: Operator availability window for the Cancellation policy
-  # SignalSource composition. Outside the window the ActiveHoursSource
-  # reports AWAY so downstream consumers can defer speculative coder
-  # work overnight. Hours are inclusive-start, exclusive-end.
   operator_active_hours_start: 9
   operator_active_hours_end: 21
   operator_timezone: Europe/Rome
-  # PR-231: Anthropic OAuth beta header. Required for current API tier.
-  # NOTE: Anthropic periodically rotates beta headers. If auth breaks after
-  # an Anthropic announcement, re-verify this value matches the current
-  # supported beta cycle. Loss of correct value broke production on 2026-05-01.
-  usage_api_beta_header: "oauth-2025-04-20"
 web:
   host: 0.0.0.0
   port: 8000
 auth:
   claude_config_dir: /data/auth/claude
   gh_config_dir: /data/auth/gh
+  codex_home_dir: /data/auth
