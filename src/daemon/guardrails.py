@@ -51,7 +51,8 @@ _TIER1_PATTERNS: dict[str, re.Pattern[str]] = {
         # require a force token and a refspec whose destination resolves
         # to the protected default branch, while avoiding remote-name
         # collisions such as ``git push main feature-branch``.
-        r"\bgit push\b"
+        _COMMAND_PREFIX_RE
+        + r"git push\b"
         r"(?:"
         r"(?="
         r"(?:[ \t]+[^\s,;|&#]+)*?"
@@ -72,7 +73,8 @@ _TIER1_PATTERNS: dict[str, re.Pattern[str]] = {
         re.IGNORECASE,
     ),
     "branch_delete_main": re.compile(
-        r"\bgit push\b"
+        _COMMAND_PREFIX_RE
+        + r"git push\b"
         r"(?:"
         r"(?="
         r"(?:[ \t]+[^\s,;|&#]+)*?"
@@ -95,7 +97,7 @@ _TIER1_PATTERNS: dict[str, re.Pattern[str]] = {
         re.IGNORECASE,
     ),
     "direct_commit_main": re.compile(
-        r"\bgit[^\S\r\n]+commit\b",
+        _COMMAND_PREFIX_RE + r"git[^\S\r\n]+commit\b",
         re.IGNORECASE,
     ),
 }
@@ -110,9 +112,13 @@ _TIER1_RULES: dict[str, str] = {
 
 _EXCERPT_LIMIT = 200
 _DIRECT_COMMIT_CATEGORY = "direct_commit_main"
-_GH_PR_CREATE_RE = re.compile(r"\bgh[^\S\r\n]+pr[^\S\r\n]+create\b", re.IGNORECASE)
+_GH_PR_CREATE_RE = re.compile(
+    _COMMAND_PREFIX_RE + r"gh[^\S\r\n]+pr[^\S\r\n]+create\b",
+    re.IGNORECASE,
+)
 _GIT_PUSH_PROTECTED_BRANCH_RE = re.compile(
-    r"\bgit push\b"
+    _COMMAND_PREFIX_RE
+    + r"git push\b"
     r"(?="
     rf"{_PROTECTED_BRANCH_POSITIONAL_RE}"
     r")",

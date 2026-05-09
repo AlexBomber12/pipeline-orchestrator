@@ -155,6 +155,12 @@ def test_scan_stdout_force_push_to_feature_branch_not_flagged() -> None:
     assert scan_stdout(stdout) == []
 
 
+def test_scan_stdout_force_push_main_prose_not_flagged() -> None:
+    stdout = "Reminder: do not run git push --force origin main\n"
+
+    assert scan_stdout(stdout) == []
+
+
 def test_scan_stdout_branch_delete_default_via_colon_refspec() -> None:
     violations = scan_stdout("git push origin :main\n")
 
@@ -182,6 +188,12 @@ def test_scan_stdout_branch_delete_feature_not_flagged() -> None:
     assert scan_stdout(stdout) == []
 
 
+def test_scan_stdout_branch_delete_main_prose_not_flagged() -> None:
+    stdout = "Reminder: do not run git push origin :main\n"
+
+    assert scan_stdout(stdout) == []
+
+
 def test_scan_stdout_direct_commit_default_no_pr_create() -> None:
     stdout = "git commit -m guardrail\npython -m pytest -q\ngit push origin main\n"
 
@@ -199,6 +211,17 @@ def test_scan_stdout_direct_commit_with_pr_create_between() -> None:
 
 def test_scan_stdout_direct_commit_amend_excluded() -> None:
     stdout = "git commit --amend --no-edit\ngit push origin main\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_direct_commit_main_checklist_not_flagged() -> None:
+    stdout = (
+        "Checklist:\n"
+        "1. Run git commit -m guardrail\n"
+        "2. Run tests\n"
+        "3. Run git push origin main\n"
+    )
 
     assert scan_stdout(stdout) == []
 
