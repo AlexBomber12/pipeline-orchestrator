@@ -124,15 +124,15 @@ async def _write_outcome_cause(
     )
 
 
-async def _copy_legacy_record_to_canonical_key(
+async def _write_canonical_record_key(
     redis_client: Any,
-    key: str | bytes,
     record_id: str,
     record: dict[str, Any],
+    repo_scope: str,
 ) -> None:
+    if not record.get("repo_name"):
+        record["repo_name"] = repo_scope
     canonical_key = f"metrics:run:{record_id}"
-    if _decode(key) == canonical_key:
-        return
     await _maybe_await(
         redis_client.set(
             canonical_key,
@@ -231,11 +231,11 @@ async def migrate_run_records_to_outcome_cause(
             )
             counts["records_migrated"] += 1
 
-        await _copy_legacy_record_to_canonical_key(
+        await _write_canonical_record_key(
             redis_client,
-            key,
             record_id,
             record,
+            repo_scope,
         )
         task_runs_key = f"metrics:task_runs:{repo_scope}:{task_id}"
         await _maybe_await(redis_client.sadd(task_runs_key, record_id))

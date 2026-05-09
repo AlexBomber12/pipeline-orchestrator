@@ -45,6 +45,7 @@ class _FakeRedis:
         return self.strings.get(key)
 
     async def set(self, key: str | bytes, value: str, ex: int | None = None) -> bool:
+        self.hashes.pop(key, None)
         self.strings[key] = value
         if ex is not None:
             self.ttls[key] = ex
@@ -89,6 +90,7 @@ class _SyncRedis:
         return len(mapping)
 
     def set(self, key: str | bytes, value: str, ex: int | None = None) -> bool:
+        self.hashes.pop(key, None)
         self.strings[key] = value
         if ex is not None:
             self.ttls[key] = ex
@@ -217,6 +219,7 @@ async def test_backfill_copies_legacy_repo_key_to_canonical_record_key() -> None
     payload = json.loads(str(redis.strings["metrics:run:run-a"]))
     assert payload["outcome"] == "merged"
     assert payload["cause"] is None
+    assert payload["repo_name"] == "repo"
     assert payload["task_id"] == "PR-1"
     assert redis.ttls["metrics:run:run-a"] == RUN_RECORD_TTL_SECONDS
 
@@ -237,8 +240,10 @@ async def test_backfill_supports_canonical_run_record_keys() -> None:
     )
 
     assert counts["records_migrated"] == 1
-    assert redis.hashes[key]["outcome"] == "merged"
-    assert redis.hashes[key]["cause"] == NULL_CAUSE_VALUE
+    payload = json.loads(str(redis.strings[key]))
+    assert payload["outcome"] == "merged"
+    assert payload["cause"] is None
+    assert payload["repo_name"] == "repo"
     assert redis.sets["metrics:task_runs:repo:PR-1"] == {"run-canonical"}
     assert redis.ttls["metrics:task_runs:repo:PR-1"] == RUN_RECORD_TTL_SECONDS
 
@@ -250,6 +255,8 @@ async def test_backfill_canonical_key_without_repo_name_uses_global_scope() -> N
 
     await migrate_run_records_to_outcome_cause(redis, logging.getLogger(__name__))
 
+    payload = json.loads(str(redis.strings[key]))
+    assert payload["repo_name"] == "global"
     assert redis.sets["metrics:task_runs:global:PR-1"] == {"run-global"}
     assert redis.ttls["metrics:task_runs:global:PR-1"] == RUN_RECORD_TTL_SECONDS
 
