@@ -118,7 +118,6 @@ _GH_PR_CREATE_RE = re.compile(
 )
 _GH_PR_CREATE_NO_CREATE_FLAG_RE = re.compile(
     r"(?<!\S)(?:--dry-run(?:=[^\s]+)?|--help|-h)(?!\S)",
-    re.IGNORECASE,
 )
 _GIT_PUSH_PROTECTED_BRANCH_RE = re.compile(
     _COMMAND_PREFIX_RE
