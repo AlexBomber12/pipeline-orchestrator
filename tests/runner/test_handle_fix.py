@@ -69,6 +69,115 @@ def test_handle_fix_posts_codex_review_after_push(
     assert any("Posted @codex review on PR #77" in e["event"] for e in runner.state.history)
 
 
+def test_fix_post_coder_guardrail_violation_transitions_to_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "fix_review_async",
+        h._async_cli_result(0, "gh repo create octo/demo\n", ""),
+    )
+    transition_calls: list[tuple[str, str | None]] = []
+    posted: list[tuple[str, int, str]] = []
+
+    async def fake_transition_to_error(
+        message: str,
+        **kwargs: object,
+    ) -> None:
+        transition_calls.append((message, kwargs.get("log_prefix")))  # type: ignore[arg-type]
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-019")
+    monkeypatch.setattr(runner, "_transition_to_error", fake_transition_to_error)
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
+
+    asyncio.run(runner.handle_fix())
+
+    assert transition_calls
+    assert transition_calls[0][0].startswith("GUARDRAIL: repo_create:")
+    assert transition_calls[0][1] == "[FIX]"
+    assert posted == []
+
+
+def test_fix_post_coder_guardrail_violation_scans_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "fix_review_async",
+        h._async_cli_result(0, "ordinary stdout\n", "++ gh repo create octo/demo\n"),
+    )
+    transition_calls: list[str] = []
+    posted: list[tuple[str, int, str]] = []
+
+    async def fake_transition_to_error(
+        message: str,
+        **kwargs: object,
+    ) -> None:
+        transition_calls.append(message)
+
+    def fake_post(repo: str, number: int, body: str) -> None:
+        posted.append((repo, number, body))
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-019")
+    monkeypatch.setattr(runner, "_transition_to_error", fake_transition_to_error)
+    monkeypatch.setattr("src.github.comments.post_comment", fake_post)
+
+    asyncio.run(runner.handle_fix())
+
+    assert transition_calls
+    assert transition_calls[0].startswith("GUARDRAIL: repo_create:")
+    assert posted == []
+
+
+def test_fix_post_coder_guardrail_violation_honors_deferred_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "fix_review_async",
+        h._async_cli_result(0, "gh repo create octo/demo\n", ""),
+    )
+    transition_calls: list[str] = []
+
+    async def fake_transition_to_error(
+        message: str,
+        **kwargs: object,
+    ) -> None:
+        transition_calls.append(message)
+        runner.state.state = PipelineState.ERROR
+        runner.state.error_message = message
+
+    async def stale_stop_monitor(
+        _cli_task: asyncio.Task[tuple[int, str, str]],
+    ) -> None:
+        return None
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-019")
+    runner.redis.store[f"control:{runner.name}:stop"] = "1"
+    monkeypatch.setattr(runner, "_transition_to_error", fake_transition_to_error)
+    monkeypatch.setattr(runner, "_monitor_stop_request", stale_stop_monitor)
+
+    asyncio.run(runner.handle_fix())
+
+    assert transition_calls == []
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.user_paused is True
+    assert runner.state.error_message is None
+    assert any("FIX aborted: user stop requested." in e["event"] for e in runner.state.history)
+
+
 def test_handle_fix_injects_ci_logs_when_ci_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
