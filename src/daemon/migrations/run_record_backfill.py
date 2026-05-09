@@ -16,7 +16,9 @@ NULL_CAUSE_VALUE = ""
 
 _EXIT_REASON_TO_OUTCOME_CAUSE: dict[str, tuple[str, str]] = {
     "success_merged": ("merged", NULL_CAUSE_VALUE),
+    "coding_complete": ("superseded", NULL_CAUSE_VALUE),
     "closed_unmerged": ("superseded", NULL_CAUSE_VALUE),
+    "rate_limit": ("paused", NULL_CAUSE_VALUE),
     "crash": ("failed", "CRASH"),
     "timeout": ("failed", "TIMEOUT"),
     "error": ("failed", "INFRA"),
@@ -53,6 +55,17 @@ def _normalize_hash(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return {}
     return {str(_decode(key)): _decode(value) for key, value in raw.items()}
+
+
+async def _key_type(redis_client: Any, key: str | bytes) -> str | None:
+    type_method = getattr(redis_client, "type", None)
+    if type_method is None:
+        return None
+    raw_type = await _maybe_await(type_method(key))
+    decoded = _decode(raw_type)
+    if decoded is None:
+        return None
+    return str(decoded)
 
 
 def _extract_repo_and_record_id(key: str | bytes) -> tuple[str | None, str] | None:
@@ -101,6 +114,12 @@ async def migrate_run_records_to_outcome_cause(
             _warn(log, f"[MIGRATION] Skipping malformed run-record key {key}")
             continue
         repo, record_id = parsed
+
+        redis_type = await _key_type(redis_client, key)
+        if redis_type not in {None, "hash"}:
+            counts["records_skipped_malformed"] += 1
+            _warn(log, f"[MIGRATION] Skipping non-hash run-record key {key}")
+            continue
 
         raw_record = await _maybe_await(redis_client.hgetall(key))
         record = _normalize_hash(raw_record)

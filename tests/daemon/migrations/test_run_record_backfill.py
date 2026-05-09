@@ -10,6 +10,7 @@ from src.daemon.migrations.run_record_backfill import (
     NULL_CAUSE_VALUE,
     RUN_RECORD_TTL_SECONDS,
     _extract_repo_and_record_id,
+    _key_type,
     migrate_run_records_to_outcome_cause,
 )
 
@@ -29,6 +30,9 @@ class _FakeRedis:
 
     async def hgetall(self, key: str | bytes) -> dict[Any, Any]:
         return dict(self.hashes.get(key, {}))
+
+    async def type(self, key: str | bytes) -> bytes:
+        return b"hash" if key in self.hashes else b"none"
 
     async def hset(self, key: str | bytes, mapping: dict[str, str]) -> int:
         self.hashes.setdefault(key, {}).update(mapping)
@@ -116,7 +120,9 @@ async def test_backfill_maps_exit_reason_to_outcome_cause() -> None:
     redis = _FakeRedis()
     expected = {
         "success_merged": ("merged", NULL_CAUSE_VALUE),
+        "coding_complete": ("superseded", NULL_CAUSE_VALUE),
         "closed_unmerged": ("superseded", NULL_CAUSE_VALUE),
+        "rate_limit": ("paused", NULL_CAUSE_VALUE),
         "crash": ("failed", "CRASH"),
         "timeout": ("failed", "TIMEOUT"),
         "error": ("failed", "INFRA"),
@@ -136,8 +142,8 @@ async def test_backfill_maps_exit_reason_to_outcome_cause() -> None:
     )
 
     assert counts == {
-        "records_scanned": 9,
-        "records_migrated": 9,
+        "records_scanned": 11,
+        "records_migrated": 11,
         "records_skipped_already_migrated": 0,
         "records_skipped_malformed": 0,
     }
@@ -301,6 +307,35 @@ async def test_backfill_skips_non_hash_records(
 
     assert counts["records_skipped_malformed"] == 1
     assert any("Skipping malformed run-record hash" in rec.getMessage() for rec in caplog.records)
+
+
+async def test_backfill_skips_typed_non_hash_keys_before_hgetall(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _StringRedis(_FakeRedis):
+        async def type(self, key: str | bytes) -> bytes:
+            return b"string"
+
+        async def hgetall(self, key: str | bytes) -> dict[Any, Any]:
+            raise AssertionError("hgetall should not be called for string keys")
+
+    redis = _StringRedis()
+    redis.hashes["metrics:run:run-string"] = {"task_id": "PR-1"}
+    log = logging.getLogger("test_run_record_backfill")
+
+    with caplog.at_level(logging.WARNING, logger=log.name):
+        counts = await migrate_run_records_to_outcome_cause(redis, log)
+
+    assert counts["records_skipped_malformed"] == 1
+    assert any("Skipping non-hash run-record key" in rec.getMessage() for rec in caplog.records)
+
+
+async def test_key_type_handles_none_response() -> None:
+    class _NoneTypeRedis:
+        async def type(self, key: str) -> None:
+            return None
+
+    assert await _key_type(_NoneTypeRedis(), "metrics:run:missing") is None
 
 
 def test_extract_repo_and_record_id_rejects_non_string_key() -> None:
