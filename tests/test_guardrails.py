@@ -227,6 +227,18 @@ def test_scan_stdout_direct_commit_with_pr_create_help_still_flagged() -> None:
     assert violations[0].category == "direct_commit_main"
 
 
+@pytest.mark.parametrize("web_flag", ["--web", "-w"])
+def test_scan_stdout_direct_commit_with_pr_create_web_still_flagged(
+    web_flag: str,
+) -> None:
+    stdout = f"git commit -m guardrail\ngh pr create {web_flag}\ngit push origin main\n"
+
+    violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "direct_commit_main"
+
+
 def test_scan_stdout_direct_commit_with_pr_create_head_flag_not_flagged() -> None:
     stdout = "git commit -m guardrail\ngh pr create -H user:branch\ngit push origin main\n"
 
