@@ -572,7 +572,10 @@ class FixMixin(BreachMixin):
                 return
             return
         await self._save_cli_log(stdout, stderr, f"FIX FEEDBACK output [{coder_name}]")
-        guardrail_violations = scan_stdout(stdout)
+        guardrail_violations = scan_stdout(
+            stdout,
+            default_branch=self.repo_config.branch,
+        )
         if guardrail_violations:
             guardrail_prefix = "[GUARDRAIL]"
             for violation in guardrail_violations:

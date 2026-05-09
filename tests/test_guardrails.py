@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 
 import pytest
-
 from src.daemon.guardrails import (
     GuardrailViolation,
     _command_tokens_after_git_push,
@@ -11,8 +10,11 @@ from src.daemon.guardrails import (
 )
 
 
-def _categories(stdout: str) -> list[str]:
-    return [violation.category for violation in scan_stdout(stdout)]
+def _categories(stdout: str, *, default_branch: str = "main") -> list[str]:
+    return [
+        violation.category
+        for violation in scan_stdout(stdout, default_branch=default_branch)
+    ]
 
 
 def test_scan_stdout_gh_repo_create_returns_repo_create_violation() -> None:
@@ -32,6 +34,7 @@ def test_scan_stdout_gh_repo_create_returns_repo_create_violation() -> None:
         ("gh repo delete AlexBomber12/test", ["repo_delete"]),
         ("git push --force origin HEAD:main", ["force_push_main"]),
         ("git push --force-with-lease origin refs/heads/main", ["force_push_main"]),
+        ("git push origin +HEAD:main", ["force_push_main"]),
         ("I force-pushed to main during cleanup", ["force_push_main"]),
         ("git push origin :main", ["branch_delete_main"]),
         ("git push upstream :main", ["branch_delete_main"]),
@@ -62,6 +65,8 @@ def test_scan_stdout_forbidden_patterns(
         "git commit -m foo\npython -m pytest -q",
         "git push origin --delete feature/thing",
         "git push upstream :feature/thing",
+        "git commit -m foo\ngit push origin -o main feature/thing",
+        "git commit -m foo\ngit push origin --push-option main feature/thing",
         "git commit -m foo\ngit push --repo origin main",
     ],
 )
@@ -76,6 +81,36 @@ def test_scan_stdout_multiple_violations_returns_all() -> None:
         "repo_create",
         "force_push_main",
     ]
+
+
+def test_scan_stdout_uses_configured_default_branch() -> None:
+    stdout = "\n".join(
+        [
+            "git push --force origin HEAD:trunk",
+            "git push upstream --delete refs/heads/trunk",
+            "git commit -m foo",
+            "git push origin trunk",
+        ]
+    )
+
+    assert _categories(stdout, default_branch="trunk") == [
+        "force_push_main",
+        "branch_delete_main",
+        "direct_commit_main",
+    ]
+
+
+def test_scan_stdout_configured_default_branch_does_not_flag_main() -> None:
+    stdout = "\n".join(
+        [
+            "git push --force origin HEAD:main",
+            "git push upstream --delete refs/heads/main",
+            "git commit -m foo",
+            "git push origin main",
+        ]
+    )
+
+    assert _categories(stdout, default_branch="trunk") == []
 
 
 def test_scan_stdout_negation_does_not_suppress() -> None:
