@@ -186,6 +186,16 @@ def test_scan_stdout_force_push_tracks_checkout_away_from_main_before_push() -> 
     assert scan_stdout(stdout, current_branch="main") == []
 
 
+def test_scan_stdout_force_push_tracks_checkout_before_delayed_stderr_feedback() -> None:
+    stdout_then_stderr = (
+        "git checkout feature/xyz\n"
+        "git push --force origin\n"
+        "Switched to branch 'feature/xyz'\n"
+    )
+
+    assert scan_stdout(stdout_then_stderr, current_branch="main") == []
+
+
 def test_scan_stdout_force_push_does_not_treat_checkout_path_as_branch() -> None:
     stdout = "git checkout README.md\ngit push --force origin\n"
 
@@ -197,6 +207,16 @@ def test_scan_stdout_force_push_does_not_treat_checkout_path_as_branch() -> None
 
 def test_scan_stdout_force_push_discards_checkout_path_before_switch() -> None:
     stdout = "git checkout README.md\ngit switch feature/xyz\ngit push --force origin\n"
+
+    assert scan_stdout(stdout, current_branch="main") == []
+
+
+def test_scan_stdout_force_push_tracks_confirmed_checkout_pathlike_branch() -> None:
+    stdout = (
+        "git checkout release/v1.2\n"
+        "Switched to branch 'release/v1.2'\n"
+        "git push --force origin\n"
+    )
 
     assert scan_stdout(stdout, current_branch="main") == []
 

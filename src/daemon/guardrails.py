@@ -206,13 +206,22 @@ def _branch_after_command(
         return (previous_branch or current_branch, False)
     checkout_target = match.group("checkout_target")
     if checkout_target:
-        return (checkout_target, checkout_target != _PROTECTED_DEFAULT_BRANCH)
+        return (checkout_target, _looks_like_checkout_pathspec(checkout_target))
     branch = (
         match.group("branch")
         or match.group("switch_create")
         or match.group("checkout_create")
     )
     return (branch, False)
+
+
+def _looks_like_checkout_pathspec(target: str) -> bool:
+    return (
+        target in {".", ".."}
+        or target.startswith(("./", "../", "/", ":"))
+        or target.endswith("/")
+        or "." in target
+    )
 
 
 def _apply_branch_change(
