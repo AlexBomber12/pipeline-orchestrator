@@ -171,7 +171,11 @@ def _git_push_line_info(line: str) -> tuple[bool, bool]:
                 has_non_branch_mode = True
             continue
         positionals.append(token)
-    return has_force_flag, not has_non_branch_mode and len(positionals) <= 1
+    has_current_branch_refspec = len(positionals) >= 2 and all(
+        refspec in {"HEAD", "+HEAD"} for refspec in positionals[1:]
+    )
+    has_no_explicit_refspec = len(positionals) <= 1 or has_current_branch_refspec
+    return has_force_flag, not has_non_branch_mode and has_no_explicit_refspec
 
 
 def _branch_after_command(line: str, current_branch: str | None) -> str | None:

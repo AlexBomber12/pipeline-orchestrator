@@ -182,6 +182,13 @@ def test_scan_stdout_force_push_tracks_checkout_away_from_main_before_push() -> 
     assert scan_stdout(stdout, current_branch="main") == []
 
 
+def test_scan_stdout_force_push_main_current_branch_head_refspec_flagged() -> None:
+    violations = scan_stdout("git push --force origin HEAD\n", current_branch="main")
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
 def test_scan_stdout_force_push_tags_mode_on_main_not_flagged() -> None:
     stdout = "git push --force --tags\n"
 
@@ -336,6 +343,15 @@ def test_scan_stdout_direct_commit_tracks_switch_away_from_main_before_push() ->
     stdout = "git commit -m guardrail\ngit switch feature/xyz\ngit push origin\n"
 
     assert scan_stdout(stdout, current_branch="main") == []
+
+
+def test_scan_stdout_direct_commit_main_current_branch_head_refspec_flagged() -> None:
+    stdout = "git commit -m guardrail\ngit push origin HEAD\n"
+
+    violations = scan_stdout(stdout, current_branch="main")
+
+    assert len(violations) == 1
+    assert violations[0].category == "direct_commit_main"
 
 
 def test_scan_stdout_direct_commit_tags_mode_on_main_not_flagged() -> None:
