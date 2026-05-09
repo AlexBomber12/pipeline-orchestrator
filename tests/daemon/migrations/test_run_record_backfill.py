@@ -67,6 +67,7 @@ class _FakeRedis:
 class _SyncRedis:
     def __init__(self, hashes: dict[str | bytes, dict[Any, Any]]) -> None:
         self.hashes = hashes
+        self.strings: dict[str | bytes, str] = {}
         self.sets: dict[str, set[str]] = {}
         self.ttls: dict[str | bytes, int] = {}
 
@@ -86,6 +87,12 @@ class _SyncRedis:
     def hset(self, key: str | bytes, mapping: dict[str, str]) -> int:
         self.hashes[key].update(mapping)
         return len(mapping)
+
+    def set(self, key: str | bytes, value: str, ex: int | None = None) -> bool:
+        self.strings[key] = value
+        if ex is not None:
+            self.ttls[key] = ex
+        return True
 
     def sadd(self, key: str, member: str) -> int:
         self.sets.setdefault(key, set()).add(member)
@@ -201,6 +208,19 @@ async def test_backfill_populates_task_runs_index() -> None:
     assert redis.ttls["metrics:task_runs:repo:PR-1"] == RUN_RECORD_TTL_SECONDS
 
 
+async def test_backfill_copies_legacy_repo_key_to_canonical_record_key() -> None:
+    redis = _FakeRedis()
+    _record(redis, "repo", "run-a", "success_merged", task_id="PR-1")
+
+    await migrate_run_records_to_outcome_cause(redis, logging.getLogger(__name__))
+
+    payload = json.loads(str(redis.strings["metrics:run:run-a"]))
+    assert payload["outcome"] == "merged"
+    assert payload["cause"] is None
+    assert payload["task_id"] == "PR-1"
+    assert redis.ttls["metrics:run:run-a"] == RUN_RECORD_TTL_SECONDS
+
+
 async def test_backfill_supports_canonical_run_record_keys() -> None:
     redis = _FakeRedis()
     key = _canonical_record(
@@ -303,9 +323,9 @@ async def test_backfill_idempotent_skip_already_migrated() -> None:
 
     assert first["records_migrated"] == 1
     assert second == {
-        "records_scanned": 1,
+        "records_scanned": 2,
         "records_migrated": 0,
-        "records_skipped_already_migrated": 1,
+        "records_skipped_already_migrated": 2,
         "records_skipped_non_hash": 0,
         "records_skipped_malformed": 0,
     }
@@ -326,7 +346,7 @@ async def test_backfill_skips_malformed_records(
     assert any("missing task_id" in rec.getMessage() for rec in caplog.records)
 
 
-async def test_backfill_unknown_exit_reason_defaults_to_failed_unknown(
+async def test_backfill_unknown_exit_reason_defaults_to_failed_crash(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     redis = _FakeRedis()
@@ -338,8 +358,19 @@ async def test_backfill_unknown_exit_reason_defaults_to_failed_unknown(
 
     assert counts["records_migrated"] == 1
     assert redis.hashes[key]["outcome"] == "failed"
-    assert redis.hashes[key]["cause"] == NULL_CAUSE_VALUE
+    assert redis.hashes[key]["cause"] == "CRASH"
     assert any("Unknown run-record exit_reason" in rec.getMessage() for rec in caplog.records)
+
+
+async def test_backfill_unknown_string_exit_reason_keeps_failed_cause() -> None:
+    redis = _FakeRedis()
+    key = _string_record(redis, "run-weird-json", "weird")
+
+    await migrate_run_records_to_outcome_cause(redis, logging.getLogger(__name__))
+
+    payload = json.loads(str(redis.strings[key]))
+    assert payload["outcome"] == "failed"
+    assert payload["cause"] == "CRASH"
 
 
 async def test_backfill_supports_sync_redis_bytes_and_callable_logger() -> None:

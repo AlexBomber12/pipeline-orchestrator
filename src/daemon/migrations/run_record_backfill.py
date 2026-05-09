@@ -71,6 +71,11 @@ def _normalize_json_record(raw: Any) -> dict[str, Any]:
     return {str(key): value for key, value in record.items()}
 
 
+def _apply_outcome_cause(record: dict[str, Any], outcome: str, cause: str) -> None:
+    record["outcome"] = outcome
+    record["cause"] = cause if outcome == "failed" else None
+
+
 async def _key_type(redis_client: Any, key: str | bytes) -> str | None:
     type_method = getattr(redis_client, "type", None)
     if type_method is None:
@@ -103,9 +108,8 @@ async def _write_outcome_cause(
     outcome: str,
     cause: str,
 ) -> None:
+    _apply_outcome_cause(record, outcome, cause)
     if storage == "string":
-        record["outcome"] = outcome
-        record["cause"] = cause or None
         await _maybe_await(
             redis_client.set(
                 key,
@@ -117,6 +121,24 @@ async def _write_outcome_cause(
 
     await _maybe_await(
         redis_client.hset(key, mapping={"outcome": outcome, "cause": cause})
+    )
+
+
+async def _copy_legacy_record_to_canonical_key(
+    redis_client: Any,
+    key: str | bytes,
+    record_id: str,
+    record: dict[str, Any],
+) -> None:
+    canonical_key = f"metrics:run:{record_id}"
+    if _decode(key) == canonical_key:
+        return
+    await _maybe_await(
+        redis_client.set(
+            canonical_key,
+            json.dumps(record, sort_keys=True),
+            ex=RUN_RECORD_TTL_SECONDS,
+        )
     )
 
 
@@ -192,7 +214,7 @@ async def migrate_run_records_to_outcome_cause(
             exit_reason = str(record.get("exit_reason") or "")
             mapped = _EXIT_REASON_TO_OUTCOME_CAUSE.get(exit_reason)
             if mapped is None:
-                mapped = ("failed", NULL_CAUSE_VALUE)
+                mapped = ("failed", "CRASH")
                 _warn(
                     log,
                     "[MIGRATION] Unknown run-record exit_reason "
@@ -209,6 +231,12 @@ async def migrate_run_records_to_outcome_cause(
             )
             counts["records_migrated"] += 1
 
+        await _copy_legacy_record_to_canonical_key(
+            redis_client,
+            key,
+            record_id,
+            record,
+        )
         task_runs_key = f"metrics:task_runs:{repo_scope}:{task_id}"
         await _maybe_await(redis_client.sadd(task_runs_key, record_id))
         await _maybe_await(
