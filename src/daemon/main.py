@@ -40,6 +40,9 @@ from src.coders.codex import CodexPlugin
 from src.config import AppConfig, RepoConfig, load_config, normalize_repo_url
 from src.daemon.config_watcher import watch_config_file_changes
 from src.daemon.migrations.hung_to_idle import migrate_hung_to_idle_on_startup
+from src.daemon.migrations.run_record_backfill import (
+    migrate_run_records_to_outcome_cause,
+)
 from src.daemon.runner import PipelineRunner
 from src.events.wake import repo_from_channel, subscribe_wake
 from src.models import PipelineState
@@ -689,6 +692,14 @@ async def main() -> None:
     logger.info(
         "[MIGRATION] HUNG to IDLE startup migration rewrote %d repo(s)",
         migrated_hung_repos,
+    )
+    run_record_backfill_counts = await migrate_run_records_to_outcome_cause(
+        redis_client,
+        logger,
+    )
+    logger.info(
+        "[MIGRATION] run-record outcome/cause backfill counts: %s",
+        run_record_backfill_counts,
     )
 
     logger.info(
