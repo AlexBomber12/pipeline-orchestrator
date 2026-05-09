@@ -44,11 +44,28 @@ _ETAG_PAGINATED_DEFAULT_PER_PAGE = 30
 
 
 _HTTP_STATUS_RE = re.compile(r"^HTTP/\S+\s+(\d{3})", re.MULTILINE)
+_HTTP_304_PATTERN = re.compile(r"\bHTTP\s+304\b")
 
 
 def clear_etag_cache() -> None:
     """Clear the ETag conditional-request cache (used in tests)."""
     _etag_cache.clear()
+
+
+def _is_http_304_error(exc: Exception) -> bool:
+    """Detect whether a RuntimeError from run_gh represents HTTP 304 success.
+
+    gh CLI exits with code 1 on any non-2xx response when --include is
+    passed, with stderr containing the status line. 304 Not Modified is
+    the desired outcome of a conditional read (zero rate-limit cost),
+    but the non-zero exit makes it indistinguishable from a real failure
+    without inspecting the message.
+
+    Returns True iff the exception message contains the canonical
+    "HTTP 304" token gh emits. Anchored on word boundaries so substrings
+    like "1304" or "HTTP 3040" do not falsely match.
+    """
+    return bool(_HTTP_304_PATTERN.search(str(exc)))
 
 
 def _etag_cache_put(path: str, etag: str, payload: object) -> None:
@@ -121,7 +138,15 @@ def _etag_get(path: str) -> object:
     if cached is not None:
         args.extend(["-H", f"If-None-Match: {cached[0]}"])
 
-    raw = gh_runner.run_gh(args)
+    try:
+        raw = gh_runner.run_gh(args)
+    except RuntimeError as exc:  # pragma: no cover - gh 304 stderr path needs real gh
+        if _is_http_304_error(exc):
+            if cached is not None:
+                _etag_cache.move_to_end(path)
+                return cached[1]
+            return _etag_get_no_cache(path)
+        raise
 
     # When stubbed (tests mock ``run_gh`` to return a pre-parsed object or a
     # bare ``--jq`` scalar), bypass ``--include`` parsing and surface the
