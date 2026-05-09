@@ -61,6 +61,13 @@ def test_scan_stdout_repo_create_pattern_accepts_shell_prompts() -> None:
     ]
 
 
+def test_scan_stdout_repo_create_pattern_accepts_repeated_xtrace_prefix() -> None:
+    violations = scan_stdout("++ gh repo create octo/demo\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "repo_create"
+
+
 def test_scan_stdout_no_match_returns_empty_list() -> None:
     stdout = (
         "python -m ruff check .\n"
