@@ -121,10 +121,6 @@ _GH_PR_CREATE_RE = re.compile(
     _COMMAND_PREFIX_RE + r"gh[^\S\r\n]+pr[^\S\r\n]+create\b",
     re.IGNORECASE,
 )
-_GH_PR_CREATE_INLINE_RE = re.compile(
-    r"\bgh[^\S\r\n]+pr[^\S\r\n]+create\b",
-    re.IGNORECASE,
-)
 _GH_PR_CREATE_NO_CREATE_FLAG_RE = re.compile(
     r"(?<!\S)(?:--dry-run(?:=[^\s]+)?|--help|-h)(?!\S)",
 )
@@ -330,10 +326,39 @@ def _is_pr_create_command(line: str) -> bool:
     )
 
 
-def _contains_pr_create_command(text: str) -> bool:
-    return bool(_GH_PR_CREATE_INLINE_RE.search(text)) and not bool(
-        _GH_PR_CREATE_NO_CREATE_FLAG_RE.search(text)
-    )
+def _split_shell_segments(text: str) -> list[str]:
+    segments: list[str] = []
+    start = 0
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if char == "\\":
+            escaped = True
+            index += 1
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char == ";" or text.startswith("&&", index):
+            segments.append(text[start:index])
+            index += 2 if char == "&" else 1
+            start = index
+            continue
+        index += 1
+    segments.append(text[start:])
+    return segments
 
 
 def _line_excerpt(coder_stdout: str, start: int, end: int) -> str:
@@ -367,33 +392,33 @@ def _detect_direct_commit_main(
             continue
 
         same_line_after_commit = commit_line[commit_match.end() :]
-        same_line_push_match = re.search(r"\bgit[^\S\r\n]+push\b.*", same_line_after_commit)
-        same_line_push = (
-            same_line_push_match.group(0) if same_line_push_match else ""
-        )
-        same_line_before_push = (
-            same_line_after_commit[: same_line_push_match.start()]
-            if same_line_push_match
-            else ""
-        )
-        if (
-            not _contains_pr_create_command(same_line_before_push)
-            and (
-                _GIT_PUSH_PROTECTED_BRANCH_RE.search(same_line_push)
+        same_line_pr_created = False
+        same_line_violation = False
+        for same_line_segment in _split_shell_segments(same_line_after_commit)[1:]:
+            same_line_command = same_line_segment.strip()
+            if _is_pr_create_command(same_line_command):
+                same_line_pr_created = True
+                continue
+            if same_line_pr_created:
+                continue
+            if (
+                _GIT_PUSH_PROTECTED_BRANCH_RE.search(same_line_command)
                 or _is_current_branch_push_to_protected(
-                    same_line_push,
+                    same_line_command,
                     branch_by_line.get(commit_index),
                 )
-            )
-        ):
-            violations.append(
-                GuardrailViolation(
-                    tier=1,
-                    category=_DIRECT_COMMIT_CATEGORY,
-                    excerpt=commit_line.strip()[:_EXCERPT_LIMIT],
-                    rule=_TIER1_RULES[_DIRECT_COMMIT_CATEGORY],
+            ):
+                violations.append(
+                    GuardrailViolation(
+                        tier=1,
+                        category=_DIRECT_COMMIT_CATEGORY,
+                        excerpt=commit_line.strip()[:_EXCERPT_LIMIT],
+                        rule=_TIER1_RULES[_DIRECT_COMMIT_CATEGORY],
+                    )
                 )
-            )
+                same_line_violation = True
+                break
+        if same_line_violation:
             continue
 
         for push_index in range(commit_index + 1, len(lines)):

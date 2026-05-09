@@ -384,10 +384,31 @@ def test_scan_stdout_direct_commit_same_line_no_refspec_push_flagged() -> None:
     assert violations[0].category == "direct_commit_main"
 
 
+def test_scan_stdout_direct_commit_same_line_ignores_push_in_commit_message() -> None:
+    stdout = 'git commit -m "docs: mention git push origin main"\n'
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_direct_commit_same_line_ignores_escaped_separator() -> None:
+    stdout = r"git commit -m docs\; git push origin main" "\n"
+
+    assert scan_stdout(stdout) == []
+
+
 def test_scan_stdout_direct_commit_same_line_pr_create_before_push_not_flagged() -> None:
     stdout = "git commit -m guardrail && gh pr create --fill && git push origin main\n"
 
     assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_direct_commit_same_line_pr_create_in_message_still_flagged() -> None:
+    stdout = 'git commit -m "mention gh pr create" && git push origin main\n'
+
+    violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "direct_commit_main"
 
 
 def test_scan_stdout_direct_commit_same_line_pr_create_dry_run_still_flagged() -> None:
