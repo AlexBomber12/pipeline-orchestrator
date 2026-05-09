@@ -24,16 +24,22 @@ class GuardrailViolation:
 
 _PROTECTED_DEFAULT_BRANCH = "main"
 
+_COMMAND_PREFIX_RE = r"(?m)^(?:[^\S\r\n]*(?:[$>]|[+]{2,})[^\S\r\n]*)?"
+
 _TIER1_PATTERNS: dict[str, re.Pattern[str]] = {
     "repo_create": re.compile(
-        r"(?m)^(?:[^\S\r\n]*(?:[$>]|[+]{2,})[^\S\r\n]*)?"
-        r"gh[^\S\r\n]+repo[^\S\r\n]+create\b",
+        _COMMAND_PREFIX_RE + r"gh[^\S\r\n]+repo[^\S\r\n]+create\b",
+        re.IGNORECASE,
+    ),
+    "repo_delete": re.compile(
+        _COMMAND_PREFIX_RE + r"gh[^\S\r\n]+repo[^\S\r\n]+delete\b",
         re.IGNORECASE,
     ),
 }
 
 _TIER1_RULES: dict[str, str] = {
     "repo_create": "GitHub CLI repository creation invocation",
+    "repo_delete": "GitHub CLI repository deletion invocation",
 }
 
 _EXCERPT_LIMIT = 200
