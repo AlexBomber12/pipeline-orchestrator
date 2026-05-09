@@ -36,6 +36,16 @@ def test_validate_returns_violations_alongside_schema():
     )
 
 
+def test_validate_task_spec_still_emits_agents_violations():
+    """Upload-time validation still invokes the AGENTS anti-pattern scan."""
+    from src.mcp.tools.functional import validate_task_spec
+
+    body = _VALID_SPEC + "\nRun `gh pr create --draft` to open the PR.\n"
+    result = validate_task_spec(body)
+
+    assert result["agents_violations"]
+
+
 def test_valid_field_false_when_violations_present():
     """``valid`` is False whenever any violation surfaces."""
     from src.mcp.tools.functional import validate_task_spec
