@@ -2388,6 +2388,7 @@ def test_repo_card_buttons_block_positioned_top_right(
     body = _render_repo_list_body(monkeypatch)
 
     assert 'class="relative rounded-lg border bg-surface-2 p-4' in body
+    assert "mb-3 flex flex-col gap-3 pr-40" in body
     assert (
         'class="absolute top-0 right-0 flex flex-nowrap items-center '
         'justify-end gap-2 p-4"'
