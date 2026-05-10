@@ -877,6 +877,11 @@ def test_scan_force_merge_pr_commit_guidance_not_flagged():
     assert scan_for_conflicts(body) == []
 
 
+def test_scan_force_merge_qualified_commit_guidance_not_flagged():
+    body = "Use --no-ff to force merge feature branch commits for traceability."
+    assert scan_for_conflicts(body) == []
+
+
 def test_multiple_violations_all_returned():
     body = (
         "Step 1: gh pr create --draft --title 'wip'.\n"

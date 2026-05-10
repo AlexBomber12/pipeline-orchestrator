@@ -311,7 +311,7 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
         re.compile(
             r"\b(?:"
             r"force(?:-|\s+)merge\b"
-            r"(?!\s+(?:PR\s+)?commits?\b)"
+            r"(?!\s+(?:(?:[\w-]+\s+){0,4})?commits?\b)"
             r"|"
             r"merge\s+(?:despite|with)\s+(?:red|failing|broken|stale)\s+(?:CI|checks?|tests?)"
             r")\b",
