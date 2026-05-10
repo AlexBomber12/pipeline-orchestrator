@@ -25,8 +25,22 @@ class GuardrailViolation:
 
 _PROTECTED_DEFAULT_BRANCH = "main"
 _PROTECTED_DEFAULT_BRANCH_RE = re.escape(_PROTECTED_DEFAULT_BRANCH)
+_PROTECTED_BRANCH_REFSPEC_RE = (
+    rf"(?:[^\s:,;|&#]+:)?(?:refs/heads/)?{_PROTECTED_DEFAULT_BRANCH_RE}"
+    r"(?![\w/:-]|\.\w)"
+)
+_PROTECTED_BRANCH_POSITIONAL_RE = (
+    r"(?:[ \t]+[^\s,;|&#]+)*?"
+    r"[ \t]+(?![-+])[^\s,;|&#]+"
+    r"(?:[ \t]+[^\s,;|&#]+)*?"
+    r"[ \t]+"
+    rf"{_PROTECTED_BRANCH_REFSPEC_RE}"
+)
 
 _COMMAND_PREFIX_RE = r"(?m)^(?:[^\S\r\n]*(?:[$>]|[+]{2,})[^\S\r\n]*)?"
+_GIT_PUSH_NOT_DRY_RUN_RE = (
+    r"(?![^\r\n]*[ \t]+(?:--dry-run|-(?!-)[A-Za-z]*n[A-Za-z]*)(?![\w-]))"
+)
 _SHELL_WORD_RE = r"(?:'[^'\r\n]*'|\"[^\"\r\n]*\"|[^'\"\s\r\n]+)"
 _SHELL_ENV_ASSIGNMENT_RE = rf"[A-Za-z_][A-Za-z0-9_]*={_SHELL_WORD_RE}"
 _SHELL_ENV_OPTION_RE = (
@@ -91,12 +105,36 @@ _TIER1_PATTERNS: dict[str, re.Pattern[str]] = {
         _COMMAND_PREFIX_RE + r"gh[^\S\r\n]+repo[^\S\r\n]+delete\b",
         re.IGNORECASE,
     ),
+    "force_push_main": re.compile(
+        _COMMAND_PREFIX_RE
+        + r"git push\b"
+        + _GIT_PUSH_NOT_DRY_RUN_RE
+        + r"(?:"
+        r"(?="
+        r"(?:[ \t]+[^\s,;|&#]+)*?"
+        r"[ \t]+"
+        r"(?:--force(?:-with-lease(?:=[^\s,;|&#]*)?)?|-f)"
+        r"(?![\w-])"
+        r")"
+        r"(?="
+        rf"{_PROTECTED_BRANCH_POSITIONAL_RE}"
+        r")"
+        r"|"
+        r"(?="
+        r"(?:[ \t]+[^\s,;|&#]+)*?"
+        r"[ \t]+"
+        rf"\+{_PROTECTED_BRANCH_REFSPEC_RE}"
+        r")"
+        r")",
+        re.IGNORECASE,
+    ),
 }
 
 _TIER1_RULES: dict[str, str] = {
     "repo_create": "GitHub CLI repository creation invocation",
     "repo_delete": "GitHub CLI repository deletion invocation",
     "branch_delete_main": "Git push deletion targeting protected default branch",
+    "force_push_main": "Git force-push targeting protected default branch",
 }
 
 _EXCERPT_LIMIT = 200

@@ -327,6 +327,51 @@ def test_scan_stdout_branch_delete_main_prose_not_flagged() -> None:
     assert scan_stdout(stdout) == []
 
 
+def test_scan_stdout_force_push_main_standard_form() -> None:
+    violations = scan_stdout("git push --force origin main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
+def test_scan_stdout_force_with_lease_main_flagged() -> None:
+    violations = scan_stdout("git push --force-with-lease origin main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
+def test_scan_stdout_force_push_main_plus_refspec_form() -> None:
+    violations = scan_stdout("git push origin +main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
+def test_scan_stdout_force_push_to_feature_branch_not_flagged() -> None:
+    stdout = "git push --force origin feature-xyz\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_remote_named_main_not_misclassified() -> None:
+    stdout = "git push main feature-branch\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_force_push_main_dry_run_not_flagged() -> None:
+    stdout = "git push --force --dry-run origin main\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_force_push_main_prose_not_flagged() -> None:
+    stdout = "A force push to main would be rejected by policy.\n"
+
+    assert scan_stdout(stdout) == []
+
+
 def test_scan_stdout_repo_create_pattern_allows_horizontal_whitespace() -> None:
     violations = scan_stdout("$ gh\trepo\tcreate octo/demo\n")
 
