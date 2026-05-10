@@ -210,7 +210,7 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
             r"(?:(?:the|a)\s+)?(?:PR|pull request)\s+as\s+(?:a\s+)?draft\b"
             r"|"
             r"(?:it\s+)?as\s+(?:a\s+)?draft(?:\s+(?:PR|pull request))?"
-            r"(?=\s*(?:[,.;!?\n]|$|\bthen\b|\band\b|\bbefore\b|\bcontinue\b))"
+            r"(?=\s*(?:[,.;!?\n]|$|\bthen\b|\band\b|\bbefore\b|\bcontinue\b|\bto\b))"
             r")",
             re.IGNORECASE,
         ),

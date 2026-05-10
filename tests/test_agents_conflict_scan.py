@@ -207,6 +207,13 @@ def test_scan_flags_open_as_draft_before_continuation():
     assert "draft_pr_open_as" in types
 
 
+def test_scan_flags_open_as_draft_pr_with_to_continuation():
+    body = "Open as draft pull request to collect feedback."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_open_as" in types
+
+
 def test_scan_flags_open_pull_request_as_a_draft():
     body = "Open the pull request as a draft."
     violations = scan_for_conflicts(body)
