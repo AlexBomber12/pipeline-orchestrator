@@ -122,6 +122,17 @@ def test_scan_stdout_branch_delete_with_option_value_still_flags_main_ref() -> N
     assert violations[0].category == "branch_delete_main"
 
 
+def test_scan_stdout_branch_delete_push_option_value_not_dry_run() -> None:
+    violations = scan_stdout("git push -o -notify --delete origin main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_push_option_value_not_delete_flag() -> None:
+    assert scan_stdout("git push -o -debug origin main\n") == []
+
+
 @pytest.mark.parametrize("delete_flag", ["--delete", "-d"])
 def test_scan_stdout_branch_delete_without_ref_not_flagged(delete_flag: str) -> None:
     stdout = f"git push {delete_flag} main\n"

@@ -31,6 +31,10 @@ _GIT_PUSH_COMMAND_RE = re.compile(
     _COMMAND_PREFIX_RE + r"git[^\S\r\n]+push\b(?P<args>[^\r\n]*)",
     re.IGNORECASE,
 )
+_PUSH_VALUE_OPTIONS = {"-o", "--push-option", "--receive-pack", "--exec"}
+_PUSH_VALUE_OPTION_PREFIXES = tuple(
+    f"{option}=" for option in _PUSH_VALUE_OPTIONS if option != "-o"
+)
 
 _TIER1_PATTERNS: dict[str, re.Pattern[str]] = {
     "repo_create": re.compile(
@@ -106,19 +110,23 @@ def _is_repository_token(token: str) -> bool:
     )
 
 
-def _push_positionals(tokens: list[str]) -> list[str]:
-    positionals: list[str] = []
+def _push_tokens_without_option_values(tokens: list[str]) -> list[str]:
+    filtered: list[str] = []
     skip_next = False
-    value_options = {"-o", "--push-option", "--receive-pack", "--exec"}
-    value_option_prefixes = tuple(f"{option}=" for option in value_options if option != "-o")
     for token in tokens:
         if skip_next:
             skip_next = False
             continue
-        if token in value_options:
+        filtered.append(token)
+        if token in _PUSH_VALUE_OPTIONS:
             skip_next = True
-            continue
-        if token.startswith(value_option_prefixes):
+    return filtered
+
+
+def _push_positionals(tokens: list[str]) -> list[str]:
+    positionals: list[str] = []
+    for token in _push_tokens_without_option_values(tokens):
+        if token.startswith(_PUSH_VALUE_OPTION_PREFIXES):
             continue
         if _is_positional_push_token(token):
             positionals.append(token)
@@ -126,9 +134,12 @@ def _push_positionals(tokens: list[str]) -> list[str]:
 
 
 def _delete_flag_targets_protected_branch(tokens: list[str]) -> bool:
-    if not any(_is_delete_token(token) for token in tokens):
+    filtered_tokens = _push_tokens_without_option_values(tokens)
+    if not any(_is_delete_token(token) for token in filtered_tokens):
         return False
-    positional = _push_positionals(tokens)
+    positional = [
+        token for token in filtered_tokens if _is_positional_push_token(token)
+    ]
     if len(positional) < 2:
         return False
     return any(_is_protected_branch_ref(ref) for ref in positional[1:])
@@ -147,7 +158,8 @@ def _scan_branch_delete_main(coder_stdout: str) -> list[GuardrailViolation]:
     violations: list[GuardrailViolation] = []
     for match in _GIT_PUSH_COMMAND_RE.finditer(coder_stdout):
         tokens = _push_args_tokens(match.group("args"))
-        if any(_is_dry_run_token(token) for token in tokens):
+        option_value_filtered_tokens = _push_tokens_without_option_values(tokens)
+        if any(_is_dry_run_token(token) for token in option_value_filtered_tokens):
             continue
         if not (
             _colon_refspec_targets_protected_branch(tokens)
