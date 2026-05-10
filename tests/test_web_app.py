@@ -407,6 +407,7 @@ def test_global_spinner_present_on_dashboard(
     assert response.status_code == 200
     assert 'id="global-spinner"' in response.text
     assert "htmx:beforeRequest" in response.text
+    assert "htmx:sendError" not in response.text
     assert "body.htmx-request #global-spinner" in response.text
 
 

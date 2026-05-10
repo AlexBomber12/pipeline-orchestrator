@@ -770,10 +770,6 @@
                 syncSpinner();
             });
 
-            document.body.addEventListener('htmx:sendError', function () {
-                activeRequests = Math.max(0, activeRequests - 1);
-                syncSpinner();
-            });
         })();
     </script>
 
