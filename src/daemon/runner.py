@@ -475,7 +475,10 @@ class PipelineRunner(
         await error_rate_tracker.mark_auto_pause(self.redis, self.name)
         self.state.state = PipelineState.PAUSED
         self.state.user_paused = True
-        self.state.error_message = None
+        await self._clear_error_message_on_recovery(
+            log_prefix="[AUTO-PAUSE]",
+            reason="error-rate threshold auto-pause",
+        )
         self.log_event(
             f"[AUTO-PAUSE] ERROR rate exceeded threshold; manual Resume "
             f"required ({reason})."
@@ -1208,6 +1211,40 @@ class PipelineRunner(
                 record.task_id,
                 exc,
             )
+
+    async def _clear_error_message_on_recovery(
+        self,
+        *,
+        log_prefix: str,
+        reason: str,
+        publish: bool = False,
+    ) -> None:
+        """Atomic clear of ``state.error_message`` at recovery transitions.
+
+        Logs the clearing event so operators can reconstruct dashboard
+        state changes from the event log. Mirrors ``_transition_to_error``:
+        every ``error_message`` lifecycle write goes through a primitive
+        with logging.
+
+        Args:
+            log_prefix: prefix matching the calling handler.
+            reason: human-readable cause of the recovery.
+            publish: when True, immediately publishes the cleared state.
+        """
+        if self.state.error_message is None:
+            return
+        previous = self.state.error_message
+        self.state.error_message = None
+        self.log_event(
+            f"{log_prefix} cleared error_message ({reason}): "
+            f"{previous[:120]}"
+        )
+        if publish:
+            await self._publish_state_for_repo()
+
+    async def _publish_state_for_repo(self) -> None:
+        """Compatibility wrapper for repo-scoped state publication."""
+        await self.publish_state()
 
     # All ERROR transitions must use this primitive. Direct writes to
     # ``state.state = PipelineState.ERROR`` are forbidden after PR-219b.

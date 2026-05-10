@@ -372,7 +372,10 @@ class CodingMixin:
                 if current_pr_id is not None:
                     self._user_stopped_task_pr_ids.add(current_pr_id)
                 self.state.state = PipelineState.PAUSED
-                self.state.error_message = None
+                await self._clear_error_message_on_recovery(
+                    log_prefix="[CODING]",
+                    reason="user stop requested during coder run",
+                )
                 await self._save_current_run_record("error")
                 self.log_event("[CODING] CODING aborted: user stop requested.")
                 return None
@@ -382,7 +385,10 @@ class CodingMixin:
                 target_branch, "before breach-cancel pause"
             )
             self.state.state = PipelineState.PAUSED
-            self.state.error_message = None
+            await self._clear_error_message_on_recovery(
+                log_prefix="[CODING]",
+                reason="in-flight rate limit breach",
+            )
             await self._save_current_run_record("rate_limit")
             self.log_event(
                 f"[CODING] CODING aborted: in-flight rate limit breach, "
@@ -404,7 +410,10 @@ class CodingMixin:
                 target_branch, "before late-breach pause"
             )
             self.state.state = PipelineState.PAUSED
-            self.state.error_message = None
+            await self._clear_error_message_on_recovery(
+                log_prefix="[CODING]",
+                reason="late in-flight rate limit breach",
+            )
             await self._save_current_run_record("rate_limit")
             self.log_event(
                 f"[CODING] CODING paused: late in-flight rate limit breach, "
@@ -591,7 +600,10 @@ class CodingMixin:
             if current_pr_id is not None:
                 self._user_stopped_task_pr_ids.add(current_pr_id)
             self.state.state = PipelineState.PAUSED
-            self.state.error_message = None
+            await self._clear_error_message_on_recovery(
+                log_prefix="[CODING]",
+                reason="user stop requested after coder exit",
+            )
             await self._save_current_run_record("error")
             self.log_event("[CODING] CODING aborted: user stop requested.")
             return True
@@ -633,7 +645,10 @@ class CodingMixin:
             self._detect_rate_limit(stderr, coder_name=coder_name)
             if self.state.rate_limited_until is not None:
                 self.state.state = PipelineState.PAUSED
-                self.state.error_message = None
+                await self._clear_error_message_on_recovery(
+                    log_prefix="[CODING]",
+                    reason="rate-limit pause after coder failure",
+                )
                 await self._save_current_run_record("rate_limit")
                 self.log_event(
                     f"[RATE-LIMIT] Rate limit pause active until "

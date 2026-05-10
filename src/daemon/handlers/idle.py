@@ -55,6 +55,33 @@ class IdleMixin:
             }
         )
 
+    async def _resolve_rate_limit_error_state(
+        self,
+        *,
+        log_prefix: str,
+        label: str,
+    ) -> bool:
+        """Process ``state.error_message`` during rate-limit recovery."""
+        if self.state.error_message is None:
+            return False
+        lowered = self.state.error_message.lower()
+        is_rate_limit_msg = (
+            "rate limit" in lowered or re.search(r"\b429\b", lowered)
+        )
+        if is_rate_limit_msg:
+            await self._clear_error_message_on_recovery(
+                log_prefix=log_prefix,
+                reason=f"{label}, cleared legacy rate-limit error",
+            )
+            return False
+        await self._transition_to_error(
+            self.state.error_message,
+            save_run_record_as=None,
+            publish=False,
+            log_prefix=f"{log_prefix} {label} -> ERROR (preserved context):",
+        )
+        return True
+
     def _scan_task_specs_for_agents_md_drift(self) -> None:
         """Run the AGENTS.md anti-pattern scan over ``tasks/PR-*.md``.
 
@@ -747,28 +774,10 @@ class IdleMixin:
             self.state.rate_limited_until = None
             self.state.rate_limit_reactive = False
             self.state.rate_limit_reactive_coder = None
-            if self.state.error_message:
-                lowered = self.state.error_message.lower()
-                is_rate_limit_msg = (
-                    "rate limit" in lowered or re.search(r"\b429\b", lowered)
-                )
-                if is_rate_limit_msg:
-                    self.state.error_message = None
-                    self.log_event(
-                        f"[RATE-LIMIT] {label}, cleared legacy "
-                        f"rate-limit error."
-                    )
-                else:
-                    await self._transition_to_error(
-                        self.state.error_message,
-                        save_run_record_as=None,
-                        publish=False,
-                        log_prefix=(
-                            f"[RATE-LIMIT] {label} -> ERROR "
-                            f"(preserved context):"
-                        ),
-                    )
-                    return
+            if await self._resolve_rate_limit_error_state(
+                log_prefix="[RATE-LIMIT]", label=label
+            ):
+                return
             if (
                 self.state.current_pr is not None
                 and self.state.current_task is not None
@@ -794,28 +803,10 @@ class IdleMixin:
         self.state.rate_limit_reactive = False
         self.state.rate_limit_reactive_coder = None
         self._error_diagnose_policy.reset(self)
-        if self.state.error_message:
-            lowered = self.state.error_message.lower()
-            is_rate_limit_msg = (
-                "rate limit" in lowered or re.search(r"\b429\b", lowered)
-            )
-            if is_rate_limit_msg:
-                self.state.error_message = None
-                self.log_event(
-                    "[RATE-LIMIT] Rate limit expired, cleared legacy "
-                    "rate-limit error."
-                )
-            else:
-                await self._transition_to_error(
-                    self.state.error_message,
-                    save_run_record_as=None,
-                    publish=False,
-                    log_prefix=(
-                        "[RATE-LIMIT] Rate limit expired, resuming -> ERROR "
-                        "(preserved context):"
-                    ),
-                )
-                return
+        if await self._resolve_rate_limit_error_state(
+            log_prefix="[RATE-LIMIT]", label="Rate limit expired, resuming"
+        ):
+            return
         if (
             self.state.current_pr is not None
             and self.state.current_task is not None

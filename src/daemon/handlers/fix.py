@@ -244,7 +244,10 @@ class FixMixin(BreachMixin):
         current_pr = self.state.current_pr
         fix_iteration_cap = self.app_config.daemon.fix_iteration_cap
         if current_pr is not None and current_pr.is_escalated:
-            self.state.error_message = None
+            await self._clear_error_message_on_recovery(
+                log_prefix="[FIX]",
+                reason="escalated PR returned to IDLE",
+            )
             self.state.state = PipelineState.IDLE
             self.log_event(
                 f"[FIX] FIX blocked for escalated PR #{current_pr.number}, "
@@ -405,7 +408,10 @@ class FixMixin(BreachMixin):
                         ):
                             return
                 self.state.state = PipelineState.PAUSED
-                self.state.error_message = None
+                await self._clear_error_message_on_recovery(
+                    log_prefix="[FIX]",
+                    reason="in-flight rate limit breach",
+                )
                 self.log_event(
                     f"[FIX] FIX aborted: in-flight rate limit breach, "
                     f"paused until {self.state.rate_limited_until}."
@@ -456,7 +462,10 @@ class FixMixin(BreachMixin):
                     ):
                         return
             self.state.state = PipelineState.PAUSED
-            self.state.error_message = None
+            await self._clear_error_message_on_recovery(
+                log_prefix="[FIX]",
+                reason="late in-flight rate limit breach",
+            )
             self.log_event(
                 f"[FIX] FIX paused: late in-flight rate limit breach, "
                 f"paused until {self.state.rate_limited_until}."
@@ -488,7 +497,10 @@ class FixMixin(BreachMixin):
             if not stop_requested_after_exit:
                 return False
             self.state.state = PipelineState.PAUSED
-            self.state.error_message = None
+            await self._clear_error_message_on_recovery(
+                log_prefix="[FIX]",
+                reason="user stop requested after FIX exit",
+            )
             self.log_event("[FIX] FIX aborted: user stop requested.")
             return True
 
@@ -656,7 +668,10 @@ class FixMixin(BreachMixin):
             if await pause_for_stop_after_bookkeeping():
                 return
             self.state.state = PipelineState.PAUSED  # pragma: no cover - defensive fallback
-            self.state.error_message = None  # pragma: no cover - defensive fallback
+            await self._clear_error_message_on_recovery(  # pragma: no cover - defensive fallback
+                log_prefix="[FIX]",
+                reason="stop-cancel defensive pause fallback",
+            )
             return  # pragma: no cover - defensive fallback
         if code != 0:
             # FIX failure breaks the consecutive no-push streak (Codex P2
@@ -668,7 +683,10 @@ class FixMixin(BreachMixin):
             self._detect_rate_limit(stderr, coder_name=coder_name)
             if self.state.rate_limited_until is not None:
                 self.state.state = PipelineState.PAUSED
-                self.state.error_message = None
+                await self._clear_error_message_on_recovery(
+                    log_prefix="[FIX]",
+                    reason="rate-limit pause after fix failure",
+                )
                 self.log_event(
                     f"[RATE-LIMIT] Rate limit pause active until "
                     f"{self.state.rate_limited_until.isoformat()}."
