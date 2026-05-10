@@ -106,20 +106,40 @@ def _is_repository_token(token: str) -> bool:
     )
 
 
+def _push_positionals(tokens: list[str]) -> list[str]:
+    positionals: list[str] = []
+    skip_next = False
+    value_options = {"-o", "--push-option", "--receive-pack", "--exec"}
+    value_option_prefixes = tuple(f"{option}=" for option in value_options if option != "-o")
+    for token in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in value_options:
+            skip_next = True
+            continue
+        if token.startswith(value_option_prefixes):
+            continue
+        if _is_positional_push_token(token):
+            positionals.append(token)
+    return positionals
+
+
 def _delete_flag_targets_protected_branch(tokens: list[str]) -> bool:
     if not any(_is_delete_token(token) for token in tokens):
         return False
-    positional = [token for token in tokens if _is_positional_push_token(token)]
+    positional = _push_positionals(tokens)
     if len(positional) < 2:
         return False
     return any(_is_protected_branch_ref(ref) for ref in positional[1:])
 
 
 def _colon_refspec_targets_protected_branch(tokens: list[str]) -> bool:
-    for index, token in enumerate(tokens):
+    positional = _push_positionals(tokens)
+    for index, token in enumerate(positional):
         if not _is_empty_source_protected_refspec(token):
             continue
-        return any(_is_repository_token(previous) for previous in tokens[:index])
+        return any(_is_repository_token(previous) for previous in positional[:index])
     return False
 
 

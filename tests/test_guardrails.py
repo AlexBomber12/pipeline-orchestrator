@@ -95,6 +95,33 @@ def test_scan_stdout_branch_delete_push_option_attached_value_not_dry_run() -> N
     assert violations[0].category == "branch_delete_main"
 
 
+@pytest.mark.parametrize("option", ["-o", "--push-option", "--receive-pack"])
+def test_scan_stdout_branch_delete_option_value_main_not_ref(option: str) -> None:
+    stdout = f"git push origin {option} main --delete feature-x\n"
+
+    assert scan_stdout(stdout) == []
+
+
+@pytest.mark.parametrize("option", ["--push-option=main", "--receive-pack=main"])
+def test_scan_stdout_branch_delete_attached_long_option_value_not_ref(
+    option: str,
+) -> None:
+    stdout = f"git push origin {option} --delete feature-x\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_branch_delete_option_value_before_colon_refspec_not_remote() -> None:
+    assert scan_stdout("git push -o origin :main\n") == []
+
+
+def test_scan_stdout_branch_delete_with_option_value_still_flags_main_ref() -> None:
+    violations = scan_stdout("git push -o ci origin --delete main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
 @pytest.mark.parametrize("delete_flag", ["--delete", "-d"])
 def test_scan_stdout_branch_delete_without_ref_not_flagged(delete_flag: str) -> None:
     stdout = f"git push {delete_flag} main\n"
