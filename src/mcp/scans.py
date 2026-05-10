@@ -169,7 +169,16 @@ def _is_guarded_remedial_dirty_context(prefix: str, suffix: str) -> bool:
     branch_end = re.search(r"[.!?\n]", suffix)
     guarded_branch = suffix[: branch_end.start()] if branch_end else suffix
     has_negated_merge_policy = re.match(
-        r"\s*,?\s*(?:do\s+not|don't|never)\s+merge\b", suffix, re.IGNORECASE
+        r"\s*,?\s*(?:"
+        r"do not|don't|don’t|"
+        r"cannot|can not|can't|can’t|"
+        r"never|"
+        r"must not|mustn't|mustn’t|"
+        r"will not|won't|won’t|"
+        r"should not|shouldn't|shouldn’t"
+        r")\s+merge\b",
+        suffix,
+        re.IGNORECASE,
     )
     if has_negated_merge_policy:
         return True
@@ -425,7 +434,9 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
             r"\b(?:"
             r"force(?:-|\s+)merge\b"
             r"|"
-            r"merge\s+(?:despite|with)\s+(?:red|failing|broken|stale)\s+(?:CI|checks?|tests?)"
+            r"merge\s+(?:despite|with)\s+"
+            r"(?:red|fail|failed|failing|broken|stale|non-green)\s+"
+            r"(?:CI|checks?|tests?)"
             r")\b",
             re.IGNORECASE,
         ),

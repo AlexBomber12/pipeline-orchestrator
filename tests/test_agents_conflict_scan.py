@@ -904,6 +904,20 @@ def test_scan_flags_merge_with_broken_tests():
     assert "merge_dirty_alt" in types
 
 
+def test_scan_flags_merge_with_failed_checks():
+    body = "merge with failed checks."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "merge_dirty_alt" in types
+
+
+def test_scan_flags_merge_despite_non_green_ci():
+    body = "merge despite non-green CI."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "merge_dirty_alt" in types
+
+
 def test_scan_negated_do_not_force_merge_not_flagged():
     body = "Coders must not force-merge under any circumstances."
     assert scan_for_conflicts(body) == []
@@ -1105,6 +1119,16 @@ def test_scan_no_ff_force_merge_commits_if_checks_fail_flagged():
 
 def test_scan_no_ff_force_merge_commits_if_checks_fail_do_not_merge_not_flagged():
     body = "Use --no-ff to force merge commits if checks fail, do not merge."
+    assert scan_for_conflicts(body) == []
+
+
+def test_scan_no_ff_force_merge_commits_if_checks_fail_must_not_merge_not_flagged():
+    body = "Use --no-ff to force merge commits if checks fail, must not merge."
+    assert scan_for_conflicts(body) == []
+
+
+def test_scan_no_ff_force_merge_commits_if_checks_fail_should_not_merge_not_flagged():
+    body = "Use --no-ff to force merge commits if checks fail, should not merge."
     assert scan_for_conflicts(body) == []
 
 
