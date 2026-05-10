@@ -136,7 +136,10 @@ class MergeMixin:
                             )
                             if self.state.rate_limited_until is not None:
                                 self.state.state = PipelineState.PAUSED
-                                self.state.error_message = None
+                                await self._clear_error_message_on_recovery(
+                                    log_prefix="[MERGE]",
+                                    reason="rate-limit pause during merge conflict resolution",
+                                )
                                 await self._save_current_run_record("rate_limit")
                                 self.log_event(
                                     f"[RATE-LIMIT] Rate limit pause "

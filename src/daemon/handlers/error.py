@@ -236,7 +236,10 @@ class ErrorMixin:
             )
             await _clear_cause_for_retry()
             self.state.state = PipelineState.IDLE
-            self.state.error_message = None
+            await self._clear_error_message_on_recovery(
+                log_prefix="[ERROR]",
+                reason="rate-limited diagnosis skipped to IDLE",
+            )
             self._error_diagnose_policy.reset(self)
             return
 
@@ -434,7 +437,10 @@ class ErrorMixin:
             self.log_event("[ERROR] diagnose_error: SKIP -> IDLE.")
         elif verdict == "FIX":
             await _clear_cause_for_retry()
-            self.state.error_message = None
+            await self._clear_error_message_on_recovery(
+                log_prefix="[ERROR]",
+                reason="diagnose_error FIX retry",
+            )
             self.state.state = PipelineState.IDLE
             self._error_diagnose_policy.reset(self)
             self.log_event(

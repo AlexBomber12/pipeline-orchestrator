@@ -86,6 +86,64 @@ def test_handle_idle_no_tasks_leaves_state_idle(
     assert ["git", "clean", "-fd"] in calls
 
 
+def test_resolve_rate_limit_error_state_clears_rate_limit_message() -> None:
+    runner = h._make_runner()
+    runner.state.error_message = "rate limit exceeded for claude-3.5-sonnet"
+
+    should_return = asyncio.run(
+        runner._resolve_rate_limit_error_state(
+            log_prefix="[RATE-LIMIT]",
+            label="Rate limit expired, resuming",
+        )
+    )
+
+    assert should_return is False
+    assert runner.state.error_message is None
+    assert any(
+        "[RATE-LIMIT] cleared error_message "
+        "(Rate limit expired, resuming, cleared legacy rate-limit error): "
+        "rate limit exceeded for claude-3.5-sonnet" == entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_resolve_rate_limit_error_state_preserves_non_rate_limit_message() -> None:
+    runner = h._make_runner()
+    runner.state.error_message = "git push failed: branch protection"
+
+    should_return = asyncio.run(
+        runner._resolve_rate_limit_error_state(
+            log_prefix="[RATE-LIMIT]",
+            label="Rate limit expired, resuming",
+        )
+    )
+
+    assert should_return is True
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "git push failed: branch protection"
+    assert any(
+        "[RATE-LIMIT] Rate limit expired, resuming -> ERROR "
+        "(preserved context): git push failed: branch protection."
+        == entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_resolve_rate_limit_error_state_429_pattern() -> None:
+    runner = h._make_runner()
+    runner.state.error_message = "HTTP 429 too many requests"
+
+    should_return = asyncio.run(
+        runner._resolve_rate_limit_error_state(
+            log_prefix="[RATE-LIMIT]",
+            label="Rate limit expired, resuming",
+        )
+    )
+
+    assert should_return is False
+    assert runner.state.error_message is None
+
+
 def test_handle_idle_picks_task_and_drives_coding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
