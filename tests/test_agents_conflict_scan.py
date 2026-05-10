@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from src.mcp.scans import scan_for_conflicts
 
-
 _CLEAN_SPEC = """# PR-999: Example task
 
 Branch: pr-999-example
@@ -1078,6 +1077,20 @@ def test_scan_no_ff_force_merge_commits_with_checks_enabled_not_flagged():
 def test_scan_no_ff_force_merge_commits_negated_dirty_context_not_flagged():
     body = "Use --no-ff to force merge commits, but never with failing checks."
     assert scan_for_conflicts(body) == []
+
+
+def test_scan_no_ff_force_merge_commits_unrelated_negation_dirty_context_flagged():
+    body = "Do not delay even with failing checks use --no-ff to force merge commits."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "merge_dirty_alt" in types
+
+
+def test_scan_no_ff_force_merge_commits_double_negative_dirty_context_flagged():
+    body = "Don't forget to merge with failing checks use --no-ff to force merge commits."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "merge_dirty_alt" in types
 
 
 def test_scan_no_ff_force_merge_then_force_merge_pr_flagged():

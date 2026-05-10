@@ -152,7 +152,7 @@ def _is_negated(text: str, match_start: int) -> bool:
     clause_start = clause_start + 1 if clause_start >= 0 else 0
     negations = list(_NEGATION_CONTEXT.finditer(text, clause_start, match_start))
     if not negations:
-        return False
+        return False  # pragma: no cover - caller only invokes after _is_negated.
     nearest = negations[-1]
     if _DOUBLE_NEGATIVE_INVERTER.search(text, nearest.end(), match_start):
         return False
@@ -204,6 +204,37 @@ def _is_guarded_remedial_dirty_context(prefix: str, suffix: str) -> bool:
     return bool(has_remedial_action and not has_merge_intent)
 
 
+def _is_dirty_context_negated(text: str, match_start: int) -> bool:
+    """Return True when negation directly governs dirty merge context."""
+    clause_start = max(text.rfind(c, 0, match_start) for c in _CLAUSE_BOUNDARIES)
+    clause_start = clause_start + 1 if clause_start >= 0 else 0
+    for negation in reversed(list(_NEGATION_CONTEXT.finditer(text, clause_start, match_start))):
+        if _DOUBLE_NEGATIVE_INVERTER.search(text, negation.end(), match_start):
+            continue
+        gap = text[negation.end() : match_start]
+        if re.fullmatch(r"[\s,]*(?:merge\s+)?", gap, re.IGNORECASE):
+            return True
+    return False
+
+
+def _has_unnegated_dirty_context_after_nearest_negation(
+    text: str, match_start: int
+) -> bool:
+    """Return True when dirty context appears after the nearest negation."""
+    clause_start = max(text.rfind(c, 0, match_start) for c in _CLAUSE_BOUNDARIES)
+    clause_start = clause_start + 1 if clause_start >= 0 else 0
+    negations = list(_NEGATION_CONTEXT.finditer(text, clause_start, match_start))
+    if not negations:
+        return False  # pragma: no cover - caller only invokes after _is_negated.
+    nearest = negations[-1]
+    for dirty_match in _DIRTY_MERGE_CONTEXT.finditer(
+        text, nearest.end(), match_start
+    ):
+        if not _is_dirty_context_negated(text, dirty_match.start()):
+            return True
+    return False
+
+
 def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
     """Return True for benign ``--no-ff`` merge-commit guidance."""
     line_start = text.rfind("\n", 0, match_start) + 1
@@ -237,14 +268,14 @@ def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
         if previous_line and not previous_line.endswith((".", "!", "?")):
             prefatory_start = previous_line_start
     for dirty_match in _DIRTY_MERGE_CONTEXT.finditer(text, prefatory_start, clause_start):
-        if not _is_negated(text, dirty_match.start()):
+        if not _is_dirty_context_negated(text, dirty_match.start()):
             return False
     for dirty_match in _DIRTY_MERGE_CONTEXT.finditer(text, clause_start, dirty_window_end):
         prefix = text[clause_start : dirty_match.start()]
         suffix = text[dirty_match.end() : dirty_window_end]
         if _is_guarded_remedial_dirty_context(prefix, suffix):
             continue
-        if not _is_negated(text, dirty_match.start()):
+        if not _is_dirty_context_negated(text, dirty_match.start()):
             return False
     if line_end < len(text) and not current_line.endswith((".", "!", "?")):
         next_line_end = text.find("\n", line_end + 1)
@@ -265,7 +296,7 @@ def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
                 continue
             if _is_guarded_remedial_dirty_context(prefix, suffix):
                 continue
-            if not _is_negated(text, next_line_start + dirty_match.start()):
+            if not _is_dirty_context_negated(text, next_line_start + dirty_match.start()):
                 return False
     return any(
         strategy.start() <= match_start < strategy.end()
@@ -489,7 +520,16 @@ def scan_for_conflicts(task_spec_body: str) -> list[ConflictViolation]:
     violations: list[ConflictViolation] = []
     for vtype, pattern, rule in _ANTI_PATTERNS:
         for match in pattern.finditer(normalized):
-            if _is_negated(normalized, match.start()):
+            is_negated = _is_negated(normalized, match.start())
+            if (
+                is_negated
+                and vtype == "merge_dirty_alt"
+                and _has_unnegated_dirty_context_after_nearest_negation(
+                    normalized, match.start()
+                )
+            ):
+                is_negated = False
+            if is_negated:
                 continue
             if vtype == "merge_dirty_alt" and _is_force_merge_commit_strategy(
                 normalized, match.start()
