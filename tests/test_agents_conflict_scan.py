@@ -948,6 +948,27 @@ def test_scan_pre_match_dirty_context_blocks_no_ff_strategy_exemption():
     assert "merge_dirty_alt" in types
 
 
+def test_scan_colon_prefixed_dirty_context_blocks_no_ff_strategy_exemption():
+    body = "Even with failing checks: use --no-ff to force merge commits."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "merge_dirty_alt" in types
+
+
+def test_scan_no_ff_force_merge_commits_with_failed_tests_flagged():
+    body = "Use --no-ff to force merge commits with failed tests."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "merge_dirty_alt" in types
+
+
+def test_scan_no_ff_force_merge_commits_with_non_green_ci_flagged():
+    body = "Use --no-ff to force merge commits with non-green CI."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "merge_dirty_alt" in types
+
+
 def test_multiple_violations_all_returned():
     body = (
         "Step 1: gh pr create --draft --title 'wip'.\n"

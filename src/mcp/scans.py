@@ -80,8 +80,8 @@ _FORCE_MERGE_COMMIT_STRATEGY = re.compile(
 _DIRTY_MERGE_CONTEXT = re.compile(
     r"\b(?:"
     r"despite|regardless\s+of|even\s+with|"
-    r"with\s+(?:red|failing|broken|stale)|"
-    r"red|failing|broken|stale"
+    r"with\s+(?:red|failing|failed|broken|stale|non-green)|"
+    r"red|failing|failed|broken|stale|non-green"
     r")\b"
     r"[^\n]{0,80}\b(?:CI|checks?|tests?)\b",
     re.IGNORECASE,
@@ -158,7 +158,7 @@ def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
     line_end = text.find("\n", match_start)
     if line_end == -1:
         line_end = len(text)
-    sentence_start = max(text.rfind(c, line_start, match_start) for c in ".;!?:\n")
+    sentence_start = max(text.rfind(c, line_start, match_start) for c in ".!?\n")
     sentence_start = sentence_start + 1 if sentence_start >= 0 else line_start
     dirty_window_end = min(len(text), match_start + 160)
     if _DIRTY_MERGE_CONTEXT.search(text, sentence_start, dirty_window_end):
