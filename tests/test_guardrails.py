@@ -33,6 +33,45 @@ def test_scan_stdout_repo_delete_pattern_matches() -> None:
     assert violations[0].category == "repo_delete"
 
 
+def test_scan_stdout_branch_delete_default_via_colon_refspec() -> None:
+    violations = scan_stdout("git push origin :refs/heads/main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_default_via_dash_d_flag() -> None:
+    violations = scan_stdout("git push --delete origin main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_default_via_dash_d_short_flag() -> None:
+    violations = scan_stdout("git push origin -d main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_feature_not_flagged() -> None:
+    stdout = "git push --delete origin pr-123-something\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_branch_delete_main_dry_run_not_flagged() -> None:
+    stdout = "git push --dry-run --delete origin main\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_branch_delete_main_prose_not_flagged() -> None:
+    stdout = "The next example mentions --delete main without a push command.\n"
+
+    assert scan_stdout(stdout) == []
+
+
 def test_scan_stdout_repo_create_pattern_allows_horizontal_whitespace() -> None:
     violations = scan_stdout("$ gh\trepo\tcreate octo/demo\n")
 
