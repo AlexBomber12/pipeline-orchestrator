@@ -22,6 +22,13 @@ def _check_runs(*conclusions: str) -> dict:
     return {"check_runs": [{"conclusion": conclusion} for conclusion in conclusions]}
 
 
+def _status(state: str, statuses: list[dict] | None = None) -> dict:
+    return {
+        "state": state,
+        "statuses": statuses if statuses is not None else [{"state": state}],
+    }
+
+
 def test_audit_direct_commit_flagged(monkeypatch):
     def fake_run_gh(args):
         path = args[1]
@@ -53,6 +60,8 @@ def test_audit_merge_commit_with_pr_passing_ci_clean(monkeypatch):
             return _commit("Merge pull request #42 from feature-x", ["base", "head"])
         if path.endswith("/commits/head/check-runs"):
             return _check_runs("success")
+        if path.endswith("/commits/head/status"):
+            return _status("success")
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
@@ -69,6 +78,8 @@ def test_audit_merge_commit_with_pr_failed_ci_flagged(monkeypatch):
             return _commit("Merge pull request #42 from feature-x", ["base", "head"])
         if path.endswith("/commits/head/check-runs"):
             return _check_runs("failure")
+        if path.endswith("/commits/head/status"):
+            return _status("success")
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
@@ -81,6 +92,46 @@ def test_audit_merge_commit_with_pr_failed_ci_flagged(monkeypatch):
     assert findings[0].pr_number == 42
 
 
+def test_audit_merge_commit_with_mixed_check_runs_flagged(monkeypatch):
+    def fake_run_gh(args):
+        path = args[1]
+        if path.endswith("/commits?sha=main&per_page=10"):
+            return [_summary("merge42")]
+        if path.endswith("/commits/merge42"):
+            return _commit("Merge pull request #42 from feature-x", ["base", "head"])
+        if path.endswith("/commits/head/check-runs"):
+            return _check_runs("success", "failure")
+        if path.endswith("/commits/head/status"):
+            return _status("success")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+
+    findings = main_commit_audit.audit_main_commits("octo/demo")
+
+    assert [finding.violation_category for finding in findings] == [
+        "merge_commit_pr_failed_ci"
+    ]
+
+
+def test_audit_merge_commit_with_legacy_status_success_clean(monkeypatch):
+    def fake_run_gh(args):
+        path = args[1]
+        if path.endswith("/commits?sha=main&per_page=10"):
+            return [_summary("merge42")]
+        if path.endswith("/commits/merge42"):
+            return _commit("Merge pull request #42 from feature-x", ["base", "head"])
+        if path.endswith("/commits/head/check-runs"):
+            return {"check_runs": []}
+        if path.endswith("/commits/head/status"):
+            return _status("success")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+
+    assert main_commit_audit.audit_main_commits("octo/demo") == []
+
+
 def test_audit_merge_commit_no_check_runs_flagged(monkeypatch):
     def fake_run_gh(args):
         path = args[1]
@@ -90,6 +141,8 @@ def test_audit_merge_commit_no_check_runs_flagged(monkeypatch):
             return _commit("Merge pull request #42 from feature-x", ["base", "head"])
         if path.endswith("/commits/head/check-runs"):
             return {"check_runs": []}
+        if path.endswith("/commits/head/status"):
+            return _status("pending")
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
@@ -157,6 +210,8 @@ def test_audit_linear_pr_commit_with_passing_ci_clean(monkeypatch):
             ]
         if path.endswith("/commits/head42/check-runs"):
             return _check_runs("success")
+        if path.endswith("/commits/head42/status"):
+            return _status("success")
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
@@ -181,6 +236,8 @@ def test_audit_linear_pr_commit_with_failed_ci_flagged(monkeypatch):
             ]
         if path.endswith("/commits/head42/check-runs"):
             return _check_runs("failure")
+        if path.endswith("/commits/head42/status"):
+            return _status("success")
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
@@ -204,6 +261,8 @@ def test_audit_linear_pr_commit_falls_back_to_main_sha_without_head(monkeypatch)
             return [{"number": "42", "merged_at": "2026-05-10T12:00:00Z"}]
         if path.endswith("/commits/rebase42/check-runs"):
             return _check_runs("failure")
+        if path.endswith("/commits/rebase42/status"):
+            return _status("success")
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
@@ -388,6 +447,8 @@ def test_audit_check_runs_malformed_payload_flagged(monkeypatch):
             return _commit("Merge pull request #42 from feature-x", ["base", "head"])
         if path.endswith("/commits/head/check-runs"):
             return {"check_runs": "not-a-list"}
+        if path.endswith("/commits/head/status"):
+            return _status("pending")
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)

@@ -14,7 +14,9 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from src.github import checks
 from src.github.gh_runner import run_gh
+from src.models import CIStatus
 
 logger = logging.getLogger(__name__)
 
@@ -143,14 +145,32 @@ def _pr_head_sha(payload: dict[str, Any]) -> str | None:
     return sha if isinstance(sha, str) and sha else None
 
 
-def _has_success_check_run(payload: object) -> bool:
+def _check_runs(payload: object) -> list[dict]:
     check_runs = payload.get("check_runs") if isinstance(payload, dict) else payload
     if not isinstance(check_runs, list):
-        return False
-    return any(
-        isinstance(run, dict)
-        and str(run.get("conclusion", "")).lower() == "success"
-        for run in check_runs
+        return []
+    return [run for run in check_runs if isinstance(run, dict)]
+
+
+def _has_successful_ci(owner_repo: str, sha: str) -> bool:
+    check_payload = run_gh(
+        [
+            "api",
+            f"repos/{owner_repo}/commits/{sha}/check-runs",
+        ]
+    )
+    status_payload = run_gh(
+        [
+            "api",
+            f"repos/{owner_repo}/commits/{sha}/status",
+        ]
+    )
+    return (
+        checks._map_rest_ci_status_to_enum(
+            _check_runs(check_payload),
+            status_payload if isinstance(status_payload, dict) else {},
+        )
+        == CIStatus.SUCCESS
     )
 
 
@@ -221,13 +241,7 @@ def audit_main_commit_shas(
 
                 pr_number = _pr_number(associated_pr)
                 ci_sha = _pr_head_sha(associated_pr) or sha
-                check_payload = run_gh(
-                    [
-                        "api",
-                        f"repos/{owner_repo}/commits/{ci_sha}/check-runs",
-                    ]
-                )
-                if not _has_success_check_run(check_payload):
+                if not _has_successful_ci(owner_repo, ci_sha):
                     findings.append(
                         _finding(
                             sha=sha,
@@ -287,13 +301,7 @@ def audit_main_commit_shas(
                 checked_shas.append(sha)
                 continue
 
-            check_payload = run_gh(
-                [
-                    "api",
-                    f"repos/{owner_repo}/commits/{pr_head_sha}/check-runs",
-                ]
-            )
-            if not _has_success_check_run(check_payload):
+            if not _has_successful_ci(owner_repo, pr_head_sha):
                 findings.append(
                     _finding(
                         sha=sha,
