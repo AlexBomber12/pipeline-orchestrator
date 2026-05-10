@@ -63,11 +63,8 @@ _GIT_VALUE_OPTION_PREFIXES = (
 _GIT_FLAG_OPTIONS = {
     "--bare",
     "--glob-pathspecs",
-    "--help",
-    "--html-path",
     "--icase-pathspecs",
     "--literal-pathspecs",
-    "--man-path",
     "--no-optional-locks",
     "--no-pager",
     "--no-replace-objects",
@@ -78,6 +75,7 @@ _GIT_FLAG_OPTIONS = {
     "-P",
     "-v",
 }
+_GIT_TERMINAL_OPTIONS = {"--help", "--html-path", "--man-path", "--version"}
 _PUSH_VALUE_OPTIONS = {"-o", "--push-option", "--receive-pack", "--exec", "--repo"}
 _PUSH_VALUE_OPTION_PREFIXES = tuple(
     f"{option}=" for option in _PUSH_VALUE_OPTIONS if option != "-o"
@@ -140,6 +138,8 @@ def _push_tokens_after_git_global_options(tokens: list[str]) -> list[str] | None
         token = tokens[index]
         if token.lower() == "push":
             return tokens[index + 1 :]
+        if token in _GIT_TERMINAL_OPTIONS:
+            return None
         if token in _GIT_VALUE_OPTIONS:
             index += 2
             continue

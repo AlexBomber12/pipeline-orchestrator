@@ -119,6 +119,11 @@ def test_scan_stdout_branch_delete_git_without_subcommand_not_flagged() -> None:
     assert scan_stdout("git -C /repo\n") == []
 
 
+@pytest.mark.parametrize("option", ["--help", "--html-path", "--man-path", "--version"])
+def test_scan_stdout_branch_delete_git_terminal_option_not_flagged(option: str) -> None:
+    assert scan_stdout(f"git {option} push --delete origin main\n") == []
+
+
 @pytest.mark.parametrize("delete_flag", ["--delete", "-d"])
 def test_scan_stdout_branch_delete_default_with_delete_flag_after_ref(
     delete_flag: str,
