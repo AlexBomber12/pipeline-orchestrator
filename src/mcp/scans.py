@@ -162,7 +162,7 @@ def _is_negated(text: str, match_start: int) -> bool:
 def _is_guarded_remedial_dirty_context(prefix: str, suffix: str) -> bool:
     """Return True when dirty context belongs to a remedial failure branch."""
     has_guarded_condition = re.search(
-        r"(?:^|\s)(?:if|when|unless)\s*$", prefix, re.IGNORECASE
+        r"(?:^|\s)(?:if|when)\s*$", prefix, re.IGNORECASE
     ) and not re.search(r"(?:^|\s)even\s+if\s*$", prefix, re.IGNORECASE)
     if not has_guarded_condition:
         return False
