@@ -111,6 +111,7 @@ def _is_effective_delete(tokens: list[str]) -> bool:
 def _is_protected_branch_ref(token: str) -> bool:
     return token in {
         _PROTECTED_DEFAULT_BRANCH,
+        f"heads/{_PROTECTED_DEFAULT_BRANCH}",
         f"refs/heads/{_PROTECTED_DEFAULT_BRANCH}",
     }
 

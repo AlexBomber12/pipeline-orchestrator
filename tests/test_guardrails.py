@@ -64,6 +64,13 @@ def test_scan_stdout_branch_delete_default_via_dash_d_short_flag() -> None:
     assert violations[0].category == "branch_delete_main"
 
 
+def test_scan_stdout_branch_delete_default_via_heads_ref_alias() -> None:
+    violations = scan_stdout("git push --delete origin heads/main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
 @pytest.mark.parametrize("delete_flag", ["--delete", "-d"])
 def test_scan_stdout_branch_delete_default_with_delete_flag_after_ref(
     delete_flag: str,
