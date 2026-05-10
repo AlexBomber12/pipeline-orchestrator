@@ -307,7 +307,9 @@ def _force_flag_targets_protected_branch(tokens: list[str]) -> bool:
         return False
     positional = _push_positionals(tokens)
     if _has_repo_option(option_tokens):
-        candidate_refs = positional
+        # Git treats a positional repository as overriding --repo, so
+        # refspecs only begin after that first positional token.
+        candidate_refs = positional[1:]
     elif len(positional) >= 2:
         candidate_refs = positional[1:]
     else:

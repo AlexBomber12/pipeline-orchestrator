@@ -413,15 +413,16 @@ def test_scan_stdout_force_push_main_repo_option_with_positional_remote() -> Non
     assert violations[0].category == "force_push_main"
 
 
-def test_scan_stdout_force_push_main_repo_option_without_positional_remote() -> None:
-    violations = scan_stdout("git push --repo=origin --force main\n")
-
-    assert len(violations) == 1
-    assert violations[0].category == "force_push_main"
+def test_scan_stdout_force_push_main_repo_option_without_refspec_not_flagged() -> None:
+    assert scan_stdout("git push --repo=origin --force main\n") == []
 
 
-def test_scan_stdout_force_push_main_repo_option_scans_all_positionals() -> None:
-    violations = scan_stdout("git push --repo=upstream --force main feature\n")
+def test_scan_stdout_force_push_main_repo_option_positional_remote_named_main() -> None:
+    assert scan_stdout("git push --repo=upstream --force main feature\n") == []
+
+
+def test_scan_stdout_force_push_main_repo_option_positional_remote_dst_main() -> None:
+    violations = scan_stdout("git push --repo=upstream --force main HEAD:main\n")
 
     assert len(violations) == 1
     assert violations[0].category == "force_push_main"
