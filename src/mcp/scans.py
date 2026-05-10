@@ -173,7 +173,11 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
     (
         "draft_pr_open_as",
         re.compile(
-            r"\bopen(?:s|ed|ing)?\s+(?:the\s+)?(?:PR|pull request)\s+as\s+(?:a\s+)?draft\b",
+            r"\bopen(?:s|ed|ing)?\s+(?:"
+            r"(?:the\s+)?(?:PR|pull request)\s+as\s+(?:a\s+)?draft\b"
+            r"|"
+            r"(?:it\s+)?as\s+(?:a\s+)?draft(?=[.;!?\n]|$)"
+            r")",
             re.IGNORECASE,
         ),
         "AGENTS.md prohibits opening PRs in draft state. PR-196.",
@@ -307,8 +311,12 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
         re.compile(
             r"\b(?:"
             r"force[-\s]merge\b"
+            r"(?:"
             r"(?=[^\n]{0,80}\b(?:despite|regardless\s+of|with|red|failing|broken|stale)\b)"
             r"(?=[^\n]{0,80}\b(?:CI|checks?|tests?)\b)"
+            r"|"
+            r"\s+(?:the\s+)?(?:PR|pull request)\b(?!\s+commits?\b)"
+            r")"
             r"|"
             r"merge\s+(?:despite|with)\s+(?:red|failing|broken|stale)\s+(?:CI|checks?|tests?)"
             r")\b",

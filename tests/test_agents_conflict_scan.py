@@ -151,8 +151,22 @@ def test_scan_open_as_draft_without_pr_context_not_flagged():
     assert scan_for_conflicts(body) == []
 
 
+def test_scan_flags_open_as_draft_clause():
+    body = "Open as draft."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_open_as" in types
+
+
 def test_scan_flags_open_pr_as_draft():
     body = "Open the PR as draft."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_open_as" in types
+
+
+def test_scan_flags_open_it_as_a_draft_clause():
+    body = "Open it as a draft."
     violations = scan_for_conflicts(body)
     types = {v.violation_type for v in violations}
     assert "draft_pr_open_as" in types
@@ -779,7 +793,7 @@ def test_auto_merge_dirty_detected():
 
 
 def test_scan_flags_force_merge():
-    body = "force-merge the PR with failing checks."
+    body = "force-merge the PR after review."
     violations = scan_for_conflicts(body)
     types = {v.violation_type for v in violations}
     assert "merge_dirty_alt" in types
