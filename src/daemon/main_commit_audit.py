@@ -14,7 +14,7 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from src.github import checks
+from src.github import cache, checks
 from src.github.gh_runner import run_gh
 from src.models import CIStatus
 
@@ -152,13 +152,18 @@ def _check_runs(payload: object) -> list[dict]:
     return [run for run in check_runs if isinstance(run, dict)]
 
 
-def _has_successful_ci(owner_repo: str, sha: str) -> bool:
-    check_payload = run_gh(
-        [
-            "api",
-            f"repos/{owner_repo}/commits/{sha}/check-runs",
-        ]
+def _check_run_pages(owner_repo: str, sha: str) -> list[dict] | None:
+    return cache._gh_api_paginated(
+        f"repos/{owner_repo}/commits/{sha}/check-runs?per_page=100"
     )
+
+
+def _has_successful_ci(owner_repo: str, sha: str) -> bool:
+    check_runs = []
+    check_pages = _check_run_pages(owner_repo, sha)
+    if isinstance(check_pages, list):
+        for page in check_pages:
+            check_runs.extend(_check_runs(page))
     status_payload = run_gh(
         [
             "api",
@@ -167,7 +172,7 @@ def _has_successful_ci(owner_repo: str, sha: str) -> bool:
     )
     return (
         checks._map_rest_ci_status_to_enum(
-            _check_runs(check_payload),
+            check_runs,
             status_payload if isinstance(status_payload, dict) else {},
         )
         == CIStatus.SUCCESS

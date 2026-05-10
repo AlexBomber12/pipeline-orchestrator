@@ -22,6 +22,19 @@ def _check_runs(*conclusions: str) -> dict:
     return {"check_runs": [{"conclusion": conclusion} for conclusion in conclusions]}
 
 
+def _patch_check_runs(monkeypatch, by_sha: dict[str, object]) -> None:
+    def fake_check_run_pages(owner_repo: str, sha: str) -> list[dict]:
+        assert owner_repo == "octo/demo"
+        payload = by_sha[sha]
+        return payload if isinstance(payload, list) else [payload]
+
+    monkeypatch.setattr(
+        main_commit_audit,
+        "_check_run_pages",
+        fake_check_run_pages,
+    )
+
+
 def _status(state: str, statuses: list[dict] | None = None) -> dict:
     return {
         "state": state,
@@ -65,6 +78,7 @@ def test_audit_merge_commit_with_pr_passing_ci_clean(monkeypatch):
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+    _patch_check_runs(monkeypatch, {"head": _check_runs("success")})
 
     assert main_commit_audit.audit_main_commits("octo/demo") == []
 
@@ -83,6 +97,7 @@ def test_audit_merge_commit_with_pr_failed_ci_flagged(monkeypatch):
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+    _patch_check_runs(monkeypatch, {"head": _check_runs("failure")})
 
     findings = main_commit_audit.audit_main_commits("octo/demo")
 
@@ -106,12 +121,79 @@ def test_audit_merge_commit_with_mixed_check_runs_flagged(monkeypatch):
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+    _patch_check_runs(monkeypatch, {"head": _check_runs("success", "failure")})
 
     findings = main_commit_audit.audit_main_commits("octo/demo")
 
     assert [finding.violation_category for finding in findings] == [
         "merge_commit_pr_failed_ci"
     ]
+
+
+def test_audit_merge_commit_checks_all_check_run_pages(monkeypatch):
+    def fake_run_gh(args):
+        path = args[1]
+        if path.endswith("/commits?sha=main&per_page=10"):
+            return [_summary("merge42")]
+        if path.endswith("/commits/merge42"):
+            return _commit("Merge pull request #42 from feature-x", ["base", "head"])
+        if path.endswith("/commits/head/status"):
+            return _status("success")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+    _patch_check_runs(
+        monkeypatch,
+        {
+            "head": [
+                _check_runs("success"),
+                _check_runs("failure"),
+            ]
+        },
+    )
+
+    findings = main_commit_audit.audit_main_commits("octo/demo")
+
+    assert [finding.violation_category for finding in findings] == [
+        "merge_commit_pr_failed_ci"
+    ]
+
+
+def test_has_successful_ci_uses_paginated_check_runs(monkeypatch):
+    paths = []
+
+    def fake_pages(owner_repo: str, sha: str) -> list[dict]:
+        paths.append(f"{owner_repo}:{sha}")
+        return [
+            _check_runs("success"),
+            _check_runs("success"),
+        ]
+
+    def fake_run_gh(args):
+        if args == ["api", "repos/octo/demo/commits/head/status"]:
+            return _status("success")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(main_commit_audit, "_check_run_pages", fake_pages)
+    monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+
+    assert main_commit_audit._has_successful_ci("octo/demo", "head") is True
+    assert paths == ["octo/demo:head"]
+
+
+def test_check_run_pages_requests_max_page_size(monkeypatch):
+    paths = []
+
+    def fake_paginated(path: str) -> list[dict]:
+        paths.append(path)
+        return [_check_runs("success")]
+
+    monkeypatch.setattr(main_commit_audit.cache, "_gh_api_paginated", fake_paginated)
+
+    assert main_commit_audit._check_run_pages("octo/demo", "head") == [
+        _check_runs("success")
+    ]
+    assert paths == ["repos/octo/demo/commits/head/check-runs?per_page=100"]
 
 
 def test_audit_merge_commit_with_legacy_status_success_clean(monkeypatch):
@@ -128,6 +210,7 @@ def test_audit_merge_commit_with_legacy_status_success_clean(monkeypatch):
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+    _patch_check_runs(monkeypatch, {"head": _check_runs()})
 
     assert main_commit_audit.audit_main_commits("octo/demo") == []
 
@@ -146,6 +229,7 @@ def test_audit_merge_commit_no_check_runs_flagged(monkeypatch):
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+    _patch_check_runs(monkeypatch, {"head": _check_runs()})
 
     findings = main_commit_audit.audit_main_commits("octo/demo")
 
@@ -215,6 +299,7 @@ def test_audit_linear_pr_commit_with_passing_ci_clean(monkeypatch):
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+    _patch_check_runs(monkeypatch, {"head42": _check_runs("success")})
 
     assert main_commit_audit.audit_main_commits("octo/demo") == []
 
@@ -241,6 +326,7 @@ def test_audit_linear_pr_commit_with_failed_ci_flagged(monkeypatch):
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+    _patch_check_runs(monkeypatch, {"head42": _check_runs("failure")})
 
     findings = main_commit_audit.audit_main_commits("octo/demo")
 
@@ -266,6 +352,7 @@ def test_audit_linear_pr_commit_falls_back_to_main_sha_without_head(monkeypatch)
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+    _patch_check_runs(monkeypatch, {"rebase42": _check_runs("failure")})
 
     findings = main_commit_audit.audit_main_commits("octo/demo")
 
@@ -452,6 +539,7 @@ def test_audit_check_runs_malformed_payload_flagged(monkeypatch):
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+    _patch_check_runs(monkeypatch, {"head": {"check_runs": "not-a-list"}})
 
     findings, checked = main_commit_audit.audit_main_commit_shas(
         "octo/demo",
