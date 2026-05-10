@@ -214,6 +214,20 @@ def test_scan_flags_open_as_draft_pr_with_to_continuation():
     assert "draft_pr_open_as" in types
 
 
+def test_scan_flags_open_as_draft_for_feedback():
+    body = "Open as draft for feedback."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_open_as" in types
+
+
+def test_scan_flags_open_it_as_draft_while_tests_run():
+    body = "Open it as draft while tests run."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_open_as" in types
+
+
 def test_scan_flags_open_pull_request_as_a_draft():
     body = "Open the pull request as a draft."
     violations = scan_for_conflicts(body)
@@ -943,6 +957,13 @@ def test_scan_no_ff_force_merge_commits_with_wrapped_failing_checks_flagged():
 
 def test_scan_prior_wrapped_dirty_context_blocks_no_ff_strategy_exemption():
     body = "Even with failing checks\nUse --no-ff to force merge commits."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "merge_dirty_alt" in types
+
+
+def test_scan_list_marker_wrapped_dirty_context_blocks_no_ff_strategy_exemption():
+    body = "Use --no-ff to force merge commits\n- even with failing checks."
     violations = scan_for_conflicts(body)
     types = {v.violation_type for v in violations}
     assert "merge_dirty_alt" in types

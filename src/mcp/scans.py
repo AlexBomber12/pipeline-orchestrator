@@ -201,8 +201,9 @@ def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
         next_line_end = len(text) if next_line_end == -1 else next_line_end
         next_line_start = line_end + 1
         next_line = text[next_line_start:next_line_end]
-        leading_space = len(next_line) - len(next_line.lstrip())
-        dirty_match = _DIRTY_MERGE_CONTEXT.match(next_line, leading_space)
+        marker = re.match(r"\s*(?:[-*]|\d+[.)])?\s*", next_line)
+        marker_end = marker.end() if marker else 0
+        dirty_match = _DIRTY_MERGE_CONTEXT.match(next_line, marker_end)
         if dirty_match and not _is_negated(text, next_line_start + dirty_match.start()):
             return False
     return any(
@@ -252,7 +253,7 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
             r"(?:(?:the|a)\s+)?(?:PR|pull request)\s+as\s+(?:a\s+)?draft\b"
             r"|"
             r"(?:it\s+)?as\s+(?:a\s+)?draft(?:\s+(?:PR|pull request))?"
-            r"(?=\s*(?:[,.;!?\n]|$|\bthen\b|\band\b|\bbefore\b|\bcontinue\b|\bto\b))"
+            r"(?=\s*(?:[,.;!?\n]|$|\bthen\b|\band\b|\bbefore\b|\bcontinue\b|\bfor\b|\bto\b|\bwhile\b))"
             r")",
             re.IGNORECASE,
         ),
