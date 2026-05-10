@@ -941,6 +941,13 @@ def test_scan_prior_dirty_policy_does_not_block_no_ff_strategy_exemption():
     assert scan_for_conflicts(body) == []
 
 
+def test_scan_pre_match_dirty_context_blocks_no_ff_strategy_exemption():
+    body = "Even with failing checks, use --no-ff to force merge commits."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "merge_dirty_alt" in types
+
+
 def test_multiple_violations_all_returned():
     body = (
         "Step 1: gh pr create --draft --title 'wip'.\n"
