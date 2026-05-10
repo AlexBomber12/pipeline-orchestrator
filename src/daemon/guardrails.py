@@ -27,8 +27,9 @@ _PROTECTED_DEFAULT_BRANCH_RE = re.escape(_PROTECTED_DEFAULT_BRANCH)
 
 _COMMAND_PREFIX_RE = r"(?m)^(?:[^\S\r\n]*(?:[$>]|[+]{2,})[^\S\r\n]*)?"
 _GIT_PUSH_NOT_DRY_RUN_RE = (
-    r"(?!(?:[ \t]+[^\s,;|&#]+)*?[ \t]+(?:--dry-run|-n)(?![\w-]))"
+    r"(?!(?:[ \t]+[^\s,;|&#]+)*?[ \t]+(?:--dry-run|-[A-Za-z]*n[A-Za-z]*)(?![\w-]))"
 )
+_GIT_PUSH_DELETE_FLAG_RE = r"(?:--delete|-[A-Za-z]*d[A-Za-z]*)(?![\w-])"
 
 _TIER1_PATTERNS: dict[str, re.Pattern[str]] = {
     "repo_create": re.compile(
@@ -55,11 +56,12 @@ _TIER1_PATTERNS: dict[str, re.Pattern[str]] = {
         r"|"
         r"(?="
         r"(?:[ \t]+[^\s,;|&#]+)*?"
-        r"[ \t]+(?:--delete|-d)(?![\w-])"
-        r"(?:[ \t]+[^\s,;|&#]+)*?"
-        r"[ \t]+(?![-+])[^\s,;|&#]+"
-        r"(?:[ \t]+[^\s,;|&#]+)*?"
         r"[ \t]+"
+        + _GIT_PUSH_DELETE_FLAG_RE
+        + r"(?:[ \t]+[^\s,;|&#]+)*?"
+        + r"[ \t]+(?![-+])[^\s,;|&#]+"
+        + r"(?:[ \t]+[^\s,;|&#]+)*?"
+        + r"[ \t]+"
         rf"(?:refs/heads/)?{_PROTECTED_DEFAULT_BRANCH_RE}"
         r"(?![\w/:-]|\.\w)"
         r")"
@@ -68,9 +70,10 @@ _TIER1_PATTERNS: dict[str, re.Pattern[str]] = {
         r"(?:[ \t]+[^\s,;|&#]+)*?"
         r"[ \t]+(?![-+])[^\s,;|&#]+"
         r"(?:[ \t]+[^\s,;|&#]+)*?"
-        r"[ \t]+(?:--delete|-d)(?![\w-])"
-        r"(?:[ \t]+[^\s,;|&#]+)*?"
         r"[ \t]+"
+        + _GIT_PUSH_DELETE_FLAG_RE
+        + r"(?:[ \t]+[^\s,;|&#]+)*?"
+        + r"[ \t]+"
         rf"(?:refs/heads/)?{_PROTECTED_DEFAULT_BRANCH_RE}"
         r"(?![\w/:-]|\.\w)"
         r")"

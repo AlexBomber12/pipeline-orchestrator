@@ -64,6 +64,16 @@ def test_scan_stdout_branch_delete_default_via_dash_d_short_flag() -> None:
     assert violations[0].category == "branch_delete_main"
 
 
+@pytest.mark.parametrize("delete_flag", ["-df", "-fd"])
+def test_scan_stdout_branch_delete_default_via_clustered_short_delete_flag(
+    delete_flag: str,
+) -> None:
+    violations = scan_stdout(f"git push {delete_flag} origin main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
 @pytest.mark.parametrize("delete_flag", ["--delete", "-d"])
 def test_scan_stdout_branch_delete_without_ref_not_flagged(delete_flag: str) -> None:
     stdout = f"git push {delete_flag} main\n"
@@ -79,6 +89,12 @@ def test_scan_stdout_branch_delete_feature_not_flagged() -> None:
 
 def test_scan_stdout_branch_delete_main_dry_run_not_flagged() -> None:
     stdout = "git push --dry-run --delete origin main\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_branch_delete_main_clustered_short_dry_run_not_flagged() -> None:
+    stdout = "git push origin :main -nq\n"
 
     assert scan_stdout(stdout) == []
 
