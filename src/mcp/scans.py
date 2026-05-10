@@ -73,6 +73,11 @@ _DOUBLE_NEGATIVE_INVERTER = re.compile(
     re.IGNORECASE,
 )
 
+_FORCE_MERGE_COMMIT_STRATEGY = re.compile(
+    r"--no-ff[^\n]{0,80}\bforce(?:-|\s+)merge\b[^\n]{0,80}\bcommits?\b",
+    re.IGNORECASE,
+)
+
 
 def _is_negated(text: str, match_start: int) -> bool:
     """Return True if a negation phrase semantically prohibits the
@@ -136,6 +141,15 @@ def _is_negated(text: str, match_start: int) -> bool:
     if _DOUBLE_NEGATIVE_INVERTER.search(text, nearest.end(), match_start):
         return False
     return True
+
+
+def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
+    """Return True for benign ``--no-ff`` merge-commit guidance."""
+    line_start = text.rfind("\n", 0, match_start) + 1
+    line_end = text.find("\n", match_start)
+    if line_end == -1:
+        line_end = len(text)
+    return bool(_FORCE_MERGE_COMMIT_STRATEGY.search(text, line_start, line_end))
 
 
 _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
@@ -312,7 +326,6 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
         re.compile(
             r"\b(?:"
             r"force(?:-|\s+)merge\b"
-            r"(?!\s+(?:(?:[\w-]+\s+){0,4})?commits?\b)"
             r"|"
             r"merge\s+(?:despite|with)\s+(?:red|failing|broken|stale)\s+(?:CI|checks?|tests?)"
             r")\b",
@@ -352,6 +365,10 @@ def scan_for_conflicts(task_spec_body: str) -> list[ConflictViolation]:
     for vtype, pattern, rule in _ANTI_PATTERNS:
         for match in pattern.finditer(normalized):
             if _is_negated(normalized, match.start()):
+                continue
+            if vtype == "merge_dirty_alt" and _is_force_merge_commit_strategy(
+                normalized, match.start()
+            ):
                 continue
             line_start = normalized.rfind("\n", 0, match.start()) + 1
             line_end = normalized.find("\n", match.start())
