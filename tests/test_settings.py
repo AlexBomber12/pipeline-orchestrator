@@ -158,19 +158,16 @@ def test_settings_page_returns_html(empty_config: Path) -> None:
     assert "Add Repository" in body
 
 
-def test_settings_add_repo_form_has_spinner(empty_config: Path) -> None:
-    """The Add Repository form must show an htmx-indicator spinner while the
-    request is in flight so users see feedback after clicking submit."""
+def test_settings_add_repo_form_uses_global_spinner(empty_config: Path) -> None:
+    """The Add Repository form relies on the base global spinner."""
     with TestClient(app) as client:
         response = client.get("/settings")
 
     assert response.status_code == 200
     body = response.text
-    assert 'hx-indicator="#settings-add-repo-spinner"' in body
-    assert 'id="settings-add-repo-spinner"' in body
-    assert "htmx-indicator" in body
-    assert "animate-spin" in body
-    assert "Saving..." in body
+    assert 'id="global-spinner"' in body
+    assert 'hx-indicator="#settings-add-repo-spinner"' not in body
+    assert 'id="settings-add-repo-spinner"' not in body
 
 
 def test_settings_nav_link_present_on_dashboard(empty_config: Path) -> None:

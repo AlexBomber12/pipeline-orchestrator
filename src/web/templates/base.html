@@ -436,6 +436,47 @@
             color: var(--text-3);
         }
 
+        .global-spinner {
+            position: fixed;
+            top: 88px;
+            right: 16px;
+            z-index: 50;
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            padding: 5px 10px;
+            border: 1px solid var(--border-strong);
+            border-radius: 999px;
+            background-color: rgb(var(--bg-2-rgb) / 0.92);
+            color: var(--text-2);
+            box-shadow: 0 10px 30px rgb(0 0 0 / 0.24);
+            opacity: 0;
+            pointer-events: none;
+            transform: translateY(-4px);
+            transition: opacity 0.15s ease, transform 0.15s ease;
+        }
+
+        .global-spinner.is-active,
+        body.htmx-request #global-spinner {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .global-spinner-dot {
+            width: 14px;
+            height: 14px;
+            border-radius: 999px;
+            border: 2px solid rgb(var(--accent-rgb) / 0.25);
+            border-top-color: var(--accent);
+            animation: global-spinner-spin 0.8s linear infinite;
+        }
+
+        @keyframes global-spinner-spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
         /* PR-254: cancellation cards on the per-repo detail page. Color
            tokens are defined per-theme so the left border, badge, and
            label all share the category color and remain readable in
@@ -644,19 +685,12 @@
                     <span class="dot" aria-hidden="true"></span>
                     <span class="label">AUTO</span>
                 </button>
-                <button
-                    id="theme-toggle"
-                    type="button"
-                    class="secondary-interactive inline-flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-surface-3/60 text-gray-300"
-                    aria-label="Switch to light theme"
-                    title="Toggle theme">
-                    <span id="theme-icon-dark" aria-hidden="true">☾</span>
-                    <span id="theme-icon-light" class="hidden" aria-hidden="true">☀</span>
-                </button>
                 <div id="clock" class="font-mono text-sm text-gray-400 sm:text-right">--:--:--</div>
             </div>
         </div>
     </nav>
+
+    {% include "components/_global_spinner.html" %}
 
     <div hx-get="/partials/redis-banner" hx-trigger="every 30s" hx-swap="innerHTML" id="redis-banner">
         {% include "components/redis_banner.html" %}
@@ -669,11 +703,12 @@
     <script>
         (function () {
             const STORAGE_KEY = 'theme';
-            const button = document.getElementById('theme-toggle');
-            const darkIcon = document.getElementById('theme-icon-dark');
-            const lightIcon = document.getElementById('theme-icon-light');
 
             function applyTheme(theme, persist) {
+                const button = document.getElementById('theme-toggle');
+                const darkIcon = document.getElementById('theme-icon-dark');
+                const lightIcon = document.getElementById('theme-icon-light');
+
                 document.documentElement.dataset.theme = theme;
                 document.documentElement.style.colorScheme = theme;
 
@@ -697,6 +732,8 @@
 
             applyTheme(document.documentElement.dataset.theme || 'dark', false);
 
+            const button = document.getElementById('theme-toggle');
+
             if (button) {
                 button.addEventListener('click', function () {
                     const currentTheme = document.documentElement.dataset.theme === 'light'
@@ -706,6 +743,37 @@
                     applyTheme(nextTheme, true);
                 });
             }
+        })();
+    </script>
+
+    <script>
+        (function () {
+            const spinner = document.getElementById('global-spinner');
+            if (!spinner) {
+                return;
+            }
+
+            let activeRequests = 0;
+
+            function syncSpinner() {
+                spinner.classList.toggle('is-active', activeRequests > 0);
+                document.body.classList.toggle('htmx-request', activeRequests > 0);
+            }
+
+            document.body.addEventListener('htmx:beforeRequest', function () {
+                activeRequests += 1;
+                syncSpinner();
+            });
+
+            document.body.addEventListener('htmx:afterRequest', function () {
+                activeRequests = Math.max(0, activeRequests - 1);
+                syncSpinner();
+            });
+
+            document.body.addEventListener('htmx:sendError', function () {
+                activeRequests = Math.max(0, activeRequests - 1);
+                syncSpinner();
+            });
         })();
     </script>
 
