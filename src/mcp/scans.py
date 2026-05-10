@@ -87,7 +87,10 @@ _DIRTY_MERGE_CONTEXT = re.compile(
     r"with\s+(?:red|failing|failed|broken|stale|non-green)|"
     r"red|failing|failed|broken|stale|non-green"
     r")\b"
-    r"[^\n]{0,80}\b(?:CI|checks?|tests?)\b",
+    r"[^\n]{0,80}\b(?:CI|checks?|tests?)\b"
+    r"|"
+    r"\b(?:CI|checks?|tests?)\b[^\n]{0,80}"
+    r"\b(?:red|failing|failed|broken|stale|non-green)\b",
     re.IGNORECASE,
 )
 
