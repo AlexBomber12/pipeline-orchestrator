@@ -161,19 +161,19 @@ async def _build_recent_graphql_burns_view(
     }
 
 
-def _resource_zone(percent_remaining: float | None) -> str:
-    """Map ``percent_remaining`` to one of ``green|amber|red|none``.
+def _resource_zone(percent_used: float | None) -> str:
+    """Map ``percent_used`` to one of ``green|yellow|red|none``.
 
-    Boundaries: ``>=50`` green, ``20<=pct<50`` amber, ``<20`` red. ``None``
+    Boundaries: ``<70`` green, ``70<=pct<90`` yellow, ``>=90`` red. ``None``
     (resource value unknown) collapses to ``none`` so the chip can render
     a neutral placeholder rather than mis-coloring a missing reading.
     """
-    if percent_remaining is None:
+    if percent_used is None:
         return "none"
-    if percent_remaining >= 50:
+    if percent_used < 70:
         return "green"
-    if percent_remaining >= 20:
-        return "amber"
+    if percent_used < 90:
+        return "yellow"
     return "red"
 
 
@@ -186,7 +186,7 @@ def _budget_chip(
         return {
             "remaining": None,
             "limit": None,
-            "percent_remaining": None,
+            "percent_used": None,
             "reset_unix": None,
             "zone": "none",
         }
@@ -200,28 +200,29 @@ def _budget_chip(
         return {
             "remaining": None,
             "limit": None,
-            "percent_remaining": None,
+            "percent_used": None,
             "reset_unix": None,
             "zone": "none",
         }
-    pct = budget.remaining_percent
+    pct_used = max(0.0, min(100.0, 100.0 - float(budget.remaining_percent)))
     return {
         "remaining": budget.remaining,
         "limit": budget.limit,
-        "percent_remaining": round(pct, 1),
+        "percent_used": round(pct_used, 1),
         "reset_unix": int(budget.reset_at.timestamp()),
-        "zone": _resource_zone(pct),
+        "zone": _resource_zone(pct_used),
     }
 
 
-def _claude_usage_chip(
+def _coder_usage_chip(
     states: list[RepoState],
     *,
+    coder: Literal["claude", "codex"],
     window: Literal["session", "weekly"],
 ) -> dict[str, Any]:
-    """Aggregate Claude usage across active Claude repos for the chip row.
+    """Aggregate coder usage across active repos for the chip row.
 
-    All Claude repos share one OAuth account so any active Claude state's
+    Coder repos share one account so any active coder state's
     snapshot is representative of the whole account. The most recently
     updated one wins so the chip reflects the freshest observation.
 
@@ -233,7 +234,7 @@ def _claude_usage_chip(
     """
     candidate: RepoState | None = None
     for state in states:
-        if (state.coder or "") != "claude":
+        if (state.coder or "") != coder:
             continue
         if not state.active:
             continue
@@ -247,7 +248,7 @@ def _claude_usage_chip(
         return {
             "remaining": None,
             "limit": None,
-            "percent_remaining": None,
+            "percent_used": None,
             "reset_unix": None,
             "zone": "none",
         }
@@ -257,25 +258,41 @@ def _claude_usage_chip(
     else:
         used = candidate.usage_weekly_percent or 0
         reset_unix = candidate.usage_weekly_resets_at
-    pct_remaining = max(0.0, min(100.0, 100.0 - float(used)))
+    pct_used = max(0.0, min(100.0, float(used)))
     return {
-        "remaining": int(round(pct_remaining)),
+        "remaining": int(round(100.0 - pct_used)),
         "limit": 100,
-        "percent_remaining": round(pct_remaining, 1),
+        "percent_used": round(pct_used, 1),
         "reset_unix": reset_unix,
-        "zone": _resource_zone(pct_remaining),
+        "zone": _resource_zone(pct_used),
     }
+
+
+def _claude_usage_chip(
+    states: list[RepoState],
+    *,
+    window: Literal["session", "weekly"],
+) -> dict[str, Any]:
+    return _coder_usage_chip(states, coder="claude", window=window)
+
+
+def _codex_usage_chip(
+    states: list[RepoState],
+    *,
+    window: Literal["session", "weekly"],
+) -> dict[str, Any]:
+    return _coder_usage_chip(states, coder="codex", window=window)
 
 
 async def _build_resources_view(
     redis_client: aioredis.Redis | None,
     states: list[RepoState],
 ) -> dict[str, dict[str, Any]]:
-    """Return the four-resource payload for the dashboard chip row.
+    """Return the resource payload for the dashboard chip row.
 
-    Each entry exposes ``remaining``, ``limit``, ``percent_remaining``,
-    ``reset_unix`` and a precomputed ``zone`` (``green|amber|red|none``).
-    Missing data renders as ``percent_remaining: None`` plus ``zone: none``
+    Each entry exposes ``remaining``, ``limit``, ``percent_used``,
+    ``reset_unix`` and a precomputed ``zone`` (``green|yellow|red|none``).
+    Missing data renders as ``percent_used: None`` plus ``zone: none``
     rather than crashing the dashboard or hiding the chip.
     """
     rest = await read_rest_budget(redis_client)
@@ -286,6 +303,8 @@ async def _build_resources_view(
         "github_graphql": _budget_chip(graphql, now=now),
         "claude_5h": _claude_usage_chip(states, window="session"),
         "claude_weekly": _claude_usage_chip(states, window="weekly"),
+        "codex_5h": _codex_usage_chip(states, window="session"),
+        "codex_weekly": _codex_usage_chip(states, window="weekly"),
     }
 
 
@@ -313,11 +332,13 @@ async def _repo_template_context(
     recent_graphql_burns = await _build_recent_graphql_burns_view(
         redis_client, name
     )
+    resources = await _build_resources_view(redis_client, [state])
     selected_repo_coder = _repo_coder_form_value(repo_config)
     active_repo_coder = _active_repo_coder(state)
     return {
         "repo": state,
         "recent_graphql_burns": recent_graphql_burns,
+        "resources": resources,
         "repo_config": repo_config,
         "daemon": config.daemon,
         "coders": build_coder_registry().list_coders(),

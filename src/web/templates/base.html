@@ -381,9 +381,9 @@
             box-shadow: 0 0 0 0 transparent;
         }
 
-        /* Resource chip row: four compact indicators replacing the legacy
-           single GitHub API budget bar. Color zone reflects percent
-           remaining; `none` is a neutral grey for missing data. */
+        /* Resource chip row: compact indicators replacing the legacy
+           single GitHub API budget bar. Color zone reflects percent used;
+           `none` is a neutral grey for missing data. */
         .resource-chip-row {
             display: flex;
             flex-wrap: wrap;
@@ -418,6 +418,7 @@
             color: var(--ok);
         }
 
+        .resource-chip[data-zone="yellow"],
         .resource-chip[data-zone="amber"] {
             background-color: color-mix(in srgb, var(--warn) 18%, transparent);
             border-color: color-mix(in srgb, var(--warn) 35%, transparent);
