@@ -77,6 +77,11 @@ _FORCE_MERGE_COMMIT_STRATEGY = re.compile(
     r"--no-ff[^\n]{0,80}\bforce(?:-|\s+)merge\b[^\n]{0,80}\bcommits?\b",
     re.IGNORECASE,
 )
+_DIRTY_MERGE_CONTEXT = re.compile(
+    r"\b(?:despite|regardless\s+of|with|even\s+with|red|failing|broken|stale)\b"
+    r"[^\n]{0,80}\b(?:CI|checks?|tests?)\b",
+    re.IGNORECASE,
+)
 
 
 def _is_negated(text: str, match_start: int) -> bool:
@@ -149,6 +154,8 @@ def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
     line_end = text.find("\n", match_start)
     if line_end == -1:
         line_end = len(text)
+    if _DIRTY_MERGE_CONTEXT.search(text, line_start, line_end):
+        return False
     return bool(_FORCE_MERGE_COMMIT_STRATEGY.search(text, line_start, line_end))
 
 
