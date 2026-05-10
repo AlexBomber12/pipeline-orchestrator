@@ -754,18 +754,42 @@
             }
 
             let activeRequests = 0;
+            const countedRequests = new WeakSet();
 
             function syncSpinner() {
                 spinner.classList.toggle('is-active', activeRequests > 0);
                 document.body.classList.toggle('htmx-request', activeRequests > 0);
             }
 
-            document.body.addEventListener('htmx:beforeRequest', function () {
+            function shouldTrackRequest(event) {
+                const elt = event.detail && event.detail.elt;
+                const trigger = elt ? elt.getAttribute('hx-trigger') || '' : '';
+                return trigger.indexOf('every ') === -1;
+            }
+
+            document.body.addEventListener('htmx:beforeRequest', function (event) {
+                if (!shouldTrackRequest(event)) {
+                    return;
+                }
+
+                if (event.detail && event.detail.xhr) {
+                    countedRequests.add(event.detail.xhr);
+                }
+
                 activeRequests += 1;
                 syncSpinner();
             });
 
-            document.body.addEventListener('htmx:afterRequest', function () {
+            document.body.addEventListener('htmx:afterRequest', function (event) {
+                if (event.detail && event.detail.xhr) {
+                    if (!countedRequests.has(event.detail.xhr)) {
+                        return;
+                    }
+                    countedRequests.delete(event.detail.xhr);
+                } else if (!shouldTrackRequest(event)) {
+                    return;
+                }
+
                 activeRequests = Math.max(0, activeRequests - 1);
                 syncSpinner();
             });
