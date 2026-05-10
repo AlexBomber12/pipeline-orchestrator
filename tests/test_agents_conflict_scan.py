@@ -1013,6 +1013,13 @@ def test_scan_no_ff_force_merge_commits_with_checks_failing_flagged():
     assert "merge_dirty_alt" in types
 
 
+def test_scan_no_ff_force_merge_commits_if_checks_fail_flagged():
+    body = "Use --no-ff to force merge commits if checks fail."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "merge_dirty_alt" in types
+
+
 def test_multiple_violations_all_returned():
     body = (
         "Step 1: gh pr create --draft --title 'wip'.\n"

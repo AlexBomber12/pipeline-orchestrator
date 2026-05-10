@@ -84,13 +84,13 @@ _FORCE_MERGE_COMMIT_STRATEGY = re.compile(
 _DIRTY_MERGE_CONTEXT = re.compile(
     r"\b(?:"
     r"despite|regardless\s+of|even\s+with|"
-    r"with\s+(?:red|failing|failed|broken|stale|non-green)|"
-    r"red|failing|failed|broken|stale|non-green"
+    r"with\s+(?:red|fail|fails|failing|failed|broken|stale|non-green)|"
+    r"red|fail|fails|failing|failed|broken|stale|non-green"
     r")\b"
     r"[^\n]{0,80}\b(?:CI|checks?|tests?)\b"
     r"|"
     r"\b(?:CI|checks?|tests?)\b[^\n]{0,80}"
-    r"\b(?:red|failing|failed|broken|stale|non-green)\b",
+    r"\b(?:red|fail|fails|failing|failed|broken|stale|non-green)\b",
     re.IGNORECASE,
 )
 
