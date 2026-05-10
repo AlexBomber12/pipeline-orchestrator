@@ -186,6 +186,13 @@ def test_scan_flags_open_as_draft_with_comma_continuation():
     assert "draft_pr_open_as" in types
 
 
+def test_scan_flags_open_as_draft_with_colon_continuation():
+    body = "Open as draft: then request review."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_open_as" in types
+
+
 def test_scan_flags_open_as_draft_pr():
     body = "Open as draft PR."
     violations = scan_for_conflicts(body)
@@ -223,6 +230,13 @@ def test_scan_flags_open_as_draft_for_feedback():
 
 def test_scan_flags_open_it_as_draft_while_tests_run():
     body = "Open it as draft while tests run."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_open_as" in types
+
+
+def test_scan_flags_open_it_as_draft_with_colon_continuation():
+    body = "Open it as draft: continue."
     violations = scan_for_conflicts(body)
     types = {v.violation_type for v in violations}
     assert "draft_pr_open_as" in types
@@ -1009,6 +1023,16 @@ def test_scan_no_ff_force_merge_commits_next_line_policy_not_flagged():
 
 def test_scan_no_ff_force_merge_commits_wrapped_retry_policy_not_flagged():
     body = "Use --no-ff to force merge commits\nif checks fail, retry."
+    assert scan_for_conflicts(body) == []
+
+
+def test_scan_no_ff_force_merge_commits_wrapped_abort_merge_not_flagged():
+    body = "Use --no-ff to force merge commits\nif checks fail, abort merge."
+    assert scan_for_conflicts(body) == []
+
+
+def test_scan_no_ff_force_merge_commits_wrapped_stop_merge_not_flagged():
+    body = "Use --no-ff to force merge commits\nif checks fail, stop merge."
     assert scan_for_conflicts(body) == []
 
 

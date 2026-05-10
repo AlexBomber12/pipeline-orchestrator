@@ -182,6 +182,15 @@ def _is_guarded_remedial_dirty_context(prefix: str, suffix: str) -> bool:
     )
     if has_negated_merge_policy:
         return True
+    has_abort_merge_policy = re.match(
+        r"\s*,?\s*(?:abort|stop)\s+merge\b", suffix, re.IGNORECASE
+    ) and not re.search(
+        r"\b(?:then|and)\s+(?:force(?:-|\s+)merge|merge)\b",
+        guarded_branch,
+        re.IGNORECASE,
+    )
+    if has_abort_merge_policy:
+        return True
     has_remedial_action = re.match(
         r"\s*,?\s*(?:retry|re-run|rerun|try\s+again|fix|stop|abort|wait)\b",
         suffix,
@@ -298,7 +307,7 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
             r"(?:(?:the|a)\s+)?(?:PR|pull request)\s+as\s+(?:a\s+)?draft\b"
             r"|"
             r"(?:it\s+)?as\s+(?:a\s+)?draft(?:\s+(?:PR|pull request))?"
-            r"(?=\s*(?:[,.;!?\n]|$|\bthen\b|\band\b|\bbefore\b|\bcontinue\b|\bfor\b|\bto\b|\bwhile\b))"
+            r"(?=\s*(?:[,.:;!?\n]|$|\bthen\b|\band\b|\bbefore\b|\bcontinue\b|\bfor\b|\bto\b|\bwhile\b))"
             r")",
             re.IGNORECASE,
         ),
