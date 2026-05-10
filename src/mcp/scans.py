@@ -174,7 +174,7 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
         "draft_pr_open_as",
         re.compile(
             r"\bopen(?:s|ed|ing)?\s+(?:"
-            r"(?:the\s+)?(?:PR|pull request)\s+as\s+(?:a\s+)?draft\b"
+            r"(?:(?:the|a)\s+)?(?:PR|pull request)\s+as\s+(?:a\s+)?draft\b"
             r"|"
             r"(?:it\s+)?as\s+(?:a\s+)?draft(?=\s*(?:[,.;!?\n]|$|\bthen\b))"
             r")",
@@ -310,7 +310,7 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
         "merge_dirty_alt",
         re.compile(
             r"\b(?:"
-            r"force[-\s]merge\b"
+            r"force(?:-|\s+)merge\b"
             r"(?!\s+(?:PR\s+)?commits?\b)"
             r"|"
             r"merge\s+(?:despite|with)\s+(?:red|failing|broken|stale)\s+(?:CI|checks?|tests?)"
