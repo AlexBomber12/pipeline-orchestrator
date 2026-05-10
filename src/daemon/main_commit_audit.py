@@ -316,6 +316,13 @@ def audit_main_commit_shas(
 
             pr_number = _extract_pr_number(message)
             if pr_number is None:
+                associated_pr = _merged_associated_pr(
+                    run_gh(["api", f"repos/{owner_repo}/commits/{sha}/pulls"])
+                )
+                if associated_pr is not None:
+                    pr_number = _pr_number(associated_pr)
+
+            if pr_number is None:
                 findings.append(
                     _finding(
                         sha=sha,

@@ -245,6 +245,8 @@ def test_audit_merge_commit_message_unparseable_flagged(monkeypatch):
             return [_summary("mergeish")]
         if path.endswith("/commits/mergeish"):
             return _commit("hotfix", ["base", "head"])
+        if path.endswith("/commits/mergeish/pulls"):
+            return []
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
@@ -254,6 +256,27 @@ def test_audit_merge_commit_message_unparseable_flagged(monkeypatch):
     assert [finding.violation_category for finding in findings] == [
         "merge_commit_pr_unverified"
     ]
+
+
+def test_audit_merge_commit_uses_associated_pr_when_message_unparseable(
+    monkeypatch,
+):
+    def fake_run_gh(args):
+        path = args[1]
+        if path.endswith("/commits?sha=main&per_page=10"):
+            return [_summary("merge42")]
+        if path.endswith("/commits/merge42"):
+            return _commit("custom merge subject", ["base", "head"])
+        if path.endswith("/commits/merge42/pulls"):
+            return [{"number": 42, "merged_at": "2026-05-10T12:00:00Z"}]
+        if path.endswith("/commits/head/status"):
+            return _status("success")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+    _patch_check_runs(monkeypatch, {"head": _check_runs("success")})
+
+    assert main_commit_audit.audit_main_commits("octo/demo") == []
 
 
 def test_audit_squash_merge_default_message(monkeypatch):
