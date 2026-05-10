@@ -158,6 +158,27 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
         "AGENTS.md prohibits opening PRs in draft state. PR-196.",
     ),
     (
+        "draft_pull_request_text",
+        re.compile(r"\bcreate (a |the )?draft pull request\b", re.IGNORECASE),
+        "AGENTS.md prohibits opening PRs in draft state. PR-196.",
+    ),
+    (
+        "draft_pr_convert",
+        re.compile(
+            r"\bconvert(?:s|ed|ing)?\s+(?:the\s+)?(?:PR|pull request)\s+to\s+draft\b",
+            re.IGNORECASE,
+        ),
+        "AGENTS.md prohibits draft PR state. Do not convert PRs to draft. PR-196.",
+    ),
+    (
+        "draft_pr_open_as",
+        re.compile(
+            r"\bopen(?:s|ed|ing)?\s+(?:the\s+)?(?:PR|pull request|it)?\s*as\s+(?:a\s+)?draft\b",
+            re.IGNORECASE,
+        ),
+        "AGENTS.md prohibits opening PRs in draft state. PR-196.",
+    ),
+    (
         "force_push_main",
         # Detect ``git push`` lines that force-push to ``main``. Both
         # arms walk only the tokens that belong to the ``git push``
@@ -280,6 +301,14 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
         "auto_merge_dirty",
         re.compile(r"\bauto.merge[^\n]*(dirty|red|failing)\b", re.IGNORECASE),
         "AGENTS.md prohibits merging with failing checks.",
+    ),
+    (
+        "merge_dirty_alt",
+        re.compile(
+            r"\b(?:force[-\s]merge|merge\s+(?:despite|with)\s+(?:red|failing|broken|stale)\s+(?:CI|checks?|tests?))\b",
+            re.IGNORECASE,
+        ),
+        "AGENTS.md prohibits merging with non-green CI. PR-118.",
     ),
 ]
 

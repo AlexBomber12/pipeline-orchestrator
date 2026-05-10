@@ -87,6 +87,91 @@ def test_draft_pr_text_negated_typographic_apostrophe_not_flagged():
     assert "draft_pr_text" not in types
 
 
+def test_scan_flags_create_draft_pull_request():
+    body = "Coders should create a draft pull request first."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pull_request_text" in types
+
+
+def test_scan_flags_create_the_draft_pull_request():
+    body = "Coders should create the draft pull request first."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pull_request_text" in types
+
+
+def test_scan_negated_create_draft_pull_request_not_flagged():
+    body = "Coders must never create a draft pull request."
+    assert scan_for_conflicts(body) == []
+
+
+def test_scan_create_draft_pr_short_form_still_uses_existing_pattern():
+    body = "Coders should create a draft PR first."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_text" in types
+
+
+def test_scan_flags_convert_pr_to_draft():
+    body = "After tests pass, convert the PR to draft."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_convert" in types
+
+
+def test_scan_flags_convert_pull_request_to_draft():
+    body = "After tests pass, convert pull request to draft."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_convert" in types
+
+
+def test_scan_flags_converted_pr_to_draft_past_tense():
+    body = "Codex converted the PR to draft."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_convert" in types
+
+
+def test_scan_flags_converting_pr_to_draft_progressive():
+    body = "Continue after converting the PR to draft."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_convert" in types
+
+
+def test_scan_negated_do_not_convert_pr_to_draft_not_flagged():
+    body = "Do not convert PR to draft."
+    assert scan_for_conflicts(body) == []
+
+
+def test_scan_flags_open_as_draft():
+    body = "Open as draft."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_open_as" in types
+
+
+def test_scan_flags_open_pr_as_draft():
+    body = "Open the PR as draft."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_open_as" in types
+
+
+def test_scan_flags_open_as_a_draft():
+    body = "Open it as a draft."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_open_as" in types
+
+
+def test_scan_negated_do_not_open_as_draft_not_flagged():
+    body = "Do not open as draft."
+    assert scan_for_conflicts(body) == []
+
+
 def test_force_push_main_detected():
     body = "If history diverges, run git push --force origin main."
     violations = scan_for_conflicts(body)
@@ -693,6 +778,46 @@ def test_auto_merge_dirty_detected():
     violations = scan_for_conflicts(body)
     types = {v.violation_type for v in violations}
     assert "auto_merge_dirty" in types
+
+
+def test_scan_flags_force_merge():
+    body = "force-merge the PR after review."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "merge_dirty_alt" in types
+
+
+def test_scan_flags_force_merge_with_space():
+    body = "force merge regardless of CI."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "merge_dirty_alt" in types
+
+
+def test_scan_flags_merge_despite_failing_checks():
+    body = "merge despite failing checks."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "merge_dirty_alt" in types
+
+
+def test_scan_flags_merge_with_red_ci():
+    body = "merge with red CI."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "merge_dirty_alt" in types
+
+
+def test_scan_flags_merge_with_broken_tests():
+    body = "merge with broken tests."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "merge_dirty_alt" in types
+
+
+def test_scan_negated_do_not_force_merge_not_flagged():
+    body = "Coders must not force-merge under any circumstances."
+    assert scan_for_conflicts(body) == []
 
 
 def test_multiple_violations_all_returned():
