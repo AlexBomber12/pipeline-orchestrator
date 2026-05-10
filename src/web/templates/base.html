@@ -692,7 +692,11 @@
 
     {% include "components/_global_spinner.html" %}
 
-    <div hx-get="/partials/redis-banner" hx-trigger="every 30s" hx-swap="innerHTML" id="redis-banner">
+    <div hx-get="/partials/redis-banner"
+         hx-trigger="every 30s"
+         hx-swap="innerHTML"
+         id="redis-banner"
+         data-global-spinner="false">
         {% include "components/redis_banner.html" %}
     </div>
 
@@ -763,6 +767,11 @@
             }
 
             document.body.addEventListener('htmx:trigger', function (event) {
+                const triggerSpec = event.detail && event.detail.triggerSpec;
+                if (triggerSpec && triggerSpec.pollInterval > 0) {
+                    return;
+                }
+
                 if (event.target instanceof Element) {
                     triggeredElements.add(event.target);
                 }
@@ -771,6 +780,11 @@
             function shouldTrackRequest(event) {
                 const elt = event.detail && event.detail.elt;
                 const requestConfig = event.detail && event.detail.requestConfig;
+
+                if (elt && elt.closest('[data-global-spinner="false"]')) {
+                    triggeredElements.delete(elt);
+                    return false;
+                }
 
                 if (requestConfig && requestConfig.triggeringEvent) {
                     return true;
