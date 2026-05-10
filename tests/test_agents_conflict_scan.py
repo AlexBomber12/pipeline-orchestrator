@@ -172,6 +172,20 @@ def test_scan_flags_open_it_as_a_draft_clause():
     assert "draft_pr_open_as" in types
 
 
+def test_scan_flags_open_as_draft_with_then_continuation():
+    body = "Open as draft then request review."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_open_as" in types
+
+
+def test_scan_flags_open_as_draft_with_comma_continuation():
+    body = "Open as draft, then request review."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_open_as" in types
+
+
 def test_scan_flags_open_pull_request_as_a_draft():
     body = "Open the pull request as a draft."
     violations = scan_for_conflicts(body)
@@ -801,6 +815,13 @@ def test_scan_flags_force_merge():
 
 def test_scan_flags_force_merge_with_space():
     body = "force merge regardless of CI."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "merge_dirty_alt" in types
+
+
+def test_scan_flags_bare_force_merge_now():
+    body = "please force merge now."
     violations = scan_for_conflicts(body)
     types = {v.violation_type for v in violations}
     assert "merge_dirty_alt" in types

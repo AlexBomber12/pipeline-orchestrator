@@ -176,7 +176,7 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
             r"\bopen(?:s|ed|ing)?\s+(?:"
             r"(?:the\s+)?(?:PR|pull request)\s+as\s+(?:a\s+)?draft\b"
             r"|"
-            r"(?:it\s+)?as\s+(?:a\s+)?draft(?=[.;!?\n]|$)"
+            r"(?:it\s+)?as\s+(?:a\s+)?draft(?=\s*(?:[,.;!?\n]|$|\bthen\b))"
             r")",
             re.IGNORECASE,
         ),
@@ -311,12 +311,7 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
         re.compile(
             r"\b(?:"
             r"force[-\s]merge\b"
-            r"(?:"
-            r"(?=[^\n]{0,80}\b(?:despite|regardless\s+of|with|red|failing|broken|stale)\b)"
-            r"(?=[^\n]{0,80}\b(?:CI|checks?|tests?)\b)"
-            r"|"
-            r"\s+(?:the\s+)?(?:PR|pull request)\b(?!\s+commits?\b)"
-            r")"
+            r"(?!\s+(?:PR\s+)?commits?\b)"
             r"|"
             r"merge\s+(?:despite|with)\s+(?:red|failing|broken|stale)\s+(?:CI|checks?|tests?)"
             r")\b",
