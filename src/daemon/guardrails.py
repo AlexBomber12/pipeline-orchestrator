@@ -31,7 +31,7 @@ _GIT_PUSH_COMMAND_RE = re.compile(
     _COMMAND_PREFIX_RE + r"git[^\S\r\n]+push\b(?P<args>[^\r\n]*)",
     re.IGNORECASE,
 )
-_PUSH_VALUE_OPTIONS = {"-o", "--push-option", "--receive-pack", "--exec"}
+_PUSH_VALUE_OPTIONS = {"-o", "--push-option", "--receive-pack", "--exec", "--repo"}
 _PUSH_VALUE_OPTION_PREFIXES = tuple(
     f"{option}=" for option in _PUSH_VALUE_OPTIONS if option != "-o"
 )
@@ -84,6 +84,16 @@ def _is_dry_run_token(token: str) -> bool:
     return token == "--dry-run" or _short_option_cluster_contains(token, "n")
 
 
+def _is_effective_dry_run(tokens: list[str]) -> bool:
+    dry_run = False
+    for token in tokens:
+        if _is_dry_run_token(token):
+            dry_run = True
+        elif token == "--no-dry-run":
+            dry_run = False
+    return dry_run
+
+
 def _is_delete_token(token: str) -> bool:
     return token == "--delete" or _short_option_cluster_contains(token, "d")
 
@@ -108,6 +118,10 @@ def _is_repository_token(token: str) -> bool:
     return _is_positional_push_token(token) and not _is_empty_source_protected_refspec(
         token
     )
+
+
+def _has_repo_option(tokens: list[str]) -> bool:
+    return any(token == "--repo" or token.startswith("--repo=") for token in tokens)
 
 
 def _push_tokens_without_option_values(tokens: list[str]) -> list[str]:
@@ -140,9 +154,13 @@ def _delete_flag_targets_protected_branch(tokens: list[str]) -> bool:
     positional = [
         token for token in filtered_tokens if _is_positional_push_token(token)
     ]
-    if len(positional) < 2:
+    if _has_repo_option(tokens):
+        candidate_refs = positional
+    elif len(positional) >= 2:
+        candidate_refs = positional[1:]
+    else:
         return False
-    return any(_is_protected_branch_ref(ref) for ref in positional[1:])
+    return any(_is_protected_branch_ref(ref) for ref in candidate_refs)
 
 
 def _colon_refspec_targets_protected_branch(tokens: list[str]) -> bool:
@@ -159,7 +177,7 @@ def _scan_branch_delete_main(coder_stdout: str) -> list[GuardrailViolation]:
     for match in _GIT_PUSH_COMMAND_RE.finditer(coder_stdout):
         tokens = _push_args_tokens(match.group("args"))
         option_value_filtered_tokens = _push_tokens_without_option_values(tokens)
-        if any(_is_dry_run_token(token) for token in option_value_filtered_tokens):
+        if _is_effective_dry_run(option_value_filtered_tokens):
             continue
         if not (
             _colon_refspec_targets_protected_branch(tokens)

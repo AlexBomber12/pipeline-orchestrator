@@ -172,6 +172,25 @@ def test_scan_stdout_branch_delete_main_clustered_short_dry_run_not_flagged() ->
     assert scan_stdout(stdout) == []
 
 
+def test_scan_stdout_branch_delete_no_dry_run_after_dry_run_still_flagged() -> None:
+    stdout = "git push --dry-run --no-dry-run --delete origin main\n"
+
+    violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+@pytest.mark.parametrize("repo_option", ["--repo=origin", "--repo origin"])
+def test_scan_stdout_branch_delete_repo_option_with_delete_flag(
+    repo_option: str,
+) -> None:
+    violations = scan_stdout(f"git push {repo_option} --delete main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
 @pytest.mark.parametrize(
     "stdout",
     [
