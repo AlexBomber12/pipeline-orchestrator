@@ -93,11 +93,13 @@ def test_handle_idle_main_commit_audit_invoked_at_interval(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
     monkeypatch.setattr("src.github.prs.get_merged_prs", lambda repo, branch, refresh=False: [])
-    monkeypatch.setattr(
-        idle_module,
-        "list_recent_main_commit_shas",
-        lambda repo, lookback_n: ["sha20"],
-    )
+    list_calls: list[tuple[str, int, str]] = []
+
+    def fake_list(owner_repo: str, lookback_n: int, branch: str) -> list[str]:
+        list_calls.append((owner_repo, lookback_n, branch))
+        return ["sha20"]
+
+    monkeypatch.setattr(idle_module, "list_recent_main_commit_shas", fake_list)
     audit_calls: list[tuple[str, list[str], set[str]]] = []
 
     def fake_audit(owner_repo: str, shas: list[str], audited_shas: set[str]):
@@ -115,6 +117,7 @@ def test_handle_idle_main_commit_audit_invoked_at_interval(
     asyncio.run(runner.handle_idle())
 
     assert audit_calls == [("octo/demo", ["sha20"], set())]
+    assert list_calls == [("octo/demo", 10, "main")]
 
 
 def test_handle_idle_main_commit_audit_findings_logged(
@@ -126,7 +129,7 @@ def test_handle_idle_main_commit_audit_findings_logged(
     monkeypatch.setattr(
         idle_module,
         "list_recent_main_commit_shas",
-        lambda repo, lookback_n: ["abc1234"],
+        lambda repo, lookback_n, branch: ["abc1234"],
     )
     finding = main_commit_audit.MainCommitAuditFinding(
         sha="abc1234",
@@ -164,7 +167,7 @@ def test_handle_idle_main_commit_audit_failure_logged(
 
     attempts = 0
 
-    def fail_list(owner_repo: str, lookback_n: int) -> list[str]:
+    def fail_list(owner_repo: str, lookback_n: int, branch: str) -> list[str]:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
@@ -195,6 +198,41 @@ def test_handle_idle_main_commit_audit_failure_logged(
 
     assert audit_calls == [("octo/demo", ["retry-sha"], set())]
     assert runner._main_commit_audit_counter == 0
+
+
+def test_handle_idle_main_commit_audit_repeated_failures_return_to_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
+    monkeypatch.setattr("src.github.prs.get_merged_prs", lambda repo, branch, refresh=False: [])
+    attempts = 0
+
+    def fail_list(owner_repo: str, lookback_n: int, branch: str) -> list[str]:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("gh unavailable")
+
+    monkeypatch.setattr(idle_module, "list_recent_main_commit_shas", fail_list)
+
+    runner = h._make_runner()
+    for _ in range(20):
+        asyncio.run(runner.handle_idle())
+
+    assert attempts == 1
+    assert runner._main_commit_audit_counter == 19
+    assert runner._main_commit_audit_retry_pending is True
+
+    asyncio.run(runner.handle_idle())
+
+    assert attempts == 2
+    assert runner._main_commit_audit_counter == 0
+    assert runner._main_commit_audit_retry_pending is False
+
+    asyncio.run(runner.handle_idle())
+
+    assert attempts == 2
+    assert runner._main_commit_audit_counter == 1
 
 
 def test_resolve_rate_limit_error_state_clears_rate_limit_message() -> None:

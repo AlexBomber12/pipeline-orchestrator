@@ -95,14 +95,18 @@ def _commit_shas(payload: object) -> list[str]:
     return shas
 
 
-def list_recent_main_commit_shas(owner_repo: str, lookback_n: int = 10) -> list[str]:
-    """Return the newest ``lookback_n`` main commit SHAs via GitHub CLI."""
+def list_recent_main_commit_shas(
+    owner_repo: str,
+    lookback_n: int = 10,
+    branch: str = "main",
+) -> list[str]:
+    """Return the newest ``lookback_n`` base-branch commit SHAs via GitHub CLI."""
     if lookback_n <= 0:
         return []
     payload = run_gh(
         [
             "api",
-            f"repos/{owner_repo}/commits?sha=main&per_page={lookback_n}",
+            f"repos/{owner_repo}/commits?sha={branch}&per_page={lookback_n}",
         ]
     )
     return _commit_shas(payload)

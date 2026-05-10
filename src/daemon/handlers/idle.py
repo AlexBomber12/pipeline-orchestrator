@@ -176,6 +176,7 @@ class IdleMixin:
                 list_recent_main_commit_shas,
                 self.owner_repo,
                 lookback_n,
+                self.repo_config.branch,
             )
             findings, checked_shas = await asyncio.to_thread(
                 audit_main_commit_shas,
@@ -188,6 +189,12 @@ class IdleMixin:
                 f"[AUDIT] [MAIN-COMMIT-AUDIT] Skipping audit for "
                 f"{self.owner_repo}: {exc}"
             )
+            if getattr(self, "_main_commit_audit_retry_pending", False):
+                self._main_commit_audit_retry_pending = False
+                self._main_commit_audit_counter = 0
+            else:
+                self._main_commit_audit_retry_pending = True
+                self._main_commit_audit_counter = max(audit_interval - 1, 0)
             return
 
         for finding in findings:
@@ -202,6 +209,7 @@ class IdleMixin:
             repo_key,
             checked_shas,
         )
+        self._main_commit_audit_retry_pending = False
         self._main_commit_audit_counter = 0
 
     @staticmethod

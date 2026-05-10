@@ -547,8 +547,14 @@ def test_list_recent_main_commit_shas_handles_empty_and_malformed(monkeypatch):
     assert main_commit_audit.list_recent_main_commit_shas("octo/demo", 2) == [
         "good"
     ]
+    assert main_commit_audit.list_recent_main_commit_shas(
+        "octo/demo",
+        3,
+        branch="release",
+    ) == ["good"]
     assert calls == [
         ["api", "repos/octo/demo/commits?sha=main&per_page=2"],
+        ["api", "repos/octo/demo/commits?sha=release&per_page=3"],
     ]
     assert main_commit_audit._commit_shas({"sha": "not-a-list"}) == []
 
