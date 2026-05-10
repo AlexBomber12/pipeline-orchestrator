@@ -27,6 +27,7 @@ from src.web.app import (
     _build_recent_graphql_burns_view,
     _build_resources_view,
     _claude_usage_chip,
+    _codex_usage_chip,
     _find_repo_config_by_name,
     _format_duration_ms,
     _format_reset_unix,
@@ -2103,8 +2104,8 @@ def test_partial_repo_detail_renders_redis_payload(
                     2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc
                 ),
             ),
-            ("Claude Session 16%", "Weekly 42%"),
-            ("Codex Session",),
+            ('data-resource="claude_5h"', 'data-resource="claude_weekly"', "16%", "42%"),
+            ('data-resource="codex_5h"', "Claude Session"),
         ),
         (
             RepoState(
@@ -2125,8 +2126,14 @@ def test_partial_repo_detail_renders_redis_payload(
                     2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc
                 ),
             ),
-            ("Codex Session 16%", "Weekly 42%", "Usage API degraded"),
-            ("Claude Session",),
+            (
+                'data-resource="codex_5h"',
+                'data-resource="codex_weekly"',
+                "16%",
+                "42%",
+                "Usage API degraded",
+            ),
+            ('data-resource="claude_5h"', "Codex Session"),
         ),
         (
             RepoState(
@@ -2141,8 +2148,8 @@ def test_partial_repo_detail_renders_redis_payload(
                     2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc
                 ),
             ),
-            (),
-            ("Claude Session", "Session 16%", "Weekly 42%"),
+            ('data-resource="claude_5h"', 'data-resource="claude_weekly"', "16%", "42%"),
+            ("Claude Session",),
         ),
     ],
 )
@@ -3383,31 +3390,63 @@ def _claude_state(
 
 
 def test_resource_zone_boundaries() -> None:
-    # Spec boundaries: 50% → green, 49% → amber, 20% → amber, 19% → red.
-    assert _resource_zone(100.0) == "green"
-    assert _resource_zone(50.0) == "green"
-    assert _resource_zone(49.9) == "amber"
-    assert _resource_zone(20.0) == "amber"
-    assert _resource_zone(19.9) == "red"
-    assert _resource_zone(0.0) == "red"
+    assert _resource_zone(69.9) == "green"
+    assert _resource_zone(70.0) == "yellow"
+    assert _resource_zone(89.9) == "yellow"
+    assert _resource_zone(90.0) == "red"
+    assert _resource_zone(100.0) == "red"
     assert _resource_zone(None) == "none"
 
 
-def test_format_reset_unix_renders_utc_clock() -> None:
+def test_format_reset_unix_smart_switches_relative_and_absolute() -> None:
     assert _format_reset_unix(0) == "unknown"
     assert _format_reset_unix(None) == "unknown"
-    # 2024-01-01 12:34:56 UTC.
-    assert _format_reset_unix(1704112496) == "12:34 UTC"
+    now = datetime(2026, 5, 8, 12, 0, 0, tzinfo=timezone.utc)
+    assert (
+        _format_reset_unix(
+            int((now + timedelta(minutes=30)).timestamp()),
+            now=now,
+        )
+        == "resets in 30 min"
+    )
+    assert (
+        _format_reset_unix(
+            int((now + timedelta(hours=2)).timestamp()),
+            now=now,
+        )
+        == "resets in 2h"
+    )
+    assert (
+        _format_reset_unix(
+            int((now + timedelta(hours=2, minutes=15)).timestamp()),
+            now=now,
+        )
+        == "resets in 2h 15m"
+    )
+    assert (
+        _format_reset_unix(
+            int((now + timedelta(days=2)).timestamp()),
+            now=now,
+        )
+        == "resets May 10, 12:00 PM"
+    )
 
 
 def test_build_resources_view_missing_data_renders_neutral() -> None:
-    """No GitHub or Claude data anywhere → all four chips render as none."""
+    """No GitHub or coder data anywhere → all six chips render as none."""
     view = asyncio.run(_build_resources_view(_FakeRedis(), []))
 
-    assert set(view) == {"github_rest", "github_graphql", "claude_5h", "claude_weekly"}
+    assert set(view) == {
+        "github_rest",
+        "github_graphql",
+        "claude_5h",
+        "claude_weekly",
+        "codex_5h",
+        "codex_weekly",
+    }
     for chip in view.values():
         assert chip["remaining"] is None
-        assert chip["percent_remaining"] is None
+        assert chip["percent_used"] is None
         assert chip["zone"] == "none"
 
 
@@ -3418,12 +3457,16 @@ def test_build_resources_view_populates_github_buckets_independently() -> None:
     view = asyncio.run(_build_resources_view(redis, []))
 
     assert view["github_rest"]["remaining"] == 4500
-    assert view["github_rest"]["zone"] == "green"  # 90%
+    assert view["github_rest"]["percent_used"] == 10.0
+    assert view["github_rest"]["zone"] == "green"
     assert view["github_graphql"]["remaining"] == 1000
-    assert view["github_graphql"]["zone"] == "amber"  # 20%
-    # Claude chips are still neutral when no Claude state is provided.
+    assert view["github_graphql"]["percent_used"] == 80.0
+    assert view["github_graphql"]["zone"] == "yellow"
+    # Coder chips are still neutral when no matching state is provided.
     assert view["claude_5h"]["zone"] == "none"
     assert view["claude_weekly"]["zone"] == "none"
+    assert view["codex_5h"]["zone"] == "none"
+    assert view["codex_weekly"]["zone"] == "none"
 
 
 def test_build_resources_view_red_zone_when_buckets_near_exhaustion() -> None:
@@ -3431,10 +3474,10 @@ def test_build_resources_view_red_zone_when_buckets_near_exhaustion() -> None:
 
     view = asyncio.run(_build_resources_view(redis, []))
 
-    # 0.2% remaining → red.
+    # 99.8% used → red.
     assert view["github_rest"]["zone"] == "red"
-    # 18% remaining → red.
-    assert view["github_graphql"]["zone"] == "red"
+    # 82% used → yellow.
+    assert view["github_graphql"]["zone"] == "yellow"
 
 
 def test_build_resources_view_neutralizes_expired_bucket_snapshot() -> None:
@@ -3453,7 +3496,7 @@ def test_build_resources_view_neutralizes_expired_bucket_snapshot() -> None:
 
     for key in ("github_rest", "github_graphql"):
         assert view[key]["zone"] == "none"
-        assert view[key]["percent_remaining"] is None
+        assert view[key]["percent_used"] is None
         assert view[key]["remaining"] is None
         assert view[key]["reset_unix"] is None
 
@@ -3485,20 +3528,88 @@ def test_build_resources_view_picks_most_recent_claude_state() -> None:
 
     view = asyncio.run(_build_resources_view(_FakeRedis(), [older, newer, other]))
 
-    # 100 - 70 = 30% remaining → amber.
-    assert view["claude_5h"]["percent_remaining"] == 30.0
-    assert view["claude_5h"]["zone"] == "amber"
+    assert view["claude_5h"]["percent_used"] == 70.0
+    assert view["claude_5h"]["zone"] == "yellow"
     assert view["claude_5h"]["reset_unix"] == 1700000000
-    # 100 - 80 = 20% remaining → amber.
-    assert view["claude_weekly"]["percent_remaining"] == 20.0
-    assert view["claude_weekly"]["zone"] == "amber"
+    assert view["claude_weekly"]["percent_used"] == 80.0
+    assert view["claude_weekly"]["zone"] == "yellow"
+
+
+def test_repo_detail_shows_chip_row_filtered_by_active_claude_coder(
+    two_repo_config: Path,
+) -> None:
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        coder="claude",
+        usage_session_percent=27,
+        usage_weekly_percent=42,
+    )
+    fake = _make_bucket_redis(rest_remaining=4500, graphql_remaining=1000)
+    fake.store["pipeline:example__alpha"] = stored.model_dump_json()
+
+    context = asyncio.run(web_app._repo_template_context("example__alpha", fake))
+    rendered = web_app.templates.get_template(
+        "components/repo_summary.html"
+    ).render(context)
+
+    assert 'data-resource="github_rest"' in rendered
+    assert 'data-resource="github_graphql"' in rendered
+    assert 'data-resource="claude_5h"' in rendered
+    assert 'data-resource="claude_weekly"' in rendered
+    assert 'data-resource="codex_5h"' not in rendered
+    assert 'data-resource="codex_weekly"' not in rendered
+    assert "Claude Session 27%" not in rendered
+    assert "|</span>" not in rendered
+
+
+def test_repo_detail_shows_codex_repo_chips(two_repo_config: Path) -> None:
+    stored = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        coder="codex",
+        usage_session_percent=92,
+        usage_weekly_percent=35,
+    )
+    fake = _make_bucket_redis(rest_remaining=4500, graphql_remaining=1000)
+    fake.store["pipeline:example__alpha"] = stored.model_dump_json()
+
+    context = asyncio.run(web_app._repo_template_context("example__alpha", fake))
+    rendered = web_app.templates.get_template(
+        "components/repo_summary.html"
+    ).render(context)
+
+    assert 'data-resource="github_rest"' in rendered
+    assert 'data-resource="github_graphql"' in rendered
+    assert 'data-resource="codex_5h"' in rendered
+    assert 'data-resource="codex_weekly"' in rendered
+    assert 'data-resource="claude_5h"' not in rendered
+    assert 'data-resource="claude_weekly"' not in rendered
+    assert 'data-zone="red" data-resource="codex_5h"' in rendered
+    assert "92%" in rendered.split('data-resource="codex_5h"', 1)[1].split(
+        'data-resource="codex_weekly"', 1
+    )[0]
 
 
 def test_claude_usage_chip_returns_neutral_when_no_claude_state() -> None:
     only_codex = _claude_state(coder="codex", session_percent=10, weekly_percent=10)
     chip = _claude_usage_chip([only_codex], window="session")
     assert chip["zone"] == "none"
-    assert chip["percent_remaining"] is None
+    assert chip["percent_used"] is None
+
+
+def test_codex_usage_chip_uses_codex_state() -> None:
+    codex = _claude_state(
+        coder="codex",
+        session_percent=92,
+        session_resets_at=1700000000,
+    )
+
+    chip = _codex_usage_chip([codex], window="session")
+
+    assert chip["percent_used"] == 92.0
+    assert chip["remaining"] == 8
+    assert chip["zone"] == "red"
 
 
 def test_claude_usage_chip_skips_states_without_window_data() -> None:
@@ -3542,9 +3653,9 @@ def test_claude_usage_chip_excludes_inactive_repos() -> None:
     )
 
     # Active repo's snapshot wins despite being older.
-    assert session["percent_remaining"] == 90.0
+    assert session["percent_used"] == 10.0
     assert session["reset_unix"] == 1700000000
-    assert weekly["percent_remaining"] == 85.0
+    assert weekly["percent_used"] == 15.0
     assert weekly["reset_unix"] == 1700100000
 
 

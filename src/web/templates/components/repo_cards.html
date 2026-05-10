@@ -23,15 +23,17 @@
     ('github_graphql', 'GraphQL', 'GitHub GraphQL API'),
     ('claude_5h', 'Claude 5h', 'Claude 5-hour window'),
     ('claude_weekly', 'Claude weekly', 'Claude weekly window'),
+    ('codex_5h', 'Codex 5h', 'Codex 5-hour window'),
+    ('codex_weekly', 'Codex weekly', 'Codex weekly window'),
 ] %}
 <div class="mb-3 resource-chip-row" data-resource-chips>
     {% for key, label, full_name in chip_specs %}
     {% set chip = resources[key] %}
-    {% set pct = chip.percent_remaining %}
+    {% set pct = chip.percent_used %}
     {% if chip.reset_unix %}
     {%- set tooltip -%}{{ full_name }}
 {{ chip.remaining }} / {{ chip.limit }} remaining
-Resets at {{ chip.reset_unix | format_reset }}{%- endset -%}
+{{ chip.reset_unix | format_reset }}{%- endset -%}
     {% else %}
     {%- set tooltip -%}{{ full_name }}
 {% if chip.remaining is not none %}{{ chip.remaining }} / {{ chip.limit }} remaining{% else %}No data{% endif %}{%- endset -%}

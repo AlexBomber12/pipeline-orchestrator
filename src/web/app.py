@@ -69,12 +69,16 @@ templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 templates.env.globals["utcnow"] = lambda: datetime.now(timezone.utc)
 
 
-def _format_reset_unix(reset_unix: int | None) -> str:
-    """Render ``reset_unix`` as ``HH:MM UTC`` for resource-chip tooltips.
+def _format_reset_unix(
+    reset_unix: int | None,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Render ``reset_unix`` as a smart relative/absolute reset label.
 
     Returns ``"unknown"`` for ``None`` so the template still has a string
-    to interpolate; the chip template only renders the "Resets at" line
-    when ``reset_unix`` is truthy, so this branch is defensive.
+    to interpolate; chip templates only render the reset line when
+    ``reset_unix`` is truthy, so this branch is defensive.
 
     Defined here rather than in ``src.web.routes.dashboard`` because the
     Jinja filter has to be registered at module load time and the dashboard
@@ -84,9 +88,19 @@ def _format_reset_unix(reset_unix: int | None) -> str:
     """
     if not reset_unix:
         return "unknown"
-    return datetime.fromtimestamp(int(reset_unix), tz=timezone.utc).strftime(
-        "%H:%M UTC"
-    )
+    current = now if now is not None else datetime.now(timezone.utc)
+    reset_at = datetime.fromtimestamp(int(reset_unix), tz=timezone.utc)
+    seconds_until_reset = (reset_at - current).total_seconds()
+    if 0 <= seconds_until_reset < 24 * 60 * 60:
+        minutes = max(1, int(seconds_until_reset // 60))
+        if minutes < 60:
+            return f"resets in {minutes} min"
+        hours = minutes // 60
+        remaining_minutes = minutes % 60
+        if remaining_minutes == 0:
+            return f"resets in {hours}h"
+        return f"resets in {hours}h {remaining_minutes}m"
+    return reset_at.strftime("resets %b %-d, %I:%M %p")
 
 
 templates.env.filters["format_reset"] = _format_reset_unix
@@ -138,6 +152,7 @@ _DASHBOARD_REEXPORTS = frozenset(
         "_build_recent_graphql_burns_view",
         "_build_resources_view",
         "_claude_usage_chip",
+        "_codex_usage_chip",
         "_coder_rate_limit_supported",
         "_compute_stats",
         "_daemon_default_coder_name",
