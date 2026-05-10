@@ -170,14 +170,13 @@ def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
     sentence_start = max(text.rfind(c, line_start, match_start) for c in ".!?\n")
     sentence_start = sentence_start + 1 if sentence_start >= 0 else line_start
     dirty_window_end = line_end
-    if line_end < len(text):
+    current_line = text[line_start:line_end].rstrip()
+    if line_end < len(text) and not current_line.endswith((".", "!", "?")):
         next_line_end = text.find("\n", line_end + 1)
         dirty_window_end = len(text) if next_line_end == -1 else next_line_end
-    prefatory_context = text[sentence_start:clause_start]
-    if _DIRTY_MERGE_CONTEXT.search(prefatory_context) and not _NEGATION_CONTEXT.search(
-        prefatory_context
-    ):
-        return False
+    for dirty_match in _DIRTY_MERGE_CONTEXT.finditer(text, sentence_start, clause_start):
+        if not _is_negated(text, dirty_match.start()):
+            return False
     if _DIRTY_MERGE_CONTEXT.search(text, clause_start, dirty_window_end):
         return False
     return any(
