@@ -341,9 +341,9 @@ def test_index_route_returns_html(
 
 @pytest.mark.parametrize(
     "path",
-    ["/", "/settings", "/repo/example__alpha"],
+    ["/", "/repo/example__alpha"],
 )
-def test_theme_toggle_is_rendered_on_main_pages(
+def test_base_template_top_nav_no_theme_toggle(
     two_repo_config: Path,
     monkeypatch: pytest.MonkeyPatch,
     path: str,
@@ -354,8 +354,26 @@ def test_theme_toggle_is_rendered_on_main_pages(
         response = client.get(path)
 
     assert response.status_code == 200
-    assert 'id="theme-toggle"' in response.text
+    body = response.text
+    nav = body[body.index("<nav"):body.index("</nav>")]
+    assert 'id="theme-toggle"' not in nav
     assert 'meta name="color-scheme" content="dark light"' in response.text
+
+
+def test_settings_template_has_theme_toggle(
+    two_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/settings")
+
+    assert response.status_code == 200
+    assert "Appearance" in response.text
+    assert 'id="theme-toggle"' in response.text
+    assert 'id="theme-icon-dark"' in response.text
+    assert 'id="theme-icon-light"' in response.text
 
 
 def test_base_template_includes_theme_bootstrap_assets(
@@ -376,6 +394,42 @@ def test_base_template_includes_theme_bootstrap_assets(
     assert "document.documentElement.dataset.theme = theme;" in body
     assert "theme-icon-dark" in body
     assert "theme-icon-light" in body
+
+
+def test_global_spinner_present_on_dashboard(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert 'id="global-spinner"' in response.text
+    assert 'data-global-spinner="false"' in response.text
+    assert "htmx:beforeRequest" in response.text
+    assert "htmx:afterRequest" in response.text
+    assert "htmx:trigger" in response.text
+    assert "triggerSpec.pollInterval > 0" in response.text
+    assert "pollingElements.has(elt)" in response.text
+    assert response.text.index("pollingElements.has(elt)") < response.text.index(
+        "requestConfig.triggeringEvent"
+    )
+    assert "requestConfig.triggeringEvent" in response.text
+    assert "htmx:sendError" not in response.text
+    assert "body.htmx-request #global-spinner" in response.text
+
+
+def test_global_spinner_present_on_repo_detail(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/repo/example__alpha")
+
+    assert response.status_code == 200
+    assert 'id="global-spinner"' in response.text
 
 
 def test_base_template_declares_dark_color_scheme(
@@ -2245,13 +2299,10 @@ def test_repo_card_has_onclick(
     assert "window.location='/repo/example__beta'" in body
     assert "event.target.closest('form,label,input,button,a')" in body
     assert 'hx-target="#upload-feedback-example__alpha"' in body
-    assert 'hx-indicator="#upload-indicator-example__alpha"' in body
     assert 'hx-disabled-elt="#upload-example__alpha"' in body
     assert 'id="upload-feedback-example__alpha"' in body
-    assert 'id="upload-indicator-example__alpha"' in body
-    assert "htmx-indicator" in body
-    assert "animate-spin" in body
-    assert "Uploading..." in body
+    assert 'id="upload-indicator-example__alpha"' not in body
+    assert "Uploading..." not in body
 
 
 def test_repo_card_escapes_dotted_repo_name_in_hx_selectors(
@@ -2273,11 +2324,10 @@ def test_repo_card_escapes_dotted_repo_name_in_hx_selectors(
     assert response.status_code == 200
     body = response.text
     assert 'hx-target="#upload-feedback-example__my\\.repo"' in body
-    assert 'hx-indicator="#upload-indicator-example__my\\.repo"' in body
     assert 'hx-disabled-elt="#upload-example__my\\.repo"' in body
     assert 'id="upload-feedback-example__my.repo"' in body
-    assert 'id="upload-indicator-example__my.repo"' in body
     assert 'id="upload-example__my.repo"' in body
+    assert "upload-indicator-example__my" not in body
 
 
 def test_repo_card_renders_pause_and_stop_controls_for_active_repo(
@@ -3674,12 +3724,11 @@ def test_repo_cards_omit_stalled_artifacts_when_last_updated_is_old(
     assert "data-updated-at" not in body
 
 
-def test_repo_controls_have_spinners_with_unique_ids_per_repo(
+def test_repo_controls_use_global_spinner_without_inline_indicators(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Pause/Stop buttons rendered by `_controls.html` for active states must
-    each carry an `hx-indicator` pointing at a per-repo spinner partial, so two
-    repo cards on the dashboard cannot share the same in-flight indicator."""
+    """Pause/Stop buttons are covered by the base global spinner, so the
+    partial must not render per-repo htmx-indicator elements."""
     now = datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc)
     alpha = RepoState(
         url="https://github.com/example/alpha.git",
@@ -3707,23 +3756,18 @@ def test_repo_controls_have_spinners_with_unique_ids_per_repo(
     assert response.status_code == 200
     body = response.text
     for name in ("example__alpha", "example__beta"):
-        assert f'hx-indicator="#controls-pause-spinner-{name}"' in body
-        assert f'hx-indicator="#controls-stop-spinner-{name}"' in body
-        assert f'id="controls-pause-spinner-{name}"' in body
-        assert f'id="controls-stop-spinner-{name}"' in body
-    assert body.count('id="controls-pause-spinner-example__alpha"') == 1
-    assert body.count('id="controls-pause-spinner-example__beta"') == 1
-    assert body.count('id="controls-stop-spinner-example__alpha"') == 1
-    assert body.count('id="controls-stop-spinner-example__beta"') == 1
-    assert body.count("htmx-indicator") >= 4
-    assert body.count("animate-spin") >= 4
+        assert f'hx-post="/repos/{name}/pause"' in body
+        assert f'hx-post="/repos/{name}/stop"' in body
+        assert f"controls-pause-spinner-{name}" not in body
+        assert f"controls-stop-spinner-{name}" not in body
+    assert "htmx-indicator" not in body
+    assert "animate-spin" not in body
 
 
 def test_repo_controls_resume_button_has_spinner(
     two_repo_config: Path,
 ) -> None:
-    """The Resume button shown for IDLE-with-queued-tasks repos must include
-    a per-repo spinner partial wired up via `hx-indicator`."""
+    """The Resume button is covered by the base global spinner."""
     now = datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc)
     stored = RepoState(
         url="https://github.com/example/alpha.git",
@@ -3740,12 +3784,10 @@ def test_repo_controls_resume_button_has_spinner(
         "components/repo_summary.html"
     ).render(context)
 
-    assert (
-        'hx-indicator="#controls-resume-spinner-example__alpha"' in rendered
-    )
-    assert 'id="controls-resume-spinner-example__alpha"' in rendered
-    assert "htmx-indicator" in rendered
-    assert "animate-spin" in rendered
+    assert 'hx-post="/repos/example__alpha/resume"' in rendered
+    assert "controls-resume-spinner-example__alpha" not in rendered
+    assert "htmx-indicator" not in rendered
+    assert "animate-spin" not in rendered
 
 
 def _repo_header_coder_fragment(rendered: str) -> str:

@@ -5,6 +5,22 @@
 {% block content %}
 <div class="space-y-10">
     <section>
+        <h2 class="text-xl font-semibold tracking-tight mb-4">Appearance</h2>
+
+        <div class="rounded-lg border border-white/5 bg-surface-2 p-5">
+            <button
+                id="theme-toggle"
+                type="button"
+                class="secondary-interactive inline-flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-surface-3/60 text-gray-300"
+                aria-label="Switch to light theme"
+                title="Toggle theme">
+                <span id="theme-icon-dark" aria-hidden="true">☾</span>
+                <span id="theme-icon-light" class="hidden" aria-hidden="true">☀</span>
+            </button>
+        </div>
+    </section>
+
+    <section>
         <div class="flex items-baseline justify-between mb-4">
             <h2 class="text-xl font-semibold tracking-tight">Repositories</h2>
             <span class="font-mono text-sm text-gray-500">{{ repos|length }} total</span>
