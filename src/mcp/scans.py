@@ -185,7 +185,8 @@ def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
             min(next_line_boundaries) if next_line_boundaries else len(text)
         )
     prefatory_start = sentence_start
-    if line_start > 0:
+    current_line_is_list_item = re.match(r"\s*(?:[-*]|\d+[.)])\s+", current_line)
+    if line_start > 0 and not current_line_is_list_item:
         previous_line_start = text.rfind("\n", 0, line_start - 1) + 1
         previous_line = text[previous_line_start : line_start - 1].rstrip()
         if previous_line and not previous_line.endswith((".", "!", "?")):
