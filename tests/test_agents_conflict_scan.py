@@ -200,6 +200,13 @@ def test_scan_flags_open_as_draft_pr_with_and_continuation():
     assert "draft_pr_open_as" in types
 
 
+def test_scan_flags_open_as_draft_before_continuation():
+    body = "Open as draft before requesting review."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_open_as" in types
+
+
 def test_scan_flags_open_pull_request_as_a_draft():
     body = "Open the pull request as a draft."
     violations = scan_for_conflicts(body)
@@ -927,6 +934,11 @@ def test_scan_no_ff_force_merge_then_force_merge_pr_flagged():
     violations = scan_for_conflicts(body)
     types = {v.violation_type for v in violations}
     assert "merge_dirty_alt" in types
+
+
+def test_scan_prior_dirty_policy_does_not_block_no_ff_strategy_exemption():
+    body = "Never merge with failing checks. Use --no-ff to force merge commits."
+    assert scan_for_conflicts(body) == []
 
 
 def test_multiple_violations_all_returned():

@@ -159,7 +159,7 @@ def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
     if line_end == -1:
         line_end = len(text)
     dirty_window_end = min(len(text), match_start + 160)
-    if _DIRTY_MERGE_CONTEXT.search(text, line_start, dirty_window_end):
+    if _DIRTY_MERGE_CONTEXT.search(text, match_start, dirty_window_end):
         return False
     return any(
         strategy.start() <= match_start < strategy.end()
@@ -208,7 +208,7 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
             r"(?:(?:the|a)\s+)?(?:PR|pull request)\s+as\s+(?:a\s+)?draft\b"
             r"|"
             r"(?:it\s+)?as\s+(?:a\s+)?draft(?:\s+(?:PR|pull request))?"
-            r"(?=\s*(?:[,.;!?\n]|$|\bthen\b|\band\b|\bcontinue\b))"
+            r"(?=\s*(?:[,.;!?\n]|$|\bthen\b|\band\b|\bbefore\b|\bcontinue\b))"
             r")",
             re.IGNORECASE,
         ),
