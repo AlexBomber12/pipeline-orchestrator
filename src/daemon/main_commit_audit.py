@@ -364,7 +364,6 @@ def audit_main_commit_shas(
                     rule="Main commit audit failed before verification completed; investigate manually.",
                 )
             )
-            checked_shas.append(sha)
             continue
 
     return findings, checked_shas
