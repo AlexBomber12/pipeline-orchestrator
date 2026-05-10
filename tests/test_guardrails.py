@@ -92,6 +92,9 @@ def test_scan_stdout_branch_delete_with_git_global_options(stdout: str) -> None:
     [
         "GIT_SSH_COMMAND='ssh -i key' git push --delete origin main\n",
         "env FOO=bar git push origin :main\n",
+        "env -i git push --delete origin main\n",
+        "env --ignore-environment FOO=bar git push origin :main\n",
+        "env -u FOO git push origin +:main\n",
         "$ FOO=bar BAR=baz git push origin +:refs/heads/main\n",
     ],
 )
