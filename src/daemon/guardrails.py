@@ -35,6 +35,7 @@ _PUSH_VALUE_OPTIONS = {"-o", "--push-option", "--receive-pack", "--exec", "--rep
 _PUSH_VALUE_OPTION_PREFIXES = tuple(
     f"{option}=" for option in _PUSH_VALUE_OPTIONS if option != "-o"
 )
+_SHELL_CONTROL_SEPARATORS = (";", "|", "&")
 
 _TIER1_PATTERNS: dict[str, re.Pattern[str]] = {
     "repo_create": re.compile(
@@ -66,9 +67,24 @@ def _line_excerpt(coder_stdout: str, start: int, end: int) -> str:
 
 def _push_args_tokens(args: str) -> list[str]:
     try:
-        return shlex.split(args, comments=False, posix=True)
+        tokens = shlex.split(args, comments=False, posix=True)
     except ValueError:
-        return args.split()
+        tokens = args.split()
+    normalized: list[str] = []
+    for token in tokens:
+        separator_offsets = [
+            offset
+            for separator in _SHELL_CONTROL_SEPARATORS
+            if (offset := token.find(separator)) != -1
+        ]
+        if not separator_offsets:
+            normalized.append(token)
+            continue
+        offset = min(separator_offsets)
+        if offset:
+            normalized.append(token[:offset])
+        break
+    return normalized
 
 
 def _short_option_cluster_contains(token: str, flag: str) -> bool:

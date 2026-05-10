@@ -151,6 +151,20 @@ def test_scan_stdout_branch_delete_colon_refspec_without_remote_not_flagged() ->
     assert scan_stdout("git push :main\n") == []
 
 
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "git push origin :main; echo ok\n",
+        "git push --delete origin main; echo ok\n",
+    ],
+)
+def test_scan_stdout_branch_delete_before_shell_separator(stdout: str) -> None:
+    violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
 def test_scan_stdout_branch_delete_remote_named_main_not_flagged() -> None:
     stdout = "git push --delete main feature-x\n"
 
