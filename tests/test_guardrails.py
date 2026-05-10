@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 
 import pytest
-
 from src.daemon.guardrails import GuardrailViolation, scan_stdout
 
 
@@ -348,10 +347,53 @@ def test_scan_stdout_force_push_main_plus_refspec_form() -> None:
     assert violations[0].category == "force_push_main"
 
 
+def test_scan_stdout_force_push_main_plus_refspec_with_dst_main() -> None:
+    violations = scan_stdout("git push origin +HEAD:main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "git -C /repo push --force origin main\n",
+        "git --git-dir=/repo/.git push --force-with-lease origin main\n",
+        "git --no-pager -C /repo push origin +main\n",
+    ],
+)
+def test_scan_stdout_force_push_main_with_git_global_options(stdout: str) -> None:
+    violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
+@pytest.mark.parametrize("option", ["-o", "--push-option"])
+def test_scan_stdout_force_push_main_push_option_value_not_dry_run(
+    option: str,
+) -> None:
+    violations = scan_stdout(f"git push --force {option} -notify origin main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
+def test_scan_stdout_force_push_main_repo_option_without_remote_position() -> None:
+    violations = scan_stdout("git push --repo=origin --force main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
 def test_scan_stdout_force_push_to_feature_branch_not_flagged() -> None:
     stdout = "git push --force origin feature-xyz\n"
 
     assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_force_push_without_ref_not_flagged() -> None:
+    assert scan_stdout("git push --force main\n") == []
 
 
 def test_scan_stdout_remote_named_main_not_misclassified() -> None:
@@ -364,6 +406,19 @@ def test_scan_stdout_force_push_main_dry_run_not_flagged() -> None:
     stdout = "git push --force --dry-run origin main\n"
 
     assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_force_push_main_no_dry_run_after_dry_run_still_flagged() -> None:
+    stdout = "git push --force --dry-run --no-dry-run origin main\n"
+
+    violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
+def test_scan_stdout_force_push_main_no_force_after_force_not_flagged() -> None:
+    assert scan_stdout("git push --force --no-force origin main\n") == []
 
 
 def test_scan_stdout_force_push_main_prose_not_flagged() -> None:
