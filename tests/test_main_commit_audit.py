@@ -29,6 +29,8 @@ def test_audit_direct_commit_flagged(monkeypatch):
             return [_summary("abc1234")]
         if path.endswith("/commits/abc1234"):
             return _commit("direct hotfix", ["parent"])
+        if path.endswith("/commits/abc1234/pulls"):
+            return []
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
@@ -124,6 +126,8 @@ def test_audit_squash_merge_default_message(monkeypatch):
             return [_summary("squash42")]
         if path.endswith("/commits/squash42"):
             return _commit("Feature complete (#42)", ["base"])
+        if path.endswith("/commits/squash42/pulls"):
+            return []
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
@@ -134,6 +138,87 @@ def test_audit_squash_merge_default_message(monkeypatch):
         "direct_commit_no_pr"
     ]
     assert findings[0].pr_number is None
+
+
+def test_audit_linear_pr_commit_with_passing_ci_clean(monkeypatch):
+    def fake_run_gh(args):
+        path = args[1]
+        if path.endswith("/commits?sha=main&per_page=10"):
+            return [_summary("rebase42")]
+        if path.endswith("/commits/rebase42"):
+            return _commit("feature commit", ["base"])
+        if path.endswith("/commits/rebase42/pulls"):
+            return [
+                {
+                    "number": 42,
+                    "merged_at": "2026-05-10T12:00:00Z",
+                    "head": {"sha": "head42"},
+                }
+            ]
+        if path.endswith("/commits/head42/check-runs"):
+            return _check_runs("success")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+
+    assert main_commit_audit.audit_main_commits("octo/demo") == []
+
+
+def test_audit_linear_pr_commit_with_failed_ci_flagged(monkeypatch):
+    def fake_run_gh(args):
+        path = args[1]
+        if path.endswith("/commits?sha=main&per_page=10"):
+            return [_summary("rebase42")]
+        if path.endswith("/commits/rebase42"):
+            return _commit("feature commit", ["base"])
+        if path.endswith("/commits/rebase42/pulls"):
+            return [
+                {
+                    "number": 42,
+                    "merged_at": "2026-05-10T12:00:00Z",
+                    "head": {"sha": "head42"},
+                }
+            ]
+        if path.endswith("/commits/head42/check-runs"):
+            return _check_runs("failure")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+
+    findings = main_commit_audit.audit_main_commits("octo/demo")
+
+    assert [finding.violation_category for finding in findings] == [
+        "linear_pr_failed_ci"
+    ]
+    assert findings[0].pr_number == 42
+
+
+def test_audit_linear_pr_commit_falls_back_to_main_sha_without_head(monkeypatch):
+    def fake_run_gh(args):
+        path = args[1]
+        if path.endswith("/commits?sha=main&per_page=10"):
+            return [_summary("rebase42")]
+        if path.endswith("/commits/rebase42"):
+            return _commit("feature commit", ["base"])
+        if path.endswith("/commits/rebase42/pulls"):
+            return [{"number": "42", "merged_at": "2026-05-10T12:00:00Z"}]
+        if path.endswith("/commits/rebase42/check-runs"):
+            return _check_runs("failure")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+
+    findings = main_commit_audit.audit_main_commits("octo/demo")
+
+    assert [finding.violation_category for finding in findings] == [
+        "linear_pr_failed_ci"
+    ]
+    assert findings[0].pr_number is None
+
+
+def test_audit_associated_pr_helpers_handle_malformed_payloads():
+    assert main_commit_audit._merged_associated_pr({"not": "a-list"}) is None
+    assert main_commit_audit._merged_associated_pr(["bad", {"merged_at": None}]) is None
 
 
 def test_audit_octopus_merge_flagged(monkeypatch):
@@ -162,6 +247,8 @@ def test_audit_skips_already_audited_shas(monkeypatch):
         path = args[1]
         if path.endswith("/commits?sha=main&per_page=10"):
             return [_summary("abc123"), _summary("def456"), _summary("ghi789")]
+        if path.endswith("/pulls"):
+            return []
         if "/commits/" in path:
             sha = path.rsplit("/", 1)[-1]
             processed.append(sha)
@@ -252,8 +339,14 @@ def test_audit_commit_fetch_error_returns_partial_findings(monkeypatch, caplog):
         path = args[1]
         if path.endswith("/commits/good"):
             return _commit("direct hotfix", ["parent"])
+        if path.endswith("/commits/good/pulls"):
+            return []
         if path.endswith("/commits/bad"):
             raise RuntimeError("gh unavailable")
+        if path.endswith("/commits/later"):
+            return _commit("direct later", ["parent"])
+        if path.endswith("/commits/later/pulls"):
+            return []
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
@@ -264,8 +357,8 @@ def test_audit_commit_fetch_error_returns_partial_findings(monkeypatch, caplog):
             ["good", "bad", "later"],
         )
 
-    assert checked == ["good"]
-    assert [finding.sha for finding in findings] == ["good"]
+    assert checked == ["good", "later"]
+    assert [finding.sha for finding in findings] == ["good", "later"]
     assert "Failed to audit main commit bad" in caplog.text
 
 

@@ -1,10 +1,9 @@
 """Best-effort audit for commits that landed on main without verified CI.
 
-GitHub squash merges produce a single linear commit on main. Although the PR
-number is often present in the commit subject tail, the original PR head SHA is
-not recoverable from main history alone. PR-300 v1 therefore flags one-parent
-squash commits as ``direct_commit_no_pr``; a future enhancement can query the
-closed PR and verify its head SHA.
+GitHub squash and rebase merges can produce single-parent linear commits on
+main. The audit queries GitHub's associated-pulls endpoint before treating a
+single-parent commit as a direct commit, then verifies CI against the PR head
+SHA when a merged PR is available.
 """
 
 from __future__ import annotations
@@ -120,6 +119,30 @@ def _parents(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [parent for parent in parents if isinstance(parent, dict)]
 
 
+def _merged_associated_pr(payload: object) -> dict[str, Any] | None:
+    if not isinstance(payload, list):
+        return None
+    for pr in payload:
+        if not isinstance(pr, dict):
+            continue
+        if pr.get("merged_at"):
+            return pr
+    return None
+
+
+def _pr_number(payload: dict[str, Any]) -> int | None:
+    number = payload.get("number")
+    return number if isinstance(number, int) else None
+
+
+def _pr_head_sha(payload: dict[str, Any]) -> str | None:
+    head = payload.get("head")
+    if not isinstance(head, dict):
+        return None
+    sha = head.get("sha")
+    return sha if isinstance(sha, str) and sha else None
+
+
 def _has_success_check_run(payload: object) -> bool:
     check_runs = payload.get("check_runs") if isinstance(payload, dict) else payload
     if not isinstance(check_runs, list):
@@ -176,16 +199,48 @@ def audit_main_commit_shas(
             parent_count = len(parents)
             message = _commit_message(commit_payload)
             if parent_count == 1:
-                findings.append(
-                    _finding(
-                        sha=sha,
-                        message=message,
-                        parent_count=parent_count,
-                        pr_number=None,
-                        violation_category="direct_commit_no_pr",
-                        rule="Commit landed on main without a merge commit; investigate and revert if unauthorized.",
-                    )
+                associated_pr = _merged_associated_pr(
+                    run_gh(["api", f"repos/{owner_repo}/commits/{sha}/pulls"])
                 )
+                if associated_pr is None:
+                    findings.append(
+                        _finding(
+                            sha=sha,
+                            message=message,
+                            parent_count=parent_count,
+                            pr_number=None,
+                            violation_category="direct_commit_no_pr",
+                            rule=(
+                                "Commit landed on main without an associated "
+                                "merged PR; investigate and revert if unauthorized."
+                            ),
+                        )
+                    )
+                    checked_shas.append(sha)
+                    continue
+
+                pr_number = _pr_number(associated_pr)
+                ci_sha = _pr_head_sha(associated_pr) or sha
+                check_payload = run_gh(
+                    [
+                        "api",
+                        f"repos/{owner_repo}/commits/{ci_sha}/check-runs",
+                    ]
+                )
+                if not _has_success_check_run(check_payload):
+                    findings.append(
+                        _finding(
+                            sha=sha,
+                            message=message,
+                            parent_count=parent_count,
+                            pr_number=pr_number,
+                            violation_category="linear_pr_failed_ci",
+                            rule=(
+                                "Linear-history PR commit has no successful "
+                                "PR-head check run; investigate branch-protection bypass."
+                            ),
+                        )
+                    )
                 checked_shas.append(sha)
                 continue
             if parent_count > 2:
@@ -252,7 +307,7 @@ def audit_main_commit_shas(
             checked_shas.append(sha)
         except Exception:
             logger.exception("Failed to audit main commit %s for %s", sha, owner_repo)
-            return findings, checked_shas
+            continue
 
     return findings, checked_shas
 
