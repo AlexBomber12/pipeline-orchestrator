@@ -174,27 +174,41 @@ def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
         pos for c in _CLAUSE_BOUNDARIES if (pos := text.find(c, match_start)) != -1
     ]
     dirty_window_end = min(next_boundaries) if next_boundaries else line_end
-    if (
-        dirty_window_end == line_end
-        and line_end < len(text)
-        and not current_line.endswith((".", "!", "?"))
-    ):
+    strategy_window_end = dirty_window_end
+    if line_end < len(text) and not current_line.endswith((".", "!", "?")):
         next_line_boundaries = [
             pos
             for c in _CLAUSE_BOUNDARIES
             if (pos := text.find(c, line_end + 1)) != -1
         ]
-        dirty_window_end = min(next_line_boundaries) if next_line_boundaries else len(text)
-    for dirty_match in _DIRTY_MERGE_CONTEXT.finditer(text, sentence_start, clause_start):
+        strategy_window_end = (
+            min(next_line_boundaries) if next_line_boundaries else len(text)
+        )
+    prefatory_start = sentence_start
+    if line_start > 0:
+        previous_line_start = text.rfind("\n", 0, line_start - 1) + 1
+        previous_line = text[previous_line_start : line_start - 1].rstrip()
+        if previous_line and not previous_line.endswith((".", "!", "?")):
+            prefatory_start = previous_line_start
+    for dirty_match in _DIRTY_MERGE_CONTEXT.finditer(text, prefatory_start, clause_start):
         if not _is_negated(text, dirty_match.start()):
             return False
     for dirty_match in _DIRTY_MERGE_CONTEXT.finditer(text, clause_start, dirty_window_end):
         if not _is_negated(text, dirty_match.start()):
             return False
+    if line_end < len(text) and not current_line.endswith((".", "!", "?")):
+        next_line_end = text.find("\n", line_end + 1)
+        next_line_end = len(text) if next_line_end == -1 else next_line_end
+        next_line_start = line_end + 1
+        next_line = text[next_line_start:next_line_end]
+        leading_space = len(next_line) - len(next_line.lstrip())
+        dirty_match = _DIRTY_MERGE_CONTEXT.match(next_line, leading_space)
+        if dirty_match and not _is_negated(text, next_line_start + dirty_match.start()):
+            return False
     return any(
         strategy.start() <= match_start < strategy.end()
         for strategy in _FORCE_MERGE_COMMIT_STRATEGY.finditer(
-            text, line_start, dirty_window_end
+            text, line_start, strategy_window_end
         )
     )
 
