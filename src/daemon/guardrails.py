@@ -147,6 +147,12 @@ def _is_repository_token(token: str) -> bool:
     )
 
 
+def _tokens_before_end_of_options(tokens: list[str]) -> list[str]:
+    if "--" not in tokens:
+        return tokens
+    return tokens[: tokens.index("--")]
+
+
 def _has_repo_option(tokens: list[str]) -> bool:
     return any(token == "--repo" or token.startswith("--repo=") for token in tokens)
 
@@ -175,13 +181,13 @@ def _push_positionals(tokens: list[str]) -> list[str]:
 
 
 def _delete_flag_targets_protected_branch(tokens: list[str]) -> bool:
-    filtered_tokens = _push_tokens_without_option_values(tokens)
-    if not _is_effective_delete(filtered_tokens):
+    option_tokens = _push_tokens_without_option_values(
+        _tokens_before_end_of_options(tokens)
+    )
+    if not _is_effective_delete(option_tokens):
         return False
-    positional = [
-        token for token in filtered_tokens if _is_positional_push_token(token)
-    ]
-    if _has_repo_option(tokens):
+    positional = _push_positionals(tokens)
+    if _has_repo_option(option_tokens):
         candidate_refs = positional
     elif len(positional) >= 2:
         candidate_refs = positional[1:]
@@ -192,10 +198,11 @@ def _delete_flag_targets_protected_branch(tokens: list[str]) -> bool:
 
 def _colon_refspec_targets_protected_branch(tokens: list[str]) -> bool:
     positional = _push_positionals(tokens)
+    option_tokens = _tokens_before_end_of_options(tokens)
     for index, token in enumerate(positional):
         if not _is_empty_source_protected_refspec(token):
             continue
-        return _has_repo_option(tokens) or any(
+        return _has_repo_option(option_tokens) or any(
             _is_repository_token(previous) for previous in positional[:index]
         )
     return False
@@ -205,7 +212,9 @@ def _scan_branch_delete_main(coder_stdout: str) -> list[GuardrailViolation]:
     violations: list[GuardrailViolation] = []
     for match in _GIT_PUSH_COMMAND_RE.finditer(coder_stdout):
         tokens = _push_args_tokens(match.group("args"))
-        option_value_filtered_tokens = _push_tokens_without_option_values(tokens)
+        option_value_filtered_tokens = _push_tokens_without_option_values(
+            _tokens_before_end_of_options(tokens)
+        )
         if _is_effective_dry_run(option_value_filtered_tokens):
             continue
         if not (

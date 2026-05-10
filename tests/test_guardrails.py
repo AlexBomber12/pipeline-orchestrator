@@ -230,6 +230,17 @@ def test_scan_stdout_branch_delete_delete_after_no_delete_still_flagged() -> Non
     assert violations[0].category == "branch_delete_main"
 
 
+def test_scan_stdout_branch_delete_after_end_of_options_not_delete_flag() -> None:
+    assert scan_stdout("git push origin -- --delete main\n") == []
+
+
+def test_scan_stdout_branch_delete_colon_refspec_after_end_of_options_flagged() -> None:
+    violations = scan_stdout("git push origin -- :main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
 @pytest.mark.parametrize(
     "stdout",
     [
