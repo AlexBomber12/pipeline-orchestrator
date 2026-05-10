@@ -618,6 +618,21 @@ def test_redis_helpers_record_and_load_audit_state():
     assert redis.ttls["audit:main_commits:octo-demo:audited"] == 30 * 24 * 60 * 60
     assert redis.ttls["audit:main_commits:octo-demo:findings"] == 30 * 24 * 60 * 60
 
+    redis.ttls["audit:main_commits:octo-demo:audited"] = 123
+    asyncio.run(
+        main_commit_audit.mark_shas_audited_in_redis(
+            redis,
+            "octo-demo",
+            ["def5678"],
+        )
+    )
+
+    assert redis.sets["audit:main_commits:octo-demo:audited"] == {
+        "abc1234",
+        "def5678",
+    }
+    assert redis.ttls["audit:main_commits:octo-demo:audited"] == 123
+
 
 def test_redis_helpers_skip_empty_inputs():
     redis = _FakeRedis()

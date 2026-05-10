@@ -413,6 +413,8 @@ async def mark_shas_audited_in_redis(
     try:
         for sha in shas:
             await redis.sadd(key, sha)
-        await redis.expire(key, _AUDIT_TTL_SECONDS)
+        ttl = await redis.ttl(key)
+        if ttl < 0:
+            await redis.expire(key, _AUDIT_TTL_SECONDS)
     except Exception:
         logger.exception("Failed to update main commit audit cache for %s", repo)
