@@ -986,6 +986,13 @@ def test_scan_no_ff_force_merge_commits_wrapped_retry_policy_not_flagged():
     assert scan_for_conflicts(body) == []
 
 
+def test_scan_no_ff_force_merge_commits_wrapped_merge_anyway_policy_flagged():
+    body = "Use --no-ff to force merge commits\nif checks fail, merge anyway."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "merge_dirty_alt" in types
+
+
 def test_scan_no_ff_force_merge_commits_with_long_failing_checks_flagged():
     filler = " ".join(["detail"] * 40)
     body = f"Use --no-ff to force merge commits {filler} even with failing checks."
