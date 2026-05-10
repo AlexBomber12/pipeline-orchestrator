@@ -91,35 +91,17 @@ def _is_empty_source_protected_refspec(token: str) -> bool:
     return refspec.startswith(":") and _is_protected_branch_ref(refspec[1:])
 
 
-def _is_repository_token(token: str) -> bool:
-    return (
-        bool(token)
-        and not token.startswith("-")
-        and not _is_empty_source_protected_refspec(token)
-    )
-
-
 def _delete_flag_targets_protected_branch(tokens: list[str]) -> bool:
     for index, token in enumerate(tokens):
         if not _is_delete_token(token):
             continue
-        for ref_index in range(index + 1, len(tokens)):
-            if not _is_protected_branch_ref(tokens[ref_index]):
-                continue
-            return any(
-                _is_repository_token(previous)
-                for previous in tokens[:ref_index]
-                if not _is_delete_token(previous)
-            )
+        if any(_is_protected_branch_ref(ref) for ref in tokens[index + 1 :]):
+            return True
     return False
 
 
 def _colon_refspec_targets_protected_branch(tokens: list[str]) -> bool:
-    for index, token in enumerate(tokens):
-        if not _is_empty_source_protected_refspec(token):
-            continue
-        return any(_is_repository_token(previous) for previous in tokens[:index])
-    return False
+    return any(_is_empty_source_protected_refspec(token) for token in tokens)
 
 
 def _scan_branch_delete_main(coder_stdout: str) -> list[GuardrailViolation]:
