@@ -27,10 +27,46 @@ _PROTECTED_DEFAULT_BRANCH = "main"
 _PROTECTED_DEFAULT_BRANCH_RE = re.escape(_PROTECTED_DEFAULT_BRANCH)
 
 _COMMAND_PREFIX_RE = r"(?m)^(?:[^\S\r\n]*(?:[$>]|[+]{2,})[^\S\r\n]*)?"
-_GIT_PUSH_COMMAND_RE = re.compile(
-    _COMMAND_PREFIX_RE + r"git[^\S\r\n]+push\b(?P<args>[^\r\n]*)",
+_GIT_COMMAND_RE = re.compile(
+    _COMMAND_PREFIX_RE + r"git\b(?P<args>[^\r\n]*)",
     re.IGNORECASE,
 )
+_GIT_VALUE_OPTIONS = {
+    "-C",
+    "-c",
+    "--config-env",
+    "--exec-path",
+    "--git-dir",
+    "--namespace",
+    "--super-prefix",
+    "--work-tree",
+}
+_GIT_VALUE_OPTION_PREFIXES = (
+    "--config-env=",
+    "--exec-path=",
+    "--git-dir=",
+    "--namespace=",
+    "--super-prefix=",
+    "--work-tree=",
+)
+_GIT_FLAG_OPTIONS = {
+    "--bare",
+    "--glob-pathspecs",
+    "--help",
+    "--html-path",
+    "--icase-pathspecs",
+    "--literal-pathspecs",
+    "--man-path",
+    "--no-optional-locks",
+    "--no-pager",
+    "--no-replace-objects",
+    "--noglob-pathspecs",
+    "--paginate",
+    "--version",
+    "-p",
+    "-P",
+    "-v",
+}
 _PUSH_VALUE_OPTIONS = {"-o", "--push-option", "--receive-pack", "--exec", "--repo"}
 _PUSH_VALUE_OPTION_PREFIXES = tuple(
     f"{option}=" for option in _PUSH_VALUE_OPTIONS if option != "-o"
@@ -85,6 +121,25 @@ def _push_args_tokens(args: str) -> list[str]:
             normalized.append(token[:offset])
         break
     return normalized
+
+
+def _push_tokens_after_git_global_options(tokens: list[str]) -> list[str] | None:
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token.lower() == "push":
+            return tokens[index + 1 :]
+        if token in _GIT_VALUE_OPTIONS:
+            index += 2
+            continue
+        if token.startswith(_GIT_VALUE_OPTION_PREFIXES):
+            index += 1
+            continue
+        if token in _GIT_FLAG_OPTIONS:
+            index += 1
+            continue
+        return None
+    return None
 
 
 def _short_option_cluster_contains(token: str, flag: str) -> bool:
@@ -210,8 +265,12 @@ def _colon_refspec_targets_protected_branch(tokens: list[str]) -> bool:
 
 def _scan_branch_delete_main(coder_stdout: str) -> list[GuardrailViolation]:
     violations: list[GuardrailViolation] = []
-    for match in _GIT_PUSH_COMMAND_RE.finditer(coder_stdout):
-        tokens = _push_args_tokens(match.group("args"))
+    for match in _GIT_COMMAND_RE.finditer(coder_stdout):
+        tokens = _push_tokens_after_git_global_options(
+            _push_args_tokens(match.group("args"))
+        )
+        if tokens is None:
+            continue
         option_value_filtered_tokens = _push_tokens_without_option_values(
             _tokens_before_end_of_options(tokens)
         )

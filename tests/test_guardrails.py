@@ -71,6 +71,30 @@ def test_scan_stdout_branch_delete_default_via_heads_ref_alias() -> None:
     assert violations[0].category == "branch_delete_main"
 
 
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "git -C /repo push --delete origin main\n",
+        "git --git-dir=/repo/.git push origin :main\n",
+        "git -c core.sshCommand=ssh push origin :main\n",
+        "git --no-pager -C /repo push origin +:refs/heads/main\n",
+    ],
+)
+def test_scan_stdout_branch_delete_with_git_global_options(stdout: str) -> None:
+    violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_push_word_after_other_git_command_not_flagged() -> None:
+    assert scan_stdout("git commit -m push --delete origin main\n") == []
+
+
+def test_scan_stdout_branch_delete_git_without_subcommand_not_flagged() -> None:
+    assert scan_stdout("git -C /repo\n") == []
+
+
 @pytest.mark.parametrize("delete_flag", ["--delete", "-d"])
 def test_scan_stdout_branch_delete_default_with_delete_flag_after_ref(
     delete_flag: str,
