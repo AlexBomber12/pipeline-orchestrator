@@ -33,6 +33,300 @@ def test_scan_stdout_repo_delete_pattern_matches() -> None:
     assert violations[0].category == "repo_delete"
 
 
+def test_scan_stdout_branch_delete_default_via_colon_refspec() -> None:
+    violations = scan_stdout("git push origin :refs/heads/main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+@pytest.mark.parametrize("refspec", ["+:main", "+:refs/heads/main"])
+def test_scan_stdout_branch_delete_default_via_forced_empty_src_refspec(
+    refspec: str,
+) -> None:
+    violations = scan_stdout(f"git push origin {refspec}\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_default_via_dash_d_flag() -> None:
+    violations = scan_stdout("git push --delete origin main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_default_via_dash_d_short_flag() -> None:
+    violations = scan_stdout("git push origin -d main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_default_via_heads_ref_alias() -> None:
+    violations = scan_stdout("git push --delete origin heads/main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "git -C /repo push --delete origin main\n",
+        "git --git-dir=/repo/.git push origin :main\n",
+        "git -c core.sshCommand=ssh push origin :main\n",
+        "git --no-pager -C /repo push origin +:refs/heads/main\n",
+    ],
+)
+def test_scan_stdout_branch_delete_with_git_global_options(stdout: str) -> None:
+    violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "GIT_SSH_COMMAND='ssh -i key' git push --delete origin main\n",
+        "env FOO=bar git push origin :main\n",
+        "env -i git push --delete origin main\n",
+        "env --ignore-environment FOO=bar git push origin :main\n",
+        "env -u FOO git push origin +:main\n",
+        "$ FOO=bar BAR=baz git push origin +:refs/heads/main\n",
+    ],
+)
+def test_scan_stdout_branch_delete_with_shell_env_prefix(stdout: str) -> None:
+    violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_env_prefix_before_other_command_not_flagged() -> None:
+    stdout = "GIT_SSH_COMMAND='ssh -i key' echo git push --delete origin main\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_branch_delete_push_word_after_other_git_command_not_flagged() -> None:
+    assert scan_stdout("git commit -m push --delete origin main\n") == []
+
+
+def test_scan_stdout_branch_delete_git_without_subcommand_not_flagged() -> None:
+    assert scan_stdout("git -C /repo\n") == []
+
+
+@pytest.mark.parametrize("option", ["--help", "--html-path", "--man-path", "--version"])
+def test_scan_stdout_branch_delete_git_terminal_option_not_flagged(option: str) -> None:
+    assert scan_stdout(f"git {option} push --delete origin main\n") == []
+
+
+@pytest.mark.parametrize("delete_flag", ["--delete", "-d"])
+def test_scan_stdout_branch_delete_default_with_delete_flag_after_ref(
+    delete_flag: str,
+) -> None:
+    violations = scan_stdout(f"git push origin main {delete_flag}\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+@pytest.mark.parametrize("delete_flag", ["-df", "-fd"])
+def test_scan_stdout_branch_delete_default_via_clustered_short_delete_flag(
+    delete_flag: str,
+) -> None:
+    violations = scan_stdout(f"git push {delete_flag} origin main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_push_option_attached_value_not_delete_flag() -> None:
+    assert scan_stdout("git push -odeploy origin main\n") == []
+
+
+def test_scan_stdout_branch_delete_push_option_attached_value_not_dry_run() -> None:
+    violations = scan_stdout("git push -onotify --delete origin main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+@pytest.mark.parametrize("option", ["-o", "--push-option", "--receive-pack"])
+def test_scan_stdout_branch_delete_option_value_main_not_ref(option: str) -> None:
+    stdout = f"git push origin {option} main --delete feature-x\n"
+
+    assert scan_stdout(stdout) == []
+
+
+@pytest.mark.parametrize("option", ["--push-option=main", "--receive-pack=main"])
+def test_scan_stdout_branch_delete_attached_long_option_value_not_ref(
+    option: str,
+) -> None:
+    stdout = f"git push origin {option} --delete feature-x\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_branch_delete_option_value_before_colon_refspec_still_flagged() -> None:
+    violations = scan_stdout("git push -o origin :main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_with_option_value_still_flags_main_ref() -> None:
+    violations = scan_stdout("git push -o ci origin --delete main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_push_option_value_not_dry_run() -> None:
+    violations = scan_stdout("git push -o -notify --delete origin main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_push_option_value_not_delete_flag() -> None:
+    assert scan_stdout("git push -o -debug origin main\n") == []
+
+
+@pytest.mark.parametrize("delete_flag", ["--delete", "-d"])
+def test_scan_stdout_branch_delete_without_ref_not_flagged(delete_flag: str) -> None:
+    stdout = f"git push {delete_flag} main\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_branch_delete_colon_refspec_without_remote_flagged() -> None:
+    violations = scan_stdout("git push :main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "git push origin :main; echo ok\n",
+        "git push --delete origin main; echo ok\n",
+    ],
+)
+def test_scan_stdout_branch_delete_before_shell_separator(stdout: str) -> None:
+    violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_remote_named_main_not_flagged() -> None:
+    stdout = "git push --delete main feature-x\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_branch_delete_without_target_not_flagged() -> None:
+    assert scan_stdout("git push --delete\n") == []
+
+
+def test_scan_stdout_branch_delete_feature_not_flagged() -> None:
+    stdout = "git push --delete origin pr-123-something\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_branch_delete_main_dry_run_not_flagged() -> None:
+    stdout = "git push --dry-run --delete origin main\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_branch_delete_main_clustered_short_dry_run_not_flagged() -> None:
+    stdout = "git push origin :main -nq\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_branch_delete_no_dry_run_after_dry_run_still_flagged() -> None:
+    stdout = "git push --dry-run --no-dry-run --delete origin main\n"
+
+    violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+@pytest.mark.parametrize("repo_option", ["--repo=origin", "--repo origin"])
+def test_scan_stdout_branch_delete_repo_option_with_delete_flag(
+    repo_option: str,
+) -> None:
+    violations = scan_stdout(f"git push {repo_option} --delete main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_repo_option_with_colon_refspec() -> None:
+    violations = scan_stdout("git push --repo=origin :main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_no_delete_after_delete_not_flagged() -> None:
+    assert scan_stdout("git push --delete --no-delete origin main\n") == []
+
+
+def test_scan_stdout_branch_delete_delete_after_no_delete_still_flagged() -> None:
+    violations = scan_stdout("git push --no-delete --delete origin main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_after_end_of_options_not_delete_flag() -> None:
+    assert scan_stdout("git push origin -- --delete main\n") == []
+
+
+def test_scan_stdout_branch_delete_colon_refspec_after_end_of_options_flagged() -> None:
+    violations = scan_stdout("git push origin -- :main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "git push --delete origin MAIN\n",
+        "git push origin :MAIN\n",
+    ],
+)
+def test_scan_stdout_branch_delete_main_is_case_sensitive(stdout: str) -> None:
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_branch_delete_unclosed_quote_not_flagged() -> None:
+    assert scan_stdout('git push --delete origin "main\n') == []
+
+
+def test_scan_stdout_branch_delete_long_nonmatching_push_returns_empty() -> None:
+    stdout = "git push " + " ".join(f"feature-{index}" for index in range(1000))
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_branch_delete_main_prose_not_flagged() -> None:
+    stdout = "The next example mentions --delete main without a push command.\n"
+
+    assert scan_stdout(stdout) == []
+
+
 def test_scan_stdout_repo_create_pattern_allows_horizontal_whitespace() -> None:
     violations = scan_stdout("$ gh\trepo\tcreate octo/demo\n")
 
