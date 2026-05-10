@@ -408,7 +408,8 @@ def test_global_spinner_present_on_dashboard(
     assert 'id="global-spinner"' in response.text
     assert "htmx:beforeRequest" in response.text
     assert "htmx:afterRequest" in response.text
-    assert "trigger.indexOf('every ') === -1" in response.text
+    assert "htmx:trigger" in response.text
+    assert "requestConfig.triggeringEvent" in response.text
     assert "htmx:sendError" not in response.text
     assert "body.htmx-request #global-spinner" in response.text
 

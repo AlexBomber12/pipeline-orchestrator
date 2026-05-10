@@ -755,16 +755,33 @@
 
             let activeRequests = 0;
             const countedRequests = new WeakSet();
+            const triggeredElements = new WeakSet();
 
             function syncSpinner() {
                 spinner.classList.toggle('is-active', activeRequests > 0);
                 document.body.classList.toggle('htmx-request', activeRequests > 0);
             }
 
+            document.body.addEventListener('htmx:trigger', function (event) {
+                if (event.target instanceof Element) {
+                    triggeredElements.add(event.target);
+                }
+            });
+
             function shouldTrackRequest(event) {
                 const elt = event.detail && event.detail.elt;
-                const trigger = elt ? elt.getAttribute('hx-trigger') || '' : '';
-                return trigger.indexOf('every ') === -1;
+                const requestConfig = event.detail && event.detail.requestConfig;
+
+                if (requestConfig && requestConfig.triggeringEvent) {
+                    return true;
+                }
+
+                if (elt && triggeredElements.has(elt)) {
+                    triggeredElements.delete(elt);
+                    return true;
+                }
+
+                return !elt;
             }
 
             document.body.addEventListener('htmx:beforeRequest', function (event) {
