@@ -411,6 +411,10 @@ def test_global_spinner_present_on_dashboard(
     assert "htmx:afterRequest" in response.text
     assert "htmx:trigger" in response.text
     assert "triggerSpec.pollInterval > 0" in response.text
+    assert "pollingElements.has(elt)" in response.text
+    assert response.text.index("pollingElements.has(elt)") < response.text.index(
+        "requestConfig.triggeringEvent"
+    )
     assert "requestConfig.triggeringEvent" in response.text
     assert "htmx:sendError" not in response.text
     assert "body.htmx-request #global-spinner" in response.text

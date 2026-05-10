@@ -759,6 +759,7 @@
 
             let activeRequests = 0;
             const countedRequests = new WeakSet();
+            const pollingElements = new WeakSet();
             const triggeredElements = new WeakSet();
 
             function syncSpinner() {
@@ -769,6 +770,9 @@
             document.body.addEventListener('htmx:trigger', function (event) {
                 const triggerSpec = event.detail && event.detail.triggerSpec;
                 if (triggerSpec && triggerSpec.pollInterval > 0) {
+                    if (event.target instanceof Element) {
+                        pollingElements.add(event.target);
+                    }
                     return;
                 }
 
@@ -782,7 +786,13 @@
                 const requestConfig = event.detail && event.detail.requestConfig;
 
                 if (elt && elt.closest('[data-global-spinner="false"]')) {
+                    pollingElements.delete(elt);
                     triggeredElements.delete(elt);
+                    return false;
+                }
+
+                if (elt && pollingElements.has(elt)) {
+                    pollingElements.delete(elt);
                     return false;
                 }
 
