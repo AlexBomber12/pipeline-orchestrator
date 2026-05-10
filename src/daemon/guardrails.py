@@ -207,12 +207,6 @@ def _is_positional_push_token(token: str) -> bool:
     return bool(token) and not token.startswith("-")
 
 
-def _is_repository_token(token: str) -> bool:
-    return _is_positional_push_token(token) and not _is_empty_source_protected_refspec(
-        token
-    )
-
-
 def _tokens_before_end_of_options(tokens: list[str]) -> list[str]:
     if "--" not in tokens:
         return tokens
@@ -264,14 +258,7 @@ def _delete_flag_targets_protected_branch(tokens: list[str]) -> bool:
 
 def _colon_refspec_targets_protected_branch(tokens: list[str]) -> bool:
     positional = _push_positionals(tokens)
-    option_tokens = _tokens_before_end_of_options(tokens)
-    for index, token in enumerate(positional):
-        if not _is_empty_source_protected_refspec(token):
-            continue
-        return _has_repo_option(option_tokens) or any(
-            _is_repository_token(previous) for previous in positional[:index]
-        )
-    return False
+    return any(_is_empty_source_protected_refspec(token) for token in positional)
 
 
 def _scan_branch_delete_main(coder_stdout: str) -> list[GuardrailViolation]:
