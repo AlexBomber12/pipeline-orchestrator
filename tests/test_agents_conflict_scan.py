@@ -915,6 +915,11 @@ def test_scan_force_merge_commit_guidance_with_trailing_no_ff_not_flagged():
     assert scan_for_conflicts(body) == []
 
 
+def test_scan_wrapped_force_merge_commit_guidance_not_flagged():
+    body = "Use --no-ff to force merge\ncommits for traceability."
+    assert scan_for_conflicts(body) == []
+
+
 def test_scan_force_merge_pr_commits_with_failing_checks_flagged():
     body = "force-merge the PR commits even with failing checks."
     violations = scan_for_conflicts(body)
@@ -951,6 +956,11 @@ def test_scan_no_ff_force_merge_commits_with_long_failing_checks_flagged():
 
 def test_scan_no_ff_force_merge_commits_with_checks_enabled_not_flagged():
     body = "Use --no-ff to force merge commits with checks enabled."
+    assert scan_for_conflicts(body) == []
+
+
+def test_scan_no_ff_force_merge_commits_negated_dirty_context_not_flagged():
+    body = "Use --no-ff to force merge commits, but never with failing checks."
     assert scan_for_conflicts(body) == []
 
 

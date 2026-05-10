@@ -75,9 +75,9 @@ _DOUBLE_NEGATIVE_INVERTER = re.compile(
 
 _FORCE_MERGE_COMMIT_STRATEGY = re.compile(
     r"(?:"
-    r"--no-ff[^\n]{0,80}\bforce(?:-|\s+)merge\b[^\n]{0,80}\bcommits?\b"
+    r"--no-ff[\s\S]{0,80}\bforce(?:-|\s+)merge\b[\s\S]{0,80}\bcommits?\b"
     r"|"
-    r"\bforce(?:-|\s+)merge\b[^\n]{0,80}\bcommits?\b[^\n]{0,80}--no-ff"
+    r"\bforce(?:-|\s+)merge\b[\s\S]{0,80}\bcommits?\b[\s\S]{0,80}--no-ff"
     r")",
     re.IGNORECASE,
 )
@@ -177,12 +177,13 @@ def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
     for dirty_match in _DIRTY_MERGE_CONTEXT.finditer(text, sentence_start, clause_start):
         if not _is_negated(text, dirty_match.start()):
             return False
-    if _DIRTY_MERGE_CONTEXT.search(text, clause_start, dirty_window_end):
-        return False
+    for dirty_match in _DIRTY_MERGE_CONTEXT.finditer(text, clause_start, dirty_window_end):
+        if not _is_negated(text, dirty_match.start()):
+            return False
     return any(
         strategy.start() <= match_start < strategy.end()
         for strategy in _FORCE_MERGE_COMMIT_STRATEGY.finditer(
-            text, line_start, line_end
+            text, line_start, dirty_window_end
         )
     )
 
