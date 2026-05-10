@@ -166,7 +166,10 @@ def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
     clause_start = clause_start + 1 if clause_start >= 0 else line_start
     sentence_start = max(text.rfind(c, line_start, match_start) for c in ".!?\n")
     sentence_start = sentence_start + 1 if sentence_start >= 0 else line_start
-    dirty_window_end = min(len(text), match_start + 160)
+    dirty_window_end = line_end
+    if line_end < len(text):
+        next_line_end = text.find("\n", line_end + 1)
+        dirty_window_end = len(text) if next_line_end == -1 else next_line_end
     prefatory_context = text[sentence_start:clause_start]
     if _DIRTY_MERGE_CONTEXT.search(prefatory_context) and not _NEGATION_CONTEXT.search(
         prefatory_context
