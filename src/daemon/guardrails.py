@@ -100,6 +100,12 @@ def _is_positional_push_token(token: str) -> bool:
     return bool(token) and not token.startswith("-")
 
 
+def _is_repository_token(token: str) -> bool:
+    return _is_positional_push_token(token) and not _is_empty_source_protected_refspec(
+        token
+    )
+
+
 def _delete_flag_targets_protected_branch(tokens: list[str]) -> bool:
     for index, token in enumerate(tokens):
         if not _is_delete_token(token):
@@ -112,19 +118,25 @@ def _delete_flag_targets_protected_branch(tokens: list[str]) -> bool:
         if not positional_after_delete:
             continue
         has_repository_before_delete = any(
-            _is_positional_push_token(token) for token in tokens[:index]
+            _is_repository_token(token) for token in tokens[:index]
         )
-        if has_repository_before_delete or len(positional_after_delete) == 1:
+        if has_repository_before_delete:
             candidate_refs = positional_after_delete
-        else:
+        elif len(positional_after_delete) > 1:
             candidate_refs = positional_after_delete[1:]
+        else:
+            continue
         if any(_is_protected_branch_ref(ref) for ref in candidate_refs):
             return True
     return False
 
 
 def _colon_refspec_targets_protected_branch(tokens: list[str]) -> bool:
-    return any(_is_empty_source_protected_refspec(token) for token in tokens)
+    for index, token in enumerate(tokens):
+        if not _is_empty_source_protected_refspec(token):
+            continue
+        return any(_is_repository_token(previous) for previous in tokens[:index])
+    return False
 
 
 def _scan_branch_delete_main(coder_stdout: str) -> list[GuardrailViolation]:

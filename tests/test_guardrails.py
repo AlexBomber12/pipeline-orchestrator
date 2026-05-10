@@ -86,22 +86,14 @@ def test_scan_stdout_branch_delete_push_option_attached_value_not_dry_run() -> N
 
 
 @pytest.mark.parametrize("delete_flag", ["--delete", "-d"])
-def test_scan_stdout_branch_delete_default_via_default_remote(
-    delete_flag: str,
-) -> None:
+def test_scan_stdout_branch_delete_without_ref_not_flagged(delete_flag: str) -> None:
     stdout = f"git push {delete_flag} main\n"
 
-    violations = scan_stdout(stdout)
-
-    assert len(violations) == 1
-    assert violations[0].category == "branch_delete_main"
+    assert scan_stdout(stdout) == []
 
 
-def test_scan_stdout_branch_delete_colon_refspec_via_default_remote() -> None:
-    violations = scan_stdout("git push :main\n")
-
-    assert len(violations) == 1
-    assert violations[0].category == "branch_delete_main"
+def test_scan_stdout_branch_delete_colon_refspec_without_remote_not_flagged() -> None:
+    assert scan_stdout("git push :main\n") == []
 
 
 def test_scan_stdout_branch_delete_remote_named_main_not_flagged() -> None:
