@@ -74,6 +74,17 @@ def test_scan_stdout_branch_delete_default_via_clustered_short_delete_flag(
     assert violations[0].category == "branch_delete_main"
 
 
+def test_scan_stdout_branch_delete_push_option_attached_value_not_delete_flag() -> None:
+    assert scan_stdout("git push -odeploy origin main\n") == []
+
+
+def test_scan_stdout_branch_delete_push_option_attached_value_not_dry_run() -> None:
+    violations = scan_stdout("git push -onotify --delete origin main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
 @pytest.mark.parametrize("delete_flag", ["--delete", "-d"])
 def test_scan_stdout_branch_delete_default_via_default_remote(
     delete_flag: str,

@@ -68,7 +68,12 @@ def _push_args_tokens(args: str) -> list[str]:
 
 
 def _short_option_cluster_contains(token: str, flag: str) -> bool:
-    return token.startswith("-") and not token.startswith("--") and flag in token[1:]
+    return (
+        token.startswith("-")
+        and not token.startswith("--")
+        and not token.startswith("-o")
+        and flag in token[1:]
+    )
 
 
 def _is_dry_run_token(token: str) -> bool:
