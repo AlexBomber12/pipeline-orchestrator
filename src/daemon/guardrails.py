@@ -225,16 +225,18 @@ def _is_empty_source_protected_refspec(token: str) -> bool:
     return refspec.startswith(":") and _is_protected_branch_ref(refspec[1:])
 
 
-def _is_forced_protected_refspec(token: str) -> bool:
-    if not token.startswith("+"):
-        return False
-    refspec = token[1:]
+def _refspec_targets_protected_branch(token: str) -> bool:
+    refspec = token[1:] if token.startswith("+") else token
     if refspec.startswith(":"):
         return False
     if ":" in refspec:
         _, destination = refspec.rsplit(":", 1)
         return _is_protected_branch_ref(destination)
     return _is_protected_branch_ref(refspec)
+
+
+def _is_forced_protected_refspec(token: str) -> bool:
+    return token.startswith("+") and _refspec_targets_protected_branch(token)
 
 
 def _is_positional_push_token(token: str) -> bool:
@@ -308,7 +310,7 @@ def _force_flag_targets_protected_branch(tokens: list[str]) -> bool:
         candidate_refs = positional[1:]
     else:
         return False
-    return any(_is_protected_branch_ref(ref) for ref in candidate_refs)
+    return any(_refspec_targets_protected_branch(ref) for ref in candidate_refs)
 
 
 def _plus_refspec_targets_protected_branch(tokens: list[str]) -> bool:

@@ -355,6 +355,26 @@ def test_scan_stdout_force_push_main_plus_refspec_with_dst_main() -> None:
 
 
 @pytest.mark.parametrize(
+    "refspec",
+    [
+        "HEAD:main",
+        "feature:refs/heads/main",
+    ],
+)
+def test_scan_stdout_force_push_main_force_flag_with_dst_main_refspec(
+    refspec: str,
+) -> None:
+    violations = scan_stdout(f"git push --force origin {refspec}\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
+def test_scan_stdout_force_push_main_src_main_dst_other_not_flagged() -> None:
+    assert scan_stdout("git push --force origin main:feature\n") == []
+
+
+@pytest.mark.parametrize(
     "stdout",
     [
         "git -C /repo push --force origin main\n",
