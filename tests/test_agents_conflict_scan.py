@@ -820,6 +820,11 @@ def test_scan_negated_do_not_force_merge_not_flagged():
     assert scan_for_conflicts(body) == []
 
 
+def test_scan_force_merge_commit_guidance_not_flagged():
+    body = "Use --no-ff to force merge commits when preserving branch history."
+    assert scan_for_conflicts(body) == []
+
+
 def test_multiple_violations_all_returned():
     body = (
         "Step 1: gh pr create --draft --title 'wip'.\n"

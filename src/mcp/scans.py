@@ -305,7 +305,12 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
     (
         "merge_dirty_alt",
         re.compile(
-            r"\b(?:force[-\s]merge|merge\s+(?:despite|with)\s+(?:red|failing|broken|stale)\s+(?:CI|checks?|tests?))\b",
+            r"\b(?:"
+            r"force[-\s]merge\b"
+            r"(?=[^\n]{0,80}\b(?:PR|pull request|CI|checks?|tests?)\b)"
+            r"|"
+            r"merge\s+(?:despite|with)\s+(?:red|failing|broken|stale)\s+(?:CI|checks?|tests?)"
+            r")\b",
             re.IGNORECASE,
         ),
         "AGENTS.md prohibits merging with non-green CI. PR-118.",
