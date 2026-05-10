@@ -244,6 +244,34 @@ def _has_unnegated_dirty_context_after_nearest_negation(
     return False
 
 
+def _continuation_dirty_context_blocks_strategy(text: str, cursor: int) -> bool:
+    """Return True when a following continuation line adds dirty merge context."""
+    while cursor < len(text):
+        line_end = text.find("\n", cursor)
+        line_end = len(text) if line_end == -1 else line_end
+        line = text[cursor:line_end]
+        marker = re.match(r"\s*(?:[-*]|\d+[.)])?\s*", line)
+        marker_end = marker.end() if marker else 0
+        is_list_item = re.match(r"\s*(?:[-*]|\d+[.)])\s+", line)
+        for dirty_match in _DIRTY_MERGE_CONTEXT.finditer(line, marker_end):
+            prefix = line[marker_end : dirty_match.start()]
+            suffix = line[dirty_match.end() :]
+            if is_list_item and re.match(
+                r"\s*(?:fix|resolve|repair|address|retry|re-run|rerun|wait|stop|abort)\b",
+                prefix,
+                re.IGNORECASE,
+            ):
+                continue
+            if _is_guarded_remedial_dirty_context(prefix, suffix):
+                continue
+            if not _is_dirty_context_negated(text, cursor + dirty_match.start()):
+                return True
+        if line.rstrip().endswith((".", "!", "?")) or line_end == len(text):
+            break
+        cursor = line_end + 1
+    return False
+
+
 def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
     """Return True for benign ``--no-ff`` merge-commit guidance."""
     line_start = text.rfind("\n", 0, match_start) + 1
@@ -286,27 +314,12 @@ def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
             continue
         if not _is_dirty_context_negated(text, dirty_match.start()):
             return False
-    if line_end < len(text) and not current_line.endswith((".", "!", "?")):
-        next_line_end = text.find("\n", line_end + 1)
-        next_line_end = len(text) if next_line_end == -1 else next_line_end
-        next_line_start = line_end + 1
-        next_line = text[next_line_start:next_line_end]
-        marker = re.match(r"\s*(?:[-*]|\d+[.)])?\s*", next_line)
-        marker_end = marker.end() if marker else 0
-        is_next_line_list_item = re.match(r"\s*(?:[-*]|\d+[.)])\s+", next_line)
-        for dirty_match in _DIRTY_MERGE_CONTEXT.finditer(next_line, marker_end):
-            prefix = next_line[marker_end : dirty_match.start()]
-            suffix = next_line[dirty_match.end() :]
-            if is_next_line_list_item and re.match(
-                r"\s*(?:fix|resolve|repair|address|retry|re-run|rerun|wait|stop|abort)\b",
-                prefix,
-                re.IGNORECASE,
-            ):
-                continue
-            if _is_guarded_remedial_dirty_context(prefix, suffix):
-                continue
-            if not _is_dirty_context_negated(text, next_line_start + dirty_match.start()):
-                return False
+    if (
+        line_end < len(text)
+        and not current_line.endswith((".", "!", "?"))
+        and _continuation_dirty_context_blocks_strategy(text, line_end + 1)
+    ):
+        return False
     return any(
         strategy.start() <= match_start < strategy.end()
         for strategy in _FORCE_MERGE_COMMIT_STRATEGY.finditer(
