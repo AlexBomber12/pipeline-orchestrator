@@ -1052,6 +1052,11 @@ def test_scan_no_ff_force_merge_commits_wrapped_stop_merge_not_flagged():
     assert scan_for_conflicts(body) == []
 
 
+def test_scan_no_ff_force_merge_commits_if_checks_fail_skip_merge_not_flagged():
+    body = "Use --no-ff to force merge commits if checks fail, skip merge."
+    assert scan_for_conflicts(body) == []
+
+
 def test_scan_no_ff_force_merge_commits_wrapped_merge_anyway_policy_flagged():
     body = "Use --no-ff to force merge commits\nif checks fail, merge anyway."
     violations = scan_for_conflicts(body)

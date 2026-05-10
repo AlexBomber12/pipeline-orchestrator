@@ -183,7 +183,7 @@ def _is_guarded_remedial_dirty_context(prefix: str, suffix: str) -> bool:
     if has_negated_merge_policy:
         return True
     has_abort_merge_policy = re.match(
-        r"\s*,?\s*(?:abort|stop)\s+merge\b", suffix, re.IGNORECASE
+        r"\s*,?\s*(?:abort|stop|skip)\s+merge\b", suffix, re.IGNORECASE
     ) and not re.search(
         r"\b(?:then|and)\s+(?:force(?:-|\s+)merge|merge)\b",
         guarded_branch,
