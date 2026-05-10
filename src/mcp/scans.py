@@ -159,6 +159,33 @@ def _is_negated(text: str, match_start: int) -> bool:
     return True
 
 
+def _is_guarded_remedial_dirty_context(prefix: str, suffix: str) -> bool:
+    """Return True when dirty context belongs to a remedial failure branch."""
+    has_guarded_condition = re.search(
+        r"(?:^|\s)(?:if|when|unless)\s*$", prefix, re.IGNORECASE
+    ) and not re.search(r"(?:^|\s)even\s+if\s*$", prefix, re.IGNORECASE)
+    if not has_guarded_condition:
+        return False
+    branch_end = re.search(r"[.!?\n]", suffix)
+    guarded_branch = suffix[: branch_end.start()] if branch_end else suffix
+    has_negated_merge_policy = re.match(
+        r"\s*,?\s*(?:do\s+not|don't|never)\s+merge\b", suffix, re.IGNORECASE
+    )
+    if has_negated_merge_policy:
+        return True
+    has_remedial_action = re.match(
+        r"\s*,?\s*(?:retry|re-run|rerun|try\s+again|fix|stop|abort|wait)\b",
+        suffix,
+        re.IGNORECASE,
+    )
+    has_merge_intent = re.search(
+        r"\b(?:merge|force(?:-|\s+)merge|bypass|skip)\b",
+        guarded_branch,
+        re.IGNORECASE,
+    )
+    return bool(has_remedial_action and not has_merge_intent)
+
+
 def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
     """Return True for benign ``--no-ff`` merge-commit guidance."""
     line_start = text.rfind("\n", 0, match_start) + 1
@@ -197,25 +224,7 @@ def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
     for dirty_match in _DIRTY_MERGE_CONTEXT.finditer(text, clause_start, dirty_window_end):
         prefix = text[clause_start : dirty_match.start()]
         suffix = text[dirty_match.end() : dirty_window_end]
-        has_guarded_condition = re.search(
-            r"(?:^|\s)(?:if|when|unless)\s*$", prefix, re.IGNORECASE
-        ) and not re.search(r"(?:^|\s)even\s+if\s*$", prefix, re.IGNORECASE)
-        branch_end = re.search(r"[.!?\n]", suffix)
-        guarded_branch = suffix[: branch_end.start()] if branch_end else suffix
-        has_remedial_action = re.match(
-            r"\s*,?\s*(?:retry|re-run|rerun|try\s+again|fix|stop|abort|wait)\b",
-            suffix,
-            re.IGNORECASE,
-        )
-        has_merge_intent = re.search(
-            r"\b(?:merge|force(?:-|\s+)merge|bypass|skip)\b",
-            guarded_branch,
-            re.IGNORECASE,
-        )
-        is_guarded_retry = (
-            has_guarded_condition and has_remedial_action and not has_merge_intent
-        )
-        if is_guarded_retry:
+        if _is_guarded_remedial_dirty_context(prefix, suffix):
             continue
         if not _is_negated(text, dirty_match.start()):
             return False
@@ -229,25 +238,7 @@ def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
         for dirty_match in _DIRTY_MERGE_CONTEXT.finditer(next_line, marker_end):
             prefix = next_line[marker_end : dirty_match.start()]
             suffix = next_line[dirty_match.end() :]
-            has_guarded_condition = re.search(
-                r"(?:^|\s)(?:if|when|unless)\s*$", prefix, re.IGNORECASE
-            ) and not re.search(r"(?:^|\s)even\s+if\s*$", prefix, re.IGNORECASE)
-            branch_end = re.search(r"[.!?\n]", suffix)
-            guarded_branch = suffix[: branch_end.start()] if branch_end else suffix
-            has_remedial_action = re.match(
-                r"\s*,?\s*(?:retry|re-run|rerun|try\s+again|fix|stop|abort|wait)\b",
-                suffix,
-                re.IGNORECASE,
-            )
-            has_merge_intent = re.search(
-                r"\b(?:merge|force(?:-|\s+)merge|bypass|skip)\b",
-                guarded_branch,
-                re.IGNORECASE,
-            )
-            is_guarded_retry = (
-                has_guarded_condition and has_remedial_action and not has_merge_intent
-            )
-            if is_guarded_retry:
+            if _is_guarded_remedial_dirty_context(prefix, suffix):
                 continue
             if not _is_negated(text, next_line_start + dirty_match.start()):
                 return False

@@ -1103,6 +1103,11 @@ def test_scan_no_ff_force_merge_commits_if_checks_fail_flagged():
     assert "merge_dirty_alt" in types
 
 
+def test_scan_no_ff_force_merge_commits_if_checks_fail_do_not_merge_not_flagged():
+    body = "Use --no-ff to force merge commits if checks fail, do not merge."
+    assert scan_for_conflicts(body) == []
+
+
 def test_scan_no_ff_force_merge_commits_then_retry_if_checks_fail_not_flagged():
     body = "Use --no-ff to force merge commits when checks pass; if checks fail, retry."
     assert scan_for_conflicts(body) == []
