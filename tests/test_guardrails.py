@@ -40,6 +40,16 @@ def test_scan_stdout_branch_delete_default_via_colon_refspec() -> None:
     assert violations[0].category == "branch_delete_main"
 
 
+@pytest.mark.parametrize("refspec", ["+:main", "+:refs/heads/main"])
+def test_scan_stdout_branch_delete_default_via_forced_empty_src_refspec(
+    refspec: str,
+) -> None:
+    violations = scan_stdout(f"git push origin {refspec}\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
 def test_scan_stdout_branch_delete_default_via_dash_d_flag() -> None:
     violations = scan_stdout("git push --delete origin main\n")
 

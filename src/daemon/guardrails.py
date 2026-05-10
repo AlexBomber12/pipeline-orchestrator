@@ -49,7 +49,7 @@ _TIER1_PATTERNS: dict[str, re.Pattern[str]] = {
         r"[ \t]+(?![-+])[^\s,;|&#]+"
         r"(?:[ \t]+[^\s,;|&#]+)*?"
         r"[ \t]+"
-        rf":(?:refs/heads/)?{_PROTECTED_DEFAULT_BRANCH_RE}"
+        rf"\+?:(?:refs/heads/)?{_PROTECTED_DEFAULT_BRANCH_RE}"
         r"(?![\w/:-]|\.\w)"
         r")"
         r"|"
