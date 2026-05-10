@@ -1009,6 +1009,11 @@ def test_scan_list_marker_wrapped_dirty_context_blocks_no_ff_strategy_exemption(
     assert "merge_dirty_alt" in types
 
 
+def test_scan_next_bullet_remedial_dirty_context_does_not_block_no_ff_strategy():
+    body = "- Use --no-ff to force merge commits\n- Fix failing checks before merge."
+    assert scan_for_conflicts(body) == []
+
+
 def test_scan_midline_wrapped_dirty_context_blocks_no_ff_strategy_exemption():
     body = "Use --no-ff to force merge commits\nand even with failing checks, continue."
     violations = scan_for_conflicts(body)

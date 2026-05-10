@@ -253,9 +253,16 @@ def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
         next_line = text[next_line_start:next_line_end]
         marker = re.match(r"\s*(?:[-*]|\d+[.)])?\s*", next_line)
         marker_end = marker.end() if marker else 0
+        is_next_line_list_item = re.match(r"\s*(?:[-*]|\d+[.)])\s+", next_line)
         for dirty_match in _DIRTY_MERGE_CONTEXT.finditer(next_line, marker_end):
             prefix = next_line[marker_end : dirty_match.start()]
             suffix = next_line[dirty_match.end() :]
+            if is_next_line_list_item and re.match(
+                r"\s*(?:fix|resolve|repair|address|retry|re-run|rerun|wait|stop|abort)\b",
+                prefix,
+                re.IGNORECASE,
+            ):
+                continue
             if _is_guarded_remedial_dirty_context(prefix, suffix):
                 continue
             if not _is_negated(text, next_line_start + dirty_match.start()):
