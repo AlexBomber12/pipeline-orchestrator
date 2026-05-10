@@ -203,9 +203,15 @@ def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
         next_line = text[next_line_start:next_line_end]
         marker = re.match(r"\s*(?:[-*]|\d+[.)])?\s*", next_line)
         marker_end = marker.end() if marker else 0
-        dirty_match = _DIRTY_MERGE_CONTEXT.match(next_line, marker_end)
-        if dirty_match and not _is_negated(text, next_line_start + dirty_match.start()):
-            return False
+        for dirty_match in _DIRTY_MERGE_CONTEXT.finditer(next_line, marker_end):
+            prefix = next_line[marker_end : dirty_match.start()]
+            is_guarded_retry = re.search(
+                r"(?:^|\s)(?:if|when|unless)\s*$", prefix, re.IGNORECASE
+            ) and not re.search(r"(?:^|\s)even\s+if\s*$", prefix, re.IGNORECASE)
+            if is_guarded_retry:
+                continue
+            if not _is_negated(text, next_line_start + dirty_match.start()):
+                return False
     return any(
         strategy.start() <= match_start < strategy.end()
         for strategy in _FORCE_MERGE_COMMIT_STRATEGY.finditer(
