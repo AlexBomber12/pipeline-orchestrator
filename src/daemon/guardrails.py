@@ -27,8 +27,12 @@ _PROTECTED_DEFAULT_BRANCH = "main"
 _PROTECTED_DEFAULT_BRANCH_RE = re.escape(_PROTECTED_DEFAULT_BRANCH)
 
 _COMMAND_PREFIX_RE = r"(?m)^(?:[^\S\r\n]*(?:[$>]|[+]{2,})[^\S\r\n]*)?"
+_SHELL_ENV_ASSIGNMENT_RE = (
+    r"[A-Za-z_][A-Za-z0-9_]*=(?:'[^'\r\n]*'|\"[^\"\r\n]*\"|[^'\"\s\r\n]+)"
+)
+_SHELL_ENV_PREFIX_RE = rf"(?:(?:env|{_SHELL_ENV_ASSIGNMENT_RE})[^\S\r\n]+)*"
 _GIT_COMMAND_RE = re.compile(
-    _COMMAND_PREFIX_RE + r"git\b(?P<args>[^\r\n]*)",
+    _COMMAND_PREFIX_RE + _SHELL_ENV_PREFIX_RE + r"git\b(?P<args>[^\r\n]*)",
     re.IGNORECASE,
 )
 _GIT_VALUE_OPTIONS = {

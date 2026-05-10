@@ -87,6 +87,27 @@ def test_scan_stdout_branch_delete_with_git_global_options(stdout: str) -> None:
     assert violations[0].category == "branch_delete_main"
 
 
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "GIT_SSH_COMMAND='ssh -i key' git push --delete origin main\n",
+        "env FOO=bar git push origin :main\n",
+        "$ FOO=bar BAR=baz git push origin +:refs/heads/main\n",
+    ],
+)
+def test_scan_stdout_branch_delete_with_shell_env_prefix(stdout: str) -> None:
+    violations = scan_stdout(stdout)
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_env_prefix_before_other_command_not_flagged() -> None:
+    stdout = "GIT_SSH_COMMAND='ssh -i key' echo git push --delete origin main\n"
+
+    assert scan_stdout(stdout) == []
+
+
 def test_scan_stdout_branch_delete_push_word_after_other_git_command_not_flagged() -> None:
     assert scan_stdout("git commit -m push --delete origin main\n") == []
 
