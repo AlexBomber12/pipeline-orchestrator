@@ -199,10 +199,20 @@ def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
         has_guarded_condition = re.search(
             r"(?:^|\s)(?:if|when|unless)\s*$", prefix, re.IGNORECASE
         ) and not re.search(r"(?:^|\s)even\s+if\s*$", prefix, re.IGNORECASE)
-        is_guarded_retry = has_guarded_condition and re.match(
+        branch_end = re.search(r"[.!?\n]", suffix)
+        guarded_branch = suffix[: branch_end.start()] if branch_end else suffix
+        has_remedial_action = re.match(
             r"\s*,?\s*(?:retry|re-run|rerun|try\s+again|fix|stop|abort|wait)\b",
             suffix,
             re.IGNORECASE,
+        )
+        has_merge_intent = re.search(
+            r"\b(?:merge|force(?:-|\s+)merge|bypass|skip)\b",
+            guarded_branch,
+            re.IGNORECASE,
+        )
+        is_guarded_retry = (
+            has_guarded_condition and has_remedial_action and not has_merge_intent
         )
         if is_guarded_retry:
             continue
@@ -221,10 +231,20 @@ def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
             has_guarded_condition = re.search(
                 r"(?:^|\s)(?:if|when|unless)\s*$", prefix, re.IGNORECASE
             ) and not re.search(r"(?:^|\s)even\s+if\s*$", prefix, re.IGNORECASE)
-            is_guarded_retry = has_guarded_condition and re.match(
+            branch_end = re.search(r"[.!?\n]", suffix)
+            guarded_branch = suffix[: branch_end.start()] if branch_end else suffix
+            has_remedial_action = re.match(
                 r"\s*,?\s*(?:retry|re-run|rerun|try\s+again|fix|stop|abort|wait)\b",
                 suffix,
                 re.IGNORECASE,
+            )
+            has_merge_intent = re.search(
+                r"\b(?:merge|force(?:-|\s+)merge|bypass|skip)\b",
+                guarded_branch,
+                re.IGNORECASE,
+            )
+            is_guarded_retry = (
+                has_guarded_condition and has_remedial_action and not has_merge_intent
             )
             if is_guarded_retry:
                 continue
