@@ -304,9 +304,7 @@ def _force_flag_targets_protected_branch(tokens: list[str]) -> bool:
     if not _is_effective_force(option_tokens):
         return False
     positional = _push_positionals(tokens)
-    if _has_repo_option(option_tokens):
-        candidate_refs = positional
-    elif len(positional) >= 2:
+    if len(positional) >= 2:
         candidate_refs = positional[1:]
     else:
         return False

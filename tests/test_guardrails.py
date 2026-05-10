@@ -399,11 +399,17 @@ def test_scan_stdout_force_push_main_push_option_value_not_dry_run(
     assert violations[0].category == "force_push_main"
 
 
-def test_scan_stdout_force_push_main_repo_option_without_remote_position() -> None:
-    violations = scan_stdout("git push --repo=origin --force main\n")
+def test_scan_stdout_force_push_main_repo_option_with_positional_remote() -> None:
+    violations = scan_stdout("git push --repo=upstream --force origin main\n")
 
     assert len(violations) == 1
     assert violations[0].category == "force_push_main"
+
+
+def test_scan_stdout_force_push_main_repo_option_positional_remote_named_main() -> None:
+    stdout = "git push --repo=upstream --force main feature\n"
+
+    assert scan_stdout(stdout) == []
 
 
 def test_scan_stdout_force_push_to_feature_branch_not_flagged() -> None:
