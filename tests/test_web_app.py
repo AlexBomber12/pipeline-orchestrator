@@ -2369,6 +2369,100 @@ def test_repo_card_renders_pause_and_stop_controls_for_active_repo(
     assert 'h-8 w-8 md:h-7 md:w-7' in body
 
 
+def _render_repo_list_body(
+    monkeypatch: pytest.MonkeyPatch, redis: _FakeRedis | None = None
+) -> str:
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    with TestClient(app) as client:
+        if redis is not None:
+            client.app.state.redis = redis
+        response = client.get("/partials/repo-list")
+
+    assert response.status_code == 200
+    return response.text
+
+
+def test_repo_card_buttons_block_positioned_top_right(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = _render_repo_list_body(monkeypatch)
+
+    assert 'class="relative rounded-lg border bg-surface-2 p-4' in body
+    assert "mb-3 flex min-h-12 flex-col gap-3 pr-40" in body
+    assert (
+        'class="absolute top-0 right-0 flex flex-nowrap items-center '
+        'justify-end gap-2 p-4"'
+    ) in body
+
+
+def test_repo_card_buttons_single_row_no_wrap(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = _render_repo_list_body(monkeypatch)
+
+    assert (
+        'class="absolute top-0 right-0 flex flex-nowrap items-center '
+        'justify-end gap-2 p-4"'
+    ) in body
+    assert "flex w-full flex-wrap items-center justify-between" not in body
+
+
+def test_repo_card_upload_uses_global_spinner(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = _render_repo_list_body(monkeypatch)
+
+    assert 'hx-indicator="#global-spinner"' in body
+    assert "upload-indicator-example__alpha" not in body
+    assert "upload-indicator-example__beta" not in body
+    assert "Uploading..." not in body
+
+
+def test_repo_card_button_order(
+    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 4, 10, 12, 0, 0, tzinfo=timezone.utc)
+    active = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.CODING,
+        user_paused=False,
+        queue_done=0,
+        queue_total=2,
+        last_updated=now,
+    )
+    active_body = _render_repo_list_body(
+        monkeypatch,
+        _FakeRedis(
+            {"pipeline:example__alpha": active.model_dump_json()}
+        ),
+    )
+    paused_body = _render_repo_list_body(
+        monkeypatch,
+        _FakeRedis(
+            {
+                "pipeline:example__alpha": active.model_copy(
+                    update={"user_paused": True}
+                ).model_dump_json()
+            }
+        ),
+    )
+
+    assert active_body.index('hx-post="/repos/example__alpha/pause"') < active_body.index(
+        'hx-post="/repos/example__alpha/stop"'
+    )
+    assert active_body.index('hx-post="/repos/example__alpha/stop"') < active_body.index(
+        'hx-post="/repos/example__alpha/upload-tasks"'
+    )
+
+    assert paused_body.index(
+        'hx-post="/repos/example__alpha/resume"'
+    ) < paused_body.index('hx-post="/repos/example__alpha/stop"')
+    assert paused_body.index('hx-post="/repos/example__alpha/stop"') < paused_body.index(
+        'hx-post="/repos/example__alpha/upload-tasks"'
+    )
+
+
 def test_repo_card_upload_button_renders_as_flat_icon(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
