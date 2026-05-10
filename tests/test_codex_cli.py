@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from src.codex_cli import (
+    _build_fix_feedback_prompt,
     diagnose_error_async,
     fix_review_async,
     run_auto_pr_async,
@@ -272,6 +273,35 @@ async def test_fix_review_async_appends_extra_context(
     assert prompt.startswith("FIX FEEDBACK\n\n")
     assert "CI failure logs (last 5000 chars):" in prompt
     assert "boom" in prompt
+
+
+def test_build_fix_feedback_prompt_with_task_anchor() -> None:
+    prompt = _build_fix_feedback_prompt(
+        "some logs",
+        pr_id="PR-100",
+        task_file="tasks/PR-100.md",
+    )
+
+    assert prompt.startswith("Task: PR-100\n\nFile: tasks/PR-100.md\n\n")
+    assert (
+        "Stay in the scope of this task. Do not address any "
+        "other PR or task in this run."
+    ) in prompt
+    assert "\n\nFIX FEEDBACK\n\nsome logs" in prompt
+
+
+def test_build_fix_feedback_prompt_legacy_fallbacks() -> None:
+    assert _build_fix_feedback_prompt(
+        "ci logs",
+        pr_id=None,
+        task_file=None,
+    ) == "FIX FEEDBACK\n\nci logs"
+    assert _build_fix_feedback_prompt(
+        "ci logs",
+        pr_id="PR-100",
+        task_file=None,
+    ) == "FIX FEEDBACK\n\nci logs"
+    assert _build_fix_feedback_prompt(None) == "FIX FEEDBACK"
 
 
 @pytest.mark.asyncio

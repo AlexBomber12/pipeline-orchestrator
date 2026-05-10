@@ -315,6 +315,31 @@ def test_handle_fix_omits_extra_context_when_no_signals(
     asyncio.run(runner.handle_fix())
 
     assert "extra_context" not in captured["kwargs"]
+    assert captured["kwargs"].get("pr_id") is None
+    assert captured["kwargs"].get("task_file") is None
+
+
+def test_handle_fix_passes_pr_id_and_task_file_to_plugin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    captured = h._capture_fix_kwargs(monkeypatch)
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_task = QueueTask(
+        pr_id="PR-100",
+        title="t",
+        status=TaskStatus.DOING,
+        task_file="tasks/PR-100.md",
+        branch="pr-100",
+    )
+    runner.state.current_pr = PRInfo(number=100, branch="pr-100")
+
+    asyncio.run(runner.handle_fix())
+
+    assert captured["kwargs"]["pr_id"] == "PR-100"
+    assert captured["kwargs"]["task_file"] == "tasks/PR-100.md"
 
 
 def test_handle_fix_finishes_push_bookkeeping_before_post_exit_stop_pause(
