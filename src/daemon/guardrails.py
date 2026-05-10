@@ -227,6 +227,8 @@ def _is_empty_source_protected_refspec(token: str) -> bool:
 
 def _refspec_targets_protected_branch(token: str) -> bool:
     refspec = token[1:] if token.startswith("+") else token
+    if refspec == ":":
+        return True
     if refspec.startswith(":"):
         return False
     if ":" in refspec:
@@ -304,7 +306,7 @@ def _force_flag_targets_protected_branch(tokens: list[str]) -> bool:
     if not _is_effective_force(option_tokens):
         return False
     positional = _push_positionals(tokens)
-    if _has_repo_option(option_tokens) and len(positional) == 1:
+    if _has_repo_option(option_tokens):
         candidate_refs = positional
     elif len(positional) >= 2:
         candidate_refs = positional[1:]

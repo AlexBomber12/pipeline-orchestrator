@@ -354,6 +354,13 @@ def test_scan_stdout_force_push_main_plus_refspec_with_dst_main() -> None:
     assert violations[0].category == "force_push_main"
 
 
+def test_scan_stdout_force_push_main_plus_matching_refspec_form() -> None:
+    violations = scan_stdout("git push origin +:\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
+
+
 @pytest.mark.parametrize(
     "refspec",
     [
@@ -413,10 +420,11 @@ def test_scan_stdout_force_push_main_repo_option_without_positional_remote() -> 
     assert violations[0].category == "force_push_main"
 
 
-def test_scan_stdout_force_push_main_repo_option_positional_remote_named_main() -> None:
-    stdout = "git push --repo=upstream --force main feature\n"
+def test_scan_stdout_force_push_main_repo_option_scans_all_positionals() -> None:
+    violations = scan_stdout("git push --repo=upstream --force main feature\n")
 
-    assert scan_stdout(stdout) == []
+    assert len(violations) == 1
+    assert violations[0].category == "force_push_main"
 
 
 def test_scan_stdout_force_push_to_feature_branch_not_flagged() -> None:
