@@ -146,11 +146,9 @@ def test_scan_negated_do_not_convert_pr_to_draft_not_flagged():
     assert scan_for_conflicts(body) == []
 
 
-def test_scan_flags_open_as_draft():
-    body = "Open as draft."
-    violations = scan_for_conflicts(body)
-    types = {v.violation_type for v in violations}
-    assert "draft_pr_open_as" in types
+def test_scan_open_as_draft_without_pr_context_not_flagged():
+    body = "Open as draft architecture notes before implementation."
+    assert scan_for_conflicts(body) == []
 
 
 def test_scan_flags_open_pr_as_draft():
@@ -160,15 +158,15 @@ def test_scan_flags_open_pr_as_draft():
     assert "draft_pr_open_as" in types
 
 
-def test_scan_flags_open_as_a_draft():
-    body = "Open it as a draft."
+def test_scan_flags_open_pull_request_as_a_draft():
+    body = "Open the pull request as a draft."
     violations = scan_for_conflicts(body)
     types = {v.violation_type for v in violations}
     assert "draft_pr_open_as" in types
 
 
 def test_scan_negated_do_not_open_as_draft_not_flagged():
-    body = "Do not open as draft."
+    body = "Do not open the PR as draft."
     assert scan_for_conflicts(body) == []
 
 
@@ -781,7 +779,7 @@ def test_auto_merge_dirty_detected():
 
 
 def test_scan_flags_force_merge():
-    body = "force-merge the PR after review."
+    body = "force-merge the PR with failing checks."
     violations = scan_for_conflicts(body)
     types = {v.violation_type for v in violations}
     assert "merge_dirty_alt" in types
@@ -822,6 +820,11 @@ def test_scan_negated_do_not_force_merge_not_flagged():
 
 def test_scan_force_merge_commit_guidance_not_flagged():
     body = "Use --no-ff to force merge commits when preserving branch history."
+    assert scan_for_conflicts(body) == []
+
+
+def test_scan_force_merge_pr_commit_guidance_not_flagged():
+    body = "Use --no-ff to force merge PR commits for traceability."
     assert scan_for_conflicts(body) == []
 
 
