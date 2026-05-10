@@ -109,11 +109,25 @@ def run_auto_pr(
     )
 
 
-def _build_fix_feedback_prompt(extra_context: str | None) -> str:
-    """Compose the ``FIX FEEDBACK`` prompt with optional daemon-supplied context."""
+def _build_fix_feedback_prompt(
+    extra_context: str | None,
+    *,
+    pr_id: str | None = None,
+    task_file: str | None = None,
+) -> str:
+    """Compose the FIX FEEDBACK prompt with optional Task anchor + context."""
+    parts: list[str] = []
+    if pr_id and task_file:
+        parts.append(f"Task: {pr_id}")
+        parts.append(f"File: {task_file}")
+        parts.append(
+            "Stay in the scope of this task. Do not address any "
+            "other PR or task in this run."
+        )
+    parts.append("FIX FEEDBACK")
     if extra_context:
-        return f"FIX FEEDBACK\n\n{extra_context}"
-    return "FIX FEEDBACK"
+        parts.append(extra_context)
+    return "\n\n".join(parts)
 
 
 def fix_review(
@@ -303,6 +317,8 @@ async def fix_review_async(
     session_threshold: int | None = None,
     weekly_threshold: int | None = None,
     extra_context: str | None = None,
+    pr_id: str | None = None,
+    task_file: str | None = None,
 ) -> tuple[int, str, str]:
     kwargs: dict[str, object] = {
         "timeout": timeout,
@@ -315,7 +331,13 @@ async def fix_review_async(
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
     return await run_claude_async(
-        _build_fix_feedback_prompt(extra_context), repo_path, **kwargs
+        _build_fix_feedback_prompt(
+            extra_context,
+            pr_id=pr_id,
+            task_file=task_file,
+        ),
+        repo_path,
+        **kwargs,
     )
 
 

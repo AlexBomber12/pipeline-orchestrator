@@ -344,6 +344,9 @@ class FixMixin(BreachMixin):
             **plugin_run_kwargs,
             "on_process_start": self._track_current_coder_process,
         }
+        if self.state.current_task is not None:
+            fix_kwargs["pr_id"] = self.state.current_task.pr_id
+            fix_kwargs["task_file"] = self.state.current_task.task_file
         if self.state.current_pr is not None:
             extra_context = await self._build_fix_feedback_context(
                 self.state.current_pr

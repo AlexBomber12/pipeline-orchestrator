@@ -307,6 +307,7 @@ If any condition fails, MICRO is not allowed. Use PLANNED PR.
 - Stay on the existing PR branch
 - Do not edit `tasks/QUEUE.md` (auto-generated; manual edits are overwritten on next IDLE cycle) or `tasks/PR-*.md`
 - Fix only the review comments
+- The FIX FEEDBACK prompt now includes explicit `Task:` and `File:` headers identifying the PR's source task. Operate only within the scope of that task; do not address other PRs in the same run. Cross-task scope expansion is detected by the daemon's pre-push hook (PR-272) and ESCALATEs.
 - Use the Codex Review gate above and stop only when a non-stale Codex thumbs up is present
 - Run `scripts/ci.sh` to exit 0
 - Generate review artifacts (not committed, excluded by .gitignore)

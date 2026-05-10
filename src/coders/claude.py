@@ -90,12 +90,17 @@ class ClaudePlugin:
         repo_path: str,
         model: str | None,
         timeout: int | None = None,
+        *,
+        pr_id: str | None = None,
+        task_file: str | None = None,
         **kwargs: Any,
     ) -> tuple[int, str, str]:
         return await claude_cli.fix_review_async(
             repo_path,
             model=model,
             timeout=timeout,
+            pr_id=pr_id,
+            task_file=task_file,
             **kwargs,
         )
 
