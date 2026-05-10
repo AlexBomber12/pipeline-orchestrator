@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 from src.coders import claude as claude_plugin_module
 from src.daemon import git_ops as git_ops_module
+from src.daemon import main_commit_audit
 from src.daemon import runner as runner_module
 from src.daemon.handlers import idle as idle_module
 from src.models import (
@@ -84,6 +85,98 @@ def test_handle_idle_no_tasks_leaves_state_idle(
     clean_idx = next(i for i, cmd in enumerate(commands) if cmd[:2] == ["git", "clean"])
     assert reset_idx < clean_idx
     assert ["git", "clean", "-fd"] in calls
+
+
+def test_handle_idle_main_commit_audit_invoked_at_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
+    monkeypatch.setattr("src.github.prs.get_merged_prs", lambda repo, branch, refresh=False: [])
+    monkeypatch.setattr(
+        idle_module,
+        "list_recent_main_commit_shas",
+        lambda repo, lookback_n: ["sha20"],
+    )
+    audit_calls: list[tuple[str, list[str], set[str]]] = []
+
+    def fake_audit(owner_repo: str, shas: list[str], audited_shas: set[str]):
+        audit_calls.append((owner_repo, shas, audited_shas))
+        return [], shas
+
+    monkeypatch.setattr(idle_module, "audit_main_commit_shas", fake_audit)
+
+    runner = h._make_runner()
+    for _ in range(19):
+        asyncio.run(runner.handle_idle())
+
+    assert audit_calls == []
+
+    asyncio.run(runner.handle_idle())
+
+    assert audit_calls == [("octo/demo", ["sha20"], set())]
+
+
+def test_handle_idle_main_commit_audit_findings_logged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
+    monkeypatch.setattr("src.github.prs.get_merged_prs", lambda repo, branch, refresh=False: [])
+    monkeypatch.setattr(
+        idle_module,
+        "list_recent_main_commit_shas",
+        lambda repo, lookback_n: ["abc1234"],
+    )
+    finding = main_commit_audit.MainCommitAuditFinding(
+        sha="abc1234",
+        short_sha="abc1234",
+        message_first_line="direct hotfix",
+        parent_count=1,
+        pr_number=None,
+        violation_category="direct_commit_no_pr",
+        rule="revert",
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "audit_main_commit_shas",
+        lambda owner_repo, shas, audited_shas: ([finding], shas),
+    )
+
+    runner = h._make_runner()
+    for _ in range(20):
+        asyncio.run(runner.handle_idle())
+
+    assert any(
+        entry["event"].startswith(
+            "[AUDIT] [MAIN-COMMIT-AUDIT] VIOLATION direct_commit_no_pr: abc1234"
+        )
+        for entry in runner.state.history
+    )
+
+
+def test_handle_idle_main_commit_audit_failure_logged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
+    monkeypatch.setattr("src.github.prs.get_merged_prs", lambda repo, branch, refresh=False: [])
+
+    def fail_list(owner_repo: str, lookback_n: int) -> list[str]:
+        raise RuntimeError("gh unavailable")
+
+    monkeypatch.setattr(idle_module, "list_recent_main_commit_shas", fail_list)
+
+    runner = h._make_runner()
+    for _ in range(20):
+        asyncio.run(runner.handle_idle())
+
+    assert any(
+        entry["event"].startswith(
+            "[AUDIT] [MAIN-COMMIT-AUDIT] Skipping audit for octo/demo"
+        )
+        for entry in runner.state.history
+    )
 
 
 def test_resolve_rate_limit_error_state_clears_rate_limit_message() -> None:

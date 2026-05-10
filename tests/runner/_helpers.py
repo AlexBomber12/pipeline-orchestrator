@@ -253,6 +253,10 @@ class _FakeRedis:
     async def smembers(self, key: str) -> set[str]:
         return set(self.sets.get(key, set()))
 
+    async def expire(self, key: str, seconds: int) -> bool:
+        self.ttls[key] = seconds
+        return True
+
     async def publish(self, key: str, value: str) -> int:
         return 1
 
