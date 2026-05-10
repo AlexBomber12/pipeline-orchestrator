@@ -99,6 +99,27 @@ def test_scan_stdout_branch_delete_main_clustered_short_dry_run_not_flagged() ->
     assert scan_stdout(stdout) == []
 
 
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "git push --delete origin MAIN\n",
+        "git push origin :MAIN\n",
+    ],
+)
+def test_scan_stdout_branch_delete_main_is_case_sensitive(stdout: str) -> None:
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_branch_delete_unclosed_quote_not_flagged() -> None:
+    assert scan_stdout('git push --delete origin "main\n') == []
+
+
+def test_scan_stdout_branch_delete_long_nonmatching_push_returns_empty() -> None:
+    stdout = "git push " + " ".join(f"feature-{index}" for index in range(1000))
+
+    assert scan_stdout(stdout) == []
+
+
 def test_scan_stdout_branch_delete_main_prose_not_flagged() -> None:
     stdout = "The next example mentions --delete main without a push command.\n"
 

@@ -11,6 +11,7 @@ surrounded by negating words.
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass
 
 
@@ -26,10 +27,10 @@ _PROTECTED_DEFAULT_BRANCH = "main"
 _PROTECTED_DEFAULT_BRANCH_RE = re.escape(_PROTECTED_DEFAULT_BRANCH)
 
 _COMMAND_PREFIX_RE = r"(?m)^(?:[^\S\r\n]*(?:[$>]|[+]{2,})[^\S\r\n]*)?"
-_GIT_PUSH_NOT_DRY_RUN_RE = (
-    r"(?!(?:[ \t]+[^\s,;|&#]+)*?[ \t]+(?:--dry-run|-[A-Za-z]*n[A-Za-z]*)(?![\w-]))"
+_GIT_PUSH_COMMAND_RE = re.compile(
+    _COMMAND_PREFIX_RE + r"git[^\S\r\n]+push\b(?P<args>[^\r\n]*)",
+    re.IGNORECASE,
 )
-_GIT_PUSH_DELETE_FLAG_RE = r"(?:--delete|-[A-Za-z]*d[A-Za-z]*)(?![\w-])"
 
 _TIER1_PATTERNS: dict[str, re.Pattern[str]] = {
     "repo_create": re.compile(
@@ -38,46 +39,6 @@ _TIER1_PATTERNS: dict[str, re.Pattern[str]] = {
     ),
     "repo_delete": re.compile(
         _COMMAND_PREFIX_RE + r"gh[^\S\r\n]+repo[^\S\r\n]+delete\b",
-        re.IGNORECASE,
-    ),
-    "branch_delete_main": re.compile(
-        _COMMAND_PREFIX_RE
-        + r"git push\b"
-        + _GIT_PUSH_NOT_DRY_RUN_RE
-        + r"(?:"
-        r"(?="
-        r"(?:[ \t]+[^\s,;|&#]+)*?"
-        r"[ \t]+(?![-+])[^\s,;|&#]+"
-        r"(?:[ \t]+[^\s,;|&#]+)*?"
-        r"[ \t]+"
-        rf"\+?:(?:refs/heads/)?{_PROTECTED_DEFAULT_BRANCH_RE}"
-        r"(?![\w/:-]|\.\w)"
-        r")"
-        r"|"
-        r"(?="
-        r"(?:[ \t]+[^\s,;|&#]+)*?"
-        r"[ \t]+"
-        + _GIT_PUSH_DELETE_FLAG_RE
-        + r"(?:[ \t]+[^\s,;|&#]+)*?"
-        + r"[ \t]+(?![-+])[^\s,;|&#]+"
-        + r"(?:[ \t]+[^\s,;|&#]+)*?"
-        + r"[ \t]+"
-        rf"(?:refs/heads/)?{_PROTECTED_DEFAULT_BRANCH_RE}"
-        r"(?![\w/:-]|\.\w)"
-        r")"
-        r"|"
-        r"(?="
-        r"(?:[ \t]+[^\s,;|&#]+)*?"
-        r"[ \t]+(?![-+])[^\s,;|&#]+"
-        r"(?:[ \t]+[^\s,;|&#]+)*?"
-        r"[ \t]+"
-        + _GIT_PUSH_DELETE_FLAG_RE
-        + r"(?:[ \t]+[^\s,;|&#]+)*?"
-        + r"[ \t]+"
-        rf"(?:refs/heads/)?{_PROTECTED_DEFAULT_BRANCH_RE}"
-        r"(?![\w/:-]|\.\w)"
-        r")"
-        r")",
         re.IGNORECASE,
     ),
 }
@@ -99,9 +60,93 @@ def _line_excerpt(coder_stdout: str, start: int, end: int) -> str:
     return coder_stdout[line_start:line_end].strip()[:_EXCERPT_LIMIT]
 
 
+def _push_args_tokens(args: str) -> list[str]:
+    try:
+        return shlex.split(args, comments=False, posix=True)
+    except ValueError:
+        return args.split()
+
+
+def _short_option_cluster_contains(token: str, flag: str) -> bool:
+    return token.startswith("-") and not token.startswith("--") and flag in token[1:]
+
+
+def _is_dry_run_token(token: str) -> bool:
+    return token == "--dry-run" or _short_option_cluster_contains(token, "n")
+
+
+def _is_delete_token(token: str) -> bool:
+    return token == "--delete" or _short_option_cluster_contains(token, "d")
+
+
+def _is_protected_branch_ref(token: str) -> bool:
+    return token in {
+        _PROTECTED_DEFAULT_BRANCH,
+        f"refs/heads/{_PROTECTED_DEFAULT_BRANCH}",
+    }
+
+
+def _is_empty_source_protected_refspec(token: str) -> bool:
+    refspec = token[1:] if token.startswith("+") else token
+    return refspec.startswith(":") and _is_protected_branch_ref(refspec[1:])
+
+
+def _is_repository_token(token: str) -> bool:
+    return (
+        bool(token)
+        and not token.startswith("-")
+        and not _is_empty_source_protected_refspec(token)
+    )
+
+
+def _delete_flag_targets_protected_branch(tokens: list[str]) -> bool:
+    for index, token in enumerate(tokens):
+        if not _is_delete_token(token):
+            continue
+        for ref_index in range(index + 1, len(tokens)):
+            if not _is_protected_branch_ref(tokens[ref_index]):
+                continue
+            return any(
+                _is_repository_token(previous)
+                for previous in tokens[:ref_index]
+                if not _is_delete_token(previous)
+            )
+    return False
+
+
+def _colon_refspec_targets_protected_branch(tokens: list[str]) -> bool:
+    for index, token in enumerate(tokens):
+        if not _is_empty_source_protected_refspec(token):
+            continue
+        return any(_is_repository_token(previous) for previous in tokens[:index])
+    return False
+
+
+def _scan_branch_delete_main(coder_stdout: str) -> list[GuardrailViolation]:
+    violations: list[GuardrailViolation] = []
+    for match in _GIT_PUSH_COMMAND_RE.finditer(coder_stdout):
+        tokens = _push_args_tokens(match.group("args"))
+        if any(_is_dry_run_token(token) for token in tokens):
+            continue
+        if not (
+            _colon_refspec_targets_protected_branch(tokens)
+            or _delete_flag_targets_protected_branch(tokens)
+        ):
+            continue
+        violations.append(
+            GuardrailViolation(
+                tier=1,
+                category="branch_delete_main",
+                excerpt=_line_excerpt(coder_stdout, match.start(), match.end()),
+                rule=_TIER1_RULES["branch_delete_main"],
+            )
+        )
+    return violations
+
+
 def scan_stdout(coder_stdout: str) -> list[GuardrailViolation]:
     """Return guardrail violations found in captured coder stdout."""
-    violations: list[GuardrailViolation] = []
+    violations: list[GuardrailViolation] = _scan_branch_delete_main(coder_stdout)
     for category in sorted(_TIER1_PATTERNS):
         pattern = _TIER1_PATTERNS[category]
         for match in pattern.finditer(coder_stdout):
