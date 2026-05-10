@@ -98,6 +98,16 @@ def _is_delete_token(token: str) -> bool:
     return token == "--delete" or _short_option_cluster_contains(token, "d")
 
 
+def _is_effective_delete(tokens: list[str]) -> bool:
+    delete = False
+    for token in tokens:
+        if _is_delete_token(token):
+            delete = True
+        elif token == "--no-delete":
+            delete = False
+    return delete
+
+
 def _is_protected_branch_ref(token: str) -> bool:
     return token in {
         _PROTECTED_DEFAULT_BRANCH,
@@ -149,7 +159,7 @@ def _push_positionals(tokens: list[str]) -> list[str]:
 
 def _delete_flag_targets_protected_branch(tokens: list[str]) -> bool:
     filtered_tokens = _push_tokens_without_option_values(tokens)
-    if not any(_is_delete_token(token) for token in filtered_tokens):
+    if not _is_effective_delete(filtered_tokens):
         return False
     positional = [
         token for token in filtered_tokens if _is_positional_push_token(token)
@@ -168,7 +178,9 @@ def _colon_refspec_targets_protected_branch(tokens: list[str]) -> bool:
     for index, token in enumerate(positional):
         if not _is_empty_source_protected_refspec(token):
             continue
-        return any(_is_repository_token(previous) for previous in positional[:index])
+        return _has_repo_option(tokens) or any(
+            _is_repository_token(previous) for previous in positional[:index]
+        )
     return False
 
 

@@ -191,6 +191,24 @@ def test_scan_stdout_branch_delete_repo_option_with_delete_flag(
     assert violations[0].category == "branch_delete_main"
 
 
+def test_scan_stdout_branch_delete_repo_option_with_colon_refspec() -> None:
+    violations = scan_stdout("git push --repo=origin :main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
+def test_scan_stdout_branch_delete_no_delete_after_delete_not_flagged() -> None:
+    assert scan_stdout("git push --delete --no-delete origin main\n") == []
+
+
+def test_scan_stdout_branch_delete_delete_after_no_delete_still_flagged() -> None:
+    violations = scan_stdout("git push --no-delete --delete origin main\n")
+
+    assert len(violations) == 1
+    assert violations[0].category == "branch_delete_main"
+
+
 @pytest.mark.parametrize(
     "stdout",
     [
