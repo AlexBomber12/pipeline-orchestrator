@@ -173,8 +173,8 @@ def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
     next_boundaries = [
         pos for c in _CLAUSE_BOUNDARIES if (pos := text.find(c, match_start)) != -1
     ]
-    dirty_window_end = min(next_boundaries) if next_boundaries else line_end
-    strategy_window_end = dirty_window_end
+    dirty_window_end = line_end
+    strategy_window_end = min(next_boundaries) if next_boundaries else line_end
     if line_end < len(text) and not current_line.endswith((".", "!", "?")):
         next_line_boundaries = [
             pos
@@ -194,6 +194,18 @@ def _is_force_merge_commit_strategy(text: str, match_start: int) -> bool:
         if not _is_negated(text, dirty_match.start()):
             return False
     for dirty_match in _DIRTY_MERGE_CONTEXT.finditer(text, clause_start, dirty_window_end):
+        prefix = text[clause_start : dirty_match.start()]
+        suffix = text[dirty_match.end() : dirty_window_end]
+        has_guarded_condition = re.search(
+            r"(?:^|\s)(?:if|when|unless)\s*$", prefix, re.IGNORECASE
+        ) and not re.search(r"(?:^|\s)even\s+if\s*$", prefix, re.IGNORECASE)
+        is_guarded_retry = has_guarded_condition and re.match(
+            r"\s*,?\s*(?:retry|re-run|rerun|try\s+again|fix|stop|abort|wait)\b",
+            suffix,
+            re.IGNORECASE,
+        )
+        if is_guarded_retry:
+            continue
         if not _is_negated(text, dirty_match.start()):
             return False
     if line_end < len(text) and not current_line.endswith((".", "!", "?")):
