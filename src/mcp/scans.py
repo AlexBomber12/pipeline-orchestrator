@@ -69,7 +69,7 @@ _CLAUSE_BOUNDARIES = ".,;!?:\n"
 # negation is silently equated with semantic prohibition and a
 # conflicting task spec passes ``validate_task_spec``.
 _DOUBLE_NEGATIVE_INVERTER = re.compile(
-    r"\b(?:forget|fail|neglect|hesitate|refuse)\s+to\b",
+    r"\b(?:forget|fail|neglect|hesitate|refuse|wait)\s+to\b",
     re.IGNORECASE,
 )
 
@@ -212,7 +212,12 @@ def _is_dirty_context_negated(text: str, match_start: int) -> bool:
         if _DOUBLE_NEGATIVE_INVERTER.search(text, negation.end(), match_start):
             continue
         gap = text[negation.end() : match_start]
-        if re.fullmatch(r"[\s,]*(?:merge\s+)?", gap, re.IGNORECASE):
+        if re.fullmatch(
+            r"[\s,]*(?:(?:use|run|perform)\s+)?"
+            r"(?:(?:force(?:-|\s+))?merge\b[^\n,.;!?:]{0,80})?",
+            gap,
+            re.IGNORECASE,
+        ):
             return True
     return False
 
@@ -227,8 +232,12 @@ def _has_unnegated_dirty_context_after_nearest_negation(
     if not negations:
         return False  # pragma: no cover - caller only invokes after _is_negated.
     nearest = negations[-1]
+    sentence_end_candidates = [
+        pos for c in ".!?\n" if (pos := text.find(c, match_start)) != -1
+    ]
+    dirty_window_end = min(sentence_end_candidates) if sentence_end_candidates else len(text)
     for dirty_match in _DIRTY_MERGE_CONTEXT.finditer(
-        text, nearest.end(), match_start
+        text, nearest.end(), dirty_window_end
     ):
         if not _is_dirty_context_negated(text, dirty_match.start()):
             return True

@@ -936,6 +936,18 @@ def test_scan_negated_do_not_force_merge_not_flagged():
     assert scan_for_conflicts(body) == []
 
 
+def test_scan_negated_force_merge_with_dirty_context_not_flagged():
+    body = "Do not force-merge the PR with failing checks."
+    assert scan_for_conflicts(body) == []
+
+
+def test_scan_do_not_wait_to_force_merge_with_dirty_context_flagged():
+    body = "Do not wait to force-merge the PR with failing checks."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "merge_dirty_alt" in types
+
+
 def test_scan_force_merge_commit_guidance_not_flagged():
     body = "Use --no-ff to force merge commits when preserving branch history."
     assert scan_for_conflicts(body) == []
