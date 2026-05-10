@@ -523,8 +523,14 @@ def test_audit_commit_fetch_error_returns_partial_findings(monkeypatch, caplog):
             ["good", "bad", "later"],
         )
 
-    assert checked == ["good", "later"]
-    assert [finding.sha for finding in findings] == ["good", "later"]
+    assert checked == ["good", "bad", "later"]
+    assert [finding.sha for finding in findings] == ["good", "bad", "later"]
+    assert [finding.violation_category for finding in findings] == [
+        "direct_commit_no_pr",
+        "merge_commit_pr_unverified",
+        "direct_commit_no_pr",
+    ]
+    assert findings[1].message_first_line == ""
     assert "Failed to audit main commit bad" in caplog.text
 
 

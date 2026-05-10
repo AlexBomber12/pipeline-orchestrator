@@ -167,7 +167,6 @@ class IdleMixin:
         )
         if self._main_commit_audit_counter < audit_interval:
             return
-        self._main_commit_audit_counter = 0
 
         repo_key = self.name
         lookback_n = self.app_config.daemon.main_commit_audit_lookback_n
@@ -203,6 +202,7 @@ class IdleMixin:
             repo_key,
             checked_shas,
         )
+        self._main_commit_audit_counter = 0
 
     @staticmethod
     def _validate_task_file_header_match(task_file: Path, header_pr_id: str) -> None:

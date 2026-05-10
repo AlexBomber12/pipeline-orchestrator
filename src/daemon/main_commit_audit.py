@@ -216,6 +216,9 @@ def audit_main_commit_shas(
     for sha in shas:
         if sha in audited:
             continue
+        message = ""
+        parent_count = 0
+        pr_number = None
         try:
             commit_payload = _as_dict(
                 run_gh(["api", f"repos/{owner_repo}/commits/{sha}"])
@@ -351,6 +354,17 @@ def audit_main_commit_shas(
             checked_shas.append(sha)
         except Exception:
             logger.exception("Failed to audit main commit %s for %s", sha, owner_repo)
+            findings.append(
+                _finding(
+                    sha=sha,
+                    message=message,
+                    parent_count=parent_count,
+                    pr_number=pr_number,
+                    violation_category="merge_commit_pr_unverified",
+                    rule="Main commit audit failed before verification completed; investigate manually.",
+                )
+            )
+            checked_shas.append(sha)
             continue
 
     return findings, checked_shas

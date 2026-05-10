@@ -162,10 +162,23 @@ def test_handle_idle_main_commit_audit_failure_logged(
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
     monkeypatch.setattr("src.github.prs.get_merged_prs", lambda repo, branch, refresh=False: [])
 
+    attempts = 0
+
     def fail_list(owner_repo: str, lookback_n: int) -> list[str]:
-        raise RuntimeError("gh unavailable")
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("gh unavailable")
+        return ["retry-sha"]
 
     monkeypatch.setattr(idle_module, "list_recent_main_commit_shas", fail_list)
+    audit_calls: list[tuple[str, list[str], set[str]]] = []
+
+    def fake_audit(owner_repo: str, shas: list[str], audited_shas: set[str]):
+        audit_calls.append((owner_repo, shas, audited_shas))
+        return [], shas
+
+    monkeypatch.setattr(idle_module, "audit_main_commit_shas", fake_audit)
 
     runner = h._make_runner()
     for _ in range(20):
@@ -177,6 +190,11 @@ def test_handle_idle_main_commit_audit_failure_logged(
         )
         for entry in runner.state.history
     )
+
+    asyncio.run(runner.handle_idle())
+
+    assert audit_calls == [("octo/demo", ["retry-sha"], set())]
+    assert runner._main_commit_audit_counter == 0
 
 
 def test_resolve_rate_limit_error_state_clears_rate_limit_message() -> None:
