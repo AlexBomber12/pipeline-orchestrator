@@ -93,6 +93,16 @@ def test_scan_stdout_branch_delete_colon_refspec_via_default_remote() -> None:
     assert violations[0].category == "branch_delete_main"
 
 
+def test_scan_stdout_branch_delete_remote_named_main_not_flagged() -> None:
+    stdout = "git push --delete main feature-x\n"
+
+    assert scan_stdout(stdout) == []
+
+
+def test_scan_stdout_branch_delete_without_target_not_flagged() -> None:
+    assert scan_stdout("git push --delete\n") == []
+
+
 def test_scan_stdout_branch_delete_feature_not_flagged() -> None:
     stdout = "git push --delete origin pr-123-something\n"
 

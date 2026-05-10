@@ -91,11 +91,29 @@ def _is_empty_source_protected_refspec(token: str) -> bool:
     return refspec.startswith(":") and _is_protected_branch_ref(refspec[1:])
 
 
+def _is_positional_push_token(token: str) -> bool:
+    return bool(token) and not token.startswith("-")
+
+
 def _delete_flag_targets_protected_branch(tokens: list[str]) -> bool:
     for index, token in enumerate(tokens):
         if not _is_delete_token(token):
             continue
-        if any(_is_protected_branch_ref(ref) for ref in tokens[index + 1 :]):
+        positional_after_delete = [
+            token
+            for token in tokens[index + 1 :]
+            if _is_positional_push_token(token)
+        ]
+        if not positional_after_delete:
+            continue
+        has_repository_before_delete = any(
+            _is_positional_push_token(token) for token in tokens[:index]
+        )
+        if has_repository_before_delete or len(positional_after_delete) == 1:
+            candidate_refs = positional_after_delete
+        else:
+            candidate_refs = positional_after_delete[1:]
+        if any(_is_protected_branch_ref(ref) for ref in candidate_refs):
             return True
     return False
 
