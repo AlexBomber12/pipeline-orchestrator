@@ -114,10 +114,10 @@ def _commit_message(payload: dict[str, Any]) -> str:
     return message if isinstance(message, str) else ""
 
 
-def _parents(payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _parents(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
     parents = payload.get("parents")
     if not isinstance(parents, list):
-        return []
+        return None
     return [parent for parent in parents if isinstance(parent, dict)]
 
 
@@ -221,8 +221,39 @@ def audit_main_commit_shas(
                 run_gh(["api", f"repos/{owner_repo}/commits/{sha}"])
             )
             parents = _parents(commit_payload)
-            parent_count = len(parents)
             message = _commit_message(commit_payload)
+            if parents is None:
+                findings.append(
+                    _finding(
+                        sha=sha,
+                        message=message,
+                        parent_count=0,
+                        pr_number=None,
+                        violation_category="merge_commit_pr_unverified",
+                        rule="Commit parent metadata is unavailable; verify main history manually.",
+                    )
+                )
+                checked_shas.append(sha)
+                continue
+
+            parent_count = len(parents)
+            if parent_count == 0:
+                findings.append(
+                    _finding(
+                        sha=sha,
+                        message=message,
+                        parent_count=parent_count,
+                        pr_number=None,
+                        violation_category="direct_commit_no_pr",
+                        rule=(
+                            "Root commit is not associated with a merged PR; "
+                            "investigate and revert if unauthorized."
+                        ),
+                    )
+                )
+                checked_shas.append(sha)
+                continue
+
             if parent_count == 1:
                 associated_pr = _merged_associated_pr(
                     run_gh(["api", f"repos/{owner_repo}/commits/{sha}/pulls"])

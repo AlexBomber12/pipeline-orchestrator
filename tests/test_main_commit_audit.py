@@ -386,6 +386,26 @@ def test_audit_octopus_merge_flagged(monkeypatch):
     assert findings[0].parent_count == 3
 
 
+def test_audit_root_commit_flagged_as_direct_commit(monkeypatch):
+    def fake_run_gh(args):
+        path = args[1]
+        if path.endswith("/commits?sha=main&per_page=10"):
+            return [_summary("rootsha")]
+        if path.endswith("/commits/rootsha"):
+            return _commit("initial commit", [])
+        raise AssertionError(args)
+
+    monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+
+    findings = main_commit_audit.audit_main_commits("octo/demo")
+
+    assert [finding.violation_category for finding in findings] == [
+        "direct_commit_no_pr"
+    ]
+    assert findings[0].parent_count == 0
+    assert findings[0].pr_number is None
+
+
 def test_audit_skips_already_audited_shas(monkeypatch):
     processed: list[str] = []
 
