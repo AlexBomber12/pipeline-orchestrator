@@ -334,6 +334,40 @@ def test_audit_linear_pr_commit_with_passing_ci_clean(monkeypatch):
     assert main_commit_audit.audit_main_commits("octo/demo") == []
 
 
+def test_audit_linear_pr_commit_with_landed_ci_clean(monkeypatch):
+    def fake_run_gh(args):
+        path = args[1]
+        if path.endswith("/commits?sha=main&per_page=10"):
+            return [_summary("rebase42")]
+        if path.endswith("/commits/rebase42"):
+            return _commit("feature commit", ["base"])
+        if path.endswith("/commits/rebase42/pulls"):
+            return [
+                {
+                    "number": 42,
+                    "merged_at": "2026-05-10T12:00:00Z",
+                    "head": {"sha": "head42"},
+                    "base": {"ref": "main"},
+                }
+            ]
+        if path.endswith("/commits/head42/status"):
+            return _status("failure")
+        if path.endswith("/commits/rebase42/status"):
+            return _status("success")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+    _patch_check_runs(
+        monkeypatch,
+        {
+            "head42": _check_runs("failure"),
+            "rebase42": _check_runs("success"),
+        },
+    )
+
+    assert main_commit_audit.audit_main_commits("octo/demo") == []
+
+
 def test_audit_linear_pr_commit_with_failed_ci_flagged(monkeypatch):
     def fake_run_gh(args):
         path = args[1]
@@ -354,10 +388,18 @@ def test_audit_linear_pr_commit_with_failed_ci_flagged(monkeypatch):
             return _check_runs("failure")
         if path.endswith("/commits/head42/status"):
             return _status("success")
+        if path.endswith("/commits/rebase42/status"):
+            return _status("failure")
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
-    _patch_check_runs(monkeypatch, {"head42": _check_runs("failure")})
+    _patch_check_runs(
+        monkeypatch,
+        {
+            "head42": _check_runs("failure"),
+            "rebase42": _check_runs("failure"),
+        },
+    )
 
     findings = main_commit_audit.audit_main_commits("octo/demo")
 

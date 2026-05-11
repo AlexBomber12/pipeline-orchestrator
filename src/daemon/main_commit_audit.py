@@ -3,7 +3,7 @@
 GitHub squash and rebase merges can produce single-parent linear commits on
 main. The audit queries GitHub's associated-pulls endpoint before treating a
 single-parent commit as a direct commit, then verifies CI against the PR head
-SHA when a merged PR is available.
+SHA or the landed SHA when a merged PR is available.
 """
 
 from __future__ import annotations
@@ -194,6 +194,17 @@ def _has_successful_ci(owner_repo: str, sha: str) -> bool:
     )
 
 
+def _has_successful_ci_on_any_sha(owner_repo: str, shas: list[str | None]) -> bool:
+    seen: set[str] = set()
+    for sha in shas:
+        if not sha or sha in seen:
+            continue
+        seen.add(sha)
+        if _has_successful_ci(owner_repo, sha):
+            return True
+    return False
+
+
 def audit_main_commits(
     owner_repo: str,
     lookback_n: int = 10,
@@ -302,8 +313,10 @@ def audit_main_commit_shas(
                     continue
 
                 pr_number = _pr_number(associated_pr)
-                ci_sha = _pr_head_sha(associated_pr) or sha
-                if not _has_successful_ci(owner_repo, ci_sha):
+                if not _has_successful_ci_on_any_sha(
+                    owner_repo,
+                    [_pr_head_sha(associated_pr), sha],
+                ):
                     findings.append(
                         _finding(
                             sha=sha,
@@ -313,7 +326,7 @@ def audit_main_commit_shas(
                             violation_category="linear_pr_failed_ci",
                             rule=(
                                 "Linear-history PR commit has no successful "
-                                "PR-head check run; investigate branch-protection bypass."
+                                "PR-head or landed check run; investigate branch-protection bypass."
                             ),
                         )
                     )
