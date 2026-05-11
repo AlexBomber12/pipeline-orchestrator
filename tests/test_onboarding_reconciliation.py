@@ -57,6 +57,24 @@ def test_dry_run_on_existing_agents_md_without_markers_appends_and_preserves(
     assert "+## Mission" not in diff, "user lines must not be re-added"
 
 
+def test_reconcile_agents_md_propagates_forbidden_actions_section(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "AGENTS.md"
+    target.write_text(USER_INTRO)
+
+    proposed, _ = reconcile_agents_md(target, dry_run=True)
+
+    assert (
+        "<!-- pipeline-orchestrator: managed BEGIN forbidden_actions -->"
+        in proposed
+    )
+    assert (
+        "<!-- pipeline-orchestrator: managed END forbidden_actions -->"
+        in proposed
+    )
+
+
 def test_dry_run_on_existing_markers_updates_in_place(tmp_path: Path) -> None:
     target = tmp_path / "AGENTS.md"
     stale_body = (

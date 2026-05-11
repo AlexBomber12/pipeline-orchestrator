@@ -25,6 +25,7 @@ MANAGED_SECTIONS: tuple[str, ...] = (
     "codex_review_gate",
     "escalate_protocol",
     "branch_naming",
+    "forbidden_actions",  # PR-291
     "auto_pr_runbook",
     "planned_pr_runbook",
     "micro_pr_runbook",
