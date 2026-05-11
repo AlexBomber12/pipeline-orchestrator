@@ -296,6 +296,29 @@ def test_watch_diff_fetch_failure_logs_and_continues(
     assert any("diff fetch failed" in e["event"] for e in runner.state.history)
 
 
+def test_watch_diff_fetch_runtime_error_logs_and_continues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_get_pr_diff(repo: str, number: int) -> str:
+        raise RuntimeError("gh failed")
+
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_diff", fail_get_pr_diff)
+    transitions: list[str] = []
+
+    async def fake_transition(self: PipelineRunner, cause: str, **kwargs: Any) -> None:
+        transitions.append(cause)
+
+    monkeypatch.setattr(PipelineRunner, "_transition_to_error", fake_transition)
+    runner = _make_pending_watch_runner(monkeypatch)
+
+    asyncio.run(runner.handle_watch())
+
+    assert transitions == []
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.diff_scanned_at is None
+    assert any("diff fetch failed" in e["event"] for e in runner.state.history)
+
+
 def test_scan_pr_diff_once_without_current_pr_returns_false() -> None:
     runner = h._make_runner()
     runner.state.current_pr = None

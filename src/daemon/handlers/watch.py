@@ -353,7 +353,11 @@ class WatchMixin:
             return False
         try:
             diff_text = gh_prs.get_pr_diff(self.owner_repo, pr_number)
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        except (
+            RuntimeError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+        ) as exc:
             self.log_event(
                 f"[WATCH] PR #{pr_number} diff fetch failed: {exc}; "
                 f"skipping guardrail diff scan."
