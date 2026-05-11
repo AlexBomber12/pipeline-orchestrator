@@ -131,4 +131,4 @@ if [[ -n "$FILTER" ]]; then
   FILTER_ARGS=(-k "$FILTER")
 fi
 
-python -m pytest tests/e2e/ -v "${FILTER_ARGS[@]}" || exit_code=$?
+python3 -m pytest tests/e2e/ -v "${FILTER_ARGS[@]}" || exit_code=$?
