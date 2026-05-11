@@ -331,6 +331,7 @@ class WatchMixin:
                     f"PR #{found.number} hung after {elapsed_min:.0f}m "
                     f"(review={review.value}, ci={ci.value})."
                 ),
+                cancellation_subsource="review_timeout",
             )
         else:
             self.log_event(

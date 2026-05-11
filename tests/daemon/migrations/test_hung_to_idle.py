@@ -126,8 +126,9 @@ async def test_migrate_one_hung_repo_rewrites_state() -> None:
     cause = CancellationCause.from_redis(
         redis.values[cause_key("test_repo", "PR-100")]
     )
-    assert cause.category == "ESCALATE"
+    assert cause.category == "ERROR"
     assert cause.payload["subsource"] == "daemon"
+    assert cause.payload["legacy_category"] == "ESCALATE"
     assert cause.payload["migration_note"]
 
 

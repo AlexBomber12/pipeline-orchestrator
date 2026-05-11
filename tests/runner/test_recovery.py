@@ -199,7 +199,7 @@ def test_no_push_escalation_cancels_task_and_returns_to_idle(
     assert runner.state.current_pr is None
     assert pr.no_push_fix_count == 0
     assert not hasattr(runner, "_recovered_task_pr_ids")
-    assert recorded == [(runner.name, "PR-400", "NO_PUSH_DEADLOCK")]
+    assert recorded == [(runner.name, "PR-400", "ERROR")]
     assert any(
         "PR #400 no-push deadlock after 3 attempts; canceling task"
         in e["event"]

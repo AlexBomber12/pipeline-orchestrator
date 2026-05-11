@@ -627,7 +627,7 @@ class CodingMixin:
                 publish=False,
                 log_prefix="[CODING]",
                 cancellation_cause=CancellationCause(
-                    category="ESCALATE",
+                    category="ERROR",
                     payload={"subsource": "guardrail", "reason_text": cause},
                 ),
             )
@@ -783,6 +783,7 @@ class CodingMixin:
                     apply_escalated_label=False,
                     set_pr_escalated_flag=False,
                     log_message=f"{message}.",
+                    cancellation_subsource="no_push_deadlock",
                 )
                 return
             if not local_exists:
@@ -801,6 +802,7 @@ class CodingMixin:
                 apply_escalated_label=False,
                 set_pr_escalated_flag=False,
                 log_message=f"{message}.",
+                cancellation_subsource="no_push_deadlock",
             )
             return
 
@@ -868,8 +870,9 @@ class CodingMixin:
                 infra_cause = classify_infra_exception(last_list_exc)
                 if infra_cause is None:
                     infra_cause = CancellationCause(
-                        category="INFRA",
+                        category="ERROR",
                         payload={
+                            "subsource": "infra_failure",
                             "subsystem": "gh_api",
                             "retry_count": 3,
                             "last_attempt_iso": datetime.now(
@@ -899,6 +902,7 @@ class CodingMixin:
                     apply_escalated_label=False,
                     set_pr_escalated_flag=False,
                     log_message=f"{message}.",
+                    cancellation_subsource="infra_failure",
                 )
             return
 
@@ -994,6 +998,7 @@ class CodingMixin:
                 apply_escalated_label=False,
                 set_pr_escalated_flag=False,
                 log_message=f"{message}.",
+                cancellation_subsource="infra_failure",
             )
             return False
         gh_cache._invalidate_etag_cache(

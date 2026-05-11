@@ -5,10 +5,24 @@ through these helpers; UI (PR-254) reads through them. Centralizing
 the schema here makes the contract bisectable from its consumers.
 PR-252.
 
-``ESCALATE`` causes use ``payload.subsource`` to distinguish explicit
-coder ``ESCALATE`` markers from daemon-detected stuck states. Canonical
-values are ``"coder"`` and ``"daemon"``; the daemon subsource includes
-transitions that previously used HUNG-specific cancellation semantics.
+PR-315 collapsed the five legacy ``category`` values (``CRASH``,
+``ESCALATE``, ``TIMEOUT``, ``INFRA``, ``NO_PUSH_DEADLOCK``) into a
+single canonical ``ERROR``. Forensic detail moves to
+``payload.subsource`` with the stable vocabulary:
+
+* ``crash`` — daemon process died mid-operation
+* ``coder_escalate`` — coder stdout contained an explicit ``ESCALATE:``
+  marker
+* ``guardrail`` — Tier 1/2 guardrail violation
+* ``review_timeout`` — WATCH review_timeout exceeded
+* ``fix_idle_timeout`` — FIX cycle idle without push
+* ``fix_iteration_cap`` — FIX iteration count exceeded
+* ``no_push_deadlock`` — coder claimed fix without git push
+* ``infra_failure`` — repeated INFRA failures past grace period
+
+The ``escalate_to_error`` startup migration rewrites legacy records
+in place and preserves the original detector value as
+``payload.legacy_category`` for forensic recall in the UI.
 """
 
 from __future__ import annotations
@@ -20,13 +34,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-CATEGORIES = (
-    "CRASH",
-    "ESCALATE",
-    "TIMEOUT",
-    "INFRA",
-    "NO_PUSH_DEADLOCK",
-)
+CATEGORIES = ("ERROR",)
 
 TTL_SECONDS = 30 * 24 * 3600
 

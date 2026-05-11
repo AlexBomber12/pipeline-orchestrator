@@ -139,14 +139,8 @@ def test_categories_tuple_does_not_include_operator_recovery() -> None:
     assert "OPERATOR_RECOVERY" not in CATEGORIES
 
 
-def test_categories_tuple_has_5_canonical_values() -> None:
-    assert CATEGORIES == (
-        "CRASH",
-        "ESCALATE",
-        "TIMEOUT",
-        "INFRA",
-        "NO_PUSH_DEADLOCK",
-    )
+def test_categories_tuple_collapsed_to_unified_error() -> None:
+    assert CATEGORIES == ("ERROR",)
 
 
 def test_cause_and_index_key_format() -> None:

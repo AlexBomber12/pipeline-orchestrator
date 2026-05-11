@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import pytest
 
+from src.cancellation import CancellationCause
+from src.daemon.runner import _legacy_run_cause_from_cancellation
+from src.metrics import RunRecord
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 
 from tests.runner import _helpers as h
@@ -79,6 +83,86 @@ def test_transition_to_error_uses_caller_phase_and_cause(
     assert record.outcome == "failed"
     assert record.cause == "CRASH"
     assert record.run_phase == "merge"
+
+
+@pytest.mark.parametrize(
+    ("subsource", "expected_cause"),
+    [
+        ("crash", "CRASH"),
+        ("coder_escalate", "ESCALATE"),
+        ("guardrail", "ESCALATE"),
+        ("review_timeout", "TIMEOUT"),
+        ("fix_idle_timeout", "TIMEOUT"),
+        ("fix_iteration_cap", "TIMEOUT"),
+        ("no_push_deadlock", "NO_PUSH_DEADLOCK"),
+        ("infra_failure", "INFRA"),
+    ],
+)
+def test_transition_to_error_maps_pr315_subsource_to_legacy_run_cause(
+    monkeypatch: pytest.MonkeyPatch,
+    subsource: str,
+    expected_cause: str,
+) -> None:
+    """PR-315 ``category="ERROR"`` causes must persist a legacy ``RunCause``.
+
+    ``RunRecord.cause`` only accepts the legacy enum, so forwarding the raw
+    new-style ``"ERROR"`` would break ``MetricsStore.get/recent``
+    deserialization. The transition must translate ``payload.subsource``
+    back to the legacy vocabulary before saving.
+    """
+    runner = h._make_runner()
+    h._patch_subprocess(monkeypatch)
+    _install_task(runner)
+    runner.state.state = PipelineState.FIX
+    runner._start_current_run_record("claude", "opus")
+
+    cause = CancellationCause(
+        category="ERROR",
+        payload={"subsource": subsource, "reason_text": "boom"},
+    )
+    asyncio.run(
+        runner._transition_to_error(
+            "boom",
+            publish=False,
+            cancellation_cause=cause,
+        )
+    )
+
+    record = runner._current_run_record
+    assert record is not None
+    assert record.outcome == "failed"
+    assert record.cause == expected_cause
+    # Round-trip through the persisted payload to confirm
+    # ``RunRecord.__post_init__`` accepts the value (the bug surfaced as a
+    # ``ValueError("invalid run record cause: ERROR")`` on read-back).
+    rehydrated = RunRecord(
+        **json.loads(json.dumps(record.__dict__))
+    )
+    assert rehydrated.cause == expected_cause
+
+
+def test_legacy_run_cause_helper_prefers_legacy_category_payload() -> None:
+    """When the migration preserved ``legacy_category``, surface that value."""
+    cause = CancellationCause(
+        category="ERROR",
+        payload={
+            "subsource": "guardrail",
+            "legacy_category": "INFRA",
+        },
+    )
+
+    assert _legacy_run_cause_from_cancellation(cause) == "INFRA"
+
+
+def test_legacy_run_cause_helper_returns_none_for_unknown_subsource() -> None:
+    """Unknown subsources fall back to the caller's exit-reason default."""
+    cause = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "mystery"},
+    )
+
+    assert _legacy_run_cause_from_cancellation(cause) is None
+    assert _legacy_run_cause_from_cancellation(None) is None
 
 
 def test_run_phase_from_state_covers_fix_and_recovery() -> None:

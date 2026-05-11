@@ -115,7 +115,11 @@ def test_default_args_skip_to_idle_apply_label_no_comment(
     runner.state.current_pr = pr
     publish_calls = _install_publish_state_spy(runner)
 
-    asyncio.run(runner._escalate_and_skip("park me"))
+    asyncio.run(
+        runner._escalate_and_skip(
+            "park me", cancellation_subsource="infra_failure"
+        )
+    )
 
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.error_message == "park me"
@@ -147,7 +151,12 @@ def test_escalate_and_skip_sets_status_write_fallback_when_commit_fails(
 
     monkeypatch.setattr(runner, "_commit_task_status_change", fake_commit)
 
-    asyncio.run(runner._escalate_and_skip("park after write failure"))
+    asyncio.run(
+        runner._escalate_and_skip(
+            "park after write failure",
+            cancellation_subsource="infra_failure",
+        )
+    )
 
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
@@ -294,6 +303,7 @@ def test_target_state_error_transitions_to_error(
         runner._escalate_and_skip(
             "iteration cap",
             target_state=PipelineState.ERROR,
+            cancellation_subsource="fix_iteration_cap",
         )
     )
 
@@ -316,6 +326,7 @@ def test_apply_escalated_label_calls_pr_edit(
         runner._escalate_and_skip(
             "park me",
             label_create_log_prefix="custom",
+            cancellation_subsource="infra_failure",
         )
     )
 
@@ -340,7 +351,11 @@ def test_label_apply_failure_still_sets_in_memory_flag(
     runner.state.current_pr = pr
     _install_publish_state_spy(runner)
 
-    label_applied = asyncio.run(runner._escalate_and_skip("park me"))
+    label_applied = asyncio.run(
+        runner._escalate_and_skip(
+            "park me", cancellation_subsource="infra_failure"
+        )
+    )
 
     assert label_applied is False
     assert pr.is_escalated is True
@@ -368,6 +383,7 @@ def test_post_comment_on_pr_calls_post_comment(
         runner._escalate_and_skip(
             "park me",
             post_comment_on_pr="please review",
+            cancellation_subsource="infra_failure",
         )
     )
 
@@ -394,6 +410,7 @@ def test_post_comment_failure_logged_not_raised(
         runner._escalate_and_skip(
             "park me",
             post_comment_on_pr="please review",
+            cancellation_subsource="infra_failure",
         )
     )
 
@@ -411,7 +428,11 @@ def test_publish_state_called_at_end(
     runner.state.current_pr = pr
     publish_calls = _install_publish_state_spy(runner)
 
-    asyncio.run(runner._escalate_and_skip("park me"))
+    asyncio.run(
+        runner._escalate_and_skip(
+            "park me", cancellation_subsource="infra_failure"
+        )
+    )
 
     assert publish_calls == [None]
 
@@ -435,6 +456,7 @@ def test_error_message_override_clears_error_message(
         runner._escalate_and_skip(
             "park me",
             error_message_override=None,
+            cancellation_subsource="infra_failure",
         )
     )
 
@@ -456,6 +478,7 @@ def test_log_message_overrides_log_body(
         runner._escalate_and_skip(
             "stored",
             log_message="logged.",
+            cancellation_subsource="infra_failure",
         )
     )
 
@@ -478,6 +501,7 @@ def test_set_pr_escalated_flag_false_skips_flag(
             "park me",
             apply_escalated_label=False,
             set_pr_escalated_flag=False,
+            cancellation_subsource="infra_failure",
         )
     )
 
@@ -504,6 +528,7 @@ def test_no_current_pr_skips_label_and_comment(
         runner._escalate_and_skip(
             "park me",
             post_comment_on_pr="ignored",
+            cancellation_subsource="infra_failure",
         )
     )
 
@@ -537,16 +562,20 @@ def test_records_cause_before_state_transition(
     runner.state.current_pr = PRInfo(number=600, branch="pr-600")
     _install_publish_state_spy(runner)
 
-    asyncio.run(runner._escalate_and_skip("review timeout"))
+    asyncio.run(
+        runner._escalate_and_skip(
+            "review timeout", cancellation_subsource="review_timeout"
+        )
+    )
 
     assert runner.state.state == PipelineState.IDLE
     assert len(seen) == 1
     task_id, state_at_record, cause = seen[0]
     assert task_id == "PR-600"
     assert state_at_record == PipelineState.WATCH
-    assert cause.category == "ESCALATE"
+    assert cause.category == "ERROR"
     assert cause.payload == {
-        "subsource": "daemon",
+        "subsource": "review_timeout",
         "reason_text": "review timeout",
         "previous_state": "WATCH",
     }
@@ -575,7 +604,11 @@ def test_escalate_and_skip_preserves_existing_coder_escalate_cause(
     runner.redis.store[cause_key(runner.name, "PR-602")] = coder_cause.to_redis()
     _install_publish_state_spy(runner)
 
-    asyncio.run(runner._escalate_and_skip("daemon wrapper"))
+    asyncio.run(
+        runner._escalate_and_skip(
+            "daemon wrapper", cancellation_subsource="coder_escalate"
+        )
+    )
 
     stored = CancellationCause.from_redis(
         runner.redis.store[cause_key(runner.name, "PR-602")]
@@ -613,7 +646,11 @@ def test_escalate_and_skip_records_cause_when_existing_read_fails(
     runner.state.current_pr = PRInfo(number=603, branch="pr-603")
     _install_publish_state_spy(runner)
 
-    asyncio.run(runner._escalate_and_skip("daemon wrapper"))
+    asyncio.run(
+        runner._escalate_and_skip(
+            "daemon wrapper", cancellation_subsource="coder_escalate"
+        )
+    )
 
     assert recorded == ["PR-603"]
 
@@ -641,6 +678,7 @@ def test_idle_escalation_clears_current_task(
         runner._escalate_and_skip(
             "coder escalated",
             error_message_override=None,
+            cancellation_subsource="coder_escalate",
         )
     )
 
@@ -673,6 +711,7 @@ def test_error_escalation_preserves_current_task(
         runner._escalate_and_skip(
             "iteration cap",
             target_state=PipelineState.ERROR,
+            cancellation_subsource="fix_iteration_cap",
         )
     )
 
@@ -701,7 +740,11 @@ def test_escalate_and_skip_writes_status_error_to_file(
     runner.state.current_task = task
     _install_publish_state_spy(runner)
 
-    asyncio.run(runner._escalate_and_skip("final failure"))
+    asyncio.run(
+        runner._escalate_and_skip(
+            "final failure", cancellation_subsource="infra_failure"
+        )
+    )
 
     task_text = (repo / "tasks" / "PR-700.md").read_text(encoding="utf-8")
     assert task_text.startswith("---\nstatus: ERROR\n---\n")
@@ -734,7 +777,11 @@ def test_escalate_status_commit_ignores_divergent_pr_branch_task_file(
     runner.state.current_task = task
     _install_publish_state_spy(runner)
 
-    asyncio.run(runner._escalate_and_skip("final failure"))
+    asyncio.run(
+        runner._escalate_and_skip(
+            "final failure", cancellation_subsource="infra_failure"
+        )
+    )
 
     task_text = (repo / "tasks" / "PR-700.md").read_text(encoding="utf-8")
     assert task_text.startswith("---\nstatus: ERROR\n---\n")
@@ -767,7 +814,11 @@ def test_escalate_logs_status_commit_exception(
 
     runner._commit_task_status_change = fail_commit  # type: ignore[method-assign]
 
-    asyncio.run(runner._escalate_and_skip("final failure"))
+    asyncio.run(
+        runner._escalate_and_skip(
+            "final failure", cancellation_subsource="infra_failure"
+        )
+    )
 
     assert any(
         "[ERROR] Failed to write status:ERROR to tasks/PR-700.md: checkout refused"
@@ -804,6 +855,7 @@ def test_escalate_skips_status_error_for_recoverable_escalation(
             "review timeout",
             apply_escalated_label=False,
             set_pr_escalated_flag=False,
+            cancellation_subsource="review_timeout",
         )
     )
 

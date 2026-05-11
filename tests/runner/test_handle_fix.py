@@ -2154,8 +2154,12 @@ def test_handle_fix_external_close_during_coder_skips_with_crash_cause(
         (
             runner.name,
             "PR-078",
-            "CRASH",
-            {"closed_externally": True, "pr_number": 78},
+            "ERROR",
+            {
+                "subsource": "crash",
+                "closed_externally": True,
+                "pr_number": 78,
+            },
         )
     ]
     assert any("closed externally during FIX" in e["event"] for e in runner.state.history)

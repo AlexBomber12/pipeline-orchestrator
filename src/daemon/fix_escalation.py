@@ -161,8 +161,9 @@ async def escalate_fix_no_push_deadlock(
         else f"pr_{pr_number}"
     )
     cause = CancellationCause(
-        category="NO_PUSH_DEADLOCK",
+        category="ERROR",
         payload={
+            "subsource": "no_push_deadlock",
             "attempts": attempts,
             "pr_number": pr_number,
             "head_sha": current_pr.head_sha or "",
@@ -233,6 +234,7 @@ async def escalate_fix_coder_initiated(
             target_state=PipelineState.IDLE,
             error_message_override=None,
             apply_escalated_label=False,
+            cancellation_subsource="coder_escalate",
         )
         return
     await runner._escalate_and_skip(
@@ -240,6 +242,7 @@ async def escalate_fix_coder_initiated(
         f"`escalated` label. Reason: {clean_reason}. Manual "
         "review required.",
         apply_escalated_label=False,
+        cancellation_subsource="coder_escalate",
     )
 
 
@@ -305,4 +308,5 @@ async def escalate_fix_iteration_cap(
         target_state=PipelineState.IDLE,
         error_message_override=None,
         apply_escalated_label=False,
+        cancellation_subsource="fix_iteration_cap",
     )

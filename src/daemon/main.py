@@ -39,6 +39,9 @@ from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
 from src.config import AppConfig, RepoConfig, load_config, normalize_repo_url
 from src.daemon.config_watcher import watch_config_file_changes
+from src.daemon.migrations.escalate_to_error import (
+    migrate_escalate_to_error_on_startup,
+)
 from src.daemon.migrations.hung_to_idle import migrate_hung_to_idle_on_startup
 from src.daemon.migrations.run_record_backfill import (
     migrate_run_records_to_outcome_cause,
@@ -692,6 +695,13 @@ async def main() -> None:
     logger.info(
         "[MIGRATION] HUNG to IDLE startup migration rewrote %d repo(s)",
         migrated_hung_repos,
+    )
+    migrated_legacy_causes = await migrate_escalate_to_error_on_startup(
+        redis_client, logger
+    )
+    logger.info(
+        "[MIGRATION] Legacy cancellation cause category collapse rewrote %d record(s)",
+        migrated_legacy_causes,
     )
     run_record_backfill_counts = await migrate_run_records_to_outcome_cause(
         redis_client,
