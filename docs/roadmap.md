@@ -43,7 +43,7 @@ Continuous sprint numbering aligned with operator's mental model. Replaces ad-ho
 | Sprint 15d | Defense in depth (OBS-CA panic mode auto-stop on cascade HUNG, OBS-CB token spend ceiling per day, OBS-CC GUARDRAIL hit quarantine for Tier 1/2, OBS-CD git bundle backups, OBS-CE coder process read-only filesystem) | Queued | 5 PRs, ~12-16 daemon-hours |
 | Sprint 16 | Config architecture three-layer split (config.yml shipped immutable / config/providers.yml / data/user_state.yml gitignored / Redis transient; OBS-BZ resolution; dynamic list_models per provider plugin; auto-detect bootstrap; one-time migration; UI add-provider/add-coder wizard) | Queued | 12-16 PRs, ~26-32 daemon-hours |
 | Sprint 17 | Multi-testbed harness + multi-repo tests (was Sprint 16 pre-2026-05-04) | Queued | 7+ PRs, ~15 daemon-hours |
-| Sprint 18 | Documentation Sprint (MkDocs Material, full operator + contributor docs, getting-started + concepts + operating + reference + architecture + uninstall, was Sprint 17 pre-2026-05-04) | Queued | 10-15 PRs, ~32 daemon-hours |
+| Sprint 18 | Documentation Sprint (MkDocs Material, full operator + contributor docs, getting-started + concepts + operating + reference + architecture + uninstall, was Sprint 17 pre-2026-05-04) + AGENTS.md improvements batch (plan-first hint, style guide section, coverage sprint conventions cleanup, MCP servers managed wrapper, prompt improver pass via Anthropic console) | Queued | 12-17 PRs, ~36 daemon-hours |
 | Sprint 19+ | Vision A multi-vendor routing first slice (Plugin Protocol generalization, API plugins, SQLite Scenario A migration, Analytics dashboard, Thompson Sampling) — was Sprint 18+ pre-2026-05-04 | Pending strategic decision | TBD |
 
 Earlier "Wave X" references inside OBS items remain for backward compatibility; mapping is `Wave 1+2 = Sprint 13`, `Wave 5 = Sprint 14`, `Wave 3+4 = Sprint 15a/15b`, `Wave 6+7 = Sprint 17`. Sprint 13.5 (MCP), Sprint 15a.5 (AUTO PR), Sprint 15c (Tier 2 guardrails), Sprint 15d (defense in depth), Sprint 16 (config architecture), Sprint 18 (Documentation), Sprint 19+ (Vision A) are entries with no Wave-era predecessor. New OBS items added 2026-05-02..2026-05-06 use sprint terminology directly.
@@ -132,7 +132,7 @@ Earlier "Wave X" references inside OBS items remain for backward compatibility; 
 - **AGENTS.md reconciliation framework + conflict scans shipped** (PR-192a/b/c reconciliation, PR-259 inline scan in MCP validate_task_spec, PR-260 periodic scan at IDLE sync time with fingerprint dedup). **Periodic scan invocation flagged for removal per OBS-CU 2026-05-07** — events advisory only with no actionable workflow surface, polluting event log. MICRO PR drafted, not yet shipped.
 - **Multi-repo isolation audit complete** (PR-193, `docs/multi-repo-audit-2026-04-29.md`). PR-207 parallelized main loop. 3 active repos in production (pipeline-orchestrator + megaraid-dashboard + sms-gateway-v2) sustainable.
 - **Sprint 15b first phase = architecture decision** (no code) covering Status field design (file-vs-Redis subset, reconciliation rules) per OBS-CS, plus PR-275 cross-repo intent layer permanently-deprecated-vs-LLM-classification-retry decision per OBS-CR. Second phase = Polish + Tier 1 guardrails work resumed once architecture clear.
-- **Architectural future work documented** for post-Sprint-16 period: PR-FUTURE-1 (AGENTS template scope cleanup), PR-FUTURE-2 (per-repo config inheritance), PR-FUTURE-3 (onboarding wizard with semantic conflict resolution), PR-FUTURE-4 (AI-driven scaffold replacing template-driven), PR-FUTURE-5 (read-only/observe mode for trial onboarding), PR-FUTURE-6 (UI-driven auth flow for GH/Claude/Codex). **PR-FUTURE-7 (eliminate tasks/QUEUE.md entirely) — DONE 2026-05-06** delivered by Sprint 15a #6 (PR-263..PR-269) + Sprint 15a #7 cleanup PR #365 2026-05-07. **PR-FUTURE-RESTART-BUTTON** (~145 LoC, Sprint 16 Batch A), **PR-FUTURE-UPLOAD-PRESERVE** (~50 LoC, Sprint 16 Batch A), **PR-FUTURE-MCP-STATUS** (~50 LoC, Sprint 16 Batch A) added 2026-05-10 in response to v4 upload reconciliation incident — combined ~5 hours as Sprint 16 Batch A "Reliability layer" defensive infrastructure.
+- **Architectural future work documented** for post-Sprint-16 period: PR-FUTURE-1 (AGENTS template scope cleanup), PR-FUTURE-2 (per-repo config inheritance), PR-FUTURE-3 (onboarding wizard with semantic conflict resolution), PR-FUTURE-4 (AI-driven scaffold replacing template-driven), PR-FUTURE-5 (read-only/observe mode for trial onboarding), PR-FUTURE-6 (UI-driven auth flow for GH/Claude/Codex). **PR-FUTURE-7 (eliminate tasks/QUEUE.md entirely) — DONE 2026-05-06** delivered by Sprint 15a #6 (PR-263..PR-269) + Sprint 15a #7 cleanup PR #365 2026-05-07. **PR-FUTURE-RESTART-BUTTON** (~145 LoC, Sprint 16 Batch A), **PR-FUTURE-UPLOAD-PRESERVE** (~50 LoC, Sprint 16 Batch A), **PR-FUTURE-MCP-STATUS** (~50 LoC, Sprint 16 Batch A) added 2026-05-10 in response to v4 upload reconciliation incident — combined ~5 hours as Sprint 16 Batch A "Reliability layer" defensive infrastructure. **PR-FUTURE-SERENA-PILOT** added 2026-05-12 — opportunistic pilot of Serena MCP as alternative to zip-upload context for planning chats, no daemon work, operator time only.
 
 ---
 
@@ -2429,7 +2429,52 @@ Sprint 18 (Queued — Documentation Sprint, MkDocs Material):
   - Architecture decisions records (ADR)                           (~4h)
     Extract key decisions from roadmap.md into ADR format
   - Uninstall procedures                                           (~2h)
-  Total: 10-15 PRs, ~32 daemon-hours.
+  - AGENTS.md plan-first hint                                      (~30min)
+    Add to AGENTS.md Quick rules: "Before implementing, briefly
+    state your plan in stdout (one paragraph). If the plan reveals
+    ambiguity in the spec, ESCALATE rather than guess." Gives coder
+    permission to think before acting without adding bureaucracy.
+    Direct response to PR-128 9-iteration nitpick cycle + PR-275/
+    PR-289b-3/PR-299 deadlock pattern (OBS-CR class) where coder
+    cycled on local maxima without stepping back.
+  - AGENTS.md style conventions section                            (~1h)
+    Currently style enforced mechanically via ruff/mypy in
+    pre-commit but not documented in AGENTS.md. Add new section
+    listing: naming conventions (snake_case functions, PascalCase
+    classes), docstring style (Google or NumPy or one-liner —
+    operator decides), import order preferences, async-first vs
+    sync preferences, test naming conventions. Coder currently
+    learns these implicitly from existing code; explicit doc helps
+    new onboarded repos (megaraid, sms-gateway) where existing
+    code base smaller.
+  - AGENTS.md coverage sprint conventions cleanup                  (~15min)
+    Existing "Coverage sprint conventions (PR-094 through PR-123)"
+    section in AGENTS.md describes Sprint 9 work that closed long
+    ago. Section occupies context budget without operational value
+    for current Sprint 15c+. Action: remove section entirely OR
+    mark as archival reference (move to docs/historical/ if
+    Sprint 18 introduces that directory).
+  - AGENTS.md MCP servers section managed wrapper                  (~5min)
+    Section "MCP servers and tool usage" in AGENTS.md is free-form
+    text outside managed-section markers. All other sections
+    wrapped in <!-- pipeline-orchestrator: managed BEGIN
+    section_name --> ... <!-- pipeline-orchestrator: managed END
+    section_name --> markers. Either wrap (consistency) or document
+    why this one is free-form (intentional exception). Operator
+    decides format alignment vs explicit-exception.
+  - AGENTS.md prompt improver pass via Anthropic console           (~1-2h)
+    Anthropic console has prompt improver tool that takes existing
+    prompt and suggests clarity/specificity improvements. Run pass
+    section-by-section on AGENTS.md daemon-managed content. Caveat:
+    AGENTS.md contains managed sections with strict invariants
+    (HTML markers, exact regex matching for ESCALATE marker, exact
+    comment body `@codex review`). Prompt improver may suggest
+    "improvements" that break invariants. Run section by section,
+    NOT whole file, manually review each suggestion. Output:
+    incremental MICRO PR per section with measurable improvement.
+    Confirmed not yet executed as of 2026-05-12.
+  Total: 12-17 PRs, ~36 daemon-hours.
+  AGENTS.md improvements batch adds ~3-4 hours over base docs scope.
   Strategic significance: ships before non-author alpha user
   exposure. Same gate as Sprint 17 multi-testbed.
 
@@ -2975,9 +3020,63 @@ The current "shell in and set up" model is fine for the author. For pipeline-orc
 
 **Type:** feature. **Complexity:** medium. **Estimated:** 3-4 PRs, ~6 daemon-hours. Per-provider device flow (single shared pattern) + UI polling + expiry banner. Security-sensitive but the device-flow pattern is well-trodden..
 
+### PR-FUTURE-SERENA-PILOT: evaluate Serena MCP for planning chat context
+
+**Problem:** planning task specs in chat sessions currently requires uploading zip of pipeline-orchestrator codebase (or megaraid-dashboard, or sms-gateway-v2) into claude.ai conversation to give Claude awareness of project state. Zip approach has three structural problems: (1) entire context budget consumed by zip even when only small slice of code is relevant to current planning question, (2) cannot include all 3 managed repos simultaneously without exhausting budget, (3) uncommitted edits in working tree not visible because git snapshot only.
+
+Operator pain manifests as: re-upload zip on every new chat session, plan tasks based on stale snapshot if edits are uncommitted, switch context manually between repos in same conversation.
+
+**Hypothesis:** Serena MCP (oraios/serena, ~23k stars, MIT license) provides LSP-backed symbol-level code retrieval via MCP tools. Claude in planning chat calls `find_symbol`, `find_referencing_symbols`, `list_dir` etc. instead of consuming whole-file context. Targeted queries return ~5-10K tokens of relevant context per question instead of 200K+ zip dump. Multi-project support via in-conversation `activate_project` tool. LSP-based (pylsp under hood for Python) — symbol-level accuracy as IDE, not embedding-similarity approximation.
+
+**Pilot scope (~1 evening, low cost):**
+
+1. Run Serena locally on home-server via docker-compose service alongside daemon/web/redis. Mount `/data/repos:/repos:ro` (read-only).
+2. Register 3 projects: AlexBomber12__pipeline-orchestrator, megaraid-dashboard, sms-gateway-v2.
+3. Connect from Claude Desktop (or browser via Cloudflare tunnel + auth if Desktop unavailable) to local Serena.
+4. Run 5-10 planning queries that operator typically uses: "show me handler for FIX state", "find all callers of dispatch_coder", "what does PR-275 spec contain", "compare cancellation flow vs availability fork", etc.
+5. Measure token consumption per query vs equivalent zip-upload baseline.
+6. Subjective assessment: does answer quality stay equivalent or improve? Multi-project switch friction?
+
+**Decision criteria post-pilot:**
+- Significant token reduction (target >50%) AND answer quality preserved → proceed to production deploy
+- Quality regresses OR token reduction marginal → drop Serena pilot, document why for posterity
+- Mixed result (some queries better, some worse) → identify query patterns where Serena shines vs where zip remains superior; potentially keep both as parallel tools
+
+**Production deploy (if pilot zashло):**
+1. Add `serena` service to docker-compose.yml. Pin commit hash for reproducibility (Serena is pre-1.0).
+2. Set up `serena-mcp.alexbomber.com` subdomain via nginx reverse proxy.
+3. Implement bearer-token auth (Serena exposes private code — auth non-negotiable, unlike current orchestrator-mcp which is read-only metadata).
+4. Register as Custom Integration in claude.ai.
+5. Document operator setup in Sprint 18 getting-started docs.
+
+**Architectural decisions confirmed:**
+- Serena does NOT become "part of pipeline-orchestrator product". It runs as optional sidecar docker service. Daemon does not depend on Serena for any runtime function.
+- Serena is for **operator planning chat**, NOT for coder dispatch. Coders (Claude CLI, Codex CLI) get task spec inline in AUTO PR prompt and do not need Serena.
+- Multi-repo support: one Serena server, project registration + in-chat activation. NOT per-repo deployment. Mirrors orchestrator-mcp pattern.
+- License compatibility: Serena MIT, pipeline-orchestrator Apache 2.0 (post-Sprint 13 license switch). MIT more permissive than Apache 2.0 → compatible.
+- Auth required for production. Local pilot via Claude Desktop bypasses auth requirement (LAN-only).
+
+**Risks identified:**
+- **Onboarding token spike.** First Serena onboarding per project consumes significant Claude quota (Serena instructs Claude to read many files for memory generation). Mitigation: skip auto-onboarding by pre-creating `.serena/memories/` with hand-written or copy-from-AGENTS.md content.
+- **Pre-1.0 maturity.** Serena pins to specific commit; breaking API changes possible before 1.0. Monitor releases.
+- **Language server dependencies.** Docker image needs pylsp for Python, plus servers for other languages if used (TypeScript, Rust). Adds ~200MB to image weight.
+- **Single-project active per conversation.** Each chat must explicitly activate one project. Cross-project queries in same conversation require switching, not parallel.
+- **Privacy in managed deployment (Sprint 19+ Vision A territory).** Serena LSP runs locally — code never leaves operator's machine. Compatible with self-hosted thesis. Managed/hosted deployment would expose Serena differently and needs separate analysis.
+
+**Estimate:** pilot 1 evening (~2-3h operator time), no daemon work. Production deploy if pilot passes: ~2-3h operator time (docker service setup, nginx proxy, auth, claude.ai integration registration).
+
+**Strategic significance:** Serena adoption is **operator productivity multiplier**, not orchestrator feature. Reduces friction in planning sessions (the upstream of every PR). If pilot validates, planning becomes faster and less context-budget-constrained, which feeds back into better task specs, which feeds back into fewer coder deadlocks (OBS-CR class), which feeds back into higher merge throughput. Indirect chain but real.
+
+**Cross-references:**
+- orchestrator-mcp pattern: Serena follows same deployment shape (one global service, multi-repo via mount, single endpoint, optional auth).
+- Sprint 18 Documentation Sprint: Serena setup belongs in getting-started docs IF pilot passes.
+- Vision A managed deployment territory: managed product hosting Serena raises privacy questions (code visibility across users); revisit if/when managed product fork lands.
+
+**Status:** scheduled for opportunistic execution. NOT a sprint commitment. Operator runs pilot when 2-3 evening hours available, then makes deploy/drop decision based on measured outcome.
+
 ### Sequencing
 
-The seven PRs above build on each other:
+The seven numbered PR-FUTURE entries above (PR-FUTURE-1 through PR-FUTURE-7) build on each other in the critical path described below. PR-FUTURE-SERENA-PILOT is separate — opportunistic operator-productivity item, no daemon work, no sequencing dependency on the onboarding chain.
 
 1. **PR-FUTURE-6 first** (auth flow). Without UI-driven auth, the wizard cannot run AI scaffolding (PR-FUTURE-4) which needs Claude/Codex CLI authenticated. Foundational. Can ship independently of others — improves existing single-operator UX even before wizard exists.
 
@@ -3010,6 +3109,8 @@ Honest sizing per PR-FUTURE:
 - **PR-FUTURE-7 QUEUE.md elimination:** 1-2 PRs. 4 read-site refactor onto `RepoState.current_queue` snapshot + test shim migration. ~4 daemon-hours.
 
 **Total daemon work: ~17-25 PRs, ~37-44 daemon-hours = 1.5-2 daemon-working-days at 17 PR/day throughput.**
+
+**Not included in daemon totals:** PR-FUTURE-SERENA-PILOT (~2-3h operator time for pilot, ~2-3h operator time for production deploy if pilot passes). Operator productivity tool, runs outside daemon dispatch.
 
 **Calendar: 1-2 weeks** with buffer for testing days between batches, strategic conversations, fixes on observed issues, plus operator's review and direction time. Calendar is dominated by buffer/review, not daemon coding.
 
