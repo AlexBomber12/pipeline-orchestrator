@@ -96,6 +96,8 @@ from src.daemon.selector import (
 )
 from src.events import publish_repo_event
 from src.github import comments as gh_comments
+from src.github import gh_runner
+from src.github import prs as gh_prs
 from src.github import rate_limit as gh_rate_limit
 from src.keyspace import (
     cli_log_history,
@@ -838,6 +840,46 @@ class PipelineRunner(
         if result.returncode != 0:
             return ""
         return result.stdout.strip()
+
+    def _canonical_push_timestamp(self, pr_number: int) -> datetime:
+        """Return a monotonic baseline timestamp for ``_last_push_at``.
+
+        Reads the GitHub committer date of the PR head via
+        ``gh_prs.get_pr_metadata``. Centralizes writes to
+        ``_last_push_at`` so daemon wall clock drift cannot push the
+        baseline past a Codex review submitted seconds after the actual
+        git push (PR #407 incident).
+
+        To guard against rebases or cherry-picks where the committer
+        date is older than the actual push event, the result never
+        moves below the existing baseline for the same PR — preventing
+        old Codex comments from re-appearing as "new" feedback (Codex
+        P1 on PR #408).
+
+        Falls back to ``datetime.now(timezone.utc)`` only when no
+        canonical value AND no prior baseline are available, preserving
+        liveness of the WATCH cycle when GitHub is unreachable on the
+        first observation.
+        """
+        previous: datetime | None = None
+        if (
+            self._last_push_at is not None
+            and self._last_push_at_pr_number == pr_number
+        ):
+            previous = self._last_push_at
+        try:
+            metadata = gh_prs.get_pr_metadata(self.owner_repo, pr_number)
+            head_iso = metadata.get("head_commit_date", "")
+        except Exception:
+            head_iso = ""
+        head_time = gh_runner._parse_iso(head_iso) if head_iso else None
+        if head_time is not None and head_time.tzinfo is None:
+            head_time = head_time.replace(tzinfo=timezone.utc)
+        if head_time is None:
+            return previous if previous is not None else datetime.now(timezone.utc)
+        if previous is not None and head_time < previous:
+            return previous
+        return head_time
 
     @staticmethod
     def _attempt_count_key(repo_name: str, task_id: str) -> str:
