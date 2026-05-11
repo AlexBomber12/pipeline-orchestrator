@@ -792,9 +792,15 @@ def test_list_recent_main_commit_shas_handles_empty_and_malformed(monkeypatch):
         3,
         branch="release",
     ) == ["good"]
+    assert main_commit_audit.list_recent_main_commit_shas(
+        "octo/demo",
+        4,
+        branch="release/a&b#c",
+    ) == ["good"]
     assert calls == [
         ["api", "repos/octo/demo/commits?sha=main&per_page=2"],
         ["api", "repos/octo/demo/commits?sha=release&per_page=3"],
+        ["api", "repos/octo/demo/commits?sha=release%2Fa%26b%23c&per_page=4"],
     ]
     assert main_commit_audit._commit_shas({"sha": "not-a-list"}) == []
 
@@ -864,11 +870,13 @@ def test_redis_helpers_record_and_load_audit_state():
     assert asyncio.run(
         main_commit_audit.load_audited_shas_from_redis(redis, "octo-demo")
     ) == {"abc1234"}
-    assert redis.lists["audit:main_commits:octo-demo:findings"]
-    assert redis.ttls["audit:main_commits:octo-demo:audited"] == 30 * 24 * 60 * 60
-    assert redis.ttls["audit:main_commits:octo-demo:findings"] == 30 * 24 * 60 * 60
+    audited_key = "audit:main_commits:octo-demo:main:audited"
+    findings_key = "audit:main_commits:octo-demo:main:findings"
+    assert redis.lists[findings_key]
+    assert redis.ttls[audited_key] == 30 * 24 * 60 * 60
+    assert redis.ttls[findings_key] == 30 * 24 * 60 * 60
 
-    redis.ttls["audit:main_commits:octo-demo:audited"] = 123
+    redis.ttls[audited_key] = 123
     asyncio.run(
         main_commit_audit.mark_shas_audited_in_redis(
             redis,
@@ -877,11 +885,65 @@ def test_redis_helpers_record_and_load_audit_state():
         )
     )
 
-    assert redis.sets["audit:main_commits:octo-demo:audited"] == {
+    assert redis.sets[audited_key] == {
         "abc1234",
         "def5678",
     }
-    assert redis.ttls["audit:main_commits:octo-demo:audited"] == 123
+    assert redis.ttls[audited_key] == 123
+
+
+def test_redis_helpers_scope_audit_state_by_branch():
+    redis = _FakeRedis()
+    finding = main_commit_audit.MainCommitAuditFinding(
+        sha="abc1234",
+        short_sha="abc1234",
+        message_first_line="direct hotfix",
+        parent_count=1,
+        pr_number=None,
+        violation_category="direct_commit_no_pr",
+        rule="revert",
+    )
+
+    asyncio.run(
+        main_commit_audit.mark_shas_audited_in_redis(
+            redis,
+            "octo-demo",
+            ["mainsha"],
+            branch="main",
+        )
+    )
+    asyncio.run(
+        main_commit_audit.mark_shas_audited_in_redis(
+            redis,
+            "octo-demo",
+            ["releasesha"],
+            branch="release/a&b#c",
+        )
+    )
+    asyncio.run(
+        main_commit_audit.record_audit_findings_in_redis(
+            redis,
+            "octo-demo",
+            [finding],
+            branch="release/a&b#c",
+        )
+    )
+
+    assert asyncio.run(
+        main_commit_audit.load_audited_shas_from_redis(
+            redis,
+            "octo-demo",
+            branch="main",
+        )
+    ) == {"mainsha"}
+    assert asyncio.run(
+        main_commit_audit.load_audited_shas_from_redis(
+            redis,
+            "octo-demo",
+            branch="release/a&b#c",
+        )
+    ) == {"releasesha"}
+    assert "audit:main_commits:octo-demo:release%2Fa%26b%23c:findings" in redis.lists
 
 
 def test_redis_helpers_skip_empty_inputs():

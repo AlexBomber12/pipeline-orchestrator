@@ -13,6 +13,7 @@ import logging
 import re
 from dataclasses import asdict, dataclass
 from typing import Any
+from urllib.parse import quote
 
 from src.github import cache, checks
 from src.github.gh_runner import run_gh
@@ -39,12 +40,16 @@ class MainCommitAuditFinding:
     rule: str
 
 
-def _audited_key(repo: str) -> str:
-    return f"audit:main_commits:{repo}:audited"
+def _branch_key_part(branch: str) -> str:
+    return quote(branch, safe="")
 
 
-def _findings_key(repo: str) -> str:
-    return f"audit:main_commits:{repo}:findings"
+def _audited_key(repo: str, branch: str = "main") -> str:
+    return f"audit:main_commits:{repo}:{_branch_key_part(branch)}:audited"
+
+
+def _findings_key(repo: str, branch: str = "main") -> str:
+    return f"audit:main_commits:{repo}:{_branch_key_part(branch)}:findings"
 
 
 def _message_first_line(message: object) -> str:
@@ -103,10 +108,11 @@ def list_recent_main_commit_shas(
     """Return the newest ``lookback_n`` base-branch commit SHAs via GitHub CLI."""
     if lookback_n <= 0:
         return []
+    encoded_branch = quote(branch, safe="")
     payload = run_gh(
         [
             "api",
-            f"repos/{owner_repo}/commits?sha={branch}&per_page={lookback_n}",
+            f"repos/{owner_repo}/commits?sha={encoded_branch}&per_page={lookback_n}",
         ]
     )
     return _commit_shas(payload)
@@ -419,9 +425,13 @@ def audit_main_commit_shas(
     return findings, checked_shas
 
 
-async def load_audited_shas_from_redis(redis: Any, repo: str) -> set[str]:
+async def load_audited_shas_from_redis(
+    redis: Any,
+    repo: str,
+    branch: str = "main",
+) -> set[str]:
     try:
-        values = await redis.smembers(_audited_key(repo))
+        values = await redis.smembers(_audited_key(repo, branch))
     except Exception:
         logger.exception("Failed to load main commit audit cache for %s", repo)
         return set()
@@ -435,10 +445,11 @@ async def record_audit_findings_in_redis(
     redis: Any,
     repo: str,
     findings: list[MainCommitAuditFinding],
+    branch: str = "main",
 ) -> None:
     if not findings:
         return
-    key = _findings_key(repo)
+    key = _findings_key(repo, branch)
     try:
         for finding in findings:
             await redis.lpush(key, json.dumps(asdict(finding), sort_keys=True))
@@ -452,10 +463,11 @@ async def mark_shas_audited_in_redis(
     redis: Any,
     repo: str,
     shas: list[str],
+    branch: str = "main",
 ) -> None:
     if not shas:
         return
-    key = _audited_key(repo)
+    key = _audited_key(repo, branch)
     try:
         for sha in shas:
             await redis.sadd(key, sha)

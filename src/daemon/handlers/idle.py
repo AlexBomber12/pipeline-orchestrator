@@ -170,7 +170,11 @@ class IdleMixin:
 
         repo_key = self.name
         lookback_n = self.app_config.daemon.main_commit_audit_lookback_n
-        audited_shas = await load_audited_shas_from_redis(self.redis, repo_key)
+        audited_shas = await load_audited_shas_from_redis(
+            self.redis,
+            repo_key,
+            self.repo_config.branch,
+        )
         try:
             recent_shas = await asyncio.to_thread(
                 list_recent_main_commit_shas,
@@ -204,11 +208,17 @@ class IdleMixin:
                 f"{finding.violation_category}: {finding.short_sha} "
                 f'"{finding.message_first_line}"'
             )
-        await record_audit_findings_in_redis(self.redis, repo_key, findings)
+        await record_audit_findings_in_redis(
+            self.redis,
+            repo_key,
+            findings,
+            self.repo_config.branch,
+        )
         await mark_shas_audited_in_redis(
             self.redis,
             repo_key,
             checked_shas,
+            self.repo_config.branch,
         )
         self._main_commit_audit_retry_pending = False
         self._main_commit_audit_counter = 0
