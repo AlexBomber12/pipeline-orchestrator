@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import re
 from dataclasses import FrozenInstanceError
 
 import pytest
 
-from src.daemon.guardrails import GuardrailViolation, scan_stdout
+from src.daemon import guardrails
+from src.daemon.guardrails import GuardrailViolation, scan_pr_diff, scan_stdout
 
 
 def test_guardrail_violation_dataclass_frozen() -> None:
@@ -24,6 +26,48 @@ def test_scan_stdout_repo_create_pattern_matches() -> None:
 
     assert len(violations) == 1
     assert violations[0].category == "repo_create"
+
+
+def test_scan_pr_diff_empty_catalogue_returns_empty_list() -> None:
+    diff = """diff --git a/src/app.py b/src/app.py
+index 1111111..2222222 100644
+--- a/src/app.py
++++ b/src/app.py
+@@ -1 +1,2 @@
+ print("hello")
++print("world")
+"""
+
+    assert scan_pr_diff(diff) == []
+
+
+def test_scan_pr_diff_clean_realistic_diff_returns_empty_list() -> None:
+    diff = """diff --git a/src/tasks.py b/src/tasks.py
+index 1234567..89abcde 100644
+--- a/src/tasks.py
++++ b/src/tasks.py
+@@ -4,7 +4,8 @@ def summarize(items: list[str]) -> str:
+-    return ", ".join(items)
++    cleaned = [item.strip() for item in items]
++    return ", ".join(cleaned)
+"""
+
+    assert scan_pr_diff(diff) == []
+
+
+def test_scan_pr_diff_dispatches_catalogue_in_sorted_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        guardrails,
+        "_DIFF_PATTERNS",
+        {"z_rule": re.compile("zeta"), "a_rule": re.compile("alpha")},
+    )
+    monkeypatch.setattr(guardrails, "_DIFF_RULES", {"z_rule": "z", "a_rule": "a"})
+
+    violations = scan_pr_diff("+zeta\n+alpha\n")
+
+    assert [violation.category for violation in violations] == ["a_rule", "z_rule"]
 
 
 def test_scan_stdout_repo_delete_pattern_matches() -> None:

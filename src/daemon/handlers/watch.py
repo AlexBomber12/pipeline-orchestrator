@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 
+from src.daemon.guardrails import scan_pr_diff
 from src.github import cache as gh_cache
 from src.github import checks as gh_checks
 from src.github import gh_runner
@@ -178,6 +180,7 @@ class WatchMixin:
                 "no_push_fix_count": current_pr.no_push_fix_count,
                 "observed_head_shas": merged_shas,
                 "push_count": merged_push_count,
+                "diff_scanned_at": current_pr.diff_scanned_at,
                 # Preserve OBS-BL (PR-249) counter across the GitHub-fetched
                 # PR refresh. ``_observe_watch_event_signature`` has already
                 # zeroed ``current_pr.watch_retrigger_count`` if a fresh
@@ -188,6 +191,9 @@ class WatchMixin:
             }
         )
         self.state.current_pr = found
+        if await self._scan_pr_diff_once(found.number):
+            return
+        found = self.state.current_pr or found
         # Retry rehydrate every cycle so a transient commit-time fetch
         # failure during ``recover_state`` doesn't permanently leave
         # ``_last_push_at`` unset.
@@ -338,6 +344,35 @@ class WatchMixin:
                 f"(review={review.value}, ci={ci.value}, "
                 f"{elapsed_min:.0f}/{timeout_min}m)."
             )
+
+    async def _scan_pr_diff_once(self, pr_number: int) -> bool:
+        """Fetch and scan PR diff once per persisted PR."""
+        if self.state.current_pr is None:
+            return False
+        if self.state.current_pr.diff_scanned_at is not None:
+            return False
+        try:
+            diff_text = gh_prs.get_pr_diff(self.owner_repo, pr_number)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            self.log_event(
+                f"[WATCH] PR #{pr_number} diff fetch failed: {exc}; "
+                f"skipping guardrail diff scan."
+            )
+            return False
+        violations = scan_pr_diff(diff_text)
+        self.state.current_pr = self.state.current_pr.model_copy(
+            update={"diff_scanned_at": datetime.now(timezone.utc)}
+        )
+        if not violations:
+            return False
+        first = violations[0]
+        cause = f"GUARDRAIL: {first.category}: {first.excerpt}"
+        await self._transition_to_error(
+            cause,
+            publish=False,
+            log_prefix="[WATCH]",
+        )
+        return True
 
     async def _maybe_reclassify_stuck_pending(self, found: object) -> None:
         """Upgrade ``found.ci_status`` to FAILURE when CI has been PENDING too long.

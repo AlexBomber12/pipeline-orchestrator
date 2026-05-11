@@ -99,6 +99,19 @@ _TIER1_RULES: dict[str, str] = {
     "branch_delete_main": "Git push deletion targeting protected default branch",
 }
 
+_DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
+    # Catalogue intentionally empty in PR-290a. Subsequent PRs append:
+    # PR-290b: workflow patterns (permissions_escalation, workflow_destruction).
+    # PR-290c: governance + supply chain patterns
+    # (branch_protection_modification, dangerous_action_external_install).
+    # PR-301..PR-304: Tier 2 patterns.
+}
+
+_DIFF_RULES: dict[str, str] = {
+    # Catalogue intentionally empty in PR-290a; populated alongside
+    # _DIFF_PATTERNS additions in subsequent PRs.
+}
+
 _EXCERPT_LIMIT = 200
 
 
@@ -302,6 +315,27 @@ def scan_stdout(coder_stdout: str) -> list[GuardrailViolation]:
                     category=category,
                     excerpt=_line_excerpt(coder_stdout, match.start(), match.end()),
                     rule=_TIER1_RULES[category],
+                )
+            )
+    return violations
+
+
+def scan_pr_diff(diff_text: str) -> list[GuardrailViolation]:
+    """Scan a unified PR diff for catalogued forbidden patterns.
+
+    PR-290a ships the dispatcher with an empty catalogue. Returns an
+    empty list until PR-290b adds the first pattern.
+    """
+    violations: list[GuardrailViolation] = []
+    for category in sorted(_DIFF_PATTERNS):
+        pattern = _DIFF_PATTERNS[category]
+        for match in pattern.finditer(diff_text):
+            violations.append(
+                GuardrailViolation(
+                    tier=1,
+                    category=category,
+                    excerpt=_line_excerpt(diff_text, match.start(), match.end()),
+                    rule=_DIFF_RULES[category],
                 )
             )
     return violations

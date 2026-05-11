@@ -7,6 +7,7 @@ tests/test_runner.py and are referenced via the ``h`` alias.
 from __future__ import annotations
 
 import asyncio
+import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -15,6 +16,7 @@ import pytest
 from src.coders import claude as claude_plugin_module
 from src.config import AppConfig, DaemonConfig, RepoConfig
 from src.daemon import runner as runner_module
+from src.daemon.guardrails import GuardrailViolation
 from src.daemon.handlers import watch as watch_module
 from src.daemon.runner import PipelineRunner
 from src.models import (
@@ -29,6 +31,11 @@ from src.models import (
 from tests.runner import _helpers as h
 
 claude_cli = claude_plugin_module.claude_cli
+
+
+@pytest.fixture(autouse=True)
+def _stub_pr_diff_fetch_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_diff", lambda repo, number: "")
 
 
 def test_observe_watch_event_signature_resets_retrigger_count() -> None:
@@ -204,6 +211,144 @@ def test_handle_watch_preserves_fix_iteration_count_for_same_pr(
 
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.fix_iteration_count == 7
+
+
+def _make_pending_watch_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    diff_scanned_at: datetime | None = None,
+) -> PipelineRunner:
+    pr = PRInfo(
+        number=5,
+        branch="pr-001",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=datetime.now(timezone.utc),
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=5,
+        branch="pr-001",
+        diff_scanned_at=diff_scanned_at,
+    )
+    return runner
+
+
+def test_watch_calls_scan_pr_diff_once_when_diff_scanned_at_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        watch_module.gh_prs,
+        "get_pr_diff",
+        lambda repo, number: calls.append((repo, number)) or "diff\n+ok\n",
+    )
+    runner = _make_pending_watch_runner(monkeypatch)
+
+    asyncio.run(runner.handle_watch())
+
+    assert calls == [(runner.owner_repo, 5)]
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.diff_scanned_at is not None
+
+
+def test_watch_skips_scan_when_diff_scanned_at_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scanned_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+    calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        watch_module.gh_prs,
+        "get_pr_diff",
+        lambda repo, number: calls.append((repo, number)) or "",
+    )
+    runner = _make_pending_watch_runner(monkeypatch, diff_scanned_at=scanned_at)
+
+    asyncio.run(runner.handle_watch())
+
+    assert calls == []
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.diff_scanned_at == scanned_at
+
+
+def test_watch_diff_fetch_failure_logs_and_continues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_get_pr_diff(repo: str, number: int) -> str:
+        raise subprocess.CalledProcessError(1, ["gh", "pr", "diff"])
+
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_diff", fail_get_pr_diff)
+    transitions: list[str] = []
+
+    async def fake_transition(self: PipelineRunner, cause: str, **kwargs: Any) -> None:
+        transitions.append(cause)
+
+    monkeypatch.setattr(PipelineRunner, "_transition_to_error", fake_transition)
+    runner = _make_pending_watch_runner(monkeypatch)
+
+    asyncio.run(runner.handle_watch())
+
+    assert transitions == []
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.diff_scanned_at is None
+    assert any("diff fetch failed" in e["event"] for e in runner.state.history)
+
+
+def test_scan_pr_diff_once_without_current_pr_returns_false() -> None:
+    runner = h._make_runner()
+    runner.state.current_pr = None
+
+    assert asyncio.run(runner._scan_pr_diff_once(5)) is False
+
+
+def test_watch_diff_scan_violation_transitions_to_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_diff", lambda repo, number: "x")
+    monkeypatch.setattr(
+        watch_module,
+        "scan_pr_diff",
+        lambda diff: [GuardrailViolation(1, "diff_rule", "bad line", "rule")],
+    )
+    transitions: list[str] = []
+
+    async def fake_transition(self: PipelineRunner, cause: str, **kwargs: Any) -> None:
+        transitions.append(cause)
+
+    monkeypatch.setattr(PipelineRunner, "_transition_to_error", fake_transition)
+    runner = _make_pending_watch_runner(monkeypatch)
+
+    asyncio.run(runner.handle_watch())
+
+    assert transitions == ["GUARDRAIL: diff_rule: bad line"]
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.diff_scanned_at is not None
+
+
+def test_watch_empty_catalogue_does_not_escalate_on_clean_diff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        watch_module.gh_prs,
+        "get_pr_diff",
+        lambda repo, number: "diff --git a/src/app.py b/src/app.py\n+ok\n",
+    )
+    transitions: list[str] = []
+
+    async def fake_transition(self: PipelineRunner, cause: str, **kwargs: Any) -> None:
+        transitions.append(cause)
+
+    monkeypatch.setattr(PipelineRunner, "_transition_to_error", fake_transition)
+    runner = _make_pending_watch_runner(monkeypatch)
+
+    asyncio.run(runner.handle_watch())
+
+    assert transitions == []
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.diff_scanned_at is not None
 
 
 def test_handle_watch_preserves_no_push_fix_count_for_same_pr(

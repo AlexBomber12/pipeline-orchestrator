@@ -396,6 +396,16 @@ def is_pr_merged(repo: str, pr_number: int) -> bool | None:
     return None
 
 
+def get_pr_diff(owner_repo: str, pr_number: int) -> str:
+    """Return unified diff text for a PR via gh CLI."""
+    result = gh_runner.run_gh(
+        ["pr", "diff", str(pr_number), "--repo", owner_repo],
+    )
+    if isinstance(result, str):
+        return result
+    return ""
+
+
 def merge_pr(repo: str, pr_number: int) -> None:
     """Merge a PR using ``gh pr merge --squash --delete-branch``.
 

@@ -91,6 +91,7 @@ class PRInfo(BaseModel):
     watch_retrigger_count: int = 0
     url: str = ""
     last_activity: datetime | None = None
+    diff_scanned_at: datetime | None = None
     is_escalated: bool = False
     # True when the PR head is on a forked repository instead of
     # ``origin``. The daemon's auto-commit safety net cannot push to a
