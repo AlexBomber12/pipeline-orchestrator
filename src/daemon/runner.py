@@ -2348,6 +2348,26 @@ class PipelineRunner(
             )
             self.state.state = PipelineState.IDLE
 
+        # PR-316 review feedback: ``skip_ai_error_diagnose`` is bound to the
+        # specific ERROR park that WATCH creates on ``review_timeout``. Any
+        # code path that moves the runner out of ERROR — recovery setting
+        # IDLE from task headers, the ``rate_limited_until`` -> PAUSED
+        # redirect inside the ERROR branch below, an operator forcing state
+        # through Redis — must reset the flag. Without this invariant a
+        # stale ``True`` from a prior timeout incident silently skips
+        # ``handle_error`` on the next unrelated ERROR cycle and leaves the
+        # daemon parked waiting on a cancellation-cause deletion that no
+        # operator will perform for an ordinary error.
+        if (
+            self.state.state != PipelineState.ERROR
+            and self.state.skip_ai_error_diagnose
+        ):
+            self.state.skip_ai_error_diagnose = False
+            self.log_event(
+                "[ESCALATE] review_timeout park flag cleared "
+                f"(state {self.state.state.value} is not ERROR)."
+            )
+
         if self.state.state == PipelineState.IDLE:
             await self._refresh_user_paused_from_redis()
             if self.state.user_paused:
