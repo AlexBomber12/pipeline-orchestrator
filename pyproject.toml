@@ -14,3 +14,4 @@ select = ["E", "F", "W", "I"]
 testpaths = ["tests"]
 norecursedirs = ["tests/e2e", "tests-manual"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
