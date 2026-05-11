@@ -562,7 +562,7 @@ def test_handle_watch_timeout_skips_to_idle_with_cause(
             "PR-005",
             "ERROR",
             {
-                "subsource": "daemon",
+                "subsource": "review_timeout",
                 "reason_text": "PR #5 hung after 90m (review=EYES, ci=PENDING)",
                 "previous_state": "WATCH",
             },

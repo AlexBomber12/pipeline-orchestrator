@@ -481,6 +481,42 @@ async def test_migration_fallback_logs_when_set_with_ex_fails(
     assert any("Failed to rewrite" in rec.getMessage() for rec in caplog.records)
 
 
+async def test_migration_fallback_preserves_expiry_when_ttl_reports_zero() -> None:
+    """A near-expiry TTL of 0 must not become a persistent (no-ex) record.
+
+    Redis TTL is second-granularity, so a key within its final second of
+    life reports ``0``. The pre-fix branch took the ``set(...)`` path
+    without ``ex``, converting the soon-to-expire cancellation record
+    into a permanent entry. The fallback now reapplies ``ex=1`` so the
+    expiry is preserved.
+    """
+
+    class _NoKeepTTLRedis(_FakeRedis):
+        async def set(
+            self,
+            key: Any,
+            value: str,
+            *,
+            ex: int | None = None,
+        ) -> bool:
+            return await super().set(key, value, ex=ex)
+
+    key = cause_key("alpha", "PR-NEAR-EXPIRY")
+    redis = _NoKeepTTLRedis(
+        {key: _legacy_payload("CRASH", {"error_message": "boom"})},
+        ttls={key: 0},
+    )
+
+    migrated = await migrate_escalate_to_error_on_startup(
+        redis, logging.getLogger(__name__)
+    )
+
+    assert migrated == 1
+    # ex floor is 1 so the record retains an expiry rather than becoming
+    # persistent.
+    assert redis.ttls[key] == 1
+
+
 async def test_migration_callable_logger_warns_for_malformed_key() -> None:
     """Callable loggers receive ``_warn`` messages alongside info messages."""
     seeded = {

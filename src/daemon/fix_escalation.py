@@ -234,6 +234,7 @@ async def escalate_fix_coder_initiated(
             target_state=PipelineState.IDLE,
             error_message_override=None,
             apply_escalated_label=False,
+            cancellation_subsource="coder_escalate",
         )
         return
     await runner._escalate_and_skip(
@@ -241,6 +242,7 @@ async def escalate_fix_coder_initiated(
         f"`escalated` label. Reason: {clean_reason}. Manual "
         "review required.",
         apply_escalated_label=False,
+        cancellation_subsource="coder_escalate",
     )
 
 
@@ -306,4 +308,5 @@ async def escalate_fix_iteration_cap(
         target_state=PipelineState.IDLE,
         error_message_override=None,
         apply_escalated_label=False,
+        cancellation_subsource="fix_iteration_cap",
     )

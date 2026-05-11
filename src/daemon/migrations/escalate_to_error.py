@@ -118,9 +118,17 @@ async def migrate_escalate_to_error_on_startup(
                 )
                 continue
             try:
-                if isinstance(ttl_remaining, int) and ttl_remaining > 0:
+                if isinstance(ttl_remaining, int) and ttl_remaining >= 0:
+                    # Redis TTL is second-granularity, so a reported 0
+                    # means the key is within its final second of life.
+                    # Reapply ex=max(ttl, 1) instead of falling through
+                    # to the no-expiry set() path, which would convert a
+                    # near-expiry cancellation record into a persistent
+                    # one. ex=0 is rejected by Redis, hence the floor.
                     await _maybe_await(
-                        redis_client.set(raw_key, serialized, ex=ttl_remaining)
+                        redis_client.set(
+                            raw_key, serialized, ex=max(ttl_remaining, 1)
+                        )
                     )
                 else:
                     await _maybe_await(redis_client.set(raw_key, serialized))

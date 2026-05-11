@@ -1382,6 +1382,7 @@ class PipelineRunner(
         post_comment_on_pr: str | None = None,
         set_pr_escalated_flag: bool = True,
         log_message: str | None = None,
+        cancellation_subsource: str = "daemon",
     ) -> bool:
         """Escalate the active PR with consistent telemetry.
 
@@ -1434,6 +1435,19 @@ class PipelineRunner(
             log_message: Overrides the body after ``[ESCALATE] `` when
                 the operator-visible log differs from
                 ``error_message``. Defaults to ``message``.
+            cancellation_subsource: Canonical ``payload.subsource`` value
+                written when this primitive needs to seed a new
+                ``CancellationCause`` (no prior cause exists for the
+                active task). Callers should pass a value from the
+                vocabulary documented in
+                ``src/cancellation/storage.py`` so downstream consumers
+                can dispatch on detector identity (e.g.
+                ``"review_timeout"`` from WATCH, ``"fix_iteration_cap"``
+                from FIX-cap, ``"coder_escalate"`` from the coder
+                ESCALATE marker). The ``"daemon"`` default is the
+                pre-PR-315 legacy value retained only for callsites
+                whose detector type does not map onto the canonical
+                vocabulary.
         """
         pr = self.state.current_pr
 
@@ -1477,7 +1491,7 @@ class PipelineRunner(
                     CancellationCause(
                         category="ERROR",
                         payload={
-                            "subsource": "daemon",
+                            "subsource": cancellation_subsource,
                             "reason_text": message,
                             "previous_state": prior_state.value,
                         },

@@ -17,13 +17,22 @@ from typing import Any
 
 import pytest
 
+from datetime import datetime, timedelta, timezone
+
 from src.cancellation import (
     CancellationCause,
     classify_infra_exception,
 )
 from src.daemon import fix_escalation
 from src.daemon import fix_supervision
-from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
+from src.models import (
+    CIStatus,
+    PipelineState,
+    PRInfo,
+    QueueTask,
+    ReviewStatus,
+    TaskStatus,
+)
 
 from tests.runner import _helpers as h
 
@@ -172,9 +181,15 @@ def test_coder_escalate_detector_writes_coder_escalate_subsource(
     coder_writes = [
         c for c in captured if c.payload.get("subsource") == "coder_escalate"
     ]
-    assert len(coder_writes) == 1
-    assert coder_writes[0].category == "ERROR"
-    assert coder_writes[0].payload["reason_text"] == "cannot resolve"
+    # The FIX handler's coder-ESCALATE detector emits one write with the
+    # coder's verbatim reason; the downstream ``_escalate_and_skip`` then
+    # may seed a second cause with the same canonical subsource and a
+    # daemon-wrapper reason. Both must classify as ``coder_escalate``.
+    assert coder_writes, "expected at least one coder_escalate cause"
+    assert all(c.category == "ERROR" for c in coder_writes)
+    assert any(
+        c.payload.get("reason_text") == "cannot resolve" for c in coder_writes
+    )
     assert "coder_escalate" in DOCUMENTED_SUBSOURCES
 
 
@@ -295,3 +310,70 @@ def test_infra_failure_detector_writes_infra_failure_subsource() -> None:
     assert cause.category == "ERROR"
     assert cause.payload["subsource"] == "infra_failure"
     assert "infra_failure" in DOCUMENTED_SUBSOURCES
+
+
+def test_review_timeout_detector_writes_review_timeout_subsource(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The WATCH review-timeout path emits ``subsource="review_timeout"``."""
+    captured = _captured_safe_record(monkeypatch)
+    stale = datetime.now(timezone.utc) - timedelta(minutes=90)
+    pr = PRInfo(
+        number=5,
+        branch="pr-rev-timeout",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.EYES,
+        last_activity=stale,
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+
+    runner = h._make_runner(review_timeout_min=30)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-rev-timeout")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-REV-TIMEOUT",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-rev-timeout",
+    )
+
+    asyncio.run(runner.handle_watch())
+
+    review_writes = [
+        c for c in captured if c.payload.get("subsource") == "review_timeout"
+    ]
+    assert len(review_writes) == 1
+    assert review_writes[0].category == "ERROR"
+    assert review_writes[0].payload["previous_state"] == "WATCH"
+    assert "review_timeout" in DOCUMENTED_SUBSOURCES
+
+
+def test_fix_iteration_cap_detector_writes_fix_iteration_cap_subsource(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The FIX iteration-cap path emits ``subsource="fix_iteration_cap"``."""
+    captured = _captured_safe_record(monkeypatch)
+    monkeypatch.setattr("src.github.comments.post_comment", lambda *a, **k: None)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda cmd, **kw: "")
+
+    runner = h._make_runner()
+    cap = runner.app_config.daemon.fix_iteration_cap
+    pr = PRInfo(number=801, branch="pr-cap", fix_iteration_count=cap)
+    runner.state.state = PipelineState.FIX
+    runner.state.current_pr = pr
+    runner.state.current_task = QueueTask(
+        pr_id="PR-FIX-CAP",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-cap",
+    )
+
+    asyncio.run(fix_escalation.escalate_fix_iteration_cap(runner, pr))
+
+    cap_writes = [
+        c for c in captured if c.payload.get("subsource") == "fix_iteration_cap"
+    ]
+    assert len(cap_writes) == 1
+    assert cap_writes[0].category == "ERROR"
+    assert cap_writes[0].payload["previous_state"] == "FIX"
+    assert "fix_iteration_cap" in DOCUMENTED_SUBSOURCES
