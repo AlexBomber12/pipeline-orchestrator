@@ -627,7 +627,7 @@ class CodingMixin:
                 publish=False,
                 log_prefix="[CODING]",
                 cancellation_cause=CancellationCause(
-                    category="ESCALATE",
+                    category="ERROR",
                     payload={"subsource": "guardrail", "reason_text": cause},
                 ),
             )
@@ -868,8 +868,9 @@ class CodingMixin:
                 infra_cause = classify_infra_exception(last_list_exc)
                 if infra_cause is None:
                     infra_cause = CancellationCause(
-                        category="INFRA",
+                        category="ERROR",
                         payload={
+                            "subsource": "infra_failure",
                             "subsystem": "gh_api",
                             "retry_count": 3,
                             "last_attempt_iso": datetime.now(

@@ -85,8 +85,9 @@ def test_escalate_fix_no_push_deadlock_writes_cancellation_cause(
     repo_slug, task_id, cause = recorded[0]
     assert repo_slug == runner.name
     assert task_id == "PR-500"
-    assert cause.category == "NO_PUSH_DEADLOCK"
+    assert cause.category == "ERROR"
     assert cause.payload == {
+        "subsource": "no_push_deadlock",
         "attempts": 3,
         "pr_number": 500,
         "head_sha": "deadbeef",

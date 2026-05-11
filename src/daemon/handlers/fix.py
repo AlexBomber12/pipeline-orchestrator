@@ -579,8 +579,9 @@ class FixMixin(BreachMixin):
                 publish=False,
                 log_prefix="[FIX]",
                 cancellation_cause=CancellationCause(
-                    category="TIMEOUT",
+                    category="ERROR",
                     payload={
+                        "subsource": "fix_idle_timeout",
                         "limit_type": "fix_idle",
                         "duration_elapsed_sec": idle_limit,
                         "active_phase": PipelineState.FIX.value,
@@ -609,7 +610,7 @@ class FixMixin(BreachMixin):
                 publish=False,
                 log_prefix="[FIX]",
                 cancellation_cause=CancellationCause(
-                    category="ESCALATE",
+                    category="ERROR",
                     payload={"subsource": "guardrail", "reason_text": cause},
                 ),
             )
@@ -629,9 +630,9 @@ class FixMixin(BreachMixin):
                     self.name,
                     self.state.current_task.pr_id,
                     CancellationCause(
-                        category="ESCALATE",
+                        category="ERROR",
                         payload={
-                            "subsource": "coder",
+                            "subsource": "coder_escalate",
                             "reason_text": escalate_reason,
                         },
                     ),

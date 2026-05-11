@@ -161,8 +161,9 @@ async def escalate_fix_no_push_deadlock(
         else f"pr_{pr_number}"
     )
     cause = CancellationCause(
-        category="NO_PUSH_DEADLOCK",
+        category="ERROR",
         payload={
+            "subsource": "no_push_deadlock",
             "attempts": attempts,
             "pr_number": pr_number,
             "head_sha": current_pr.head_sha or "",

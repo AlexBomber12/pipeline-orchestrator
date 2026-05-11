@@ -1353,8 +1353,11 @@ class PipelineRunner(
                 existing = None
             if existing is None:
                 cause = cancellation_cause or CancellationCause(
-                    category="CRASH",
-                    payload={"error_message": truncate_for_payload(message)},
+                    category="ERROR",
+                    payload={
+                        "subsource": "crash",
+                        "error_message": truncate_for_payload(message),
+                    },
                 )
                 await safe_record_cancellation_cause(
                     self.redis,
@@ -1472,7 +1475,7 @@ class PipelineRunner(
                     self.name,
                     current_task.pr_id,
                     CancellationCause(
-                        category="ESCALATE",
+                        category="ERROR",
                         payload={
                             "subsource": "daemon",
                             "reason_text": message,

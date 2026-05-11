@@ -1,10 +1,11 @@
-"""End-to-end coverage for the cancellation-cause CRASH detection path.
+"""End-to-end coverage for the cancellation-cause crash detection path.
 
 Drives a coder failure through the daemon (``exit_nonzero`` shim) and
 asserts the chain that PR-252 / PR-253 / PR-254 / PR-257 shipped:
 
-* the daemon writes a ``CancellationCause`` with ``category="CRASH"``
-  via ``_transition_to_error`` for the failed task,
+* the daemon writes a ``CancellationCause`` with ``category="ERROR"``
+  and ``payload.subsource="crash"`` via ``_transition_to_error`` for
+  the failed task,
 * the dashboard's ``/api/cancellations/{repo}`` surface returns the
   recorded cause within the recent-7-days window, and
 * the dependents-aware ``dependents_count`` augmentation reflects a
@@ -77,7 +78,8 @@ def test_coder_crash_records_cancellation_cause_and_propagates(
 
         # The daemon must select PR-A first (PR-B depends on it). When
         # the exit_nonzero shim returns non-zero, ``_transition_to_error``
-        # records the default ``CancellationCause(category="CRASH")``
+        # records the default ``CancellationCause(category="ERROR",
+        # payload.subsource="crash")``
         # under ``cancellation:{slug}:PR-A`` (see
         # ``src/daemon/runner.py`` _transition_to_error and
         # ``src/daemon/handlers/coding.py`` for the producing call site).
@@ -108,9 +110,13 @@ def test_coder_crash_records_cancellation_cause_and_propagates(
             f"last payload={last_payload!r}; "
             f"runner state={get_state()!r}"
         )
-        assert cause_for_a.get("category") == "CRASH", (
+        assert cause_for_a.get("category") == "ERROR", (
             f"unexpected category for {pr_a_id!r}: cause={cause_for_a!r}; "
-            f"expected category=CRASH; runner state={get_state()!r}"
+            f"expected category=ERROR; runner state={get_state()!r}"
+        )
+        assert cause_for_a.get("payload", {}).get("subsource") == "crash", (
+            f"unexpected subsource for {pr_a_id!r}: cause={cause_for_a!r}; "
+            f"expected subsource=crash; runner state={get_state()!r}"
         )
 
         # ``dependents_count`` is computed from QUEUE.md, which the daemon

@@ -161,8 +161,11 @@ def test_crash_wiring_writes_correct_payload(
 
     assert len(captured) == 1
     cause = captured[0]
-    assert cause.category == "CRASH"
-    assert cause.payload == {"error_message": "subprocess crashed"}
+    assert cause.category == "ERROR"
+    assert cause.payload == {
+        "subsource": "crash",
+        "error_message": "subprocess crashed",
+    }
 
 
 def test_transition_to_error_skips_cause_when_no_task(
@@ -209,8 +212,9 @@ def test_timeout_wiring_writes_limit_type(
     runner.state.current_task = _doing_task("PR-103")
 
     timeout_cause = CancellationCause(
-        category="TIMEOUT",
+        category="ERROR",
         payload={
+            "subsource": "fix_idle_timeout",
             "limit_type": "fix_idle",
             "duration_elapsed_sec": 600,
             "active_phase": PipelineState.FIX.value,
@@ -228,7 +232,8 @@ def test_timeout_wiring_writes_limit_type(
 
     assert len(captured) == 1
     cause = captured[0]
-    assert cause.category == "TIMEOUT"
+    assert cause.category == "ERROR"
+    assert cause.payload["subsource"] == "fix_idle_timeout"
     assert cause.payload["limit_type"] == "fix_idle"
     assert cause.payload["duration_elapsed_sec"] == 600
     assert cause.payload["active_phase"] == PipelineState.FIX.value
@@ -257,9 +262,9 @@ def test_escalate_wiring_writes_reason_text(
 
     asyncio.run(runner.handle_fix())
 
-    escalate_writes = [c for c in captured if c.category == "ESCALATE"]
+    escalate_writes = [c for c in captured if c.category == "ERROR"]
     assert [c.payload for c in escalate_writes] == [
-        {"subsource": "coder", "reason_text": "cannot resolve"},
+        {"subsource": "coder_escalate", "reason_text": "cannot resolve"},
         {
             "subsource": "daemon",
             "reason_text": "FIX coder ESCALATE on PR #304: cannot resolve. Moving to IDLE.",
@@ -272,7 +277,8 @@ def test_infra_classifier_recognizes_retry_exhaustion() -> None:
     exc = RuntimeError("gh api repos/x/y failed after 3 attempts: connection reset")
     cause = classify_infra_exception(exc)
     assert cause is not None
-    assert cause.category == "INFRA"
+    assert cause.category == "ERROR"
+    assert cause.payload["subsource"] == "infra_failure"
     assert cause.payload["subsystem"] == "gh_api"
     assert cause.payload["retry_count"] == 3
     assert cause.payload["error_class"] == "RuntimeError"
@@ -305,7 +311,8 @@ def test_infra_wiring_writes_subsystem(
 
     assert len(captured) == 1
     cause = captured[0]
-    assert cause.category == "INFRA"
+    assert cause.category == "ERROR"
+    assert cause.payload["subsource"] == "infra_failure"
     assert cause.payload["subsystem"] == "gh_api"
     assert cause.payload["retry_count"] == 3
 
@@ -546,7 +553,8 @@ def test_transition_to_error_truncates_default_crash_payload(
 
     assert len(captured) == 1
     cause = captured[0]
-    assert cause.category == "CRASH"
+    assert cause.category == "ERROR"
+    assert cause.payload["subsource"] == "crash"
     payload_message = cause.payload["error_message"]
     assert len(payload_message) <= len("[truncated]\n") + CRASH_PAYLOAD_MESSAGE_MAX
     assert payload_message.endswith("ENDTAIL")
@@ -623,7 +631,8 @@ def test_transition_to_error_writes_when_redis_read_fails(
     asyncio.run(runner._transition_to_error("subprocess crashed"))
 
     assert len(captured) == 1
-    assert captured[0].category == "CRASH"
+    assert captured[0].category == "ERROR"
+    assert captured[0].payload["subsource"] == "crash"
 
 
 def _make_clear_cause_runner(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, list[str]]:

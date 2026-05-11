@@ -128,22 +128,25 @@ async def safe_delete_cancellation_cause(
 def classify_infra_exception(
     exc: BaseException, *, subsystem: str = "gh_api"
 ) -> CancellationCause | None:
-    """Return an INFRA cause if ``exc`` looks like retry-exhausted infra.
+    """Return an ERROR cause with ``infra_failure`` subsource if ``exc`` looks
+    like retry-exhausted infra.
 
     ``retry_transient`` raises ``RuntimeError("<op> failed after N attempts:
     <last_exc>")`` after exhausting transient retries. Caller sites that
-    catch that exception classify the failure as INFRA so the dashboard
-    surfaces the subsystem outage rather than a generic CRASH. Returns
-    ``None`` for exceptions that are not retry-exhaustion — those callers
-    fall back to the default CRASH cause written by ``_transition_to_error``.
+    catch that exception classify the failure as ``infra_failure`` so the
+    dashboard surfaces the subsystem outage rather than a generic crash.
+    Returns ``None`` for exceptions that are not retry-exhaustion — those
+    callers fall back to the default ``crash`` cause written by
+    ``_transition_to_error``.
     """
     msg = str(exc)
     match = _RETRY_EXHAUSTION_RE.search(msg)
     if match is None:
         return None
     return CancellationCause(
-        category="INFRA",
+        category="ERROR",
         payload={
+            "subsource": "infra_failure",
             "subsystem": subsystem,
             "retry_count": int(match.group(1)),
             "last_attempt_iso": datetime.now(timezone.utc).isoformat(),

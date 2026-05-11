@@ -224,8 +224,9 @@ async def handle_external_terminal_pr_state(
             runner.name,
             current_task.pr_id,
             CancellationCause(
-                category="CRASH",
+                category="ERROR",
                 payload={
+                    "subsource": "crash",
                     "closed_externally": True,
                     "pr_number": pr.number if pr is not None else None,
                 },

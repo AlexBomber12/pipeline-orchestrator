@@ -123,11 +123,12 @@ async def migrate_hung_to_idle_on_startup(redis_client: Any, log: Any) -> int:
         cause_recorded = False
         if task_id is not None:
             cause = CancellationCause(
-                category="ESCALATE",
+                category="ERROR",
                 payload={
                     "subsource": "daemon",
                     "reason_text": MIGRATION_REASON,
                     "migration_note": MIGRATION_NOTE,
+                    "legacy_category": "ESCALATE",
                 },
             )
             try:

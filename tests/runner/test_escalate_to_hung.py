@@ -544,7 +544,7 @@ def test_records_cause_before_state_transition(
     task_id, state_at_record, cause = seen[0]
     assert task_id == "PR-600"
     assert state_at_record == PipelineState.WATCH
-    assert cause.category == "ESCALATE"
+    assert cause.category == "ERROR"
     assert cause.payload == {
         "subsource": "daemon",
         "reason_text": "review timeout",
