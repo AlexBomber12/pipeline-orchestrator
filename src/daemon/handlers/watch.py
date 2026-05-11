@@ -12,6 +12,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 
+from src.cancellation import CancellationCause
 from src.github import cache as gh_cache
 from src.github import checks as gh_checks
 from src.github import gh_runner
@@ -321,17 +322,50 @@ class WatchMixin:
             else self.app_config.daemon.review_timeout_min
         )
         if elapsed_min >= timeout_min:
-            await self._escalate_and_skip(
+            # PR-316 (OBS-DD): WATCH review_timeout was previously routed
+            # through ``_escalate_and_skip`` to IDLE, which let the picker
+            # re-select the same status:TODO task and route it back into
+            # WATCH indefinitely. Decompose into the durable GitHub-side
+            # label, a status:ERROR frontmatter write, and a terminal
+            # ERROR transition so the picker stops re-picking.
+            message = (
                 f"PR #{found.number} hung after {elapsed_min:.0f}m "
-                f"(review={review.value}, ci={ci.value})",
-                error_message_override=None,
-                apply_escalated_label=False,
-                set_pr_escalated_flag=False,
-                log_message=(
-                    f"PR #{found.number} hung after {elapsed_min:.0f}m "
-                    f"(review={review.value}, ci={ci.value})."
+                f"(review={review.value}, ci={ci.value})"
+            )
+            self._ensure_escalated_label(
+                found.number,
+                label_create_log_prefix="WATCH review timeout",
+            )
+            current_task = self.state.current_task
+            if current_task is not None:
+                try:
+                    status_written = await self._commit_task_status_change(
+                        current_task, "ERROR", message
+                    )
+                except Exception as exc:
+                    self.log_event(
+                        f"[ERROR] Failed to write status:ERROR to "
+                        f"{current_task.task_file}: {exc}"
+                    )
+                    status_written = False
+                if not status_written:
+                    await self._mark_status_write_failed_task(current_task)
+            await self._transition_to_error(
+                message,
+                save_run_record_as="error",
+                log_prefix="[ESCALATE]",
+                log_message=f"{message}.",
+                cancellation_cause=CancellationCause(
+                    category="ERROR",
+                    payload={
+                        "subsource": "review_timeout",
+                        "reason_text": message,
+                        "previous_state": PipelineState.WATCH.value,
+                        "elapsed_min": int(elapsed_min),
+                        "ci_status": ci.value,
+                        "review_status": review.value,
+                    },
                 ),
-                cancellation_subsource="review_timeout",
             )
         else:
             self.log_event(

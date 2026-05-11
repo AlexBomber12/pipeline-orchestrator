@@ -522,9 +522,16 @@ def test_handle_watch_pending_within_threshold_does_not_reclassify(
     assert "reclassified" not in history_events
 
 
-def test_handle_watch_timeout_skips_to_idle_with_cause(
+def test_handle_watch_timeout_transitions_to_error_with_cause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """PR-316 (OBS-DD): review_timeout now terminates in ERROR, not IDLE.
+
+    The picker re-selects status:TODO tasks, so routing back to IDLE on a
+    genuine stale review caused a WATCH→ESCALATE→IDLE→re-pick→WATCH loop.
+    The cause payload still carries ``subsource=review_timeout`` so the
+    dashboard can dispatch on the same key as before.
+    """
     recorded: list[tuple[str, str, str, dict[str, object]]] = []
 
     async def fake_safe_record(redis_client, repo_slug, task_id, cause, *, log=None):
@@ -553,9 +560,19 @@ def test_handle_watch_timeout_skips_to_idle_with_cause(
         status=TaskStatus.DOING,
         branch="pr-001",
     )
+
+    async def fake_commit(self, current_task, status, reason):
+        return True
+
+    monkeypatch.setattr(
+        PipelineRunner,
+        "_commit_task_status_change",
+        fake_commit,
+    )
+
     asyncio.run(runner.handle_watch())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
     assert recorded == [
         (
             runner.name,
@@ -565,9 +582,223 @@ def test_handle_watch_timeout_skips_to_idle_with_cause(
                 "subsource": "review_timeout",
                 "reason_text": "PR #5 hung after 90m (review=EYES, ci=PENDING)",
                 "previous_state": "WATCH",
+                "elapsed_min": 90,
+                "ci_status": "PENDING",
+                "review_status": "EYES",
             },
         )
     ]
+
+
+def test_watch_review_timeout_writes_frontmatter_status_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-316: review_timeout must invoke _commit_task_status_change with
+    status="ERROR" (which in turn calls write_frontmatter_status) so the
+    picker stops re-selecting the status:TODO task on next cycle."""
+    stale = datetime.now(timezone.utc) - timedelta(minutes=45)
+    pr = PRInfo(
+        number=9,
+        branch="pr-009",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.EYES,
+        last_activity=stale,
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    monkeypatch.setattr(
+        "src.github.cache._gh_api_paginated",
+        lambda path: [],
+    )
+
+    commit_calls: list[tuple[Any, str, str]] = []
+
+    async def fake_commit(self, current_task, status, reason):
+        commit_calls.append((current_task, status, reason))
+        return True
+
+    monkeypatch.setattr(
+        PipelineRunner,
+        "_commit_task_status_change",
+        fake_commit,
+    )
+
+    runner = h._make_runner(review_timeout_min=30)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=9, branch="pr-009")
+    task = QueueTask(
+        pr_id="PR-009",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-009",
+        task_file="tasks/PR-009.md",
+    )
+    runner.state.current_task = task
+    asyncio.run(runner.handle_watch())
+
+    assert len(commit_calls) == 1
+    recorded_task, status, _reason = commit_calls[0]
+    assert getattr(recorded_task, "task_file", None) == "tasks/PR-009.md"
+    assert status == "ERROR"
+
+
+def test_watch_review_timeout_preserves_escalated_label_on_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-316: review_timeout must still call _ensure_escalated_label so the
+    GitHub-side durable marker survives the move off _escalate_and_skip."""
+    stale = datetime.now(timezone.utc) - timedelta(minutes=45)
+    pr = PRInfo(
+        number=11,
+        branch="pr-011",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.EYES,
+        last_activity=stale,
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+
+    label_calls: list[tuple[int, str]] = []
+
+    def fake_label(self, pr_number: int, label_create_log_prefix: str) -> bool:
+        label_calls.append((pr_number, label_create_log_prefix))
+        return True
+
+    monkeypatch.setattr(
+        PipelineRunner,
+        "_ensure_escalated_label",
+        fake_label,
+    )
+
+    async def fake_commit(self, current_task, status, reason):
+        return True
+
+    monkeypatch.setattr(
+        PipelineRunner,
+        "_commit_task_status_change",
+        fake_commit,
+    )
+
+    runner = h._make_runner(review_timeout_min=30)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=11, branch="pr-011")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-011",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-011",
+        task_file="tasks/PR-011.md",
+    )
+    asyncio.run(runner.handle_watch())
+
+    assert label_calls == [(11, "WATCH review timeout")]
+
+
+def test_watch_review_timeout_status_write_exception_marks_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If _commit_task_status_change raises, watch.py must log the failure
+    and fall through to _mark_status_write_failed_task instead of
+    propagating the exception out of handle_watch."""
+    stale = datetime.now(timezone.utc) - timedelta(minutes=45)
+    pr = PRInfo(
+        number=13,
+        branch="pr-013",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.EYES,
+        last_activity=stale,
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+
+    async def fake_commit_raise(self, current_task, status, reason):
+        raise RuntimeError("git unavailable")
+
+    monkeypatch.setattr(
+        PipelineRunner,
+        "_commit_task_status_change",
+        fake_commit_raise,
+    )
+
+    marked: list[Any] = []
+
+    async def fake_mark(self, current_task: Any) -> None:
+        marked.append(current_task)
+
+    monkeypatch.setattr(
+        PipelineRunner,
+        "_mark_status_write_failed_task",
+        fake_mark,
+    )
+
+    runner = h._make_runner(review_timeout_min=30)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=13, branch="pr-013")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-013",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-013",
+        task_file="tasks/PR-013.md",
+    )
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert len(marked) == 1
+    assert any(
+        "Failed to write status:ERROR" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_watch_review_timeout_status_write_failure_marks_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When _commit_task_status_change soft-fails (returns False), the runner
+    must record the in-memory parking fallback via _mark_status_write_failed_task
+    so the picker still skips the task."""
+    stale = datetime.now(timezone.utc) - timedelta(minutes=45)
+    pr = PRInfo(
+        number=12,
+        branch="pr-012",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.EYES,
+        last_activity=stale,
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+
+    async def fake_commit_fail(self, current_task, status, reason):
+        return False
+
+    monkeypatch.setattr(
+        PipelineRunner,
+        "_commit_task_status_change",
+        fake_commit_fail,
+    )
+
+    marked: list[Any] = []
+
+    async def fake_mark(self, current_task: Any) -> None:
+        marked.append(current_task)
+
+    monkeypatch.setattr(
+        PipelineRunner,
+        "_mark_status_write_failed_task",
+        fake_mark,
+    )
+
+    runner = h._make_runner(review_timeout_min=30)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=12, branch="pr-012")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-012",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-012",
+        task_file="tasks/PR-012.md",
+    )
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert len(marked) == 1
+    assert getattr(marked[0], "pr_id", None) == "PR-012"
 
 
 def test_handle_watch_within_timeout_stays_watching(
@@ -619,7 +850,8 @@ def test_handle_watch_approved_but_ci_pending_applies_timeout(
 ) -> None:
     """APPROVED + CI PENDING used to fall through the branches in handle_watch,
     leaving the runner stuck in WATCH forever. It should now apply the review
-    timeout and transition to IDLE when the PR stays pending for too long."""
+    timeout and transition to ERROR (PR-316: was IDLE) when the PR stays
+    pending past the configured timeout."""
     stale = datetime.now(timezone.utc) - timedelta(minutes=90)
     pr = PRInfo(
         number=5,
@@ -635,7 +867,7 @@ def test_handle_watch_approved_but_ci_pending_applies_timeout(
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
     asyncio.run(runner.handle_watch())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
     assert any("review=APPROVED" in e["event"] and "ci=PENDING" in e["event"] for e in runner.state.history)
 
 
@@ -683,7 +915,7 @@ def test_handle_watch_falls_back_to_daemon_review_timeout(
     runner.state.current_pr = PRInfo(number=7, branch="pr-002")
     asyncio.run(runner.handle_watch())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
 
 
 def test_handle_watch_repo_timeout_override_wins_over_daemon_default(
@@ -954,9 +1186,11 @@ def test_handle_watch_still_fixes_ci_failure(
 def test_handle_watch_stale_feedback_still_times_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """CHANGES_REQUESTED + no new feedback must still escalate to HUNG when
-    the review timeout has elapsed. Early-returning here would pin the
-    runner in WATCH forever for a sticky historical CHANGES_REQUESTED."""
+    """CHANGES_REQUESTED + no new feedback must still escalate when the
+    review timeout has elapsed. Early-returning here would pin the runner
+    in WATCH forever for a sticky historical CHANGES_REQUESTED. PR-316
+    moved the terminal state from IDLE to ERROR so the picker stops
+    re-selecting the task."""
     last_push = datetime.now(timezone.utc) - timedelta(hours=2)
     pr = PRInfo(
         number=42,
@@ -987,7 +1221,7 @@ def test_handle_watch_stale_feedback_still_times_out(
     asyncio.run(runner.handle_watch())
 
     assert fix_called == []
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
 
 
 def test_handle_watch_retriggers_stale_changes_requested_review(
@@ -1570,7 +1804,8 @@ def test_handle_watch_falls_through_for_fork_with_ci_failure(
 ) -> None:
     """CI failure on a fork PR must NOT call handle_fix (which would no-op
     and create a skip loop). It must fall through to the waiting/timeout
-    logic so the PR can escalate to HUNG."""
+    logic so the PR can escalate. PR-316 moved the terminal state from
+    IDLE to ERROR so the picker stops re-selecting the task."""
     past = datetime.now(timezone.utc) - timedelta(hours=2)
     pr = PRInfo(
         number=88,
@@ -1600,14 +1835,15 @@ def test_handle_watch_falls_through_for_fork_with_ci_failure(
     asyncio.run(runner.handle_watch())
 
     assert fix_called == []
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
 
 
 def test_handle_watch_falls_through_for_fork_with_changes_requested(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """CHANGES_REQUESTED on a fork PR must also fall through to timeout
-    instead of being routed into handle_fix (even with fresh feedback)."""
+    instead of being routed into handle_fix (even with fresh feedback).
+    PR-316: terminal state is ERROR (was IDLE)."""
     past = datetime.now(timezone.utc) - timedelta(hours=2)
     pr = PRInfo(
         number=88,
@@ -1637,7 +1873,7 @@ def test_handle_watch_falls_through_for_fork_with_changes_requested(
     asyncio.run(runner.handle_watch())
 
     assert fix_called == []
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
 
 
 def test_handle_watch_rehydrates_on_pr_number_mismatch(
