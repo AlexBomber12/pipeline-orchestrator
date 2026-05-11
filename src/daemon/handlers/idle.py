@@ -799,6 +799,7 @@ class IdleMixin:
                     apply_escalated_label=False,
                     set_pr_escalated_flag=False,
                     log_message=f"{message}.",
+                    cancellation_subsource="infra_failure",
                 )
                 return
 

@@ -783,6 +783,7 @@ class CodingMixin:
                     apply_escalated_label=False,
                     set_pr_escalated_flag=False,
                     log_message=f"{message}.",
+                    cancellation_subsource="no_push_deadlock",
                 )
                 return
             if not local_exists:
@@ -801,6 +802,7 @@ class CodingMixin:
                 apply_escalated_label=False,
                 set_pr_escalated_flag=False,
                 log_message=f"{message}.",
+                cancellation_subsource="no_push_deadlock",
             )
             return
 
@@ -900,6 +902,7 @@ class CodingMixin:
                     apply_escalated_label=False,
                     set_pr_escalated_flag=False,
                     log_message=f"{message}.",
+                    cancellation_subsource="infra_failure",
                 )
             return
 
@@ -995,6 +998,7 @@ class CodingMixin:
                 apply_escalated_label=False,
                 set_pr_escalated_flag=False,
                 log_message=f"{message}.",
+                cancellation_subsource="infra_failure",
             )
             return False
         gh_cache._invalidate_etag_cache(
