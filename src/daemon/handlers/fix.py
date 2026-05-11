@@ -540,15 +540,18 @@ class FixMixin(BreachMixin):
             if head_before and head_before == head_after:
                 return True
 
-            push_time = datetime.now(timezone.utc)
-            self._last_push_at = push_time
+            now_time = datetime.now(timezone.utc)
             if self.state.current_pr is not None:
+                self._last_push_at = self._canonical_push_timestamp(
+                    self.state.current_pr.number
+                )
                 self._last_push_at_pr_number = self.state.current_pr.number
                 self.state.current_pr.record_observed_head(head_after)
                 iteration = fix_iteration_policy.increment(self.state.current_pr)
                 no_push_policy.reset(self.state.current_pr)
-                self.state.current_pr.last_activity = push_time
+                self.state.current_pr.last_activity = now_time
             else:
+                self._last_push_at = now_time
                 iteration = 0
 
             self.log_event(f"[FIX] Fix pushed, iteration #{iteration}.")
@@ -737,6 +740,10 @@ class FixMixin(BreachMixin):
 
         if local_no_push or remote_no_push:
             self._last_push_at = datetime.now(timezone.utc)
+            if self.state.current_pr is not None:
+                self._last_push_at = self._canonical_push_timestamp(
+                    self.state.current_pr.number
+                )
             if local_no_push:
                 self.log_event(
                     "[FIX] FIX FEEDBACK exited 0 but HEAD unchanged; "

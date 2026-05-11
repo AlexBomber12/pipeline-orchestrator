@@ -4901,3 +4901,158 @@ def test_verify_pushes_since_returns_false_when_remote_diverged(
     )
 
     assert result is False
+
+
+def test_canonical_push_timestamp_helper_returns_parsed_iso(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The helper parses the GitHub committer date returned by get_pr_metadata."""
+    head_iso = "2026-05-10T02:32:43Z"
+    monkeypatch.setattr(
+        "src.github.prs.get_pr_metadata",
+        lambda repo, number: {
+            "author": "",
+            "head_sha": "abc123",
+            "head_commit_date": head_iso,
+        },
+    )
+
+    runner = h._make_runner()
+    result = runner._canonical_push_timestamp(407)
+
+    assert result.isoformat() == "2026-05-10T02:32:43+00:00"
+
+
+def test_canonical_push_timestamp_helper_falls_back_to_now_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the GitHub fetch raises, the helper returns datetime.now(UTC)."""
+    def raise_runtime(repo: str, number: int) -> dict:
+        raise RuntimeError("github unreachable")
+
+    monkeypatch.setattr("src.github.prs.get_pr_metadata", raise_runtime)
+
+    runner = h._make_runner()
+    before = datetime.now(timezone.utc)
+    result = runner._canonical_push_timestamp(407)
+    after = datetime.now(timezone.utc)
+
+    assert before <= result <= after
+
+
+def test_canonical_push_timestamp_helper_attaches_utc_to_naive_datetime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A naive ISO timestamp is normalized to UTC so downstream comparisons
+    against tz-aware Codex comment timestamps don't raise TypeError."""
+    monkeypatch.setattr(
+        "src.github.prs.get_pr_metadata",
+        lambda repo, number: {
+            "author": "",
+            "head_sha": "abc123",
+            "head_commit_date": "2026-05-10T02:32:43",
+        },
+    )
+
+    runner = h._make_runner()
+    result = runner._canonical_push_timestamp(407)
+
+    assert result.tzinfo is timezone.utc
+    assert result.isoformat() == "2026-05-10T02:32:43+00:00"
+
+
+def test_record_fix_push_uses_committer_date_when_metadata_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``record_fix_push`` seeds ``_last_push_at`` from the GitHub committer
+    date so a Codex review submitted seconds after the actual push remains
+    visible to ``_has_new_codex_feedback_since_last_push`` (PR #407 bug)."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", h._async_cli_result(0, "", "")
+    )
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda repo, number, body: None,
+    )
+    head_iso = "2026-05-10T02:32:43Z"
+    monkeypatch.setattr(
+        "src.github.prs.get_pr_metadata",
+        lambda repo, number: {
+            "author": "",
+            "head_sha": "head-after-def",
+            "head_commit_date": head_iso,
+        },
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=407, branch="pr-407")
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner._last_push_at is not None
+    assert runner._last_push_at.isoformat() == "2026-05-10T02:32:43+00:00"
+    assert runner._last_push_at_pr_number == 407
+
+
+def test_record_fix_push_falls_back_to_now_on_metadata_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If ``get_pr_metadata`` raises during ``record_fix_push`` the daemon
+    keeps the WATCH cycle live by seeding ``_last_push_at`` to now()."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli, "fix_review_async", h._async_cli_result(0, "", "")
+    )
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda repo, number, body: None,
+    )
+
+    def raise_runtime(repo: str, number: int) -> dict:
+        raise RuntimeError("github unreachable")
+
+    monkeypatch.setattr("src.github.prs.get_pr_metadata", raise_runtime)
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=407, branch="pr-407")
+
+    before = datetime.now(timezone.utc)
+    asyncio.run(runner.handle_fix())
+    after = datetime.now(timezone.utc)
+
+    assert runner._last_push_at is not None
+    assert before - timedelta(seconds=2) <= runner._last_push_at <= after + timedelta(seconds=2)
+
+
+def test_no_push_branch_uses_committer_date_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The no-push fallback also seeds ``_last_push_at`` from the committer
+    date so a wall-clock advance during a no-push FIX cycle cannot mask a
+    pending Codex review on the unchanged head."""
+    h._patch_no_push_fix(monkeypatch, head_seq=lambda: "abc123")
+    head_iso = "2026-05-10T02:30:00Z"
+    monkeypatch.setattr(
+        "src.github.prs.get_pr_metadata",
+        lambda repo, number: {
+            "author": "",
+            "head_sha": "abc123",
+            "head_commit_date": head_iso,
+        },
+    )
+
+    runner = h._make_runner()
+    runner._app_config = h._app_cfg(fix_no_push_cap=3)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=407, branch="pr-407")
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.no_push_fix_count == 1
+    assert runner._last_push_at is not None
+    assert runner._last_push_at.isoformat() == "2026-05-10T02:30:00+00:00"
