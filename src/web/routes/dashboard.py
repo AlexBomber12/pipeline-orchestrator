@@ -834,7 +834,7 @@ async def api_alerts(request: Request) -> JSONResponse:
     Returns ``{"has_alerts": bool, "count": int}``. Sized independently of
     the repo count so the per-poll cost does not grow with deployment size,
     unlike ``/api/states`` which serializes every ``RepoState`` in full.
-    The alert criterion mirrors ``_ALERT_STATES`` (HUNG/ERROR) so the badge
+    The alert criterion mirrors ``_ALERT_STATES`` (ERROR) so the badge
     and the dashboard ``alerts`` panel agree on what an alert is.
     """
     redis_client = getattr(request.app.state, "redis", None)
