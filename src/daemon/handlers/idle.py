@@ -7,12 +7,20 @@ Mixin methods:
 
 from __future__ import annotations
 
+import asyncio
 import re
 import subprocess
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.daemon.main_commit_audit import (
+    audit_main_commit_shas,
+    list_recent_main_commit_shas,
+    load_audited_shas_from_redis,
+    mark_shas_audited_in_redis,
+    record_audit_findings_in_redis,
+)
 from src.dag import get_eligible_tasks
 from src.github import prs as gh_prs
 from src.models import PipelineState, QueueTask, TaskStatus
@@ -149,6 +157,71 @@ class IdleMixin:
         self._last_agents_scan_fingerprint = fingerprint
         for event in pending:
             self.log_event(event)
+
+    async def _audit_main_commits_if_due(self) -> None:
+        self._main_commit_audit_counter = (
+            getattr(self, "_main_commit_audit_counter", 0) + 1
+        )
+        audit_interval = (
+            self.app_config.daemon.main_commit_audit_interval_idle_cycles
+        )
+        if self._main_commit_audit_counter < audit_interval:
+            return
+
+        repo_key = self.name
+        lookback_n = self.app_config.daemon.main_commit_audit_lookback_n
+        audited_shas = await load_audited_shas_from_redis(
+            self.redis,
+            repo_key,
+            self.repo_config.branch,
+        )
+        try:
+            recent_shas = await asyncio.to_thread(
+                list_recent_main_commit_shas,
+                self.owner_repo,
+                lookback_n,
+                self.repo_config.branch,
+            )
+            findings, checked_shas = await asyncio.to_thread(
+                audit_main_commit_shas,
+                self.owner_repo,
+                recent_shas,
+                audited_shas,
+                self.repo_config.branch,
+            )
+        except Exception as exc:
+            self.log_event(
+                f"[AUDIT] [MAIN-COMMIT-AUDIT] Skipping audit for "
+                f"{self.owner_repo}: {exc}"
+            )
+            if getattr(self, "_main_commit_audit_retry_pending", False):
+                self._main_commit_audit_retry_pending = False
+                self._main_commit_audit_counter = 0
+            else:
+                self._main_commit_audit_retry_pending = True
+                self._main_commit_audit_counter = max(audit_interval - 1, 0)
+            return
+
+        for finding in findings:
+            self.log_event(
+                f"[AUDIT] [MAIN-COMMIT-AUDIT] VIOLATION "
+                f"{finding.violation_category}: {finding.short_sha} "
+                f'"{finding.message_first_line}"'
+            )
+        await record_audit_findings_in_redis(
+            self.redis,
+            repo_key,
+            findings,
+            self.repo_config.branch,
+        )
+        await mark_shas_audited_in_redis(
+            self.redis,
+            repo_key,
+            checked_shas,
+            self.repo_config.branch,
+        )
+        self._main_commit_audit_retry_pending = False
+        self._main_commit_audit_counter = 0
 
     @staticmethod
     def _validate_task_file_header_match(task_file: Path, header_pr_id: str) -> None:
@@ -696,6 +769,8 @@ class IdleMixin:
                 merged_prs = []
         else:
             self._idle_open_pr_snapshot = open_pr_snapshot
+
+        await self._audit_main_commits_if_due()
 
         task = await self._select_next_task_or_attach(prs, merged_prs)
         if task is None:
