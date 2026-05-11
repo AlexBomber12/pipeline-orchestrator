@@ -21,6 +21,7 @@ EXPECTED_SECTION_NAMES = {
     "codex_review_gate",
     "escalate_protocol",
     "branch_naming",
+    "forbidden_actions",
     "auto_pr_runbook",
     "planned_pr_runbook",
     "micro_pr_runbook",
@@ -33,11 +34,30 @@ def test_managed_sections_contains_all_expected_names() -> None:
     assert set(MANAGED_SECTIONS) == EXPECTED_SECTION_NAMES
 
 
+def test_managed_sections_includes_forbidden_actions() -> None:
+    assert "forbidden_actions" in MANAGED_SECTIONS
+
+
+def test_managed_sections_order_places_forbidden_actions_after_branch_naming() -> None:
+    assert MANAGED_SECTIONS.index("forbidden_actions") == (
+        MANAGED_SECTIONS.index("branch_naming") + 1
+    )
+
+
 def test_daemon_managed_content_returns_content_for_every_managed_section() -> None:
     regions = daemon_managed_content()
     assert set(regions) == EXPECTED_SECTION_NAMES
     for name in MANAGED_SECTIONS:
         assert regions[name].strip(), f"section {name!r} unexpectedly empty"
+
+
+def test_daemon_managed_content_returns_forbidden_actions_section() -> None:
+    regions = daemon_managed_content()
+    content = regions["forbidden_actions"]
+
+    assert content.strip()
+    assert "Forbidden actions" in content
+    assert "GUARDRAIL: <category>:" in content
 
 
 def test_daemon_managed_content_applies_repo_specific_overrides() -> None:

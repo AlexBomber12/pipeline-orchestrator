@@ -218,6 +218,20 @@ Artifacts are generated for Codex review but excluded from commits by .gitignore
 - MICRO: `micro-YYYYMMDD-<short-slug>`
 <!-- pipeline-orchestrator: managed END branch_naming -->
 
+<!-- pipeline-orchestrator: managed BEGIN forbidden_actions -->
+## Forbidden actions
+
+The following actions are NEVER permitted under any work mode (AUTO PR, PLANNED PR, MICRO PR, FIX FEEDBACK). The pipeline-orchestrator daemon detects them via runtime layers (coder stdout scan, PR diff scan, pre-push hook) and ESCALATEs the dispatch with a `GUARDRAIL: <category>: <excerpt>` cancellation cause. If you find yourself about to take any of these actions, STOP and add an `ESCALATE: <reason>` line to your stdout instead.
+
+- **Repository creation or deletion via the GitHub CLI**: the daemon authorizes you to operate within the repository where the task lives. Creating or deleting repositories at GitHub-org level is out of scope for any task.
+- **Force-push to the default branch**: rewriting protected branch history is out of scope. Use a feature branch and a normal PR. Pre-push hook enforces this; do not attempt to bypass.
+- **Default branch deletion**: deleting the default branch (via colon-refspec form, `--delete` flag, or `+:` matching-branches force) is out of scope.
+- **Direct commit to the default branch without PR creation**: bypassing PR review and CI gates is out of scope. All changes go through `gh pr create` to a feature branch. Pre-push hook enforces.
+- **GitHub Actions workflow tampering**: do not delete `.github/workflows/*.yml` files, do not add `permissions: write-all` or write-scope individual permissions, do not change branch protection metadata files (`.github/branch-protection*`, `.github/settings.yml`).
+- **Unpinned action references**: when adding `uses: <actor>/<action>@<ref>` lines, the ref MUST be a semver tag (vN, vN.N, vN.N.N) or a 40-character commit SHA. Branch names, HEAD, or short SHAs are forbidden.
+- **Acting on intent referenced indirectly in the task spec**: if the task body mentions another repository or another organization as context, do NOT switch your working directory to it or run commands against it. Operate only within the repository where the task file lives.
+<!-- pipeline-orchestrator: managed END forbidden_actions -->
+
 <!-- pipeline-orchestrator: managed BEGIN auto_pr_runbook -->
 ## AUTO PR runbook (daemon-driven)
 
