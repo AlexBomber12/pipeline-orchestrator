@@ -188,6 +188,13 @@ class RepoState(BaseModel):
     coder: str | None = None
     last_stale_retrigger_at: datetime | None = None
     last_codex_retrigger_at: datetime | None = None
+    # PR-316 review feedback: when True, ``run_cycle`` keeps the runner
+    # parked in ERROR without invoking ``handle_error``. Set by WATCH on
+    # ``review_timeout`` so the AI diagnose loop does not burn budget on
+    # a non-fixable problem and cannot auto-leave ERROR via FIX/SKIP.
+    # Cleared by ``run_cycle`` when the cancellation cause is gone
+    # (operator pressed Retry, which deletes the cause).
+    skip_ai_error_diagnose: bool = False
 
     @field_validator("state", mode="before")
     @classmethod

@@ -1749,6 +1749,160 @@ def test_run_cycle_dispatches_error_handler_when_ai_enabled(
     assert publishes == ["published"]
 
 
+def test_run_cycle_in_error_with_review_timeout_park_skips_handle_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-316 follow-up: WATCH parks ERROR with ``skip_ai_error_diagnose``.
+
+    While the cancellation cause for the active task is still present,
+    ``run_cycle`` must NOT invoke ``handle_error`` — otherwise the AI
+    diagnose loop burns budget on a non-fixable review timeout and may
+    auto-leave ERROR through a FIX/SKIP verdict, undermining the
+    operator-controlled park.
+    """
+    from src.cancellation import CancellationCause
+    from src.cancellation.storage import cause_key
+
+    calls: list[str] = []
+    runner = h._make_runner()
+    runner._recovered = True
+    runner._scaffolded = True
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "PR #5 hung after 90m (review=EYES, ci=PENDING)"
+    runner.state.skip_ai_error_diagnose = True
+    runner.state.current_task = QueueTask(
+        pr_id="PR-005",
+        title="t",
+        status=TaskStatus.ERROR,
+        branch="pr-001",
+    )
+    cause = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "review_timeout"},
+        created_at="2026-05-11T00:00:00+00:00",
+        task_id="PR-005",
+        repo_slug=runner.name,
+    )
+    asyncio.run(
+        runner.redis.set(cause_key(runner.name, "PR-005"), cause.to_redis())
+    )
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_handle_error() -> None:
+        calls.append("handle_error")
+
+    async def fake_publish_state() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "preflight", h._preflight_true_stub)
+    monkeypatch.setattr(runner, "handle_error", fake_handle_error)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+
+    asyncio.run(runner.run_cycle())
+
+    assert calls == []
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
+
+
+def test_review_timeout_park_cleared_returns_true_when_no_current_task() -> None:
+    """The helper reports cleared when there is no task to read a cause for.
+
+    Defensive: a runner that already dropped ``current_task`` cannot have
+    a cancellation cause to wait on, so ``run_cycle`` should release the
+    park rather than spin forever in ERROR.
+    """
+    runner = h._make_runner()
+    runner.state.current_task = None
+    assert asyncio.run(runner._review_timeout_park_cleared()) is True
+
+
+def test_review_timeout_park_cleared_returns_false_on_redis_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Redis read failure keeps the runner parked.
+
+    Without this guard a transient Redis blip would race the operator's
+    Retry button and falsely transition the runner to IDLE while the
+    cause record is still authoritative on the server.
+    """
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-099",
+        title="t",
+        status=TaskStatus.ERROR,
+    )
+
+    async def boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("redis down")
+
+    monkeypatch.setattr(
+        "src.daemon.runner.get_cancellation_cause", boom
+    )
+    assert asyncio.run(runner._review_timeout_park_cleared()) is False
+
+
+def test_run_cycle_in_error_with_park_flag_releases_when_cause_deleted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operator Retry deletes the cause; the park flag releases to IDLE.
+
+    PR-316 follow-up: ``repo_control.retry_repo_task`` clears the
+    cancellation cause record. The next ERROR cycle observes the empty
+    slot, clears ``skip_ai_error_diagnose`` and ``error_message``, and
+    transitions to IDLE so ``handle_idle``'s picker can pick up the
+    now-status:TODO task without an AI round-trip.
+    """
+    calls: list[str] = []
+    runner = h._make_runner()
+    runner._recovered = True
+    runner._scaffolded = True
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "PR #7 hung after 90m (review=EYES, ci=PENDING)"
+    runner.state.skip_ai_error_diagnose = True
+    runner.state.current_task = QueueTask(
+        pr_id="PR-007",
+        title="t",
+        status=TaskStatus.TODO,
+        branch="pr-007",
+    )
+    # No cause stored in Redis — operator's Retry just deleted it.
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_handle_error() -> None:
+        calls.append("handle_error")
+
+    async def fake_publish_state() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "preflight", h._preflight_true_stub)
+    monkeypatch.setattr(runner, "handle_error", fake_handle_error)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+    # The cycle ends in IDLE; the subsequent handle_idle dispatch is
+    # outside this test's scope.
+    async def fake_handle_idle() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "handle_idle", fake_handle_idle)
+
+    asyncio.run(runner.run_cycle())
+
+    assert calls == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.skip_ai_error_diagnose is False
+    assert runner.state.error_message is None
+    assert any(
+        "review_timeout park cleared by operator" in entry.get("event", "")
+        for entry in runner.state.history
+    )
+
+
 @pytest.mark.parametrize(
     "msg",
     ["Timeout after 3600s", "network timeout", "claude CLI timeout after 900s"],

@@ -369,6 +369,14 @@ class WatchMixin:
                     },
                 ),
             )
+            # PR-316 review feedback: park terminally for operator action.
+            # ``run_cycle`` checks this flag in the ERROR branch and skips
+            # the AI diagnose call so the model is not invoked on a
+            # non-fixable timeout (and cannot auto-leave ERROR via
+            # FIX/SKIP). Operator Retry deletes the cancellation cause,
+            # which ``run_cycle`` detects to clear the flag and transition
+            # back to IDLE.
+            self.state.skip_ai_error_diagnose = True
         else:
             self.log_event(
                 f"[WATCH] PR #{found.number} waiting "

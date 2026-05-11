@@ -573,6 +573,9 @@ def test_handle_watch_timeout_transitions_to_error_with_cause(
     asyncio.run(runner.handle_watch())
 
     assert runner.state.state == PipelineState.ERROR
+    # PR-316 follow-up: the persisted park flag tells run_cycle to skip
+    # the AI diagnose loop on subsequent ERROR cycles.
+    assert runner.state.skip_ai_error_diagnose is True
     assert recorded == [
         (
             runner.name,
