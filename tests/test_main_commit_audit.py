@@ -42,6 +42,14 @@ def _status(state: str, statuses: list[dict] | None = None) -> dict:
     }
 
 
+def _associated_pr(number: int = 42, branch: str = "main") -> dict:
+    return {
+        "number": number,
+        "merged_at": "2026-05-10T12:00:00Z",
+        "base": {"ref": branch},
+    }
+
+
 def test_audit_direct_commit_flagged(monkeypatch):
     def fake_run_gh(args):
         path = args[1]
@@ -71,6 +79,8 @@ def test_audit_merge_commit_with_pr_passing_ci_clean(monkeypatch):
             return [_summary("merge42")]
         if path.endswith("/commits/merge42"):
             return _commit("Merge pull request #42 from feature-x", ["base", "head"])
+        if path.endswith("/commits/merge42/pulls"):
+            return [_associated_pr()]
         if path.endswith("/commits/head/check-runs"):
             return _check_runs("success")
         if path.endswith("/commits/head/status"):
@@ -83,6 +93,27 @@ def test_audit_merge_commit_with_pr_passing_ci_clean(monkeypatch):
     assert main_commit_audit.audit_main_commits("octo/demo") == []
 
 
+def test_audit_merge_commit_requires_associated_pr(monkeypatch):
+    def fake_run_gh(args):
+        path = args[1]
+        if path.endswith("/commits?sha=main&per_page=10"):
+            return [_summary("merge42")]
+        if path.endswith("/commits/merge42"):
+            return _commit("Merge pull request #42 from feature-x", ["base", "head"])
+        if path.endswith("/commits/merge42/pulls"):
+            return []
+        raise AssertionError(args)
+
+    monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+
+    findings = main_commit_audit.audit_main_commits("octo/demo")
+
+    assert [finding.violation_category for finding in findings] == [
+        "merge_commit_pr_unverified"
+    ]
+    assert findings[0].pr_number == 42
+
+
 def test_audit_merge_commit_with_pr_failed_ci_flagged(monkeypatch):
     def fake_run_gh(args):
         path = args[1]
@@ -90,6 +121,8 @@ def test_audit_merge_commit_with_pr_failed_ci_flagged(monkeypatch):
             return [_summary("merge42")]
         if path.endswith("/commits/merge42"):
             return _commit("Merge pull request #42 from feature-x", ["base", "head"])
+        if path.endswith("/commits/merge42/pulls"):
+            return [_associated_pr()]
         if path.endswith("/commits/head/check-runs"):
             return _check_runs("failure")
         if path.endswith("/commits/head/status"):
@@ -114,6 +147,8 @@ def test_audit_merge_commit_with_mixed_check_runs_flagged(monkeypatch):
             return [_summary("merge42")]
         if path.endswith("/commits/merge42"):
             return _commit("Merge pull request #42 from feature-x", ["base", "head"])
+        if path.endswith("/commits/merge42/pulls"):
+            return [_associated_pr()]
         if path.endswith("/commits/head/check-runs"):
             return _check_runs("success", "failure")
         if path.endswith("/commits/head/status"):
@@ -137,6 +172,8 @@ def test_audit_merge_commit_checks_all_check_run_pages(monkeypatch):
             return [_summary("merge42")]
         if path.endswith("/commits/merge42"):
             return _commit("Merge pull request #42 from feature-x", ["base", "head"])
+        if path.endswith("/commits/merge42/pulls"):
+            return [_associated_pr()]
         if path.endswith("/commits/head/status"):
             return _status("success")
         raise AssertionError(args)
@@ -203,6 +240,8 @@ def test_audit_merge_commit_with_legacy_status_success_clean(monkeypatch):
             return [_summary("merge42")]
         if path.endswith("/commits/merge42"):
             return _commit("Merge pull request #42 from feature-x", ["base", "head"])
+        if path.endswith("/commits/merge42/pulls"):
+            return [_associated_pr()]
         if path.endswith("/commits/head/check-runs"):
             return {"check_runs": []}
         if path.endswith("/commits/head/status"):
@@ -222,6 +261,8 @@ def test_audit_merge_commit_no_check_runs_flagged(monkeypatch):
             return [_summary("merge42")]
         if path.endswith("/commits/merge42"):
             return _commit("Merge pull request #42 from feature-x", ["base", "head"])
+        if path.endswith("/commits/merge42/pulls"):
+            return [_associated_pr()]
         if path.endswith("/commits/head/check-runs"):
             return {"check_runs": []}
         if path.endswith("/commits/head/status"):
@@ -627,6 +668,8 @@ def test_audit_merge_commit_missing_head_sha_flagged(monkeypatch):
                 "commit": {"message": "Merge pull request #42 from feature-x"},
                 "parents": [{"sha": "base"}, {}],
             }
+        if path.endswith("/commits/merge42/pulls"):
+            return [_associated_pr()]
         raise AssertionError(args)
 
     monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
@@ -707,6 +750,8 @@ def test_audit_check_runs_malformed_payload_flagged(monkeypatch):
         path = args[1]
         if path.endswith("/commits/merge42"):
             return _commit("Merge pull request #42 from feature-x", ["base", "head"])
+        if path.endswith("/commits/merge42/pulls"):
+            return [_associated_pr()]
         if path.endswith("/commits/head/check-runs"):
             return {"check_runs": "not-a-list"}
         if path.endswith("/commits/head/status"):

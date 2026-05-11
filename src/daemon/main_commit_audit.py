@@ -346,24 +346,27 @@ def audit_main_commit_shas(
                 checked_shas.append(sha)
                 continue
 
-            pr_number = _extract_pr_number(message)
-            if pr_number is None:
-                associated_pr = _merged_associated_pr(
-                    run_gh(["api", f"repos/{owner_repo}/commits/{sha}/pulls"]),
-                    branch,
-                )
-                if associated_pr is not None:
-                    pr_number = _pr_number(associated_pr)
+            message_pr_number = _extract_pr_number(message)
+            associated_pr = _merged_associated_pr(
+                run_gh(["api", f"repos/{owner_repo}/commits/{sha}/pulls"]),
+                branch,
+            )
+            if associated_pr is not None:
+                pr_number = _pr_number(associated_pr) or message_pr_number
 
-            if pr_number is None:
+            if associated_pr is None:
                 findings.append(
                     _finding(
                         sha=sha,
                         message=message,
                         parent_count=parent_count,
-                        pr_number=None,
+                        pr_number=message_pr_number,
                         violation_category="merge_commit_pr_unverified",
-                        rule="Merge commit on main does not identify a PR; verify operator action and CI manually.",
+                        rule=(
+                            "Merge commit on main is not associated with a "
+                            "merged PR targeting the audited branch; verify "
+                            "operator action and CI manually."
+                        ),
                     )
                 )
                 checked_shas.append(sha)
