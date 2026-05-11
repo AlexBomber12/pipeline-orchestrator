@@ -326,17 +326,18 @@ class WatchMixin:
                 f"PR #{found.number} hung after {elapsed_min:.0f}m "
                 f"(review={review.value}, ci={ci.value})"
             )
-            # PR-316: apply ``escalated`` label as a durable GitHub-side
-            # signal, then transition to terminal ERROR. The prior
+            # PR-316: transition to terminal ERROR. The prior
             # ``_escalate_and_skip`` call routed to IDLE, which let the
             # picker re-select the same PR on the next cycle and produced
             # an infinite WATCH/IDLE loop (OBS-DD). ERROR is terminal:
-            # the task spec is rewritten to ``status:ERROR`` below so
+            # the task spec is rewritten to ``status:ERROR`` below so the
             # picker filters it out, and the operator clears it via the
-            # dashboard Retry button.
-            self._ensure_escalated_label(
-                found.number, "WATCH review timeout"
-            )
+            # dashboard Retry button. The ``escalated`` GitHub label is
+            # intentionally NOT applied here: Retry only resets the task
+            # frontmatter, so a sticky ``escalated`` label would persist
+            # on the open PR and make ``handle_fix`` refuse the next FIX
+            # cycle (``current_pr.is_escalated`` short-circuit), bouncing
+            # the task between WATCH and IDLE without ever repairing.
             await self._transition_to_error(
                 timeout_message,
                 save_run_record_as="error",

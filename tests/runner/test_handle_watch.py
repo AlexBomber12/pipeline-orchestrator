@@ -529,8 +529,12 @@ def test_handle_watch_review_timeout_transitions_to_error_not_idle(
     (not IDLE) so the picker does not re-select the same PR and loop.
 
     Asserts cancellation cause payload carries subsource=review_timeout,
-    final state is ERROR, task frontmatter is written status:ERROR, and
-    the escalated label is applied as a durable GitHub-side signal.
+    final state is ERROR, and task frontmatter is written status:ERROR.
+
+    The ``escalated`` GitHub label is intentionally NOT applied: Retry
+    only resets the task frontmatter, so a sticky label would persist
+    on the open PR and make ``handle_fix`` refuse the next FIX cycle,
+    deadlocking the task in a WATCH/IDLE bounce.
     """
     recorded: list[tuple[str, str, str, dict[str, object]]] = []
 
@@ -585,7 +589,11 @@ def test_handle_watch_review_timeout_transitions_to_error_not_idle(
     asyncio.run(runner.handle_watch())
 
     assert runner.state.state == PipelineState.ERROR
-    assert label_calls == [(5, "WATCH review timeout")]
+    # PR-316 follow-up: ``escalated`` label intentionally NOT applied —
+    # operator Retry only resets the task frontmatter, so a sticky label
+    # would deadlock the next FIX cycle (``current_pr.is_escalated``
+    # short-circuit in ``handle_fix``).
+    assert label_calls == []
     assert recorded == [
         (
             runner.name,
