@@ -387,7 +387,7 @@ def audit_main_commit_shas(
                 checked_shas.append(sha)
                 continue
 
-            if not _has_successful_ci(owner_repo, pr_head_sha):
+            if not _has_successful_ci_on_any_sha(owner_repo, [pr_head_sha, sha]):
                 findings.append(
                     _finding(
                         sha=sha,
@@ -395,7 +395,10 @@ def audit_main_commit_shas(
                         parent_count=parent_count,
                         pr_number=pr_number,
                         violation_category="merge_commit_pr_failed_ci",
-                        rule="Merged PR head has no successful check run; investigate branch-protection bypass.",
+                        rule=(
+                            "Merged PR head or landed merge commit has no "
+                            "successful check run; investigate branch-protection bypass."
+                        ),
                     )
                 )
             checked_shas.append(sha)
