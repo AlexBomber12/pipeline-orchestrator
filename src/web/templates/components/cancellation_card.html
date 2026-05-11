@@ -62,6 +62,20 @@
             {% endif %}
         {% elif cause.category == 'OPERATOR_RECOVERY' %}
             <div>Manual recovery via dashboard</div>
+        {% elif cause.category == 'ERROR' %}
+            {# PR-315 safety net: post-migration every record carries
+               ``category == 'ERROR'``. PR-319 replaces this branch with
+               per-subsource rendering; until then, surface forensic
+               detail from payload so operators are never shown a blank
+               card during the PR-315→PR-319 ship window. #}
+            {% set sub = cause.payload.get('subsource', '') %}
+            {% set legacy = cause.payload.get('legacy_category', '') %}
+            {% if legacy %}
+            <span class="cause-badge cause-error">Legacy: {{ legacy }}</span>
+            {% else %}
+            <span class="cause-badge cause-error">{{ sub or 'Error' }}</span>
+            {% endif %}
+            <p>{{ cause.payload.get('reason_text') or cause.payload.get('error_message') or cause.payload.get('excerpt') or 'Cancellation reason not recorded.' }}</p>
         {% endif %}
     </div>
 </article>
