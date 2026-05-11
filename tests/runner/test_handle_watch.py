@@ -522,9 +522,16 @@ def test_handle_watch_pending_within_threshold_does_not_reclassify(
     assert "reclassified" not in history_events
 
 
-def test_handle_watch_timeout_skips_to_idle_with_cause(
+def test_handle_watch_review_timeout_transitions_to_error_not_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """PR-316: WATCH review_timeout transitions to terminal ERROR
+    (not IDLE) so the picker does not re-select the same PR and loop.
+
+    Asserts cancellation cause payload carries subsource=review_timeout,
+    final state is ERROR, task frontmatter is written status:ERROR, and
+    the escalated label is applied as a durable GitHub-side signal.
+    """
     recorded: list[tuple[str, str, str, dict[str, object]]] = []
 
     async def fake_safe_record(redis_client, repo_slug, task_id, cause, *, log=None):
@@ -544,6 +551,27 @@ def test_handle_watch_timeout_skips_to_idle_with_cause(
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
 
+    label_calls: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        "src.daemon.fix_escalation.ensure_escalated_label",
+        lambda runner, pr_number, prefix: label_calls.append(
+            (pr_number, prefix)
+        )
+        or True,
+    )
+
+    status_writes: list[tuple[str, str]] = []
+
+    async def fake_commit(self, current_task, status, reason):
+        status_writes.append((status, reason))
+        return True
+
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_commit_task_status_change",
+        fake_commit,
+    )
+
     runner = h._make_runner(review_timeout_min=30)
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
@@ -552,10 +580,12 @@ def test_handle_watch_timeout_skips_to_idle_with_cause(
         title="t",
         status=TaskStatus.DOING,
         branch="pr-001",
+        task_file="tasks/PR-005.md",
     )
     asyncio.run(runner.handle_watch())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert label_calls == [(5, "WATCH review timeout")]
     assert recorded == [
         (
             runner.name,
@@ -568,6 +598,72 @@ def test_handle_watch_timeout_skips_to_idle_with_cause(
             },
         )
     ]
+    assert status_writes == [
+        ("ERROR", "PR #5 hung after 90m (review=EYES, ci=PENDING)")
+    ]
+    assert any(
+        e["event"].startswith("[ESCALATE]") and "hung after 90m" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_watch_review_timeout_status_write_failure_marks_task_parked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-316: when ``_commit_task_status_change`` raises or returns
+    False, the runner records the in-memory status-write-failed parking
+    fallback so the picker still avoids re-selecting the task."""
+    stale = datetime.now(timezone.utc) - timedelta(minutes=90)
+    pr = PRInfo(
+        number=5,
+        branch="pr-001",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.EYES,
+        last_activity=stale,
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    monkeypatch.setattr(
+        "src.daemon.fix_escalation.ensure_escalated_label",
+        lambda runner, pr_number, prefix: True,
+    )
+
+    async def raising_commit(self, current_task, status, reason):
+        raise RuntimeError("git push exploded")
+
+    parked: list[str] = []
+
+    async def fake_mark_parked(self, current_task):
+        parked.append(current_task.pr_id)
+
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_commit_task_status_change",
+        raising_commit,
+    )
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_mark_status_write_failed_task",
+        fake_mark_parked,
+    )
+
+    runner = h._make_runner(review_timeout_min=30)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-005",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-005.md",
+    )
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert parked == ["PR-005"]
+    assert any(
+        "Failed to write status:ERROR" in e["event"]
+        for e in runner.state.history
+    )
 
 
 def test_handle_watch_within_timeout_stays_watching(
@@ -618,8 +714,8 @@ def test_handle_watch_approved_but_ci_pending_applies_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """APPROVED + CI PENDING used to fall through the branches in handle_watch,
-    leaving the runner stuck in WATCH forever. It should now apply the review
-    timeout and transition to IDLE when the PR stays pending for too long."""
+    leaving the runner stuck in WATCH forever. After PR-316 the review timeout
+    transitions to ERROR (terminal) so the picker stops re-selecting the PR."""
     stale = datetime.now(timezone.utc) - timedelta(minutes=90)
     pr = PRInfo(
         number=5,
@@ -629,13 +725,17 @@ def test_handle_watch_approved_but_ci_pending_applies_timeout(
         last_activity=stale,
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    monkeypatch.setattr(
+        "src.daemon.fix_escalation.ensure_escalated_label",
+        lambda runner, pr_number, prefix: True,
+    )
 
     runner = h._make_runner(review_timeout_min=30)
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
     asyncio.run(runner.handle_watch())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
     assert any("review=APPROVED" in e["event"] and "ci=PENDING" in e["event"] for e in runner.state.history)
 
 
@@ -661,10 +761,14 @@ def test_handle_watch_falls_back_to_daemon_review_timeout(
         last_activity=stale,
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    monkeypatch.setattr(
+        "src.daemon.fix_escalation.ensure_escalated_label",
+        lambda runner, pr_number, prefix: True,
+    )
 
     # ``review_timeout_min=None`` on the repo → the runner must use the
     # daemon's 30-minute default. 40 minutes of inactivity is past that,
-    # so the task is skipped to IDLE.
+    # so the task transitions to ERROR (PR-316).
     repo_cfg = RepoConfig(
         url="https://github.com/octo/demo.git",
         branch="main",
@@ -683,7 +787,7 @@ def test_handle_watch_falls_back_to_daemon_review_timeout(
     runner.state.current_pr = PRInfo(number=7, branch="pr-002")
     asyncio.run(runner.handle_watch())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
 
 
 def test_handle_watch_repo_timeout_override_wins_over_daemon_default(
@@ -954,9 +1058,10 @@ def test_handle_watch_still_fixes_ci_failure(
 def test_handle_watch_stale_feedback_still_times_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """CHANGES_REQUESTED + no new feedback must still escalate to HUNG when
-    the review timeout has elapsed. Early-returning here would pin the
-    runner in WATCH forever for a sticky historical CHANGES_REQUESTED."""
+    """CHANGES_REQUESTED + no new feedback must still escalate when the
+    review timeout has elapsed. Early-returning here would pin the
+    runner in WATCH forever for a sticky historical CHANGES_REQUESTED.
+    Post-PR-316 the destination is terminal ERROR, not IDLE."""
     last_push = datetime.now(timezone.utc) - timedelta(hours=2)
     pr = PRInfo(
         number=42,
@@ -973,6 +1078,10 @@ def test_handle_watch_stale_feedback_still_times_out(
         "src.github.cache._gh_api_paginated",
         lambda path: [],
     )
+    monkeypatch.setattr(
+        "src.daemon.fix_escalation.ensure_escalated_label",
+        lambda runner, pr_number, prefix: True,
+    )
     fix_called: list[bool] = []
 
     async def fake_fix() -> None:
@@ -987,7 +1096,7 @@ def test_handle_watch_stale_feedback_still_times_out(
     asyncio.run(runner.handle_watch())
 
     assert fix_called == []
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
 
 
 def test_handle_watch_retriggers_stale_changes_requested_review(
@@ -1588,6 +1697,10 @@ def test_handle_watch_falls_through_for_fork_with_ci_failure(
         "src.github.prs.get_pr_metadata",
         lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": ""},
     )
+    monkeypatch.setattr(
+        "src.daemon.fix_escalation.ensure_escalated_label",
+        lambda runner, pr_number, prefix: True,
+    )
     fix_called: list[bool] = []
 
     async def fake_fix() -> None:
@@ -1600,7 +1713,7 @@ def test_handle_watch_falls_through_for_fork_with_ci_failure(
     asyncio.run(runner.handle_watch())
 
     assert fix_called == []
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
 
 
 def test_handle_watch_falls_through_for_fork_with_changes_requested(
@@ -1625,6 +1738,10 @@ def test_handle_watch_falls_through_for_fork_with_changes_requested(
         "src.github.prs.get_pr_metadata",
         lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": ""},
     )
+    monkeypatch.setattr(
+        "src.daemon.fix_escalation.ensure_escalated_label",
+        lambda runner, pr_number, prefix: True,
+    )
     fix_called: list[bool] = []
 
     async def fake_fix() -> None:
@@ -1637,7 +1754,7 @@ def test_handle_watch_falls_through_for_fork_with_changes_requested(
     asyncio.run(runner.handle_watch())
 
     assert fix_called == []
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
 
 
 def test_handle_watch_rehydrates_on_pr_number_mismatch(

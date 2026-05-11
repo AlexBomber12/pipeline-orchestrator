@@ -12,6 +12,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 
+from src.cancellation import CancellationCause
 from src.github import cache as gh_cache
 from src.github import checks as gh_checks
 from src.github import gh_runner
@@ -321,18 +322,50 @@ class WatchMixin:
             else self.app_config.daemon.review_timeout_min
         )
         if elapsed_min >= timeout_min:
-            await self._escalate_and_skip(
+            timeout_message = (
                 f"PR #{found.number} hung after {elapsed_min:.0f}m "
-                f"(review={review.value}, ci={ci.value})",
-                error_message_override=None,
-                apply_escalated_label=False,
-                set_pr_escalated_flag=False,
-                log_message=(
-                    f"PR #{found.number} hung after {elapsed_min:.0f}m "
-                    f"(review={review.value}, ci={ci.value})."
-                ),
-                cancellation_subsource="review_timeout",
+                f"(review={review.value}, ci={ci.value})"
             )
+            # PR-316: apply ``escalated`` label as a durable GitHub-side
+            # signal, then transition to terminal ERROR. The prior
+            # ``_escalate_and_skip`` call routed to IDLE, which let the
+            # picker re-select the same PR on the next cycle and produced
+            # an infinite WATCH/IDLE loop (OBS-DD). ERROR is terminal:
+            # the task spec is rewritten to ``status:ERROR`` below so
+            # picker filters it out, and the operator clears it via the
+            # dashboard Retry button.
+            self._ensure_escalated_label(
+                found.number, "WATCH review timeout"
+            )
+            await self._transition_to_error(
+                timeout_message,
+                save_run_record_as="error",
+                log_prefix="[ESCALATE]",
+                cancellation_cause=CancellationCause(
+                    category="ERROR",
+                    payload={
+                        "subsource": "review_timeout",
+                        "reason_text": timeout_message,
+                        "previous_state": PipelineState.WATCH.value,
+                    },
+                ),
+            )
+            current_task = self.state.current_task
+            if current_task is not None:
+                try:
+                    status_written = await self._commit_task_status_change(
+                        current_task,
+                        "ERROR",
+                        timeout_message,
+                    )
+                except Exception as exc:
+                    self.log_event(
+                        f"[ERROR] Failed to write status:ERROR to "
+                        f"{current_task.task_file}: {exc}"
+                    )
+                    status_written = False
+                if not status_written:
+                    await self._mark_status_write_failed_task(current_task)
         else:
             self.log_event(
                 f"[WATCH] PR #{found.number} waiting "
