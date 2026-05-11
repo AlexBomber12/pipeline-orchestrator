@@ -591,6 +591,46 @@ async def test_migration_fallback_skips_expired_key_reported_by_ttl() -> None:
     assert redis.set_calls == []
 
 
+async def test_migration_logs_when_get_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Transient Redis read failures must be logged but not abort startup.
+
+    A connection blip or ``WRONGTYPE`` on a malformed ``cancellation:*``
+    key would otherwise raise out of the migration loop and prevent the
+    daemon from booting. The loop must absorb the failure, log it, and
+    continue with the remaining records.
+    """
+
+    class _ReadBoomRedis(_FakeRedis):
+        def __init__(self, values: dict[Any, str], bad_key: Any) -> None:
+            super().__init__(values)
+            self._bad_key = bad_key
+
+        async def get(self, key: Any) -> str | None:
+            if key == self._bad_key:
+                raise RuntimeError("WRONGTYPE Operation against a key")
+            return await super().get(key)
+
+    bad_key = cause_key("alpha", "PR-BAD-READ")
+    good_key = cause_key("alpha", "PR-GOOD")
+    seeded = {
+        bad_key: _legacy_payload("CRASH", {}),
+        good_key: _legacy_payload("CRASH", {"error_message": "ok"}),
+    }
+    redis = _ReadBoomRedis(seeded, bad_key=bad_key)
+    log = logging.getLogger("test_migration_read")
+
+    with caplog.at_level(logging.WARNING, logger=log.name):
+        migrated = await migrate_escalate_to_error_on_startup(redis, log)
+
+    # The good record still migrated; the bad one was logged and skipped.
+    assert migrated == 1
+    assert any("Failed to read" in rec.getMessage() for rec in caplog.records)
+    good_record = json.loads(redis.values[good_key])
+    assert good_record["category"] == "ERROR"
+
+
 async def test_migration_callable_logger_warns_for_malformed_key() -> None:
     """Callable loggers receive ``_warn`` messages alongside info messages."""
     seeded = {

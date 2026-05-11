@@ -83,7 +83,17 @@ async def migrate_escalate_to_error_on_startup(
     migrated = 0
     async for raw_key in _iter_cancellation_keys(redis_client):
         key_str = _decode_key(raw_key)
-        raw = await _maybe_await(redis_client.get(raw_key))
+        try:
+            raw = await _maybe_await(redis_client.get(raw_key))
+        except Exception as exc:
+            # Transient Redis read failures (connection drops, WRONGTYPE on
+            # a malformed key under cancellation:*, etc.) must not abort
+            # daemon startup. Log and move on to the next record.
+            _warn(
+                log,
+                f"[MIGRATION] Failed to read {key_str}: {exc}",
+            )
+            continue
         if raw is None:
             continue
         if isinstance(raw, bytes):
