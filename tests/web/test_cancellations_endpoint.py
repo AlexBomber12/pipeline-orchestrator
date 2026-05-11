@@ -27,10 +27,12 @@ def _make_cause(
     payload: dict | None = None,
     created_at: str | None = None,
 ) -> CancellationCause:
+    if created_at is None:
+        created_at = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
     return CancellationCause(
         category=category,
         payload=payload if payload is not None else {"reason_text": "manual"},
-        created_at=created_at or "2026-05-04T12:00:00+00:00",
+        created_at=created_at,
         task_id=task_id,
         repo_slug="example__repo",
     )
