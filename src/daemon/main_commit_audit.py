@@ -125,13 +125,24 @@ def _parents(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
     return [parent for parent in parents if isinstance(parent, dict)]
 
 
-def _merged_associated_pr(payload: object) -> dict[str, Any] | None:
+def _pr_base_ref(payload: dict[str, Any]) -> str | None:
+    base = payload.get("base")
+    if not isinstance(base, dict):
+        return None
+    ref = base.get("ref")
+    return ref if isinstance(ref, str) and ref else None
+
+
+def _merged_associated_pr(
+    payload: object,
+    base_branch: str = "main",
+) -> dict[str, Any] | None:
     if not isinstance(payload, list):
         return None
     for pr in payload:
         if not isinstance(pr, dict):
             continue
-        if pr.get("merged_at"):
+        if pr.get("merged_at") and _pr_base_ref(pr) == base_branch:
             return pr
     return None
 
@@ -187,6 +198,7 @@ def audit_main_commits(
     owner_repo: str,
     lookback_n: int = 10,
     audited_shas: set[str] | None = None,
+    branch: str = "main",
 ) -> list[MainCommitAuditFinding]:
     """Audit recent main commits for CI bypass violations.
 
@@ -199,12 +211,17 @@ def audit_main_commits(
 
     audited = audited_shas or set()
     try:
-        shas = list_recent_main_commit_shas(owner_repo, lookback_n)
+        shas = list_recent_main_commit_shas(owner_repo, lookback_n, branch)
     except Exception:
         logger.exception("Failed to list recent main commits for %s", owner_repo)
         return []
 
-    findings, _checked_shas = audit_main_commit_shas(owner_repo, shas, audited)
+    findings, _checked_shas = audit_main_commit_shas(
+        owner_repo,
+        shas,
+        audited,
+        branch,
+    )
     return findings
 
 
@@ -212,6 +229,7 @@ def audit_main_commit_shas(
     owner_repo: str,
     shas: list[str],
     audited_shas: set[str] | None = None,
+    branch: str = "main",
 ) -> tuple[list[MainCommitAuditFinding], list[str]]:
     """Audit explicit main commit SHAs and return findings plus checked SHAs."""
     audited = audited_shas or set()
@@ -263,7 +281,8 @@ def audit_main_commit_shas(
 
             if parent_count == 1:
                 associated_pr = _merged_associated_pr(
-                    run_gh(["api", f"repos/{owner_repo}/commits/{sha}/pulls"])
+                    run_gh(["api", f"repos/{owner_repo}/commits/{sha}/pulls"]),
+                    branch,
                 )
                 if associated_pr is None:
                     findings.append(
@@ -317,7 +336,8 @@ def audit_main_commit_shas(
             pr_number = _extract_pr_number(message)
             if pr_number is None:
                 associated_pr = _merged_associated_pr(
-                    run_gh(["api", f"repos/{owner_repo}/commits/{sha}/pulls"])
+                    run_gh(["api", f"repos/{owner_repo}/commits/{sha}/pulls"]),
+                    branch,
                 )
                 if associated_pr is not None:
                     pr_number = _pr_number(associated_pr)

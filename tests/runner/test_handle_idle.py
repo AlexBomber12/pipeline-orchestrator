@@ -100,10 +100,15 @@ def test_handle_idle_main_commit_audit_invoked_at_interval(
         return ["sha20"]
 
     monkeypatch.setattr(idle_module, "list_recent_main_commit_shas", fake_list)
-    audit_calls: list[tuple[str, list[str], set[str]]] = []
+    audit_calls: list[tuple[str, list[str], set[str], str]] = []
 
-    def fake_audit(owner_repo: str, shas: list[str], audited_shas: set[str]):
-        audit_calls.append((owner_repo, shas, audited_shas))
+    def fake_audit(
+        owner_repo: str,
+        shas: list[str],
+        audited_shas: set[str],
+        branch: str,
+    ):
+        audit_calls.append((owner_repo, shas, audited_shas, branch))
         return [], shas
 
     monkeypatch.setattr(idle_module, "audit_main_commit_shas", fake_audit)
@@ -116,7 +121,7 @@ def test_handle_idle_main_commit_audit_invoked_at_interval(
 
     asyncio.run(runner.handle_idle())
 
-    assert audit_calls == [("octo/demo", ["sha20"], set())]
+    assert audit_calls == [("octo/demo", ["sha20"], set(), "main")]
     assert list_calls == [("octo/demo", 10, "main")]
 
 
@@ -143,7 +148,7 @@ def test_handle_idle_main_commit_audit_findings_logged(
     monkeypatch.setattr(
         idle_module,
         "audit_main_commit_shas",
-        lambda owner_repo, shas, audited_shas: ([finding], shas),
+        lambda owner_repo, shas, audited_shas, branch: ([finding], shas),
     )
 
     runner = h._make_runner()
@@ -175,10 +180,15 @@ def test_handle_idle_main_commit_audit_failure_logged(
         return ["retry-sha"]
 
     monkeypatch.setattr(idle_module, "list_recent_main_commit_shas", fail_list)
-    audit_calls: list[tuple[str, list[str], set[str]]] = []
+    audit_calls: list[tuple[str, list[str], set[str], str]] = []
 
-    def fake_audit(owner_repo: str, shas: list[str], audited_shas: set[str]):
-        audit_calls.append((owner_repo, shas, audited_shas))
+    def fake_audit(
+        owner_repo: str,
+        shas: list[str],
+        audited_shas: set[str],
+        branch: str,
+    ):
+        audit_calls.append((owner_repo, shas, audited_shas, branch))
         return [], shas
 
     monkeypatch.setattr(idle_module, "audit_main_commit_shas", fake_audit)
@@ -196,7 +206,7 @@ def test_handle_idle_main_commit_audit_failure_logged(
 
     asyncio.run(runner.handle_idle())
 
-    assert audit_calls == [("octo/demo", ["retry-sha"], set())]
+    assert audit_calls == [("octo/demo", ["retry-sha"], set(), "main")]
     assert runner._main_commit_audit_counter == 0
 
 

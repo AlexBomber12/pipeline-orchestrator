@@ -268,7 +268,13 @@ def test_audit_merge_commit_uses_associated_pr_when_message_unparseable(
         if path.endswith("/commits/merge42"):
             return _commit("custom merge subject", ["base", "head"])
         if path.endswith("/commits/merge42/pulls"):
-            return [{"number": 42, "merged_at": "2026-05-10T12:00:00Z"}]
+            return [
+                {
+                    "number": 42,
+                    "merged_at": "2026-05-10T12:00:00Z",
+                    "base": {"ref": "main"},
+                }
+            ]
         if path.endswith("/commits/head/status"):
             return _status("success")
         raise AssertionError(args)
@@ -313,6 +319,7 @@ def test_audit_linear_pr_commit_with_passing_ci_clean(monkeypatch):
                     "number": 42,
                     "merged_at": "2026-05-10T12:00:00Z",
                     "head": {"sha": "head42"},
+                    "base": {"ref": "main"},
                 }
             ]
         if path.endswith("/commits/head42/check-runs"):
@@ -340,6 +347,7 @@ def test_audit_linear_pr_commit_with_failed_ci_flagged(monkeypatch):
                     "number": 42,
                     "merged_at": "2026-05-10T12:00:00Z",
                     "head": {"sha": "head42"},
+                    "base": {"ref": "main"},
                 }
             ]
         if path.endswith("/commits/head42/check-runs"):
@@ -367,7 +375,13 @@ def test_audit_linear_pr_commit_falls_back_to_main_sha_without_head(monkeypatch)
         if path.endswith("/commits/rebase42"):
             return _commit("feature commit", ["base"])
         if path.endswith("/commits/rebase42/pulls"):
-            return [{"number": "42", "merged_at": "2026-05-10T12:00:00Z"}]
+            return [
+                {
+                    "number": "42",
+                    "merged_at": "2026-05-10T12:00:00Z",
+                    "base": {"ref": "main"},
+                }
+            ]
         if path.endswith("/commits/rebase42/check-runs"):
             return _check_runs("failure")
         if path.endswith("/commits/rebase42/status"):
@@ -388,6 +402,70 @@ def test_audit_linear_pr_commit_falls_back_to_main_sha_without_head(monkeypatch)
 def test_audit_associated_pr_helpers_handle_malformed_payloads():
     assert main_commit_audit._merged_associated_pr({"not": "a-list"}) is None
     assert main_commit_audit._merged_associated_pr(["bad", {"merged_at": None}]) is None
+    assert (
+        main_commit_audit._merged_associated_pr(
+            [{"merged_at": "2026-05-10T12:00:00Z", "base": "bad"}]
+        )
+        is None
+    )
+
+
+def test_audit_linear_pr_commit_ignores_associated_pr_for_other_base(monkeypatch):
+    def fake_run_gh(args):
+        path = args[1]
+        if path.endswith("/commits?sha=release&per_page=10"):
+            return [_summary("rebase42")]
+        if path.endswith("/commits/rebase42"):
+            return _commit("feature commit", ["base"])
+        if path.endswith("/commits/rebase42/pulls"):
+            return [
+                {
+                    "number": 42,
+                    "merged_at": "2026-05-10T12:00:00Z",
+                    "head": {"sha": "head42"},
+                    "base": {"ref": "main"},
+                }
+            ]
+        raise AssertionError(args)
+
+    monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+
+    findings = main_commit_audit.audit_main_commits("octo/demo", branch="release")
+
+    assert [finding.violation_category for finding in findings] == [
+        "direct_commit_no_pr"
+    ]
+    assert findings[0].pr_number is None
+
+
+def test_audit_merge_commit_ignores_associated_pr_for_other_base(monkeypatch):
+    def fake_run_gh(args):
+        path = args[1]
+        if path.endswith("/commits/merge42"):
+            return _commit("custom merge subject", ["base", "head"])
+        if path.endswith("/commits/merge42/pulls"):
+            return [
+                {
+                    "number": 42,
+                    "merged_at": "2026-05-10T12:00:00Z",
+                    "base": {"ref": "main"},
+                }
+            ]
+        raise AssertionError(args)
+
+    monkeypatch.setattr(main_commit_audit, "run_gh", fake_run_gh)
+
+    findings, checked = main_commit_audit.audit_main_commit_shas(
+        "octo/demo",
+        ["merge42"],
+        branch="release",
+    )
+
+    assert checked == ["merge42"]
+    assert [finding.violation_category for finding in findings] == [
+        "merge_commit_pr_unverified"
+    ]
+    assert findings[0].pr_number is None
 
 
 def test_audit_octopus_merge_flagged(monkeypatch):

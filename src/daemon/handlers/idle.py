@@ -183,6 +183,7 @@ class IdleMixin:
                 self.owner_repo,
                 recent_shas,
                 audited_shas,
+                self.repo_config.branch,
             )
         except Exception as exc:
             self.log_event(
