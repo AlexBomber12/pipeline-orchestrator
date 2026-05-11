@@ -641,11 +641,20 @@ def test_watch_review_timeout_writes_frontmatter_status_error(
     assert status == "ERROR"
 
 
-def test_watch_review_timeout_preserves_escalated_label_on_pr(
+def test_watch_review_timeout_does_not_apply_escalated_label(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """PR-316: review_timeout must still call _ensure_escalated_label so the
-    GitHub-side durable marker survives the move off _escalate_and_skip."""
+    """PR-316 review-feedback fix: review_timeout must NOT apply the
+    ``escalated`` GitHub label.
+
+    ``get_open_prs`` maps that label to ``PRInfo.is_escalated`` and
+    ``handle_fix`` short-circuits to IDLE when that flag is true. Applying
+    the label here would block the operator-Retry recovery flow, because a
+    later ``CHANGES_REQUESTED`` or CI failure on the same PR could not
+    re-enter FIX without manual label removal. Termination of the
+    re-pick loop is delivered by the status:ERROR frontmatter write plus
+    ``_transition_to_error``; the GitHub label is intentionally omitted.
+    """
     stale = datetime.now(timezone.utc) - timedelta(minutes=45)
     pr = PRInfo(
         number=11,
@@ -689,7 +698,8 @@ def test_watch_review_timeout_preserves_escalated_label_on_pr(
     )
     asyncio.run(runner.handle_watch())
 
-    assert label_calls == [(11, "WATCH review timeout")]
+    assert label_calls == []
+    assert runner.state.state == PipelineState.ERROR
 
 
 def test_watch_review_timeout_status_write_exception_marks_task(

@@ -325,16 +325,18 @@ class WatchMixin:
             # PR-316 (OBS-DD): WATCH review_timeout was previously routed
             # through ``_escalate_and_skip`` to IDLE, which let the picker
             # re-select the same status:TODO task and route it back into
-            # WATCH indefinitely. Decompose into the durable GitHub-side
-            # label, a status:ERROR frontmatter write, and a terminal
-            # ERROR transition so the picker stops re-picking.
+            # WATCH indefinitely. The status:ERROR frontmatter write plus a
+            # terminal ERROR transition stop the picker from re-picking.
+            # We deliberately do NOT apply the ``escalated`` label here:
+            # ``get_open_prs`` maps that label to ``PRInfo.is_escalated``,
+            # and ``handle_fix`` short-circuits to IDLE when that flag is
+            # true. Applying the label would block the operator-Retry
+            # recovery flow because a later ``CHANGES_REQUESTED`` or CI
+            # failure on the same PR could not re-enter FIX without
+            # manual label removal.
             message = (
                 f"PR #{found.number} hung after {elapsed_min:.0f}m "
                 f"(review={review.value}, ci={ci.value})"
-            )
-            self._ensure_escalated_label(
-                found.number,
-                label_create_log_prefix="WATCH review timeout",
             )
             current_task = self.state.current_task
             if current_task is not None:
