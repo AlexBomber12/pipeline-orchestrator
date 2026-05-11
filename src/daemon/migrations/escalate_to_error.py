@@ -98,10 +98,39 @@ async def migrate_escalate_to_error_on_startup(
         cause_payload.setdefault("legacy_category", category)
         payload["category"] = UNIFIED_CATEGORY
 
+        serialized = json.dumps(payload, separators=(",", ":"))
         try:
+            # keepttl preserves the prior expiry so migrated records still
+            # roll off after the original cancellation:* TTL window.
             await _maybe_await(
-                redis_client.set(raw_key, json.dumps(payload, separators=(",", ":")))
+                redis_client.set(raw_key, serialized, keepttl=True)
             )
+        except TypeError:
+            # Older Redis client shims may not accept keepttl=; fall back to
+            # reapplying the remaining TTL fetched via ttl().
+            try:
+                ttl_remaining = await _maybe_await(redis_client.ttl(raw_key))
+            except Exception as exc:
+                _warn(
+                    log,
+                    f"[MIGRATION] Failed to read TTL for {key_str} "
+                    f"(legacy_category={category}): {exc}",
+                )
+                continue
+            try:
+                if isinstance(ttl_remaining, int) and ttl_remaining > 0:
+                    await _maybe_await(
+                        redis_client.set(raw_key, serialized, ex=ttl_remaining)
+                    )
+                else:
+                    await _maybe_await(redis_client.set(raw_key, serialized))
+            except Exception as exc:
+                _warn(
+                    log,
+                    f"[MIGRATION] Failed to rewrite {key_str} "
+                    f"(legacy_category={category}): {exc}",
+                )
+                continue
         except Exception as exc:
             _warn(
                 log,

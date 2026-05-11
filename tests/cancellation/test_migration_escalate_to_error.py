@@ -14,8 +14,13 @@ from src.daemon.migrations.escalate_to_error import (
 
 
 class _FakeRedis:
-    def __init__(self, values: dict[str | bytes, str]) -> None:
+    def __init__(
+        self,
+        values: dict[str | bytes, str],
+        ttls: dict[Any, int] | None = None,
+    ) -> None:
         self.values: dict[Any, str] = dict(values)
+        self.ttls: dict[Any, int] = dict(ttls or {})
         self.set_calls: list[tuple[Any, str]] = []
 
     async def scan_iter(self, match: str):
@@ -28,15 +33,34 @@ class _FakeRedis:
     async def get(self, key: Any) -> str | None:
         return self.values.get(key)
 
-    async def set(self, key: Any, value: str) -> bool:
+    async def set(
+        self,
+        key: Any,
+        value: str,
+        *,
+        keepttl: bool = False,
+        ex: int | None = None,
+    ) -> bool:
         self.set_calls.append((key, value))
         self.values[key] = value
+        if keepttl:
+            pass  # preserve existing self.ttls[key] if any
+        elif ex is not None:
+            self.ttls[key] = ex
+        else:
+            self.ttls.pop(key, None)
         return True
+
+    async def ttl(self, key: Any) -> int:
+        if key not in self.values:
+            return -2
+        return self.ttls.get(key, -1)
 
 
 class _SyncRedis:
     def __init__(self, values: dict[Any, str]) -> None:
         self.values: dict[Any, str] = dict(values)
+        self.ttls: dict[Any, int] = {}
         self.set_calls: list[tuple[Any, str]] = []
 
     def scan_iter(self, match: str):
@@ -49,10 +73,28 @@ class _SyncRedis:
     def get(self, key: Any) -> str | None:
         return self.values.get(key)
 
-    def set(self, key: Any, value: str) -> bool:
+    def set(
+        self,
+        key: Any,
+        value: str,
+        *,
+        keepttl: bool = False,
+        ex: int | None = None,
+    ) -> bool:
         self.set_calls.append((key, value))
         self.values[key] = value
+        if keepttl:
+            pass
+        elif ex is not None:
+            self.ttls[key] = ex
+        else:
+            self.ttls.pop(key, None)
         return True
+
+    def ttl(self, key: Any) -> int:
+        if key not in self.values:
+            return -2
+        return self.ttls.get(key, -1)
 
 
 def _legacy_payload(category: str, payload: dict[str, Any]) -> str:
@@ -219,7 +261,7 @@ async def test_migration_logs_when_write_fails(
     """A Redis write failure must be logged but not abort the migration."""
 
     class _BoomRedis(_FakeRedis):
-        async def set(self, key: Any, value: str) -> bool:
+        async def set(self, key: Any, value: str, **_: Any) -> bool:
             raise RuntimeError("redis down")
 
     seeded = {
@@ -309,6 +351,134 @@ async def test_migration_skips_non_object_payload() -> None:
 
     assert migrated == 0
     assert redis.set_calls == []
+
+
+async def test_migration_preserves_ttl_via_keepttl() -> None:
+    """Migration must not reset the TTL on rewritten cancellation:* records."""
+    key = cause_key("alpha", "PR-CRASH")
+    redis = _FakeRedis(
+        {key: _legacy_payload("CRASH", {"error_message": "boom"})},
+        ttls={key: 12345},
+    )
+
+    migrated = await migrate_escalate_to_error_on_startup(
+        redis, logging.getLogger(__name__)
+    )
+
+    assert migrated == 1
+    # The prior TTL is preserved verbatim — neither cleared nor reset to
+    # the 30-day default that record_cancellation_cause would apply.
+    assert redis.ttls[key] == 12345
+
+
+async def test_migration_falls_back_to_explicit_ex_when_keepttl_unsupported() -> None:
+    """Clients that reject ``keepttl=`` get the remaining TTL reapplied via ex=."""
+
+    class _NoKeepTTLRedis(_FakeRedis):
+        async def set(
+            self,
+            key: Any,
+            value: str,
+            *,
+            ex: int | None = None,
+        ) -> bool:
+            return await super().set(key, value, ex=ex)
+
+    key = cause_key("alpha", "PR-CRASH")
+    redis = _NoKeepTTLRedis(
+        {key: _legacy_payload("CRASH", {"error_message": "boom"})},
+        ttls={key: 999},
+    )
+
+    migrated = await migrate_escalate_to_error_on_startup(
+        redis, logging.getLogger(__name__)
+    )
+
+    assert migrated == 1
+    # Fallback reapplied the remaining TTL exactly.
+    assert redis.ttls[key] == 999
+
+
+async def test_migration_fallback_logs_when_ttl_read_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If keepttl is rejected and ttl() also fails, the record is skipped."""
+
+    class _BrokenTTLRedis(_FakeRedis):
+        async def set(self, key: Any, value: str) -> bool:
+            return await super().set(key, value)
+
+        async def ttl(self, key: Any) -> int:
+            raise RuntimeError("ttl broken")
+
+    key = cause_key("alpha", "PR-CRASH")
+    redis = _BrokenTTLRedis(
+        {key: _legacy_payload("CRASH", {})},
+        ttls={key: 100},
+    )
+    log = logging.getLogger("test_migration_ttl_read")
+
+    with caplog.at_level(logging.WARNING, logger=log.name):
+        migrated = await migrate_escalate_to_error_on_startup(redis, log)
+
+    assert migrated == 0
+    assert any("Failed to read TTL" in rec.getMessage() for rec in caplog.records)
+
+
+async def test_migration_fallback_writes_without_ex_when_no_ttl() -> None:
+    """Records without a TTL stay without a TTL through the fallback path."""
+
+    class _NoKeepTTLRedis(_FakeRedis):
+        async def set(
+            self,
+            key: Any,
+            value: str,
+            *,
+            ex: int | None = None,
+        ) -> bool:
+            return await super().set(key, value, ex=ex)
+
+    key = cause_key("alpha", "PR-CRASH")
+    redis = _NoKeepTTLRedis(
+        {key: _legacy_payload("CRASH", {})},
+        ttls={},  # no TTL on the key
+    )
+
+    migrated = await migrate_escalate_to_error_on_startup(
+        redis, logging.getLogger(__name__)
+    )
+
+    assert migrated == 1
+    assert key not in redis.ttls
+
+
+async def test_migration_fallback_logs_when_set_with_ex_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A TTL-aware set failure in the fallback path must be logged."""
+
+    class _NoKeepTTLBoom(_FakeRedis):
+        async def set(
+            self,
+            key: Any,
+            value: str,
+            *,
+            ex: int | None = None,
+        ) -> bool:
+            raise RuntimeError("redis down")
+
+    key = cause_key("alpha", "PR-CRASH")
+    redis = _NoKeepTTLBoom(
+        {key: _legacy_payload("CRASH", {})},
+        ttls={key: 50},
+    )
+    log = logging.getLogger("test_migration_fallback_write")
+
+    with caplog.at_level(logging.WARNING, logger=log.name):
+        migrated = await migrate_escalate_to_error_on_startup(redis, log)
+
+    assert migrated == 0
+    assert any("Failed to rewrite" in rec.getMessage() for rec in caplog.records)
 
 
 async def test_migration_callable_logger_warns_for_malformed_key() -> None:
