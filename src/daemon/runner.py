@@ -142,6 +142,46 @@ _EXIT_REASON_TO_RUN_OUTCOME: dict[str, tuple[str, str | None]] = {
     "crash": ("failed", "CRASH"),
 }
 
+# PR-315 collapsed CancellationCause.category to a single ``ERROR`` value with
+# detector identity moved to ``payload.subsource``. ``RunRecord.cause`` retains
+# the legacy enum (CRASH/ESCALATE/TIMEOUT/INFRA/NO_PUSH_DEADLOCK), so when
+# ``_transition_to_error`` forwards a cause to ``_save_current_run_record`` it
+# must translate the new subsource back to the legacy vocabulary. Without this
+# mapping the persisted run record carries ``cause="ERROR"`` and any later
+# ``MetricsStore.get/recent`` raises in ``RunRecord.__post_init__``.
+_SUBSOURCE_TO_LEGACY_RUN_CAUSE: dict[str, str] = {
+    "crash": "CRASH",
+    "coder_escalate": "ESCALATE",
+    "guardrail": "ESCALATE",
+    "review_timeout": "TIMEOUT",
+    "fix_idle_timeout": "TIMEOUT",
+    "fix_iteration_cap": "TIMEOUT",
+    "no_push_deadlock": "NO_PUSH_DEADLOCK",
+    "infra_failure": "INFRA",
+}
+
+
+def _legacy_run_cause_from_cancellation(
+    cause: CancellationCause | None,
+) -> str | None:
+    """Project a PR-315 ``ERROR`` cause back onto the legacy ``RunCause``.
+
+    Prefers ``payload.legacy_category`` when the cause was constructed from
+    a migrated record so historical attribution survives. Otherwise maps
+    ``payload.subsource`` through the canonical detector vocabulary.
+    Returns ``None`` when no usable hint is present so the caller falls
+    back on its exit-reason-derived default.
+    """
+    if cause is None:
+        return None
+    legacy = cause.payload.get("legacy_category") if cause.payload else None
+    if isinstance(legacy, str) and legacy in _SUBSOURCE_TO_LEGACY_RUN_CAUSE.values():
+        return legacy
+    subsource = cause.payload.get("subsource") if cause.payload else None
+    if isinstance(subsource, str):
+        return _SUBSOURCE_TO_LEGACY_RUN_CAUSE.get(subsource)
+    return None
+
 _HISTORY_LIMIT = 100
 _STOP_POLL_INTERVAL_SEC = 0.5
 _IDLE_STREAK_CAP = 100
@@ -1336,11 +1376,7 @@ class PipelineRunner(
             await self._save_current_run_record(
                 save_run_record_as,
                 run_phase=self._run_phase_from_state(prior_state),
-                cause=(
-                    cancellation_cause.category
-                    if cancellation_cause is not None
-                    else None
-                ),
+                cause=_legacy_run_cause_from_cancellation(cancellation_cause),
             )
         task = self.state.current_task
         if task is not None:
