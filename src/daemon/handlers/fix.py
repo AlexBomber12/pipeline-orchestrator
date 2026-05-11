@@ -739,11 +739,12 @@ class FixMixin(BreachMixin):
                 )
 
         if local_no_push or remote_no_push:
-            self._last_push_at = datetime.now(timezone.utc)
             if self.state.current_pr is not None:
                 self._last_push_at = self._canonical_push_timestamp(
                     self.state.current_pr.number
                 )
+            else:  # pragma: no cover - defensive: current_pr is set throughout handle_fix
+                self._last_push_at = datetime.now(timezone.utc)
             if local_no_push:
                 self.log_event(
                     "[FIX] FIX FEEDBACK exited 0 but HEAD unchanged; "

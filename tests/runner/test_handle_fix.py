@@ -5027,6 +5027,76 @@ def test_record_fix_push_falls_back_to_now_on_metadata_failure(
     assert before - timedelta(seconds=2) <= runner._last_push_at <= after + timedelta(seconds=2)
 
 
+def test_canonical_push_timestamp_helper_does_not_move_baseline_backwards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P1 on PR #408: a rebase or cherry-pick can produce a HEAD
+    whose committer date predates the actual push. The helper must
+    never move ``_last_push_at`` below the existing baseline for the
+    same PR, otherwise old Codex comments would re-appear as new
+    feedback and cause false FIX retriggers."""
+    monkeypatch.setattr(
+        "src.github.prs.get_pr_metadata",
+        lambda repo, number: {
+            "author": "",
+            "head_sha": "rebased",
+            "head_commit_date": "2026-05-10T01:50:00Z",
+        },
+    )
+
+    runner = h._make_runner()
+    runner._last_push_at = datetime(2026, 5, 10, 2, 30, 0, tzinfo=timezone.utc)
+    runner._last_push_at_pr_number = 407
+
+    result = runner._canonical_push_timestamp(407)
+
+    assert result == datetime(2026, 5, 10, 2, 30, 0, tzinfo=timezone.utc)
+
+
+def test_canonical_push_timestamp_helper_preserves_baseline_on_fetch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When GitHub is unreachable but a same-PR baseline exists, keep
+    the baseline instead of advancing to wall clock — wall clock would
+    re-introduce the PR #407 masking bug."""
+    def raise_runtime(repo: str, number: int) -> dict:
+        raise RuntimeError("github unreachable")
+
+    monkeypatch.setattr("src.github.prs.get_pr_metadata", raise_runtime)
+
+    runner = h._make_runner()
+    baseline = datetime(2026, 5, 10, 2, 30, 0, tzinfo=timezone.utc)
+    runner._last_push_at = baseline
+    runner._last_push_at_pr_number = 407
+
+    result = runner._canonical_push_timestamp(407)
+
+    assert result == baseline
+
+
+def test_canonical_push_timestamp_helper_ignores_baseline_from_other_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A baseline recorded against a different PR must not influence
+    the new PR's timestamp — each PR has its own monotonic timeline."""
+    monkeypatch.setattr(
+        "src.github.prs.get_pr_metadata",
+        lambda repo, number: {
+            "author": "",
+            "head_sha": "abc123",
+            "head_commit_date": "2026-05-10T01:00:00Z",
+        },
+    )
+
+    runner = h._make_runner()
+    runner._last_push_at = datetime(2026, 5, 10, 5, 0, 0, tzinfo=timezone.utc)
+    runner._last_push_at_pr_number = 400
+
+    result = runner._canonical_push_timestamp(407)
+
+    assert result == datetime(2026, 5, 10, 1, 0, 0, tzinfo=timezone.utc)
+
+
 def test_no_push_branch_uses_committer_date_when_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
