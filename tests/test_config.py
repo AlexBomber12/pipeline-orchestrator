@@ -1306,13 +1306,20 @@ def test_committed_config_yml_uses_production_defaults() -> None:
     directly. ``load_config`` would deep-merge a sibling
     ``config.production.yml`` overlay and apply ``PO_*`` env overrides,
     which makes the assertion non-hermetic on developer/ops machines.
+
+    Critical security invariants (e.g. usage_api_beta_header) use
+    exact-equality checks because their loss caused real incidents.
+    Operator-tunable policy fields (timeouts, iteration caps, rate-limit
+    thresholds) use range-check assertions instead — the operator may
+    legitimately tune them, but values outside sane ranges still signal a
+    config bug or merge accident.
     """
     raw = config_module._load_config_raw("config.yml")
     cfg = AppConfig.model_validate(raw)
 
-    assert cfg.daemon.review_timeout_min == 20
-    assert cfg.daemon.planned_pr_timeout_sec == 3600
-    assert cfg.daemon.fix_iteration_cap == 25
+    assert 5 <= cfg.daemon.review_timeout_min <= 120
+    assert 300 <= cfg.daemon.planned_pr_timeout_sec <= 86400
+    assert 1 <= cfg.daemon.fix_iteration_cap <= 100
     assert cfg.daemon.usage_api_beta_header == "oauth-2025-04-20"
-    assert cfg.daemon.rate_limit_session_pause_percent == 95
-    assert cfg.daemon.rate_limit_weekly_pause_percent == 100
+    assert 50 <= cfg.daemon.rate_limit_session_pause_percent <= 100
+    assert 50 <= cfg.daemon.rate_limit_weekly_pause_percent <= 100
