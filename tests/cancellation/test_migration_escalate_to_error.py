@@ -517,6 +517,80 @@ async def test_migration_fallback_preserves_expiry_when_ttl_reports_zero() -> No
     assert redis.ttls[key] == 1
 
 
+async def test_migration_skips_unknown_legacy_category() -> None:
+    """Out-of-scope historical categories (e.g. ``OPERATOR_RECOVERY``) are
+    left untouched.
+
+    PR-315 only intends to collapse ``CRASH``, ``ESCALATE``, ``TIMEOUT``,
+    ``INFRA`` and ``NO_PUSH_DEADLOCK``. Any record carrying a different
+    category must keep its original semantics, even though the runtime
+    canonical CATEGORIES tuple has shrunk to ``("ERROR",)``.
+    """
+    op_key = cause_key("alpha", "PR-LEGACY-OP")
+    crash_key = cause_key("alpha", "PR-LEGACY-CRASH")
+    seeded = {
+        op_key: _legacy_payload(
+            "OPERATOR_RECOVERY", {"reason": "manual recover button"}
+        ),
+        crash_key: _legacy_payload("CRASH", {"error_message": "boom"}),
+    }
+    redis = _FakeRedis(seeded)
+
+    migrated = await migrate_escalate_to_error_on_startup(
+        redis, logging.getLogger(__name__)
+    )
+
+    # Only the in-scope CRASH record was rewritten.
+    assert migrated == 1
+    op_record = json.loads(redis.values[op_key])
+    assert op_record["category"] == "OPERATOR_RECOVERY"
+    assert "legacy_category" not in op_record["payload"]
+    crash_record = json.loads(redis.values[crash_key])
+    assert crash_record["category"] == "ERROR"
+    assert crash_record["payload"]["legacy_category"] == "CRASH"
+    # No write was issued for the out-of-scope record.
+    assert all(key != op_key for key, _value in redis.set_calls)
+
+
+async def test_migration_fallback_skips_expired_key_reported_by_ttl() -> None:
+    """If a key expires between ``get`` and ``ttl`` (``TTL == -2``) in
+    the fallback path, the migration must not write it back.
+
+    Resurrecting a record that already vanished from Redis would
+    re-create the cancellation entry as a persistent (no-expiry) state,
+    leaking stale forensic data forever.
+    """
+
+    class _NoKeepTTLRedis(_FakeRedis):
+        async def set(
+            self,
+            key: Any,
+            value: str,
+            *,
+            ex: int | None = None,
+        ) -> bool:
+            return await super().set(key, value, ex=ex)
+
+        async def ttl(self, key: Any) -> int:
+            # Simulate the race: get() returned the payload but by the
+            # time ttl() runs the key has already expired.
+            return -2
+
+    key = cause_key("alpha", "PR-EXPIRED")
+    redis = _NoKeepTTLRedis(
+        {key: _legacy_payload("CRASH", {"error_message": "boom"})},
+        ttls={},
+    )
+
+    migrated = await migrate_escalate_to_error_on_startup(
+        redis, logging.getLogger(__name__)
+    )
+
+    assert migrated == 0
+    # No set() was issued; the expired key is not resurrected.
+    assert redis.set_calls == []
+
+
 async def test_migration_callable_logger_warns_for_malformed_key() -> None:
     """Callable loggers receive ``_warn`` messages alongside info messages."""
     seeded = {

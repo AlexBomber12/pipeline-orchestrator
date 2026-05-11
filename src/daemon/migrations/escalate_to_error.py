@@ -23,6 +23,16 @@ from typing import Any
 
 UNIFIED_CATEGORY = "ERROR"
 
+# Explicit allow-list of legacy ``category`` values PR-315 intends to
+# collapse. Records carrying any other historical category (for example
+# ``OPERATOR_RECOVERY``, which predates the PR-281 cleanup and is still
+# treated as a legacy value by the dashboard's cancellation card) are
+# preserved verbatim — silently rewriting them to ``ERROR`` would
+# corrupt their original semantics in Redis history.
+LEGACY_CATEGORIES = frozenset(
+    {"CRASH", "ESCALATE", "TIMEOUT", "INFRA", "NO_PUSH_DEADLOCK"}
+)
+
 
 async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
@@ -90,6 +100,11 @@ async def migrate_escalate_to_error_on_startup(
         category = payload.get("category")
         if category == UNIFIED_CATEGORY:
             continue
+        if category not in LEGACY_CATEGORIES:
+            # Unknown / out-of-scope historical category — leave the
+            # record untouched rather than silently relabeling its
+            # forensic semantics to ERROR.
+            continue
 
         cause_payload = payload.get("payload")
         if not isinstance(cause_payload, dict):
@@ -117,6 +132,13 @@ async def migrate_escalate_to_error_on_startup(
                     f"(legacy_category={category}): {exc}",
                 )
                 continue
+            if ttl_remaining == -2:
+                # Redis returns -2 when the key no longer exists, i.e.
+                # it expired between the get() above and this ttl()
+                # probe. Writing it back would resurrect stale
+                # cancellation data as a persistent record; skip the
+                # rewrite entirely.
+                continue
             try:
                 if isinstance(ttl_remaining, int) and ttl_remaining >= 0:
                     # Redis TTL is second-granularity, so a reported 0
@@ -131,6 +153,8 @@ async def migrate_escalate_to_error_on_startup(
                         )
                     )
                 else:
+                    # -1 means the key exists with no expiry; rewrite
+                    # it without an ex= argument to preserve persistence.
                     await _maybe_await(redis_client.set(raw_key, serialized))
             except Exception as exc:
                 _warn(
