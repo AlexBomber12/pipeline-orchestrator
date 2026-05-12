@@ -1277,6 +1277,7 @@ def test_handle_watch_retriggers_stale_changes_requested_review(
         number: int,
         *,
         bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
     ) -> tuple[bool, bool, datetime | None]:
         retriggers.append(number)
         bypass_flags.append(bypass_same_head_dedup)
@@ -1290,7 +1291,11 @@ def test_handle_watch_retriggers_stale_changes_requested_review(
     assert bypass_flags == [True]
     assert runner.state.last_stale_retrigger_at is not None
     assert any(
-        entry["event"] == "[WATCH] Stale CHANGES_REQUESTED on PR #42; re-triggering @codex review."
+        entry["event"]
+        == (
+            "[WATCH] Stale CHANGES_REQUESTED on PR #42; "
+            "re-triggering @codex review (attempt 1/3)."
+        )
         for entry in runner.state.history
     )
 
@@ -1338,6 +1343,7 @@ def test_handle_watch_retries_after_author_dedup_window_expires(
         number: int,
         *,
         bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
     ) -> tuple[bool, bool, datetime | None]:
         bypass_flags.append(bypass_same_head_dedup)
         return True, False, requested_at + timedelta(minutes=5)
@@ -1392,6 +1398,7 @@ def test_handle_watch_debounces_failed_stale_review_retrigger(
         number: int,
         *,
         bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
     ) -> tuple[bool, bool, datetime | None]:
         bypass_flags.append(bypass_same_head_dedup)
         return False, False, None
@@ -1572,6 +1579,7 @@ def test_handle_watch_retriggers_stale_eyes_review(
         number: int,
         *,
         bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
     ) -> tuple[bool, bool, datetime | None]:
         retriggers.append(number)
         bypass_flags.append(bypass_same_head_dedup)
@@ -2469,6 +2477,7 @@ def test_handle_watch_eyes_runs_stale_review_when_bot_error_does_not_post(
         number: int,
         *,
         bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
     ) -> tuple[bool, bool, datetime | None]:
         posts.append((number, bypass_same_head_dedup))
         return True, True, None
@@ -3906,3 +3915,890 @@ def test_handle_watch_holds_merge_when_diff_fetch_fails_with_populated_patterns(
         "merge held: diff scan did not complete" in entry.get("event", "")
         for entry in runner.state.history
     )
+
+
+def test_pending_review_triggers_stale_retrigger_with_bypass_author_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PENDING review past the stale threshold re-triggers @codex review with
+    both bypass flags set, restoring the HUNG-fallback behavior lost in
+    Sprint 15b Phase 2."""
+    now = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=now,
+        head_sha="pendinghd",
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_last_push_age_seconds",
+        lambda repo, number: 700,
+    )
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return now if tz is None else now.astimezone(tz)
+
+    monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
+
+    runner = h._make_runner()
+    runner.app_config.daemon.hung_fallback_codex_review = True
+    runner.app_config.daemon.stale_review_threshold_min = 10
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.state.last_stale_retrigger_at = None
+
+    bypass_flags: list[dict[str, bool]] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        bypass_flags.append(
+            {
+                "bypass_same_head_dedup": bypass_same_head_dedup,
+                "bypass_author_dedup": bypass_author_dedup,
+            }
+        )
+        return True, True, None
+
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    result = asyncio.run(runner._maybe_retrigger_stale_review(42))
+
+    assert result is True
+    assert bypass_flags == [
+        {"bypass_same_head_dedup": True, "bypass_author_dedup": True}
+    ]
+    assert runner.state.last_stale_retrigger_at is not None
+    assert any(
+        entry["event"]
+        == (
+            "[WATCH] Stale PENDING on PR #42; "
+            "re-triggering @codex review (attempt 1/3)."
+        )
+        for entry in runner.state.history
+    )
+
+
+def test_pending_review_retrigger_respects_hung_fallback_codex_review_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``hung_fallback_codex_review`` is False the PENDING-stale path
+    must not retrigger, preserving the post-Phase-2 opt-out for operators
+    who explicitly disabled HUNG retries."""
+    now = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=now,
+        head_sha="pendinghd",
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_last_push_age_seconds",
+        lambda repo, number: 700,
+    )
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return now if tz is None else now.astimezone(tz)
+
+    monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
+
+    runner = h._make_runner()
+    runner.app_config.daemon.hung_fallback_codex_review = False
+    runner.app_config.daemon.stale_review_threshold_min = 10
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.state.last_stale_retrigger_at = None
+
+    calls: list[int] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        calls.append(number)
+        return True, True, None
+
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    result = asyncio.run(runner._maybe_retrigger_stale_review(42))
+
+    assert result is False
+    assert calls == []
+    assert not any(
+        "Stale PENDING" in entry.get("event", "")
+        for entry in runner.state.history
+    )
+
+
+def test_pending_review_retrigger_respects_stale_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PENDING review whose last push is younger than the stale threshold
+    must not retrigger; the recency gate is the same one the
+    CHANGES_REQUESTED path uses."""
+    now = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=now,
+        head_sha="pendinghd",
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_last_push_age_seconds",
+        lambda repo, number: 300,
+    )
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return now if tz is None else now.astimezone(tz)
+
+    monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
+
+    runner = h._make_runner()
+    runner.app_config.daemon.hung_fallback_codex_review = True
+    runner.app_config.daemon.stale_review_threshold_min = 10
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.state.last_stale_retrigger_at = None
+
+    calls: list[int] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        calls.append(number)
+        return True, True, None
+
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    result = asyncio.run(runner._maybe_retrigger_stale_review(42))
+
+    assert result is False
+    assert calls == []
+
+
+def test_handle_watch_pending_review_calls_stale_retrigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The WATCH dispatch must invoke ``_maybe_retrigger_stale_review`` when
+    review_status is PENDING and CI is green-or-pending; otherwise the
+    PENDING branch would silently fall through and the retrigger would
+    never fire."""
+    now = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=now,
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        "src.github.cache._gh_api_paginated",
+        lambda path: [],
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_last_push_age_seconds",
+        lambda repo, number: 700,
+    )
+
+    retrigger_calls: list[int] = []
+
+    async def fake_stale(pr_number: int) -> bool:
+        retrigger_calls.append(pr_number)
+        return True
+
+    runner = h._make_runner(review_timeout_min=120)
+    runner.app_config.daemon.hung_fallback_codex_review = True
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = now - timedelta(minutes=12)
+    runner._last_push_at_pr_number = pr.number
+    runner._maybe_retrigger_stale_review = fake_stale  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert retrigger_calls == [42]
+
+
+def test_changes_requested_retrigger_still_passes_bypass_author_dedup_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the CHANGES_REQUESTED stale-retrigger path now also passes
+    ``bypass_author_dedup=True``, consistent with the EYES path. This
+    matches the rationale of PR-422 — when retrigger fires past the stale
+    threshold the dedup window (5 min) has long expired, so author-dedup
+    must not block the deliberate retry."""
+    now = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=now,
+        head_sha="changeshd",
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_last_push_age_seconds",
+        lambda repo, number: 700,
+    )
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return now if tz is None else now.astimezone(tz)
+
+    monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
+
+    runner = h._make_runner()
+    runner.app_config.daemon.stale_review_threshold_min = 10
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.state.last_stale_retrigger_at = None
+
+    bypass_flags: list[dict[str, bool]] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        bypass_flags.append(
+            {
+                "bypass_same_head_dedup": bypass_same_head_dedup,
+                "bypass_author_dedup": bypass_author_dedup,
+            }
+        )
+        return True, True, None
+
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner._maybe_retrigger_stale_review(42))
+
+    assert bypass_flags[-1] == {
+        "bypass_same_head_dedup": True,
+        "bypass_author_dedup": True,
+    }
+
+
+def _freeze_watch_datetime(
+    monkeypatch: pytest.MonkeyPatch, now: datetime
+) -> None:
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return now if tz is None else now.astimezone(tz)
+
+    monkeypatch.setattr(watch_module, "datetime", _FrozenDateTime)
+
+
+def test_pending_retrigger_increments_watch_retrigger_count_on_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful @codex review retrigger bumps the per-PR counter so the
+    cap can eventually fire on the third stale cycle."""
+    now = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=now,
+        head_sha="pendinghd",
+        watch_retrigger_count=0,
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_last_push_age_seconds",
+        lambda repo, number: 700,
+    )
+    _freeze_watch_datetime(monkeypatch, now)
+
+    runner = h._make_runner()
+    runner.app_config.daemon.hung_fallback_codex_review = True
+    runner.app_config.daemon.stale_review_threshold_min = 10
+    runner.app_config.daemon.watch_retrigger_cap = 3
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.state.last_stale_retrigger_at = None
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        return True, True, None
+
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    result = asyncio.run(runner._maybe_retrigger_stale_review(42))
+
+    assert result is True
+    assert runner.state.current_pr.watch_retrigger_count == 1
+    assert any(
+        entry["event"]
+        == (
+            "[WATCH] Stale PENDING on PR #42; "
+            "re-triggering @codex review (attempt 1/3)."
+        )
+        for entry in runner.state.history
+    )
+
+
+def test_pending_retrigger_does_not_increment_on_dedup_skip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``_post_codex_review_result`` skips via dedup (posted=False) the
+    counter must NOT advance — counter accuracy reflects wasted retries
+    only, not bypassed ones."""
+    now = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=now,
+        head_sha="pendinghd",
+        watch_retrigger_count=0,
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_last_push_age_seconds",
+        lambda repo, number: 700,
+    )
+    _freeze_watch_datetime(monkeypatch, now)
+
+    runner = h._make_runner()
+    runner.app_config.daemon.hung_fallback_codex_review = True
+    runner.app_config.daemon.stale_review_threshold_min = 10
+    runner.app_config.daemon.watch_retrigger_cap = 3
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.state.last_stale_retrigger_at = None
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        return True, False, now + timedelta(minutes=2)
+
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    result = asyncio.run(runner._maybe_retrigger_stale_review(42))
+
+    assert result is False
+    assert runner.state.current_pr.watch_retrigger_count == 0
+
+
+def test_pending_retrigger_cap_reached_escalates_to_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Third stale cycle on a permanently-silent Codex Connector escalates
+    through ``_commit_and_park_in_error`` instead of re-posting @codex review."""
+    now = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=now,
+        head_sha="pendinghd",
+        watch_retrigger_count=3,
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_last_push_age_seconds",
+        lambda repo, number: 700,
+    )
+    _freeze_watch_datetime(monkeypatch, now)
+
+    runner = h._make_runner()
+    runner.app_config.daemon.hung_fallback_codex_review = True
+    runner.app_config.daemon.stale_review_threshold_min = 10
+    runner.app_config.daemon.watch_retrigger_cap = 3
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.state.last_stale_retrigger_at = None
+
+    park_calls: list[dict[str, Any]] = []
+
+    async def fake_park(
+        message: str,
+        *,
+        subsource: str,
+        log_message: str | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
+        park_calls.append(
+            {
+                "message": message,
+                "subsource": subsource,
+                "log_message": log_message,
+                "extra_payload": extra_payload,
+            }
+        )
+        if log_message is not None:
+            runner.log_event(log_message)
+
+    runner._commit_and_park_in_error = fake_park  # type: ignore[assignment]
+
+    post_calls: list[int] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        post_calls.append(number)
+        return True, True, None
+
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    result = asyncio.run(runner._maybe_retrigger_stale_review(42))
+
+    assert result is False
+    assert post_calls == []
+    assert len(park_calls) == 1
+    call = park_calls[0]
+    assert "watch_retrigger_cap_reached: 3 cycles" in call["message"]
+    assert call["subsource"] == "watch_retrigger_cap"
+    assert call["extra_payload"] == {
+        "review_status": "PENDING",
+        "retrigger_count": 3,
+        "cap": 3,
+    }
+    assert any(
+        entry["event"]
+        == (
+            "PR #42 watch_retrigger cap reached (3/3); escalating to "
+            "ERROR instead of re-triggering @codex review."
+        )
+        for entry in runner.state.history
+    )
+
+
+def test_changes_requested_retrigger_cap_reached_escalates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cap covers CHANGES_REQUESTED, not just PENDING — Codex going silent on
+    a real review-requested PR is the same failure mode."""
+    now = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=now,
+        head_sha="changeshd",
+        watch_retrigger_count=3,
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_last_push_age_seconds",
+        lambda repo, number: 700,
+    )
+    _freeze_watch_datetime(monkeypatch, now)
+
+    runner = h._make_runner()
+    runner.app_config.daemon.stale_review_threshold_min = 10
+    runner.app_config.daemon.watch_retrigger_cap = 3
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.state.last_stale_retrigger_at = None
+
+    park_calls: list[dict[str, Any]] = []
+
+    async def fake_park(
+        message: str,
+        *,
+        subsource: str,
+        log_message: str | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
+        park_calls.append({"subsource": subsource, "extra_payload": extra_payload})
+
+    runner._commit_and_park_in_error = fake_park  # type: ignore[assignment]
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        raise AssertionError("cap branch must not call _post_codex_review_result")
+
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    result = asyncio.run(runner._maybe_retrigger_stale_review(42))
+
+    assert result is False
+    assert len(park_calls) == 1
+    assert park_calls[0]["subsource"] == "watch_retrigger_cap"
+    assert park_calls[0]["extra_payload"]["review_status"] == "CHANGES_REQUESTED"
+
+
+def test_eyes_retrigger_cap_reached_escalates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cap covers EYES too — using the shorter eyes-specific threshold."""
+    now = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.EYES,
+        last_activity=now,
+        head_sha="eyeshd",
+        watch_retrigger_count=3,
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_last_push_age_seconds",
+        lambda repo, number: 6 * 60,
+    )
+    _freeze_watch_datetime(monkeypatch, now)
+
+    runner = h._make_runner()
+    runner.app_config.daemon.stale_review_threshold_eyes_min = 5
+    runner.app_config.daemon.watch_retrigger_cap = 3
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.state.last_stale_retrigger_at = None
+
+    park_calls: list[dict[str, Any]] = []
+
+    async def fake_park(
+        message: str,
+        *,
+        subsource: str,
+        log_message: str | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
+        park_calls.append({"subsource": subsource, "extra_payload": extra_payload})
+
+    runner._commit_and_park_in_error = fake_park  # type: ignore[assignment]
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        raise AssertionError("cap branch must not call _post_codex_review_result")
+
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    result = asyncio.run(runner._maybe_retrigger_stale_review(42))
+
+    assert result is False
+    assert len(park_calls) == 1
+    assert park_calls[0]["subsource"] == "watch_retrigger_cap"
+    assert park_calls[0]["extra_payload"]["review_status"] == "EYES"
+
+
+def test_pending_retrigger_counter_resets_on_fresh_review_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Genuine GitHub event observed between WATCH cycles zeros the counter
+    so the next stale cycle gets the full retry budget back."""
+    now = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.EYES,
+        last_activity=now,
+        head_sha="freshhd",
+        watch_retrigger_count=2,
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        "src.github.cache._gh_api_paginated",
+        lambda path: [],
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_last_push_age_seconds",
+        lambda repo, number: 60,
+    )
+    _freeze_watch_datetime(monkeypatch, now)
+
+    runner = h._make_runner(review_timeout_min=120)
+    runner.app_config.daemon.hung_fallback_codex_review = True
+    runner.app_config.daemon.stale_review_threshold_eyes_min = 5
+    runner.app_config.daemon.watch_retrigger_cap = 3
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = now - timedelta(minutes=12)
+    runner._last_push_at_pr_number = pr.number
+    runner._watch_last_event_signature = (
+        42,
+        CIStatus.PENDING,
+        ReviewStatus.PENDING,
+        now - timedelta(minutes=20),
+    )
+
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.watch_retrigger_count == 0
+
+
+def test_call_sites_in_handle_watch_use_await(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Smoke test: handle_watch must ``await`` the now-async retrigger helper
+    for each review state that dispatches to it. A missing ``await`` would
+    yield a coroutine warning or a never-called record."""
+    now = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
+    _freeze_watch_datetime(monkeypatch, now)
+
+    monkeypatch.setattr(
+        "src.github.cache._gh_api_paginated",
+        lambda path: [],
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_last_push_age_seconds",
+        lambda repo, number: 700,
+    )
+
+    states = [
+        (ReviewStatus.CHANGES_REQUESTED, CIStatus.SUCCESS),
+        (ReviewStatus.EYES, CIStatus.PENDING),
+        (ReviewStatus.PENDING, CIStatus.PENDING),
+    ]
+
+    for review_status, ci_status in states:
+        pr = PRInfo(
+            number=42,
+            branch="pr-042-fix",
+            ci_status=ci_status,
+            review_status=review_status,
+            last_activity=now,
+            head_sha="hd",
+        )
+        monkeypatch.setattr(
+            "src.github.prs.get_open_prs",
+            lambda repo, **kw: [pr],
+        )
+
+        retrigger_calls: list[int] = []
+
+        async def fake_stale(pr_number: int) -> bool:
+            retrigger_calls.append(pr_number)
+            return False
+
+        runner = h._make_runner(review_timeout_min=120)
+        runner.app_config.daemon.hung_fallback_codex_review = True
+        runner.state.current_pr = pr
+        runner.state.state = PipelineState.WATCH
+        runner._last_push_at = now - timedelta(minutes=12)
+        runner._last_push_at_pr_number = pr.number
+        runner._maybe_retrigger_stale_review = fake_stale  # type: ignore[assignment]
+        runner._maybe_retrigger_on_codex_bot_error = (  # type: ignore[assignment]
+            lambda pr_number: False
+        )
+
+        asyncio.run(runner.handle_watch())
+
+        assert retrigger_calls == [42], (
+            f"retrigger not awaited for review={review_status.value}, "
+            f"ci={ci_status.value}"
+        )
+
+
+@pytest.mark.parametrize(
+    "review_status,ci_status",
+    [
+        (ReviewStatus.PENDING, CIStatus.PENDING),
+        (ReviewStatus.EYES, CIStatus.PENDING),
+        (ReviewStatus.CHANGES_REQUESTED, CIStatus.SUCCESS),
+    ],
+)
+def test_handle_watch_returns_after_cap_reached_escalation(
+    monkeypatch: pytest.MonkeyPatch,
+    review_status: ReviewStatus,
+    ci_status: CIStatus,
+) -> None:
+    """When the cap branch fires inside ``_maybe_retrigger_stale_review`` the
+    runner state transitions to ERROR; ``handle_watch`` must short-circuit
+    before the review-timeout branch, otherwise a second escalation would
+    overwrite the cap message and set ``skip_ai_error_diagnose=True``
+    (turning a task-level park into a global stop-the-world ERROR).
+    Covers all three review states that dispatch to the stale-retrigger
+    helper, so each early-return guard is exercised."""
+    now = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
+    last_activity = now - timedelta(hours=3)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=ci_status,
+        review_status=review_status,
+        last_activity=last_activity,
+        head_sha="caphd",
+        watch_retrigger_count=3,
+    )
+    _freeze_watch_datetime(monkeypatch, now)
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        "src.github.cache._gh_api_paginated",
+        lambda path: [],
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_last_push_age_seconds",
+        lambda repo, number: 700,
+    )
+
+    runner = h._make_runner(review_timeout_min=20)
+    runner.app_config.daemon.hung_fallback_codex_review = True
+    runner.app_config.daemon.stale_review_threshold_min = 10
+    runner.app_config.daemon.stale_review_threshold_eyes_min = 5
+    runner.app_config.daemon.watch_retrigger_cap = 3
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.state.last_stale_retrigger_at = None
+    runner._last_push_at = last_activity
+    runner._last_push_at_pr_number = pr.number
+
+    park_calls: list[dict[str, Any]] = []
+
+    async def fake_park(
+        message: str,
+        *,
+        subsource: str,
+        log_message: str | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
+        park_calls.append({"subsource": subsource, "message": message})
+        runner.state.state = PipelineState.ERROR
+
+    runner._commit_and_park_in_error = fake_park  # type: ignore[assignment]
+
+    transition_calls: list[str] = []
+
+    async def fake_transition_to_error(
+        message: str,
+        *,
+        save_run_record_as: str | None = None,
+        log_prefix: str = "[ERROR]",
+        log_message: str | None = None,
+        cancellation_cause: Any = None,
+    ) -> None:
+        transition_calls.append(message)
+        runner.state.state = PipelineState.ERROR
+
+    runner._transition_to_error = fake_transition_to_error  # type: ignore[assignment]
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        raise AssertionError(
+            "cap branch must not call _post_codex_review_result"
+        )
+
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert len(park_calls) == 1
+    assert park_calls[0]["subsource"] == "watch_retrigger_cap"
+    assert transition_calls == []
+
+
+def test_pending_retrigger_cap_permits_exactly_cap_retriggers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured cap of N must allow exactly N actual retrigger posts
+    before escalating. Regression for the off-by-one where ``next_count >=
+    cap`` short-circuited at cycle N (only N-1 posts) and made
+    ``watch_retrigger_cap=1`` post zero retriggers."""
+    now = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=now,
+        head_sha="caphd",
+        watch_retrigger_count=0,
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_last_push_age_seconds",
+        lambda repo, number: 700,
+    )
+    _freeze_watch_datetime(monkeypatch, now)
+
+    runner = h._make_runner()
+    runner.app_config.daemon.hung_fallback_codex_review = True
+    runner.app_config.daemon.stale_review_threshold_min = 10
+    runner.app_config.daemon.watch_retrigger_cap = 3
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+
+    post_calls: list[int] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        post_calls.append(number)
+        return True, True, None
+
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    park_calls: list[str] = []
+
+    async def fake_park(
+        message: str,
+        *,
+        subsource: str,
+        log_message: str | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
+        park_calls.append(subsource)
+
+    runner._commit_and_park_in_error = fake_park  # type: ignore[assignment]
+
+    for cycle in range(1, 5):
+        runner.state.last_stale_retrigger_at = None
+        result = asyncio.run(runner._maybe_retrigger_stale_review(42))
+        if cycle <= 3:
+            assert result is True, f"cycle {cycle} should post"
+            assert runner.state.current_pr.watch_retrigger_count == cycle
+        else:
+            assert result is False, "cycle 4 must hit cap"
+
+    assert len(post_calls) == 3
+    assert park_calls == ["watch_retrigger_cap"]
