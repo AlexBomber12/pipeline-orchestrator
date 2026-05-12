@@ -337,7 +337,13 @@ class WatchMixin:
                 f"[WATCH] PR #{found.number} CHANGES_REQUESTED but no new "
                 f"Codex feedback since last push; waiting for fresh review."
             )
-            self._maybe_retrigger_stale_review(found.number)
+            await self._maybe_retrigger_stale_review(found.number)
+            # watch_retrigger_cap reached -> task parked in ERROR. Skip the
+            # review-timeout block below so the cap escalation is not
+            # immediately overwritten by a second (global, skip-AI-diagnose)
+            # escalation in the same cycle.
+            if self.state.state != PipelineState.WATCH:
+                return
         elif ci == CIStatus.PENDING:
             pass
 
@@ -354,10 +360,14 @@ class WatchMixin:
         if review == ReviewStatus.EYES:
             posted = self._maybe_retrigger_on_codex_bot_error(found.number)
             if not posted:
-                self._maybe_retrigger_stale_review(found.number)
+                await self._maybe_retrigger_stale_review(found.number)
+                if self.state.state != PipelineState.WATCH:
+                    return
 
         if review == ReviewStatus.PENDING:
-            self._maybe_retrigger_stale_review(found.number)
+            await self._maybe_retrigger_stale_review(found.number)
+            if self.state.state != PipelineState.WATCH:
+                return
 
         last_activity = found.last_activity or self.state.last_updated
         if last_activity.tzinfo is None:
@@ -622,7 +632,7 @@ class WatchMixin:
                 return FeedbackCheckResult.NEW
         return FeedbackCheckResult.NONE
 
-    def _maybe_retrigger_stale_review(self, pr_number: int) -> bool:
+    async def _maybe_retrigger_stale_review(self, pr_number: int) -> bool:
         """Re-trigger ``@codex review`` when a stale review blocks progress.
 
         EYES is the OBS-Z race-window state — Codex acknowledged the
@@ -674,9 +684,31 @@ class WatchMixin:
                 return False
 
         state_label = current_pr.review_status.value
+        cap = self.app_config.daemon.watch_retrigger_cap
+        prior_count = current_pr.watch_retrigger_count
+        if prior_count >= cap:
+            await self._commit_and_park_in_error(
+                (
+                    f"watch_retrigger_cap_reached: {prior_count} cycles "
+                    f"with no fresh review activity (review={state_label})"
+                ),
+                subsource="watch_retrigger_cap",
+                log_message=(
+                    f"PR #{pr_number} watch_retrigger cap reached "
+                    f"({prior_count}/{cap}); escalating to ERROR instead "
+                    f"of re-triggering @codex review."
+                ),
+                extra_payload={
+                    "review_status": state_label,
+                    "retrigger_count": prior_count,
+                    "cap": cap,
+                },
+            )
+            return False
+        next_count = prior_count + 1
         self.log_event(
             f"[WATCH] Stale {state_label} on PR #{pr_number}; "
-            f"re-triggering @codex review."
+            f"re-triggering @codex review (attempt {next_count}/{cap})."
         )
         success, posted, retry_at = self._post_codex_review_result(
             pr_number,
@@ -684,6 +716,8 @@ class WatchMixin:
             bypass_author_dedup=True,
         )
         self.state.last_stale_retrigger_at = now
+        if posted:
+            current_pr.watch_retrigger_count = next_count
         return posted
 
     def _maybe_retrigger_on_codex_bot_error(self, pr_number: int) -> bool:
