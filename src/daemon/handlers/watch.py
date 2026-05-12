@@ -182,8 +182,15 @@ class WatchMixin:
         # HEAD once ``_DIFF_PATTERNS`` is populated, defeating the
         # "once per SHA" contract. Preserve the cache when the head SHA
         # is unchanged; a new HEAD legitimately re-arms the scan, so
-        # leave the field at its default ``None`` in that case.
-        if current_pr.head_sha and current_pr.head_sha == found.head_sha:
+        # leave the field at its default ``None`` in that case. The
+        # comparison is equality-only (no truthy guard on
+        # ``current_pr.head_sha``) so that a transient ``""`` head SHA
+        # observed on both sides — a state ``PRInfo`` already models for
+        # ``gh`` payloads that omit the SHA — still counts as
+        # "head unchanged" and the cache survives, instead of being
+        # repeatedly dropped and forcing a noisy retry loop against a
+        # populated catalogue.
+        if current_pr.head_sha == found.head_sha:
             preserved_diff_scanned_at_sha = current_pr.diff_scanned_at_sha
         else:
             preserved_diff_scanned_at_sha = found.diff_scanned_at_sha

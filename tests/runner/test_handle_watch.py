@@ -3791,6 +3791,53 @@ def test_handle_watch_drops_diff_scanned_at_sha_when_head_changes(
     assert runner.state.current_pr.diff_scanned_at_sha is None
 
 
+def test_handle_watch_preserves_diff_scanned_at_sha_when_head_sha_empty_on_both_sides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``PRInfo`` models a transiently empty ``head_sha`` for ``gh``
+    payloads that omit the SHA. When both the in-memory and polled HEAD
+    SHA are empty strings the HEAD has not changed, so the cache-carry
+    logic must preserve ``diff_scanned_at_sha`` (equality alone, no
+    truthy guard) — otherwise ``_scan_pr_diff_once`` would re-run
+    ``gh pr diff`` on every WATCH cycle for the same PR state and, with
+    populated diff guardrails, repeatedly hit fetch failures and hold
+    merges noisily."""
+    pr = PRInfo(
+        number=23,
+        branch="pr-023",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=datetime.now(timezone.utc),
+        head_sha="",
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+
+    observed: list[str | None] = []
+
+    async def fake_scan(self: Any) -> bool:
+        observed.append(self.state.current_pr.diff_scanned_at_sha)
+        return False
+
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_scan_pr_diff_once",
+        fake_scan,
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=23,
+        branch="pr-023",
+        head_sha="",
+        diff_scanned_at_sha="cachedsha",
+    )
+    asyncio.run(runner.handle_watch())
+
+    assert observed == ["cachedsha"]
+    assert runner.state.current_pr.diff_scanned_at_sha == "cachedsha"
+
+
 def test_handle_watch_holds_merge_when_diff_fetch_fails_with_populated_patterns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
