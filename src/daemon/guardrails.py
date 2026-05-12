@@ -126,7 +126,9 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         + _DIFF_WORKFLOW_B_PATH_RE
         + r"[^\r\n]*\r?\n"
         r"(?:(?:(?!^diff --git[ \t]).)*?^[ +][ \t]*"
-        r"[\"']?permissions[\"']?[ \t]*:[ \t]*(?:#.*)?\r?\n"
+        r"[\"']?permissions[\"']?[ \t]*:[ \t]*(?:"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"\{[ \t]*)?(?:#.*)?\r?\n"
         r"(?:^[ +][ \t]*(?:#.*)?\r?\n|^[ +\-][ \t]+"
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
         + r"[ \t]*:[^\r\n]*\r?\n)*^\+[ \t]+"
