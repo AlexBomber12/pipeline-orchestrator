@@ -4623,3 +4623,94 @@ def test_call_sites_in_handle_watch_use_await(
             f"retrigger not awaited for review={review_status.value}, "
             f"ci={ci_status.value}"
         )
+
+
+def test_handle_watch_returns_after_cap_reached_escalation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the cap branch fires inside ``_maybe_retrigger_stale_review`` the
+    runner state transitions to ERROR; ``handle_watch`` must short-circuit
+    before the review-timeout branch, otherwise a second escalation would
+    overwrite the cap message and set ``skip_ai_error_diagnose=True``
+    (turning a task-level park into a global stop-the-world ERROR)."""
+    now = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
+    last_activity = now - timedelta(hours=3)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=last_activity,
+        head_sha="pendinghd",
+        watch_retrigger_count=2,
+    )
+    _freeze_watch_datetime(monkeypatch, now)
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+    monkeypatch.setattr(
+        "src.github.cache._gh_api_paginated",
+        lambda path: [],
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_last_push_age_seconds",
+        lambda repo, number: 700,
+    )
+
+    runner = h._make_runner(review_timeout_min=20)
+    runner.app_config.daemon.hung_fallback_codex_review = True
+    runner.app_config.daemon.stale_review_threshold_min = 10
+    runner.app_config.daemon.watch_retrigger_cap = 3
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.state.last_stale_retrigger_at = None
+    runner._last_push_at = last_activity
+    runner._last_push_at_pr_number = pr.number
+
+    park_calls: list[dict[str, Any]] = []
+
+    async def fake_park(
+        message: str,
+        *,
+        subsource: str,
+        log_message: str | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
+        park_calls.append({"subsource": subsource, "message": message})
+        runner.state.state = PipelineState.ERROR
+
+    runner._commit_and_park_in_error = fake_park  # type: ignore[assignment]
+
+    transition_calls: list[str] = []
+
+    async def fake_transition_to_error(
+        message: str,
+        *,
+        save_run_record_as: str | None = None,
+        log_prefix: str = "[ERROR]",
+        log_message: str | None = None,
+        cancellation_cause: Any = None,
+    ) -> None:
+        transition_calls.append(message)
+        runner.state.state = PipelineState.ERROR
+
+    runner._transition_to_error = fake_transition_to_error  # type: ignore[assignment]
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        raise AssertionError(
+            "cap branch must not call _post_codex_review_result"
+        )
+
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    asyncio.run(runner.handle_watch())
+
+    assert len(park_calls) == 1
+    assert park_calls[0]["subsource"] == "watch_retrigger_cap"
+    assert transition_calls == []

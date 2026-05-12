@@ -338,6 +338,12 @@ class WatchMixin:
                 f"Codex feedback since last push; waiting for fresh review."
             )
             await self._maybe_retrigger_stale_review(found.number)
+            # watch_retrigger_cap reached -> task parked in ERROR. Skip the
+            # review-timeout block below so the cap escalation is not
+            # immediately overwritten by a second (global, skip-AI-diagnose)
+            # escalation in the same cycle.
+            if self.state.state != PipelineState.WATCH:
+                return
         elif ci == CIStatus.PENDING:
             pass
 
@@ -355,9 +361,13 @@ class WatchMixin:
             posted = self._maybe_retrigger_on_codex_bot_error(found.number)
             if not posted:
                 await self._maybe_retrigger_stale_review(found.number)
+                if self.state.state != PipelineState.WATCH:
+                    return
 
         if review == ReviewStatus.PENDING:
             await self._maybe_retrigger_stale_review(found.number)
+            if self.state.state != PipelineState.WATCH:
+                return
 
         last_activity = found.last_activity or self.state.last_updated
         if last_activity.tzinfo is None:
