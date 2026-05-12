@@ -717,7 +717,8 @@ def test_scan_pr_diff_workflow_quoted_scope_key_write_flagged() -> None:
 
 def test_scan_pr_diff_workflow_scope_write_without_parent_context_flagged() -> None:
     diff_text = (
-        WORKFLOW_DIFF_HEADER + "@@ -20,3 +20,4 @@\n+  pull-requests: write\n"
+        WORKFLOW_DIFF_HEADER
+        + "@@ -20,3 +20,3 @@\n-  pull-requests: read\n+  pull-requests: write\n"
     )
 
     _assert_diff_categories(diff_text, ["permissions_escalation"])
@@ -814,6 +815,17 @@ def test_scan_pr_diff_workflow_env_named_contents_not_flagged() -> None:
         + "@@ -1,4 +1,5 @@\n"
         " env:\n"
         "+  contents: write\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_workflow_env_named_write_scope_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,4 +1,5 @@\n"
+        " env:\n"
+        "+  issues: write\n"
     )
 
     assert scan_pr_diff(diff_text) == []

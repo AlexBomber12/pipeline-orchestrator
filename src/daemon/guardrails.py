@@ -109,12 +109,6 @@ _WORKFLOW_WRITE_PERMISSION_SCOPES_RE = (
     r"pull-requests|repository-projects|security-events|statuses|models|"
     r"vulnerability-alerts)[\"']?"
 )
-_WORKFLOW_WRITE_PERMISSION_SCOPES_WITHOUT_CONTENTS_RE = (
-    r"[\"']?(?:actions|attestations|artifact-metadata|checks|code-quality|"
-    r"deployments|discussions|id-token|issues|packages|pages|pull-requests|"
-    r"repository-projects|security-events|statuses|models|"
-    r"vulnerability-alerts)[\"']?"
-)
 _YAML_SCALAR_ANCHOR_RE = r"(?:&[A-Za-z_][A-Za-z0-9_-]*[ \t]+)?"
 
 # Diff-content scan catalogue. PR-290b adds workflow YAML tampering checks;
@@ -130,8 +124,8 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         # those YAML positions to avoid script-literal false positives.
         # Top-level permission-map scope additions are also matched even
         # when the parent `permissions:` line is outside the diff hunk.
-        # `contents` needs a separate partial-hunk replacement path because
-        # unrelated YAML blocks commonly use a `contents` key too.
+        # Contextless partial hunks need a replacement path because unrelated
+        # workflow YAML blocks can use the same keys outside `permissions`.
         r"(?ms)^diff --git[^\r\n]*[ \t]+"
         + _DIFF_WORKFLOW_B_PATH_RE
         + r"[^\r\n]*\r?\n"
@@ -161,13 +155,11 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         + r"[ \t]*:[ \t]*"
         + _YAML_SCALAR_ANCHOR_RE
         + r"[\"']?write[\"']?[^\r\n}]*\})"
-        r"|(?:(?!^diff --git[ \t]).)*?^-[ \t]{2}[\"']?contents[\"']?"
-        r"[ \t]*:[ \t]*[\"']?(?:read|none)[\"']?[^\r\n]*\r?\n"
-        r"^\+[ \t]{2}[\"']?contents[\"']?[ \t]*:[ \t]*"
-        + _YAML_SCALAR_ANCHOR_RE
-        + r"[\"']?write[\"']?"
-        r"|(?:(?!^diff --git[ \t]).)*?^\+[ \t]{2}"
-        + _WORKFLOW_WRITE_PERMISSION_SCOPES_WITHOUT_CONTENTS_RE
+        r"|(?:(?!^diff --git[ \t]).)*?^-[ \t]{2}"
+        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+        + r"[ \t]*:[ \t]*[\"']?(?:read|none)[\"']?[^\r\n]*\r?\n"
+        r"^\+[ \t]{2}"
+        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
         + r"[ \t]*:[ \t]*"
         + _YAML_SCALAR_ANCHOR_RE
         + r"[\"']?write[\"']?"
