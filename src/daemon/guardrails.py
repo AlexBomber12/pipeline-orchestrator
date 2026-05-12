@@ -115,13 +115,13 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         r"(?ms)^diff --git[ \t]+a/\.github/workflows/[^\r\n]+\.ya?ml"
         r"[ \t]+b/\.github/workflows/[^\r\n]+\.ya?ml[^\r\n]*\r?\n"
         r"(?:(?!^diff --git[ \t]).)*?(?:"
-        r"^\+[ \t]*permissions:[ \t]*write-all[ \t]*(?:#.*)?$"
+        r"^\+[ \t]*permissions:[ \t]*[\"']?write-all[\"']?[ \t]*(?:#.*)?$"
         r"|^[ +][ \t]*permissions:[ \t]*(?:#.*)?\r?\n"
         r"(?:(?!^diff --git[ \t]).)*?^\+[ \t]+(?:actions|attestations|"
         r"artifact-metadata|checks|code-quality|contents|deployments|"
         r"discussions|id-token|issues|packages|pages|pull-requests|"
-        r"repository-projects|security-events|statuses):[ \t]*write"
-        r"[ \t]*(?:#.*)?$"
+        r"repository-projects|security-events|statuses):[ \t]*[\"']?write"
+        r"[\"']?[ \t]*(?:#.*)?$"
         r")",
         re.IGNORECASE,
     ),
