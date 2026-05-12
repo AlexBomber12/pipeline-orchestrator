@@ -3521,13 +3521,15 @@ def test_scan_pr_diff_once_leaves_cache_unchanged_on_fetch_failure(
     assert runner.state.current_pr.diff_scanned_at_sha == "prior"
 
 
-def test_scan_pr_diff_once_empty_catalogue_marks_head_to_avoid_loop(
+def test_scan_pr_diff_once_empty_catalogue_does_not_mark_head(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """PR-290a skeleton: with an empty pattern catalogue, the dispatcher
-    still records ``diff_scanned_at_sha`` so subsequent WATCH cycles on
-    the same HEAD short-circuit cheaply at the cache-hit gate instead
-    of re-entering the empty-catalogue branch every poll."""
+    must NOT record ``diff_scanned_at_sha``. Catalogue contents change at
+    deploy time; marking a HEAD as scanned while patterns are empty would
+    let the cache-hit gate short-circuit the same HEAD forever after the
+    PR-290b/c rollout populated the rules, bypassing the new catalogue
+    until a fresh push moved HEAD."""
     monkeypatch.setattr(watch_module.guardrails, "_DIFF_PATTERNS", {})
     monkeypatch.setattr(watch_module.guardrails, "_DIFF_RULES", {})
 
@@ -3547,7 +3549,7 @@ def test_scan_pr_diff_once_empty_catalogue_marks_head_to_avoid_loop(
     result = asyncio.run(runner._scan_pr_diff_once())
 
     assert result is False
-    assert runner.state.current_pr.diff_scanned_at_sha == "bee1bee1"
+    assert runner.state.current_pr.diff_scanned_at_sha is None
 
 
 def test_scan_pr_diff_once_violation_transitions_to_error_with_guardrail_subsource(

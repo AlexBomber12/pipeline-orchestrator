@@ -441,10 +441,15 @@ class WatchMixin:
           ``get_pr_diff`` + scan. A transient ``gh`` failure leaves the
           field unchanged so the next WATCH cycle retries on the same
           SHA — fetch failures must never count as "scanned".
-        * The empty-catalogue branch (PR-290a skeleton) still marks the
-          current HEAD as scanned. Without that update the dispatcher
-          would re-enter the empty-catalogue path every cycle and
-          consume polling time on a no-op.
+        * The empty-catalogue branch (PR-290a skeleton) MUST NOT mark
+          the current HEAD as scanned. Catalogue contents change at
+          deploy time (PR-290b/c, PR-301..PR-304 add real patterns); a
+          PR scanned during the empty-catalogue skeleton state and
+          cached as "already scanned" would short-circuit at the cache
+          gate forever after, never being evaluated against the newly
+          populated rules unless a fresh push moved HEAD. The cost of
+          re-checking the empty-dict each cycle is a single ``not``
+          test — far cheaper than the bypass it prevents.
 
         On a populated catalogue (PR-290b/c, PR-301..PR-304) a match
         routes through ``_transition_to_error`` with a structured
@@ -454,10 +459,9 @@ class WatchMixin:
         current_pr = self.state.current_pr
         if current_pr is None:
             return False
-        if current_pr.diff_scanned_at_sha == current_pr.head_sha:
-            return False
         if not guardrails._DIFF_PATTERNS:
-            current_pr.diff_scanned_at_sha = current_pr.head_sha
+            return False
+        if current_pr.diff_scanned_at_sha == current_pr.head_sha:
             return False
         try:
             diff_text = gh_prs.get_pr_diff(self.owner_repo, current_pr.number)
