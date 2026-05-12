@@ -186,15 +186,22 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         # diff format, a deletion shows `--- a/<path>` followed by
         # `+++ /dev/null` (where the deleted file's path appears in the
         # `--- a/` line and the special path `/dev/null` appears in the
-        # `+++ b/` line). Pure rename diffs use `rename from`/`rename to`
-        # metadata instead, but moving a workflow elsewhere still removes
-        # it from GitHub Actions. Match constrained to .github/workflows/
-        # source paths.
-        r"(?m)(?:^---[ \t]+"
+        # `+++ b/` line). Require the surrounding `diff --git` section so
+        # documentation snippets containing file-header text are not treated
+        # as real workflow deletions. Pure rename diffs use `rename from`/
+        # `rename to` metadata instead, but moving a workflow elsewhere still
+        # removes it from GitHub Actions.
+        r"(?ms)(?:^diff --git[^\r\n]*[ \t]+"
+        + _DIFF_WORKFLOW_A_PATH_RE
+        + r"[^\r\n]*\r?\n"
+        r"(?:(?!^diff --git[ \t]).)*?^---[ \t]+"
         + _DIFF_WORKFLOW_A_PATH_RE
         + r"[ \t]*\r?\n"
         r"\+\+\+[ \t]+/dev/null\b"
-        r"|^rename from[ \t]+"
+        r"|^diff --git[^\r\n]*[ \t]+"
+        + _DIFF_WORKFLOW_A_PATH_RE
+        + r"[^\r\n]*\r?\n"
+        r"(?:(?!^diff --git[ \t]).)*?^rename from[ \t]+"
         + _DIFF_WORKFLOW_RENAME_PATH_RE
         + r"[ \t]*\r?\n"
         r"rename to[ \t]+(?!"

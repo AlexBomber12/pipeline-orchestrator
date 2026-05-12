@@ -1021,6 +1021,19 @@ def test_scan_pr_diff_workflow_modification_not_flagged() -> None:
     assert scan_pr_diff(diff_text) == []
 
 
+def test_scan_pr_diff_documented_workflow_deletion_header_not_flagged() -> None:
+    diff_text = (
+        "diff --git a/docs/guide.md b/docs/guide.md\n"
+        "@@ -1,4 +1,4 @@\n"
+        " ```diff\n"
+        " --- a/.github/workflows/ci.yml\n"
+        " +++ /dev/null\n"
+        " ```\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
 def test_scan_pr_diff_non_workflow_yml_deletion_not_flagged() -> None:
     diff_text = (
         "diff --git a/some-other.yml b/some-other.yml\n"
