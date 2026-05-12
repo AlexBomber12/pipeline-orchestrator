@@ -193,3 +193,40 @@ def test_pre_merge_sync_path_passes_bypass_author_dedup_true(
         )
         for entry in runner.state.history
     )
+
+
+def test_pre_merge_sync_logs_unknown_head_when_rev_parse_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rev_parse_calls = {"n": 0}
+
+    def fake_git(repo_path: str, *args: str, **kwargs: object):
+        if args[:1] == ("merge",) and len(args) > 1 and str(args[1]).startswith("origin/"):
+            return h._FakeCompletedProcess(
+                stdout="Merge made by the 'ort' strategy.\n",
+                returncode=0,
+            )
+        if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_calls["n"] += 1
+            raise RuntimeError("rev-parse HEAD failed")
+        return h._FakeCompletedProcess(stdout="", returncode=0)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(merge_module, "retry_transient", lambda op, **_: op())
+    monkeypatch.setattr(
+        "src.github.cache._invalidate_etag_cache",
+        lambda prefix: None,
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.MERGE
+    runner.state.current_pr = PRInfo(number=11, branch="pr-011")
+    monkeypatch.setattr(runner, "_post_codex_review", lambda *a, **kw: True)
+
+    asyncio.run(runner.handle_merge())
+
+    assert any(
+        "[MERGE] Bypass-requesting fresh @codex review on new head <unknown>"
+        in entry.get("event", "")
+        for entry in runner.state.history
+    )
