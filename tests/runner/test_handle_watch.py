@@ -3699,3 +3699,91 @@ def test_handle_watch_returns_when_diff_scan_transitions_to_error(
 
     assert merged == []
     assert runner.state.state == PipelineState.ERROR
+
+
+def test_handle_watch_preserves_diff_scanned_at_sha_when_head_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``get_open_prs`` returns a fresh ``PRInfo`` whose
+    ``diff_scanned_at_sha`` defaults to ``None``. When the polled HEAD
+    matches the in-memory HEAD, ``handle_watch`` must carry the cached
+    SHA forward through ``model_copy`` so the ``_scan_pr_diff_once``
+    cache gate keeps holding and ``gh pr diff`` is not re-run on every
+    poll for an unchanged HEAD."""
+    pr = PRInfo(
+        number=21,
+        branch="pr-021",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=datetime.now(timezone.utc),
+        head_sha="stable01",
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+
+    observed: list[str | None] = []
+
+    async def fake_scan(self: Any) -> bool:
+        observed.append(self.state.current_pr.diff_scanned_at_sha)
+        return False
+
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_scan_pr_diff_once",
+        fake_scan,
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=21,
+        branch="pr-021",
+        head_sha="stable01",
+        diff_scanned_at_sha="stable01",
+    )
+    asyncio.run(runner.handle_watch())
+
+    assert observed == ["stable01"]
+    assert runner.state.current_pr.diff_scanned_at_sha == "stable01"
+
+
+def test_handle_watch_drops_diff_scanned_at_sha_when_head_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh coder push (new HEAD SHA) must re-arm the diff scan:
+    the cached ``diff_scanned_at_sha`` from the prior HEAD must NOT be
+    carried forward, otherwise a prohibited diff introduced by the
+    new push could slip past the catalogue."""
+    pr = PRInfo(
+        number=22,
+        branch="pr-022",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=datetime.now(timezone.utc),
+        head_sha="newhead2",
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+
+    observed: list[str | None] = []
+
+    async def fake_scan(self: Any) -> bool:
+        observed.append(self.state.current_pr.diff_scanned_at_sha)
+        return False
+
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_scan_pr_diff_once",
+        fake_scan,
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=22,
+        branch="pr-022",
+        head_sha="oldhead1",
+        diff_scanned_at_sha="oldhead1",
+    )
+    asyncio.run(runner.handle_watch())
+
+    assert observed == [None]
+    assert runner.state.current_pr.diff_scanned_at_sha is None

@@ -174,6 +174,19 @@ class WatchMixin:
             return
 
         merged_shas, merged_push_count = current_pr.merge_observed_pushes(found)
+        # PR-290a follow-up: ``get_open_prs`` returns a fresh ``PRInfo``
+        # whose ``diff_scanned_at_sha`` is the default ``None``. Without
+        # carrying the cached value forward, the SHA-cache gate in
+        # ``_scan_pr_diff_once`` would be reset every WATCH cycle and
+        # ``gh pr diff`` would re-run on every poll for an unchanged
+        # HEAD once ``_DIFF_PATTERNS`` is populated, defeating the
+        # "once per SHA" contract. Preserve the cache when the head SHA
+        # is unchanged; a new HEAD legitimately re-arms the scan, so
+        # leave the field at its default ``None`` in that case.
+        if current_pr.head_sha and current_pr.head_sha == found.head_sha:
+            preserved_diff_scanned_at_sha = current_pr.diff_scanned_at_sha
+        else:
+            preserved_diff_scanned_at_sha = found.diff_scanned_at_sha
         found = found.model_copy(
             update={
                 "fix_iteration_count": current_pr.fix_iteration_count,
@@ -187,6 +200,7 @@ class WatchMixin:
                 # resets the new ``found`` on real progress and preserves
                 # the count when the PR is still stuck.
                 "watch_retrigger_count": current_pr.watch_retrigger_count,
+                "diff_scanned_at_sha": preserved_diff_scanned_at_sha,
             }
         )
         self.state.current_pr = found
