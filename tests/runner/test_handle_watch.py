@@ -3787,3 +3787,67 @@ def test_handle_watch_drops_diff_scanned_at_sha_when_head_changes(
 
     assert observed == [None]
     assert runner.state.current_pr.diff_scanned_at_sha is None
+
+
+def test_handle_watch_holds_merge_when_diff_fetch_fails_with_populated_patterns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient ``gh pr diff`` failure on a merge-eligible cycle must
+    NOT fall through to the green-path merge logic when ``_DIFF_PATTERNS``
+    is populated. The diff scan is the only enforcement point for the
+    diff catalogue; treating a fetch failure as equivalent to a clean
+    scan would let a coder slip prohibited content past the catalogue by
+    timing a ``gh`` outage with an otherwise-green PR.
+    """
+    import re as _re
+
+    monkeypatch.setattr(
+        watch_module.guardrails,
+        "_DIFF_PATTERNS",
+        {"workflow_permissions_write_all": _re.compile(r"permissions:\s*write-all")},
+    )
+    monkeypatch.setattr(
+        watch_module.guardrails,
+        "_DIFF_RULES",
+        {"workflow_permissions_write_all": "Workflow permissions write-all"},
+    )
+
+    def boom(repo: str, number: int) -> str:
+        raise RuntimeError("gh CLI timed out")
+
+    monkeypatch.setattr("src.github.prs.get_pr_diff", boom)
+
+    pr = PRInfo(
+        number=33,
+        branch="pr-033",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.APPROVED,
+        last_activity=datetime.now(timezone.utc),
+        head_sha="freshhd1",
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+
+    merged: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        "src.github.prs.merge_pr",
+        lambda repo, number: merged.append((repo, number)),
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=33,
+        branch="pr-033",
+        head_sha="freshhd1",
+        diff_scanned_at_sha=None,
+    )
+    asyncio.run(runner.handle_watch())
+
+    assert merged == []
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.diff_scanned_at_sha != "freshhd1"
+    assert any(
+        "merge held: diff scan did not complete" in entry.get("event", "")
+        for entry in runner.state.history
+    )

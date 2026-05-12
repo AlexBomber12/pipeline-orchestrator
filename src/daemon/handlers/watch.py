@@ -224,6 +224,26 @@ class WatchMixin:
             and review == ReviewStatus.PENDING
         )
         if ci == CIStatus.SUCCESS and review_allows_merge:
+            # PR-290a follow-up: ``_scan_pr_diff_once`` only updates
+            # ``diff_scanned_at_sha`` on a successful fetch + scan; a
+            # transient ``gh pr diff`` failure leaves the cache field
+            # unchanged. When ``_DIFF_PATTERNS`` is populated the diff
+            # scan is the sole enforcement point, so a fetch failure on
+            # a merge-eligible cycle must NOT fall through to merge —
+            # otherwise a coder could push prohibited diff content that
+            # the catalogue would catch, and a ``gh`` timeout would
+            # silently bypass it. Hold the merge and let the next WATCH
+            # cycle retry the scan on the same HEAD.
+            if (
+                guardrails._DIFF_PATTERNS
+                and found.diff_scanned_at_sha != found.head_sha
+            ):
+                self.log_event(
+                    f"[WATCH] PR #{found.number} merge held: diff scan "
+                    f"did not complete for head {found.head_sha[:7]}; "
+                    f"will retry next cycle."
+                )
+                return
             if self.repo_config.auto_merge:
                 await self.handle_merge()
             else:
