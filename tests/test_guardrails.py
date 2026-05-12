@@ -464,7 +464,9 @@ def test_scan_pr_diff_workflow_permissions_write_all_flagged() -> None:
 
 
 def test_scan_pr_diff_workflow_contents_write_flagged() -> None:
-    diff_text = WORKFLOW_DIFF_HEADER + "@@ -1,3 +1,4 @@\n+  contents: write\n"
+    diff_text = (
+        WORKFLOW_DIFF_HEADER + "@@ -1,3 +1,4 @@\n permissions:\n+  contents: write\n"
+    )
 
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
@@ -472,7 +474,7 @@ def test_scan_pr_diff_workflow_contents_write_flagged() -> None:
 def test_scan_pr_diff_workflow_id_token_write_flagged() -> None:
     diff_text = (
         "diff --git a/.github/workflows/oidc.yml b/.github/workflows/oidc.yml\n"
-        "@@ -1,3 +1,4 @@\n+  id-token: write\n"
+        "@@ -1,3 +1,4 @@\n permissions:\n+  id-token: write\n"
     )
 
     _assert_diff_categories(diff_text, ["permissions_escalation"])
@@ -481,16 +483,16 @@ def test_scan_pr_diff_workflow_id_token_write_flagged() -> None:
 def test_scan_pr_diff_workflow_packages_write_flagged() -> None:
     diff_text = (
         "diff --git a/.github/workflows/publish.yml b/.github/workflows/publish.yml\n"
-        "@@ -1,3 +1,4 @@\n+  packages: write\n"
+        "@@ -1,3 +1,4 @@\n permissions:\n+  packages: write\n"
     )
 
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
-def test_scan_pr_diff_workflow_unlisted_write_scope_flagged() -> None:
+def test_scan_pr_diff_workflow_additional_write_scope_flagged() -> None:
     diff_text = (
         "diff --git a/.github/workflows/pages.yml b/.github/workflows/pages.yml\n"
-        "@@ -1,3 +1,4 @@\n+  pages: write\n"
+        "@@ -1,3 +1,4 @@\n permissions:\n+  pages: write\n"
     )
 
     _assert_diff_categories(diff_text, ["permissions_escalation"])
@@ -513,7 +515,19 @@ def test_scan_pr_diff_workflow_permission_in_deletion_line_not_flagged() -> None
 
 
 def test_scan_pr_diff_workflow_read_permission_not_flagged() -> None:
-    diff_text = WORKFLOW_DIFF_HEADER + "@@ -1,3 +1,4 @@\n+  contents: read\n"
+    diff_text = (
+        WORKFLOW_DIFF_HEADER + "@@ -1,3 +1,4 @@\n permissions:\n+  contents: read\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_workflow_run_write_output_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,3 +1,4 @@\n"
+        "+      run: write-output.sh\n"
+    )
 
     assert scan_pr_diff(diff_text) == []
 
