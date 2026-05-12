@@ -476,6 +476,18 @@ def test_workflow_permission_context_skips_non_diff_parent_lines() -> None:
     assert guardrails._match_has_workflow_permission_context(match_text)
 
 
+def test_workflow_permission_context_skips_non_added_block_scalar_lines() -> None:
+    match_text = (
+        " permissions:\n"
+        "+  contents: |-\n"
+        "@@ -1,2 +1,3 @@\n"
+        "-    read\n"
+        "+    write\n"
+    )
+
+    assert guardrails._match_has_workflow_permission_context(match_text)
+
+
 def test_workflow_permission_context_rejects_scope_not_under_parent() -> None:
     match_text = "   permissions:\n+  contents: write\n"
 
@@ -638,9 +650,45 @@ def test_scan_pr_diff_workflow_permissions_alias_flagged() -> None:
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_permissions_block_scalar_write_all_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,2 +1,4 @@\n"
+        "+permissions: |-\n"
+        "+  write-all\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_job_permissions_block_scalar_write_all_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,6 +1,8 @@\n"
+        " jobs:\n"
+        "   build:\n"
+        "+    permissions: |-\n"
+        "+      write-all\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
 def test_scan_pr_diff_workflow_contents_write_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER + "@@ -1,3 +1,4 @@\n permissions:\n+  contents: write\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_scope_block_scalar_write_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,3 +1,5 @@\n"
+        " permissions:\n"
+        "+  contents: |-\n"
+        "+    write\n"
     )
 
     _assert_diff_categories(diff_text, ["permissions_escalation"])

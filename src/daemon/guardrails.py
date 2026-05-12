@@ -126,6 +126,18 @@ _YAML_WRITE_SCOPE_RE = re.compile(
     + r"[\"']?write[\"']?,?(?:[ \t]*(?:#.*)?)?$",
     re.IGNORECASE,
 )
+_YAML_WRITE_SCOPE_BLOCK_RE = re.compile(
+    r"^[ \t]*"
+    + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+    + r"[ \t]*:[ \t]*"
+    + _YAML_SCALAR_ANCHOR_RE
+    + r"[|>][+-]?(?:[ \t]*(?:#.*)?)?$",
+    re.IGNORECASE,
+)
+_YAML_WRITE_BLOCK_VALUE_RE = re.compile(
+    r"^[ \t]+[\"']?write[\"']?(?:[ \t]*(?:#.*)?)?$",
+    re.IGNORECASE,
+)
 _NON_PERMISSION_MAPPING_KEYS = {
     "env",
     "matrix",
@@ -163,11 +175,14 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
         + r"[ \t]*:[ \t]*"
         + _YAML_SCALAR_ANCHOR_RE
-        + r"[\"']?write[\"']?"
-        r",?|(?:(?!^diff --git[ \t]).)*?^\+[ \t]*"
+        + r"(?:[\"']?write[\"']?,?|[|>][+-]?[ \t]*(?:#.*)?\r?\n"
+        r"^\+[ \t]+[\"']?write[\"']?)|(?:(?!^diff --git[ \t]).)*?^\+[ \t]*"
         r"[\"']?permissions[\"']?[ \t]*:[ \t]*(?:"
         + _YAML_SCALAR_ANCHOR_RE
         + r"[\"']?write-all[\"']?"
+        r"|"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"[|>][+-]?[ \t]*(?:#.*)?\r?\n^\+[ \t]+[\"']?write-all[\"']?"
         r"|&[A-Za-z_][A-Za-z0-9_-]*[ \t]*\{[^\r\n}]*"
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
         + r"[ \t]*:[ \t]*"
@@ -300,7 +315,18 @@ def _match_has_workflow_permission_context(match_text: str) -> bool:
             _is_workflow_permission_key_context(lines, index, yaml_line)
         ):
             return True
-        if not _YAML_WRITE_SCOPE_RE.match(yaml_line):
+        is_write_scope = bool(_YAML_WRITE_SCOPE_RE.match(yaml_line))
+        if not is_write_scope and _YAML_WRITE_SCOPE_BLOCK_RE.match(yaml_line):
+            for block_index in range(index + 1, len(lines)):
+                block_diff_line = _diff_yaml_line(lines[block_index])
+                if block_diff_line is None:
+                    continue
+                block_prefix, block_yaml_line = block_diff_line
+                if block_prefix == "-":
+                    continue
+                is_write_scope = bool(_YAML_WRITE_BLOCK_VALUE_RE.match(block_yaml_line))
+                break
+        if not is_write_scope:
             continue
         for parent_index in range(index - 1, -1, -1):
             parent_diff_line = _diff_yaml_line(lines[parent_index])
