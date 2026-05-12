@@ -1405,6 +1405,29 @@ class PipelineRunner(
         if publish:
             await self.publish_state()
 
+    async def _review_timeout_park_cleared(self) -> bool:
+        """Return True when the operator-park cancellation cause is gone.
+
+        ``run_cycle`` calls this on every ERROR cycle while the
+        ``skip_ai_error_diagnose`` flag is set so the operator's Retry
+        button — which deletes the cancellation cause via
+        ``repo_control.retry_repo_task`` — releases the park without an
+        AI diagnose round-trip. A missing ``current_task`` means there is
+        nothing left to wait on (the runner already dropped the handle),
+        so report cleared. Redis read errors keep the runner parked and
+        retry on the next cycle.
+        """
+        task = self.state.current_task
+        if task is None:
+            return True
+        try:
+            cause = await get_cancellation_cause(
+                self.redis, self.name, task.pr_id
+            )
+        except Exception:
+            return False
+        return cause is None
+
     # All daemon escalation-and-skip transitions must use this primitive so
     # the queue can continue while the PR keeps its durable escalation signal.
     async def _escalate_and_skip(
@@ -2325,6 +2348,26 @@ class PipelineRunner(
             )
             self.state.state = PipelineState.IDLE
 
+        # PR-316 review feedback: ``skip_ai_error_diagnose`` is bound to the
+        # specific ERROR park that WATCH creates on ``review_timeout``. Any
+        # code path that moves the runner out of ERROR — recovery setting
+        # IDLE from task headers, the ``rate_limited_until`` -> PAUSED
+        # redirect inside the ERROR branch below, an operator forcing state
+        # through Redis — must reset the flag. Without this invariant a
+        # stale ``True`` from a prior timeout incident silently skips
+        # ``handle_error`` on the next unrelated ERROR cycle and leaves the
+        # daemon parked waiting on a cancellation-cause deletion that no
+        # operator will perform for an ordinary error.
+        if (
+            self.state.state != PipelineState.ERROR
+            and self.state.skip_ai_error_diagnose
+        ):
+            self.state.skip_ai_error_diagnose = False
+            self.log_event(
+                "[ESCALATE] review_timeout park flag cleared "
+                f"(state {self.state.state.value} is not ERROR)."
+            )
+
         if self.state.state == PipelineState.IDLE:
             await self._refresh_user_paused_from_redis()
             if self.state.user_paused:
@@ -2355,6 +2398,22 @@ class PipelineRunner(
                     "[RATE-LIMIT] Legacy ERROR + rate_limited_until "
                     "-> PAUSED."
                 )
+            elif self.state.skip_ai_error_diagnose:
+                # PR-316 review feedback: WATCH parked the runner here
+                # because of a review_timeout — a non-fixable problem the
+                # AI diagnose loop should never see. Stay in ERROR until
+                # the operator presses Retry, which deletes the
+                # cancellation cause. When the cause is gone, drop the
+                # flag and transition to IDLE so the picker can re-attempt
+                # the now status:TODO task without an AI round-trip.
+                if await self._review_timeout_park_cleared():
+                    self.state.skip_ai_error_diagnose = False
+                    self.state.error_message = None
+                    self.state.state = PipelineState.IDLE
+                    self.log_event(
+                        "[ESCALATE] review_timeout park cleared by "
+                        "operator -> IDLE."
+                    )
             elif self.app_config.daemon.error_handler_use_ai:
                 await self.handle_error()
 

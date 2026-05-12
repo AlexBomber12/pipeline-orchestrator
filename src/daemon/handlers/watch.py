@@ -12,6 +12,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 
+from src.cancellation import CancellationCause
 from src.github import cache as gh_cache
 from src.github import checks as gh_checks
 from src.github import gh_runner
@@ -321,18 +322,61 @@ class WatchMixin:
             else self.app_config.daemon.review_timeout_min
         )
         if elapsed_min >= timeout_min:
-            await self._escalate_and_skip(
+            # PR-316 (OBS-DD): WATCH review_timeout was previously routed
+            # through ``_escalate_and_skip`` to IDLE, which let the picker
+            # re-select the same status:TODO task and route it back into
+            # WATCH indefinitely. The status:ERROR frontmatter write plus a
+            # terminal ERROR transition stop the picker from re-picking.
+            # We deliberately do NOT apply the ``escalated`` label here:
+            # ``get_open_prs`` maps that label to ``PRInfo.is_escalated``,
+            # and ``handle_fix`` short-circuits to IDLE when that flag is
+            # true. Applying the label would block the operator-Retry
+            # recovery flow because a later ``CHANGES_REQUESTED`` or CI
+            # failure on the same PR could not re-enter FIX without
+            # manual label removal.
+            message = (
                 f"PR #{found.number} hung after {elapsed_min:.0f}m "
-                f"(review={review.value}, ci={ci.value})",
-                error_message_override=None,
-                apply_escalated_label=False,
-                set_pr_escalated_flag=False,
-                log_message=(
-                    f"PR #{found.number} hung after {elapsed_min:.0f}m "
-                    f"(review={review.value}, ci={ci.value})."
-                ),
-                cancellation_subsource="review_timeout",
+                f"(review={review.value}, ci={ci.value})"
             )
+            current_task = self.state.current_task
+            if current_task is not None:
+                try:
+                    status_written = await self._commit_task_status_change(
+                        current_task, "ERROR", message
+                    )
+                except Exception as exc:
+                    self.log_event(
+                        f"[ERROR] Failed to write status:ERROR to "
+                        f"{current_task.task_file}: {exc}"
+                    )
+                    status_written = False
+                if not status_written:
+                    await self._mark_status_write_failed_task(current_task)
+            await self._transition_to_error(
+                message,
+                save_run_record_as="error",
+                log_prefix="[ESCALATE]",
+                log_message=f"{message}.",
+                cancellation_cause=CancellationCause(
+                    category="ERROR",
+                    payload={
+                        "subsource": "review_timeout",
+                        "reason_text": message,
+                        "previous_state": PipelineState.WATCH.value,
+                        "elapsed_min": int(elapsed_min),
+                        "ci_status": ci.value,
+                        "review_status": review.value,
+                    },
+                ),
+            )
+            # PR-316 review feedback: park terminally for operator action.
+            # ``run_cycle`` checks this flag in the ERROR branch and skips
+            # the AI diagnose call so the model is not invoked on a
+            # non-fixable timeout (and cannot auto-leave ERROR via
+            # FIX/SKIP). Operator Retry deletes the cancellation cause,
+            # which ``run_cycle`` detects to clear the flag and transition
+            # back to IDLE.
+            self.state.skip_ai_error_diagnose = True
         else:
             self.log_event(
                 f"[WATCH] PR #{found.number} waiting "
