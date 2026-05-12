@@ -100,9 +100,16 @@ _TIER1_RULES: dict[str, str] = {
 }
 
 _EXCERPT_LIMIT = 200
-_DIFF_WORKFLOW_B_PATH_RE = r'"?b/\.github/workflows/[^"/\r\n]+\.ya?ml"?'
-_DIFF_WORKFLOW_A_PATH_RE = r'"?a/\.github/workflows/[^"/\r\n]+\.ya?ml"?'
-_DIFF_WORKFLOW_RENAME_PATH_RE = r'"?\.github/workflows/[^"/\r\n]+\.ya?ml"?'
+_WORKFLOW_PATH_END_RE = r'(?:"|(?=[ \t\r\n]))'
+_DIFF_WORKFLOW_B_PATH_RE = (
+    r'"?b/\.github/workflows/[^"/\r\n]+\.ya?ml' + _WORKFLOW_PATH_END_RE
+)
+_DIFF_WORKFLOW_A_PATH_RE = (
+    r'"?a/\.github/workflows/[^"/\r\n]+\.ya?ml' + _WORKFLOW_PATH_END_RE
+)
+_DIFF_WORKFLOW_RENAME_PATH_RE = (
+    r'"?\.github/workflows/[^"/\r\n]+\.ya?ml' + _WORKFLOW_PATH_END_RE
+)
 _WORKFLOW_WRITE_PERMISSION_SCOPES_RE = (
     r"[\"']?(?:actions|attestations|artifact-metadata|checks|code-quality|"
     r"contents|deployments|discussions|id-token|issues|packages|pages|"

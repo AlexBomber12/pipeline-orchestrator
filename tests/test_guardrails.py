@@ -1036,6 +1036,17 @@ def test_scan_pr_diff_nested_workflow_path_permission_not_flagged() -> None:
     assert scan_pr_diff(diff_text) == []
 
 
+def test_scan_pr_diff_disabled_workflow_path_permission_not_flagged() -> None:
+    diff_text = (
+        "diff --git a/.github/workflows/ci.yml.disabled "
+        "b/.github/workflows/ci.yml.disabled\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+permissions: write-all\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
 def test_scan_pr_diff_workflow_yml_deletion_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER
