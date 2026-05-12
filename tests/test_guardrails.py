@@ -592,6 +592,19 @@ def test_scan_pr_diff_workflow_wide_indent_job_permission_flagged() -> None:
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_deep_indent_job_permission_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,7 +1,8 @@\n"
+        " jobs:\n"
+        "             build:\n"
+        "             permissions:\n"
+        "+                contents: write\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
 def test_scan_pr_diff_workflow_existing_job_permission_block_addition_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER
