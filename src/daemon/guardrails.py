@@ -130,6 +130,8 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         # those YAML positions to avoid script-literal false positives.
         # Top-level permission-map scope additions are also matched even
         # when the parent `permissions:` line is outside the diff hunk.
+        # `contents` needs a separate partial-hunk replacement path because
+        # unrelated YAML blocks commonly use a `contents` key too.
         r"(?ms)^diff --git[^\r\n]*[ \t]+"
         + _DIFF_WORKFLOW_B_PATH_RE
         + r"[^\r\n]*\r?\n"
@@ -159,6 +161,11 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         + r"[ \t]*:[ \t]*"
         + _YAML_SCALAR_ANCHOR_RE
         + r"[\"']?write[\"']?[^\r\n}]*\})"
+        r"|(?:(?!^diff --git[ \t]).)*?^-[ \t]{2}[\"']?contents[\"']?"
+        r"[ \t]*:[ \t]*[\"']?(?:read|none)[\"']?[^\r\n]*\r?\n"
+        r"^\+[ \t]{2}[\"']?contents[\"']?[ \t]*:[ \t]*"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"[\"']?write[\"']?"
         r"|(?:(?!^diff --git[ \t]).)*?^\+[ \t]{2}"
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_WITHOUT_CONTENTS_RE
         + r"[ \t]*:[ \t]*"

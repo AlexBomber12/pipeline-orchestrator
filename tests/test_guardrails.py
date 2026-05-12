@@ -622,6 +622,17 @@ def test_scan_pr_diff_workflow_permission_read_replaced_with_write_flagged() -> 
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_contents_replacement_without_parent_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -40,3 +40,3 @@\n"
+        + "-  contents: read\n"
+        + "+  contents: write\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
 def test_scan_pr_diff_workflow_job_level_contents_write_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER
