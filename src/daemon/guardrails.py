@@ -123,7 +123,12 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         r"(?ms)^diff --git[^\r\n]*[ \t]+"
         + _DIFF_WORKFLOW_B_PATH_RE
         + r"[^\r\n]*\r?\n"
-        r"(?:(?!^diff --git[ \t]).)*?^\+(?:[ \t]{0,6}"
+        r"(?:(?:(?!^diff --git[ \t]).)*?^[ +][ \t]{0,4}"
+        r"[\"']?permissions[\"']?:[ \t]*(?:#.*)?\r?\n"
+        r"(?:(?!^diff --git[ \t]).)*?^\+[ \t]{2,6}"
+        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+        + r":[ \t]*[\"']?write[\"']?"
+        r"|(?:(?!^diff --git[ \t]).)*?^\+(?:[ \t]{0,6}"
         r"[\"']?permissions[\"']?:[ \t]*(?:[\"']?write-all[\"']?"
         r"|&[A-Za-z_][A-Za-z0-9_-]*[ \t]*\{[^\r\n}]*"
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
@@ -135,7 +140,7 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
         + r":[ \t]*[\"']?write"
         r"[\"']?"
-        r")[ \t]*(?:#.*)?$",
+        r"))[ \t]*(?:#.*)?$",
         re.IGNORECASE,
     ),
     "workflow_destruction": re.compile(
