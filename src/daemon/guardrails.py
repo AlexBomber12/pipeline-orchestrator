@@ -109,6 +109,7 @@ _WORKFLOW_WRITE_PERMISSION_SCOPES_RE = (
     r"pull-requests|repository-projects|security-events|statuses|models|"
     r"vulnerability-alerts)[\"']?"
 )
+_YAML_SCALAR_ANCHOR_RE = r"(?:&[A-Za-z_][A-Za-z0-9_-]*[ \t]+)?"
 
 # Diff-content scan catalogue. PR-290b adds workflow YAML tampering checks;
 # PR-290c and PR-301..PR-304 extend the same dispatcher with governance,
@@ -130,16 +131,24 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
         + r"[ \t]*:[^\r\n]*\r?\n)*^\+[ \t]+"
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
-        + r"[ \t]*:[ \t]*[\"']?write[\"']?"
+        + r"[ \t]*:[ \t]*"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"[\"']?write[\"']?"
         r"|(?:(?!^diff --git[ \t]).)*?^\+(?:[ \t]*"
-        r"[\"']?permissions[\"']?[ \t]*:[ \t]*(?:[\"']?write-all[\"']?"
+        r"[\"']?permissions[\"']?[ \t]*:[ \t]*(?:"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"[\"']?write-all[\"']?"
         r"|&[A-Za-z_][A-Za-z0-9_-]*[ \t]*\{[^\r\n}]*"
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
-        + r"[ \t]*:[ \t]*[\"']?write[\"']?[^\r\n}]*\}"
+        + r"[ \t]*:[ \t]*"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"[\"']?write[\"']?[^\r\n}]*\}"
         r"|\*[A-Za-z_][A-Za-z0-9_-]*"
         r"|\{[^\r\n}]*"
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
-        + r"[ \t]*:[ \t]*[\"']?write[\"']?[^\r\n}]*\})"
+        + r"[ \t]*:[ \t]*"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"[\"']?write[\"']?[^\r\n}]*\})"
         r"))[ \t]*(?:#.*)?$",
         re.IGNORECASE,
     ),

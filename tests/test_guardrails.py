@@ -487,6 +487,14 @@ def test_scan_pr_diff_workflow_permissions_spaced_separator_flagged() -> None:
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_permissions_anchored_write_all_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER + "@@ -1,2 +1,3 @@\n+permissions: &all write-all\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
 def test_scan_pr_diff_workflow_permissions_rename_into_workflows_flagged() -> None:
     diff_text = (
         "diff --git a/scripts/build.yml b/.github/workflows/build.yml\n"
@@ -577,6 +585,14 @@ def test_scan_pr_diff_workflow_contents_write_flagged() -> None:
 def test_scan_pr_diff_workflow_scope_spaced_separator_write_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER + "@@ -1,3 +1,4 @@\n permissions:\n+  contents : write\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_scope_anchored_write_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER + "@@ -1,3 +1,4 @@\n permissions:\n+  contents: &w write\n"
     )
 
     _assert_diff_categories(diff_text, ["permissions_escalation"])
