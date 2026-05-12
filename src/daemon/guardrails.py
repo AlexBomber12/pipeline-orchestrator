@@ -123,12 +123,15 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         r"(?ms)^diff --git[^\r\n]*[ \t]+"
         + _DIFF_WORKFLOW_B_PATH_RE
         + r"[^\r\n]*\r?\n"
-        r"(?:(?!^diff --git[ \t]).)*?^\+[ \t]{0,6}(?:"
+        r"(?:(?!^diff --git[ \t]).)*?^\+(?:[ \t]{0,6}"
         r"[\"']?permissions[\"']?:[ \t]*(?:[\"']?write-all[\"']?"
+        r"|&[A-Za-z_][A-Za-z0-9_-]*[ \t]*\{[^\r\n}]*"
+        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+        + r":[ \t]*[\"']?write[\"']?[^\r\n}]*\}"
         r"|\{[^\r\n}]*"
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
         + r":[ \t]*[\"']?write[\"']?[^\r\n}]*\})"
-        r"|"
+        r"|[ \t]{0,2}"
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
         + r":[ \t]*[\"']?write"
         r"[\"']?"

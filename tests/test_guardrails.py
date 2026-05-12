@@ -538,6 +538,16 @@ def test_scan_pr_diff_workflow_inline_permissions_map_quoted_key_flagged() -> No
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_inline_permissions_map_anchor_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,2 +1,3 @@\n"
+        "+permissions: &full { contents: write }\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
 def test_scan_pr_diff_workflow_contents_write_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER + "@@ -1,3 +1,4 @@\n permissions:\n+  contents: write\n"
@@ -634,6 +644,20 @@ def test_scan_pr_diff_workflow_script_literal_permission_word_not_flagged() -> N
         WORKFLOW_DIFF_HEADER
         + "@@ -1,3 +1,4 @@\n"
         "+          contents: write\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_workflow_reusable_input_named_contents_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,7 +1,8 @@\n"
+        " jobs:\n"
+        "   call:\n"
+        "     uses: org/repo/.github/workflows/build.yml@v1\n"
+        "     with:\n"
+        "+      contents: write\n"
     )
 
     assert scan_pr_diff(diff_text) == []
