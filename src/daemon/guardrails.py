@@ -100,6 +100,9 @@ _TIER1_RULES: dict[str, str] = {
 }
 
 _EXCERPT_LIMIT = 200
+_DIFF_WORKFLOW_B_PATH_RE = r'"?b/\.github/workflows/[^"\r\n]+\.ya?ml"?'
+_DIFF_WORKFLOW_A_PATH_RE = r'"?a/\.github/workflows/[^"\r\n]+\.ya?ml"?'
+_DIFF_WORKFLOW_RENAME_PATH_RE = r'"?\.github/workflows/[^"\r\n]+\.ya?ml"?'
 
 # Diff-content scan catalogue. PR-290b adds workflow YAML tampering checks;
 # PR-290c and PR-301..PR-304 extend the same dispatcher with governance,
@@ -112,8 +115,9 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         # exactly `write`. Permission keys can appear at workflow top
         # level or under a job, so accepted indentation is bounded to
         # those YAML positions to avoid script-literal false positives.
-        r"(?ms)^diff --git[ \t]+a/[^\r\n]+"
-        r"[ \t]+b/\.github/workflows/[^\r\n]+\.ya?ml[^\r\n]*\r?\n"
+        r"(?ms)^diff --git[^\r\n]*[ \t]+"
+        + _DIFF_WORKFLOW_B_PATH_RE
+        + r"[^\r\n]*\r?\n"
         r"(?:(?!^diff --git[ \t]).)*?^\+[ \t]{0,6}(?:"
         r"permissions:[ \t]*(?:[\"']?write-all[\"']?"
         r"|\{[^\r\n}]*\b(?:actions|attestations|artifact-metadata|checks|"
@@ -137,10 +141,16 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         # metadata instead, but moving a workflow elsewhere still removes
         # it from GitHub Actions. Match constrained to .github/workflows/
         # source paths.
-        r"(?m)(?:^---[ \t]+a/\.github/workflows/[^\r\n]+\.ya?ml[ \t]*\r?\n"
+        r"(?m)(?:^---[ \t]+"
+        + _DIFF_WORKFLOW_A_PATH_RE
+        + r"[ \t]*\r?\n"
         r"\+\+\+[ \t]+/dev/null\b"
-        r"|^rename from[ \t]+\.github/workflows/[^\r\n]+\.ya?ml[ \t]*\r?\n"
-        r"rename to[ \t]+(?!\.github/workflows/[^\r\n]+\.ya?ml[ \t]*$)"
+        r"|^rename from[ \t]+"
+        + _DIFF_WORKFLOW_RENAME_PATH_RE
+        + r"[ \t]*\r?\n"
+        r"rename to[ \t]+(?!"
+        + _DIFF_WORKFLOW_RENAME_PATH_RE
+        + r"[ \t]*$)"
         r"[^\r\n]+)",
         re.IGNORECASE,
     ),
