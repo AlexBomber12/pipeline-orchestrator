@@ -115,6 +115,7 @@ class HungMixin:
         pr_number: int,
         *,
         bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
     ) -> tuple[bool, bool, datetime | None]:
         """Post ``@codex review`` and report success/post/retry timing."""
         current_pr = self.state.current_pr
@@ -149,7 +150,8 @@ class HungMixin:
                 f"#{pr_number}; posting @codex review without dedup."
             )
         elif (
-            pr_author
+            not bypass_author_dedup
+            and pr_author
             and head_commit_date
             and _author_already_requested_review(
                 self.owner_repo,
@@ -216,6 +218,7 @@ class HungMixin:
         pr_number: int,
         *,
         bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
     ) -> bool:
         """Post ``@codex review`` on ``pr_number``.
 
@@ -242,5 +245,6 @@ class HungMixin:
         success, _posted, _retry_at = self._post_codex_review_result(
             pr_number,
             bypass_same_head_dedup=bypass_same_head_dedup,
+            bypass_author_dedup=bypass_author_dedup,
         )
         return success
