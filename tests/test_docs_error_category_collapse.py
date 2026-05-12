@@ -48,7 +48,7 @@ def test_agents_md_template_escalate_protocol_no_idle_reference() -> None:
     regions = daemon_managed_content()
     section = regions["escalate_protocol"]
     assert "IDLE escalation" not in section
-    assert "transition the runner to IDLE" not in section.lower()
+    assert "transition the runner to idle" not in section.lower()
     assert "HUNG" not in section
     assert "ERROR" in section
 
