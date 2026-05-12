@@ -356,6 +356,9 @@ class WatchMixin:
             if not posted:
                 self._maybe_retrigger_stale_review(found.number)
 
+        if review == ReviewStatus.PENDING:
+            self._maybe_retrigger_stale_review(found.number)
+
         last_activity = found.last_activity or self.state.last_updated
         if last_activity.tzinfo is None:
             last_activity = last_activity.replace(tzinfo=timezone.utc)
@@ -641,6 +644,11 @@ class WatchMixin:
             stale_minutes = self.app_config.daemon.stale_review_threshold_min
         elif current_pr.review_status == ReviewStatus.EYES:
             stale_minutes = self.app_config.daemon.stale_review_threshold_eyes_min
+        elif (
+            current_pr.review_status == ReviewStatus.PENDING
+            and self.app_config.daemon.hung_fallback_codex_review
+        ):
+            stale_minutes = self.app_config.daemon.stale_review_threshold_min
         else:
             return False
 
@@ -665,13 +673,15 @@ class WatchMixin:
             if now - last_retrigger_at < _STALE_RETRIGGER_DEBOUNCE:
                 return False
 
+        state_label = current_pr.review_status.value
         self.log_event(
-            f"[WATCH] Stale CHANGES_REQUESTED on PR #{pr_number}; "
+            f"[WATCH] Stale {state_label} on PR #{pr_number}; "
             f"re-triggering @codex review."
         )
         success, posted, retry_at = self._post_codex_review_result(
             pr_number,
             bypass_same_head_dedup=True,
+            bypass_author_dedup=True,
         )
         self.state.last_stale_retrigger_at = now
         return posted
