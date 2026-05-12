@@ -689,6 +689,22 @@ def test_scan_pr_diff_workflow_reusable_input_named_contents_not_flagged() -> No
     assert scan_pr_diff(diff_text) == []
 
 
+def test_scan_pr_diff_workflow_unrelated_permissions_block_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,12 +1,13 @@\n"
+        " permissions:\n"
+        "   contents: read\n"
+        " jobs:\n"
+        "   call:\n"
+        "     uses: org/repo/.github/workflows/build.yml@v1\n"
+        "     with:\n"
+        "+      contents: write\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
 def test_scan_pr_diff_non_workflow_permission_write_not_flagged() -> None:
     diff_text = (
         "diff --git a/docs/example.yml b/docs/example.yml\n"
