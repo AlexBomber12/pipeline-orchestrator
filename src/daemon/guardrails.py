@@ -103,6 +103,11 @@ _EXCERPT_LIMIT = 200
 _DIFF_WORKFLOW_B_PATH_RE = r'"?b/\.github/workflows/[^"\r\n]+\.ya?ml"?'
 _DIFF_WORKFLOW_A_PATH_RE = r'"?a/\.github/workflows/[^"\r\n]+\.ya?ml"?'
 _DIFF_WORKFLOW_RENAME_PATH_RE = r'"?\.github/workflows/[^"\r\n]+\.ya?ml"?'
+_WORKFLOW_WRITE_PERMISSION_SCOPES_RE = (
+    r"[\"']?(?:actions|attestations|artifact-metadata|checks|code-quality|"
+    r"contents|deployments|discussions|id-token|issues|packages|pages|"
+    r"pull-requests|repository-projects|security-events|statuses)[\"']?"
+)
 
 # Diff-content scan catalogue. PR-290b adds workflow YAML tampering checks;
 # PR-290c and PR-301..PR-304 extend the same dispatcher with governance,
@@ -119,15 +124,13 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         + _DIFF_WORKFLOW_B_PATH_RE
         + r"[^\r\n]*\r?\n"
         r"(?:(?!^diff --git[ \t]).)*?^\+[ \t]{0,6}(?:"
-        r"permissions:[ \t]*(?:[\"']?write-all[\"']?"
-        r"|\{[^\r\n}]*\b(?:actions|attestations|artifact-metadata|checks|"
-        r"code-quality|contents|deployments|discussions|id-token|issues|"
-        r"packages|pages|pull-requests|repository-projects|security-events|"
-        r"statuses):[ \t]*[\"']?write[\"']?[^\r\n}]*\})"
-        r"|(?:actions|attestations|"
-        r"artifact-metadata|checks|code-quality|contents|deployments|"
-        r"discussions|id-token|issues|packages|pages|pull-requests|"
-        r"repository-projects|security-events|statuses):[ \t]*[\"']?write"
+        r"[\"']?permissions[\"']?:[ \t]*(?:[\"']?write-all[\"']?"
+        r"|\{[^\r\n}]*"
+        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+        + r":[ \t]*[\"']?write[\"']?[^\r\n}]*\})"
+        r"|"
+        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+        + r":[ \t]*[\"']?write"
         r"[\"']?"
         r")[ \t]*(?:#.*)?$",
         re.IGNORECASE,
