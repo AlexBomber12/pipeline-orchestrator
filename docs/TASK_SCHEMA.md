@@ -73,8 +73,12 @@ Historical records pre-dating the 2026-05-XX migration may carry
 TIMEOUT, INFRA, NO_PUSH_DEADLOCK, CRASH). Dashboard renders these with
 a "Legacy" badge for continuity.
 
-All terminal failures route to the single `ERROR` category; the operator
-Retry button is the only recovery affordance.
+All terminal failures route to the single `ERROR` category. The operator
+recovers an ERROR task either via the dashboard Retry button (for
+unchanged content; retry counter capped by `DaemonConfig.retry_button_cap`,
+default 3 and configurable in `config.yml`) or by re-uploading a spec
+whose content has changed. See `docs/operations.md` for the full recovery
+flow.
 
 ## Type field
 

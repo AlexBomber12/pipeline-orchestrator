@@ -113,9 +113,16 @@ When a daemon-detected failure occurs (review timeout, FIX iteration
 cap exceeded, no-push deadlock, etc.), the task transitions to terminal
 ERROR state. The operator addresses the failure via the dashboard
 Retry button or by re-uploading a modified spec. Coders should not
-attempt to "recover" from their own escalation — emit a clear
-ESCALATE: marker in stdout if the task is genuinely impossible, and
-the daemon will route it to ERROR with subsource=coder_escalate.
+attempt to "recover" from their own escalation — if the task is
+genuinely impossible, emit an `ESCALATE:` marker as the LAST non-empty
+line of stdout. The parser (`parse_escalate_marker` in
+`src/daemon/fix_escalation.py`) is strict: the literal prefix must be
+uppercase `ESCALATE:` at column 0 (no leading whitespace, no indentation,
+case-sensitive). Variants like `escalate:`, `ESCALATED:`, or an
+indented `  ESCALATE:` are not recognized and the task will keep
+cycling until another timeout path fires. When the marker is
+recognized, the daemon routes the task to ERROR with
+subsource=coder_escalate.
 <!-- pipeline-orchestrator: managed END escalate_protocol -->
 
 ## MCP servers and tool usage
