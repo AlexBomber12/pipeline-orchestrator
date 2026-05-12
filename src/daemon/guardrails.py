@@ -106,7 +106,8 @@ _DIFF_WORKFLOW_RENAME_PATH_RE = r'"?\.github/workflows/[^"\r\n]+\.ya?ml"?'
 _WORKFLOW_WRITE_PERMISSION_SCOPES_RE = (
     r"[\"']?(?:actions|attestations|artifact-metadata|checks|code-quality|"
     r"contents|deployments|discussions|id-token|issues|packages|pages|"
-    r"pull-requests|repository-projects|security-events|statuses)[\"']?"
+    r"pull-requests|repository-projects|security-events|statuses|models|"
+    r"vulnerability-alerts)[\"']?"
 )
 
 # Diff-content scan catalogue. PR-290b adds workflow YAML tampering checks;

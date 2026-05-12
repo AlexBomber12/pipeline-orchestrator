@@ -631,6 +631,19 @@ def test_scan_pr_diff_workflow_existing_job_permission_block_addition_flagged() 
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_permission_block_with_read_only_scopes_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,5 +1,6 @@\n"
+        + " permissions:\n"
+        + "   models: read\n"
+        + "   vulnerability-alerts: read\n"
+        + "+  issues: write\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
 def test_scan_pr_diff_workflow_quoted_scope_write_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER + "@@ -1,3 +1,4 @@\n permissions:\n+  contents: 'write'\n"
