@@ -15,6 +15,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from src.branch_context import BranchContext
+from src.cancellation import (
+    SUBSOURCE_VOCABULARY,
+    CancellationCause,
+    classify_cancellation_subsource,
+    get_cancellation_cause,
+    get_current_run_started_at,
+)
 from src.daemon import git_ops
 from src.github import gh_runner
 from src.github import prs as gh_prs
@@ -505,6 +512,16 @@ class RecoveryMixin:
             # so the cancellation diagnostic names the task branch the
             # crash was associated with rather than ``<absent>``.
             ctx = BranchContext.from_runner(self)
+            # PR-318: dispatch the recovery branch off ``payload.subsource``
+            # (PR-315 collapsed ``category`` to a single ``ERROR``).
+            # ``_dispatch_recovery_branch`` defensively reads the recorded
+            # cause, warns on any non-ERROR category (legacy record that
+            # escaped the startup migration), and returns either ``crash``
+            # or ``operator_attention``. Both branches mark the task ERROR
+            # — the distinction is the operator-visible log line so the
+            # dashboard surfaces whether the previous run died abruptly
+            # or was deliberately parked by a detector.
+            branch_kind = await self._dispatch_recovery_branch(doing.pr_id)
             self._crashed_task_pr_ids.add(doing.pr_id)
             # PR-266b crash-no-PR fix: reflect the cancellation in the
             # in-memory tasks list so the headers-mode current_queue
@@ -520,11 +537,18 @@ class RecoveryMixin:
             self.state.current_task = None
             self._reset_runner_local_task_counters()
             self.state.state = PipelineState.IDLE
-            self.log_event(
-                f"[INFRA] Task {doing.pr_id} crashed, marking ERROR. "
-                f"Manually re-upload to retry. "
-                f"({ctx.log_summary()})"
-            )
+            if branch_kind == "crash":
+                self.log_event(
+                    f"[INFRA] Task {doing.pr_id} crashed, marking ERROR. "
+                    f"Manually re-upload to retry. "
+                    f"({ctx.log_summary()})"
+                )
+            else:
+                self.log_event(
+                    f"[INFRA] Task {doing.pr_id} parked for operator "
+                    f"attention, marking ERROR. Manually re-upload to "
+                    f"retry. ({ctx.log_summary()})"
+                )
             return
 
         queued_by_branch = {
@@ -568,6 +592,141 @@ class RecoveryMixin:
             self.log_event(
                 "[INFRA] Recovered: no DOING tasks, no open PRs -> IDLE."
             )
+
+    async def _dispatch_recovery_branch(self, task_pr_id: str) -> str:
+        """Read ``task_pr_id``'s cancellation cause and return the dispatch branch.
+
+        PR-318: returns ``"operator_attention"`` only when a cause record
+        exists, its ``payload.subsource`` is a deliberate detector park
+        signal (review_timeout, fix_iteration_cap, ...), AND the cause's
+        ``created_at`` is at or after the dispatch timestamp recorded by
+        ``handle_coding`` for the current run. Every other code path
+        returns ``"crash"``:
+
+        * no cause record exists — the daemon was killed before
+          ``_transition_to_error`` ran (the canonical mid-CODING crash);
+        * Redis read error — back-compatible default matching the pre-
+          PR-318 single-branch behavior;
+        * cause exists with ``payload.subsource == "crash"`` — the
+          explicit crash signal;
+        * cause exists with empty/unknown subsource — degrade per the
+          PR-318 edge-case to the safer crash-recovery log line;
+        * cause exists with a non-crash subsource but predates the
+          current dispatch (or no dispatch timestamp is recorded) —
+          the cause is stale from a previous run whose best-effort
+          ``safe_delete_cancellation_cause`` cleanup failed, so trusting
+          it would misclassify a real mid-CODING crash as operator-
+          attention and hide the crash signal dashboards depend on.
+
+        Defaulting unknown signals to ``"crash"`` keeps recovery's log
+        line back-compatible: dashboards have grepped on the "crashed,
+        marking ERROR" line since PR-186, and the only PR-318-intended
+        deviation is the deliberate non-crash subsource.
+
+        ``classify_cancellation_subsource`` already logs an ``[INFRA]``
+        warning when the cause carries a legacy ``category`` value the
+        PR-315 startup migration should have rewritten. The log function
+        is threaded through so the warning lands on the same operator
+        event stream as the rest of recovery diagnostics rather than the
+        module logger.
+        """
+        try:
+            cause = await get_cancellation_cause(
+                self.redis, self.name, task_pr_id
+            )
+        except Exception as exc:
+            self.log_event(
+                f"[INFRA] recover_state: failed to read cancellation "
+                f"cause for {task_pr_id}: {exc}. Falling back to "
+                f"crash-recovery branch."
+            )
+            return "crash"
+        if cause is None:
+            return "crash"
+        subsource = classify_cancellation_subsource(cause, log=self.log_event)
+        if subsource == "crash":
+            return "crash"
+        if subsource not in SUBSOURCE_VOCABULARY:
+            self.log_event(
+                f"[INFRA] recover_state: cancellation cause for "
+                f"{task_pr_id} has empty/unrecognized subsource "
+                f"{subsource!r}; falling back to crash-recovery branch."
+            )
+            return "crash"
+        if not await self._cause_belongs_to_current_run(cause, task_pr_id):
+            return "crash"
+        return "operator_attention"
+
+    async def _cause_belongs_to_current_run(
+        self, cause: CancellationCause, task_pr_id: str
+    ) -> bool:
+        """Return ``True`` iff ``cause`` was written during the current run.
+
+        PR-318 fix-feedback: ``safe_delete_cancellation_cause`` is best-
+        effort and swallows Redis failures, so a non-crash cause recorded
+        by an earlier run may persist across retries. If the next run
+        then dies mid-CODING before writing a fresh cause, the recovery
+        handler would observe the stale cause and misclassify a real
+        crash as deliberate operator-attention parking.
+
+        Treat a non-crash cause as authoritative only when we can prove
+        it belongs to the current dispatch. The proof is the per-task
+        ``current_run_started_at`` timestamp written by ``handle_coding``
+        on every dispatch: if ``cause.created_at`` predates that
+        timestamp (or the timestamp is absent or unreadable), the cause
+        does not belong to this run.
+
+        ``False`` therefore covers four sub-cases, each logged via the
+        same ``[INFRA]`` event stream as other recovery diagnostics:
+
+        * Redis read failure for the run-start key — back-compatible
+          conservative default;
+        * no run-start key recorded — pre-fix records, or first dispatch
+          after a deployment that introduced the marker;
+        * cause has malformed ``created_at`` — corrupt record;
+        * cause was created strictly before the recorded dispatch — the
+          canonical stale-cause scenario.
+        """
+        try:
+            started_at = await get_current_run_started_at(
+                self.redis, self.name, task_pr_id
+            )
+        except Exception as exc:
+            self.log_event(
+                f"[INFRA] recover_state: failed to read current_run "
+                f"start for {task_pr_id}: {exc}. Treating cause as "
+                f"stale and falling back to crash-recovery branch."
+            )
+            return False
+        if started_at is None:
+            self.log_event(
+                f"[INFRA] recover_state: no current_run start recorded "
+                f"for {task_pr_id}; cannot prove non-crash cause belongs "
+                f"to the current run, falling back to crash-recovery "
+                f"branch."
+            )
+            return False
+        try:
+            cause_created_at = datetime.fromisoformat(cause.created_at)
+        except (TypeError, ValueError):
+            self.log_event(
+                f"[INFRA] recover_state: cancellation cause for "
+                f"{task_pr_id} has malformed created_at "
+                f"{cause.created_at!r}; treating as stale and falling "
+                f"back to crash-recovery branch."
+            )
+            return False
+        if cause_created_at.tzinfo is None:
+            cause_created_at = cause_created_at.replace(tzinfo=timezone.utc)
+        if cause_created_at < started_at:
+            self.log_event(
+                f"[INFRA] recover_state: cancellation cause for "
+                f"{task_pr_id} created at {cause.created_at} predates "
+                f"current run start {started_at.isoformat()}; treating "
+                f"as stale and falling back to crash-recovery branch."
+            )
+            return False
+        return True
 
     def _preserve_crashed_run_commits(self, branch: str) -> bool:
         """Push any unpushed commits on ``branch`` to origin.

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from src.cancellation import task_spec_content_hash, task_spec_hash_key
+from src.cancellation.storage import current_run_started_at_key
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 from src.usage import UsageSnapshot
 
@@ -205,6 +206,256 @@ def test_dispatch_continues_when_previous_task_hash_read_fails(
     assert runner.state.state == PipelineState.WATCH
     assert runner._current_run_record is not None
     assert runner._current_run_record.attempt_index == 1
+
+
+def test_dispatch_records_current_run_started_at_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Every CODING dispatch anchors the staleness check by writing the marker.
+
+    Regression for the PR-318 review feedback: without this marker, recovery
+    cannot prove that a non-crash cancellation cause belongs to the current
+    run and would misclassify a real mid-CODING crash as operator-attention.
+    """
+    h._patch_subprocess(monkeypatch, stub_auto_pr_read=False)
+
+    async def fake_auto_pr(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        return (0, "ok", "")
+
+    monkeypatch.setattr(h.claude_cli, "run_auto_pr_async", fake_auto_pr)
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [PRInfo(number=42, branch="pr-001")],
+    )
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda repo, number, body: None,
+    )
+
+    task_content = "# PR-001: Sample\n\nBranch: pr-001\n"
+    task_file = tmp_path / "tasks" / "PR-001.md"
+    task_file.parent.mkdir(parents=True)
+    task_file.write_text(task_content, encoding="utf-8")
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.state = PipelineState.CODING
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="Sample",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    key = current_run_started_at_key("octo__demo", "PR-001")
+    assert key in runner.redis.store
+
+
+def test_dispatch_continues_when_current_run_marker_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A Redis failure recording the dispatch timestamp must not park the task.
+
+    The marker is a defense-in-depth signal for recovery; recovery already
+    degrades a missing marker to the conservative crash branch. A transient
+    Redis blip during CODING dispatch must therefore log and continue rather
+    than route through ``_transition_to_error``.
+    """
+    h._patch_subprocess(monkeypatch, stub_auto_pr_read=False)
+
+    async def fake_auto_pr(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        return (0, "ok", "")
+
+    monkeypatch.setattr(h.claude_cli, "run_auto_pr_async", fake_auto_pr)
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [PRInfo(number=42, branch="pr-001")],
+    )
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda repo, number, body: None,
+    )
+
+    task_content = "# PR-001: Sample\n\nBranch: pr-001\n"
+    task_file = tmp_path / "tasks" / "PR-001.md"
+    task_file.parent.mkdir(parents=True)
+    task_file.write_text(task_content, encoding="utf-8")
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.state = PipelineState.CODING
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="Sample",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    marker_key = current_run_started_at_key("octo__demo", "PR-001")
+    original_set = runner.redis.set
+
+    async def fail_marker_set(
+        key: str,
+        value: str,
+        ex: int | None = None,
+        nx: bool = False,
+    ) -> bool | None:
+        if key == marker_key:
+            raise RuntimeError("redis down")
+        return await original_set(key, value, ex=ex, nx=nx)
+
+    runner.redis.set = fail_marker_set  # type: ignore[method-assign]
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    events = [entry["event"] for entry in runner.state.history]
+    assert any(
+        "current_run_started_at write failed for PR-001" in ev for ev in events
+    ), events
+
+
+def test_dispatch_clears_stale_marker_when_fresh_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failed marker write must invalidate any prior-run marker.
+
+    Regression for the PR-318 review feedback: leaving a prior-run marker
+    in place lets ``_cause_belongs_to_current_run`` anchor the staleness
+    check against an older dispatch, so a stale non-crash cause from a
+    previous run can be wrongly treated as belonging to this run and
+    misclassify a real mid-CODING crash as operator-attention.
+    """
+    h._patch_subprocess(monkeypatch, stub_auto_pr_read=False)
+
+    async def fake_auto_pr(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        return (0, "ok", "")
+
+    monkeypatch.setattr(h.claude_cli, "run_auto_pr_async", fake_auto_pr)
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [PRInfo(number=42, branch="pr-001")],
+    )
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda repo, number, body: None,
+    )
+
+    task_content = "# PR-001: Sample\n\nBranch: pr-001\n"
+    task_file = tmp_path / "tasks" / "PR-001.md"
+    task_file.parent.mkdir(parents=True)
+    task_file.write_text(task_content, encoding="utf-8")
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.state = PipelineState.CODING
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="Sample",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    marker_key = current_run_started_at_key("octo__demo", "PR-001")
+    runner.redis.store[marker_key] = "2020-01-01T00:00:00+00:00"
+    original_set = runner.redis.set
+
+    async def fail_marker_set(
+        key: str,
+        value: str,
+        ex: int | None = None,
+        nx: bool = False,
+    ) -> bool | None:
+        if key == marker_key:
+            raise RuntimeError("redis down")
+        return await original_set(key, value, ex=ex, nx=nx)
+
+    runner.redis.set = fail_marker_set  # type: ignore[method-assign]
+
+    asyncio.run(runner.handle_coding())
+
+    assert marker_key not in runner.redis.store
+    assert marker_key in runner.redis.deleted
+    events = [entry["event"] for entry in runner.state.history]
+    assert any(
+        "stale marker cleared" in ev for ev in events
+    ), events
+
+
+def test_dispatch_logs_when_stale_marker_clear_also_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A double-failure (write + delete) must surface a diagnostic event.
+
+    Without the second log line, an operator chasing a misclassified
+    crash has no evidence that the staleness check is anchored on a
+    prior-run marker still resident in Redis.
+    """
+    h._patch_subprocess(monkeypatch, stub_auto_pr_read=False)
+
+    async def fake_auto_pr(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        return (0, "ok", "")
+
+    monkeypatch.setattr(h.claude_cli, "run_auto_pr_async", fake_auto_pr)
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [PRInfo(number=42, branch="pr-001")],
+    )
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda repo, number, body: None,
+    )
+
+    task_content = "# PR-001: Sample\n\nBranch: pr-001\n"
+    task_file = tmp_path / "tasks" / "PR-001.md"
+    task_file.parent.mkdir(parents=True)
+    task_file.write_text(task_content, encoding="utf-8")
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.state = PipelineState.CODING
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="Sample",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    marker_key = current_run_started_at_key("octo__demo", "PR-001")
+    runner.redis.store[marker_key] = "2020-01-01T00:00:00+00:00"
+    original_set = runner.redis.set
+
+    async def fail_marker_set(
+        key: str,
+        value: str,
+        ex: int | None = None,
+        nx: bool = False,
+    ) -> bool | None:
+        if key == marker_key:
+            raise RuntimeError("redis down")
+        return await original_set(key, value, ex=ex, nx=nx)
+
+    async def fail_marker_delete(key: str) -> int:
+        if key == marker_key:
+            raise RuntimeError("redis still down")
+        return 0
+
+    runner.redis.set = fail_marker_set  # type: ignore[method-assign]
+    runner.redis.delete = fail_marker_delete  # type: ignore[method-assign]
+
+    asyncio.run(runner.handle_coding())
+
+    events = [entry["event"] for entry in runner.state.history]
+    assert any(
+        "marker invalidation also failed" in ev for ev in events
+    ), events
 
 
 def test_handle_coding_transitions_error_when_task_hash_persist_fails(

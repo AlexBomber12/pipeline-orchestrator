@@ -75,6 +75,11 @@ def retry_count_key(repo_slug: str, task_id: str) -> str:
     return f"metrics:retry_count:{repo_slug}:{task_id}"
 
 
+def current_run_started_at_key(repo_slug: str, task_id: str) -> str:
+    """Key for the per-task dispatch timestamp of the currently active run."""
+    return f"current_run_started_at:{repo_slug}:{task_id}"
+
+
 def task_spec_content_hash(task_text: str) -> str:
     """Hash task spec content excluding daemon-managed frontmatter status."""
     lines = task_text.splitlines(keepends=True)
@@ -196,6 +201,64 @@ async def delete_task_spec_hash(
     task_id: str,
 ) -> None:
     await redis_client.delete(task_spec_hash_key(repo_slug, task_id))
+
+
+async def record_current_run_started_at(
+    redis_client: Any,
+    repo_slug: str,
+    task_id: str,
+    started_at: datetime | None = None,
+) -> None:
+    """Persist the dispatch timestamp anchoring the current run.
+
+    PR-318 follow-up: ``_dispatch_recovery_branch`` compares
+    ``cause.created_at`` against this value to detect stale cancellation
+    causes left behind by a prior run when ``safe_delete_cancellation_cause``
+    (best-effort) failed to clear them. A cause whose ``created_at`` predates
+    the current run's dispatch timestamp does not belong to this run and
+    must not be trusted to classify a mid-CODING crash as operator-attention.
+
+    Callers should invoke this from the CODING entry path on every dispatch
+    so the marker tracks the latest run. The 30-day TTL matches the
+    cancellation cause TTL, and natural overwriting on the next dispatch
+    keeps the marker fresh without explicit cleanup.
+    """
+    if started_at is None:
+        started_at = datetime.now(timezone.utc)
+    await redis_client.set(
+        current_run_started_at_key(repo_slug, task_id),
+        started_at.isoformat(),
+        ex=TTL_SECONDS,
+    )
+
+
+async def get_current_run_started_at(
+    redis_client: Any,
+    repo_slug: str,
+    task_id: str,
+) -> datetime | None:
+    """Return the dispatch timestamp recorded for ``task_id``, or ``None``."""
+    raw = await redis_client.get(current_run_started_at_key(repo_slug, task_id))
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+async def delete_current_run_started_at(
+    redis_client: Any,
+    repo_slug: str,
+    task_id: str,
+) -> None:
+    """Drop the dispatch timestamp; used when a task definitively ends."""
+    await redis_client.delete(current_run_started_at_key(repo_slug, task_id))
 
 
 async def reset_retry_count(

@@ -17,7 +17,9 @@ from src.branch_context import BranchContext
 from src.cancellation import (
     CancellationCause,
     classify_infra_exception,
+    delete_current_run_started_at,
     get_task_spec_hash,
+    record_current_run_started_at,
     record_task_spec_hash,
     task_spec_content_hash,
 )
@@ -244,6 +246,37 @@ class CodingMixin:
                 log_prefix="[CODING]",
             )
             return
+        # PR-318 fix-feedback: anchor the current run's dispatch timestamp
+        # so ``_dispatch_recovery_branch`` can distinguish a stale non-crash
+        # cause (left over from a prior run after a best-effort delete
+        # failed) from one written during this dispatch. Best-effort write:
+        # a Redis blip here only weakens the staleness check, and recovery
+        # already degrades a missing marker to the conservative crash
+        # branch, so a transient outage must not park the task. When the
+        # fresh write fails any previously-stored marker would still anchor
+        # the staleness check against an older dispatch, so a stale non-
+        # crash cause from a prior run could be wrongly treated as
+        # belonging to this run; invalidate the marker on failure so
+        # recovery falls back to the conservative crash branch instead.
+        try:
+            await record_current_run_started_at(self.redis, self.name, pr_id)
+        except Exception as exc:
+            try:
+                await delete_current_run_started_at(self.redis, self.name, pr_id)
+            except Exception as delete_exc:
+                self.log_event(
+                    f"[CODING] current_run_started_at write failed for "
+                    f"{pr_id}: {exc}; marker invalidation also failed: "
+                    f"{delete_exc}. A stale non-crash cause from a prior "
+                    f"run may be wrongly classified as belonging to this "
+                    f"run on recovery."
+                )
+            else:
+                self.log_event(
+                    f"[CODING] current_run_started_at write failed for "
+                    f"{pr_id}: {exc}; stale marker cleared so recovery "
+                    f"falls back to crash-branch on this run."
+                )
         await self._prepare_current_run_record_dispatch_metadata(
             task_hash=task_hash,
             previous_task_hash=previous_task_hash,
