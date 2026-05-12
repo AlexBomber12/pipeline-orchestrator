@@ -4,7 +4,6 @@ import re
 from dataclasses import FrozenInstanceError
 
 import pytest
-
 from src.daemon import guardrails
 from src.daemon.guardrails import GuardrailViolation, scan_pr_diff, scan_stdout
 
@@ -455,6 +454,34 @@ def _assert_diff_categories(diff_text: str, categories: list[str]) -> None:
     assert [violation.category for violation in scan_pr_diff(diff_text)] == categories
 
 
+def test_workflow_permission_context_helpers_handle_non_yaml_lines() -> None:
+    assert guardrails._diff_yaml_line("+++ b/.github/workflows/ci.yml") is None
+    assert guardrails._yaml_key("not a mapping") is None
+    assert guardrails._visible_yaml_context(
+        ["-jobs:", " # comment", " jobs:"], 3
+    ) == [(0, "jobs")]
+    assert not guardrails._is_workflow_permission_key_context([], 0, "not a mapping")
+    assert not guardrails._is_workflow_permission_key_context([], 0, "contents: write")
+
+
+def test_workflow_permission_context_rejects_indented_key_without_ancestor() -> None:
+    match_text = "+  permissions: write-all\n"
+
+    assert not guardrails._match_has_workflow_permission_context(match_text)
+
+
+def test_workflow_permission_context_skips_non_diff_parent_lines() -> None:
+    match_text = " permissions:\n@@ -1,2 +1,3 @@\n+  contents: write\n"
+
+    assert guardrails._match_has_workflow_permission_context(match_text)
+
+
+def test_workflow_permission_context_rejects_scope_not_under_parent() -> None:
+    match_text = "   permissions:\n+  contents: write\n"
+
+    assert not guardrails._match_has_workflow_permission_context(match_text)
+
+
 def test_scan_pr_diff_workflow_permissions_write_all_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER + "@@ -1,2 +1,3 @@\n+permissions: write-all\n"
@@ -490,6 +517,18 @@ def test_scan_pr_diff_workflow_permissions_spaced_separator_flagged() -> None:
 def test_scan_pr_diff_workflow_permissions_anchored_write_all_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER + "@@ -1,2 +1,3 @@\n+permissions: &all write-all\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_job_permissions_write_all_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,6 +1,7 @@\n"
+        + " jobs:\n"
+        + "   build:\n"
+        + "+    permissions: write-all\n"
     )
 
     _assert_diff_categories(diff_text, ["permissions_escalation"])
@@ -816,6 +855,20 @@ def test_scan_pr_diff_workflow_reusable_input_named_contents_not_flagged() -> No
         "     uses: org/repo/.github/workflows/build.yml@v1\n"
         "     with:\n"
         "+      contents: write\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_workflow_reusable_input_named_permissions_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,7 +1,8 @@\n"
+        " jobs:\n"
+        "   call:\n"
+        "     uses: org/repo/.github/workflows/build.yml@v1\n"
+        "     with:\n"
+        "+      permissions: write-all\n"
     )
 
     assert scan_pr_diff(diff_text) == []

@@ -110,6 +110,31 @@ _WORKFLOW_WRITE_PERMISSION_SCOPES_RE = (
     r"vulnerability-alerts)[\"']?"
 )
 _YAML_SCALAR_ANCHOR_RE = r"(?:&[A-Za-z_][A-Za-z0-9_-]*[ \t]+)?"
+_YAML_KEY_RE = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<quote>[\"']?)(?P<key>[^:\"'\r\n]+)"
+    r"(?P=quote)[ \t]*:",
+)
+_YAML_PERMISSION_KEY_RE = re.compile(
+    r"^[ \t]*[\"']?permissions[\"']?[ \t]*:",
+    re.IGNORECASE,
+)
+_YAML_WRITE_SCOPE_RE = re.compile(
+    r"^[ \t]*"
+    + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+    + r"[ \t]*:[ \t]*"
+    + _YAML_SCALAR_ANCHOR_RE
+    + r"[\"']?write[\"']?(?:[ \t]*(?:#.*)?)?$",
+    re.IGNORECASE,
+)
+_NON_PERMISSION_MAPPING_KEYS = {
+    "env",
+    "matrix",
+    "run",
+    "services",
+    "steps",
+    "strategy",
+    "with",
+}
 
 # Diff-content scan catalogue. PR-290b adds workflow YAML tampering checks;
 # PR-290c and PR-301..PR-304 extend the same dispatcher with governance,
@@ -196,6 +221,101 @@ def _line_excerpt(coder_stdout: str, start: int, end: int) -> str:
     if line_end == -1:
         line_end = len(coder_stdout)
     return coder_stdout[line_start:line_end].strip()[:_EXCERPT_LIMIT]
+
+
+def _diff_yaml_line(line: str) -> tuple[str, str] | None:
+    if not line or line[0] not in {" ", "+", "-"}:
+        return None
+    if line.startswith(("+++", "---")):
+        return None
+    return line[0], line[1:]
+
+
+def _yaml_key(line: str) -> tuple[int, str] | None:
+    match = _YAML_KEY_RE.match(line)
+    if match is None:
+        return None
+    return len(match.group("indent").expandtabs(2)), match.group("key").strip()
+
+
+def _visible_yaml_context(lines: list[str], line_index: int) -> list[tuple[int, str]]:
+    context: list[tuple[int, str]] = []
+    for previous_line in lines[:line_index]:
+        diff_line = _diff_yaml_line(previous_line)
+        if diff_line is None:
+            continue
+        prefix, yaml_line = diff_line
+        if prefix == "-":
+            continue
+        key = _yaml_key(yaml_line)
+        if key is None:
+            continue
+        context.append(key)
+    return context
+
+
+def _is_workflow_permission_key_context(
+    lines: list[str], line_index: int, permission_line: str
+) -> bool:
+    key = _yaml_key(permission_line)
+    if key is None:
+        return False
+    permission_indent, key_name = key
+    if key_name.strip("\"'").lower() != "permissions":
+        return False
+    if permission_indent == 0:
+        return True
+
+    ancestors = [
+        (indent, name.strip("\"'").lower())
+        for indent, name in _visible_yaml_context(lines, line_index)
+        if indent < permission_indent
+    ]
+    if not ancestors:
+        return False
+    nearest_ancestor = ancestors[-1][1]
+    if nearest_ancestor in _NON_PERMISSION_MAPPING_KEYS:
+        return False
+    return any(name == "jobs" for _indent, name in ancestors)
+
+
+def _match_has_workflow_permission_context(match_text: str) -> bool:
+    lines = match_text.splitlines()
+    for index, line in enumerate(lines):
+        diff_line = _diff_yaml_line(line)
+        if diff_line is None:
+            continue
+        prefix, yaml_line = diff_line
+        if prefix != "+":
+            continue
+        if _YAML_PERMISSION_KEY_RE.match(yaml_line) and (
+            _is_workflow_permission_key_context(lines, index, yaml_line)
+        ):
+            return True
+        if not _YAML_WRITE_SCOPE_RE.match(yaml_line):
+            continue
+        for parent_index in range(index - 1, -1, -1):
+            parent_diff_line = _diff_yaml_line(lines[parent_index])
+            if parent_diff_line is None:
+                continue
+            parent_prefix, parent_yaml_line = parent_diff_line
+            if parent_prefix == "-":
+                continue
+            if not _YAML_PERMISSION_KEY_RE.match(parent_yaml_line):
+                continue
+            parent_key = _yaml_key(parent_yaml_line)
+            scope_key = _yaml_key(yaml_line)
+            # Regex prefilters require key-shaped YAML lines here.
+            if parent_key is None or scope_key is None:  # pragma: no cover
+                continue
+            parent_indent = parent_key[0]
+            scope_indent = scope_key[0]
+            if parent_indent < scope_indent and _is_workflow_permission_key_context(
+                lines, parent_index, parent_yaml_line
+            ):
+                return True
+            break
+    return False
 
 
 def _push_args_tokens(args: str) -> list[str]:
@@ -413,6 +533,10 @@ def scan_pr_diff(diff_text: str) -> list[GuardrailViolation]:
     for category in sorted(_DIFF_PATTERNS):
         pattern = _DIFF_PATTERNS[category]
         for match in pattern.finditer(diff_text):
+            if category == "permissions_escalation" and not (
+                _match_has_workflow_permission_context(match.group(0))
+            ):
+                continue
             violations.append(
                 GuardrailViolation(
                     tier=1,
