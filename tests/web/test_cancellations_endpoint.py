@@ -191,50 +191,77 @@ def test_endpoint_empty_when_no_redis(monkeypatch: pytest.MonkeyPatch) -> None:
     assert sentinel["called"] is False
 
 
-def test_partial_endpoint_renders_each_category(cancellations_client) -> None:
-    """The HTML partial renders one card per category with the expected
-    payload fields, exercising every branch of the macro."""
+def test_partial_endpoint_renders_each_subsource(cancellations_client) -> None:
+    """The HTML partial renders one card per PR-315 subsource with the
+    expected payload fields, exercising every branch of the macro after
+    the PR-319 rewrite. ``cause.category`` is always ``ERROR`` post-
+    migration; detector identity lives in ``payload.subsource``."""
     client, causes, _captured = cancellations_client
     now = datetime.now(timezone.utc)
     causes[:] = [
         _make_cause(
             "PR-CRASH",
-            category="CRASH",
-            payload={"exit_code": 137, "error_message": "boom on stderr"},
+            category="ERROR",
+            payload={
+                "subsource": "crash",
+                "exit_code": 137,
+                "error_message": "boom on stderr",
+            },
             created_at=(now - timedelta(minutes=10)).isoformat(),
         ),
         _make_cause(
             "PR-ESC-CODER",
-            category="ESCALATE",
+            category="ERROR",
             payload={
-                "subsource": "coder",
+                "subsource": "coder_escalate",
                 "reason_text": "manual ESCALATE marker",
             },
             created_at=(now - timedelta(minutes=20)).isoformat(),
         ),
         _make_cause(
-            "PR-ESC-DAEMON",
-            category="ESCALATE",
+            "PR-GR",
+            category="ERROR",
             payload={
-                "subsource": "daemon",
-                "reason_text": "review timeout",
+                "subsource": "guardrail",
+                "reason_text": "GUARDRAIL: deletion: rm -rf /",
             },
             created_at=(now - timedelta(minutes=25)).isoformat(),
         ),
         _make_cause(
-            "PR-TO",
-            category="TIMEOUT",
+            "PR-RT",
+            category="ERROR",
             payload={
-                "limit_type": "wallclock",
-                "duration_elapsed_sec": 1800,
-                "active_phase": "CODING",
+                "subsource": "review_timeout",
+                "elapsed_min": 90,
+                "reason_text": "review timeout",
             },
             created_at=(now - timedelta(minutes=30)).isoformat(),
         ),
         _make_cause(
-            "PR-INF",
-            category="INFRA",
+            "PR-FIT",
+            category="ERROR",
             payload={
+                "subsource": "fix_idle_timeout",
+                "duration_elapsed_sec": 1800,
+                "active_phase": "FIX",
+            },
+            created_at=(now - timedelta(minutes=35)).isoformat(),
+        ),
+        _make_cause(
+            "PR-FIC",
+            category="ERROR",
+            payload={
+                "subsource": "fix_iteration_cap",
+                "iteration_count": 8,
+                "pr_number": 42,
+            },
+            created_at=(now - timedelta(minutes=38)).isoformat(),
+        ),
+        _make_cause(
+            "PR-INF",
+            category="ERROR",
+            payload={
+                "subsource": "infra_failure",
                 "subsystem": "gh_api",
                 "retry_count": 5,
                 "last_attempt_iso": (now - timedelta(minutes=40)).isoformat(),
@@ -243,8 +270,8 @@ def test_partial_endpoint_renders_each_category(cancellations_client) -> None:
         ),
         _make_cause(
             "PR-NPD",
-            category="NO_PUSH_DEADLOCK",
-            payload={"attempts": 3},
+            category="ERROR",
+            payload={"subsource": "no_push_deadlock", "attempts": 3},
             created_at=(now - timedelta(minutes=60)).isoformat(),
         ),
     ]
@@ -253,19 +280,24 @@ def test_partial_endpoint_renders_each_category(cancellations_client) -> None:
 
     assert resp.status_code == 200
     body = resp.text
-    # Per-category badge label + class hook present.
-    assert "category-crash" in body and ">CRASH<" in body
-    assert "category-escalate" in body and ">ESCALATE<" in body
-    assert "category-timeout" in body and ">TIMEOUT<" in body
-    assert "category-infra" in body and ">INFRA<" in body
-    assert "category-no_push_deadlock" in body and ">NO_PUSH_DEADLOCK<" in body
+    # Per-subsource wrapper class hook + badge label present.
+    assert "subsource-crash" in body and "Daemon crash" in body
+    assert "subsource-coder_escalate" in body and "Coder escalate" in body
+    assert "subsource-guardrail" in body and "Guardrail violation" in body
+    assert "subsource-review_timeout" in body and "Stale review" in body
+    assert "subsource-fix_idle_timeout" in body and "FIX idle timeout" in body
+    assert "subsource-fix_iteration_cap" in body and "FIX iteration cap" in body
+    assert "subsource-infra_failure" in body and "Infrastructure failure" in body
+    assert "subsource-no_push_deadlock" in body and "No-push deadlock" in body
     # Payload fields render per branch.
     assert "boom on stderr" in body
-    assert "Coder gave up: manual ESCALATE marker" in body
-    assert "Daemon detected stuck: review timeout" in body
-    assert "wallclock" in body and "1800s" in body and "CODING" in body
+    assert "manual ESCALATE marker" in body
+    assert "GUARDRAIL: deletion: rm -rf /" in body
+    assert "90m" in body
+    assert "1800s" in body
+    assert "8 iterations" in body
     assert "gh_api" in body
-    assert "no push for" in body and ">3<" in body
+    assert "3 consecutive cycles" in body
 
 
 def test_partial_endpoint_renders_empty_state_when_no_causes(
@@ -364,15 +396,24 @@ def test_partial_endpoint_renders_empty_state_when_redis_read_raises(
 def test_partial_endpoint_renders_legacy_records_without_payload_fields(
     cancellations_client,
 ) -> None:
-    """Older records (recorded before PR-253 added payload fields)
-    must render without 5xx — each subfield guard short-circuits cleanly."""
+    """Older records must render without 5xx — each subfield guard short-
+    circuits cleanly. After PR-319 the template dispatches on
+    ``payload.subsource``; records missing the field (whether pre-PR-253
+    bare payloads or pre-PR-315 raw legacy categories the migration
+    missed) fall through to the legacy-category / generic-error fallback
+    branch. ``OPERATOR_RECOVERY`` is the one legacy category the
+    ``escalate_to_error`` migration intentionally leaves untouched, so
+    the card still renders the dedicated manual-recovery label."""
     client, causes, _captured = cancellations_client
     causes[:] = [
-        _make_cause("PR-LEGACY-CRASH", category="CRASH", payload={}),
-        _make_cause("PR-LEGACY-ESC", category="ESCALATE", payload={}),
-        _make_cause("PR-LEGACY-TO", category="TIMEOUT", payload={}),
-        _make_cause("PR-LEGACY-INF", category="INFRA", payload={}),
-        _make_cause("PR-LEGACY-NPD", category="NO_PUSH_DEADLOCK", payload={}),
+        _make_cause("PR-LEGACY-MIG", category="ERROR", payload={
+            "legacy_category": "ESCALATE",
+            "reason_text": "manual",
+        }),
+        _make_cause("PR-LEGACY-RAW", category="CRASH", payload={}),
+        _make_cause("PR-LEGACY-NPD-EMPTY", category="ERROR", payload={
+            "subsource": "no_push_deadlock",
+        }),
         _make_cause("PR-LEGACY-OP", category="OPERATOR_RECOVERY", payload={}),
     ]
 
@@ -380,11 +421,16 @@ def test_partial_endpoint_renders_legacy_records_without_payload_fields(
 
     assert resp.status_code == 200
     body = resp.text
-    assert "PR-LEGACY-CRASH" in body
-    assert "PR-LEGACY-ESC" in body
+    assert "PR-LEGACY-MIG" in body
+    assert "PR-LEGACY-RAW" in body
+    # Migrated record surfaces the preserved legacy category badge.
+    assert "Legacy: ESCALATE" in body
+    # OPERATOR_RECOVERY keeps its dedicated label per the migration design.
     assert "Manual recovery via dashboard" in body
-    # NO_PUSH_DEADLOCK falls back to the no-attempts message.
+    # no_push_deadlock without ``attempts`` falls back to the no-count message.
     assert "no push across consecutive cycles" in body
+    # Raw un-migrated category falls through to the generic error fallback.
+    assert "Cancellation reason not recorded" in body
 
 
 def test_endpoint_short_circuits_when_repo_not_in_config(
