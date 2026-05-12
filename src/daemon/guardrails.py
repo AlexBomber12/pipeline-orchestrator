@@ -108,21 +108,20 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
     "permissions_escalation": re.compile(
         # Match `+`-prefixed lines (additions only) only inside workflow
         # YAML diff sections containing `permissions: write-all`
-        # (top-level blanket write) OR a permission scope set to `write`
-        # inside a permissions block. Indentation is variable (top-level
-        # vs nested under a job), so leading whitespace is captured but
-        # otherwise non-significant.
+        # (top-level blanket write) OR a known permission scope set to
+        # exactly `write`. Indentation is variable (top-level vs nested
+        # under a job), so leading whitespace is captured but otherwise
+        # non-significant.
         r"(?ms)^diff --git[ \t]+a/\.github/workflows/[^\r\n]+\.ya?ml"
         r"[ \t]+b/\.github/workflows/[^\r\n]+\.ya?ml[^\r\n]*\r?\n"
-        r"(?:(?!^diff --git[ \t]).)*?(?:"
-        r"^\+[ \t]*permissions:[ \t]*[\"']?write-all[\"']?[ \t]*(?:#.*)?$"
-        r"|^[ +][ \t]*permissions:[ \t]*(?:#.*)?\r?\n"
-        r"(?:(?!^diff --git[ \t]).)*?^\+[ \t]+(?:actions|attestations|"
+        r"(?:(?!^diff --git[ \t]).)*?^\+[ \t]*(?:"
+        r"permissions:[ \t]*[\"']?write-all[\"']?"
+        r"|(?:actions|attestations|"
         r"artifact-metadata|checks|code-quality|contents|deployments|"
         r"discussions|id-token|issues|packages|pages|pull-requests|"
         r"repository-projects|security-events|statuses):[ \t]*[\"']?write"
-        r"[\"']?[ \t]*(?:#.*)?$"
-        r")",
+        r"[\"']?"
+        r")[ \t]*(?:#.*)?$",
         re.IGNORECASE,
     ),
     "workflow_destruction": re.compile(

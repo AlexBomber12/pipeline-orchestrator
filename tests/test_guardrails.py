@@ -487,6 +487,12 @@ def test_scan_pr_diff_workflow_quoted_scope_write_flagged() -> None:
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_scope_write_without_parent_context_flagged() -> None:
+    diff_text = WORKFLOW_DIFF_HEADER + "@@ -20,3 +20,4 @@\n+  issues: write\n"
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
 def test_scan_pr_diff_workflow_id_token_write_flagged() -> None:
     diff_text = (
         "diff --git a/.github/workflows/oidc.yml b/.github/workflows/oidc.yml\n"
