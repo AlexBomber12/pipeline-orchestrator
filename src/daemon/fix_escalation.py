@@ -2,11 +2,10 @@
 
 Each function takes the active ``PipelineRunner`` as the first argument
 because the operations need access to ``runner.state``, ``runner.owner_repo``,
-``runner.app_config``, ``runner.log_event`` and ``runner._escalate_and_skip`` /
-``runner._transition_to_error`` primitives. ``handlers/fix.py`` keeps thin
-wrapper methods on ``FixMixin`` so existing callers (regression tests in
-``tests/runner/`` and the runner itself via ``_escalate_and_skip``) continue
-to work unchanged.
+``runner.app_config``, ``runner.log_event`` and the
+``runner._commit_and_park_in_error`` / ``runner._transition_to_error``
+primitives. ``handlers/fix.py`` keeps thin wrapper methods on ``FixMixin``
+so existing callers in ``tests/runner/`` continue to work unchanged.
 """
 
 from __future__ import annotations
@@ -205,11 +204,14 @@ async def escalate_fix_no_push_deadlock(
 async def escalate_fix_coder_initiated(
     runner: "PipelineRunner", current_pr: PRInfo, reason: str
 ) -> None:
-    """Skip the task after the coder emits an ESCALATE marker.
+    """Park the task after the coder emits an ESCALATE marker.
 
-    Posts a fix.py-specific failure-log comment and then routes state via
-    ``_escalate_and_skip``. The durable PR escalation markers remain on the
-    PR while daemon state returns to ``IDLE`` for the next task.
+    Posts the fix.py failure-log comment, applies the durable ``escalated``
+    label, sets ``PRInfo.is_escalated`` so dashboards surface the operator
+    park, then routes state via ``_commit_and_park_in_error`` (PR-317).
+    Parking in ERROR instead of IDLE closes the OBS-DD class loop where
+    the picker would otherwise re-select the still-status:TODO task on
+    every cycle.
     """
     pr_number = current_pr.number
     clean_reason = reason.strip() or _ESCALATE_EMPTY_REASON
@@ -227,35 +229,41 @@ async def escalate_fix_coder_initiated(
     label_applied = ensure_escalated_label(
         runner, pr_number, "FIX coder ESCALATE"
     )
+    current_pr.is_escalated = True
     if label_applied:
-        await runner._escalate_and_skip(
+        message = (
             f"FIX coder ESCALATE on PR #{pr_number}: {clean_reason}. "
-            "Moving to IDLE.",
-            target_state=PipelineState.IDLE,
-            error_message_override=None,
-            apply_escalated_label=False,
-            cancellation_subsource="coder_escalate",
+            "Parking in ERROR"
         )
-        return
-    await runner._escalate_and_skip(
-        f"FIX coder ESCALATE on PR #{pr_number}: failed to apply "
-        f"`escalated` label. Reason: {clean_reason}. Manual "
-        "review required.",
-        apply_escalated_label=False,
-        cancellation_subsource="coder_escalate",
+    else:
+        message = (
+            f"FIX coder ESCALATE on PR #{pr_number}: failed to apply "
+            f"`escalated` label. Reason: {clean_reason}. Manual "
+            "review required"
+        )
+    await runner._commit_and_park_in_error(
+        message,
+        subsource="coder_escalate",
+        extra_payload={
+            "pr_number": pr_number,
+            "label_applied": label_applied,
+        },
     )
 
 
 async def escalate_fix_iteration_cap(
     runner: "PipelineRunner", current_pr: PRInfo
 ) -> None:
-    """Escalate the PR after the FIX iteration cap is reached.
+    """Park the PR after the FIX iteration cap is reached.
 
-    The comment-post and ``pr edit --add-label`` failure paths route to
-    ``ERROR`` (durable parking signal for daemon-driven escalation,
-    distinct from the coder-initiated ``HUNG`` fallback). The success path
-    delegates to ``_escalate_and_skip`` for the IDLE transition +
-    ``[ESCALATE]`` log + publish.
+    Posts the failure-log comment + applies the durable ``escalated`` label,
+    then routes state via ``_commit_and_park_in_error`` (PR-317). The
+    ``post_comment`` and ``pr edit --add-label`` failure paths still route
+    through ``_transition_to_error`` to preserve the daemon-driven
+    durability requirement (a label-apply failure here is a hard error
+    because there is no coder self-report fallback). PR-317 replaced the
+    success path's ``_escalate_and_skip`` → IDLE with a terminal ERROR
+    park so the picker stops re-selecting the same task.
     """
     count = current_pr.fix_iteration_count
     fix_iteration_cap = runner.app_config.daemon.fix_iteration_cap
@@ -302,11 +310,14 @@ async def escalate_fix_iteration_cap(
             log_prefix="[FIX]",
         )
         return
-    await runner._escalate_and_skip(
+    current_pr.is_escalated = True
+    await runner._commit_and_park_in_error(
         f"FIX cap reached ({count}/{fix_iteration_cap}) on PR "
-        f"#{pr_number}: escalated, moving to IDLE.",
-        target_state=PipelineState.IDLE,
-        error_message_override=None,
-        apply_escalated_label=False,
-        cancellation_subsource="fix_iteration_cap",
+        f"#{pr_number}: escalated, parking in ERROR",
+        subsource="fix_iteration_cap",
+        extra_payload={
+            "pr_number": pr_number,
+            "iteration_count": count,
+            "fix_iteration_cap": fix_iteration_cap,
+        },
     )

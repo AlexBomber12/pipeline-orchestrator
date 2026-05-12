@@ -102,9 +102,10 @@ class FixMixin(BreachMixin):
     ) -> bool:
         """Thin wrapper over ``fix_escalation.ensure_escalated_label``.
 
-        Kept as a method because ``runner._escalate_and_skip`` calls it via
-        ``self._ensure_escalated_label(...)`` and existing tests still
-        invoke ``runner._ensure_escalated_label(...)`` directly.
+        Kept as a method because existing tests still invoke
+        ``runner._ensure_escalated_label(...)`` directly to assert the
+        durable PR-side escalation marker behaves as the FixMixin
+        contract describes.
         """
         return fix_escalation.ensure_escalated_label(
             self, pr_number, label_create_log_prefix

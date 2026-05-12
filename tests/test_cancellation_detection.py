@@ -267,8 +267,10 @@ def test_escalate_wiring_writes_reason_text(
         {"subsource": "coder_escalate", "reason_text": "cannot resolve"},
         {
             "subsource": "coder_escalate",
-            "reason_text": "FIX coder ESCALATE on PR #304: cannot resolve. Moving to IDLE.",
+            "reason_text": "FIX coder ESCALATE on PR #304: cannot resolve. Parking in ERROR",
             "previous_state": "FIX",
+            "pr_number": 304,
+            "label_applied": True,
         },
     ]
 

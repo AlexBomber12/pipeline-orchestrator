@@ -95,7 +95,6 @@ from src.daemon.selector import (
     select_coder,
 )
 from src.events import publish_repo_event
-from src.github import comments as gh_comments
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.github import rate_limit as gh_rate_limit
@@ -185,11 +184,6 @@ def _legacy_run_cause_from_cancellation(
 _HISTORY_LIMIT = 100
 _STOP_POLL_INTERVAL_SEC = 0.5
 _IDLE_STREAK_CAP = 100
-
-# Sentinel for ``_escalate_and_skip``'s ``error_message_override``: when
-# the caller passes the sentinel (the default), ``error_message`` is set
-# to ``message``. ``None`` and any string value override that default.
-_USE_MESSAGE_AS_ERROR: object = object()
 
 # A ``PR #<number>`` token is a semantic identifier (different PRs are
 # distinct events) and is preserved verbatim. The alternation tries the
@@ -1405,6 +1399,84 @@ class PipelineRunner(
         if publish:
             await self.publish_state()
 
+    async def _commit_and_park_in_error(
+        self,
+        message: str,
+        *,
+        subsource: str,
+        log_message: str | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Park the active task in ERROR; let the runner continue with the queue.
+
+        PR-317 collapsed the seven legacy ``_escalate_and_skip`` callsites
+        (coding/idle handlers + fix_escalation) into this primitive so
+        every terminal failure path closes the OBS-DD ESCALATE→IDLE→re-pick
+        loop on the same shared shape:
+
+        1. Transition through ``_transition_to_error`` with a structured
+           ``CancellationCause`` (subsource from the PR-315 vocabulary) so
+           OBS-BE attribution stays correct.
+        2. Write ``status:ERROR`` to the task frontmatter so the IDLE
+           picker stops re-selecting the now-failed task — the
+           loop-breaking fix.
+
+        PR-317 review feedback (P1): this helper does NOT set
+        ``skip_ai_error_diagnose``. That flag is reserved for the WATCH
+        ``review_timeout`` park (handled inline in ``handlers/watch.py``),
+        which is an intentional repo-wide stop-the-world event awaiting
+        operator Retry. Task-level escalations from coding/fix/idle
+        handlers must not block unrelated queued tasks on the same
+        runner: the next ERROR cycle invokes ``handle_error`` per the
+        standard routing (infra/rate-limit/timeout fall back to IDLE for
+        retry; other categories route via AI diagnose) and the
+        ``status:ERROR`` frontmatter prevents the IDLE picker from
+        re-selecting the parked task.
+
+        The ``[ESCALATE]`` log prefix is preserved for operator/grep
+        continuity with the pre-PR-317 history. ``extra_payload`` is
+        merged into the canonical ``{subsource, reason_text,
+        previous_state}`` payload so detector-specific telemetry survives
+        in the OBS-DD UI (e.g. fix_iteration_cap callers add
+        ``iteration_count``).
+        """
+        prior_state = self.state.state
+        current_task = self.state.current_task
+        payload: dict[str, Any] = {
+            "subsource": subsource,
+            "reason_text": message,
+            "previous_state": prior_state.value,
+        }
+        if extra_payload:
+            payload.update(extra_payload)
+        # Finalize the run record before ``_commit_task_status_change``
+        # checks out origin/<base>: ``_save_current_run_record`` captures
+        # ``HEAD`` at save time, so deferring it past the checkout would
+        # record the base-branch SHA instead of the failing task branch.
+        await self._transition_to_error(
+            message,
+            save_run_record_as="error",
+            log_prefix="[ESCALATE]",
+            log_message=log_message,
+            cancellation_cause=CancellationCause(
+                category="ERROR",
+                payload=payload,
+            ),
+        )
+        if current_task is not None:
+            try:
+                status_written = await self._commit_task_status_change(
+                    current_task, "ERROR", message
+                )
+            except Exception as exc:
+                self.log_event(
+                    f"[ERROR] Failed to write status:ERROR to "
+                    f"{current_task.task_file}: {exc}"
+                )
+                status_written = False
+            if not status_written:
+                await self._mark_status_write_failed_task(current_task)
+
     async def _review_timeout_park_cleared(self) -> bool:
         """Return True when the operator-park cancellation cause is gone.
 
@@ -1427,165 +1499,6 @@ class PipelineRunner(
         except Exception:
             return False
         return cause is None
-
-    # All daemon escalation-and-skip transitions must use this primitive so
-    # the queue can continue while the PR keeps its durable escalation signal.
-    async def _escalate_and_skip(
-        self,
-        message: str,
-        *,
-        target_state: PipelineState = PipelineState.IDLE,
-        error_message_override: str | None | object = _USE_MESSAGE_AS_ERROR,
-        apply_escalated_label: bool = True,
-        label_create_log_prefix: str = "escalate",
-        post_comment_on_pr: str | None = None,
-        set_pr_escalated_flag: bool = True,
-        log_message: str | None = None,
-        cancellation_subsource: str,
-    ) -> bool:
-        """Escalate the active PR with consistent telemetry.
-
-        By default sets state=IDLE, applies the ``escalated`` label on
-        the current PR via ``_ensure_escalated_label`` (FixMixin),
-        marks ``PRInfo.is_escalated=True``, logs an ``[ESCALATE]``
-        event and publishes state.
-
-        Returns ``True`` when the ``escalated`` label was applied
-        successfully (or label-apply was skipped); ``False`` when
-        ``_ensure_escalated_label`` reported a soft-failure on the
-        ``pr edit --add-label`` step. Callers that route to a state
-        which depends on the GitHub label for durability inspect this
-        return to downgrade when the upstream apply failed.
-
-        Args:
-            message: Becomes ``error_message`` and the default log
-                payload. Callers that need a different log body pass
-                ``log_message``; callers that need to clear or replace
-                ``error_message`` pass ``error_message_override``.
-            target_state: Final state. Default ``IDLE``. ``ERROR`` may be
-                passed when the escalation should also act as a durable
-                parking error.
-            error_message_override: Sentinel default uses ``message``.
-                Pass ``None`` to clear ``state.error_message``. Pass a
-                string to replace it (e.g.
-                ``_escalate_fix_coder_initiated`` expands the failure
-                context when label-apply fails).
-            apply_escalated_label: When True, calls
-                ``_ensure_escalated_label`` so the GitHub label is
-                created (idempotent) and applied to the PR. Default
-                True. Returns the apply outcome via the function's
-                return value.
-            label_create_log_prefix: Forwarded to
-                ``_ensure_escalated_label`` so existing label-create
-                soft-fail log prefixes (``"FIX no-push"``, ``"FIX
-                coder ESCALATE"``, ...) survive the migration.
-            post_comment_on_pr: When non-None, posts the supplied text
-                via ``comments.post_comment``. Failure is logged
-                with a generic ``[INFRA] Warning:`` prefix; callers
-                that need a custom failure-log body (e.g. fix.py
-                wrappers asserted on by regression tests) post the
-                comment themselves before invoking the primitive.
-            set_pr_escalated_flag: When True, sets
-                ``self.state.current_pr.is_escalated = True``. Default
-                True. Set False at sites where the in-memory flag is
-                explicitly NOT meant to mark the PR as escalated
-                (e.g. ``watch.py``'s review-timeout HUNG fall-through,
-                where the PR is parked but recoverable).
-            log_message: Overrides the body after ``[ESCALATE] `` when
-                the operator-visible log differs from
-                ``error_message``. Defaults to ``message``.
-            cancellation_subsource: Canonical ``payload.subsource`` value
-                written when this primitive needs to seed a new
-                ``CancellationCause`` (no prior cause exists for the
-                active task). Required — must be one of the eight values
-                documented in ``src/cancellation/storage.py`` so
-                downstream consumers can dispatch on detector identity
-                (e.g. ``"review_timeout"`` from WATCH,
-                ``"fix_iteration_cap"`` from FIX-cap,
-                ``"coder_escalate"`` from the coder ESCALATE marker).
-                The pre-PR-315 ``"daemon"`` default was removed (PR-315
-                feedback): silently defaulting reintroduced ambiguous
-                attribution at any caller that did not pass a value,
-                violating the canonical subsource contract.
-        """
-        pr = self.state.current_pr
-
-        if post_comment_on_pr is not None and pr is not None:
-            try:
-                gh_comments.post_comment(
-                    self.owner_repo, pr.number, post_comment_on_pr
-                )
-            except Exception as exc:
-                self.log_event(
-                    f"[INFRA] Warning: failed to post escalation comment "
-                    f"on PR #{pr.number}: {exc}."
-                )
-
-        label_applied = True
-        if apply_escalated_label and pr is not None:
-            label_applied = self._ensure_escalated_label(
-                pr.number, label_create_log_prefix
-            )
-
-        if set_pr_escalated_flag and pr is not None:
-            pr.is_escalated = True
-
-        prior_state = self.state.state
-        current_task = self.state.current_task
-        if current_task is not None:
-            existing_cause: CancellationCause | None
-            try:
-                existing_cause = await get_cancellation_cause(
-                    self.redis,
-                    self.name,
-                    current_task.pr_id,
-                )
-            except Exception:
-                existing_cause = None
-            if existing_cause is None:
-                await safe_record_cancellation_cause(
-                    self.redis,
-                    self.name,
-                    current_task.pr_id,
-                    CancellationCause(
-                        category="ERROR",
-                        payload={
-                            "subsource": cancellation_subsource,
-                            "reason_text": message,
-                            "previous_state": prior_state.value,
-                        },
-                    ),
-                    log=self.log_event,
-                )
-            if set_pr_escalated_flag:
-                try:
-                    status_written = await self._commit_task_status_change(
-                        current_task,
-                        "ERROR",
-                        message,
-                    )
-                except Exception as exc:
-                    self.log_event(
-                        f"[ERROR] Failed to write status:ERROR to "
-                        f"{current_task.task_file}: {exc}"
-                    )
-                    status_written = False
-                if not status_written:
-                    await self._mark_status_write_failed_task(current_task)
-
-        if target_state == PipelineState.IDLE and current_task is not None:
-            self.state.current_task = None
-            self._reset_runner_local_task_counters()
-
-        self.state.state = target_state
-        if error_message_override is _USE_MESSAGE_AS_ERROR:
-            self.state.error_message = message
-        else:
-            self.state.error_message = error_message_override  # type: ignore[assignment]
-        log_body = log_message if log_message is not None else message
-        self.log_event(f"[ESCALATE] {log_body}")
-        await self.publish_state()
-        return label_applied
 
     async def _commit_task_status_change(
         self,
