@@ -472,7 +472,8 @@ def test_handle_fix_escalates_at_iteration_cap_before_next_spawn(
     asyncio.run(runner.handle_fix())
 
     assert fix_called == []
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     assert runner.state.user_paused is False
     assert posted == [
         (
@@ -495,7 +496,7 @@ def test_handle_fix_escalates_at_iteration_cap_before_next_spawn(
     ]
     assert any(
         entry["event"]
-        == f"[ESCALATE] FIX cap reached ({cap}/{cap}) on PR #77: escalated, moving to IDLE."
+        == f"[ESCALATE] FIX cap reached ({cap}/{cap}) on PR #77: escalated, parking in ERROR."
         for entry in runner.state.history
     )
 
@@ -556,7 +557,8 @@ def test_handle_fix_cap_ignores_existing_label_create_failure(
         ],
         ["pr", "edit", "88", "--add-label", "escalated"],
     ]
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     assert runner.state.user_paused is True
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.is_escalated is True
@@ -774,7 +776,8 @@ def test_handle_fix_routes_iteration_cap_through_bounded_recovery_policy(
     asyncio.run(runner.handle_fix())
 
     assert maybe_escalate_calls == ["fix_iteration_cap"]
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.is_escalated is True
 
@@ -1056,7 +1059,7 @@ def test_handle_fix_no_push_deadlock_label_failures_do_not_block_idle(
     )
 
 
-def test_handle_fix_coder_escalate_transitions_to_idle(
+def test_handle_fix_coder_escalate_transitions_to_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     posted, gh_calls = h._patch_fix_with_stdout(monkeypatch, stdout="working...\nESCALATE: rate limit exceeded\n")
@@ -1067,7 +1070,8 @@ def test_handle_fix_coder_escalate_transitions_to_idle(
 
     asyncio.run(runner.handle_fix())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.is_escalated is True
     expected_message = "Coder explicitly escalated this PR. Reason: rate limit exceeded. Manual review required."
@@ -1085,7 +1089,7 @@ def test_handle_fix_coder_escalate_transitions_to_idle(
         ["pr", "edit", "300", "--add-label", "escalated"],
     ]
     assert any(
-        entry["event"] == "[ESCALATE] FIX coder ESCALATE on PR #300: rate limit exceeded. Moving to IDLE."
+        entry["event"] == "[ESCALATE] FIX coder ESCALATE on PR #300: rate limit exceeded. Parking in ERROR."
         for entry in runner.state.history
     )
 
@@ -1142,7 +1146,8 @@ def test_handle_fix_coder_escalate_empty_reason_uses_placeholder(
 
     asyncio.run(runner.handle_fix())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.is_escalated is True
     expected_message = "Coder explicitly escalated this PR. Reason: (no reason provided). Manual review required."
@@ -1172,7 +1177,8 @@ def test_handle_fix_coder_escalate_wins_over_productive_push(
 
     asyncio.run(runner.handle_fix())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.is_escalated is True
     # ESCALATE preempts record_fix_push → no iteration increment, no
@@ -1193,7 +1199,7 @@ def test_handle_fix_coder_escalate_wins_over_productive_push(
 def test_handle_fix_coder_escalate_post_failure_still_parks_pr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Comment-post failure must not block the IDLE transition."""
+    """Comment-post failure must not block the terminal ERROR park (PR-317)."""
     h._patch_fix_with_stdout(monkeypatch, stdout="ESCALATE: cannot recover\n")
     monkeypatch.setattr(
         "src.github.comments.post_comment",
@@ -1206,7 +1212,8 @@ def test_handle_fix_coder_escalate_post_failure_still_parks_pr(
 
     asyncio.run(runner.handle_fix())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.is_escalated is True
     assert any(
@@ -1214,10 +1221,10 @@ def test_handle_fix_coder_escalate_post_failure_still_parks_pr(
     )
 
 
-def test_handle_fix_coder_escalate_label_apply_failure_skips_to_idle(
+def test_handle_fix_coder_escalate_label_apply_failure_parks_in_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Label apply failure keeps context and returns to IDLE."""
+    """Label apply failure keeps context and parks in ERROR (PR-317)."""
     posted, _ = h._patch_fix_with_stdout(monkeypatch, stdout="ESCALATE: infra error\n")
 
     def fake_run_gh(cmd: list[str], **kwargs: Any) -> str:
@@ -1235,7 +1242,8 @@ def test_handle_fix_coder_escalate_label_apply_failure_skips_to_idle(
 
     asyncio.run(runner.handle_fix())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.is_escalated is True
     assert runner.state.error_message is not None
@@ -1295,7 +1303,8 @@ def test_handle_fix_coder_escalate_resets_no_push_counter(
 
     asyncio.run(runner.handle_fix())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.no_push_fix_count == 0
     assert runner.state.current_pr.is_escalated is True

@@ -274,10 +274,10 @@ def test_apply_canceled_label_pr_edit_failure_is_soft(
     )
 
 
-def test_escalate_fix_coder_initiated_label_success_parks_in_idle(
+def test_escalate_fix_coder_initiated_label_success_parks_in_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Coder ESCALATE with successful label apply transitions to IDLE."""
+    """PR-317: coder ESCALATE parks in ERROR with subsource=coder_escalate."""
     posted: list[tuple[str, int, str]] = []
     monkeypatch.setattr(
         "src.github.comments.post_comment",
@@ -294,7 +294,8 @@ def test_escalate_fix_coder_initiated_label_success_parks_in_idle(
         fix_escalation.escalate_fix_coder_initiated(runner, pr, "auth expired")
     )
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     assert pr.is_escalated is True
     assert posted == [
         (
@@ -326,10 +327,10 @@ def test_escalate_fix_coder_initiated_empty_reason_substitutes_placeholder(
     assert "Reason: (no reason provided)" in posted[0][2]
 
 
-def test_escalate_fix_iteration_cap_success_path_idle_with_label(
+def test_escalate_fix_iteration_cap_success_path_parks_in_error_with_label(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Iteration-cap success path: comment + label + IDLE transition."""
+    """PR-317: iteration-cap parks in ERROR with subsource=fix_iteration_cap."""
     posted: list[tuple[str, int, str]] = []
     gh_calls: list[list[str]] = []
 
@@ -350,7 +351,9 @@ def test_escalate_fix_iteration_cap_success_path_idle_with_label(
 
     asyncio.run(fix_escalation.escalate_fix_iteration_cap(runner, pr))
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
+    assert pr.is_escalated is True
     assert any(
         "@AlexBomber12 FIX iteration cap reached" in body
         for _, _, body in posted
@@ -403,3 +406,20 @@ def test_ensure_escalated_label_returns_false_on_apply_failure(
         "failed to apply escalated label to PR #700" in event["event"]
         for event in runner.state.history
     )
+
+
+def test_runner_ensure_escalated_label_wrapper_delegates_to_module_function(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The FixMixin wrapper still exists for tests that patch it directly.
+
+    After PR-317 deleted ``_escalate_and_skip`` no production code path
+    invokes ``runner._ensure_escalated_label(...)`` itself, but tests in
+    ``test_handle_watch.py`` continue to ``monkeypatch.setattr`` it to
+    spy on the escalation-label intent. This pin keeps the wrapper's
+    delegation contract under test so a future refactor cannot silently
+    drop the method behind tests' backs.
+    """
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda cmd, **kw: "")
+    runner = h._make_runner()
+    assert runner._ensure_escalated_label(101, "context") is True

@@ -94,13 +94,15 @@ def test_happy_path_pr_exists_transitions_to_watch(
     assert runner.state.current_pr.number == 42
 
 
-def test_case_a_no_branch_no_remote_skips_to_idle(
+def test_case_a_no_branch_no_remote_parks_in_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """PR-317: case-A 'coder did nothing' parks in ERROR, not IDLE."""
     runner = _runner(monkeypatch)
     _patch_branch_state(monkeypatch, local_exists=False, remote_exists=False)
     asyncio.run(runner.handle_coding())
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     assert "did nothing" in (runner.state.error_message or "")
     assert any("did nothing" in entry["event"] for entry in runner.state.history)
 
@@ -128,7 +130,8 @@ def test_branch_mismatch_after_coder_exit_escalates_explicitly(
 
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     error = runner.state.error_message or ""
     assert "Branch mismatch" in error
     assert "task_branch=pr-001" in error
@@ -137,13 +140,15 @@ def test_branch_mismatch_after_coder_exit_escalates_explicitly(
     assert any("[BRANCH] mismatch detected" in e for e in log_entries)
 
 
-def test_case_b_local_branch_only_skips_to_idle(
+def test_case_b_local_branch_only_parks_in_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """PR-317: case-B 'local branch but no push' parks in ERROR, not IDLE."""
     runner = _runner(monkeypatch)
     _patch_branch_state(monkeypatch, local_exists=True, remote_exists=False)
     asyncio.run(runner.handle_coding())
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     assert "no push" in (runner.state.error_message or "")
 
 
@@ -205,9 +210,10 @@ def test_case_c_branch_mismatch_does_not_block_daemon_recovery(
     assert not any("[BRANCH] mismatch detected" in e for e in log_entries)
 
 
-def test_case_c_create_pr_failure_skips_to_idle(
+def test_case_c_create_pr_failure_parks_in_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """PR-317: gh pr create failure parks in ERROR, not IDLE."""
     runner = _runner(monkeypatch)
     _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
 
@@ -218,7 +224,8 @@ def test_case_c_create_pr_failure_skips_to_idle(
 
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     assert "Daemon PR creation failed" in (runner.state.error_message or "")
 
 
@@ -264,16 +271,18 @@ def test_case_c_post_create_list_transient_failure_recovers(
     assert any("Daemon-created PR list failed" in entry["event"] for entry in runner.state.history)
 
 
-def test_case_c_pr_not_found_after_create_skips_to_idle(
+def test_case_c_pr_not_found_after_create_parks_in_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """PR-317: post-create PR-not-visible parks in ERROR, not IDLE."""
     runner = _runner(monkeypatch, open_prs_after_create=[])
     _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: "")
 
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     assert "Daemon-created PR not found" in (runner.state.error_message or "")
 
 
@@ -406,7 +415,8 @@ def test_case_c_already_exists_error_falls_through_when_pr_invisible(
 
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     assert "Daemon-created PR not found" in (runner.state.error_message or "")
 
 

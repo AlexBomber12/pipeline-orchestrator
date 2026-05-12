@@ -212,10 +212,16 @@ def test_no_push_escalation_cancels_task_and_returns_to_idle(
 # ---------------------------------------------------------------------------
 
 
-def test_coder_escalate_label_apply_failure_skips_to_idle(
+def test_coder_escalate_label_apply_failure_parks_in_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Coder ESCALATE with a label-apply failure records context and skips."""
+    """PR-317: coder ESCALATE with label-apply failure now parks in ERROR.
+
+    The terminal state migrated from IDLE to ERROR so the picker stops
+    re-selecting the still-status:TODO task. The expanded failure context
+    (mentioning the failed label apply) remains the operator-visible
+    ``error_message`` so dashboards surface the GitHub mutation outage.
+    """
     posted: list[tuple[str, int, str]] = []
 
     monkeypatch.setattr(
@@ -237,7 +243,8 @@ def test_coder_escalate_label_apply_failure_skips_to_idle(
 
     asyncio.run(runner._escalate_fix_coder_initiated(pr, "transient infra failure"))
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     assert pr.is_escalated is True
     assert runner.state.error_message is not None
     assert "FIX coder ESCALATE on PR #401" in runner.state.error_message

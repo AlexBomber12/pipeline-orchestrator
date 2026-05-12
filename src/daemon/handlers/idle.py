@@ -794,12 +794,9 @@ class IdleMixin:
                 message = (
                     f"Task {task.pr_id} pinned to {pin} but coder unavailable"
                 )
-                await self._escalate_and_skip(
+                await self._commit_and_park_in_error(
                     message,
-                    apply_escalated_label=False,
-                    set_pr_escalated_flag=False,
-                    log_message=f"{message}.",
-                    cancellation_subsource="infra_failure",
+                    subsource="infra_failure",
                 )
                 return
 

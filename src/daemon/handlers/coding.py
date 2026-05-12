@@ -777,13 +777,9 @@ class CodingMixin:
                     f"[{coder_name}] Branch mismatch: "
                     f"{ctx.mismatch_reason} ({ctx.log_summary()})"
                 )
-                await self._save_current_run_record("error")
-                await self._escalate_and_skip(
+                await self._commit_and_park_in_error(
                     message,
-                    apply_escalated_label=False,
-                    set_pr_escalated_flag=False,
-                    log_message=f"{message}.",
-                    cancellation_subsource="no_push_deadlock",
+                    subsource="no_push_deadlock",
                 )
                 return
             if not local_exists:
@@ -796,13 +792,9 @@ class CodingMixin:
                     f"[{coder_name}] Coder exited 0 with local branch but "
                     f"no push — escalating ({ctx.log_summary()})"
                 )
-            await self._save_current_run_record("error")
-            await self._escalate_and_skip(
+            await self._commit_and_park_in_error(
                 message,
-                apply_escalated_label=False,
-                set_pr_escalated_flag=False,
-                log_message=f"{message}.",
-                cancellation_subsource="no_push_deadlock",
+                subsource="no_push_deadlock",
             )
             return
 
@@ -896,13 +888,9 @@ class CodingMixin:
                     f"[{coder_name}] Daemon-created PR not found for branch "
                     f"{target_branch!r}"
                 )
-                await self._save_current_run_record("error")
-                await self._escalate_and_skip(
+                await self._commit_and_park_in_error(
                     message,
-                    apply_escalated_label=False,
-                    set_pr_escalated_flag=False,
-                    log_message=f"{message}.",
-                    cancellation_subsource="infra_failure",
+                    subsource="infra_failure",
                 )
             return
 
@@ -992,13 +980,9 @@ class CodingMixin:
                 f"[{coder_name}] Daemon PR creation failed for "
                 f"{target_branch!r}: {exc}"
             )
-            await self._save_current_run_record("error")
-            await self._escalate_and_skip(
+            await self._commit_and_park_in_error(
                 message,
-                apply_escalated_label=False,
-                set_pr_escalated_flag=False,
-                log_message=f"{message}.",
-                cancellation_subsource="infra_failure",
+                subsource="infra_failure",
             )
             return False
         gh_cache._invalidate_etag_cache(

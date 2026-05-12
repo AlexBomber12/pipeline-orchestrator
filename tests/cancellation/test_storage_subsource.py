@@ -182,8 +182,8 @@ def test_coder_escalate_detector_writes_coder_escalate_subsource(
         c for c in captured if c.payload.get("subsource") == "coder_escalate"
     ]
     # The FIX handler's coder-ESCALATE detector emits one write with the
-    # coder's verbatim reason; the downstream ``_escalate_and_skip`` then
-    # may seed a second cause with the same canonical subsource and a
+    # coder's verbatim reason; the downstream ``_commit_and_park_in_error``
+    # then may seed a second cause with the same canonical subsource and a
     # daemon-wrapper reason. Both must classify as ``coder_escalate``.
     assert coder_writes, "expected at least one coder_escalate cause"
     assert all(c.category == "ERROR" for c in coder_writes)

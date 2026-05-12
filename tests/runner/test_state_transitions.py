@@ -890,7 +890,8 @@ def test_handle_coding_no_pr_routes_to_diagnostic(
     runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001")
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     assert "did nothing" in (runner.state.error_message or "")
 
 
@@ -1056,7 +1057,7 @@ def test_handle_coding_rejects_unmatched_branch(
 ) -> None:
     """When no open PR matches current_task.branch, fail fast instead of
         attaching to an unrelated newest open PR. The diagnostic handler then
-        routes the no-PR outcome to IDLE via case A/B/C."""
+        routes the no-PR outcome to ERROR via case A/B/C (PR-317)."""
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
@@ -1083,7 +1084,8 @@ def test_handle_coding_rejects_unmatched_branch(
     runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001")
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     assert runner.state.current_pr is None
     assert "did nothing" in (runner.state.error_message or "")
 
@@ -1397,8 +1399,9 @@ def test_handle_coding_runs_three_retries_before_diagnostic(
 ) -> None:
     """After 3 consecutive empty get_open_prs results the runner must
         invoke ``_diagnose_exit_zero_no_pr`` rather than flipping straight
-        to ERROR. That diagnostic distinguishes A/B/C and routes to IDLE
-        when the coder did nothing observable upstream."""
+        through the framework. That diagnostic distinguishes A/B/C and
+        routes the "did nothing" outcome through ``_commit_and_park_in_error``
+        (PR-317) so the task ends in ERROR with status:ERROR on the file."""
     h._patch_subprocess(monkeypatch)
     call_count = {"n": 0}
 
@@ -1440,7 +1443,8 @@ def test_handle_coding_runs_three_retries_before_diagnostic(
     runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING, branch="pr-001")
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     assert "[codex]" in (runner.state.error_message or "")
     assert call_count["n"] == 3
     assert slept.count(5) == 2

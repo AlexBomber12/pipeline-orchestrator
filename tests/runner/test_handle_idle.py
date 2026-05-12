@@ -729,12 +729,16 @@ def test_handle_idle_proceeds_to_coding_when_no_matching_pr(
     assert runner.state.current_pr.number == 17
 
 
-def test_handle_idle_transitions_to_hung_when_pinned_coder_unavailable(
+def test_handle_idle_transitions_to_error_when_pinned_coder_unavailable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A task pinned to ``codex`` whose coder is unavailable must skip to IDLE
-    with a clear message instead of silently falling back."""
+    """PR-317: A task pinned to ``codex`` whose coder is unavailable parks
+    the runner in ERROR with subsource=infra_failure.
+
+    The terminal state migrated from IDLE to ERROR so the picker stops
+    re-selecting the same pinned task on every cycle while the coder auth
+    is broken — the prior ESCALATE→IDLE→re-pick loop is closed."""
     h._patch_subprocess(monkeypatch)
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
@@ -786,7 +790,8 @@ def test_handle_idle_transitions_to_hung_when_pinned_coder_unavailable(
     )
     asyncio.run(runner.handle_idle())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
     assert runner.state.error_message == ("Task PR-200 pinned to codex but coder unavailable")
     assert runner.state.current_pr is None
     assert not coding_called["v"]
