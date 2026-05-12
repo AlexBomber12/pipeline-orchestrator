@@ -138,10 +138,6 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         r"|\{[^\r\n}]*"
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
         + r":[ \t]*[\"']?write[\"']?[^\r\n}]*\})"
-        r"|[ \t]{0,2}"
-        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
-        + r":[ \t]*[\"']?write"
-        r"[\"']?"
         r"))[ \t]*(?:#.*)?$",
         re.IGNORECASE,
     ),

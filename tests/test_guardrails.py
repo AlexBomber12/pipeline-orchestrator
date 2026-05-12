@@ -612,10 +612,10 @@ def test_scan_pr_diff_workflow_quoted_scope_key_write_flagged() -> None:
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
-def test_scan_pr_diff_workflow_scope_write_without_parent_context_flagged() -> None:
+def test_scan_pr_diff_workflow_scope_write_without_parent_context_not_flagged() -> None:
     diff_text = WORKFLOW_DIFF_HEADER + "@@ -20,3 +20,4 @@\n+  issues: write\n"
 
-    _assert_diff_categories(diff_text, ["permissions_escalation"])
+    assert scan_pr_diff(diff_text) == []
 
 
 def test_scan_pr_diff_workflow_id_token_write_flagged() -> None:
@@ -698,6 +698,17 @@ def test_scan_pr_diff_workflow_reusable_input_named_contents_not_flagged() -> No
         "     uses: org/repo/.github/workflows/build.yml@v1\n"
         "     with:\n"
         "+      contents: write\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_workflow_env_named_contents_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,4 +1,5 @@\n"
+        " env:\n"
+        "+  contents: write\n"
     )
 
     assert scan_pr_diff(diff_text) == []
