@@ -66,6 +66,8 @@ def test_handle_watch_approved_and_green_merges(
         branch="pr-001",
         ci_status=CIStatus.SUCCESS,
         review_status=ReviewStatus.APPROVED,
+        head_sha="green001",
+        diff_scanned_at_sha="green001",
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
 
@@ -130,6 +132,8 @@ def test_handle_watch_green_but_auto_merge_disabled_stays_watching(
         branch="pr-001",
         ci_status=CIStatus.SUCCESS,
         review_status=ReviewStatus.APPROVED,
+        head_sha="green005",
+        diff_scanned_at_sha="green005",
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
 
@@ -1725,6 +1729,8 @@ def test_handle_watch_allows_pending_review_only_when_repo_bypasses_review(
         ci_status=CIStatus.SUCCESS,
         review_status=ReviewStatus.PENDING,
         last_activity=datetime.now(timezone.utc),
+        head_sha="green042",
+        diff_scanned_at_sha="green042",
     )
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",

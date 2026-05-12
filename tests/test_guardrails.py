@@ -8,6 +8,10 @@ import pytest
 from src.daemon import guardrails
 from src.daemon.guardrails import GuardrailViolation, scan_pr_diff, scan_stdout
 
+WORKFLOW_DIFF_HEADER = (
+    "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+)
+
 
 def test_guardrail_violation_dataclass_frozen() -> None:
     violation = GuardrailViolation(
@@ -445,6 +449,144 @@ def test_scan_pr_diff_empty_catalogue_returns_empty(
     )
 
     assert scan_pr_diff(sample_diff) == []
+
+
+def _assert_diff_categories(diff_text: str, categories: list[str]) -> None:
+    assert [violation.category for violation in scan_pr_diff(diff_text)] == categories
+
+
+def test_scan_pr_diff_workflow_permissions_write_all_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER + "@@ -1,2 +1,3 @@\n+permissions: write-all\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_contents_write_flagged() -> None:
+    diff_text = WORKFLOW_DIFF_HEADER + "@@ -1,3 +1,4 @@\n+  contents: write\n"
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_id_token_write_flagged() -> None:
+    diff_text = (
+        "diff --git a/.github/workflows/oidc.yml b/.github/workflows/oidc.yml\n"
+        "@@ -1,3 +1,4 @@\n+  id-token: write\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_packages_write_flagged() -> None:
+    diff_text = (
+        "diff --git a/.github/workflows/publish.yml b/.github/workflows/publish.yml\n"
+        "@@ -1,3 +1,4 @@\n+  packages: write\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_existing_permission_on_context_line_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER + "@@ -1,3 +1,4 @@\n permissions: write-all\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_workflow_permission_in_deletion_line_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER + "@@ -1,3 +1,2 @@\n-permissions: write-all\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_workflow_read_permission_not_flagged() -> None:
+    diff_text = WORKFLOW_DIFF_HEADER + "@@ -1,3 +1,4 @@\n+  contents: read\n"
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_workflow_yml_deletion_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        +
+        "deleted file mode 100644\n--- a/.github/workflows/ci.yml\n+++ /dev/null\n"
+    )
+
+    _assert_diff_categories(diff_text, ["workflow_destruction"])
+
+
+def test_scan_pr_diff_workflow_yaml_extension_deletion_flagged() -> None:
+    diff_text = (
+        "diff --git a/.github/workflows/ci.yaml b/.github/workflows/ci.yaml\n"
+        "deleted file mode 100644\n--- a/.github/workflows/ci.yaml\n+++ /dev/null\n"
+    )
+
+    _assert_diff_categories(diff_text, ["workflow_destruction"])
+
+
+def test_scan_pr_diff_workflow_modification_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        +
+        "--- a/.github/workflows/ci.yml\n+++ b/.github/workflows/ci.yml\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_non_workflow_yml_deletion_not_flagged() -> None:
+    diff_text = (
+        "diff --git a/some-other.yml b/some-other.yml\n"
+        "--- a/some-other.yml\n+++ /dev/null\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_non_workflow_path_yml_deletion_not_flagged() -> None:
+    diff_text = (
+        "diff --git a/docs/example.yml b/docs/example.yml\n"
+        "--- a/docs/example.yml\n+++ /dev/null\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_both_patterns_in_same_diff_returns_both() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        +
+        "@@ -1,2 +1,3 @@\n+permissions: write-all\n"
+        "diff --git a/.github/workflows/old.yml b/.github/workflows/old.yml\n"
+        "deleted file mode 100644\n--- a/.github/workflows/old.yml\n+++ /dev/null\n"
+    )
+
+    _assert_diff_categories(
+        diff_text,
+        [
+            "permissions_escalation",
+            "workflow_destruction",
+        ],
+    )
+
+
+def test_scan_pr_diff_clean_diff_returns_empty_list() -> None:
+    diff_text = (
+        "diff --git a/src/example.py b/src/example.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/example.py\n"
+        "+++ b/src/example.py\n"
+        "@@ -1,3 +1,4 @@\n"
+        " def run() -> None:\n"
+        "+    print('ok')\n"
+        "     return None\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
 
 
 def test_scan_pr_diff_helper_is_callable_with_unified_diff() -> None:

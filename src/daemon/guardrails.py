@@ -101,15 +101,41 @@ _TIER1_RULES: dict[str, str] = {
 
 _EXCERPT_LIMIT = 200
 
-# PR-290a: diff-content scan catalogue. Populated by PR-290b (workflow YAML)
-# and PR-290c (governance / supply chain). PR-301..PR-304 extend the same
-# dispatcher with Tier 2 secrets / large-diff / mass-deletion entries. The
-# empty default makes ``scan_pr_diff`` behaviorally inert at skeleton time
-# so PR-290a can ship the dispatcher + cache wiring without changing any
-# detection outcomes.
-_DIFF_PATTERNS: dict[str, re.Pattern[str]] = {}
+# Diff-content scan catalogue. PR-290b adds workflow YAML tampering checks;
+# PR-290c and PR-301..PR-304 extend the same dispatcher with governance,
+# supply-chain, secrets, large-diff, and mass-deletion entries.
+_DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
+    "permissions_escalation": re.compile(
+        # Match `+`-prefixed lines (additions only) inside workflow YAML
+        # diff sections containing `permissions: write-all` (top-level
+        # blanket write) OR a specific scope set to `write` (e.g.,
+        # contents, id-token, packages). Indentation is variable
+        # (top-level vs nested under a job), so leading whitespace is
+        # captured but otherwise non-significant.
+        r"(?m)^\+[ \t]*(?:"
+        r"permissions:[ \t]*write-all"
+        r"|(?:contents|id-token|actions|checks|deployments|issues|"
+        r"packages|pull-requests|repository-projects|"
+        r"security-events|statuses):[ \t]*write\b"
+        r")",
+        re.IGNORECASE,
+    ),
+    "workflow_destruction": re.compile(
+        # Detect workflow YAML files being deleted entirely. In unified
+        # diff format, a deletion shows `--- a/<path>` followed by
+        # `+++ /dev/null` (where the deleted file's path appears in the
+        # `--- a/` line and the special path `/dev/null` appears in the
+        # `+++ b/` line). Match constrained to .github/workflows/ paths.
+        r"(?m)^---[ \t]+a/\.github/workflows/[^\r\n]+\.ya?ml[ \t]*\r?\n"
+        r"\+\+\+[ \t]+/dev/null\b",
+        re.IGNORECASE,
+    ),
+}
 
-_DIFF_RULES: dict[str, str] = {}
+_DIFF_RULES: dict[str, str] = {
+    "permissions_escalation": "Workflow permission escalation in diff additions",
+    "workflow_destruction": "Workflow YAML file deletion under .github/workflows/",
+}
 
 
 def _clip_excerpt(text: str) -> str:
