@@ -115,8 +115,19 @@ class HungMixin:
         pr_number: int,
         *,
         bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
     ) -> tuple[bool, bool, datetime | None]:
-        """Post ``@codex review`` and report success/post/retry timing."""
+        """Post ``@codex review`` and report success/post/retry timing.
+
+        ``bypass_author_dedup`` short-circuits the PR-author dedup check
+        that consults the GitHub REST API for the current head's
+        committer date. Pre-merge sync rewrites HEAD locally and the
+        cached ``repos/{repo}/pulls`` payload can lag for several
+        seconds; the dedup would then anchor on the previous head and
+        block the post even though the new head needs a fresh review.
+        Only callers that just produced the new commit locally should
+        set this flag.
+        """
         current_pr = self.state.current_pr
         cache_dedup_key = False
         head_sha: str | None = None
@@ -149,7 +160,8 @@ class HungMixin:
                 f"#{pr_number}; posting @codex review without dedup."
             )
         elif (
-            pr_author
+            not bypass_author_dedup
+            and pr_author
             and head_commit_date
             and _author_already_requested_review(
                 self.owner_repo,
@@ -216,6 +228,7 @@ class HungMixin:
         pr_number: int,
         *,
         bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
     ) -> bool:
         """Post ``@codex review`` on ``pr_number``.
 
@@ -242,5 +255,6 @@ class HungMixin:
         success, _posted, _retry_at = self._post_codex_review_result(
             pr_number,
             bypass_same_head_dedup=bypass_same_head_dedup,
+            bypass_author_dedup=bypass_author_dedup,
         )
         return success
