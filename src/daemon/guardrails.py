@@ -316,8 +316,7 @@ def _is_workflow_permission_key_context(
     ]
     if not ancestors:
         return False
-    nearest_ancestor = ancestors[-1][1]
-    if nearest_ancestor in _NON_PERMISSION_MAPPING_KEYS:
+    if any(name in _NON_PERMISSION_MAPPING_KEYS for _indent, name in ancestors):
         return False
     return any(name == "jobs" for _indent, name in ancestors)
 

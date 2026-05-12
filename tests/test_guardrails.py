@@ -979,6 +979,22 @@ def test_scan_pr_diff_workflow_call_input_permission_after_jobs_not_flagged() ->
     assert scan_pr_diff(diff_text) == []
 
 
+def test_scan_pr_diff_workflow_matrix_include_permission_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,11 +1,12 @@\n"
+        " jobs:\n"
+        "   test:\n"
+        "     strategy:\n"
+        "       matrix:\n"
+        "         include:\n"
+        "           - os: ubuntu-latest\n"
+        "+            permissions: write-all\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
 def test_scan_pr_diff_workflow_job_output_named_permissions_not_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER
