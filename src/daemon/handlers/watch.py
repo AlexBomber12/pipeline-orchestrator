@@ -13,6 +13,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from src.cancellation import CancellationCause
+from src.daemon import guardrails
 from src.github import cache as gh_cache
 from src.github import checks as gh_checks
 from src.github import gh_runner
@@ -173,6 +174,26 @@ class WatchMixin:
             return
 
         merged_shas, merged_push_count = current_pr.merge_observed_pushes(found)
+        # PR-290a follow-up: ``get_open_prs`` returns a fresh ``PRInfo``
+        # whose ``diff_scanned_at_sha`` is the default ``None``. Without
+        # carrying the cached value forward, the SHA-cache gate in
+        # ``_scan_pr_diff_once`` would be reset every WATCH cycle and
+        # ``gh pr diff`` would re-run on every poll for an unchanged
+        # HEAD once ``_DIFF_PATTERNS`` is populated, defeating the
+        # "once per SHA" contract. Preserve the cache when the head SHA
+        # is unchanged; a new HEAD legitimately re-arms the scan, so
+        # leave the field at its default ``None`` in that case. The
+        # comparison is equality-only (no truthy guard on
+        # ``current_pr.head_sha``) so that a transient ``""`` head SHA
+        # observed on both sides — a state ``PRInfo`` already models for
+        # ``gh`` payloads that omit the SHA — still counts as
+        # "head unchanged" and the cache survives, instead of being
+        # repeatedly dropped and forcing a noisy retry loop against a
+        # populated catalogue.
+        if current_pr.head_sha == found.head_sha:
+            preserved_diff_scanned_at_sha = current_pr.diff_scanned_at_sha
+        else:
+            preserved_diff_scanned_at_sha = found.diff_scanned_at_sha
         found = found.model_copy(
             update={
                 "fix_iteration_count": current_pr.fix_iteration_count,
@@ -186,6 +207,7 @@ class WatchMixin:
                 # resets the new ``found`` on real progress and preserves
                 # the count when the PR is still stuck.
                 "watch_retrigger_count": current_pr.watch_retrigger_count,
+                "diff_scanned_at_sha": preserved_diff_scanned_at_sha,
             }
         )
         self.state.current_pr = found
@@ -199,6 +221,9 @@ class WatchMixin:
             self._rehydrate_last_push_at(found)
 
         await self._maybe_reclassify_stuck_pending(found)
+        await self._scan_pr_diff_once()
+        if self.state.state != PipelineState.WATCH:
+            return
         ci = found.ci_status
         review = found.review_status
         review_allows_merge = review == ReviewStatus.APPROVED or (
@@ -206,6 +231,26 @@ class WatchMixin:
             and review == ReviewStatus.PENDING
         )
         if ci == CIStatus.SUCCESS and review_allows_merge:
+            # PR-290a follow-up: ``_scan_pr_diff_once`` only updates
+            # ``diff_scanned_at_sha`` on a successful fetch + scan; a
+            # transient ``gh pr diff`` failure leaves the cache field
+            # unchanged. When ``_DIFF_PATTERNS`` is populated the diff
+            # scan is the sole enforcement point, so a fetch failure on
+            # a merge-eligible cycle must NOT fall through to merge —
+            # otherwise a coder could push prohibited diff content that
+            # the catalogue would catch, and a ``gh`` timeout would
+            # silently bypass it. Hold the merge and let the next WATCH
+            # cycle retry the scan on the same HEAD.
+            if (
+                guardrails._DIFF_PATTERNS
+                and found.diff_scanned_at_sha != found.head_sha
+            ):
+                self.log_event(
+                    f"[WATCH] PR #{found.number} merge held: diff scan "
+                    f"did not complete for head {found.head_sha[:7]}; "
+                    f"will retry next cycle."
+                )
+                return
             if self.repo_config.auto_merge:
                 await self.handle_merge()
             else:
@@ -383,6 +428,79 @@ class WatchMixin:
                 f"(review={review.value}, ci={ci.value}, "
                 f"{elapsed_min:.0f}/{timeout_min}m)."
             )
+
+    async def _scan_pr_diff_once(self) -> bool:
+        """Run the PR diff content scan exactly once per HEAD SHA.
+
+        PR-290a (OBS-CR diff scan infrastructure). Returns ``True`` when
+        a scan executed against fresh diff content this cycle, ``False``
+        when the call short-circuited (no current PR, cache hit on the
+        current HEAD SHA, empty catalogue, or transient fetch failure).
+
+        Cache discipline (SHA-keyed, not timestamp-keyed):
+
+        * The SHA-keyed cache lets a fresh coder push (new HEAD SHA)
+          re-arm the scan. A timestamp-only cache would mark the PR as
+          "already scanned" after the first fetch and let prohibited
+          content slipped in by a follow-up push slide past the
+          catalogue.
+        * ``diff_scanned_at_sha`` is only updated after a successful
+          ``get_pr_diff`` + scan. A transient ``gh`` failure leaves the
+          field unchanged so the next WATCH cycle retries on the same
+          SHA — fetch failures must never count as "scanned".
+        * The empty-catalogue branch (PR-290a skeleton) MUST NOT mark
+          the current HEAD as scanned. Catalogue contents change at
+          deploy time (PR-290b/c, PR-301..PR-304 add real patterns); a
+          PR scanned during the empty-catalogue skeleton state and
+          cached as "already scanned" would short-circuit at the cache
+          gate forever after, never being evaluated against the newly
+          populated rules unless a fresh push moved HEAD. The cost of
+          re-checking the empty-dict each cycle is a single ``not``
+          test — far cheaper than the bypass it prevents.
+
+        On a populated catalogue (PR-290b/c, PR-301..PR-304) a match
+        routes through ``_transition_to_error`` with a structured
+        ``CancellationCause`` carrying ``payload.subsource = "guardrail"``,
+        matching the PR-315/PR-320 single-ERROR-category model.
+        """
+        current_pr = self.state.current_pr
+        if current_pr is None:
+            return False
+        if not guardrails._DIFF_PATTERNS:
+            return False
+        if current_pr.diff_scanned_at_sha == current_pr.head_sha:
+            return False
+        try:
+            diff_text = gh_prs.get_pr_diff(self.owner_repo, current_pr.number)
+        except Exception as exc:
+            logger.warning(
+                "Diff fetch failed for PR #%s: %s; will retry next cycle",
+                current_pr.number,
+                exc,
+            )
+            return False
+        violations = guardrails.scan_pr_diff(diff_text)
+        current_pr.diff_scanned_at_sha = current_pr.head_sha
+        if violations:
+            first = violations[0]
+            message = (
+                f"[GUARDRAIL] tier={first.tier} {first.category}: "
+                f"{first.excerpt}"
+            )
+            await self._transition_to_error(
+                message,
+                log_prefix="[WATCH]",
+                cancellation_cause=CancellationCause(
+                    category="ERROR",
+                    payload={
+                        "subsource": "guardrail",
+                        "tier": first.tier,
+                        "category": first.category,
+                        "excerpt": first.excerpt,
+                    },
+                ),
+            )
+        return True
 
     async def _maybe_reclassify_stuck_pending(self, found: object) -> None:
         """Upgrade ``found.ci_status`` to FAILURE when CI has been PENDING too long.

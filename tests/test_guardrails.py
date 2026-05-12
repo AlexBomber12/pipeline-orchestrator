@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import re
 from dataclasses import FrozenInstanceError
 
 import pytest
 
-from src.daemon.guardrails import GuardrailViolation, scan_stdout
+from src.daemon import guardrails
+from src.daemon.guardrails import GuardrailViolation, scan_pr_diff, scan_stdout
 
 
 def test_guardrail_violation_dataclass_frozen() -> None:
@@ -426,3 +428,87 @@ def test_scan_stdout_repo_delete_negation_does_not_suppress() -> None:
 
     assert len(violations) == 1
     assert violations[0].category == "repo_delete"
+
+
+def test_scan_pr_diff_empty_catalogue_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-290a skeleton: with no diff patterns registered, scan_pr_diff
+    never reports a violation, even on diffs that contain content
+    PR-290b/c will later flag."""
+    monkeypatch.setattr(guardrails, "_DIFF_PATTERNS", {})
+    monkeypatch.setattr(guardrails, "_DIFF_RULES", {})
+    sample_diff = (
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+permissions: write-all\n"
+    )
+
+    assert scan_pr_diff(sample_diff) == []
+
+
+def test_scan_pr_diff_helper_is_callable_with_unified_diff() -> None:
+    """The dispatcher signature must mirror scan_stdout so callers can
+    treat both diff and stdout signals uniformly."""
+    diff_text = (
+        "diff --git a/src/a.py b/src/a.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+
+    result = scan_pr_diff(diff_text)
+
+    assert isinstance(result, list)
+
+
+def test_scan_pr_diff_populated_catalogue_emits_violation_with_clipped_excerpt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When PR-290b/c register a pattern, scan_pr_diff surfaces a
+    GuardrailViolation with the diff-matching excerpt clipped to the
+    shared 200-char limit."""
+    monkeypatch.setattr(
+        guardrails,
+        "_DIFF_PATTERNS",
+        {"workflow_permissions_write_all": re.compile(r"permissions:\s*write-all")},
+    )
+    monkeypatch.setattr(
+        guardrails,
+        "_DIFF_RULES",
+        {"workflow_permissions_write_all": "Workflow permissions write-all"},
+    )
+    diff_text = (
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "+permissions: write-all\n"
+    )
+
+    violations = scan_pr_diff(diff_text)
+
+    assert len(violations) == 1
+    violation = violations[0]
+    assert isinstance(violation, GuardrailViolation)
+    assert violation.tier == 1
+    assert violation.category == "workflow_permissions_write_all"
+    assert violation.excerpt == "permissions: write-all"
+    assert violation.rule == "Workflow permissions write-all"
+
+
+def test_scan_pr_diff_excerpt_truncation_200_chars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The excerpt clip helper enforces the same 200-char cap as
+    scan_stdout so dashboard payloads stay bounded regardless of which
+    signal produced the violation."""
+    monkeypatch.setattr(
+        guardrails,
+        "_DIFF_PATTERNS",
+        {"long": re.compile(r"X+")},
+    )
+    monkeypatch.setattr(guardrails, "_DIFF_RULES", {"long": ""})
+    diff_text = "+" + ("X" * 500)
+
+    violations = scan_pr_diff(diff_text)
+
+    assert len(violations) == 1
+    assert len(violations[0].excerpt) <= 200
