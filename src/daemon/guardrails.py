@@ -135,6 +135,7 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         r"|&[A-Za-z_][A-Za-z0-9_-]*[ \t]*\{[^\r\n}]*"
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
         + r":[ \t]*[\"']?write[\"']?[^\r\n}]*\}"
+        r"|\*[A-Za-z_][A-Za-z0-9_-]*"
         r"|\{[^\r\n}]*"
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
         + r":[ \t]*[\"']?write[\"']?[^\r\n}]*\})"
