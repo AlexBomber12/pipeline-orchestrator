@@ -615,6 +615,19 @@ def test_scan_pr_diff_workflow_multiline_flow_permissions_map_flagged() -> None:
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_multiline_flow_permissions_trailing_comma_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,2 +1,5 @@\n"
+        "+permissions: {\n"
+        "+  contents: write,\n"
+        "+  issues: read\n"
+        "+}\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
 def test_scan_pr_diff_workflow_permissions_alias_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER

@@ -123,7 +123,7 @@ _YAML_WRITE_SCOPE_RE = re.compile(
     + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
     + r"[ \t]*:[ \t]*"
     + _YAML_SCALAR_ANCHOR_RE
-    + r"[\"']?write[\"']?(?:[ \t]*(?:#.*)?)?$",
+    + r"[\"']?write[\"']?,?(?:[ \t]*(?:#.*)?)?$",
     re.IGNORECASE,
 )
 _NON_PERMISSION_MAPPING_KEYS = {
@@ -164,7 +164,7 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         + r"[ \t]*:[ \t]*"
         + _YAML_SCALAR_ANCHOR_RE
         + r"[\"']?write[\"']?"
-        r"|(?:(?!^diff --git[ \t]).)*?^\+[ \t]*"
+        r",?|(?:(?!^diff --git[ \t]).)*?^\+[ \t]*"
         r"[\"']?permissions[\"']?[ \t]*:[ \t]*(?:"
         + _YAML_SCALAR_ANCHOR_RE
         + r"[\"']?write-all[\"']?"
