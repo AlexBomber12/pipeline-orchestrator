@@ -191,7 +191,22 @@ class MergeMixin:
                         f"#{number}; returning to WATCH to re-verify "
                         f"gates."
                     )
-                    if not self._post_codex_review(number):
+                    try:
+                        new_head_sha = git_ops._git(
+                            self.repo_path, "rev-parse", "HEAD"
+                        ).stdout.strip()
+                    except Exception:
+                        new_head_sha = ""
+                    self.log_event(
+                        f"[MERGE] Bypass-requesting fresh @codex review on "
+                        f"new head "
+                        f"{new_head_sha[:7] or '<unknown>'} after "
+                        f"pre-merge sync."
+                    )
+                    if not self._post_codex_review(
+                        number,
+                        bypass_author_dedup=True,
+                    ):
                         await self._transition_to_error(
                             (
                                 f"Failed to post @codex review on PR "
