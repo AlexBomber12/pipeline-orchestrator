@@ -61,6 +61,31 @@ def test_recovery_handles_missing_subsource_field() -> None:
     assert recovery_branch_for_subsource(subsource) == "operator_attention"
 
 
+@pytest.mark.parametrize(
+    "malformed_payload",
+    [
+        ["subsource", "crash"],
+        "subsource=crash",
+        42,
+        None,
+    ],
+)
+def test_recovery_handles_non_mapping_payload(malformed_payload: object) -> None:
+    """A cause with a non-mapping ``payload`` does not raise.
+
+    ``CancellationCause.from_redis`` does not enforce runtime types, so a
+    malformed Redis record (payload serialized as a list/string/etc.) used
+    to raise ``AttributeError`` from ``payload.get(...)`` and abort the
+    recovery dispatch. The helper must guard the type and degrade to the
+    empty sentinel so ``_dispatch_recovery_branch`` keeps marking the task
+    ERROR through the crash branch.
+    """
+    cause = CancellationCause(category="ERROR", payload=malformed_payload)  # type: ignore[arg-type]
+    subsource = classify_cancellation_subsource(cause)
+    assert subsource == ""
+    assert recovery_branch_for_subsource(subsource) == "operator_attention"
+
+
 def test_recovery_handles_none_cause() -> None:
     """``classify_cancellation_subsource(None)`` returns the empty sentinel."""
     subsource = classify_cancellation_subsource(None)

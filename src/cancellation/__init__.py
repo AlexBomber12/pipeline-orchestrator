@@ -109,7 +109,11 @@ def classify_cancellation_subsource(
     if cause is None:
         return ""
 
-    payload = cause.payload or {}
+    # ``CancellationCause.from_redis`` is a dataclass ``**json.loads`` round
+    # trip — a malformed Redis record (payload serialized as a list/string)
+    # would otherwise reach ``.get`` and raise AttributeError, aborting
+    # ``_dispatch_recovery_branch`` and breaking the restart path.
+    payload = cause.payload if isinstance(cause.payload, dict) else {}
     subsource = payload.get("subsource")
     legacy = payload.get("legacy_category")
     category = cause.category
