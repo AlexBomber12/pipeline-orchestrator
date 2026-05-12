@@ -109,12 +109,12 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         # Match `+`-prefixed lines (additions only) only inside workflow
         # YAML diff sections containing `permissions: write-all`
         # (top-level blanket write) OR a known permission scope set to
-        # exactly `write`. Indentation is variable (top-level vs nested
-        # under a job), so leading whitespace is captured but otherwise
-        # non-significant.
-        r"(?ms)^diff --git[ \t]+a/\.github/workflows/[^\r\n]+\.ya?ml"
+        # exactly `write`. Permission keys can appear at workflow top
+        # level or under a job, so accepted indentation is bounded to
+        # those YAML positions to avoid script-literal false positives.
+        r"(?ms)^diff --git[ \t]+a/[^\r\n]+"
         r"[ \t]+b/\.github/workflows/[^\r\n]+\.ya?ml[^\r\n]*\r?\n"
-        r"(?:(?!^diff --git[ \t]).)*?^\+[ \t]*(?:"
+        r"(?:(?!^diff --git[ \t]).)*?^\+[ \t]{0,6}(?:"
         r"permissions:[ \t]*[\"']?write-all[\"']?"
         r"|(?:actions|attestations|"
         r"artifact-metadata|checks|code-quality|contents|deployments|"

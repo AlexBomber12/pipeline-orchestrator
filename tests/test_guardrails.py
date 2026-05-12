@@ -471,6 +471,15 @@ def test_scan_pr_diff_workflow_permissions_quoted_write_all_flagged() -> None:
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_permissions_rename_into_workflows_flagged() -> None:
+    diff_text = (
+        "diff --git a/scripts/build.yml b/.github/workflows/build.yml\n"
+        "@@ -1,2 +1,3 @@\n+permissions: write-all\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
 def test_scan_pr_diff_workflow_contents_write_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER + "@@ -1,3 +1,4 @@\n permissions:\n+  contents: write\n"
@@ -549,6 +558,16 @@ def test_scan_pr_diff_workflow_run_write_output_not_flagged() -> None:
         WORKFLOW_DIFF_HEADER
         + "@@ -1,3 +1,4 @@\n"
         "+      run: write-output.sh\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_workflow_script_literal_permission_word_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,3 +1,4 @@\n"
+        "+          contents: write\n"
     )
 
     assert scan_pr_diff(diff_text) == []
