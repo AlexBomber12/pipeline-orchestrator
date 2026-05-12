@@ -710,6 +710,19 @@ def test_scan_pr_diff_workflow_scope_anchored_write_flagged() -> None:
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_scope_alias_write_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,4 +1,5 @@\n"
+        + " env:\n"
+        + "   FULL_WRITE: &full_write write\n"
+        + " permissions:\n"
+        + "+  contents: *full_write\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
 def test_scan_pr_diff_workflow_permission_read_replaced_with_write_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER

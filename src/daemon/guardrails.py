@@ -138,6 +138,12 @@ _YAML_WRITE_BLOCK_VALUE_RE = re.compile(
     r"^[ \t]+[\"']?write[\"']?(?:[ \t]*(?:#.*)?)?$",
     re.IGNORECASE,
 )
+_YAML_PERMISSION_SCOPE_ALIAS_RE = re.compile(
+    r"^[ \t]*"
+    + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+    + r"[ \t]*:[ \t]*\*[A-Za-z_][A-Za-z0-9_-]*[ \t]*(?:#.*)?$",
+    re.IGNORECASE,
+)
 _NON_PERMISSION_MAPPING_KEYS = {
     "env",
     "matrix",
@@ -176,7 +182,8 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         + r"[ \t]*:[ \t]*"
         + _YAML_SCALAR_ANCHOR_RE
         + r"(?:[\"']?write[\"']?,?|[|>][+-]?[ \t]*(?:#.*)?\r?\n"
-        r"^\+[ \t]+[\"']?write[\"']?)|(?:(?!^diff --git[ \t]).)*?^\+[ \t]*"
+        r"^\+[ \t]+[\"']?write[\"']?|\*[A-Za-z_][A-Za-z0-9_-]*)"
+        r"|(?:(?!^diff --git[ \t]).)*?^\+[ \t]*"
         r"[\"']?permissions[\"']?[ \t]*:[ \t]*(?:"
         + _YAML_SCALAR_ANCHOR_RE
         + r"[\"']?write-all[\"']?"
@@ -315,7 +322,10 @@ def _match_has_workflow_permission_context(match_text: str) -> bool:
             _is_workflow_permission_key_context(lines, index, yaml_line)
         ):
             return True
-        is_write_scope = bool(_YAML_WRITE_SCOPE_RE.match(yaml_line))
+        is_write_scope = bool(
+            _YAML_WRITE_SCOPE_RE.match(yaml_line)
+            or _YAML_PERMISSION_SCOPE_ALIAS_RE.match(yaml_line)
+        )
         if not is_write_scope and _YAML_WRITE_SCOPE_BLOCK_RE.match(yaml_line):
             for block_index in range(index + 1, len(lines)):
                 block_diff_line = _diff_yaml_line(lines[block_index])
