@@ -108,17 +108,15 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
     "permissions_escalation": re.compile(
         # Match `+`-prefixed lines (additions only) only inside workflow
         # YAML diff sections containing `permissions: write-all`
-        # (top-level blanket write) OR a specific scope set to `write`
-        # (e.g., contents, id-token, packages). Indentation is variable
+        # (top-level blanket write) OR a permission scope set to `write`.
+        # Indentation is variable
         # (top-level vs nested under a job), so leading whitespace is
         # captured but otherwise non-significant.
         r"(?ms)^diff --git[ \t]+a/\.github/workflows/[^\r\n]+\.ya?ml"
         r"[ \t]+b/\.github/workflows/[^\r\n]+\.ya?ml[^\r\n]*\r?\n"
         r"(?:(?!^diff --git[ \t]).)*?^\+[ \t]*(?:"
         r"permissions:[ \t]*write-all"
-        r"|(?:contents|id-token|actions|checks|deployments|issues|"
-        r"packages|pull-requests|repository-projects|"
-        r"security-events|statuses):[ \t]*write\b"
+        r"|[a-z][a-z0-9-]*:[ \t]*write\b"
         r")",
         re.IGNORECASE,
     ),
@@ -127,9 +125,15 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         # diff format, a deletion shows `--- a/<path>` followed by
         # `+++ /dev/null` (where the deleted file's path appears in the
         # `--- a/` line and the special path `/dev/null` appears in the
-        # `+++ b/` line). Match constrained to .github/workflows/ paths.
-        r"(?m)^---[ \t]+a/\.github/workflows/[^\r\n]+\.ya?ml[ \t]*\r?\n"
-        r"\+\+\+[ \t]+/dev/null\b",
+        # `+++ b/` line). Pure rename diffs use `rename from`/`rename to`
+        # metadata instead, but moving a workflow elsewhere still removes
+        # it from GitHub Actions. Match constrained to .github/workflows/
+        # source paths.
+        r"(?m)(?:^---[ \t]+a/\.github/workflows/[^\r\n]+\.ya?ml[ \t]*\r?\n"
+        r"\+\+\+[ \t]+/dev/null\b"
+        r"|^rename from[ \t]+\.github/workflows/[^\r\n]+\.ya?ml[ \t]*\r?\n"
+        r"rename to[ \t]+(?!\.github/workflows/[^\r\n]+\.ya?ml[ \t]*$)"
+        r"[^\r\n]+)",
         re.IGNORECASE,
     ),
 }

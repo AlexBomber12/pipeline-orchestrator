@@ -487,6 +487,15 @@ def test_scan_pr_diff_workflow_packages_write_flagged() -> None:
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_unlisted_write_scope_flagged() -> None:
+    diff_text = (
+        "diff --git a/.github/workflows/pages.yml b/.github/workflows/pages.yml\n"
+        "@@ -1,3 +1,4 @@\n+  pages: write\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
 def test_scan_pr_diff_workflow_existing_permission_on_context_line_not_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER + "@@ -1,3 +1,4 @@\n permissions: write-all\n"
@@ -539,6 +548,28 @@ def test_scan_pr_diff_workflow_yaml_extension_deletion_flagged() -> None:
     )
 
     _assert_diff_categories(diff_text, ["workflow_destruction"])
+
+
+def test_scan_pr_diff_workflow_rename_out_of_directory_flagged() -> None:
+    diff_text = (
+        "diff --git a/.github/workflows/ci.yml b/docs/ci.yml\n"
+        "similarity index 100%\n"
+        "rename from .github/workflows/ci.yml\n"
+        "rename to docs/ci.yml\n"
+    )
+
+    _assert_diff_categories(diff_text, ["workflow_destruction"])
+
+
+def test_scan_pr_diff_workflow_rename_within_directory_not_flagged() -> None:
+    diff_text = (
+        "diff --git a/.github/workflows/old.yml b/.github/workflows/new.yml\n"
+        "similarity index 100%\n"
+        "rename from .github/workflows/old.yml\n"
+        "rename to .github/workflows/new.yml\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
 
 
 def test_scan_pr_diff_workflow_modification_not_flagged() -> None:
