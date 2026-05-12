@@ -125,21 +125,21 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         + _DIFF_WORKFLOW_B_PATH_RE
         + r"[^\r\n]*\r?\n"
         r"(?:(?:(?!^diff --git[ \t]).)*?^[ +][ \t]*"
-        r"[\"']?permissions[\"']?:[ \t]*(?:#.*)?\r?\n"
+        r"[\"']?permissions[\"']?[ \t]*:[ \t]*(?:#.*)?\r?\n"
         r"(?:^[ +][ \t]*(?:#.*)?\r?\n|^[ +\-][ \t]+"
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
-        + r":[^\r\n]*\r?\n)*^\+[ \t]+"
+        + r"[ \t]*:[^\r\n]*\r?\n)*^\+[ \t]+"
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
-        + r":[ \t]*[\"']?write[\"']?"
+        + r"[ \t]*:[ \t]*[\"']?write[\"']?"
         r"|(?:(?!^diff --git[ \t]).)*?^\+(?:[ \t]*"
-        r"[\"']?permissions[\"']?:[ \t]*(?:[\"']?write-all[\"']?"
+        r"[\"']?permissions[\"']?[ \t]*:[ \t]*(?:[\"']?write-all[\"']?"
         r"|&[A-Za-z_][A-Za-z0-9_-]*[ \t]*\{[^\r\n}]*"
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
-        + r":[ \t]*[\"']?write[\"']?[^\r\n}]*\}"
+        + r"[ \t]*:[ \t]*[\"']?write[\"']?[^\r\n}]*\}"
         r"|\*[A-Za-z_][A-Za-z0-9_-]*"
         r"|\{[^\r\n}]*"
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
-        + r":[ \t]*[\"']?write[\"']?[^\r\n}]*\})"
+        + r"[ \t]*:[ \t]*[\"']?write[\"']?[^\r\n}]*\})"
         r"))[ \t]*(?:#.*)?$",
         re.IGNORECASE,
     ),
