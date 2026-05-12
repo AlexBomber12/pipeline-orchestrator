@@ -289,6 +289,95 @@ async def test_retry_count_helpers_reset_and_delete() -> None:
     assert key not in redis.values
 
 
+def test_current_run_started_at_key_format() -> None:
+    assert (
+        storage.current_run_started_at_key("alpha", "PR-318")
+        == "current_run_started_at:alpha:PR-318"
+    )
+
+
+async def test_current_run_started_at_record_uses_now_by_default() -> None:
+    redis = _FakeRedis()
+    before = datetime.now(timezone.utc)
+    await storage.record_current_run_started_at(redis, "alpha", "PR-318")
+    after = datetime.now(timezone.utc)
+
+    key = storage.current_run_started_at_key("alpha", "PR-318")
+    assert key in redis.values
+    parsed = datetime.fromisoformat(redis.values[key])
+    assert before <= parsed <= after
+    assert redis.ttls[key] == TTL_SECONDS
+
+
+async def test_current_run_started_at_record_honors_explicit_timestamp() -> None:
+    redis = _FakeRedis()
+    ts = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+    await storage.record_current_run_started_at(redis, "alpha", "PR-318", ts)
+
+    key = storage.current_run_started_at_key("alpha", "PR-318")
+    assert redis.values[key] == ts.isoformat()
+
+
+async def test_current_run_started_at_get_round_trip() -> None:
+    redis = _FakeRedis()
+    ts = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+    await storage.record_current_run_started_at(redis, "alpha", "PR-318", ts)
+
+    fetched = await storage.get_current_run_started_at(redis, "alpha", "PR-318")
+    assert fetched == ts
+
+
+async def test_current_run_started_at_get_missing_returns_none() -> None:
+    redis = _FakeRedis()
+    assert (
+        await storage.get_current_run_started_at(redis, "alpha", "PR-MISSING")
+        is None
+    )
+
+
+async def test_current_run_started_at_get_malformed_returns_none() -> None:
+    redis = _FakeRedis()
+    key = storage.current_run_started_at_key("alpha", "PR-318")
+    redis.values[key] = "not-a-timestamp"
+    assert (
+        await storage.get_current_run_started_at(redis, "alpha", "PR-318")
+        is None
+    )
+
+
+async def test_current_run_started_at_get_naive_iso_normalized_to_utc() -> None:
+    redis = _FakeRedis()
+    key = storage.current_run_started_at_key("alpha", "PR-318")
+    redis.values[key] = "2026-05-04T12:00:00"
+
+    fetched = await storage.get_current_run_started_at(redis, "alpha", "PR-318")
+    assert fetched == datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+
+
+async def test_current_run_started_at_get_decodes_bytes() -> None:
+    class _BytesRedis(_FakeRedis):
+        async def get(self, key: str) -> bytes | None:
+            raw = self.values.get(key)
+            return raw.encode("utf-8") if raw is not None else None
+
+    redis = _BytesRedis()
+    ts = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+    await storage.record_current_run_started_at(redis, "alpha", "PR-318", ts)
+
+    fetched = await storage.get_current_run_started_at(redis, "alpha", "PR-318")
+    assert fetched == ts
+
+
+async def test_current_run_started_at_delete_drops_key() -> None:
+    redis = _FakeRedis()
+    await storage.record_current_run_started_at(redis, "alpha", "PR-318")
+    key = storage.current_run_started_at_key("alpha", "PR-318")
+    assert key in redis.values
+
+    await storage.delete_current_run_started_at(redis, "alpha", "PR-318")
+    assert key not in redis.values
+
+
 async def test_multi_repo_isolation() -> None:
     redis = _FakeRedis()
     await record_cancellation_cause(

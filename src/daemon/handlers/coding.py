@@ -18,6 +18,7 @@ from src.cancellation import (
     CancellationCause,
     classify_infra_exception,
     get_task_spec_hash,
+    record_current_run_started_at,
     record_task_spec_hash,
     task_spec_content_hash,
 )
@@ -244,6 +245,20 @@ class CodingMixin:
                 log_prefix="[CODING]",
             )
             return
+        # PR-318 fix-feedback: anchor the current run's dispatch timestamp
+        # so ``_dispatch_recovery_branch`` can distinguish a stale non-crash
+        # cause (left over from a prior run after a best-effort delete
+        # failed) from one written during this dispatch. Best-effort write:
+        # a Redis blip here only weakens the staleness check, and recovery
+        # already degrades a missing marker to the conservative crash
+        # branch, so a transient outage must not park the task.
+        try:
+            await record_current_run_started_at(self.redis, self.name, pr_id)
+        except Exception as exc:
+            self.log_event(
+                f"[CODING] current_run_started_at write failed for {pr_id}: "
+                f"{exc}; recovery will default to crash-branch on this run."
+            )
         await self._prepare_current_run_record_dispatch_metadata(
             task_hash=task_hash,
             previous_task_hash=previous_task_hash,

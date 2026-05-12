@@ -10,11 +10,12 @@ for operator attention, marking ERROR``).
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
 from src.cancellation import CancellationCause
-from src.cancellation.storage import cause_key
+from src.cancellation.storage import cause_key, current_run_started_at_key
 from src.models import PipelineState, QueueTask, TaskStatus
 
 from tests.runner import _helpers as h
@@ -48,6 +49,13 @@ def _seed_cause(runner: Any, cause: CancellationCause) -> None:
     which reads through ``redis.get``.
     """
     runner.redis.store[cause_key(runner.name, "PR-318")] = cause.to_redis()
+
+
+def _seed_current_run_started_at(runner: Any, started_at: datetime) -> None:
+    """Seed the per-task dispatch timestamp recorded by ``handle_coding``."""
+    runner.redis.store[
+        current_run_started_at_key(runner.name, "PR-318")
+    ] = started_at.isoformat()
 
 
 def test_dispatch_crash_subsource_logs_crashed_branch(
@@ -92,13 +100,23 @@ def test_dispatch_crash_subsource_logs_crashed_branch(
 def test_dispatch_non_crash_subsource_logs_operator_attention(
     monkeypatch: pytest.MonkeyPatch, subsource: str
 ) -> None:
-    """A non-crash subsource routes to the operator-attention log line."""
+    """A non-crash subsource routes to the operator-attention log line.
+
+    Seeds a ``current_run_started_at`` marker that predates the cause's
+    ``created_at`` so the PR-318 fix-feedback staleness check accepts
+    the cause as belonging to the current run.
+    """
     runner = _crashed_doing_runner(monkeypatch)
+    cause_created_at = datetime.now(timezone.utc)
+    _seed_current_run_started_at(
+        runner, cause_created_at - timedelta(seconds=30)
+    )
     _seed_cause(
         runner,
         CancellationCause(
             category="ERROR",
             payload={"subsource": subsource, "reason_text": "parked"},
+            created_at=cause_created_at.isoformat(),
         ),
     )
 
@@ -133,11 +151,16 @@ def test_dispatch_legacy_escalate_category_record_logs_warning(
 ) -> None:
     """A pre-PR-315 legacy ``category=ESCALATE`` record triggers the warning."""
     runner = _crashed_doing_runner(monkeypatch)
+    cause_created_at = datetime.now(timezone.utc)
+    _seed_current_run_started_at(
+        runner, cause_created_at - timedelta(seconds=30)
+    )
     _seed_cause(
         runner,
         CancellationCause(
             category="ESCALATE",
             payload={"reason_text": "legacy"},
+            created_at=cause_created_at.isoformat(),
         ),
     )
 
@@ -188,8 +211,17 @@ def test_dispatch_empty_subsource_routes_to_operator_attention(
 ) -> None:
     """ERROR cause with no subsource degrades to operator-attention."""
     runner = _crashed_doing_runner(monkeypatch)
+    cause_created_at = datetime.now(timezone.utc)
+    _seed_current_run_started_at(
+        runner, cause_created_at - timedelta(seconds=30)
+    )
     _seed_cause(
-        runner, CancellationCause(category="ERROR", payload={})
+        runner,
+        CancellationCause(
+            category="ERROR",
+            payload={},
+            created_at=cause_created_at.isoformat(),
+        ),
     )
 
     asyncio.run(runner.recover_state())
@@ -229,4 +261,176 @@ def test_dispatch_invalid_subsource_with_legacy_crash_logs_crashed_branch(
     ), events
     assert not any(
         "parked for operator attention" in ev for ev in events
+    ), events
+
+
+def test_dispatch_stale_non_crash_cause_falls_back_to_crash_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-crash cause that predates the current run is treated as stale.
+
+    Regression for the PR-318 review feedback: ``safe_delete_cancellation_cause``
+    is best-effort and may leave a stale non-crash cause in Redis across
+    retries. If the next run then dies mid-CODING before writing a fresh
+    cause, trusting the stale value would misclassify a real crash as
+    operator-attention and hide the crash signal dashboards depend on.
+    Recovery must compare ``cause.created_at`` against the dispatch
+    timestamp and fall back to the crash branch when the cause predates
+    the current run.
+    """
+    runner = _crashed_doing_runner(monkeypatch)
+    now = datetime.now(timezone.utc)
+    _seed_current_run_started_at(runner, now)
+    _seed_cause(
+        runner,
+        CancellationCause(
+            category="ERROR",
+            payload={"subsource": "review_timeout", "reason_text": "stale"},
+            created_at=(now - timedelta(minutes=10)).isoformat(),
+        ),
+    )
+
+    asyncio.run(runner.recover_state())
+
+    events = [e["event"] for e in runner.state.history]
+    assert any(
+        "predates current run start" in ev for ev in events
+    ), events
+    assert any(
+        ev.startswith("[INFRA] Task PR-318 crashed, marking ERROR.")
+        for ev in events
+    ), events
+    assert not any(
+        "parked for operator attention" in ev for ev in events
+    ), events
+
+
+def test_dispatch_missing_current_run_marker_falls_back_to_crash_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-crash cause without a recorded dispatch timestamp is treated as stale.
+
+    The absence of ``current_run_started_at`` means recovery cannot prove
+    the cause belongs to the current run; per the PR-318 review feedback
+    this must fall back to the crash branch rather than trust the
+    non-crash subsource.
+    """
+    runner = _crashed_doing_runner(monkeypatch)
+    _seed_cause(
+        runner,
+        CancellationCause(
+            category="ERROR",
+            payload={"subsource": "review_timeout", "reason_text": "unknown age"},
+            created_at=datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+
+    asyncio.run(runner.recover_state())
+
+    events = [e["event"] for e in runner.state.history]
+    assert any(
+        "no current_run start recorded for PR-318" in ev for ev in events
+    ), events
+    assert any(
+        ev.startswith("[INFRA] Task PR-318 crashed, marking ERROR.")
+        for ev in events
+    ), events
+
+
+def test_dispatch_current_run_marker_read_failure_falls_back_to_crash_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Redis failure reading the dispatch timestamp falls back to crash.
+
+    When the cause read succeeds but the run-start read raises, recovery
+    cannot prove freshness; the safer default is the crash branch so the
+    operator-attention log line cannot mask a real crash.
+    """
+    runner = _crashed_doing_runner(monkeypatch)
+    _seed_cause(
+        runner,
+        CancellationCause(
+            category="ERROR",
+            payload={"subsource": "review_timeout", "reason_text": "redis fail"},
+            created_at=datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    original_get = runner.redis.get
+
+    async def selective_boom(key: str) -> Any:
+        if key.startswith("current_run_started_at:"):
+            raise RuntimeError("redis down")
+        return await original_get(key)
+
+    runner.redis.get = selective_boom  # type: ignore[method-assign]
+
+    asyncio.run(runner.recover_state())
+
+    events = [e["event"] for e in runner.state.history]
+    assert any(
+        "failed to read current_run start for PR-318" in ev for ev in events
+    ), events
+    assert any(
+        ev.startswith("[INFRA] Task PR-318 crashed, marking ERROR.")
+        for ev in events
+    ), events
+
+
+def test_dispatch_malformed_cause_created_at_falls_back_to_crash_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A corrupt ``cause.created_at`` cannot prove freshness; fall back to crash."""
+    runner = _crashed_doing_runner(monkeypatch)
+    _seed_current_run_started_at(runner, datetime.now(timezone.utc))
+    _seed_cause(
+        runner,
+        CancellationCause(
+            category="ERROR",
+            payload={"subsource": "review_timeout"},
+            created_at="not-a-timestamp",
+        ),
+    )
+
+    asyncio.run(runner.recover_state())
+
+    events = [e["event"] for e in runner.state.history]
+    assert any(
+        "malformed created_at" in ev for ev in events
+    ), events
+    assert any(
+        ev.startswith("[INFRA] Task PR-318 crashed, marking ERROR.")
+        for ev in events
+    ), events
+
+
+def test_dispatch_naive_cause_created_at_treated_as_utc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``cause.created_at`` without timezone info is interpreted as UTC.
+
+    Legacy records written before timezone-aware ISO strings landed must
+    still pass the staleness check when their wall-clock time is at or
+    after the dispatch timestamp. Otherwise a naive timestamp would
+    routinely fail ``cause_created_at < started_at`` and force every
+    operator-attention recovery through the crash branch.
+    """
+    runner = _crashed_doing_runner(monkeypatch)
+    now = datetime.now(timezone.utc)
+    _seed_current_run_started_at(runner, now - timedelta(seconds=30))
+    naive_iso = now.replace(tzinfo=None).isoformat()
+    _seed_cause(
+        runner,
+        CancellationCause(
+            category="ERROR",
+            payload={"subsource": "review_timeout"},
+            created_at=naive_iso,
+        ),
+    )
+
+    asyncio.run(runner.recover_state())
+
+    events = [e["event"] for e in runner.state.history]
+    assert any(
+        ev.startswith("[INFRA] Task PR-318 parked for operator attention,")
+        for ev in events
     ), events
