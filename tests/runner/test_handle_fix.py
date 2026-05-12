@@ -4537,7 +4537,7 @@ def test_terminate_current_coder_uses_configured_grace(
 def test_maybe_retrigger_stale_review_returns_without_current_pr() -> None:
     runner = h._make_runner()
 
-    runner._maybe_retrigger_stale_review(42)
+    asyncio.run(runner._maybe_retrigger_stale_review(42))
 
     assert runner.state.last_stale_retrigger_at is None
 
@@ -4550,7 +4550,7 @@ def test_maybe_retrigger_stale_review_returns_for_non_changes_requested() -> Non
         review_status=ReviewStatus.APPROVED,
     )
 
-    runner._maybe_retrigger_stale_review(42)
+    asyncio.run(runner._maybe_retrigger_stale_review(42))
 
     assert runner.state.last_stale_retrigger_at is None
 
@@ -4570,7 +4570,7 @@ def test_maybe_retrigger_stale_review_returns_for_missing_push_age(
         lambda repo, number: None,
     )
 
-    runner._maybe_retrigger_stale_review(42)
+    asyncio.run(runner._maybe_retrigger_stale_review(42))
 
     assert runner.state.last_stale_retrigger_at is None
 
