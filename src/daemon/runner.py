@@ -1434,6 +1434,27 @@ class PipelineRunner(
         """
         prior_state = self.state.state
         current_task = self.state.current_task
+        payload: dict[str, Any] = {
+            "subsource": subsource,
+            "reason_text": message,
+            "previous_state": prior_state.value,
+        }
+        if extra_payload:
+            payload.update(extra_payload)
+        # Finalize the run record before ``_commit_task_status_change``
+        # checks out origin/<base>: ``_save_current_run_record`` captures
+        # ``HEAD`` at save time, so deferring it past the checkout would
+        # record the base-branch SHA instead of the failing task branch.
+        await self._transition_to_error(
+            message,
+            save_run_record_as="error",
+            log_prefix="[ESCALATE]",
+            log_message=log_message,
+            cancellation_cause=CancellationCause(
+                category="ERROR",
+                payload=payload,
+            ),
+        )
         if current_task is not None:
             try:
                 status_written = await self._commit_task_status_change(
@@ -1447,23 +1468,6 @@ class PipelineRunner(
                 status_written = False
             if not status_written:
                 await self._mark_status_write_failed_task(current_task)
-        payload: dict[str, Any] = {
-            "subsource": subsource,
-            "reason_text": message,
-            "previous_state": prior_state.value,
-        }
-        if extra_payload:
-            payload.update(extra_payload)
-        await self._transition_to_error(
-            message,
-            save_run_record_as="error",
-            log_prefix="[ESCALATE]",
-            log_message=log_message,
-            cancellation_cause=CancellationCause(
-                category="ERROR",
-                payload=payload,
-            ),
-        )
         self.state.skip_ai_error_diagnose = True
 
     async def _review_timeout_park_cleared(self) -> bool:

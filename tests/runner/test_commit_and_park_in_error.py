@@ -258,6 +258,74 @@ def test_commit_and_park_in_error_marks_status_write_fallback_on_failure(
     assert runner._status_write_failed_task_pr_ids == {"PR-903"}
 
 
+def test_commit_and_park_in_error_saves_run_record_before_status_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run record must capture task-branch ``HEAD``, not the post-checkout base SHA.
+
+    ``_commit_task_status_change`` issues ``git checkout -f <base>`` +
+    ``git reset --hard origin/<base>`` before committing the daemon-side
+    status:ERROR write. ``_save_current_run_record`` captures
+    ``HEAD`` at save time via ``_git_rev_parse``, so the helper must
+    finalize the run record before invoking the status-change git
+    operations — otherwise the record stamps the base-branch SHA and
+    OBS-DD run-level attribution for parked CODING/FIX failures points
+    at the wrong commit.
+    """
+    runner = h._make_runner()
+    runner.state.state = PipelineState.CODING
+    runner.state.current_task = QueueTask(
+        pr_id="PR-905",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-905",
+        task_file="tasks/PR-905.md",
+    )
+    runner._start_current_run_record("claude", "opus")
+
+    head_state = {"sha": "task-branch-sha"}
+
+    def fake_rev_parse(self, ref):  # type: ignore[no-untyped-def]
+        if ref == "HEAD":
+            return head_state["sha"]
+        return ""
+
+    monkeypatch.setattr(
+        type(runner),
+        "_git_rev_parse",
+        fake_rev_parse,
+    )
+
+    async def fake_commit(self, task, status, reason):  # type: ignore[no-untyped-def]
+        # Mirror the production behavior: checkout/reset to origin/<base>
+        # advances HEAD to the base-branch SHA before the function returns.
+        head_state["sha"] = "base-branch-sha"
+        return True
+
+    monkeypatch.setattr(
+        type(runner),
+        "_commit_task_status_change",
+        fake_commit,
+    )
+
+    async def noop_record(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "src.cancellation.record_cancellation_cause", noop_record
+    )
+
+    asyncio.run(
+        runner._commit_and_park_in_error(
+            "boom",
+            subsource="no_push_deadlock",
+        )
+    )
+
+    assert runner._current_run_record is not None
+    assert runner._current_run_record.head_sha == "task-branch-sha"
+
+
 def test_commit_and_park_in_error_logs_status_write_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
