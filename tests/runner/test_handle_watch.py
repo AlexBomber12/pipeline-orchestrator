@@ -4625,23 +4625,35 @@ def test_call_sites_in_handle_watch_use_await(
         )
 
 
+@pytest.mark.parametrize(
+    "review_status,ci_status",
+    [
+        (ReviewStatus.PENDING, CIStatus.PENDING),
+        (ReviewStatus.EYES, CIStatus.PENDING),
+        (ReviewStatus.CHANGES_REQUESTED, CIStatus.SUCCESS),
+    ],
+)
 def test_handle_watch_returns_after_cap_reached_escalation(
     monkeypatch: pytest.MonkeyPatch,
+    review_status: ReviewStatus,
+    ci_status: CIStatus,
 ) -> None:
     """When the cap branch fires inside ``_maybe_retrigger_stale_review`` the
     runner state transitions to ERROR; ``handle_watch`` must short-circuit
     before the review-timeout branch, otherwise a second escalation would
     overwrite the cap message and set ``skip_ai_error_diagnose=True``
-    (turning a task-level park into a global stop-the-world ERROR)."""
+    (turning a task-level park into a global stop-the-world ERROR).
+    Covers all three review states that dispatch to the stale-retrigger
+    helper, so each early-return guard is exercised."""
     now = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
     last_activity = now - timedelta(hours=3)
     pr = PRInfo(
         number=42,
         branch="pr-042-fix",
-        ci_status=CIStatus.PENDING,
-        review_status=ReviewStatus.PENDING,
+        ci_status=ci_status,
+        review_status=review_status,
         last_activity=last_activity,
-        head_sha="pendinghd",
+        head_sha="caphd",
         watch_retrigger_count=2,
     )
     _freeze_watch_datetime(monkeypatch, now)
@@ -4661,6 +4673,7 @@ def test_handle_watch_returns_after_cap_reached_escalation(
     runner = h._make_runner(review_timeout_min=20)
     runner.app_config.daemon.hung_fallback_codex_review = True
     runner.app_config.daemon.stale_review_threshold_min = 10
+    runner.app_config.daemon.stale_review_threshold_eyes_min = 5
     runner.app_config.daemon.watch_retrigger_cap = 3
     runner.state.current_pr = pr
     runner.state.state = PipelineState.WATCH
