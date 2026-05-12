@@ -102,7 +102,7 @@ def test_case_a_no_branch_no_remote_parks_in_error(
     _patch_branch_state(monkeypatch, local_exists=False, remote_exists=False)
     asyncio.run(runner.handle_coding())
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
     assert "did nothing" in (runner.state.error_message or "")
     assert any("did nothing" in entry["event"] for entry in runner.state.history)
 
@@ -131,7 +131,7 @@ def test_branch_mismatch_after_coder_exit_escalates_explicitly(
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
     error = runner.state.error_message or ""
     assert "Branch mismatch" in error
     assert "task_branch=pr-001" in error
@@ -148,7 +148,7 @@ def test_case_b_local_branch_only_parks_in_error(
     _patch_branch_state(monkeypatch, local_exists=True, remote_exists=False)
     asyncio.run(runner.handle_coding())
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
     assert "no push" in (runner.state.error_message or "")
 
 
@@ -225,7 +225,7 @@ def test_case_c_create_pr_failure_parks_in_error(
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
     assert "Daemon PR creation failed" in (runner.state.error_message or "")
 
 
@@ -282,7 +282,7 @@ def test_case_c_pr_not_found_after_create_parks_in_error(
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
     assert "Daemon-created PR not found" in (runner.state.error_message or "")
 
 
@@ -416,7 +416,7 @@ def test_case_c_already_exists_error_falls_through_when_pr_invisible(
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
     assert "Daemon-created PR not found" in (runner.state.error_message or "")
 
 

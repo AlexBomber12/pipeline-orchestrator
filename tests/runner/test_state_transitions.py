@@ -891,7 +891,7 @@ def test_handle_coding_no_pr_routes_to_diagnostic(
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
     assert "did nothing" in (runner.state.error_message or "")
 
 
@@ -1085,7 +1085,7 @@ def test_handle_coding_rejects_unmatched_branch(
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
     assert runner.state.current_pr is None
     assert "did nothing" in (runner.state.error_message or "")
 
@@ -1444,7 +1444,7 @@ def test_handle_coding_runs_three_retries_before_diagnostic(
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
     assert "[codex]" in (runner.state.error_message or "")
     assert call_count["n"] == 3
     assert slept.count(5) == 2

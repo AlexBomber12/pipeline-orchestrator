@@ -277,7 +277,7 @@ def test_coder_exit_zero_with_no_target_branch_marks_hung(
     runner = _run_coder_no_target_scenario(monkeypatch)
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
     assert "did nothing" in (runner.state.error_message or "")
     log = _log_text(runner)
     assert "[ESCALATE]" in log
@@ -333,7 +333,7 @@ def test_coder_pushed_wrong_branch_target_absent_marks_hung_silently(
     # not see the wrong branch. This collapse is precisely the OBS-AI
     # ambiguity.
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
     assert "did nothing" in (runner.state.error_message or "")
     log = _log_text(runner)
     assert "[ESCALATE]" in log

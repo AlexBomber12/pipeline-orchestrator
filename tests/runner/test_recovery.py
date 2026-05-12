@@ -244,7 +244,7 @@ def test_coder_escalate_label_apply_failure_parks_in_error(
     asyncio.run(runner._escalate_fix_coder_initiated(pr, "transient infra failure"))
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
     assert pr.is_escalated is True
     assert runner.state.error_message is not None
     assert "FIX coder ESCALATE on PR #401" in runner.state.error_message

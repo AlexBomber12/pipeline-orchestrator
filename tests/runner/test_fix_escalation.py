@@ -295,7 +295,7 @@ def test_escalate_fix_coder_initiated_label_success_parks_in_error(
     )
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
     assert pr.is_escalated is True
     assert posted == [
         (
@@ -352,7 +352,7 @@ def test_escalate_fix_iteration_cap_success_path_parks_in_error_with_label(
     asyncio.run(fix_escalation.escalate_fix_iteration_cap(runner, pr))
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
     assert pr.is_escalated is True
     assert any(
         "@AlexBomber12 FIX iteration cap reached" in body

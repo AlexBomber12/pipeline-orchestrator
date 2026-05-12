@@ -1407,23 +1407,31 @@ class PipelineRunner(
         log_message: str | None = None,
         extra_payload: dict[str, Any] | None = None,
     ) -> None:
-        """Park the runner in ERROR with task-level durability + cause telemetry.
+        """Park the active task in ERROR; let the runner continue with the queue.
 
         PR-317 collapsed the seven legacy ``_escalate_and_skip`` callsites
         (coding/idle handlers + fix_escalation) into this primitive so
         every terminal failure path closes the OBS-DD ESCALATE→IDLE→re-pick
-        loop the same way WATCH review_timeout did in PR-316:
+        loop on the same shared shape:
 
-        1. Write ``status:ERROR`` to the task frontmatter so the IDLE
-           picker stops re-selecting the now-failed task.
-        2. Transition through ``_transition_to_error`` with a structured
+        1. Transition through ``_transition_to_error`` with a structured
            ``CancellationCause`` (subsource from the PR-315 vocabulary) so
            OBS-BE attribution stays correct.
-        3. Set ``skip_ai_error_diagnose`` so ``run_cycle`` does not invoke
-           ``handle_error`` on a failure that already routed through the
-           operator-controlled park; operator Retry deletes the cause and
-           the next ERROR cycle observes the empty slot to transition back
-           to IDLE for a re-pick.
+        2. Write ``status:ERROR`` to the task frontmatter so the IDLE
+           picker stops re-selecting the now-failed task — the
+           loop-breaking fix.
+
+        PR-317 review feedback (P1): this helper does NOT set
+        ``skip_ai_error_diagnose``. That flag is reserved for the WATCH
+        ``review_timeout`` park (handled inline in ``handlers/watch.py``),
+        which is an intentional repo-wide stop-the-world event awaiting
+        operator Retry. Task-level escalations from coding/fix/idle
+        handlers must not block unrelated queued tasks on the same
+        runner: the next ERROR cycle invokes ``handle_error`` per the
+        standard routing (infra/rate-limit/timeout fall back to IDLE for
+        retry; other categories route via AI diagnose) and the
+        ``status:ERROR`` frontmatter prevents the IDLE picker from
+        re-selecting the parked task.
 
         The ``[ESCALATE]`` log prefix is preserved for operator/grep
         continuity with the pre-PR-317 history. ``extra_payload`` is
@@ -1468,7 +1476,6 @@ class PipelineRunner(
                 status_written = False
             if not status_written:
                 await self._mark_status_write_failed_task(current_task)
-        self.state.skip_ai_error_diagnose = True
 
     async def _review_timeout_park_cleared(self) -> bool:
         """Return True when the operator-park cancellation cause is gone.

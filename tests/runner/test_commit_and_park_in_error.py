@@ -1,13 +1,19 @@
 """PR-317: ``_commit_and_park_in_error`` primitive + converted callsites.
 
-The PR-316 WATCH review_timeout fix established the "park in ERROR with
-status:ERROR + cancellation cause + ``skip_ai_error_diagnose``" pattern.
 PR-317 deletes the legacy ``_escalate_and_skip`` primitive and routes
 the seven remaining ESCALATE→IDLE→re-pick callsites (coding/idle/fix)
-through a new ``_commit_and_park_in_error`` helper that captures the
-canonical pattern in one place. These tests pin (a) the helper's
-behavior directly and (b) the terminal state + subsource for each
-converted callsite so future refactors cannot reopen the OBS-DD loop.
+through ``_commit_and_park_in_error``. The helper records a structured
+``CancellationCause`` and writes ``status:ERROR`` to the task
+frontmatter so the IDLE picker stops re-selecting the failed task.
+
+PR-317 review feedback (P1): the helper deliberately does NOT set
+``skip_ai_error_diagnose`` — that flag is reserved for the WATCH
+``review_timeout`` operator-park (set inline in ``handlers/watch.py``).
+Task-level escalations must not block unrelated queued tasks on the
+same runner; ``handle_error`` is allowed to run on the next ERROR
+cycle and route per its standard logic. These tests pin (a) the
+helper's behavior directly and (b) the terminal ERROR state + subsource
+for each converted callsite so future refactors cannot reopen the loop.
 """
 
 from __future__ import annotations
@@ -55,7 +61,12 @@ def test_no_escalate_and_skip_in_production_code() -> None:
 def test_commit_and_park_in_error_writes_status_error_and_transitions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The primitive writes status:ERROR, transitions to ERROR, sets park flag."""
+    """The primitive writes status:ERROR and transitions to ERROR.
+
+    PR-317 review (P1): the helper must not set
+    ``skip_ai_error_diagnose`` — only the WATCH review_timeout park
+    sets that flag (see ``handlers/watch.py``).
+    """
     runner = h._make_runner()
     runner.state.state = PipelineState.CODING
     runner.state.current_task = QueueTask(
@@ -93,7 +104,7 @@ def test_commit_and_park_in_error_writes_status_error_and_transitions(
     )
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
     assert runner.state.error_message == "branch mismatch"
     assert status_writes == [
         (runner.state.current_task, "ERROR", "branch mismatch")
@@ -222,7 +233,7 @@ def test_commit_and_park_in_error_no_current_task_skips_status_write(
 
     assert commit_calls == []
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
 
 
 def test_commit_and_park_in_error_marks_status_write_fallback_on_failure(
@@ -410,7 +421,7 @@ def test_coding_branch_mismatch_parks_in_error_with_no_push_deadlock(
         )
     )
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
 
 
 @pytest.mark.parametrize(
@@ -434,7 +445,7 @@ def test_coding_callsite_subsources_park_in_error(
         )
     )
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
     assert runner.state.error_message == f"site exercising {subsource}"
 
 
@@ -472,7 +483,7 @@ def test_idle_pinned_coder_unavailable_parks_in_error(
     )
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
 
 
 # ---------------------------------------------------------------------------
@@ -526,7 +537,7 @@ def test_fix_coder_escalate_marker_parks_in_error_with_coder_escalate(
     )
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
     assert pr.is_escalated is True
     assert recorded and recorded[0].payload["subsource"] == "coder_escalate"
 
@@ -575,7 +586,7 @@ def test_fix_iteration_cap_parks_in_error_with_fix_iteration_cap(
     asyncio.run(fix_escalation.escalate_fix_iteration_cap(runner, pr))
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is True
+    assert runner.state.skip_ai_error_diagnose is False
     assert pr.is_escalated is True
     assert recorded and recorded[0].payload["subsource"] == "fix_iteration_cap"
     assert recorded[0].payload["iteration_count"] == cap
