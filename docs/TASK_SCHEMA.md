@@ -52,6 +52,30 @@ AWAY mode never auto-pauses for rate alone. The authoritative policy
 notes live in `docs/roadmap.md` under "Sprint 15b Phase 1 finalized
 decisions (2026-05-07)" and the historical "Cancellation policy" section.
 
+## Cancellation cause classification
+
+Terminal failures record a `CancellationCause` with `category="ERROR"` and
+a `payload.subsource` field carrying forensic detail:
+
+| Subsource | Trigger |
+| --- | --- |
+| `crash` | Daemon process died mid-operation |
+| `coder_escalate` | Coder stdout contained explicit ESCALATE: marker |
+| `guardrail` | Tier 1/2 guardrail violation in coder stdout or PR diff |
+| `review_timeout` | WATCH cycle exceeded review_timeout_min without new Codex feedback |
+| `fix_idle_timeout` | FIX cycle exceeded fix_idle_timeout_sec without push |
+| `fix_iteration_cap` | FIX cycle exceeded fix_iteration_cap iterations |
+| `no_push_deadlock` | Coder claimed fix without git push |
+| `infra_failure` | Repeated INFRA failures past grace period |
+
+Historical records pre-dating the 2026-05-XX migration may carry
+`payload.legacy_category` with the original vocabulary value (ESCALATE,
+TIMEOUT, INFRA, NO_PUSH_DEADLOCK, CRASH). Dashboard renders these with
+a "Legacy" badge for continuity.
+
+All terminal failures route to the single `ERROR` category; the operator
+Retry button is the only recovery affordance.
+
 ## Type field
 
 Canonical values:
