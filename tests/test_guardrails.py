@@ -560,6 +560,18 @@ def test_scan_pr_diff_workflow_job_permissions_write_all_flagged() -> None:
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_reserved_word_job_id_permissions_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,6 +1,7 @@\n"
+        + " jobs:\n"
+        + "   run:\n"
+        + "+    permissions: write-all\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
 def test_scan_pr_diff_workflow_permissions_rename_into_workflows_flagged() -> None:
     diff_text = (
         "diff --git a/scripts/build.yml b/.github/workflows/build.yml\n"

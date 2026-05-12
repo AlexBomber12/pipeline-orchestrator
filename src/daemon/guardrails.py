@@ -315,9 +315,16 @@ def _is_workflow_permission_key_context(
     ]
     if not ancestors:
         return False
-    if any(name in _NON_PERMISSION_MAPPING_KEYS for _indent, name in ancestors):
+    jobs_index = next(
+        (index for index, (_indent, name) in enumerate(ancestors) if name == "jobs"),
+        None,
+    )
+    if jobs_index is None:
         return False
-    return any(name == "jobs" for _indent, name in ancestors)
+    job_body_ancestors = ancestors[jobs_index + 2 :]
+    if any(name in _NON_PERMISSION_MAPPING_KEYS for _indent, name in job_body_ancestors):
+        return False
+    return len(ancestors) > jobs_index
 
 
 def _match_has_workflow_permission_context(match_text: str) -> bool:
