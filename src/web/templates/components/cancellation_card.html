@@ -97,9 +97,14 @@
                with ``payload.legacy_category`` preserved by the
                ``escalate_to_error`` startup migration, or a forward-
                incompatible/unknown subsource. Surface whichever forensic
-               detail the payload carries so the card is never blank. #}
+               detail the payload carries so the card is never blank. A
+               present-but-unknown ``subsource`` (e.g. a detector emitted
+               before the template caught up) is inlined into the badge
+               so operators do not lose the key forensic identifier. #}
             {% if legacy_category %}
             <span class="cause-badge cause-legacy">Legacy: {{ legacy_category }}</span>
+            {% elif subsource %}
+            <span class="cause-badge cause-error">Error: {{ subsource }}</span>
             {% else %}
             <span class="cause-badge cause-error">Error</span>
             {% endif %}

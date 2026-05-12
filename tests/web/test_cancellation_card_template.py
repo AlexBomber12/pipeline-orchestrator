@@ -204,3 +204,43 @@ def test_card_wrapper_carries_unknown_subsource_class_for_blank_payload() -> Non
     rendered = _render(_error_cause({}))
 
     assert "subsource-unknown" in rendered
+
+
+def test_card_renders_unknown_subsource_in_fallback_badge() -> None:
+    # Forward-incompatible detector names (a subsource emitted before
+    # the template catches up) must surface the actual ``subsource``
+    # value on the badge so operators retain the forensic identifier.
+    rendered = _render(
+        _error_cause(
+            {
+                "subsource": "gh_408",
+                "reason_text": "GitHub API HTTP 408",
+            }
+        )
+    )
+
+    assert "cause-error" in rendered
+    assert "Error: gh_408" in rendered
+    assert "GitHub API HTTP 408" in rendered
+    assert "Legacy:" not in rendered
+
+
+def test_operator_recovery_record_keeps_category_class_without_subsource() -> None:
+    # OPERATOR_RECOVERY records intentionally lack ``payload.subsource``
+    # (the PR-315 migration leaves them untouched). The wrapper must
+    # still carry ``category-operator_recovery`` so the category-driven
+    # border-left color wins over the ERROR-only ``subsource-unknown``
+    # fallback color.
+    cause = CancellationCause(
+        category="OPERATOR_RECOVERY",
+        payload={},
+        created_at="2026-05-11T12:00:00+00:00",
+        task_id="PR-999",
+        repo_slug="example__alpha",
+    )
+
+    rendered = _render(cause)
+
+    assert "category-operator_recovery" in rendered
+    assert "subsource-unknown" in rendered
+    assert "Manual recovery via dashboard" in rendered

@@ -621,7 +621,13 @@
         .cancellation-card.subsource-infra_failure {
             border-left-color: var(--cause-infra);
         }
-        .cancellation-card.subsource-unknown {
+        /* Scope the unknown-subsource border to ERROR-classified records.
+           Pre-PR-315 records with categories such as ``OPERATOR_RECOVERY``,
+           ``CRASH``, ``ESCALATE``, etc. keep their own ``.category-<name>``
+           color even when ``payload.subsource`` is missing; otherwise the
+           later, equal-specificity ``.subsource-unknown`` rule would
+           collapse those distinct visual signals into the legacy gray. */
+        .cancellation-card.category-error.subsource-unknown {
             border-left-color: var(--cause-legacy);
         }
 
