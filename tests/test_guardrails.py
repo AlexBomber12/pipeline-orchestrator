@@ -961,6 +961,20 @@ def test_scan_pr_diff_workflow_job_output_named_permissions_not_flagged() -> Non
     assert scan_pr_diff(diff_text) == []
 
 
+def test_scan_pr_diff_workflow_job_secret_named_permissions_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,8 +1,9 @@\n"
+        " jobs:\n"
+        "   call:\n"
+        "     uses: org/repo/.github/workflows/build.yml@v1\n"
+        "     secrets:\n"
+        "+      permissions: write-all\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
 def test_scan_pr_diff_workflow_env_named_contents_not_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER

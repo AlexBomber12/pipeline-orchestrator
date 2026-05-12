@@ -149,6 +149,7 @@ _NON_PERMISSION_MAPPING_KEYS = {
     "matrix",
     "outputs",
     "run",
+    "secrets",
     "services",
     "steps",
     "strategy",
