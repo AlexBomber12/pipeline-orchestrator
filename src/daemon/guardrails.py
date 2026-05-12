@@ -122,9 +122,7 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         # exactly `write`. Permission keys can appear at workflow top
         # level or under a job, so accepted indentation is bounded to
         # those YAML positions to avoid script-literal false positives.
-        # Top-level permission-map scope additions are also matched even
-        # when the parent `permissions:` line is outside the diff hunk.
-        # Contextless partial hunks need a replacement path because unrelated
+        # Replacement hunks require visible `permissions:` context; unrelated
         # workflow YAML blocks can use the same keys outside `permissions`.
         r"(?ms)^diff --git[^\r\n]*[ \t]+"
         + _DIFF_WORKFLOW_B_PATH_RE
@@ -155,14 +153,6 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         + r"[ \t]*:[ \t]*"
         + _YAML_SCALAR_ANCHOR_RE
         + r"[\"']?write[\"']?[^\r\n}]*\})"
-        r"|(?:(?!^diff --git[ \t]).)*?^-[ \t]{2}"
-        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
-        + r"[ \t]*:[ \t]*[\"']?(?:read|none)[\"']?[^\r\n]*\r?\n"
-        r"^\+[ \t]{2}"
-        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
-        + r"[ \t]*:[ \t]*"
-        + _YAML_SCALAR_ANCHOR_RE
-        + r"[\"']?write[\"']?"
         r")[ \t]*(?:#.*)?$",
         re.IGNORECASE,
     ),
