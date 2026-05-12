@@ -464,6 +464,20 @@ def test_workflow_permission_context_helpers_handle_non_yaml_lines() -> None:
     assert not guardrails._is_workflow_permission_key_context([], 0, "contents: write")
 
 
+def test_workflow_permission_context_helpers_track_active_yaml_stack() -> None:
+    assert guardrails._visible_yaml_context(
+        [
+            " jobs:",
+            "   build:",
+            "     steps:",
+            " on:",
+            "   workflow_call:",
+            "     inputs:",
+        ],
+        6,
+    ) == [(0, "on"), (2, "workflow_call"), (4, "inputs")]
+
+
 def test_workflow_permission_context_rejects_indented_key_without_ancestor() -> None:
     match_text = "+  permissions: write-all\n"
 
@@ -943,6 +957,23 @@ def test_scan_pr_diff_workflow_reusable_input_named_permissions_not_flagged() ->
         "     uses: org/repo/.github/workflows/build.yml@v1\n"
         "     with:\n"
         "+      permissions: write-all\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_workflow_call_input_permission_after_jobs_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,10 +1,11 @@\n"
+        " jobs:\n"
+        "   build:\n"
+        "     runs-on: ubuntu-latest\n"
+        " on:\n"
+        "   workflow_call:\n"
+        "     inputs:\n"
+        "       token:\n"
+        "+        permissions: write-all\n"
     )
 
     assert scan_pr_diff(diff_text) == []

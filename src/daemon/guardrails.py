@@ -288,6 +288,11 @@ def _visible_yaml_context(lines: list[str], line_index: int) -> list[tuple[int, 
         key = _yaml_key(yaml_line)
         if key is None:
             continue
+        context = [
+            (existing_indent, existing_name)
+            for existing_indent, existing_name in context
+            if existing_indent < key[0]
+        ]
         context.append(key)
     return context
 
