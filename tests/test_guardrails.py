@@ -704,10 +704,12 @@ def test_scan_pr_diff_workflow_quoted_scope_key_write_flagged() -> None:
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
-def test_scan_pr_diff_workflow_scope_write_without_parent_context_not_flagged() -> None:
-    diff_text = WORKFLOW_DIFF_HEADER + "@@ -20,3 +20,4 @@\n+  issues: write\n"
+def test_scan_pr_diff_workflow_scope_write_without_parent_context_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER + "@@ -20,3 +20,4 @@\n+  pull-requests: write\n"
+    )
 
-    assert scan_pr_diff(diff_text) == []
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
 def test_scan_pr_diff_workflow_id_token_write_flagged() -> None:
