@@ -97,6 +97,12 @@ class PRInfo(BaseModel):
     # fork (no credentials, different remote), so it must refuse
     # rather than silently publish to the wrong branch on origin.
     is_cross_repository: bool = False
+    # PR-290a (OBS-CR diff scan): head SHA at which the most recent
+    # successful PR diff scan completed. SHA-keyed rather than
+    # timestamp-keyed so a fresh coder push (new HEAD SHA) re-arms the
+    # scan; a timestamp-only cache would mark "scanned" forever after
+    # the first fetch and let a follow-up push slip past the catalogue.
+    diff_scanned_at_sha: str | None = None
 
     def record_observed_head(self, sha: str) -> None:
         """Add ``sha`` to ``observed_head_shas`` and refresh ``push_count``.

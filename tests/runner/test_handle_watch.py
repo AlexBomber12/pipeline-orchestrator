@@ -3389,3 +3389,313 @@ def test_retry_failed_workflow_handles_no_run_found(
     assert float(raw) > 0
     history = " ".join(entry.get("event", "") for entry in runner.state.history)
     assert "no Actions workflow run ID" in history
+
+
+# ---------------------------------------------------------------------------
+# PR-290a: _scan_pr_diff_once (diff content scan infrastructure)
+# ---------------------------------------------------------------------------
+
+
+def test_scan_pr_diff_once_skips_when_no_current_pr() -> None:
+    """The dispatcher cannot scan a diff for a PR that does not exist;
+    in that case the call returns ``False`` and changes no state."""
+    runner = h._make_runner()
+    runner.state.current_pr = None
+
+    result = asyncio.run(runner._scan_pr_diff_once())
+
+    assert result is False
+
+
+def test_scan_pr_diff_once_skips_when_cache_matches_head_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SHA-keyed cache hit: when ``diff_scanned_at_sha`` equals the
+    current ``head_sha`` the scan must short-circuit (no gh CLI call)
+    so each WATCH cycle costs nothing on a HEAD it already cleared."""
+    import re as _re
+
+    monkeypatch.setattr(
+        watch_module.guardrails,
+        "_DIFF_PATTERNS",
+        {"x": _re.compile(r"x")},
+    )
+
+    called: list[int] = []
+
+    def fail_fetch(repo: str, number: int) -> str:
+        called.append(number)
+        raise AssertionError("get_pr_diff must not be called on cache hit")
+
+    monkeypatch.setattr("src.github.prs.get_pr_diff", fail_fetch)
+
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=7,
+        branch="pr-007",
+        head_sha="cafe1234",
+        diff_scanned_at_sha="cafe1234",
+    )
+
+    result = asyncio.run(runner._scan_pr_diff_once())
+
+    assert result is False
+    assert called == []
+
+
+def test_scan_pr_diff_once_runs_when_cache_mismatches_head_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh HEAD SHA (new coder push) re-arms the scan. The dispatcher
+    fetches the diff, runs the catalogue (empty in this assertion, so
+    no violation), and updates ``diff_scanned_at_sha`` to the new SHA
+    on success."""
+    import re as _re
+
+    monkeypatch.setattr(
+        watch_module.guardrails,
+        "_DIFF_PATTERNS",
+        {"never_match": _re.compile(r"NEVER_MATCH_TOKEN")},
+    )
+    monkeypatch.setattr(
+        watch_module.guardrails,
+        "_DIFF_RULES",
+        {"never_match": "test rule"},
+    )
+
+    fetched: list[tuple[str, int]] = []
+
+    def fake_fetch(repo: str, number: int) -> str:
+        fetched.append((repo, number))
+        return "diff --git a/x b/x\n+innocuous\n"
+
+    monkeypatch.setattr("src.github.prs.get_pr_diff", fake_fetch)
+
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=8,
+        branch="pr-008",
+        head_sha="deadbeef",
+        diff_scanned_at_sha="oldcafe1",
+    )
+
+    result = asyncio.run(runner._scan_pr_diff_once())
+
+    assert result is True
+    assert fetched == [(runner.owner_repo, 8)]
+    assert runner.state.current_pr.diff_scanned_at_sha == "deadbeef"
+    assert runner.state.state != PipelineState.ERROR
+
+
+def test_scan_pr_diff_once_leaves_cache_unchanged_on_fetch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient ``gh pr diff`` failure must NOT mark the HEAD as
+    scanned; otherwise the next WATCH cycle would skip the SHA and a
+    prohibited diff could slip past the catalogue. Fetch failures are
+    retried on subsequent cycles."""
+    import re as _re
+
+    monkeypatch.setattr(
+        watch_module.guardrails,
+        "_DIFF_PATTERNS",
+        {"x": _re.compile(r"x")},
+    )
+
+    def boom(repo: str, number: int) -> str:
+        raise RuntimeError("gh CLI timed out")
+
+    monkeypatch.setattr("src.github.prs.get_pr_diff", boom)
+
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=9,
+        branch="pr-009",
+        head_sha="freshSHA",
+        diff_scanned_at_sha="prior",
+    )
+
+    result = asyncio.run(runner._scan_pr_diff_once())
+
+    assert result is False
+    assert runner.state.current_pr.diff_scanned_at_sha == "prior"
+
+
+def test_scan_pr_diff_once_empty_catalogue_marks_head_to_avoid_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-290a skeleton: with an empty pattern catalogue, the dispatcher
+    still records ``diff_scanned_at_sha`` so subsequent WATCH cycles on
+    the same HEAD short-circuit cheaply at the cache-hit gate instead
+    of re-entering the empty-catalogue branch every poll."""
+    monkeypatch.setattr(watch_module.guardrails, "_DIFF_PATTERNS", {})
+    monkeypatch.setattr(watch_module.guardrails, "_DIFF_RULES", {})
+
+    def fail_fetch(repo: str, number: int) -> str:
+        raise AssertionError("get_pr_diff must not be called on empty catalogue")
+
+    monkeypatch.setattr("src.github.prs.get_pr_diff", fail_fetch)
+
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=10,
+        branch="pr-010",
+        head_sha="bee1bee1",
+        diff_scanned_at_sha=None,
+    )
+
+    result = asyncio.run(runner._scan_pr_diff_once())
+
+    assert result is False
+    assert runner.state.current_pr.diff_scanned_at_sha == "bee1bee1"
+
+
+def test_scan_pr_diff_once_violation_transitions_to_error_with_guardrail_subsource(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the catalogue is populated and the diff matches, the
+    dispatcher must transition through ``_transition_to_error`` with a
+    structured ``CancellationCause`` whose ``payload.subsource`` is
+    ``"guardrail"`` (PR-315/PR-320 single-ERROR-category model)."""
+    import re as _re
+
+    monkeypatch.setattr(
+        watch_module.guardrails,
+        "_DIFF_PATTERNS",
+        {
+            "workflow_permissions_write_all": _re.compile(
+                r"permissions:\s*write-all"
+            )
+        },
+    )
+    monkeypatch.setattr(
+        watch_module.guardrails,
+        "_DIFF_RULES",
+        {"workflow_permissions_write_all": "Workflow permissions write-all"},
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_pr_diff",
+        lambda repo, number: (
+            "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+            "+permissions: write-all\n"
+        ),
+    )
+
+    captured: list[dict[str, Any]] = []
+
+    async def fake_transition(
+        self: Any,
+        message: str,
+        **kwargs: Any,
+    ) -> None:
+        captured.append({"message": message, **kwargs})
+        self.state.state = PipelineState.ERROR
+
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_transition_to_error",
+        fake_transition,
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=11,
+        branch="pr-011",
+        head_sha="newsha01",
+        diff_scanned_at_sha=None,
+    )
+
+    result = asyncio.run(runner._scan_pr_diff_once())
+
+    assert result is True
+    assert len(captured) == 1
+    call = captured[0]
+    assert "[GUARDRAIL]" in call["message"]
+    assert "workflow_permissions_write_all" in call["message"]
+    cause = call["cancellation_cause"]
+    assert cause.category == "ERROR"
+    assert cause.payload["subsource"] == "guardrail"
+    assert cause.payload["tier"] == 1
+    assert cause.payload["category"] == "workflow_permissions_write_all"
+    assert cause.payload["excerpt"] == "permissions: write-all"
+    # Cache must update on a successful scan, even when a violation fires,
+    # so the same HEAD does not re-run the scan after an operator Retry.
+    assert runner.state.current_pr.diff_scanned_at_sha == "newsha01"
+
+
+def test_handle_watch_invokes_diff_scan_once_per_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The WATCH cycle must call ``_scan_pr_diff_once`` exactly once per
+    poll. With an empty catalogue this is a no-op that still updates
+    the SHA cache so future cycles short-circuit cheaply."""
+    pr = PRInfo(
+        number=12,
+        branch="pr-012",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=datetime.now(timezone.utc),
+        head_sha="poll0001",
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+
+    invocations: list[int] = []
+
+    async def fake_scan(self: Any) -> bool:
+        invocations.append(1)
+        return False
+
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_scan_pr_diff_once",
+        fake_scan,
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=12, branch="pr-012")
+    asyncio.run(runner.handle_watch())
+
+    assert invocations == [1]
+
+
+def test_handle_watch_returns_when_diff_scan_transitions_to_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the diff scan finds a violation and transitions to ERROR, the
+    WATCH cycle must short-circuit; otherwise the trailing merge / fix
+    / timeout dispatch could re-enter handling on a now-ERROR state."""
+    pr = PRInfo(
+        number=13,
+        branch="pr-013",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.APPROVED,
+        last_activity=datetime.now(timezone.utc),
+        head_sha="violate1",
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+
+    async def fake_scan(self: Any) -> bool:
+        self.state.state = PipelineState.ERROR
+        return True
+
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_scan_pr_diff_once",
+        fake_scan,
+    )
+
+    merged: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        "src.github.prs.merge_pr",
+        lambda repo, number: merged.append((repo, number)),
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=13, branch="pr-013")
+    asyncio.run(runner.handle_watch())
+
+    assert merged == []
+    assert runner.state.state == PipelineState.ERROR

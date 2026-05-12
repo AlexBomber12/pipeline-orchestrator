@@ -101,6 +101,20 @@ _TIER1_RULES: dict[str, str] = {
 
 _EXCERPT_LIMIT = 200
 
+# PR-290a: diff-content scan catalogue. Populated by PR-290b (workflow YAML)
+# and PR-290c (governance / supply chain). PR-301..PR-304 extend the same
+# dispatcher with Tier 2 secrets / large-diff / mass-deletion entries. The
+# empty default makes ``scan_pr_diff`` behaviorally inert at skeleton time
+# so PR-290a can ship the dispatcher + cache wiring without changing any
+# detection outcomes.
+_DIFF_PATTERNS: dict[str, re.Pattern[str]] = {}
+
+_DIFF_RULES: dict[str, str] = {}
+
+
+def _clip_excerpt(text: str) -> str:
+    return text[:_EXCERPT_LIMIT]
+
 
 def _line_excerpt(coder_stdout: str, start: int, end: int) -> str:
     line_start = coder_stdout.rfind("\n", 0, start) + 1
@@ -302,6 +316,35 @@ def scan_stdout(coder_stdout: str) -> list[GuardrailViolation]:
                     category=category,
                     excerpt=_line_excerpt(coder_stdout, match.start(), match.end()),
                     rule=_TIER1_RULES[category],
+                )
+            )
+    return violations
+
+
+def scan_pr_diff(diff_text: str) -> list[GuardrailViolation]:
+    """Scan PR diff content for prohibited patterns.
+
+    Returns guardrail violations found in ``diff_text`` (the unified-diff
+    format emitted by ``gh pr diff``). Mirrors :func:`scan_stdout` so
+    callers can treat both signals uniformly. With the catalogue empty
+    (PR-290a skeleton state) the result is always ``[]``; PR-290b/c and
+    PR-301..PR-304 populate ``_DIFF_PATTERNS`` to add real detections.
+
+    Patterns match against the full diff including ``+``/``-`` line
+    prefixes so governance-file modifications, workflow YAML edits, and
+    similar changes are visible regardless of which side of the diff
+    they appear on.
+    """
+    violations: list[GuardrailViolation] = []
+    for category in sorted(_DIFF_PATTERNS):
+        pattern = _DIFF_PATTERNS[category]
+        for match in pattern.finditer(diff_text):
+            violations.append(
+                GuardrailViolation(
+                    tier=1,
+                    category=category,
+                    excerpt=_clip_excerpt(match.group(0)),
+                    rule=_DIFF_RULES.get(category, ""),
                 )
             )
     return violations

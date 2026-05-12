@@ -520,6 +520,26 @@ def _extract_author_and_head_sha(payload: object) -> tuple[str, str]:
     return "", ""
 
 
+def get_pr_diff(repo: str, pr_number: int) -> str:
+    """Return the unified-diff text for ``pr_number`` via ``gh pr diff``.
+
+    PR-290a: powers :meth:`WatchMixin._scan_pr_diff_once`. Equivalent to
+    ``git diff base..head`` for the PR but routed through ``gh`` so the
+    daemon does not need a local checkout of the PR branch. ``subprocess``
+    errors propagate to the caller; the WATCH integration wraps the call
+    in a try/except and leaves the SHA-keyed cache field unchanged on
+    failure so the next cycle retries.
+    """
+    result = subprocess.run(
+        ["gh", "pr", "diff", str(pr_number), "--repo", repo],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    return result.stdout
+
+
 def get_branch_last_push_time(repo: str, pr_number: int) -> float | None:
     """Return ``time.monotonic()`` if the PR's head SHA changed since last call.
 
