@@ -89,6 +89,14 @@ def classify_cancellation_subsource(
     3. ``cause`` is ``None`` (no record found) — return ``""`` so the
        caller routes to the operator-attention path.
 
+    ``payload.subsource`` is also validated against ``SUBSOURCE_VOCABULARY``
+    on the ERROR path. A malformed or forward-incompatible value (operator
+    typo, detector string introduced by a newer daemon writing to a Redis
+    store an older daemon then reads) must not pass through unchecked: an
+    unrecognized non-empty subsource would otherwise route to operator-
+    attention even when ``legacy_category`` records the original detector
+    as ``CRASH``, suppressing the expected crash log signal.
+
     The empty string ``""`` is the sentinel "no usable subsource"; the
     companion ``recovery_branch_for_subsource`` maps it to operator
     attention so an unknown cause never silently re-enters the crash
@@ -118,7 +126,7 @@ def classify_cancellation_subsource(
             return _LEGACY_CATEGORY_TO_SUBSOURCE[category]
         return ""
 
-    if isinstance(subsource, str) and subsource:
+    if isinstance(subsource, str) and subsource in SUBSOURCE_VOCABULARY:
         return subsource
     if isinstance(legacy, str) and legacy in _LEGACY_CATEGORY_TO_SUBSOURCE:
         return _LEGACY_CATEGORY_TO_SUBSOURCE[legacy]

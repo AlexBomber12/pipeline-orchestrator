@@ -205,6 +205,42 @@ def test_recovery_default_logger_warns_when_no_log_sink_provided(
     )
 
 
+def test_recovery_error_path_rejects_subsource_outside_vocabulary() -> None:
+    """An ERROR cause with an unrecognized subsource must not pass through.
+
+    A typo (``"crsh"``) or a forward-incompatible detector string written
+    by a newer daemon would otherwise silently route to operator-attention
+    while masquerading as a valid hint. The helper must validate against
+    ``SUBSOURCE_VOCABULARY`` and degrade to ``""`` so the empty sentinel
+    surfaces the corruption rather than committing to a wrong branch.
+    """
+    cause = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "crsh", "error_message": "killed"},
+    )
+    subsource = classify_cancellation_subsource(cause)
+    assert subsource == ""
+    assert recovery_branch_for_subsource(subsource) == "operator_attention"
+
+
+def test_recovery_error_path_invalid_subsource_falls_back_to_legacy_category() -> None:
+    """Invalid subsource still recovers the crash signal via legacy_category.
+
+    The ``escalate_to_error`` migration preserves the pre-PR-315 detector
+    as ``payload.legacy_category``. If a partially-migrated record carries
+    a malformed ``subsource`` but a recoverable ``legacy_category="CRASH"``,
+    validation must let the legacy fallback win so the crash log line is
+    not suppressed by the corrupt subsource field.
+    """
+    cause = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "crsh", "legacy_category": "CRASH"},
+    )
+    subsource = classify_cancellation_subsource(cause)
+    assert subsource == "crash"
+    assert recovery_branch_for_subsource(subsource) == "crash"
+
+
 def test_recovery_branch_empty_subsource_routes_to_operator_attention() -> None:
     """The empty string sentinel maps to the operator-attention branch."""
     assert recovery_branch_for_subsource("") == "operator_attention"

@@ -199,3 +199,34 @@ def test_dispatch_empty_subsource_routes_to_operator_attention(
         ev.startswith("[INFRA] Task PR-318 parked for operator attention,")
         for ev in events
     ), events
+
+
+def test_dispatch_invalid_subsource_with_legacy_crash_logs_crashed_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed subsource still recovers the crash log via legacy_category.
+
+    Forward-incompatible/corrupt ``payload.subsource`` values must not
+    suppress the crash signal when ``payload.legacy_category`` records the
+    original detector as ``CRASH``. The defensive vocabulary check lets the
+    legacy fallback win so the operator still sees the crash log line.
+    """
+    runner = _crashed_doing_runner(monkeypatch)
+    _seed_cause(
+        runner,
+        CancellationCause(
+            category="ERROR",
+            payload={"subsource": "crsh", "legacy_category": "CRASH"},
+        ),
+    )
+
+    asyncio.run(runner.recover_state())
+
+    events = [e["event"] for e in runner.state.history]
+    assert any(
+        ev.startswith("[INFRA] Task PR-318 crashed, marking ERROR.")
+        for ev in events
+    ), events
+    assert not any(
+        "parked for operator attention" in ev for ev in events
+    ), events
