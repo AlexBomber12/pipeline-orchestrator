@@ -685,26 +685,27 @@ class WatchMixin:
 
         state_label = current_pr.review_status.value
         cap = self.app_config.daemon.watch_retrigger_cap
-        next_count = current_pr.watch_retrigger_count + 1
-        if next_count >= cap:
+        prior_count = current_pr.watch_retrigger_count
+        if prior_count >= cap:
             await self._commit_and_park_in_error(
                 (
-                    f"watch_retrigger_cap_reached: {next_count} cycles "
+                    f"watch_retrigger_cap_reached: {prior_count} cycles "
                     f"with no fresh review activity (review={state_label})"
                 ),
                 subsource="watch_retrigger_cap",
                 log_message=(
                     f"PR #{pr_number} watch_retrigger cap reached "
-                    f"({next_count}/{cap}); escalating to ERROR instead "
+                    f"({prior_count}/{cap}); escalating to ERROR instead "
                     f"of re-triggering @codex review."
                 ),
                 extra_payload={
                     "review_status": state_label,
-                    "retrigger_count": next_count,
+                    "retrigger_count": prior_count,
                     "cap": cap,
                 },
             )
             return False
+        next_count = prior_count + 1
         self.log_event(
             f"[WATCH] Stale {state_label} on PR #{pr_number}; "
             f"re-triggering @codex review (attempt {next_count}/{cap})."

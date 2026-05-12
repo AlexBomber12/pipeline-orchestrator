@@ -4321,7 +4321,7 @@ def test_pending_retrigger_cap_reached_escalates_to_error(
         review_status=ReviewStatus.PENDING,
         last_activity=now,
         head_sha="pendinghd",
-        watch_retrigger_count=2,
+        watch_retrigger_count=3,
     )
     monkeypatch.setattr(
         "src.github.prs.get_last_push_age_seconds",
@@ -4408,7 +4408,7 @@ def test_changes_requested_retrigger_cap_reached_escalates(
         review_status=ReviewStatus.CHANGES_REQUESTED,
         last_activity=now,
         head_sha="changeshd",
-        watch_retrigger_count=2,
+        watch_retrigger_count=3,
     )
     monkeypatch.setattr(
         "src.github.prs.get_last_push_age_seconds",
@@ -4466,7 +4466,7 @@ def test_eyes_retrigger_cap_reached_escalates(
         review_status=ReviewStatus.EYES,
         last_activity=now,
         head_sha="eyeshd",
-        watch_retrigger_count=2,
+        watch_retrigger_count=3,
     )
     monkeypatch.setattr(
         "src.github.prs.get_last_push_age_seconds",
@@ -4654,7 +4654,7 @@ def test_handle_watch_returns_after_cap_reached_escalation(
         review_status=review_status,
         last_activity=last_activity,
         head_sha="caphd",
-        watch_retrigger_count=2,
+        watch_retrigger_count=3,
     )
     _freeze_watch_datetime(monkeypatch, now)
     monkeypatch.setattr(
@@ -4727,3 +4727,72 @@ def test_handle_watch_returns_after_cap_reached_escalation(
     assert len(park_calls) == 1
     assert park_calls[0]["subsource"] == "watch_retrigger_cap"
     assert transition_calls == []
+
+
+def test_pending_retrigger_cap_permits_exactly_cap_retriggers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured cap of N must allow exactly N actual retrigger posts
+    before escalating. Regression for the off-by-one where ``next_count >=
+    cap`` short-circuited at cycle N (only N-1 posts) and made
+    ``watch_retrigger_cap=1`` post zero retriggers."""
+    now = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
+    pr = PRInfo(
+        number=42,
+        branch="pr-042-fix",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        last_activity=now,
+        head_sha="caphd",
+        watch_retrigger_count=0,
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_last_push_age_seconds",
+        lambda repo, number: 700,
+    )
+    _freeze_watch_datetime(monkeypatch, now)
+
+    runner = h._make_runner()
+    runner.app_config.daemon.hung_fallback_codex_review = True
+    runner.app_config.daemon.stale_review_threshold_min = 10
+    runner.app_config.daemon.watch_retrigger_cap = 3
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+
+    post_calls: list[int] = []
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        post_calls.append(number)
+        return True, True, None
+
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    park_calls: list[str] = []
+
+    async def fake_park(
+        message: str,
+        *,
+        subsource: str,
+        log_message: str | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
+        park_calls.append(subsource)
+
+    runner._commit_and_park_in_error = fake_park  # type: ignore[assignment]
+
+    for cycle in range(1, 5):
+        runner.state.last_stale_retrigger_at = None
+        result = asyncio.run(runner._maybe_retrigger_stale_review(42))
+        if cycle <= 3:
+            assert result is True, f"cycle {cycle} should post"
+            assert runner.state.current_pr.watch_retrigger_count == cycle
+        else:
+            assert result is False, "cycle 4 must hit cap"
+
+    assert len(post_calls) == 3
+    assert park_calls == ["watch_retrigger_cap"]
