@@ -108,6 +108,7 @@
             --cause-infra: #60a5fa;
             --cause-operator: #9ca3af;
             --cause-deadlock: #a78bfa;
+            --cause-legacy: #9ca3af;
         }
 
         html[data-theme="light"] {
@@ -137,6 +138,7 @@
             --cause-infra: #1d4ed8;
             --cause-operator: #475569;
             --cause-deadlock: #7c3aed;
+            --cause-legacy: #475569;
         }
 
         html {
@@ -594,6 +596,72 @@
         }
         .cancellation-card.category-no_push_deadlock .category-badge {
             color: var(--cause-deadlock);
+        }
+
+        /* PR-319: subsource-driven left border for post-migration records
+           whose ``cause.category`` is always ``ERROR``. The legacy
+           ``.category-<name>`` rules above still apply to pre-PR-315
+           records the migration missed; ``.subsource-<name>`` covers the
+           common path going forward. */
+        .cancellation-card.subsource-crash {
+            border-left-color: var(--cause-crash);
+        }
+        .cancellation-card.subsource-review_timeout,
+        .cancellation-card.subsource-fix_idle_timeout {
+            border-left-color: var(--cause-timeout);
+        }
+        .cancellation-card.subsource-fix_iteration_cap,
+        .cancellation-card.subsource-no_push_deadlock {
+            border-left-color: var(--cause-deadlock);
+        }
+        .cancellation-card.subsource-coder_escalate,
+        .cancellation-card.subsource-guardrail {
+            border-left-color: var(--cause-escalate);
+        }
+        .cancellation-card.subsource-infra_failure {
+            border-left-color: var(--cause-infra);
+        }
+        .cancellation-card.subsource-unknown {
+            border-left-color: var(--cause-legacy);
+        }
+
+        /* PR-319: ``cause-badge`` variants render the subsource-dispatched
+           label inside the payload body, in addition to the header
+           ``category-badge`` which always shows ``ERROR`` post-migration.
+           Color tokens reuse the existing palette so light/dark themes
+           keep working without additional vars. */
+        .cause-badge {
+            display: inline-block;
+            font-family: 'JetBrains Mono', ui-monospace, monospace;
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            padding: 2px 6px;
+            border-radius: 4px;
+            border: 1px solid currentColor;
+            background-color: color-mix(in srgb, currentColor 12%, transparent);
+            align-self: flex-start;
+        }
+        .cause-badge.cause-crash {
+            color: var(--cause-crash);
+        }
+        .cause-badge.cause-stale {
+            color: var(--cause-timeout);
+        }
+        .cause-badge.cause-deadlock {
+            color: var(--cause-deadlock);
+        }
+        .cause-badge.cause-escalate {
+            color: var(--cause-escalate);
+        }
+        .cause-badge.cause-infra {
+            color: var(--cause-infra);
+        }
+        .cause-badge.cause-legacy {
+            color: var(--cause-legacy);
+        }
+        .cause-badge.cause-error {
+            color: var(--cause-escalate);
         }
 
         /* PR-232: dark-theme select option styling. Native <option> styling has

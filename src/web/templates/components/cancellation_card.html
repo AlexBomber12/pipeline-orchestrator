@@ -1,10 +1,17 @@
 {# Cancellation cause card — renders one CancellationCause from
-   src.cancellation.storage. Per-category branches degrade gracefully
-   when an older record is missing payload fields (PR-253 added some
-   fields after PR-252 shipped), so guards on each subfield avoid
-   KeyError on legacy entries. #}
+   src.cancellation.storage. PR-319 dispatches on ``payload.subsource``
+   from the PR-315 stable vocabulary (``crash``, ``coder_escalate``,
+   ``guardrail``, ``review_timeout``, ``fix_idle_timeout``,
+   ``fix_iteration_cap``, ``no_push_deadlock``, ``infra_failure``).
+   Pre-migration records that lack ``subsource`` but carry
+   ``payload.legacy_category`` surface a "Legacy: <CATEGORY>" badge so
+   forensic detail survives the PR-315 category collapse. Each subfield
+   read is guarded so older payloads with missing optional keys do not
+   raise. #}
 {% macro cancellation_card(cause) %}
-<article class="cancellation-card category-{{ cause.category | lower }}">
+{% set subsource = cause.payload.get('subsource', '') %}
+{% set legacy_category = cause.payload.get('legacy_category', '') %}
+<article class="cancellation-card category-{{ cause.category | lower }} subsource-{{ subsource or 'unknown' }}">
     <header class="cancellation-header">
         <span class="category-badge">{{ cause.category }}</span>
         <span class="task-id font-mono">{{ cause.task_id }}</span>
@@ -13,34 +20,62 @@
               data-ts="{{ cause.created_at }}">{{ cause.created_at }}</time>
     </header>
     <div class="cancellation-payload">
-        {% if cause.category == 'CRASH' %}
+        {% if cause.category == 'OPERATOR_RECOVERY' %}
+            {# Pre-PR-281 manual-recovery records the PR-315 migration
+               intentionally leaves untouched (see
+               ``src/daemon/migrations/escalate_to_error.py``). #}
+            <div>Manual recovery via dashboard</div>
+        {% elif subsource == 'crash' %}
+            <span class="cause-badge cause-crash">Daemon crash</span>
             {% if cause.payload.get('exit_code') is not none %}
             <div>Exit: <span class="font-mono">{{ cause.payload.get('exit_code') }}</span></div>
             {% endif %}
             {% if cause.payload.get('error_message') %}
             <pre class="cancellation-stderr">{{ cause.payload.get('error_message') }}</pre>
             {% endif %}
-        {% elif cause.category == 'ESCALATE' %}
+        {% elif subsource == 'review_timeout' %}
+            <span class="cause-badge cause-stale">Stale review</span>
+            {% if cause.payload.get('elapsed_min') is not none %}
+            <p>Codex did not respond within {{ cause.payload.get('elapsed_min') }}m. Push a manual review or close the PR.</p>
+            {% else %}
+            <p>Codex did not respond within the review_timeout window. Push a manual review or close the PR.</p>
+            {% endif %}
             {% if cause.payload.get('reason_text') %}
-                {% if cause.payload.get('subsource') == 'coder' %}
-            <div class="cancellation-reason">Coder gave up: {{ cause.payload.get('reason_text') }}</div>
-                {% elif cause.payload.get('subsource') == 'daemon' %}
-            <div class="cancellation-reason">Daemon detected stuck: {{ cause.payload.get('reason_text') }}</div>
-                {% else %}
             <div class="cancellation-reason">{{ cause.payload.get('reason_text') }}</div>
-                {% endif %}
             {% endif %}
-        {% elif cause.category == 'TIMEOUT' %}
-            {% if cause.payload.get('limit_type') %}
-            <div>Limit: <span class="font-mono">{{ cause.payload.get('limit_type') }}</span></div>
+        {% elif subsource == 'fix_iteration_cap' %}
+            <span class="cause-badge cause-deadlock">FIX iteration cap</span>
+            {% if cause.payload.get('iteration_count') is not none %}
+            <p>FIX cycle exceeded {{ cause.payload.get('iteration_count') }} iterations without convergence.</p>
+            {% else %}
+            <p>FIX cycle exceeded its iteration cap without convergence.</p>
             {% endif %}
+        {% elif subsource == 'no_push_deadlock' %}
+            <span class="cause-badge cause-deadlock">No-push deadlock</span>
+            {% if cause.payload.get('attempts') is not none %}
+            <p>FIX iteration produced no push for {{ cause.payload.get('attempts') }} consecutive cycles.</p>
+            {% else %}
+            <p>FIX iteration produced no push across consecutive cycles.</p>
+            {% endif %}
+        {% elif subsource == 'coder_escalate' %}
+            <span class="cause-badge cause-escalate">Coder escalate</span>
+            {% if cause.payload.get('reason_text') %}
+            <div class="cancellation-reason">{{ cause.payload.get('reason_text') }}</div>
+            {% endif %}
+        {% elif subsource == 'guardrail' %}
+            <span class="cause-badge cause-escalate">Guardrail violation</span>
+            {% if cause.payload.get('reason_text') %}
+            <div class="cancellation-reason">{{ cause.payload.get('reason_text') }}</div>
+            {% endif %}
+        {% elif subsource == 'fix_idle_timeout' %}
+            <span class="cause-badge cause-stale">FIX idle timeout</span>
             {% if cause.payload.get('duration_elapsed_sec') is not none %}
-            <div>Elapsed: <span class="font-mono">{{ cause.payload.get('duration_elapsed_sec') }}s</span></div>
+            <p>FIX cycle idled for {{ cause.payload.get('duration_elapsed_sec') }}s without a push.</p>
+            {% else %}
+            <p>FIX cycle idled without a push.</p>
             {% endif %}
-            {% if cause.payload.get('active_phase') %}
-            <div>Phase: <span class="font-mono">{{ cause.payload.get('active_phase') }}</span></div>
-            {% endif %}
-        {% elif cause.category == 'INFRA' %}
+        {% elif subsource == 'infra_failure' %}
+            <span class="cause-badge cause-infra">Infrastructure failure</span>
             {% if cause.payload.get('subsystem') %}
             <div>Subsystem: <span class="font-mono">{{ cause.payload.get('subsystem') }}</span></div>
             {% endif %}
@@ -54,26 +89,19 @@
                       data-ts="{{ cause.payload.get('last_attempt_iso') }}">{{ cause.payload.get('last_attempt_iso') }}</time>
             </div>
             {% endif %}
-        {% elif cause.category == 'NO_PUSH_DEADLOCK' %}
-            {% if cause.payload.get('attempts') is not none %}
-            <div>FIX iteration produced no push for <span class="font-mono">{{ cause.payload.get('attempts') }}</span> cycles</div>
-            {% else %}
-            <div>FIX iteration produced no push across consecutive cycles</div>
+            {% if cause.payload.get('error_message') %}
+            <pre class="cancellation-stderr">{{ cause.payload.get('error_message') }}</pre>
             {% endif %}
-        {% elif cause.category == 'OPERATOR_RECOVERY' %}
-            <div>Manual recovery via dashboard</div>
-        {% elif cause.category == 'ERROR' %}
-            {# PR-315 safety net: post-migration every record carries
-               ``category == 'ERROR'``. PR-319 replaces this branch with
-               per-subsource rendering; until then, surface forensic
-               detail from payload so operators are never shown a blank
-               card during the PR-315→PR-319 ship window. #}
-            {% set sub = cause.payload.get('subsource', '') %}
-            {% set legacy = cause.payload.get('legacy_category', '') %}
-            {% if legacy %}
-            <span class="cause-badge cause-error">Legacy: {{ legacy }}</span>
+        {% else %}
+            {# Fallback path: pre-migration record without ``subsource`` but
+               with ``payload.legacy_category`` preserved by the
+               ``escalate_to_error`` startup migration, or a forward-
+               incompatible/unknown subsource. Surface whichever forensic
+               detail the payload carries so the card is never blank. #}
+            {% if legacy_category %}
+            <span class="cause-badge cause-legacy">Legacy: {{ legacy_category }}</span>
             {% else %}
-            <span class="cause-badge cause-error">{{ sub or 'Error' }}</span>
+            <span class="cause-badge cause-error">Error</span>
             {% endif %}
             <p>{{ cause.payload.get('reason_text') or cause.payload.get('error_message') or cause.payload.get('excerpt') or 'Cancellation reason not recorded.' }}</p>
         {% endif %}
