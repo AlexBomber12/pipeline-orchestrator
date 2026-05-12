@@ -206,10 +206,18 @@ def test_dispatch_redis_failure_falls_back_to_crash_branch(
     ), events
 
 
-def test_dispatch_empty_subsource_routes_to_operator_attention(
+def test_dispatch_empty_subsource_routes_to_crash_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ERROR cause with no subsource degrades to operator-attention."""
+    """ERROR cause with no subsource falls back to the crash branch.
+
+    Regression for the PR-318 review feedback: ``classify_cancellation_subsource``
+    returns ``""`` for malformed or incomplete cause payloads, and routing
+    that through the operator-attention branch would mask a real mid-CODING
+    crash behind the parked-for-operator-attention log line. The conservative
+    fallback documented by ``_dispatch_recovery_branch`` requires the crash
+    log line so dashboards still surface the crash signal.
+    """
     runner = _crashed_doing_runner(monkeypatch)
     cause_created_at = datetime.now(timezone.utc)
     _seed_current_run_started_at(
@@ -228,8 +236,55 @@ def test_dispatch_empty_subsource_routes_to_operator_attention(
 
     events = [e["event"] for e in runner.state.history]
     assert any(
-        ev.startswith("[INFRA] Task PR-318 parked for operator attention,")
+        "empty/unrecognized subsource" in ev for ev in events
+    ), events
+    assert any(
+        ev.startswith("[INFRA] Task PR-318 crashed, marking ERROR.")
         for ev in events
+    ), events
+    assert not any(
+        "parked for operator attention" in ev for ev in events
+    ), events
+
+
+def test_dispatch_unrecognized_subsource_routes_to_crash_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ERROR cause with a forward-incompatible subsource falls back to crash.
+
+    A subsource string that is not in ``SUBSOURCE_VOCABULARY`` (operator
+    typo, detector value written by a newer daemon, partial migration)
+    must not silently route to the operator-attention branch. The
+    conservative fallback contract for ``_dispatch_recovery_branch``
+    requires the crash log line so a real mid-CODING crash that wrote a
+    corrupt cause is still surfaced to dashboards.
+    """
+    runner = _crashed_doing_runner(monkeypatch)
+    cause_created_at = datetime.now(timezone.utc)
+    _seed_current_run_started_at(
+        runner, cause_created_at - timedelta(seconds=30)
+    )
+    _seed_cause(
+        runner,
+        CancellationCause(
+            category="ERROR",
+            payload={"subsource": "made_up_signal"},
+            created_at=cause_created_at.isoformat(),
+        ),
+    )
+
+    asyncio.run(runner.recover_state())
+
+    events = [e["event"] for e in runner.state.history]
+    assert any(
+        "empty/unrecognized subsource" in ev for ev in events
+    ), events
+    assert any(
+        ev.startswith("[INFRA] Task PR-318 crashed, marking ERROR.")
+        for ev in events
+    ), events
+    assert not any(
+        "parked for operator attention" in ev for ev in events
     ), events
 
 

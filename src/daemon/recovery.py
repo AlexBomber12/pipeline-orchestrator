@@ -16,6 +16,7 @@ from pathlib import Path
 
 from src.branch_context import BranchContext
 from src.cancellation import (
+    SUBSOURCE_VOCABULARY,
     CancellationCause,
     classify_cancellation_subsource,
     get_cancellation_cause,
@@ -644,6 +645,13 @@ class RecoveryMixin:
             return "crash"
         subsource = classify_cancellation_subsource(cause, log=self.log_event)
         if subsource == "crash":
+            return "crash"
+        if subsource not in SUBSOURCE_VOCABULARY:
+            self.log_event(
+                f"[INFRA] recover_state: cancellation cause for "
+                f"{task_pr_id} has empty/unrecognized subsource "
+                f"{subsource!r}; falling back to crash-recovery branch."
+            )
             return "crash"
         if not await self._cause_belongs_to_current_run(cause, task_pr_id):
             return "crash"
