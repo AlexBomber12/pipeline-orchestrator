@@ -509,6 +509,19 @@ def test_scan_pr_diff_workflow_read_permission_not_flagged() -> None:
     assert scan_pr_diff(diff_text) == []
 
 
+def test_scan_pr_diff_non_workflow_permission_write_not_flagged() -> None:
+    diff_text = (
+        "diff --git a/docs/example.yml b/docs/example.yml\n"
+        "@@ -1,3 +1,4 @@\n"
+        "+  contents: write\n"
+        "diff --git a/policies/actions.md b/policies/actions.md\n"
+        "@@ -1,3 +1,4 @@\n"
+        "+permissions: write-all\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
 def test_scan_pr_diff_workflow_yml_deletion_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER

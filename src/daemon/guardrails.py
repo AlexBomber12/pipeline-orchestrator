@@ -106,13 +106,15 @@ _EXCERPT_LIMIT = 200
 # supply-chain, secrets, large-diff, and mass-deletion entries.
 _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
     "permissions_escalation": re.compile(
-        # Match `+`-prefixed lines (additions only) inside workflow YAML
-        # diff sections containing `permissions: write-all` (top-level
-        # blanket write) OR a specific scope set to `write` (e.g.,
-        # contents, id-token, packages). Indentation is variable
+        # Match `+`-prefixed lines (additions only) only inside workflow
+        # YAML diff sections containing `permissions: write-all`
+        # (top-level blanket write) OR a specific scope set to `write`
+        # (e.g., contents, id-token, packages). Indentation is variable
         # (top-level vs nested under a job), so leading whitespace is
         # captured but otherwise non-significant.
-        r"(?m)^\+[ \t]*(?:"
+        r"(?ms)^diff --git[ \t]+a/\.github/workflows/[^\r\n]+\.ya?ml"
+        r"[ \t]+b/\.github/workflows/[^\r\n]+\.ya?ml[^\r\n]*\r?\n"
+        r"(?:(?!^diff --git[ \t]).)*?^\+[ \t]*(?:"
         r"permissions:[ \t]*write-all"
         r"|(?:contents|id-token|actions|checks|deployments|issues|"
         r"packages|pull-requests|repository-projects|"
