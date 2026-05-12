@@ -238,8 +238,7 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         r"rename to[ \t]+(?!"
         + _DIFF_WORKFLOW_RENAME_PATH_RE
         + r"[ \t]*$)"
-        r"[^\r\n]+)",
-        re.IGNORECASE,
+        r"[^\r\n]+)"
     ),
 }
 

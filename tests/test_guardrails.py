@@ -1157,6 +1157,17 @@ def test_scan_pr_diff_workflow_rename_into_subdirectory_flagged() -> None:
     _assert_diff_categories(diff_text, ["workflow_destruction"])
 
 
+def test_scan_pr_diff_workflow_rename_to_wrong_case_directory_flagged() -> None:
+    diff_text = (
+        "diff --git a/.github/workflows/ci.yml b/.github/Workflows/ci.yml\n"
+        "similarity index 100%\n"
+        "rename from .github/workflows/ci.yml\n"
+        "rename to .github/Workflows/ci.yml\n"
+    )
+
+    _assert_diff_categories(diff_text, ["workflow_destruction"])
+
+
 def test_scan_pr_diff_workflow_rename_within_directory_not_flagged() -> None:
     diff_text = (
         "diff --git a/.github/workflows/old.yml b/.github/workflows/new.yml\n"
