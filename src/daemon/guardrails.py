@@ -145,6 +145,14 @@ _YAML_WRITE_BLOCK_VALUE_RE = re.compile(
     r"^[ \t]+[\"']?write[\"']?(?:[ \t]*(?:#.*)?)?$",
     re.IGNORECASE,
 )
+_YAML_READ_SCOPE_RE = re.compile(
+    r"^[ \t]*"
+    + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+    + r"[ \t]*:[ \t]*"
+    + _YAML_SCALAR_ANCHOR_RE
+    + r"[\"']?read[\"']?,?(?:[ \t]*(?:#.*)?)?$",
+    re.IGNORECASE,
+)
 _YAML_PERMISSION_SCOPE_ALIAS_RE = re.compile(
     r"^[ \t]*"
     + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
@@ -209,6 +217,16 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         + r"[ \t]*:[ \t]*"
         + _YAML_SCALAR_ANCHOR_RE
         + r"[\"']?write[\"']?[^\r\n}]*\})"
+        r"|(?:(?!^diff --git[ \t]).)*?^-[ \t]+"
+        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+        + r"[ \t]*:[ \t]*"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"[\"']?read[\"']?,?[ \t]*(?:#.*)?\r?\n"
+        r"^\+[ \t]+"
+        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+        + r"[ \t]*:[ \t]*"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"[\"']?write[\"']?,?"
         r")[ \t]*(?:#.*)?$",
         re.IGNORECASE,
     ),
@@ -327,6 +345,44 @@ def _is_workflow_permission_key_context(
     return len(ancestors) > jobs_index
 
 
+def _replaces_read_scope_with_write(
+    lines: list[str], line_index: int, scope_line: str
+) -> bool:
+    scope_key = _yaml_key(scope_line)
+    if scope_key is None:
+        return False
+    scope_indent, scope_name = scope_key
+    normalized_scope = scope_name.strip("\"'").lower()
+    found_read_replacement = False
+    for parent_index in range(line_index - 1, -1, -1):
+        parent_diff_line = _diff_yaml_line(lines[parent_index])
+        if parent_diff_line is None:
+            continue
+        parent_prefix, parent_yaml_line = parent_diff_line
+        parent_key = _yaml_key(parent_yaml_line)
+        if parent_key is None:
+            continue
+        parent_indent, parent_name = parent_key
+        if (
+            parent_prefix == "-"
+            and parent_indent == scope_indent
+            and parent_name.strip("\"'").lower() == normalized_scope
+            and _YAML_READ_SCOPE_RE.match(parent_yaml_line)
+        ):
+            found_read_replacement = True
+            continue
+        if parent_prefix == "-" or parent_indent >= scope_indent:
+            continue
+        if not found_read_replacement:
+            return False
+        if _YAML_PERMISSION_KEY_RE.match(parent_yaml_line):
+            return _is_workflow_permission_key_context(
+                lines, parent_index, parent_yaml_line
+            )
+        return False
+    return found_read_replacement
+
+
 def _match_has_workflow_permission_context(match_text: str) -> bool:
     lines = match_text.splitlines()
     for index, line in enumerate(lines):
@@ -377,6 +433,8 @@ def _match_has_workflow_permission_context(match_text: str) -> bool:
             ):
                 return True
             break
+        if _replaces_read_scope_with_write(lines, index, yaml_line):
+            return True
     return False
 
 
