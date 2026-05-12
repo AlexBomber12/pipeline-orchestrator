@@ -129,6 +129,7 @@ _YAML_WRITE_SCOPE_RE = re.compile(
 _NON_PERMISSION_MAPPING_KEYS = {
     "env",
     "matrix",
+    "outputs",
     "run",
     "services",
     "steps",

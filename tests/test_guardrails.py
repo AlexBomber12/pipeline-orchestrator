@@ -874,6 +874,19 @@ def test_scan_pr_diff_workflow_reusable_input_named_permissions_not_flagged() ->
     assert scan_pr_diff(diff_text) == []
 
 
+def test_scan_pr_diff_workflow_job_output_named_permissions_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,7 +1,8 @@\n"
+        " jobs:\n"
+        "   build:\n"
+        "     outputs:\n"
+        "+      permissions: write-all\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
 def test_scan_pr_diff_workflow_env_named_contents_not_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER
