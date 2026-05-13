@@ -409,7 +409,7 @@ _SUSPICIOUS_CONTEXT_RE = re.compile(
 )
 
 GOVERNANCE_FILE_PATTERNS: dict[str, re.Pattern[str]] = {
-    "codeowners": re.compile(r"^(?:CODEOWNERS|(?:\.github|docs|src)/CODEOWNERS)$"),
+    "codeowners": re.compile(r"^(?:CODEOWNERS|(?:\.github|docs)/CODEOWNERS)$"),
     "dependabot_config": re.compile(r"^\.github/dependabot\.ya?ml$"),
     "labels_sync": re.compile(r"^\.github/(?:labels|labeler)\.ya?ml$"),
     "repo_settings": re.compile(r"^\.github/settings\.ya?ml$"),

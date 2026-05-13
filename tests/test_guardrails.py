@@ -918,7 +918,6 @@ def _governance_violations(diff_text: str) -> list[GuardrailViolation]:
         (".github/CODEOWNERS", "codeowners"),
         ("CODEOWNERS", "codeowners"),
         ("docs/CODEOWNERS", "codeowners"),
-        ("src/CODEOWNERS", "codeowners"),
         (".github/dependabot.yml", "dependabot_config"),
         (".github/dependabot.yaml", "dependabot_config"),
         (".github/labels.yml", "labels_sync"),
@@ -939,7 +938,7 @@ def test_scan_governance_paths_flagged(path: str, subtype: str) -> None:
     assert subtype in violations[0].excerpt
 
 
-@pytest.mark.parametrize("path", ["random/CODEOWNERS", "src/foo.py"])
+@pytest.mark.parametrize("path", ["random/CODEOWNERS", "src/CODEOWNERS", "src/foo.py"])
 def test_scan_governance_non_governance_paths_not_flagged(path: str) -> None:
     assert _governance_violations(_diff_for_file(path, additions=1)) == []
 
