@@ -824,6 +824,12 @@ def test_scan_pr_diff_detects_govslack_webhook() -> None:
     _assert_secret_violation_redacted(placeholder, "slack_webhook")
 
 
+def test_scan_pr_diff_detects_slack_oauth_webhook() -> None:
+    placeholder = "https://hooks.slack.com/T0123456789/B0123456789/" + ("A" * 24)
+
+    _assert_secret_violation_redacted(placeholder, "slack_webhook")
+
+
 def test_scan_pr_diff_detects_stripe_secret_key() -> None:
     placeholder = "sk_test_" + ("A" * 24)
 
@@ -890,6 +896,10 @@ def test_scan_pr_diff_group_b_excerpt_never_contains_secret_value() -> None:
         (
             "https://hooks.slack-gov.com/services/T0123456789/B0123456789/"
             + ("A" * 24),
+            "slack_webhook",
+        ),
+        (
+            "https://hooks.slack.com/T0123456789/B0123456789/" + ("A" * 24),
             "slack_webhook",
         ),
         ("sk_test_" + ("A" * 24), "stripe_secret_key", "TOKEN"),
