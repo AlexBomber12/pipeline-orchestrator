@@ -1168,7 +1168,7 @@ def test_scan_pr_diff_workflow_wide_indent_job_permission_flagged() -> None:
         + "@@ -1,7 +1,8 @@\n"
         " jobs:\n"
         "     build:\n"
-        "     permissions:\n"
+        "       permissions:\n"
         "+        contents: write\n"
     )
 
@@ -1181,7 +1181,7 @@ def test_scan_pr_diff_workflow_deep_indent_job_permission_flagged() -> None:
         + "@@ -1,7 +1,8 @@\n"
         " jobs:\n"
         "             build:\n"
-        "             permissions:\n"
+        "               permissions:\n"
         "+                contents: write\n"
     )
 
@@ -1200,6 +1200,19 @@ def test_scan_pr_diff_workflow_existing_job_permission_block_addition_flagged() 
     )
 
     _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_nested_job_permissions_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,8 +1,10 @@\n"
+        " jobs:\n"
+        "   build:\n"
+        "     concurrency:\n"
+        "+      permissions: write-all\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
 
 
 def test_scan_pr_diff_workflow_permission_block_with_read_only_scopes_flagged() -> None:

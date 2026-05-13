@@ -190,18 +190,6 @@ _YAML_JOBS_FLOW_PERMISSION_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
-_NON_PERMISSION_MAPPING_KEYS = {
-    "env",
-    "matrix",
-    "outputs",
-    "run",
-    "secrets",
-    "services",
-    "steps",
-    "strategy",
-    "with",
-}
-
 # Diff-content scan catalogue. PR-290b adds workflow YAML tampering checks;
 # PR-290c and PR-301..PR-304 extend the same dispatcher with governance,
 # supply-chain, secrets, large-diff, and mass-deletion entries.
@@ -486,10 +474,7 @@ def _is_workflow_permission_key_context(
     )
     if jobs_index is None:
         return False
-    job_body_ancestors = ancestors[jobs_index + 2 :]
-    if any(name in _NON_PERMISSION_MAPPING_KEYS for _indent, name in job_body_ancestors):
-        return False
-    return len(ancestors) > jobs_index
+    return len(ancestors) == jobs_index + 2
 
 
 def _flow_permission_alias_name(line: str) -> str | None:
