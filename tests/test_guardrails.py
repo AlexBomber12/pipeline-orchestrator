@@ -478,6 +478,15 @@ def _delete_diff_for_file(path: str) -> str:
     )
 
 
+def _delete_binary_diff_for_file(path: str) -> str:
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "deleted file mode 100644\n"
+        "index 1111111..0000000\n"
+        f"Binary files a/{path} and /dev/null differ\n"
+    )
+
+
 def _rename_diff_for_file(old_path: str, new_path: str) -> str:
     return (
         f"diff --git a/{old_path} b/{new_path}\n"
@@ -665,6 +674,15 @@ def test_count_file_deletions_handles_mixed_diff() -> None:
     )
 
 
+def test_count_file_deletions_includes_binary_deletions() -> None:
+    diff_text = _delete_binary_diff_for_file("assets/logo.png")
+
+    assert guardrails._count_file_deletions(diff_text) == (
+        ["assets/logo.png"],
+        [],
+    )
+
+
 def test_classify_test_files_python_conventions() -> None:
     paths = ["tests/test_foo.py", "src/test_bar.py", "test_baz.py"]
 
@@ -683,8 +701,49 @@ def test_classify_test_files_go_conventions() -> None:
     ]
 
 
+def test_classify_test_files_top_level_test_directories() -> None:
+    paths = ["test/foo.py", "unit-tests/foo.py", "integration_tests/foo.py"]
+
+    assert guardrails._classify_test_files(paths) == paths
+
+
 def test_classify_test_files_non_test_paths() -> None:
-    assert guardrails._classify_test_files(["src/foo.py", "README.md", "config.yml"]) == []
+    assert (
+        guardrails._classify_test_files(
+            [
+                "src/foo.py",
+                "README.md",
+                "config.yml",
+                "latest/foo.py",
+                "contest/bar.py",
+                "attest/baz.py",
+            ]
+        )
+        == []
+    )
+
+
+def test_scan_pr_diff_mass_deletion_counts_binary_deletions() -> None:
+    diff_text = "".join(
+        _delete_binary_diff_for_file(f"assets/image_{index}.png")
+        for index in range(20)
+    )
+
+    _assert_diff_categories(diff_text, ["mass_file_deletion"])
+
+
+def test_scan_pr_diff_non_test_top_level_deletions_do_not_trigger_test_deletion() -> None:
+    diff_text = (
+        "".join(_delete_diff_for_file(f"latest/file_{index}.py") for index in range(2))
+        + "".join(
+            _delete_diff_for_file(f"contest/file_{index}.py") for index in range(2)
+        )
+        + "".join(
+            _delete_diff_for_file(f"attest/file_{index}.py") for index in range(2)
+        )
+    )
+
+    assert scan_pr_diff(diff_text) == []
 
 
 def test_scan_pr_diff_under_threshold_no_violation() -> None:

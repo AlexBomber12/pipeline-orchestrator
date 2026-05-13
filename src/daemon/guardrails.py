@@ -424,7 +424,7 @@ LOCKFILE_PATTERNS = (
 _LOCKFILE_RES = tuple(re.compile(pattern) for pattern in LOCKFILE_PATTERNS)
 TEST_FILE_PATTERNS = (
     re.compile(r"^tests?/"),
-    re.compile(r"^[^/]*tests?/"),
+    re.compile(r"^(?:[^/]+[_-])?tests?/"),
     re.compile(r"/tests?/"),
     re.compile(r"^__tests__/"),
     re.compile(r"/__tests__/"),
@@ -566,6 +566,9 @@ def _count_file_deletions(diff_text: str) -> tuple[list[str], list[tuple[str, st
     for line in diff_text.splitlines():
         if line.startswith("diff --git "):
             flush_section()
+            paths = _diff_git_paths(line)
+            if paths is not None:
+                old_path = paths[0]
             continue
         if line.startswith("--- "):
             path = _diff_file_header_path(line)
@@ -574,6 +577,9 @@ def _count_file_deletions(diff_text: str) -> tuple[list[str], list[tuple[str, st
             continue
         if line.startswith("+++ "):
             deleted = _diff_file_header_path(line) == "/dev/null"
+            continue
+        if line.startswith("Binary files ") and line.endswith(" and /dev/null differ"):
+            deleted = True
             continue
         if line.startswith("rename from "):
             rename_from = line[len("rename from ") :].strip()
