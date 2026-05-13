@@ -379,7 +379,7 @@ SECRET_PATTERNS_B: list[tuple[str, re.Pattern[str]]] = [
     (
         "slack_webhook",
         re.compile(
-            r"\bhttps://hooks\.slack\.com/services/"
+            r"\bhttps://hooks\.slack(?:-gov)?\.com/services/"
             r"T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]{24}\b"
         ),
     ),
