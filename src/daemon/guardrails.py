@@ -220,6 +220,11 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         + _YAML_BLOCK_SCALAR_HEADER_RE
         + r"[ \t]*(?:#.*)?\r?\n"
         r"^\+[ \t]+[\"']?write[\"']?|\*[A-Za-z_][A-Za-z0-9_-]*)"
+        r"|(?:(?!^diff --git[ \t]).)*?^\+[ \t]+\{[^\r\n}]*"
+        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+        + r"[ \t]*:[ \t]*"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"[\"']?write[\"']?[^\r\n}]*\}"
         r"|(?:(?!^diff --git[ \t]).)*?^\+[ \t]*"
         r"[\"']?permissions[\"']?[ \t]*:[ \t]*(?:"
         + _YAML_SCALAR_ANCHOR_RE
@@ -766,6 +771,8 @@ def _match_has_workflow_permission_context(match_text: str) -> bool:
                 continue
             return True
         is_write_scope = bool(_YAML_WRITE_SCOPE_RE.match(yaml_line))
+        if not is_write_scope and _yaml_flow_permission_map_escalates(yaml_line):
+            is_write_scope = True
         if not is_write_scope and _YAML_PERMISSION_SCOPE_ALIAS_RE.match(yaml_line):
             is_write_scope = _yaml_alias_resolves_to_escalation(
                 lines,
