@@ -389,7 +389,10 @@ SECRET_PATTERNS_B: list[tuple[str, re.Pattern[str]]] = [
     (
         "jwt_like",
         re.compile(
-            r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\."
+            r"\b(?i:(?:authorization\s*[:=]\s*[\"']?bearer\s+|"
+            r"(?:jwt|id_token|access_token|refresh_token|auth_token)"
+            r"[A-Za-z0-9_ -]{0,32}\s*[:=]\s*[\"']?))"
+            r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\."
             r"[A-Za-z0-9_-]{10,}\b"
         ),
     ),

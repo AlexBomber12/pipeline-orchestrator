@@ -674,21 +674,22 @@ def test_scan_pr_diff_tier_1_violations_still_flagged() -> None:
     )
 
 
-def _secret_diff(secret_value: str) -> str:
+def _secret_diff(secret_value: str, assignment_name: str = "TOKEN") -> str:
     return (
         "diff --git a/src/settings.py b/src/settings.py\n"
         "--- a/src/settings.py\n"
         "+++ b/src/settings.py\n"
         "@@ -1,1 +1,2 @@\n"
-        f'+TOKEN = "{secret_value}"\n'
+        f'+{assignment_name} = "{secret_value}"\n'
     )
 
 
 def _assert_secret_violation_redacted(
     secret_value: str,
     category: str,
+    assignment_name: str = "TOKEN",
 ) -> GuardrailViolation:
-    violations = scan_pr_diff(_secret_diff(secret_value))
+    violations = scan_pr_diff(_secret_diff(secret_value, assignment_name))
 
     assert len(violations) == 1
     assert violations[0].tier == 2
@@ -838,7 +839,13 @@ def test_scan_pr_diff_detects_google_api_key() -> None:
 def test_scan_pr_diff_detects_jwt_like() -> None:
     placeholder = "eyJ" + ("A" * 10) + "." + ("B" * 10) + "." + ("C" * 10)
 
-    _assert_secret_violation_redacted(placeholder, "jwt_like")
+    _assert_secret_violation_redacted(placeholder, "jwt_like", "JWT_TOKEN")
+
+
+def test_scan_pr_diff_ignores_bare_jwt_like_sample() -> None:
+    placeholder = "eyJ" + ("A" * 10) + "." + ("B" * 10) + "." + ("C" * 10)
+
+    assert scan_pr_diff(_secret_diff(placeholder, "EXAMPLE_VALUE")) == []
 
 
 def test_scan_pr_diff_group_b_excerpt_never_contains_secret_value() -> None:
@@ -885,14 +892,23 @@ def test_scan_pr_diff_group_b_excerpt_never_contains_secret_value() -> None:
             + ("A" * 24),
             "slack_webhook",
         ),
-        ("sk_test_" + ("A" * 24), "stripe_secret_key"),
-        ("rk_live_" + ("A" * 24), "stripe_restricted_key"),
-        ("AIza" + ("A" * 35), "google_api_key"),
-        ("eyJ" + ("A" * 10) + "." + ("B" * 10) + "." + ("C" * 10), "jwt_like"),
+        ("sk_test_" + ("A" * 24), "stripe_secret_key", "TOKEN"),
+        ("rk_live_" + ("A" * 24), "stripe_restricted_key", "TOKEN"),
+        ("AIza" + ("A" * 35), "google_api_key", "TOKEN"),
+        (
+            "eyJ" + ("A" * 10) + "." + ("B" * 10) + "." + ("C" * 10),
+            "jwt_like",
+            "JWT_TOKEN",
+        ),
     ]
 
-    for secret_value, category in positive_cases:
-        _assert_secret_violation_redacted(secret_value, category)
+    for positive_case in positive_cases:
+        secret_value, category, *assignment_name = positive_case
+        _assert_secret_violation_redacted(
+            secret_value,
+            category,
+            assignment_name[0] if assignment_name else "TOKEN",
+        )
 
 
 def test_workflow_permission_context_helpers_handle_non_yaml_lines() -> None:
