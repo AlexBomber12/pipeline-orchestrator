@@ -462,9 +462,14 @@ def test_workflow_permission_context_helpers_handle_non_yaml_lines() -> None:
     ) == [(0, "jobs")]
     assert not guardrails._is_workflow_permission_key_context([], 0, "not a mapping")
     assert not guardrails._is_workflow_permission_key_context([], 0, "contents: write")
-    assert not guardrails._is_workflow_jobs_flow_permission_escalation("not a mapping")
     assert not guardrails._is_workflow_jobs_flow_permission_escalation(
-        "jobs: { build: { permissions: *read_only } }"
+        [], 0, "not a mapping"
+    )
+    assert not guardrails._is_workflow_jobs_flow_permission_escalation(
+        [], 0, "jobs: { build: { runs-on: ubuntu-latest } }"
+    )
+    assert not guardrails._is_workflow_jobs_flow_permission_escalation(
+        [], 0, "jobs: { build: { permissions: *read_only } }"
     )
 
 
@@ -714,6 +719,18 @@ def test_scan_pr_diff_workflow_inline_jobs_permission_alias_not_flagged() -> Non
     )
 
     assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_workflow_inline_jobs_permission_alias_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,2 +1,5 @@\n"
+        + "+env:\n"
+        + "+  FULL_WRITE: &full_write write-all\n"
+        + "+jobs: { build: { permissions: *full_write } }\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
 def test_scan_pr_diff_workflow_permissions_rename_into_workflows_flagged() -> None:

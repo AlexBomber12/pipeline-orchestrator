@@ -485,14 +485,36 @@ def _is_workflow_permission_key_context(
     return len(ancestors) > jobs_index
 
 
-def _is_workflow_jobs_flow_permission_escalation(jobs_line: str) -> bool:
+def _flow_permission_alias_name(line: str) -> str | None:
+    match = re.search(
+        r"[\"']?permissions[\"']?[ \t]*:[ \t]*"
+        r"\*(?P<name>[A-Za-z_][A-Za-z0-9_-]*)",
+        line,
+        re.IGNORECASE,
+    )
+    return None if match is None else match.group("name")
+
+
+def _is_workflow_jobs_flow_permission_escalation(
+    lines: list[str], line_index: int, jobs_line: str
+) -> bool:
     key = _yaml_key(jobs_line)
     if key is None:
         return False
     jobs_indent, jobs_name = key
     if jobs_indent != 0 or jobs_name.strip("\"'").lower() != "jobs":
         return False
-    return bool(_YAML_JOBS_FLOW_PERMISSION_RE.match(jobs_line))
+    if _YAML_JOBS_FLOW_PERMISSION_RE.match(jobs_line):
+        return True
+    alias_name = _flow_permission_alias_name(jobs_line)
+    if alias_name is None:
+        return False
+    alias_value = _yaml_anchor_values_before(lines, line_index).get(alias_name)
+    if alias_value is None:
+        return False
+    return _normalized_yaml_scalar(
+        alias_value
+    ) == "write-all" or _yaml_flow_permission_map_escalates(alias_value)
 
 
 def _replaces_read_scope_with_write(
@@ -542,7 +564,7 @@ def _match_has_workflow_permission_context(match_text: str) -> bool:
         prefix, yaml_line = diff_line
         if prefix != "+":
             continue
-        if _is_workflow_jobs_flow_permission_escalation(yaml_line):
+        if _is_workflow_jobs_flow_permission_escalation(lines, index, yaml_line):
             return True
         if _YAML_PERMISSION_KEY_RE.match(yaml_line) and (
             _is_workflow_permission_key_context(lines, index, yaml_line)
