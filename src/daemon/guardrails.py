@@ -508,6 +508,18 @@ def _jobs_flow_fragment(lines: list[str], line_index: int, jobs_line: str) -> st
     return " ".join(fragment)
 
 
+def _is_visible_root_jobs_key(
+    lines: list[str], line_index: int, key_indent: int, key_name: str
+) -> bool:
+    if key_name.strip("\"'").lower() != "jobs":
+        return False
+    return not [
+        ancestor
+        for ancestor in _visible_yaml_context(lines, line_index)
+        if ancestor[0] < key_indent
+    ]
+
+
 def _is_workflow_jobs_flow_permission_escalation(
     lines: list[str], line_index: int, jobs_line: str
 ) -> bool:
@@ -515,7 +527,7 @@ def _is_workflow_jobs_flow_permission_escalation(
     if key is None:
         return False
     jobs_indent, jobs_name = key
-    if jobs_indent != 0 or jobs_name.strip("\"'").lower() != "jobs":
+    if not _is_visible_root_jobs_key(lines, line_index, jobs_indent, jobs_name):
         return False
     flow_line = _jobs_flow_fragment(lines, line_index, jobs_line)
     if _YAML_JOBS_FLOW_PERMISSION_RE.match(flow_line):
@@ -545,7 +557,7 @@ def _is_workflow_job_flow_permission_escalation(
         for indent, name in _visible_yaml_context(lines, line_index)
         if indent < job_indent
     ]
-    if not ancestors or ancestors[-1] != (0, "jobs"):
+    if len(ancestors) != 1 or ancestors[0][1] != "jobs":
         return False
     flow_line = f"jobs: {{ {job_line.strip()} }}"
     if _YAML_JOBS_FLOW_PERMISSION_RE.match(flow_line):

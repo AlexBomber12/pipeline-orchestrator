@@ -755,6 +755,16 @@ def test_scan_pr_diff_workflow_inline_jobs_permission_write_all_flagged() -> Non
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_indented_inline_jobs_permission_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,2 +1,3 @@\n"
+        + "+  jobs: { build: { permissions: write-all } }\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
 def test_scan_pr_diff_workflow_inline_jobs_permission_scope_write_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER
@@ -795,6 +805,17 @@ def test_scan_pr_diff_workflow_job_flow_permission_write_all_flagged() -> None:
         + "@@ -1,3 +1,4 @@\n"
         + " jobs:\n"
         + "+  build: { permissions: write-all, runs-on: ubuntu-latest }\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_indented_jobs_job_flow_permission_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,3 +1,4 @@\n"
+        + "   jobs:\n"
+        + "+    build: { permissions: write-all, runs-on: ubuntu-latest }\n"
     )
 
     _assert_diff_categories(diff_text, ["permissions_escalation"])
