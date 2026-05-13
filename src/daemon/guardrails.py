@@ -100,15 +100,22 @@ _TIER1_RULES: dict[str, str] = {
 }
 
 _EXCERPT_LIMIT = 200
-_WORKFLOW_PATH_END_RE = r'(?:"|(?=[ \t\r\n]))'
+_WORKFLOW_PATH_END_RE = r'(?:"|(?=[ \t\r\n])|$)'
 _DIFF_WORKFLOW_B_PATH_RE = (
     r'"?b/\.github/workflows/[^"/\r\n]+\.ya?ml' + _WORKFLOW_PATH_END_RE
+)
+_DIFF_ACTION_B_PATH_RE = (
+    r'"?b/\.github/actions/(?:[^"\r\n]*/)?action\.ya?ml' + _WORKFLOW_PATH_END_RE
 )
 _DIFF_WORKFLOW_A_PATH_RE = (
     r'"?a/\.github/workflows/[^"/\r\n]+\.ya?ml' + _WORKFLOW_PATH_END_RE
 )
 _DIFF_WORKFLOW_RENAME_PATH_RE = (
     r'"?\.github/workflows/[^"/\r\n]+\.ya?ml' + _WORKFLOW_PATH_END_RE
+)
+_DIFF_BRANCH_PROTECTION_PATH_RE = (
+    r'"?\.github/(?:branch[-_]protection[^"/\r\n]*\.ya?ml|settings\.ya?ml)'
+    + _WORKFLOW_PATH_END_RE
 )
 _WORKFLOW_WRITE_PERMISSION_SCOPES_RE = (
     r"[\"']?(?:actions|attestations|artifact-metadata|checks|code-quality|"
@@ -190,10 +197,45 @@ _YAML_JOBS_FLOW_PERMISSION_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+_PINNED_ACTION_REF_RE = re.compile(
+    r"^(?:v\d+(?:\.\d+){0,2}|[0-9a-f]{40})$",
+    re.IGNORECASE,
+)
 # Diff-content scan catalogue. PR-290b adds workflow YAML tampering checks;
 # PR-290c and PR-301..PR-304 extend the same dispatcher with governance,
 # supply-chain, secrets, large-diff, and mass-deletion entries.
 _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
+    "branch_protection_modification": re.compile(
+        # Detect branch-protection metadata modification or deletion by
+        # matching unified diff file headers or rename metadata for the
+        # governed files.
+        r"(?ms)(?:^---[ \t]+(?:a/\.github/(?:"
+        r"branch[-_]protection[^ \r\n]*\.ya?ml"
+        r"|settings\.ya?ml"
+        r")|/dev/null)[ \t]*\r?\n"
+        r"\+\+\+[ \t]+(?:b/\.github/(?:branch[-_]protection[^ \r\n]*\.ya?ml"
+        r"|settings\.ya?ml)|/dev/null)"
+        r"|^diff --git[^\r\n]*\r?\n"
+        r"(?:(?!^diff --git[ \t]).)*?^rename (?:from|to)[ \t]+"
+        + _DIFF_BRANCH_PROTECTION_PATH_RE
+        + r"[ \t]*$)",
+        re.IGNORECASE,
+    ),
+    "dangerous_action_external_install": re.compile(
+        # Match added action references; pinned refs are filtered in
+        # scan_pr_diff because this regex captures all candidate refs.
+        r"(?m)^\+[ \t]*-?[ \t]*(?:"
+        r"[\"']?uses[\"']?[ \t]*:[ \t]+"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"(?P<quote>[\"']?)"
+        r"(?P<repo>[\w.-]+/[\w./-]+)@(?P<ref>[^\"'\s\r\n},]+)(?P=quote)"
+        r"|\{[^\r\n}]*[\"']?uses[\"']?[ \t]*:[ \t]*"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"(?P<flow_quote>[\"']?)"
+        r"(?P<flow_repo>[\w.-]+/[\w./-]+)@(?P<flow_ref>[^\"'\s\r\n},]+)"
+        r"(?P=flow_quote))",
+        re.IGNORECASE,
+    ),
     "permissions_escalation": re.compile(
         # Match `+`-prefixed lines (additions only) only inside workflow
         # YAML diff sections containing `permissions: write-all`
@@ -305,6 +347,13 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
 }
 
 _DIFF_RULES: dict[str, str] = {
+    "branch_protection_modification": (
+        "Branch protection metadata file modification or deletion in diff"
+    ),
+    "dangerous_action_external_install": (
+        "Workflow uses unpinned external action reference "
+        "(mutable ref like @main or @HEAD)"
+    ),
     "permissions_escalation": "Workflow permission escalation in diff additions",
     "workflow_destruction": "Workflow YAML file deletion under .github/workflows/",
 }
@@ -312,6 +361,15 @@ _DIFF_RULES: dict[str, str] = {
 
 def _clip_excerpt(text: str) -> str:
     return text[:_EXCERPT_LIMIT]
+
+
+def _action_ref_is_pinned(ref: str) -> bool:
+    """Return True if ``ref`` is a semver tag or 40-char commit SHA."""
+    return bool(_PINNED_ACTION_REF_RE.match(ref))
+
+
+def _action_uses_match_ref(match: re.Match[str]) -> str:
+    return match.group("ref") or match.group("flow_ref")
 
 
 def _line_excerpt(coder_stdout: str, start: int, end: int) -> str:
@@ -732,6 +790,85 @@ def _diff_file_section_at(diff_text: str, position: int) -> str:
     return diff_text[start:end]
 
 
+def _diff_file_section_start_at(diff_text: str, position: int) -> int:
+    start = diff_text.rfind("\ndiff --git ", 0, position)
+    return 0 if start == -1 else start + 1
+
+
+def _diff_section_is_action_reference_file(section_text: str) -> bool:
+    first_line = section_text.splitlines()[0] if section_text else ""
+    return bool(re.match(r"^diff --git[^\r\n]*[ \t]+", first_line)) and bool(
+        re.search(
+            rf"(?:{_DIFF_WORKFLOW_B_PATH_RE}|{_DIFF_ACTION_B_PATH_RE})",
+            first_line,
+        )
+    )
+
+
+def _yaml_line_is_in_block_scalar(lines: list[str], line_index: int) -> bool:
+    diff_line = _diff_yaml_line(lines[line_index])
+    if diff_line is None:
+        return False
+    _prefix, yaml_line = diff_line
+    line_indent = _yaml_indent(yaml_line)
+    for previous_line in reversed(lines[:line_index]):
+        previous_diff_line = _diff_yaml_line(previous_line)
+        if previous_diff_line is None:
+            continue
+        previous_prefix, previous_yaml_line = previous_diff_line
+        if previous_prefix == "-":
+            continue
+        stripped = previous_yaml_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        previous_indent = _yaml_indent(previous_yaml_line)
+        if previous_indent >= line_indent:
+            continue
+        if re.search(
+            r":[ \t]*"
+            + _YAML_SCALAR_ANCHOR_RE
+            + _YAML_BLOCK_SCALAR_HEADER_RE
+            + r"(?:[ \t]*(?:#.*)?)?$",
+            previous_yaml_line,
+            re.IGNORECASE,
+        ):
+            return True
+        candidate_key_line = previous_yaml_line.lstrip(" \t")
+        if candidate_key_line.startswith("-"):
+            candidate_key_line = candidate_key_line[1:].lstrip(" \t")
+        if _yaml_key(candidate_key_line) is not None:
+            return False
+    return False
+
+
+def _action_uses_match_is_yaml_key(section_text: str, relative_start: int) -> bool:
+    lines = section_text.splitlines()
+    line_index = section_text.count("\n", 0, relative_start)
+    if line_index >= len(lines):
+        return False
+    diff_line = _diff_yaml_line(lines[line_index])
+    if diff_line is None:
+        return False
+    _prefix, yaml_line = diff_line
+    stripped = yaml_line.lstrip(" \t")
+    if stripped.startswith("-"):
+        stripped = stripped[1:].lstrip(" \t")
+    key = _yaml_key(stripped)
+    return (
+        (
+            key is not None
+            and key[1].strip("\"'").lower() == "uses"
+            or re.search(
+                r"\{[^\r\n}]*[\"']?uses[\"']?[ \t]*:",
+                _mask_yaml_quoted_colon_values(stripped),
+                re.IGNORECASE,
+            )
+            is not None
+        )
+        and not _yaml_line_is_in_block_scalar(lines, line_index)
+    )
+
+
 def _replaces_read_scope_with_write(
     lines: list[str], line_index: int, scope_line: str
 ) -> bool:
@@ -1077,10 +1214,20 @@ def scan_pr_diff(diff_text: str) -> list[GuardrailViolation]:
     for category in sorted(_DIFF_PATTERNS):
         pattern = _DIFF_PATTERNS[category]
         for match in pattern.finditer(diff_text):
+            section_start = _diff_file_section_start_at(diff_text, match.start())
+            section_text = _diff_file_section_at(diff_text, match.start())
+            if category == "dangerous_action_external_install" and (
+                _action_ref_is_pinned(_action_uses_match_ref(match))
+                or not _diff_section_is_action_reference_file(section_text)
+                or not _action_uses_match_is_yaml_key(
+                    section_text, match.start() - section_start
+                )
+            ):
+                continue
             if category == "permissions_escalation" and not (
                 _match_has_workflow_permission_context(match.group(0))
                 or _anchor_value_edit_escalates_in_section(
-                    _diff_file_section_at(diff_text, match.start()), match.group(0)
+                    section_text, match.group(0)
                 )
             ):
                 continue
