@@ -916,6 +916,7 @@ def _governance_violations(diff_text: str) -> list[GuardrailViolation]:
     ("path", "subtype"),
     [
         (".github/CODEOWNERS", "codeowners"),
+        ("CODEOWNERS", "codeowners"),
         ("docs/CODEOWNERS", "codeowners"),
         ("src/CODEOWNERS", "codeowners"),
         (".github/dependabot.yml", "dependabot_config"),
