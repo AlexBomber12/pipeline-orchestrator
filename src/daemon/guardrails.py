@@ -466,12 +466,13 @@ def _is_workflow_permission_key_context(
         if indent < permission_indent
     ]
     if not ancestors:
-        return False
+        return True
+    root_indent = ancestors[0][0]
     jobs_index = next(
         (
             index
             for index, (indent, name) in enumerate(ancestors)
-            if indent == 0 and name == "jobs"
+            if indent == root_indent and name == "jobs"
         ),
         None,
     )
