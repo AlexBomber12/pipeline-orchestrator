@@ -392,6 +392,13 @@ def _diff_git_paths(line: str) -> tuple[str, str] | None:
     return _strip_diff_prefix(parts[0], "a/"), _strip_diff_prefix(parts[1], "b/")
 
 
+def _is_diff_file_header(line: str) -> bool:
+    return line.startswith(("--- a/", "+++ b/")) or line in {
+        "--- /dev/null",
+        "+++ /dev/null",
+    }
+
+
 def _strip_diff_prefix(path: str, prefix: str) -> str:
     return path[len(prefix) :] if path.startswith(prefix) else path
 
@@ -409,7 +416,7 @@ def _count_diff_size(diff_text: str) -> tuple[int, int, int, int]:
             files_changed += 1
             current_path = paths[1]
             continue
-        if line.startswith("+++") or line.startswith("---"):
+        if _is_diff_file_header(line):
             continue
         if line.startswith("+"):
             additions += 1
@@ -441,7 +448,11 @@ def _count_additions_in_paths(diff_text: str, paths: set[str]) -> int:
         if diff_paths is not None:
             current_path = diff_paths[1]
             continue
-        if line.startswith("+") and not line.startswith("+++") and current_path in paths:
+        if (
+            line.startswith("+")
+            and not _is_diff_file_header(line)
+            and current_path in paths
+        ):
             additions += 1
     return additions
 
