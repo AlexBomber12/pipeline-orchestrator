@@ -360,6 +360,19 @@ _DIFF_RULES: dict[str, str] = {
     "workflow_destruction": "Workflow YAML file deletion under .github/workflows/",
 }
 
+SECRET_PATTERNS_A: list[tuple[str, re.Pattern[str]]] = [
+    ("github_pat_classic", re.compile(r"\bghp_[A-Za-z0-9]{36}\b")),
+    ("github_pat_finegrained", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{82}\b")),
+    ("github_oauth", re.compile(r"\bgho_[A-Za-z0-9]{36}\b")),
+    ("github_app_token", re.compile(r"\b(?:ghs|ghu|ghr)_[A-Za-z0-9]{36}\b")),
+    (
+        "aws_access_key",
+        re.compile(r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA)[A-Z0-9]{16}\b"),
+    ),
+    ("anthropic_api_key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{30,}\b")),
+    ("openai_api_key", re.compile(r"\bsk-(?!ant-)[A-Za-z0-9_-]{48,}\b")),
+]
+
 LOCKFILE_PATTERNS = (
     r"package-lock\.json$",
     r"yarn\.lock$",
@@ -482,6 +495,34 @@ def _count_additions_in_paths(diff_text: str, paths: set[str]) -> int:
         ):
             additions += 1
     return additions
+
+
+def _scan_secrets_group_a_in_additions(
+    diff_text: str,
+) -> list[tuple[str, int, str]]:
+    matches: list[tuple[str, int, str]] = []
+    current_path: str | None = None
+    in_hunk = False
+
+    for line_number, line in enumerate(diff_text.splitlines(), start=1):
+        diff_paths = _diff_git_paths(line)
+        if diff_paths is not None:
+            current_path = diff_paths[1]
+            in_hunk = False
+            continue
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if (
+            current_path is None
+            or not line.startswith("+")
+            or (not in_hunk and _is_diff_file_header(line))
+        ):
+            continue
+        for category, pattern in SECRET_PATTERNS_A:
+            if pattern.search(line):
+                matches.append((current_path, line_number, category))
+    return matches
 
 
 def _action_ref_is_pinned(ref: str) -> bool:
@@ -1388,6 +1429,17 @@ def scan_pr_diff(
                     "AGENTS.md prohibits scope expansion beyond task spec. "
                     "Large diffs require operator review."
                 ),
+            )
+        )
+    for file_path, line_in_diff, category in _scan_secrets_group_a_in_additions(
+        diff_text
+    ):
+        violations.append(
+            GuardrailViolation(
+                tier=2,
+                category=category,
+                excerpt=f"{file_path}:{line_in_diff} (category: {category})",
+                rule="High-confidence provider token shape detected in added diff line",
             )
         )
     return violations
