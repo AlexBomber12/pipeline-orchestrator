@@ -100,16 +100,214 @@ _TIER1_RULES: dict[str, str] = {
 }
 
 _EXCERPT_LIMIT = 200
+_WORKFLOW_PATH_END_RE = r'(?:"|(?=[ \t\r\n]))'
+_DIFF_WORKFLOW_B_PATH_RE = (
+    r'"?b/\.github/workflows/[^"/\r\n]+\.ya?ml' + _WORKFLOW_PATH_END_RE
+)
+_DIFF_WORKFLOW_A_PATH_RE = (
+    r'"?a/\.github/workflows/[^"/\r\n]+\.ya?ml' + _WORKFLOW_PATH_END_RE
+)
+_DIFF_WORKFLOW_RENAME_PATH_RE = (
+    r'"?\.github/workflows/[^"/\r\n]+\.ya?ml' + _WORKFLOW_PATH_END_RE
+)
+_WORKFLOW_WRITE_PERMISSION_SCOPES_RE = (
+    r"[\"']?(?:actions|attestations|artifact-metadata|checks|code-quality|"
+    r"contents|deployments|discussions|id-token|issues|packages|pages|"
+    r"pull-requests|repository-projects|security-events|statuses|models|"
+    r"vulnerability-alerts)[\"']?"
+)
+_YAML_ANCHOR_NAME_RE = r"&[A-Za-z_][A-Za-z0-9_-]*"
+_YAML_SCALAR_ANCHOR_RE = r"(?:(?:&[A-Za-z_][A-Za-z0-9_-]*|![^\s#]+)[ \t]+)*"
+_YAML_BLOCK_SCALAR_HEADER_RE = r"[|>](?:[1-9][+-]?|[+-][1-9]?)?"
+_YAML_KEY_RE = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<quote>[\"']?)(?P<key>[^:\"'\r\n]+)"
+    r"(?P=quote)[ \t]*:",
+)
+_YAML_PERMISSION_KEY_RE = re.compile(
+    r"^[ \t]*[\"']?permissions[\"']?[ \t]*:",
+    re.IGNORECASE,
+)
+_YAML_WRITE_SCOPE_RE = re.compile(
+    r"^[ \t]*"
+    + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+    + r"[ \t]*:[ \t]*"
+    + _YAML_SCALAR_ANCHOR_RE
+    + r"[\"']?write[\"']?,?(?:[ \t]*(?:#.*)?)?$",
+    re.IGNORECASE,
+)
+_YAML_WRITE_SCOPE_BLOCK_RE = re.compile(
+    r"^[ \t]*"
+    + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+    + r"[ \t]*:[ \t]*"
+    + _YAML_SCALAR_ANCHOR_RE
+    + _YAML_BLOCK_SCALAR_HEADER_RE
+    + r"(?:[ \t]*(?:#.*)?)?$",
+    re.IGNORECASE,
+)
+_YAML_WRITE_BLOCK_VALUE_RE = re.compile(
+    r"^[ \t]+[\"']?write[\"']?(?:[ \t]*(?:#.*)?)?$",
+    re.IGNORECASE,
+)
+_YAML_NON_WRITE_SCOPE_RE = re.compile(
+    r"^[ \t]*"
+    + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+    + r"[ \t]*:[ \t]*"
+    + _YAML_SCALAR_ANCHOR_RE
+    + r"[\"']?(?:read|none)[\"']?,?(?:[ \t]*(?:#.*)?)?$",
+    re.IGNORECASE,
+)
+_YAML_PERMISSION_SCOPE_ALIAS_RE = re.compile(
+    r"^[ \t]*"
+    + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+    + r"[ \t]*:[ \t]*\*[A-Za-z_][A-Za-z0-9_-]*[ \t]*(?:#.*)?$",
+    re.IGNORECASE,
+)
+_YAML_VALUE_ALIAS_RE = re.compile(
+    r":[ \t]*\*(?P<name>[A-Za-z_][A-Za-z0-9_-]*)[ \t]*(?:#.*)?$",
+    re.IGNORECASE,
+)
+_YAML_ANCHOR_VALUE_RE = re.compile(
+    r"&(?P<name>[A-Za-z_][A-Za-z0-9_-]*)[ \t]+(?P<value>[^\r\n#]+)",
+    re.IGNORECASE,
+)
+_YAML_BLOCK_ANCHOR_RE = re.compile(
+    r"&(?P<name>[A-Za-z_][A-Za-z0-9_-]*)[ \t]*(?:#.*)?$",
+    re.IGNORECASE,
+)
+_YAML_JOBS_FLOW_PERMISSION_RE = re.compile(
+    r"^[ \t]*[\"']?jobs[\"']?[ \t]*:[ \t]*"
+    + _YAML_SCALAR_ANCHOR_RE
+    + r"\{[^\r\n]*[\"']?permissions[\"']?[ \t]*:[ \t]*(?:"
+    + _YAML_SCALAR_ANCHOR_RE
+    + r"[\"']?write-all[\"']?"
+    r"|"
+    + _YAML_SCALAR_ANCHOR_RE
+    + r"\{[^\r\n}]*"
+    + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+    + r"[ \t]*:[ \t]*"
+    + _YAML_SCALAR_ANCHOR_RE
+    + r"[\"']?write[\"']?[^\r\n}]*\}"
+    r")",
+    re.IGNORECASE,
+)
+# Diff-content scan catalogue. PR-290b adds workflow YAML tampering checks;
+# PR-290c and PR-301..PR-304 extend the same dispatcher with governance,
+# supply-chain, secrets, large-diff, and mass-deletion entries.
+_DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
+    "permissions_escalation": re.compile(
+        # Match `+`-prefixed lines (additions only) only inside workflow
+        # YAML diff sections containing `permissions: write-all`
+        # (top-level blanket write) OR a known permission scope set to
+        # exactly `write`. Permission keys can appear at workflow top
+        # level or under a job, so accepted indentation is bounded to
+        # those YAML positions to avoid script-literal false positives.
+        # Replacement hunks require visible `permissions:` context; unrelated
+        # workflow YAML blocks can use the same keys outside `permissions`.
+        r"(?ms)^diff --git[^\r\n]*[ \t]+"
+        + _DIFF_WORKFLOW_B_PATH_RE
+        + r"[^\r\n]*\r?\n"
+        r"(?i:(?:(?:(?!^diff --git[ \t]).)*?^[ +][ \t]*"
+        r"[\"']?permissions[\"']?[ \t]*:[ \t]*(?:"
+        + _YAML_ANCHOR_NAME_RE
+        + r"[ \t]*(?:\{[ \t]*)?|\{[ \t]*)?(?:#.*)?\r?\n"
+        r"(?:^[ +][ \t]*(?:#.*)?\r?\n|^[ +\-][ \t]+"
+        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+        + r"[ \t]*:[^\r\n]*\r?\n)*^\+[ \t]+"
+        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+        + r"[ \t]*:[ \t]*"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"(?:[\"']?write[\"']?,?|"
+        + _YAML_BLOCK_SCALAR_HEADER_RE
+        + r"[ \t]*(?:#.*)?\r?\n"
+        r"^\+[ \t]+[\"']?write[\"']?|\*[A-Za-z_][A-Za-z0-9_-]*)"
+        r"|(?:(?!^diff --git[ \t]).)*?^\+[ \t]+\{[^\r\n}]*"
+        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+        + r"[ \t]*:[ \t]*"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"[\"']?write[\"']?[^\r\n}]*\}"
+        r"|(?:(?!^diff --git[ \t]).)*?^\+[ \t]*"
+        r"[\"']?permissions[\"']?[ \t]*:[ \t]*(?:"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"[\"']?write-all[\"']?"
+        r"|"
+        + _YAML_SCALAR_ANCHOR_RE
+        + _YAML_BLOCK_SCALAR_HEADER_RE
+        + r"[ \t]*(?:#.*)?\r?\n^\+[ \t]+[\"']?write-all[\"']?"
+        r"|&[A-Za-z_][A-Za-z0-9_-]*[ \t]*\{[^\r\n}]*"
+        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+        + r"[ \t]*:[ \t]*"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"[\"']?write[\"']?[^\r\n}]*\}"
+        r"|\*[A-Za-z_][A-Za-z0-9_-]*"
+        r"|\{[^\r\n}]*"
+        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+        + r"[ \t]*:[ \t]*"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"[\"']?write[\"']?[^\r\n}]*\})"
+        r"|(?:(?!^diff --git[ \t]).)*?^-[ \t]+"
+        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+        + r"[ \t]*:[ \t]*"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"[\"']?(?:read|none)[\"']?,?[ \t]*(?:#.*)?\r?\n"
+        r"^\+[ \t]+"
+        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+        + r"[ \t]*:[ \t]*"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"[\"']?write[\"']?,?"
+        r"|(?:(?!^diff --git[ \t]).)*?^\+[ \t]+"
+        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+        + r"[ \t]*:[ \t]*"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"[\"']?write[\"']?,?"
+        r"|(?:(?!^diff --git[ \t]).)*?^\+[ \t]*"
+        r"[\"']?jobs[\"']?[ \t]*:[ \t]*"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"\{(?:(?!^diff --git[ \t]).)*?[\"']?permissions[\"']?[ \t]*:[^\r\n]*"
+        r"|(?:(?!^diff --git[ \t]).)*?^\+[ \t]+[\"']?[^:\"'\r\n]+[\"']?"
+        r"[ \t]*:[ \t]*\{[^\r\n]*[\"']?permissions[\"']?[ \t]*:[^\r\n]*"
+        r"|(?:(?!^diff --git[ \t]).)*?^\+[^\r\n]*"
+        r"&[A-Za-z_][A-Za-z0-9_-]*[ \t]+[\"']?(?:write|write-all)[\"']?"
+        r"(?:(?!^diff --git[ \t]).)*"
+        r"|(?:(?!^diff --git[ \t]).)*?^[ +][^\r\n]*"
+        r"&[A-Za-z_][A-Za-z0-9_-]*[ \t]*(?:#.*)?\r?\n"
+        r"(?:(?!^diff --git[ \t]).)*?^\+[ \t]+[\"']?(?:write|write-all)[\"']?"
+        r"(?:(?!^diff --git[ \t]).)*"
+        r"))[ \t]*(?:#.*)?$",
+    ),
+    "workflow_destruction": re.compile(
+        # Detect workflow YAML files being deleted entirely. In unified
+        # diff format, a deletion shows `--- a/<path>` followed by
+        # `+++ /dev/null` (where the deleted file's path appears in the
+        # `--- a/` line and the special path `/dev/null` appears in the
+        # `+++ b/` line). Require the surrounding `diff --git` section so
+        # documentation snippets containing file-header text are not treated
+        # as real workflow deletions. Pure rename diffs use `rename from`/
+        # `rename to` metadata instead, but moving a workflow elsewhere still
+        # removes it from GitHub Actions.
+        r"(?ms)(?:^diff --git[^\r\n]*[ \t]+"
+        + _DIFF_WORKFLOW_A_PATH_RE
+        + r"[^\r\n]*\r?\n"
+        r"(?:(?!^diff --git[ \t]).)*?^---[ \t]+"
+        + _DIFF_WORKFLOW_A_PATH_RE
+        + r"[ \t]*\r?\n"
+        r"\+\+\+[ \t]+/dev/null\b"
+        r"|^diff --git[^\r\n]*[ \t]+"
+        + _DIFF_WORKFLOW_A_PATH_RE
+        + r"[^\r\n]*\r?\n"
+        r"(?:(?!^diff --git[ \t]).)*?^rename from[ \t]+"
+        + _DIFF_WORKFLOW_RENAME_PATH_RE
+        + r"[ \t]*\r?\n"
+        r"rename to[ \t]+(?!"
+        + _DIFF_WORKFLOW_RENAME_PATH_RE
+        + r"[ \t]*$)"
+        r"[^\r\n]+)"
+    ),
+}
 
-# PR-290a: diff-content scan catalogue. Populated by PR-290b (workflow YAML)
-# and PR-290c (governance / supply chain). PR-301..PR-304 extend the same
-# dispatcher with Tier 2 secrets / large-diff / mass-deletion entries. The
-# empty default makes ``scan_pr_diff`` behaviorally inert at skeleton time
-# so PR-290a can ship the dispatcher + cache wiring without changing any
-# detection outcomes.
-_DIFF_PATTERNS: dict[str, re.Pattern[str]] = {}
-
-_DIFF_RULES: dict[str, str] = {}
+_DIFF_RULES: dict[str, str] = {
+    "permissions_escalation": "Workflow permission escalation in diff additions",
+    "workflow_destruction": "Workflow YAML file deletion under .github/workflows/",
+}
 
 
 def _clip_excerpt(text: str) -> str:
@@ -122,6 +320,546 @@ def _line_excerpt(coder_stdout: str, start: int, end: int) -> str:
     if line_end == -1:
         line_end = len(coder_stdout)
     return coder_stdout[line_start:line_end].strip()[:_EXCERPT_LIMIT]
+
+
+def _diff_yaml_line(line: str) -> tuple[str, str] | None:
+    if not line or line[0] not in {" ", "+", "-"}:
+        return None
+    if line.startswith(("+++", "---")):
+        return None
+    return line[0], line[1:]
+
+
+def _diff_hunk_context_yaml_line(line: str) -> str | None:
+    if not line.startswith("@@"):
+        return None
+    _, _separator, context = line.rpartition("@@")
+    context = context.strip()
+    if not context:
+        return None
+    return context if _yaml_key(context) is not None else None
+
+
+def _yaml_key(line: str) -> tuple[int, str] | None:
+    match = _YAML_KEY_RE.match(line)
+    if match is None:
+        return None
+    return len(match.group("indent").expandtabs(2)), match.group("key").strip()
+
+
+def _yaml_indent(line: str) -> int:
+    return len(line[: len(line) - len(line.lstrip(" \t"))].expandtabs(2))
+
+
+def _normalized_yaml_scalar(value: str) -> str:
+    value = re.sub(
+        r"^(?:(?:&[A-Za-z_][A-Za-z0-9_-]*|![^\s#]+)[ \t]+)*",
+        "",
+        value.strip(),
+    )
+    return value.rstrip(",").strip("\"'").lower()
+
+
+def _mask_yaml_quoted_colon_values(value: str) -> str:
+    chars = list(value)
+    index = 0
+    while index < len(chars):
+        quote = chars[index]
+        if quote not in {"'", '"'}:
+            index += 1
+            continue
+        end = index + 1
+        while end < len(chars):
+            if chars[end] == quote and value[end - 1] != "\\":
+                break
+            end += 1
+        if end >= len(chars):
+            return "".join(chars)
+        tail = value[end + 1 :].lstrip()
+        if not tail.startswith(":") and ":" in value[index + 1 : end]:
+            chars[index + 1 : end] = [" "] * (end - index - 1)
+        index = end + 1
+    return "".join(chars)
+
+
+def _yaml_flow_permission_map_escalates(value: str) -> bool:
+    value = _mask_yaml_quoted_colon_values(value)
+    return bool(
+        re.search(
+            _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+            + r"[ \t]*:[ \t]*"
+            + _YAML_SCALAR_ANCHOR_RE
+            + r"[\"']?write[\"']?",
+            value,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _yaml_anchor_values_before(
+    lines: list[str], line_index: int
+) -> dict[str, str]:
+    anchors: dict[str, str] = {}
+    for previous_index, previous_line in enumerate(lines[:line_index]):
+        diff_line = _diff_yaml_line(previous_line)
+        if diff_line is None:
+            continue
+        prefix, yaml_line = diff_line
+        if prefix == "-":
+            continue
+        match = _YAML_ANCHOR_VALUE_RE.search(yaml_line)
+        if match is not None:
+            anchors[match.group("name")] = match.group("value").strip()
+            continue
+        block_match = _YAML_BLOCK_ANCHOR_RE.search(yaml_line)
+        if block_match is None:
+            continue
+        anchor_indent = _yaml_indent(yaml_line)
+        block_lines: list[str] = []
+        for block_line in lines[previous_index + 1 : line_index]:
+            block_diff_line = _diff_yaml_line(block_line)
+            if block_diff_line is None:
+                continue
+            block_prefix, block_yaml_line = block_diff_line
+            if block_prefix == "-":
+                continue
+            stripped_block_line = block_yaml_line.strip()
+            if not stripped_block_line or stripped_block_line.startswith("#"):
+                continue
+            if _yaml_indent(block_yaml_line) <= anchor_indent:
+                break
+            block_lines.append(stripped_block_line)
+        if block_lines:
+            anchors[block_match.group("name")] = "\n".join(block_lines)
+    return anchors
+
+
+def _yaml_alias_value(line: str) -> str | None:
+    match = _YAML_VALUE_ALIAS_RE.search(line)
+    return None if match is None else match.group("name")
+
+
+def _yaml_alias_resolves_to_escalation(
+    lines: list[str], line_index: int, yaml_line: str, *, top_level_permissions: bool
+) -> bool:
+    alias_name = _yaml_alias_value(yaml_line)
+    if alias_name is None:
+        return False
+    alias_value = _yaml_anchor_values_before(lines, line_index).get(alias_name)
+    if alias_value is None:
+        return False
+    normalized_value = _normalized_yaml_scalar(alias_value)
+    if top_level_permissions:
+        return normalized_value == "write-all" or _yaml_flow_permission_map_escalates(
+            alias_value
+        )
+    return normalized_value == "write"
+
+
+def _visible_yaml_context(lines: list[str], line_index: int) -> list[tuple[int, str]]:
+    context: list[tuple[int, str]] = []
+    for previous_line in lines[:line_index]:
+        hunk_context_line = _diff_hunk_context_yaml_line(previous_line)
+        if hunk_context_line is not None:
+            key = _yaml_key(hunk_context_line)
+            if key is None:  # pragma: no cover - helper prefilters key-shaped lines
+                continue
+            context = [
+                (existing_indent, existing_name)
+                for existing_indent, existing_name in context
+                if existing_indent < key[0]
+            ]
+            context.append(key)
+            continue
+        diff_line = _diff_yaml_line(previous_line)
+        if diff_line is None:
+            continue
+        prefix, yaml_line = diff_line
+        if prefix == "-":
+            continue
+        key = _yaml_key(yaml_line)
+        if key is None:
+            continue
+        context = [
+            (existing_indent, existing_name)
+            for existing_indent, existing_name in context
+            if existing_indent < key[0]
+        ]
+        context.append(key)
+    return context
+
+
+def _is_workflow_permission_key_context(
+    lines: list[str], line_index: int, permission_line: str
+) -> bool:
+    key = _yaml_key(permission_line)
+    if key is None:
+        return False
+    permission_indent, key_name = key
+    if key_name.strip("\"'").lower() != "permissions":
+        return False
+    if permission_indent == 0:
+        return True
+
+    ancestors = [
+        (indent, name.strip("\"'").lower())
+        for indent, name in _visible_yaml_context(lines, line_index)
+        if indent < permission_indent
+    ]
+    if not ancestors:
+        return True
+    root_indent = ancestors[0][0]
+    jobs_index = next(
+        (
+            index
+            for index, (indent, name) in enumerate(ancestors)
+            if indent == root_indent and name == "jobs"
+        ),
+        None,
+    )
+    if jobs_index is None:
+        return False
+    return len(ancestors) == jobs_index + 2
+
+
+def _flow_permission_alias_name(line: str) -> str | None:
+    match = re.search(
+        r"[\"']?permissions[\"']?[ \t]*:[ \t]*"
+        r"\*(?P<name>[A-Za-z_][A-Za-z0-9_-]*)",
+        line,
+        re.IGNORECASE,
+    )
+    return None if match is None else match.group("name")
+
+
+def _jobs_flow_fragment(lines: list[str], line_index: int, jobs_line: str) -> str:
+    fragment = [jobs_line.strip()]
+    brace_depth = jobs_line.count("{") - jobs_line.count("}")
+    for next_line in lines[line_index + 1 :]:
+        if brace_depth <= 0:
+            break
+        diff_line = _diff_yaml_line(next_line)
+        if diff_line is None:
+            continue
+        prefix, yaml_line = diff_line
+        if prefix == "-":
+            continue
+        fragment.append(yaml_line.strip())
+        brace_depth += yaml_line.count("{") - yaml_line.count("}")
+    return " ".join(fragment)
+
+
+def _is_visible_root_jobs_key(
+    lines: list[str], line_index: int, key_indent: int, key_name: str
+) -> bool:
+    if key_name.strip("\"'").lower() != "jobs":
+        return False
+    return not [
+        ancestor
+        for ancestor in _visible_yaml_context(lines, line_index)
+        if ancestor[0] < key_indent
+    ]
+
+
+def _is_workflow_jobs_flow_permission_escalation(
+    lines: list[str], line_index: int, jobs_line: str
+) -> bool:
+    key = _yaml_key(jobs_line)
+    if key is None:
+        return False
+    jobs_indent, jobs_name = key
+    if not _is_visible_root_jobs_key(lines, line_index, jobs_indent, jobs_name):
+        return False
+    flow_line = _jobs_flow_fragment(lines, line_index, jobs_line)
+    if _YAML_JOBS_FLOW_PERMISSION_RE.match(_mask_yaml_quoted_colon_values(flow_line)):
+        return True
+    alias_name = _flow_permission_alias_name(flow_line)
+    if alias_name is None:
+        return False
+    alias_value = _yaml_anchor_values_before(lines, line_index).get(alias_name)
+    if alias_value is None:
+        return False
+    return _normalized_yaml_scalar(
+        alias_value
+    ) == "write-all" or _yaml_flow_permission_map_escalates(alias_value)
+
+
+def _is_workflow_job_flow_permission_escalation(
+    lines: list[str], line_index: int, job_line: str
+) -> bool:
+    key = _yaml_key(job_line)
+    if key is None:
+        return False
+    job_indent, _job_name = key
+    if job_indent == 0 or "{" not in job_line:
+        return False
+    ancestors = [
+        (indent, name.strip("\"'").lower())
+        for indent, name in _visible_yaml_context(lines, line_index)
+        if indent < job_indent
+    ]
+    if len(ancestors) != 1 or ancestors[0][1] != "jobs":
+        return False
+    flow_line = f"jobs: {{ {job_line.strip()} }}"
+    if _YAML_JOBS_FLOW_PERMISSION_RE.match(_mask_yaml_quoted_colon_values(flow_line)):
+        return True
+    alias_name = _flow_permission_alias_name(flow_line)
+    if alias_name is None:
+        return False
+    alias_value = _yaml_anchor_values_before(lines, line_index).get(alias_name)
+    if alias_value is None:
+        return False
+    return _normalized_yaml_scalar(
+        alias_value
+    ) == "write-all" or _yaml_flow_permission_map_escalates(alias_value)
+
+
+def _visible_permission_alias_reference_escalates(
+    lines: list[str], alias_name: str, *, top_level_permissions: bool
+) -> bool:
+    alias_ref_re = re.compile(rf"\*{re.escape(alias_name)}\b", re.IGNORECASE)
+    scope_alias_re = re.compile(
+        _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+        + rf"[ \t]*:[ \t]*\*{re.escape(alias_name)}\b",
+        re.IGNORECASE,
+    )
+    for index, line in enumerate(lines):
+        diff_line = _diff_yaml_line(line)
+        if diff_line is None:
+            continue
+        prefix, yaml_line = diff_line
+        if prefix == "-" or alias_ref_re.search(yaml_line) is None:
+            continue
+        if top_level_permissions and _YAML_PERMISSION_KEY_RE.match(yaml_line):
+            if _is_workflow_permission_key_context(lines, index, yaml_line):
+                return True
+        if not top_level_permissions and scope_alias_re.search(yaml_line):
+            if _YAML_PERMISSION_KEY_RE.match(yaml_line):
+                return _is_workflow_permission_key_context(lines, index, yaml_line)
+            for parent_index in range(index - 1, -1, -1):
+                parent_diff_line = _diff_yaml_line(lines[parent_index])
+                if parent_diff_line is None:
+                    continue
+                parent_prefix, parent_yaml_line = parent_diff_line
+                if parent_prefix == "-":
+                    continue
+                if not _YAML_PERMISSION_KEY_RE.match(parent_yaml_line):
+                    continue
+                return _is_workflow_permission_key_context(
+                    lines, parent_index, parent_yaml_line
+                )
+    return False
+
+
+def _anchor_value_edit_escalates(lines: list[str], yaml_line: str) -> bool:
+    match = _YAML_ANCHOR_VALUE_RE.search(yaml_line)
+    if match is None:
+        return False
+    alias_name = match.group("name")
+    normalized_value = _normalized_yaml_scalar(match.group("value"))
+    if normalized_value == "write-all":
+        return _visible_permission_alias_reference_escalates(
+            lines, alias_name, top_level_permissions=True
+        )
+    if normalized_value == "write":
+        return _visible_permission_alias_reference_escalates(
+            lines, alias_name, top_level_permissions=False
+        )
+    return False
+
+
+def _block_anchor_value_edit_escalates(
+    lines: list[str], line_index: int, yaml_line: str
+) -> bool:
+    normalized_value = _normalized_yaml_scalar(yaml_line)
+    if normalized_value not in {"write", "write-all"}:
+        return False
+    value_indent = _yaml_indent(yaml_line)
+    for previous_line in reversed(lines[:line_index]):
+        diff_line = _diff_yaml_line(previous_line)
+        if diff_line is None:
+            continue
+        prefix, previous_yaml_line = diff_line
+        if prefix == "-":
+            continue
+        stripped_line = previous_yaml_line.strip()
+        if not stripped_line or stripped_line.startswith("#"):
+            continue
+        previous_indent = _yaml_indent(previous_yaml_line)
+        if previous_indent >= value_indent:
+            continue
+        block_match = _YAML_BLOCK_ANCHOR_RE.search(previous_yaml_line)
+        if block_match is None:
+            return False
+        return _visible_permission_alias_reference_escalates(
+            lines,
+            block_match.group("name"),
+            top_level_permissions=normalized_value == "write-all",
+        )
+    return False
+
+
+def _anchor_value_edit_escalates_in_section(
+    section_text: str, match_text: str
+) -> bool:
+    section_lines = section_text.splitlines()
+    matched_lines = set(match_text.splitlines())
+    for index, line in enumerate(section_lines):
+        if line not in matched_lines:
+            continue
+        diff_line = _diff_yaml_line(line)
+        if diff_line is None:
+            continue
+        prefix, yaml_line = diff_line
+        if prefix != "+":
+            continue
+        if _anchor_value_edit_escalates(section_lines, yaml_line):
+            return True
+        if _block_anchor_value_edit_escalates(section_lines, index, yaml_line):
+            return True
+    return False
+
+
+def _diff_file_section_at(diff_text: str, position: int) -> str:
+    start = diff_text.rfind("\ndiff --git ", 0, position)
+    if start == -1:
+        start = 0
+    else:
+        start += 1
+    end = diff_text.find("\ndiff --git ", position)
+    if end == -1:
+        end = len(diff_text)
+    return diff_text[start:end]
+
+
+def _replaces_read_scope_with_write(
+    lines: list[str], line_index: int, scope_line: str
+) -> bool:
+    scope_key = _yaml_key(scope_line)
+    if scope_key is None:
+        return False
+    scope_indent, scope_name = scope_key
+    normalized_scope = scope_name.strip("\"'").lower()
+    found_read_replacement = False
+    for parent_index in range(line_index - 1, -1, -1):
+        parent_diff_line = _diff_yaml_line(lines[parent_index])
+        if parent_diff_line is None:
+            continue
+        parent_prefix, parent_yaml_line = parent_diff_line
+        parent_key = _yaml_key(parent_yaml_line)
+        if parent_key is None:
+            continue
+        parent_indent, parent_name = parent_key
+        if (
+            parent_prefix == "-"
+            and parent_indent == scope_indent
+            and parent_name.strip("\"'").lower() == normalized_scope
+            and _YAML_NON_WRITE_SCOPE_RE.match(parent_yaml_line)
+        ):
+            found_read_replacement = True
+            continue
+        if parent_prefix == "-" or parent_indent >= scope_indent:
+            continue
+        if not found_read_replacement:
+            return False
+        if _YAML_PERMISSION_KEY_RE.match(parent_yaml_line):
+            return _is_workflow_permission_key_context(
+                lines, parent_index, parent_yaml_line
+            )
+        return False
+    return found_read_replacement
+
+
+def _is_contextless_permission_scope_addition(
+    lines: list[str], line_index: int, scope_line: str
+) -> bool:
+    scope_key = _yaml_key(scope_line)
+    if scope_key is None:
+        return False
+    scope_indent, _scope_name = scope_key
+    if scope_indent not in {2, 6}:
+        return False
+    return not _visible_yaml_context(lines, line_index)
+
+
+def _match_has_workflow_permission_context(match_text: str) -> bool:
+    lines = match_text.splitlines()
+    for index, line in enumerate(lines):
+        diff_line = _diff_yaml_line(line)
+        if diff_line is None:
+            continue
+        prefix, yaml_line = diff_line
+        if prefix != "+":
+            continue
+        if _anchor_value_edit_escalates(lines, yaml_line):
+            return True
+        if _block_anchor_value_edit_escalates(lines, index, yaml_line):
+            return True
+        if _is_workflow_jobs_flow_permission_escalation(lines, index, yaml_line):
+            return True
+        if _is_workflow_job_flow_permission_escalation(lines, index, yaml_line):
+            return True
+        if _YAML_PERMISSION_KEY_RE.match(yaml_line) and (
+            _is_workflow_permission_key_context(lines, index, yaml_line)
+        ):
+            if _yaml_alias_value(yaml_line) is not None:
+                if _yaml_alias_resolves_to_escalation(
+                    lines,
+                    index,
+                    yaml_line,
+                    top_level_permissions=True,
+                ):
+                    return True
+                continue
+            return True
+        is_write_scope = bool(_YAML_WRITE_SCOPE_RE.match(yaml_line))
+        if not is_write_scope and _yaml_flow_permission_map_escalates(yaml_line):
+            is_write_scope = True
+        if not is_write_scope and _YAML_PERMISSION_SCOPE_ALIAS_RE.match(yaml_line):
+            is_write_scope = _yaml_alias_resolves_to_escalation(
+                lines,
+                index,
+                yaml_line,
+                top_level_permissions=False,
+            )
+        if not is_write_scope and _YAML_WRITE_SCOPE_BLOCK_RE.match(yaml_line):
+            for block_index in range(index + 1, len(lines)):
+                block_diff_line = _diff_yaml_line(lines[block_index])
+                if block_diff_line is None:
+                    continue
+                block_prefix, block_yaml_line = block_diff_line
+                if block_prefix == "-":
+                    continue
+                is_write_scope = bool(_YAML_WRITE_BLOCK_VALUE_RE.match(block_yaml_line))
+                break
+        if not is_write_scope:
+            continue
+        for parent_index in range(index - 1, -1, -1):
+            parent_diff_line = _diff_yaml_line(lines[parent_index])
+            if parent_diff_line is None:
+                continue
+            parent_prefix, parent_yaml_line = parent_diff_line
+            if parent_prefix == "-":
+                continue
+            parent_key = _yaml_key(parent_yaml_line)
+            scope_key = _yaml_key(yaml_line)
+            # Regex prefilters require key-shaped YAML lines here.
+            if parent_key is None or scope_key is None:  # pragma: no cover
+                continue
+            parent_indent = parent_key[0]
+            scope_indent = scope_key[0]
+            if parent_indent >= scope_indent:
+                continue
+            if _YAML_PERMISSION_KEY_RE.match(parent_yaml_line):
+                return _is_workflow_permission_key_context(
+                    lines, parent_index, parent_yaml_line
+                )
+            break
+        if _replaces_read_scope_with_write(lines, index, yaml_line):
+            return True
+        if _is_contextless_permission_scope_addition(lines, index, yaml_line):
+            return True
+    return False
 
 
 def _push_args_tokens(args: str) -> list[str]:
@@ -339,6 +1077,13 @@ def scan_pr_diff(diff_text: str) -> list[GuardrailViolation]:
     for category in sorted(_DIFF_PATTERNS):
         pattern = _DIFF_PATTERNS[category]
         for match in pattern.finditer(diff_text):
+            if category == "permissions_escalation" and not (
+                _match_has_workflow_permission_context(match.group(0))
+                or _anchor_value_edit_escalates_in_section(
+                    _diff_file_section_at(diff_text, match.start()), match.group(0)
+                )
+            ):
+                continue
             violations.append(
                 GuardrailViolation(
                     tier=1,
