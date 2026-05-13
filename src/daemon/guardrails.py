@@ -146,12 +146,12 @@ _YAML_WRITE_BLOCK_VALUE_RE = re.compile(
     r"^[ \t]+[\"']?write[\"']?(?:[ \t]*(?:#.*)?)?$",
     re.IGNORECASE,
 )
-_YAML_READ_SCOPE_RE = re.compile(
+_YAML_NON_WRITE_SCOPE_RE = re.compile(
     r"^[ \t]*"
     + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
     + r"[ \t]*:[ \t]*"
     + _YAML_SCALAR_ANCHOR_RE
-    + r"[\"']?read[\"']?,?(?:[ \t]*(?:#.*)?)?$",
+    + r"[\"']?(?:read|none)[\"']?,?(?:[ \t]*(?:#.*)?)?$",
     re.IGNORECASE,
 )
 _YAML_PERMISSION_SCOPE_ALIAS_RE = re.compile(
@@ -250,7 +250,7 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
         + r"[ \t]*:[ \t]*"
         + _YAML_SCALAR_ANCHOR_RE
-        + r"[\"']?read[\"']?,?[ \t]*(?:#.*)?\r?\n"
+        + r"[\"']?(?:read|none)[\"']?,?[ \t]*(?:#.*)?\r?\n"
         r"^\+[ \t]+"
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
         + r"[ \t]*:[ \t]*"
@@ -539,7 +539,7 @@ def _replaces_read_scope_with_write(
             parent_prefix == "-"
             and parent_indent == scope_indent
             and parent_name.strip("\"'").lower() == normalized_scope
-            and _YAML_READ_SCOPE_RE.match(parent_yaml_line)
+            and _YAML_NON_WRITE_SCOPE_RE.match(parent_yaml_line)
         ):
             found_read_replacement = True
             continue

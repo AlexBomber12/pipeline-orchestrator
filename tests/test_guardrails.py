@@ -1123,6 +1123,15 @@ def test_scan_pr_diff_workflow_scope_read_to_write_without_parent_context_flagge
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_scope_none_to_write_without_parent_context_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -20,3 +20,3 @@\n-  contents: none\n+  contents: write\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
 def test_scan_pr_diff_workflow_env_replacement_named_write_scope_not_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER
