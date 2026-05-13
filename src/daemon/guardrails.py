@@ -813,16 +813,20 @@ def _yaml_line_is_in_block_scalar(lines: list[str], line_index: int) -> bool:
         previous_indent = _yaml_indent(previous_yaml_line)
         if previous_indent >= line_indent:
             continue
-        return bool(
-            re.search(
-                r":[ \t]*"
-                + _YAML_SCALAR_ANCHOR_RE
-                + _YAML_BLOCK_SCALAR_HEADER_RE
-                + r"(?:[ \t]*(?:#.*)?)?$",
-                previous_yaml_line,
-                re.IGNORECASE,
-            )
-        )
+        if re.search(
+            r":[ \t]*"
+            + _YAML_SCALAR_ANCHOR_RE
+            + _YAML_BLOCK_SCALAR_HEADER_RE
+            + r"(?:[ \t]*(?:#.*)?)?$",
+            previous_yaml_line,
+            re.IGNORECASE,
+        ):
+            return True
+        candidate_key_line = previous_yaml_line.lstrip(" \t")
+        if candidate_key_line.startswith("-"):
+            candidate_key_line = candidate_key_line[1:].lstrip(" \t")
+        if _yaml_key(candidate_key_line) is not None:
+            return False
     return False
 
 

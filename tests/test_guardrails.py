@@ -2089,6 +2089,19 @@ def test_scan_pr_diff_action_in_run_block_scalar_not_flagged() -> None:
     assert scan_pr_diff(diff_text) == []
 
 
+def test_scan_pr_diff_action_nested_in_run_block_scalar_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,3 +1,5 @@\n"
+        "       - run: |\n"
+        "+          cat <<'YAML'\n"
+        "+            uses: actions/checkout@main\n"
+        "+          YAML\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
 def test_scan_pr_diff_action_block_scalar_helper_ignores_non_yaml_lines() -> None:
     assert not guardrails._yaml_line_is_in_block_scalar(["diff --git a b"], 0)
 
