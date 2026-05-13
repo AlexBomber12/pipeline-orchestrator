@@ -474,19 +474,26 @@ def test_workflow_permission_alias_helpers_resolve_only_visible_values() -> None
         "-  OLD: &old_write write",
         "   READ_ONLY: &read_only read",
         "   FULL: &full { contents: write }",
+        "   BLOCK: &block",
+        "@@ non-yaml hunk metadata",
+        "-    issues: write",
+        "     # visible comment",
+        "     ",
+        "     contents: write",
         "+permissions: *full",
     ]
 
     assert guardrails._yaml_flow_permission_map_escalates("{ contents: write }")
-    assert guardrails._yaml_anchor_values_before(lines, 4) == {
+    assert guardrails._yaml_anchor_values_before(lines, 10) == {
         "read_only": "read",
         "full": "{ contents: write }",
+        "block": "contents: write",
     }
     assert not guardrails._yaml_alias_resolves_to_escalation(
-        lines, 4, "contents: write", top_level_permissions=False
+        lines, 10, "contents: write", top_level_permissions=False
     )
     assert guardrails._yaml_alias_resolves_to_escalation(
-        lines, 4, "permissions: *full", top_level_permissions=True
+        lines, 10, "permissions: *full", top_level_permissions=True
     )
 
 
@@ -826,6 +833,18 @@ def test_scan_pr_diff_workflow_permissions_alias_flagged() -> None:
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_permissions_block_alias_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,4 +1,5 @@\n"
+        + " env: &full_write\n"
+        + "   contents: write\n"
+        "+permissions: *full_write\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
 def test_scan_pr_diff_workflow_permissions_unresolved_alias_not_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER
@@ -909,12 +928,40 @@ def test_scan_pr_diff_workflow_scope_alias_write_flagged() -> None:
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_scope_block_alias_write_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,5 +1,6 @@\n"
+        + " env:\n"
+        + "   FULL_WRITE: &full_write\n"
+        + "     write\n"
+        + " permissions:\n"
+        + "+  contents: *full_write\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
 def test_scan_pr_diff_workflow_scope_alias_read_not_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER
         + "@@ -1,4 +1,5 @@\n"
         + " env:\n"
         + "   READ_ONLY: &read_only read\n"
+        + " permissions:\n"
+        + "+  contents: *read_only\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_workflow_scope_block_alias_read_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,5 +1,6 @@\n"
+        + " env:\n"
+        + "   READ_ONLY: &read_only\n"
+        + "     read\n"
         + " permissions:\n"
         + "+  contents: *read_only\n"
     )
