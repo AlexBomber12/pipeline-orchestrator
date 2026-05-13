@@ -1936,61 +1936,76 @@ def test_scan_pr_diff_non_workflow_path_yml_deletion_not_flagged() -> None:
 
 
 def test_scan_pr_diff_action_main_ref_flagged() -> None:
-    diff_text = "+      - uses: actions/checkout@main\n"
+    diff_text = WORKFLOW_DIFF_HEADER + "+      - uses: actions/checkout@main\n"
 
     _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
 
 
 def test_scan_pr_diff_action_master_ref_flagged() -> None:
-    diff_text = "+      - uses: actions/checkout@master\n"
+    diff_text = WORKFLOW_DIFF_HEADER + "+      - uses: actions/checkout@master\n"
 
     _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
 
 
 def test_scan_pr_diff_action_head_ref_flagged() -> None:
-    diff_text = "+      - uses: actions/checkout@HEAD\n"
+    diff_text = WORKFLOW_DIFF_HEADER + "+      - uses: actions/checkout@HEAD\n"
 
     _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
 
 
 def test_scan_pr_diff_action_branch_name_ref_flagged() -> None:
-    diff_text = "+      - uses: actions/checkout@develop\n"
+    diff_text = WORKFLOW_DIFF_HEADER + "+      - uses: actions/checkout@develop\n"
 
     _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
 
 
 def test_scan_pr_diff_action_semver_tag_v1_not_flagged() -> None:
-    diff_text = "+      - uses: actions/checkout@v1\n"
+    diff_text = WORKFLOW_DIFF_HEADER + "+      - uses: actions/checkout@v1\n"
 
     assert scan_pr_diff(diff_text) == []
 
 
 def test_scan_pr_diff_action_semver_tag_v1_2_3_not_flagged() -> None:
-    diff_text = "+      - uses: actions/checkout@v1.2.3\n"
+    diff_text = WORKFLOW_DIFF_HEADER + "+      - uses: actions/checkout@v1.2.3\n"
 
     assert scan_pr_diff(diff_text) == []
 
 
 def test_scan_pr_diff_action_commit_sha_not_flagged() -> None:
-    diff_text = "+      - uses: actions/checkout@a1b2c3d4e5f6789012345678901234567890abcd\n"
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "+      - uses: actions/checkout@a1b2c3d4e5f6789012345678901234567890abcd\n"
+    )
 
     assert scan_pr_diff(diff_text) == []
 
 
 def test_scan_pr_diff_action_short_sha_flagged() -> None:
-    diff_text = "+      - uses: actions/checkout@a1b2c3d\n"
+    diff_text = WORKFLOW_DIFF_HEADER + "+      - uses: actions/checkout@a1b2c3d\n"
 
     _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
 
 
 def test_scan_pr_diff_action_in_context_line_not_flagged() -> None:
-    diff_text = "  - uses: actions/checkout@main\n"
+    diff_text = WORKFLOW_DIFF_HEADER + "  - uses: actions/checkout@main\n"
 
     assert scan_pr_diff(diff_text) == []
 
 
 def test_scan_pr_diff_action_in_deletion_line_not_flagged() -> None:
-    diff_text = "-  - uses: actions/checkout@main\n"
+    diff_text = WORKFLOW_DIFF_HEADER + "-  - uses: actions/checkout@main\n"
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_action_example_in_docs_not_flagged() -> None:
+    diff_text = (
+        "diff --git a/docs/actions.md b/docs/actions.md\n"
+        "--- a/docs/actions.md\n"
+        "+++ b/docs/actions.md\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+      - uses: actions/checkout@main\n"
+    )
 
     assert scan_pr_diff(diff_text) == []
 

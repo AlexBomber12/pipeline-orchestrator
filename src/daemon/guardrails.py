@@ -100,7 +100,7 @@ _TIER1_RULES: dict[str, str] = {
 }
 
 _EXCERPT_LIMIT = 200
-_WORKFLOW_PATH_END_RE = r'(?:"|(?=[ \t\r\n]))'
+_WORKFLOW_PATH_END_RE = r'(?:"|(?=[ \t\r\n])|$)'
 _DIFF_WORKFLOW_B_PATH_RE = (
     r'"?b/\.github/workflows/[^"/\r\n]+\.ya?ml' + _WORKFLOW_PATH_END_RE
 )
@@ -767,6 +767,13 @@ def _diff_file_section_at(diff_text: str, position: int) -> str:
     return diff_text[start:end]
 
 
+def _diff_section_is_workflow_file(section_text: str) -> bool:
+    first_line = section_text.splitlines()[0] if section_text else ""
+    return bool(re.match(r"^diff --git[^\r\n]*[ \t]+", first_line)) and bool(
+        re.search(_DIFF_WORKFLOW_B_PATH_RE, first_line)
+    )
+
+
 def _replaces_read_scope_with_write(
     lines: list[str], line_index: int, scope_line: str
 ) -> bool:
@@ -1112,14 +1119,16 @@ def scan_pr_diff(diff_text: str) -> list[GuardrailViolation]:
     for category in sorted(_DIFF_PATTERNS):
         pattern = _DIFF_PATTERNS[category]
         for match in pattern.finditer(diff_text):
+            section_text = _diff_file_section_at(diff_text, match.start())
             if category == "dangerous_action_external_install" and (
                 _action_ref_is_pinned(match.group("ref"))
+                or not _diff_section_is_workflow_file(section_text)
             ):
                 continue
             if category == "permissions_escalation" and not (
                 _match_has_workflow_permission_context(match.group(0))
                 or _anchor_value_edit_escalates_in_section(
-                    _diff_file_section_at(diff_text, match.start()), match.group(0)
+                    section_text, match.group(0)
                 )
             ):
                 continue
