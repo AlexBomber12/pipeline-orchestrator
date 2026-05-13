@@ -848,6 +848,40 @@ def test_scan_pr_diff_detects_jwt_like() -> None:
     _assert_secret_violation_redacted(placeholder, "jwt_like", "JWT_TOKEN")
 
 
+def test_scan_pr_diff_detects_json_access_token_jwt_like() -> None:
+    placeholder = "eyJ" + ("A" * 10) + "." + ("B" * 10) + "." + ("C" * 10)
+    diff = (
+        "diff --git a/config.json b/config.json\n"
+        "--- a/config.json\n"
+        "+++ b/config.json\n"
+        "@@ -1,1 +1,2 @@\n"
+        f'+"access_token": "{placeholder}"\n'
+    )
+
+    violations = scan_pr_diff(diff)
+
+    assert len(violations) == 1
+    assert violations[0].category == "jwt_like"
+    assert placeholder not in violations[0].excerpt
+
+
+def test_scan_pr_diff_detects_json_authorization_bearer_jwt_like() -> None:
+    placeholder = "eyJ" + ("A" * 10) + "." + ("B" * 10) + "." + ("C" * 10)
+    diff = (
+        "diff --git a/config.json b/config.json\n"
+        "--- a/config.json\n"
+        "+++ b/config.json\n"
+        "@@ -1,1 +1,2 @@\n"
+        f'+"Authorization": "Bearer {placeholder}"\n'
+    )
+
+    violations = scan_pr_diff(diff)
+
+    assert len(violations) == 1
+    assert violations[0].category == "jwt_like"
+    assert placeholder not in violations[0].excerpt
+
+
 def test_scan_pr_diff_ignores_bare_jwt_like_sample() -> None:
     placeholder = "eyJ" + ("A" * 10) + "." + ("B" * 10) + "." + ("C" * 10)
 
