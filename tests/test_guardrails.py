@@ -478,6 +478,18 @@ def _delete_diff_for_file(path: str) -> str:
     )
 
 
+def _add_diff_for_file(path: str) -> str:
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "new file mode 100644\n"
+        "index 0000000..1111111\n"
+        "--- /dev/null\n"
+        f"+++ b/{path}\n"
+        "@@ -0,0 +1,1 @@\n"
+        "+new\n"
+    )
+
+
 def _delete_binary_diff_for_file(path: str) -> str:
     return (
         f"diff --git a/{path} b/{path}\n"
@@ -890,6 +902,81 @@ def test_scan_pr_diff_prior_violations_still_flagged() -> None:
     )
 
     _assert_diff_categories(diff_text, ["large_diff_threshold", "mass_file_deletion"])
+
+
+def _governance_violations(diff_text: str) -> list[GuardrailViolation]:
+    return [
+        violation
+        for violation in scan_pr_diff(diff_text)
+        if violation.category == "governance_file_modified"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("path", "subtype"),
+    [
+        (".github/CODEOWNERS", "codeowners"),
+        ("docs/CODEOWNERS", "codeowners"),
+        ("src/CODEOWNERS", "codeowners"),
+        (".github/dependabot.yml", "dependabot_config"),
+        (".github/dependabot.yaml", "dependabot_config"),
+        (".github/labels.yml", "labels_sync"),
+        (".github/labeler.yml", "labels_sync"),
+        (".github/settings.yml", "repo_settings"),
+        (".github/auto-merge.yml", "auto_merge_config"),
+        (".github/automerge.yml", "auto_merge_config"),
+        (".github/PULL_REQUEST_TEMPLATE/foo.md", "issue_pr_template"),
+        (".github/ISSUE_TEMPLATE/bug.md", "issue_pr_template"),
+        (".github/FUNDING.yml", "funding"),
+    ],
+)
+def test_scan_governance_paths_flagged(path: str, subtype: str) -> None:
+    violations = _governance_violations(_diff_for_file(path, additions=1))
+
+    assert len(violations) == 1
+    assert path in violations[0].excerpt
+    assert subtype in violations[0].excerpt
+
+
+@pytest.mark.parametrize("path", ["random/CODEOWNERS", "src/foo.py"])
+def test_scan_governance_non_governance_paths_not_flagged(path: str) -> None:
+    assert _governance_violations(_diff_for_file(path, additions=1)) == []
+
+
+def test_scan_governance_workflow_yml_not_double_flagged() -> None:
+    diff_text = WORKFLOW_DIFF_HEADER + "@@ -1,2 +1,3 @@\n+permissions: write-all\n"
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_governance_added_and_deleted_codeowners_flagged() -> None:
+    for diff_text in (
+        _add_diff_for_file(".github/CODEOWNERS"),
+        _delete_diff_for_file(".github/CODEOWNERS"),
+    ):
+        violations = _governance_violations(diff_text)
+
+        assert len(violations) == 1
+        assert "codeowners" in violations[0].excerpt
+
+
+def test_scan_governance_disabled_via_config() -> None:
+    diff_text = _diff_for_file(".github/CODEOWNERS", additions=1)
+    daemon_config = DaemonConfig(governance_scan_enabled=False)
+
+    assert scan_pr_diff(diff_text, daemon_config=daemon_config) == []
+
+
+def test_scan_governance_prior_layers_still_flagged() -> None:
+    diff_text = _diff_for_file(".github/CODEOWNERS", additions=1) + _diff_for_file(
+        "src/large.py",
+        additions=1600,
+    )
+
+    _assert_diff_categories(
+        diff_text,
+        ["large_diff_threshold", "governance_file_modified"],
+    )
 
 
 def _secret_diff(secret_value: str, assignment_name: str = "TOKEN") -> str:
@@ -2710,7 +2797,10 @@ def test_scan_pr_diff_settings_yml_modification_flagged() -> None:
         "+++ b/.github/settings.yml\n"
     )
 
-    _assert_diff_categories(diff_text, ["branch_protection_modification"])
+    _assert_diff_categories(
+        diff_text,
+        ["branch_protection_modification", "governance_file_modified"],
+    )
 
 
 def test_scan_pr_diff_branch_protection_deletion_flagged() -> None:
@@ -2733,7 +2823,10 @@ def test_scan_pr_diff_branch_protection_creation_flagged() -> None:
         "+++ b/.github/settings.yml\n"
     )
 
-    _assert_diff_categories(diff_text, ["branch_protection_modification"])
+    _assert_diff_categories(
+        diff_text,
+        ["branch_protection_modification", "governance_file_modified"],
+    )
 
 
 def test_scan_pr_diff_branch_protection_rename_only_from_flagged() -> None:
@@ -2755,7 +2848,10 @@ def test_scan_pr_diff_branch_protection_rename_only_to_flagged() -> None:
         "rename to .github/settings.yml\n"
     )
 
-    _assert_diff_categories(diff_text, ["branch_protection_modification"])
+    _assert_diff_categories(
+        diff_text,
+        ["branch_protection_modification", "governance_file_modified"],
+    )
 
 
 def test_scan_pr_diff_unrelated_file_not_flagged() -> None:

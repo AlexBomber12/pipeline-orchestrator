@@ -88,6 +88,7 @@ _DAEMON_FIELDS = {
     "large_diff_files_threshold",
     "mass_deletion_threshold",
     "test_deletion_threshold",
+    "governance_scan_enabled",
     "main_commit_audit_interval_idle_cycles",
     "main_commit_audit_lookback_n",
 }
@@ -186,6 +187,7 @@ class DaemonConfig(BaseModel):
     large_diff_files_threshold: int = Field(default=30, ge=2)
     mass_deletion_threshold: int = Field(default=20, ge=1)
     test_deletion_threshold: int = Field(default=5, ge=1)
+    governance_scan_enabled: bool = True
     main_commit_audit_interval_idle_cycles: int = Field(default=20, ge=1)
     main_commit_audit_lookback_n: int = Field(default=10, ge=1, le=50)
 
