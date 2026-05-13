@@ -926,7 +926,11 @@ def _governance_violations(diff_text: str) -> list[GuardrailViolation]:
         (".github/auto-merge.yml", "auto_merge_config"),
         (".github/automerge.yml", "auto_merge_config"),
         (".github/PULL_REQUEST_TEMPLATE/foo.md", "issue_pr_template"),
+        (".github/pull_request_template.md", "issue_pr_template"),
+        ("PULL_REQUEST_TEMPLATE.md", "issue_pr_template"),
+        ("docs/PULL_REQUEST_TEMPLATE.md", "issue_pr_template"),
         (".github/ISSUE_TEMPLATE/bug.md", "issue_pr_template"),
+        (".github/issue_template.md", "issue_pr_template"),
         (".github/FUNDING.yml", "funding"),
     ],
 )
@@ -938,7 +942,15 @@ def test_scan_governance_paths_flagged(path: str, subtype: str) -> None:
     assert subtype in violations[0].excerpt
 
 
-@pytest.mark.parametrize("path", ["random/CODEOWNERS", "src/CODEOWNERS", "src/foo.py"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "random/CODEOWNERS",
+        "src/CODEOWNERS",
+        "src/foo.py",
+        ".github/ISSUE_TEMPLATE_BACKUP.md",
+    ],
+)
 def test_scan_governance_non_governance_paths_not_flagged(path: str) -> None:
     assert _governance_violations(_diff_for_file(path, additions=1)) == []
 

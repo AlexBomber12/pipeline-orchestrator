@@ -417,7 +417,12 @@ GOVERNANCE_FILE_PATTERNS: dict[str, re.Pattern[str]] = {
         r"^\.github/(?:auto-merge|automerge|merge-config)\.ya?ml$"
     ),
     "issue_pr_template": re.compile(
-        r"^\.github/(?:ISSUE_TEMPLATE|PULL_REQUEST_TEMPLATE)/?"
+        r"^(?:"
+        r"(?:\.github|docs)/PULL_REQUEST_TEMPLATE(?:/[^/].*|\.md)"
+        r"|PULL_REQUEST_TEMPLATE\.md"
+        r"|\.github/ISSUE_TEMPLATE(?:/[^/].*|\.md)"
+        r")$",
+        re.IGNORECASE,
     ),
     "funding": re.compile(r"^\.github/FUNDING\.ya?ml$"),
 }
