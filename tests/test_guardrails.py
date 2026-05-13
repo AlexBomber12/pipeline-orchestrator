@@ -955,6 +955,118 @@ def test_scan_pr_diff_group_b_excerpt_never_contains_secret_value() -> None:
         )
 
 
+def test_scan_pr_diff_generic_detects_high_entropy_token_assignment() -> None:
+    diff_text = (
+        "diff --git a/src/settings.py b/src/settings.py\n"
+        "--- a/src/settings.py\n"
+        "+++ b/src/settings.py\n"
+        "@@ -1,1 +1,2 @@\n"
+        "+token=abc123XyZ_HighEntropyValue9876ZQT5\n"
+    )
+
+    violations = scan_pr_diff(diff_text)
+
+    assert len(violations) == 1
+    assert violations[0].category == "generic_high_entropy"
+
+
+@pytest.mark.parametrize(
+    "assignment_name",
+    ["OPENAI_API_KEY", "MY_TOKEN", "DB_PASSWORD"],
+)
+def test_scan_pr_diff_generic_detects_prefixed_secret_assignment(
+    assignment_name: str,
+) -> None:
+    diff_text = _secret_diff("abc123XyZ_HighEntropyValue9876ZQT5", assignment_name)
+
+    violations = scan_pr_diff(diff_text)
+
+    assert len(violations) == 1
+    assert violations[0].category == "generic_high_entropy"
+
+
+@pytest.mark.parametrize(
+    "assignment_name",
+    ["clientSecret", "accessToken", "dbPassword", "openaiApiKey", "myApiKey"],
+)
+def test_scan_pr_diff_generic_detects_camel_case_secret_assignment(
+    assignment_name: str,
+) -> None:
+    diff_text = _secret_diff("abc123XyZ_HighEntropyValue9876ZQT5", assignment_name)
+
+    violations = scan_pr_diff(diff_text)
+
+    assert len(violations) == 1
+    assert violations[0].category == "generic_high_entropy"
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_scan_pr_diff_generic_detects_quoted_structured_key(quote: str) -> None:
+    diff_text = (
+        "diff --git a/src/settings.json b/src/settings.json\n"
+        "--- a/src/settings.json\n"
+        "+++ b/src/settings.json\n"
+        "@@ -1,1 +1,2 @@\n"
+        f"+{quote}api_key{quote}: {quote}abc123XyZ_HighEntropyValue9876ZQT5{quote}\n"
+    )
+
+    violations = scan_pr_diff(diff_text)
+
+    assert len(violations) == 1
+    assert violations[0].category == "generic_high_entropy"
+
+
+def test_scan_pr_diff_generic_scans_later_assignment_on_same_line() -> None:
+    diff_text = (
+        "diff --git a/src/settings.json b/src/settings.json\n"
+        "--- a/src/settings.json\n"
+        "+++ b/src/settings.json\n"
+        "@@ -1,1 +1,2 @@\n"
+        '+"token": "dev", "api_key": "abc123XyZ_HighEntropyValue9876ZQT5"\n'
+    )
+
+    violations = scan_pr_diff(diff_text)
+
+    assert len(violations) == 1
+    assert violations[0].category == "generic_high_entropy"
+
+
+def test_scan_pr_diff_generic_no_match_low_entropy() -> None:
+    diff_text = _secret_diff("hello_world_simple_value", "token")
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_generic_no_match_short_value() -> None:
+    diff_text = _secret_diff("abc123XyZ9876", "api_key")
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_generic_no_match_no_suspicious_context() -> None:
+    diff_text = _secret_diff("abc123XyZ_HighEntropyValue9876ZQT5", "setting")
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_generic_excerpt_redacted() -> None:
+    secret_value = "abc123XyZ_HighEntropyValue9876ZQT5"
+    violations = scan_pr_diff(_secret_diff(secret_value, "auth_token"))
+
+    assert len(violations) == 1
+    assert violations[0].category == "generic_high_entropy"
+    assert secret_value not in violations[0].excerpt
+
+
+def test_shannon_entropy_known_values() -> None:
+    assert guardrails._shannon_entropy("") == 0.0
+    assert guardrails._shannon_entropy("aaaaaaaaaaaaaaaa") == 0.0
+    assert guardrails._shannon_entropy("abcdefghijklmnopqrstuvwxyz") == pytest.approx(
+        4.7,
+        abs=0.01,
+    )
+
+
 def test_workflow_permission_context_helpers_handle_non_yaml_lines() -> None:
     assert guardrails._diff_yaml_line("+++ b/.github/workflows/ci.yml") is None
     assert guardrails._yaml_key("not a mapping") is None

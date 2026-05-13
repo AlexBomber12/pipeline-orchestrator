@@ -399,6 +399,15 @@ SECRET_PATTERNS_B: list[tuple[str, re.Pattern[str]]] = [
     ),
 ]
 
+_SUSPICIOUS_CONTEXT_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])"
+    r"['\"]?"
+    r"(?:[A-Za-z0-9]+[_-])*"
+    r"([A-Za-z0-9]*(?:secret|token|api[_-]?key|password|passwd|auth[_-]?token))"
+    r"['\"]?"
+    r"\s*[:=]\s*['\"]?([A-Za-z0-9+/=_-]{20,})['\"]?",
+)
+
 LOCKFILE_PATTERNS = (
     r"package-lock\.json$",
     r"yarn\.lock$",
@@ -417,6 +426,18 @@ _LOCKFILE_RES = tuple(re.compile(pattern) for pattern in LOCKFILE_PATTERNS)
 
 def _clip_excerpt(text: str) -> str:
     return text[:_EXCERPT_LIMIT]
+
+
+def _shannon_entropy(s: str) -> float:
+    """Return Shannon entropy for ``s`` in bits per character."""
+    if not s:
+        return 0.0
+    import math
+    from collections import Counter
+
+    counts = Counter(s)
+    length = len(s)
+    return -sum((c / length) * math.log2(c / length) for c in counts.values())
 
 
 def _diff_git_paths(line: str) -> tuple[str, str] | None:
@@ -562,6 +583,34 @@ def _scan_secrets_group_b_in_additions(
     diff_text: str,
 ) -> list[tuple[str, int, str]]:
     return _scan_secret_patterns_in_additions(diff_text, SECRET_PATTERNS_B)
+
+
+def _scan_secrets_generic_in_additions(diff_text: str) -> list[tuple[str, int, str]]:
+    """Return generic high-entropy secret matches from added diff lines."""
+    matches: list[tuple[str, int, str]] = []
+    current_path: str | None = None
+    in_hunk = False
+
+    for line_number, line in enumerate(diff_text.splitlines(), start=1):
+        diff_paths = _diff_git_paths(line)
+        if diff_paths is not None:
+            current_path = diff_paths[1]
+            in_hunk = False
+            continue
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if (
+            current_path is None
+            or not line.startswith("+")
+            or (not in_hunk and _is_diff_file_header(line))
+        ):
+            continue
+        for match in _SUSPICIOUS_CONTEXT_RE.finditer(line):
+            value = match.group(2)
+            if len(value) >= 20 and _shannon_entropy(value) >= 4.5:
+                matches.append((current_path, line_number, "generic_high_entropy"))
+    return matches
 
 
 def _action_ref_is_pinned(ref: str) -> bool:
@@ -1490,6 +1539,20 @@ def scan_pr_diff(
                 category=category,
                 excerpt=f"{file_path}:{line_in_diff} (category: {category})",
                 rule="High-confidence provider token shape detected in added diff line",
+            )
+        )
+    for file_path, line_in_diff, category in _scan_secrets_generic_in_additions(
+        diff_text
+    ):
+        violations.append(
+            GuardrailViolation(
+                tier=2,
+                category=category,
+                excerpt=f"{file_path}:{line_in_diff} (category: {category})",
+                rule=(
+                    "Generic high-entropy secret-like value detected "
+                    "in suspicious assignment context"
+                ),
             )
         )
     return violations
