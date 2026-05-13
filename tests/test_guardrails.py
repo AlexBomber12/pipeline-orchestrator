@@ -478,6 +478,17 @@ def test_workflow_permission_context_helpers_track_active_yaml_stack() -> None:
     ) == [(0, "on"), (2, "workflow_call"), (4, "inputs")]
 
 
+def test_workflow_permission_context_helpers_use_hunk_header_yaml_context() -> None:
+    assert guardrails._visible_yaml_context(
+        [
+            "@@ -20,6 +20,7 @@ jobs:",
+            "   build:",
+            "     permissions:",
+        ],
+        3,
+    ) == [(0, "jobs"), (2, "build"), (4, "permissions")]
+
+
 def test_workflow_permission_context_rejects_indented_key_without_ancestor() -> None:
     match_text = "+  permissions: write-all\n"
 
@@ -828,6 +839,18 @@ def test_scan_pr_diff_workflow_job_level_contents_write_flagged() -> None:
         WORKFLOW_DIFF_HEADER
         + "@@ -1,7 +1,8 @@\n"
         " jobs:\n"
+        "   build:\n"
+        "     permissions:\n"
+        "+      contents: write\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_job_level_scope_with_jobs_hunk_header_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -20,6 +20,7 @@ jobs:\n"
         "   build:\n"
         "     permissions:\n"
         "+      contents: write\n"

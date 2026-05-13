@@ -287,6 +287,16 @@ def _diff_yaml_line(line: str) -> tuple[str, str] | None:
     return line[0], line[1:]
 
 
+def _diff_hunk_context_yaml_line(line: str) -> str | None:
+    if not line.startswith("@@"):
+        return None
+    _, _separator, context = line.rpartition("@@")
+    context = context.strip()
+    if not context:
+        return None
+    return context if _yaml_key(context) is not None else None
+
+
 def _yaml_key(line: str) -> tuple[int, str] | None:
     match = _YAML_KEY_RE.match(line)
     if match is None:
@@ -297,6 +307,18 @@ def _yaml_key(line: str) -> tuple[int, str] | None:
 def _visible_yaml_context(lines: list[str], line_index: int) -> list[tuple[int, str]]:
     context: list[tuple[int, str]] = []
     for previous_line in lines[:line_index]:
+        hunk_context_line = _diff_hunk_context_yaml_line(previous_line)
+        if hunk_context_line is not None:
+            key = _yaml_key(hunk_context_line)
+            if key is None:  # pragma: no cover - helper prefilters key-shaped lines
+                continue
+            context = [
+                (existing_indent, existing_name)
+                for existing_indent, existing_name in context
+                if existing_indent < key[0]
+            ]
+            context.append(key)
+            continue
         diff_line = _diff_yaml_line(previous_line)
         if diff_line is None:
             continue
