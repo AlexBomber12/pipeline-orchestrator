@@ -720,6 +720,16 @@ def test_scan_pr_diff_detects_anthropic_api_key() -> None:
     _assert_secret_violation_redacted(placeholder, "anthropic_api_key")
 
 
+def test_scan_pr_diff_detects_hyphenated_openai_api_keys() -> None:
+    placeholders = [
+        "sk-proj-" + ("A" * 24) + "-" + ("B" * 24),
+        "sk-svcacct-" + ("A" * 20) + "-" + ("B" * 20),
+    ]
+
+    for placeholder in placeholders:
+        _assert_secret_violation_redacted(placeholder, "openai_api_key")
+
+
 def test_scan_pr_diff_addition_only_no_context_lines() -> None:
     placeholder = "ghp_" + "A" * 36
     diff_text = (
@@ -745,6 +755,7 @@ def test_scan_pr_diff_excerpt_never_contains_secret_value() -> None:
         ("ghp_" + "A" * 36, "github_pat_classic"),
         ("AKIA" + "A" * 16, "aws_access_key"),
         ("sk-ant-" + "A" * 30, "anthropic_api_key"),
+        ("sk-proj-" + ("A" * 24) + "-" + ("B" * 24), "openai_api_key"),
     ]
 
     for secret_value, category in positive_cases:

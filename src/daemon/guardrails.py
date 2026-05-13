@@ -370,7 +370,7 @@ SECRET_PATTERNS_A: list[tuple[str, re.Pattern[str]]] = [
         re.compile(r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA)[A-Z0-9]{16}\b"),
     ),
     ("anthropic_api_key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{30,}\b")),
-    ("openai_api_key", re.compile(r"\bsk-[A-Za-z0-9]{48,}\b")),
+    ("openai_api_key", re.compile(r"\bsk-(?!ant-)[A-Za-z0-9_-]{48,}\b")),
 ]
 
 LOCKFILE_PATTERNS = (
