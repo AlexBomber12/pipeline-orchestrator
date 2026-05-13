@@ -952,6 +952,20 @@ def test_scan_pr_diff_workflow_permissions_unresolved_alias_not_flagged() -> Non
     assert scan_pr_diff(diff_text) == []
 
 
+def test_scan_pr_diff_workflow_non_escalating_alias_before_scope_write_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,6 +1,8 @@\n"
+        + " env:\n"
+        + "   READ_ONLY: &ro read\n"
+        + "+permissions: *ro\n"
+        + " permissions:\n"
+        + "+  contents: write\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
 def test_scan_pr_diff_workflow_permissions_block_scalar_write_all_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER

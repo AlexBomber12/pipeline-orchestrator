@@ -627,12 +627,14 @@ def _match_has_workflow_permission_context(match_text: str) -> bool:
             _is_workflow_permission_key_context(lines, index, yaml_line)
         ):
             if _yaml_alias_value(yaml_line) is not None:
-                return _yaml_alias_resolves_to_escalation(
+                if _yaml_alias_resolves_to_escalation(
                     lines,
                     index,
                     yaml_line,
                     top_level_permissions=True,
-                )
+                ):
+                    return True
+                continue
             return True
         is_write_scope = bool(_YAML_WRITE_SCOPE_RE.match(yaml_line))
         if not is_write_scope and _YAML_PERMISSION_SCOPE_ALIAS_RE.match(yaml_line):
