@@ -776,10 +776,64 @@ def _diff_file_section_at(diff_text: str, position: int) -> str:
     return diff_text[start:end]
 
 
+def _diff_file_section_start_at(diff_text: str, position: int) -> int:
+    start = diff_text.rfind("\ndiff --git ", 0, position)
+    return 0 if start == -1 else start + 1
+
+
 def _diff_section_is_workflow_file(section_text: str) -> bool:
     first_line = section_text.splitlines()[0] if section_text else ""
     return bool(re.match(r"^diff --git[^\r\n]*[ \t]+", first_line)) and bool(
         re.search(_DIFF_WORKFLOW_B_PATH_RE, first_line)
+    )
+
+
+def _yaml_line_is_in_block_scalar(lines: list[str], line_index: int) -> bool:
+    diff_line = _diff_yaml_line(lines[line_index])
+    if diff_line is None:
+        return False
+    _prefix, yaml_line = diff_line
+    line_indent = _yaml_indent(yaml_line)
+    for previous_line in reversed(lines[:line_index]):
+        previous_diff_line = _diff_yaml_line(previous_line)
+        if previous_diff_line is None:
+            continue
+        previous_prefix, previous_yaml_line = previous_diff_line
+        if previous_prefix == "-":
+            continue
+        stripped = previous_yaml_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        previous_indent = _yaml_indent(previous_yaml_line)
+        if previous_indent >= line_indent:
+            continue
+        return bool(
+            re.search(
+                r":[ \t]*"
+                + _YAML_SCALAR_ANCHOR_RE
+                + _YAML_BLOCK_SCALAR_HEADER_RE
+                + r"(?:[ \t]*(?:#.*)?)?$",
+                previous_yaml_line,
+                re.IGNORECASE,
+            )
+        )
+    return False
+
+
+def _action_uses_match_is_yaml_key(section_text: str, relative_start: int) -> bool:
+    lines = section_text.splitlines()
+    line_index = section_text.count("\n", 0, relative_start)
+    if line_index >= len(lines):
+        return False
+    diff_line = _diff_yaml_line(lines[line_index])
+    if diff_line is None:
+        return False
+    _prefix, yaml_line = diff_line
+    stripped = yaml_line.lstrip(" \t")
+    if stripped.startswith("-"):
+        stripped = stripped[1:].lstrip(" \t")
+    return stripped.lower().startswith("uses:") and not _yaml_line_is_in_block_scalar(
+        lines, line_index
     )
 
 
@@ -1128,10 +1182,14 @@ def scan_pr_diff(diff_text: str) -> list[GuardrailViolation]:
     for category in sorted(_DIFF_PATTERNS):
         pattern = _DIFF_PATTERNS[category]
         for match in pattern.finditer(diff_text):
+            section_start = _diff_file_section_start_at(diff_text, match.start())
             section_text = _diff_file_section_at(diff_text, match.start())
             if category == "dangerous_action_external_install" and (
                 _action_ref_is_pinned(match.group("ref"))
                 or not _diff_section_is_workflow_file(section_text)
+                or not _action_uses_match_is_yaml_key(
+                    section_text, match.start() - section_start
+                )
             ):
                 continue
             if category == "permissions_escalation" and not (

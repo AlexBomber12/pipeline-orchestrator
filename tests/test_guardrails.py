@@ -1992,6 +1992,16 @@ def test_scan_pr_diff_action_branch_name_ref_flagged() -> None:
     _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
 
 
+def test_scan_pr_diff_action_key_after_step_name_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "+      - name: Checkout\n"
+        "+        uses: actions/checkout@main\n"
+    )
+
+    _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
+
+
 def test_scan_pr_diff_action_double_quoted_main_ref_flagged() -> None:
     diff_text = WORKFLOW_DIFF_HEADER + '+      - uses: "actions/checkout@main"\n'
 
@@ -2041,6 +2051,42 @@ def test_scan_pr_diff_action_in_deletion_line_not_flagged() -> None:
     diff_text = WORKFLOW_DIFF_HEADER + "-  - uses: actions/checkout@main\n"
 
     assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_action_in_run_block_scalar_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,3 +1,5 @@\n"
+        "       - run: |\n"
+        "+          cat <<'YAML'\n"
+        "+          uses: actions/checkout@main\n"
+        "+          YAML\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_action_block_scalar_helper_ignores_non_yaml_lines() -> None:
+    assert not guardrails._yaml_line_is_in_block_scalar(["diff --git a b"], 0)
+
+
+def test_scan_pr_diff_action_block_scalar_helper_skips_deleted_and_comment_context() -> None:
+    lines = [
+        "-      - run: |",
+        "       # comment",
+        "       ",
+        "       uses: actions/checkout@main",
+    ]
+
+    assert not guardrails._yaml_line_is_in_block_scalar(lines, 3)
+
+
+def test_scan_pr_diff_action_uses_helper_handles_out_of_range_match() -> None:
+    assert not guardrails._action_uses_match_is_yaml_key(WORKFLOW_DIFF_HEADER, 999)
+
+
+def test_scan_pr_diff_action_uses_helper_ignores_diff_header_match() -> None:
+    assert not guardrails._action_uses_match_is_yaml_key(WORKFLOW_DIFF_HEADER, 0)
 
 
 def test_scan_pr_diff_action_example_in_docs_not_flagged() -> None:
