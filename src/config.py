@@ -178,6 +178,8 @@ class DaemonConfig(BaseModel):
     operator_timezone: str = "Europe/Rome"
     guardrail_notification_webhook_url: str | None = Field(default=None)
     guardrail_notification_timeout_seconds: float = Field(default=5.0, ge=1.0, le=30.0)
+    large_diff_addition_threshold: int = Field(default=1500, ge=100)
+    large_diff_files_threshold: int = Field(default=30, ge=2)
     main_commit_audit_interval_idle_cycles: int = Field(default=20, ge=1)
     main_commit_audit_lookback_n: int = Field(default=10, ge=1, le=50)
 

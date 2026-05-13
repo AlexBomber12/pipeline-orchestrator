@@ -14,6 +14,8 @@ import re
 import shlex
 from dataclasses import dataclass
 
+from src.config import DaemonConfig, load_config
+
 
 @dataclass(frozen=True)
 class GuardrailViolation:
@@ -358,9 +360,94 @@ _DIFF_RULES: dict[str, str] = {
     "workflow_destruction": "Workflow YAML file deletion under .github/workflows/",
 }
 
+LOCKFILE_PATTERNS = (
+    r"package-lock\.json$",
+    r"yarn\.lock$",
+    r"pnpm-lock\.yaml$",
+    r"Cargo\.lock$",
+    r"poetry\.lock$",
+    r"Pipfile\.lock$",
+    r"composer\.lock$",
+    r"Gemfile\.lock$",
+    r"go\.sum$",
+    r"requirements\.txt$",
+    r"requirements-.+\.txt$",
+)
+_LOCKFILE_RES = tuple(re.compile(pattern) for pattern in LOCKFILE_PATTERNS)
+
 
 def _clip_excerpt(text: str) -> str:
     return text[:_EXCERPT_LIMIT]
+
+
+def _load_guardrail_config() -> DaemonConfig:
+    return load_config().daemon
+
+
+def _diff_git_paths(line: str) -> tuple[str, str] | None:
+    if not line.startswith("diff --git "):
+        return None
+    try:
+        parts = shlex.split(line[len("diff --git ") :])
+    except ValueError:
+        return None
+    if len(parts) < 2:
+        return None
+    return _strip_diff_prefix(parts[0], "a/"), _strip_diff_prefix(parts[1], "b/")
+
+
+def _strip_diff_prefix(path: str, prefix: str) -> str:
+    return path[len(prefix) :] if path.startswith(prefix) else path
+
+
+def _count_diff_size(diff_text: str) -> tuple[int, int, int, int]:
+    additions = 0
+    deletions = 0
+    files_changed = 0
+    files_with_additions: set[str] = set()
+    current_path: str | None = None
+
+    for line in diff_text.splitlines():
+        paths = _diff_git_paths(line)
+        if paths is not None:
+            files_changed += 1
+            current_path = paths[1]
+            continue
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            additions += 1
+            if current_path is not None:
+                files_with_additions.add(current_path)
+        elif line.startswith("-"):
+            deletions += 1
+
+    return additions, deletions, files_changed, len(files_with_additions)
+
+
+def _classify_files_lockfile_exempt(diff_text: str) -> set[str]:
+    lockfile_paths: set[str] = set()
+    for line in diff_text.splitlines():
+        paths = _diff_git_paths(line)
+        if paths is None:
+            continue
+        path = paths[1]
+        if any(pattern.search(path) for pattern in _LOCKFILE_RES):
+            lockfile_paths.add(path)
+    return lockfile_paths
+
+
+def _count_additions_in_paths(diff_text: str, paths: set[str]) -> int:
+    additions = 0
+    current_path: str | None = None
+    for line in diff_text.splitlines():
+        diff_paths = _diff_git_paths(line)
+        if diff_paths is not None:
+            current_path = diff_paths[1]
+            continue
+        if line.startswith("+") and not line.startswith("+++") and current_path in paths:
+            additions += 1
+    return additions
 
 
 def _action_ref_is_pinned(ref: str) -> bool:
@@ -1239,4 +1326,31 @@ def scan_pr_diff(diff_text: str) -> list[GuardrailViolation]:
                     rule=_DIFF_RULES.get(category, ""),
                 )
             )
+    config = _load_guardrail_config()
+    adds, _dels, _files, files_with_adds = _count_diff_size(diff_text)
+    lockfile_paths = _classify_files_lockfile_exempt(diff_text)
+    lockfile_additions = _count_additions_in_paths(diff_text, lockfile_paths)
+    effective_additions = adds - lockfile_additions
+
+    if (
+        effective_additions >= config.large_diff_addition_threshold
+        or files_with_adds >= config.large_diff_files_threshold
+    ):
+        excerpt = (
+            f"+{effective_additions} LOC across {files_with_adds} files "
+            f"({len(lockfile_paths)} lockfile excluded). "
+            f"Threshold: +{config.large_diff_addition_threshold} LOC or "
+            f"{config.large_diff_files_threshold} files."
+        )
+        violations.append(
+            GuardrailViolation(
+                tier=2,
+                category="large_diff_threshold",
+                excerpt=_clip_excerpt(excerpt),
+                rule=(
+                    "AGENTS.md prohibits scope expansion beyond task spec. "
+                    "Large diffs require operator review."
+                ),
+            )
+        )
     return violations
