@@ -160,6 +160,14 @@ _YAML_PERMISSION_SCOPE_ALIAS_RE = re.compile(
     + r"[ \t]*:[ \t]*\*[A-Za-z_][A-Za-z0-9_-]*[ \t]*(?:#.*)?$",
     re.IGNORECASE,
 )
+_YAML_VALUE_ALIAS_RE = re.compile(
+    r":[ \t]*\*(?P<name>[A-Za-z_][A-Za-z0-9_-]*)[ \t]*(?:#.*)?$",
+    re.IGNORECASE,
+)
+_YAML_ANCHOR_VALUE_RE = re.compile(
+    r"&(?P<name>[A-Za-z_][A-Za-z0-9_-]*)[ \t]+(?P<value>[^\r\n#]+)",
+    re.IGNORECASE,
+)
 _YAML_JOBS_FLOW_PERMISSION_RE = re.compile(
     r"^[ \t]*[\"']?jobs[\"']?[ \t]*:[ \t]*"
     + _YAML_SCALAR_ANCHOR_RE
@@ -173,7 +181,6 @@ _YAML_JOBS_FLOW_PERMISSION_RE = re.compile(
     + r"[ \t]*:[ \t]*"
     + _YAML_SCALAR_ANCHOR_RE
     + r"[\"']?write[\"']?[^\r\n}]*\}"
-    r"|\*[A-Za-z_][A-Za-z0-9_-]*"
     r")",
     re.IGNORECASE,
 )
@@ -325,6 +332,63 @@ def _yaml_key(line: str) -> tuple[int, str] | None:
     return len(match.group("indent").expandtabs(2)), match.group("key").strip()
 
 
+def _normalized_yaml_scalar(value: str) -> str:
+    return value.strip().rstrip(",").strip("\"'").lower()
+
+
+def _yaml_flow_permission_map_escalates(value: str) -> bool:
+    return bool(
+        re.search(
+            _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+            + r"[ \t]*:[ \t]*"
+            + _YAML_SCALAR_ANCHOR_RE
+            + r"[\"']?write[\"']?",
+            value,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _yaml_anchor_values_before(
+    lines: list[str], line_index: int
+) -> dict[str, str]:
+    anchors: dict[str, str] = {}
+    for previous_line in lines[:line_index]:
+        diff_line = _diff_yaml_line(previous_line)
+        if diff_line is None:
+            continue
+        prefix, yaml_line = diff_line
+        if prefix == "-":
+            continue
+        match = _YAML_ANCHOR_VALUE_RE.search(yaml_line)
+        if match is None:
+            continue
+        anchors[match.group("name")] = match.group("value").strip()
+    return anchors
+
+
+def _yaml_alias_value(line: str) -> str | None:
+    match = _YAML_VALUE_ALIAS_RE.search(line)
+    return None if match is None else match.group("name")
+
+
+def _yaml_alias_resolves_to_escalation(
+    lines: list[str], line_index: int, yaml_line: str, *, top_level_permissions: bool
+) -> bool:
+    alias_name = _yaml_alias_value(yaml_line)
+    if alias_name is None:
+        return False
+    alias_value = _yaml_anchor_values_before(lines, line_index).get(alias_name)
+    if alias_value is None:
+        return False
+    normalized_value = _normalized_yaml_scalar(alias_value)
+    if top_level_permissions:
+        return normalized_value == "write-all" or _yaml_flow_permission_map_escalates(
+            alias_value
+        )
+    return normalized_value == "write"
+
+
 def _visible_yaml_context(lines: list[str], line_index: int) -> list[tuple[int, str]]:
     context: list[tuple[int, str]] = []
     for previous_line in lines[:line_index]:
@@ -455,11 +519,22 @@ def _match_has_workflow_permission_context(match_text: str) -> bool:
         if _YAML_PERMISSION_KEY_RE.match(yaml_line) and (
             _is_workflow_permission_key_context(lines, index, yaml_line)
         ):
+            if _yaml_alias_value(yaml_line) is not None:
+                return _yaml_alias_resolves_to_escalation(
+                    lines,
+                    index,
+                    yaml_line,
+                    top_level_permissions=True,
+                )
             return True
-        is_write_scope = bool(
-            _YAML_WRITE_SCOPE_RE.match(yaml_line)
-            or _YAML_PERMISSION_SCOPE_ALIAS_RE.match(yaml_line)
-        )
+        is_write_scope = bool(_YAML_WRITE_SCOPE_RE.match(yaml_line))
+        if not is_write_scope and _YAML_PERMISSION_SCOPE_ALIAS_RE.match(yaml_line):
+            is_write_scope = _yaml_alias_resolves_to_escalation(
+                lines,
+                index,
+                yaml_line,
+                top_level_permissions=False,
+            )
         if not is_write_scope and _YAML_WRITE_SCOPE_BLOCK_RE.match(yaml_line):
             for block_index in range(index + 1, len(lines)):
                 block_diff_line = _diff_yaml_line(lines[block_index])

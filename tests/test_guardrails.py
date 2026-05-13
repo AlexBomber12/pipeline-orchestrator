@@ -463,6 +463,31 @@ def test_workflow_permission_context_helpers_handle_non_yaml_lines() -> None:
     assert not guardrails._is_workflow_permission_key_context([], 0, "not a mapping")
     assert not guardrails._is_workflow_permission_key_context([], 0, "contents: write")
     assert not guardrails._is_workflow_jobs_flow_permission_escalation("not a mapping")
+    assert not guardrails._is_workflow_jobs_flow_permission_escalation(
+        "jobs: { build: { permissions: *read_only } }"
+    )
+
+
+def test_workflow_permission_alias_helpers_resolve_only_visible_values() -> None:
+    lines = [
+        " env:",
+        "-  OLD: &old_write write",
+        "   READ_ONLY: &read_only read",
+        "   FULL: &full { contents: write }",
+        "+permissions: *full",
+    ]
+
+    assert guardrails._yaml_flow_permission_map_escalates("{ contents: write }")
+    assert guardrails._yaml_anchor_values_before(lines, 4) == {
+        "read_only": "read",
+        "full": "{ contents: write }",
+    }
+    assert not guardrails._yaml_alias_resolves_to_escalation(
+        lines, 4, "contents: write", top_level_permissions=False
+    )
+    assert guardrails._yaml_alias_resolves_to_escalation(
+        lines, 4, "permissions: *full", top_level_permissions=True
+    )
 
 
 def test_workflow_permission_context_helpers_track_active_yaml_stack() -> None:
@@ -674,6 +699,16 @@ def test_scan_pr_diff_workflow_inline_jobs_permission_scope_write_flagged() -> N
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_inline_jobs_permission_alias_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,2 +1,3 @@\n"
+        + "+jobs: { build: { permissions: *full_write } }\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
 def test_scan_pr_diff_workflow_permissions_rename_into_workflows_flagged() -> None:
     diff_text = (
         "diff --git a/scripts/build.yml b/.github/workflows/build.yml\n"
@@ -782,11 +817,23 @@ def test_scan_pr_diff_workflow_multiline_flow_permissions_trailing_comma_flagged
 def test_scan_pr_diff_workflow_permissions_alias_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER
-        + "@@ -1,2 +1,3 @@\n"
+        + "@@ -1,3 +1,4 @@\n"
+        + " env:\n"
+        + "   FULL_WRITE: &full_write write-all\n"
         "+permissions: *full_write\n"
     )
 
     _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_permissions_unresolved_alias_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,2 +1,3 @@\n"
+        "+permissions: *full_write\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
 
 
 def test_scan_pr_diff_workflow_permissions_block_scalar_write_all_flagged() -> None:
@@ -860,6 +907,30 @@ def test_scan_pr_diff_workflow_scope_alias_write_flagged() -> None:
     )
 
     _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_scope_alias_read_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,4 +1,5 @@\n"
+        + " env:\n"
+        + "   READ_ONLY: &read_only read\n"
+        + " permissions:\n"
+        + "+  contents: *read_only\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_workflow_scope_unresolved_alias_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,3 +1,4 @@\n"
+        + " permissions:\n"
+        + "+  contents: *full_write\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
 
 
 def test_scan_pr_diff_workflow_permission_read_replaced_with_write_flagged() -> None:
