@@ -2037,6 +2037,18 @@ def test_scan_pr_diff_composite_action_unpinned_uses_flagged() -> None:
     _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
 
 
+def test_scan_pr_diff_action_flow_mapping_main_ref_flagged() -> None:
+    diff_text = WORKFLOW_DIFF_HEADER + "+      - { uses: actions/checkout@main }\n"
+
+    _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
+
+
+def test_scan_pr_diff_action_flow_mapping_semver_ref_not_flagged() -> None:
+    diff_text = WORKFLOW_DIFF_HEADER + "+      - { uses: actions/checkout@v1 }\n"
+
+    assert scan_pr_diff(diff_text) == []
+
+
 def test_scan_pr_diff_action_semver_tag_v1_not_flagged() -> None:
     diff_text = WORKFLOW_DIFF_HEADER + "+      - uses: actions/checkout@v1\n"
 

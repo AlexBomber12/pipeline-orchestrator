@@ -224,9 +224,12 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
     "dangerous_action_external_install": re.compile(
         # Match added action references; pinned refs are filtered in
         # scan_pr_diff because this regex captures all candidate refs.
-        r"(?m)^\+[ \t]*-?[ \t]*[\"']?uses[\"']?[ \t]*:[ \t]+(?P<quote>[\"']?)"
-        r"(?P<repo>[\w.-]+/[\w./-]+)"
-        r"@(?P<ref>[^\"'\s\r\n]+)(?P=quote)",
+        r"(?m)^\+[ \t]*-?[ \t]*(?:"
+        r"[\"']?uses[\"']?[ \t]*:[ \t]+(?P<quote>[\"']?)"
+        r"(?P<repo>[\w.-]+/[\w./-]+)@(?P<ref>[^\"'\s\r\n},]+)(?P=quote)"
+        r"|\{[^\r\n}]*[\"']?uses[\"']?[ \t]*:[ \t]*(?P<flow_quote>[\"']?)"
+        r"(?P<flow_repo>[\w.-]+/[\w./-]+)@(?P<flow_ref>[^\"'\s\r\n},]+)"
+        r"(?P=flow_quote))",
         re.IGNORECASE,
     ),
     "permissions_escalation": re.compile(
@@ -359,6 +362,10 @@ def _clip_excerpt(text: str) -> str:
 def _action_ref_is_pinned(ref: str) -> bool:
     """Return True if ``ref`` is a semver tag or 40-char commit SHA."""
     return bool(_PINNED_ACTION_REF_RE.match(ref))
+
+
+def _action_uses_match_ref(match: re.Match[str]) -> str:
+    return match.group("ref") or match.group("flow_ref")
 
 
 def _line_excerpt(coder_stdout: str, start: int, end: int) -> str:
@@ -844,8 +851,16 @@ def _action_uses_match_is_yaml_key(section_text: str, relative_start: int) -> bo
         stripped = stripped[1:].lstrip(" \t")
     key = _yaml_key(stripped)
     return (
-        key is not None
-        and key[1].strip("\"'").lower() == "uses"
+        (
+            key is not None
+            and key[1].strip("\"'").lower() == "uses"
+            or re.search(
+                r"\{[^\r\n}]*[\"']?uses[\"']?[ \t]*:",
+                stripped,
+                re.IGNORECASE,
+            )
+            is not None
+        )
         and not _yaml_line_is_in_block_scalar(lines, line_index)
     )
 
@@ -1198,7 +1213,7 @@ def scan_pr_diff(diff_text: str) -> list[GuardrailViolation]:
             section_start = _diff_file_section_start_at(diff_text, match.start())
             section_text = _diff_file_section_at(diff_text, match.start())
             if category == "dangerous_action_external_install" and (
-                _action_ref_is_pinned(match.group("ref"))
+                _action_ref_is_pinned(_action_uses_match_ref(match))
                 or not _diff_section_is_action_reference_file(section_text)
                 or not _action_uses_match_is_yaml_key(
                     section_text, match.start() - section_start
