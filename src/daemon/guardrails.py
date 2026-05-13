@@ -374,8 +374,8 @@ SECRET_PATTERNS_A: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 SECRET_PATTERNS_B: list[tuple[str, re.Pattern[str]]] = [
-    ("slack_token_user", re.compile(r"\bxoxp-[0-9]+-[0-9]+-[0-9]+-[a-f0-9]{32}\b")),
-    ("slack_token_bot", re.compile(r"\bxoxb-[0-9]+-[0-9]+-[A-Za-z0-9]{24}\b")),
+    ("slack_token_user", re.compile(r"\bxoxp-(?:[0-9]+-){2,}[A-Za-z0-9-]{24,}\b")),
+    ("slack_token_bot", re.compile(r"\bxoxb-(?:[0-9]+-){2,}[A-Za-z0-9-]{24,}\b")),
     (
         "slack_webhook",
         re.compile(

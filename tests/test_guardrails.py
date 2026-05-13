@@ -762,14 +762,46 @@ def test_scan_pr_diff_excerpt_never_contains_secret_value() -> None:
         _assert_secret_violation_redacted(secret_value, category)
 
 
+def _slack_token(kind: str, segments: list[str], suffix: str) -> str:
+    return "xo" + kind + "-" + "-".join(segments) + "-" + suffix
+
+
 def test_scan_pr_diff_detects_slack_user_token() -> None:
-    placeholder = "xoxp-1234567890-2345678901-3456789012-" + ("a" * 32)
+    placeholder = _slack_token(
+        "xp",
+        ["1234567890", "2345678901", "3456789012"],
+        "a" * 32,
+    )
+
+    _assert_secret_violation_redacted(placeholder, "slack_token_user")
+
+
+def test_scan_pr_diff_detects_modern_slack_user_token() -> None:
+    placeholder = _slack_token(
+        "xp",
+        ["11111111111", "22222222222", "33333333333", "44444444444"],
+        "Ab" * 20,
+    )
 
     _assert_secret_violation_redacted(placeholder, "slack_token_user")
 
 
 def test_scan_pr_diff_detects_slack_bot_token() -> None:
-    placeholder = "xoxb-1234567890-2345678901-" + ("A" * 24)
+    placeholder = _slack_token(
+        "xb",
+        ["1234567890", "2345678901"],
+        "A" * 24,
+    )
+
+    _assert_secret_violation_redacted(placeholder, "slack_token_bot")
+
+
+def test_scan_pr_diff_detects_modern_slack_bot_token() -> None:
+    placeholder = _slack_token(
+        "xb",
+        ["11111111111", "22222222222", "33333333333"],
+        "abcdef0123456789abcdef0123456789",
+    )
 
     _assert_secret_violation_redacted(placeholder, "slack_token_bot")
 
@@ -802,8 +834,38 @@ def test_scan_pr_diff_detects_jwt_like() -> None:
 
 def test_scan_pr_diff_group_b_excerpt_never_contains_secret_value() -> None:
     positive_cases = [
-        ("xoxp-1234567890-2345678901-3456789012-" + ("a" * 32), "slack_token_user"),
-        ("xoxb-1234567890-2345678901-" + ("A" * 24), "slack_token_bot"),
+        (
+            _slack_token(
+                "xp",
+                ["1234567890", "2345678901", "3456789012"],
+                "a" * 32,
+            ),
+            "slack_token_user",
+        ),
+        (
+            _slack_token(
+                "xp",
+                ["11111111111", "22222222222", "33333333333", "44444444444"],
+                "Ab" * 20,
+            ),
+            "slack_token_user",
+        ),
+        (
+            _slack_token(
+                "xb",
+                ["1234567890", "2345678901"],
+                "A" * 24,
+            ),
+            "slack_token_bot",
+        ),
+        (
+            _slack_token(
+                "xb",
+                ["11111111111", "22222222222", "33333333333"],
+                "abcdef0123456789abcdef0123456789",
+            ),
+            "slack_token_bot",
+        ),
         (
             "https://hooks.slack.com/services/T0123456789/B0123456789/"
             + ("A" * 24),
