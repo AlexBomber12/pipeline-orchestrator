@@ -928,6 +928,7 @@ def _governance_violations(diff_text: str) -> list[GuardrailViolation]:
         (".github/PULL_REQUEST_TEMPLATE/foo.md", "issue_pr_template"),
         (".github/pull_request_template.md", "issue_pr_template"),
         ("PULL_REQUEST_TEMPLATE.md", "issue_pr_template"),
+        ("PULL_REQUEST_TEMPLATE/bugfix.md", "issue_pr_template"),
         ("docs/PULL_REQUEST_TEMPLATE.md", "issue_pr_template"),
         (".github/ISSUE_TEMPLATE/bug.md", "issue_pr_template"),
         (".github/issue_template.md", "issue_pr_template"),

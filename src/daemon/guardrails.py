@@ -419,6 +419,7 @@ GOVERNANCE_FILE_PATTERNS: dict[str, re.Pattern[str]] = {
     "issue_pr_template": re.compile(
         r"^(?:"
         r"(?:\.github|docs)/PULL_REQUEST_TEMPLATE(?:/[^/].*|\.md)"
+        r"|PULL_REQUEST_TEMPLATE/[^/].*"
         r"|PULL_REQUEST_TEMPLATE\.md"
         r"|\.github/ISSUE_TEMPLATE(?:/[^/].*|\.md)"
         r")$",
