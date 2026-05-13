@@ -1894,6 +1894,28 @@ def test_scan_pr_diff_branch_protection_deletion_flagged() -> None:
     _assert_diff_categories(diff_text, ["branch_protection_modification"])
 
 
+def test_scan_pr_diff_branch_protection_rename_only_from_flagged() -> None:
+    diff_text = (
+        "diff --git a/.github/branch-protection.yml b/docs/branch-protection.yml\n"
+        "similarity index 100%\n"
+        "rename from .github/branch-protection.yml\n"
+        "rename to docs/branch-protection.yml\n"
+    )
+
+    _assert_diff_categories(diff_text, ["branch_protection_modification"])
+
+
+def test_scan_pr_diff_branch_protection_rename_only_to_flagged() -> None:
+    diff_text = (
+        "diff --git a/docs/settings.yml b/.github/settings.yml\n"
+        "similarity index 100%\n"
+        "rename from docs/settings.yml\n"
+        "rename to .github/settings.yml\n"
+    )
+
+    _assert_diff_categories(diff_text, ["branch_protection_modification"])
+
+
 def test_scan_pr_diff_unrelated_file_not_flagged() -> None:
     diff_text = (
         "diff --git a/src/foo.py b/src/foo.py\n"
@@ -1955,6 +1977,18 @@ def test_scan_pr_diff_action_head_ref_flagged() -> None:
 
 def test_scan_pr_diff_action_branch_name_ref_flagged() -> None:
     diff_text = WORKFLOW_DIFF_HEADER + "+      - uses: actions/checkout@develop\n"
+
+    _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
+
+
+def test_scan_pr_diff_action_double_quoted_main_ref_flagged() -> None:
+    diff_text = WORKFLOW_DIFF_HEADER + '+      - uses: "actions/checkout@main"\n'
+
+    _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
+
+
+def test_scan_pr_diff_action_single_quoted_main_ref_flagged() -> None:
+    diff_text = WORKFLOW_DIFF_HEADER + "+      - uses: 'actions/checkout@main'\n"
 
     _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
 

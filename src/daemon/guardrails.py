@@ -110,6 +110,10 @@ _DIFF_WORKFLOW_A_PATH_RE = (
 _DIFF_WORKFLOW_RENAME_PATH_RE = (
     r'"?\.github/workflows/[^"/\r\n]+\.ya?ml' + _WORKFLOW_PATH_END_RE
 )
+_DIFF_BRANCH_PROTECTION_PATH_RE = (
+    r'"?\.github/(?:branch[-_]protection[^"/\r\n]*\.ya?ml|settings\.ya?ml)'
+    + _WORKFLOW_PATH_END_RE
+)
 _WORKFLOW_WRITE_PERMISSION_SCOPES_RE = (
     r"[\"']?(?:actions|attestations|artifact-metadata|checks|code-quality|"
     r"contents|deployments|discussions|id-token|issues|packages|pages|"
@@ -200,21 +204,26 @@ _PINNED_ACTION_REF_RE = re.compile(
 _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
     "branch_protection_modification": re.compile(
         # Detect branch-protection metadata modification or deletion by
-        # matching unified diff file headers for the governed files.
-        r"(?m)^---[ \t]+a/\.github/(?:"
+        # matching unified diff file headers or rename metadata for the
+        # governed files.
+        r"(?ms)(?:^---[ \t]+a/\.github/(?:"
         r"branch[-_]protection[^ \r\n]*\.ya?ml"
         r"|settings\.ya?ml"
         r")[ \t]*\r?\n"
         r"\+\+\+[ \t]+(?:b/\.github/(?:branch[-_]protection[^ \r\n]*\.ya?ml"
-        r"|settings\.ya?ml)|/dev/null)",
+        r"|settings\.ya?ml)|/dev/null)"
+        r"|^diff --git[^\r\n]*\r?\n"
+        r"(?:(?!^diff --git[ \t]).)*?^rename (?:from|to)[ \t]+"
+        + _DIFF_BRANCH_PROTECTION_PATH_RE
+        + r"[ \t]*$)",
         re.IGNORECASE,
     ),
     "dangerous_action_external_install": re.compile(
         # Match added action references; pinned refs are filtered in
         # scan_pr_diff because this regex captures all candidate refs.
-        r"(?m)^\+[ \t]*-?[ \t]*uses:[ \t]+"
+        r"(?m)^\+[ \t]*-?[ \t]*uses:[ \t]+(?P<quote>[\"']?)"
         r"(?P<repo>[\w.-]+/[\w./-]+)"
-        r"@(?P<ref>[^\s\r\n]+)",
+        r"@(?P<ref>[^\"'\s\r\n]+)(?P=quote)",
         re.IGNORECASE,
     ),
     "permissions_escalation": re.compile(
