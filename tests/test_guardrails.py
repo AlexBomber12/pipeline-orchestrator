@@ -485,6 +485,22 @@ def test_count_diff_size_excludes_file_headers() -> None:
     assert guardrails._count_diff_size(diff_text) == (0, 0, 1, 0)
 
 
+def test_count_diff_size_excludes_quoted_file_headers() -> None:
+    diff_text = (
+        'diff --git "a/src/path with space.py" "b/src/path with space.py"\n'
+        '--- "a/src/path with space.py"\n'
+        '+++ "b/src/path with space.py"\n'
+        "@@ -1,1 +1,1 @@\n"
+    )
+
+    assert guardrails._count_diff_size(diff_text) == (0, 0, 1, 0)
+
+
+def test_diff_file_header_rejects_invalid_or_empty_header_paths() -> None:
+    assert not guardrails._is_diff_file_header('+++ "unterminated')
+    assert not guardrails._is_diff_file_header("+++ ")
+
+
 def test_count_diff_size_counts_added_and_deleted_lines_with_header_prefixes() -> None:
     diff_text = (
         "diff --git a/src/a.py b/src/a.py\n"
@@ -541,6 +557,15 @@ def test_classify_lockfile_exempt_requirements_txt() -> None:
 
 def test_classify_lockfile_exempt_non_lockfile() -> None:
     diff_text = _diff_for_file("src/foo.py", additions=1)
+
+    assert guardrails._classify_files_lockfile_exempt(diff_text) == set()
+
+
+def test_classify_lockfile_exempt_rejects_suffix_only_matches() -> None:
+    diff_text = _diff_for_file("src/myrequirements.txt", additions=1) + _diff_for_file(
+        "docs/foo-package-lock.json",
+        additions=1,
+    )
 
     assert guardrails._classify_files_lockfile_exempt(diff_text) == set()
 

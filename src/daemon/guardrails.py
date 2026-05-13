@@ -393,10 +393,27 @@ def _diff_git_paths(line: str) -> tuple[str, str] | None:
 
 
 def _is_diff_file_header(line: str) -> bool:
-    return line.startswith(("--- a/", "+++ b/")) or line in {
-        "--- /dev/null",
-        "+++ /dev/null",
-    }
+    if line.startswith("--- "):
+        expected_prefix = "a/"
+        path_text = line[4:]
+    elif line.startswith("+++ "):
+        expected_prefix = "b/"
+        path_text = line[4:]
+    else:
+        return False
+    try:
+        parts = shlex.split(path_text)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    path = parts[0]
+    return path == "/dev/null" or path.startswith(expected_prefix)
+
+
+def _is_lockfile_path(path: str) -> bool:
+    filename = path.rsplit("/", 1)[-1]
+    return any(pattern.fullmatch(filename) for pattern in _LOCKFILE_RES)
 
 
 def _strip_diff_prefix(path: str, prefix: str) -> str:
@@ -435,7 +452,7 @@ def _classify_files_lockfile_exempt(diff_text: str) -> set[str]:
         if paths is None:
             continue
         path = paths[1]
-        if any(pattern.search(path) for pattern in _LOCKFILE_RES):
+        if _is_lockfile_path(path):
             lockfile_paths.add(path)
     return lockfile_paths
 
