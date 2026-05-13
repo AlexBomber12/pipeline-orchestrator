@@ -646,6 +646,14 @@ def test_workflow_read_to_write_helper_rejects_non_key_scope_line() -> None:
     )
 
 
+def test_contextless_scope_addition_helper_rejects_non_key_scope_line() -> None:
+    assert not guardrails._is_contextless_permission_scope_addition(
+        ["+  write"],
+        0,
+        "  write",
+    )
+
+
 def test_workflow_read_to_write_helper_skips_non_yaml_context_lines() -> None:
     assert guardrails._replaces_read_scope_with_write(
         ["@@ -1,3 +1,3 @@", "-  statuses: read", "+  statuses: write"],
@@ -1413,6 +1421,16 @@ def test_scan_pr_diff_workflow_scope_none_to_write_without_parent_context_flagge
     diff_text = (
         WORKFLOW_DIFF_HEADER
         + "@@ -20,3 +20,3 @@\n-  contents: none\n+  contents: write\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_scope_addition_without_parent_context_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -20,6 +20,7 @@\n"
+        + "+  contents: write\n"
     )
 
     _assert_diff_categories(diff_text, ["permissions_escalation"])

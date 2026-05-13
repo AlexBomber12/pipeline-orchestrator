@@ -249,6 +249,11 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         + r"[ \t]*:[ \t]*"
         + _YAML_SCALAR_ANCHOR_RE
         + r"[\"']?write[\"']?,?"
+        r"|(?:(?!^diff --git[ \t]).)*?^\+[ \t]+"
+        + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+        + r"[ \t]*:[ \t]*"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"[\"']?write[\"']?,?"
         r"|(?:(?!^diff --git[ \t]).)*?^\+[ \t]*"
         r"[\"']?jobs[\"']?[ \t]*:[ \t]*"
         + _YAML_SCALAR_ANCHOR_RE
@@ -720,6 +725,18 @@ def _replaces_read_scope_with_write(
     return found_read_replacement
 
 
+def _is_contextless_permission_scope_addition(
+    lines: list[str], line_index: int, scope_line: str
+) -> bool:
+    scope_key = _yaml_key(scope_line)
+    if scope_key is None:
+        return False
+    scope_indent, _scope_name = scope_key
+    if scope_indent not in {2, 6}:
+        return False
+    return not _visible_yaml_context(lines, line_index)
+
+
 def _match_has_workflow_permission_context(match_text: str) -> bool:
     lines = match_text.splitlines()
     for index, line in enumerate(lines):
@@ -775,8 +792,6 @@ def _match_has_workflow_permission_context(match_text: str) -> bool:
             parent_prefix, parent_yaml_line = parent_diff_line
             if parent_prefix == "-":
                 continue
-            if not _YAML_PERMISSION_KEY_RE.match(parent_yaml_line):
-                continue
             parent_key = _yaml_key(parent_yaml_line)
             scope_key = _yaml_key(yaml_line)
             # Regex prefilters require key-shaped YAML lines here.
@@ -784,12 +799,16 @@ def _match_has_workflow_permission_context(match_text: str) -> bool:
                 continue
             parent_indent = parent_key[0]
             scope_indent = scope_key[0]
-            if parent_indent < scope_indent and _is_workflow_permission_key_context(
-                lines, parent_index, parent_yaml_line
-            ):
-                return True
+            if parent_indent >= scope_indent:
+                continue
+            if _YAML_PERMISSION_KEY_RE.match(parent_yaml_line):
+                return _is_workflow_permission_key_context(
+                    lines, parent_index, parent_yaml_line
+                )
             break
         if _replaces_read_scope_with_write(lines, index, yaml_line):
+            return True
+        if _is_contextless_permission_scope_addition(lines, index, yaml_line):
             return True
     return False
 
