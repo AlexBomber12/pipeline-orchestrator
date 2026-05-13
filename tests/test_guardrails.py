@@ -674,6 +674,83 @@ def test_scan_pr_diff_tier_1_violations_still_flagged() -> None:
     )
 
 
+def _secret_diff(secret_value: str) -> str:
+    return (
+        "diff --git a/src/settings.py b/src/settings.py\n"
+        "--- a/src/settings.py\n"
+        "+++ b/src/settings.py\n"
+        "@@ -1,1 +1,2 @@\n"
+        f'+TOKEN = "{secret_value}"\n'
+    )
+
+
+def _assert_secret_violation_redacted(
+    secret_value: str,
+    category: str,
+) -> GuardrailViolation:
+    violations = scan_pr_diff(_secret_diff(secret_value))
+
+    assert len(violations) == 1
+    assert violations[0].tier == 2
+    assert violations[0].category == category
+    assert secret_value not in violations[0].excerpt
+    return violations[0]
+
+
+def test_scan_pr_diff_detects_github_pat_classic() -> None:
+    placeholder = "ghp_" + "A" * 36
+
+    violation = _assert_secret_violation_redacted(
+        placeholder,
+        "github_pat_classic",
+    )
+
+    assert violation.excerpt == "src/settings.py:5 (category: github_pat_classic)"
+
+
+def test_scan_pr_diff_detects_aws_access_key() -> None:
+    placeholder = "AKIA" + "A" * 16
+
+    _assert_secret_violation_redacted(placeholder, "aws_access_key")
+
+
+def test_scan_pr_diff_detects_anthropic_api_key() -> None:
+    placeholder = "sk-ant-" + "A" * 30
+
+    _assert_secret_violation_redacted(placeholder, "anthropic_api_key")
+
+
+def test_scan_pr_diff_addition_only_no_context_lines() -> None:
+    placeholder = "ghp_" + "A" * 36
+    diff_text = (
+        "diff --git a/src/settings.py b/src/settings.py\n"
+        "--- a/src/settings.py\n"
+        "+++ b/src/settings.py\n"
+        "@@ -1,2 +1,1 @@\n"
+        f' TOKEN = "{placeholder}"\n'
+        f'-OLD_TOKEN = "{placeholder}"\n'
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_clean_diff_no_violations() -> None:
+    diff_text = _secret_diff("not-a-token")
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_excerpt_never_contains_secret_value() -> None:
+    positive_cases = [
+        ("ghp_" + "A" * 36, "github_pat_classic"),
+        ("AKIA" + "A" * 16, "aws_access_key"),
+        ("sk-ant-" + "A" * 30, "anthropic_api_key"),
+    ]
+
+    for secret_value, category in positive_cases:
+        _assert_secret_violation_redacted(secret_value, category)
+
+
 def test_workflow_permission_context_helpers_handle_non_yaml_lines() -> None:
     assert guardrails._diff_yaml_line("+++ b/.github/workflows/ci.yml") is None
     assert guardrails._yaml_key("not a mapping") is None
