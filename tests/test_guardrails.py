@@ -561,6 +561,10 @@ def test_workflow_permission_alias_helpers_resolve_only_visible_values() -> None
         "write_value",
         top_level_permissions=False,
     )
+    assert guardrails._anchor_value_edit_escalates_in_section(
+        " permissions: *perm\n+env:\n+  PERM: &perm write-all\n",
+        "+  PERM: &perm write-all\n",
+    )
 
 
 def test_workflow_permission_context_helpers_track_active_yaml_stack() -> None:
@@ -1073,6 +1077,27 @@ def test_scan_pr_diff_workflow_permissions_anchor_value_edit_to_write_all_flagge
     )
 
     _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_anchor_value_edit_uses_file_section_context() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,5 +1,5 @@\n"
+        + " env:\n"
+        + "-  PERM: &perm read-all\n"
+        + "+  PERM: &perm write-all\n"
+        + "@@ -40,5 +40,5 @@\n"
+        + " permissions: *perm\n"
+        + " jobs:\n"
+        + "   build:\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+    second_section = "diff --git a/docs/readme.md b/docs/readme.md\n+doc\n"
+    combined_diff = diff_text + "\n" + second_section
+    assert guardrails._diff_file_section_at(
+        combined_diff, combined_diff.index("+doc")
+    ).startswith(second_section)
 
 
 def test_scan_pr_diff_workflow_permissions_block_scalar_write_all_flagged() -> None:

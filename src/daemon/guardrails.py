@@ -654,6 +654,34 @@ def _anchor_value_edit_escalates(lines: list[str], yaml_line: str) -> bool:
     return False
 
 
+def _anchor_value_edit_escalates_in_section(
+    section_text: str, match_text: str
+) -> bool:
+    section_lines = section_text.splitlines()
+    for line in match_text.splitlines():
+        diff_line = _diff_yaml_line(line)
+        if diff_line is None:
+            continue
+        prefix, yaml_line = diff_line
+        if prefix != "+":
+            continue
+        if _anchor_value_edit_escalates(section_lines, yaml_line):
+            return True
+    return False
+
+
+def _diff_file_section_at(diff_text: str, position: int) -> str:
+    start = diff_text.rfind("\ndiff --git ", 0, position)
+    if start == -1:
+        start = 0
+    else:
+        start += 1
+    end = diff_text.find("\ndiff --git ", position)
+    if end == -1:
+        end = len(diff_text)
+    return diff_text[start:end]
+
+
 def _replaces_read_scope_with_write(
     lines: list[str], line_index: int, scope_line: str
 ) -> bool:
@@ -983,6 +1011,9 @@ def scan_pr_diff(diff_text: str) -> list[GuardrailViolation]:
         for match in pattern.finditer(diff_text):
             if category == "permissions_escalation" and not (
                 _match_has_workflow_permission_context(match.group(0))
+                or _anchor_value_edit_escalates_in_section(
+                    _diff_file_section_at(diff_text, match.start()), match.group(0)
+                )
             ):
                 continue
             violations.append(
