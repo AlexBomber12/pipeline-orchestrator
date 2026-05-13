@@ -206,10 +206,10 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         # Detect branch-protection metadata modification or deletion by
         # matching unified diff file headers or rename metadata for the
         # governed files.
-        r"(?ms)(?:^---[ \t]+a/\.github/(?:"
+        r"(?ms)(?:^---[ \t]+(?:a/\.github/(?:"
         r"branch[-_]protection[^ \r\n]*\.ya?ml"
         r"|settings\.ya?ml"
-        r")[ \t]*\r?\n"
+        r")|/dev/null)[ \t]*\r?\n"
         r"\+\+\+[ \t]+(?:b/\.github/(?:branch[-_]protection[^ \r\n]*\.ya?ml"
         r"|settings\.ya?ml)|/dev/null)"
         r"|^diff --git[^\r\n]*\r?\n"

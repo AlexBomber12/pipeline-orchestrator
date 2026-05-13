@@ -1894,6 +1894,17 @@ def test_scan_pr_diff_branch_protection_deletion_flagged() -> None:
     _assert_diff_categories(diff_text, ["branch_protection_modification"])
 
 
+def test_scan_pr_diff_branch_protection_creation_flagged() -> None:
+    diff_text = (
+        "diff --git a/.github/settings.yml b/.github/settings.yml\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/.github/settings.yml\n"
+    )
+
+    _assert_diff_categories(diff_text, ["branch_protection_modification"])
+
+
 def test_scan_pr_diff_branch_protection_rename_only_from_flagged() -> None:
     diff_text = (
         "diff --git a/.github/branch-protection.yml b/docs/branch-protection.yml\n"
