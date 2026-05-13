@@ -118,6 +118,7 @@ _WORKFLOW_WRITE_PERMISSION_SCOPES_RE = (
 )
 _YAML_ANCHOR_NAME_RE = r"&[A-Za-z_][A-Za-z0-9_-]*"
 _YAML_SCALAR_ANCHOR_RE = r"(?:&[A-Za-z_][A-Za-z0-9_-]*[ \t]+)?"
+_YAML_BLOCK_SCALAR_HEADER_RE = r"[|>](?:[1-9][+-]?|[+-][1-9]?)?"
 _YAML_KEY_RE = re.compile(
     r"^(?P<indent>[ \t]*)(?P<quote>[\"']?)(?P<key>[^:\"'\r\n]+)"
     r"(?P=quote)[ \t]*:",
@@ -139,7 +140,8 @@ _YAML_WRITE_SCOPE_BLOCK_RE = re.compile(
     + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
     + r"[ \t]*:[ \t]*"
     + _YAML_SCALAR_ANCHOR_RE
-    + r"[|>][+-]?(?:[ \t]*(?:#.*)?)?$",
+    + _YAML_BLOCK_SCALAR_HEADER_RE
+    + r"(?:[ \t]*(?:#.*)?)?$",
     re.IGNORECASE,
 )
 _YAML_WRITE_BLOCK_VALUE_RE = re.compile(
@@ -226,7 +228,9 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
         + r"[ \t]*:[ \t]*"
         + _YAML_SCALAR_ANCHOR_RE
-        + r"(?:[\"']?write[\"']?,?|[|>][+-]?[ \t]*(?:#.*)?\r?\n"
+        + r"(?:[\"']?write[\"']?,?|"
+        + _YAML_BLOCK_SCALAR_HEADER_RE
+        + r"[ \t]*(?:#.*)?\r?\n"
         r"^\+[ \t]+[\"']?write[\"']?|\*[A-Za-z_][A-Za-z0-9_-]*)"
         r"|(?:(?!^diff --git[ \t]).)*?^\+[ \t]*"
         r"[\"']?permissions[\"']?[ \t]*:[ \t]*(?:"
@@ -234,7 +238,8 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         + r"[\"']?write-all[\"']?"
         r"|"
         + _YAML_SCALAR_ANCHOR_RE
-        + r"[|>][+-]?[ \t]*(?:#.*)?\r?\n^\+[ \t]+[\"']?write-all[\"']?"
+        + _YAML_BLOCK_SCALAR_HEADER_RE
+        + r"[ \t]*(?:#.*)?\r?\n^\+[ \t]+[\"']?write-all[\"']?"
         r"|&[A-Za-z_][A-Za-z0-9_-]*[ \t]*\{[^\r\n}]*"
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
         + r"[ \t]*:[ \t]*"

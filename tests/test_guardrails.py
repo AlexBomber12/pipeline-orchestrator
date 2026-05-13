@@ -915,6 +915,17 @@ def test_scan_pr_diff_workflow_permissions_block_scalar_write_all_flagged() -> N
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_permissions_block_scalar_indent_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,2 +1,4 @@\n"
+        "+permissions: |2-\n"
+        "+    write-all\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
 def test_scan_pr_diff_workflow_job_permissions_block_scalar_write_all_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER
@@ -943,6 +954,18 @@ def test_scan_pr_diff_workflow_scope_block_scalar_write_flagged() -> None:
         " permissions:\n"
         "+  contents: |-\n"
         "+    write\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_scope_block_scalar_indent_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,3 +1,5 @@\n"
+        " permissions:\n"
+        "+  contents: >1+\n"
+        "+   write\n"
     )
 
     _assert_diff_categories(diff_text, ["permissions_escalation"])
