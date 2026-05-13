@@ -471,6 +471,14 @@ def test_workflow_permission_context_helpers_handle_non_yaml_lines() -> None:
     assert not guardrails._is_workflow_jobs_flow_permission_escalation(
         [], 0, "jobs: { build: { permissions: *read_only } }"
     )
+    assert guardrails._jobs_flow_fragment(
+        ["+jobs: {}", "+env: {}"], 0, "jobs: {}"
+    ) == "jobs: {}"
+    assert guardrails._jobs_flow_fragment(
+        ["+jobs: {", "@@ -1,2 +1,3 @@", "-  old: {}", "+  build: {}"],
+        0,
+        "jobs: {",
+    ) == "jobs: { build: {}"
 
 
 def test_workflow_permission_alias_helpers_resolve_only_visible_values() -> None:
@@ -706,6 +714,30 @@ def test_scan_pr_diff_workflow_inline_jobs_permission_scope_write_flagged() -> N
         WORKFLOW_DIFF_HEADER
         + "@@ -1,2 +1,3 @@\n"
         + "+jobs: { build: { permissions: { contents: write } } }\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_multiline_jobs_flow_permission_write_all_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,2 +1,5 @@\n"
+        + "+jobs: {\n"
+        + "+  build: { permissions: write-all }\n"
+        + "+}\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_multiline_jobs_flow_permission_scope_write_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,2 +1,5 @@\n"
+        + "+jobs: {\n"
+        + "+  build: { permissions: { contents: write } }\n"
+        + "+}\n"
     )
 
     _assert_diff_categories(diff_text, ["permissions_escalation"])

@@ -259,7 +259,7 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         r"|(?:(?!^diff --git[ \t]).)*?^\+[ \t]*"
         r"[\"']?jobs[\"']?[ \t]*:[ \t]*"
         + _YAML_SCALAR_ANCHOR_RE
-        + r"\{[^\r\n]*[\"']?permissions[\"']?[ \t]*:[^\r\n]*"
+        + r"\{(?:(?!^diff --git[ \t]).)*?[\"']?permissions[\"']?[ \t]*:[^\r\n]*"
         r")[ \t]*(?:#.*)?$",
         re.IGNORECASE,
     ),
@@ -495,6 +495,23 @@ def _flow_permission_alias_name(line: str) -> str | None:
     return None if match is None else match.group("name")
 
 
+def _jobs_flow_fragment(lines: list[str], line_index: int, jobs_line: str) -> str:
+    fragment = [jobs_line.strip()]
+    brace_depth = jobs_line.count("{") - jobs_line.count("}")
+    for next_line in lines[line_index + 1 :]:
+        if brace_depth <= 0:
+            break
+        diff_line = _diff_yaml_line(next_line)
+        if diff_line is None:
+            continue
+        prefix, yaml_line = diff_line
+        if prefix == "-":
+            continue
+        fragment.append(yaml_line.strip())
+        brace_depth += yaml_line.count("{") - yaml_line.count("}")
+    return " ".join(fragment)
+
+
 def _is_workflow_jobs_flow_permission_escalation(
     lines: list[str], line_index: int, jobs_line: str
 ) -> bool:
@@ -504,9 +521,10 @@ def _is_workflow_jobs_flow_permission_escalation(
     jobs_indent, jobs_name = key
     if jobs_indent != 0 or jobs_name.strip("\"'").lower() != "jobs":
         return False
-    if _YAML_JOBS_FLOW_PERMISSION_RE.match(jobs_line):
+    flow_line = _jobs_flow_fragment(lines, line_index, jobs_line)
+    if _YAML_JOBS_FLOW_PERMISSION_RE.match(flow_line):
         return True
-    alias_name = _flow_permission_alias_name(jobs_line)
+    alias_name = _flow_permission_alias_name(flow_line)
     if alias_name is None:
         return False
     alias_value = _yaml_anchor_values_before(lines, line_index).get(alias_name)
