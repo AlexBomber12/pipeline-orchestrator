@@ -422,6 +422,19 @@ LOCKFILE_PATTERNS = (
     r"requirements-.+\.txt$",
 )
 _LOCKFILE_RES = tuple(re.compile(pattern) for pattern in LOCKFILE_PATTERNS)
+TEST_FILE_PATTERNS = (
+    re.compile(r"^tests?/"),
+    re.compile(r"^[^/]*tests?/"),
+    re.compile(r"/tests?/"),
+    re.compile(r"^__tests__/"),
+    re.compile(r"/__tests__/"),
+    re.compile(r"_test\.py$"),
+    re.compile(r"^test_.*\.py$"),
+    re.compile(r"/test_.*\.py$"),
+    re.compile(r"\.test\.[jt]sx?$"),
+    re.compile(r"\.spec\.[jt]sx?$"),
+    re.compile(r"_test\.go$"),
+)
 
 
 def _clip_excerpt(text: str) -> str:
@@ -471,6 +484,27 @@ def _is_diff_file_header(line: str) -> bool:
     return path == "/dev/null" or path.startswith(expected_prefix)
 
 
+def _diff_file_header_path(line: str) -> str | None:
+    if line.startswith("--- "):
+        expected_prefix = "a/"
+        path_text = line[4:]
+    elif line.startswith("+++ "):
+        expected_prefix = "b/"
+        path_text = line[4:]
+    else:
+        return None
+    try:
+        parts = shlex.split(path_text)
+    except ValueError:
+        return None
+    if not parts:
+        return None
+    path = parts[0]
+    if path == "/dev/null":
+        return path
+    return _strip_diff_prefix(path, expected_prefix)
+
+
 def _is_lockfile_path(path: str) -> bool:
     filename = path.rsplit("/", 1)[-1]
     return any(pattern.fullmatch(filename) for pattern in _LOCKFILE_RES)
@@ -508,6 +542,54 @@ def _count_diff_size(diff_text: str) -> tuple[int, int, int, int]:
             deletions += 1
 
     return additions, deletions, files_changed, len(files_with_additions)
+
+
+def _count_file_deletions(diff_text: str) -> tuple[list[str], list[tuple[str, str]]]:
+    deleted_paths: list[str] = []
+    renamed_paths: list[tuple[str, str]] = []
+    old_path: str | None = None
+    deleted = False
+    rename_from: str | None = None
+    rename_to: str | None = None
+
+    def flush_section() -> None:
+        nonlocal old_path, deleted, rename_from, rename_to
+        if rename_from is not None and rename_to is not None:
+            renamed_paths.append((rename_from, rename_to))
+        elif deleted and old_path is not None:
+            deleted_paths.append(old_path)
+        old_path = None
+        deleted = False
+        rename_from = None
+        rename_to = None
+
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            flush_section()
+            continue
+        if line.startswith("--- "):
+            path = _diff_file_header_path(line)
+            if path != "/dev/null":
+                old_path = path
+            continue
+        if line.startswith("+++ "):
+            deleted = _diff_file_header_path(line) == "/dev/null"
+            continue
+        if line.startswith("rename from "):
+            rename_from = line[len("rename from ") :].strip()
+            continue
+        if line.startswith("rename to "):
+            rename_to = line[len("rename to ") :].strip()
+    flush_section()
+    return deleted_paths, renamed_paths
+
+
+def _classify_test_files(paths: list[str]) -> list[str]:
+    return [
+        path
+        for path in paths
+        if any(pattern.search(path) for pattern in TEST_FILE_PATTERNS)
+    ]
 
 
 def _classify_files_lockfile_exempt(diff_text: str) -> set[str]:
@@ -1552,6 +1634,46 @@ def scan_pr_diff(
                 rule=(
                     "Generic high-entropy secret-like value detected "
                     "in suspicious assignment context"
+                ),
+            )
+        )
+    deleted_paths, renamed_paths = _count_file_deletions(diff_text)
+    deleted_count = len(deleted_paths)
+    test_paths = _classify_test_files(deleted_paths)
+    test_count = len(test_paths)
+    if deleted_count >= config.mass_deletion_threshold:
+        excerpt = (
+            f"{deleted_count} files deleted "
+            f"({test_count} test files among them, "
+            f"{len(renamed_paths)} renames excluded). "
+            f"Threshold: {config.mass_deletion_threshold}."
+        )
+        violations.append(
+            GuardrailViolation(
+                tier=2,
+                category="mass_file_deletion",
+                excerpt=_clip_excerpt(excerpt),
+                rule=(
+                    "Bulk file deletion requires operator review. "
+                    "Verify the task spec authorizes removal."
+                ),
+            )
+        )
+    elif test_count >= config.test_deletion_threshold:
+        sample = ", ".join(test_paths[:5])
+        excerpt = (
+            f"{test_count} test files deleted "
+            f"(threshold: {config.test_deletion_threshold}). "
+            f"Sample: {sample}"
+        )
+        violations.append(
+            GuardrailViolation(
+                tier=2,
+                category="test_file_deletion",
+                excerpt=_clip_excerpt(excerpt),
+                rule=(
+                    "Test deletion may indicate silencing failures rather "
+                    "than fixing them. Operator review required."
                 ),
             )
         )

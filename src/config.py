@@ -86,6 +86,8 @@ _DAEMON_FIELDS = {
     "guardrail_notification_timeout_seconds",
     "large_diff_addition_threshold",
     "large_diff_files_threshold",
+    "mass_deletion_threshold",
+    "test_deletion_threshold",
     "main_commit_audit_interval_idle_cycles",
     "main_commit_audit_lookback_n",
 }
@@ -182,6 +184,8 @@ class DaemonConfig(BaseModel):
     guardrail_notification_timeout_seconds: float = Field(default=5.0, ge=1.0, le=30.0)
     large_diff_addition_threshold: int = Field(default=1500, ge=100)
     large_diff_files_threshold: int = Field(default=30, ge=2)
+    mass_deletion_threshold: int = Field(default=20, ge=1)
+    test_deletion_threshold: int = Field(default=5, ge=1)
     main_commit_audit_interval_idle_cycles: int = Field(default=20, ge=1)
     main_commit_audit_lookback_n: int = Field(default=10, ge=1, le=50)
 

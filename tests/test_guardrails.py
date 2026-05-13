@@ -466,6 +466,27 @@ def _diff_for_file(path: str, additions: int = 0, deletions: int = 0) -> str:
     )
 
 
+def _delete_diff_for_file(path: str) -> str:
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "deleted file mode 100644\n"
+        "index 1111111..0000000\n"
+        f"--- a/{path}\n"
+        "+++ /dev/null\n"
+        "@@ -1,1 +0,0 @@\n"
+        "-old\n"
+    )
+
+
+def _rename_diff_for_file(old_path: str, new_path: str) -> str:
+    return (
+        f"diff --git a/{old_path} b/{new_path}\n"
+        "similarity index 100%\n"
+        f"rename from {old_path}\n"
+        f"rename to {new_path}\n"
+    )
+
+
 def test_count_diff_size_simple_diff() -> None:
     diff_text = _diff_for_file("src/a.py", additions=2, deletions=1) + _diff_for_file(
         "src/b.py", additions=1, deletions=2
@@ -499,6 +520,12 @@ def test_count_diff_size_excludes_quoted_file_headers() -> None:
 def test_diff_file_header_rejects_invalid_or_empty_header_paths() -> None:
     assert not guardrails._is_diff_file_header('+++ "unterminated')
     assert not guardrails._is_diff_file_header("+++ ")
+
+
+def test_diff_file_header_path_rejects_invalid_or_empty_lines() -> None:
+    assert guardrails._diff_file_header_path("not a file header") is None
+    assert guardrails._diff_file_header_path('+++ "unterminated') is None
+    assert guardrails._diff_file_header_path("+++ ") is None
 
 
 def test_count_diff_size_counts_added_and_deleted_lines_with_header_prefixes() -> None:
@@ -594,6 +621,72 @@ def test_classify_lockfile_exempt_rejects_suffix_only_matches() -> None:
     assert guardrails._classify_files_lockfile_exempt(diff_text) == set()
 
 
+def test_count_file_deletions_simple() -> None:
+    diff_text = "".join(
+        _delete_diff_for_file(f"src/deleted_{index}.py") for index in range(3)
+    )
+
+    deleted_paths, renamed_paths = guardrails._count_file_deletions(diff_text)
+
+    assert deleted_paths == [
+        "src/deleted_0.py",
+        "src/deleted_1.py",
+        "src/deleted_2.py",
+    ]
+    assert renamed_paths == []
+
+
+def test_count_file_deletions_excludes_modifications() -> None:
+    diff_text = _diff_for_file("src/modified.py", additions=1, deletions=1)
+
+    assert guardrails._count_file_deletions(diff_text) == ([], [])
+
+
+def test_count_file_deletions_excludes_renames() -> None:
+    diff_text = _rename_diff_for_file("src/foo.py", "src/bar.py")
+
+    assert guardrails._count_file_deletions(diff_text) == (
+        [],
+        [("src/foo.py", "src/bar.py")],
+    )
+
+
+def test_count_file_deletions_handles_mixed_diff() -> None:
+    diff_text = (
+        _delete_diff_for_file("src/old_a.py")
+        + _diff_for_file("src/modified.py", additions=1, deletions=1)
+        + _rename_diff_for_file("src/foo.py", "src/bar.py")
+        + _delete_diff_for_file("src/old_b.py")
+    )
+
+    assert guardrails._count_file_deletions(diff_text) == (
+        ["src/old_a.py", "src/old_b.py"],
+        [("src/foo.py", "src/bar.py")],
+    )
+
+
+def test_classify_test_files_python_conventions() -> None:
+    paths = ["tests/test_foo.py", "src/test_bar.py", "test_baz.py"]
+
+    assert guardrails._classify_test_files(paths) == paths
+
+
+def test_classify_test_files_javascript_conventions() -> None:
+    paths = ["__tests__/foo.js", "src/foo.test.ts", "src/bar.spec.tsx"]
+
+    assert guardrails._classify_test_files(paths) == paths
+
+
+def test_classify_test_files_go_conventions() -> None:
+    assert guardrails._classify_test_files(["pkg/foo_test.go"]) == [
+        "pkg/foo_test.go"
+    ]
+
+
+def test_classify_test_files_non_test_paths() -> None:
+    assert guardrails._classify_test_files(["src/foo.py", "README.md", "config.yml"]) == []
+
+
 def test_scan_pr_diff_under_threshold_no_violation() -> None:
     diff_text = "".join(
         _diff_for_file(f"src/file_{index}.py", additions=20) for index in range(5)
@@ -672,6 +765,72 @@ def test_scan_pr_diff_tier_1_violations_still_flagged() -> None:
     _assert_diff_categories(
         diff_text, ["permissions_escalation", "large_diff_threshold"]
     )
+
+
+def test_scan_pr_diff_mass_deletion_threshold_general() -> None:
+    diff_text = "".join(
+        _delete_diff_for_file(f"src/file_{index}.py") for index in range(16)
+    ) + "".join(_delete_diff_for_file(f"tests/test_{index}.py") for index in range(5))
+
+    violations = scan_pr_diff(diff_text)
+
+    assert [violation.category for violation in violations] == ["mass_file_deletion"]
+    assert "21 files deleted" in violations[0].excerpt
+    assert "5 test files among them" in violations[0].excerpt
+
+
+def test_scan_pr_diff_test_deletion_threshold_below_mass() -> None:
+    diff_text = "".join(
+        _delete_diff_for_file(f"tests/test_{index}.py") for index in range(6)
+    )
+
+    _assert_diff_categories(diff_text, ["test_file_deletion"])
+
+
+def test_scan_pr_diff_under_both_thresholds_no_deletion_violation() -> None:
+    diff_text = "".join(
+        _delete_diff_for_file(f"src/file_{index}.py") for index in range(10)
+    ) + "".join(_delete_diff_for_file(f"tests/test_{index}.py") for index in range(3))
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_renames_not_counted_as_deletions() -> None:
+    diff_text = "".join(
+        _rename_diff_for_file(f"src/old_{index}.py", f"src/new_{index}.py")
+        for index in range(25)
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_mass_deletion_supersedes_test_deletion() -> None:
+    diff_text = "".join(
+        _delete_diff_for_file(f"tests/test_{index}.py") for index in range(10)
+    ) + "".join(_delete_diff_for_file(f"src/file_{index}.py") for index in range(15))
+
+    _assert_diff_categories(diff_text, ["mass_file_deletion"])
+
+
+def test_scan_pr_diff_excerpt_includes_sample_test_paths() -> None:
+    diff_text = "".join(
+        _delete_diff_for_file(f"tests/test_{index}.py") for index in range(5)
+    )
+
+    violations = scan_pr_diff(diff_text)
+
+    assert len(violations) == 1
+    assert violations[0].category == "test_file_deletion"
+    assert "tests/test_0.py" in violations[0].excerpt
+    assert "tests/test_4.py" in violations[0].excerpt
+
+
+def test_scan_pr_diff_prior_violations_still_flagged() -> None:
+    diff_text = _diff_for_file("src/large.py", additions=1600) + "".join(
+        _delete_diff_for_file(f"src/file_{index}.py") for index in range(20)
+    )
+
+    _assert_diff_categories(diff_text, ["large_diff_threshold", "mass_file_deletion"])
 
 
 def _secret_diff(secret_value: str, assignment_name: str = "TOKEN") -> str:
