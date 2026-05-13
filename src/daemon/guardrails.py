@@ -265,6 +265,8 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         r"[\"']?jobs[\"']?[ \t]*:[ \t]*"
         + _YAML_SCALAR_ANCHOR_RE
         + r"\{(?:(?!^diff --git[ \t]).)*?[\"']?permissions[\"']?[ \t]*:[^\r\n]*"
+        r"|(?:(?!^diff --git[ \t]).)*?^\+[ \t]+[\"']?[^:\"'\r\n]+[\"']?"
+        r"[ \t]*:[ \t]*\{[^\r\n]*[\"']?permissions[\"']?[ \t]*:[^\r\n]*"
         r")[ \t]*(?:#.*)?$",
         re.IGNORECASE,
     ),
@@ -540,6 +542,36 @@ def _is_workflow_jobs_flow_permission_escalation(
     ) == "write-all" or _yaml_flow_permission_map_escalates(alias_value)
 
 
+def _is_workflow_job_flow_permission_escalation(
+    lines: list[str], line_index: int, job_line: str
+) -> bool:
+    key = _yaml_key(job_line)
+    if key is None:
+        return False
+    job_indent, _job_name = key
+    if job_indent == 0 or "{" not in job_line:
+        return False
+    ancestors = [
+        (indent, name.strip("\"'").lower())
+        for indent, name in _visible_yaml_context(lines, line_index)
+        if indent < job_indent
+    ]
+    if not ancestors or ancestors[-1] != (0, "jobs"):
+        return False
+    flow_line = f"jobs: {{ {job_line.strip()} }}"
+    if _YAML_JOBS_FLOW_PERMISSION_RE.match(flow_line):
+        return True
+    alias_name = _flow_permission_alias_name(flow_line)
+    if alias_name is None:
+        return False
+    alias_value = _yaml_anchor_values_before(lines, line_index).get(alias_name)
+    if alias_value is None:
+        return False
+    return _normalized_yaml_scalar(
+        alias_value
+    ) == "write-all" or _yaml_flow_permission_map_escalates(alias_value)
+
+
 def _replaces_read_scope_with_write(
     lines: list[str], line_index: int, scope_line: str
 ) -> bool:
@@ -588,6 +620,8 @@ def _match_has_workflow_permission_context(match_text: str) -> bool:
         if prefix != "+":
             continue
         if _is_workflow_jobs_flow_permission_escalation(lines, index, yaml_line):
+            return True
+        if _is_workflow_job_flow_permission_escalation(lines, index, yaml_line):
             return True
         if _YAML_PERMISSION_KEY_RE.match(yaml_line) and (
             _is_workflow_permission_key_context(lines, index, yaml_line)

@@ -479,6 +479,32 @@ def test_workflow_permission_context_helpers_handle_non_yaml_lines() -> None:
         0,
         "jobs: {",
     ) == "jobs: { build: {}"
+    assert not guardrails._is_workflow_job_flow_permission_escalation(
+        [], 0, "not a mapping"
+    )
+    assert not guardrails._is_workflow_job_flow_permission_escalation(
+        [], 0, "  build: { permissions: write-all }"
+    )
+    assert not guardrails._is_workflow_job_flow_permission_escalation(
+        [" jobs:", "+  build: { runs-on: ubuntu-latest }"],
+        1,
+        "  build: { runs-on: ubuntu-latest }",
+    )
+    assert not guardrails._is_workflow_job_flow_permission_escalation(
+        [" jobs:", "+  build: { permissions: *full_write }"],
+        1,
+        "  build: { permissions: *full_write }",
+    )
+    assert guardrails._is_workflow_job_flow_permission_escalation(
+        [
+            " env:",
+            "   FULL_WRITE: &full_write write-all",
+            " jobs:",
+            "+  build: { permissions: *full_write }",
+        ],
+        3,
+        "  build: { permissions: *full_write }",
+    )
 
 
 def test_workflow_permission_alias_helpers_resolve_only_visible_values() -> None:
@@ -738,6 +764,28 @@ def test_scan_pr_diff_workflow_multiline_jobs_flow_permission_scope_write_flagge
         + "+jobs: {\n"
         + "+  build: { permissions: { contents: write } }\n"
         + "+}\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_job_flow_permission_write_all_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,3 +1,4 @@\n"
+        + " jobs:\n"
+        + "+  build: { permissions: write-all, runs-on: ubuntu-latest }\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_job_flow_permission_scope_write_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,3 +1,4 @@\n"
+        + " jobs:\n"
+        + "+  build: { permissions: { contents: write }, runs-on: ubuntu-latest }\n"
     )
 
     _assert_diff_categories(diff_text, ["permissions_escalation"])
