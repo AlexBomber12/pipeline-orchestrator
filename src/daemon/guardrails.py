@@ -104,6 +104,9 @@ _WORKFLOW_PATH_END_RE = r'(?:"|(?=[ \t\r\n])|$)'
 _DIFF_WORKFLOW_B_PATH_RE = (
     r'"?b/\.github/workflows/[^"/\r\n]+\.ya?ml' + _WORKFLOW_PATH_END_RE
 )
+_DIFF_ACTION_B_PATH_RE = (
+    r'"?b/\.github/actions/[^"\r\n]*/action\.ya?ml' + _WORKFLOW_PATH_END_RE
+)
 _DIFF_WORKFLOW_A_PATH_RE = (
     r'"?a/\.github/workflows/[^"/\r\n]+\.ya?ml' + _WORKFLOW_PATH_END_RE
 )
@@ -781,10 +784,13 @@ def _diff_file_section_start_at(diff_text: str, position: int) -> int:
     return 0 if start == -1 else start + 1
 
 
-def _diff_section_is_workflow_file(section_text: str) -> bool:
+def _diff_section_is_action_reference_file(section_text: str) -> bool:
     first_line = section_text.splitlines()[0] if section_text else ""
     return bool(re.match(r"^diff --git[^\r\n]*[ \t]+", first_line)) and bool(
-        re.search(_DIFF_WORKFLOW_B_PATH_RE, first_line)
+        re.search(
+            rf"(?:{_DIFF_WORKFLOW_B_PATH_RE}|{_DIFF_ACTION_B_PATH_RE})",
+            first_line,
+        )
     )
 
 
@@ -1189,7 +1195,7 @@ def scan_pr_diff(diff_text: str) -> list[GuardrailViolation]:
             section_text = _diff_file_section_at(diff_text, match.start())
             if category == "dangerous_action_external_install" and (
                 _action_ref_is_pinned(match.group("ref"))
-                or not _diff_section_is_workflow_file(section_text)
+                or not _diff_section_is_action_reference_file(section_text)
                 or not _action_uses_match_is_yaml_key(
                     section_text, match.start() - section_start
                 )

@@ -2026,6 +2026,17 @@ def test_scan_pr_diff_action_spaced_uses_key_separator_flagged() -> None:
     _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
 
 
+def test_scan_pr_diff_composite_action_unpinned_uses_flagged() -> None:
+    diff_text = (
+        "diff --git a/.github/actions/build/action.yml "
+        "b/.github/actions/build/action.yml\n"
+        "@@ -1,3 +1,4 @@\n"
+        "+    - uses: actions/checkout@main\n"
+    )
+
+    _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
+
+
 def test_scan_pr_diff_action_semver_tag_v1_not_flagged() -> None:
     diff_text = WORKFLOW_DIFF_HEADER + "+      - uses: actions/checkout@v1\n"
 
