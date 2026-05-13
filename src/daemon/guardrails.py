@@ -856,7 +856,7 @@ def _action_uses_match_is_yaml_key(section_text: str, relative_start: int) -> bo
             and key[1].strip("\"'").lower() == "uses"
             or re.search(
                 r"\{[^\r\n}]*[\"']?uses[\"']?[ \t]*:",
-                stripped,
+                _mask_yaml_quoted_colon_values(stripped),
                 re.IGNORECASE,
             )
             is not None

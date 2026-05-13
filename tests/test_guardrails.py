@@ -2049,6 +2049,15 @@ def test_scan_pr_diff_action_flow_mapping_semver_ref_not_flagged() -> None:
     assert scan_pr_diff(diff_text) == []
 
 
+def test_scan_pr_diff_action_flow_mapping_quoted_value_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + '+      - { name: "{ uses: actions/checkout@main }" }\n'
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
 def test_scan_pr_diff_action_semver_tag_v1_not_flagged() -> None:
     diff_text = WORKFLOW_DIFF_HEADER + "+      - uses: actions/checkout@v1\n"
 
