@@ -117,7 +117,7 @@ _WORKFLOW_WRITE_PERMISSION_SCOPES_RE = (
     r"vulnerability-alerts)[\"']?"
 )
 _YAML_ANCHOR_NAME_RE = r"&[A-Za-z_][A-Za-z0-9_-]*"
-_YAML_SCALAR_ANCHOR_RE = r"(?:&[A-Za-z_][A-Za-z0-9_-]*[ \t]+)?"
+_YAML_SCALAR_ANCHOR_RE = r"(?:(?:&[A-Za-z_][A-Za-z0-9_-]*|![^\s#]+)[ \t]+)*"
 _YAML_BLOCK_SCALAR_HEADER_RE = r"[|>](?:[1-9][+-]?|[+-][1-9]?)?"
 _YAML_KEY_RE = re.compile(
     r"^(?P<indent>[ \t]*)(?P<quote>[\"']?)(?P<key>[^:\"'\r\n]+)"
@@ -339,7 +339,12 @@ def _yaml_indent(line: str) -> int:
 
 
 def _normalized_yaml_scalar(value: str) -> str:
-    return value.strip().rstrip(",").strip("\"'").lower()
+    value = re.sub(
+        r"^(?:(?:&[A-Za-z_][A-Za-z0-9_-]*|![^\s#]+)[ \t]+)*",
+        "",
+        value.strip(),
+    )
+    return value.rstrip(",").strip("\"'").lower()
 
 
 def _yaml_flow_permission_map_escalates(value: str) -> bool:
