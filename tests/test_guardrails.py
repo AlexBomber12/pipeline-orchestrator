@@ -970,6 +970,18 @@ def test_scan_pr_diff_generic_detects_high_entropy_token_assignment() -> None:
     assert violations[0].category == "generic_high_entropy"
 
 
+@pytest.mark.parametrize("assignment_name", ["OPENAI_API_KEY", "MY_TOKEN", "DB_PASSWORD"])
+def test_scan_pr_diff_generic_detects_prefixed_secret_assignment(
+    assignment_name: str,
+) -> None:
+    diff_text = _secret_diff("abc123XyZ_HighEntropyValue9876ZQT5", assignment_name)
+
+    violations = scan_pr_diff(diff_text)
+
+    assert len(violations) == 1
+    assert violations[0].category == "generic_high_entropy"
+
+
 def test_scan_pr_diff_generic_no_match_low_entropy() -> None:
     diff_text = _secret_diff("hello_world_simple_value", "token")
 

@@ -400,7 +400,9 @@ SECRET_PATTERNS_B: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 _SUSPICIOUS_CONTEXT_RE = re.compile(
-    r"(?i)\b(secret|token|api[_-]?key|password|passwd|auth[_-]?token)"
+    r"(?i)(?<![A-Za-z0-9])"
+    r"(?:[A-Za-z0-9]+[_-])*"
+    r"(secret|token|api[_-]?key|password|passwd|auth[_-]?token)"
     r"\s*[:=]\s*['\"]?([A-Za-z0-9+/=_-]{20,})['\"]?",
 )
 
