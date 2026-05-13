@@ -1087,6 +1087,59 @@ def test_scan_pr_diff_workflow_permissions_anchor_value_edit_to_write_all_flagge
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_block_anchor_value_edit_to_write_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,9 +1,9 @@\n"
+        + " env:\n"
+        + "   PERM: &perm\n"
+        + "-    read\n"
+        + "+    write\n"
+        + " permissions: { contents: *perm }\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_block_anchor_value_edit_helper_rejects_without_block_anchor() -> None:
+    assert not guardrails._block_anchor_value_edit_escalates(
+        [" env:", "+  write"],
+        1,
+        "  write",
+    )
+
+
+def test_block_anchor_value_edit_helper_skips_non_parent_lines() -> None:
+    assert not guardrails._block_anchor_value_edit_escalates(
+        ["@@ -1,2 +1,2 @@", "-  PERM: &perm", " # comment", "   nested: &perm", "+  write"],
+        4,
+        "  write",
+    )
+
+
+def test_block_anchor_value_edit_helper_rejects_without_visible_anchor() -> None:
+    assert not guardrails._block_anchor_value_edit_escalates(
+        ["@@ -1,2 +1,2 @@", "+  write"],
+        1,
+        "  write",
+    )
+
+
+def test_anchor_value_edit_in_section_detects_block_anchor_context() -> None:
+    section_text = (
+        WORKFLOW_DIFF_HEADER
+        + " env:\n"
+        + "   PERM: &perm\n"
+        + "+    write\n"
+        + " permissions: { contents: *perm }\n"
+    )
+
+    assert guardrails._anchor_value_edit_escalates_in_section(
+        section_text,
+        "   PERM: &perm\n+    write\n",
+    )
+
+
 def test_scan_pr_diff_workflow_anchor_value_edit_uses_file_section_context() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER

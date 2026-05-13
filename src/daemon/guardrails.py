@@ -268,6 +268,10 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         r"|(?:(?!^diff --git[ \t]).)*?^\+[^\r\n]*"
         r"&[A-Za-z_][A-Za-z0-9_-]*[ \t]+[\"']?(?:write|write-all)[\"']?"
         r"(?:(?!^diff --git[ \t]).)*"
+        r"|(?:(?!^diff --git[ \t]).)*?^[ +][^\r\n]*"
+        r"&[A-Za-z_][A-Za-z0-9_-]*[ \t]*(?:#.*)?\r?\n"
+        r"(?:(?!^diff --git[ \t]).)*?^\+[ \t]+[\"']?(?:write|write-all)[\"']?"
+        r"(?:(?!^diff --git[ \t]).)*"
         r"))[ \t]*(?:#.*)?$",
     ),
     "workflow_destruction": re.compile(
@@ -664,11 +668,45 @@ def _anchor_value_edit_escalates(lines: list[str], yaml_line: str) -> bool:
     return False
 
 
+def _block_anchor_value_edit_escalates(
+    lines: list[str], line_index: int, yaml_line: str
+) -> bool:
+    normalized_value = _normalized_yaml_scalar(yaml_line)
+    if normalized_value not in {"write", "write-all"}:
+        return False
+    value_indent = _yaml_indent(yaml_line)
+    for previous_line in reversed(lines[:line_index]):
+        diff_line = _diff_yaml_line(previous_line)
+        if diff_line is None:
+            continue
+        prefix, previous_yaml_line = diff_line
+        if prefix == "-":
+            continue
+        stripped_line = previous_yaml_line.strip()
+        if not stripped_line or stripped_line.startswith("#"):
+            continue
+        previous_indent = _yaml_indent(previous_yaml_line)
+        if previous_indent >= value_indent:
+            continue
+        block_match = _YAML_BLOCK_ANCHOR_RE.search(previous_yaml_line)
+        if block_match is None:
+            return False
+        return _visible_permission_alias_reference_escalates(
+            lines,
+            block_match.group("name"),
+            top_level_permissions=normalized_value == "write-all",
+        )
+    return False
+
+
 def _anchor_value_edit_escalates_in_section(
     section_text: str, match_text: str
 ) -> bool:
     section_lines = section_text.splitlines()
-    for line in match_text.splitlines():
+    matched_lines = set(match_text.splitlines())
+    for index, line in enumerate(section_lines):
+        if line not in matched_lines:
+            continue
         diff_line = _diff_yaml_line(line)
         if diff_line is None:
             continue
@@ -676,6 +714,8 @@ def _anchor_value_edit_escalates_in_section(
         if prefix != "+":
             continue
         if _anchor_value_edit_escalates(section_lines, yaml_line):
+            return True
+        if _block_anchor_value_edit_escalates(section_lines, index, yaml_line):
             return True
     return False
 
@@ -752,6 +792,8 @@ def _match_has_workflow_permission_context(match_text: str) -> bool:
         if prefix != "+":
             continue
         if _anchor_value_edit_escalates(lines, yaml_line):
+            return True
+        if _block_anchor_value_edit_escalates(lines, index, yaml_line):
             return True
         if _is_workflow_jobs_flow_permission_escalation(lines, index, yaml_line):
             return True
