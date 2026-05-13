@@ -225,9 +225,13 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         # Match added action references; pinned refs are filtered in
         # scan_pr_diff because this regex captures all candidate refs.
         r"(?m)^\+[ \t]*-?[ \t]*(?:"
-        r"[\"']?uses[\"']?[ \t]*:[ \t]+(?P<quote>[\"']?)"
+        r"[\"']?uses[\"']?[ \t]*:[ \t]+"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"(?P<quote>[\"']?)"
         r"(?P<repo>[\w.-]+/[\w./-]+)@(?P<ref>[^\"'\s\r\n},]+)(?P=quote)"
-        r"|\{[^\r\n}]*[\"']?uses[\"']?[ \t]*:[ \t]*(?P<flow_quote>[\"']?)"
+        r"|\{[^\r\n}]*[\"']?uses[\"']?[ \t]*:[ \t]*"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"(?P<flow_quote>[\"']?)"
         r"(?P<flow_repo>[\w.-]+/[\w./-]+)@(?P<flow_ref>[^\"'\s\r\n},]+)"
         r"(?P=flow_quote))",
         re.IGNORECASE,
