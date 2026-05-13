@@ -190,10 +190,33 @@ _YAML_JOBS_FLOW_PERMISSION_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+_PINNED_ACTION_REF_RE = re.compile(
+    r"^(?:v\d+(?:\.\d+){0,2}|[0-9a-f]{40})$",
+    re.IGNORECASE,
+)
 # Diff-content scan catalogue. PR-290b adds workflow YAML tampering checks;
 # PR-290c and PR-301..PR-304 extend the same dispatcher with governance,
 # supply-chain, secrets, large-diff, and mass-deletion entries.
 _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
+    "branch_protection_modification": re.compile(
+        # Detect branch-protection metadata modification or deletion by
+        # matching unified diff file headers for the governed files.
+        r"(?m)^---[ \t]+a/\.github/(?:"
+        r"branch[-_]protection[^ \r\n]*\.ya?ml"
+        r"|settings\.ya?ml"
+        r")[ \t]*\r?\n"
+        r"\+\+\+[ \t]+(?:b/\.github/(?:branch[-_]protection[^ \r\n]*\.ya?ml"
+        r"|settings\.ya?ml)|/dev/null)",
+        re.IGNORECASE,
+    ),
+    "dangerous_action_external_install": re.compile(
+        # Match added action references; pinned refs are filtered in
+        # scan_pr_diff because this regex captures all candidate refs.
+        r"(?m)^\+[ \t]*-?[ \t]*uses:[ \t]+"
+        r"(?P<repo>[\w.-]+/[\w./-]+)"
+        r"@(?P<ref>[^\s\r\n]+)",
+        re.IGNORECASE,
+    ),
     "permissions_escalation": re.compile(
         # Match `+`-prefixed lines (additions only) only inside workflow
         # YAML diff sections containing `permissions: write-all`
@@ -305,6 +328,13 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
 }
 
 _DIFF_RULES: dict[str, str] = {
+    "branch_protection_modification": (
+        "Branch protection metadata file modification or deletion in diff"
+    ),
+    "dangerous_action_external_install": (
+        "Workflow uses unpinned external action reference "
+        "(mutable ref like @main or @HEAD)"
+    ),
     "permissions_escalation": "Workflow permission escalation in diff additions",
     "workflow_destruction": "Workflow YAML file deletion under .github/workflows/",
 }
@@ -312,6 +342,11 @@ _DIFF_RULES: dict[str, str] = {
 
 def _clip_excerpt(text: str) -> str:
     return text[:_EXCERPT_LIMIT]
+
+
+def _action_ref_is_pinned(ref: str) -> bool:
+    """Return True if ``ref`` is a semver tag or 40-char commit SHA."""
+    return bool(_PINNED_ACTION_REF_RE.match(ref))
 
 
 def _line_excerpt(coder_stdout: str, start: int, end: int) -> str:
@@ -1077,6 +1112,10 @@ def scan_pr_diff(diff_text: str) -> list[GuardrailViolation]:
     for category in sorted(_DIFF_PATTERNS):
         pattern = _DIFF_PATTERNS[category]
         for match in pattern.finditer(diff_text):
+            if category == "dangerous_action_external_install" and (
+                _action_ref_is_pinned(match.group("ref"))
+            ):
+                continue
             if category == "permissions_escalation" and not (
                 _match_has_workflow_permission_context(match.group(0))
                 or _anchor_value_edit_escalates_in_section(

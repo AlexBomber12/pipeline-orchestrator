@@ -1850,6 +1850,60 @@ def test_scan_pr_diff_workflow_modification_not_flagged() -> None:
     assert scan_pr_diff(diff_text) == []
 
 
+def test_scan_pr_diff_branch_protection_modification_flagged() -> None:
+    diff_text = (
+        "diff --git a/.github/branch-protection.yml "
+        "b/.github/branch-protection.yml\n"
+        "--- a/.github/branch-protection.yml\n"
+        "+++ b/.github/branch-protection.yml\n"
+    )
+
+    _assert_diff_categories(diff_text, ["branch_protection_modification"])
+
+
+def test_scan_pr_diff_branch_protection_underscore_variant_flagged() -> None:
+    diff_text = (
+        "diff --git a/.github/branch_protection.yaml "
+        "b/.github/branch_protection.yaml\n"
+        "--- a/.github/branch_protection.yaml\n"
+        "+++ b/.github/branch_protection.yaml\n"
+    )
+
+    _assert_diff_categories(diff_text, ["branch_protection_modification"])
+
+
+def test_scan_pr_diff_settings_yml_modification_flagged() -> None:
+    diff_text = (
+        "diff --git a/.github/settings.yml b/.github/settings.yml\n"
+        "--- a/.github/settings.yml\n"
+        "+++ b/.github/settings.yml\n"
+    )
+
+    _assert_diff_categories(diff_text, ["branch_protection_modification"])
+
+
+def test_scan_pr_diff_branch_protection_deletion_flagged() -> None:
+    diff_text = (
+        "diff --git a/.github/branch-protection.yml "
+        "b/.github/branch-protection.yml\n"
+        "deleted file mode 100644\n"
+        "--- a/.github/branch-protection.yml\n"
+        "+++ /dev/null\n"
+    )
+
+    _assert_diff_categories(diff_text, ["branch_protection_modification"])
+
+
+def test_scan_pr_diff_unrelated_file_not_flagged() -> None:
+    diff_text = (
+        "diff --git a/src/foo.py b/src/foo.py\n"
+        "--- a/src/foo.py\n"
+        "+++ b/src/foo.py\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
 def test_scan_pr_diff_documented_workflow_deletion_header_not_flagged() -> None:
     diff_text = (
         "diff --git a/docs/guide.md b/docs/guide.md\n"
@@ -1881,6 +1935,66 @@ def test_scan_pr_diff_non_workflow_path_yml_deletion_not_flagged() -> None:
     assert scan_pr_diff(diff_text) == []
 
 
+def test_scan_pr_diff_action_main_ref_flagged() -> None:
+    diff_text = "+      - uses: actions/checkout@main\n"
+
+    _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
+
+
+def test_scan_pr_diff_action_master_ref_flagged() -> None:
+    diff_text = "+      - uses: actions/checkout@master\n"
+
+    _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
+
+
+def test_scan_pr_diff_action_head_ref_flagged() -> None:
+    diff_text = "+      - uses: actions/checkout@HEAD\n"
+
+    _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
+
+
+def test_scan_pr_diff_action_branch_name_ref_flagged() -> None:
+    diff_text = "+      - uses: actions/checkout@develop\n"
+
+    _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
+
+
+def test_scan_pr_diff_action_semver_tag_v1_not_flagged() -> None:
+    diff_text = "+      - uses: actions/checkout@v1\n"
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_action_semver_tag_v1_2_3_not_flagged() -> None:
+    diff_text = "+      - uses: actions/checkout@v1.2.3\n"
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_action_commit_sha_not_flagged() -> None:
+    diff_text = "+      - uses: actions/checkout@a1b2c3d4e5f6789012345678901234567890abcd\n"
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_action_short_sha_flagged() -> None:
+    diff_text = "+      - uses: actions/checkout@a1b2c3d\n"
+
+    _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
+
+
+def test_scan_pr_diff_action_in_context_line_not_flagged() -> None:
+    diff_text = "  - uses: actions/checkout@main\n"
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_action_in_deletion_line_not_flagged() -> None:
+    diff_text = "-  - uses: actions/checkout@main\n"
+
+    assert scan_pr_diff(diff_text) == []
+
+
 def test_scan_pr_diff_both_patterns_in_same_diff_returns_both() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER
@@ -1899,6 +2013,35 @@ def test_scan_pr_diff_both_patterns_in_same_diff_returns_both() -> None:
     )
 
 
+def test_scan_pr_diff_all_four_patterns_no_overlap() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,2 +1,3 @@\n+permissions: write-all\n"
+        "diff --git a/.github/workflows/old.yml b/.github/workflows/old.yml\n"
+        "deleted file mode 100644\n"
+        "--- a/.github/workflows/old.yml\n"
+        "+++ /dev/null\n"
+        "diff --git a/.github/branch-protection.yml "
+        "b/.github/branch-protection.yml\n"
+        "--- a/.github/branch-protection.yml\n"
+        "+++ b/.github/branch-protection.yml\n"
+        "diff --git a/.github/workflows/release.yml "
+        "b/.github/workflows/release.yml\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+      - uses: actions/checkout@main\n"
+    )
+
+    _assert_diff_categories(
+        diff_text,
+        [
+            "branch_protection_modification",
+            "dangerous_action_external_install",
+            "permissions_escalation",
+            "workflow_destruction",
+        ],
+    )
+
+
 def test_scan_pr_diff_clean_diff_returns_empty_list() -> None:
     diff_text = (
         "diff --git a/src/example.py b/src/example.py\n"
@@ -1909,6 +2052,31 @@ def test_scan_pr_diff_clean_diff_returns_empty_list() -> None:
         " def run() -> None:\n"
         "+    print('ok')\n"
         "     return None\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_clean_realistic_diff_returns_empty_list() -> None:
+    diff_text = (
+        "diff --git a/src/daemon/recovery.py b/src/daemon/recovery.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/daemon/recovery.py\n"
+        "+++ b/src/daemon/recovery.py\n"
+        "@@ -10,6 +10,8 @@ def recover_state() -> None:\n"
+        "     tasks = load_tasks()\n"
+        "+    for task in tasks:\n"
+        "+        task.refresh_status()\n"
+        "     return None\n"
+        "diff --git a/tests/test_recovery.py b/tests/test_recovery.py\n"
+        "index 3333333..4444444 100644\n"
+        "--- a/tests/test_recovery.py\n"
+        "+++ b/tests/test_recovery.py\n"
+        "@@ -1,3 +1,6 @@\n"
+        " def test_recover_state() -> None:\n"
+        "+    result = recover_state()\n"
+        "+\n"
+        "+    assert result is None\n"
     )
 
     assert scan_pr_diff(diff_text) == []
