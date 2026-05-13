@@ -681,6 +681,17 @@ def test_scan_pr_diff_workflow_inline_permissions_map_anchor_flagged() -> None:
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_anchored_block_permissions_map_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,2 +1,4 @@\n"
+        "+permissions: &full\n"
+        "+  contents: write\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
 def test_scan_pr_diff_workflow_multiline_flow_permissions_map_flagged() -> None:
     diff_text = (
         WORKFLOW_DIFF_HEADER

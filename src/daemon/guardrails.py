@@ -116,6 +116,7 @@ _WORKFLOW_WRITE_PERMISSION_SCOPES_RE = (
     r"pull-requests|repository-projects|security-events|statuses|models|"
     r"vulnerability-alerts)[\"']?"
 )
+_YAML_ANCHOR_NAME_RE = r"&[A-Za-z_][A-Za-z0-9_-]*"
 _YAML_SCALAR_ANCHOR_RE = r"(?:&[A-Za-z_][A-Za-z0-9_-]*[ \t]+)?"
 _YAML_KEY_RE = re.compile(
     r"^(?P<indent>[ \t]*)(?P<quote>[\"']?)(?P<key>[^:\"'\r\n]+)"
@@ -189,8 +190,8 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         + r"[^\r\n]*\r?\n"
         r"(?:(?:(?!^diff --git[ \t]).)*?^[ +][ \t]*"
         r"[\"']?permissions[\"']?[ \t]*:[ \t]*(?:"
-        + _YAML_SCALAR_ANCHOR_RE
-        + r"\{[ \t]*)?(?:#.*)?\r?\n"
+        + _YAML_ANCHOR_NAME_RE
+        + r"[ \t]*(?:\{[ \t]*)?|\{[ \t]*)?(?:#.*)?\r?\n"
         r"(?:^[ +][ \t]*(?:#.*)?\r?\n|^[ +\-][ \t]+"
         + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
         + r"[ \t]*:[^\r\n]*\r?\n)*^\+[ \t]+"
