@@ -255,6 +255,9 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         + r"\{(?:(?!^diff --git[ \t]).)*?[\"']?permissions[\"']?[ \t]*:[^\r\n]*"
         r"|(?:(?!^diff --git[ \t]).)*?^\+[ \t]+[\"']?[^:\"'\r\n]+[\"']?"
         r"[ \t]*:[ \t]*\{[^\r\n]*[\"']?permissions[\"']?[ \t]*:[^\r\n]*"
+        r"|(?:(?!^diff --git[ \t]).)*?^\+[^\r\n]*"
+        r"&[A-Za-z_][A-Za-z0-9_-]*[ \t]+[\"']?(?:write|write-all)[\"']?"
+        r"(?:(?!^diff --git[ \t]).)*"
         r")[ \t]*(?:#.*)?$",
         re.IGNORECASE,
     ),
@@ -557,6 +560,60 @@ def _is_workflow_job_flow_permission_escalation(
     ) == "write-all" or _yaml_flow_permission_map_escalates(alias_value)
 
 
+def _visible_permission_alias_reference_escalates(
+    lines: list[str], alias_name: str, *, top_level_permissions: bool
+) -> bool:
+    alias_ref_re = re.compile(rf"\*{re.escape(alias_name)}\b", re.IGNORECASE)
+    scope_alias_re = re.compile(
+        _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+        + rf"[ \t]*:[ \t]*\*{re.escape(alias_name)}\b",
+        re.IGNORECASE,
+    )
+    for index, line in enumerate(lines):
+        diff_line = _diff_yaml_line(line)
+        if diff_line is None:
+            continue
+        prefix, yaml_line = diff_line
+        if prefix == "-" or alias_ref_re.search(yaml_line) is None:
+            continue
+        if top_level_permissions and _YAML_PERMISSION_KEY_RE.match(yaml_line):
+            if _is_workflow_permission_key_context(lines, index, yaml_line):
+                return True
+        if not top_level_permissions and scope_alias_re.search(yaml_line):
+            if _YAML_PERMISSION_KEY_RE.match(yaml_line):
+                return _is_workflow_permission_key_context(lines, index, yaml_line)
+            for parent_index in range(index - 1, -1, -1):
+                parent_diff_line = _diff_yaml_line(lines[parent_index])
+                if parent_diff_line is None:
+                    continue
+                parent_prefix, parent_yaml_line = parent_diff_line
+                if parent_prefix == "-":
+                    continue
+                if not _YAML_PERMISSION_KEY_RE.match(parent_yaml_line):
+                    continue
+                return _is_workflow_permission_key_context(
+                    lines, parent_index, parent_yaml_line
+                )
+    return False
+
+
+def _anchor_value_edit_escalates(lines: list[str], yaml_line: str) -> bool:
+    match = _YAML_ANCHOR_VALUE_RE.search(yaml_line)
+    if match is None:
+        return False
+    alias_name = match.group("name")
+    normalized_value = _normalized_yaml_scalar(match.group("value"))
+    if normalized_value == "write-all":
+        return _visible_permission_alias_reference_escalates(
+            lines, alias_name, top_level_permissions=True
+        )
+    if normalized_value == "write":
+        return _visible_permission_alias_reference_escalates(
+            lines, alias_name, top_level_permissions=False
+        )
+    return False
+
+
 def _replaces_read_scope_with_write(
     lines: list[str], line_index: int, scope_line: str
 ) -> bool:
@@ -604,6 +661,8 @@ def _match_has_workflow_permission_context(match_text: str) -> bool:
         prefix, yaml_line = diff_line
         if prefix != "+":
             continue
+        if _anchor_value_edit_escalates(lines, yaml_line):
+            return True
         if _is_workflow_jobs_flow_permission_escalation(lines, index, yaml_line):
             return True
         if _is_workflow_job_flow_permission_escalation(lines, index, yaml_line):

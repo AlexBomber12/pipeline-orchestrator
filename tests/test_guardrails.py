@@ -534,6 +534,18 @@ def test_workflow_permission_alias_helpers_resolve_only_visible_values() -> None
     assert guardrails._yaml_alias_resolves_to_escalation(
         lines, 10, "permissions: *full", top_level_permissions=True
     )
+    assert guardrails._visible_permission_alias_reference_escalates(
+        [
+            "- permissions:",
+            " permissions:",
+            "@@ -1,3 +1,4 @@",
+            "-  issues: *write_value",
+            "   # comment",
+            "+  contents: *write_value",
+        ],
+        "write_value",
+        top_level_permissions=False,
+    )
 
 
 def test_workflow_permission_context_helpers_track_active_yaml_stack() -> None:
@@ -961,6 +973,32 @@ def test_scan_pr_diff_workflow_non_escalating_alias_before_scope_write_flagged()
         + "+permissions: *ro\n"
         + " permissions:\n"
         + "+  contents: write\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_scope_anchor_value_edit_to_write_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,7 +1,7 @@\n"
+        + " env:\n"
+        + "-  PERM: &perm read\n"
+        + "+  PERM: &perm write\n"
+        + " permissions: { contents: *perm }\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_permissions_anchor_value_edit_to_write_all_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,7 +1,7 @@\n"
+        + " env:\n"
+        + "-  PERM: &perm read-all\n"
+        + "+  PERM: &perm write-all\n"
+        + " permissions: *perm\n"
     )
 
     _assert_diff_categories(diff_text, ["permissions_escalation"])
