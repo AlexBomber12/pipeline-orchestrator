@@ -84,6 +84,8 @@ _DAEMON_FIELDS = {
     "operator_timezone",
     "guardrail_notification_webhook_url",
     "guardrail_notification_timeout_seconds",
+    "large_diff_addition_threshold",
+    "large_diff_files_threshold",
     "main_commit_audit_interval_idle_cycles",
     "main_commit_audit_lookback_n",
 }

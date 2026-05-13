@@ -426,14 +426,19 @@ def _count_diff_size(diff_text: str) -> tuple[int, int, int, int]:
     files_changed = 0
     files_with_additions: set[str] = set()
     current_path: str | None = None
+    in_hunk = False
 
     for line in diff_text.splitlines():
         paths = _diff_git_paths(line)
         if paths is not None:
             files_changed += 1
             current_path = paths[1]
+            in_hunk = False
             continue
-        if _is_diff_file_header(line):
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if not in_hunk and _is_diff_file_header(line):
             continue
         if line.startswith("+"):
             additions += 1
@@ -460,14 +465,19 @@ def _classify_files_lockfile_exempt(diff_text: str) -> set[str]:
 def _count_additions_in_paths(diff_text: str, paths: set[str]) -> int:
     additions = 0
     current_path: str | None = None
+    in_hunk = False
     for line in diff_text.splitlines():
         diff_paths = _diff_git_paths(line)
         if diff_paths is not None:
             current_path = diff_paths[1]
+            in_hunk = False
+            continue
+        if line.startswith("@@"):
+            in_hunk = True
             continue
         if (
             line.startswith("+")
-            and not _is_diff_file_header(line)
+            and (in_hunk or not _is_diff_file_header(line))
             and current_path in paths
         ):
             additions += 1

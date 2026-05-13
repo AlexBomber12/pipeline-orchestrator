@@ -514,6 +514,18 @@ def test_count_diff_size_counts_added_and_deleted_lines_with_header_prefixes() -
     assert guardrails._count_diff_size(diff_text) == (1, 1, 1, 1)
 
 
+def test_count_diff_size_counts_added_lines_that_look_like_file_headers() -> None:
+    diff_text = (
+        "diff --git a/src/a.py b/src/a.py\n"
+        "--- a/src/a.py\n"
+        "+++ b/src/a.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "+++ b/not-a-header.py\n"
+    )
+
+    assert guardrails._count_diff_size(diff_text) == (1, 0, 1, 1)
+
+
 def test_count_diff_size_ignores_malformed_diff_git_headers() -> None:
     diff_text = (
         'diff --git "a/src/unclosed.py b/src/unclosed.py\n'
@@ -539,6 +551,18 @@ def test_count_additions_in_paths_counts_added_lines_with_header_prefixes() -> N
         "+++ b/package-lock.json\n"
         "@@ -1,1 +1,1 @@\n"
         "+++lockfile_value\n"
+    )
+
+    assert guardrails._count_additions_in_paths(diff_text, {"package-lock.json"}) == 1
+
+
+def test_count_additions_in_paths_counts_added_lines_that_look_like_headers() -> None:
+    diff_text = (
+        "diff --git a/package-lock.json b/package-lock.json\n"
+        "--- a/package-lock.json\n"
+        "+++ b/package-lock.json\n"
+        "@@ -1,1 +1,1 @@\n"
+        "+++ b/not-a-header.json\n"
     )
 
     assert guardrails._count_additions_in_paths(diff_text, {"package-lock.json"}) == 1
