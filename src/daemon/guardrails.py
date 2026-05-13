@@ -105,7 +105,7 @@ _DIFF_WORKFLOW_B_PATH_RE = (
     r'"?b/\.github/workflows/[^"/\r\n]+\.ya?ml' + _WORKFLOW_PATH_END_RE
 )
 _DIFF_ACTION_B_PATH_RE = (
-    r'"?b/\.github/actions/[^"\r\n]*/action\.ya?ml' + _WORKFLOW_PATH_END_RE
+    r'"?b/\.github/actions/(?:[^"\r\n]*/)?action\.ya?ml' + _WORKFLOW_PATH_END_RE
 )
 _DIFF_WORKFLOW_A_PATH_RE = (
     r'"?a/\.github/workflows/[^"/\r\n]+\.ya?ml' + _WORKFLOW_PATH_END_RE
