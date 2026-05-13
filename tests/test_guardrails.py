@@ -970,11 +970,45 @@ def test_scan_pr_diff_generic_detects_high_entropy_token_assignment() -> None:
     assert violations[0].category == "generic_high_entropy"
 
 
-@pytest.mark.parametrize("assignment_name", ["OPENAI_API_KEY", "MY_TOKEN", "DB_PASSWORD"])
+@pytest.mark.parametrize(
+    "assignment_name",
+    ["OPENAI_API_KEY", "MY_TOKEN", "DB_PASSWORD"],
+)
 def test_scan_pr_diff_generic_detects_prefixed_secret_assignment(
     assignment_name: str,
 ) -> None:
     diff_text = _secret_diff("abc123XyZ_HighEntropyValue9876ZQT5", assignment_name)
+
+    violations = scan_pr_diff(diff_text)
+
+    assert len(violations) == 1
+    assert violations[0].category == "generic_high_entropy"
+
+
+@pytest.mark.parametrize(
+    "assignment_name",
+    ["clientSecret", "accessToken", "dbPassword"],
+)
+def test_scan_pr_diff_generic_detects_camel_case_secret_assignment(
+    assignment_name: str,
+) -> None:
+    diff_text = _secret_diff("abc123XyZ_HighEntropyValue9876ZQT5", assignment_name)
+
+    violations = scan_pr_diff(diff_text)
+
+    assert len(violations) == 1
+    assert violations[0].category == "generic_high_entropy"
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_scan_pr_diff_generic_detects_quoted_structured_key(quote: str) -> None:
+    diff_text = (
+        "diff --git a/src/settings.json b/src/settings.json\n"
+        "--- a/src/settings.json\n"
+        "+++ b/src/settings.json\n"
+        "@@ -1,1 +1,2 @@\n"
+        f"+{quote}api_key{quote}: {quote}abc123XyZ_HighEntropyValue9876ZQT5{quote}\n"
+    )
 
     violations = scan_pr_diff(diff_text)
 
