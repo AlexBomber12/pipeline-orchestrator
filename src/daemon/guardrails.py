@@ -221,7 +221,7 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
     "dangerous_action_external_install": re.compile(
         # Match added action references; pinned refs are filtered in
         # scan_pr_diff because this regex captures all candidate refs.
-        r"(?m)^\+[ \t]*-?[ \t]*uses:[ \t]+(?P<quote>[\"']?)"
+        r"(?m)^\+[ \t]*-?[ \t]*[\"']?uses[\"']?[ \t]*:[ \t]+(?P<quote>[\"']?)"
         r"(?P<repo>[\w.-]+/[\w./-]+)"
         r"@(?P<ref>[^\"'\s\r\n]+)(?P=quote)",
         re.IGNORECASE,
@@ -832,8 +832,11 @@ def _action_uses_match_is_yaml_key(section_text: str, relative_start: int) -> bo
     stripped = yaml_line.lstrip(" \t")
     if stripped.startswith("-"):
         stripped = stripped[1:].lstrip(" \t")
-    return stripped.lower().startswith("uses:") and not _yaml_line_is_in_block_scalar(
-        lines, line_index
+    key = _yaml_key(stripped)
+    return (
+        key is not None
+        and key[1].strip("\"'").lower() == "uses"
+        and not _yaml_line_is_in_block_scalar(lines, line_index)
     )
 
 

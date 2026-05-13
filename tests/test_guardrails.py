@@ -2014,6 +2014,18 @@ def test_scan_pr_diff_action_single_quoted_main_ref_flagged() -> None:
     _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
 
 
+def test_scan_pr_diff_action_quoted_uses_key_flagged() -> None:
+    diff_text = WORKFLOW_DIFF_HEADER + '+      - "uses": actions/checkout@main\n'
+
+    _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
+
+
+def test_scan_pr_diff_action_spaced_uses_key_separator_flagged() -> None:
+    diff_text = WORKFLOW_DIFF_HEADER + "+      - uses : actions/checkout@main\n"
+
+    _assert_diff_categories(diff_text, ["dangerous_action_external_install"])
+
+
 def test_scan_pr_diff_action_semver_tag_v1_not_flagged() -> None:
     diff_text = WORKFLOW_DIFF_HEADER + "+      - uses: actions/checkout@v1\n"
 
