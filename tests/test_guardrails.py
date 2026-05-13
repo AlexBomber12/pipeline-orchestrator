@@ -1016,6 +1016,21 @@ def test_scan_pr_diff_generic_detects_quoted_structured_key(quote: str) -> None:
     assert violations[0].category == "generic_high_entropy"
 
 
+def test_scan_pr_diff_generic_scans_later_assignment_on_same_line() -> None:
+    diff_text = (
+        "diff --git a/src/settings.json b/src/settings.json\n"
+        "--- a/src/settings.json\n"
+        "+++ b/src/settings.json\n"
+        "@@ -1,1 +1,2 @@\n"
+        '+"token": "dev", "api_key": "abc123XyZ_HighEntropyValue9876ZQT5"\n'
+    )
+
+    violations = scan_pr_diff(diff_text)
+
+    assert len(violations) == 1
+    assert violations[0].category == "generic_high_entropy"
+
+
 def test_scan_pr_diff_generic_no_match_low_entropy() -> None:
     diff_text = _secret_diff("hello_world_simple_value", "token")
 

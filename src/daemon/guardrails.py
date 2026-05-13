@@ -606,12 +606,10 @@ def _scan_secrets_generic_in_additions(diff_text: str) -> list[tuple[str, int, s
             or (not in_hunk and _is_diff_file_header(line))
         ):
             continue
-        match = _SUSPICIOUS_CONTEXT_RE.search(line)
-        if match is None:
-            continue
-        value = match.group(2)
-        if len(value) >= 20 and _shannon_entropy(value) >= 4.5:
-            matches.append((current_path, line_number, "generic_high_entropy"))
+        for match in _SUSPICIOUS_CONTEXT_RE.finditer(line):
+            value = match.group(2)
+            if len(value) >= 20 and _shannon_entropy(value) >= 4.5:
+                matches.append((current_path, line_number, "generic_high_entropy"))
     return matches
 
 
