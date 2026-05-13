@@ -523,6 +523,21 @@ def test_workflow_permission_alias_helpers_resolve_only_visible_values() -> None
     ]
 
     assert guardrails._yaml_flow_permission_map_escalates("{ contents: write }")
+    assert not guardrails._yaml_flow_permission_map_escalates(
+        '{ name: "contents: write" }'
+    )
+    assert (
+        guardrails._mask_yaml_quoted_colon_values('"permissions": write-all')
+        == '"permissions": write-all'
+    )
+    assert (
+        guardrails._mask_yaml_quoted_colon_values('name: "permissions: write-all"')
+        == 'name: "                      "'
+    )
+    assert (
+        guardrails._mask_yaml_quoted_colon_values('name: "permissions: write-all')
+        == 'name: "permissions: write-all'
+    )
     assert guardrails._yaml_anchor_values_before(lines, 10) == {
         "read_only": "read",
         "full": "{ contents: write }",
@@ -761,6 +776,16 @@ def test_scan_pr_diff_workflow_inline_jobs_permission_write_all_flagged() -> Non
     )
 
     _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_inline_jobs_permission_string_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,2 +1,3 @@\n"
+        + '+jobs: { build: { name: "permissions: write-all", runs-on: ubuntu-latest } }\n'
+    )
+
+    assert scan_pr_diff(diff_text) == []
 
 
 def test_scan_pr_diff_workflow_indented_inline_jobs_permission_flagged() -> None:

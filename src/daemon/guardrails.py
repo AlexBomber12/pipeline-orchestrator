@@ -347,7 +347,30 @@ def _normalized_yaml_scalar(value: str) -> str:
     return value.rstrip(",").strip("\"'").lower()
 
 
+def _mask_yaml_quoted_colon_values(value: str) -> str:
+    chars = list(value)
+    index = 0
+    while index < len(chars):
+        quote = chars[index]
+        if quote not in {"'", '"'}:
+            index += 1
+            continue
+        end = index + 1
+        while end < len(chars):
+            if chars[end] == quote and value[end - 1] != "\\":
+                break
+            end += 1
+        if end >= len(chars):
+            return "".join(chars)
+        tail = value[end + 1 :].lstrip()
+        if not tail.startswith(":") and ":" in value[index + 1 : end]:
+            chars[index + 1 : end] = [" "] * (end - index - 1)
+        index = end + 1
+    return "".join(chars)
+
+
 def _yaml_flow_permission_map_escalates(value: str) -> bool:
+    value = _mask_yaml_quoted_colon_values(value)
     return bool(
         re.search(
             _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
@@ -535,7 +558,7 @@ def _is_workflow_jobs_flow_permission_escalation(
     if not _is_visible_root_jobs_key(lines, line_index, jobs_indent, jobs_name):
         return False
     flow_line = _jobs_flow_fragment(lines, line_index, jobs_line)
-    if _YAML_JOBS_FLOW_PERMISSION_RE.match(flow_line):
+    if _YAML_JOBS_FLOW_PERMISSION_RE.match(_mask_yaml_quoted_colon_values(flow_line)):
         return True
     alias_name = _flow_permission_alias_name(flow_line)
     if alias_name is None:
@@ -565,7 +588,7 @@ def _is_workflow_job_flow_permission_escalation(
     if len(ancestors) != 1 or ancestors[0][1] != "jobs":
         return False
     flow_line = f"jobs: {{ {job_line.strip()} }}"
-    if _YAML_JOBS_FLOW_PERMISSION_RE.match(flow_line):
+    if _YAML_JOBS_FLOW_PERMISSION_RE.match(_mask_yaml_quoted_colon_values(flow_line)):
         return True
     alias_name = _flow_permission_alias_name(flow_line)
     if alias_name is None:
