@@ -674,21 +674,22 @@ def test_scan_pr_diff_tier_1_violations_still_flagged() -> None:
     )
 
 
-def _secret_diff(secret_value: str) -> str:
+def _secret_diff(secret_value: str, assignment_name: str = "TOKEN") -> str:
     return (
         "diff --git a/src/settings.py b/src/settings.py\n"
         "--- a/src/settings.py\n"
         "+++ b/src/settings.py\n"
         "@@ -1,1 +1,2 @@\n"
-        f'+TOKEN = "{secret_value}"\n'
+        f'+{assignment_name} = "{secret_value}"\n'
     )
 
 
 def _assert_secret_violation_redacted(
     secret_value: str,
     category: str,
+    assignment_name: str = "TOKEN",
 ) -> GuardrailViolation:
-    violations = scan_pr_diff(_secret_diff(secret_value))
+    violations = scan_pr_diff(_secret_diff(secret_value, assignment_name))
 
     assert len(violations) == 1
     assert violations[0].tier == 2
@@ -760,6 +761,198 @@ def test_scan_pr_diff_excerpt_never_contains_secret_value() -> None:
 
     for secret_value, category in positive_cases:
         _assert_secret_violation_redacted(secret_value, category)
+
+
+def _slack_token(kind: str, segments: list[str], suffix: str) -> str:
+    return "xo" + kind + "-" + "-".join(segments) + "-" + suffix
+
+
+def test_scan_pr_diff_detects_slack_user_token() -> None:
+    placeholder = _slack_token(
+        "xp",
+        ["1234567890", "2345678901", "3456789012"],
+        "a" * 32,
+    )
+
+    _assert_secret_violation_redacted(placeholder, "slack_token_user")
+
+
+def test_scan_pr_diff_detects_modern_slack_user_token() -> None:
+    placeholder = _slack_token(
+        "xp",
+        ["11111111111", "22222222222", "33333333333", "44444444444"],
+        "Ab" * 20,
+    )
+
+    _assert_secret_violation_redacted(placeholder, "slack_token_user")
+
+
+def test_scan_pr_diff_detects_slack_bot_token() -> None:
+    placeholder = _slack_token(
+        "xb",
+        ["1234567890", "2345678901"],
+        "A" * 24,
+    )
+
+    _assert_secret_violation_redacted(placeholder, "slack_token_bot")
+
+
+def test_scan_pr_diff_detects_modern_slack_bot_token() -> None:
+    placeholder = _slack_token(
+        "xb",
+        ["11111111111", "22222222222", "33333333333"],
+        "abcdef0123456789abcdef0123456789",
+    )
+
+    _assert_secret_violation_redacted(placeholder, "slack_token_bot")
+
+
+def test_scan_pr_diff_detects_slack_webhook() -> None:
+    placeholder = (
+        "https://hooks.slack.com/services/T0123456789/B0123456789/" + ("A" * 24)
+    )
+
+    _assert_secret_violation_redacted(placeholder, "slack_webhook")
+
+
+def test_scan_pr_diff_detects_govslack_webhook() -> None:
+    placeholder = (
+        "https://hooks.slack-gov.com/services/T0123456789/B0123456789/"
+        + ("A" * 24)
+    )
+
+    _assert_secret_violation_redacted(placeholder, "slack_webhook")
+
+
+def test_scan_pr_diff_detects_slack_oauth_webhook() -> None:
+    placeholder = "https://hooks.slack.com/T0123456789/B0123456789/" + ("A" * 24)
+
+    _assert_secret_violation_redacted(placeholder, "slack_webhook")
+
+
+def test_scan_pr_diff_detects_stripe_secret_key() -> None:
+    placeholder = "sk_test_" + ("A" * 24)
+
+    _assert_secret_violation_redacted(placeholder, "stripe_secret_key")
+
+
+def test_scan_pr_diff_detects_google_api_key() -> None:
+    placeholder = "AIza" + ("A" * 35)
+
+    _assert_secret_violation_redacted(placeholder, "google_api_key")
+
+
+def test_scan_pr_diff_detects_jwt_like() -> None:
+    placeholder = "eyJ" + ("A" * 10) + "." + ("B" * 10) + "." + ("C" * 10)
+
+    _assert_secret_violation_redacted(placeholder, "jwt_like", "JWT_TOKEN")
+
+
+def test_scan_pr_diff_detects_json_access_token_jwt_like() -> None:
+    placeholder = "eyJ" + ("A" * 10) + "." + ("B" * 10) + "." + ("C" * 10)
+    diff = (
+        "diff --git a/config.json b/config.json\n"
+        "--- a/config.json\n"
+        "+++ b/config.json\n"
+        "@@ -1,1 +1,2 @@\n"
+        f'+"access_token": "{placeholder}"\n'
+    )
+
+    violations = scan_pr_diff(diff)
+
+    assert len(violations) == 1
+    assert violations[0].category == "jwt_like"
+    assert placeholder not in violations[0].excerpt
+
+
+def test_scan_pr_diff_detects_json_authorization_bearer_jwt_like() -> None:
+    placeholder = "eyJ" + ("A" * 10) + "." + ("B" * 10) + "." + ("C" * 10)
+    diff = (
+        "diff --git a/config.json b/config.json\n"
+        "--- a/config.json\n"
+        "+++ b/config.json\n"
+        "@@ -1,1 +1,2 @@\n"
+        f'+"Authorization": "Bearer {placeholder}"\n'
+    )
+
+    violations = scan_pr_diff(diff)
+
+    assert len(violations) == 1
+    assert violations[0].category == "jwt_like"
+    assert placeholder not in violations[0].excerpt
+
+
+def test_scan_pr_diff_ignores_bare_jwt_like_sample() -> None:
+    placeholder = "eyJ" + ("A" * 10) + "." + ("B" * 10) + "." + ("C" * 10)
+
+    assert scan_pr_diff(_secret_diff(placeholder, "EXAMPLE_VALUE")) == []
+
+
+def test_scan_pr_diff_group_b_excerpt_never_contains_secret_value() -> None:
+    positive_cases = [
+        (
+            _slack_token(
+                "xp",
+                ["1234567890", "2345678901", "3456789012"],
+                "a" * 32,
+            ),
+            "slack_token_user",
+        ),
+        (
+            _slack_token(
+                "xp",
+                ["11111111111", "22222222222", "33333333333", "44444444444"],
+                "Ab" * 20,
+            ),
+            "slack_token_user",
+        ),
+        (
+            _slack_token(
+                "xb",
+                ["1234567890", "2345678901"],
+                "A" * 24,
+            ),
+            "slack_token_bot",
+        ),
+        (
+            _slack_token(
+                "xb",
+                ["11111111111", "22222222222", "33333333333"],
+                "abcdef0123456789abcdef0123456789",
+            ),
+            "slack_token_bot",
+        ),
+        (
+            "https://hooks.slack.com/services/T0123456789/B0123456789/"
+            + ("A" * 24),
+            "slack_webhook",
+        ),
+        (
+            "https://hooks.slack-gov.com/services/T0123456789/B0123456789/"
+            + ("A" * 24),
+            "slack_webhook",
+        ),
+        (
+            "https://hooks.slack.com/T0123456789/B0123456789/" + ("A" * 24),
+            "slack_webhook",
+        ),
+        ("sk_test_" + ("A" * 24), "stripe_secret_key", "TOKEN"),
+        ("rk_live_" + ("A" * 24), "stripe_restricted_key", "TOKEN"),
+        ("AIza" + ("A" * 35), "google_api_key", "TOKEN"),
+        (
+            "eyJ" + ("A" * 10) + "." + ("B" * 10) + "." + ("C" * 10),
+            "jwt_like",
+            "JWT_TOKEN",
+        ),
+    ]
+
+    for positive_case in positive_cases:
+        secret_value, category, *assignment_name = positive_case
+        _assert_secret_violation_redacted(
+            secret_value,
+            category,
+            assignment_name[0] if assignment_name else "TOKEN",
+        )
 
 
 def test_workflow_permission_context_helpers_handle_non_yaml_lines() -> None:
