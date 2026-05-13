@@ -3641,6 +3641,60 @@ def test_scan_pr_diff_once_violation_transitions_to_error_with_guardrail_subsour
     assert runner.state.current_pr.diff_scanned_at_sha == "newsha01"
 
 
+def test_scan_pr_diff_once_uses_runner_daemon_config_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WATCH diff scans must use the runner's loaded config snapshot.
+
+    Re-loading ``config.yml`` inside the guardrail scan would make WATCH
+    sensitive to temporary config edit failures and could apply thresholds
+    that differ from the active runner cycle.
+    """
+    import re as _re
+
+    monkeypatch.setattr(
+        watch_module.guardrails,
+        "_DIFF_PATTERNS",
+        {"workflow_permissions_write_all": _re.compile(r"permissions:\s*write-all")},
+    )
+    monkeypatch.setattr("src.github.prs.get_pr_diff", lambda repo, number: "clean\n")
+
+    captured: list[DaemonConfig] = []
+
+    def fake_scan(
+        diff_text: str,
+        *,
+        daemon_config: DaemonConfig | None = None,
+    ) -> list[Any]:
+        assert diff_text == "clean\n"
+        assert daemon_config is not None
+        captured.append(daemon_config)
+        return []
+
+    monkeypatch.setattr(watch_module.guardrails, "scan_pr_diff", fake_scan)
+
+    runner = h._make_runner()
+    runner.app_config = h._app_cfg(
+        large_diff_addition_threshold=250,
+        large_diff_files_threshold=8,
+    )
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=12,
+        branch="pr-012",
+        head_sha="snapshot1",
+        diff_scanned_at_sha=None,
+    )
+
+    result = asyncio.run(runner._scan_pr_diff_once())
+
+    assert result is True
+    assert captured == [runner.app_config.daemon]
+    assert captured[0].large_diff_addition_threshold == 250
+    assert captured[0].large_diff_files_threshold == 8
+    assert runner.state.current_pr.diff_scanned_at_sha == "snapshot1"
+
+
 def test_handle_watch_invokes_diff_scan_once_per_cycle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

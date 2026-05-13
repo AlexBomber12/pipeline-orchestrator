@@ -14,7 +14,7 @@ import re
 import shlex
 from dataclasses import dataclass
 
-from src.config import DaemonConfig, load_config
+from src.config import DaemonConfig
 
 
 @dataclass(frozen=True)
@@ -378,10 +378,6 @@ _LOCKFILE_RES = tuple(re.compile(pattern) for pattern in LOCKFILE_PATTERNS)
 
 def _clip_excerpt(text: str) -> str:
     return text[:_EXCERPT_LIMIT]
-
-
-def _load_guardrail_config() -> DaemonConfig:
-    return load_config().daemon
 
 
 def _diff_git_paths(line: str) -> tuple[str, str] | None:
@@ -1283,7 +1279,10 @@ def scan_stdout(coder_stdout: str) -> list[GuardrailViolation]:
     return violations
 
 
-def scan_pr_diff(diff_text: str) -> list[GuardrailViolation]:
+def scan_pr_diff(
+    diff_text: str,
+    daemon_config: DaemonConfig | None = None,
+) -> list[GuardrailViolation]:
     """Scan PR diff content for prohibited patterns.
 
     Returns guardrail violations found in ``diff_text`` (the unified-diff
@@ -1326,7 +1325,7 @@ def scan_pr_diff(diff_text: str) -> list[GuardrailViolation]:
                     rule=_DIFF_RULES.get(category, ""),
                 )
             )
-    config = _load_guardrail_config()
+    config = daemon_config or DaemonConfig()
     adds, _dels, _files, files_with_adds = _count_diff_size(diff_text)
     lockfile_paths = _classify_files_lockfile_exempt(diff_text)
     lockfile_additions = _count_additions_in_paths(diff_text, lockfile_paths)

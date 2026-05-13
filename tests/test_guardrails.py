@@ -4,6 +4,7 @@ import re
 from dataclasses import FrozenInstanceError
 
 import pytest
+from src.config import DaemonConfig
 from src.daemon import guardrails
 from src.daemon.guardrails import GuardrailViolation, scan_pr_diff, scan_stdout
 
@@ -527,6 +528,21 @@ def test_scan_pr_diff_under_threshold_no_violation() -> None:
     assert "large_diff_threshold" not in [
         violation.category for violation in scan_pr_diff(diff_text)
     ]
+
+
+def test_scan_pr_diff_uses_supplied_daemon_config_thresholds() -> None:
+    diff_text = _diff_for_file("src/configured.py", additions=120)
+    daemon_config = DaemonConfig(
+        large_diff_addition_threshold=100,
+        large_diff_files_threshold=30,
+    )
+
+    violations = scan_pr_diff(diff_text, daemon_config=daemon_config)
+
+    assert [violation.category for violation in violations] == [
+        "large_diff_threshold"
+    ]
+    assert "Threshold: +100 LOC or 30 files." in violations[0].excerpt
 
 
 def test_scan_pr_diff_over_addition_threshold_flagged() -> None:
