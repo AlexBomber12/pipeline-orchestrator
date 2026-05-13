@@ -762,6 +762,63 @@ def test_scan_pr_diff_excerpt_never_contains_secret_value() -> None:
         _assert_secret_violation_redacted(secret_value, category)
 
 
+def test_scan_pr_diff_detects_slack_user_token() -> None:
+    placeholder = "xoxp-1234567890-2345678901-3456789012-" + ("a" * 32)
+
+    _assert_secret_violation_redacted(placeholder, "slack_token_user")
+
+
+def test_scan_pr_diff_detects_slack_bot_token() -> None:
+    placeholder = "xoxb-1234567890-2345678901-" + ("A" * 24)
+
+    _assert_secret_violation_redacted(placeholder, "slack_token_bot")
+
+
+def test_scan_pr_diff_detects_slack_webhook() -> None:
+    placeholder = (
+        "https://hooks.slack.com/services/T0123456789/B0123456789/" + ("A" * 24)
+    )
+
+    _assert_secret_violation_redacted(placeholder, "slack_webhook")
+
+
+def test_scan_pr_diff_detects_stripe_secret_key() -> None:
+    placeholder = "sk_test_" + ("A" * 24)
+
+    _assert_secret_violation_redacted(placeholder, "stripe_secret_key")
+
+
+def test_scan_pr_diff_detects_google_api_key() -> None:
+    placeholder = "AIza" + ("A" * 35)
+
+    _assert_secret_violation_redacted(placeholder, "google_api_key")
+
+
+def test_scan_pr_diff_detects_jwt_like() -> None:
+    placeholder = "eyJ" + ("A" * 10) + "." + ("B" * 10) + "." + ("C" * 10)
+
+    _assert_secret_violation_redacted(placeholder, "jwt_like")
+
+
+def test_scan_pr_diff_group_b_excerpt_never_contains_secret_value() -> None:
+    positive_cases = [
+        ("xoxp-1234567890-2345678901-3456789012-" + ("a" * 32), "slack_token_user"),
+        ("xoxb-1234567890-2345678901-" + ("A" * 24), "slack_token_bot"),
+        (
+            "https://hooks.slack.com/services/T0123456789/B0123456789/"
+            + ("A" * 24),
+            "slack_webhook",
+        ),
+        ("sk_test_" + ("A" * 24), "stripe_secret_key"),
+        ("rk_live_" + ("A" * 24), "stripe_restricted_key"),
+        ("AIza" + ("A" * 35), "google_api_key"),
+        ("eyJ" + ("A" * 10) + "." + ("B" * 10) + "." + ("C" * 10), "jwt_like"),
+    ]
+
+    for secret_value, category in positive_cases:
+        _assert_secret_violation_redacted(secret_value, category)
+
+
 def test_workflow_permission_context_helpers_handle_non_yaml_lines() -> None:
     assert guardrails._diff_yaml_line("+++ b/.github/workflows/ci.yml") is None
     assert guardrails._yaml_key("not a mapping") is None

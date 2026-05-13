@@ -373,6 +373,28 @@ SECRET_PATTERNS_A: list[tuple[str, re.Pattern[str]]] = [
     ("openai_api_key", re.compile(r"\bsk-(?!ant-)[A-Za-z0-9_-]{48,}\b")),
 ]
 
+SECRET_PATTERNS_B: list[tuple[str, re.Pattern[str]]] = [
+    ("slack_token_user", re.compile(r"\bxoxp-[0-9]+-[0-9]+-[0-9]+-[a-f0-9]{32}\b")),
+    ("slack_token_bot", re.compile(r"\bxoxb-[0-9]+-[0-9]+-[A-Za-z0-9]{24}\b")),
+    (
+        "slack_webhook",
+        re.compile(
+            r"\bhttps://hooks\.slack\.com/services/"
+            r"T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]{24}\b"
+        ),
+    ),
+    ("stripe_secret_key", re.compile(r"\bsk_(?:test|live)_[A-Za-z0-9]{24,}\b")),
+    ("stripe_restricted_key", re.compile(r"\brk_(?:test|live)_[A-Za-z0-9]{24,}\b")),
+    ("google_api_key", re.compile(r"\bAIza[A-Za-z0-9_-]{35}\b")),
+    (
+        "jwt_like",
+        re.compile(
+            r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\."
+            r"[A-Za-z0-9_-]{10,}\b"
+        ),
+    ),
+]
+
 LOCKFILE_PATTERNS = (
     r"package-lock\.json$",
     r"yarn\.lock$",
@@ -497,8 +519,9 @@ def _count_additions_in_paths(diff_text: str, paths: set[str]) -> int:
     return additions
 
 
-def _scan_secrets_group_a_in_additions(
+def _scan_secret_patterns_in_additions(
     diff_text: str,
+    patterns: list[tuple[str, re.Pattern[str]]],
 ) -> list[tuple[str, int, str]]:
     matches: list[tuple[str, int, str]] = []
     current_path: str | None = None
@@ -519,10 +542,22 @@ def _scan_secrets_group_a_in_additions(
             or (not in_hunk and _is_diff_file_header(line))
         ):
             continue
-        for category, pattern in SECRET_PATTERNS_A:
+        for category, pattern in patterns:
             if pattern.search(line):
                 matches.append((current_path, line_number, category))
     return matches
+
+
+def _scan_secrets_group_a_in_additions(
+    diff_text: str,
+) -> list[tuple[str, int, str]]:
+    return _scan_secret_patterns_in_additions(diff_text, SECRET_PATTERNS_A)
+
+
+def _scan_secrets_group_b_in_additions(
+    diff_text: str,
+) -> list[tuple[str, int, str]]:
+    return _scan_secret_patterns_in_additions(diff_text, SECRET_PATTERNS_B)
 
 
 def _action_ref_is_pinned(ref: str) -> bool:
@@ -1432,6 +1467,17 @@ def scan_pr_diff(
             )
         )
     for file_path, line_in_diff, category in _scan_secrets_group_a_in_additions(
+        diff_text
+    ):
+        violations.append(
+            GuardrailViolation(
+                tier=2,
+                category=category,
+                excerpt=f"{file_path}:{line_in_diff} (category: {category})",
+                rule="High-confidence provider token shape detected in added diff line",
+            )
+        )
+    for file_path, line_in_diff, category in _scan_secrets_group_b_in_additions(
         diff_text
     ):
         violations.append(
