@@ -987,7 +987,7 @@ def test_scan_pr_diff_generic_detects_prefixed_secret_assignment(
 
 @pytest.mark.parametrize(
     "assignment_name",
-    ["clientSecret", "accessToken", "dbPassword"],
+    ["clientSecret", "accessToken", "dbPassword", "openaiApiKey", "myApiKey"],
 )
 def test_scan_pr_diff_generic_detects_camel_case_secret_assignment(
     assignment_name: str,
