@@ -462,6 +462,7 @@ def test_workflow_permission_context_helpers_handle_non_yaml_lines() -> None:
     ) == [(0, "jobs")]
     assert not guardrails._is_workflow_permission_key_context([], 0, "not a mapping")
     assert not guardrails._is_workflow_permission_key_context([], 0, "contents: write")
+    assert not guardrails._is_workflow_jobs_flow_permission_escalation("not a mapping")
 
 
 def test_workflow_permission_context_helpers_track_active_yaml_stack() -> None:
@@ -487,6 +488,22 @@ def test_workflow_permission_context_helpers_use_hunk_header_yaml_context() -> N
         ],
         3,
     ) == [(0, "jobs"), (2, "build"), (4, "permissions")]
+
+
+def test_workflow_permission_context_ignores_nested_jobs_keys() -> None:
+    lines = [
+        " on:",
+        "   workflow_call:",
+        "     inputs:",
+        "       jobs:",
+        "+        permissions: write-all",
+    ]
+
+    assert not guardrails._is_workflow_permission_key_context(
+        lines,
+        4,
+        "        permissions: write-all",
+    )
 
 
 def test_workflow_permission_context_rejects_indented_key_without_ancestor() -> None:
@@ -618,6 +635,40 @@ def test_scan_pr_diff_workflow_reserved_word_job_id_permissions_flagged() -> Non
         + " jobs:\n"
         + "   run:\n"
         + "+    permissions: write-all\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_call_input_named_jobs_permissions_not_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,7 +1,8 @@\n"
+        + " on:\n"
+        + "   workflow_call:\n"
+        + "     inputs:\n"
+        + "       jobs:\n"
+        + "+        permissions: write-all\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_workflow_inline_jobs_permission_write_all_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,2 +1,3 @@\n"
+        + "+jobs: { build: { permissions: write-all } }\n"
+    )
+
+    _assert_diff_categories(diff_text, ["permissions_escalation"])
+
+
+def test_scan_pr_diff_workflow_inline_jobs_permission_scope_write_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,2 +1,3 @@\n"
+        + "+jobs: { build: { permissions: { contents: write } } }\n"
     )
 
     _assert_diff_categories(diff_text, ["permissions_escalation"])

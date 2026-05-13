@@ -160,6 +160,23 @@ _YAML_PERMISSION_SCOPE_ALIAS_RE = re.compile(
     + r"[ \t]*:[ \t]*\*[A-Za-z_][A-Za-z0-9_-]*[ \t]*(?:#.*)?$",
     re.IGNORECASE,
 )
+_YAML_JOBS_FLOW_PERMISSION_RE = re.compile(
+    r"^[ \t]*[\"']?jobs[\"']?[ \t]*:[ \t]*"
+    + _YAML_SCALAR_ANCHOR_RE
+    + r"\{[^\r\n]*[\"']?permissions[\"']?[ \t]*:[ \t]*(?:"
+    + _YAML_SCALAR_ANCHOR_RE
+    + r"[\"']?write-all[\"']?"
+    r"|"
+    + _YAML_SCALAR_ANCHOR_RE
+    + r"\{[^\r\n}]*"
+    + _WORKFLOW_WRITE_PERMISSION_SCOPES_RE
+    + r"[ \t]*:[ \t]*"
+    + _YAML_SCALAR_ANCHOR_RE
+    + r"[\"']?write[\"']?[^\r\n}]*\}"
+    r"|\*[A-Za-z_][A-Za-z0-9_-]*"
+    r")",
+    re.IGNORECASE,
+)
 _NON_PERMISSION_MAPPING_KEYS = {
     "env",
     "matrix",
@@ -228,6 +245,10 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         + r"[ \t]*:[ \t]*"
         + _YAML_SCALAR_ANCHOR_RE
         + r"[\"']?write[\"']?,?"
+        r"|(?:(?!^diff --git[ \t]).)*?^\+[ \t]*"
+        r"[\"']?jobs[\"']?[ \t]*:[ \t]*"
+        + _YAML_SCALAR_ANCHOR_RE
+        + r"\{[^\r\n]*[\"']?permissions[\"']?[ \t]*:[^\r\n]*"
         r")[ \t]*(?:#.*)?$",
         re.IGNORECASE,
     ),
@@ -357,7 +378,11 @@ def _is_workflow_permission_key_context(
     if not ancestors:
         return False
     jobs_index = next(
-        (index for index, (_indent, name) in enumerate(ancestors) if name == "jobs"),
+        (
+            index
+            for index, (indent, name) in enumerate(ancestors)
+            if indent == 0 and name == "jobs"
+        ),
         None,
     )
     if jobs_index is None:
@@ -366,6 +391,16 @@ def _is_workflow_permission_key_context(
     if any(name in _NON_PERMISSION_MAPPING_KEYS for _indent, name in job_body_ancestors):
         return False
     return len(ancestors) > jobs_index
+
+
+def _is_workflow_jobs_flow_permission_escalation(jobs_line: str) -> bool:
+    key = _yaml_key(jobs_line)
+    if key is None:
+        return False
+    jobs_indent, jobs_name = key
+    if jobs_indent != 0 or jobs_name.strip("\"'").lower() != "jobs":
+        return False
+    return bool(_YAML_JOBS_FLOW_PERMISSION_RE.match(jobs_line))
 
 
 def _replaces_read_scope_with_write(
@@ -415,6 +450,8 @@ def _match_has_workflow_permission_context(match_text: str) -> bool:
         prefix, yaml_line = diff_line
         if prefix != "+":
             continue
+        if _is_workflow_jobs_flow_permission_escalation(yaml_line):
+            return True
         if _YAML_PERMISSION_KEY_RE.match(yaml_line) and (
             _is_workflow_permission_key_context(lines, index, yaml_line)
         ):
