@@ -492,7 +492,10 @@ class WatchMixin:
                 exc,
             )
             return False
-        violations = guardrails.scan_pr_diff(diff_text)
+        violations = guardrails.scan_pr_diff(
+            diff_text,
+            daemon_config=self.app_config.daemon,
+        )
         current_pr.diff_scanned_at_sha = current_pr.head_sha
         if violations:
             first = violations[0]

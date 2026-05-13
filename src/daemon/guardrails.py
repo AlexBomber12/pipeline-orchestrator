@@ -14,6 +14,8 @@ import re
 import shlex
 from dataclasses import dataclass
 
+from src.config import DaemonConfig
+
 
 @dataclass(frozen=True)
 class GuardrailViolation:
@@ -358,9 +360,128 @@ _DIFF_RULES: dict[str, str] = {
     "workflow_destruction": "Workflow YAML file deletion under .github/workflows/",
 }
 
+LOCKFILE_PATTERNS = (
+    r"package-lock\.json$",
+    r"yarn\.lock$",
+    r"pnpm-lock\.yaml$",
+    r"Cargo\.lock$",
+    r"poetry\.lock$",
+    r"Pipfile\.lock$",
+    r"composer\.lock$",
+    r"Gemfile\.lock$",
+    r"go\.sum$",
+    r"requirements\.txt$",
+    r"requirements-.+\.txt$",
+)
+_LOCKFILE_RES = tuple(re.compile(pattern) for pattern in LOCKFILE_PATTERNS)
+
 
 def _clip_excerpt(text: str) -> str:
     return text[:_EXCERPT_LIMIT]
+
+
+def _diff_git_paths(line: str) -> tuple[str, str] | None:
+    if not line.startswith("diff --git "):
+        return None
+    try:
+        parts = shlex.split(line[len("diff --git ") :])
+    except ValueError:
+        return None
+    if len(parts) < 2:
+        return None
+    return _strip_diff_prefix(parts[0], "a/"), _strip_diff_prefix(parts[1], "b/")
+
+
+def _is_diff_file_header(line: str) -> bool:
+    if line.startswith("--- "):
+        expected_prefix = "a/"
+        path_text = line[4:]
+    elif line.startswith("+++ "):
+        expected_prefix = "b/"
+        path_text = line[4:]
+    else:
+        return False
+    try:
+        parts = shlex.split(path_text)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    path = parts[0]
+    return path == "/dev/null" or path.startswith(expected_prefix)
+
+
+def _is_lockfile_path(path: str) -> bool:
+    filename = path.rsplit("/", 1)[-1]
+    return any(pattern.fullmatch(filename) for pattern in _LOCKFILE_RES)
+
+
+def _strip_diff_prefix(path: str, prefix: str) -> str:
+    return path[len(prefix) :] if path.startswith(prefix) else path
+
+
+def _count_diff_size(diff_text: str) -> tuple[int, int, int, int]:
+    additions = 0
+    deletions = 0
+    files_changed = 0
+    files_with_additions: set[str] = set()
+    current_path: str | None = None
+    in_hunk = False
+
+    for line in diff_text.splitlines():
+        paths = _diff_git_paths(line)
+        if paths is not None:
+            files_changed += 1
+            current_path = paths[1]
+            in_hunk = False
+            continue
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if not in_hunk and _is_diff_file_header(line):
+            continue
+        if line.startswith("+"):
+            additions += 1
+            if current_path is not None:
+                files_with_additions.add(current_path)
+        elif line.startswith("-"):
+            deletions += 1
+
+    return additions, deletions, files_changed, len(files_with_additions)
+
+
+def _classify_files_lockfile_exempt(diff_text: str) -> set[str]:
+    lockfile_paths: set[str] = set()
+    for line in diff_text.splitlines():
+        paths = _diff_git_paths(line)
+        if paths is None:
+            continue
+        path = paths[1]
+        if _is_lockfile_path(path):
+            lockfile_paths.add(path)
+    return lockfile_paths
+
+
+def _count_additions_in_paths(diff_text: str, paths: set[str]) -> int:
+    additions = 0
+    current_path: str | None = None
+    in_hunk = False
+    for line in diff_text.splitlines():
+        diff_paths = _diff_git_paths(line)
+        if diff_paths is not None:
+            current_path = diff_paths[1]
+            in_hunk = False
+            continue
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if (
+            line.startswith("+")
+            and (in_hunk or not _is_diff_file_header(line))
+            and current_path in paths
+        ):
+            additions += 1
+    return additions
 
 
 def _action_ref_is_pinned(ref: str) -> bool:
@@ -1196,7 +1317,10 @@ def scan_stdout(coder_stdout: str) -> list[GuardrailViolation]:
     return violations
 
 
-def scan_pr_diff(diff_text: str) -> list[GuardrailViolation]:
+def scan_pr_diff(
+    diff_text: str,
+    daemon_config: DaemonConfig | None = None,
+) -> list[GuardrailViolation]:
     """Scan PR diff content for prohibited patterns.
 
     Returns guardrail violations found in ``diff_text`` (the unified-diff
@@ -1239,4 +1363,31 @@ def scan_pr_diff(diff_text: str) -> list[GuardrailViolation]:
                     rule=_DIFF_RULES.get(category, ""),
                 )
             )
+    config = daemon_config or DaemonConfig()
+    adds, _dels, _files, files_with_adds = _count_diff_size(diff_text)
+    lockfile_paths = _classify_files_lockfile_exempt(diff_text)
+    lockfile_additions = _count_additions_in_paths(diff_text, lockfile_paths)
+    effective_additions = adds - lockfile_additions
+
+    if (
+        effective_additions >= config.large_diff_addition_threshold
+        or files_with_adds >= config.large_diff_files_threshold
+    ):
+        excerpt = (
+            f"+{effective_additions} LOC across {files_with_adds} files "
+            f"({len(lockfile_paths)} lockfile excluded). "
+            f"Threshold: +{config.large_diff_addition_threshold} LOC or "
+            f"{config.large_diff_files_threshold} files."
+        )
+        violations.append(
+            GuardrailViolation(
+                tier=2,
+                category="large_diff_threshold",
+                excerpt=_clip_excerpt(excerpt),
+                rule=(
+                    "AGENTS.md prohibits scope expansion beyond task spec. "
+                    "Large diffs require operator review."
+                ),
+            )
+        )
     return violations

@@ -454,6 +454,23 @@ def test_update_daemon_config_updates_fields(tmp_path: Path) -> None:
     assert reloaded.daemon.error_handler_use_ai is False
 
 
+def test_update_daemon_config_accepts_large_diff_thresholds(tmp_path: Path) -> None:
+    path = tmp_path / "config.yml"
+    save_config(AppConfig(), str(path))
+
+    cfg = update_daemon_config(
+        str(path),
+        large_diff_addition_threshold=2000,
+        large_diff_files_threshold=40,
+    )
+
+    assert cfg.daemon.large_diff_addition_threshold == 2000
+    assert cfg.daemon.large_diff_files_threshold == 40
+    reloaded = load_config(str(path))
+    assert reloaded.daemon.large_diff_addition_threshold == 2000
+    assert reloaded.daemon.large_diff_files_threshold == 40
+
+
 def test_update_daemon_config_selector_fields(tmp_path: Path) -> None:
     path = tmp_path / "config.yml"
     save_config(AppConfig(), str(path))

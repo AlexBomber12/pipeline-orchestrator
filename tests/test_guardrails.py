@@ -4,6 +4,7 @@ import re
 from dataclasses import FrozenInstanceError
 
 import pytest
+from src.config import DaemonConfig
 from src.daemon import guardrails
 from src.daemon.guardrails import GuardrailViolation, scan_pr_diff, scan_stdout
 
@@ -452,6 +453,225 @@ def test_scan_pr_diff_empty_catalogue_returns_empty(
 
 def _assert_diff_categories(diff_text: str, categories: list[str]) -> None:
     assert [violation.category for violation in scan_pr_diff(diff_text)] == categories
+
+
+def _diff_for_file(path: str, additions: int = 0, deletions: int = 0) -> str:
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        f"--- a/{path}\n"
+        f"+++ b/{path}\n"
+        "@@ -1,1 +1,1 @@\n"
+        + "".join(f"-old {index}\n" for index in range(deletions))
+        + "".join(f"+new {index}\n" for index in range(additions))
+    )
+
+
+def test_count_diff_size_simple_diff() -> None:
+    diff_text = _diff_for_file("src/a.py", additions=2, deletions=1) + _diff_for_file(
+        "src/b.py", additions=1, deletions=2
+    )
+
+    assert guardrails._count_diff_size(diff_text) == (3, 3, 2, 2)
+
+
+def test_count_diff_size_excludes_file_headers() -> None:
+    diff_text = (
+        "diff --git a/src/a.py b/src/a.py\n"
+        "--- a/src/a.py\n"
+        "+++ b/src/a.py\n"
+        "@@ -1,1 +1,1 @@\n"
+    )
+
+    assert guardrails._count_diff_size(diff_text) == (0, 0, 1, 0)
+
+
+def test_count_diff_size_excludes_quoted_file_headers() -> None:
+    diff_text = (
+        'diff --git "a/src/path with space.py" "b/src/path with space.py"\n'
+        '--- "a/src/path with space.py"\n'
+        '+++ "b/src/path with space.py"\n'
+        "@@ -1,1 +1,1 @@\n"
+    )
+
+    assert guardrails._count_diff_size(diff_text) == (0, 0, 1, 0)
+
+
+def test_diff_file_header_rejects_invalid_or_empty_header_paths() -> None:
+    assert not guardrails._is_diff_file_header('+++ "unterminated')
+    assert not guardrails._is_diff_file_header("+++ ")
+
+
+def test_count_diff_size_counts_added_and_deleted_lines_with_header_prefixes() -> None:
+    diff_text = (
+        "diff --git a/src/a.py b/src/a.py\n"
+        "--- a/src/a.py\n"
+        "+++ b/src/a.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "+++counter\n"
+        "---old_value\n"
+    )
+
+    assert guardrails._count_diff_size(diff_text) == (1, 1, 1, 1)
+
+
+def test_count_diff_size_counts_added_lines_that_look_like_file_headers() -> None:
+    diff_text = (
+        "diff --git a/src/a.py b/src/a.py\n"
+        "--- a/src/a.py\n"
+        "+++ b/src/a.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "+++ b/not-a-header.py\n"
+    )
+
+    assert guardrails._count_diff_size(diff_text) == (1, 0, 1, 1)
+
+
+def test_count_diff_size_ignores_malformed_diff_git_headers() -> None:
+    diff_text = (
+        'diff --git "a/src/unclosed.py b/src/unclosed.py\n'
+        "diff --git a/src/only-one-path.py\n"
+        "+added\n"
+    )
+
+    assert guardrails._count_diff_size(diff_text) == (1, 0, 0, 0)
+
+
+def test_classify_lockfile_exempt_package_lock() -> None:
+    diff_text = _diff_for_file("frontend/package-lock.json", additions=1)
+
+    assert guardrails._classify_files_lockfile_exempt(diff_text) == {
+        "frontend/package-lock.json"
+    }
+
+
+def test_count_additions_in_paths_counts_added_lines_with_header_prefixes() -> None:
+    diff_text = (
+        "diff --git a/package-lock.json b/package-lock.json\n"
+        "--- a/package-lock.json\n"
+        "+++ b/package-lock.json\n"
+        "@@ -1,1 +1,1 @@\n"
+        "+++lockfile_value\n"
+    )
+
+    assert guardrails._count_additions_in_paths(diff_text, {"package-lock.json"}) == 1
+
+
+def test_count_additions_in_paths_counts_added_lines_that_look_like_headers() -> None:
+    diff_text = (
+        "diff --git a/package-lock.json b/package-lock.json\n"
+        "--- a/package-lock.json\n"
+        "+++ b/package-lock.json\n"
+        "@@ -1,1 +1,1 @@\n"
+        "+++ b/not-a-header.json\n"
+    )
+
+    assert guardrails._count_additions_in_paths(diff_text, {"package-lock.json"}) == 1
+
+
+def test_classify_lockfile_exempt_requirements_txt() -> None:
+    diff_text = _diff_for_file("requirements.txt", additions=1) + _diff_for_file(
+        "requirements-test.txt", additions=1
+    )
+
+    assert guardrails._classify_files_lockfile_exempt(diff_text) == {
+        "requirements.txt",
+        "requirements-test.txt",
+    }
+
+
+def test_classify_lockfile_exempt_non_lockfile() -> None:
+    diff_text = _diff_for_file("src/foo.py", additions=1)
+
+    assert guardrails._classify_files_lockfile_exempt(diff_text) == set()
+
+
+def test_classify_lockfile_exempt_rejects_suffix_only_matches() -> None:
+    diff_text = _diff_for_file("src/myrequirements.txt", additions=1) + _diff_for_file(
+        "docs/foo-package-lock.json",
+        additions=1,
+    )
+
+    assert guardrails._classify_files_lockfile_exempt(diff_text) == set()
+
+
+def test_scan_pr_diff_under_threshold_no_violation() -> None:
+    diff_text = "".join(
+        _diff_for_file(f"src/file_{index}.py", additions=20) for index in range(5)
+    )
+
+    assert "large_diff_threshold" not in [
+        violation.category for violation in scan_pr_diff(diff_text)
+    ]
+
+
+def test_scan_pr_diff_uses_supplied_daemon_config_thresholds() -> None:
+    diff_text = _diff_for_file("src/configured.py", additions=120)
+    daemon_config = DaemonConfig(
+        large_diff_addition_threshold=100,
+        large_diff_files_threshold=30,
+    )
+
+    violations = scan_pr_diff(diff_text, daemon_config=daemon_config)
+
+    assert [violation.category for violation in violations] == [
+        "large_diff_threshold"
+    ]
+    assert "Threshold: +100 LOC or 30 files." in violations[0].excerpt
+
+
+def test_scan_pr_diff_over_addition_threshold_flagged() -> None:
+    diff_text = _diff_for_file("src/large.py", additions=1600)
+
+    _assert_diff_categories(diff_text, ["large_diff_threshold"])
+
+
+def test_scan_pr_diff_over_file_threshold_flagged() -> None:
+    diff_text = "".join(
+        _diff_for_file(f"src/file_{index}.py", additions=50) for index in range(31)
+    )
+
+    _assert_diff_categories(diff_text, ["large_diff_threshold"])
+
+
+def test_scan_pr_diff_lockfile_additions_excluded() -> None:
+    diff_text = _diff_for_file("package-lock.json", additions=2000)
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_mixed_lockfile_and_source() -> None:
+    diff_text = _diff_for_file(
+        "package-lock.json", additions=1500
+    ) + _diff_for_file("src/source.py", additions=200)
+
+    assert scan_pr_diff(diff_text) == []
+
+
+def test_scan_pr_diff_excerpt_includes_counts() -> None:
+    diff_text = _diff_for_file("package-lock.json", additions=100) + _diff_for_file(
+        "src/large.py", additions=1600
+    )
+
+    violations = scan_pr_diff(diff_text)
+
+    assert len(violations) == 1
+    assert violations[0].category == "large_diff_threshold"
+    assert "+1600 LOC" in violations[0].excerpt
+    assert "2 files" in violations[0].excerpt
+    assert "1 lockfile excluded" in violations[0].excerpt
+
+
+def test_scan_pr_diff_tier_1_violations_still_flagged() -> None:
+    diff_text = (
+        WORKFLOW_DIFF_HEADER
+        + "@@ -1,2 +1,3 @@\n"
+        + "+permissions: write-all\n"
+        + _diff_for_file("src/large.py", additions=1600)
+    )
+
+    _assert_diff_categories(
+        diff_text, ["permissions_escalation", "large_diff_threshold"]
+    )
 
 
 def test_workflow_permission_context_helpers_handle_non_yaml_lines() -> None:
