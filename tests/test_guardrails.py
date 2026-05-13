@@ -896,6 +896,15 @@ def test_scan_pr_diff_workflow_permissions_rename_into_workflows_flagged() -> No
     _assert_diff_categories(diff_text, ["permissions_escalation"])
 
 
+def test_scan_pr_diff_workflow_permissions_wrong_case_directory_not_flagged() -> None:
+    diff_text = (
+        "diff --git a/.github/Workflows/ci.yml b/.github/Workflows/ci.yml\n"
+        "@@ -1,2 +1,3 @@\n+permissions: write-all\n"
+    )
+
+    assert scan_pr_diff(diff_text) == []
+
+
 def test_scan_pr_diff_workflow_permissions_quoted_path_flagged() -> None:
     diff_text = (
         'diff --git "a/.github/workflows/caf\\303\\251.yml" '

@@ -206,7 +206,7 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         r"(?ms)^diff --git[^\r\n]*[ \t]+"
         + _DIFF_WORKFLOW_B_PATH_RE
         + r"[^\r\n]*\r?\n"
-        r"(?:(?:(?!^diff --git[ \t]).)*?^[ +][ \t]*"
+        r"(?i:(?:(?:(?!^diff --git[ \t]).)*?^[ +][ \t]*"
         r"[\"']?permissions[\"']?[ \t]*:[ \t]*(?:"
         + _YAML_ANCHOR_NAME_RE
         + r"[ \t]*(?:\{[ \t]*)?|\{[ \t]*)?(?:#.*)?\r?\n"
@@ -258,8 +258,7 @@ _DIFF_PATTERNS: dict[str, re.Pattern[str]] = {
         r"|(?:(?!^diff --git[ \t]).)*?^\+[^\r\n]*"
         r"&[A-Za-z_][A-Za-z0-9_-]*[ \t]+[\"']?(?:write|write-all)[\"']?"
         r"(?:(?!^diff --git[ \t]).)*"
-        r")[ \t]*(?:#.*)?$",
-        re.IGNORECASE,
+        r"))[ \t]*(?:#.*)?$",
     ),
     "workflow_destruction": re.compile(
         # Detect workflow YAML files being deleted entirely. In unified
