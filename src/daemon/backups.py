@@ -43,7 +43,7 @@ async def create_repo_bundle(
 ) -> Path | None:
     """Create and verify a ``--all`` git bundle off the asyncio thread."""
     backup_root = Path(backup_dir) / repo_name
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     bundle_path = backup_root / f"{repo_name}-{timestamp}.bundle"
     ok = await asyncio.to_thread(_create_and_verify_sync, repo_path, bundle_path)
     if not ok:

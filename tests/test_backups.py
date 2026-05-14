@@ -168,7 +168,9 @@ def test_create_repo_bundle_filename_format(tmp_path: Path) -> None:
     ))
 
     assert bundle_path is not None
-    assert re.fullmatch(r"myrepo-\d{8}T\d{6}Z\.bundle", bundle_path.name)
+    assert re.fullmatch(
+        r"myrepo-\d{8}T\d{6}\.\d{6}Z\.bundle", bundle_path.name,
+    )
 
 
 def test_prune_old_bundles_keeps_daily_retention(tmp_path: Path) -> None:
