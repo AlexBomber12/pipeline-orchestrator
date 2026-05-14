@@ -1407,12 +1407,21 @@ async def _gh_best_effort(
 async def _approve_guardrail_decision(
     name: str, pr_id: str, repo_config: Any, redis_client: aioredis.Redis
 ) -> Response:
-    raw_cause = await redis_client.get(cause_key(name, pr_id))
+    # Wrap initial Redis reads so a transient outage surfaces as 503
+    # instead of an uncaught 500 — the dashboard relies on deterministic
+    # error codes to keep the operator's decision handle usable.
+    try:
+        raw_cause = await redis_client.get(cause_key(name, pr_id))
+    except RedisError:
+        return HTMLResponse("Redis unavailable", status_code=503)
     if _validated_guardrail_cause(raw_cause) is None:
         return HTMLResponse(_NO_PENDING_GUARDRAIL, status_code=404)
 
     state_key = pipeline_state(name)
-    raw_state = await redis_client.get(state_key)
+    try:
+        raw_state = await redis_client.get(state_key)
+    except RedisError:
+        return HTMLResponse("Redis unavailable", status_code=503)
     state: RepoState | None = None
     if raw_state is not None:
         try:
@@ -1452,24 +1461,27 @@ async def _approve_guardrail_decision(
     # to main, then our CAS would fail with 409 but the frontmatter commit
     # has already escaped, re-queueing work that was explicitly rejected.
     original_cause: CancellationCause | None = None
-    async with redis_client.pipeline(transaction=True) as pipe:
-        await pipe.watch(cause_key(name, pr_id))
-        watched_raw = await pipe.get(cause_key(name, pr_id))
-        watched_cause = _validated_guardrail_cause(watched_raw)
-        if watched_cause is None:
-            await pipe.unwatch()
-            return HTMLResponse(_NO_PENDING_GUARDRAIL, status_code=404)
-        original_cause = watched_cause
-        pipe.multi()
-        pipe.delete(cause_key(name, pr_id))
-        pipe.zrem(index_key(name), pr_id)
-        try:
-            await pipe.execute()
-        except aioredis.WatchError:
-            return HTMLResponse(
-                "Concurrent state change detected; please retry the decision",
-                status_code=409,
-            )
+    try:
+        async with redis_client.pipeline(transaction=True) as pipe:
+            await pipe.watch(cause_key(name, pr_id))
+            watched_raw = await pipe.get(cause_key(name, pr_id))
+            watched_cause = _validated_guardrail_cause(watched_raw)
+            if watched_cause is None:
+                await pipe.unwatch()
+                return HTMLResponse(_NO_PENDING_GUARDRAIL, status_code=404)
+            original_cause = watched_cause
+            pipe.multi()
+            pipe.delete(cause_key(name, pr_id))
+            pipe.zrem(index_key(name), pr_id)
+            try:
+                await pipe.execute()
+            except aioredis.WatchError:
+                return HTMLResponse(
+                    "Concurrent state change detected; please retry the decision",
+                    status_code=409,
+                )
+    except RedisError:
+        return HTMLResponse("Redis unavailable", status_code=503)
 
     async def _restore_cause() -> None:
         # Best-effort rollback so the operator does not lose the decision
@@ -1570,7 +1582,10 @@ async def _approve_guardrail_decision(
 async def _reject_guardrail_decision(
     name: str, pr_id: str, repo_config: Any, redis_client: aioredis.Redis
 ) -> Response:
-    raw_cause = await redis_client.get(cause_key(name, pr_id))
+    try:
+        raw_cause = await redis_client.get(cause_key(name, pr_id))
+    except RedisError:
+        return HTMLResponse("Redis unavailable", status_code=503)
     cause = _validated_guardrail_cause(raw_cause)
     if cause is None:
         return HTMLResponse(_NO_PENDING_GUARDRAIL, status_code=404)
@@ -1582,7 +1597,10 @@ async def _reject_guardrail_decision(
 
     pr_number: int | None = None
     state: RepoState | None = None
-    raw_state = await redis_client.get(pipeline_state(name))
+    try:
+        raw_state = await redis_client.get(pipeline_state(name))
+    except RedisError:
+        return HTMLResponse("Redis unavailable", status_code=503)
     if raw_state is not None:
         try:
             state = RepoState.model_validate_json(raw_state)

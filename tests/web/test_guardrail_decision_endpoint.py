@@ -1345,3 +1345,148 @@ def test_guardrail_decision_reject_record_failure_returns_503(
     resp = _post("reject")
     assert resp.status_code == 503
     assert "Redis unavailable" in resp.text
+
+
+def test_guardrail_decision_approve_initial_get_redis_error_returns_503(
+    tmp_path, monkeypatch
+) -> None:
+    """Transient Redis outage on the first read surfaces as 503, not 500."""
+    _, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+    from redis.exceptions import RedisError as _RedisError
+
+    async def boom_get(key: str) -> str | None:
+        raise _RedisError("conn refused")
+
+    monkeypatch.setattr(redis_client, "get", boom_get)
+    resp = _post("approve")
+    assert resp.status_code == 503
+    assert "Redis unavailable" in resp.text
+
+
+def test_guardrail_decision_approve_state_get_redis_error_returns_503(
+    tmp_path, monkeypatch
+) -> None:
+    """RedisError on the state read after the cause read surfaces as 503."""
+    _, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+    from redis.exceptions import RedisError as _RedisError
+
+    original_get = redis_client.get
+    call_count = {"n": 0}
+
+    async def flaky_get(key: str) -> str | None:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return await original_get(key)
+        raise _RedisError("conn dropped")
+
+    monkeypatch.setattr(redis_client, "get", flaky_get)
+    resp = _post("approve")
+    assert resp.status_code == 503
+    assert "Redis unavailable" in resp.text
+
+
+def test_guardrail_decision_approve_pipeline_redis_error_returns_503(
+    tmp_path, monkeypatch
+) -> None:
+    """RedisError from the WATCH/MULTI pipeline surfaces as 503."""
+    _, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+    from redis.exceptions import RedisError as _RedisError
+
+    original_pipeline = redis_client.pipeline
+
+    def make_pipeline(transaction: bool = False) -> _FakePipeline:
+        pipe = original_pipeline(transaction=transaction)
+
+        async def boom_watch(*keys: str) -> None:
+            raise _RedisError("watch failed")
+
+        pipe.watch = boom_watch  # type: ignore[assignment]
+        return pipe
+
+    monkeypatch.setattr(redis_client, "pipeline", make_pipeline)
+    resp = _post("approve")
+    assert resp.status_code == 503
+    assert "Redis unavailable" in resp.text
+
+
+def test_guardrail_decision_reject_initial_get_redis_error_returns_503(
+    tmp_path, monkeypatch
+) -> None:
+    """Reject's first read must degrade to 503 on Redis outage."""
+    _, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+    from redis.exceptions import RedisError as _RedisError
+
+    async def boom_get(key: str) -> str | None:
+        raise _RedisError("conn refused")
+
+    monkeypatch.setattr(redis_client, "get", boom_get)
+    resp = _post("reject")
+    assert resp.status_code == 503
+    assert "Redis unavailable" in resp.text
+
+
+def test_guardrail_decision_reject_state_get_redis_error_returns_503(
+    tmp_path, monkeypatch
+) -> None:
+    """Reject's state read must degrade to 503 on Redis outage."""
+    _, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+    from redis.exceptions import RedisError as _RedisError
+
+    original_get = redis_client.get
+    call_count = {"n": 0}
+
+    async def flaky_get(key: str) -> str | None:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return await original_get(key)
+        raise _RedisError("conn dropped")
+
+    monkeypatch.setattr(redis_client, "get", flaky_get)
+    resp = _post("reject")
+    assert resp.status_code == 503
+    assert "Redis unavailable" in resp.text
