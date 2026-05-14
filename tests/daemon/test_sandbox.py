@@ -28,7 +28,34 @@ def test_build_bwrap_command_includes_bwrap_prefix(
     result = sandbox.build_bwrap_command(
         command=["echo", "hi"], repo_path="/repo"
     )
-    assert result[:4] == ["bwrap", "--ro-bind", "/", "/"]
+    assert result[0] == "bwrap"
+    # Host root must not be bound wholesale into the sandbox; only the
+    # allowlisted essential paths are exposed read-only.
+    for i in range(len(result) - 2):
+        if result[i] in ("--ro-bind", "--ro-bind-try", "--bind"):
+            assert not (
+                result[i + 1] == "/" and result[i + 2] == "/"
+            ), "host root must not be bound into the sandbox"
+    for path in sandbox.ESSENTIAL_RO_PATHS:
+        assert any(
+            result[i : i + 3] == ["--ro-bind-try", path, path]
+            for i in range(len(result) - 2)
+        ), f"essential ro path {path} should be bound read-only"
+
+
+def test_build_bwrap_command_does_not_expose_sensitive_host_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox, "is_bubblewrap_available", lambda: True)
+    result = sandbox.build_bwrap_command(
+        command=["echo", "hi"], repo_path="/repo"
+    )
+    joined = " ".join(result)
+    for sensitive in ("/home", "/root", "/data/auth", "/data/secrets"):
+        assert sensitive not in joined, (
+            f"sensitive host path {sensitive} must not appear in the "
+            "default sandbox mount setup"
+        )
 
 
 def test_build_bwrap_command_repo_path_rw_bound(
