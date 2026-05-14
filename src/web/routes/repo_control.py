@@ -22,7 +22,10 @@ import redis.asyncio as aioredis
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-from src.cancellation.storage import delete_cancellation_cause
+from src.cancellation.storage import (
+    delete_cancellation_cause,
+    list_pending_guardrail_decisions,
+)
 from src.config import load_config
 from src.keyspace import (
     control_stop,
@@ -1193,6 +1196,51 @@ async def api_repo_queue(name: str) -> Response:
             snapshot_at=snapshot_at,
         )
     )
+
+
+@router.get(
+    "/api/repo/{name}/guardrail/pending",
+    response_class=JSONResponse,
+)
+async def get_repo_guardrail_pending(request: Request, name: str) -> Response:
+    """List pending guardrail decisions for a repo, oldest first.
+
+    Returns a JSON object with shape::
+
+        {
+            "pending": [
+                {
+                    "pr_id": "PR-296",
+                    "rule": "large_diff_threshold",
+                    "excerpt": "+1800 LOC across 35 files",
+                    "recorded_at": 1746789012
+                },
+                ...
+            ]
+        }
+
+    The list is sorted ascending by ``recorded_at`` so operators triage
+    in arrival order. Bounded by the underlying helper's ``limit`` (100).
+
+    Returns 404 if the repo name does not match any configured repo.
+    """
+    cfg = load_config(_app.CONFIG_PATH)
+    if _find_repo_config_by_name(cfg, name) is None:
+        return JSONResponse({"error": "repo not found"}, status_code=404)
+    redis_client = request.app.state.redis
+    pending = await list_pending_guardrail_decisions(redis_client, name)
+    payload = {
+        "pending": [
+            {
+                "pr_id": entry.task_id,
+                "rule": entry.rule,
+                "excerpt": entry.excerpt,
+                "recorded_at": entry.recorded_at,
+            }
+            for entry in pending
+        ]
+    }
+    return JSONResponse(payload)
 
 
 async def _resolve_repo_task_path(name: str, pr_id: str) -> tuple[Path, str] | None:
