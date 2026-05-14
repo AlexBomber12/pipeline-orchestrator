@@ -62,8 +62,11 @@ _DETAILS_URL_RUN_RE = re.compile(r"/actions/runs/(\d+)")
 # immediately.
 CODEX_BOT_ERROR_PATTERNS = (
     "Something went wrong while reviewing",
+    "Something went wrong. Try again",
     "error reviewing this PR",
+    "Try again later by commenting",
     "Please try again",
+    "unable to download your code",
     "unable to complete review",
 )
 
@@ -653,7 +656,8 @@ class WatchMixin:
         """
         current_pr = self.state.current_pr
         if current_pr is None:
-            return False
+            return self._stale_skip(None, "no-current-pr", "[WATCH] Stale retrigger skipped: no current_pr.")
+        prefix = f"[WATCH] Stale retrigger skipped for PR #{pr_number}: "
         if current_pr.review_status == ReviewStatus.CHANGES_REQUESTED:
             stale_minutes = self.app_config.daemon.stale_review_threshold_min
         elif current_pr.review_status == ReviewStatus.EYES:
@@ -664,19 +668,23 @@ class WatchMixin:
         ):
             stale_minutes = self.app_config.daemon.stale_review_threshold_min
         else:
-            return False
+            return self._stale_skip(
+                pr_number, "review-status", f"{prefix}review_status {current_pr.review_status.value} not eligible."
+            )
 
         last_push_age_seconds = gh_prs.get_last_push_age_seconds(
             self.owner_repo,
             pr_number,
         )
         if last_push_age_seconds is None:
-            return False
+            return self._stale_skip(pr_number, "last-push-age", f"{prefix}last_push_age unavailable.")
 
         now = datetime.now(timezone.utc)
         stale_after = timedelta(minutes=stale_minutes)
         if last_push_age_seconds < stale_after.total_seconds():
-            return False
+            age = int(last_push_age_seconds)
+            threshold = int(stale_after.total_seconds())
+            return self._stale_skip(pr_number, "threshold", f"{prefix}push age {age}s below threshold {threshold}s.")
 
         last_retrigger_at = self.state.last_stale_retrigger_at
         if last_retrigger_at is not None:
@@ -685,7 +693,7 @@ class WatchMixin:
                     tzinfo=timezone.utc
                 )
             if now - last_retrigger_at < _STALE_RETRIGGER_DEBOUNCE:
-                return False
+                return self._stale_skip(pr_number, "debounce", f"{prefix}debounce window active.")
 
         state_label = current_pr.review_status.value
         cap = self.app_config.daemon.watch_retrigger_cap
@@ -721,8 +729,19 @@ class WatchMixin:
         )
         self.state.last_stale_retrigger_at = now
         if posted:
+            getattr(self, "_stale_retrigger_skip_reasons", {}).pop(pr_number, None)
             current_pr.watch_retrigger_count = next_count
         return posted
+
+    def _stale_skip(self, pr_number: int | None, reason: str, message: str) -> bool:
+        cache = self.__dict__.setdefault("_stale_retrigger_skip_reasons", {})
+        if getattr(self, "_stale_retrigger_skip_current_pr", None) != pr_number:
+            cache.clear()
+            self._stale_retrigger_skip_current_pr = pr_number
+        if cache.get(pr_number) != reason:
+            self.log_event(message)
+            cache[pr_number] = reason
+        return False
 
     def _maybe_retrigger_on_codex_bot_error(self, pr_number: int) -> bool:
         """Re-trigger ``@codex review`` when chatgpt-codex-connector[bot]
