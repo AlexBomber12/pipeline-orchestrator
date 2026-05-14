@@ -101,7 +101,8 @@ async def send_guardrail_notification(
         "text": text_summary,
     }
     async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-        await client.post(webhook_url, json=payload)
+        response = await client.post(webhook_url, json=payload)
+        response.raise_for_status()
 
 
 def _parse_guardrail_cause_for_notification(

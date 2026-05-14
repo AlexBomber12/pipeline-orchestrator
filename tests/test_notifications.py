@@ -30,6 +30,11 @@ def _send(**overrides: Any) -> None:
     asyncio.run(send_guardrail_notification(**kwargs))
 
 
+class _OkResponse:
+    def raise_for_status(self) -> None:
+        return None
+
+
 class _CapturingClient:
     """Stand-in for httpx.AsyncClient that records posts."""
 
@@ -44,8 +49,9 @@ class _CapturingClient:
     async def __aexit__(self, *args: object) -> None:
         return None
 
-    async def post(self, url: str, json: dict[str, Any]) -> None:
+    async def post(self, url: str, json: dict[str, Any]) -> _OkResponse:
         type(self).posted.append((url, json, self._timeout))
+        return _OkResponse()
 
 
 def _make_raising_client(exc: Exception) -> type:
@@ -55,6 +61,20 @@ def _make_raising_client(exc: Exception) -> type:
         async def __aexit__(self, *args: object) -> None: return None
         async def post(self, url: str, json: dict[str, Any]) -> None: raise exc
     return _Raising
+
+
+def _make_error_response_client(exc: Exception) -> type:
+    class _ErrorResponse:
+        def raise_for_status(self) -> None:
+            raise exc
+
+    class _ErrorClient:
+        def __init__(self, timeout: float) -> None: ...
+        async def __aenter__(self) -> _ErrorClient: return self
+        async def __aexit__(self, *args: object) -> None: return None
+        async def post(self, url: str, json: dict[str, Any]) -> _ErrorResponse:
+            return _ErrorResponse()
+    return _ErrorClient
 
 
 @pytest.fixture
@@ -161,6 +181,22 @@ def test_send_guardrail_notification_propagates_httpx_connection_error(
         _make_raising_client(httpx.ConnectError("refused")),
     )
     with pytest.raises(httpx.ConnectError):
+        _send()
+
+
+def test_send_guardrail_notification_raises_on_http_error_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    http_error = httpx.HTTPStatusError(
+        "500 Server Error",
+        request=httpx.Request("POST", "https://example.test/hook"),
+        response=httpx.Response(500),
+    )
+    monkeypatch.setattr(
+        "src.daemon.notifications.httpx.AsyncClient",
+        _make_error_response_client(http_error),
+    )
+    with pytest.raises(httpx.HTTPStatusError):
         _send()
 
 
