@@ -200,6 +200,7 @@ def test_repo_config_defaults() -> None:
     # control is set to.
     assert repo.review_timeout_min is None
     assert repo.disabled_coders is None
+    assert repo.governance_scan_enabled is None
 
 
 def test_normalize_repo_url_strips_git_and_slash() -> None:
@@ -813,6 +814,20 @@ def test_repo_allow_merge_without_checks_loads_from_yaml(tmp_path: Path) -> None
     )
     cfg = load_config(str(cfg_path))
     assert cfg.repositories[0].allow_merge_without_checks is True
+
+
+def test_repo_governance_scan_enabled_loads_from_yaml(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/repo\n"
+        "    governance_scan_enabled: false\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(str(cfg_path))
+
+    assert cfg.repositories[0].governance_scan_enabled is False
 
 
 def test_repo_allow_merge_without_review_loads_from_yaml(tmp_path: Path) -> None:

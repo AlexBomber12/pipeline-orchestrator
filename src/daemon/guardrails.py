@@ -14,7 +14,7 @@ import re
 import shlex
 from dataclasses import dataclass
 
-from src.config import DaemonConfig
+from src.config import DaemonConfig, RepoConfig
 
 
 @dataclass(frozen=True)
@@ -408,6 +408,26 @@ _SUSPICIOUS_CONTEXT_RE = re.compile(
     r"\s*[:=]\s*['\"]?([A-Za-z0-9+/=_-]{20,})['\"]?",
 )
 
+GOVERNANCE_FILE_PATTERNS: dict[str, re.Pattern[str]] = {
+    "codeowners": re.compile(r"^(?:CODEOWNERS|(?:\.github|docs)/CODEOWNERS)$"),
+    "dependabot_config": re.compile(r"^\.github/dependabot\.ya?ml$"),
+    "labels_sync": re.compile(r"^\.github/(?:labels|labeler)\.ya?ml$"),
+    "repo_settings": re.compile(r"^\.github/settings\.ya?ml$"),
+    "auto_merge_config": re.compile(
+        r"^\.github/(?:auto-merge|automerge|merge-config)\.ya?ml$"
+    ),
+    "issue_pr_template": re.compile(
+        r"^(?:"
+        r"(?:\.github|docs)/PULL_REQUEST_TEMPLATE(?:/[^/].*|\.(?:md|txt))"
+        r"|PULL_REQUEST_TEMPLATE/[^/].*"
+        r"|PULL_REQUEST_TEMPLATE\.(?:md|txt)"
+        r"|\.github/ISSUE_TEMPLATE(?:/[^/].*|\.md)"
+        r")$",
+        re.IGNORECASE,
+    ),
+    "funding": re.compile(r"^\.github/FUNDING\.ya?ml$"),
+}
+
 LOCKFILE_PATTERNS = (
     r"package-lock\.json$",
     r"yarn\.lock$",
@@ -588,6 +608,22 @@ def _count_file_deletions(diff_text: str) -> tuple[list[str], list[tuple[str, st
             rename_to = line[len("rename to ") :].strip()
     flush_section()
     return deleted_paths, renamed_paths
+
+
+def _scan_governance_files(diff_text: str) -> list[tuple[str, str]]:
+    findings: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for line in diff_text.splitlines():
+        paths = _diff_git_paths(line)
+        if paths is None:
+            continue
+        for path in paths:
+            for category, pattern in GOVERNANCE_FILE_PATTERNS.items():
+                finding = (path, category)
+                if pattern.match(path) and finding not in seen:
+                    findings.append(finding)
+                    seen.add(finding)
+    return findings
 
 
 def _classify_test_files(paths: list[str]) -> list[str]:
@@ -1537,6 +1573,7 @@ def scan_stdout(coder_stdout: str) -> list[GuardrailViolation]:
 def scan_pr_diff(
     diff_text: str,
     daemon_config: DaemonConfig | None = None,
+    repo_config: RepoConfig | None = None,
 ) -> list[GuardrailViolation]:
     """Scan PR diff content for prohibited patterns.
 
@@ -1683,4 +1720,28 @@ def scan_pr_diff(
                 ),
             )
         )
+    governance_scan_enabled = (
+        config.governance_scan_enabled
+        if repo_config is None or repo_config.governance_scan_enabled is None
+        else repo_config.governance_scan_enabled
+    )
+    if governance_scan_enabled:
+        governance_rule = (
+            "Changes to governance files (CODEOWNERS, dependabot, "
+            "label sync, repo settings, auto-merge config) require "
+            "operator approval. PR cannot proceed without override."
+        )
+        for file_path, governance_category in _scan_governance_files(diff_text):
+            excerpt = (
+                f"Governance file modified: {file_path} "
+                f"(category: {governance_category}). Operator review required."
+            )
+            violations.append(
+                GuardrailViolation(
+                    tier=2,
+                    category="governance_file_modified",
+                    excerpt=_clip_excerpt(excerpt),
+                    rule=governance_rule,
+                )
+            )
     return violations
