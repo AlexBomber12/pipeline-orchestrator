@@ -229,3 +229,39 @@ async def test_list_pending_guardrail_decisions_decodes_bytes_task_ids() -> None
     result = await list_pending_guardrail_decisions(redis, "alpha")
 
     assert [p.task_id for p in result] == ["PR-BYTES"]
+
+
+async def test_list_pending_guardrail_decisions_skips_non_dict_payload() -> None:
+    """Malformed records where ``payload`` is not a dict must be skipped, not crash."""
+    redis = _FakeRedis()
+    # Live guardrail entry that must still be returned.
+    _put(redis, "alpha", "PR-OK", {"subsource": "guardrail"}, _iso(_BASE + 1))
+    # Corrupted legacy records: payload deserializes to a string / list / None
+    # instead of dict. Calling ``.get`` on them would raise AttributeError and
+    # poison the whole pending-decisions read for the operator override view.
+    for tid, bad_payload, offset in [
+        ("PR-BAD-STR", "guardrail", 2),
+        ("PR-BAD-LIST", ["guardrail"], 3),
+        ("PR-BAD-NONE", None, 4),
+    ]:
+        created_at = _iso(_BASE + offset)
+        raw = (
+            '{"category":"ERROR","payload":'
+            + (
+                "null"
+                if bad_payload is None
+                else (
+                    f'"{bad_payload}"'
+                    if isinstance(bad_payload, str)
+                    else '["guardrail"]'
+                )
+            )
+            + f',"created_at":"{created_at}","task_id":"{tid}","repo_slug":"alpha"}}'
+        )
+        redis.values[cause_key("alpha", tid)] = raw
+        score = datetime.fromisoformat(created_at).timestamp()
+        redis.zsets.setdefault(index_key("alpha"), {})[tid] = score
+
+    result = await list_pending_guardrail_decisions(redis, "alpha")
+
+    assert [p.task_id for p in result] == ["PR-OK"]

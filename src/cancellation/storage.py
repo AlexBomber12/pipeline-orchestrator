@@ -354,6 +354,8 @@ async def list_pending_guardrail_decisions(
             if cause is None:
                 stale.append(tid)
                 continue
+            if not isinstance(cause.payload, dict):
+                continue
             if cause.payload.get("subsource") != "guardrail":
                 continue
             rule = cause.payload.get("rule", "")
