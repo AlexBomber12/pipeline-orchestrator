@@ -25,6 +25,7 @@ class _FakeRedis:
     def __init__(self) -> None:
         self.values: dict[str, str] = {}
         self.zsets: dict[str, dict[str, float]] = {}
+        self.zrange_calls: list[tuple[int, int]] = []
 
     async def get(self, key: str) -> str | None:
         return self.values.get(key)
@@ -36,10 +37,22 @@ class _FakeRedis:
         stop: int,
         withscores: bool = False,
     ) -> list[Any]:
+        self.zrange_calls.append((start, stop))
         ordered = sorted(self.zsets.get(key, {}).items(), key=lambda kv: kv[1])
         members = [tid for tid, _ in ordered]
         sliced = members[start:] if stop == -1 else members[start : stop + 1]
         return [(m, dict(ordered)[m]) for m in sliced] if withscores else sliced
+
+    async def zrem(self, key: str, *members: str) -> int:
+        zset = self.zsets.get(key)
+        if not zset:
+            return 0
+        removed = 0
+        for member in members:
+            if member in zset:
+                del zset[member]
+                removed += 1
+        return removed
 
 
 def _put(
@@ -161,8 +174,8 @@ async def test_list_pending_guardrail_decisions_empty_returns_empty_list() -> No
     assert await list_pending_guardrail_decisions(redis, "alpha") == []
 
 
-async def test_list_pending_guardrail_decisions_skips_stale_index_entries() -> None:
-    """Index entries whose payload key has expired must be skipped, not crash."""
+async def test_list_pending_guardrail_decisions_prunes_stale_index_entries() -> None:
+    """Stale members (payload expired) must be skipped AND removed from the index."""
     redis = _FakeRedis()
     _put(redis, "alpha", "PR-STALE", {"subsource": "guardrail"}, _iso(_BASE))
     _put(redis, "alpha", "PR-LIVE", {"subsource": "guardrail"}, _iso(_BASE + 1))
@@ -172,6 +185,33 @@ async def test_list_pending_guardrail_decisions_skips_stale_index_entries() -> N
     result = await list_pending_guardrail_decisions(redis, "alpha")
 
     assert [p.task_id for p in result] == ["PR-LIVE"]
+    # Stale member is dropped so future calls do not re-scan it.
+    assert "PR-STALE" not in redis.zsets[index_key("alpha")]
+    assert "PR-LIVE" in redis.zsets[index_key("alpha")]
+
+
+async def test_list_pending_guardrail_decisions_paginates_below_full_index() -> None:
+    """When ``limit`` is small relative to the index, do not load the whole ZSET."""
+    redis = _FakeRedis()
+    # 50 guardrail entries; helper called with limit=10 should fetch one batch
+    # of size 10, not the entire ZSET.
+    for idx in range(50):
+        _put(
+            redis,
+            "alpha",
+            f"PR-{idx:03d}",
+            {"subsource": "guardrail"},
+            _iso(_BASE + idx),
+        )
+
+    result = await list_pending_guardrail_decisions(redis, "alpha", limit=10)
+
+    assert len(result) == 10
+    # Each zrange call requested at most ``limit`` rows — never the full set.
+    assert redis.zrange_calls, "helper must call zrange at least once"
+    for start, stop in redis.zrange_calls:
+        assert stop - start + 1 <= 10
+        assert stop != -1
 
 
 async def test_list_pending_guardrail_decisions_decodes_bytes_task_ids() -> None:
