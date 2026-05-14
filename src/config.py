@@ -84,7 +84,9 @@ _DAEMON_FIELDS = {
     "operator_active_hours_end",
     "operator_timezone",
     "guardrail_notification_webhook_url",
+    "guardrail_notification_min_tier",
     "guardrail_notification_timeout_seconds",
+    "dashboard_base_url",
     "large_diff_addition_threshold",
     "large_diff_files_threshold",
     "mass_deletion_threshold",
@@ -184,7 +186,9 @@ class DaemonConfig(BaseModel):
     operator_active_hours_end: int = Field(default=21, ge=1, le=24)
     operator_timezone: str = "Europe/Rome"
     guardrail_notification_webhook_url: str | None = Field(default=None)
+    guardrail_notification_min_tier: int = Field(default=1, ge=1, le=2)
     guardrail_notification_timeout_seconds: float = Field(default=5.0, ge=1.0, le=30.0)
+    dashboard_base_url: str | None = Field(default=None)
     large_diff_addition_threshold: int = Field(default=1500, ge=100)
     large_diff_files_threshold: int = Field(default=30, ge=2)
     mass_deletion_threshold: int = Field(default=20, ge=1)
