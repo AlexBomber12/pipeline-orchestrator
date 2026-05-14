@@ -14,6 +14,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.daemon.backups import create_repo_bundle, prune_old_bundles
 from src.daemon.main_commit_audit import (
     audit_main_commit_shas,
     list_recent_main_commit_shas,
@@ -222,6 +223,46 @@ class IdleMixin:
         )
         self._main_commit_audit_retry_pending = False
         self._main_commit_audit_counter = 0
+
+    async def _run_git_bundle_backup_if_due(self) -> None:
+        self._git_bundle_backup_counter = (
+            getattr(self, "_git_bundle_backup_counter", 0) + 1
+        )
+        config = self.app_config.daemon
+        if not (config.git_bundle_backup_enabled and config.git_bundle_backup_dir):
+            return
+        cycles_per_hour = max(1, 3600 // max(1, config.poll_interval_sec))
+        interval_cycles = config.git_bundle_backup_interval_hours * cycles_per_hour
+        if self._git_bundle_backup_counter < interval_cycles:
+            return
+        self._git_bundle_backup_counter = 0
+        try:
+            bundle_path = await create_repo_bundle(
+                repo_path=self.repo_path,
+                repo_name=self.name,
+                backup_dir=config.git_bundle_backup_dir,
+            )
+        except Exception as exc:
+            self.log_event(f"[BACKUP] bundle creation crashed: {exc}")
+            return
+        if bundle_path is None:
+            self.log_event(
+                "[BACKUP] git bundle failed; will retry next cycle"
+            )
+            return
+        self.log_event(f"[BACKUP] git bundle created: {bundle_path.name}")
+        try:
+            removed = await prune_old_bundles(
+                backup_dir=config.git_bundle_backup_dir,
+                repo_name=self.name,
+                daily_retention=config.git_bundle_backup_daily_retention,
+                weekly_retention=config.git_bundle_backup_weekly_retention,
+            )
+        except Exception as exc:
+            self.log_event(f"[BACKUP] prune failed: {exc}")
+            return
+        if removed > 0:
+            self.log_event(f"[BACKUP] pruned {removed} old bundles")
 
     @staticmethod
     def _validate_task_file_header_match(task_file: Path, header_pr_id: str) -> None:
@@ -771,6 +812,7 @@ class IdleMixin:
             self._idle_open_pr_snapshot = open_pr_snapshot
 
         await self._audit_main_commits_if_due()
+        await self._run_git_bundle_backup_if_due()
 
         task = await self._select_next_task_or_attach(prs, merged_prs)
         if task is None:
