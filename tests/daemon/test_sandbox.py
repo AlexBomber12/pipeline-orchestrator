@@ -2,13 +2,68 @@
 
 from __future__ import annotations
 
+import subprocess
+
 import pytest
 
 from src.daemon import sandbox
 
 
+@pytest.fixture(autouse=True)
+def _clear_bwrap_cache() -> None:
+    """Reset the cached availability result between tests."""
+    sandbox.is_bubblewrap_available.cache_clear()
+
+
 def test_is_bubblewrap_available_returns_bool() -> None:
     assert isinstance(sandbox.is_bubblewrap_available(), bool)
+
+
+def test_is_bubblewrap_available_false_when_not_on_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox.shutil, "which", lambda _: None)
+    assert sandbox.is_bubblewrap_available() is False
+
+
+def test_is_bubblewrap_available_false_when_runtime_check_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox.shutil, "which", lambda _: "/usr/bin/bwrap")
+    monkeypatch.setattr(
+        sandbox.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args, returncode=1, stdout=b"", stderr=b"bwrap: ..."
+        ),
+    )
+    assert sandbox.is_bubblewrap_available() is False
+
+
+def test_is_bubblewrap_available_false_when_runtime_check_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox.shutil, "which", lambda _: "/usr/bin/bwrap")
+
+    def _raise(*args, **kwargs):
+        raise OSError("could not exec bwrap")
+
+    monkeypatch.setattr(sandbox.subprocess, "run", _raise)
+    assert sandbox.is_bubblewrap_available() is False
+
+
+def test_is_bubblewrap_available_true_when_runtime_check_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox.shutil, "which", lambda _: "/usr/bin/bwrap")
+    monkeypatch.setattr(
+        sandbox.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args, returncode=0, stdout=b"", stderr=b""
+        ),
+    )
+    assert sandbox.is_bubblewrap_available() is True
 
 
 def test_build_bwrap_command_no_bwrap_returns_inner_command_unchanged(
@@ -111,8 +166,8 @@ def test_build_bwrap_command_optional_dirs_included_when_provided(
                 return True
         return False
 
-    assert _has_bind("--bind", "/data/auth/claude", "/data/auth/claude")
-    assert _has_bind("--bind", "/data/auth/gh", "/data/auth/gh")
+    assert _has_bind("--bind-try", "/data/auth/claude", "/data/auth/claude")
+    assert _has_bind("--bind-try", "/data/auth/gh", "/data/auth/gh")
     assert _has_bind("--bind", "/data/secrets", "/data/secrets")
     assert _has_bind("--ro-bind", "/etc/ssl", "/etc/ssl")
 

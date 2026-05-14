@@ -10,7 +10,10 @@ coder dispatch path.
 
 from __future__ import annotations
 
+import functools
 import shutil
+import subprocess
+import sys
 
 # Minimal set of host paths bound read-only into the sandbox so that
 # common coder binaries (claude, codex, gh, git, python) and their
@@ -30,9 +33,42 @@ ESSENTIAL_RO_PATHS: tuple[str, ...] = (
 )
 
 
+@functools.cache
 def is_bubblewrap_available() -> bool:
-    """Return True if the ``bwrap`` executable is on PATH."""
-    return shutil.which("bwrap") is not None
+    """Return True if ``bwrap`` is on PATH **and** can launch a sandbox.
+
+    Many hardened or containerized hosts ship ``bwrap`` on PATH but
+    refuse to create user namespaces at runtime (kernel
+    ``user.max_user_namespaces=0``, restrictive seccomp profile,
+    missing ``CAP_SYS_ADMIN`` inside an unprivileged container, etc.).
+    A pure PATH check would let the helper wrap every command and
+    then fail unconditionally at exec time, defeating the intended
+    graceful fallback to the inner command. The smoke test below
+    actually invokes ``bwrap`` to launch a trivial child, so the
+    helper only returns True when sandboxing will really work.
+
+    The result is cached for the process lifetime: both PATH lookup
+    and kernel-level sandbox capability are stable once the daemon
+    is running, and re-running the subprocess on every call would be
+    wasteful on the hot dispatch path.
+    """
+    if shutil.which("bwrap") is None:
+        return False
+    try:
+        result = subprocess.run(
+            [
+                "bwrap",
+                "--ro-bind", "/", "/",
+                "--",
+                sys.executable, "-c", "",
+            ],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
 
 
 def build_bwrap_command(
@@ -61,8 +97,11 @@ def build_bwrap_command(
       libraries, and the TLS trust store remain resolvable; missing
       paths on the host are silently skipped.
     - ``repo_path``: read-write bind mount (the coder's working tree)
-    - ``coder_config_dir``: read-write bind mount if provided
-    - ``gh_config_dir``: read-write bind mount if provided
+    - ``coder_config_dir``: read-write bind mount via ``--bind-try``
+      if provided; missing on the host is silently skipped so that a
+      stale optional path does not abort sandbox startup.
+    - ``gh_config_dir``: read-write bind mount via ``--bind-try`` if
+      provided; same fail-soft semantics as ``coder_config_dir``.
     - ``/proc``: bwrap-managed procfs
     - ``/dev``: bwrap-managed minimal devfs
     - ``/tmp``: bwrap-managed tmpfs
@@ -83,9 +122,9 @@ def build_bwrap_command(
     args.extend(["--tmpfs", "/tmp"])
     args.extend(["--bind", repo_path, repo_path])
     if coder_config_dir:
-        args.extend(["--bind", coder_config_dir, coder_config_dir])
+        args.extend(["--bind-try", coder_config_dir, coder_config_dir])
     if gh_config_dir:
-        args.extend(["--bind", gh_config_dir, gh_config_dir])
+        args.extend(["--bind-try", gh_config_dir, gh_config_dir])
     for path in additional_rw_dirs or []:
         args.extend(["--bind", path, path])
     for path in additional_ro_dirs or []:
