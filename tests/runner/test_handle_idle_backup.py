@@ -165,6 +165,8 @@ def test_handle_idle_backup_create_failure_logs_and_continues(
         for event in events
     )
     assert prune_calls == []
+    # Counter must stay at threshold so the next IDLE cycle retries.
+    assert runner._git_bundle_backup_counter == 60
 
 
 def test_handle_idle_backup_create_exception_logs_and_continues(
@@ -192,6 +194,37 @@ def test_handle_idle_backup_create_exception_logs_and_continues(
         for event in events
     )
     assert prune_calls == []
+    # Counter must stay at threshold so the next IDLE cycle retries.
+    assert runner._git_bundle_backup_counter == 60
+
+
+def test_handle_idle_backup_failure_retries_on_next_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a failed bundle creation must retry on the next IDLE
+    cycle instead of waiting another full ``interval_cycles``."""
+    _wire_stable_idle(monkeypatch)
+    create_calls: list[None] = []
+
+    async def fake_create(**kwargs: Any) -> Path | None:
+        create_calls.append(None)
+        return None
+
+    async def fake_prune(**kwargs: Any) -> int:
+        return 0
+
+    monkeypatch.setattr(idle_module, "create_repo_bundle", fake_create)
+    monkeypatch.setattr(idle_module, "prune_old_bundles", fake_prune)
+
+    runner = _make_backup_runner(interval_hours=1, poll_interval_sec=60)
+    # cycles_per_hour = 60; interval_cycles = 60.
+    _drive_idle(runner, 60)
+    assert len(create_calls) == 1
+    assert runner._git_bundle_backup_counter == 60
+
+    _drive_idle(runner, 1)
+    assert len(create_calls) == 2
+    assert runner._git_bundle_backup_counter == 61
 
 
 def test_handle_idle_backup_prune_logs_removed_count(

@@ -235,7 +235,6 @@ class IdleMixin:
         interval_cycles = config.git_bundle_backup_interval_hours * cycles_per_hour
         if self._git_bundle_backup_counter < interval_cycles:
             return
-        self._git_bundle_backup_counter = 0
         try:
             bundle_path = await create_repo_bundle(
                 repo_path=self.repo_path,
@@ -243,6 +242,8 @@ class IdleMixin:
                 backup_dir=config.git_bundle_backup_dir,
             )
         except Exception as exc:
+            # Leave the counter at threshold so the next IDLE cycle retries
+            # instead of waiting another full interval_cycles.
             self.log_event(f"[BACKUP] bundle creation crashed: {exc}")
             return
         if bundle_path is None:
@@ -250,6 +251,7 @@ class IdleMixin:
                 "[BACKUP] git bundle failed; will retry next cycle"
             )
             return
+        self._git_bundle_backup_counter = 0
         self.log_event(f"[BACKUP] git bundle created: {bundle_path.name}")
         try:
             removed = await prune_old_bundles(
