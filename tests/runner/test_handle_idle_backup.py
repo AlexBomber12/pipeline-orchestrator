@@ -305,6 +305,38 @@ def test_handle_idle_backup_uses_effective_idle_poll_interval(
     assert len(create_calls) == 1
 
 
+def test_handle_idle_backup_long_cadence_scales_by_elapsed_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: when the effective IDLE cadence exceeds 3600s, the
+    schedule must derive cycles from elapsed seconds rather than a
+    floor-based cycles-per-hour. A 24h interval with a 7200s cadence must
+    fire every 12 cycles (12 * 7200s = 24h), not every 24 cycles (which
+    would stretch the cadence to 48h).
+    """
+    _wire_stable_idle(monkeypatch)
+    create_calls: list[dict[str, Any]] = []
+    fake_bundle = Path("/tmp/test-backup/octo__demo/octo__demo-X.bundle")
+
+    async def fake_create(**kwargs: Any) -> Path | None:
+        create_calls.append(kwargs)
+        return fake_bundle
+
+    async def fake_prune(**kwargs: Any) -> int:
+        return 0
+
+    monkeypatch.setattr(idle_module, "create_repo_bundle", fake_create)
+    monkeypatch.setattr(idle_module, "prune_old_bundles", fake_prune)
+
+    runner = _make_backup_runner(interval_hours=24, poll_interval_sec=7200)
+    # ceil(24 * 3600 / 7200) = 12 cycles.
+    _drive_idle(runner, 11)
+    assert create_calls == []
+
+    _drive_idle(runner, 1)
+    assert len(create_calls) == 1
+
+
 def test_handle_idle_backup_counter_persists_across_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

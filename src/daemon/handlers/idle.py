@@ -8,6 +8,7 @@ Mixin methods:
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 import subprocess
 from dataclasses import replace
@@ -236,14 +237,20 @@ class IdleMixin:
         # ``poll_interval_sec`` plus any extended-idle slowdown — not the
         # daemon-level ``poll_interval_sec``. Using the wrong base would
         # undercount cycles on quiet repos and delay backups by multiples
-        # of the configured interval.
-        effective_interval = getattr(
-            self,
-            "effective_idle_poll_interval",
-            self.repo_config.poll_interval_sec,
+        # of the configured interval. Derive cycles from elapsed seconds so
+        # cadences longer than one hour (e.g. 7200s slowdown intervals) do
+        # not collapse a floor-based ``3600 // interval`` to ``0`` and
+        # silently stretch the configured 24h cadence to 48h.
+        effective_interval = max(
+            1,
+            getattr(
+                self,
+                "effective_idle_poll_interval",
+                self.repo_config.poll_interval_sec,
+            ),
         )
-        cycles_per_hour = max(1, 3600 // max(1, effective_interval))
-        interval_cycles = config.git_bundle_backup_interval_hours * cycles_per_hour
+        target_seconds = config.git_bundle_backup_interval_hours * 3600
+        interval_cycles = max(1, math.ceil(target_seconds / effective_interval))
         if self._git_bundle_backup_counter < interval_cycles:
             return
         try:
