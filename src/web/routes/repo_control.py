@@ -1285,12 +1285,15 @@ def _read_task_branch(task_path: Path) -> str | None:
     return None
 
 
-def _gh_lookup_pr_number_by_branch(branch: str) -> int | None:
+def _gh_lookup_pr_number_by_branch(
+    branch: str, owner_repo: str | None = None
+) -> int | None:
+    args = ["gh", "pr", "list", "--head", branch, "--state", "open",
+            "--json", "number"]
+    if owner_repo:
+        args.extend(["--repo", owner_repo])
     try:
-        rc, output = _gh_subprocess(
-            ["gh", "pr", "list", "--head", branch, "--state", "open",
-             "--json", "number"]
-        )
+        rc, output = _gh_subprocess(args)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if rc != 0:
@@ -1304,6 +1307,17 @@ def _gh_lookup_pr_number_by_branch(branch: str) -> int | None:
         if isinstance(number, int):
             return number
     return None
+
+
+def _checkout_guardrail_approve_base(
+    repo_root: Path, base_branch: str
+) -> None:
+    # The daemon worktree is typically on the task/PR branch; without this
+    # reset the subsequent push of HEAD would fast-forward base_branch with
+    # PR commits (or fail under branch protection).
+    _run_retry_git(repo_root, "fetch", "origin", base_branch)
+    _run_retry_git(repo_root, "checkout", "-f", base_branch)
+    _run_retry_git(repo_root, "reset", "--hard", f"origin/{base_branch}")
 
 
 def _commit_guardrail_approve(
@@ -1404,6 +1418,21 @@ async def _approve_guardrail_decision(
             )
 
         try:
+            await asyncio.to_thread(
+                _checkout_guardrail_approve_base,
+                repo_root, repo_config.branch,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            await pipe.unwatch()
+            _app.logger.warning(
+                "Failed to checkout base branch for %s %s: %s",
+                name, pr_id, exc,
+            )
+            return HTMLResponse(
+                "Failed to commit guardrail decision", status_code=503
+            )
+
+        try:
             await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
         except (OSError, ValueError) as exc:
             await pipe.unwatch()
@@ -1479,6 +1508,11 @@ async def _reject_guardrail_decision(
     if cause is None:
         return HTMLResponse(_NO_PENDING_GUARDRAIL, status_code=404)
 
+    try:
+        owner_repo: str | None = gh_runner.get_repo_full_name(repo_config.url)
+    except ValueError:
+        owner_repo = None
+
     pr_number: int | None = None
     state: RepoState | None = None
     raw_state = await redis_client.get(pipeline_state(name))
@@ -1508,9 +1542,9 @@ async def _reject_guardrail_decision(
                 head_branch = await asyncio.to_thread(
                     _read_task_branch, task_resolved[0]
                 )
-        if head_branch:
+        if head_branch and owner_repo is not None:
             pr_number = await asyncio.to_thread(
-                _gh_lookup_pr_number_by_branch, head_branch
+                _gh_lookup_pr_number_by_branch, head_branch, owner_repo
             )
 
     try:
@@ -1533,10 +1567,11 @@ async def _reject_guardrail_decision(
     except RedisError:
         return HTMLResponse("Redis unavailable", status_code=503)
 
-    if pr_number is not None:
+    if pr_number is not None and owner_repo is not None:
         await _gh_best_effort(
             name, pr_number, "gh pr close",
             ["gh", "pr", "close", str(pr_number),
+             "--repo", owner_repo,
              "--comment", "Guardrail violation rejected by operator"],
         )
     return HTMLResponse("", status_code=204)

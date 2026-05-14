@@ -275,6 +275,13 @@ def test_guardrail_decision_approve_with_pending_guardrail_cause(
     assert "chore(tasks): guardrail decision approve for PR-305c [skip ci]" in (
         " ".join(commit_calls[0])
     )
+    # Base branch must be checked out and hard-reset BEFORE the push so the
+    # commit lands on `main` regardless of which branch the worktree was on.
+    git_subcmds = [c[3] for c in git_calls if c[:3] == ["git", "-C", str(repo_dir)]]
+    push_idx = git_subcmds.index("push")
+    assert "fetch" in git_subcmds[:push_idx]
+    assert "checkout" in git_subcmds[:push_idx]
+    assert "reset" in git_subcmds[:push_idx]
     stored = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
     assert stored.state == PipelineState.WATCH
 
@@ -531,6 +538,8 @@ def test_guardrail_decision_reject_attempts_pr_close(tmp_path, monkeypatch) -> N
         "pr",
         "close",
         "99",
+        "--repo",
+        "example/alpha",
         "--comment",
         "Guardrail violation rejected by operator",
     ]
@@ -569,7 +578,11 @@ def test_guardrail_decision_reject_falls_back_to_gh_list_when_inactive(
     # the task file (``Branch:`` header), not the repo's base branch.
     head_idx = list_calls[0].index("--head")
     assert list_calls[0][head_idx + 1] == "pr-305c-feature"
+    repo_idx = list_calls[0].index("--repo")
+    assert list_calls[0][repo_idx + 1] == "example/alpha"
     assert close_calls and close_calls[0][3] == "503"
+    close_repo_idx = close_calls[0].index("--repo")
+    assert close_calls[0][close_repo_idx + 1] == "example/alpha"
 
 
 def test_guardrail_decision_reject_uses_current_task_branch_when_pr_missing(
@@ -858,6 +871,86 @@ def test_guardrail_decision_approve_frontmatter_write_failure(
     resp = _post("approve")
     assert resp.status_code == 503
     assert "Failed to update task status" in resp.text
+
+
+def test_guardrail_decision_approve_checkout_failure_returns_503(
+    tmp_path, monkeypatch
+) -> None:
+    _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if "fetch" in args or "reset" in args or "checkout" in args:
+            raise subprocess.CalledProcessError(
+                returncode=128, cmd=args, output="", stderr="branch protected"
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("approve")
+    assert resp.status_code == 503
+    assert "Failed to commit guardrail decision" in resp.text
+
+
+def test_guardrail_decision_reject_skips_gh_when_url_unparseable(
+    tmp_path, monkeypatch
+) -> None:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories:\n"
+        "  - url: not-a-real-url\n"
+        "    branch: main\n"
+        "daemon:\n"
+        "  retry_button_cap: 3\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(web_app, "REPOS_DIR", str(tmp_path / "repos"))
+    slug = "not-a-real-url"
+    repo_dir = tmp_path / "repos" / slug
+    (repo_dir / "tasks").mkdir(parents=True)
+    (repo_dir / "tasks" / "PR-305c.md").write_text(
+        "---\nstatus: ERROR\n---\n\n# x\n", encoding="utf-8"
+    )
+    state = RepoState(
+        url="not-a-real-url",
+        name=slug,
+        state=PipelineState.ERROR,
+        current_task=QueueTask(pr_id="PR-305c", title="x", status=TaskStatus.ERROR),
+        current_pr=PRInfo(number=42, branch="main"),
+    )
+    redis_client = _GuardrailRedis(
+        {
+            f"pipeline:{slug}": state.model_dump_json(),
+            cause_key(slug, "PR-305c"): _seed_cause({"subsource": "guardrail"}),
+        }
+    )
+    monkeypatch.setattr(web_app, "aioredis", _aioredis_factory(redis_client))
+
+    gh_calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        gh_calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    with TestClient(app) as client:
+        resp = client.post(
+            f"/repos/{slug}/guardrail/PR-305c/decision",
+            data={"decision": "reject"},
+        )
+    assert resp.status_code == 204
+    # `--repo` cannot be derived, so `gh pr close` must be skipped entirely
+    # to avoid acting on whichever repo gh infers from the process context.
+    assert not any(c[:3] == ["gh", "pr", "close"] for c in gh_calls)
 
 
 def test_guardrail_decision_approve_commit_failure_returns_503(
