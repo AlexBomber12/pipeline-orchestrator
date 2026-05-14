@@ -480,15 +480,14 @@ def test_guardrail_decision_approve_concurrent_change_returns_409(
     resp = _post("approve")
     assert resp.status_code == 409
     assert "Concurrent state change" in resp.text
-    # Side effects run BEFORE the CAS-delete so a transient git/frontmatter
-    # failure does not strand the operator with a deleted cause. On
-    # WatchError the cause must therefore still be in Redis (the operator
-    # retries; the second approve is idempotent — the frontmatter is
-    # already TODO and the commit becomes a no-op).
-    assert git_calls
-    assert gh_calls
+    # CAS happens BEFORE the side effects so a concurrent reject cannot
+    # interleave with frontmatter push. WatchError must therefore short
+    # circuit with no git/gh subprocesses fired and the task file
+    # untouched on disk. The cause stays in Redis because the EXEC failed.
+    assert not git_calls
+    assert not gh_calls
     assert cause_key("example__alpha", "PR-305c") in redis_client.store
-    assert "status: TODO" in (repo_dir / "tasks" / "PR-305c.md").read_text(
+    assert "status: TODO" not in (repo_dir / "tasks" / "PR-305c.md").read_text(
         encoding="utf-8"
     )
 
@@ -734,6 +733,39 @@ def test_read_task_branch_handles_unreadable_file(tmp_path) -> None:
     assert repo_control._read_task_branch(missing) is None
 
 
+def test_read_task_branch_ignores_body_section(tmp_path) -> None:
+    """``Branch:`` lines after the first H2 must not drive ``gh pr close``.
+
+    The canonical header lives in the preamble between frontmatter and the
+    first ``## `` heading; matches from the body could otherwise target
+    an unrelated PR.
+    """
+    task_path = tmp_path / "PR-body-branch.md"
+    task_path.write_text(
+        "---\nstatus: TODO\n---\n\n"
+        "# PR-body-branch\n\n"
+        "## Scope\n\n"
+        "Example: Branch: rogue-branch\n",
+        encoding="utf-8",
+    )
+    assert repo_control._read_task_branch(task_path) is None
+
+
+def test_read_task_branch_matches_preamble_only(tmp_path) -> None:
+    """Preamble ``Branch:`` is honored; body ``Branch:`` is ignored."""
+    task_path = tmp_path / "PR-preamble.md"
+    task_path.write_text(
+        "---\nstatus: TODO\n---\n\n"
+        "# PR-preamble\n\n"
+        "Branch: real-branch\n"
+        "- Type: feature\n\n"
+        "## Scope\n\n"
+        "Branch: rogue-branch\n",
+        encoding="utf-8",
+    )
+    assert repo_control._read_task_branch(task_path) == "real-branch"
+
+
 def test_guardrail_decision_reject_inactive_no_task_file_skips_close(
     tmp_path, monkeypatch
 ) -> None:
@@ -970,8 +1002,9 @@ def test_guardrail_decision_approve_frontmatter_write_failure(
     resp = _post("approve")
     assert resp.status_code == 503
     assert "Failed to update task status" in resp.text
-    # Cause must survive a transient side-effect failure so the operator
-    # can retry approve (or fall back to reject) without manual Redis edits.
+    # Cause was CAS-deleted before side effects, then restored when the
+    # frontmatter write failed — the operator must still see the decision
+    # handle so they can retry approve or fall back to reject.
     assert cause_key("example__alpha", "PR-305c") in redis_client.store
 
 
@@ -1000,8 +1033,9 @@ def test_guardrail_decision_approve_checkout_failure_returns_503(
     resp = _post("approve")
     assert resp.status_code == 503
     assert "Failed to commit guardrail decision" in resp.text
-    # Cause must survive a transient checkout failure so the operator can
-    # retry the decision instead of losing the handle to a 404.
+    # CAS-delete happened first; the rollback path restores the cause
+    # so the operator does not lose the decision handle to a 404 after a
+    # transient checkout failure.
     assert cause_key("example__alpha", "PR-305c") in redis_client.store
 
 
@@ -1083,9 +1117,45 @@ def test_guardrail_decision_approve_commit_failure_returns_503(
     resp = _post("approve")
     assert resp.status_code == 503
     assert "Failed to commit guardrail decision" in resp.text
-    # Cause must survive a transient commit failure so the operator can
-    # retry the decision instead of losing the handle to a 404.
+    # CAS-delete happened first; the rollback path restores the cause
+    # so the operator does not lose the decision handle to a 404 after a
+    # transient commit failure.
     assert cause_key("example__alpha", "PR-305c") in redis_client.store
+
+
+def test_guardrail_decision_approve_rollback_failure_still_surfaces_503(
+    tmp_path, monkeypatch
+) -> None:
+    """If the side-effect failure rollback itself fails, log and surface 503."""
+    _, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if "commit" in args:
+            raise subprocess.CalledProcessError(
+                returncode=128, cmd=args, output="", stderr="merge conflict"
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    async def boom_record(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("redis flaked during rollback")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    monkeypatch.setattr(repo_control, "record_cancellation_cause", boom_record)
+    resp = _post("approve")
+    assert resp.status_code == 503
+    assert "Failed to commit guardrail decision" in resp.text
+    # Rollback failed silently; CAS-deleted cause stays gone but the
+    # operator gets a clear error to investigate.
+    assert cause_key("example__alpha", "PR-305c") not in redis_client.store
 
 
 def test_guardrail_decision_approve_watch_reread_missing_returns_404(

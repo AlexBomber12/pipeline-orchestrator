@@ -1269,16 +1269,27 @@ def _gh_subprocess(args: list[str]) -> tuple[int, str]:
 
 
 _TASK_BRANCH_HEADER_RE = re.compile(r"^Branch\s*:\s*(.+?)\s*$")
+_TASK_BODY_HEADING_RE = re.compile(r"^#{2,}\s")
 
 
 def _read_task_branch(task_path: Path) -> str | None:
-    """Return the ``Branch:`` header value declared in a task file."""
+    """Return the ``Branch:`` header value declared in a task file.
+
+    The canonical metadata section lives in the preamble between the
+    YAML frontmatter and the first ``## `` (or deeper) heading. Scanning
+    is bounded to that preamble so a ``Branch:``-like line in the body
+    (code blocks, prose, examples) cannot drive a ``gh pr close`` against
+    an unrelated PR.
+    """
     try:
         text = task_path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
     for raw_line in text.splitlines():
-        match = _TASK_BRANCH_HEADER_RE.match(raw_line.rstrip())
+        stripped = raw_line.rstrip()
+        if _TASK_BODY_HEADING_RE.match(stripped):
+            return None
+        match = _TASK_BRANCH_HEADER_RE.match(stripped)
         if match:
             branch = match.group(1).strip()
             return branch or None
@@ -1431,15 +1442,52 @@ async def _approve_guardrail_decision(
     repo_root = Path(_app.REPOS_DIR) / name
     relative_task = Path(task_filename)
 
-    # Run the git/frontmatter side effects BEFORE deleting the cancellation
-    # cause. If any of them fail we return 503 and the operator can retry
-    # approve (or fall back to reject) because the decision handle in Redis
-    # is still intact. The reverse order — pre-deleting the cause — makes a
-    # transient checkout/commit/push failure non-recoverable: the 503
-    # response would leave Redis with no cause, so the next approve/reject
-    # attempt 404s and the task stays in ERROR until somebody edits Redis
-    # by hand. ``_commit_guardrail_approve`` already tolerates a no-op
-    # commit on retry, so re-running the side effects is idempotent.
+    # CAS-claim the decision BEFORE any side effects. The pipeline below
+    # atomically (a) re-validates the cause is still ``subsource=guardrail``
+    # and (b) deletes the cause + index entry. If a concurrent reject (or
+    # another approve) modifies the cause between our initial read and the
+    # EXEC, the WatchError surfaces here and no side effects run. The
+    # reverse order — side effects first, CAS last — is split-brain prone:
+    # a concurrent reject could land while we are pushing ``status: TODO``
+    # to main, then our CAS would fail with 409 but the frontmatter commit
+    # has already escaped, re-queueing work that was explicitly rejected.
+    original_cause: CancellationCause | None = None
+    async with redis_client.pipeline(transaction=True) as pipe:
+        await pipe.watch(cause_key(name, pr_id))
+        watched_raw = await pipe.get(cause_key(name, pr_id))
+        watched_cause = _validated_guardrail_cause(watched_raw)
+        if watched_cause is None:
+            await pipe.unwatch()
+            return HTMLResponse(_NO_PENDING_GUARDRAIL, status_code=404)
+        original_cause = watched_cause
+        pipe.multi()
+        pipe.delete(cause_key(name, pr_id))
+        pipe.zrem(index_key(name), pr_id)
+        try:
+            await pipe.execute()
+        except aioredis.WatchError:
+            return HTMLResponse(
+                "Concurrent state change detected; please retry the decision",
+                status_code=409,
+            )
+
+    async def _restore_cause() -> None:
+        # Best-effort rollback so the operator does not lose the decision
+        # handle when a transient git/frontmatter failure aborts approve
+        # after the CAS-delete. If the restore itself fails, log and let
+        # the side-effect error surface — the operator can fall back to
+        # editing Redis by hand or to the per-task Retry button.
+        try:
+            await record_cancellation_cause(
+                redis_client, name, pr_id, original_cause
+            )
+        except Exception:
+            _app.logger.warning(
+                "Failed to restore guardrail cause for %s %s after"
+                " side-effect failure",
+                name, pr_id, exc_info=True,
+            )
+
     if owner_repo is not None:
         await _gh_best_effort(
             name, pr_number, "escalated-label removal",
@@ -1457,6 +1505,7 @@ async def _approve_guardrail_decision(
             "Failed to checkout base branch for %s %s: %s",
             name, pr_id, exc,
         )
+        await _restore_cause()
         return HTMLResponse(
             "Failed to commit guardrail decision", status_code=503
         )
@@ -1464,6 +1513,7 @@ async def _approve_guardrail_decision(
     try:
         await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
     except (OSError, ValueError) as exc:
+        await _restore_cause()
         return HTMLResponse(
             f"Failed to update task status: {exc}", status_code=503
         )
@@ -1481,32 +1531,10 @@ async def _approve_guardrail_decision(
             "Failed to commit guardrail approve for %s %s: %s",
             name, pr_id, exc,
         )
+        await _restore_cause()
         return HTMLResponse(
             "Failed to commit guardrail decision", status_code=503
         )
-
-    # Side effects succeeded — finalize by CAS-deleting the cancellation
-    # cause. On WatchError the frontmatter commit has already landed on
-    # main, but a retry is idempotent and benign: the cause is still in
-    # Redis, the second approve sees the same TODO frontmatter (so the
-    # commit is a no-op) and the CAS succeeds on the second pass.
-    async with redis_client.pipeline(transaction=True) as pipe:
-        await pipe.watch(cause_key(name, pr_id))
-        watched_raw = await pipe.get(cause_key(name, pr_id))
-        if _validated_guardrail_cause(watched_raw) is None:
-            await pipe.unwatch()
-            return HTMLResponse(_NO_PENDING_GUARDRAIL, status_code=404)
-
-        pipe.multi()
-        pipe.delete(cause_key(name, pr_id))
-        pipe.zrem(index_key(name), pr_id)
-        try:
-            await pipe.execute()
-        except aioredis.WatchError:
-            return HTMLResponse(
-                "Concurrent state change detected; please retry the decision",
-                status_code=409,
-            )
 
     async def _transition(pipe: Any) -> None:
         raw = await pipe.get(state_key)
