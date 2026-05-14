@@ -8,9 +8,9 @@ Mixin methods:
 from __future__ import annotations
 
 import asyncio
-import math
 import re
 import subprocess
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -226,32 +226,27 @@ class IdleMixin:
         self._main_commit_audit_counter = 0
 
     async def _run_git_bundle_backup_if_due(self) -> None:
-        self._git_bundle_backup_counter = (
-            getattr(self, "_git_bundle_backup_counter", 0) + 1
-        )
         config = self.app_config.daemon
         if not (config.git_bundle_backup_enabled and config.git_bundle_backup_dir):
             return
-        # The counter ticks once per IDLE cycle. The runner's actual IDLE
-        # cadence is ``effective_idle_poll_interval`` — per-repo
-        # ``poll_interval_sec`` plus any extended-idle slowdown — not the
-        # daemon-level ``poll_interval_sec``. Using the wrong base would
-        # undercount cycles on quiet repos and delay backups by multiples
-        # of the configured interval. Derive cycles from elapsed seconds so
-        # cadences longer than one hour (e.g. 7200s slowdown intervals) do
-        # not collapse a floor-based ``3600 // interval`` to ``0`` and
-        # silently stretch the configured 24h cadence to 48h.
-        effective_interval = max(
-            1,
-            getattr(
-                self,
-                "effective_idle_poll_interval",
-                self.repo_config.poll_interval_sec,
-            ),
-        )
+        # Track the last successful run on a monotonic clock so the
+        # cadence stays anchored to wall-clock seconds. A cycle counter
+        # cannot work here because the runner's IDLE cadence
+        # (``effective_idle_poll_interval``) changes mid-run when the
+        # adaptive extended-idle threshold fires or the GitHub rate-limit
+        # slowdown engages. Comparing elapsed seconds keeps the
+        # configured ``git_bundle_backup_interval_hours`` honored across
+        # those transitions.
+        now = time.monotonic()
+        last_run = getattr(self, "_git_bundle_backup_last_run_at", None)
         target_seconds = config.git_bundle_backup_interval_hours * 3600
-        interval_cycles = max(1, math.ceil(target_seconds / effective_interval))
-        if self._git_bundle_backup_counter < interval_cycles:
+        if last_run is None:
+            # First IDLE cycle after runner start: anchor the clock so
+            # the first backup fires after the configured interval
+            # rather than immediately.
+            self._git_bundle_backup_last_run_at = now
+            return
+        if now - last_run < target_seconds:
             return
         try:
             bundle_path = await create_repo_bundle(
@@ -260,8 +255,8 @@ class IdleMixin:
                 backup_dir=config.git_bundle_backup_dir,
             )
         except Exception as exc:
-            # Leave the counter at threshold so the next IDLE cycle retries
-            # instead of waiting another full interval_cycles.
+            # Leave ``last_run`` untouched so the next IDLE cycle retries
+            # instead of waiting another full interval.
             self.log_event(f"[BACKUP] bundle creation crashed: {exc}")
             return
         if bundle_path is None:
@@ -269,7 +264,7 @@ class IdleMixin:
                 "[BACKUP] git bundle failed; will retry next cycle"
             )
             return
-        self._git_bundle_backup_counter = 0
+        self._git_bundle_backup_last_run_at = now
         self.log_event(f"[BACKUP] git bundle created: {bundle_path.name}")
         try:
             removed = await prune_old_bundles(
