@@ -9,11 +9,39 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Callable
 
+from src.config import load_config
+from src.daemon.sandbox import build_bwrap_command, is_bubblewrap_available
 from src.diagnosis import build_diagnosis_prompt
 
 logger = logging.getLogger(__name__)
+
+
+def _maybe_wrap_sandbox(cmd: list[str], cwd: str) -> list[str]:
+    """Wrap ``cmd`` with bwrap when ``coder_filesystem_isolation`` is on."""
+    cfg = load_config()
+    if not cfg.daemon.coder_filesystem_isolation:
+        return cmd
+    if not is_bubblewrap_available():
+        logger.warning(
+            "[SANDBOX] coder_filesystem_isolation enabled but bwrap not "
+            "available; spawning coder unsandboxed"
+        )
+        return cmd
+    # Bind the daemon HOME so files written outside of codex_home_dir
+    # (notably ~/.gitconfig from ``gh auth setup-git``) remain visible to
+    # the sandboxed coder; without it non-interactive git push fails.
+    home = os.environ.get("HOME")
+    additional_rw_dirs = [home] if home else None
+    return build_bwrap_command(
+        command=cmd,
+        repo_path=cwd,
+        coder_config_dir=cfg.auth.codex_home_dir,
+        gh_config_dir=cfg.auth.gh_config_dir,
+        additional_rw_dirs=additional_rw_dirs,
+    )
 
 
 async def run_codex_async(
@@ -41,6 +69,7 @@ async def run_codex_async(
     cmd.append(prompt)
     logger.info("[codex] running codex exec with prompt: %s", prompt[:80])
 
+    cmd = _maybe_wrap_sandbox(cmd, cwd)
     proc: asyncio.subprocess.Process | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
