@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import subprocess
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 
@@ -68,11 +68,17 @@ async def prune_old_bundles(
         key=lambda p: p.stat().st_mtime, reverse=True,
     )
     keep: set[Path] = set(bundles[:daily_retention])
-    sundays = [
-        b for b in bundles
-        if datetime.fromtimestamp(b.stat().st_mtime, tz=timezone.utc).weekday() == 6
-    ]
-    keep.update(sundays[:weekly_retention])
+    # Sub-24h backup intervals can produce multiple bundles per Sunday; count
+    # distinct Sunday UTC dates so weekly slots span weeks, not same-day files.
+    seen_sundays: set[date] = set()
+    distinct_sundays: list[Path] = []
+    for bundle in bundles:
+        dt = datetime.fromtimestamp(bundle.stat().st_mtime, tz=timezone.utc)
+        if dt.weekday() != 6 or dt.date() in seen_sundays:
+            continue
+        seen_sundays.add(dt.date())
+        distinct_sundays.append(bundle)
+    keep.update(distinct_sundays[:weekly_retention])
     removed = 0
     for bundle in bundles:
         if bundle in keep:

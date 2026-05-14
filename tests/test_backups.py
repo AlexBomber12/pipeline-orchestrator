@@ -284,6 +284,40 @@ def test_prune_old_bundles_keeps_sunday_for_weekly(tmp_path: Path) -> None:
     assert removed == 4
 
 
+def test_prune_old_bundles_weekly_retention_dedupes_same_sunday_date(
+    tmp_path: Path,
+) -> None:
+    """Sub-24h backup intervals: weekly slots count distinct Sunday dates."""
+    backup_dir = tmp_path / "backups"
+    backup_root = backup_dir / "repo"
+    backup_root.mkdir(parents=True)
+    # Three bundles on Sunday 2026-05-10 (sub-24h interval) plus one bundle
+    # on the prior Sunday 2026-05-03 — older-week restore point must survive.
+    times = [
+        ("repo-sun10-c.bundle",
+         datetime(2026, 5, 10, 18, 0, 0, tzinfo=timezone.utc).timestamp()),
+        ("repo-sun10-b.bundle",
+         datetime(2026, 5, 10, 12, 0, 0, tzinfo=timezone.utc).timestamp()),
+        ("repo-sun10-a.bundle",
+         datetime(2026, 5, 10, 6, 0, 0, tzinfo=timezone.utc).timestamp()),
+        ("repo-sun03.bundle",
+         datetime(2026, 5, 3, 12, 0, 0, tzinfo=timezone.utc).timestamp()),
+    ]
+    for name, ts in times:
+        _touch_bundle(backup_root / name, ts)
+
+    removed = asyncio.run(prune_old_bundles(
+        backup_dir=str(backup_dir), repo_name="repo",
+        daily_retention=1, weekly_retention=2,
+    ))
+
+    # daily keeps newest (repo-sun10-c). Weekly with distinct-date dedup keeps
+    # newest from 2026-05-10 (repo-sun10-c) and 2026-05-03 (repo-sun03).
+    remaining = {p.name for p in backup_root.glob("*.bundle")}
+    assert remaining == {"repo-sun10-c.bundle", "repo-sun03.bundle"}
+    assert removed == 2
+
+
 def test_prune_old_bundles_zero_weekly_retention_removes_all_non_daily(
     tmp_path: Path,
 ) -> None:
