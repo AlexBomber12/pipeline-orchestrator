@@ -14,6 +14,7 @@ single canonical ``ERROR``. Forensic detail moves to
 * ``coder_escalate`` — coder stdout contained an explicit ``ESCALATE:``
   marker
 * ``guardrail`` — Tier 1/2 guardrail violation
+* ``operator_reject`` — operator rejected a guardrail-flagged PR
 * ``review_timeout`` — WATCH review_timeout exceeded
 * ``fix_idle_timeout`` — FIX cycle idle without push
 * ``fix_iteration_cap`` — FIX iteration count exceeded
@@ -57,6 +58,15 @@ class CancellationCause:
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8")
         return cls(**json.loads(raw))
+
+
+@dataclass(frozen=True)
+class GuardrailPending:
+    repo: str
+    pr_id: str
+    rule: str
+    excerpt: str
+    recorded_at: int
 
 
 def cause_key(repo_slug: str, task_id: str) -> str:
@@ -301,3 +311,69 @@ async def list_recent_cancellations(
         await redis_client.zrem(index_key(repo_slug), *stale)
     causes.sort(key=lambda c: datetime.fromisoformat(c.created_at), reverse=True)
     return causes
+
+
+async def _iter_cancellation_index_repos(redis_client: Any) -> list[str]:
+    repos: list[str] = []
+    prefix = "cancellation_index:"
+    if hasattr(redis_client, "scan_iter"):
+        async for key in redis_client.scan_iter(match=f"{prefix}*"):
+            if isinstance(key, bytes):
+                key = key.decode("utf-8")
+            repos.append(str(key)[len(prefix) :])
+        return repos
+
+    cursor = 0
+    while True:
+        cursor, keys = await redis_client.scan(cursor, match=f"{prefix}*", count=100)
+        for key in keys or []:
+            if isinstance(key, bytes):
+                key = key.decode("utf-8")
+            repos.append(str(key)[len(prefix) :])
+        if int(cursor) == 0:
+            return repos
+
+
+async def list_pending_guardrail_decisions(
+    redis_client: Any,
+    repo: str | None = None,
+) -> list[GuardrailPending]:
+    """Return pending guardrail decisions, oldest first.
+
+    The existing ``cancellation_index:{repo}`` ZSET is the source of truth.
+    Each repo read is bounded to the oldest 100 indexed task ids.
+    """
+    repos = [repo] if repo is not None else await _iter_cancellation_index_repos(redis_client)
+    pending: list[GuardrailPending] = []
+    stale: dict[str, list[str]] = {}
+    for repo_slug in repos:
+        task_ids = await redis_client.zrange(index_key(repo_slug), 0, 99)
+        for raw_task_id in task_ids or []:
+            task_id = (
+                raw_task_id.decode("utf-8")
+                if isinstance(raw_task_id, bytes)
+                else str(raw_task_id)
+            )
+            cause = await get_cancellation_cause(redis_client, repo_slug, task_id)
+            if cause is None:
+                stale.setdefault(repo_slug, []).append(task_id)
+                continue
+            if cause.payload.get("subsource") != "guardrail":
+                continue
+            try:
+                recorded_at = int(datetime.fromisoformat(cause.created_at).timestamp())
+            except (TypeError, ValueError):
+                recorded_at = 0
+            pending.append(
+                GuardrailPending(
+                    repo=repo_slug,
+                    pr_id=task_id,
+                    rule=str(cause.payload.get("rule", "")),
+                    excerpt=str(cause.payload.get("excerpt", "")),
+                    recorded_at=recorded_at,
+                )
+            )
+    for repo_slug, task_ids in stale.items():
+        await redis_client.zrem(index_key(repo_slug), *task_ids)
+    pending.sort(key=lambda item: item.recorded_at)
+    return pending
