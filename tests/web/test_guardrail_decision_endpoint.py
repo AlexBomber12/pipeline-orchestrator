@@ -455,7 +455,7 @@ def test_guardrail_decision_approve_inactive_task_returns_409(
 def test_guardrail_decision_approve_concurrent_change_returns_409(
     tmp_path, monkeypatch
 ) -> None:
-    _, redis_client = _setup(
+    repo_dir, redis_client = _setup(
         tmp_path,
         monkeypatch,
         store={
@@ -466,14 +466,112 @@ def test_guardrail_decision_approve_concurrent_change_returns_409(
         },
     )
     redis_client.pending_watch_error = True
+    git_calls: list[list[str]] = []
+    gh_calls: list[list[str]] = []
 
     def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if args and args[0] == "git":
+            git_calls.append(args)
+        elif args and args[0] == "gh":
+            gh_calls.append(args)
         return subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
     resp = _post("approve")
     assert resp.status_code == 409
     assert "Concurrent state change" in resp.text
+    # WATCH must fail before any external side effect runs; otherwise a
+    # commit could land on main while Redis still reports the guardrail
+    # cause and ERROR state.
+    assert not git_calls
+    assert not gh_calls
+    assert cause_key("example__alpha", "PR-305c") in redis_client.store
+    assert "status: ERROR" in (repo_dir / "tasks" / "PR-305c.md").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_guardrail_decision_reject_falls_back_to_category_and_reason_text(
+    tmp_path, monkeypatch
+) -> None:
+    """Operator-reject preserves identifying signal regardless of cause shape.
+
+    Daemon emissions vary: ``watch.py`` writes structured ``category`` /
+    ``excerpt`` fields, while ``coding.py`` and ``fix.py`` write only
+    ``reason_text="GUARDRAIL: {category}: {excerpt}"``. The reject record
+    must derive ``original_rule`` / ``original_excerpt`` from whichever
+    shape is present.
+    """
+    _, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {
+                    "subsource": "guardrail",
+                    "tier": "2",
+                    "category": "large_diff_threshold",
+                    "excerpt": "+1800 LOC across 35 files",
+                }
+            ),
+        },
+    )
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("reject")
+    assert resp.status_code == 204
+    raw = redis_client.store[cause_key("example__alpha", "PR-305c")]
+    cause = CancellationCause.from_redis(raw)
+    assert cause.payload["original_rule"] == "large_diff_threshold"
+    assert cause.payload["original_excerpt"] == "+1800 LOC across 35 files"
+
+
+def test_guardrail_decision_reject_parses_reason_text_when_fields_absent(
+    tmp_path, monkeypatch
+) -> None:
+    """``coding.py`` / ``fix.py`` emit only ``reason_text`` — reject must parse it."""
+    _, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {
+                    "subsource": "guardrail",
+                    "reason_text": "GUARDRAIL: secrets_leak: AWS_SECRET=...",
+                }
+            ),
+        },
+    )
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("reject")
+    assert resp.status_code == 204
+    raw = redis_client.store[cause_key("example__alpha", "PR-305c")]
+    cause = CancellationCause.from_redis(raw)
+    assert cause.payload["original_rule"] == "secrets_leak"
+    assert cause.payload["original_excerpt"] == "AWS_SECRET=..."
+
+
+def test_extract_guardrail_metadata_unparseable_reason_text() -> None:
+    """When reason_text is non-conforming, fall back to empty strings."""
+    rule, excerpt = repo_control._extract_guardrail_metadata(
+        {"subsource": "guardrail", "reason_text": "no colon delimiters here"}
+    )
+    assert rule == ""
+    assert excerpt == ""
+    rule, excerpt = repo_control._extract_guardrail_metadata(
+        {"subsource": "guardrail", "reason_text": 12345}
+    )
+    assert rule == ""
+    assert excerpt == ""
 
 
 def test_guardrail_decision_reject_records_operator_reject_cause(

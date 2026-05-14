@@ -1348,6 +1348,34 @@ def _validated_guardrail_cause(raw: object) -> CancellationCause | None:
     return cause
 
 
+_GUARDRAIL_REASON_RE = re.compile(r"^GUARDRAIL:\s*([^:]+):\s*(.+)$")
+
+
+def _extract_guardrail_metadata(payload: dict[str, Any]) -> tuple[str, str]:
+    """Return ``(rule, excerpt)`` from a guardrail cause payload.
+
+    The daemon writes guardrail causes in two shapes: watch.py emits
+    structured ``category``/``excerpt`` fields while coding.py and fix.py
+    emit only ``reason_text="GUARDRAIL: {category}: {excerpt}"``. The
+    operator_reject record must preserve identifying signal regardless of
+    which shape produced the original cause, so fall back through
+    ``rule`` -> ``category`` -> parsed ``reason_text``.
+    """
+    rule = payload.get("rule") or payload.get("category") or ""
+    excerpt = payload.get("excerpt", "") or ""
+    if rule and excerpt:
+        return rule, excerpt
+    reason = payload.get("reason_text", "")
+    if isinstance(reason, str):
+        match = _GUARDRAIL_REASON_RE.match(reason)
+        if match:
+            if not rule:
+                rule = match.group(1).strip()
+            if not excerpt:
+                excerpt = match.group(2).strip()
+    return rule, excerpt
+
+
 async def _gh_best_effort(
     name: str, pr_number: int, what: str, args: list[str]
 ) -> None:
@@ -1403,60 +1431,17 @@ async def _approve_guardrail_decision(
     repo_root = Path(_app.REPOS_DIR) / name
     relative_task = Path(task_filename)
 
+    # CAS-commit the cancellation-cause deletion BEFORE any external side
+    # effects. Otherwise a WatchError raised after we have already pushed
+    # the frontmatter commit to ``main`` would surface a 409 to the
+    # operator while the side effect has already escaped, leaving Redis in
+    # ERROR with a guardrail cause but ``main`` already updated.
     async with redis_client.pipeline(transaction=True) as pipe:
         await pipe.watch(cause_key(name, pr_id))
         watched_raw = await pipe.get(cause_key(name, pr_id))
         if _validated_guardrail_cause(watched_raw) is None:
             await pipe.unwatch()
             return HTMLResponse(_NO_PENDING_GUARDRAIL, status_code=404)
-
-        if owner_repo is not None:
-            await _gh_best_effort(
-                name, pr_number, "escalated-label removal",
-                ["gh", "api", "-X", "DELETE",
-                 f"repos/{owner_repo}/issues/{pr_number}/labels/escalated"],
-            )
-
-        try:
-            await asyncio.to_thread(
-                _checkout_guardrail_approve_base,
-                repo_root, repo_config.branch,
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            await pipe.unwatch()
-            _app.logger.warning(
-                "Failed to checkout base branch for %s %s: %s",
-                name, pr_id, exc,
-            )
-            return HTMLResponse(
-                "Failed to commit guardrail decision", status_code=503
-            )
-
-        try:
-            await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
-        except (OSError, ValueError) as exc:
-            await pipe.unwatch()
-            return HTMLResponse(
-                f"Failed to update task status: {exc}", status_code=503
-            )
-
-        commit_subject = (
-            f"chore(tasks): guardrail decision approve for {pr_id} [skip ci]"
-        )
-        try:
-            await asyncio.to_thread(
-                _commit_guardrail_approve,
-                repo_root, relative_task, commit_subject, repo_config.branch,
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            await pipe.unwatch()
-            _app.logger.warning(
-                "Failed to commit guardrail approve for %s %s: %s",
-                name, pr_id, exc,
-            )
-            return HTMLResponse(
-                "Failed to commit guardrail decision", status_code=503
-            )
 
         pipe.multi()
         pipe.delete(cause_key(name, pr_id))
@@ -1468,6 +1453,51 @@ async def _approve_guardrail_decision(
                 "Concurrent state change detected; please retry the decision",
                 status_code=409,
             )
+
+    if owner_repo is not None:
+        await _gh_best_effort(
+            name, pr_number, "escalated-label removal",
+            ["gh", "api", "-X", "DELETE",
+             f"repos/{owner_repo}/issues/{pr_number}/labels/escalated"],
+        )
+
+    try:
+        await asyncio.to_thread(
+            _checkout_guardrail_approve_base,
+            repo_root, repo_config.branch,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        _app.logger.warning(
+            "Failed to checkout base branch for %s %s after CAS commit: %s",
+            name, pr_id, exc,
+        )
+        return HTMLResponse(
+            "Failed to commit guardrail decision", status_code=503
+        )
+
+    try:
+        await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
+    except (OSError, ValueError) as exc:
+        return HTMLResponse(
+            f"Failed to update task status: {exc}", status_code=503
+        )
+
+    commit_subject = (
+        f"chore(tasks): guardrail decision approve for {pr_id} [skip ci]"
+    )
+    try:
+        await asyncio.to_thread(
+            _commit_guardrail_approve,
+            repo_root, relative_task, commit_subject, repo_config.branch,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        _app.logger.warning(
+            "Failed to commit guardrail approve for %s %s after CAS commit: %s",
+            name, pr_id, exc,
+        )
+        return HTMLResponse(
+            "Failed to commit guardrail decision", status_code=503
+        )
 
     async def _transition(pipe: Any) -> None:
         raw = await pipe.get(state_key)
@@ -1547,6 +1577,7 @@ async def _reject_guardrail_decision(
                 _gh_lookup_pr_number_by_branch, head_branch, owner_repo
             )
 
+    original_rule, original_excerpt = _extract_guardrail_metadata(cause.payload)
     try:
         await record_cancellation_cause(
             redis_client, name, pr_id,
@@ -1559,8 +1590,8 @@ async def _reject_guardrail_decision(
                         if pr_number is not None
                         else "Operator rejected guardrail-flagged PR via dashboard"
                     ),
-                    "original_rule": cause.payload.get("rule", ""),
-                    "original_excerpt": cause.payload.get("excerpt", ""),
+                    "original_rule": original_rule,
+                    "original_excerpt": original_excerpt,
                 },
             ),
         )
