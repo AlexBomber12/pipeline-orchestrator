@@ -13,7 +13,6 @@ from redis.exceptions import WatchError
 from src.cancellation.storage import (
     CancellationCause,
     cause_key,
-    index_key,
 )
 from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
 from src.web import app as web_app
