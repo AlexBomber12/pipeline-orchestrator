@@ -1400,7 +1400,10 @@ class PipelineRunner(
                     cause,
                     log=self.log_event,
                 )
-        if message.startswith("GUARDRAIL") and task is not None:
+        if (
+            message.startswith(("GUARDRAIL", "[GUARDRAIL]"))
+            and task is not None
+        ):
             parsed = _parse_guardrail_cause_for_notification(message)
             webhook_url = self.app_config.daemon.guardrail_notification_webhook_url
             min_tier = self.app_config.daemon.guardrail_notification_min_tier

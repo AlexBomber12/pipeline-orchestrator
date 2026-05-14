@@ -101,6 +101,27 @@ def test_transition_to_error_guardrail_calls_notification_when_configured(
     assert kwargs["rule"] == "large_diff_threshold"
 
 
+def test_transition_to_error_bracketed_guardrail_prefix_calls_notification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_notification_config()
+    _set_active_task(runner)
+    mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(runner_module, "send_guardrail_notification", mock)
+
+    asyncio.run(
+        runner._transition_to_error(
+            "[GUARDRAIL] tier=2 large_diff_threshold: +1500 LOC across 30 files"
+        )
+    )
+
+    mock.assert_awaited_once()
+    kwargs = mock.await_args.kwargs
+    assert kwargs["tier"] == 2
+    assert kwargs["category"] == "large_diff_threshold"
+    assert "+1500 LOC" in kwargs["excerpt"]
+
+
 def test_transition_to_error_guardrail_skips_notification_when_webhook_url_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
