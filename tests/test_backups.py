@@ -158,6 +158,57 @@ def test_create_repo_bundle_returns_none_on_mkdir_failure(
     assert not (backup_dir / "repo").exists()
 
 
+def test_create_repo_bundle_swallows_unlink_oserror_after_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cleanup unlink failure on the error path must not escape the call."""
+    backup_dir = tmp_path / "backups"
+
+    def _fake_run(*args: Any, **kwargs: Any) -> Any:
+        raise OSError("disk full")
+
+    def _raising_unlink(self: Path, *args: Any, **kwargs: Any) -> None:
+        raise OSError("locked")
+
+    monkeypatch.setattr(backups.subprocess, "run", _fake_run)
+    monkeypatch.setattr(Path, "unlink", _raising_unlink)
+
+    result = asyncio.run(create_repo_bundle(
+        repo_path=str(tmp_path), repo_name="repo", backup_dir=str(backup_dir),
+    ))
+
+    assert result is None
+
+
+def test_create_repo_bundle_swallows_unlink_oserror_on_verify_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify-failure cleanup unlink must not propagate OSError."""
+    backup_dir = tmp_path / "backups"
+
+    class _Completed:
+        def __init__(self, returncode: int) -> None:
+            self.returncode = returncode
+
+    def _fake_run(args: list[str], **kwargs: Any) -> _Completed:
+        if "create" in args:
+            Path(args[3]).write_bytes(b"partial-bundle-bytes")
+            return _Completed(0)
+        return _Completed(1)
+
+    def _raising_unlink(self: Path, *args: Any, **kwargs: Any) -> None:
+        raise OSError("locked")
+
+    monkeypatch.setattr(backups.subprocess, "run", _fake_run)
+    monkeypatch.setattr(Path, "unlink", _raising_unlink)
+
+    result = asyncio.run(create_repo_bundle(
+        repo_path=str(tmp_path), repo_name="repo", backup_dir=str(backup_dir),
+    ))
+
+    assert result is None
+
+
 def test_create_repo_bundle_filename_format(tmp_path: Path) -> None:
     repo = tmp_path / "myrepo"
     _init_git_repo(repo)

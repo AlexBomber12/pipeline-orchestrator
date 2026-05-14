@@ -9,6 +9,7 @@ corruption, or credential compromise. PR-311b wires this into IDLE.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,18 +24,21 @@ def _create_and_verify_sync(repo_path: str, bundle_path: Path) -> bool:
             cwd=repo_path, capture_output=True, text=True, timeout=300,
         )
         if create.returncode != 0:
-            bundle_path.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                bundle_path.unlink(missing_ok=True)
             return False
         verify = subprocess.run(
             ["git", "bundle", "verify", str(bundle_path)],
             cwd=repo_path, capture_output=True, text=True, timeout=60,
         )
         if verify.returncode != 0:
-            bundle_path.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                bundle_path.unlink(missing_ok=True)
             return False
         return True
     except (subprocess.TimeoutExpired, OSError):
-        bundle_path.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            bundle_path.unlink(missing_ok=True)
         return False
 
 
