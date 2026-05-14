@@ -32,6 +32,7 @@ ALLOWED_CATEGORIES = (
     "AUDIT",
     "AUTO-PAUSE",
     "GUARDRAIL",
+    "BACKUP",
 )
 _PREFIX_RE = re.compile(
     r"^\[(?:" + "|".join(re.escape(c) for c in ALLOWED_CATEGORIES) + r")\] "
