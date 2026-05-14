@@ -84,6 +84,10 @@ from src.daemon.handlers.hung import HungMixin
 from src.daemon.handlers.idle import IdleMixin
 from src.daemon.handlers.merge import MergeMixin
 from src.daemon.handlers.watch import WatchMixin
+from src.daemon.notifications import (
+    _parse_guardrail_cause_for_notification,
+    send_guardrail_notification,
+)
 from src.daemon.preflight import PreflightMixin
 from src.daemon.rate_limit import RateLimitMixin
 from src.daemon.recovery import RecoveryMixin
@@ -1396,6 +1400,46 @@ class PipelineRunner(
                     cause,
                     log=self.log_event,
                 )
+        if message.startswith("GUARDRAIL") and task is not None:
+            parsed = _parse_guardrail_cause_for_notification(message)
+            webhook_url = self.app_config.daemon.guardrail_notification_webhook_url
+            min_tier = self.app_config.daemon.guardrail_notification_min_tier
+            if parsed and webhook_url and parsed["tier"] >= min_tier:
+                pr_number = (
+                    self.state.current_pr.number
+                    if self.state.current_pr is not None
+                    else None
+                )
+                timeout_seconds = (
+                    self.app_config.daemon.guardrail_notification_timeout_seconds
+                )
+                try:
+                    await asyncio.wait_for(
+                        send_guardrail_notification(
+                            webhook_url=webhook_url,
+                            repo_name=self.name,
+                            pr_id=task.pr_id,
+                            pr_number=pr_number,
+                            owner_repo=self.owner_repo,
+                            tier=parsed["tier"],
+                            category=parsed["category"],
+                            excerpt=parsed["excerpt"],
+                            rule=parsed["rule"],
+                            timeout_seconds=timeout_seconds,
+                            dashboard_base_url=(
+                                self.app_config.daemon.dashboard_base_url
+                            ),
+                        ),
+                        timeout=timeout_seconds + 2.0,
+                    )
+                except asyncio.TimeoutError:
+                    self.log_event(
+                        "[GUARDRAIL] notification webhook timed out"
+                    )
+                except Exception as exc:
+                    self.log_event(
+                        f"[GUARDRAIL] notification webhook failed: {exc}"
+                    )
         if publish:
             await self.publish_state()
 
