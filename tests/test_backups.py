@@ -140,6 +140,24 @@ def test_create_repo_bundle_returns_none_on_oserror(
     assert list((backup_dir / "repo").glob("*.bundle")) == []
 
 
+def test_create_repo_bundle_returns_none_on_mkdir_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backup_dir = tmp_path / "readonly"
+
+    def _raising_mkdir(self: Path, *args: Any, **kwargs: Any) -> None:
+        raise PermissionError("read-only filesystem")
+
+    monkeypatch.setattr(Path, "mkdir", _raising_mkdir)
+
+    result = asyncio.run(create_repo_bundle(
+        repo_path=str(tmp_path), repo_name="repo", backup_dir=str(backup_dir),
+    ))
+
+    assert result is None
+    assert not (backup_dir / "repo").exists()
+
+
 def test_create_repo_bundle_filename_format(tmp_path: Path) -> None:
     repo = tmp_path / "myrepo"
     _init_git_repo(repo)

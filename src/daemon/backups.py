@@ -17,6 +17,7 @@ from pathlib import Path
 def _create_and_verify_sync(repo_path: str, bundle_path: Path) -> bool:
     """Bundle and verify; clean up the partial file on any failure path."""
     try:
+        bundle_path.parent.mkdir(parents=True, exist_ok=True)
         create = subprocess.run(
             ["git", "bundle", "create", str(bundle_path), "--all"],
             cwd=repo_path, capture_output=True, text=True, timeout=300,
@@ -42,7 +43,6 @@ async def create_repo_bundle(
 ) -> Path | None:
     """Create and verify a ``--all`` git bundle off the asyncio thread."""
     backup_root = Path(backup_dir) / repo_name
-    backup_root.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     bundle_path = backup_root / f"{repo_name}-{timestamp}.bundle"
     ok = await asyncio.to_thread(_create_and_verify_sync, repo_path, bundle_path)
