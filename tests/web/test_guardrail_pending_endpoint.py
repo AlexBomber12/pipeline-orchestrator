@@ -8,9 +8,11 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from redis.exceptions import RedisError
 from src.cancellation.storage import CancellationCause, cause_key, index_key
 from src.web import app as web_app
 from src.web.app import app
+from src.web.routes import repo_control as repo_control_routes
 
 _BASE = datetime(2026, 5, 14, 12, 0, tzinfo=timezone.utc).timestamp()
 
@@ -146,3 +148,46 @@ def test_guardrail_pending_bounded_at_100(tmp_path, monkeypatch) -> None:
     assert len(body["pending"]) == 100
     assert body["pending"][0]["pr_id"] == "PR-000"
     assert body["pending"][-1]["pr_id"] == "PR-099"
+
+
+def test_guardrail_pending_returns_503_when_redis_unattached(
+    tmp_path, monkeypatch
+) -> None:
+    """If lifespan never attached a redis client, return 503 instead of 500."""
+    _setup(tmp_path, monkeypatch)
+    sentinel = {"called": False}
+
+    async def fake_list(redis_client, repo_slug, **kwargs):  # pragma: no cover
+        sentinel["called"] = True
+        return []
+
+    monkeypatch.setattr(
+        repo_control_routes, "list_pending_guardrail_decisions", fake_list
+    )
+    if hasattr(web_app.app.state, "redis"):
+        monkeypatch.delattr(web_app.app.state, "redis", raising=False)
+
+    client = TestClient(web_app.app)
+    resp = client.get("/api/repo/example__alpha/guardrail/pending")
+
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "redis unavailable"}
+    assert sentinel["called"] is False
+
+
+def test_guardrail_pending_returns_503_when_redis_raises(
+    tmp_path, monkeypatch
+) -> None:
+    """RedisError from the storage helper surfaces as 503, not 500."""
+    _setup(tmp_path, monkeypatch)
+
+    async def boom(redis_client, repo_slug, **kwargs):
+        raise RedisError("connection refused")
+
+    monkeypatch.setattr(
+        repo_control_routes, "list_pending_guardrail_decisions", boom
+    )
+
+    resp = _get("example__alpha")
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "redis unavailable"}

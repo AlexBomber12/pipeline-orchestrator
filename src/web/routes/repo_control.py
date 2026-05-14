@@ -21,6 +21,7 @@ from typing import Any, Callable, Literal
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
+from redis.exceptions import RedisError
 
 from src.cancellation.storage import (
     delete_cancellation_cause,
@@ -1227,8 +1228,13 @@ async def get_repo_guardrail_pending(request: Request, name: str) -> Response:
     cfg = load_config(_app.CONFIG_PATH)
     if _find_repo_config_by_name(cfg, name) is None:
         return JSONResponse({"error": "repo not found"}, status_code=404)
-    redis_client = request.app.state.redis
-    pending = await list_pending_guardrail_decisions(redis_client, name)
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        return JSONResponse({"error": "redis unavailable"}, status_code=503)
+    try:
+        pending = await list_pending_guardrail_decisions(redis_client, name)
+    except RedisError:
+        return JSONResponse({"error": "redis unavailable"}, status_code=503)
     payload = {
         "pending": [
             {
