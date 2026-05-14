@@ -24,10 +24,15 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from redis.exceptions import RedisError
 
 from src.cancellation.storage import (
+    CancellationCause,
+    cause_key,
     delete_cancellation_cause,
+    index_key,
     list_pending_guardrail_decisions,
+    record_cancellation_cause,
 )
 from src.config import load_config
+from src.github import gh_runner
 from src.keyspace import (
     control_stop,
     legacy_recovered_tasks,
@@ -1247,6 +1252,293 @@ async def get_repo_guardrail_pending(request: Request, name: str) -> Response:
         ]
     }
     return JSONResponse(payload)
+
+
+_NO_PENDING_GUARDRAIL = "PR has no pending guardrail decision"
+
+
+def _gh_subprocess(args: list[str]) -> tuple[int, str]:
+    result = subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        timeout=_RETRY_GIT_TIMEOUT_SECONDS,
+        check=False,
+    )
+    return result.returncode, _git_output(result)
+
+
+def _gh_lookup_pr_number_by_branch(branch: str) -> int | None:
+    try:
+        rc, output = _gh_subprocess(
+            ["gh", "pr", "list", "--head", branch, "--state", "open",
+             "--json", "number"]
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if rc != 0:
+        return None
+    try:
+        payload = json.loads(output or "[]")
+    except json.JSONDecodeError:
+        return None
+    for entry in payload if isinstance(payload, list) else []:
+        number = entry.get("number") if isinstance(entry, dict) else None
+        if isinstance(number, int):
+            return number
+    return None
+
+
+def _commit_guardrail_approve(
+    repo_root: Path, relative_task: Path, commit_subject: str, base_branch: str
+) -> None:
+    _run_retry_git(repo_root, "add", relative_task.as_posix())
+    try:
+        _run_retry_git(
+            repo_root, "commit", "-m", commit_subject, "-m", "[skip ci]",
+            "--", relative_task.as_posix(),
+        )
+    except subprocess.CalledProcessError as exc:
+        if not _is_nothing_to_commit(exc):
+            raise
+    _run_retry_git(repo_root, "push", "origin", f"HEAD:{base_branch}")
+
+
+def _validated_guardrail_cause(raw: object) -> CancellationCause | None:
+    if raw is None:
+        return None
+    try:
+        cause = CancellationCause.from_redis(raw)  # type: ignore[arg-type]
+    except Exception:
+        return None
+    payload = cause.payload if isinstance(cause.payload, dict) else None
+    if payload is None or payload.get("subsource") != "guardrail":
+        return None
+    return cause
+
+
+async def _gh_best_effort(
+    name: str, pr_number: int, what: str, args: list[str]
+) -> None:
+    try:
+        rc, output = await asyncio.to_thread(_gh_subprocess, args)
+        if rc != 0:
+            _app.logger.warning(
+                "Best-effort %s failed for %s PR #%s: %s",
+                what, name, pr_number, output.strip(),
+            )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _app.logger.warning(
+            "Best-effort %s raised for %s PR #%s: %s",
+            what, name, pr_number, exc,
+        )
+
+
+async def _approve_guardrail_decision(
+    name: str, pr_id: str, repo_config: Any, redis_client: aioredis.Redis
+) -> Response:
+    raw_cause = await redis_client.get(cause_key(name, pr_id))
+    if _validated_guardrail_cause(raw_cause) is None:
+        return HTMLResponse(_NO_PENDING_GUARDRAIL, status_code=404)
+
+    state_key = pipeline_state(name)
+    raw_state = await redis_client.get(state_key)
+    state: RepoState | None = None
+    if raw_state is not None:
+        try:
+            state = RepoState.model_validate_json(raw_state)
+        except Exception:
+            state = None
+    if (
+        state is None
+        or state.current_task is None
+        or state.current_task.pr_id != pr_id
+        or state.current_pr is None
+    ):
+        return HTMLResponse(
+            "Open PR not active in daemon state; reject and re-upload spec instead",
+            status_code=409,
+        )
+    pr_number = state.current_pr.number
+    try:
+        owner_repo: str | None = gh_runner.get_repo_full_name(repo_config.url)
+    except ValueError:
+        owner_repo = None
+
+    repo_root = Path(_app.REPOS_DIR) / name
+    task_path = repo_root / "tasks" / f"{pr_id}.md"
+    relative_task = Path("tasks") / f"{pr_id}.md"
+
+    async with redis_client.pipeline(transaction=True) as pipe:
+        await pipe.watch(cause_key(name, pr_id))
+        watched_raw = await pipe.get(cause_key(name, pr_id))
+        if _validated_guardrail_cause(watched_raw) is None:
+            await pipe.unwatch()
+            return HTMLResponse(_NO_PENDING_GUARDRAIL, status_code=404)
+
+        if owner_repo is not None:
+            await _gh_best_effort(
+                name, pr_number, "escalated-label removal",
+                ["gh", "api", "-X", "DELETE",
+                 f"repos/{owner_repo}/issues/{pr_number}/labels/escalated"],
+            )
+
+        try:
+            await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
+        except (OSError, ValueError) as exc:
+            await pipe.unwatch()
+            return HTMLResponse(
+                f"Failed to update task status: {exc}", status_code=503
+            )
+
+        commit_subject = (
+            f"chore(tasks): guardrail decision approve for {pr_id} [skip ci]"
+        )
+        try:
+            await asyncio.to_thread(
+                _commit_guardrail_approve,
+                repo_root, relative_task, commit_subject, repo_config.branch,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            await pipe.unwatch()
+            _app.logger.warning(
+                "Failed to commit guardrail approve for %s %s: %s",
+                name, pr_id, exc,
+            )
+            return HTMLResponse(
+                "Failed to commit guardrail decision", status_code=503
+            )
+
+        pipe.multi()
+        pipe.delete(cause_key(name, pr_id))
+        pipe.zrem(index_key(name), pr_id)
+        try:
+            await pipe.execute()
+        except aioredis.WatchError:
+            return HTMLResponse(
+                "Concurrent state change detected; please retry the decision",
+                status_code=409,
+            )
+
+    async def _transition(pipe: Any) -> None:
+        raw = await pipe.get(state_key)
+        if raw is None:
+            return
+        try:
+            current = RepoState.model_validate_json(raw)
+        except Exception:
+            return
+        if current.current_task is None or current.current_task.pr_id != pr_id:
+            return
+        current.state = PipelineState.WATCH
+        pipe.multi()
+        pipe.set(state_key, current.model_dump_json())
+
+    try:
+        await redis_client.transaction(_transition, state_key)
+    except Exception:
+        _app.logger.warning(
+            "Failed to transition %s to WATCH after guardrail approve",
+            name, exc_info=True,
+        )
+    try:
+        await _app.publish_wake(redis_client, name, "guardrail_decision")
+    except Exception:
+        _app.logger.warning(
+            "publish_wake failed for %s; daemon will pick up next tick",
+            name, exc_info=True,
+        )
+    return HTMLResponse("", status_code=204)
+
+
+async def _reject_guardrail_decision(
+    name: str, pr_id: str, repo_config: Any, redis_client: aioredis.Redis
+) -> Response:
+    raw_cause = await redis_client.get(cause_key(name, pr_id))
+    cause = _validated_guardrail_cause(raw_cause)
+    if cause is None:
+        return HTMLResponse(_NO_PENDING_GUARDRAIL, status_code=404)
+
+    pr_number: int | None = None
+    raw_state = await redis_client.get(pipeline_state(name))
+    if raw_state is not None:
+        try:
+            state = RepoState.model_validate_json(raw_state)
+        except Exception:
+            state = None
+        if (
+            state is not None
+            and state.current_task is not None
+            and state.current_task.pr_id == pr_id
+            and state.current_pr is not None
+        ):
+            pr_number = state.current_pr.number
+    if pr_number is None:
+        pr_number = await asyncio.to_thread(
+            _gh_lookup_pr_number_by_branch, repo_config.branch
+        )
+
+    try:
+        await record_cancellation_cause(
+            redis_client, name, pr_id,
+            CancellationCause(
+                category="ERROR",
+                payload={
+                    "subsource": "operator_reject",
+                    "reason_text": (
+                        f"Operator rejected guardrail-flagged PR #{pr_number} via dashboard"
+                        if pr_number is not None
+                        else "Operator rejected guardrail-flagged PR via dashboard"
+                    ),
+                    "original_rule": cause.payload.get("rule", ""),
+                    "original_excerpt": cause.payload.get("excerpt", ""),
+                },
+            ),
+        )
+    except RedisError:
+        return HTMLResponse("Redis unavailable", status_code=503)
+
+    if pr_number is not None:
+        await _gh_best_effort(
+            name, pr_number, "gh pr close",
+            ["gh", "pr", "close", str(pr_number),
+             "--comment", "Guardrail violation rejected by operator"],
+        )
+    return HTMLResponse("", status_code=204)
+
+
+@router.post(
+    "/repos/{name}/guardrail/{pr_id}/decision",
+    response_class=HTMLResponse,
+)
+async def post_repo_guardrail_decision(
+    request: Request,
+    name: str,
+    pr_id: str,
+    decision: str = Form(...),
+) -> Response:
+    """Operator-driven approve/reject of a guardrail-flagged PR."""
+    if not _TASK_PR_ID_PATTERN.match(pr_id):
+        return HTMLResponse("Invalid task identifier", status_code=400)
+    if decision not in ("approve", "reject"):
+        return HTMLResponse(
+            f"Invalid decision: {decision!r}; expected 'approve' or 'reject'",
+            status_code=400,
+        )
+    cfg = load_config(_app.CONFIG_PATH)
+    repo_config = _find_repo_config_by_name(cfg, name)
+    if repo_config is None:
+        return HTMLResponse("Repository not found", status_code=404)
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        return HTMLResponse("Redis unavailable", status_code=503)
+    if decision == "approve":
+        return await _approve_guardrail_decision(
+            name, pr_id, repo_config, redis_client
+        )
+    return await _reject_guardrail_decision(
+        name, pr_id, repo_config, redis_client
+    )
 
 
 async def _resolve_repo_task_path(name: str, pr_id: str) -> tuple[Path, str] | None:

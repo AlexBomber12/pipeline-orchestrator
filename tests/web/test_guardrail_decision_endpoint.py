@@ -1,0 +1,919 @@
+"""Tests for the operator override POST decision endpoint (PR-305c)."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import pytest
+from fastapi.testclient import TestClient
+from redis.exceptions import WatchError
+from src.cancellation.storage import (
+    CancellationCause,
+    cause_key,
+    index_key,
+)
+from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
+from src.web import app as web_app
+from src.web.app import app
+from src.web.routes import repo_control
+
+
+class _FakePipeline:
+    def __init__(self, redis: "_GuardrailRedis", *, transaction: bool) -> None:
+        self.redis = redis
+        self.transaction = transaction
+        self.pending: list[tuple[str, tuple[Any, ...]]] = []
+        self.watching = False
+        self.watch_keys: tuple[str, ...] = ()
+
+    async def __aenter__(self) -> "_FakePipeline":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+    async def watch(self, *keys: str) -> None:
+        self.watching = True
+        self.watch_keys = keys
+
+    async def unwatch(self) -> None:
+        self.watching = False
+
+    async def get(self, key: str) -> str | None:
+        return self.redis.store.get(key)
+
+    def multi(self) -> None:
+        return None
+
+    def set(self, key: str, value: str, ex: int | None = None) -> "_FakePipeline":
+        self.pending.append(("set", (key, value)))
+        return self
+
+    def delete(self, key: str) -> "_FakePipeline":
+        self.pending.append(("delete", (key,)))
+        return self
+
+    def zadd(self, key: str, mapping: dict[str, float]) -> "_FakePipeline":
+        self.pending.append(("zadd", (key, mapping)))
+        return self
+
+    def zrem(self, key: str, *members: str) -> "_FakePipeline":
+        self.pending.append(("zrem", (key, members)))
+        return self
+
+    def zremrangebyscore(
+        self, key: str, mn: Any, mx: Any
+    ) -> "_FakePipeline":
+        self.pending.append(("zremrangebyscore", (key,)))
+        return self
+
+    def expire(self, key: str, seconds: int) -> "_FakePipeline":
+        return self
+
+    async def execute(self) -> list[Any]:
+        if self.redis.pending_watch_error and self.watching:
+            self.redis.pending_watch_error = False
+            self.pending.clear()
+            raise WatchError("simulated concurrent change")
+        for op, args in self.pending:
+            if op == "set":
+                self.redis.store[args[0]] = args[1]
+            elif op == "delete":
+                self.redis.store.pop(args[0], None)
+                self.redis.deleted.append(args[0])
+            elif op == "zadd":
+                self.redis.zsets.setdefault(args[0], {}).update(args[1])
+            elif op == "zrem":
+                zset = self.redis.zsets.get(args[0], {})
+                for m in args[1]:
+                    zset.pop(m, None)
+                self.redis.zremmed.append((args[0], args[1]))
+        results = [None] * len(self.pending)
+        self.pending.clear()
+        return results
+
+
+class _GuardrailRedis:
+    def __init__(self, store: dict[str, str] | None = None) -> None:
+        self.store: dict[str, str] = dict(store or {})
+        self.zsets: dict[str, dict[str, float]] = {}
+        self.deleted: list[str] = []
+        self.zremmed: list[tuple[str, tuple[str, ...]]] = []
+        self.pending_watch_error = False
+
+    async def ping(self) -> bool:
+        return True
+
+    async def get(self, key: str) -> str | None:
+        return self.store.get(key)
+
+    async def set(
+        self, key: str, value: str, ex: int | None = None, nx: bool = False
+    ) -> bool:
+        if nx and key in self.store:
+            return False
+        self.store[key] = value
+        return True
+
+    async def delete(self, key: str) -> int:
+        self.deleted.append(key)
+        return 1 if self.store.pop(key, None) is not None else 0
+
+    async def zrem(self, key: str, *members: str) -> int:
+        zset = self.zsets.get(key, {})
+        removed = sum(1 for m in members if zset.pop(m, None) is not None)
+        self.zremmed.append((key, members))
+        return removed
+
+    async def transaction(
+        self, callback: Any, *keys: str, value_from_callable: bool = False
+    ) -> Any:
+        pipe = _FakePipeline(self, transaction=True)
+        result = await callback(pipe)
+        await pipe.execute()
+        return result if value_from_callable else None
+
+    def pipeline(self, transaction: bool = False) -> _FakePipeline:
+        return _FakePipeline(self, transaction=transaction)
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _aioredis_factory(redis_client: _GuardrailRedis) -> Any:
+    return type(
+        "_Aioredis",
+        (),
+        {"from_url": staticmethod(lambda url, decode_responses=True: redis_client)},
+    )()
+
+
+def _seed_state(
+    *,
+    pr_id: str = "PR-305c",
+    pr_number: int = 99,
+    active: bool = True,
+) -> str:
+    current_task = (
+        QueueTask(pr_id=pr_id, title=pr_id, status=TaskStatus.ERROR) if active else None
+    )
+    current_pr = (
+        PRInfo(number=pr_number, branch="main") if active else None
+    )
+    state = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.ERROR,
+        current_task=current_task,
+        current_pr=current_pr,
+    )
+    return state.model_dump_json()
+
+
+def _seed_cause(payload: dict[str, Any]) -> str:
+    return CancellationCause(
+        category="ERROR",
+        payload=payload,
+        created_at="2026-05-14T12:00:00+00:00",
+        task_id="PR-305c",
+        repo_slug="example__alpha",
+    ).to_redis()
+
+
+def _setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, store: dict[str, str] | None = None
+) -> tuple[Path, _GuardrailRedis]:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/alpha.git\n"
+        "    branch: main\n"
+        "daemon:\n"
+        "  retry_button_cap: 3\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(web_app, "REPOS_DIR", str(tmp_path / "repos"))
+    repo_dir = tmp_path / "repos" / "example__alpha"
+    (repo_dir / "tasks").mkdir(parents=True)
+    (repo_dir / "tasks" / "PR-305c.md").write_text(
+        "---\nstatus: ERROR\n---\n\n# PR-305c\n\nBody\n", encoding="utf-8"
+    )
+    redis_client = _GuardrailRedis(store or {})
+    monkeypatch.setattr(web_app, "aioredis", _aioredis_factory(redis_client))
+    return repo_dir, redis_client
+
+
+def _post(decision: str, *, repo: str = "example__alpha", pr_id: str = "PR-305c") -> Any:
+    with TestClient(app) as client:
+        return client.post(
+            f"/repos/{repo}/guardrail/{pr_id}/decision",
+            data={"decision": decision},
+        )
+
+
+def test_guardrail_decision_invalid_pr_id_returns_400(tmp_path, monkeypatch) -> None:
+    _setup(tmp_path, monkeypatch)
+    resp = _post("approve", pr_id="not-a-valid-id")
+    assert resp.status_code == 400
+    assert "Invalid task identifier" in resp.text
+
+
+def test_guardrail_decision_invalid_decision_value_returns_400(
+    tmp_path, monkeypatch
+) -> None:
+    _setup(tmp_path, monkeypatch)
+    resp = _post("approven")
+    assert resp.status_code == 400
+    assert "Invalid decision" in resp.text
+
+
+def test_guardrail_decision_unknown_repo_returns_404(tmp_path, monkeypatch) -> None:
+    _setup(tmp_path, monkeypatch)
+    resp = _post("approve", repo="nonexistent")
+    assert resp.status_code == 404
+    assert "Repository not found" in resp.text
+
+
+def test_guardrail_decision_approve_with_pending_guardrail_cause(
+    tmp_path, monkeypatch
+) -> None:
+    repo_dir, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail", "rule": "large_diff", "excerpt": "+1800 LOC"}
+            ),
+        },
+    )
+    git_calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        git_calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+
+    resp = _post("approve")
+
+    assert resp.status_code == 204
+    assert cause_key("example__alpha", "PR-305c") not in redis_client.store
+    assert cause_key("example__alpha", "PR-305c") in redis_client.deleted
+    assert "status: TODO" in (repo_dir / "tasks" / "PR-305c.md").read_text(
+        encoding="utf-8"
+    )
+    commit_calls = [c for c in git_calls if "commit" in c]
+    assert commit_calls and "[skip ci]" in commit_calls[0]
+    assert "chore(tasks): guardrail decision approve for PR-305c [skip ci]" in (
+        " ".join(commit_calls[0])
+    )
+    stored = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
+    assert stored.state == PipelineState.WATCH
+
+
+def test_guardrail_decision_approve_attempts_label_removal(
+    tmp_path, monkeypatch
+) -> None:
+    _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+    gh_calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        gh_calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("approve")
+    assert resp.status_code == 204
+    label_calls = [c for c in gh_calls if c[:2] == ["gh", "api"]]
+    assert label_calls and label_calls[0] == [
+        "gh",
+        "api",
+        "-X",
+        "DELETE",
+        "repos/example/alpha/issues/99/labels/escalated",
+    ]
+
+
+def test_guardrail_decision_approve_label_removal_failure_continues(
+    tmp_path, monkeypatch
+) -> None:
+    repo_dir, _ = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ["gh", "api"]:
+            return subprocess.CompletedProcess(args, 1, "", "not found")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("approve")
+    assert resp.status_code == 204
+    assert "status: TODO" in (repo_dir / "tasks" / "PR-305c.md").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_guardrail_decision_approve_no_pending_cause_returns_404(
+    tmp_path, monkeypatch
+) -> None:
+    _setup(tmp_path, monkeypatch, store={"pipeline:example__alpha": _seed_state()})
+    resp = _post("approve")
+    assert resp.status_code == 404
+    assert "no pending guardrail decision" in resp.text
+
+
+def test_guardrail_decision_approve_wrong_subsource_returns_404(
+    tmp_path, monkeypatch
+) -> None:
+    _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "coder_escalate"}
+            ),
+        },
+    )
+    resp = _post("approve")
+    assert resp.status_code == 404
+
+
+def test_guardrail_decision_approve_inactive_task_returns_409(
+    tmp_path, monkeypatch
+) -> None:
+    _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(active=False),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+    resp = _post("approve")
+    assert resp.status_code == 409
+    assert "reject and re-upload" in resp.text
+
+
+def test_guardrail_decision_approve_concurrent_change_returns_409(
+    tmp_path, monkeypatch
+) -> None:
+    _, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+    redis_client.pending_watch_error = True
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("approve")
+    assert resp.status_code == 409
+    assert "Concurrent state change" in resp.text
+
+
+def test_guardrail_decision_reject_records_operator_reject_cause(
+    tmp_path, monkeypatch
+) -> None:
+    repo_dir, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {
+                    "subsource": "guardrail",
+                    "rule": "large_diff",
+                    "excerpt": "+1800 LOC",
+                }
+            ),
+        },
+    )
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("reject")
+    assert resp.status_code == 204
+    raw = redis_client.store[cause_key("example__alpha", "PR-305c")]
+    cause = CancellationCause.from_redis(raw)
+    assert cause.payload["subsource"] == "operator_reject"
+    assert cause.payload["original_rule"] == "large_diff"
+    assert cause.payload["original_excerpt"] == "+1800 LOC"
+    assert "PR #99" in cause.payload["reason_text"]
+    assert (repo_dir / "tasks" / "PR-305c.md").read_text(encoding="utf-8").startswith(
+        "---\nstatus: ERROR"
+    )
+
+
+def test_guardrail_decision_reject_attempts_pr_close(tmp_path, monkeypatch) -> None:
+    _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+    gh_calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        gh_calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("reject")
+    assert resp.status_code == 204
+    close_calls = [c for c in gh_calls if c[:3] == ["gh", "pr", "close"]]
+    assert close_calls and close_calls[0] == [
+        "gh",
+        "pr",
+        "close",
+        "99",
+        "--comment",
+        "Guardrail violation rejected by operator",
+    ]
+
+
+def test_guardrail_decision_reject_falls_back_to_gh_list_when_inactive(
+    tmp_path, monkeypatch
+) -> None:
+    _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(active=False),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+    gh_calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        gh_calls.append(args)
+        if args[:3] == ["gh", "pr", "list"]:
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps([{"number": 503}]), ""
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("reject")
+    assert resp.status_code == 204
+    list_calls = [c for c in gh_calls if c[:3] == ["gh", "pr", "list"]]
+    close_calls = [c for c in gh_calls if c[:3] == ["gh", "pr", "close"]]
+    assert list_calls
+    assert close_calls and close_calls[0][3] == "503"
+
+
+def test_guardrail_decision_reject_no_pending_cause_returns_404(
+    tmp_path, monkeypatch
+) -> None:
+    _setup(tmp_path, monkeypatch, store={"pipeline:example__alpha": _seed_state()})
+    resp = _post("reject")
+    assert resp.status_code == 404
+    assert "no pending guardrail decision" in resp.text
+
+
+def test_guardrail_decision_redis_unavailable_returns_503(
+    tmp_path, monkeypatch
+) -> None:
+    _setup(tmp_path, monkeypatch)
+    if hasattr(web_app.app.state, "redis"):
+        monkeypatch.delattr(web_app.app.state, "redis", raising=False)
+    client = TestClient(web_app.app)
+    resp = client.post(
+        "/repos/example__alpha/guardrail/PR-305c/decision",
+        data={"decision": "approve"},
+    )
+    assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_validated_guardrail_cause_edges() -> None:
+    assert repo_control._validated_guardrail_cause(None) is None
+    assert repo_control._validated_guardrail_cause("not json") is None
+    bad_payload = CancellationCause(category="ERROR", payload={}).to_redis()
+    assert repo_control._validated_guardrail_cause(bad_payload) is None
+    list_payload = CancellationCause(
+        category="ERROR", payload={"subsource": "coder_escalate"}
+    ).to_redis()
+    assert repo_control._validated_guardrail_cause(list_payload) is None
+
+
+@pytest.mark.asyncio
+async def test_gh_lookup_pr_number_by_branch_handles_errors(monkeypatch) -> None:
+    def raises(args: list[str], **kwargs: Any) -> Any:
+        raise OSError("gh missing")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", raises)
+    assert repo_control._gh_lookup_pr_number_by_branch("main") is None
+
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kw: subprocess.CompletedProcess(args, 1, "", "boom"),
+    )
+    assert repo_control._gh_lookup_pr_number_by_branch("main") is None
+
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kw: subprocess.CompletedProcess(args, 0, "not json", ""),
+    )
+    assert repo_control._gh_lookup_pr_number_by_branch("main") is None
+
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kw: subprocess.CompletedProcess(args, 0, "[]", ""),
+    )
+    assert repo_control._gh_lookup_pr_number_by_branch("main") is None
+
+
+@pytest.mark.asyncio
+async def test_commit_guardrail_approve_tolerates_nothing_to_commit(
+    tmp_path, monkeypatch
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if "commit" in args:
+            raise subprocess.CalledProcessError(
+                returncode=1, cmd=args, output="", stderr="nothing to commit"
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    repo_control._commit_guardrail_approve(tmp_path, Path("tasks/PR-1.md"), "msg", "main")
+    assert any("push" in c for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_commit_guardrail_approve_reraises_other_commit_errors(
+    tmp_path, monkeypatch
+) -> None:
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if "commit" in args:
+            raise subprocess.CalledProcessError(
+                returncode=1, cmd=args, output="", stderr="merge conflict"
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    with pytest.raises(subprocess.CalledProcessError):
+        repo_control._commit_guardrail_approve(
+            tmp_path, Path("tasks/PR-1.md"), "msg", "main"
+        )
+
+
+@pytest.mark.asyncio
+async def test_gh_best_effort_swallows_exceptions(monkeypatch) -> None:
+    def raises(args: list[str], **kwargs: Any) -> Any:
+        raise OSError("nope")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", raises)
+    await repo_control._gh_best_effort("repo", 1, "label", ["gh", "api"])
+
+
+def test_guardrail_decision_approve_garbage_state_treated_as_inactive(
+    tmp_path, monkeypatch
+) -> None:
+    _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": "not-json",
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+    resp = _post("approve")
+    assert resp.status_code == 409
+
+
+def test_guardrail_decision_approve_invalid_url_skips_label_call(
+    tmp_path, monkeypatch
+) -> None:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories:\n"
+        "  - url: not-a-real-url\n"
+        "    branch: main\n"
+        "daemon:\n"
+        "  retry_button_cap: 3\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(web_app, "REPOS_DIR", str(tmp_path / "repos"))
+    slug = "not-a-real-url"
+    repo_dir = tmp_path / "repos" / slug
+    (repo_dir / "tasks").mkdir(parents=True)
+    (repo_dir / "tasks" / "PR-305c.md").write_text(
+        "---\nstatus: ERROR\n---\n\n# x\n", encoding="utf-8"
+    )
+    state = RepoState(
+        url="not-a-real-url",
+        name=slug,
+        state=PipelineState.ERROR,
+        current_task=QueueTask(pr_id="PR-305c", title="x", status=TaskStatus.ERROR),
+        current_pr=PRInfo(number=42, branch="main"),
+    )
+    redis_client = _GuardrailRedis(
+        {
+            f"pipeline:{slug}": state.model_dump_json(),
+            cause_key(slug, "PR-305c"): _seed_cause({"subsource": "guardrail"}),
+        }
+    )
+    monkeypatch.setattr(web_app, "aioredis", _aioredis_factory(redis_client))
+
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    with TestClient(app) as client:
+        resp = client.post(
+            f"/repos/{slug}/guardrail/PR-305c/decision",
+            data={"decision": "approve"},
+        )
+    assert resp.status_code == 204
+    assert not any(c[:2] == ["gh", "api"] for c in calls)
+
+
+def test_guardrail_decision_approve_frontmatter_write_failure(
+    tmp_path, monkeypatch
+) -> None:
+    _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+
+    def raise_oserror(*args: Any, **kwargs: Any) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(repo_control, "write_frontmatter_status", raise_oserror)
+    resp = _post("approve")
+    assert resp.status_code == 503
+    assert "Failed to update task status" in resp.text
+
+
+def test_guardrail_decision_approve_commit_failure_returns_503(
+    tmp_path, monkeypatch
+) -> None:
+    _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if "commit" in args:
+            raise subprocess.CalledProcessError(
+                returncode=128, cmd=args, output="", stderr="merge conflict"
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("approve")
+    assert resp.status_code == 503
+    assert "Failed to commit guardrail decision" in resp.text
+
+
+def test_guardrail_decision_approve_watch_reread_missing_returns_404(
+    tmp_path, monkeypatch
+) -> None:
+    _, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+
+    original_pipeline = redis_client.pipeline
+
+    def make_pipeline(transaction: bool = False) -> _FakePipeline:
+        pipe = original_pipeline(transaction=transaction)
+        original_watch = pipe.watch
+
+        async def steal(*keys: str) -> None:
+            await original_watch(*keys)
+            for key in keys:
+                redis_client.store.pop(key, None)
+
+        pipe.watch = steal  # type: ignore[assignment]
+        return pipe
+
+    monkeypatch.setattr(redis_client, "pipeline", make_pipeline)
+    resp = _post("approve")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_guardrail_approve_transition_handles_failures(monkeypatch) -> None:
+    redis_client = _GuardrailRedis(
+        {
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        }
+    )
+
+    async def boom_transaction(callback: Any, *keys: str, value_from_callable: bool = False) -> Any:
+        raise RuntimeError("boom")
+
+    async def boom_wake(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("wake down")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", lambda args, **kw: subprocess.CompletedProcess(args, 0, "", ""))
+    monkeypatch.setattr(redis_client, "transaction", boom_transaction)
+    monkeypatch.setattr(web_app, "publish_wake", boom_wake)
+
+    config = type("R", (), {"url": "https://github.com/example/alpha.git", "branch": "main"})
+    monkeypatch.setattr(web_app, "REPOS_DIR", "/tmp/_guardrail_test_repos")
+    repo_dir = Path("/tmp/_guardrail_test_repos/example__alpha/tasks")
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    (repo_dir / "PR-305c.md").write_text("---\nstatus: ERROR\n---\n", encoding="utf-8")
+    resp = await repo_control._approve_guardrail_decision(
+        "example__alpha", "PR-305c", config, redis_client
+    )
+    assert resp.status_code == 204
+
+
+def test_guardrail_decision_approve_transition_no_state(tmp_path, monkeypatch) -> None:
+    """The post-commit _transition tolerates missing or stale state."""
+    repo_dir, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if args[:3] == ["git", "-C", str(repo_dir)] and "push" in args:
+            del redis_client.store["pipeline:example__alpha"]
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("approve")
+    assert resp.status_code == 204
+
+
+def test_guardrail_decision_approve_transition_bad_state_json(
+    tmp_path, monkeypatch
+) -> None:
+    repo_dir, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if args[:3] == ["git", "-C", str(repo_dir)] and "push" in args:
+            redis_client.store["pipeline:example__alpha"] = "not-json"
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("approve")
+    assert resp.status_code == 204
+
+
+def test_guardrail_decision_approve_transition_other_task_active(
+    tmp_path, monkeypatch
+) -> None:
+    repo_dir, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if args[:3] == ["git", "-C", str(repo_dir)] and "push" in args:
+            redis_client.store["pipeline:example__alpha"] = _seed_state(pr_id="PR-999")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("approve")
+    assert resp.status_code == 204
+
+
+def test_guardrail_decision_reject_bad_state_falls_back_to_gh_list(
+    tmp_path, monkeypatch
+) -> None:
+    _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": "not-json",
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if args[:3] == ["gh", "pr", "list"]:
+            return subprocess.CompletedProcess(args, 0, json.dumps([{"number": 7}]), "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("reject")
+    assert resp.status_code == 204
+
+
+def test_guardrail_decision_reject_record_failure_returns_503(
+    tmp_path, monkeypatch
+) -> None:
+    _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+    from redis.exceptions import RedisError as _RedisError
+
+    async def fake_record(*args: Any, **kwargs: Any) -> None:
+        raise _RedisError("conn refused")
+
+    monkeypatch.setattr(repo_control, "record_cancellation_cause", fake_record)
+    resp = _post("reject")
+    assert resp.status_code == 503
+    assert "Redis unavailable" in resp.text
