@@ -360,7 +360,13 @@ async def list_pending_guardrail_decisions(
                 continue
             rule = cause.payload.get("rule", "")
             excerpt = cause.payload.get("excerpt", "")
-            recorded_at = int(datetime.fromisoformat(cause.created_at).timestamp())
+            try:
+                parsed = datetime.fromisoformat(cause.created_at)
+            except (TypeError, ValueError):
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            recorded_at = int(parsed.timestamp())
             result.append(
                 GuardrailPending(
                     repo_slug=repo_slug,

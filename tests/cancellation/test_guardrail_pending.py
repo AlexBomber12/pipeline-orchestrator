@@ -231,6 +231,45 @@ async def test_list_pending_guardrail_decisions_decodes_bytes_task_ids() -> None
     assert [p.task_id for p in result] == ["PR-BYTES"]
 
 
+async def test_list_pending_guardrail_decisions_treats_naive_created_at_as_utc() -> None:
+    """Legacy records without timezone info must be interpreted as UTC.
+
+    Without normalization, ``datetime.fromisoformat`` of a naive string
+    plus ``.timestamp()`` resolves in the host local timezone, which on
+    non-UTC hosts skews ``recorded_at`` and can misorder the operator
+    queue. Mirrors the recovery codepath in
+    ``tests/runner/test_recovery_subsource_dispatch.py``.
+    """
+    redis = _FakeRedis()
+    naive_iso = (
+        datetime.fromtimestamp(_BASE, tz=timezone.utc).replace(tzinfo=None).isoformat()
+    )
+    _put(redis, "alpha", "PR-NAIVE", {"subsource": "guardrail"}, naive_iso)
+
+    [pending] = await list_pending_guardrail_decisions(redis, "alpha")
+
+    assert pending.recorded_at == int(_BASE)
+
+
+async def test_list_pending_guardrail_decisions_skips_malformed_created_at() -> None:
+    """One corrupt ``created_at`` must not abort the whole read."""
+    redis = _FakeRedis()
+    _put(redis, "alpha", "PR-OK", {"subsource": "guardrail"}, _iso(_BASE))
+    redis.values[cause_key("alpha", "PR-BAD")] = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "guardrail"},
+        created_at="not-an-iso-string",
+        task_id="PR-BAD",
+        repo_slug="alpha",
+    ).to_redis()
+    # Score the bad entry earlier than PR-OK so it is iterated first.
+    redis.zsets.setdefault(index_key("alpha"), {})["PR-BAD"] = _BASE - 100
+
+    result = await list_pending_guardrail_decisions(redis, "alpha")
+
+    assert [p.task_id for p in result] == ["PR-OK"]
+
+
 async def test_list_pending_guardrail_decisions_skips_non_dict_payload() -> None:
     """Malformed records where ``payload`` is not a dict must be skipped, not crash."""
     redis = _FakeRedis()
