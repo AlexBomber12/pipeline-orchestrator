@@ -495,6 +495,7 @@ class WatchMixin:
         violations = guardrails.scan_pr_diff(
             diff_text,
             daemon_config=self.app_config.daemon,
+            repo_config=self.repo_config,
         )
         current_pr.diff_scanned_at_sha = current_pr.head_sha
         if violations:

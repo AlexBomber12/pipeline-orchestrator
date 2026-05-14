@@ -14,7 +14,7 @@ import re
 import shlex
 from dataclasses import dataclass
 
-from src.config import DaemonConfig
+from src.config import DaemonConfig, RepoConfig
 
 
 @dataclass(frozen=True)
@@ -1573,6 +1573,7 @@ def scan_stdout(coder_stdout: str) -> list[GuardrailViolation]:
 def scan_pr_diff(
     diff_text: str,
     daemon_config: DaemonConfig | None = None,
+    repo_config: RepoConfig | None = None,
 ) -> list[GuardrailViolation]:
     """Scan PR diff content for prohibited patterns.
 
@@ -1719,7 +1720,12 @@ def scan_pr_diff(
                 ),
             )
         )
-    if config.governance_scan_enabled:
+    governance_scan_enabled = (
+        config.governance_scan_enabled
+        if repo_config is None or repo_config.governance_scan_enabled is None
+        else repo_config.governance_scan_enabled
+    )
+    if governance_scan_enabled:
         governance_rule = (
             "Changes to governance files (CODEOWNERS, dependabot, "
             "label sync, repo settings, auto-merge config) require "

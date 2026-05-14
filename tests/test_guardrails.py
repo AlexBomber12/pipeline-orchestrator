@@ -4,7 +4,7 @@ import re
 from dataclasses import FrozenInstanceError
 
 import pytest
-from src.config import DaemonConfig
+from src.config import DaemonConfig, RepoConfig
 from src.daemon import guardrails
 from src.daemon.guardrails import GuardrailViolation, scan_pr_diff, scan_stdout
 
@@ -981,6 +981,58 @@ def test_scan_governance_disabled_via_config() -> None:
     daemon_config = DaemonConfig(governance_scan_enabled=False)
 
     assert scan_pr_diff(diff_text, daemon_config=daemon_config) == []
+
+
+def test_scan_governance_repo_config_can_disable_daemon_default() -> None:
+    diff_text = _diff_for_file(".github/CODEOWNERS", additions=1)
+    daemon_config = DaemonConfig(governance_scan_enabled=True)
+    repo_config = RepoConfig(
+        url="https://github.com/example/repo",
+        governance_scan_enabled=False,
+    )
+
+    assert (
+        scan_pr_diff(
+            diff_text,
+            daemon_config=daemon_config,
+            repo_config=repo_config,
+        )
+        == []
+    )
+
+
+def test_scan_governance_repo_config_inherits_daemon_default() -> None:
+    diff_text = _diff_for_file(".github/CODEOWNERS", additions=1)
+    daemon_config = DaemonConfig(governance_scan_enabled=False)
+    repo_config = RepoConfig(url="https://github.com/example/repo")
+
+    assert (
+        scan_pr_diff(
+            diff_text,
+            daemon_config=daemon_config,
+            repo_config=repo_config,
+        )
+        == []
+    )
+
+
+def test_scan_governance_repo_config_can_enable_when_daemon_default_disabled() -> None:
+    diff_text = _diff_for_file(".github/CODEOWNERS", additions=1)
+    daemon_config = DaemonConfig(governance_scan_enabled=False)
+    repo_config = RepoConfig(
+        url="https://github.com/example/repo",
+        governance_scan_enabled=True,
+    )
+
+    violations = scan_pr_diff(
+        diff_text,
+        daemon_config=daemon_config,
+        repo_config=repo_config,
+    )
+
+    assert [violation.category for violation in violations] == [
+        "governance_file_modified"
+    ]
 
 
 def test_scan_governance_prior_layers_still_flagged() -> None:

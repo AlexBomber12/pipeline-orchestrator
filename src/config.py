@@ -33,6 +33,7 @@ _REPO_FIELDS = {
     "allow_merge_without_review",
     "coder",
     "disabled_coders",
+    "governance_scan_enabled",
 }
 
 _DAEMON_FIELDS = {
@@ -116,6 +117,7 @@ class RepoConfig(BaseModel):
     allow_merge_without_review: bool = False
     coder: CoderType | None = None
     disabled_coders: list[str] | None = None
+    governance_scan_enabled: bool | None = None
 
     @field_validator("poll_interval_sec", mode="before")
     @classmethod

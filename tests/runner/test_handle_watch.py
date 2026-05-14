@@ -3659,16 +3659,18 @@ def test_scan_pr_diff_once_uses_runner_daemon_config_snapshot(
     )
     monkeypatch.setattr("src.github.prs.get_pr_diff", lambda repo, number: "clean\n")
 
-    captured: list[DaemonConfig] = []
+    captured: list[tuple[DaemonConfig, RepoConfig]] = []
 
     def fake_scan(
         diff_text: str,
         *,
         daemon_config: DaemonConfig | None = None,
+        repo_config: RepoConfig | None = None,
     ) -> list[Any]:
         assert diff_text == "clean\n"
         assert daemon_config is not None
-        captured.append(daemon_config)
+        assert repo_config is not None
+        captured.append((daemon_config, repo_config))
         return []
 
     monkeypatch.setattr(watch_module.guardrails, "scan_pr_diff", fake_scan)
@@ -3689,9 +3691,9 @@ def test_scan_pr_diff_once_uses_runner_daemon_config_snapshot(
     result = asyncio.run(runner._scan_pr_diff_once())
 
     assert result is True
-    assert captured == [runner.app_config.daemon]
-    assert captured[0].large_diff_addition_threshold == 250
-    assert captured[0].large_diff_files_threshold == 8
+    assert captured == [(runner.app_config.daemon, runner.repo_config)]
+    assert captured[0][0].large_diff_addition_threshold == 250
+    assert captured[0][0].large_diff_files_threshold == 8
     assert runner.state.current_pr.diff_scanned_at_sha == "snapshot1"
 
 
