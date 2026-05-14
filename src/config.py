@@ -94,6 +94,11 @@ _DAEMON_FIELDS = {
     "governance_scan_enabled",
     "main_commit_audit_interval_idle_cycles",
     "main_commit_audit_lookback_n",
+    "git_bundle_backup_enabled",
+    "git_bundle_backup_dir",
+    "git_bundle_backup_interval_hours",
+    "git_bundle_backup_daily_retention",
+    "git_bundle_backup_weekly_retention",
 }
 
 _DAEMON_ENV_OVERRIDES = {
@@ -196,6 +201,11 @@ class DaemonConfig(BaseModel):
     governance_scan_enabled: bool = True
     main_commit_audit_interval_idle_cycles: int = Field(default=20, ge=1)
     main_commit_audit_lookback_n: int = Field(default=10, ge=1, le=50)
+    git_bundle_backup_enabled: bool = Field(default=False)
+    git_bundle_backup_dir: str | None = Field(default=None)
+    git_bundle_backup_interval_hours: int = Field(default=24, ge=1)
+    git_bundle_backup_daily_retention: int = Field(default=7, ge=1)
+    git_bundle_backup_weekly_retention: int = Field(default=4, ge=0)
 
 
 class WebConfig(BaseModel):
