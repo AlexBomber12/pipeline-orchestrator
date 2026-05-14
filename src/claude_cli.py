@@ -31,11 +31,17 @@ def _maybe_wrap_sandbox(cmd: list[str], cwd: str) -> list[str]:
             "available; spawning coder unsandboxed"
         )
         return cmd
+    # Bind the daemon HOME so files written outside of claude_config_dir
+    # (notably ~/.gitconfig from ``gh auth setup-git``) remain visible to
+    # the sandboxed coder; without it non-interactive git push fails.
+    home = os.environ.get("HOME")
+    additional_rw_dirs = [home] if home else None
     return build_bwrap_command(
         command=cmd,
         repo_path=cwd,
         coder_config_dir=cfg.auth.claude_config_dir,
         gh_config_dir=cfg.auth.gh_config_dir,
+        additional_rw_dirs=additional_rw_dirs,
     )
 
 

@@ -224,3 +224,53 @@ async def test_claude_async_spawn_uses_bwrap_when_isolation_enabled_and_availabl
 
     assert captured["cmd"][0] == "bwrap"
     assert "claude" in captured["cmd"]
+
+
+def test_claude_spawn_mounts_home_dir_for_gitconfig(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> MagicMock:
+        captured["cmd"] = cmd
+        result = MagicMock()
+        result.stdout = ""
+        result.stderr = ""
+        result.returncode = 0
+        return result
+
+    monkeypatch.setenv("HOME", "/data/auth")
+    monkeypatch.setattr(claude_cli, "load_config", lambda: _config(isolation=True))
+    _patch_bwrap(monkeypatch, available=True)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    claude_cli.run_claude("prompt", "/data/repos/demo")
+
+    cmd = captured["cmd"]
+    home_idx = cmd.index("/data/auth")
+    assert cmd[home_idx - 1] == "--bind"
+    assert cmd[home_idx + 1] == "/data/auth"
+
+
+@pytest.mark.asyncio
+async def test_codex_async_spawn_mounts_home_dir_for_gitconfig(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    fake_proc = _make_fake_proc()
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        captured["cmd"] = list(args)
+        return fake_proc
+
+    monkeypatch.setenv("HOME", "/some/other/home")
+    monkeypatch.setattr(codex_cli, "load_config", lambda: _config(isolation=True))
+    _patch_bwrap(monkeypatch, available=True)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    await codex_cli.run_codex_async("prompt", "/data/repos/demo")
+
+    cmd = captured["cmd"]
+    home_idx = cmd.index("/some/other/home")
+    assert cmd[home_idx - 1] == "--bind"
+    assert cmd[home_idx + 1] == "/some/other/home"
