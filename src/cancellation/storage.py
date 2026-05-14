@@ -59,6 +59,17 @@ class CancellationCause:
         return cls(**json.loads(raw))
 
 
+@dataclass(frozen=True)
+class GuardrailPending:
+    """Pending guardrail-flagged cancellation surfaced to operator override UI."""
+
+    repo_slug: str
+    task_id: str
+    rule: str
+    excerpt: str
+    recorded_at: int
+
+
 def cause_key(repo_slug: str, task_id: str) -> str:
     return f"cancellation:{repo_slug}:{task_id}"
 
@@ -301,3 +312,47 @@ async def list_recent_cancellations(
         await redis_client.zrem(index_key(repo_slug), *stale)
     causes.sort(key=lambda c: datetime.fromisoformat(c.created_at), reverse=True)
     return causes
+
+
+async def list_pending_guardrail_decisions(
+    redis_client: Any,
+    repo_slug: str,
+    *,
+    limit: int = 100,
+) -> list[GuardrailPending]:
+    """Return guardrail-flagged pending cancellations for repo, oldest first.
+
+    Reads ``cancellation_index:{repo}``, filters entries whose
+    ``payload.subsource == "guardrail"``, returns a list of typed
+    ``GuardrailPending`` records sorted ascending by ``recorded_at``
+    (oldest first — operator triages in arrival order). Bounded by
+    ``limit`` (default 100) so one repo with many pending decisions
+    cannot block the dashboard.
+    """
+    task_ids = await redis_client.zrange(
+        index_key(repo_slug), 0, -1, withscores=False
+    )
+    result: list[GuardrailPending] = []
+    for tid in task_ids or []:
+        if isinstance(tid, bytes):
+            tid = tid.decode("utf-8")
+        cause = await get_cancellation_cause(redis_client, repo_slug, tid)
+        if cause is None:
+            continue
+        if cause.payload.get("subsource") != "guardrail":
+            continue
+        rule = cause.payload.get("rule", "")
+        excerpt = cause.payload.get("excerpt", "")
+        recorded_at = int(datetime.fromisoformat(cause.created_at).timestamp())
+        result.append(
+            GuardrailPending(
+                repo_slug=repo_slug,
+                task_id=tid,
+                rule=rule,
+                excerpt=excerpt,
+                recorded_at=recorded_at,
+            )
+        )
+        if len(result) >= limit:
+            break
+    return sorted(result, key=lambda p: p.recorded_at)

@@ -1,0 +1,191 @@
+"""Tests for ``list_pending_guardrail_decisions`` (PR-305a).
+
+The operator override backend reads guardrail-flagged pending
+cancellations from Redis. PR-305a adds the storage-layer helper; the
+HTTP endpoints (PR-305b GET, PR-305c POST) consume what this returns.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from src.cancellation.storage import (
+    CancellationCause,
+    GuardrailPending,
+    cause_key,
+    index_key,
+    list_pending_guardrail_decisions,
+)
+
+
+class _FakeRedis:
+    """Minimal Redis double exposing only the surface the helper uses."""
+
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+        self.zsets: dict[str, dict[str, float]] = {}
+
+    async def get(self, key: str) -> str | None:
+        return self.values.get(key)
+
+    async def zrange(
+        self,
+        key: str,
+        start: int,
+        stop: int,
+        withscores: bool = False,
+    ) -> list[Any]:
+        ordered = sorted(self.zsets.get(key, {}).items(), key=lambda kv: kv[1])
+        members = [tid for tid, _ in ordered]
+        sliced = members[start:] if stop == -1 else members[start : stop + 1]
+        return [(m, dict(ordered)[m]) for m in sliced] if withscores else sliced
+
+
+def _put(
+    redis: _FakeRedis,
+    repo_slug: str,
+    task_id: str,
+    payload: dict[str, Any],
+    created_at: str,
+) -> None:
+    cause = CancellationCause(
+        category="ERROR",
+        payload=payload,
+        created_at=created_at,
+        task_id=task_id,
+        repo_slug=repo_slug,
+    )
+    redis.values[cause_key(repo_slug, task_id)] = cause.to_redis()
+    score = datetime.fromisoformat(created_at).timestamp()
+    redis.zsets.setdefault(index_key(repo_slug), {})[task_id] = score
+
+
+def _iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+_BASE = datetime(2026, 5, 14, 12, 0, tzinfo=timezone.utc).timestamp()
+
+
+async def test_list_pending_guardrail_decisions_filters_by_subsource() -> None:
+    redis = _FakeRedis()
+    _put(redis, "alpha", "PR-1", {"subsource": "guardrail"}, _iso(_BASE))
+    _put(redis, "alpha", "PR-2", {"subsource": "guardrail"}, _iso(_BASE + 1))
+    _put(redis, "alpha", "PR-3", {"subsource": "coder"}, _iso(_BASE + 2))
+
+    result = await list_pending_guardrail_decisions(redis, "alpha")
+
+    assert [p.task_id for p in result] == ["PR-1", "PR-2"]
+    assert all(isinstance(p, GuardrailPending) for p in result)
+
+
+async def test_list_pending_guardrail_decisions_sorted_by_recorded_at_ascending() -> None:
+    redis = _FakeRedis()
+    for tid, offset in [("PR-MID", 5), ("PR-EARLY", 0), ("PR-LATE", 10)]:
+        _put(redis, "alpha", tid, {"subsource": "guardrail"}, _iso(_BASE + offset))
+
+    result = await list_pending_guardrail_decisions(redis, "alpha")
+
+    assert [p.task_id for p in result] == ["PR-EARLY", "PR-MID", "PR-LATE"]
+    assert [p.recorded_at for p in result] == [
+        int(_BASE),
+        int(_BASE + 5),
+        int(_BASE + 10),
+    ]
+
+
+async def test_list_pending_guardrail_decisions_extracts_rule_and_excerpt() -> None:
+    redis = _FakeRedis()
+    _put(
+        redis,
+        "alpha",
+        "PR-7",
+        {
+            "subsource": "guardrail",
+            "rule": "large_diff_threshold",
+            "excerpt": "+1800 LOC across 35 files",
+        },
+        _iso(_BASE),
+    )
+
+    [pending] = await list_pending_guardrail_decisions(redis, "alpha")
+
+    assert pending.rule == "large_diff_threshold"
+    assert pending.excerpt == "+1800 LOC across 35 files"
+    assert pending.task_id == "PR-7"
+    assert pending.repo_slug == "alpha"
+
+
+async def test_list_pending_guardrail_decisions_handles_missing_payload_keys() -> None:
+    redis = _FakeRedis()
+    _put(redis, "alpha", "PR-9", {"subsource": "guardrail"}, _iso(_BASE))
+
+    [pending] = await list_pending_guardrail_decisions(redis, "alpha")
+
+    assert pending.rule == ""
+    assert pending.excerpt == ""
+
+
+async def test_list_pending_guardrail_decisions_repo_isolation() -> None:
+    redis = _FakeRedis()
+    _put(redis, "repo_a", "PR-A1", {"subsource": "guardrail"}, _iso(_BASE))
+    _put(redis, "repo_b", "PR-B1", {"subsource": "guardrail"}, _iso(_BASE + 1))
+
+    result = await list_pending_guardrail_decisions(redis, "repo_a")
+
+    assert [p.task_id for p in result] == ["PR-A1"]
+    assert all(p.repo_slug == "repo_a" for p in result)
+
+
+async def test_list_pending_guardrail_decisions_bounded_by_limit() -> None:
+    redis = _FakeRedis()
+    for idx in range(150):
+        _put(
+            redis,
+            "alpha",
+            f"PR-{idx:03d}",
+            {"subsource": "guardrail"},
+            _iso(_BASE + idx),
+        )
+
+    result = await list_pending_guardrail_decisions(redis, "alpha", limit=100)
+
+    assert len(result) == 100
+    assert result[0].task_id == "PR-000"
+    assert result[-1].task_id == "PR-099"
+
+
+async def test_list_pending_guardrail_decisions_empty_returns_empty_list() -> None:
+    redis = _FakeRedis()
+    assert await list_pending_guardrail_decisions(redis, "alpha") == []
+
+
+async def test_list_pending_guardrail_decisions_skips_stale_index_entries() -> None:
+    """Index entries whose payload key has expired must be skipped, not crash."""
+    redis = _FakeRedis()
+    _put(redis, "alpha", "PR-STALE", {"subsource": "guardrail"}, _iso(_BASE))
+    _put(redis, "alpha", "PR-LIVE", {"subsource": "guardrail"}, _iso(_BASE + 1))
+    # Simulate TTL expiry: payload gone, but index still references the task.
+    del redis.values[cause_key("alpha", "PR-STALE")]
+
+    result = await list_pending_guardrail_decisions(redis, "alpha")
+
+    assert [p.task_id for p in result] == ["PR-LIVE"]
+
+
+async def test_list_pending_guardrail_decisions_decodes_bytes_task_ids() -> None:
+    """Redis returns members as bytes by default; helper must decode them."""
+    redis = _FakeRedis()
+    _put(redis, "alpha", "PR-BYTES", {"subsource": "guardrail"}, _iso(_BASE))
+
+    async def _bytes_zrange(
+        key: str, start: int, stop: int, withscores: bool = False
+    ) -> list[bytes]:
+        return [b"PR-BYTES"]
+
+    redis.zrange = _bytes_zrange  # type: ignore[assignment]
+
+    result = await list_pending_guardrail_decisions(redis, "alpha")
+
+    assert [p.task_id for p in result] == ["PR-BYTES"]
