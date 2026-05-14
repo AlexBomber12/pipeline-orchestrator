@@ -11,9 +11,30 @@ import asyncio
 import logging
 from typing import Callable
 
+from src.config import load_config
+from src.daemon.sandbox import build_bwrap_command, is_bubblewrap_available
 from src.diagnosis import build_diagnosis_prompt
 
 logger = logging.getLogger(__name__)
+
+
+def _maybe_wrap_sandbox(cmd: list[str], cwd: str) -> list[str]:
+    """Wrap ``cmd`` with bwrap when ``coder_filesystem_isolation`` is on."""
+    cfg = load_config()
+    if not cfg.daemon.coder_filesystem_isolation:
+        return cmd
+    if not is_bubblewrap_available():
+        logger.warning(
+            "[SANDBOX] coder_filesystem_isolation enabled but bwrap not "
+            "available; spawning coder unsandboxed"
+        )
+        return cmd
+    return build_bwrap_command(
+        command=cmd,
+        repo_path=cwd,
+        coder_config_dir=cfg.auth.codex_home_dir,
+        gh_config_dir=cfg.auth.gh_config_dir,
+    )
 
 
 async def run_codex_async(
@@ -41,6 +62,7 @@ async def run_codex_async(
     cmd.append(prompt)
     logger.info("[codex] running codex exec with prompt: %s", prompt[:80])
 
+    cmd = _maybe_wrap_sandbox(cmd, cwd)
     proc: asyncio.subprocess.Process | None = None
     try:
         proc = await asyncio.create_subprocess_exec(

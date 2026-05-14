@@ -99,6 +99,7 @@ _DAEMON_FIELDS = {
     "git_bundle_backup_interval_hours",
     "git_bundle_backup_daily_retention",
     "git_bundle_backup_weekly_retention",
+    "coder_filesystem_isolation",
 }
 
 _DAEMON_ENV_OVERRIDES = {
@@ -206,6 +207,7 @@ class DaemonConfig(BaseModel):
     git_bundle_backup_interval_hours: int = Field(default=24, ge=1)
     git_bundle_backup_daily_retention: int = Field(default=7, ge=1)
     git_bundle_backup_weekly_retention: int = Field(default=4, ge=0)
+    coder_filesystem_isolation: bool = Field(default=False)
 
 
 class WebConfig(BaseModel):
