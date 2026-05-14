@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 
-_GUARDRAIL_PREFIX = "GUARDRAIL"
+_GUARDRAIL_PREFIXES = ("GUARDRAIL:", "[GUARDRAIL]")
 _TIER_TOKEN_RE = re.compile(r"^tier=(\d+)\s+")
 
 # PR-307a spec names overlap partly with src/daemon/guardrails.py emitted
@@ -115,9 +115,13 @@ def _parse_guardrail_cause_for_notification(
     categories default to Tier 2. Optional ``tier=N`` token in the
     message overrides the map.
     """
-    if not cause_message.startswith(f"{_GUARDRAIL_PREFIX}:"):
+    body: str | None = None
+    for prefix in _GUARDRAIL_PREFIXES:
+        if cause_message.startswith(prefix):
+            body = cause_message[len(prefix) :].lstrip()
+            break
+    if body is None:
         return None
-    body = cause_message[len(_GUARDRAIL_PREFIX) + 1 :].lstrip()
     tier_from_token: int | None = None
     tier_match = _TIER_TOKEN_RE.match(body)
     if tier_match:

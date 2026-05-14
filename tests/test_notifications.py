@@ -233,6 +233,16 @@ def test_send_guardrail_notification_raises_on_http_error_status(
             2,
             "governance_file_tampering",
         ),
+        (
+            "[GUARDRAIL] tier=2 large_diff_threshold: +1535 LOC across 4 files",
+            2,
+            "large_diff_threshold",
+        ),
+        (
+            "[GUARDRAIL] tier=1 secret_in_diff: src/example.py:42",
+            1,
+            "secret_in_diff",
+        ),
     ],
 )
 def test_parse_guardrail_cause_classification(
@@ -251,6 +261,18 @@ def test_parse_guardrail_cause_extracts_excerpt() -> None:
     )
     assert parsed is not None
     assert parsed["excerpt"] == "+1535 LOC across 4 files"
+
+
+def test_parse_guardrail_cause_accepts_watch_bracket_format() -> None:
+    """handle_watch emits ``[GUARDRAIL] tier=N category: excerpt``."""
+    parsed = _parse_guardrail_cause_for_notification(
+        "[GUARDRAIL] tier=2 large_diff_threshold: +1535 LOC across 4 files"
+    )
+    assert parsed is not None
+    assert parsed["tier"] == 2
+    assert parsed["category"] == "large_diff_threshold"
+    assert parsed["excerpt"] == "+1535 LOC across 4 files"
+    assert parsed["rule"] == "large_diff_threshold"
 
 
 @pytest.mark.parametrize(
