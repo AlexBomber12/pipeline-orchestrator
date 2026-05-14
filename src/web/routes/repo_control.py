@@ -1300,10 +1300,29 @@ def _read_task_branch(task_path: Path) -> str | None:
 def _gh_lookup_pr_number_by_branch(
     branch: str, owner_repo: str | None = None
 ) -> int | None:
-    args = ["gh", "pr", "list", "--head", branch, "--state", "open",
-            "--json", "number"]
-    if owner_repo:
-        args.extend(["--repo", owner_repo])
+    """Return the unique open PR number for ``branch`` in ``owner_repo``.
+
+    ``gh pr list --head <branch>`` does not accept the ``owner:branch``
+    disambiguator (https://cli.github.com/manual/gh_pr_list), so a branch
+    name that collides with one in a fork can match multiple PRs and a
+    naive first-match would let ``_reject_guardrail_decision`` close the
+    wrong PR. Daemon-pushed PRs always have their head in the configured
+    base repo, so filter ``headRepositoryOwner.login`` to the base
+    owner and require exactly one match — zero or multiple matches yield
+    ``None`` so the caller skips the destructive ``gh pr close``.
+    """
+    if not owner_repo:
+        return None
+    base_owner, sep, _ = owner_repo.partition("/")
+    if not sep or not base_owner:
+        return None
+    args = [
+        "gh", "pr", "list",
+        "--head", branch,
+        "--state", "open",
+        "--repo", owner_repo,
+        "--json", "number,headRefName,headRepositoryOwner",
+    ]
     try:
         rc, output = _gh_subprocess(args)
     except (OSError, subprocess.TimeoutExpired):
@@ -1314,10 +1333,27 @@ def _gh_lookup_pr_number_by_branch(
         payload = json.loads(output or "[]")
     except json.JSONDecodeError:
         return None
-    for entry in payload if isinstance(payload, list) else []:
-        number = entry.get("number") if isinstance(entry, dict) else None
-        if isinstance(number, int):
-            return number
+    if not isinstance(payload, list):
+        return None
+    matches: list[int] = []
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        number = entry.get("number")
+        if not isinstance(number, int):
+            continue
+        head_ref = entry.get("headRefName")
+        if isinstance(head_ref, str) and head_ref != branch:
+            continue
+        owner_obj = entry.get("headRepositoryOwner")
+        owner_login = (
+            owner_obj.get("login") if isinstance(owner_obj, dict) else None
+        )
+        if owner_login != base_owner:
+            continue
+        matches.append(number)
+    if len(matches) == 1:
+        return matches[0]
     return None
 
 

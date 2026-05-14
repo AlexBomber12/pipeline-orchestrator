@@ -662,7 +662,18 @@ def test_guardrail_decision_reject_falls_back_to_gh_list_when_inactive(
         gh_calls.append(args)
         if args[:3] == ["gh", "pr", "list"]:
             return subprocess.CompletedProcess(
-                args, 0, json.dumps([{"number": 503}]), ""
+                args,
+                0,
+                json.dumps(
+                    [
+                        {
+                            "number": 503,
+                            "headRefName": "pr-305c-feature",
+                            "headRepositoryOwner": {"login": "example"},
+                        }
+                    ]
+                ),
+                "",
             )
         return subprocess.CompletedProcess(args, 0, "", "")
 
@@ -715,7 +726,18 @@ def test_guardrail_decision_reject_uses_current_task_branch_when_pr_missing(
         gh_calls.append(args)
         if args[:3] == ["gh", "pr", "list"]:
             return subprocess.CompletedProcess(
-                args, 0, json.dumps([{"number": 88}]), ""
+                args,
+                0,
+                json.dumps(
+                    [
+                        {
+                            "number": 88,
+                            "headRefName": "branch-from-state",
+                            "headRepositoryOwner": {"login": "example"},
+                        }
+                    ]
+                ),
+                "",
             )
         return subprocess.CompletedProcess(args, 0, "", "")
 
@@ -838,28 +860,221 @@ async def test_gh_lookup_pr_number_by_branch_handles_errors(monkeypatch) -> None
         raise OSError("gh missing")
 
     monkeypatch.setattr(repo_control.subprocess, "run", raises)
-    assert repo_control._gh_lookup_pr_number_by_branch("main") is None
+    assert (
+        repo_control._gh_lookup_pr_number_by_branch("main", "example/alpha")
+        is None
+    )
 
     monkeypatch.setattr(
         repo_control.subprocess,
         "run",
         lambda args, **kw: subprocess.CompletedProcess(args, 1, "", "boom"),
     )
-    assert repo_control._gh_lookup_pr_number_by_branch("main") is None
+    assert (
+        repo_control._gh_lookup_pr_number_by_branch("main", "example/alpha")
+        is None
+    )
 
     monkeypatch.setattr(
         repo_control.subprocess,
         "run",
         lambda args, **kw: subprocess.CompletedProcess(args, 0, "not json", ""),
     )
-    assert repo_control._gh_lookup_pr_number_by_branch("main") is None
+    assert (
+        repo_control._gh_lookup_pr_number_by_branch("main", "example/alpha")
+        is None
+    )
 
     monkeypatch.setattr(
         repo_control.subprocess,
         "run",
         lambda args, **kw: subprocess.CompletedProcess(args, 0, "[]", ""),
     )
+    assert (
+        repo_control._gh_lookup_pr_number_by_branch("main", "example/alpha")
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_gh_lookup_pr_number_by_branch_requires_owner_repo(
+    monkeypatch,
+) -> None:
+    """Without ``owner_repo`` the helper cannot disambiguate forks; skip the
+    gh call entirely so a stray subprocess cannot return a fork-owned PR."""
+    called: list[list[str]] = []
+
+    def fake_run(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+        called.append(args)
+        return subprocess.CompletedProcess(args, 0, "[]", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
     assert repo_control._gh_lookup_pr_number_by_branch("main") is None
+    assert repo_control._gh_lookup_pr_number_by_branch("main", "") is None
+    # Malformed ``owner_repo`` (missing slash) is rejected: without an
+    # explicit owner segment the headRepositoryOwner filter cannot apply.
+    assert repo_control._gh_lookup_pr_number_by_branch("main", "noslash") is None
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_gh_lookup_pr_number_by_branch_filters_fork_prs(monkeypatch) -> None:
+    """A fork PR sharing the branch name must not match the base-repo PR."""
+    payload = [
+        {
+            "number": 777,
+            "headRefName": "shared-branch",
+            "headRepositoryOwner": {"login": "fork-user"},
+        },
+        {
+            "number": 42,
+            "headRefName": "shared-branch",
+            "headRepositoryOwner": {"login": "example"},
+        },
+    ]
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kw: subprocess.CompletedProcess(
+            args, 0, json.dumps(payload), ""
+        ),
+    )
+    assert (
+        repo_control._gh_lookup_pr_number_by_branch(
+            "shared-branch", "example/alpha"
+        )
+        == 42
+    )
+
+
+@pytest.mark.asyncio
+async def test_gh_lookup_pr_number_by_branch_returns_none_on_zero_or_many(
+    monkeypatch,
+) -> None:
+    """Zero or multiple base-owner matches must yield ``None`` so the
+    caller cannot accidentally close an unrelated PR."""
+    fork_only = [
+        {
+            "number": 777,
+            "headRefName": "shared-branch",
+            "headRepositoryOwner": {"login": "fork-user"},
+        }
+    ]
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kw: subprocess.CompletedProcess(
+            args, 0, json.dumps(fork_only), ""
+        ),
+    )
+    assert (
+        repo_control._gh_lookup_pr_number_by_branch(
+            "shared-branch", "example/alpha"
+        )
+        is None
+    )
+
+    two_base_owner = [
+        {
+            "number": 1,
+            "headRefName": "shared-branch",
+            "headRepositoryOwner": {"login": "example"},
+        },
+        {
+            "number": 2,
+            "headRefName": "shared-branch",
+            "headRepositoryOwner": {"login": "example"},
+        },
+    ]
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kw: subprocess.CompletedProcess(
+            args, 0, json.dumps(two_base_owner), ""
+        ),
+    )
+    assert (
+        repo_control._gh_lookup_pr_number_by_branch(
+            "shared-branch", "example/alpha"
+        )
+        is None
+    )
+
+    # Defensive: ``gh pr list`` returning a non-list payload yields None.
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kw: subprocess.CompletedProcess(args, 0, "{}", ""),
+    )
+    assert (
+        repo_control._gh_lookup_pr_number_by_branch(
+            "shared-branch", "example/alpha"
+        )
+        is None
+    )
+
+    # Defensive: missing/null headRepositoryOwner (older gh schemas) yields None.
+    no_owner = [{"number": 1, "headRefName": "shared-branch"}]
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kw: subprocess.CompletedProcess(
+            args, 0, json.dumps(no_owner), ""
+        ),
+    )
+    assert (
+        repo_control._gh_lookup_pr_number_by_branch(
+            "shared-branch", "example/alpha"
+        )
+        is None
+    )
+
+    # Defensive: head ref name mismatch (gh returning a superset) is dropped.
+    mismatch = [
+        {
+            "number": 9,
+            "headRefName": "different-branch",
+            "headRepositoryOwner": {"login": "example"},
+        }
+    ]
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kw: subprocess.CompletedProcess(
+            args, 0, json.dumps(mismatch), ""
+        ),
+    )
+    assert (
+        repo_control._gh_lookup_pr_number_by_branch(
+            "shared-branch", "example/alpha"
+        )
+        is None
+    )
+
+    # Defensive: malformed entries (non-dict, non-int number) are skipped
+    # so an unexpected gh schema cannot crash the helper.
+    malformed = [
+        "not-a-dict",
+        {"number": "not-an-int", "headRepositoryOwner": {"login": "example"}},
+        {
+            "number": 13,
+            "headRefName": "shared-branch",
+            "headRepositoryOwner": {"login": "example"},
+        },
+    ]
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda args, **kw: subprocess.CompletedProcess(
+            args, 0, json.dumps(malformed), ""
+        ),
+    )
+    assert (
+        repo_control._gh_lookup_pr_number_by_branch(
+            "shared-branch", "example/alpha"
+        )
+        == 13
+    )
 
 
 @pytest.mark.asyncio
