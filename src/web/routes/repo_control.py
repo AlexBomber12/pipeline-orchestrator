@@ -1268,6 +1268,23 @@ def _gh_subprocess(args: list[str]) -> tuple[int, str]:
     return result.returncode, _git_output(result)
 
 
+_TASK_BRANCH_HEADER_RE = re.compile(r"^Branch\s*:\s*(.+?)\s*$")
+
+
+def _read_task_branch(task_path: Path) -> str | None:
+    """Return the ``Branch:`` header value declared in a task file."""
+    try:
+        text = task_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    for raw_line in text.splitlines():
+        match = _TASK_BRANCH_HEADER_RE.match(raw_line.rstrip())
+        if match:
+            branch = match.group(1).strip()
+            return branch or None
+    return None
+
+
 def _gh_lookup_pr_number_by_branch(branch: str) -> int | None:
     try:
         rc, output = _gh_subprocess(
@@ -1365,9 +1382,12 @@ async def _approve_guardrail_decision(
     except ValueError:
         owner_repo = None
 
+    resolved = await _resolve_repo_task_path(name, pr_id)
+    if resolved is None:
+        return HTMLResponse("Task file not found", status_code=404)
+    task_path, task_filename = resolved
     repo_root = Path(_app.REPOS_DIR) / name
-    task_path = repo_root / "tasks" / f"{pr_id}.md"
-    relative_task = Path("tasks") / f"{pr_id}.md"
+    relative_task = Path(task_filename)
 
     async with redis_client.pipeline(transaction=True) as pipe:
         await pipe.watch(cause_key(name, pr_id))
@@ -1460,23 +1480,38 @@ async def _reject_guardrail_decision(
         return HTMLResponse(_NO_PENDING_GUARDRAIL, status_code=404)
 
     pr_number: int | None = None
+    state: RepoState | None = None
     raw_state = await redis_client.get(pipeline_state(name))
     if raw_state is not None:
         try:
             state = RepoState.model_validate_json(raw_state)
         except Exception:
             state = None
+    if (
+        state is not None
+        and state.current_task is not None
+        and state.current_task.pr_id == pr_id
+        and state.current_pr is not None
+    ):
+        pr_number = state.current_pr.number
+    if pr_number is None:
+        head_branch: str | None = None
         if (
             state is not None
             and state.current_task is not None
             and state.current_task.pr_id == pr_id
-            and state.current_pr is not None
         ):
-            pr_number = state.current_pr.number
-    if pr_number is None:
-        pr_number = await asyncio.to_thread(
-            _gh_lookup_pr_number_by_branch, repo_config.branch
-        )
+            head_branch = state.current_task.branch or None
+        if head_branch is None:
+            task_resolved = await _resolve_repo_task_path(name, pr_id)
+            if task_resolved is not None:
+                head_branch = await asyncio.to_thread(
+                    _read_task_branch, task_resolved[0]
+                )
+        if head_branch:
+            pr_number = await asyncio.to_thread(
+                _gh_lookup_pr_number_by_branch, head_branch
+            )
 
     try:
         await record_cancellation_cause(

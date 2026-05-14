@@ -156,6 +156,7 @@ def _seed_state(
     pr_id: str = "PR-305c",
     pr_number: int = 99,
     active: bool = True,
+    current_queue: list[QueueTask] | None = None,
 ) -> str:
     current_task = (
         QueueTask(pr_id=pr_id, title=pr_id, status=TaskStatus.ERROR) if active else None
@@ -169,6 +170,7 @@ def _seed_state(
         state=PipelineState.ERROR,
         current_task=current_task,
         current_pr=current_pr,
+        current_queue=current_queue,
     )
     return state.model_dump_json()
 
@@ -200,7 +202,8 @@ def _setup(
     repo_dir = tmp_path / "repos" / "example__alpha"
     (repo_dir / "tasks").mkdir(parents=True)
     (repo_dir / "tasks" / "PR-305c.md").write_text(
-        "---\nstatus: ERROR\n---\n\n# PR-305c\n\nBody\n", encoding="utf-8"
+        "---\nstatus: ERROR\n---\n\n# PR-305c\n\nBranch: pr-305c-feature\n\nBody\n",
+        encoding="utf-8",
     )
     redis_client = _GuardrailRedis(store or {})
     monkeypatch.setattr(web_app, "aioredis", _aioredis_factory(redis_client))
@@ -274,6 +277,70 @@ def test_guardrail_decision_approve_with_pending_guardrail_cause(
     )
     stored = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
     assert stored.state == PipelineState.WATCH
+
+
+def test_guardrail_decision_approve_uses_queue_mapped_task_file(
+    tmp_path, monkeypatch
+) -> None:
+    """Approve must honor queue ``task_file`` mappings, not hardcode tasks/{pr_id}.md."""
+    repo_dir, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(
+                current_queue=[
+                    QueueTask(
+                        pr_id="PR-305c",
+                        title="PR-305c",
+                        status=TaskStatus.ERROR,
+                        task_file="tasks/custom-name.md",
+                    )
+                ]
+            ),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+    # Default file is absent; mapped file exists at a non-default name.
+    (repo_dir / "tasks" / "PR-305c.md").unlink()
+    (repo_dir / "tasks" / "custom-name.md").write_text(
+        "---\nstatus: ERROR\n---\n\n# PR-305c\n\nBranch: pr-305c-feature\n\nBody\n",
+        encoding="utf-8",
+    )
+    git_calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        git_calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("approve")
+    assert resp.status_code == 204
+    assert "status: TODO" in (repo_dir / "tasks" / "custom-name.md").read_text(
+        encoding="utf-8"
+    )
+    add_calls = [c for c in git_calls if "add" in c]
+    assert add_calls and add_calls[0][-1] == "tasks/custom-name.md"
+
+
+def test_guardrail_decision_approve_missing_task_file_returns_404(
+    tmp_path, monkeypatch
+) -> None:
+    repo_dir, _ = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+    (repo_dir / "tasks" / "PR-305c.md").unlink()
+    resp = _post("approve")
+    assert resp.status_code == 404
+    assert "Task file not found" in resp.text
 
 
 def test_guardrail_decision_approve_attempts_label_removal(
@@ -498,7 +565,92 @@ def test_guardrail_decision_reject_falls_back_to_gh_list_when_inactive(
     list_calls = [c for c in gh_calls if c[:3] == ["gh", "pr", "list"]]
     close_calls = [c for c in gh_calls if c[:3] == ["gh", "pr", "close"]]
     assert list_calls
+    # `gh pr list --head` must filter by the PR's head branch declared in
+    # the task file (``Branch:`` header), not the repo's base branch.
+    head_idx = list_calls[0].index("--head")
+    assert list_calls[0][head_idx + 1] == "pr-305c-feature"
     assert close_calls and close_calls[0][3] == "503"
+
+
+def test_guardrail_decision_reject_uses_current_task_branch_when_pr_missing(
+    tmp_path, monkeypatch
+) -> None:
+    """Active current_task with no current_pr: head branch comes from current_task."""
+    state = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.ERROR,
+        current_task=QueueTask(
+            pr_id="PR-305c",
+            title="PR-305c",
+            status=TaskStatus.ERROR,
+            branch="branch-from-state",
+        ),
+        current_pr=None,
+    )
+    _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": state.model_dump_json(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+    gh_calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        gh_calls.append(args)
+        if args[:3] == ["gh", "pr", "list"]:
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps([{"number": 88}]), ""
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("reject")
+    assert resp.status_code == 204
+    list_calls = [c for c in gh_calls if c[:3] == ["gh", "pr", "list"]]
+    assert list_calls
+    head_idx = list_calls[0].index("--head")
+    assert list_calls[0][head_idx + 1] == "branch-from-state"
+
+
+def test_read_task_branch_handles_unreadable_file(tmp_path) -> None:
+    missing = tmp_path / "does-not-exist.md"
+    assert repo_control._read_task_branch(missing) is None
+
+
+def test_guardrail_decision_reject_inactive_no_task_file_skips_close(
+    tmp_path, monkeypatch
+) -> None:
+    repo_dir, _ = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(active=False),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+    # Wipe the Branch: header so the fallback finds no head branch
+    # and skips the gh lookup entirely.
+    (repo_dir / "tasks" / "PR-305c.md").write_text(
+        "---\nstatus: ERROR\n---\n\n# PR-305c\n\nBody\n", encoding="utf-8"
+    )
+    gh_calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        gh_calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("reject")
+    assert resp.status_code == 204
+    assert not any(c[:3] == ["gh", "pr", "list"] for c in gh_calls)
+    assert not any(c[:3] == ["gh", "pr", "close"] for c in gh_calls)
 
 
 def test_guardrail_decision_reject_no_pending_cause_returns_404(
