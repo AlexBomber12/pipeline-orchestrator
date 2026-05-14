@@ -24,6 +24,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from redis.exceptions import RedisError
 
 from src.cancellation.storage import (
+    TTL_SECONDS,
     CancellationCause,
     cause_key,
     delete_cancellation_cause,
@@ -1543,6 +1544,20 @@ async def _approve_guardrail_decision(
             "Failed to commit guardrail approve for %s %s: %s",
             name, pr_id, exc,
         )
+        # Mirror the retry endpoint: a failed commit/push can leave the
+        # worktree with staged frontmatter changes or a local commit
+        # ahead of origin. Hard-reset back to origin/{base_branch} so the
+        # checkout is clean for the next daemon git operation.
+        try:
+            await asyncio.to_thread(
+                _reset_retry_worktree, repo_root, repo_config.branch,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            _app.logger.warning(
+                "Failed to reset worktree after guardrail approve"
+                " commit failure for %s %s",
+                name, pr_id, exc_info=True,
+            )
         await _restore_cause()
         return HTMLResponse(
             "Failed to commit guardrail decision", status_code=503
@@ -1633,23 +1648,55 @@ async def _reject_guardrail_decision(
             )
 
     original_rule, original_excerpt = _extract_guardrail_metadata(cause.payload)
-    try:
-        await record_cancellation_cause(
-            redis_client, name, pr_id,
-            CancellationCause(
-                category="ERROR",
-                payload={
-                    "subsource": "operator_reject",
-                    "reason_text": (
-                        f"Operator rejected guardrail-flagged PR #{pr_number} via dashboard"
-                        if pr_number is not None
-                        else "Operator rejected guardrail-flagged PR via dashboard"
-                    ),
-                    "original_rule": original_rule,
-                    "original_excerpt": original_excerpt,
-                },
+    new_cause = CancellationCause(
+        category="ERROR",
+        payload={
+            "subsource": "operator_reject",
+            "reason_text": (
+                f"Operator rejected guardrail-flagged PR #{pr_number} via dashboard"
+                if pr_number is not None
+                else "Operator rejected guardrail-flagged PR via dashboard"
             ),
-        )
+            "original_rule": original_rule,
+            "original_excerpt": original_excerpt,
+        },
+        created_at=datetime.now(timezone.utc).isoformat(),
+        task_id=pr_id,
+        repo_slug=name,
+    )
+    serialized = new_cause.to_redis()
+    score = datetime.fromisoformat(new_cause.created_at).timestamp()
+    expiry_cutoff = datetime.now(timezone.utc).timestamp() - TTL_SECONDS
+    # CAS-guard the operator_reject write: a concurrent approve can
+    # CAS-delete the guardrail cause between our initial read and this
+    # write, and an unguarded ``set`` would resurrect a cancellation key
+    # the approve flow just dropped — leaving the task in split-brain
+    # state (frontmatter pushed to TODO by approve, but cause flipped to
+    # operator_reject and PR closed by reject). WATCH the cause key and
+    # re-validate it is still ``subsource=guardrail`` immediately before
+    # writing; if it changed, surface 409 so the operator retries.
+    try:
+        async with redis_client.pipeline(transaction=True) as pipe:
+            await pipe.watch(cause_key(name, pr_id))
+            watched_raw = await pipe.get(cause_key(name, pr_id))
+            if _validated_guardrail_cause(watched_raw) is None:
+                await pipe.unwatch()
+                return HTMLResponse(
+                    "Concurrent state change detected; please retry the decision",
+                    status_code=409,
+                )
+            pipe.multi()
+            pipe.set(cause_key(name, pr_id), serialized, ex=TTL_SECONDS)
+            pipe.zadd(index_key(name), {pr_id: score})
+            pipe.zremrangebyscore(index_key(name), "-inf", f"({expiry_cutoff}")
+            pipe.expire(index_key(name), TTL_SECONDS)
+            try:
+                await pipe.execute()
+            except aioredis.WatchError:
+                return HTMLResponse(
+                    "Concurrent state change detected; please retry the decision",
+                    status_code=409,
+                )
     except RedisError:
         return HTMLResponse("Redis unavailable", status_code=503)
 

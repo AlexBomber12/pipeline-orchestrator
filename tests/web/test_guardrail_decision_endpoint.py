@@ -1326,7 +1326,8 @@ def test_guardrail_decision_reject_bad_state_falls_back_to_gh_list(
 def test_guardrail_decision_reject_record_failure_returns_503(
     tmp_path, monkeypatch
 ) -> None:
-    _setup(
+    """RedisError on the CAS-guarded write surfaces as 503."""
+    _, redis_client = _setup(
         tmp_path,
         monkeypatch,
         store={
@@ -1338,10 +1339,18 @@ def test_guardrail_decision_reject_record_failure_returns_503(
     )
     from redis.exceptions import RedisError as _RedisError
 
-    async def fake_record(*args: Any, **kwargs: Any) -> None:
-        raise _RedisError("conn refused")
+    original_pipeline = redis_client.pipeline
 
-    monkeypatch.setattr(repo_control, "record_cancellation_cause", fake_record)
+    def make_pipeline(transaction: bool = False) -> _FakePipeline:
+        pipe = original_pipeline(transaction=transaction)
+
+        async def boom_watch(*keys: str) -> None:
+            raise _RedisError("conn refused")
+
+        pipe.watch = boom_watch  # type: ignore[assignment]
+        return pipe
+
+    monkeypatch.setattr(redis_client, "pipeline", make_pipeline)
     resp = _post("reject")
     assert resp.status_code == 503
     assert "Redis unavailable" in resp.text
@@ -1490,3 +1499,180 @@ def test_guardrail_decision_reject_state_get_redis_error_returns_503(
     resp = _post("reject")
     assert resp.status_code == 503
     assert "Redis unavailable" in resp.text
+
+
+def test_guardrail_decision_reject_concurrent_change_returns_409(
+    tmp_path, monkeypatch
+) -> None:
+    """A concurrent approve between initial read and CAS write must surface 409.
+
+    Without the CAS guard the unconditional ``operator_reject`` write
+    would resurrect a cancellation key that a concurrent approve just
+    deleted, putting the task in split-brain: frontmatter pushed to TODO
+    by approve but cause flipped to operator_reject by reject. The
+    WATCH/MULTI on cause_key forces EXEC to fail when the key has been
+    touched, and the reject path returns 409 so the operator retries.
+    """
+    _, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+    redis_client.pending_watch_error = True
+    gh_calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        gh_calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("reject")
+    assert resp.status_code == 409
+    assert "Concurrent state change" in resp.text
+    # gh pr close must not run when the CAS aborts — the open PR may have
+    # been approved by the concurrent decision and closing it would undo
+    # that approval.
+    assert not any(c[:3] == ["gh", "pr", "close"] for c in gh_calls)
+    # Original guardrail cause must remain intact for the operator to
+    # re-evaluate; the failed EXEC did not write operator_reject.
+    raw = redis_client.store[cause_key("example__alpha", "PR-305c")]
+    assert CancellationCause.from_redis(raw).payload["subsource"] == "guardrail"
+
+
+def test_guardrail_decision_reject_cause_cleared_during_watch_returns_409(
+    tmp_path, monkeypatch
+) -> None:
+    """If the cause is deleted between initial read and watch re-read, 409.
+
+    Models the race where a concurrent approve CAS-deletes the cause
+    after this handler's initial GET returned ``guardrail``. The
+    re-read inside WATCH returns ``None`` and the reject must short
+    circuit without resurrecting the cancellation key.
+    """
+    _, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+
+    original_pipeline = redis_client.pipeline
+
+    def make_pipeline(transaction: bool = False) -> _FakePipeline:
+        pipe = original_pipeline(transaction=transaction)
+        original_watch = pipe.watch
+
+        async def steal(*keys: str) -> None:
+            await original_watch(*keys)
+            for key in keys:
+                redis_client.store.pop(key, None)
+
+        pipe.watch = steal  # type: ignore[assignment]
+        return pipe
+
+    monkeypatch.setattr(redis_client, "pipeline", make_pipeline)
+    gh_calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        gh_calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("reject")
+    assert resp.status_code == 409
+    assert "Concurrent state change" in resp.text
+    assert cause_key("example__alpha", "PR-305c") not in redis_client.store
+    assert not any(c[:3] == ["gh", "pr", "close"] for c in gh_calls)
+
+
+def test_guardrail_decision_approve_commit_failure_resets_worktree(
+    tmp_path, monkeypatch
+) -> None:
+    """A commit/push failure after frontmatter write hard-resets the worktree.
+
+    Without the reset, a failed push leaves the checkout with a local
+    commit ahead of origin (or with staged frontmatter changes on a
+    failed commit), and those uncommitted bytes leak into later daemon
+    git operations from the same checkout.
+    """
+    _, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+    git_calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        git_calls.append(args)
+        if "push" in args:
+            raise subprocess.CalledProcessError(
+                returncode=1, cmd=args, output="", stderr="rejected"
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("approve")
+    assert resp.status_code == 503
+    assert "Failed to commit guardrail decision" in resp.text
+    # The cleanup reset must run after the failed push, with the same
+    # base branch the checkout used.
+    push_idx = next(i for i, c in enumerate(git_calls) if "push" in c)
+    post_push = git_calls[push_idx + 1 :]
+    assert any(
+        c[3:] == ["reset", "--hard", "origin/main"] for c in post_push
+    ), f"expected reset --hard origin/main after push failure, got: {post_push}"
+    assert cause_key("example__alpha", "PR-305c") in redis_client.store
+
+
+def test_guardrail_decision_approve_commit_failure_reset_failure_still_returns_503(
+    tmp_path, monkeypatch
+) -> None:
+    """Even when the cleanup reset itself fails, the handler still returns 503.
+
+    The reset is best-effort: if both the commit/push and the cleanup
+    reset fail, the operator must still see 503 so they can investigate.
+    """
+    _, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+
+    seen_push = {"flag": False}
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if "push" in args:
+            seen_push["flag"] = True
+            raise subprocess.CalledProcessError(
+                returncode=1, cmd=args, output="", stderr="rejected"
+            )
+        if seen_push["flag"] and "reset" in args:
+            raise subprocess.CalledProcessError(
+                returncode=128, cmd=args, output="", stderr="lock held"
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("approve")
+    assert resp.status_code == 503
+    assert "Failed to commit guardrail decision" in resp.text
+    assert cause_key("example__alpha", "PR-305c") in redis_client.store
