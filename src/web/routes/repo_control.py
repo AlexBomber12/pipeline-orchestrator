@@ -1431,29 +1431,15 @@ async def _approve_guardrail_decision(
     repo_root = Path(_app.REPOS_DIR) / name
     relative_task = Path(task_filename)
 
-    # CAS-commit the cancellation-cause deletion BEFORE any external side
-    # effects. Otherwise a WatchError raised after we have already pushed
-    # the frontmatter commit to ``main`` would surface a 409 to the
-    # operator while the side effect has already escaped, leaving Redis in
-    # ERROR with a guardrail cause but ``main`` already updated.
-    async with redis_client.pipeline(transaction=True) as pipe:
-        await pipe.watch(cause_key(name, pr_id))
-        watched_raw = await pipe.get(cause_key(name, pr_id))
-        if _validated_guardrail_cause(watched_raw) is None:
-            await pipe.unwatch()
-            return HTMLResponse(_NO_PENDING_GUARDRAIL, status_code=404)
-
-        pipe.multi()
-        pipe.delete(cause_key(name, pr_id))
-        pipe.zrem(index_key(name), pr_id)
-        try:
-            await pipe.execute()
-        except aioredis.WatchError:
-            return HTMLResponse(
-                "Concurrent state change detected; please retry the decision",
-                status_code=409,
-            )
-
+    # Run the git/frontmatter side effects BEFORE deleting the cancellation
+    # cause. If any of them fail we return 503 and the operator can retry
+    # approve (or fall back to reject) because the decision handle in Redis
+    # is still intact. The reverse order — pre-deleting the cause — makes a
+    # transient checkout/commit/push failure non-recoverable: the 503
+    # response would leave Redis with no cause, so the next approve/reject
+    # attempt 404s and the task stays in ERROR until somebody edits Redis
+    # by hand. ``_commit_guardrail_approve`` already tolerates a no-op
+    # commit on retry, so re-running the side effects is idempotent.
     if owner_repo is not None:
         await _gh_best_effort(
             name, pr_number, "escalated-label removal",
@@ -1468,7 +1454,7 @@ async def _approve_guardrail_decision(
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         _app.logger.warning(
-            "Failed to checkout base branch for %s %s after CAS commit: %s",
+            "Failed to checkout base branch for %s %s: %s",
             name, pr_id, exc,
         )
         return HTMLResponse(
@@ -1492,12 +1478,35 @@ async def _approve_guardrail_decision(
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         _app.logger.warning(
-            "Failed to commit guardrail approve for %s %s after CAS commit: %s",
+            "Failed to commit guardrail approve for %s %s: %s",
             name, pr_id, exc,
         )
         return HTMLResponse(
             "Failed to commit guardrail decision", status_code=503
         )
+
+    # Side effects succeeded — finalize by CAS-deleting the cancellation
+    # cause. On WatchError the frontmatter commit has already landed on
+    # main, but a retry is idempotent and benign: the cause is still in
+    # Redis, the second approve sees the same TODO frontmatter (so the
+    # commit is a no-op) and the CAS succeeds on the second pass.
+    async with redis_client.pipeline(transaction=True) as pipe:
+        await pipe.watch(cause_key(name, pr_id))
+        watched_raw = await pipe.get(cause_key(name, pr_id))
+        if _validated_guardrail_cause(watched_raw) is None:
+            await pipe.unwatch()
+            return HTMLResponse(_NO_PENDING_GUARDRAIL, status_code=404)
+
+        pipe.multi()
+        pipe.delete(cause_key(name, pr_id))
+        pipe.zrem(index_key(name), pr_id)
+        try:
+            await pipe.execute()
+        except aioredis.WatchError:
+            return HTMLResponse(
+                "Concurrent state change detected; please retry the decision",
+                status_code=409,
+            )
 
     async def _transition(pipe: Any) -> None:
         raw = await pipe.get(state_key)

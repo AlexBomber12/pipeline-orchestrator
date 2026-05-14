@@ -480,13 +480,15 @@ def test_guardrail_decision_approve_concurrent_change_returns_409(
     resp = _post("approve")
     assert resp.status_code == 409
     assert "Concurrent state change" in resp.text
-    # WATCH must fail before any external side effect runs; otherwise a
-    # commit could land on main while Redis still reports the guardrail
-    # cause and ERROR state.
-    assert not git_calls
-    assert not gh_calls
+    # Side effects run BEFORE the CAS-delete so a transient git/frontmatter
+    # failure does not strand the operator with a deleted cause. On
+    # WatchError the cause must therefore still be in Redis (the operator
+    # retries; the second approve is idempotent — the frontmatter is
+    # already TODO and the commit becomes a no-op).
+    assert git_calls
+    assert gh_calls
     assert cause_key("example__alpha", "PR-305c") in redis_client.store
-    assert "status: ERROR" in (repo_dir / "tasks" / "PR-305c.md").read_text(
+    assert "status: TODO" in (repo_dir / "tasks" / "PR-305c.md").read_text(
         encoding="utf-8"
     )
 
@@ -945,7 +947,7 @@ def test_guardrail_decision_approve_invalid_url_skips_label_call(
 def test_guardrail_decision_approve_frontmatter_write_failure(
     tmp_path, monkeypatch
 ) -> None:
-    _setup(
+    _, redis_client = _setup(
         tmp_path,
         monkeypatch,
         store={
@@ -968,12 +970,15 @@ def test_guardrail_decision_approve_frontmatter_write_failure(
     resp = _post("approve")
     assert resp.status_code == 503
     assert "Failed to update task status" in resp.text
+    # Cause must survive a transient side-effect failure so the operator
+    # can retry approve (or fall back to reject) without manual Redis edits.
+    assert cause_key("example__alpha", "PR-305c") in redis_client.store
 
 
 def test_guardrail_decision_approve_checkout_failure_returns_503(
     tmp_path, monkeypatch
 ) -> None:
-    _setup(
+    _, redis_client = _setup(
         tmp_path,
         monkeypatch,
         store={
@@ -995,6 +1000,9 @@ def test_guardrail_decision_approve_checkout_failure_returns_503(
     resp = _post("approve")
     assert resp.status_code == 503
     assert "Failed to commit guardrail decision" in resp.text
+    # Cause must survive a transient checkout failure so the operator can
+    # retry the decision instead of losing the handle to a 404.
+    assert cause_key("example__alpha", "PR-305c") in redis_client.store
 
 
 def test_guardrail_decision_reject_skips_gh_when_url_unparseable(
@@ -1053,7 +1061,7 @@ def test_guardrail_decision_reject_skips_gh_when_url_unparseable(
 def test_guardrail_decision_approve_commit_failure_returns_503(
     tmp_path, monkeypatch
 ) -> None:
-    _setup(
+    _, redis_client = _setup(
         tmp_path,
         monkeypatch,
         store={
@@ -1075,6 +1083,9 @@ def test_guardrail_decision_approve_commit_failure_returns_503(
     resp = _post("approve")
     assert resp.status_code == 503
     assert "Failed to commit guardrail decision" in resp.text
+    # Cause must survive a transient commit failure so the operator can
+    # retry the decision instead of losing the handle to a 404.
+    assert cause_key("example__alpha", "PR-305c") in redis_client.store
 
 
 def test_guardrail_decision_approve_watch_reread_missing_returns_404(
@@ -1106,6 +1117,11 @@ def test_guardrail_decision_approve_watch_reread_missing_returns_404(
         return pipe
 
     monkeypatch.setattr(redis_client, "pipeline", make_pipeline)
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
     resp = _post("approve")
     assert resp.status_code == 404
 
