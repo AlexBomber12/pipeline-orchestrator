@@ -50,11 +50,13 @@ def _make_backup_runner(
     daily_retention: int = 7,
     weekly_retention: int = 4,
 ) -> Any:
-    runner = h._make_runner()
+    # poll_interval_sec drives the repo_config field because the IDLE
+    # cadence comes from ``effective_idle_poll_interval``, which reads
+    # ``repo_config.poll_interval_sec`` (not ``daemon.poll_interval_sec``).
+    runner = h._make_runner(poll_interval_sec=poll_interval_sec)
     runner.app_config.daemon.git_bundle_backup_enabled = enabled
     runner.app_config.daemon.git_bundle_backup_dir = backup_dir
     runner.app_config.daemon.git_bundle_backup_interval_hours = interval_hours
-    runner.app_config.daemon.poll_interval_sec = poll_interval_sec
     runner.app_config.daemon.git_bundle_backup_daily_retention = daily_retention
     runner.app_config.daemon.git_bundle_backup_weekly_retention = weekly_retention
     return runner
@@ -269,6 +271,38 @@ def test_handle_idle_backup_prune_exception_logs_and_continues(
 
     events = [entry["event"] for entry in runner.state.history]
     assert any(event.startswith("[BACKUP] prune failed:") for event in events)
+
+
+def test_handle_idle_backup_uses_effective_idle_poll_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cadence must scale with the runner's IDLE interval, not the
+    daemon-level ``poll_interval_sec``. With a 300s effective IDLE cadence
+    and a 1h interval, the backup must fire after 12 cycles — not 60.
+    """
+    _wire_stable_idle(monkeypatch)
+    create_calls: list[dict[str, Any]] = []
+    fake_bundle = Path("/tmp/test-backup/octo__demo/octo__demo-X.bundle")
+
+    async def fake_create(**kwargs: Any) -> Path | None:
+        create_calls.append(kwargs)
+        return fake_bundle
+
+    async def fake_prune(**kwargs: Any) -> int:
+        return 0
+
+    monkeypatch.setattr(idle_module, "create_repo_bundle", fake_create)
+    monkeypatch.setattr(idle_module, "prune_old_bundles", fake_prune)
+
+    runner = _make_backup_runner(interval_hours=1, poll_interval_sec=300)
+    # cycles_per_hour = 3600 // 300 = 12; interval_cycles = 12.
+    # If the implementation used daemon.poll_interval_sec (60s default
+    # from DaemonConfig), it would expect 60 cycles instead.
+    _drive_idle(runner, 11)
+    assert create_calls == []
+
+    _drive_idle(runner, 1)
+    assert len(create_calls) == 1
 
 
 def test_handle_idle_backup_counter_persists_across_calls(

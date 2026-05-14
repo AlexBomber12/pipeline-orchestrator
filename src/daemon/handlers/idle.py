@@ -231,7 +231,18 @@ class IdleMixin:
         config = self.app_config.daemon
         if not (config.git_bundle_backup_enabled and config.git_bundle_backup_dir):
             return
-        cycles_per_hour = max(1, 3600 // max(1, config.poll_interval_sec))
+        # The counter ticks once per IDLE cycle. The runner's actual IDLE
+        # cadence is ``effective_idle_poll_interval`` — per-repo
+        # ``poll_interval_sec`` plus any extended-idle slowdown — not the
+        # daemon-level ``poll_interval_sec``. Using the wrong base would
+        # undercount cycles on quiet repos and delay backups by multiples
+        # of the configured interval.
+        effective_interval = getattr(
+            self,
+            "effective_idle_poll_interval",
+            self.repo_config.poll_interval_sec,
+        )
+        cycles_per_hour = max(1, 3600 // max(1, effective_interval))
         interval_cycles = config.git_bundle_backup_interval_hours * cycles_per_hour
         if self._git_bundle_backup_counter < interval_cycles:
             return
