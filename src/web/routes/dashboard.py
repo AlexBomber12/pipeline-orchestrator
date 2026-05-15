@@ -69,12 +69,13 @@ _CANCELLATIONS_MAX = 50
 # PR-310: subsource_filter dropdown groups (UI vocabulary) projected onto
 # the canonical PR-315 ``payload.subsource`` vocabulary. ``daemon`` covers
 # every detector that fires automatically (review_timeout, FIX timers,
-# no-push deadlock, infra streak, raw daemon crash) plus the literal
-# ``"daemon"`` subsource emitted by ``_escalate_and_skip`` (PR-276) and the
-# HUNG→IDLE migration (``src/daemon/migrations/hung_to_idle.py``); ``coder``
-# is the explicit ``ESCALATE:`` marker; ``guardrail`` and ``operator_reject``
-# map one-to-one. ``""`` (empty string from the "All" option) skips
-# filtering entirely.
+# no-push deadlock, infra streak, watch retrigger cap, raw daemon crash)
+# plus the literal ``"daemon"`` subsource emitted by ``_escalate_and_skip``
+# (PR-276) and the HUNG→IDLE migration
+# (``src/daemon/migrations/hung_to_idle.py``); ``coder`` is the explicit
+# ``ESCALATE:`` marker; ``guardrail`` and ``operator_reject`` map
+# one-to-one. ``""`` (empty string from the "All" option) skips filtering
+# entirely.
 _SUBSOURCE_FILTER_GROUPS: dict[str, frozenset[str]] = {
     "guardrail": frozenset({"guardrail"}),
     "coder": frozenset({"coder_escalate"}),
@@ -87,6 +88,7 @@ _SUBSOURCE_FILTER_GROUPS: dict[str, frozenset[str]] = {
             "fix_iteration_cap",
             "no_push_deadlock",
             "infra_failure",
+            "watch_retrigger_cap",
         }
     ),
     "operator_reject": frozenset({"operator_reject"}),

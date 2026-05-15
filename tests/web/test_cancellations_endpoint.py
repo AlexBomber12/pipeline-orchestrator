@@ -523,9 +523,9 @@ def test_partial_endpoint_subsource_filter_daemon_grouping(
 ) -> None:
     """PR-310: ``?subsource_filter=daemon`` returns every daemon-detected
     subsource (review_timeout, FIX timers, no-push deadlock, infra streak,
-    raw crash) plus the literal ``"daemon"`` value emitted by
-    ``_escalate_and_skip`` and the HUNG→IDLE migration, so operators can
-    audit automatic failures in one view."""
+    watch retrigger cap, raw crash) plus the literal ``"daemon"`` value
+    emitted by ``_escalate_and_skip`` and the HUNG→IDLE migration, so
+    operators can audit automatic failures in one view."""
     client, causes, _captured = cancellations_client
     now = datetime.now(timezone.utc)
     causes[:] = [
@@ -554,6 +554,12 @@ def test_partial_endpoint_subsource_filter_daemon_grouping(
             created_at=(now - timedelta(minutes=35)).isoformat(),
         ),
         _make_cause(
+            "PR-WRC",
+            category="ERROR",
+            payload={"subsource": "watch_retrigger_cap"},
+            created_at=(now - timedelta(minutes=38)).isoformat(),
+        ),
+        _make_cause(
             "PR-GR",
             category="ERROR",
             payload={"subsource": "guardrail"},
@@ -571,6 +577,7 @@ def test_partial_endpoint_subsource_filter_daemon_grouping(
     assert "PR-RT" in body
     assert "PR-NPD" in body
     assert "PR-DAEMON" in body
+    assert "PR-WRC" in body
     assert "PR-GR" not in body
 
 
