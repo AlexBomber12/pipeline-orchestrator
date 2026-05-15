@@ -3376,3 +3376,64 @@ def test_main_continues_when_cascade_check_raises(
         "cascade ESCALATE check failed" in rec.getMessage()
         for rec in caplog.records
     )
+
+
+def test_main_keeps_housekeeping_running_during_panic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PANIC skips dispatch but must not bypass wake-pubsub or in_flight drain.
+
+    Otherwise wake messages would accumulate on the subscriber connection
+    and finished cycles that complete during PANIC would not be surfaced
+    until PANIC clears.
+    """
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    _patch_main(monkeypatch, config, sleep_iterations=2)
+
+    async def fake_panic(*_args: Any, **_kwargs: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(
+        main_module, "check_cascade_escalate_state", fake_panic
+    )
+
+    subscribed_with: list[tuple[str, ...]] = []
+    pubsubs: list[_ScriptedPubSub] = []
+
+    async def fake_subscribe_wake(redis_client: Any, slugs: tuple[str, ...]) -> Any:
+        subscribed_with.append(tuple(slugs))
+        if not slugs:
+            return None
+        ps = _ScriptedPubSub([{"channel": "orchestrator:wake:octo__alpha"}, None])
+        pubsubs.append(ps)
+        return ps
+
+    monkeypatch.setattr(main_module, "subscribe_wake", fake_subscribe_wake)
+
+    drain_calls: list[int] = []
+    real_drain = main_module._drain_finished_cycles
+
+    def tracking_drain(
+        in_flight: dict[str, asyncio.Task[None]],
+        runners: dict[str, Any],
+    ) -> None:
+        drain_calls.append(len(in_flight))
+        real_drain(in_flight, runners)
+
+    monkeypatch.setattr(main_module, "_drain_finished_cycles", tracking_drain)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    # Even though dispatch was skipped, the loop kept subscribing to the
+    # wake channel and called the finished-cycle drain each iteration.
+    assert subscribed_with and subscribed_with[0] == ("octo__alpha",)
+    assert len(drain_calls) >= 2
+    # The wake pub/sub was actually consumed: the scripted message was
+    # popped by ``_wait_or_wake``.
+    assert pubsubs and pubsubs[0]._results == []
+    # And no per-runner cycle was dispatched while PANIC was active.
+    assert all(r.cycles == 0 for r in _FakeRunner.instances)
