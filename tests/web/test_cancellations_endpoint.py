@@ -614,6 +614,70 @@ def test_partial_endpoint_subsource_filter_operator_reject(
     assert "PR-GR" not in body
 
 
+def test_partial_endpoint_subsource_filter_classifies_legacy_records(
+    cancellations_client,
+) -> None:
+    """PR-310 feedback: records that pre-date PR-315 retain only
+    ``payload.legacy_category`` (or the raw pre-migration ``category``
+    value) with no canonical ``payload.subsource`` field. The dropdown
+    groups must run such records through the same subsource-classification
+    fallback used by recovery dispatch so they surface under the right
+    group instead of being hidden from every filtered view."""
+    client, causes, _captured = cancellations_client
+    now = datetime.now(timezone.utc)
+    causes[:] = [
+        # Migrated record with legacy_category preserved by escalate_to_error.
+        _make_cause(
+            "PR-LEGACY-ESC",
+            category="ERROR",
+            payload={"legacy_category": "ESCALATE", "reason_text": "manual"},
+            created_at=(now - timedelta(minutes=10)).isoformat(),
+        ),
+        # Migrated record with legacy_category for a daemon-side detector.
+        _make_cause(
+            "PR-LEGACY-TIMEOUT",
+            category="ERROR",
+            payload={"legacy_category": "TIMEOUT"},
+            created_at=(now - timedelta(minutes=15)).isoformat(),
+        ),
+        # Raw un-migrated pre-PR-315 record: legacy category, no payload.
+        _make_cause(
+            "PR-RAW-CRASH",
+            category="CRASH",
+            payload={},
+            created_at=(now - timedelta(minutes=20)).isoformat(),
+        ),
+        _make_cause(
+            "PR-GR",
+            category="ERROR",
+            payload={"subsource": "guardrail"},
+            created_at=(now - timedelta(minutes=25)).isoformat(),
+        ),
+    ]
+
+    resp_coder = client.get(
+        "/partials/repo/example__repo/cancellations?subsource_filter=coder"
+    )
+    assert resp_coder.status_code == 200
+    body = resp_coder.text
+    # ESCALATE legacy_category maps onto coder_escalate.
+    assert "PR-LEGACY-ESC" in body
+    assert "PR-LEGACY-TIMEOUT" not in body
+    assert "PR-RAW-CRASH" not in body
+    assert "PR-GR" not in body
+
+    resp_daemon = client.get(
+        "/partials/repo/example__repo/cancellations?subsource_filter=daemon"
+    )
+    assert resp_daemon.status_code == 200
+    body = resp_daemon.text
+    # TIMEOUT → review_timeout and raw CRASH → crash both sit in the daemon group.
+    assert "PR-LEGACY-TIMEOUT" in body
+    assert "PR-RAW-CRASH" in body
+    assert "PR-LEGACY-ESC" not in body
+    assert "PR-GR" not in body
+
+
 def test_partial_endpoint_no_filter_returns_all_subsources(
     cancellations_client,
 ) -> None:

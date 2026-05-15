@@ -21,7 +21,10 @@ import redis.asyncio as aioredis
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
-from src.cancellation import list_recent_cancellations
+from src.cancellation import (
+    classify_cancellation_subsource,
+    list_recent_cancellations,
+)
 from src.cancellation.availability import (
     ActiveHoursSource,
     HeartbeatSource,
@@ -93,6 +96,32 @@ _SUBSOURCE_FILTER_GROUPS: dict[str, frozenset[str]] = {
     ),
     "operator_reject": frozenset({"operator_reject"}),
 }
+
+
+def _filter_subsource(cause: Any) -> str:
+    """Return the subsource the filter dropdown should match ``cause`` against.
+
+    Prefers the literal ``payload.subsource`` so PR-310 group memberships
+    (``"daemon"``, ``"operator_reject"``, ``"watch_retrigger_cap"``) that
+    sit outside the canonical PR-315 ``SUBSOURCE_VOCABULARY`` still round-
+    trip through the filter. When ``payload.subsource`` is absent — pre-
+    PR-315 records that the ``escalate_to_error`` migration left with only
+    ``payload.legacy_category`` — defer to ``classify_cancellation_subsource``
+    so the legacy ``ESCALATE``/``CRASH``/``TIMEOUT``/``INFRA``/
+    ``NO_PUSH_DEADLOCK`` values are mapped onto the canonical subsource and
+    show up under the correct group (otherwise "Coder ESCALATE only" and
+    "Daemon-detected only" would hide valid in-window cancellations).
+    """
+    payload = getattr(cause, "payload", None)
+    if isinstance(payload, dict):
+        raw = payload.get("subsource")
+        if isinstance(raw, str) and raw:
+            return raw
+    # ``log=lambda _msg: None`` swallows the non-ERROR-category warning
+    # emitted on every legacy record — dispatch sites elsewhere already
+    # surface the missed-migration signal, and the read-path partial
+    # would otherwise log once per cause per request.
+    return classify_cancellation_subsource(cause, log=lambda _msg: None)
 
 _ACTIVE_RUN_STATES = {
     PipelineState.PREFLIGHT,
@@ -1649,10 +1678,7 @@ async def partial_repo_cancellations(
     allowed_subsources = _SUBSOURCE_FILTER_GROUPS.get(subsource_filter)
     if allowed_subsources is not None:
         causes = [
-            cause
-            for cause in causes
-            if isinstance(getattr(cause, "payload", None), dict)
-            and cause.payload.get("subsource") in allowed_subsources
+            cause for cause in causes if _filter_subsource(cause) in allowed_subsources
         ]
     augmented = (
         await _augment_causes_with_dependents(name, causes) if causes else []
