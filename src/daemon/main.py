@@ -38,6 +38,7 @@ from src.coders import build_coder_registry
 from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
 from src.config import AppConfig, RepoConfig, load_config, normalize_repo_url
+from src.daemon.cascade_monitor import check_cascade_escalate_state
 from src.daemon.config_watcher import watch_config_file_changes
 from src.daemon.migrations.escalate_to_error import (
     migrate_escalate_to_error_on_startup,
@@ -779,6 +780,18 @@ async def main() -> None:
                         await _cleanup_in_flight_for_removed(
                             in_flight, removed_keys
                         )
+
+        try:
+            panic_active = await check_cascade_escalate_state(
+                redis_client, config, logger
+            )
+        except Exception:
+            logger.error("cascade ESCALATE check failed", exc_info=True)
+            panic_active = False
+        if panic_active:
+            logger.warning("[PANIC] dispatch skipped for cycle")
+            await asyncio.sleep(config.daemon.poll_interval_sec)
+            continue
 
         for key, runner in list(runners.items()):
             if not runner.repo_config.active:

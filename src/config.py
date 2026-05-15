@@ -80,6 +80,9 @@ _DAEMON_FIELDS = {
     "error_rate_threshold",
     "error_rate_window_min",
     "error_rate_auto_pause_enabled",
+    "cascade_escalate_threshold",
+    "cascade_escalate_window_min",
+    "cascade_escalate_auto_resume_min",
     "operator_active_hours_start",
     "operator_active_hours_end",
     "operator_timezone",
@@ -188,6 +191,9 @@ class DaemonConfig(BaseModel):
     error_rate_threshold: int = Field(default=5, ge=1)
     error_rate_window_min: int = Field(default=60, ge=1)
     error_rate_auto_pause_enabled: bool = True
+    cascade_escalate_threshold: int = Field(default=3, ge=0, le=20)
+    cascade_escalate_window_min: int = Field(default=15, ge=1)
+    cascade_escalate_auto_resume_min: int = Field(default=60, ge=0)
     operator_active_hours_start: int = Field(default=9, ge=0, le=23)
     operator_active_hours_end: int = Field(default=21, ge=1, le=24)
     operator_timezone: str = "Europe/Rome"

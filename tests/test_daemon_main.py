@@ -3319,3 +3319,60 @@ def test_main_skips_scheduling_when_drain_deactivates_runner(
     # second cycle on the same pass.
     assert beta.cycles == 1
     assert beta.repo_config.active is False
+
+
+def test_main_skips_dispatch_when_cascade_panic_active(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    _patch_main(monkeypatch, config, sleep_iterations=2)
+
+    async def fake_panic(*_args: Any, **_kwargs: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(
+        main_module, "check_cascade_escalate_state", fake_panic
+    )
+
+    with caplog.at_level(logging.WARNING, logger=main_module.logger.name):
+        with pytest.raises(_StopLoop):
+            asyncio.run(main_module.main())
+
+    # No runner cycle was scheduled while panic was active.
+    assert all(r.cycles == 0 for r in _FakeRunner.instances)
+    assert any(
+        "[PANIC] dispatch skipped" in rec.getMessage() for rec in caplog.records
+    )
+
+
+def test_main_continues_when_cascade_check_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+    )
+    _patch_main(monkeypatch, config)
+
+    async def boom(*_args: Any, **_kwargs: Any) -> bool:
+        raise RuntimeError("redis down")
+
+    monkeypatch.setattr(
+        main_module, "check_cascade_escalate_state", boom
+    )
+
+    with caplog.at_level(logging.ERROR, logger=main_module.logger.name):
+        with pytest.raises(_StopLoop):
+            asyncio.run(main_module.main())
+
+    # Dispatch must still happen — the cascade check is fail-safe.
+    assert any(r.cycles == 1 for r in _FakeRunner.instances)
+    assert any(
+        "cascade ESCALATE check failed" in rec.getMessage()
+        for rec in caplog.records
+    )
