@@ -137,6 +137,7 @@ def test_serialize_includes_pr_url_when_provided() -> None:
     view = dashboard_routes._serialize_guardrail_pending(
         _entry("PR-296"),
         current_pr_url="https://github.com/example/alpha/pull/42",
+        is_active=True,
         now=_now_at(5 * 60),
     )
     assert view["pr_id"] == "PR-296"
@@ -145,6 +146,7 @@ def test_serialize_includes_pr_url_when_provided() -> None:
     assert view["recorded_at"] == _BASE_TS
     assert view["recorded_at_text"] == "5 minutes ago"
     assert view["pr_url"] == "https://github.com/example/alpha/pull/42"
+    assert view["is_active"] is True
 
 
 def test_serialize_truncates_long_excerpts() -> None:
@@ -155,6 +157,17 @@ def test_serialize_truncates_long_excerpts() -> None:
     assert len(view["excerpt"]) <= 200
     assert view["excerpt"].endswith("…")
     assert view["pr_url"] is None
+
+
+def test_serialize_defaults_is_active_false() -> None:
+    """Historical entries serialize with ``is_active=False`` so the panel
+    hides the Approve button, which would otherwise 409 against the
+    approve endpoint's ``state.current_task.pr_id == pr_id`` gate."""
+    view = dashboard_routes._serialize_guardrail_pending(
+        _entry("PR-OTHER"),
+        current_pr_url=None,
+    )
+    assert view["is_active"] is False
 
 
 class _FakeRedis:
@@ -264,6 +277,8 @@ async def test_build_view_attaches_pr_url_only_to_current_pr_entry() -> None:
         == "https://github.com/example/alpha/pull/42"
     )
     assert by_id["PR-OTHER"]["pr_url"] is None
+    assert by_id["PR-296"]["is_active"] is True
+    assert by_id["PR-OTHER"]["is_active"] is False
 
 
 async def test_build_view_no_pr_url_when_repo_has_no_current_pr() -> None:
@@ -273,6 +288,22 @@ async def test_build_view_no_pr_url_when_repo_has_no_current_pr() -> None:
         redis, "example__alpha", _bare_state()
     )
     assert out and out[0]["pr_url"] is None
+    assert out[0]["is_active"] is False
+
+
+async def test_build_view_is_active_when_current_pr_lacks_url() -> None:
+    """``is_active`` mirrors the approve gate (``state.current_pr`` set),
+    which does not require ``current_pr.url``. An entry matching the
+    current task with an empty PR URL is still approve-eligible."""
+    redis = _FakeRedis()
+    _put_guardrail(redis, "example__alpha", "PR-296", ts=float(_BASE_TS))
+    state = _bare_state("PR-296", url="")
+    out = await dashboard_routes._build_guardrail_pending_view(
+        redis, "example__alpha", state
+    )
+    assert out and out[0]["pr_id"] == "PR-296"
+    assert out[0]["pr_url"] is None
+    assert out[0]["is_active"] is True
 
 
 # ----- partial template rendering -----
@@ -300,6 +331,7 @@ def _view(
     recorded_at: int | None = None,
     recorded_at_text: str = "5 minutes ago",
     pr_url: str | None = None,
+    is_active: bool = True,
 ) -> dict[str, Any]:
     return {
         "pr_id": pr_id,
@@ -308,6 +340,7 @@ def _view(
         "recorded_at": _BASE_TS if recorded_at is None else recorded_at,
         "recorded_at_text": recorded_at_text,
         "pr_url": pr_url,
+        "is_active": is_active,
     }
 
 
@@ -525,3 +558,36 @@ def test_repo_detail_route_route_response_template_pr_url_uses_current_pr(
 def test_panel_confirm_dialogs_mention_consequence(decision_text: str) -> None:
     html = _render_panel(guardrail_pending=[_view("PR-296")])
     assert decision_text in html
+
+
+def test_panel_hides_approve_button_for_inactive_entry() -> None:
+    """Approve only renders for entries matching the daemon's active PR.
+
+    Without this gate the operator can click Approve on historical rows
+    and the endpoint will 409 (``_approve_guardrail_decision`` requires
+    ``state.current_task.pr_id == pr_id``), leaving a dead-end action
+    that cannot clear the row.
+    """
+    html = _render_panel(guardrail_pending=[_view("PR-OTHER", is_active=False)])
+    assert "approve-btn" not in html
+    assert "Approve guardrail violation" not in html
+    # Reject remains because the reject endpoint accepts non-current PRs.
+    assert "reject-btn" in html
+    assert "Reject guardrail violation for PR-OTHER" in html
+
+
+def test_panel_shows_approve_only_on_active_row_in_mixed_list() -> None:
+    """When the panel lists both active and historical entries, only the
+    active row gets an Approve button — Reject still renders for both."""
+    html = _render_panel(
+        guardrail_pending=[
+            _view("PR-CURRENT", is_active=True),
+            _view("PR-OTHER", is_active=False),
+        ]
+    )
+    assert html.count("approve-btn") == 1
+    assert "Approve guardrail violation for PR-CURRENT" in html
+    assert "Approve guardrail violation for PR-OTHER" not in html
+    assert html.count("reject-btn") == 2
+    assert "Reject guardrail violation for PR-CURRENT" in html
+    assert "Reject guardrail violation for PR-OTHER" in html
