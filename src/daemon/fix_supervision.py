@@ -54,7 +54,10 @@ async def monitor_fix_idle(
         gh_prs.get_last_push_age_seconds,
         runner.owner_repo, pr_number,
     )
-    if head_age is not None:
+    # Head ages inside the idle window can represent daemon restart during FIX,
+    # so preserve elapsed FIX time. Ages beyond the window come from unrelated
+    # review/CI/operator quiet periods and should start a fresh FIX deadline.
+    if head_age is not None and head_age < idle_limit:
         backdate = min(head_age, idle_limit - poll_interval)
         last_known_push = now - max(0.0, backdate)
     else:
