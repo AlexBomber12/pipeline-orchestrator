@@ -149,6 +149,7 @@ _DASHBOARD_REEXPORTS = frozenset(
         "_budget_chip",
         "_build_activity_feed",
         "_build_alerts",
+        "_build_guardrail_pending_view",
         "_build_recent_graphql_burns_view",
         "_build_resources_view",
         "_claude_usage_chip",
@@ -161,6 +162,7 @@ _DASHBOARD_REEXPORTS = frozenset(
         "_exit_reason_label",
         "_format_alert_duration",
         "_format_duration_ms",
+        "_format_guardrail_relative_time",
         "_format_history_time",
         "_most_recent_transition_into",
         "_parse_history_time",
@@ -172,7 +174,9 @@ _DASHBOARD_REEXPORTS = frozenset(
         "_repo_coder_form_value",
         "_repo_template_context",
         "_resource_zone",
+        "_serialize_guardrail_pending",
         "_serialize_run_record",
+        "_truncate_guardrail_excerpt",
     }
 )
 

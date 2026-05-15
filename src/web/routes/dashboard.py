@@ -27,6 +27,10 @@ from src.cancellation.availability import (
     ManualOverrideSource,
     is_operator_available,
 )
+from src.cancellation.storage import (
+    GuardrailPending,
+    list_pending_guardrail_decisions,
+)
 from src.coders import build_coder_registry
 from src.config import AppConfig, RepoConfig, load_config
 from src.daemon.github_rate_limit import (
@@ -137,6 +141,129 @@ def _active_repo_coder(state: RepoState) -> str | None:
 def _coder_rate_limit_supported(coder: str | None) -> bool:
     """Return whether ``coder`` has meaningful rate-limit usage data."""
     return coder in {"claude", "codex"}
+
+
+_GUARDRAIL_EXCERPT_MAX_CHARS = 200
+_GUARDRAIL_PENDING_LIMIT = 100
+
+
+def _truncate_guardrail_excerpt(excerpt: str) -> str:
+    """Cap a guardrail excerpt to ``_GUARDRAIL_EXCERPT_MAX_CHARS`` characters.
+
+    The full text remains in the cancellation cause record for audit; the
+    UI cap matches the GuardrailViolation.excerpt design limit so a
+    pathological payload cannot blow up panel layout. The ellipsis costs
+    one character so the visible cutoff is ``MAX - 1`` to keep the total
+    rendered length at or below ``MAX``.
+    """
+    if len(excerpt) <= _GUARDRAIL_EXCERPT_MAX_CHARS:
+        return excerpt
+    return excerpt[: _GUARDRAIL_EXCERPT_MAX_CHARS - 1] + "…"
+
+
+def _format_guardrail_relative_time(
+    recorded_at: int,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Render ``recorded_at`` as an operator-friendly relative label.
+
+    Returns "just now" for sub-minute deltas, ``N minutes ago`` /
+    ``N hours ago`` / ``N days ago`` for larger ones. Future timestamps
+    (clock skew between daemon and dashboard) collapse to "just now"
+    rather than rendering "in N min" so the panel never confuses the
+    operator with a negative-age entry.
+    """
+    current = now if now is not None else datetime.now(timezone.utc)
+    delta_seconds = int(current.timestamp()) - int(recorded_at)
+    if delta_seconds < 60:
+        return "just now"
+    minutes = delta_seconds // 60
+    if minutes < 60:
+        suffix = "minute" if minutes == 1 else "minutes"
+        return f"{minutes} {suffix} ago"
+    hours = minutes // 60
+    if hours < 24:
+        suffix = "hour" if hours == 1 else "hours"
+        return f"{hours} {suffix} ago"
+    days = hours // 24
+    suffix = "day" if days == 1 else "days"
+    return f"{days} {suffix} ago"
+
+
+def _serialize_guardrail_pending(
+    entry: GuardrailPending,
+    *,
+    current_pr_url: str | None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Return the per-entry view model the guardrail panel template renders.
+
+    ``current_pr_url`` is the GitHub PR URL only when the entry corresponds
+    to the repo's active PR (per the daemon's ``RepoState``); otherwise the
+    URL is unknown without a synchronous ``gh`` lookup, so the template
+    falls back to plain text for the PR ID. The excerpt is truncated to
+    the panel cap here so the template can render it verbatim without
+    re-checking length.
+    """
+    return {
+        "pr_id": entry.task_id,
+        "rule": entry.rule,
+        "excerpt": _truncate_guardrail_excerpt(entry.excerpt),
+        "recorded_at": entry.recorded_at,
+        "recorded_at_text": _format_guardrail_relative_time(
+            entry.recorded_at, now=now
+        ),
+        "pr_url": current_pr_url,
+    }
+
+
+async def _build_guardrail_pending_view(
+    redis_client: aioredis.Redis | None,
+    repo_name: str,
+    state: RepoState,
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Return serialized guardrail-pending entries for a repo's panel.
+
+    Empty list when Redis is unavailable or the helper raises so the
+    dashboard never 500s on a transient outage; the operator still sees
+    the rest of the per-repo page and the next refresh recovers. Only
+    the entry matching the repo's active task/PR gets a ``pr_url`` —
+    other entries fall back to plain-text PR IDs because the GH PR
+    number for a non-current PR is not stored in ``RepoState``.
+    """
+    if redis_client is None:
+        return []
+    try:
+        pending = await list_pending_guardrail_decisions(
+            redis_client, repo_name, limit=_GUARDRAIL_PENDING_LIMIT
+        )
+    except Exception:
+        # Mirror partial_repo_cancellations: degrade silently so a Redis
+        # outage or a partial test double never breaks repo-detail
+        # rendering. The next poll of /partials/repo/{name} recovers.
+        return []
+    current_pr_url: str | None = None
+    current_task_pr_id: str | None = None
+    if (
+        state.current_task is not None
+        and state.current_pr is not None
+        and state.current_pr.url
+    ):
+        current_pr_url = state.current_pr.url
+        current_task_pr_id = state.current_task.pr_id
+    return [
+        _serialize_guardrail_pending(
+            entry,
+            current_pr_url=(
+                current_pr_url if entry.task_id == current_task_pr_id else None
+            ),
+            now=now,
+        )
+        for entry in pending
+    ]
 
 
 async def _build_recent_graphql_burns_view(
@@ -333,12 +460,16 @@ async def _repo_template_context(
         redis_client, name
     )
     resources = await _build_resources_view(redis_client, [state])
+    guardrail_pending = await _build_guardrail_pending_view(
+        redis_client, name, state
+    )
     selected_repo_coder = _repo_coder_form_value(repo_config)
     active_repo_coder = _active_repo_coder(state)
     return {
         "repo": state,
         "recent_graphql_burns": recent_graphql_burns,
         "resources": resources,
+        "guardrail_pending": guardrail_pending,
         "repo_config": repo_config,
         "daemon": config.daemon,
         "coders": build_coder_registry().list_coders(),

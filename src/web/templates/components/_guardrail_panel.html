@@ -1,0 +1,64 @@
+{# Operator override surface for guardrail-flagged PRs.
+
+   ``guardrail_pending`` is a list of serialized GuardrailPending entries
+   (see ``_serialize_guardrail_pending`` in ``src.web.routes.dashboard``):
+   ``pr_id``, ``rule``, ``excerpt`` (already truncated to <=200 chars),
+   ``recorded_at`` (unix), ``recorded_at_text`` (server-side relative
+   label), ``pr_url`` (GitHub PR URL when known, ``None`` otherwise).
+
+   The amber palette signals "needs attention but not destructive". The
+   row is replaced with empty content on 204 from the backend so the
+   operator gets immediate visceral feedback; the next poll of
+   ``/partials/repo/{name}`` reconciles state with the backend. #}
+{% if guardrail_pending %}
+<section class="guardrail-panel mb-6 rounded-lg border border-warn/30 bg-warn/10 p-4"
+         data-guardrail-panel
+         id="guardrail-panel-{{ repo.name }}">
+    <header class="mb-3 flex items-center gap-2">
+        <h3 class="text-sm font-semibold text-warn">Pending guardrail decisions</h3>
+        <span class="rounded border border-warn/30 bg-warn/10 px-2 py-0.5 font-mono text-[11px] text-warn">{{ guardrail_pending | length }}</span>
+    </header>
+    <ul class="space-y-2">
+        {% for entry in guardrail_pending %}
+        <li class="guardrail-row flex flex-col gap-2 rounded border border-warn/20 bg-surface-2 px-3 py-2 sm:flex-row sm:items-center"
+            data-guardrail-row
+            data-pr-id="{{ entry.pr_id }}">
+            <div class="flex flex-col gap-1 sm:flex-1">
+                <div class="flex flex-wrap items-baseline gap-2">
+                    {% if entry.pr_url %}
+                    <a href="{{ entry.pr_url }}" target="_blank" rel="noopener"
+                       class="secondary-interactive font-mono text-sm text-accent">{{ entry.pr_id }}</a>
+                    {% else %}
+                    <span class="font-mono text-sm text-gray-200">{{ entry.pr_id }}</span>
+                    {% endif %}
+                    <span class="font-mono text-[11px] text-warn">{{ entry.rule }}</span>
+                    <time class="ml-auto font-mono text-[11px] text-gray-400"
+                          data-ts-unix="{{ entry.recorded_at }}">{{ entry.recorded_at_text }}</time>
+                </div>
+                <p class="break-words text-xs text-gray-300">{{ entry.excerpt }}</p>
+            </div>
+            <div class="flex items-center justify-end gap-2">
+                <button type="button"
+                        class="approve-btn rounded border border-ok/40 bg-ok/15 px-3 py-1 text-xs font-semibold text-ok hover:bg-ok/25"
+                        hx-post="/repos/{{ repo.name }}/guardrail/{{ entry.pr_id }}/decision"
+                        hx-vals='{"decision": "approve"}'
+                        hx-confirm="Approve guardrail violation for {{ entry.pr_id }}? PR will proceed to MERGE."
+                        hx-target="closest .guardrail-row"
+                        hx-swap="outerHTML">
+                    Approve
+                </button>
+                <button type="button"
+                        class="reject-btn rounded border border-fail/40 bg-fail/15 px-3 py-1 text-xs font-semibold text-fail hover:bg-fail/25"
+                        hx-post="/repos/{{ repo.name }}/guardrail/{{ entry.pr_id }}/decision"
+                        hx-vals='{"decision": "reject"}'
+                        hx-confirm="Reject guardrail violation for {{ entry.pr_id }}? PR will be closed and task marked ERROR."
+                        hx-target="closest .guardrail-row"
+                        hx-swap="outerHTML">
+                    Reject
+                </button>
+            </div>
+        </li>
+        {% endfor %}
+    </ul>
+</section>
+{% endif %}
