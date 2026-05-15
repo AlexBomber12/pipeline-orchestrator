@@ -306,6 +306,161 @@ async def test_build_view_is_active_when_current_pr_lacks_url() -> None:
     assert out[0]["is_active"] is True
 
 
+def _put_guardrail_reason_text_only(
+    redis: _FakeRedis,
+    repo: str,
+    pr_id: str,
+    *,
+    reason_text: str,
+    ts: float = float(_BASE_TS),
+) -> None:
+    """Mirror the cause shape emitted by CODING/FIX handlers.
+
+    ``src.daemon.handlers.coding`` / ``fix`` record guardrail
+    cancellations as ``payload={"subsource": "guardrail",
+    "reason_text": "GUARDRAIL: <category>: <excerpt>"}`` with no
+    structured ``rule``/``excerpt`` keys; this helper reproduces that
+    shape so panel-rendering tests can exercise the fallback parser.
+    """
+    from src.cancellation.storage import CancellationCause, cause_key, index_key
+
+    cause = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "guardrail", "reason_text": reason_text},
+        created_at=datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+        task_id=pr_id,
+        repo_slug=repo,
+    )
+    redis.values[cause_key(repo, pr_id)] = cause.to_redis()
+    redis.zsets.setdefault(index_key(repo), {})[pr_id] = ts
+
+
+def test_resolve_guardrail_metadata_prefers_structured_fields() -> None:
+    rule, excerpt = dashboard_routes._resolve_guardrail_metadata(
+        {"rule": "large_diff_threshold", "excerpt": "+1800 LOC"}
+    )
+    assert rule == "large_diff_threshold"
+    assert excerpt == "+1800 LOC"
+
+
+def test_resolve_guardrail_metadata_parses_reason_text() -> None:
+    rule, excerpt = dashboard_routes._resolve_guardrail_metadata(
+        {
+            "subsource": "guardrail",
+            "reason_text": "GUARDRAIL: large_diff: +1800 LOC across 35 files",
+        }
+    )
+    assert rule == "large_diff"
+    assert excerpt == "+1800 LOC across 35 files"
+
+
+def test_resolve_guardrail_metadata_falls_back_to_category_for_rule() -> None:
+    rule, excerpt = dashboard_routes._resolve_guardrail_metadata(
+        {"category": "large_diff", "excerpt": "+1800 LOC"}
+    )
+    assert rule == "large_diff"
+    assert excerpt == "+1800 LOC"
+
+
+def test_resolve_guardrail_metadata_empty_when_no_signal() -> None:
+    rule, excerpt = dashboard_routes._resolve_guardrail_metadata(
+        {"subsource": "guardrail"}
+    )
+    assert rule == ""
+    assert excerpt == ""
+
+
+async def test_build_view_parses_reason_text_when_rule_excerpt_missing() -> None:
+    """CODING/FIX-emitted causes carry only ``reason_text``; the panel
+    must surface the parsed rule + excerpt or operators lose context."""
+    redis = _FakeRedis()
+    _put_guardrail_reason_text_only(
+        redis,
+        "example__alpha",
+        "PR-296",
+        reason_text="GUARDRAIL: large_diff_threshold: +1800 LOC across 35 files",
+        ts=float(_BASE_TS),
+    )
+    out = await dashboard_routes._build_guardrail_pending_view(
+        redis, "example__alpha", _bare_state(), now=_now_at(60)
+    )
+    assert out and out[0]["pr_id"] == "PR-296"
+    assert out[0]["rule"] == "large_diff_threshold"
+    assert out[0]["excerpt"] == "+1800 LOC across 35 files"
+
+
+async def test_build_view_leaves_blank_when_reason_text_unparseable() -> None:
+    """If the cause carries neither structured fields nor a GUARDRAIL-prefixed
+    reason_text, the view degrades to blank rather than crashing."""
+    redis = _FakeRedis()
+    _put_guardrail_reason_text_only(
+        redis,
+        "example__alpha",
+        "PR-296",
+        reason_text="cancelled by operator",
+        ts=float(_BASE_TS),
+    )
+    out = await dashboard_routes._build_guardrail_pending_view(
+        redis, "example__alpha", _bare_state()
+    )
+    assert out and out[0]["pr_id"] == "PR-296"
+    assert out[0]["rule"] == ""
+    assert out[0]["excerpt"] == ""
+
+
+async def test_build_view_keeps_entry_when_recovery_lookup_raises(
+    monkeypatch,
+) -> None:
+    """A transient Redis failure during the fallback re-fetch must not
+    drop the row; the entry survives with whatever fields the initial
+    list returned."""
+    redis = _FakeRedis()
+    _put_guardrail_reason_text_only(
+        redis,
+        "example__alpha",
+        "PR-296",
+        reason_text="GUARDRAIL: cat: text",
+        ts=float(_BASE_TS),
+    )
+
+    async def _boom(*args: Any, **kwargs: Any) -> None:
+        raise RedisError("simulated outage")
+
+    monkeypatch.setattr(dashboard_routes, "get_cancellation_cause", _boom)
+    out = await dashboard_routes._build_guardrail_pending_view(
+        redis, "example__alpha", _bare_state()
+    )
+    assert out and out[0]["pr_id"] == "PR-296"
+    assert out[0]["rule"] == ""
+    assert out[0]["excerpt"] == ""
+
+
+async def test_build_view_keeps_entry_when_cause_vanished_between_reads(
+    monkeypatch,
+) -> None:
+    """A TOCTOU race where the cause expires between the helper's read
+    and our recovery fetch must leave the row intact rather than crash."""
+    redis = _FakeRedis()
+    _put_guardrail_reason_text_only(
+        redis,
+        "example__alpha",
+        "PR-296",
+        reason_text="GUARDRAIL: cat: text",
+        ts=float(_BASE_TS),
+    )
+
+    async def _race(*args: Any, **kwargs: Any) -> Any:
+        return None
+
+    monkeypatch.setattr(dashboard_routes, "get_cancellation_cause", _race)
+    out = await dashboard_routes._build_guardrail_pending_view(
+        redis, "example__alpha", _bare_state()
+    )
+    assert out and out[0]["pr_id"] == "PR-296"
+    assert out[0]["rule"] == ""
+    assert out[0]["excerpt"] == ""
+
+
 # ----- partial template rendering -----
 
 

@@ -12,7 +12,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from dataclasses import asdict
+import re
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator, Literal
 
@@ -29,6 +30,7 @@ from src.cancellation.availability import (
 )
 from src.cancellation.storage import (
     GuardrailPending,
+    get_cancellation_cause,
     list_pending_guardrail_decisions,
 )
 from src.coders import build_coder_registry
@@ -145,6 +147,65 @@ def _coder_rate_limit_supported(coder: str | None) -> bool:
 
 _GUARDRAIL_EXCERPT_MAX_CHARS = 200
 _GUARDRAIL_PENDING_LIMIT = 100
+# Mirrors ``_extract_guardrail_metadata`` in ``src.web.routes.repo_control``:
+# coding.py and fix.py emit guardrail causes carrying only
+# ``payload.reason_text = "GUARDRAIL: {category}: {excerpt}"`` (watch.py
+# emits structured ``rule``/``excerpt`` directly), so without this parse the
+# panel renders blank rule/excerpt for the common CODING/FIX-flagged rows.
+_GUARDRAIL_REASON_RE = re.compile(r"^GUARDRAIL:\s*([^:]+):\s*(.+)$")
+
+
+def _resolve_guardrail_metadata(payload: dict[str, Any]) -> tuple[str, str]:
+    """Return ``(rule, excerpt)`` from a guardrail cause payload.
+
+    Falls back through ``rule`` -> ``category`` -> parsed ``reason_text``
+    so CODING/FIX-emitted causes (which carry only ``reason_text``) still
+    produce non-empty panel rows. Kept in lockstep with
+    ``_extract_guardrail_metadata`` in ``src.web.routes.repo_control``.
+    """
+    rule = payload.get("rule") or payload.get("category") or ""
+    excerpt = payload.get("excerpt", "") or ""
+    if rule and excerpt:
+        return rule, excerpt
+    reason = payload.get("reason_text", "")
+    if isinstance(reason, str):
+        match = _GUARDRAIL_REASON_RE.match(reason)
+        if match:
+            if not rule:
+                rule = match.group(1).strip()
+            if not excerpt:
+                excerpt = match.group(2).strip()
+    return rule, excerpt
+
+
+async def _recover_guardrail_metadata(
+    redis_client: aioredis.Redis,
+    repo_name: str,
+    entry: GuardrailPending,
+) -> GuardrailPending:
+    """Patch ``entry`` with reason_text-derived rule/excerpt when missing.
+
+    ``list_pending_guardrail_decisions`` reads only the structured
+    ``rule``/``excerpt`` payload fields, so CODING/FIX-emitted causes
+    (``payload.reason_text`` only) arrive at the view layer with blank
+    rule and excerpt. Re-fetch the cause and apply the same fallback the
+    approve/reject endpoints use; degrade silently to the original entry
+    if the cause has already vanished (TTL expiry, concurrent decision).
+    """
+    if entry.rule and entry.excerpt:
+        return entry
+    try:
+        cause = await get_cancellation_cause(
+            redis_client, repo_name, entry.task_id
+        )
+    except Exception:
+        return entry
+    if cause is None or not isinstance(cause.payload, dict):
+        return entry
+    rule, excerpt = _resolve_guardrail_metadata(cause.payload)
+    if rule == entry.rule and excerpt == entry.excerpt:
+        return entry
+    return replace(entry, rule=rule, excerpt=excerpt)
 
 
 def _truncate_guardrail_excerpt(excerpt: str) -> str:
@@ -251,6 +312,10 @@ async def _build_guardrail_pending_view(
         # outage or a partial test double never breaks repo-detail
         # rendering. The next poll of /partials/repo/{name} recovers.
         return []
+    pending = [
+        await _recover_guardrail_metadata(redis_client, repo_name, entry)
+        for entry in pending
+    ]
     current_pr_url: str | None = None
     current_task_pr_id: str | None = None
     # The approve endpoint requires ``state.current_pr`` (not its URL) — see
