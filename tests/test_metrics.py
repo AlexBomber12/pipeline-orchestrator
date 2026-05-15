@@ -223,6 +223,7 @@ async def test_record_serialization() -> None:
         "base_branch": "",
         "base_sha": "",
         "cause": None,
+        "cause_subsource": None,
         "complexity": "medium",
         "coder_session_id": "",
         "diff_lines_added": 0,
@@ -295,6 +296,68 @@ async def test_runrecord_with_all_new_fields_serializes_and_parses() -> None:
     saved = await store.get("run-expanded")
 
     assert saved == record
+
+
+async def test_runrecord_with_cause_subsource_serializes() -> None:
+    """PR-310: ``cause_subsource`` round-trips through Redis on ESCALATE.
+
+    Verifies the field appears in the serialized payload and rehydrates
+    into an equal record, so OBS-BE analytics can split ESCALATE rows by
+    guardrail vs coder_escalate without re-reading the cancellation
+    cause.
+    """
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+    record = _record(
+        "run-subsource",
+        outcome="failed",
+        cause="ESCALATE",
+        cause_subsource="guardrail",
+        run_phase="fix",
+    )
+
+    await store.save(record)
+
+    payload = json.loads(redis.store["metrics:run:run-subsource"])
+    assert payload["cause_subsource"] == "guardrail"
+
+    saved = await store.get("run-subsource")
+    assert saved == record
+    assert saved is not None
+    assert saved.cause_subsource == "guardrail"
+
+
+def test_runrecord_non_escalate_cause_subsource_none() -> None:
+    """PR-310: non-ESCALATE causes must leave ``cause_subsource`` as None."""
+    record = _record(
+        "run-crash",
+        outcome="failed",
+        cause="CRASH",
+        cause_subsource=None,
+        exit_reason="error",
+    )
+
+    assert record.cause == "CRASH"
+    assert record.cause_subsource is None
+
+
+def test_runrecord_rejects_cause_subsource_without_escalate_cause() -> None:
+    """PR-310: schema invariant — ``cause_subsource`` requires ESCALATE.
+
+    Prevents callsites from accidentally tagging a CRASH/TIMEOUT/INFRA
+    record with subsource metadata that would mis-shape the OBS-BE
+    "ESCALATE by subsource" panel.
+    """
+    with pytest.raises(
+        ValueError, match="cause_subsource only valid when cause == 'ESCALATE'"
+    ):
+        _record(
+            "bad-subsource",
+            outcome="failed",
+            cause="CRASH",
+            cause_subsource="guardrail",
+            exit_reason="error",
+        )
 
 
 def test_runrecord_outcome_merged_no_cause() -> None:

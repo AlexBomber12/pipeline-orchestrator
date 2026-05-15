@@ -48,6 +48,13 @@ class RunRecord:
     operator_intervention: bool
     outcome: RunOutcome = ""
     cause: RunCause | None = None
+    # PR-310: verbatim payload.subsource from the CancellationCause that
+    # produced the ESCALATE-class failure, so analytics queries can slice
+    # "ESCALATE rate by guardrail vs coder_escalate" without re-reading
+    # the cancellation cause record. Populated by callsites only when the
+    # mapped ``cause`` is ``ESCALATE`` (guardrail / coder_escalate
+    # subsources); other causes leave this ``None``.
+    cause_subsource: str | None = None
     run_phase: RunPhase = "coding"
     attempt_index: int = 1
     coder_session_id: str = ""
@@ -86,6 +93,10 @@ class RunRecord:
             raise ValueError(f"invalid run record phase: {self.run_phase}")
         if self.attempt_index < 1:
             raise ValueError("attempt_index must be >= 1")
+        if self.cause_subsource is not None and self.cause != "ESCALATE":
+            raise ValueError(
+                "cause_subsource only valid when cause == 'ESCALATE'"
+            )
 
 
 class MetricsStore:

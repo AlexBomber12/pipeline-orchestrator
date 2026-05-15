@@ -458,6 +458,263 @@ def test_endpoint_short_circuits_when_repo_not_in_config(
     assert "repo_slug" not in captured
 
 
+def test_partial_endpoint_renders_filter_dropdown(cancellations_client) -> None:
+    """PR-310: the partial renders a subsource filter dropdown with the
+    five canonical options (All + 4 groups) regardless of whether causes
+    exist for the current window — operators can pre-select a filter on
+    an empty repo."""
+    client, causes, _captured = cancellations_client
+    causes.clear()
+
+    resp = client.get("/partials/repo/example__repo/cancellations")
+
+    assert resp.status_code == 200
+    body = resp.text
+    assert 'name="subsource_filter"' in body
+    assert 'value=""' in body and ">All<" in body
+    assert 'value="guardrail"' in body and "Guardrail only" in body
+    assert 'value="coder"' in body and "Coder ESCALATE only" in body
+    assert 'value="daemon"' in body and "Daemon-detected only" in body
+    assert 'value="operator_reject"' in body and "Operator rejections only" in body
+
+
+def test_partial_endpoint_subsource_filter_guardrail(cancellations_client) -> None:
+    """PR-310: ``?subsource_filter=guardrail`` returns only guardrail
+    entries; coder_escalate, review_timeout, etc are filtered out."""
+    client, causes, _captured = cancellations_client
+    now = datetime.now(timezone.utc)
+    causes[:] = [
+        _make_cause(
+            "PR-GR",
+            category="ERROR",
+            payload={"subsource": "guardrail", "rule": "large_diff"},
+            created_at=(now - timedelta(minutes=10)).isoformat(),
+        ),
+        _make_cause(
+            "PR-CODER",
+            category="ERROR",
+            payload={"subsource": "coder_escalate"},
+            created_at=(now - timedelta(minutes=20)).isoformat(),
+        ),
+        _make_cause(
+            "PR-RT",
+            category="ERROR",
+            payload={"subsource": "review_timeout"},
+            created_at=(now - timedelta(minutes=30)).isoformat(),
+        ),
+    ]
+
+    resp = client.get(
+        "/partials/repo/example__repo/cancellations?subsource_filter=guardrail"
+    )
+
+    assert resp.status_code == 200
+    body = resp.text
+    assert "PR-GR" in body
+    assert "PR-CODER" not in body
+    assert "PR-RT" not in body
+    # The selected option round-trips into the dropdown markup so the
+    # operator's choice survives the htmx swap.
+    assert 'value="guardrail" selected' in body
+
+
+def test_partial_endpoint_subsource_filter_daemon_grouping(
+    cancellations_client,
+) -> None:
+    """PR-310: ``?subsource_filter=daemon`` returns every daemon-detected
+    subsource (review_timeout, FIX timers, no-push deadlock, infra streak,
+    watch retrigger cap, raw crash) plus the literal ``"daemon"`` value
+    emitted by ``_escalate_and_skip`` and the HUNG→IDLE migration, so
+    operators can audit automatic failures in one view."""
+    client, causes, _captured = cancellations_client
+    now = datetime.now(timezone.utc)
+    causes[:] = [
+        _make_cause(
+            "PR-CRASH",
+            category="ERROR",
+            payload={"subsource": "crash"},
+            created_at=(now - timedelta(minutes=10)).isoformat(),
+        ),
+        _make_cause(
+            "PR-RT",
+            category="ERROR",
+            payload={"subsource": "review_timeout"},
+            created_at=(now - timedelta(minutes=20)).isoformat(),
+        ),
+        _make_cause(
+            "PR-NPD",
+            category="ERROR",
+            payload={"subsource": "no_push_deadlock"},
+            created_at=(now - timedelta(minutes=30)).isoformat(),
+        ),
+        _make_cause(
+            "PR-DAEMON",
+            category="ERROR",
+            payload={"subsource": "daemon"},
+            created_at=(now - timedelta(minutes=35)).isoformat(),
+        ),
+        _make_cause(
+            "PR-WRC",
+            category="ERROR",
+            payload={"subsource": "watch_retrigger_cap"},
+            created_at=(now - timedelta(minutes=38)).isoformat(),
+        ),
+        _make_cause(
+            "PR-GR",
+            category="ERROR",
+            payload={"subsource": "guardrail"},
+            created_at=(now - timedelta(minutes=40)).isoformat(),
+        ),
+    ]
+
+    resp = client.get(
+        "/partials/repo/example__repo/cancellations?subsource_filter=daemon"
+    )
+
+    assert resp.status_code == 200
+    body = resp.text
+    assert "PR-CRASH" in body
+    assert "PR-RT" in body
+    assert "PR-NPD" in body
+    assert "PR-DAEMON" in body
+    assert "PR-WRC" in body
+    assert "PR-GR" not in body
+
+
+def test_partial_endpoint_subsource_filter_operator_reject(
+    cancellations_client,
+) -> None:
+    """PR-310: the operator_reject group surfaces only operator-driven
+    rejections (PR-305c subsource), distinct from the still-pending
+    guardrail subgroup."""
+    client, causes, _captured = cancellations_client
+    now = datetime.now(timezone.utc)
+    causes[:] = [
+        _make_cause(
+            "PR-REJECT",
+            category="ERROR",
+            payload={"subsource": "operator_reject"},
+            created_at=(now - timedelta(minutes=10)).isoformat(),
+        ),
+        _make_cause(
+            "PR-GR",
+            category="ERROR",
+            payload={"subsource": "guardrail"},
+            created_at=(now - timedelta(minutes=20)).isoformat(),
+        ),
+    ]
+
+    resp = client.get(
+        "/partials/repo/example__repo/cancellations?subsource_filter=operator_reject"
+    )
+
+    assert resp.status_code == 200
+    body = resp.text
+    assert "PR-REJECT" in body
+    assert "PR-GR" not in body
+
+
+def test_partial_endpoint_subsource_filter_classifies_legacy_records(
+    cancellations_client,
+) -> None:
+    """PR-310 feedback: records that pre-date PR-315 retain only
+    ``payload.legacy_category`` (or the raw pre-migration ``category``
+    value) with no canonical ``payload.subsource`` field. The dropdown
+    groups must run such records through the same subsource-classification
+    fallback used by recovery dispatch so they surface under the right
+    group instead of being hidden from every filtered view."""
+    client, causes, _captured = cancellations_client
+    now = datetime.now(timezone.utc)
+    causes[:] = [
+        # Migrated record with legacy_category preserved by escalate_to_error.
+        _make_cause(
+            "PR-LEGACY-ESC",
+            category="ERROR",
+            payload={"legacy_category": "ESCALATE", "reason_text": "manual"},
+            created_at=(now - timedelta(minutes=10)).isoformat(),
+        ),
+        # Migrated record with legacy_category for a daemon-side detector.
+        _make_cause(
+            "PR-LEGACY-TIMEOUT",
+            category="ERROR",
+            payload={"legacy_category": "TIMEOUT"},
+            created_at=(now - timedelta(minutes=15)).isoformat(),
+        ),
+        # Raw un-migrated pre-PR-315 record: legacy category, no payload.
+        _make_cause(
+            "PR-RAW-CRASH",
+            category="CRASH",
+            payload={},
+            created_at=(now - timedelta(minutes=20)).isoformat(),
+        ),
+        _make_cause(
+            "PR-GR",
+            category="ERROR",
+            payload={"subsource": "guardrail"},
+            created_at=(now - timedelta(minutes=25)).isoformat(),
+        ),
+    ]
+
+    resp_coder = client.get(
+        "/partials/repo/example__repo/cancellations?subsource_filter=coder"
+    )
+    assert resp_coder.status_code == 200
+    body = resp_coder.text
+    # ESCALATE legacy_category maps onto coder_escalate.
+    assert "PR-LEGACY-ESC" in body
+    assert "PR-LEGACY-TIMEOUT" not in body
+    assert "PR-RAW-CRASH" not in body
+    assert "PR-GR" not in body
+
+    resp_daemon = client.get(
+        "/partials/repo/example__repo/cancellations?subsource_filter=daemon"
+    )
+    assert resp_daemon.status_code == 200
+    body = resp_daemon.text
+    # TIMEOUT → review_timeout and raw CRASH → crash both sit in the daemon group.
+    assert "PR-LEGACY-TIMEOUT" in body
+    assert "PR-RAW-CRASH" in body
+    assert "PR-LEGACY-ESC" not in body
+    assert "PR-GR" not in body
+
+
+def test_partial_endpoint_no_filter_returns_all_subsources(
+    cancellations_client,
+) -> None:
+    """PR-310: omitting ``subsource_filter`` (or passing empty / unknown)
+    leaves the candidate set untouched so the default view shows
+    everything the 7-day window holds."""
+    client, causes, _captured = cancellations_client
+    now = datetime.now(timezone.utc)
+    causes[:] = [
+        _make_cause(
+            "PR-GR",
+            category="ERROR",
+            payload={"subsource": "guardrail"},
+            created_at=(now - timedelta(minutes=10)).isoformat(),
+        ),
+        _make_cause(
+            "PR-CODER",
+            category="ERROR",
+            payload={"subsource": "coder_escalate"},
+            created_at=(now - timedelta(minutes=20)).isoformat(),
+        ),
+    ]
+
+    resp = client.get("/partials/repo/example__repo/cancellations")
+    assert resp.status_code == 200
+    assert "PR-GR" in resp.text
+    assert "PR-CODER" in resp.text
+
+    # Unknown filter values fall through to "no filter" rather than 4xx-ing.
+    resp_unknown = client.get(
+        "/partials/repo/example__repo/cancellations?subsource_filter=bogus"
+    )
+    assert resp_unknown.status_code == 200
+    assert "PR-GR" in resp_unknown.text
+    assert "PR-CODER" in resp_unknown.text
+
+
 def test_partial_endpoint_short_circuits_when_repo_not_in_config(
     cancellations_client,
 ) -> None:

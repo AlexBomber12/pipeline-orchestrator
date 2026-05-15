@@ -25,6 +25,12 @@ class _PanelRedis:
     async def aclose(self) -> None:
         return None
 
+    async def delete(self, key: str) -> int:
+        return int(self.store.pop(key, None) is not None)
+
+    async def zrem(self, key: str, *members: str) -> int:
+        return 0
+
 
 def _aioredis(redis_client: _PanelRedis) -> object:
     return type(
@@ -192,3 +198,194 @@ def test_normal_todo_no_marker(
 
     assert response.status_code == 200
     assert "Blocked by:" not in response.text
+
+
+def _setup_multi_error_panel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    error_tasks: list[tuple[str, str | None]],
+    retry_cap: int = 3,
+) -> None:
+    """Install a panel where each entry in ``error_tasks`` becomes an ERROR
+    task plus, when subsource is non-None, an associated cancellation_cause
+    row in Redis. PR-310 sub-grouping renders depend on both signals so
+    the helper bundles them.
+    """
+    import json as _json
+
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/alpha.git\n"
+        f"daemon:\n  retry_button_cap: {retry_cap}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(web_app, "REPOS_DIR", str(tmp_path / "repos"))
+    tasks_dir = tmp_path / "repos" / "example__alpha" / "tasks"
+    tasks_dir.mkdir(parents=True)
+    queue_entries = []
+    for pr_id, _subsource in error_tasks:
+        (tasks_dir / f"{pr_id}.md").write_text(
+            f"---\nstatus: ERROR\n---\n\n# {pr_id}: Sub-grouping case\n\nBody\n",
+            encoding="utf-8",
+        )
+        queue_entries.append(
+            QueueTask(
+                pr_id=pr_id,
+                title=f"{pr_id} title",
+                status=TaskStatus.ERROR,
+                branch=f"branch-{pr_id.lower()}",
+            )
+        )
+    state = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.IDLE,
+        current_queue=queue_entries,
+    )
+    store: dict[str, str] = {
+        "pipeline:example__alpha": state.model_dump_json(),
+    }
+    for pr_id, subsource in error_tasks:
+        store[f"metrics:retry_count:example__alpha:{pr_id}"] = "0"
+        if subsource is not None:
+            store[f"cancellation:example__alpha:{pr_id}"] = _json.dumps(
+                {
+                    "category": "ERROR",
+                    "payload": {"subsource": subsource},
+                    "created_at": "2026-05-15T10:00:00+00:00",
+                    "task_id": pr_id,
+                    "repo_slug": "example__alpha",
+                }
+            )
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(_PanelRedis(store)))
+
+
+def test_error_group_renders_guardrail_subgroup_when_present(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-310: with at least one guardrail-subsource entry the ERROR group
+    splits into a guardrail subgroup (operator decision needed) and an
+    other subgroup (automatic failure). Tasks land in the bucket that
+    matches their cancellation cause payload, not their order in the
+    queue.
+    """
+    _setup_multi_error_panel(
+        tmp_path,
+        monkeypatch,
+        error_tasks=[
+            ("PR-401", "guardrail"),
+            ("PR-402", "guardrail"),
+            ("PR-403", "coder_escalate"),
+        ],
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "error-subgroup-guardrail" in body
+    assert "error-subgroup-other" in body
+    # Guardrail subgroup carries both guardrail tasks; the other subgroup
+    # carries the coder_escalate entry. Slicing the body around the
+    # subgroup wrappers keeps the assertion robust against unrelated
+    # markup churn.
+    guardrail_section = body.split("error-subgroup-guardrail", 1)[1].split(
+        "error-subgroup-other", 1
+    )[0]
+    other_section = body.split("error-subgroup-other", 1)[1]
+    assert "PR-401" in guardrail_section
+    assert "PR-402" in guardrail_section
+    assert "PR-403" not in guardrail_section
+    assert "PR-403" in other_section
+    assert "Operator decision needed" in guardrail_section
+
+
+def test_error_group_renders_flat_when_no_guardrail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-310: without any guardrail subsource the original flat ERROR list
+    renders unchanged — sub-grouping is opt-in on guardrail presence so
+    existing operator muscle memory survives."""
+    _setup_multi_error_panel(
+        tmp_path,
+        monkeypatch,
+        error_tasks=[
+            ("PR-411", "coder_escalate"),
+            ("PR-412", "review_timeout"),
+        ],
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "error-subgroup-guardrail" not in body
+    assert "error-subgroup-other" not in body
+    assert "PR-411" in body
+    assert "PR-412" in body
+
+
+def test_error_group_redis_read_error_falls_into_other(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-310: a Redis ``get`` failure while reading the cancellation
+    cause for an ERROR task must not 5xx the panel; the task falls into
+    the "other" bucket the same way a missing record does."""
+    from src.web.routes import repo_control as repo_control_module
+
+    async def boom(redis_client, repo_slug, task_id):  # pragma: no cover
+        raise ConnectionError("redis unreachable")
+
+    _setup_panel(tmp_path, monkeypatch, retry_count=0)
+    monkeypatch.setattr(
+        repo_control_module, "get_cancellation_cause", boom
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks")
+
+    assert response.status_code == 200
+    body = response.text
+    # No guardrail entries means the flat list still renders.
+    assert "error-subgroup-guardrail" not in body
+    assert "PR-283" in body
+
+
+def test_error_group_legacy_no_cause_record_falls_into_other(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-310: ERROR tasks without a cancellation_cause record (legacy /
+    pre-PR-253 / Redis miss) must land in the "other" bucket whenever a
+    sub-grouping is rendered, never in the guardrail bucket — operators
+    should not be misled into approving/rejecting a phantom guardrail
+    decision."""
+    _setup_multi_error_panel(
+        tmp_path,
+        monkeypatch,
+        error_tasks=[
+            ("PR-421", "guardrail"),
+            ("PR-422", None),
+        ],
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "error-subgroup-guardrail" in body
+    other_section = body.split("error-subgroup-other", 1)[1]
+    assert "PR-422" in other_section
+    guardrail_section = body.split("error-subgroup-guardrail", 1)[1].split(
+        "error-subgroup-other", 1
+    )[0]
+    assert "PR-422" not in guardrail_section
