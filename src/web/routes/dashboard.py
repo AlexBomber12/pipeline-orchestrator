@@ -1008,9 +1008,9 @@ async def _read_panic_state_for_banner(
         return None
     if raw is None:
         return None
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8")
     try:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
         parsed = json.loads(raw)
     except (TypeError, ValueError):
         return None

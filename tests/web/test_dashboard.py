@@ -113,6 +113,20 @@ async def test_read_panic_state_for_banner_handles_bytes_payload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_read_panic_state_for_banner_returns_none_for_non_utf8_bytes() -> None:
+    """Undecodable bytes must be treated as absent, not raise out of ``index``."""
+
+    class _NonUtf8Redis:
+        async def get(self, key: str) -> bytes:
+            return b"\xff\xfe\x00\x00"
+
+    assert (
+        await dashboard_routes._read_panic_state_for_banner(_NonUtf8Redis())
+        is None
+    )
+
+
+@pytest.mark.asyncio
 async def test_read_panic_state_for_banner_returns_none_for_invalid_json() -> None:
     class _BrokenJsonRedis:
         async def get(self, key: str) -> str:
