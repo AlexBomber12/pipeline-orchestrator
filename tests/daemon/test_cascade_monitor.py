@@ -424,3 +424,144 @@ async def test_bytes_keys_and_values_are_decoded(_freeze_now: datetime) -> None:
     redis.values[daemon_panic_state()] = payload.encode("utf-8")  # type: ignore[assignment]
 
     assert await check_cascade_escalate_state(redis, cfg, _logger()) is False
+
+
+class _CapturingPanicWebhook:
+    """``httpx.AsyncClient`` stand-in capturing panic-notification POSTs."""
+
+    posted: list[tuple[str, dict[str, Any], float]] = []
+
+    def __init__(self, timeout: float) -> None:
+        self._timeout = timeout
+
+    async def __aenter__(self) -> "_CapturingPanicWebhook":
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    async def post(self, url: str, json: dict[str, Any]) -> "_OkResponse":
+        type(self).posted.append((url, json, self._timeout))
+        return _OkResponse()
+
+
+class _OkResponse:
+    def raise_for_status(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_webhook_fires_on_false_to_true_transition(
+    _freeze_now: datetime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = _FakeRedis()
+    cfg = _config()
+    cfg.daemon.guardrail_notification_webhook_url = "https://hooks.example/x"
+    cfg.daemon.guardrail_notification_timeout_seconds = 3.5
+    for idx in range(3):
+        _record(redis, f"r{idx}", "PR-1", when=_freeze_now - timedelta(minutes=2))
+
+    _CapturingPanicWebhook.posted = []
+    monkeypatch.setattr(cascade_monitor.httpx, "AsyncClient", _CapturingPanicWebhook)
+
+    assert await check_cascade_escalate_state(redis, cfg, _logger()) is True
+    assert len(_CapturingPanicWebhook.posted) == 1
+    url, payload, timeout = _CapturingPanicWebhook.posted[0]
+    assert url == "https://hooks.example/x"
+    assert timeout == 3.5
+    assert payload == {
+        "event": "cascade_panic_activated",
+        "reason": "cascade_escalate_threshold_exceeded",
+        "affected_repos": ["r0", "r1", "r2"],
+        "threshold": 3,
+        "window_min": cfg.daemon.cascade_escalate_window_min,
+    }
+
+
+@pytest.mark.asyncio
+async def test_webhook_does_not_fire_on_already_active(
+    _freeze_now: datetime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = _FakeRedis()
+    cfg = _config()
+    cfg.daemon.guardrail_notification_webhook_url = "https://hooks.example/x"
+    earlier = (_freeze_now - timedelta(minutes=5)).isoformat()
+    redis.values[daemon_panic_state()] = json.dumps(
+        {
+            "enabled": True,
+            "reason": "cascade_escalate_threshold_exceeded",
+            "triggered_at": earlier,
+            "affected_repos": ["r0", "r1", "r2"],
+            "threshold_at_trigger": 3,
+        }
+    )
+    for idx in range(3):
+        _record(redis, f"r{idx}", "PR-1", when=_freeze_now - timedelta(minutes=1))
+
+    _CapturingPanicWebhook.posted = []
+    constructed: list[Any] = []
+
+    class _ShouldNotConstruct:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            constructed.append((args, kwargs))
+
+    monkeypatch.setattr(cascade_monitor.httpx, "AsyncClient", _ShouldNotConstruct)
+
+    assert await check_cascade_escalate_state(redis, cfg, _logger()) is True
+    assert constructed == []
+
+
+@pytest.mark.asyncio
+async def test_panic_webhook_skipped_when_url_unset(
+    _freeze_now: datetime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _config()
+    cfg.daemon.guardrail_notification_webhook_url = None
+
+    constructed: list[Any] = []
+
+    class _ShouldNotConstruct:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            constructed.append((args, kwargs))
+
+    monkeypatch.setattr(cascade_monitor.httpx, "AsyncClient", _ShouldNotConstruct)
+
+    await cascade_monitor._fire_panic_activation_webhook(
+        cfg,
+        affected_repos=["r0", "r1", "r2"],
+        threshold=3,
+        window_min=15,
+        log=_logger(),
+    )
+    assert constructed == []
+
+
+@pytest.mark.asyncio
+async def test_panic_webhook_swallows_post_exception(
+    _freeze_now: datetime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _config()
+    cfg.daemon.guardrail_notification_webhook_url = "https://hooks.example/x"
+
+    class _BoomClient:
+        def __init__(self, timeout: float) -> None: ...
+        async def __aenter__(self) -> "_BoomClient": return self
+        async def __aexit__(self, *args: object) -> None: return None
+        async def post(self, url: str, json: dict[str, Any]) -> None:
+            raise RuntimeError("network unreachable")
+
+    monkeypatch.setattr(cascade_monitor.httpx, "AsyncClient", _BoomClient)
+
+    # Must not raise — the panic state has already been persisted and the
+    # daemon loop must keep running even when notification delivery fails.
+    await cascade_monitor._fire_panic_activation_webhook(
+        cfg,
+        affected_repos=["r0"],
+        threshold=1,
+        window_min=15,
+        log=_logger(),
+    )

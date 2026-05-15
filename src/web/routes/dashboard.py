@@ -42,7 +42,7 @@ from src.daemon.github_rate_limit import (
     recent_cycle_burns,
 )
 from src.events.sse import format_sse_comment, format_sse_event
-from src.keyspace import cli_log_latest
+from src.keyspace import cli_log_latest, daemon_panic_state
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
 from src.utils import repo_slug_from_url
@@ -989,6 +989,36 @@ def _compute_stats(states: list[RepoState]) -> dict[str, Any]:
     }
 
 
+async def _read_panic_state_for_banner(
+    redis_client: aioredis.Redis | None,
+) -> dict[str, Any] | None:
+    """Return the daemon cascade panic record for the dashboard banner.
+
+    Mirrors ``cascade_monitor._read_panic_state`` semantics (bytes/str
+    decode, JSON parse, dict guard) without importing the private helper.
+    Returns ``None`` when there is no record, when Redis is unavailable,
+    or when the value cannot be decoded — the banner template treats all
+    of those uniformly by rendering nothing.
+    """
+    if redis_client is None:
+        return None
+    try:
+        raw = await redis_client.get(daemon_panic_state())
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed if parsed.get("enabled") else None
+
+
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
@@ -1000,6 +1030,7 @@ async def index(request: Request) -> HTMLResponse:
     alerts = _build_alerts(states)
     latest_alert = min(alerts, key=lambda a: a["duration_seconds"]) if alerts else None
     resources = await _build_resources_view(redis_client, states)
+    panic_state = await _read_panic_state_for_banner(redis_client)
     return _app.templates.TemplateResponse(
         request,
         "index.html",
@@ -1011,6 +1042,7 @@ async def index(request: Request) -> HTMLResponse:
             "redis_warning": redis_warning,
             "resources": resources,
             "page_rendered_at": page_rendered_at,
+            "panic_state": panic_state,
         },
     )
 
