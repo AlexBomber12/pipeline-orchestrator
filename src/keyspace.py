@@ -89,3 +89,8 @@ def repo_events_channel(repo_name: str) -> str:
 def repo_events_history(repo_name: str) -> str:
     """List key holding the recent history of operator-visible events."""
     return f"repo-events-history:{repo_name}"
+
+
+def daemon_panic_state() -> str:
+    """Daemon-global panic state record (not per-repo)."""
+    return "daemon:panic_state"

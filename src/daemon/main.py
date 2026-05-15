@@ -38,6 +38,7 @@ from src.coders import build_coder_registry
 from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
 from src.config import AppConfig, RepoConfig, load_config, normalize_repo_url
+from src.daemon.cascade_monitor import check_cascade_escalate_state
 from src.daemon.config_watcher import watch_config_file_changes
 from src.daemon.migrations.escalate_to_error import (
     migrate_escalate_to_error_on_startup,
@@ -780,55 +781,65 @@ async def main() -> None:
                             in_flight, removed_keys
                         )
 
-        for key, runner in list(runners.items()):
-            if not runner.repo_config.active:
-                last_run.pop(key, None)
-                try:
-                    await runner.publish_state()
-                except Exception:
-                    logger.error(
-                        "publish paused state failed for %s",
-                        runner.name,
-                        exc_info=True,
-                    )
-                continue
-            existing = in_flight.get(key)
-            if existing is not None:
-                if not existing.done():
-                    # Previous cycle still running; do not pile up another
-                    # one on top of it. last_run is left untouched so the
-                    # new cycle will be scheduled as soon as the in-flight
-                    # task finishes and the next interval is due.
-                    continue
-                # Drain a cycle that finished between iterations (e.g.
-                # during ``await runner.publish_state()`` for an inactive
-                # peer earlier in this loop) before scheduling the next
-                # one, so any config staged during the cycle is applied
-                # and the new cycle starts from the latest snapshot.
-                _drain_finished_cycle(key, in_flight, runners)
-                # The drain may have applied a staged config that flipped
-                # ``active`` to False (e.g. the user deactivated the repo
-                # while the cycle was in flight). Re-check before scheduling
-                # so a deactivated runner does not get one more cycle just
-                # because the poll interval happened to elapse.
+        try:
+            panic_active = await check_cascade_escalate_state(
+                redis_client, config, logger
+            )
+        except Exception:
+            logger.error("cascade ESCALATE check failed", exc_info=True)
+            panic_active = False
+        if panic_active:
+            logger.warning("[PANIC] dispatch skipped for cycle")
+        else:
+            for key, runner in list(runners.items()):
                 if not runner.repo_config.active:
                     last_run.pop(key, None)
+                    try:
+                        await runner.publish_state()
+                    except Exception:
+                        logger.error(
+                            "publish paused state failed for %s",
+                            runner.name,
+                            exc_info=True,
+                        )
                     continue
-            now = time.monotonic()
-            interval = _runner_poll_interval(runner)
-            if key in last_run and now - last_run[key] < interval:
-                continue
-            # last_run is stamped at scheduling time, not completion time.
-            # Otherwise a 30-minute CODING cycle would re-schedule itself
-            # the moment it returns and the per-runner interval would be
-            # ignored on long jobs.
-            last_run[key] = now
-            in_flight[key] = asyncio.create_task(runner.run_cycle())
+                existing = in_flight.get(key)
+                if existing is not None:
+                    if not existing.done():
+                        # Previous cycle still running; do not pile up another
+                        # one on top of it. last_run is left untouched so the
+                        # new cycle will be scheduled as soon as the in-flight
+                        # task finishes and the next interval is due.
+                        continue
+                    # Drain a cycle that finished between iterations (e.g.
+                    # during ``await runner.publish_state()`` for an inactive
+                    # peer earlier in this loop) before scheduling the next
+                    # one, so any config staged during the cycle is applied
+                    # and the new cycle starts from the latest snapshot.
+                    _drain_finished_cycle(key, in_flight, runners)
+                    # The drain may have applied a staged config that flipped
+                    # ``active`` to False (e.g. the user deactivated the repo
+                    # while the cycle was in flight). Re-check before scheduling
+                    # so a deactivated runner does not get one more cycle just
+                    # because the poll interval happened to elapse.
+                    if not runner.repo_config.active:
+                        last_run.pop(key, None)
+                        continue
+                now = time.monotonic()
+                interval = _runner_poll_interval(runner)
+                if key in last_run and now - last_run[key] < interval:
+                    continue
+                # last_run is stamped at scheduling time, not completion time.
+                # Otherwise a 30-minute CODING cycle would re-schedule itself
+                # the moment it returns and the per-runner interval would be
+                # ignored on long jobs.
+                last_run[key] = now
+                in_flight[key] = asyncio.create_task(runner.run_cycle())
 
-        # Clean up last_run entries for removed runners.
-        for key in list(last_run.keys()):
-            if key not in runners:
-                del last_run[key]
+            # Clean up last_run entries for removed runners.
+            for key in list(last_run.keys()):
+                if key not in runners:
+                    del last_run[key]
 
         now_after = time.monotonic()
         remaining: list[float] = []
@@ -837,10 +848,20 @@ async def main() -> None:
             if not runner.repo_config.active:
                 continue
             slug_to_key[runner.name] = key
-            due_in = (last_run.get(key, 0.0) + _runner_poll_interval(runner)) - now_after
-            remaining.append(max(due_in, 0.0))
-        tick = min(remaining) if remaining else config.daemon.poll_interval_sec
-        tick = min(tick, config.daemon.poll_interval_sec)
+            if not panic_active:
+                due_in = (last_run.get(key, 0.0) + _runner_poll_interval(runner)) - now_after
+                remaining.append(max(due_in, 0.0))
+        if panic_active:
+            # PANIC pins the cadence to ``poll_interval_sec`` so wake
+            # pub/sub messages are still consumed and finished in_flight
+            # tasks are still drained each cycle, without dispatching new
+            # cycles. ``last_run`` stamps are not refreshed during PANIC
+            # so deriving the tick from them could otherwise drive a
+            # tight 1-second wait loop while PANIC persists.
+            tick = config.daemon.poll_interval_sec
+        else:
+            tick = min(remaining) if remaining else config.daemon.poll_interval_sec
+            tick = min(tick, config.daemon.poll_interval_sec)
 
         desired_slugs = tuple(sorted(slug_to_key.keys()))
         if desired_slugs != subscribed_slugs:
