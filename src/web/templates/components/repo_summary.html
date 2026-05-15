@@ -64,6 +64,8 @@
 </div>
 {% endif %}
 
+{% include "components/_guardrail_panel.html" %}
+
 {% if resources or show_rate_limit_badge %}
 {% set active_chip_coder = repo.coder if repo.coder in ['claude', 'codex'] else (active_rate_limit_coder if active_rate_limit_coder in ['claude', 'codex'] else none) %}
 {% set active_chip_coder_label = 'Claude' if active_chip_coder == 'claude' else ('Codex' if active_chip_coder == 'codex' else '') %}
