@@ -28,6 +28,7 @@ from src.cancellation.storage import (
     CancellationCause,
     cause_key,
     delete_cancellation_cause,
+    get_cancellation_cause,
     index_key,
     list_pending_guardrail_decisions,
     record_cancellation_cause,
@@ -613,6 +614,7 @@ async def _task_view(
     redis_client: aioredis.Redis | None,
 ) -> dict[str, object]:
     retry_count = 0
+    cancellation_subsource: str | None = None
     if task.status == TaskStatus.ERROR and redis_client is not None:
         retry_fingerprint = None
         resolved = await _resolve_repo_task_path(repo_name, task.pr_id)
@@ -628,9 +630,24 @@ async def _task_view(
             task.pr_id,
             retry_fingerprint,
         )
+        # PR-310: read payload.subsource so tasks_panel.html can split the
+        # ERROR group into a guardrail subgroup (operator decision needed)
+        # vs other (automatic failure). Best-effort: Redis errors leave the
+        # task in the "other" bucket rather than 5xx-ing the panel.
+        try:
+            cause = await get_cancellation_cause(
+                redis_client, repo_name, task.pr_id
+            )
+        except Exception:
+            cause = None
+        if cause is not None and isinstance(cause.payload, dict):
+            raw_subsource = cause.payload.get("subsource")
+            if isinstance(raw_subsource, str) and raw_subsource:
+                cancellation_subsource = raw_subsource
     return {
         **task.model_dump(mode="json"),
         "retry_count": retry_count,
+        "cancellation_subsource": cancellation_subsource,
     }
 
 

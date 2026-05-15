@@ -10,8 +10,33 @@
    downstream work surface first; a "Blocks N task(s)" badge follows
    each card with a positive count. The default of zero applies when
    the canceled task has no dependents (or when QUEUE.md was unreadable
-   and the closure could not be computed). #}
+   and the closure could not be computed).
+
+   PR-310: a subsource filter dropdown precedes the card list. The
+   dropdown's hx-get round-trips the partial endpoint with
+   ``?subsource_filter=<group>`` so the swap target stays stable; the
+   route applies the filter post-read so the 7-day window/50-cap
+   contract is unchanged. ``subsource_filter`` is supplied by the route
+   and round-trips into the ``selected`` attribute so the operator's
+   choice survives the swap. #}
+{% set subsource_filter = subsource_filter | default('') %}
 <div class="cancellation-list mt-3">
+    <form class="cancellation-filter mb-3 flex items-center gap-2 text-xs">
+        <label for="cancellation-subsource-filter" class="text-gray-400">Filter:</label>
+        <select id="cancellation-subsource-filter"
+                name="subsource_filter"
+                class="rounded border border-white/10 bg-surface-3 px-2 py-1 text-xs text-gray-200"
+                hx-trigger="change"
+                hx-get="/partials/repo/{{ repo_name | default('') }}/cancellations"
+                hx-target="closest .cancellation-list"
+                hx-swap="outerHTML">
+            <option value=""{% if subsource_filter == '' %} selected{% endif %}>All</option>
+            <option value="guardrail"{% if subsource_filter == 'guardrail' %} selected{% endif %}>Guardrail only</option>
+            <option value="coder"{% if subsource_filter == 'coder' %} selected{% endif %}>Coder ESCALATE only</option>
+            <option value="daemon"{% if subsource_filter == 'daemon' %} selected{% endif %}>Daemon-detected only</option>
+            <option value="operator_reject"{% if subsource_filter == 'operator_reject' %} selected{% endif %}>Operator rejections only</option>
+        </select>
+    </form>
     {% if causes %}
     {% for cause in causes | sort(attribute='dependents_count', reverse=True) %}
         {{ cancellation_card(cause) }}

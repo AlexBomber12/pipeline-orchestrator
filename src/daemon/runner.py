@@ -185,6 +185,26 @@ def _legacy_run_cause_from_cancellation(
         return _SUBSOURCE_TO_LEGACY_RUN_CAUSE.get(subsource)
     return None
 
+
+def _subsource_from_cancellation(
+    cause: CancellationCause | None,
+) -> str | None:
+    """Return ``payload.subsource`` verbatim from a CancellationCause.
+
+    PR-310: ``RunRecord.cause_subsource`` carries the raw PR-315 subsource
+    value so analytics queries can slice ESCALATE-class failures by
+    detector (guardrail vs coder_escalate) without rejoining the
+    cancellation cause record. Returns ``None`` when no subsource is
+    recorded; the caller's downstream check (``cause == 'ESCALATE'``)
+    further constrains when the value is persisted.
+    """
+    if cause is None or not cause.payload:
+        return None
+    subsource = cause.payload.get("subsource")
+    if isinstance(subsource, str) and subsource:
+        return subsource
+    return None
+
 _HISTORY_LIMIT = 100
 _STOP_POLL_INTERVAL_SEC = 0.5
 _IDLE_STREAK_CAP = 100
@@ -1240,6 +1260,7 @@ class PipelineRunner(
         base_branch: str | None = None,
         run_phase: str | None = None,
         cause: str | None = None,
+        cause_subsource: str | None = None,
     ) -> None:
         """Finalize and persist the active run record."""
         record = self._current_run_record
@@ -1263,6 +1284,17 @@ class PipelineRunner(
         )
         record.outcome = outcome  # type: ignore[assignment]
         record.cause = cause or mapped_cause  # type: ignore[assignment]
+        # PR-310: persist payload.subsource verbatim for ESCALATE-class
+        # failures so OBS-BE can split guardrail vs coder_escalate without
+        # rejoining the cancellation_cause record. Constrained to ESCALATE
+        # to match the dataclass validation; ``cause_subsource`` arriving
+        # alongside a non-ESCALATE cause is dropped silently rather than
+        # raising, since the upstream cancellation cause may have shipped
+        # the field opportunistically.
+        if (record.cause or "") == "ESCALATE":
+            record.cause_subsource = cause_subsource
+        else:
+            record.cause_subsource = None
         record.run_phase = run_phase or self._run_phase_for_metrics(exit_reason)
         record.head_sha = self._git_rev_parse("HEAD")
         if exit_reason in ("success_merged", "coding_complete", "closed_unmerged"):
@@ -1375,6 +1407,7 @@ class PipelineRunner(
                 save_run_record_as,
                 run_phase=self._run_phase_from_state(prior_state),
                 cause=_legacy_run_cause_from_cancellation(cancellation_cause),
+                cause_subsource=_subsource_from_cancellation(cancellation_cause),
             )
         task = self.state.current_task
         if task is not None:

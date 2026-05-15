@@ -141,6 +141,83 @@ def test_transition_to_error_maps_pr315_subsource_to_legacy_run_cause(
     assert rehydrated.cause == expected_cause
 
 
+def test_save_run_record_propagates_subsource_from_cancellation_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-310: payload.subsource flows verbatim onto RunRecord.cause_subsource
+    when the cancellation cause maps to an ESCALATE legacy cause.
+
+    Without this plumbing, OBS-BE has no way to split ``cause=ESCALATE``
+    rows into guardrail vs coder_escalate without re-reading the
+    cancellation cause record per row — the cause subsource exists
+    precisely to keep that join out of the analytics hot path.
+    """
+    runner = h._make_runner()
+    h._patch_subprocess(monkeypatch)
+    _install_task(runner)
+    runner.state.state = PipelineState.FIX
+    runner._start_current_run_record("claude", "opus")
+
+    cause = CancellationCause(
+        category="ERROR",
+        payload={
+            "subsource": "guardrail",
+            "rule": "large_diff",
+            "excerpt": "+12000 LOC",
+        },
+    )
+    asyncio.run(
+        runner._transition_to_error(
+            "guardrail violation",
+            publish=False,
+            cancellation_cause=cause,
+        )
+    )
+
+    record = runner._current_run_record
+    assert record is not None
+    assert record.outcome == "failed"
+    assert record.cause == "ESCALATE"
+    assert record.cause_subsource == "guardrail"
+
+
+def test_save_run_record_drops_subsource_for_non_escalate_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-310: a non-ESCALATE legacy cause must persist ``cause_subsource=None``
+    even when the cancellation cause payload carries a subsource value.
+
+    The dataclass invariant rejects ``cause_subsource`` outside ESCALATE,
+    so the runner's save path must drop the subsource rather than rely
+    on the callsite to remember the constraint.
+    """
+    runner = h._make_runner()
+    h._patch_subprocess(monkeypatch)
+    _install_task(runner)
+    runner.state.state = PipelineState.FIX
+    runner._start_current_run_record("claude", "opus")
+
+    cause = CancellationCause(
+        category="ERROR",
+        payload={
+            "subsource": "review_timeout",
+            "elapsed_min": 90,
+        },
+    )
+    asyncio.run(
+        runner._transition_to_error(
+            "review timeout",
+            publish=False,
+            cancellation_cause=cause,
+        )
+    )
+
+    record = runner._current_run_record
+    assert record is not None
+    assert record.cause == "TIMEOUT"
+    assert record.cause_subsource is None
+
+
 def test_legacy_run_cause_helper_prefers_legacy_category_payload() -> None:
     """When the migration preserved ``legacy_category``, surface that value."""
     cause = CancellationCause(

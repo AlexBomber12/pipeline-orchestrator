@@ -98,17 +98,62 @@
     </section>
 
     {% if tasks_by_status.error %}
+    {# PR-310: split the ERROR group into a guardrail subgroup (operator
+       decision needed) vs other (automatic failure). The split only
+       appears when at least one guardrail-subsource entry is present;
+       otherwise the existing flat list renders unchanged so cosmetic
+       diff is zero on the common path. #}
+    {% set error_guardrail = [] %}
+    {% set error_other = [] %}
+    {% for task in tasks_by_status.error %}
+        {% if task.cancellation_subsource == 'guardrail' %}
+            {{ error_guardrail.append(task) or '' }}
+        {% else %}
+            {{ error_other.append(task) or '' }}
+        {% endif %}
+    {% endfor %}
     <section class="mb-4">
         <h4 class="mb-2 inline-flex items-center gap-2 text-xs font-medium uppercase tracking-[0.16em] text-gray-400">
             <span class="rounded border px-2 py-0.5 text-[11px] {{ status_styles.error }}">Error</span>
             <span class="font-mono text-gray-500">{{ tasks_by_status.error | length }}</span>
         </h4>
+        {% if error_guardrail %}
+        <div class="error-subgroup error-subgroup-guardrail mb-3">
+            <h5 class="mb-2 inline-flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.16em] text-amber-300">
+                <span class="rounded border border-amber-400/40 bg-amber-400/10 px-2 py-0.5 text-[10px] text-amber-300">Guardrail</span>
+                <span class="font-mono text-gray-500">{{ error_guardrail | length }}</span>
+            </h5>
+            <p class="mb-2 text-xs italic text-amber-200/80">Operator decision needed: approve or reject from the guardrail panel.</p>
+            <ul class="space-y-2">
+                {% for task in error_guardrail %}
+                {{ task_row(repo_name, task, 'error') }}
+                {% endfor %}
+            </ul>
+        </div>
+        <div class="error-subgroup error-subgroup-other">
+            <h5 class="mb-2 inline-flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.16em] text-fail">
+                <span class="rounded border px-2 py-0.5 text-[10px] {{ status_styles.error }}">Other</span>
+                <span class="font-mono text-gray-500">{{ error_other | length }}</span>
+            </h5>
+            <p class="mb-2 text-xs italic text-gray-500">Automatic failure; re-upload the task file or use Retry to retry.</p>
+            {% if error_other %}
+            <ul class="space-y-2">
+                {% for task in error_other %}
+                {{ task_row(repo_name, task, 'error') }}
+                {% endfor %}
+            </ul>
+            {% else %}
+            <p class="text-xs italic text-gray-500">None.</p>
+            {% endif %}
+        </div>
+        {% else %}
         <p class="mb-2 text-xs italic text-gray-500">Crashed during a prior run; re-upload the task file to retry.</p>
         <ul class="space-y-2">
             {% for task in tasks_by_status.error %}
             {{ task_row(repo_name, task, 'error') }}
             {% endfor %}
         </ul>
+        {% endif %}
     </section>
     {% endif %}
 

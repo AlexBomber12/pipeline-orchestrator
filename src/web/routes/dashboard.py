@@ -66,6 +66,29 @@ _METRICS_SCAN_LIMIT = 100
 _CANCELLATIONS_WINDOW_DAYS = 7
 _CANCELLATIONS_MAX = 50
 
+# PR-310: subsource_filter dropdown groups (UI vocabulary) projected onto
+# the canonical PR-315 ``payload.subsource`` vocabulary. ``daemon`` covers
+# every detector that fires automatically (review_timeout, FIX timers,
+# no-push deadlock, infra streak, raw daemon crash); ``coder`` is the
+# explicit ``ESCALATE:`` marker; ``guardrail`` and ``operator_reject``
+# map one-to-one. ``""`` (empty string from the "All" option) skips
+# filtering entirely.
+_SUBSOURCE_FILTER_GROUPS: dict[str, frozenset[str]] = {
+    "guardrail": frozenset({"guardrail"}),
+    "coder": frozenset({"coder_escalate"}),
+    "daemon": frozenset(
+        {
+            "crash",
+            "review_timeout",
+            "fix_idle_timeout",
+            "fix_iteration_cap",
+            "no_push_deadlock",
+            "infra_failure",
+        }
+    ),
+    "operator_reject": frozenset({"operator_reject"}),
+}
+
 _ACTIVE_RUN_STATES = {
     PipelineState.PREFLIGHT,
     PipelineState.CODING,
@@ -1592,8 +1615,15 @@ async def partial_repo_cancellations(
     Gated on ``config.yml`` for the same reason as ``api_cancellations``
     above: stale ``cancellation_index:*`` keys (TTL up to 30 days) must
     not resurface as cards for repos that were removed from the config.
+
+    PR-310: accepts a ``subsource_filter`` query param drawn from the
+    cancellation history dropdown. Unknown values fall back to "All"
+    (no filter) so a malformed URL never 4xx-s the partial. The filter
+    is applied after the storage read so the 7-day window and 50-item
+    cap still bound the candidate set.
     """
     redis_client = getattr(request.app.state, "redis", None)
+    subsource_filter = request.query_params.get("subsource_filter", "") or ""
     causes: list = []
     repo_configured = (
         _find_repo_config_by_name(load_config(_app.CONFIG_PATH), name)
@@ -1611,13 +1641,25 @@ async def partial_repo_cancellations(
             # Redis temporarily unreachable: render the empty-state placeholder
             # so the HTMX swap target stays stable instead of 5xx-ing the panel.
             causes = []
+    allowed_subsources = _SUBSOURCE_FILTER_GROUPS.get(subsource_filter)
+    if allowed_subsources is not None:
+        causes = [
+            cause
+            for cause in causes
+            if isinstance(getattr(cause, "payload", None), dict)
+            and cause.payload.get("subsource") in allowed_subsources
+        ]
     augmented = (
         await _augment_causes_with_dependents(name, causes) if causes else []
     )
     return _app.templates.TemplateResponse(
         request,
         "components/cancellation_history.html",
-        {"causes": augmented},
+        {
+            "causes": augmented,
+            "subsource_filter": subsource_filter,
+            "repo_name": name,
+        },
     )
 
 
