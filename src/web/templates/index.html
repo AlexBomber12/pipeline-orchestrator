@@ -3,6 +3,7 @@
 {% block title %}Dashboard - Pipeline Orchestrator{% endblock %}
 
 {% block content %}
+{% include "components/cascade_panic_banner.html" %}
 {# Cards refresh on state_change AND history_updated: pause/resume/stop
    mutate repo.user_paused (which controls play/pause/stop visibility) and
    emit history_updated, so without the second trigger the controls would

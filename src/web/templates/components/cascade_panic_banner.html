@@ -1,0 +1,35 @@
+{% if panic_state and panic_state.enabled %}
+<div id="cascade-panic-banner"
+     class="bg-fail/10 border border-fail/40 text-fail rounded-md px-4 py-3 mb-4">
+    <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <div class="flex flex-col gap-1 min-w-0">
+            <div class="flex items-center gap-2">
+                <span class="font-mono text-xs font-semibold uppercase tracking-wide">CASCADE PANIC</span>
+                <span class="text-sm">Daemon dispatch paused</span>
+            </div>
+            <div class="text-xs">
+                Reason: <span class="font-mono">{{ panic_state.reason }}</span>
+                {% if panic_state.triggered_at %}
+                <span class="text-fail/80">·</span>
+                Triggered
+                <span data-ts="{{ panic_state.triggered_at }}">{{ panic_state.triggered_at }}</span>
+                {% endif %}
+            </div>
+            {% if panic_state.affected_repos %}
+            <div class="text-xs break-all">
+                Affected repos:
+                <span class="font-mono">{{ panic_state.affected_repos | join(", ") }}</span>
+            </div>
+            {% endif %}
+        </div>
+        <button type="button"
+                id="cascade-panic-resume"
+                hx-post="/daemon/panic/resume"
+                hx-swap="none"
+                hx-on::after-request="window.location.reload()"
+                class="text-xs font-medium uppercase tracking-wide border border-fail/40 rounded px-3 py-1 hover:bg-fail/20 self-start sm:self-center">
+            Resume
+        </button>
+    </div>
+</div>
+{% endif %}

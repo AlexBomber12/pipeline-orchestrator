@@ -126,6 +126,7 @@ templates.env.globals["upload_feedback_target"] = (
 # attributes on a partially initialized module whenever the route module is
 # the entry point of the import (see PEP 562 ``__getattr__`` below for the
 # backward-compatible re-exports tests rely on).
+from src.web.routes import daemon_control as _daemon_control_routes  # noqa: E402
 from src.web.routes import dashboard as _dashboard_routes  # noqa: E402
 from src.web.routes import onboarding as _onboarding_routes  # noqa: E402
 from src.web.routes import repo_control as _repo_control_routes  # noqa: E402
@@ -381,3 +382,4 @@ app.include_router(_repo_control_routes.router)
 app.include_router(_settings_routes.router)
 app.include_router(_uploads_routes.router)
 app.include_router(_onboarding_routes.router)
+app.include_router(_daemon_control_routes.router)

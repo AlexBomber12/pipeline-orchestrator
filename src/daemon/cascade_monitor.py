@@ -28,6 +28,8 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
+
 from src.cancellation.storage import (
     CancellationCause,
     cause_key,
@@ -100,6 +102,42 @@ async def _count_affected_repos(
     return affected
 
 
+async def _fire_panic_activation_webhook(
+    app_config: AppConfig,
+    *,
+    affected_repos: list[str],
+    threshold: int,
+    window_min: int,
+    log: Any,
+) -> None:
+    """POST a cascade_panic_activated notification on False→True transition.
+
+    Reuses the PR-307 ``guardrail_notification_webhook_url`` channel so a
+    single operator endpoint receives all daemon-level escalations. A
+    missing webhook URL silently skips (operator has not opted in), and
+    delivery failures are logged but never raised: the panic state has
+    already been persisted to Redis, so notification flakes must not
+    crash the daemon loop.
+    """
+    webhook_url = app_config.daemon.guardrail_notification_webhook_url
+    if not webhook_url:
+        return
+    payload = {
+        "event": "cascade_panic_activated",
+        "reason": "cascade_escalate_threshold_exceeded",
+        "affected_repos": affected_repos,
+        "threshold": threshold,
+        "window_min": window_min,
+    }
+    timeout_seconds = app_config.daemon.guardrail_notification_timeout_seconds
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            response = await client.post(webhook_url, json=payload)
+            response.raise_for_status()
+    except Exception as exc:
+        log.warning("[PANIC] cascade activation webhook failed: %s", exc)
+
+
 async def check_cascade_escalate_state(
     redis_client: Any,
     app_config: AppConfig,
@@ -133,6 +171,9 @@ async def check_cascade_escalate_state(
     existing = await _read_panic_state(redis_client)
     if len(unique_affected) >= threshold:
         triggered_at = now.isoformat()
+        is_activation_transition = (
+            existing is None or not existing.get("enabled")
+        )
         if existing is not None and existing.get("enabled"):
             prior = existing.get("triggered_at")
             if isinstance(prior, str):
@@ -149,6 +190,14 @@ async def check_cascade_escalate_state(
             "[PANIC] cascade ESCALATE threshold hit: %d repos affected",
             len(unique_affected),
         )
+        if is_activation_transition:
+            await _fire_panic_activation_webhook(
+                app_config,
+                affected_repos=unique_affected,
+                threshold=threshold,
+                window_min=cfg.cascade_escalate_window_min,
+                log=log,
+            )
         return True
 
     if existing is None or not existing.get("enabled"):
