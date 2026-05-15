@@ -341,6 +341,23 @@ def test_panel_buttons_carry_confirm_target_and_swap_attributes() -> None:
     assert 'hx-swap="outerHTML"' in html
 
 
+def test_panel_buttons_opt_in_to_204_swap() -> None:
+    """htmx 2.x skips 204 swaps by default; both buttons must opt in.
+
+    The decision endpoint returns 204 No Content on success and the
+    base.html global ``htmx:beforeSwap`` hook only flips ``shouldSwap``
+    for 400/404/409/422/503. Without a per-button override the row would
+    stay rendered after a successful click, inviting duplicate clicks
+    while the operator waits for the next poll to reconcile.
+    """
+    html = _render_panel(guardrail_pending=[_view("PR-296")])
+    handler = (
+        'hx-on::before-swap="if (event.detail.xhr.status === 204) { '
+        'event.detail.shouldSwap = true; }"'
+    )
+    assert html.count(handler) == 2
+
+
 def test_panel_renders_pr_url_when_present_and_plain_text_when_missing() -> None:
     linked = _render_panel(
         guardrail_pending=[

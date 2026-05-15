@@ -9,7 +9,12 @@
    The amber palette signals "needs attention but not destructive". The
    row is replaced with empty content on 204 from the backend so the
    operator gets immediate visceral feedback; the next poll of
-   ``/partials/repo/{name}`` reconciles state with the backend. #}
+   ``/partials/repo/{name}`` reconciles state with the backend. htmx
+   2.x does not swap 204 responses by default and base.html's global
+   ``htmx:beforeSwap`` hook only opts in 400/404/409/422/503, so each
+   button installs a per-element ``before-swap`` handler that flips
+   ``shouldSwap`` for 204 — keeping the global behavior unchanged while
+   letting Approve/Reject clear the row immediately on success. #}
 {% if guardrail_pending %}
 <section class="guardrail-panel mb-6 rounded-lg border border-warn/30 bg-warn/10 p-4"
          data-guardrail-panel
@@ -44,7 +49,8 @@
                         hx-vals='{"decision": "approve"}'
                         hx-confirm="Approve guardrail violation for {{ entry.pr_id }}? PR will proceed to MERGE."
                         hx-target="closest .guardrail-row"
-                        hx-swap="outerHTML">
+                        hx-swap="outerHTML"
+                        hx-on::before-swap="if (event.detail.xhr.status === 204) { event.detail.shouldSwap = true; }">
                     Approve
                 </button>
                 <button type="button"
@@ -53,7 +59,8 @@
                         hx-vals='{"decision": "reject"}'
                         hx-confirm="Reject guardrail violation for {{ entry.pr_id }}? PR will be closed and task marked ERROR."
                         hx-target="closest .guardrail-row"
-                        hx-swap="outerHTML">
+                        hx-swap="outerHTML"
+                        hx-on::before-swap="if (event.detail.xhr.status === 204) { event.detail.shouldSwap = true; }">
                     Reject
                 </button>
             </div>
