@@ -994,8 +994,28 @@ class IdleMixin:
                 label="PAUSED inhibitors cleared, resuming",
             ):
                 return
-            self.log_event("[INFRA] PAUSED inhibitors cleared -> IDLE.")
-            self.state.state = PipelineState.IDLE
+            # Mirror the legacy WATCH-vs-IDLE resume split: a mid-watch
+            # pause leaves ``current_pr``/``current_task`` pointing at
+            # the same branch, and the legacy expired-window path
+            # resumes directly to WATCH instead of re-entering the IDLE
+            # task-selection/sync loop. Forcing IDLE here would defer
+            # monitoring of the active PR (or, if queue selection picked
+            # a different actionable task, redirect execution entirely).
+            if (
+                self.state.current_pr is not None
+                and self.state.current_task is not None
+                and self.state.current_pr.branch
+                == self.state.current_task.branch
+            ):
+                self.state.state = PipelineState.WATCH
+                self.log_event(
+                    "[INFRA] PAUSED inhibitors cleared -> WATCH."
+                )
+            else:
+                self.state.state = PipelineState.IDLE
+                self.log_event(
+                    "[INFRA] PAUSED inhibitors cleared -> IDLE."
+                )
             return
         if self.state.user_paused:
             if not getattr(self, "_user_pause_logged", False):

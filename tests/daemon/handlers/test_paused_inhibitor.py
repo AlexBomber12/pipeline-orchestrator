@@ -23,7 +23,7 @@ import pytest
 
 from src.config import FeatureFlags
 from src.inhibitor import InhibitorType, WorkInhibitor
-from src.models import PipelineState
+from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 
 from tests.runner import _helpers as h
 
@@ -408,3 +408,64 @@ def test_handle_paused_flag_on_logs_only_once_while_paused() -> None:
         if e["event"].startswith("[INFRA] PAUSED inhibited by")
     ]
     assert len(inhibited_events) == 1
+
+
+def test_handle_paused_flag_on_resumes_to_watch_when_pr_matches_task() -> None:
+    """Unified resume: matching ``current_pr.branch``/``current_task.branch`` → WATCH.
+
+    Regression for review feedback on PR-330b: the legacy expired-window
+    path resumes to WATCH when the paused runner was mid-watch on the
+    active PR, and the unified gate must preserve that split. Forcing
+    IDLE here would defer monitoring of the live PR (or, if queue
+    selection picks a different actionable task, redirect execution).
+    """
+    runner = h._make_runner()
+    _enable_flag(runner)
+    _seed_paused(runner)
+    runner.state.user_paused = False
+    runner.state.active_inhibitors = []
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="active task",
+        status=TaskStatus.DOING,
+        branch="pr-001-feature",
+    )
+    runner.state.current_pr = PRInfo(number=1, branch="pr-001-feature")
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert any(
+        e["event"] == "[INFRA] PAUSED inhibitors cleared -> WATCH."
+        for e in runner.state.history
+    )
+
+
+def test_handle_paused_flag_on_resumes_to_idle_when_pr_branch_diverges() -> None:
+    """Unified resume: divergent PR/task branches → IDLE (queue re-selection).
+
+    Companion to the WATCH variant: when ``current_pr.branch`` does not
+    match ``current_task.branch`` (or either is unset), the runner falls
+    back to the IDLE task-selection/sync path, mirroring the legacy
+    expired-window resume.
+    """
+    runner = h._make_runner()
+    _enable_flag(runner)
+    _seed_paused(runner)
+    runner.state.user_paused = False
+    runner.state.active_inhibitors = []
+    runner.state.current_task = QueueTask(
+        pr_id="PR-002",
+        title="other task",
+        status=TaskStatus.DOING,
+        branch="pr-002-other",
+    )
+    runner.state.current_pr = PRInfo(number=9, branch="pr-001-feature")
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert any(
+        e["event"] == "[INFRA] PAUSED inhibitors cleared -> IDLE."
+        for e in runner.state.history
+    )
