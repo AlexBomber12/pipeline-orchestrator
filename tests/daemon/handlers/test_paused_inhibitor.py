@@ -307,6 +307,62 @@ def test_handle_paused_flag_on_clears_stale_rate_limit_metadata() -> None:
     assert runner.state.rate_limit_reactive_coder is None
 
 
+def test_handle_paused_flag_on_routes_non_rate_limit_error_to_error() -> None:
+    """Unified resume must re-enter ERROR when ``error_message`` is non-rate-limit.
+
+    Regression for review feedback on PR-330b: ``run_cycle`` parks the
+    runner in PAUSED whenever an ERROR cycle observes
+    ``rate_limited_until is not None``, preserving the original
+    ``error_message``. When the inhibitors clear, a non-rate-limit
+    ``error_message`` means the underlying fault is still unresolved
+    and the runner must transition back to ERROR — the legacy
+    expired-window path enforces this via
+    ``_resolve_rate_limit_error_state`` and the unified path must
+    match. Otherwise the daemon would silently dispatch from IDLE with
+    an unresolved error context still in state.
+    """
+    runner = h._make_runner()
+    _enable_flag(runner)
+    _seed_paused(runner)
+    runner.state.user_paused = False
+    runner.state.active_inhibitors = []
+    runner.state.error_message = "Build failed: missing dependency X"
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "Build failed: missing dependency X"
+    assert not any(
+        e["event"] == "[INFRA] PAUSED inhibitors cleared -> IDLE."
+        for e in runner.state.history
+    )
+
+
+def test_handle_paused_flag_on_clears_rate_limit_error_message_and_idles() -> None:
+    """Unified resume must clear a rate-limit-shaped ``error_message`` and IDLE.
+
+    Companion to ``test_handle_paused_flag_on_routes_non_rate_limit_error_to_error``:
+    when ``error_message`` is itself the legacy rate-limit string,
+    ``_resolve_rate_limit_error_state`` drops it and lets the IDLE
+    transition proceed — matching the legacy expired-window path.
+    """
+    runner = h._make_runner()
+    _enable_flag(runner)
+    _seed_paused(runner)
+    runner.state.user_paused = False
+    runner.state.active_inhibitors = []
+    runner.state.error_message = "API rate limit exceeded (429)"
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message is None
+    assert any(
+        "cleared legacy rate-limit" in e["event"]
+        for e in runner.state.history
+    )
+
+
 def test_handle_paused_flag_on_logs_only_once_while_paused() -> None:
     """Repeat calls under unified path should not spam the event log."""
     runner = h._make_runner()

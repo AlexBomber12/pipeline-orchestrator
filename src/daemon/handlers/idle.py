@@ -968,6 +968,22 @@ class IdleMixin:
             self.state.rate_limited_until = None
             self.state.rate_limit_reactive = False
             self.state.rate_limit_reactive_coder = None
+            # Route any lingering ``error_message`` through the
+            # rate-limit recovery resolver before the IDLE transition.
+            # ``run_cycle`` parks runners in PAUSED when an ERROR cycle
+            # finds ``rate_limited_until`` set, preserving the original
+            # ``error_message``. When the inhibitors clear, a
+            # non-rate-limit message means the underlying fault is
+            # still unresolved and the runner must return to ERROR
+            # instead of silently dispatching from IDLE — the legacy
+            # expired-window path enforces this and the unified path
+            # must match.
+            self._error_diagnose_policy.reset(self)
+            if await self._resolve_rate_limit_error_state(
+                log_prefix="[RATE-LIMIT]",
+                label="PAUSED inhibitors cleared, resuming",
+            ):
+                return
             self.log_event("[INFRA] PAUSED inhibitors cleared -> IDLE.")
             self.state.state = PipelineState.IDLE
             return
