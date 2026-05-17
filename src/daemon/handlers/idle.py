@@ -25,7 +25,7 @@ from src.daemon.main_commit_audit import (
 )
 from src.dag import get_eligible_tasks
 from src.github import prs as gh_prs
-from src.inhibitor import is_work_inhibited
+from src.inhibitor import WorkInhibitor, is_work_inhibited
 from src.models import PipelineState, QueueTask, TaskStatus
 from src.onboarding.markdown_sections import MarkerError
 from src.onboarding.reconciliation import reconcile_agents_md
@@ -720,17 +720,31 @@ class IdleMixin:
         )
         self._idle_merged_pr_304_streak = 0
         # PR-330a: per-repo feature flag selects the unified inhibitor
-        # check over the legacy ``user_paused`` branch. Both paths must
-        # produce identical observable behavior (same return semantics,
-        # one log event). The flag stays False by default until PR-330d
-        # flips production; canary repos opt in earlier via
-        # ``feature_flags.use_unified_inhibitor_check``.
+        # check over the legacy ``user_paused`` branch. The unified
+        # gate evaluates the inhibitor list once per registered coder
+        # so a per-coder ``RATE_LIMIT`` (e.g. for ``codex``) only stops
+        # dispatch when every coder is blocked; if at least one coder
+        # remains eligible the handler falls through to the selector,
+        # mirroring the legacy path where ``selector._is_rate_limited``
+        # filters per coder during selection. The flag stays False by
+        # default until PR-330d flips production; canary repos opt in
+        # earlier via ``feature_flags.use_unified_inhibitor_check``.
         if self.repo_config.feature_flags.use_unified_inhibitor_check:
-            blocked, blocking = is_work_inhibited(self.state)
-            if blocked:
-                blocking_types = [
-                    inh.inhibitor_type.value for inh in blocking
-                ]
+            blocking_by_coder: dict[str, list[WorkInhibitor]] = {}
+            for name in self._registry.coder_names():
+                blocked, blocking = is_work_inhibited(
+                    self.state, coder=name
+                )
+                if not blocked:
+                    blocking_by_coder.clear()
+                    break
+                blocking_by_coder[name] = blocking
+            if blocking_by_coder:
+                blocking_types = sorted({
+                    inh.inhibitor_type.value
+                    for blockers in blocking_by_coder.values()
+                    for inh in blockers
+                })
                 self.log_event(
                     f"[INFRA] IDLE inhibited by {blocking_types}"
                 )

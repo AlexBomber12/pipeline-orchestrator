@@ -47,6 +47,34 @@ def _inhibitor(kind: InhibitorType) -> WorkInhibitor:
     )
 
 
+def _inhibitors_for(kind: InhibitorType) -> list[WorkInhibitor]:
+    """Return inhibitors that block every registered coder.
+
+    ``RATE_LIMIT`` is per-coder, so it must be seeded for both
+    ``claude`` and ``codex`` to actually halt IDLE dispatch — the
+    unified gate falls through whenever any coder is still eligible.
+    All other inhibitor types are global, so a single entry is enough.
+    """
+    if kind == InhibitorType.RATE_LIMIT:
+        return [
+            WorkInhibitor(
+                inhibitor_type=kind,
+                coder_affected="claude",
+                expires_at=_future(),
+                reason_text="claude rate-limited",
+                source_key="state:test.rate_limited_coder_until.claude",
+            ),
+            WorkInhibitor(
+                inhibitor_type=kind,
+                coder_affected="codex",
+                expires_at=_future(),
+                reason_text="codex rate-limited",
+                source_key="state:test.rate_limited_coder_until.codex",
+            ),
+        ]
+    return [_inhibitor(kind)]
+
+
 def _enable_flag(runner: Any) -> None:
     runner.repo_config = runner.repo_config.model_copy(
         update={
@@ -125,7 +153,7 @@ def test_handle_idle_flag_off_uses_legacy_user_pause_check(
     runner = h._make_runner()
     _disable_flag(runner)
     runner.state.user_paused = True
-    runner.state.active_inhibitors = [_inhibitor(kind)]
+    runner.state.active_inhibitors = _inhibitors_for(kind)
 
     asyncio.run(runner.handle_idle())
 
@@ -141,10 +169,10 @@ def test_handle_idle_flag_off_uses_legacy_user_pause_check(
 def test_handle_idle_flag_on_uses_helper(
     kind: InhibitorType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Unified path returns on any active inhibitor for every scenario."""
+    """Unified path returns when every registered coder is blocked."""
     runner = h._make_runner()
     _enable_flag(runner)
-    runner.state.active_inhibitors = [_inhibitor(kind)]
+    runner.state.active_inhibitors = _inhibitors_for(kind)
 
     asyncio.run(runner.handle_idle())
 
@@ -197,7 +225,16 @@ def test_handle_idle_flag_off_uses_legacy_rate_limit_check_codex() -> None:
     assert runner.state.current_task is None
 
 
-def test_handle_idle_flag_on_uses_helper_rate_limit_claude() -> None:
+def test_handle_idle_flag_on_per_coder_rate_limit_does_not_block_other_coder_claude(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A claude-only rate limit must leave codex eligible for dispatch.
+
+    Mirrors the legacy ``selector._is_rate_limited`` per-coder filter:
+    inhibitors scoped to a single coder cannot stop the IDLE handler
+    when another coder is still runnable.
+    """
+    _stub_dispatchable_world(monkeypatch)
     runner = h._make_runner()
     _enable_flag(runner)
     runner.state.active_inhibitors = [
@@ -212,14 +249,18 @@ def test_handle_idle_flag_on_uses_helper_rate_limit_claude() -> None:
 
     asyncio.run(runner.handle_idle())
 
-    assert runner.state.state == PipelineState.IDLE
-    assert runner.state.current_task is None
-    assert any(
-        "rate_limit" in e["event"] for e in runner.state.history
+    assert runner.state.state == PipelineState.WATCH
+    assert not any(
+        e["event"].startswith("[INFRA] IDLE inhibited by")
+        for e in runner.state.history
     )
 
 
-def test_handle_idle_flag_on_uses_helper_rate_limit_codex() -> None:
+def test_handle_idle_flag_on_per_coder_rate_limit_does_not_block_other_coder_codex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A codex-only rate limit must leave claude eligible for dispatch."""
+    _stub_dispatchable_world(monkeypatch)
     runner = h._make_runner()
     _enable_flag(runner)
     runner.state.active_inhibitors = [
@@ -234,10 +275,42 @@ def test_handle_idle_flag_on_uses_helper_rate_limit_codex() -> None:
 
     asyncio.run(runner.handle_idle())
 
+    assert runner.state.state == PipelineState.WATCH
+    assert not any(
+        e["event"].startswith("[INFRA] IDLE inhibited by")
+        for e in runner.state.history
+    )
+
+
+def test_handle_idle_flag_on_returns_when_every_coder_rate_limited() -> None:
+    """Per-coder inhibitors for *all* coders collapse to a global block."""
+    runner = h._make_runner()
+    _enable_flag(runner)
+    runner.state.active_inhibitors = [
+        WorkInhibitor(
+            inhibitor_type=InhibitorType.RATE_LIMIT,
+            coder_affected="claude",
+            expires_at=_future(),
+            reason_text="claude rate-limited",
+            source_key="state:octo__demo.rate_limited_coder_until.claude",
+        ),
+        WorkInhibitor(
+            inhibitor_type=InhibitorType.RATE_LIMIT,
+            coder_affected="codex",
+            expires_at=_future(),
+            reason_text="codex rate-limited",
+            source_key="state:octo__demo.rate_limited_coder_until.codex",
+        ),
+    ]
+
+    asyncio.run(runner.handle_idle())
+
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
     assert any(
-        "rate_limit" in e["event"] for e in runner.state.history
+        e["event"].startswith("[INFRA] IDLE inhibited by")
+        and "rate_limit" in e["event"]
+        for e in runner.state.history
     )
 
 
@@ -254,13 +327,13 @@ def test_handle_idle_both_paths_emit_same_log_event() -> None:
     legacy = h._make_runner()
     _disable_flag(legacy)
     legacy.state.user_paused = True
-    legacy.state.active_inhibitors = [_inhibitor(InhibitorType.USER_PAUSE)]
+    legacy.state.active_inhibitors = _inhibitors_for(InhibitorType.USER_PAUSE)
     asyncio.run(legacy.handle_idle())
 
     unified = h._make_runner()
     _enable_flag(unified)
     unified.state.user_paused = True
-    unified.state.active_inhibitors = [_inhibitor(InhibitorType.USER_PAUSE)]
+    unified.state.active_inhibitors = _inhibitors_for(InhibitorType.USER_PAUSE)
     asyncio.run(unified.handle_idle())
 
     assert legacy.state.state == unified.state.state == PipelineState.IDLE
