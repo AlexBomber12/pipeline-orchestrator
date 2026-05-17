@@ -333,6 +333,26 @@ async def test_derive_skips_cascade_panic_when_payload_missing_enabled_flag() ->
 
 
 @pytest.mark.asyncio
+async def test_derive_skips_cascade_panic_when_threshold_disables_detector() -> None:
+    """Mirror ``check_cascade_escalate_state``: when ``cascade_escalate_threshold``
+    is ``<= 0`` the daemon returns ``False`` immediately without reading the
+    panic record, so a stale ``daemon:panic_state`` (e.g. left behind after
+    the operator lowered the threshold to disable cascade detection) must not
+    surface as a CASCADE_PANIC inhibitor here either.
+    """
+    redis = _FakeRedis()
+    redis.store[daemon_panic_state()] = "{\"enabled\": true}"
+    cfg = DaemonConfig(cascade_escalate_threshold=0)
+    state = _make_state()
+
+    result = await derive_active_inhibitors(state, redis, cfg)
+
+    assert not any(
+        inh.inhibitor_type is InhibitorType.CASCADE_PANIC for inh in result
+    )
+
+
+@pytest.mark.asyncio
 async def test_derive_skips_cascade_panic_when_payload_is_malformed() -> None:
     """Malformed/non-dict payloads are ignored by ``_read_panic_state``;
     the derivation must agree rather than emit a spurious inhibitor.

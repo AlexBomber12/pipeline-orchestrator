@@ -290,26 +290,33 @@ async def derive_active_inhibitors(
                 )
             )
 
-    panic_key = daemon_panic_state()
-    # Mirror ``cascade_monitor.check_cascade_escalate_state``: a present key
-    # is not sufficient — the daemon only treats panic as active when the
-    # JSON payload parses to a dict with ``enabled=True``. Stale, disabled,
-    # or malformed records leave dispatch unblocked, so they must not
-    # surface as CASCADE_PANIC inhibitors here either.
-    raw_panic = await redis.get(panic_key)
-    if raw_panic is not None:
-        try:
-            parsed_panic = json.loads(raw_panic)
-        except (TypeError, ValueError):
-            parsed_panic = None
-        if isinstance(parsed_panic, dict) and parsed_panic.get("enabled"):
-            inhibitors.append(
-                WorkInhibitor(
-                    inhibitor_type=InhibitorType.CASCADE_PANIC,
-                    reason_text="Cascade panic mode auto-stop",
-                    source_key=panic_key,
+    # Mirror ``cascade_monitor.check_cascade_escalate_state``: when the
+    # configured threshold is ``<= 0`` the daemon returns ``False``
+    # immediately and never consults the panic record, so a stale
+    # ``daemon:panic_state`` from a prior threshold setting must not
+    # surface as an active inhibitor here either. Only read the key
+    # when panic detection is configured to be live.
+    if cfg.cascade_escalate_threshold > 0:
+        panic_key = daemon_panic_state()
+        # A present key is not sufficient — the daemon only treats panic
+        # as active when the JSON payload parses to a dict with
+        # ``enabled=True``. Stale, disabled, or malformed records leave
+        # dispatch unblocked, so they must not surface as CASCADE_PANIC
+        # inhibitors here either.
+        raw_panic = await redis.get(panic_key)
+        if raw_panic is not None:
+            try:
+                parsed_panic = json.loads(raw_panic)
+            except (TypeError, ValueError):
+                parsed_panic = None
+            if isinstance(parsed_panic, dict) and parsed_panic.get("enabled"):
+                inhibitors.append(
+                    WorkInhibitor(
+                        inhibitor_type=InhibitorType.CASCADE_PANIC,
+                        reason_text="Cascade panic mode auto-stop",
+                        source_key=panic_key,
+                    )
                 )
-            )
 
     # ``ERROR_RATE_AUTO_PAUSE`` is intentionally not derived here. The only
     # signal currently available is the ``error_rate_last_auto_pause:<repo>``
