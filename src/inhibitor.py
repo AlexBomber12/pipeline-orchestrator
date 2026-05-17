@@ -139,11 +139,18 @@ async def derive_active_inhibitors(
             )
         )
 
+    # Mirror ``selector._is_rate_limited``: the typed per-coder dict is the
+    # primary source, but the legacy global expiry, reactive marker, and
+    # ``rate_limited_coders`` set still gate dispatch on upgraded repos
+    # whose persisted state predates ``rate_limited_coder_until``. PR-328
+    # retires the legacy fields once dispatcher migration completes.
+    rate_limited_seen: set[str] = set()
     for coder, until in state.rate_limited_coder_until.items():
         until_aware = (
             until.replace(tzinfo=timezone.utc) if until.tzinfo is None else until
         )
         if until_aware > current:
+            rate_limited_seen.add(coder)
             inhibitors.append(
                 WorkInhibitor(
                     inhibitor_type=InhibitorType.RATE_LIMIT,
@@ -155,6 +162,57 @@ async def derive_active_inhibitors(
                     ),
                 )
             )
+
+    legacy_until = state.rate_limited_until
+    legacy_until_aware: Optional[datetime] = None
+    if legacy_until is not None:
+        legacy_until_aware = (
+            legacy_until.replace(tzinfo=timezone.utc)
+            if legacy_until.tzinfo is None
+            else legacy_until
+        )
+
+    reactive_coder = state.rate_limit_reactive_coder
+    if (
+        legacy_until_aware is not None
+        and reactive_coder is None
+        and legacy_until_aware > current
+        and "claude" not in rate_limited_seen
+    ):
+        rate_limited_seen.add("claude")
+        inhibitors.append(
+            WorkInhibitor(
+                inhibitor_type=InhibitorType.RATE_LIMIT,
+                coder_affected="claude",
+                expires_at=legacy_until_aware,
+                reason_text="claude rate-limited",
+                source_key=f"state:{state.name}.rate_limited_until",
+            )
+        )
+
+    if reactive_coder is not None and reactive_coder not in rate_limited_seen:
+        rate_limited_seen.add(reactive_coder)
+        inhibitors.append(
+            WorkInhibitor(
+                inhibitor_type=InhibitorType.RATE_LIMIT,
+                coder_affected=reactive_coder,
+                reason_text=f"{reactive_coder} rate-limited",
+                source_key=f"state:{state.name}.rate_limit_reactive_coder",
+            )
+        )
+
+    for coder in state.rate_limited_coders:
+        if coder in rate_limited_seen:
+            continue
+        rate_limited_seen.add(coder)
+        inhibitors.append(
+            WorkInhibitor(
+                inhibitor_type=InhibitorType.RATE_LIMIT,
+                coder_affected=coder,
+                reason_text=f"{coder} rate-limited",
+                source_key=f"state:{state.name}.rate_limited_coders",
+            )
+        )
 
     session_cap = cfg.spend_ceiling_session_percent
     weekly_cap = cfg.spend_ceiling_weekly_percent

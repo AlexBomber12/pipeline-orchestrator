@@ -276,6 +276,104 @@ async def test_derive_skips_expired_per_coder_rate_limits() -> None:
 
 
 @pytest.mark.asyncio
+async def test_derive_returns_rate_limit_from_legacy_rate_limited_until() -> None:
+    """Upgraded repos that only have the legacy global expiry still gate dispatch.
+
+    ``selector._is_rate_limited`` falls back to ``state.rate_limited_until``
+    when ``rate_limit_reactive_coder`` is unset and the coder is ``"claude"``,
+    so the typed list must surface a matching ``RATE_LIMIT`` inhibitor.
+    """
+    redis = _FakeRedis()
+    cfg = DaemonConfig()
+    future = datetime.now(timezone.utc) + timedelta(minutes=10)
+    state = _make_state(rate_limited_until=future)
+
+    result = await derive_active_inhibitors(state, redis, cfg)
+
+    matches = [i for i in result if i.inhibitor_type is InhibitorType.RATE_LIMIT]
+    assert len(matches) == 1
+    assert matches[0].coder_affected == "claude"
+    assert matches[0].expires_at == future
+    assert matches[0].source_key == "state:octo__demo.rate_limited_until"
+
+
+@pytest.mark.asyncio
+async def test_derive_skips_legacy_rate_limited_until_when_reactive_coder_set() -> None:
+    """Mirror selector: with a reactive marker the global expiry no longer gates claude.
+
+    The selector returns ``True`` only via the ``rate_limit_reactive_coder``
+    branch in this case, so the derivation must emit one inhibitor for the
+    reactive coder and nothing for ``"claude"`` via the global expiry.
+    """
+    redis = _FakeRedis()
+    cfg = DaemonConfig()
+    future = datetime.now(timezone.utc) + timedelta(minutes=10)
+    state = _make_state(
+        rate_limited_until=future,
+        rate_limit_reactive_coder="codex",
+    )
+
+    result = await derive_active_inhibitors(state, redis, cfg)
+
+    matches = [i for i in result if i.inhibitor_type is InhibitorType.RATE_LIMIT]
+    assert len(matches) == 1
+    assert matches[0].coder_affected == "codex"
+    assert matches[0].source_key == "state:octo__demo.rate_limit_reactive_coder"
+
+
+@pytest.mark.asyncio
+async def test_derive_skips_expired_legacy_rate_limited_until() -> None:
+    redis = _FakeRedis()
+    cfg = DaemonConfig()
+    past = datetime.now(timezone.utc) - timedelta(minutes=10)
+    state = _make_state(rate_limited_until=past)
+
+    result = await derive_active_inhibitors(state, redis, cfg)
+
+    assert not any(
+        inh.inhibitor_type is InhibitorType.RATE_LIMIT for inh in result
+    )
+
+
+@pytest.mark.asyncio
+async def test_derive_returns_rate_limit_from_legacy_rate_limited_coders_set() -> None:
+    redis = _FakeRedis()
+    cfg = DaemonConfig()
+    state = _make_state(rate_limited_coders={"codex"})
+
+    result = await derive_active_inhibitors(state, redis, cfg)
+
+    matches = [i for i in result if i.inhibitor_type is InhibitorType.RATE_LIMIT]
+    assert len(matches) == 1
+    assert matches[0].coder_affected == "codex"
+    assert matches[0].expires_at is None
+    assert matches[0].source_key == "state:octo__demo.rate_limited_coders"
+
+
+@pytest.mark.asyncio
+async def test_derive_dedupes_rate_limit_when_typed_and_legacy_overlap() -> None:
+    """Typed per-coder dict wins when the same coder appears in both sources."""
+    redis = _FakeRedis()
+    cfg = DaemonConfig()
+    future = datetime.now(timezone.utc) + timedelta(minutes=10)
+    state = _make_state(
+        rate_limited_coder_until={"claude": future},
+        rate_limit_reactive_coder="claude",
+        rate_limited_coders={"claude"},
+    )
+
+    result = await derive_active_inhibitors(state, redis, cfg)
+
+    matches = [i for i in result if i.inhibitor_type is InhibitorType.RATE_LIMIT]
+    assert len(matches) == 1
+    assert matches[0].coder_affected == "claude"
+    assert matches[0].expires_at == future
+    assert matches[0].source_key == (
+        "state:octo__demo.rate_limited_coder_until.claude"
+    )
+
+
+@pytest.mark.asyncio
 async def test_derive_returns_multiple_inhibitors_when_stacked() -> None:
     redis = _FakeRedis()
     _set_github_budget(redis, remaining_percent=3)
