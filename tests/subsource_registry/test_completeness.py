@@ -33,6 +33,16 @@ SUBSOURCE_SOURCE_FILES = [
     "src/subsource_registry.py",
 ]
 
+# Files scanned for the dead-entry drift check. The registry module is
+# excluded: its ``_REGISTRY`` keys are by definition every registered name,
+# so including it would make ``test_every_registered_subsource_appears_in_source``
+# pass vacuously even when a name has no write/render site backing it.
+SUBSOURCE_USE_SITE_FILES = [
+    relpath
+    for relpath in SUBSOURCE_SOURCE_FILES
+    if relpath != "src/subsource_registry.py"
+]
+
 SUBSOURCE_TEMPLATE_FILES = [
     "src/web/templates/components/cancellation_card.html",
 ]
@@ -201,7 +211,7 @@ def test_every_template_subsource_branch_is_registered():
 def test_every_registered_subsource_appears_in_source():
     registered = subsource_registry.all_subsources()
     seen: set[str] = set()
-    for relpath in SUBSOURCE_SOURCE_FILES:
+    for relpath in SUBSOURCE_USE_SITE_FILES:
         path = REPO_ROOT / relpath
         if not path.is_file():
             continue
