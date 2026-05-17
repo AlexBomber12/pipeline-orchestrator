@@ -95,6 +95,55 @@ def test_model_is_frozen() -> None:
         inhibitor.reason_text = "mutated"
 
 
+def test_naive_expires_at_is_normalized_to_utc_for_is_blocking_now() -> None:
+    naive_future = (datetime.now(timezone.utc) + timedelta(seconds=120)).replace(
+        tzinfo=None
+    )
+    assert naive_future.tzinfo is None
+    inhibitor = WorkInhibitor(
+        inhibitor_type=InhibitorType.USER_STOP,
+        expires_at=naive_future,
+        source_key="control:stop",
+    )
+    assert inhibitor.expires_at is not None
+    assert inhibitor.expires_at.tzinfo is timezone.utc
+    assert inhibitor.is_blocking_now() is True
+
+
+def test_naive_expires_at_is_normalized_to_utc_for_time_remaining_seconds() -> None:
+    naive_past = (datetime.now(timezone.utc) - timedelta(seconds=30)).replace(
+        tzinfo=None
+    )
+    assert naive_past.tzinfo is None
+    inhibitor = WorkInhibitor(
+        inhibitor_type=InhibitorType.RATE_LIMIT,
+        coder_affected="claude",
+        expires_at=naive_past,
+        source_key="rate_limited_coder_until:claude",
+    )
+    assert inhibitor.time_remaining_seconds() == 0.0
+
+
+def test_explicit_none_expires_at_passes_through_validator() -> None:
+    inhibitor = WorkInhibitor(
+        inhibitor_type=InhibitorType.USER_PAUSE,
+        expires_at=None,
+        source_key="control:user_paused",
+    )
+    assert inhibitor.expires_at is None
+
+
+def test_aware_non_utc_expires_at_is_converted_to_utc() -> None:
+    pacific = timezone(timedelta(hours=-8))
+    aware_pacific = datetime(2030, 6, 15, 4, 0, tzinfo=pacific)
+    inhibitor = WorkInhibitor(
+        inhibitor_type=InhibitorType.GITHUB_BUDGET_PAUSE,
+        expires_at=aware_pacific,
+        source_key="github_rate_limit_budget_pause",
+    )
+    assert inhibitor.expires_at == datetime(2030, 6, 15, 12, 0, tzinfo=timezone.utc)
+
+
 def test_json_round_trip_preserves_fields() -> None:
     original = WorkInhibitor(
         inhibitor_type=InhibitorType.GITHUB_BUDGET_SLOWDOWN,

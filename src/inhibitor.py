@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class InhibitorType(str, Enum):
@@ -33,6 +33,19 @@ class WorkInhibitor(BaseModel):
     source_key: str = Field(
         description="Redis key from which this inhibitor was derived."
     )
+
+    @field_validator("expires_at")
+    @classmethod
+    def _normalize_expires_at_to_utc(
+        cls, value: Optional[datetime]
+    ) -> Optional[datetime]:
+        # Naive datetimes (e.g. from ISO strings without offset) would raise
+        # TypeError when compared against the aware UTC `now` used below.
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
 
     def is_blocking_now(self, now: Optional[datetime] = None) -> bool:
         """Return True if expires_at is None or in the future."""
