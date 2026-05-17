@@ -374,6 +374,35 @@ async def test_derive_dedupes_rate_limit_when_typed_and_legacy_overlap() -> None
 
 
 @pytest.mark.asyncio
+async def test_derive_expired_typed_entry_short_circuits_legacy_fields() -> None:
+    """Mirror selector short-circuit on the typed per-coder dict.
+
+    ``selector._is_rate_limited`` returns ``False`` once the typed entry for
+    a coder has expired, without consulting the legacy ``rate_limited_until``,
+    ``rate_limit_reactive_coder``, or ``rate_limited_coders`` fields. The
+    derivation must agree so persisted mixed state (e.g. an expired
+    ``rate_limited_coder_until['codex']`` paired with a stale legacy
+    ``rate_limit_reactive_coder='codex'``) does not surface a spurious
+    ``RATE_LIMIT`` inhibitor that would block dispatch after consumers
+    switch to this helper.
+    """
+    redis = _FakeRedis()
+    cfg = DaemonConfig()
+    past = datetime.now(timezone.utc) - timedelta(minutes=10)
+    state = _make_state(
+        rate_limited_coder_until={"codex": past},
+        rate_limit_reactive_coder="codex",
+        rate_limited_coders={"codex"},
+    )
+
+    result = await derive_active_inhibitors(state, redis, cfg)
+
+    assert not any(
+        inh.inhibitor_type is InhibitorType.RATE_LIMIT for inh in result
+    )
+
+
+@pytest.mark.asyncio
 async def test_derive_returns_multiple_inhibitors_when_stacked() -> None:
     redis = _FakeRedis()
     _set_github_budget(redis, remaining_percent=3)

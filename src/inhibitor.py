@@ -146,11 +146,16 @@ async def derive_active_inhibitors(
     # retires the legacy fields once dispatcher migration completes.
     rate_limited_seen: set[str] = set()
     for coder, until in state.rate_limited_coder_until.items():
+        # Presence of a typed entry short-circuits the selector even when
+        # the expiry has elapsed (selector returns ``False`` without
+        # consulting the legacy fields). Mark the coder seen unconditionally
+        # so a stale typed entry does not let legacy branches resurrect a
+        # spurious ``RATE_LIMIT`` inhibitor here either.
+        rate_limited_seen.add(coder)
         until_aware = (
             until.replace(tzinfo=timezone.utc) if until.tzinfo is None else until
         )
         if until_aware > current:
-            rate_limited_seen.add(coder)
             inhibitors.append(
                 WorkInhibitor(
                     inhibitor_type=InhibitorType.RATE_LIMIT,
