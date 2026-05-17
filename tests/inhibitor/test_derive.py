@@ -186,7 +186,7 @@ async def test_derive_returns_error_rate_auto_pause_when_state_field_set() -> No
     redis = _FakeRedis()
     redis.store[last_auto_pause_key("octo__demo")] = "1700000000.0"
     cfg = DaemonConfig()
-    state = _make_state()
+    state = _make_state(user_paused=True)
 
     result = await derive_active_inhibitors(state, redis, cfg)
 
@@ -196,6 +196,52 @@ async def test_derive_returns_error_rate_auto_pause_when_state_field_set() -> No
     ]
     assert len(matches) == 1
     assert matches[0].source_key == last_auto_pause_key("octo__demo")
+
+
+@pytest.mark.asyncio
+async def test_derive_skips_error_rate_auto_pause_when_user_resumed() -> None:
+    """Historical ``last_auto_pause_key`` must not block a resumed repo.
+
+    ``mark_auto_pause`` writes a non-expiring marker that is never cleared
+    on manual Resume, so once a repo has ever auto-paused the key persists
+    indefinitely. Gating the inhibitor on ``state.user_paused`` ensures the
+    derived list mirrors the live operator decision.
+    """
+    redis = _FakeRedis()
+    redis.store[last_auto_pause_key("octo__demo")] = "1700000000.0"
+    cfg = DaemonConfig()
+    state = _make_state(user_paused=False)
+
+    result = await derive_active_inhibitors(state, redis, cfg)
+
+    assert not any(
+        inh.inhibitor_type is InhibitorType.ERROR_RATE_AUTO_PAUSE for inh in result
+    )
+
+
+@pytest.mark.asyncio
+async def test_derive_skips_github_budget_when_snapshot_reset_at_elapsed() -> None:
+    """Stale budget snapshots must not surface as active inhibitors.
+
+    ``runner._check_github_api_budget`` gates both pause and slowdown
+    branches on ``now < budget.reset_at``; the derivation must agree so
+    the typed list cannot disagree with the runner's blocking decision.
+    """
+    redis = _FakeRedis()
+    now = datetime(2030, 6, 15, 12, 0, tzinfo=timezone.utc)
+    _set_github_budget(
+        redis,
+        remaining_percent=3,
+        reset_at=now - timedelta(minutes=1),
+    )
+    cfg = DaemonConfig()
+    state = _make_state()
+
+    result = await derive_active_inhibitors(state, redis, cfg, now=now)
+
+    kinds = [inh.inhibitor_type for inh in result]
+    assert InhibitorType.GITHUB_BUDGET_PAUSE not in kinds
+    assert InhibitorType.GITHUB_BUDGET_SLOWDOWN not in kinds
 
 
 @pytest.mark.asyncio
