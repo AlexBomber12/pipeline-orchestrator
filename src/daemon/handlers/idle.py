@@ -926,6 +926,40 @@ class IdleMixin:
 
     async def handle_paused(self) -> None:
         """Wait for rate limit window to expire, then resume previous flow."""
+        # PR-330b: per-repo feature flag selects the unified inhibitor
+        # exit check over the legacy ``user_paused``/``rate_limited_until``
+        # branches. PAUSED is a global state — any inhibitor (per-coder
+        # or global) keeps the repo paused, so the gate calls
+        # ``is_work_inhibited`` with ``coder=None`` and treats a clean
+        # inhibitor list as the signal to transition back to IDLE.
+        # ``GITHUB_BUDGET_SLOWDOWN`` is excluded for the same reason as
+        # the IDLE gate: it is a polling-cadence throttle enforced at
+        # ``_check_github_api_budget`` and was never part of the legacy
+        # PAUSED entry/exit conditions. The flag stays False by default
+        # until PR-330d flips production; canary repos opt in earlier
+        # via ``feature_flags.use_unified_inhibitor_check``.
+        if self.repo_config.feature_flags.use_unified_inhibitor_check:
+            _, blocking = is_work_inhibited(self.state, coder=None)
+            hard_blocking = [
+                inh
+                for inh in blocking
+                if inh.inhibitor_type
+                != InhibitorType.GITHUB_BUDGET_SLOWDOWN
+            ]
+            if hard_blocking:
+                blocking_types = sorted(
+                    {inh.inhibitor_type.value for inh in hard_blocking}
+                )
+                if not getattr(self, "_paused_inhibited_logged", False):
+                    self.log_event(
+                        f"[INFRA] PAUSED inhibited by {blocking_types}"
+                    )
+                    self._paused_inhibited_logged = True
+                return
+            self._paused_inhibited_logged = False
+            self.log_event("[INFRA] PAUSED inhibitors cleared -> IDLE.")
+            self.state.state = PipelineState.IDLE
+            return
         if self.state.user_paused:
             if not getattr(self, "_user_pause_logged", False):
                 self.log_event("[INFRA] Paused. Press Play to resume.")
