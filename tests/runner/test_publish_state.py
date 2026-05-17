@@ -766,6 +766,36 @@ def test_publish_state_populates_inhibitors() -> None:
     assert runner.state.active_inhibitors == persisted.active_inhibitors
 
 
+def test_publish_state_derives_inhibitors_after_redis_refresh() -> None:
+    """Regression: ``derive_active_inhibitors`` must run *after*
+    ``_refresh_user_paused_from_redis`` (and after the transaction branch
+    merges the persisted pause flag) so the inhibitor list cannot disagree
+    with the ``user_paused`` field on the same payload. The in-memory
+    ``user_paused`` is stale (False), but Redis already holds True — the
+    persisted snapshot must surface USER_PAUSE."""
+    from src.inhibitor import InhibitorType
+
+    runner = _make_runner()
+    assert isinstance(runner.redis, _FakeRedis)
+    state_key = f"pipeline:{runner.name}"
+    persisted = RepoState(
+        url=runner.state.url,
+        name=runner.name,
+        last_updated=datetime.now(timezone.utc),
+        user_paused=True,
+    )
+    runner.redis.store[state_key] = persisted.model_dump_json()
+    runner.state.user_paused = False
+
+    asyncio.run(runner.publish_state())
+
+    _key, payload = runner.redis.writes[-1]
+    written = RepoState.model_validate_json(payload)
+    assert written.user_paused is True
+    assert len(written.active_inhibitors) == 1
+    assert written.active_inhibitors[0].inhibitor_type is InhibitorType.USER_PAUSE
+
+
 def test_publish_state_handles_derive_exception_gracefully(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
