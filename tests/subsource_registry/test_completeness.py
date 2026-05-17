@@ -81,20 +81,28 @@ class _SubsourceLiteralCollector(ast.NodeVisitor):
       (registry definition site)
     * comparison where one operand is the ``subsource`` name/attribute
       or ``...get("subsource")`` (read-side dispatch, e.g.
-      ``payload.get("subsource") == "X"``)
+      ``payload.get("subsource") == "X"`` or membership form
+      ``payload.get("subsource") in ("X", "Y")``)
     * dict literal whose assignment target name marks its keys or values
       as subsources (``_SUBSOURCE_TO_*`` keys, ``*_TO_SUBSOURCE`` values,
       ``_REGISTRY`` keys)
-    * set literal assigned to ``SUBSOURCE_VOCABULARY``
+    * set literal assigned to ``SUBSOURCE_VOCABULARY`` (opt-in via
+      ``include_vocabulary_set``; disabled for the dead-entry scan so
+      vocabulary membership alone never qualifies as a use site)
     """
 
     _SUBSOURCE_NAMES = {"subsource", "_subsource"}
 
-    def __init__(self) -> None:
+    def __init__(self, *, include_vocabulary_set: bool = True) -> None:
         self.found: set[str] = set()
         self._assign_target: str | None = None
+        self._include_vocabulary_set = include_vocabulary_set
 
     def _record(self, node: ast.AST | None) -> None:
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            for elt in node.elts:
+                self._record(elt)
+            return
         if (
             isinstance(node, ast.Constant)
             and isinstance(node.value, str)
@@ -134,7 +142,10 @@ class _SubsourceLiteralCollector(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Set(self, node: ast.Set) -> None:
-        if (self._assign_target or "").upper() == "SUBSOURCE_VOCABULARY":
+        if (
+            self._include_vocabulary_set
+            and (self._assign_target or "").upper() == "SUBSOURCE_VOCABULARY"
+        ):
             for elt in node.elts:
                 self._record(elt)
         self.generic_visit(node)
@@ -176,9 +187,13 @@ class _SubsourceLiteralCollector(ast.NodeVisitor):
         return False
 
 
-def _collect_python_subsource_literals(path: Path) -> set[str]:
+def _collect_python_subsource_literals(
+    path: Path, *, include_vocabulary_set: bool = True
+) -> set[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    collector = _SubsourceLiteralCollector()
+    collector = _SubsourceLiteralCollector(
+        include_vocabulary_set=include_vocabulary_set
+    )
     collector.visit(tree)
     return collector.found
 
@@ -218,7 +233,9 @@ def test_every_registered_subsource_appears_in_source():
     registered = subsource_registry.all_subsources()
     seen: set[str] = set()
     for path in _python_use_site_files():
-        seen |= _collect_python_subsource_literals(path)
+        seen |= _collect_python_subsource_literals(
+            path, include_vocabulary_set=False
+        )
     for path in _all_template_files():
         seen |= _collect_template_subsource_branches(path)
     unused = registered - seen
@@ -238,3 +255,60 @@ def test_plant_failing_case_fires_assertion(monkeypatch):
     monkeypatch.setattr(subsource_registry, "all_subsources", fake_lookup)
     with pytest.raises(AssertionError, match="crash"):
         test_every_python_subsource_literal_is_registered()
+
+
+def test_collector_detects_membership_container_literals():
+    """Membership comparisons must expose their tuple/list/set elements.
+
+    ``payload.get("subsource") in ("coder_escalate", "guardrail")`` in
+    ``src/daemon/cascade_monitor.py`` would otherwise hide both names from
+    the safety-net scan, leaving any new unregistered subsource added in
+    the same ``in (...)`` form uncaught.
+    """
+    src = (
+        "def f(payload):\n"
+        "    if payload.get('subsource') in ('coder_escalate', 'guardrail'):\n"
+        "        return True\n"
+        "    if payload.get('subsource') in ['crash', 'review_timeout']:\n"
+        "        return True\n"
+        "    if payload.get('subsource') in {'fix_idle_timeout'}:\n"
+        "        return True\n"
+        "    return False\n"
+    )
+    tree = ast.parse(src)
+    collector = _SubsourceLiteralCollector()
+    collector.visit(tree)
+    assert {
+        "coder_escalate",
+        "guardrail",
+        "crash",
+        "review_timeout",
+        "fix_idle_timeout",
+    } <= collector.found
+
+    cascade_path = SRC_ROOT / "daemon" / "cascade_monitor.py"
+    if cascade_path.is_file():
+        found = _collect_python_subsource_literals(cascade_path)
+        assert {"coder_escalate", "guardrail"} <= found
+
+
+def test_dead_entry_scan_ignores_vocabulary_set_definition():
+    """SUBSOURCE_VOCABULARY membership alone must not count as a use site.
+
+    Otherwise the dead-entry assertion is self-fulfilling for canonical
+    names: removing every real write/render site for ``"guardrail"`` would
+    still leave it counted as "seen" purely because it remains in the
+    vocabulary frozenset literal.
+    """
+    src = (
+        "SUBSOURCE_VOCABULARY = frozenset({'guardrail', 'crash'})\n"
+        "OTHER = {'guardrail'}\n"
+    )
+    tree = ast.parse(src)
+    with_vocab = _SubsourceLiteralCollector(include_vocabulary_set=True)
+    with_vocab.visit(tree)
+    without_vocab = _SubsourceLiteralCollector(include_vocabulary_set=False)
+    without_vocab.visit(tree)
+    assert {"guardrail", "crash"} <= with_vocab.found
+    assert "guardrail" not in without_vocab.found
+    assert "crash" not in without_vocab.found
