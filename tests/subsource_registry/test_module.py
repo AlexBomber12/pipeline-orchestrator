@@ -12,6 +12,7 @@ from src.subsource_registry import (
     group_for,
     lookup,
 )
+from src.web.routes.dashboard import _SUBSOURCE_FILTER_GROUPS
 
 _KNOWN_GROUP_BUCKETS = {"coder", "daemon", "guardrail", "operator_reject"}
 _KNOWN_SEVERITIES = {"low", "medium", "high"}
@@ -65,6 +66,20 @@ def test_group_for_returns_known_bucket(name: str) -> None:
 
 def test_group_for_returns_none_for_unknown_name() -> None:
     assert group_for("not_a_real") is None
+
+
+@pytest.mark.parametrize("name", sorted(all_subsources()))
+def test_group_for_matches_dashboard_filter_contract(name: str) -> None:
+    """Registry's group_bucket must agree with ``_SUBSOURCE_FILTER_GROUPS``.
+
+    PR-323 will swap the dashboard filter to read from the registry; any
+    drift between the two would silently misfile cancellations under the
+    wrong bucket and hide them from the operator filter views (e.g.
+    "daemon-detected only").
+    """
+    bucket = group_for(name)
+    assert bucket is not None
+    assert name in _SUBSOURCE_FILTER_GROUPS[bucket]
 
 
 def test_metadata_is_frozen() -> None:
