@@ -8,6 +8,8 @@ from typing import NotRequired, TypedDict
 
 from pydantic import BaseModel, Field, field_validator
 
+from src.inhibitor import WorkInhibitor
+
 
 class PipelineState(str, Enum):
     PREFLIGHT = "PREFLIGHT"
@@ -204,6 +206,12 @@ class RepoState(BaseModel):
     # past a transition out of ERROR and silently disable normal
     # ``handle_error`` dispatch on a later unrelated error.
     skip_ai_error_diagnose: bool = False
+    # PR-328: typed list of currently-active inhibitors, populated by
+    # ``publish_state`` via ``derive_active_inhibitors``. Purely
+    # informational at this point — dashboard JSON and template context
+    # include the typed list so consumers (PR-329 dispatcher, PR-331
+    # Resume UI) do not each re-derive the throttle stack independently.
+    active_inhibitors: list[WorkInhibitor] = Field(default_factory=list)
 
     @field_validator("state", mode="before")
     @classmethod

@@ -102,6 +102,7 @@ from src.events import publish_repo_event
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.github import rate_limit as gh_rate_limit
+from src.inhibitor import derive_active_inhibitors
 from src.keyspace import (
     cli_log_history,
     cli_log_latest,
@@ -1863,6 +1864,21 @@ class PipelineRunner(
                 self.state.usage_weekly_percent = None
                 self.state.usage_weekly_resets_at = None
             self.state.usage_api_degraded = provider.consecutive_failures >= 10
+        # PR-328: refresh the typed inhibitor list before serialising so
+        # dashboard JSON and downstream consumers see the current throttle
+        # stack. A failure inside the derivation (Redis read error, future
+        # field-shape drift) must not freeze the daemon — fall back to an
+        # empty list and continue publishing state.
+        try:
+            self.state.active_inhibitors = await derive_active_inhibitors(
+                self.state, self.redis, self.app_config.daemon
+            )
+        except Exception:
+            logger.warning(
+                "[%s] derive_active_inhibitors failed; publishing empty list",
+                self.name,
+            )
+            self.state.active_inhibitors = []
         self.state.last_updated = datetime.now(timezone.utc)
         state_key = pipeline_state(self.name)
 

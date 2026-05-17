@@ -746,6 +746,59 @@ def test_save_current_run_record_noop_when_no_active_record(
     assert published == []
 
 
+def test_publish_state_populates_inhibitors() -> None:
+    """User-paused state must surface as a USER_PAUSE inhibitor on the
+    persisted RepoState payload."""
+    from src.inhibitor import InhibitorType
+
+    runner = _make_runner()
+    runner.state.user_paused = True
+
+    asyncio.run(runner.publish_state())
+
+    assert isinstance(runner.redis, _FakeRedis)
+    _key, payload = runner.redis.writes[-1]
+    persisted = RepoState.model_validate_json(payload)
+    assert len(persisted.active_inhibitors) == 1
+    entry = persisted.active_inhibitors[0]
+    assert entry.inhibitor_type is InhibitorType.USER_PAUSE
+    assert entry.source_key == f"state:{runner.name}.user_paused"
+    assert runner.state.active_inhibitors == persisted.active_inhibitors
+
+
+def test_publish_state_handles_derive_exception_gracefully(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If ``derive_active_inhibitors`` raises, ``publish_state`` must
+    still persist state (with an empty inhibitor list) rather than crash
+    the runner cycle. A bad derivation cannot freeze the daemon."""
+    warnings: list[str] = []
+
+    async def _boom(*args: object, **kwargs: object) -> list[object]:
+        raise RuntimeError("derive failed")
+
+    monkeypatch.setattr(runner_module, "derive_active_inhibitors", _boom)
+
+    runner = _make_runner()
+    runner.state.user_paused = True
+    monkeypatch.setattr(
+        runner_module.logger,
+        "warning",
+        lambda msg, *args: warnings.append(msg % args),
+    )
+
+    asyncio.run(runner.publish_state())
+
+    assert isinstance(runner.redis, _FakeRedis)
+    _key, payload = runner.redis.writes[-1]
+    persisted = RepoState.model_validate_json(payload)
+    assert persisted.active_inhibitors == []
+    assert runner.state.active_inhibitors == []
+    assert any(
+        "derive_active_inhibitors failed" in entry for entry in warnings
+    )
+
+
 def test_repo_state_resets_codex_retrigger_on_pr_transition() -> None:
     state = RepoState(
         url="https://github.com/octo/demo",
