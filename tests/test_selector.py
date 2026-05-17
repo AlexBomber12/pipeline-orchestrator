@@ -9,6 +9,7 @@ from src.config import AppConfig, CoderType, DaemonConfig, RepoConfig
 from src.daemon.selector import (
     SelectionContext,
     _auth_failed,
+    candidate_coders,
     eligible_coders,
     rank_auxiliary_coders,
     rank_coders,
@@ -403,3 +404,29 @@ def test_task_pin_codex_ignores_disabled_repo_list() -> None:
     ctx = _ctx(task_coder_pin="codex", disabled_coders=["codex"])
 
     assert eligible_coders(ctx) == []
+
+
+def test_candidate_coders_task_pin_returns_pinned_only() -> None:
+    ctx = _ctx(task_coder_pin="claude", limited={"claude"})
+
+    assert candidate_coders(ctx) == ["claude"]
+
+
+def test_candidate_coders_skips_rate_limit_and_auth_probes() -> None:
+    ctx = _ctx(limited={"claude"}, auth={"codex": "fail"})
+
+    result = candidate_coders(ctx)
+
+    assert set(result) == {"claude", "codex"}
+
+
+def test_candidate_coders_filters_disabled_coders() -> None:
+    ctx = _ctx(disabled_coders=["codex"])
+
+    assert candidate_coders(ctx) == ["claude"]
+
+
+def test_candidate_coders_auto_fallback_off_returns_preferred() -> None:
+    ctx = _ctx(auto_fallback=False, repo_coder=CoderType.CODEX)
+
+    assert candidate_coders(ctx) == ["codex"]

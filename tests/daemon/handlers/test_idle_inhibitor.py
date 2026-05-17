@@ -374,3 +374,125 @@ def test_handle_idle_flag_off_dispatches_when_no_inhibitor(
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.number == 99
+
+
+def test_handle_idle_flag_on_pinned_task_short_circuits_when_pin_rate_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task pin narrows the gate to the pinned coder only.
+
+    Regression for the PR-330a review: when the active task pins
+    ``claude`` and claude is rate-limited, the unified gate must
+    short-circuit IDLE rather than letting dispatch proceed and
+    parking the pinned task in ERROR as "coder unavailable". The
+    legacy gate iterated over every registered coder, so codex
+    appearing unblocked masked the per-coder claude rate limit.
+    """
+    runner = h._make_runner()
+    monkeypatch.setattr(runner, "_active_task_coder_pin", lambda: "claude")
+    _enable_flag(runner)
+    runner.state.active_inhibitors = [
+        WorkInhibitor(
+            inhibitor_type=InhibitorType.RATE_LIMIT,
+            coder_affected="claude",
+            expires_at=_future(),
+            reason_text="claude rate-limited",
+            source_key="state:octo__demo.rate_limited_coder_until.claude",
+        )
+    ]
+
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert any(
+        e["event"].startswith("[INFRA] IDLE inhibited by")
+        and "rate_limit" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_idle_flag_on_disabled_coders_short_circuits_on_remaining_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``disabled_coders`` narrows the gate to the runnable coder.
+
+    Regression for the PR-330a review: with codex disabled in the
+    repo config and claude rate-limited, the only candidate dispatch
+    would consider is claude — which is blocked — so the unified gate
+    must short-circuit. The pre-fix gate iterated over every
+    registered coder and saw codex unblocked, letting IDLE proceed.
+    """
+    runner = h._make_runner(disabled_coders=["codex"])
+    _enable_flag(runner)
+    runner.state.active_inhibitors = [
+        WorkInhibitor(
+            inhibitor_type=InhibitorType.RATE_LIMIT,
+            coder_affected="claude",
+            expires_at=_future(),
+            reason_text="claude rate-limited",
+            source_key="state:octo__demo.rate_limited_coder_until.claude",
+        )
+    ]
+
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert any(
+        e["event"].startswith("[INFRA] IDLE inhibited by")
+        and "rate_limit" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_idle_flag_on_short_circuits_when_no_candidate_coders() -> None:
+    """All registered coders disabled in the repo → IDLE inhibited.
+
+    Without any candidate coder, the gate must short-circuit rather
+    than proceed to dispatch (which would otherwise try the legacy
+    fallback in ``_get_coder`` and ultimately fail downstream).
+    """
+    runner = h._make_runner(disabled_coders=["claude", "codex"])
+    _enable_flag(runner)
+    runner.state.active_inhibitors = []
+
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert any(
+        e["event"] == "[INFRA] IDLE inhibited by no eligible coder"
+        for e in runner.state.history
+    )
+
+
+def test_handle_idle_flag_on_pinned_task_proceeds_when_pin_unblocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A claude-pinned task with codex rate-limited still dispatches.
+
+    The gate must not surface codex's per-coder rate limit when the
+    task pin makes codex irrelevant to dispatch.
+    """
+    _stub_dispatchable_world(monkeypatch)
+    runner = h._make_runner()
+    monkeypatch.setattr(runner, "_active_task_coder_pin", lambda: "claude")
+    _enable_flag(runner)
+    runner.state.active_inhibitors = [
+        WorkInhibitor(
+            inhibitor_type=InhibitorType.RATE_LIMIT,
+            coder_affected="codex",
+            expires_at=_future(),
+            reason_text="codex rate-limited",
+            source_key="state:octo__demo.rate_limited_coder_until.codex",
+        )
+    ]
+
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert not any(
+        e["event"].startswith("[INFRA] IDLE inhibited by")
+        for e in runner.state.history
+    )

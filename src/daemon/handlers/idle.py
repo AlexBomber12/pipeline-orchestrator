@@ -23,6 +23,7 @@ from src.daemon.main_commit_audit import (
     mark_shas_audited_in_redis,
     record_audit_findings_in_redis,
 )
+from src.daemon.selector import SelectionContext, candidate_coders
 from src.dag import get_eligible_tasks
 from src.github import prs as gh_prs
 from src.inhibitor import WorkInhibitor, is_work_inhibited
@@ -721,17 +722,35 @@ class IdleMixin:
         self._idle_merged_pr_304_streak = 0
         # PR-330a: per-repo feature flag selects the unified inhibitor
         # check over the legacy ``user_paused`` branch. The unified
-        # gate evaluates the inhibitor list once per registered coder
-        # so a per-coder ``RATE_LIMIT`` (e.g. for ``codex``) only stops
-        # dispatch when every coder is blocked; if at least one coder
-        # remains eligible the handler falls through to the selector,
-        # mirroring the legacy path where ``selector._is_rate_limited``
-        # filters per coder during selection. The flag stays False by
+        # gate evaluates the inhibitor list once per coder that
+        # dispatch would actually consider — task pin, repo pin, and
+        # ``disabled_coders`` narrow the candidate set the same way
+        # ``selector.eligible_coders`` does, so a per-coder
+        # ``RATE_LIMIT`` on the only runnable coder short-circuits IDLE
+        # instead of being masked by a registered-but-unrunnable coder
+        # appearing unblocked. ``candidate_coders`` deliberately skips
+        # rate-limit/auth probes; per-coder rate-limit semantics flow
+        # through ``is_work_inhibited`` below. The flag stays False by
         # default until PR-330d flips production; canary repos opt in
         # earlier via ``feature_flags.use_unified_inhibitor_check``.
         if self.repo_config.feature_flags.use_unified_inhibitor_check:
+            ctx = SelectionContext(
+                registry=self._registry,
+                repo_config=self.repo_config,
+                app_config=self.app_config,
+                state=self.state,
+                rng=self._selector_rng,
+                auth_statuses=self._auth_status_cache or None,
+                task_coder_pin=self._active_task_coder_pin(),
+            )
+            candidates = candidate_coders(ctx)
+            if not candidates:
+                self.log_event(
+                    "[INFRA] IDLE inhibited by no eligible coder"
+                )
+                return
             blocking_by_coder: dict[str, list[WorkInhibitor]] = {}
-            for name in self._registry.coder_names():
+            for name in candidates:
                 blocked, blocking = is_work_inhibited(
                     self.state, coder=name
                 )
