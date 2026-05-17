@@ -307,6 +307,35 @@ def test_handle_paused_flag_on_clears_stale_rate_limit_metadata() -> None:
     assert runner.state.rate_limit_reactive_coder is None
 
 
+def test_handle_paused_flag_on_clears_stale_per_coder_rate_limit_markers() -> None:
+    """Unified resume must clear ``rate_limited_coders`` and ``rate_limited_coder_until``.
+
+    Regression for review feedback on PR-330b: when a per-coder limit
+    has just expired, ``derive_active_inhibitors`` drops the entry from
+    ``active_inhibitors`` and the unified branch transitions to IDLE.
+    ``selector._is_rate_limited`` consults
+    ``rate_limited_coder_until.get(name)`` first and falls through to
+    ``name in rate_limited_coders`` when the dict has no entry, so any
+    stale marker left in either container would block
+    ``eligible_coders`` for a repo pinned to that coder (the IDLE loop
+    then logs ``no eligible coder`` indefinitely).
+    """
+    runner = h._make_runner()
+    _enable_flag(runner)
+    _seed_paused(runner)
+    runner.state.user_paused = False
+    past = datetime.now(timezone.utc) - timedelta(minutes=5)
+    runner.state.rate_limited_coders = {"codex"}
+    runner.state.rate_limited_coder_until = {"codex": past}
+    runner.state.active_inhibitors = []
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.rate_limited_coders == set()
+    assert runner.state.rate_limited_coder_until == {}
+
+
 def test_handle_paused_flag_on_routes_non_rate_limit_error_to_error() -> None:
     """Unified resume must re-enter ERROR when ``error_message`` is non-rate-limit.
 

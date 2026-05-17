@@ -965,9 +965,19 @@ class IdleMixin:
             # ``_check_rate_limit`` happens to run. Inhibitors with
             # ``expires_at`` already cleared themselves out of
             # ``derive_active_inhibitors``; the scalar fields persist.
+            # The per-coder typed dict and legacy set are cleared for
+            # the same reason: ``selector._is_rate_limited`` consults
+            # ``rate_limited_coder_until`` first and falls through to
+            # ``rate_limited_coders`` on a miss, so a stale entry left
+            # in either container would keep ``eligible_coders``
+            # returning empty for a repo pinned to that coder (logging
+            # ``no eligible coder`` on every IDLE tick) even though
+            # the unified gate has already accepted the resume.
             self.state.rate_limited_until = None
             self.state.rate_limit_reactive = False
             self.state.rate_limit_reactive_coder = None
+            self.state.rate_limited_coders.clear()
+            self.state.rate_limited_coder_until.clear()
             # Route any lingering ``error_message`` through the
             # rate-limit recovery resolver before the IDLE transition.
             # ``run_cycle`` parks runners in PAUSED when an ERROR cycle
