@@ -57,6 +57,34 @@ def eligible_coders(ctx: SelectionContext) -> list[str]:
     return result
 
 
+def candidate_coders(ctx: SelectionContext) -> list[str]:
+    """Return coder names dispatch would consider, skipping runtime probes.
+
+    Mirrors the static narrowing applied by :func:`eligible_coders` —
+    task pin, repo pin (with ``auto_fallback`` off), and
+    ``disabled_coders`` — but does not consult per-coder rate-limit or
+    auth state. Callers that gate dispatch on the typed inhibitor list
+    use this to align the gate's coder set with the dispatcher's
+    candidate set without re-triggering a synchronous ``check_auth``
+    probe on every cycle. Rate-limit semantics still flow through
+    ``is_work_inhibited`` per returned coder.
+    """
+    task_pin = ctx.task_coder_pin
+    if task_pin in ("claude", "codex"):
+        return [task_pin]
+
+    pinned = ctx.repo_config.coder
+    preferred = pinned or ctx.app_config.daemon.coder
+    if not ctx.app_config.daemon.auto_fallback:
+        return [preferred.value]
+
+    return [
+        name
+        for name in ctx.registry.coder_names()
+        if _supports_runtime(name) and not _is_disabled_for_repo(name, ctx.repo_config)
+    ]
+
+
 def _coder_runtime_ok(name: str, ctx: SelectionContext) -> bool:
     """Return True when *name* passes every per-coder runtime gate."""
     return (
