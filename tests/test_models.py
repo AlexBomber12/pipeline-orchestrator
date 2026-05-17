@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from src.inhibitor import InhibitorType, WorkInhibitor
 from src.models import (
     CIStatus,
     PipelineState,
@@ -266,6 +267,53 @@ def test_repo_state_clearing_current_queue_clears_snapshot_at() -> None:
     state.current_queue = None
 
     assert state.current_queue_snapshot_at is None
+
+
+def test_repostate_default_inhibitors_empty_list() -> None:
+    state = RepoState(
+        url="https://github.com/example/repo.git",
+        name="repo",
+    )
+
+    assert state.active_inhibitors == []
+
+
+def test_repostate_json_round_trip_preserves_inhibitors() -> None:
+    expires = datetime(2030, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    inhibitors = [
+        WorkInhibitor(
+            inhibitor_type=InhibitorType.USER_PAUSE,
+            reason_text="Operator paused",
+            source_key="state:repo.user_paused",
+        ),
+        WorkInhibitor(
+            inhibitor_type=InhibitorType.RATE_LIMIT,
+            coder_affected="claude",
+            expires_at=expires,
+            reason_text="claude rate-limited",
+            source_key="state:repo.rate_limited_coder_until.claude",
+        ),
+        WorkInhibitor(
+            inhibitor_type=InhibitorType.CASCADE_PANIC,
+            reason_text="Cascade panic mode auto-stop",
+            source_key="daemon:panic_state",
+        ),
+    ]
+    state = RepoState(
+        url="https://github.com/example/repo.git",
+        name="repo",
+        active_inhibitors=inhibitors,
+    )
+
+    restored = RepoState.model_validate_json(state.model_dump_json())
+
+    assert restored.active_inhibitors == inhibitors
+    assert [i.inhibitor_type for i in restored.active_inhibitors] == [
+        InhibitorType.USER_PAUSE,
+        InhibitorType.RATE_LIMIT,
+        InhibitorType.CASCADE_PANIC,
+    ]
+    assert restored.active_inhibitors[1].expires_at == expires
 
 
 def test_repo_state_clearing_current_pr_does_not_clear_current_task() -> None:

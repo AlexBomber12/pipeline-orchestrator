@@ -102,6 +102,7 @@ from src.events import publish_repo_event
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.github import rate_limit as gh_rate_limit
+from src.inhibitor import derive_active_inhibitors
 from src.keyspace import (
     cli_log_history,
     cli_log_latest,
@@ -1868,6 +1869,23 @@ class PipelineRunner(
 
         async def _serialize_latest_state() -> str:
             await self._refresh_user_paused_from_redis()
+            # PR-328: derive the typed inhibitor list AFTER refreshing
+            # ``user_paused`` (and after the transaction branch has merged
+            # the persisted pause flag) so the published list cannot lag
+            # the throttle source of truth. A failure inside the
+            # derivation (Redis read error, future field-shape drift)
+            # must not freeze the daemon — fall back to an empty list
+            # and continue publishing state.
+            try:
+                self.state.active_inhibitors = await derive_active_inhibitors(
+                    self.state, self.redis, self.app_config.daemon
+                )
+            except Exception:
+                logger.warning(
+                    "[%s] derive_active_inhibitors failed; publishing empty list",
+                    self.name,
+                )
+                self.state.active_inhibitors = []
             if not self.repo_config.active:
                 data = self.state.model_dump()
                 data["state"] = PipelineState.IDLE.value

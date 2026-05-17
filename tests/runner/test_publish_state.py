@@ -746,6 +746,89 @@ def test_save_current_run_record_noop_when_no_active_record(
     assert published == []
 
 
+def test_publish_state_populates_inhibitors() -> None:
+    """User-paused state must surface as a USER_PAUSE inhibitor on the
+    persisted RepoState payload."""
+    from src.inhibitor import InhibitorType
+
+    runner = _make_runner()
+    runner.state.user_paused = True
+
+    asyncio.run(runner.publish_state())
+
+    assert isinstance(runner.redis, _FakeRedis)
+    _key, payload = runner.redis.writes[-1]
+    persisted = RepoState.model_validate_json(payload)
+    assert len(persisted.active_inhibitors) == 1
+    entry = persisted.active_inhibitors[0]
+    assert entry.inhibitor_type is InhibitorType.USER_PAUSE
+    assert entry.source_key == f"state:{runner.name}.user_paused"
+    assert runner.state.active_inhibitors == persisted.active_inhibitors
+
+
+def test_publish_state_derives_inhibitors_after_redis_refresh() -> None:
+    """Regression: ``derive_active_inhibitors`` must run *after*
+    ``_refresh_user_paused_from_redis`` (and after the transaction branch
+    merges the persisted pause flag) so the inhibitor list cannot disagree
+    with the ``user_paused`` field on the same payload. The in-memory
+    ``user_paused`` is stale (False), but Redis already holds True — the
+    persisted snapshot must surface USER_PAUSE."""
+    from src.inhibitor import InhibitorType
+
+    runner = _make_runner()
+    assert isinstance(runner.redis, _FakeRedis)
+    state_key = f"pipeline:{runner.name}"
+    persisted = RepoState(
+        url=runner.state.url,
+        name=runner.name,
+        last_updated=datetime.now(timezone.utc),
+        user_paused=True,
+    )
+    runner.redis.store[state_key] = persisted.model_dump_json()
+    runner.state.user_paused = False
+
+    asyncio.run(runner.publish_state())
+
+    _key, payload = runner.redis.writes[-1]
+    written = RepoState.model_validate_json(payload)
+    assert written.user_paused is True
+    assert len(written.active_inhibitors) == 1
+    assert written.active_inhibitors[0].inhibitor_type is InhibitorType.USER_PAUSE
+
+
+def test_publish_state_handles_derive_exception_gracefully(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If ``derive_active_inhibitors`` raises, ``publish_state`` must
+    still persist state (with an empty inhibitor list) rather than crash
+    the runner cycle. A bad derivation cannot freeze the daemon."""
+    warnings: list[str] = []
+
+    async def _boom(*args: object, **kwargs: object) -> list[object]:
+        raise RuntimeError("derive failed")
+
+    monkeypatch.setattr(runner_module, "derive_active_inhibitors", _boom)
+
+    runner = _make_runner()
+    runner.state.user_paused = True
+    monkeypatch.setattr(
+        runner_module.logger,
+        "warning",
+        lambda msg, *args: warnings.append(msg % args),
+    )
+
+    asyncio.run(runner.publish_state())
+
+    assert isinstance(runner.redis, _FakeRedis)
+    _key, payload = runner.redis.writes[-1]
+    persisted = RepoState.model_validate_json(payload)
+    assert persisted.active_inhibitors == []
+    assert runner.state.active_inhibitors == []
+    assert any(
+        "derive_active_inhibitors failed" in entry for entry in warnings
+    )
+
+
 def test_repo_state_resets_codex_retrigger_on_pr_transition() -> None:
     state = RepoState(
         url="https://github.com/octo/demo",
