@@ -55,8 +55,10 @@ daemon:
 # routes dispatcher decisions through ``src.inhibitor.is_work_inhibited``
 # instead of the legacy if-branches that read throttle keys directly.
 # Default ``false`` keeps the legacy path live; flip per repo for the
-# PR-330 canary rollout. Block illustrative — uncomment to override.
-# repositories:
-#   - url: https://github.com/your-org/your-repo
-#     feature_flags:
-#       use_unified_inhibitor_check: true
+# PR-330 canary rollout.
+#
+# Do NOT add a ``repositories:`` block here to flip the flag on one repo:
+# overlay merging replaces lists wholesale (see ``_deep_merge`` in
+# ``src/config.py``), so a one-entry overlay would drop every other
+# repository from daemon processing. Set ``feature_flags.use_unified_inhibitor_check``
+# directly under the relevant entry in the base ``config.yml`` instead.
