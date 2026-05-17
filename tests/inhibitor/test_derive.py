@@ -98,6 +98,45 @@ async def test_derive_returns_user_stop_when_control_stop_key_present() -> None:
 
 
 @pytest.mark.asyncio
+async def test_derive_returns_user_stop_when_control_stop_key_has_no_expiry() -> None:
+    """Mirror ``runner._pop_stop_request``: a ``GET`` on the key stops dispatch
+    regardless of TTL, so a key with no expiry (``TTL = -1``, common after a
+    manual Redis write) must still surface as an active USER_STOP inhibitor.
+    """
+    redis = _FakeRedis()
+    redis.store[control_stop("octo__demo")] = "1"
+    cfg = DaemonConfig()
+    state = _make_state()
+
+    result = await derive_active_inhibitors(state, redis, cfg)
+
+    stops = [i for i in result if i.inhibitor_type is InhibitorType.USER_STOP]
+    assert len(stops) == 1
+    assert stops[0].expires_at is None
+    assert stops[0].source_key == control_stop("octo__demo")
+
+
+@pytest.mark.asyncio
+async def test_derive_returns_user_stop_when_control_stop_key_ttl_is_zero() -> None:
+    """Keys in their final sub-second window (``TTL = 0``) still stop dispatch
+    via ``GET``, so the derivation must emit USER_STOP with no remaining
+    expiry rather than dropping the inhibitor.
+    """
+    redis = _FakeRedis()
+    stop_key = control_stop("octo__demo")
+    redis.store[stop_key] = "1"
+    redis.ttls[stop_key] = 0
+    cfg = DaemonConfig()
+    state = _make_state()
+
+    result = await derive_active_inhibitors(state, redis, cfg)
+
+    stops = [i for i in result if i.inhibitor_type is InhibitorType.USER_STOP]
+    assert len(stops) == 1
+    assert stops[0].expires_at is None
+
+
+@pytest.mark.asyncio
 async def test_derive_returns_rate_limit_per_coder() -> None:
     redis = _FakeRedis()
     cfg = DaemonConfig()

@@ -128,12 +128,20 @@ async def derive_active_inhibitors(
         )
 
     stop_key = control_stop(state.name)
+    # Mirror ``runner._pop_stop_request``: a present key gates dispatch via
+    # ``GET`` regardless of TTL. Redis ``TTL`` returns -2 when the key is
+    # absent, -1 when it exists without an expiry, and 0 when it is in its
+    # final sub-second window — keys in the latter two states still stop
+    # dispatch, so they must surface as USER_STOP inhibitors here too.
     stop_ttl = await redis.ttl(stop_key)
-    if stop_ttl is not None and stop_ttl > 0:
+    if stop_ttl is not None and stop_ttl != -2:
+        expires_at = (
+            current + timedelta(seconds=int(stop_ttl)) if stop_ttl > 0 else None
+        )
         inhibitors.append(
             WorkInhibitor(
                 inhibitor_type=InhibitorType.USER_STOP,
-                expires_at=current + timedelta(seconds=int(stop_ttl)),
+                expires_at=expires_at,
                 reason_text="Operator requested stop",
                 source_key=stop_key,
             )
