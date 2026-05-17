@@ -1,9 +1,16 @@
 """AST + text scan validation that every subsource literal is registered.
 
-PR-325 safety net: scans an explicit allow-list of source files for
-string literals that *syntactically denote* a subsource name and asserts
-each is present in ``src.subsource_registry``. Catches both directions
-of drift between the registry and actual write/render sites.
+PR-325 safety net: walks every Python file under ``src/`` and every HTML
+template under ``src/web/templates/`` looking for string literals that
+*syntactically denote* a subsource name, and asserts each is present in
+``src.subsource_registry``. Catches both directions of drift between the
+registry and actual write/render sites.
+
+The scan is intentionally exhaustive rather than driven by a static
+allow-list: a partial list would silently skip future write sites added
+elsewhere in ``src/``, defeating the guardrail. Context-aware AST
+detection (see ``_SubsourceLiteralCollector``) keeps false positives off
+unrelated string literals.
 """
 
 from __future__ import annotations
@@ -16,38 +23,43 @@ import pytest
 
 from src import subsource_registry
 from src.cancellation import SUBSOURCE_VOCABULARY
-from src.subsource_registry import all_subsources, canonical_subsources
+from src.subsource_registry import canonical_subsources
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+SRC_ROOT = REPO_ROOT / "src"
+TEMPLATES_ROOT = SRC_ROOT / "web" / "templates"
 
-SUBSOURCE_SOURCE_FILES = [
-    "src/cancellation/storage.py",
-    "src/cancellation/__init__.py",
-    "src/daemon/runner.py",
-    "src/daemon/handlers/watch.py",
-    "src/daemon/handlers/fix.py",
-    "src/daemon/migrations/escalate_to_error.py",
-    "src/daemon/migrations/hung_to_idle.py",
-    "src/web/routes/repo_control.py",
-    "src/web/routes/dashboard.py",
-    "src/subsource_registry.py",
-]
-
-# Files scanned for the dead-entry drift check. The registry module is
-# excluded: its ``_REGISTRY`` keys are by definition every registered name,
-# so including it would make ``test_every_registered_subsource_appears_in_source``
-# pass vacuously even when a name has no write/render site backing it.
-SUBSOURCE_USE_SITE_FILES = [
-    relpath
-    for relpath in SUBSOURCE_SOURCE_FILES
-    if relpath != "src/subsource_registry.py"
-]
-
-SUBSOURCE_TEMPLATE_FILES = [
-    "src/web/templates/components/cancellation_card.html",
-]
+# The registry module is the definition site: scanning its ``_REGISTRY``
+# keys would by definition include every registered name and make the
+# dead-entry drift test pass vacuously even when a name has no write or
+# render site backing it. Excluded from the use-site scan only.
+REGISTRY_MODULE = SRC_ROOT / "subsource_registry.py"
 
 _TEMPLATE_BRANCH_RE = re.compile(r"subsource\s*==\s*['\"]([a-z_]+)['\"]")
+
+
+def _all_python_source_files() -> list[Path]:
+    paths = sorted(SRC_ROOT.rglob("*.py"))
+    assert paths, (
+        f"No Python source files discovered under {SRC_ROOT}. Either the "
+        "source tree moved or the glob is broken; either way the scan is "
+        "no longer covering write sites."
+    )
+    return paths
+
+
+def _python_use_site_files() -> list[Path]:
+    return [p for p in _all_python_source_files() if p != REGISTRY_MODULE]
+
+
+def _all_template_files() -> list[Path]:
+    paths = sorted(TEMPLATES_ROOT.rglob("*.html"))
+    assert paths, (
+        f"No HTML templates discovered under {TEMPLATES_ROOT}. Either the "
+        "template tree moved or the glob is broken; either way the scan "
+        "is no longer covering render sites."
+    )
+    return paths
 
 
 class _SubsourceLiteralCollector(ast.NodeVisitor):
@@ -182,12 +194,9 @@ def test_canonical_subsources_match_vocabulary_frozenset():
 
 def test_every_python_subsource_literal_is_registered():
     registered = subsource_registry.all_subsources()
-    for relpath in SUBSOURCE_SOURCE_FILES:
-        path = REPO_ROOT / relpath
-        if not path.is_file():
-            continue
-        candidates = _collect_python_subsource_literals(path)
-        for name in candidates:
+    for path in _all_python_source_files():
+        relpath = path.relative_to(REPO_ROOT)
+        for name in _collect_python_subsource_literals(path):
             assert name in registered, (
                 f"Subsource literal {name!r} found in {relpath} but missing "
                 "from src.subsource_registry. Add it to the registry."
@@ -196,12 +205,9 @@ def test_every_python_subsource_literal_is_registered():
 
 def test_every_template_subsource_branch_is_registered():
     registered = subsource_registry.all_subsources()
-    for relpath in SUBSOURCE_TEMPLATE_FILES:
-        path = REPO_ROOT / relpath
-        if not path.is_file():
-            continue
-        names = _collect_template_subsource_branches(path)
-        unknown = names - registered
+    for path in _all_template_files():
+        relpath = path.relative_to(REPO_ROOT)
+        unknown = _collect_template_subsource_branches(path) - registered
         assert not unknown, (
             f"Template subsource branches in {relpath} reference unregistered "
             f"subsource names: {sorted(unknown)}. Add them to the registry."
@@ -211,22 +217,15 @@ def test_every_template_subsource_branch_is_registered():
 def test_every_registered_subsource_appears_in_source():
     registered = subsource_registry.all_subsources()
     seen: set[str] = set()
-    for relpath in SUBSOURCE_USE_SITE_FILES:
-        path = REPO_ROOT / relpath
-        if not path.is_file():
-            continue
+    for path in _python_use_site_files():
         seen |= _collect_python_subsource_literals(path)
-    for relpath in SUBSOURCE_TEMPLATE_FILES:
-        path = REPO_ROOT / relpath
-        if not path.is_file():
-            continue
+    for path in _all_template_files():
         seen |= _collect_template_subsource_branches(path)
     unused = registered - seen
     assert not unused, (
-        f"Registered subsources with no references in scanned files: "
-        f"{sorted(unused)}. Either remove from registry or add the "
-        "containing source file to SUBSOURCE_SOURCE_FILES or "
-        "SUBSOURCE_TEMPLATE_FILES."
+        f"Registered subsources with no references under src/: "
+        f"{sorted(unused)}. Either remove from src.subsource_registry or "
+        "add a write site / template branch that references the name."
     )
 
 
