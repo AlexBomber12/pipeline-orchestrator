@@ -49,6 +49,7 @@ from src.keyspace import cli_log_latest, daemon_panic_state
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
 from src.subsource_registry import all_subsources, group_for
+from src.subsource_registry import lookup as _subsource_lookup
 from src.utils import repo_slug_from_url
 from src.web.services.coder import _effective_coder_name
 from src.web.services.repo_state import (
@@ -1057,6 +1058,39 @@ async def _read_panic_state_for_banner(
     return parsed if parsed.get("enabled") else None
 
 
+async def _build_cancellation_subsources(
+    redis_client: aioredis.Redis | None,
+    states: list[RepoState],
+) -> dict[str, str]:
+    """Map ``repo_name`` to ``payload.subsource`` for ERROR-state repos.
+
+    Drives the inline subsource badge on the main dashboard so an operator
+    can distinguish a guardrail violation from a FIX iteration cap without
+    clicking through. Redis errors, missing causes, or payloads without a
+    subsource degrade silently to an omitted entry (no badge rendered).
+    """
+    if redis_client is None:
+        return {}
+    out: dict[str, str] = {}
+    for state in states:
+        if state.state.value != "ERROR":
+            continue
+        if state.current_task is None:
+            continue
+        try:
+            cause = await get_cancellation_cause(
+                redis_client, state.name, state.current_task.pr_id
+            )
+        except Exception:
+            continue
+        if cause is None or not isinstance(cause.payload, dict):
+            continue
+        raw = cause.payload.get("subsource")
+        if isinstance(raw, str) and raw:
+            out[state.name] = raw
+    return out
+
+
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
@@ -1069,6 +1103,9 @@ async def index(request: Request) -> HTMLResponse:
     latest_alert = min(alerts, key=lambda a: a["duration_seconds"]) if alerts else None
     resources = await _build_resources_view(redis_client, states)
     panic_state = await _read_panic_state_for_banner(redis_client)
+    cancellation_subsources = await _build_cancellation_subsources(
+        redis_client, states
+    )
     return _app.templates.TemplateResponse(
         request,
         "index.html",
@@ -1081,6 +1118,8 @@ async def index(request: Request) -> HTMLResponse:
             "resources": resources,
             "page_rendered_at": page_rendered_at,
             "panic_state": panic_state,
+            "cancellation_subsources": cancellation_subsources,
+            "subsource_lookup": _subsource_lookup,
         },
     )
 
@@ -1437,6 +1476,9 @@ async def partial_repo_list(request: Request) -> HTMLResponse:
         redis_client, _app.CONFIG_PATH
     )
     resources = await _build_resources_view(redis_client, states)
+    cancellation_subsources = await _build_cancellation_subsources(
+        redis_client, states
+    )
     return _app.templates.TemplateResponse(
         request,
         "components/repo_cards.html",
@@ -1444,6 +1486,8 @@ async def partial_repo_list(request: Request) -> HTMLResponse:
             "repos": states,
             "redis_warning": redis_warning,
             "resources": resources,
+            "cancellation_subsources": cancellation_subsources,
+            "subsource_lookup": _subsource_lookup,
         },
     )
 

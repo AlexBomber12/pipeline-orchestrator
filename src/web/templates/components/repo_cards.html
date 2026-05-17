@@ -1,5 +1,6 @@
 {% from "components/_controls.html" import repo_controls %}
 {% import "components/_repo_state_styles.html" as repo_state %}
+{% import "components/subsource_badge.html" as subsource_badge %}
 
 {% set init_messages = ['Waiting for daemon to initialize', 'State decode failed', 'Redis unavailable — state unknown'] %}
 
@@ -80,6 +81,10 @@
                     <span class="text-xs font-medium px-2 py-0.5 rounded border {{ style.badge }} {% if style.pulse %}pulse-badge{% endif %}" data-state-label>
                         {{ repo.state.value }}
                     </span>
+                    {% set _cancellation_subsource = (cancellation_subsources or {}).get(repo.name) %}
+                    {% if repo.state.value == 'ERROR' and _cancellation_subsource %}
+                    {{ subsource_badge.subsource_badge(_cancellation_subsource, subsource_lookup) }}
+                    {% endif %}
                     {% endif %}
                 </span>
             </div>
