@@ -101,15 +101,17 @@ async def derive_active_inhibitors(
     The spec ships a skeleton against future ``RepoState`` fields
     (``rate_limited_until_by_coder``, ``spend_ceiling_session_pct``,
     ``error_rate_auto_paused_at``). Until those fields land, this PR
-    derives from the existing equivalents: ``rate_limited_coder_until``,
-    ``usage_session_percent``/``usage_weekly_percent`` against the
-    configured caps, and the ``error_rate_last_auto_pause:`` Redis key
-    combined with ``state.user_paused`` so a manual Resume clears the
-    inhibitor even though the historical marker persists.
+    derives from the existing equivalents: ``rate_limited_coder_until``
+    and ``usage_session_percent``/``usage_weekly_percent`` against the
+    configured caps. ``ERROR_RATE_AUTO_PAUSE`` derivation is deferred:
+    ``mark_auto_pause`` writes ``error_rate_last_auto_pause:<repo>`` once
+    and nothing clears it on Resume, so the historical marker cannot
+    distinguish an active auto-pause from a manual pause that happened
+    after an earlier auto-resume. The inhibitor will be emitted once a
+    dedicated ``state.error_rate_auto_paused_at`` field lands.
     """
     # Imported lazily to keep ``src.inhibitor`` free of runtime
     # dependencies on ``src.daemon`` for non-derivation callers.
-    from src.daemon.error_rate_tracker import last_auto_pause_key
     from src.daemon.github_rate_limit import BUDGET_REDIS_KEY, read_budget
     from src.keyspace import control_stop, daemon_panic_state
 
@@ -286,21 +288,14 @@ async def derive_active_inhibitors(
             )
         )
 
-    # ``last_auto_pause_key`` is a historical watermark that ``mark_auto_pause``
-    # writes and ``has_records_after_last_auto_pause`` reads to suppress
-    # re-triggers; nothing clears it on manual Resume. Gate on the live
-    # ``state.user_paused`` flag so a resumed repo stops reporting an active
-    # auto-pause inhibitor (PR-328 will replace this with a dedicated
-    # ``state.error_rate_auto_paused_at`` field).
-    if state.user_paused:
-        error_rate_key = last_auto_pause_key(state.name)
-        if await redis.exists(error_rate_key):
-            inhibitors.append(
-                WorkInhibitor(
-                    inhibitor_type=InhibitorType.ERROR_RATE_AUTO_PAUSE,
-                    reason_text="Auto-paused due to ERROR rate threshold",
-                    source_key=error_rate_key,
-                )
-            )
+    # ``ERROR_RATE_AUTO_PAUSE`` is intentionally not derived here. The only
+    # signal currently available is the ``error_rate_last_auto_pause:<repo>``
+    # Redis key written by ``mark_auto_pause``; nothing clears it on Resume,
+    # so combining it with ``state.user_paused`` would misclassify a later
+    # operator-initiated pause as an auto-pause whenever the repo had ever
+    # auto-paused in the past. Emitting this inhibitor requires a signal
+    # tied to the live pause (e.g. a future ``state.error_rate_auto_paused_at``
+    # field cleared on Resume); until that lands, omit the entry rather than
+    # publish inaccurate inhibitor semantics to UI/automation consumers.
 
     return inhibitors

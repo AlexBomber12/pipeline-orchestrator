@@ -16,7 +16,6 @@ from src.daemon.error_rate_tracker import last_auto_pause_key
 from src.daemon.github_rate_limit import BUDGET_REDIS_KEY, RateLimitBudget
 from src.inhibitor import (
     InhibitorType,
-    WorkInhibitor,
     derive_active_inhibitors,
 )
 from src.keyspace import control_stop, daemon_panic_state
@@ -221,41 +220,29 @@ async def test_derive_returns_cascade_panic_when_key_exists() -> None:
 
 
 @pytest.mark.asyncio
-async def test_derive_returns_error_rate_auto_pause_when_state_field_set() -> None:
-    redis = _FakeRedis()
-    redis.store[last_auto_pause_key("octo__demo")] = "1700000000.0"
-    cfg = DaemonConfig()
-    state = _make_state(user_paused=True)
+async def test_derive_does_not_emit_error_rate_auto_pause_from_historical_marker() -> None:
+    """``ERROR_RATE_AUTO_PAUSE`` derivation is deferred in PR-327.
 
-    result = await derive_active_inhibitors(state, redis, cfg)
-
-    matches: list[WorkInhibitor] = [
-        inh for inh in result
-        if inh.inhibitor_type is InhibitorType.ERROR_RATE_AUTO_PAUSE
-    ]
-    assert len(matches) == 1
-    assert matches[0].source_key == last_auto_pause_key("octo__demo")
-
-
-@pytest.mark.asyncio
-async def test_derive_skips_error_rate_auto_pause_when_user_resumed() -> None:
-    """Historical ``last_auto_pause_key`` must not block a resumed repo.
-
-    ``mark_auto_pause`` writes a non-expiring marker that is never cleared
-    on manual Resume, so once a repo has ever auto-paused the key persists
-    indefinitely. Gating the inhibitor on ``state.user_paused`` ensures the
-    derived list mirrors the live operator decision.
+    ``mark_auto_pause`` writes ``error_rate_last_auto_pause:<repo>`` once
+    and nothing clears it on Resume, so combining the marker with
+    ``state.user_paused`` would misclassify a later operator-initiated
+    pause as an auto-pause whenever the repo had ever auto-paused. The
+    derivation must omit the inhibitor in both the user-paused and
+    user-resumed cases until a dedicated live-pause signal exists.
     """
-    redis = _FakeRedis()
-    redis.store[last_auto_pause_key("octo__demo")] = "1700000000.0"
     cfg = DaemonConfig()
-    state = _make_state(user_paused=False)
 
-    result = await derive_active_inhibitors(state, redis, cfg)
+    for user_paused in (True, False):
+        redis = _FakeRedis()
+        redis.store[last_auto_pause_key("octo__demo")] = "1700000000.0"
+        state = _make_state(user_paused=user_paused)
 
-    assert not any(
-        inh.inhibitor_type is InhibitorType.ERROR_RATE_AUTO_PAUSE for inh in result
-    )
+        result = await derive_active_inhibitors(state, redis, cfg)
+
+        assert not any(
+            inh.inhibitor_type is InhibitorType.ERROR_RATE_AUTO_PAUSE
+            for inh in result
+        ), f"unexpected ERROR_RATE_AUTO_PAUSE with user_paused={user_paused}"
 
 
 @pytest.mark.asyncio
