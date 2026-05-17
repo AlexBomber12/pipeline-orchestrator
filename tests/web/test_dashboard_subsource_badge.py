@@ -273,3 +273,46 @@ async def test_build_cancellation_subsources_short_circuits_without_redis() -> (
         None, [_make_error_state()]
     )
     assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_build_cancellation_subsources_runs_lookups_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ERROR repos must be fetched in parallel, not serially — otherwise the
+    dashboard latency scales linearly with the ERROR count under Redis RTT."""
+    import asyncio
+
+    inflight = 0
+    peak = 0
+
+    async def fake_get_cause(redis_client, repo_slug, task_id):
+        nonlocal inflight, peak
+        inflight += 1
+        peak = max(peak, inflight)
+        try:
+            await asyncio.sleep(0.05)
+            return CancellationCause(
+                category="ERROR",
+                payload={"subsource": "fix_iteration_cap"},
+                created_at=datetime.now(timezone.utc).isoformat(),
+                task_id=task_id,
+                repo_slug=repo_slug,
+            )
+        finally:
+            inflight -= 1
+
+    monkeypatch.setattr(
+        dashboard_routes, "get_cancellation_cause", fake_get_cause
+    )
+
+    states = [
+        _make_error_state(name=f"example__r{i}", pr_id=f"PR-{i}")
+        for i in range(5)
+    ]
+    result = await dashboard_routes._build_cancellation_subsources(
+        _StubAioredisClient(), states
+    )
+
+    assert len(result) == 5
+    assert peak == 5

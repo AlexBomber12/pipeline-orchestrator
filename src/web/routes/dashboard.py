@@ -1068,20 +1068,33 @@ async def _build_cancellation_subsources(
     can distinguish a guardrail violation from a FIX iteration cap without
     clicking through. Redis errors, missing causes, or payloads without a
     subsource degrade silently to an omitted entry (no badge rendered).
+
+    Lookups are issued concurrently via ``asyncio.gather`` so total latency
+    is one Redis RTT instead of N×RTT — this helper runs on both the full
+    dashboard render and the ``/partials/repo-list`` refresh path, so the
+    serialized variant made the UI scale linearly with the ERROR repo count.
     """
     if redis_client is None:
         return {}
-    out: dict[str, str] = {}
-    for state in states:
-        if state.state.value != "ERROR":
-            continue
-        if state.current_task is None:
-            continue
-        try:
-            cause = await get_cancellation_cause(
-                redis_client, state.name, state.current_task.pr_id
+    targets = [
+        s
+        for s in states
+        if s.state.value == "ERROR" and s.current_task is not None
+    ]
+    if not targets:
+        return {}
+    results = await asyncio.gather(
+        *(
+            get_cancellation_cause(
+                redis_client, s.name, s.current_task.pr_id
             )
-        except Exception:
+            for s in targets
+        ),
+        return_exceptions=True,
+    )
+    out: dict[str, str] = {}
+    for state, cause in zip(targets, results):
+        if isinstance(cause, BaseException):
             continue
         if cause is None or not isinstance(cause.payload, dict):
             continue
