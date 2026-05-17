@@ -7,6 +7,8 @@ repositories:
   allow_merge_without_checks: false
   allow_merge_without_review: false
   coder: codex
+  feature_flags:
+    use_unified_inhibitor_check: false
 - url: https://github.com/AlexBomber12/megaraid-dashboard
   branch: main
   auto_merge: true
@@ -15,6 +17,8 @@ repositories:
   allow_merge_without_checks: false
   allow_merge_without_review: false
   coder: codex
+  feature_flags:
+    use_unified_inhibitor_check: false
 - url: https://github.com/AlexBomber12/sms-gateway-v2
   branch: main
   auto_merge: true
@@ -23,6 +27,8 @@ repositories:
   allow_merge_without_checks: false
   allow_merge_without_review: false
   coder: codex
+  feature_flags:
+    use_unified_inhibitor_check: false
 daemon:
   poll_interval_sec: 60
   review_timeout_min: 20

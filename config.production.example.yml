@@ -50,3 +50,13 @@ daemon:
   operator_active_hours_start: 9
   operator_active_hours_end: 21
   operator_timezone: Europe/Rome
+
+# PR-329: per-repo dispatcher feature flag. ``use_unified_inhibitor_check``
+# routes dispatcher decisions through ``src.inhibitor.is_work_inhibited``
+# instead of the legacy if-branches that read throttle keys directly.
+# Default ``false`` keeps the legacy path live; flip per repo for the
+# PR-330 canary rollout. Block illustrative — uncomment to override.
+# repositories:
+#   - url: https://github.com/your-org/your-repo
+#     feature_flags:
+#       use_unified_inhibitor_check: true
