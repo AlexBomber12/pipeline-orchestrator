@@ -144,6 +144,46 @@ def test_aware_non_utc_expires_at_is_converted_to_utc() -> None:
     assert inhibitor.expires_at == datetime(2030, 6, 15, 12, 0, tzinfo=timezone.utc)
 
 
+def test_is_blocking_now_accepts_naive_now() -> None:
+    future = datetime.now(timezone.utc) + timedelta(seconds=60)
+    inhibitor = WorkInhibitor(
+        inhibitor_type=InhibitorType.USER_STOP,
+        expires_at=future,
+        source_key="control:stop",
+    )
+    naive_now = datetime.utcnow()
+    assert naive_now.tzinfo is None
+    assert inhibitor.is_blocking_now(now=naive_now) is True
+
+
+def test_time_remaining_seconds_accepts_naive_now() -> None:
+    future = datetime.now(timezone.utc) + timedelta(seconds=120)
+    inhibitor = WorkInhibitor(
+        inhibitor_type=InhibitorType.RATE_LIMIT,
+        coder_affected="claude",
+        expires_at=future,
+        source_key="rate_limited_coder_until:claude",
+    )
+    naive_now = datetime.utcnow()
+    assert naive_now.tzinfo is None
+    remaining = inhibitor.time_remaining_seconds(now=naive_now)
+    assert remaining is not None
+    assert remaining > 0
+
+
+def test_aware_non_utc_now_is_converted_for_is_blocking_now() -> None:
+    pacific = timezone(timedelta(hours=-8))
+    expires = datetime(2030, 6, 15, 12, 0, tzinfo=timezone.utc)
+    # 2030-06-15 05:00 PST == 2030-06-15 13:00 UTC, which is past expires.
+    now_pacific = datetime(2030, 6, 15, 5, 0, tzinfo=pacific)
+    inhibitor = WorkInhibitor(
+        inhibitor_type=InhibitorType.GITHUB_BUDGET_PAUSE,
+        expires_at=expires,
+        source_key="github_rate_limit_budget_pause",
+    )
+    assert inhibitor.is_blocking_now(now=now_pacific) is False
+
+
 def test_json_round_trip_preserves_fields() -> None:
     original = WorkInhibitor(
         inhibitor_type=InhibitorType.GITHUB_BUDGET_SLOWDOWN,

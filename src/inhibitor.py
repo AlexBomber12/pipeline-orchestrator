@@ -47,19 +47,27 @@ class WorkInhibitor(BaseModel):
             return value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
 
+    @staticmethod
+    def _coerce_now_to_utc(now: Optional[datetime]) -> datetime:
+        # Naive `now` from callers using datetime.utcnow() would crash the
+        # comparison/arithmetic below because expires_at is UTC-aware.
+        if now is None:
+            return datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            return now.replace(tzinfo=timezone.utc)
+        return now.astimezone(timezone.utc)
+
     def is_blocking_now(self, now: Optional[datetime] = None) -> bool:
         """Return True if expires_at is None or in the future."""
         if self.expires_at is None:
             return True
-        current = now if now is not None else datetime.now(timezone.utc)
-        return self.expires_at > current
+        return self.expires_at > self._coerce_now_to_utc(now)
 
     def time_remaining_seconds(self, now: Optional[datetime] = None) -> Optional[float]:
         """Return seconds until expires_at, None if no expiry."""
         if self.expires_at is None:
             return None
-        current = now if now is not None else datetime.now(timezone.utc)
-        delta = self.expires_at - current
+        delta = self.expires_at - self._coerce_now_to_utc(now)
         return max(0.0, delta.total_seconds())
 
     def is_per_coder(self) -> bool:
