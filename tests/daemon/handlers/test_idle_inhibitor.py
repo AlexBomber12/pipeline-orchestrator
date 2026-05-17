@@ -135,6 +135,15 @@ def _stub_dispatchable_world(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 _THROTTLE_TYPES = list(InhibitorType)
+# ``GITHUB_BUDGET_SLOWDOWN`` is a polling-cadence throttle, not a
+# dispatch block: ``_check_github_api_budget`` already skips one-in-N
+# IDLE cycles between the slowdown and pause thresholds, and the cycles
+# that do reach ``handle_idle`` must still dispatch. The unified gate
+# in ``handle_idle`` excludes it for that reason, so the
+# parametrize-blocks suite skips it.
+_DISPATCH_BLOCKING_TYPES = [
+    kind for kind in _THROTTLE_TYPES if kind != InhibitorType.GITHUB_BUDGET_SLOWDOWN
+]
 
 
 @pytest.mark.parametrize("kind", _THROTTLE_TYPES, ids=[k.value for k in _THROTTLE_TYPES])
@@ -165,7 +174,11 @@ def test_handle_idle_flag_off_uses_legacy_user_pause_check(
     )
 
 
-@pytest.mark.parametrize("kind", _THROTTLE_TYPES, ids=[k.value for k in _THROTTLE_TYPES])
+@pytest.mark.parametrize(
+    "kind",
+    _DISPATCH_BLOCKING_TYPES,
+    ids=[k.value for k in _DISPATCH_BLOCKING_TYPES],
+)
 def test_handle_idle_flag_on_uses_helper(
     kind: InhibitorType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -182,6 +195,89 @@ def test_handle_idle_flag_on_uses_helper(
         e["event"].startswith("[INFRA] IDLE inhibited by")
         and kind.value in e["event"]
         for e in runner.state.history
+    )
+
+
+def test_handle_idle_flag_on_slowdown_alone_does_not_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Slowdown is throttle-only: IDLE must dispatch on cycles that run.
+
+    Regression for the PR-330a review: when GitHub budget is between
+    the slowdown and pause thresholds, ``_check_github_api_budget``
+    allows one-in-N IDLE cycles to proceed. On those cycles, the
+    unified gate must not short-circuit on the global slowdown
+    inhibitor — otherwise the daemon stops dispatching entirely
+    instead of merely polling less often.
+    """
+    _stub_dispatchable_world(monkeypatch)
+    runner = h._make_runner()
+    _enable_flag(runner)
+    runner.state.active_inhibitors = [
+        WorkInhibitor(
+            inhibitor_type=InhibitorType.GITHUB_BUDGET_SLOWDOWN,
+            expires_at=_future(),
+            reason_text="GitHub budget slowdown",
+            source_key="github:rate_limit:budget",
+        )
+    ]
+
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert not any(
+        e["event"].startswith("[INFRA] IDLE inhibited by")
+        for e in runner.state.history
+    )
+
+
+def test_handle_idle_flag_on_slowdown_with_rate_limit_still_blocks() -> None:
+    """A real blocker alongside slowdown still short-circuits IDLE.
+
+    Slowdown is filtered as throttle-only, but a per-coder
+    ``RATE_LIMIT`` for every candidate coder is a genuine dispatch
+    block. The logged event must reference the rate-limit cause and
+    must not mention the slowdown.
+    """
+    runner = h._make_runner()
+    _enable_flag(runner)
+    runner.state.active_inhibitors = [
+        WorkInhibitor(
+            inhibitor_type=InhibitorType.GITHUB_BUDGET_SLOWDOWN,
+            expires_at=_future(),
+            reason_text="GitHub budget slowdown",
+            source_key="github:rate_limit:budget",
+        ),
+        WorkInhibitor(
+            inhibitor_type=InhibitorType.RATE_LIMIT,
+            coder_affected="claude",
+            expires_at=_future(),
+            reason_text="claude rate-limited",
+            source_key="state:octo__demo.rate_limited_coder_until.claude",
+        ),
+        WorkInhibitor(
+            inhibitor_type=InhibitorType.RATE_LIMIT,
+            coder_affected="codex",
+            expires_at=_future(),
+            reason_text="codex rate-limited",
+            source_key="state:octo__demo.rate_limited_coder_until.codex",
+        ),
+    ]
+
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    inhibitor_events = [
+        e["event"]
+        for e in runner.state.history
+        if e["event"].startswith("[INFRA] IDLE inhibited by")
+    ]
+    assert inhibitor_events, "expected a unified-gate inhibitor event"
+    assert all("rate_limit" in event for event in inhibitor_events)
+    assert all(
+        "github_budget_slowdown" not in event for event in inhibitor_events
     )
 
 

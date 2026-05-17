@@ -26,7 +26,7 @@ from src.daemon.main_commit_audit import (
 from src.daemon.selector import SelectionContext, candidate_coders
 from src.dag import get_eligible_tasks
 from src.github import prs as gh_prs
-from src.inhibitor import WorkInhibitor, is_work_inhibited
+from src.inhibitor import InhibitorType, WorkInhibitor, is_work_inhibited
 from src.models import PipelineState, QueueTask, TaskStatus
 from src.onboarding.markdown_sections import MarkerError
 from src.onboarding.reconciliation import reconcile_agents_md
@@ -749,15 +749,26 @@ class IdleMixin:
                     "[INFRA] IDLE inhibited by no eligible coder"
                 )
                 return
+            # ``GITHUB_BUDGET_SLOWDOWN`` is a polling-cadence throttle
+            # enforced by ``_check_github_api_budget`` at the runner-cycle
+            # layer (skip one-in-N IDLE cycles between the slowdown and
+            # pause thresholds); during the cycles that do reach
+            # ``handle_idle`` the slowdown must not short-circuit dispatch
+            # or the daemon stops working entirely instead of merely
+            # polling less often.
             blocking_by_coder: dict[str, list[WorkInhibitor]] = {}
             for name in candidates:
-                blocked, blocking = is_work_inhibited(
-                    self.state, coder=name
-                )
-                if not blocked:
+                _, blocking = is_work_inhibited(self.state, coder=name)
+                hard_blocking = [
+                    inh
+                    for inh in blocking
+                    if inh.inhibitor_type
+                    != InhibitorType.GITHUB_BUDGET_SLOWDOWN
+                ]
+                if not hard_blocking:
                     blocking_by_coder.clear()
                     break
-                blocking_by_coder[name] = blocking
+                blocking_by_coder[name] = hard_blocking
             if blocking_by_coder:
                 blocking_types = sorted({
                     inh.inhibitor_type.value
