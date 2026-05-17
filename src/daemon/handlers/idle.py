@@ -25,6 +25,7 @@ from src.daemon.main_commit_audit import (
 )
 from src.dag import get_eligible_tasks
 from src.github import prs as gh_prs
+from src.inhibitor import is_work_inhibited
 from src.models import PipelineState, QueueTask, TaskStatus
 from src.onboarding.markdown_sections import MarkerError
 from src.onboarding.reconciliation import reconcile_agents_md
@@ -718,8 +719,25 @@ class IdleMixin:
             self, "_idle_merged_pr_304_streak", 0,
         )
         self._idle_merged_pr_304_streak = 0
-        if self.state.user_paused:
-            return
+        # PR-330a: per-repo feature flag selects the unified inhibitor
+        # check over the legacy ``user_paused`` branch. Both paths must
+        # produce identical observable behavior (same return semantics,
+        # one log event). The flag stays False by default until PR-330d
+        # flips production; canary repos opt in earlier via
+        # ``feature_flags.use_unified_inhibitor_check``.
+        if self.repo_config.feature_flags.use_unified_inhibitor_check:
+            blocked, blocking = is_work_inhibited(self.state)
+            if blocked:
+                blocking_types = [
+                    inh.inhibitor_type.value for inh in blocking
+                ]
+                self.log_event(
+                    f"[INFRA] IDLE inhibited by {blocking_types}"
+                )
+                return
+        else:
+            if self.state.user_paused:
+                return
         if self.state.pending_queue_sync_branch is not None:
             if not await self._resolve_pending_queue_sync():
                 return
