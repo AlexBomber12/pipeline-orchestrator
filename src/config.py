@@ -34,6 +34,7 @@ _REPO_FIELDS = {
     "coder",
     "disabled_coders",
     "governance_scan_enabled",
+    "feature_flags",
 }
 
 _DAEMON_FIELDS = {
@@ -111,6 +112,13 @@ _DAEMON_ENV_OVERRIDES = {
 }
 
 
+class FeatureFlags(BaseModel):
+    # PR-329: dispatcher migration to ``is_work_inhibited`` is gated per
+    # repo so canary rollout (PR-330) can flip one repo at a time without
+    # touching the rest. Default False keeps the legacy if-branches live.
+    use_unified_inhibitor_check: bool = False
+
+
 class RepoConfig(BaseModel):
     url: str
     branch: str = "main"
@@ -129,6 +137,7 @@ class RepoConfig(BaseModel):
     coder: CoderType | None = None
     disabled_coders: list[str] | None = None
     governance_scan_enabled: bool | None = None
+    feature_flags: FeatureFlags = Field(default_factory=FeatureFlags)
 
     @field_validator("poll_interval_sec", mode="before")
     @classmethod

@@ -83,6 +83,47 @@ class WorkInhibitor(BaseModel):
         frozen = True
 
 
+def is_work_inhibited(
+    state: "RepoState",
+    coder: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> tuple[bool, list[WorkInhibitor]]:
+    """Return ``(blocked, [inhibitors_that_block])`` for the candidate coder.
+
+    Reads ``state.active_inhibitors`` (populated by ``publish_state`` via
+    ``derive_active_inhibitors``) and filters to entries that block right
+    now for the given coder:
+
+    * ``coder=None`` matches every active inhibitor (global and per-coder)
+      so callers that want "is *anything* blocking?" can ask without
+      naming a coder.
+    * ``coder="claude"`` matches global inhibitors plus per-coder
+      inhibitors whose ``coder_affected == "claude"``. A per-coder
+      ``RATE_LIMIT`` for ``codex`` does not block a ``claude`` dispatch.
+    * Inhibitors whose ``expires_at`` has elapsed are skipped — they
+      already reached their TTL and the dispatcher must not gate on stale
+      entries that ``publish_state`` will drop on the next cycle.
+
+    No callers in this PR. PR-330 wires the dispatcher under the
+    ``feature_flags.use_unified_inhibitor_check`` per-repo flag; until
+    then the helper is dormant code and the legacy if-branches in
+    ``runner.py`` remain authoritative.
+    """
+    current = now if now is not None else datetime.now(timezone.utc)
+    blocking: list[WorkInhibitor] = []
+    for inh in state.active_inhibitors:
+        if not inh.is_blocking_now(current):
+            continue
+        if (
+            inh.is_per_coder()
+            and coder is not None
+            and inh.coder_affected != coder
+        ):
+            continue
+        blocking.append(inh)
+    return (len(blocking) > 0, blocking)
+
+
 async def derive_active_inhibitors(
     state: "RepoState",
     redis: Any,
