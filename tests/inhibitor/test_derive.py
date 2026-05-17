@@ -136,6 +136,82 @@ async def test_derive_returns_user_stop_when_control_stop_key_ttl_is_zero() -> N
 
 
 @pytest.mark.asyncio
+async def test_derive_skips_user_stop_when_payload_is_empty_string() -> None:
+    """Mirror ``runner._pop_stop_request``: it gates on ``GET`` returning a
+    truthy payload (``if not raw: return False``). A present-but-empty key
+    leaves the runner free to dispatch, so the derivation must not emit a
+    USER_STOP inhibitor that would desync the typed list from the
+    dispatcher's blocking decision.
+    """
+    redis = _FakeRedis()
+    stop_key = control_stop("octo__demo")
+    redis.store[stop_key] = ""
+    redis.ttls[stop_key] = 60
+    cfg = DaemonConfig()
+    state = _make_state()
+
+    result = await derive_active_inhibitors(state, redis, cfg)
+
+    assert not any(
+        inh.inhibitor_type is InhibitorType.USER_STOP for inh in result
+    )
+
+
+@pytest.mark.asyncio
+async def test_derive_skips_user_stop_when_get_raises() -> None:
+    """``_pop_stop_request`` swallows ``GET`` errors and returns ``False`` so
+    a transient Redis failure cannot stop the runner. The derivation must
+    mirror that: surfacing USER_STOP from a key whose payload could not be
+    read would block automation that consumes this helper without any
+    corresponding runner-side stop.
+    """
+
+    class _RaisingGetRedis(_FakeRedis):
+        async def get(self, key: str) -> str | None:
+            if key == control_stop("octo__demo"):
+                raise RuntimeError("redis offline")
+            return await super().get(key)
+
+    redis = _RaisingGetRedis()
+    redis.ttls[control_stop("octo__demo")] = 60
+    cfg = DaemonConfig()
+    state = _make_state()
+
+    result = await derive_active_inhibitors(state, redis, cfg)
+
+    assert not any(
+        inh.inhibitor_type is InhibitorType.USER_STOP for inh in result
+    )
+
+
+@pytest.mark.asyncio
+async def test_derive_returns_user_stop_without_expiry_when_ttl_raises() -> None:
+    """A successful truthy ``GET`` must still emit USER_STOP even if the
+    follow-up TTL read fails: ``_pop_stop_request`` would block dispatch in
+    that case, so the typed list must surface the inhibitor with no
+    ``expires_at`` rather than dropping it because of a TTL-side error.
+    """
+
+    class _RaisingTtlRedis(_FakeRedis):
+        async def ttl(self, key: str) -> int:
+            if key == control_stop("octo__demo"):
+                raise RuntimeError("ttl unavailable")
+            return await super().ttl(key)
+
+    redis = _RaisingTtlRedis()
+    redis.store[control_stop("octo__demo")] = "1"
+    cfg = DaemonConfig()
+    state = _make_state()
+
+    result = await derive_active_inhibitors(state, redis, cfg)
+
+    stops = [i for i in result if i.inhibitor_type is InhibitorType.USER_STOP]
+    assert len(stops) == 1
+    assert stops[0].expires_at is None
+    assert stops[0].source_key == control_stop("octo__demo")
+
+
+@pytest.mark.asyncio
 async def test_derive_returns_rate_limit_per_coder() -> None:
     redis = _FakeRedis()
     cfg = DaemonConfig()

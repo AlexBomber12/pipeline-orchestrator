@@ -131,16 +131,27 @@ async def derive_active_inhibitors(
         )
 
     stop_key = control_stop(state.name)
-    # Mirror ``runner._pop_stop_request``: a present key gates dispatch via
-    # ``GET`` regardless of TTL. Redis ``TTL`` returns -2 when the key is
-    # absent, -1 when it exists without an expiry, and 0 when it is in its
-    # final sub-second window — keys in the latter two states still stop
-    # dispatch, so they must surface as USER_STOP inhibitors here too.
-    stop_ttl = await redis.ttl(stop_key)
-    if stop_ttl is not None and stop_ttl != -2:
-        expires_at = (
-            current + timedelta(seconds=int(stop_ttl)) if stop_ttl > 0 else None
-        )
+    # Mirror ``runner._pop_stop_request``: it gates dispatch on ``GET``
+    # returning a truthy payload, returning ``False`` on read errors or a
+    # falsy value (e.g. an empty string). Reading the TTL alone is not
+    # enough — a present-but-empty key would stop the inhibitor list and
+    # the dispatcher's blocking decision from agreeing once consumers wire
+    # this helper as a source of truth. The TTL is read only after a
+    # truthy GET so we can populate ``expires_at``; TTL == -1 (no expiry)
+    # and TTL == 0 (final sub-second window) both surface as inhibitors
+    # without an ``expires_at`` so they cannot be mistaken for stale.
+    try:
+        raw_stop = await redis.get(stop_key)
+    except Exception:
+        raw_stop = None
+    if raw_stop:
+        try:
+            stop_ttl = await redis.ttl(stop_key)
+        except Exception:
+            stop_ttl = None
+        expires_at: Optional[datetime] = None
+        if stop_ttl is not None and stop_ttl > 0:
+            expires_at = current + timedelta(seconds=int(stop_ttl))
         inhibitors.append(
             WorkInhibitor(
                 inhibitor_type=InhibitorType.USER_STOP,
