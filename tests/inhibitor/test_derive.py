@@ -220,6 +220,62 @@ async def test_derive_returns_cascade_panic_when_key_exists() -> None:
 
 
 @pytest.mark.asyncio
+async def test_derive_skips_cascade_panic_when_payload_disabled() -> None:
+    """Mirror ``check_cascade_escalate_state``: a panic record with ``enabled=False``
+    means the daemon has cleared the gate, so the derivation must not surface a
+    stale CASCADE_PANIC inhibitor that would desync UI/automation from the
+    runner's actual dispatch state.
+    """
+    redis = _FakeRedis()
+    redis.store[daemon_panic_state()] = "{\"enabled\": false}"
+    cfg = DaemonConfig()
+    state = _make_state()
+
+    result = await derive_active_inhibitors(state, redis, cfg)
+
+    assert not any(
+        inh.inhibitor_type is InhibitorType.CASCADE_PANIC for inh in result
+    )
+
+
+@pytest.mark.asyncio
+async def test_derive_skips_cascade_panic_when_payload_missing_enabled_flag() -> None:
+    """A dict payload without the ``enabled`` key is treated as not-enabled
+    by ``check_cascade_escalate_state`` (``existing.get('enabled')`` is
+    falsy), so the inhibitor must be omitted.
+    """
+    redis = _FakeRedis()
+    redis.store[daemon_panic_state()] = "{\"reason\": \"legacy\"}"
+    cfg = DaemonConfig()
+    state = _make_state()
+
+    result = await derive_active_inhibitors(state, redis, cfg)
+
+    assert not any(
+        inh.inhibitor_type is InhibitorType.CASCADE_PANIC for inh in result
+    )
+
+
+@pytest.mark.asyncio
+async def test_derive_skips_cascade_panic_when_payload_is_malformed() -> None:
+    """Malformed/non-dict payloads are ignored by ``_read_panic_state``;
+    the derivation must agree rather than emit a spurious inhibitor.
+    """
+    cfg = DaemonConfig()
+    state = _make_state()
+
+    for payload in ("not-json", "\"a string\"", "[1, 2, 3]", "null"):
+        redis = _FakeRedis()
+        redis.store[daemon_panic_state()] = payload
+
+        result = await derive_active_inhibitors(state, redis, cfg)
+
+        assert not any(
+            inh.inhibitor_type is InhibitorType.CASCADE_PANIC for inh in result
+        ), f"unexpected CASCADE_PANIC for payload {payload!r}"
+
+
+@pytest.mark.asyncio
 async def test_derive_does_not_emit_error_rate_auto_pause_from_historical_marker() -> None:
     """``ERROR_RATE_AUTO_PAUSE`` derivation is deferred in PR-327.
 

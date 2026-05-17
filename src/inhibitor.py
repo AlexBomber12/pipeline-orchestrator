@@ -7,6 +7,7 @@ inhibitors per repo. Consumer wiring lands in PR-327..PR-330.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
@@ -279,14 +280,25 @@ async def derive_active_inhibitors(
             )
 
     panic_key = daemon_panic_state()
-    if await redis.exists(panic_key):
-        inhibitors.append(
-            WorkInhibitor(
-                inhibitor_type=InhibitorType.CASCADE_PANIC,
-                reason_text="Cascade panic mode auto-stop",
-                source_key=panic_key,
+    # Mirror ``cascade_monitor.check_cascade_escalate_state``: a present key
+    # is not sufficient — the daemon only treats panic as active when the
+    # JSON payload parses to a dict with ``enabled=True``. Stale, disabled,
+    # or malformed records leave dispatch unblocked, so they must not
+    # surface as CASCADE_PANIC inhibitors here either.
+    raw_panic = await redis.get(panic_key)
+    if raw_panic is not None:
+        try:
+            parsed_panic = json.loads(raw_panic)
+        except (TypeError, ValueError):
+            parsed_panic = None
+        if isinstance(parsed_panic, dict) and parsed_panic.get("enabled"):
+            inhibitors.append(
+                WorkInhibitor(
+                    inhibitor_type=InhibitorType.CASCADE_PANIC,
+                    reason_text="Cascade panic mode auto-stop",
+                    source_key=panic_key,
+                )
             )
-        )
 
     # ``ERROR_RATE_AUTO_PAUSE`` is intentionally not derived here. The only
     # signal currently available is the ``error_rate_last_auto_pause:<repo>``
