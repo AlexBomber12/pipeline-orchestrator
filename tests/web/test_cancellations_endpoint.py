@@ -715,6 +715,54 @@ def test_partial_endpoint_no_filter_returns_all_subsources(
     assert "PR-CODER" in resp_unknown.text
 
 
+def test_partial_endpoint_filter_routes_through_registry_group_for(
+    cancellations_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR-323: the dropdown's group membership check goes through
+    ``subsource_registry.group_for`` rather than a duplicate dashboard
+    dict, so a future subsource added to the registry automatically
+    participates in dropdown filtering without a parallel dashboard edit.
+
+    Replaces ``group_for`` with a stub that puts ``coder_escalate`` in
+    the ``guardrail`` bucket and assert the dashboard now treats the
+    coder cause as if it were a guardrail one.
+    """
+    overrides = {"coder_escalate": "guardrail", "guardrail": "coder"}
+
+    def stub_group_for(name: str) -> str | None:
+        return overrides.get(name)
+
+    monkeypatch.setattr(dashboard_routes, "group_for", stub_group_for)
+
+    client, causes, _captured = cancellations_client
+    now = datetime.now(timezone.utc)
+    causes[:] = [
+        _make_cause(
+            "PR-CODER",
+            category="ERROR",
+            payload={"subsource": "coder_escalate"},
+            created_at=(now - timedelta(minutes=10)).isoformat(),
+        ),
+        _make_cause(
+            "PR-GR",
+            category="ERROR",
+            payload={"subsource": "guardrail"},
+            created_at=(now - timedelta(minutes=20)).isoformat(),
+        ),
+    ]
+
+    resp = client.get(
+        "/partials/repo/example__repo/cancellations?subsource_filter=guardrail"
+    )
+
+    assert resp.status_code == 200
+    body = resp.text
+    # The stub put coder_escalate in the guardrail bucket, so the coder
+    # cause must surface and the actual guardrail cause must not.
+    assert "PR-CODER" in body
+    assert "PR-GR" not in body
+
+
 def test_partial_endpoint_short_circuits_when_repo_not_in_config(
     cancellations_client,
 ) -> None:
