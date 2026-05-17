@@ -1,0 +1,36 @@
+{# Subsource badge — compact inline indicator of the cancellation subsource
+   shown on the main dashboard repo cards next to the ERROR state badge.
+   Distinct from cancellation_card.html which is the detail view in the
+   cancellation history surface.
+
+   Severity color mapping:
+   - high   -> bg-fail/10 text-fail border-fail/30
+   - medium -> bg-warn/10 text-warn border-warn/30
+   - low    -> bg-surface-3 text-gray-300 border-white/10
+
+   Falls back to medium styling and raw subsource string when registry
+   lookup returns None. Tooltip uses the title attribute so HTMX swaps
+   preserve hover hint state. #}
+{% macro subsource_badge(subsource, registry_lookup) %}
+{% if subsource %}
+{% set meta = registry_lookup(subsource) %}
+{% if meta %}
+{% set sev = meta.severity %}
+{% set label = meta.user_label %}
+{% set hint = meta.recovery_hint %}
+{% else %}
+{% set sev = "medium" %}
+{% set label = subsource %}
+{% set hint = "Unknown subsource. See cancellation history for detail." %}
+{% endif %}
+{% set sev_classes = {
+    "high":   "bg-fail/10 text-fail border-fail/30",
+    "medium": "bg-warn/10 text-warn border-warn/30",
+    "low":    "bg-surface-3 text-gray-300 border-white/10",
+} %}
+<span class="text-xs font-medium px-2 py-0.5 rounded border {{ sev_classes[sev] }}"
+      title="{{ hint }}"
+      data-subsource-badge
+      data-subsource="{{ subsource }}">{{ label }}</span>
+{% endif %}
+{% endmacro %}
