@@ -48,6 +48,7 @@ from src.events.sse import format_sse_comment, format_sse_event
 from src.keyspace import cli_log_latest, daemon_panic_state
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
+from src.subsource_registry import all_subsources, group_for
 from src.utils import repo_slug_from_url
 from src.web.services.coder import _effective_coder_name
 from src.web.services.repo_state import (
@@ -69,48 +70,28 @@ _METRICS_SCAN_LIMIT = 100
 _CANCELLATIONS_WINDOW_DAYS = 7
 _CANCELLATIONS_MAX = 50
 
-# PR-310: subsource_filter dropdown groups (UI vocabulary) projected onto
-# the canonical PR-315 ``payload.subsource`` vocabulary. ``daemon`` covers
-# every detector that fires automatically (review_timeout, FIX timers,
-# no-push deadlock, infra streak, watch retrigger cap, raw daemon crash)
-# plus the literal ``"daemon"`` subsource emitted by ``_escalate_and_skip``
-# (PR-276) and the HUNG→IDLE migration
-# (``src/daemon/migrations/hung_to_idle.py``); ``coder`` is the explicit
-# ``ESCALATE:`` marker; ``guardrail`` and ``operator_reject`` map
-# one-to-one. ``""`` (empty string from the "All" option) skips filtering
-# entirely.
-_SUBSOURCE_FILTER_GROUPS: dict[str, frozenset[str]] = {
-    "guardrail": frozenset({"guardrail"}),
-    "coder": frozenset({"coder_escalate"}),
-    "daemon": frozenset(
-        {
-            "daemon",
-            "crash",
-            "review_timeout",
-            "fix_idle_timeout",
-            "fix_iteration_cap",
-            "no_push_deadlock",
-            "infra_failure",
-            "watch_retrigger_cap",
-        }
-    ),
-    "operator_reject": frozenset({"operator_reject"}),
-}
+# Valid bucket values accepted by the cancellation history dropdown,
+# derived from the subsource registry so adding a 12th subsource to the
+# registry automatically propagates here without a parallel edit. An
+# operator-supplied filter outside this set falls through to no filter so
+# a malformed URL never 4xx-s the partial.
+_FILTER_BUCKETS: frozenset[str] = frozenset(
+    bucket
+    for bucket in (group_for(name) for name in all_subsources())
+    if bucket is not None
+)
 
 
 def _filter_subsource(cause: Any) -> str:
-    """Return the subsource the filter dropdown should match ``cause`` against.
+    """Return the subsource string the dropdown should match ``cause`` against.
 
-    Prefers the literal ``payload.subsource`` so PR-310 group memberships
-    (``"daemon"``, ``"operator_reject"``, ``"watch_retrigger_cap"``) that
-    sit outside the canonical PR-315 ``SUBSOURCE_VOCABULARY`` still round-
-    trip through the filter. When ``payload.subsource`` is absent — pre-
-    PR-315 records that the ``escalate_to_error`` migration left with only
-    ``payload.legacy_category`` — defer to ``classify_cancellation_subsource``
-    so the legacy ``ESCALATE``/``CRASH``/``TIMEOUT``/``INFRA``/
-    ``NO_PUSH_DEADLOCK`` values are mapped onto the canonical subsource and
-    show up under the correct group (otherwise "Coder ESCALATE only" and
-    "Daemon-detected only" would hide valid in-window cancellations).
+    Prefers the literal ``payload.subsource`` so every registry-known
+    subsource round-trips through the filter. When ``payload.subsource``
+    is absent — pre-PR-315 records that the ``escalate_to_error``
+    migration left with only ``payload.legacy_category`` — defer to
+    ``classify_cancellation_subsource`` so the legacy ``ESCALATE``/
+    ``CRASH``/``TIMEOUT``/``INFRA``/``NO_PUSH_DEADLOCK`` values map onto
+    the canonical subsource and surface under the right bucket.
     """
     payload = getattr(cause, "payload", None)
     if isinstance(payload, dict):
@@ -1675,10 +1656,11 @@ async def partial_repo_cancellations(
             # Redis temporarily unreachable: render the empty-state placeholder
             # so the HTMX swap target stays stable instead of 5xx-ing the panel.
             causes = []
-    allowed_subsources = _SUBSOURCE_FILTER_GROUPS.get(subsource_filter)
-    if allowed_subsources is not None:
+    if subsource_filter in _FILTER_BUCKETS:
         causes = [
-            cause for cause in causes if _filter_subsource(cause) in allowed_subsources
+            cause
+            for cause in causes
+            if group_for(_filter_subsource(cause)) == subsource_filter
         ]
     augmented = (
         await _augment_causes_with_dependents(name, causes) if causes else []
