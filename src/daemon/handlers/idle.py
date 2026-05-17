@@ -957,6 +957,17 @@ class IdleMixin:
                     self._paused_inhibited_logged = True
                 return
             self._paused_inhibited_logged = False
+            # Mirror the legacy expired-window resume below: stale
+            # rate-limit metadata must be cleared before the IDLE
+            # transition, otherwise ``run_cycle`` keeps reading
+            # ``rate_limited_until != None`` as a live pause signal
+            # (forcing ``ERROR -> PAUSED`` and similar branches) until
+            # ``_check_rate_limit`` happens to run. Inhibitors with
+            # ``expires_at`` already cleared themselves out of
+            # ``derive_active_inhibitors``; the scalar fields persist.
+            self.state.rate_limited_until = None
+            self.state.rate_limit_reactive = False
+            self.state.rate_limit_reactive_coder = None
             self.log_event("[INFRA] PAUSED inhibitors cleared -> IDLE.")
             self.state.state = PipelineState.IDLE
             return

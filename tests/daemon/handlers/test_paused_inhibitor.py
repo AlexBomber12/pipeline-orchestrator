@@ -277,6 +277,36 @@ def test_handle_paused_flag_on_per_coder_rate_limit_keeps_paused() -> None:
     )
 
 
+def test_handle_paused_flag_on_clears_stale_rate_limit_metadata() -> None:
+    """Unified resume must clear ``rate_limited_*`` scalars.
+
+    Regression for review feedback on PR-330b: when the window in
+    ``rate_limited_coder_until`` is past, ``derive_active_inhibitors``
+    returns no blocker and the unified branch transitions to IDLE. The
+    legacy scalar fields persist, however, and ``run_cycle`` then keeps
+    reading ``rate_limited_until != None`` as a live pause (forcing
+    ``ERROR -> PAUSED``) until ``_check_rate_limit`` happens to run.
+    Mirror the legacy expired-window resume and clear all three
+    scalars before setting IDLE.
+    """
+    runner = h._make_runner()
+    _enable_flag(runner)
+    _seed_paused(runner)
+    runner.state.user_paused = False
+    past = datetime.now(timezone.utc) - timedelta(minutes=5)
+    runner.state.rate_limited_until = past
+    runner.state.rate_limit_reactive = True
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.active_inhibitors = []
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive is False
+    assert runner.state.rate_limit_reactive_coder is None
+
+
 def test_handle_paused_flag_on_logs_only_once_while_paused() -> None:
     """Repeat calls under unified path should not spam the event log."""
     runner = h._make_runner()
