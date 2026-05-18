@@ -22,16 +22,36 @@ from src.web.app import app
 from src.web.routes import daemon_control as daemon_control_routes
 
 
-class _FakePipeline:
+class _FakeTransactionPipe:
+    """Stand-in for ``redis.asyncio.Pipeline`` used inside WATCH/MULTI/EXEC.
+
+    Models the surface the daemon-wide endpoints exercise: an immediate
+    ``get`` while watching, ``multi`` to switch into buffered mode, then
+    queued ``set``/``delete`` calls applied when the transaction commits.
+    Errors injected on the owning ``_FakeRedis`` (``get_error``,
+    ``set_error``, ``pipeline_execute_error``) surface at the same points
+    they would in production so the swallow-and-continue paths get
+    realistic coverage.
+    """
+
     def __init__(self, redis: "_FakeRedis") -> None:
         self._redis = redis
         self._ops: list[tuple[str, tuple[Any, ...]]] = []
+        self._in_multi = False
 
-    def set(self, key: str, value: str, ex: int | None = None) -> "_FakePipeline":
+    async def get(self, key: str) -> str | None:
+        if self._redis.get_error is not None:
+            raise self._redis.get_error
+        return self._redis.values.get(key)
+
+    def multi(self) -> None:
+        self._in_multi = True
+
+    def set(self, key: str, value: str, ex: int | None = None) -> "_FakeTransactionPipe":
         self._ops.append(("set", (key, value, ex)))
         return self
 
-    def delete(self, *keys: str) -> "_FakePipeline":
+    def delete(self, *keys: str) -> "_FakeTransactionPipe":
         self._ops.append(("delete", keys))
         return self
 
@@ -42,6 +62,8 @@ class _FakePipeline:
         for op, args in self._ops:
             if op == "set":
                 key, value, ex = args
+                if self._redis.set_error is not None:
+                    raise self._redis.set_error
                 self._redis.values[key] = value
                 if ex is not None:
                     self._redis.ttls[key] = ex
@@ -67,6 +89,7 @@ class _FakeRedis:
         self.set_error: Exception | None = None
         self.publish_error: Exception | None = None
         self.pipeline_execute_error: Exception | None = None
+        self.transaction_calls: list[tuple[str, ...]] = []
 
     async def ping(self) -> bool:
         return True
@@ -93,8 +116,18 @@ class _FakeRedis:
         self.published.append((channel, message))
         return 1
 
-    def pipeline(self) -> _FakePipeline:
-        return _FakePipeline(self)
+    async def transaction(
+        self,
+        callback: Any,
+        *keys: str,
+        value_from_callable: bool = False,
+    ) -> Any:
+        self.transaction_calls.append(keys)
+        pipe = _FakeTransactionPipe(self)
+        result = await callback(pipe)
+        if pipe._ops:
+            await pipe.execute()
+        return result if value_from_callable else None
 
     async def aclose(self) -> None:
         return None
@@ -535,6 +568,62 @@ def test_drain_progress_rate_limit_pause_not_draining(
     assert entry["draining"] is False
 
 
+def test_drain_progress_recovers_from_redis_get_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drain-progress falls back to a default IDLE entry when ``get`` raises.
+
+    The endpoint walks every configured repo sequentially; a transient
+    Redis read failure for one repo must not abort the sweep or surface
+    a 500 to the deploy operator polling this endpoint.
+    """
+    _write_config(tmp_path, monkeypatch, repo_urls=[_REPO_URLS[0]])
+    redis_client = _FakeRedis()
+    redis_client.get_error = RuntimeError("redis read down")
+    _stub_redis(monkeypatch, redis_client)
+
+    with TestClient(app) as client:
+        body = client.get("/daemon/drain-progress").json()
+
+    entry = body["repos"][0]
+    assert entry["state"] == PipelineState.IDLE.value
+    assert entry["draining"] is False
+
+
+def test_drain_progress_recovers_from_state_decode_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drain-progress falls back to a default entry on corrupt JSON."""
+    _write_config(tmp_path, monkeypatch, repo_urls=[_REPO_URLS[0]])
+    redis_client = _FakeRedis()
+    redis_client.values[pipeline_state(_REPO_SLUGS[0])] = "{not valid json"
+    _stub_redis(monkeypatch, redis_client)
+
+    with TestClient(app) as client:
+        body = client.get("/daemon/drain-progress").json()
+
+    entry = body["repos"][0]
+    assert entry["state"] == PipelineState.IDLE.value
+    assert entry["draining"] is False
+
+
+def test_drain_progress_returns_default_for_unseeded_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repos with no pipeline state in Redis report a default IDLE entry."""
+    _write_config(tmp_path, monkeypatch, repo_urls=[_REPO_URLS[0]])
+    redis_client = _FakeRedis()
+    _stub_redis(monkeypatch, redis_client)
+
+    with TestClient(app) as client:
+        body = client.get("/daemon/drain-progress").json()
+
+    entry = body["repos"][0]
+    assert entry["state"] == PipelineState.IDLE.value
+    assert entry["current_task_id"] is None
+    assert entry["draining"] is False
+
+
 def test_drain_progress_without_redis_returns_default_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -548,6 +637,56 @@ def test_drain_progress_without_redis_returns_default_state(
     assert all(entry["state"] == PipelineState.IDLE.value for entry in body["repos"])
     assert all(entry["draining"] is False for entry in body["repos"])
     assert all(entry["current_task_id"] is None for entry in body["repos"])
+
+
+def test_daemon_pause_uses_cas_watch_on_state_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``/daemon/pause`` must WATCH the pipeline state key for every repo.
+
+    Without the WATCH, a concurrent daemon ``publish_state`` write that
+    lands between our read-modify-write can overwrite ``user_paused``
+    (or our write can clobber fresher task metadata). Asserting on the
+    recorded ``transaction`` watch keys verifies the CAS structure is in
+    place; correctness of the retry-on-conflict semantics is provided by
+    the underlying ``redis-py`` ``transaction()`` helper.
+    """
+    _write_config(tmp_path, monkeypatch)
+    redis_client = _FakeRedis()
+    _stub_redis(monkeypatch, redis_client)
+    for slug, url in zip(_REPO_SLUGS, _REPO_URLS):
+        _seed_state(redis_client, slug, url=url)
+
+    with TestClient(app) as client:
+        client.post("/daemon/pause")
+
+    assert redis_client.transaction_calls == [
+        (pipeline_state(slug),) for slug in _REPO_SLUGS
+    ]
+
+
+def test_daemon_resume_uses_cas_watch_on_state_and_stop_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``/daemon/resume`` watches both the state key and the stop key.
+
+    Resume clears the per-repo stop flag inside the same transaction
+    that flips ``user_paused`` off, so both keys must participate in the
+    WATCH set to keep the clear-and-resume side effects atomic with
+    respect to concurrent daemon state writes.
+    """
+    _write_config(tmp_path, monkeypatch)
+    redis_client = _FakeRedis()
+    _stub_redis(monkeypatch, redis_client)
+    for slug, url in zip(_REPO_SLUGS, _REPO_URLS):
+        _seed_state(redis_client, slug, url=url, user_paused=True)
+
+    with TestClient(app) as client:
+        client.post("/daemon/resume")
+
+    assert redis_client.transaction_calls == [
+        (pipeline_state(slug), control_stop(slug)) for slug in _REPO_SLUGS
+    ]
 
 
 def test_daemon_endpoints_idempotent(

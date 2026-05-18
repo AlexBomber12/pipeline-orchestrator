@@ -94,19 +94,48 @@ async def _write_user_paused(
     user_paused: bool,
     clear_stop: bool,
 ) -> None:
-    """Update ``user_paused`` on a single repo's pipeline state."""
-    state = await _load_repo_state(redis_client, name, url)
-    state.user_paused = user_paused
-    serialized = state.model_dump_json()
-    key = pipeline_state(name)
-    try:
-        if clear_stop:
-            pipe = redis_client.pipeline()
-            pipe.set(key, serialized)
-            pipe.delete(control_stop(name))
-            await pipe.execute()
+    """Update ``user_paused`` on a single repo's pipeline state.
+
+    Uses Redis WATCH/MULTI/EXEC so a concurrent daemon ``publish_state``
+    write landing between our read and write aborts the transaction and
+    the callback retries with fresh state. Without CAS, a daemon write
+    could clobber the pause/resume flip we just applied, or our write
+    could overwrite fresher task metadata the daemon just persisted.
+    Mirrors the per-repo ``_update_repo_pause_state`` pattern in
+    ``repo_control.py``.
+    """
+    state_key = pipeline_state(name)
+    stop_key = control_stop(name)
+    watch_keys: tuple[str, ...] = (
+        (state_key, stop_key) if clear_stop else (state_key,)
+    )
+
+    async def _transaction(pipe: Any) -> None:
+        try:
+            raw = await pipe.get(state_key)
+        except Exception:
+            logger.warning(
+                "Failed to read state for %s", name, exc_info=True
+            )
+            raw = None
+        if raw is None:
+            state = _default_repo_state(name, url)
         else:
-            await redis_client.set(key, serialized)
+            try:
+                state = RepoState.model_validate_json(raw)
+            except Exception:
+                logger.warning(
+                    "State decode failed for %s", name, exc_info=True
+                )
+                state = _default_repo_state(name, url)
+        state.user_paused = user_paused
+        pipe.multi()
+        pipe.set(state_key, state.model_dump_json())
+        if clear_stop:
+            pipe.delete(stop_key)
+
+    try:
+        await redis_client.transaction(_transaction, *watch_keys)
     except Exception:
         logger.warning(
             "Failed to update pipeline state for %s", name, exc_info=True
