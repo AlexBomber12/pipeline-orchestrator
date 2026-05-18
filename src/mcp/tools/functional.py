@@ -159,15 +159,17 @@ def suggest_next_pr_number(repo: str) -> int:
 def _read_frontmatter_status(task_path: Path) -> str:
     """Read the canonical uppercase status from a task file frontmatter.
 
-    Returns ``"TODO"`` when frontmatter is absent, the status key is
-    missing, the value is unrecognized, or the file cannot be read.
-    Mirrors ``_read_task_frontmatter_status`` in
-    ``src/web/routes/repo_control.py`` but kept local so the MCP
-    package does not pull in FastAPI imports.
+    Returns ``"TODO"`` when frontmatter is absent or unterminated, the
+    status key is missing, the value is unrecognized, or the file
+    cannot be read or decoded. Mirrors ``parse_task_header`` in
+    ``src/queue_parser.py``: status is only read from a CLOSED
+    frontmatter block, and when multiple ``status:`` lines appear the
+    LAST one wins. Kept local so the MCP package does not pull in
+    FastAPI imports.
     """
     try:
         lines = task_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return "TODO"
 
     first_content_index = next(
@@ -180,17 +182,26 @@ def _read_frontmatter_status(task_path: Path) -> str:
     ):
         return "TODO"
 
-    for raw_line in lines[first_content_index + 1 :]:
-        if raw_line.rstrip() == _FRONTMATTER_DELIMITER:
-            return "TODO"
+    frontmatter_end_index: int | None = None
+    for index in range(first_content_index + 1, len(lines)):
+        if lines[index].rstrip() == _FRONTMATTER_DELIMITER:
+            frontmatter_end_index = index
+            break
+    if frontmatter_end_index is None:
+        return "TODO"
+
+    raw_status: str | None = None
+    for raw_line in lines[first_content_index + 1 : frontmatter_end_index]:
         status_match = _FRONTMATTER_STATUS_LINE.match(raw_line.rstrip())
         if status_match is None:
             continue
         raw_status = status_match.group(1).split("#", 1)[0].strip().strip("\"'")
-        canonical = raw_status.upper()
-        if canonical in _CANONICAL_STATUSES:
-            return canonical
+
+    if raw_status is None:
         return "TODO"
+    canonical = raw_status.upper()
+    if canonical in _CANONICAL_STATUSES:
+        return canonical
     return "TODO"
 
 

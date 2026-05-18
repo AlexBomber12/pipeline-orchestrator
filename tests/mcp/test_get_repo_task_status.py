@@ -204,6 +204,84 @@ def test_unterminated_frontmatter_without_status_returns_todo(tmp_path):
     assert result == {"PR-600": "TODO"}
 
 
+def test_closed_frontmatter_with_unrecognized_status_returns_todo(tmp_path):
+    """Closed frontmatter whose status value is not in the canonical
+    set (TODO/DONE/ERROR) falls back to TODO.
+    """
+    from src.mcp.tools import functional
+
+    fake_root = tmp_path / "data" / "repos"
+    tasks = fake_root / "owner__repo" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "PR-650.md").write_text(
+        "---\nstatus: bogus\n---\n\n# PR-650: stub\n", encoding="utf-8"
+    )
+
+    with patch.object(functional, "_REPOS_ROOT", fake_root):
+        result = functional.get_repo_task_status("owner__repo")
+
+    assert result == {"PR-650": "TODO"}
+
+
+def test_unterminated_frontmatter_with_valid_status_returns_todo(tmp_path):
+    """Unterminated ``---`` block with a canonical status must still
+    fall back to TODO so MCP clients do not see ``DONE`` for malformed
+    files. Mirrors ``parse_task_header`` which ignores the status line
+    when the frontmatter block is not closed.
+    """
+    from src.mcp.tools import functional
+
+    fake_root = tmp_path / "data" / "repos"
+    tasks = fake_root / "owner__repo" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "PR-700.md").write_text(
+        "---\nstatus: DONE\n# PR-700: stub\n", encoding="utf-8"
+    )
+
+    with patch.object(functional, "_REPOS_ROOT", fake_root):
+        result = functional.get_repo_task_status("owner__repo")
+
+    assert result == {"PR-700": "TODO"}
+
+
+def test_multiple_status_lines_uses_last_value(tmp_path):
+    """When the frontmatter has multiple ``status:`` lines, the LAST
+    one wins, matching ``parse_task_header`` in ``src/queue_parser.py``.
+    """
+    from src.mcp.tools import functional
+
+    fake_root = tmp_path / "data" / "repos"
+    tasks = fake_root / "owner__repo" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "PR-800.md").write_text(
+        "---\nstatus: TODO\nstatus: DONE\n---\n\n# PR-800: stub\n",
+        encoding="utf-8",
+    )
+
+    with patch.object(functional, "_REPOS_ROOT", fake_root):
+        result = functional.get_repo_task_status("owner__repo")
+
+    assert result == {"PR-800": "DONE"}
+
+
+def test_handles_non_utf8_file_with_fallback_to_todo(tmp_path):
+    """A non-UTF8 task file must not break the whole repo scan; the
+    individual file falls back to TODO instead of raising.
+    """
+    from src.mcp.tools import functional
+
+    fake_root = tmp_path / "data" / "repos"
+    tasks = fake_root / "owner__repo" / "tasks"
+    tasks.mkdir(parents=True)
+    _write_spec(tasks, "PR-900.md", "DONE")
+    (tasks / "PR-901.md").write_bytes(b"---\nstatus: \xff\xfe broken\n---\n")
+
+    with patch.object(functional, "_REPOS_ROOT", fake_root):
+        result = functional.get_repo_task_status("owner__repo")
+
+    assert result == {"PR-900": "DONE", "PR-901": "TODO"}
+
+
 def test_get_repo_task_status_registered_with_mcp_server():
     """Tool appears in the MCP server's tool registry after import."""
     import asyncio
