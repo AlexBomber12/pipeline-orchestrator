@@ -215,10 +215,14 @@ async def daemon_stop(request: Request) -> JSONResponse:
 async def daemon_drain_progress(request: Request) -> JSONResponse:
     """Return per-repo drain status for UI polling during a daemon pause.
 
-    A repo is ``draining`` when it sits in ``PAUSED`` with a
-    ``current_task`` still attached — i.e. the operator pressed pause
-    while the runner was mid-cycle and the coder is still finishing the
-    iteration before parking the runner.
+    A repo is ``draining`` only when the operator pressed pause while
+    the runner was mid-cycle: ``state == PAUSED``, ``user_paused`` is
+    set, and a ``current_task`` is still attached. ``user_paused`` is
+    the discriminator ``handle_paused`` itself uses to distinguish
+    operator pauses from rate-limit pauses (rate-limited repos can sit
+    in ``PAUSED`` with ``current_task`` retained), so excluding it
+    would surface rate-limit waits as "draining" to deploy operators
+    polling this endpoint.
     """
     cfg = await asyncio.to_thread(load_config, _config_path())
     redis_client = getattr(request.app.state, "redis", None)
@@ -233,7 +237,9 @@ async def daemon_drain_progress(request: Request) -> JSONResponse:
             state.current_task.pr_id if state.current_task is not None else None
         )
         draining = (
-            state.state == PipelineState.PAUSED and current_task_id is not None
+            state.state == PipelineState.PAUSED
+            and state.user_paused
+            and current_task_id is not None
         )
         repos.append(
             {

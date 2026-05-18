@@ -497,6 +497,44 @@ def test_drain_progress_non_paused_repos_not_draining(
     assert by_name[_REPO_SLUGS[2]]["draining"] is False
 
 
+def test_drain_progress_rate_limit_pause_not_draining(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PAUSED+current_task repo with ``user_paused=False`` is rate-limited.
+
+    ``handle_paused`` uses ``user_paused`` to tell operator pauses apart
+    from rate-limit pauses, and rate-limited repos can retain
+    ``current_task`` while they wait out the window. The drain endpoint
+    must mirror that distinction so deploy operators do not see
+    rate-limit waits reported as a daemon-wide drain in progress.
+    """
+    _write_config(tmp_path, monkeypatch, repo_urls=[_REPO_URLS[0]])
+    redis_client = _FakeRedis()
+    _stub_redis(monkeypatch, redis_client)
+    _seed_state(
+        redis_client,
+        _REPO_SLUGS[0],
+        url=_REPO_URLS[0],
+        state=PipelineState.PAUSED,
+        user_paused=False,
+        current_task=QueueTask(
+            pr_id="PR-200",
+            title="Rate-limited task",
+            status=TaskStatus.DOING,
+            task_file="tasks/PR-200.md",
+            branch="pr-200",
+        ),
+    )
+
+    with TestClient(app) as client:
+        body = client.get("/daemon/drain-progress").json()
+
+    entry = body["repos"][0]
+    assert entry["state"] == PipelineState.PAUSED.value
+    assert entry["current_task_id"] == "PR-200"
+    assert entry["draining"] is False
+
+
 def test_drain_progress_without_redis_returns_default_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
