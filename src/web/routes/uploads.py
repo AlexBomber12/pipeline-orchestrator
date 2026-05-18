@@ -41,6 +41,7 @@ from src.web.services.upload_validation import (
     _build_upload_success_message,
     _format_upload_message_lines,
     _upload_feedback_target,
+    preserve_terminal_status_on_collision,
     sweep_abandoned_staging,
 )
 
@@ -384,6 +385,39 @@ async def upload_tasks(
         )
 
     file_contents = accepted_file_contents
+
+    # Per OBS-CY: a re-upload of a spec at status:TODO must not regress the
+    # already-merged or already-errored copy on disk. Before staging, rewrite
+    # task-file contents whose destination already carries a terminal
+    # ``DONE``/``ERROR`` frontmatter so the daemon's later overwrite preserves
+    # that status.
+    preserved_collisions: list[tuple[str, str]] = []
+    rewritten_contents: list[tuple[str, bytes]] = []
+    tasks_dir = Path(repo_path) / "tasks"
+    for fname, content in file_contents:
+        if not re.fullmatch(_TASK_UPLOAD_PATTERN, fname):
+            rewritten_contents.append((fname, content))
+            continue
+        # Task uploads already passed the UTF-8 gate earlier; decode is safe.
+        upload_text = content.decode("utf-8")
+        new_text, preserved_status = preserve_terminal_status_on_collision(
+            tasks_dir / fname, upload_text
+        )
+        if preserved_status is None:
+            rewritten_contents.append((fname, content))
+            continue
+        preserved_collisions.append((fname, preserved_status))
+        rewritten_contents.append((fname, new_text.encode("utf-8")))
+    file_contents = rewritten_contents
+    if preserved_collisions:
+        _app.logger.info(
+            "Upload preserved terminal frontmatter status for %s in repo %s: %s",
+            len(preserved_collisions),
+            name,
+            ", ".join(
+                f"{fname}={status}" for fname, status in preserved_collisions
+            ),
+        )
 
     # Stage files to /data/uploads/{repo}/ and enqueue for daemon processing.
     # Git write operations are handled by the daemon to preserve the
