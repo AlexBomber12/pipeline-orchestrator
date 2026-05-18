@@ -166,6 +166,28 @@ def test_drain_progress_hidden_for_non_paused_states(state_value: PipelineState)
     assert "Draining" not in html
 
 
+@pytest.mark.parametrize(
+    "state_value", [PipelineState.CODING, PipelineState.FIX]
+)
+def test_drain_progress_shown_for_active_coding_or_fix_drain(
+    state_value: PipelineState,
+) -> None:
+    # Pause All flips ``user_paused=True`` but the runner keeps
+    # publishing CODING/FIX until the cycle hands off. The card must
+    # render the indicator during that active drain window.
+    state = _state(state=state_value, current_task=_task())
+    drain = {
+        state.name: {
+            "phase": state_value.value,
+            "elapsed_sec": 30.0,
+            "est_remaining_sec": 90.0,
+        }
+    }
+    html = _render_cards(repos=[state], drain_progress=drain)
+    assert "data-drain-progress" in html
+    assert f"Draining: {state_value.value} for 30s" in html
+
+
 def test_drain_progress_omits_remaining_when_phase_unknown() -> None:
     # When the view-layer cannot estimate a remaining time (e.g. timeout
     # config produces ``None`` for ``est_remaining_sec``), the indicator
@@ -285,11 +307,113 @@ async def test_build_drain_progress_returns_none_when_history_lacks_coding_or_fi
 
 
 @pytest.mark.asyncio
-async def test_build_drain_progress_returns_none_when_not_paused() -> None:
+async def test_build_drain_progress_returns_none_when_coding_without_user_pause() -> None:
+    # Active CODING without ``user_paused`` is a normal in-flight run,
+    # not a drain. The ``user_paused`` gate keeps the helper silent so
+    # nothing renders for steady-state coders.
     started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
     state = _state(
         state=PipelineState.CODING,
         user_paused=False,
+        current_task=_task(),
+        history=[_history_entry(state="CODING", time=started)],
+    )
+    view = await dashboard_routes._build_drain_progress(
+        redis_client=None,
+        state=state,
+        config=_config(),
+        now=started + timedelta(seconds=60),
+    )
+    assert view is None
+
+
+@pytest.mark.asyncio
+async def test_build_drain_progress_active_coding_drain_with_user_paused() -> None:
+    # Pause All flips ``user_paused`` but the runner keeps publishing
+    # ``state == CODING`` until the cycle naturally hands off. The
+    # helper must surface the drain immediately for that window so
+    # operators see elapsed/remaining time without waiting for the
+    # runner to finally land in PAUSED.
+    started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+    now = started + timedelta(seconds=600)
+    state = _state(
+        state=PipelineState.CODING,
+        user_paused=True,
+        current_task=_task(),
+        history=[_history_entry(state="CODING", time=started)],
+    )
+    view = await dashboard_routes._build_drain_progress(
+        redis_client=None,
+        state=state,
+        config=_config(planned_pr_timeout_sec=3600),
+        now=now,
+    )
+    assert view is not None
+    assert view["phase"] == "CODING"
+    assert view["elapsed_sec"] == pytest.approx(600.0)
+    assert view["est_remaining_sec"] == pytest.approx(3000.0)
+
+
+@pytest.mark.asyncio
+async def test_build_drain_progress_active_fix_drain_with_user_paused() -> None:
+    # Mirror of the CODING active-drain case for FIX: the runner stays
+    # in ``state == FIX`` until the fix cycle hands off, so the helper
+    # must accept that shape too. Elapsed is anchored to
+    # ``current_pr.last_activity`` (last push) per the FIX branch.
+    started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+    last_push = started + timedelta(seconds=120)
+    now = last_push + timedelta(seconds=600)
+    pr = PRInfo(number=1, branch="b", last_activity=last_push)
+    state = _state(
+        state=PipelineState.FIX,
+        user_paused=True,
+        current_task=_task(),
+        current_pr=pr,
+        history=[_history_entry(state="FIX", time=started)],
+    )
+    view = await dashboard_routes._build_drain_progress(
+        redis_client=None,
+        state=state,
+        config=_config(fix_idle_timeout_sec=1800),
+        now=now,
+    )
+    assert view is not None
+    assert view["phase"] == "FIX"
+    assert view["elapsed_sec"] == pytest.approx(600.0)
+    assert view["est_remaining_sec"] == pytest.approx(1200.0)
+
+
+@pytest.mark.asyncio
+async def test_build_drain_progress_returns_none_for_idle_with_user_paused() -> None:
+    # IDLE+user_paused has no in-flight coder cycle to drain — the gate
+    # must reject states outside {PAUSED, CODING, FIX}. Otherwise an
+    # already-quiesced repo would advertise a phantom drain immediately
+    # after Pause All.
+    started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+    state = _state(
+        state=PipelineState.IDLE,
+        user_paused=True,
+        current_task=_task(),
+        history=[_history_entry(state="CODING", time=started)],
+    )
+    view = await dashboard_routes._build_drain_progress(
+        redis_client=None,
+        state=state,
+        config=_config(),
+        now=started + timedelta(seconds=60),
+    )
+    assert view is None
+
+
+@pytest.mark.asyncio
+async def test_build_drain_progress_returns_none_for_watch_with_user_paused() -> None:
+    # WATCH means the coder already handed off; there is no coder run
+    # left to drain, so the gate must reject this shape even with
+    # ``user_paused=True``.
+    started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+    state = _state(
+        state=PipelineState.WATCH,
+        user_paused=True,
         current_task=_task(),
         history=[_history_entry(state="CODING", time=started)],
     )
@@ -463,3 +587,35 @@ async def test_build_drain_progress_map_empty_when_no_states() -> None:
         config=_config(),
     )
     assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_build_drain_progress_map_includes_active_coding_drain() -> None:
+    # Pause All flips ``user_paused=True`` but the runner stays in
+    # CODING until the cycle hands off. The map must include that repo
+    # so the per-card indicator appears during the actual drain window,
+    # not only once the runner finally publishes PAUSED.
+    started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+    active = _state(
+        repo_name="octo__alpha",
+        state=PipelineState.CODING,
+        user_paused=True,
+        current_task=_task(pr_id="PR-001"),
+        history=[_history_entry(state="CODING", time=started)],
+    )
+    parked = _state(
+        repo_name="octo__beta",
+        state=PipelineState.PAUSED,
+        user_paused=True,
+        current_task=_task(pr_id="PR-002"),
+        history=[_history_entry(state="FIX", time=started)],
+    )
+    result = await dashboard_routes._build_drain_progress_map(
+        redis_client=None,
+        states=[active, parked],
+        config=_config(),
+        now=started + timedelta(seconds=60),
+    )
+    assert set(result) == {"octo__alpha", "octo__beta"}
+    assert result["octo__alpha"]["phase"] == "CODING"
+    assert result["octo__beta"]["phase"] == "FIX"

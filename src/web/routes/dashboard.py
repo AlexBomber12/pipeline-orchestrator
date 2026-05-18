@@ -1153,11 +1153,23 @@ async def _build_drain_progress(
     """Return drain-progress view data for a single repo, or ``None``.
 
     The indicator surfaces when the operator's Pause All caught the
-    runner mid-CODING or mid-FIX: the repo is in ``PAUSED`` with
-    ``user_paused`` set and a ``current_task`` still attached, and the
-    most recent non-PAUSED history entry is CODING or FIX. Rate-limit
-    pauses skip the check via the ``user_paused`` gate so the existing
-    "Paused, Nm remaining" indicator stays the only signal there.
+    runner mid-CODING or mid-FIX. ``/daemon/pause`` flips
+    ``user_paused=True`` and wakes the runner, but it does not move the
+    repo into ``PAUSED``; the runner keeps publishing the active
+    CODING/FIX state until the current cycle naturally hands off
+    (CODING→WATCH, FIX→IDLE/MERGE). Two shapes therefore qualify as an
+    in-flight drain and the gate accepts both:
+
+    * ``state == PAUSED`` with ``user_paused`` set and a ``current_task``
+      attached — the runner has already finished its cycle and parked
+      the repo in PAUSED.
+    * ``state in {CODING, FIX}`` with ``user_paused`` set and a
+      ``current_task`` attached — the runner is still inside the cycle
+      that Pause All asked to wind down.
+
+    Rate-limit pauses skip the check via the ``user_paused`` gate so the
+    existing "Paused, Nm remaining" indicator stays the only signal
+    there.
 
     ``coding_started_at`` is read from the Redis
     ``current_run_started_at`` marker that ``handle_coding`` writes on
@@ -1167,14 +1179,17 @@ async def _build_drain_progress(
     restart. ``est_remaining_sec`` is clamped at zero so elapsed runs
     that already exceeded the configured timeout do not render negative.
     """
-    if state.state != PipelineState.PAUSED:
-        return None
     if state.current_task is None:
         return None
     if not state.user_paused:
         return None
-    phase = _drained_from_phase(state.history)
-    if phase is None:
+    if state.state == PipelineState.PAUSED:
+        phase = _drained_from_phase(state.history)
+        if phase is None:
+            return None
+    elif state.state in (PipelineState.CODING, PipelineState.FIX):
+        phase = state.state.value
+    else:
         return None
     current_time = now if now is not None else datetime.now(timezone.utc)
     started_at: datetime | None = None
