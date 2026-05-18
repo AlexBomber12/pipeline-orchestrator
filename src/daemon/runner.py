@@ -114,7 +114,7 @@ from src.keyspace import (
     upload_pending,
 )
 from src.metrics import MetricsStore, RunRecord
-from src.models import PipelineState, RepoState
+from src.models import PipelineState, RepoState, TaskStatus
 from src.queue_parser import (
     TYPE_SYNONYMS,
     QueueValidationError,
@@ -1754,7 +1754,16 @@ class PipelineRunner(
         }
 
     async def _mark_status_write_failed_task(self, current_task: Any) -> None:
-        """Keep an explicitly parked task skipped when status commit fails."""
+        """Keep an explicitly parked task skipped when status commit fails.
+
+        Inline-updates ``state.current_queue`` so the dashboard sees the
+        ERROR status immediately on the next 5-second poll. Without this
+        sync, the override only lands at boot via
+        ``_apply_recovery_decisions``, so operators see no Retry button
+        until docker restart. The override logic mirrors
+        ``recovery.py:_apply_recovery_decisions`` to keep the two paths
+        in lockstep.
+        """
         pr_id = getattr(current_task, "pr_id", "")
         if not pr_id:
             return
@@ -1764,6 +1773,35 @@ class PipelineRunner(
             f"{pr_id}; task file re-upload is required to retry."
         )
         await self._persist_status_write_failed_task_pr_ids()
+
+        snapshot = self.state.current_queue
+        if not snapshot:
+            await self.publish_state()
+            return
+        changed = False
+        for index, queued in enumerate(snapshot):
+            if queued.pr_id != pr_id:
+                continue
+            if queued.status == TaskStatus.DONE:
+                # Defensive: a status_write_failed marker should never
+                # collide with a DONE task, but if it does, do not
+                # downgrade. Mirror the discard behavior in
+                # ``recovery.py:_apply_recovery_decisions``.
+                self._status_write_failed_task_pr_ids.discard(pr_id)
+                await self._persist_status_write_failed_task_pr_ids()
+                break
+            if queued.status != TaskStatus.ERROR:
+                snapshot[index] = queued.model_copy(
+                    update={"status": TaskStatus.ERROR}
+                )
+                changed = True
+            break
+        if changed:
+            # Reassign so ``RepoState.__setattr__`` re-stamps
+            # ``current_queue_snapshot_at`` (snapshot freshness token
+            # used by ``/api/repo/{name}/queue`` to gate cache).
+            self.state.current_queue = list(snapshot)
+        await self.publish_state()
 
     def _track_current_coder_process(
         self, proc: asyncio.subprocess.Process
