@@ -2,9 +2,11 @@
 
 The dashboard upload route rewrites incoming task-file content so that a
 re-uploaded ``status: TODO`` spec cannot regress an on-disk
-``status: DONE`` or ``status: ERROR`` task. The transform happens before
-files are staged under ``/data/uploads/``, so the daemon's later
-``shutil.copy2`` into ``tasks/`` carries the preserved terminal status.
+``status: DONE`` task. ``status: ERROR`` is intentionally left replaceable
+because re-upload is the documented retry signal — see
+``src/daemon/repo_ops.py``. The transform happens before files are staged
+under ``/data/uploads/``, so the daemon's later ``shutil.copy2`` into
+``tasks/`` carries the preserved DONE status.
 """
 
 from __future__ import annotations
@@ -180,11 +182,14 @@ def test_upload_preserves_done_status_on_collision(
     assert "Regenerated spec" in staged
 
 
-def test_upload_preserves_error_status_on_collision(
+def test_upload_replaces_error_status_on_collision(
     one_repo_config: Path,
     repo_dir: Path,
     uploads_dir: Path,
 ) -> None:
+    # Re-upload is the daemon's retry signal: an existing ``status: ERROR``
+    # task must accept the incoming ``status: TODO`` so the next IDLE cycle
+    # picks the task up again. Preserving ERROR here would deadlock retry.
     (repo_dir / "tasks" / "PR-322.md").write_text(
         _task_text("PR-322", status="ERROR"),
         encoding="utf-8",
@@ -194,8 +199,7 @@ def test_upload_preserves_error_status_on_collision(
 
     assert resp.status_code == 200
     staged = _staged_text(uploads_dir, "PR-322.md")
-    assert "status: ERROR" in staged.splitlines()[1]
-    assert "Regenerated body" in staged
+    assert staged == _task_text("PR-322", status="TODO", title="Regenerated body")
 
 
 def test_upload_replaces_todo_status_on_collision(

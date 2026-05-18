@@ -22,7 +22,7 @@ _ALLOWED_TASK_PATTERN = (
 )
 _STAGING_MAX_AGE_HOURS = 24
 _FRONTMATTER_STATUS_LINE = re.compile(r"^status:\s*(.+?)\s*$", re.IGNORECASE)
-_TERMINAL_FRONTMATTER_STATUSES = frozenset({"DONE", "ERROR"})
+_TERMINAL_FRONTMATTER_STATUSES = frozenset({"DONE"})
 
 
 def _strip_inline_frontmatter_comment(value: str) -> str:
@@ -130,10 +130,14 @@ def preserve_terminal_status_on_collision(
 ) -> tuple[str, str | None]:
     """Return ``(content_to_stage, preserved_status_or_None)``.
 
-    If *existing_path* exists with frontmatter ``status: DONE`` or
-    ``status: ERROR``, the uploaded body is kept but the terminal status is
-    re-attached so the next daemon commit cannot regress a merged/crashed
-    task to ``TODO``. Otherwise the upload content is returned unchanged.
+    If *existing_path* exists with frontmatter ``status: DONE``, the uploaded
+    body is kept but the terminal status is re-attached so the next daemon
+    commit cannot regress a merged task to ``TODO``. ``status: ERROR`` is
+    intentionally NOT preserved: re-uploading a task spec is the documented
+    retry signal (``src/daemon/repo_ops.py``), and the daemon needs the
+    incoming ``status: TODO`` so the task becomes dispatchable again instead
+    of staying pinned in ERROR. Returns the upload content unchanged in every
+    other case.
     """
     if not existing_path.is_file():
         return upload_content, None

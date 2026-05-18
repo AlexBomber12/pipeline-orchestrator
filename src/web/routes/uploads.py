@@ -386,11 +386,13 @@ async def upload_tasks(
 
     file_contents = accepted_file_contents
 
-    # Per OBS-CY: a re-upload of a spec at status:TODO must not regress the
-    # already-merged or already-errored copy on disk. Before staging, rewrite
-    # task-file contents whose destination already carries a terminal
-    # ``DONE``/``ERROR`` frontmatter so the daemon's later overwrite preserves
-    # that status.
+    # Per OBS-CY: a re-upload of a spec at status:TODO must not regress an
+    # already-merged copy on disk. Before staging, rewrite task-file contents
+    # whose destination already carries a terminal ``DONE`` frontmatter so the
+    # daemon's later overwrite preserves that status. ``status: ERROR`` is
+    # intentionally NOT preserved here — re-upload is the documented retry
+    # signal (see ``src/daemon/repo_ops.py``) and the incoming TODO must reach
+    # the daemon for the task to leave ERROR.
     preserved_collisions: list[tuple[str, str]] = []
     rewritten_contents: list[tuple[str, bytes]] = []
     tasks_dir = Path(repo_path) / "tasks"
