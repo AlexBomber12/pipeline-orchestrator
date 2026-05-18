@@ -93,38 +93,44 @@
 </dialog>
 
 <script>
-    // PR-340: Pause All opener fetches /daemon/drain-progress so the
-    // operator sees how many repos will flip to PAUSED before confirming.
-    // A fetch failure must NOT block the modal — the count falls back to
-    // "?" so the operator can still hit Confirm; the dashboard's HTMX
-    // POST will surface any backend failure separately. Stop All opens
+    // PR-340: Pause All opener shows the modal immediately with a "-"
+    // placeholder in the affected-count slot, then updates that slot
+    // asynchronously once /daemon/drain-progress resolves. Awaiting the
+    // fetch before calling showModal() would make the button look dead
+    // whenever the daemon is slow or hung — exactly when the operator
+    // needs the graceful pause control. A fetch failure resolves to "?"
+    // so the operator can still hit Confirm; the dashboard's HTMX POST
+    // will surface any backend failure separately. Stop All opens
     // immediately because the destructive copy already communicates the
     // blast radius and does not need a live count to be meaningful.
-    window.openPauseAllModal = async function openPauseAllModal() {
+    window.openPauseAllModal = function openPauseAllModal() {
         const modal = document.getElementById('pause-all-modal');
         const countEl = document.getElementById('pause-all-affected-count');
         if (countEl) {
             countEl.textContent = '-';
         }
-        try {
-            const r = await fetch('/daemon/drain-progress');
-            if (r.ok) {
-                const data = await r.json();
-                const repos = Array.isArray(data.repos) ? data.repos : [];
-                if (countEl) {
-                    countEl.textContent = String(repos.length);
-                }
-            } else if (countEl) {
-                countEl.textContent = '?';
-            }
-        } catch (_error) {
-            if (countEl) {
-                countEl.textContent = '?';
-            }
-        }
         if (modal && typeof modal.showModal === 'function') {
             modal.showModal();
         }
+        fetch('/daemon/drain-progress').then(function (r) {
+            if (!r.ok) {
+                if (countEl) {
+                    countEl.textContent = '?';
+                }
+                return null;
+            }
+            return r.json();
+        }).then(function (data) {
+            if (!data || !countEl) {
+                return;
+            }
+            const repos = Array.isArray(data.repos) ? data.repos : [];
+            countEl.textContent = String(repos.length);
+        }).catch(function () {
+            if (countEl) {
+                countEl.textContent = '?';
+            }
+        });
     };
 
     window.openStopAllModal = function openStopAllModal() {

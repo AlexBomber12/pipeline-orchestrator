@@ -76,10 +76,28 @@ def test_pause_all_opener_reads_repos_length_from_drain_progress() -> None:
 
     assert "fetch('/daemon/drain-progress')" in rendered
     assert "data.repos" in rendered
-    # The opener writes the count into the placeholder span before
-    # showing the modal so the operator never sees a stale value.
+    # The count lands in the placeholder span; the modal is shown first
+    # with a "-" placeholder and updated asynchronously when the fetch
+    # resolves, so a slow/hung daemon does not block the dialog.
     assert "String(repos.length)" in rendered
     assert "showModal()" in rendered
+
+
+def test_pause_all_opener_shows_modal_before_awaiting_fetch() -> None:
+    # The opener must call ``showModal()`` synchronously before it awaits
+    # the /daemon/drain-progress response. Otherwise a slow or hung daemon
+    # makes the Pause All button look dead exactly when the operator
+    # needs the graceful pause control. The contract is asserted by
+    # position: ``showModal()`` appears in the source ahead of the
+    # ``fetch(...)`` call inside the opener.
+    rendered = _render_component()
+
+    opener_segment = rendered.split("window.openPauseAllModal", 1)[1]
+    show_index = opener_segment.find("showModal()")
+    fetch_index = opener_segment.find("fetch('/daemon/drain-progress')")
+    assert show_index != -1
+    assert fetch_index != -1
+    assert show_index < fetch_index
 
 
 def test_confirm_pause_all_posts_to_daemon_pause_endpoint() -> None:
