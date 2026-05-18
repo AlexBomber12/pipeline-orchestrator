@@ -175,6 +175,12 @@ def test_handle_paused_flag_on_stays_paused_per_inhibitor(
     runner = h._make_runner()
     _enable_flag(runner)
     _seed_paused(runner)
+    # The unified gate ignores ``USER_PAUSE`` entries when
+    # ``state.user_paused`` is ``False`` (stale-Play guard added in the
+    # PR-330b review-feedback fix); the scalar source-of-truth must
+    # agree with the inhibitor fixture for the ``user_pause`` case.
+    if kind == InhibitorType.USER_PAUSE:
+        runner.state.user_paused = True
     runner.state.active_inhibitors = [_inhibitor(kind)]
 
     asyncio.run(runner.handle_paused())
@@ -397,6 +403,7 @@ def test_handle_paused_flag_on_logs_only_once_while_paused() -> None:
     runner = h._make_runner()
     _enable_flag(runner)
     _seed_paused(runner)
+    runner.state.user_paused = True
     runner.state.active_inhibitors = [_inhibitor(InhibitorType.USER_PAUSE)]
 
     asyncio.run(runner.handle_paused())
@@ -437,6 +444,39 @@ def test_handle_paused_flag_on_resumes_to_watch_when_pr_matches_task() -> None:
     assert runner.state.state == PipelineState.WATCH
     assert any(
         e["event"] == "[INFRA] PAUSED inhibitors cleared -> WATCH."
+        for e in runner.state.history
+    )
+
+
+def test_handle_paused_flag_on_ignores_stale_user_pause_after_play() -> None:
+    """Stale ``USER_PAUSE`` entry must not lag a Play press by one cycle.
+
+    Regression for the PR-330b review feedback: ``publish_state`` rebuilds
+    ``state.active_inhibitors`` at the END of each cycle, but
+    ``_run_cycle_body`` refreshes ``state.user_paused`` from Redis at
+    cycle START. When an operator presses Play, ``user_paused`` flips to
+    ``False`` while a ``USER_PAUSE`` entry from the previous publish is
+    still sitting in ``active_inhibitors`` — and because the entry has
+    no ``expires_at``, ``is_blocking_now`` would otherwise treat it as
+    live and keep the runner PAUSED through an extra cycle. The legacy
+    path read the fresh scalar directly and resumed in the same tick;
+    the unified gate must match.
+    """
+    runner = h._make_runner()
+    _enable_flag(runner)
+    _seed_paused(runner)
+    runner.state.user_paused = False
+    runner.state.active_inhibitors = [_inhibitor(InhibitorType.USER_PAUSE)]
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert any(
+        e["event"] == "[INFRA] PAUSED inhibitors cleared -> IDLE."
+        for e in runner.state.history
+    )
+    assert not any(
+        e["event"].startswith("[INFRA] PAUSED inhibited by")
         for e in runner.state.history
     )
 

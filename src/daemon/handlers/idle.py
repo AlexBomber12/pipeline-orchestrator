@@ -940,11 +940,25 @@ class IdleMixin:
         # via ``feature_flags.use_unified_inhibitor_check``.
         if self.repo_config.feature_flags.use_unified_inhibitor_check:
             _, blocking = is_work_inhibited(self.state, coder=None)
+            # ``state.active_inhibitors`` is rebuilt by ``publish_state``
+            # at the END of each cycle, but ``_run_cycle_body`` refreshes
+            # ``state.user_paused`` from Redis at cycle START. When an
+            # operator presses Play, ``user_paused`` flips to ``False``
+            # while a stale ``USER_PAUSE`` entry from the previous publish
+            # still sits in ``active_inhibitors`` (it carries no
+            # ``expires_at`` so ``is_blocking_now`` keeps treating it as
+            # live). Ignoring that stale entry here lets the unified gate
+            # match the legacy path, which read the fresh scalar
+            # directly and resumed in the same tick.
             hard_blocking = [
                 inh
                 for inh in blocking
                 if inh.inhibitor_type
                 != InhibitorType.GITHUB_BUDGET_SLOWDOWN
+                and not (
+                    inh.inhibitor_type == InhibitorType.USER_PAUSE
+                    and not self.state.user_paused
+                )
             ]
             if hard_blocking:
                 blocking_types = sorted(
