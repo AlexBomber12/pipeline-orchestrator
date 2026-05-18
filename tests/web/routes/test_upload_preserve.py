@@ -434,6 +434,55 @@ def test_replace_frontmatter_status_handles_crlf_line_endings() -> None:
     assert "status: DONE\r\n" in rewritten
 
 
+def test_read_frontmatter_status_skips_leading_blank_lines() -> None:
+    text = "\n\n---\nstatus: DONE\n---\n\nbody\n"
+    assert upload_validation.read_frontmatter_status(text) == "DONE"
+
+
+def test_read_frontmatter_status_uses_last_duplicate_status_key() -> None:
+    text = "---\nstatus: TODO\nstatus: DONE\n---\n\nbody\n"
+    assert upload_validation.read_frontmatter_status(text) == "DONE"
+
+
+def test_upload_preserves_done_with_leading_blank_lines_on_existing(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    body = _task_body("PR-322")
+    (repo_dir / "tasks" / "PR-322.md").write_text(
+        f"\n\n---\nstatus: DONE\n---\n\n{body}",
+        encoding="utf-8",
+    )
+
+    resp = _post([_task_upload("PR-322", status="TODO", title="Regenerated")])
+
+    assert resp.status_code == 200
+    staged = _staged_text(uploads_dir, "PR-322.md")
+    assert "status: DONE" in staged
+    assert "status: TODO" not in staged
+    assert "Regenerated" in staged
+
+
+def test_upload_preserves_done_when_existing_has_duplicate_status_keys(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    body = _task_body("PR-322")
+    (repo_dir / "tasks" / "PR-322.md").write_text(
+        f"---\nstatus: TODO\nstatus: DONE\n---\n\n{body}",
+        encoding="utf-8",
+    )
+
+    resp = _post([_task_upload("PR-322", status="TODO", title="Regenerated")])
+
+    assert resp.status_code == 200
+    staged = _staged_text(uploads_dir, "PR-322.md")
+    assert "status: DONE" in staged
+    assert "Regenerated" in staged
+
+
 def test_preserve_terminal_status_missing_existing_file(tmp_path: Path) -> None:
     new_text, preserved = upload_validation.preserve_terminal_status_on_collision(
         tmp_path / "nope.md", "upload-body\n"

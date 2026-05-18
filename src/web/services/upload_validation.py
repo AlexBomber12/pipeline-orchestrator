@@ -54,17 +54,24 @@ def read_frontmatter_status(content: str) -> str | None:
     Tolerant of quoted values, inline ``#`` comments, and trailing whitespace.
     Returns ``None`` when there is no leading ``---`` block, no closing
     ``---``, or no ``status`` field inside the block.
+
+    Mirrors ``queue_parser.parse_task_header``: leading blank lines before the
+    opening ``---`` are skipped, and when multiple ``status:`` lines appear
+    inside the block the LAST one wins (so collision preservation agrees with
+    the daemon's view of the on-disk task status).
     """
     lines = content.splitlines()
-    if not lines or lines[0].rstrip() != "---":
+    opening_index: int | None = next(
+        (index for index, raw_line in enumerate(lines) if raw_line.strip()),
+        None,
+    )
+    if opening_index is None or lines[opening_index].rstrip() != "---":
         return None
     status: str | None = None
-    for line in lines[1:]:
+    for line in lines[opening_index + 1 :]:
         stripped = line.rstrip()
         if stripped == "---":
             return status
-        if status is not None:
-            continue
         match = _FRONTMATTER_STATUS_LINE.match(stripped)
         if match:
             value = _strip_inline_frontmatter_comment(match.group(1)).strip()
