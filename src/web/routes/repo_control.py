@@ -23,6 +23,7 @@ from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from redis.exceptions import RedisError
 
+from src.audit.operator_actions import write_audit_record
 from src.cancellation.storage import (
     TTL_SECONDS,
     CancellationCause,
@@ -1289,6 +1290,45 @@ async def _reset_has_status_write_failed_marker(
     return False
 
 
+async def _capture_reset_diagnostic_snapshot(
+    pipe: aioredis.client.Pipeline,
+    repo_slug: str,
+    task_id: str,
+) -> dict[str, Any]:
+    """Snapshot pre-destruction retry_count and cancellation_cause.
+
+    Read on the pipeline that holds the WATCH for the destructive
+    DELETE, after ``pipe.watch(...)`` and before ``pipe.multi()``. Both
+    keys (``metrics:retry_count``, ``cancellation:``) are already part
+    of ``_reset_keys_for_task`` and therefore watched, so a concurrent
+    writer that mutates either between this read and EXEC aborts the
+    transaction (``WatchError``). The caller surfaces 409 and the audit
+    record is skipped rather than logging stale forensic data that
+    misrepresents the state actually cleared.
+    """
+    raw_retry = await pipe.get(_retry_count_key(repo_slug, task_id))
+    retry_count = _decode_retry_count(raw_retry)
+
+    raw_cause = await pipe.get(cause_key(repo_slug, task_id))
+    cause_dump: dict[str, Any] = {}
+    if raw_cause is not None:
+        try:
+            cause = CancellationCause.from_redis(raw_cause)
+        except (ValueError, TypeError, UnicodeDecodeError):
+            cause = None
+        if cause is not None:
+            cause_dump = {
+                "category": cause.category,
+                "payload": (
+                    cause.payload if isinstance(cause.payload, dict) else {}
+                ),
+            }
+    return {
+        "retry_count": retry_count,
+        "cancellation_cause": cause_dump,
+    }
+
+
 async def _reset_close_orphan_pr(
     name: str,
     task_id: str,
@@ -1454,11 +1494,22 @@ async def reset_task(
     except RedisError:
         return JSONResponse({"error": "redis unavailable"}, status_code=503)
 
+    diagnostic_snapshot: dict[str, Any] = {}
     try:
         cancellation_index = index_key(name)
         try:
             async with redis_client.pipeline(transaction=True) as pipe:
                 await pipe.watch(*keys_to_delete, cancellation_index)
+                # PR-336 follow-up: snapshot retry_count and cancellation
+                # cause inside the same watched window as the destructive
+                # DELETE. Both keys are watched, so any concurrent mutation
+                # between this read and EXEC aborts the transaction and the
+                # audit record is skipped — preventing stale
+                # retry_count_at_reset/subsource_at_reset values from being
+                # logged as the state that was cleared.
+                diagnostic_snapshot = await _capture_reset_diagnostic_snapshot(
+                    pipe, name, task_id
+                )
                 pipe.multi()
                 for key in keys_to_delete:
                     pipe.delete(key)
@@ -1560,6 +1611,27 @@ async def reset_task(
                 name,
                 exc_info=True,
             )
+
+        subsource_at_reset = (
+            diagnostic_snapshot.get("cancellation_cause", {})
+            .get("payload", {})
+            .get("subsource")
+        )
+        write_audit_record(
+            action="reset_task",
+            repo_slug=name,
+            task_id=task_id,
+            payload={
+                "deleted_keys": keys_to_delete,
+                "closed_pr_number": closed_pr_number,
+                # Reflect the actual git outcome: when checkout already
+                # left the task at TODO we skip the commit/push, so the
+                # audit log must not claim a push happened.
+                "frontmatter_pushed": wrote_frontmatter,
+                "retry_count_at_reset": diagnostic_snapshot.get("retry_count"),
+                "subsource_at_reset": subsource_at_reset,
+            },
+        )
 
         return JSONResponse(
             {
