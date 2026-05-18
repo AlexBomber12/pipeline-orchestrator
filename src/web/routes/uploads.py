@@ -398,8 +398,13 @@ async def upload_tasks(
         if not re.fullmatch(_TASK_UPLOAD_PATTERN, fname):
             rewritten_contents.append((fname, content))
             continue
-        # Task uploads already passed the UTF-8 gate earlier; decode is safe.
-        upload_text = content.decode("utf-8")
+        # Reuse the validated UTF-8 text rather than re-decoding ``content``.
+        # ``task_uploads`` deduplicates by filename (last entry wins), so a zip
+        # carrying two ``PR-xxx.md`` entries where the earlier copy holds
+        # non-UTF-8 bytes still reaches this loop with the raw bytes — decoding
+        # them here would raise ``UnicodeDecodeError`` and return 500 instead of
+        # the 4xx the gate above already produced for the deduped entry.
+        upload_text = parsed_task_texts[fname]
         new_text, preserved_status = preserve_terminal_status_on_collision(
             tasks_dir / fname, upload_text
         )

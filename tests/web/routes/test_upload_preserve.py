@@ -502,3 +502,35 @@ def test_preserve_terminal_status_existing_unreadable_bytes(tmp_path: Path) -> N
     )
     assert preserved is None
     assert new_text == "upload-body\n"
+
+
+def test_upload_zip_with_duplicate_entry_earlier_non_utf8(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    # A zip with two ``PR-322.md`` entries where the earlier one carries
+    # non-UTF-8 bytes must not crash the collision-preserve loop. Validation
+    # runs on the deduplicated last-wins map, so the upload completes 200 and
+    # the staged file matches the later (valid) entry with the on-disk DONE
+    # status preserved.
+    (repo_dir / "tasks" / "PR-322.md").write_text(
+        _task_text("PR-322", status="DONE", title="Already merged"),
+        encoding="utf-8",
+    )
+
+    valid_payload = _task_text(
+        "PR-322", status="TODO", title="Regenerated body"
+    ).encode("utf-8")
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("PR-322.md", b"\xff\xfe not utf-8 garbage")
+        archive.writestr("PR-322.md", valid_payload)
+    zip_field = ("files", ("dup.zip", buffer.getvalue(), "application/zip"))
+
+    resp = _post([zip_field])
+
+    assert resp.status_code == 200, resp.text
+    staged = _staged_text(uploads_dir, "PR-322.md")
+    assert "status: DONE" in staged.splitlines()[1]
+    assert "Regenerated body" in staged
