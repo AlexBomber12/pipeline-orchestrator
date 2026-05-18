@@ -177,6 +177,15 @@
         {% elif repo.state.value == 'PAUSED' %}
         <div class="text-xs text-warn italic mt-1">Paused, resuming soon...</div>
         {% endif %}
+        {% set _drain = (drain_progress or {}).get(repo.name) %}
+        {% if _drain %}
+        <div class="text-xs text-warn italic mt-1" data-drain-progress>
+            Draining: {{ _drain.phase }} for {{ _drain.elapsed_sec | int }}s
+            {% if _drain.est_remaining_sec is not none -%}
+            , est ~{{ (_drain.est_remaining_sec / 60) | round(0, 'floor') | int }} min remaining
+            {%- endif %}
+        </div>
+        {% endif %}
         <div id="upload-feedback-{{ repo.name }}"></div>
     </div>
     {% endfor %}

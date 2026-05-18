@@ -34,6 +34,7 @@ from src.cancellation.availability import (
 from src.cancellation.storage import (
     GuardrailPending,
     get_cancellation_cause,
+    get_current_run_started_at,
     list_pending_guardrail_decisions,
 )
 from src.coders import build_coder_registry
@@ -1104,6 +1105,145 @@ async def _build_cancellation_subsources(
     return out
 
 
+def _drained_from_phase(history: list[Any]) -> str | None:
+    """Return the most recent CODING or FIX phase that preceded PAUSED.
+
+    Scans ``history`` backwards looking for the most recent entry whose
+    ``state`` is CODING or FIX. The walk skips PAUSED entries (the
+    operator's pause is what we are draining out of) so the search finds
+    the phase the runner was executing immediately before the pause.
+    Returns ``None`` when no CODING/FIX entry exists — the indicator
+    stays hidden because there is nothing meaningful to drain.
+    """
+    for entry in reversed(history):
+        raw_state = str(entry.get("state", ""))
+        if raw_state in {PipelineState.CODING.value, PipelineState.FIX.value}:
+            return raw_state
+    return None
+
+
+def _phase_started_at(history: list[Any], phase: str) -> datetime | None:
+    """Return the start time of the most recent run of ``phase`` in history.
+
+    A "run" is the first entry in the most recent consecutive block of
+    ``phase`` entries — same shape as ``_most_recent_transition_into``
+    used by the alerts panel. Falls back to ``None`` when ``history`` has
+    no parseable entry for ``phase``, in which case the caller uses the
+    Redis-stored dispatch timestamp instead.
+    """
+    run_start: datetime | None = None
+    prev_state: str | None = None
+    for entry in history:
+        current = str(entry.get("state", ""))
+        if current == phase and prev_state != phase:
+            parsed = _parse_history_time(str(entry.get("time", "")))
+            if parsed is not None:
+                run_start = parsed
+        prev_state = current
+    return run_start
+
+
+async def _build_drain_progress(
+    redis_client: aioredis.Redis | None,
+    state: RepoState,
+    config: AppConfig,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Return drain-progress view data for a single repo, or ``None``.
+
+    The indicator surfaces when the operator's Pause All caught the
+    runner mid-CODING or mid-FIX: the repo is in ``PAUSED`` with
+    ``user_paused`` set and a ``current_task`` still attached, and the
+    most recent non-PAUSED history entry is CODING or FIX. Rate-limit
+    pauses skip the check via the ``user_paused`` gate so the existing
+    "Paused, Nm remaining" indicator stays the only signal there.
+
+    ``coding_started_at`` is read from the Redis
+    ``current_run_started_at`` marker that ``handle_coding`` writes on
+    dispatch; if that marker is missing (Redis down, marker expired) the
+    helper falls back to the timestamp of the most recent CODING/FIX
+    entry in history so the elapsed reading still works after a daemon
+    restart. ``est_remaining_sec`` is clamped at zero so elapsed runs
+    that already exceeded the configured timeout do not render negative.
+    """
+    if state.state != PipelineState.PAUSED:
+        return None
+    if state.current_task is None:
+        return None
+    if not state.user_paused:
+        return None
+    phase = _drained_from_phase(state.history)
+    if phase is None:
+        return None
+    current_time = now if now is not None else datetime.now(timezone.utc)
+    started_at: datetime | None = None
+    if redis_client is not None:
+        try:
+            started_at = await get_current_run_started_at(
+                redis_client, state.name, state.current_task.pr_id
+            )
+        except Exception:
+            started_at = None
+    if started_at is None:
+        started_at = _phase_started_at(state.history, phase)
+    if started_at is None:
+        return None
+    # ``get_current_run_started_at`` and ``_parse_history_time`` (used by
+    # ``_phase_started_at``) both normalize naive datetimes to UTC, so
+    # ``started_at`` is guaranteed aware here.
+    if phase == PipelineState.FIX.value:
+        anchor = (
+            state.current_pr.last_activity
+            if state.current_pr is not None
+            and state.current_pr.last_activity is not None
+            else started_at
+        )
+        if anchor.tzinfo is None:
+            anchor = anchor.replace(tzinfo=timezone.utc)
+        elapsed = (current_time - anchor).total_seconds()
+        timeout_sec = config.daemon.fix_idle_timeout_sec
+    else:
+        elapsed = (current_time - started_at).total_seconds()
+        timeout_sec = config.daemon.planned_pr_timeout_sec
+    elapsed = max(0.0, elapsed)
+    est_remaining = max(0.0, float(timeout_sec) - elapsed)
+    return {
+        "phase": phase,
+        "elapsed_sec": elapsed,
+        "est_remaining_sec": est_remaining,
+    }
+
+
+async def _build_drain_progress_map(
+    redis_client: aioredis.Redis | None,
+    states: list[RepoState],
+    config: AppConfig,
+    *,
+    now: datetime | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Return ``{repo_name: drain_progress_view}`` for the dashboard grid.
+
+    Only repos that survive the ``_build_drain_progress`` gate appear in
+    the map so the template can read ``drain_progress.get(repo.name)``
+    and render only when an entry exists. Iterates serially because the
+    only async I/O is the per-repo Redis ``get_current_run_started_at``
+    call and the candidate set (PAUSED+user_paused+current_task) is
+    small in practice.
+    """
+    if not states:
+        return {}
+    current_time = now if now is not None else datetime.now(timezone.utc)
+    out: dict[str, dict[str, Any]] = {}
+    for state in states:
+        view = await _build_drain_progress(
+            redis_client, state, config, now=current_time
+        )
+        if view is not None:
+            out[state.name] = view
+    return out
+
+
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
@@ -1111,6 +1251,7 @@ async def index(request: Request) -> HTMLResponse:
     states, redis_warning = await _app.get_all_repo_states(
         redis_client, _app.CONFIG_PATH
     )
+    config = await asyncio.to_thread(load_config, _app.CONFIG_PATH)
     stats = _compute_stats(states)
     alerts = _build_alerts(states)
     latest_alert = min(alerts, key=lambda a: a["duration_seconds"]) if alerts else None
@@ -1118,6 +1259,9 @@ async def index(request: Request) -> HTMLResponse:
     panic_state = await _read_panic_state_for_banner(redis_client)
     cancellation_subsources = await _build_cancellation_subsources(
         redis_client, states
+    )
+    drain_progress = await _build_drain_progress_map(
+        redis_client, states, config
     )
     return _app.templates.TemplateResponse(
         request,
@@ -1133,6 +1277,7 @@ async def index(request: Request) -> HTMLResponse:
             "panic_state": panic_state,
             "cancellation_subsources": cancellation_subsources,
             "subsource_lookup": _subsource_lookup,
+            "drain_progress": drain_progress,
         },
     )
 
@@ -1488,9 +1633,13 @@ async def partial_repo_list(request: Request) -> HTMLResponse:
     states, redis_warning = await _app.get_all_repo_states(
         redis_client, _app.CONFIG_PATH
     )
+    config = await asyncio.to_thread(load_config, _app.CONFIG_PATH)
     resources = await _build_resources_view(redis_client, states)
     cancellation_subsources = await _build_cancellation_subsources(
         redis_client, states
+    )
+    drain_progress = await _build_drain_progress_map(
+        redis_client, states, config
     )
     return _app.templates.TemplateResponse(
         request,
@@ -1501,6 +1650,7 @@ async def partial_repo_list(request: Request) -> HTMLResponse:
             "resources": resources,
             "cancellation_subsources": cancellation_subsources,
             "subsource_lookup": _subsource_lookup,
+            "drain_progress": drain_progress,
         },
     )
 
