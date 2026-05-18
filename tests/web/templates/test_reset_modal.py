@@ -125,6 +125,31 @@ def test_modal_inline_script_gates_submit_on_repo_name_match() -> None:
     assert 'const target = "example__alpha"' in rendered
 
 
+def test_modal_selectors_are_scoped_to_current_instance() -> None:
+    # Two reset-confirm fragments can be inserted on the dashboard before
+    # the first is dismissed (rapid repeated clicks on the Reset button).
+    # If selectors are global, the newer modal's input no longer controls
+    # its own submit and Cancel can remove the wrong dialog. Every DOM
+    # lookup the modal performs at runtime must therefore be scoped to
+    # *this* modal via ``closest('[data-reset-modal]')`` or
+    # ``document.currentScript``, never via a global ``document.querySelector``.
+    rendered = _render_modal(_base_diagnostic())
+
+    # Cancel must close the modal it lives in, not the first one on the page.
+    assert "this.closest('[data-reset-modal]').remove()" in rendered
+    # HTMX submit gating filter must read the input inside this modal.
+    assert (
+        "this.closest('[data-reset-modal]')"
+        ".querySelector('[data-reset-confirm-input]')"
+    ) in rendered
+    # The inline gating script must anchor its DOM lookups to the script's
+    # own modal container, not the document root.
+    assert "document.currentScript.closest('[data-reset-modal]')" in rendered
+    # No global ``document.querySelector`` references survive the scoping
+    # fix; that pattern was the root cause of cross-instance interference.
+    assert "document.querySelector(" not in rendered
+
+
 def test_modal_post_target_matches_reset_endpoint_contract() -> None:
     # PR-334 ships POST /api/reset-task/{name}/{task_id}; the modal must
     # target that endpoint exactly so submit triggers the destructive

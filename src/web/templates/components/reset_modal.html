@@ -43,31 +43,38 @@
             <button hx-post="/api/reset-task/{{ diagnostic.repo_slug }}/{{ diagnostic.task_id }}{% if orphan_pr %}?close_orphan_pr=true{% endif %}"
                     hx-target="closest [data-repo-card]"
                     hx-swap="outerHTML"
-                    hx-trigger="click[document.querySelector('[data-reset-confirm-input]').value === '{{ diagnostic.repo_slug }}']"
+                    hx-trigger="click[this.closest('[data-reset-modal]').querySelector('[data-reset-confirm-input]').value === '{{ diagnostic.repo_slug }}']"
                     data-reset-submit
                     class="px-4 py-2 rounded bg-fail/20 text-fail border border-fail/50 hover:bg-fail/30"
                     disabled>
                 Reset task
             </button>
-            <button onclick="document.querySelector('[data-reset-modal]').remove()"
+            <button onclick="this.closest('[data-reset-modal]').remove()"
                     data-reset-cancel
                     class="px-4 py-2 rounded bg-surface-3 text-gray-300 border border-white/10">
                 Cancel
             </button>
         </div>
     </div>
+    {# Inline gating script lives inside ``[data-reset-modal]`` so it can
+       scope its DOM lookups to *this* modal via ``document.currentScript``.
+       A global ``document.querySelector`` would always bind the first
+       modal on the page; when rapid clicks insert a second reset-confirm
+       fragment before the first is dismissed, the older modal's input
+       would stop controlling its own submit and Cancel could remove the
+       wrong instance. #}
+    <script>
+    (function() {
+        const modal = document.currentScript.closest('[data-reset-modal]');
+        const input = modal.querySelector('[data-reset-confirm-input]');
+        const submit = modal.querySelector('[data-reset-submit]');
+        const target = "{{ diagnostic.repo_slug }}";
+        input.addEventListener('input', () => {
+            submit.disabled = (input.value !== target);
+        });
+    })();
+    </script>
 </div>
-
-<script>
-(function() {
-    const input = document.querySelector('[data-reset-confirm-input]');
-    const submit = document.querySelector('[data-reset-submit]');
-    const target = "{{ diagnostic.repo_slug }}";
-    input.addEventListener('input', () => {
-        submit.disabled = (input.value !== target);
-    });
-})();
-</script>
 {% endmacro %}
 {# Top-level invocation runs only when the template is rendered with a
    ``diagnostic`` context (the GET reset-confirm endpoint path). When
