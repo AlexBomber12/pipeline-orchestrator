@@ -309,6 +309,47 @@ async def diagnostic_state(
 
 
 @router.get(
+    "/repos/{name}/tasks/{task_id}/reset-confirm",
+    response_class=HTMLResponse,
+)
+async def reset_confirm(
+    name: str,
+    task_id: str,
+    request: Request,
+) -> Response:
+    """Render the reset confirmation modal (PR-335).
+
+    Triggered by the diagnostic panel Reset button (PR-333). Reuses the
+    diagnostic payload helper so the modal can list the exact keys the
+    destructive reset endpoint (PR-334) will delete and flag an orphan
+    PR when ``current_pr`` is still OPEN. The submit button is gated by
+    a typed-confirmation input in the template; the endpoint itself is
+    a pure read.
+    """
+    status, payload = await _build_diagnostic_payload(name, task_id, request)
+    if status != 200:
+        message = payload.get("error", "diagnostic unavailable")
+        return HTMLResponse(
+            f'<p class="text-xs italic text-fail">{message}</p>',
+            status_code=status,
+        )
+    current_pr = payload.get("current_pr")
+    orphan_pr = (
+        current_pr
+        if isinstance(current_pr, dict) and current_pr.get("state") == "OPEN"
+        else None
+    )
+    return _app.templates.TemplateResponse(
+        request,
+        "components/reset_modal.html",
+        {
+            "diagnostic": payload,
+            "orphan_pr": orphan_pr,
+        },
+    )
+
+
+@router.get(
     "/partials/repo/{name}/tasks/{task_id}/diagnostic",
     response_class=HTMLResponse,
 )
@@ -319,10 +360,11 @@ async def diagnostic_partial(
 ) -> Response:
     """Render the diagnostic panel for ``task_id`` as an HTML fragment.
 
-    Companion HTMX surface for the JSON endpoint. The reset button is
-    suppressed (``reset_button_enabled=False``) until PR-334 ships the
-    destructive action; the macro still accepts the flag so future
-    callers can opt in without a template rewrite.
+    Companion HTMX surface for the JSON endpoint. PR-334 shipped the
+    destructive reset endpoint and PR-335 ships the typed-confirmation
+    modal that gates it, so the reset button now renders by default;
+    the macro still accepts the flag so callers (tests, future surfaces)
+    can opt out without a template rewrite.
     """
     status, payload = await _build_diagnostic_payload(name, task_id, request)
     if status != 200:
@@ -338,7 +380,7 @@ async def diagnostic_partial(
         {
             "diagnostic": payload,
             "retry_cap": cfg.daemon.retry_button_cap,
-            "reset_button_enabled": False,
+            "reset_button_enabled": True,
         },
     )
 

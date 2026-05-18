@@ -1,0 +1,80 @@
+{# Reset confirmation modal (PR-335) — friction layer between the
+   diagnostic panel's Reset button (PR-333) and the destructive reset
+   endpoint (PR-334). The operator must type the repository name to
+   enable the submit button so accidental clicks cannot destroy task
+   state. The template both defines a ``reset_modal`` macro for direct
+   render in tests and renders it once at the top level so the GET
+   ``reset-confirm`` endpoint can return the fragment via
+   ``TemplateResponse``. #}
+{% macro reset_modal(diagnostic, orphan_pr) %}
+<div class="modal-backdrop fixed inset-0 bg-black/60 z-50 flex items-center justify-center"
+     data-reset-modal>
+    <div class="modal bg-surface-2 rounded-lg p-6 max-w-md w-full border border-fail/30">
+        <h3 class="text-lg font-semibold mb-2 text-fail">Reset task - destructive</h3>
+        <p class="text-sm text-gray-300 mb-4">
+            This is the escape hatch when Retry is blocked (cap reached, orphan PR, fingerprint unchanged).
+            Type the repository name <span class="font-mono">{{ diagnostic.repo_slug }}</span>
+            to confirm.
+        </p>
+
+        <details class="mb-3 text-xs text-gray-400">
+            <summary class="cursor-pointer">What will happen</summary>
+            <ul class="mt-2 space-y-1 list-disc list-inside">
+                <li>Delete cancellation_cause record</li>
+                <li>Delete retry_count (currently {{ diagnostic.retry_count }})</li>
+                <li>Delete retry_fingerprint</li>
+                <li>Delete current_run_started_at</li>
+                <li>Delete status_write_failed marker</li>
+                <li>ZREM from cancellation_index</li>
+                {% if orphan_pr %}
+                <li class="text-warn">Close orphan PR #{{ orphan_pr.number }} on GitHub</li>
+                {% endif %}
+                <li>Rewrite frontmatter status to TODO and commit+push</li>
+            </ul>
+        </details>
+
+        <input type="text"
+               name="confirm_name"
+               placeholder="Type {{ diagnostic.repo_slug }}"
+               data-reset-confirm-input
+               class="w-full px-3 py-2 rounded border bg-surface-3 text-white font-mono">
+
+        <div class="flex gap-2 mt-4">
+            <button hx-post="/api/reset-task/{{ diagnostic.repo_slug }}/{{ diagnostic.task_id }}{% if orphan_pr %}?close_orphan_pr=true{% endif %}"
+                    hx-target="closest [data-repo-card]"
+                    hx-swap="outerHTML"
+                    hx-trigger="click[document.querySelector('[data-reset-confirm-input]').value === '{{ diagnostic.repo_slug }}']"
+                    data-reset-submit
+                    class="px-4 py-2 rounded bg-fail/20 text-fail border border-fail/50 hover:bg-fail/30"
+                    disabled>
+                Reset task
+            </button>
+            <button onclick="document.querySelector('[data-reset-modal]').remove()"
+                    data-reset-cancel
+                    class="px-4 py-2 rounded bg-surface-3 text-gray-300 border border-white/10">
+                Cancel
+            </button>
+        </div>
+    </div>
+</div>
+
+<script>
+(function() {
+    const input = document.querySelector('[data-reset-confirm-input]');
+    const submit = document.querySelector('[data-reset-submit]');
+    const target = "{{ diagnostic.repo_slug }}";
+    input.addEventListener('input', () => {
+        submit.disabled = (input.value !== target);
+    });
+})();
+</script>
+{% endmacro %}
+{# Top-level invocation runs only when the template is rendered with a
+   ``diagnostic`` context (the GET reset-confirm endpoint path). When
+   the template is imported as a Jinja module — for example, tests that
+   call ``template.module.reset_modal(...)`` directly — there is no
+   ``diagnostic`` in scope, so the guard prevents an UndefinedError at
+   module-load time. #}
+{% if diagnostic is defined %}
+{{ reset_modal(diagnostic, orphan_pr if orphan_pr is defined else None) }}
+{% endif %}
