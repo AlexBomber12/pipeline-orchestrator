@@ -650,6 +650,38 @@ def test_diagnostic_cause_without_subsource_returns_null_metadata(
     assert body["subsource_metadata"] is None
 
 
+def test_diagnostic_malformed_cancellation_cause_degrades_to_null(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_config(tmp_path, monkeypatch)
+    redis_client = _FakeRedis()
+    _stub_aioredis(monkeypatch, redis_client)
+    redis_client.values[cause_key("example__alpha", "PR-322")] = "{not json"
+    redis_client.values[retry_count_key("example__alpha", "PR-322")] = "2"
+
+    resp = _get("example__alpha", "PR-322")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["cancellation_cause"] is None
+    assert body["subsource_metadata"] is None
+    assert body["retry_count"] == 2
+
+
+def test_diagnostic_legacy_cancellation_cause_shape_degrades_to_null(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_config(tmp_path, monkeypatch)
+    redis_client = _FakeRedis()
+    _stub_aioredis(monkeypatch, redis_client)
+    # Valid JSON, but not a dict — CancellationCause.from_redis unpacks
+    # with ** and raises TypeError on a list payload.
+    redis_client.values[cause_key("example__alpha", "PR-322")] = "[1, 2, 3]"
+
+    resp = _get("example__alpha", "PR-322")
+    assert resp.status_code == 200
+    assert resp.json()["cancellation_cause"] is None
+
+
 def test_diagnostic_ttl_failure_yields_none_ttl(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -202,7 +202,13 @@ async def diagnostic_state(
 
     try:
         raw_state = await redis_client.get(pipeline_state(name))
-        cause = await get_cancellation_cause(redis_client, name, task_id)
+        try:
+            cause = await get_cancellation_cause(redis_client, name, task_id)
+        except (json.JSONDecodeError, TypeError, ValueError, UnicodeDecodeError):
+            # Malformed/legacy JSON at cancellation:<repo>:<task> must not
+            # abort the diagnostic payload — operators rely on the rest of
+            # the triage fields precisely when Redis state is inconsistent.
+            cause = None
         retry_count_raw = await redis_client.get(retry_count_key(name, task_id))
         retry_fp_raw = await redis_client.get(
             _retry_fingerprint_key(name, task_id)
