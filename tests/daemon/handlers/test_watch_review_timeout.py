@@ -596,6 +596,72 @@ def test_codex_bot_error_retrigger_floor_suppresses_back_to_back_repost(
     assert runner.state.review_timeout_repost_attempted is False
 
 
+def test_failed_stale_retrigger_does_not_lift_timeout_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-358 review feedback (P2): a transient ``gh`` failure on the
+    stale-retrigger post must NOT stamp ``last_stale_retrigger_at``.
+
+    The floor logic in ``handle_watch`` treats that stamp as evidence
+    that ``@codex review`` was actually posted; a failed post that
+    still updated the stamp would reset ``elapsed_min`` to ~0 on the
+    next cycle and defer terminal-ERROR escalation by a full timeout
+    window for a hang the daemon never retriggered.
+    """
+    now = datetime.now(timezone.utc)
+    pr = PRInfo(
+        number=77,
+        branch="pr-077",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=now - timedelta(minutes=45),
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    monkeypatch.setattr(
+        "src.github.cache._gh_api_paginated", lambda path: []
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_last_push_age_seconds",
+        lambda repo, number: 45 * 60,
+    )
+    runner = h._make_runner(review_timeout_min=30)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-077")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-077",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-077",
+    )
+    runner._last_push_at = now - timedelta(minutes=45)
+    runner._last_push_at_pr_number = pr.number
+
+    def fake_post(
+        number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
+    ) -> tuple[bool, bool, datetime | None]:
+        return False, False, None
+
+    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
+
+    async def fake_commit(self, current_task, status, reason):
+        return True
+
+    monkeypatch.setattr(
+        PipelineRunner, "_commit_task_status_change", fake_commit
+    )
+
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.last_stale_retrigger_at is None, (
+        "Failed stale retrigger must not stamp last_stale_retrigger_at; "
+        "otherwise the floor lifts elapsed_min for a comment that was "
+        "never posted."
+    )
+
+
 def test_repost_flag_resets_on_new_head_sha_same_pr() -> None:
     """PR-358 review feedback (P3): each push earns a new repost slot.
 

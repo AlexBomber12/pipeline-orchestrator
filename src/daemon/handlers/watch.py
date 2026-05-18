@@ -807,7 +807,18 @@ class WatchMixin:
             bypass_same_head_dedup=True,
             bypass_author_dedup=True,
         )
-        self.state.last_stale_retrigger_at = now
+        # PR-358 review feedback (P2): stamp the floor only when an actual
+        # ``@codex review`` comment exists for this head — either freshly
+        # posted by the daemon (``posted=True``) or already present from
+        # the PR author / a prior same-head post (``success=True,
+        # posted=False`` via the dedup short-circuits). A transient ``gh``
+        # failure returns ``success=False`` and must NOT lift the
+        # review_timeout floor, otherwise the next WATCH cycle reads the
+        # stamp as a fresh review request, resets ``elapsed_min`` to ~0,
+        # and defers terminal-ERROR escalation by a full timeout window
+        # for a hang the daemon never actually retriggered.
+        if success:
+            self.state.last_stale_retrigger_at = now
         if posted:
             getattr(self, "_stale_retrigger_skip_reasons", {}).pop(pr_number, None)
             current_pr.watch_retrigger_count = next_count

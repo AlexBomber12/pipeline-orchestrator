@@ -1362,9 +1362,17 @@ def test_handle_watch_retries_after_author_dedup_window_expires(
     assert runner.state.last_stale_retrigger_at == now
 
 
-def test_handle_watch_debounces_failed_stale_review_retrigger(
+def test_handle_watch_failed_stale_review_retrigger_does_not_stamp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """PR-358 review feedback (P2): a transient ``gh`` failure on the
+    stale-retrigger post must NOT advance ``last_stale_retrigger_at``.
+
+    Stamping on failure would lift the review_timeout floor for a
+    comment that was never posted, deferring terminal-ERROR escalation
+    by a full timeout window and (separately) suppressing the next
+    cycle's retry via the 1-hour stale-retrigger debounce.
+    """
     now = datetime(2026, 4, 21, 12, 0, tzinfo=timezone.utc)
     pr = PRInfo(
         number=42,
@@ -1414,7 +1422,7 @@ def test_handle_watch_debounces_failed_stale_review_retrigger(
     asyncio.run(runner.handle_watch())
 
     assert bypass_flags == [True]
-    assert runner.state.last_stale_retrigger_at == now
+    assert runner.state.last_stale_retrigger_at is None
 
 
 def test_handle_watch_does_not_retrigger_recent_changes_requested_review(
