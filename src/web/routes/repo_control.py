@@ -23,6 +23,7 @@ from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from redis.exceptions import RedisError
 
+from src.audit.operator_actions import write_audit_record
 from src.cancellation.storage import (
     TTL_SECONDS,
     CancellationCause,
@@ -1289,6 +1290,34 @@ async def _reset_has_status_write_failed_marker(
     return False
 
 
+async def _capture_reset_diagnostic_snapshot(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    task_id: str,
+) -> dict[str, Any]:
+    """Snapshot pre-destruction retry_count and cancellation_cause.
+
+    Read before the Reset pipeline executes so the audit record retains
+    the state about to be wiped from Redis. Both reads are best-effort;
+    a Redis hiccup must not block the reset itself.
+    """
+    retry_count = await _get_retry_count(redis_client, repo_slug, task_id)
+    try:
+        cause = await get_cancellation_cause(redis_client, repo_slug, task_id)
+    except Exception:
+        cause = None
+    cause_dump: dict[str, Any] = {}
+    if cause is not None:
+        cause_dump = {
+            "category": cause.category,
+            "payload": cause.payload if isinstance(cause.payload, dict) else {},
+        }
+    return {
+        "retry_count": retry_count,
+        "cancellation_cause": cause_dump,
+    }
+
+
 async def _reset_close_orphan_pr(
     name: str,
     task_id: str,
@@ -1443,6 +1472,15 @@ async def reset_task(
             status_code=400,
         )
 
+    # PR-336: snapshot diagnostic state before destruction so the audit
+    # record preserves the retry_count and subsource that motivated the
+    # operator's reset. The helper swallows Redis errors internally so a
+    # Redis hiccup degrades to an empty snapshot rather than blocking the
+    # reset.
+    diagnostic_snapshot = await _capture_reset_diagnostic_snapshot(
+        redis_client, name, task_id
+    )
+
     try:
         previous_user_paused = await _reserve_repo_for_retry(
             redis_client,
@@ -1560,6 +1598,24 @@ async def reset_task(
                 name,
                 exc_info=True,
             )
+
+        subsource_at_reset = (
+            diagnostic_snapshot.get("cancellation_cause", {})
+            .get("payload", {})
+            .get("subsource")
+        )
+        write_audit_record(
+            action="reset_task",
+            repo_slug=name,
+            task_id=task_id,
+            payload={
+                "deleted_keys": keys_to_delete,
+                "closed_pr_number": closed_pr_number,
+                "frontmatter_pushed": True,
+                "retry_count_at_reset": diagnostic_snapshot.get("retry_count"),
+                "subsource_at_reset": subsource_at_reset,
+            },
+        )
 
         return JSONResponse(
             {

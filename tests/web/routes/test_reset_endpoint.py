@@ -12,7 +12,11 @@ import pytest
 import redis.asyncio as aioredis
 from fastapi.testclient import TestClient
 
+from datetime import datetime, timezone
+
+from src.audit import operator_actions
 from src.cancellation.storage import (
+    CancellationCause,
     cause_key,
     current_run_started_at_key,
     index_key,
@@ -1650,3 +1654,75 @@ def test_reset_skips_commit_push_when_checkout_reverts_to_todo(
     assert "push" not in flat_args
     # Sanity: working tree now matches origin (TODO).
     assert "status: TODO" in task_path.read_text(encoding="utf-8")
+
+
+# PR-336: audit log integration tests
+
+
+def _audit_file_today(audit_dir: Path) -> Path:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return audit_dir / f"{today}.jsonl"
+
+
+def test_reset_endpoint_writes_audit_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR-336: a successful reset appends one JSONL line to the audit log."""
+    _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _ResetRedis()
+    keys = _seed_all_keys(redis_client, "example__alpha", "PR-322")
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+    monkeypatch.setattr(repo_control.subprocess, "run", _ok_subprocess)
+
+    audit_dir = tmp_path / "audit" / "operator-actions"
+    monkeypatch.setattr(operator_actions, "AUDIT_DIR", audit_dir)
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 200
+    target = _audit_file_today(audit_dir)
+    lines = target.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["action"] == "reset_task"
+    assert record["repo_slug"] == "example__alpha"
+    assert record["task_id"] == "PR-322"
+    payload = record["payload"]
+    assert sorted(payload["deleted_keys"]) == sorted(keys)
+    assert payload["frontmatter_pushed"] is True
+    assert payload["closed_pr_number"] is None
+
+
+def test_audit_record_retains_pre_reset_retry_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR-336: snapshot captures retry_count and subsource before destruction."""
+    _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _ResetRedis()
+    _seed_all_keys(redis_client, "example__alpha", "PR-322")
+    # Pre-reset state: retry_count=3, cancellation cause with subsource.
+    redis_client.store[_retry_count_key("example__alpha", "PR-322")] = "3"
+    cause = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "review_timeout"},
+        created_at=datetime.now(timezone.utc).isoformat(),
+        task_id="PR-322",
+        repo_slug="example__alpha",
+    )
+    redis_client.store[cause_key("example__alpha", "PR-322")] = cause.to_redis()
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+    monkeypatch.setattr(repo_control.subprocess, "run", _ok_subprocess)
+
+    audit_dir = tmp_path / "audit" / "operator-actions"
+    monkeypatch.setattr(operator_actions, "AUDIT_DIR", audit_dir)
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 200
+    target = _audit_file_today(audit_dir)
+    record = json.loads(target.read_text(encoding="utf-8").splitlines()[0])
+    payload = record["payload"]
+    assert payload["retry_count_at_reset"] == 3
+    assert payload["subsource_at_reset"] == "review_timeout"
