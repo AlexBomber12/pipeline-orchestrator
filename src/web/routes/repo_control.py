@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 import redis.asyncio as aioredis
-from fastapi import APIRouter, Form, Request
+from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from redis.exceptions import RedisError
 
@@ -27,6 +27,7 @@ from src.cancellation.storage import (
     TTL_SECONDS,
     CancellationCause,
     cause_key,
+    current_run_started_at_key,
     delete_cancellation_cause,
     get_cancellation_cause,
     index_key,
@@ -35,6 +36,7 @@ from src.cancellation.storage import (
 )
 from src.config import load_config
 from src.github import gh_runner
+from src.github import prs as gh_prs
 from src.keyspace import (
     control_stop,
     legacy_recovered_tasks,
@@ -53,6 +55,10 @@ router = APIRouter()
 
 _HISTORY_LIMIT = 100
 _TASK_PR_ID_PATTERN = re.compile(r"^PR-[A-Za-z0-9_.-]+$")
+# Reset is for stuck tasks (DOING, ERROR). When status is TODO or DONE and
+# Redis carries no per-task state, the task is not stuck and reset would
+# either be a no-op (TODO) or destructively re-queue completed work (DONE).
+_RESET_NON_STUCK_STATUSES = frozenset({TaskStatus.TODO, TaskStatus.DONE})
 _QUEUE_NOT_READY_FRAGMENT = (
     '<p class="text-sm italic text-gray-500">Queue not yet computed; '
     "daemon syncing.</p>"
@@ -1194,6 +1200,373 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
                 redis_client=redis_client,
                 retry_cap=cap,
             ),
+        )
+    finally:
+        await _release_repo_retry_reservation(
+            redis_client,
+            name,
+            previous_user_paused,
+        )
+
+
+def _reset_status_write_failed_retry_key(repo_slug: str, task_id: str) -> str:
+    return f"metrics:status_write_failed_retry:{repo_slug}:{task_id}"
+
+
+def _reset_keys_for_task(repo_slug: str, task_id: str) -> list[str]:
+    return [
+        cause_key(repo_slug, task_id),
+        _retry_count_key(repo_slug, task_id),
+        _retry_fingerprint_key(repo_slug, task_id),
+        current_run_started_at_key(repo_slug, task_id),
+        _reset_status_write_failed_retry_key(repo_slug, task_id),
+    ]
+
+
+def _reset_stuck_state_keys(repo_slug: str, task_id: str) -> list[str]:
+    # Retry-history keys (metrics:retry_count, metrics:retry_fingerprint) live
+    # for 30 days for any task that was ever retried, including DONE tasks.
+    # Treating them as "stuck" state would let reset re-queue completed work
+    # whose only Redis footprint is normal retry history. Reset must only
+    # authorize on per-task state the daemon actively keeps to indicate a
+    # task is stuck (cancellation cause, in-flight run marker, parked-task
+    # fallback marker). Retry-history keys are still cleared opportunistically
+    # in _reset_keys_for_task.
+    return [
+        cause_key(repo_slug, task_id),
+        current_run_started_at_key(repo_slug, task_id),
+        _reset_status_write_failed_retry_key(repo_slug, task_id),
+    ]
+
+
+async def _reset_has_any_redis_state(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    task_id: str,
+) -> bool:
+    for key in _reset_stuck_state_keys(repo_slug, task_id):
+        if await redis_client.get(key) is not None:
+            return True
+    score = await redis_client.zscore(index_key(repo_slug), task_id)
+    if score is not None:
+        return True
+    return await _reset_has_status_write_failed_marker(
+        redis_client, repo_slug, task_id
+    )
+
+
+async def _reset_has_status_write_failed_marker(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    task_id: str,
+) -> bool:
+    # Daemon can park a task via status_write_failed_tasks:{repo} or the
+    # legacy recovered_tasks:{repo} set alone — the per-task fallback keys
+    # may be absent. If the eligibility probe ignored that, reset would
+    # exit early with 400 and never clear the marker, leaving the task
+    # forced back to ERROR on the next dispatch.
+    for key in (
+        status_write_failed_tasks(repo_slug),
+        legacy_recovered_tasks(repo_slug),
+    ):
+        raw = await redis_client.get(key)
+        try:
+            decoded = _decode_redis_text(raw)
+        except UnicodeDecodeError:
+            # Corrupt non-UTF-8 bytes mirror the invalid-JSON path:
+            # treat as absent so reset stays usable for recovery.
+            continue
+        if decoded is None:
+            continue
+        try:
+            task_ids = json.loads(decoded)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(task_ids, list):
+            continue
+        if any(str(item) == task_id for item in task_ids):
+            return True
+    return False
+
+
+async def _reset_close_orphan_pr(
+    name: str,
+    task_id: str,
+    repo_config: Any,
+    redis_client: aioredis.Redis,
+) -> int | None:
+    """Close the active GitHub PR for ``task_id`` if it is still open.
+
+    Mirrors the orphan detection used by ``/api/diagnostic``: resolves
+    against ``RepoState.current_pr`` (the single canonical pointer the
+    daemon maintains) and only closes if ``gh pr view`` reports ``OPEN``.
+    Best-effort: any lookup failure returns ``None`` so the reset still
+    completes.
+    """
+    try:
+        raw_state = await redis_client.get(pipeline_state(name))
+    except RedisError:
+        return None
+    if raw_state is None:
+        return None
+    try:
+        state = RepoState.model_validate_json(raw_state)
+    except Exception:
+        return None
+    if state.current_task is None or state.current_pr is None:
+        return None
+    if state.current_task.pr_id != task_id:
+        return None
+    pr_number = state.current_pr.number
+    try:
+        owner_repo = gh_runner.get_repo_full_name(repo_config.url)
+    except ValueError:
+        return None
+    info = await asyncio.to_thread(gh_prs.pr_state, owner_repo, pr_number)
+    if info is None or info.get("state") != "OPEN":
+        return None
+    args = [
+        "gh",
+        "pr",
+        "close",
+        str(pr_number),
+        "--repo",
+        owner_repo,
+        "--comment",
+        "Closed by operator reset",
+    ]
+    try:
+        rc, _output = await asyncio.to_thread(_gh_subprocess, args)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if rc != 0:
+        return None
+    return pr_number
+
+
+def _reset_partial_response(
+    deleted_keys: list[str],
+    closed_pr_number: int | None,
+    *,
+    error: str,
+) -> JSONResponse:
+    return JSONResponse(
+        {
+            "error": error,
+            "deleted_keys": deleted_keys,
+            "closed_pr_number": closed_pr_number,
+            "frontmatter_pushed": False,
+            "partial_reset": True,
+        },
+        status_code=503,
+    )
+
+
+@router.post("/api/reset-task/{name}/{task_id}")
+async def reset_task(
+    request: Request,
+    name: str,
+    task_id: str,
+    close_orphan_pr: bool = Query(False),
+) -> JSONResponse:
+    """Atomic destructive reset for stuck tasks.
+
+    Drops every per-task Redis key that retry leaves in place, removes
+    the task from the cancellation index, optionally closes a stale
+    open PR, and rewrites the task frontmatter to ``TODO`` so the daemon
+    re-dispatches. The destructive git operations execute under the same
+    repo-level reservation used by retry, so daemon/coder activity cannot
+    race the worktree mutations. Returns 409 if the repo is already busy
+    or if a concurrent writer touches one of the watched keys between
+    read and execute. Returns 400 if there is nothing to reset
+    (frontmatter at a non-stuck status — ``TODO``, ``DONE``, or missing
+    entirely (treated as ``TODO``) — and Redis state empty). Returns 503 with
+    a ``partial_reset`` flag if Redis succeeds but the subsequent git
+    push fails — Redis state is gone but frontmatter has not been pushed.
+    """
+    if not _TASK_PR_ID_PATTERN.match(task_id):
+        return JSONResponse({"error": "invalid task id"}, status_code=400)
+
+    cfg = load_config(_app.CONFIG_PATH)
+    repo_config = _find_repo_config_by_name(cfg, name)
+    if repo_config is None:
+        return JSONResponse({"error": "repo not found"}, status_code=404)
+
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        return JSONResponse({"error": "redis unavailable"}, status_code=503)
+
+    resolved = await _resolve_repo_task_path(name, task_id)
+    if resolved is None:
+        return JSONResponse({"error": "task file not found"}, status_code=404)
+    task_path, _task_filename = resolved
+    repo_root = Path(_app.REPOS_DIR) / name
+    try:
+        relative_task = task_path.relative_to(repo_root)
+    except ValueError:
+        return JSONResponse({"error": "task file not found"}, status_code=404)
+
+    keys_to_delete = _reset_keys_for_task(name, task_id)
+
+    try:
+        current_status = _read_task_frontmatter_status(task_path)
+    except (OSError, UnicodeError):
+        return JSONResponse({"error": "failed to read task status"}, status_code=503)
+
+    try:
+        had_redis_state = await _reset_has_any_redis_state(
+            redis_client, name, task_id
+        )
+    except RedisError:
+        return JSONResponse({"error": "redis unavailable"}, status_code=503)
+
+    # Missing frontmatter is treated as TODO elsewhere (see
+    # _is_retryable_task_status), so a task with no frontmatter must not
+    # bypass the "nothing to reset" guard and trigger a destructive
+    # checkout/write/push when Redis carries no stuck-state markers.
+    effective_status = (
+        current_status if current_status is not None else TaskStatus.TODO
+    )
+    if effective_status in _RESET_NON_STUCK_STATUSES and not had_redis_state:
+        status_label = (
+            current_status.value
+            if current_status is not None
+            else "TODO (no frontmatter)"
+        )
+        return JSONResponse(
+            {
+                "error": (
+                    f"task is {status_label} with no stuck state, "
+                    "nothing to reset"
+                )
+            },
+            status_code=400,
+        )
+
+    try:
+        previous_user_paused = await _reserve_repo_for_retry(
+            redis_client,
+            name,
+            repo_config.url,
+        )
+    except _RepoStateMutationError as exc:
+        return JSONResponse({"error": exc.message}, status_code=exc.status_code)
+    except RedisError:
+        return JSONResponse({"error": "redis unavailable"}, status_code=503)
+
+    try:
+        cancellation_index = index_key(name)
+        try:
+            async with redis_client.pipeline(transaction=True) as pipe:
+                await pipe.watch(*keys_to_delete, cancellation_index)
+                pipe.multi()
+                for key in keys_to_delete:
+                    pipe.delete(key)
+                pipe.zrem(cancellation_index, task_id)
+                try:
+                    await pipe.execute()
+                except aioredis.WatchError:
+                    return JSONResponse(
+                        {"error": "concurrent_modification"},
+                        status_code=409,
+                    )
+        except RedisError:
+            return JSONResponse({"error": "redis unavailable"}, status_code=503)
+
+        # PR-334: scheduler gates on the persisted status-write-failed set
+        # (status_write_failed_tasks:{repo} / recovered_tasks:{repo}); the
+        # per-task fallback marker dropped above is never read. Clear the
+        # persisted set entry so a reset task can be dispatched again. The
+        # helper swallows Redis errors; treat marker cleanup as best-effort
+        # in line with retry's behavior.
+        await _clear_status_write_failed_retry_marker(redis_client, name, task_id)
+
+        closed_pr_number: int | None = None
+
+        try:
+            await asyncio.to_thread(
+                _checkout_retry_base_task,
+                repo_root,
+                repo_config.branch,
+                relative_task,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return _reset_partial_response(
+                keys_to_delete,
+                closed_pr_number,
+                error="Redis cleared, frontmatter NOT pushed (checkout failed)",
+            )
+
+        wrote_frontmatter = False
+        try:
+            post_checkout_status = _read_task_frontmatter_status(task_path)
+            if post_checkout_status != TaskStatus.TODO:
+                write_frontmatter_status(task_path, "TODO")
+                wrote_frontmatter = True
+        except (OSError, ValueError, UnicodeError):
+            return _reset_partial_response(
+                keys_to_delete,
+                closed_pr_number,
+                error="Redis cleared, frontmatter NOT pushed (write failed)",
+            )
+
+        # PR-334: when checkout leaves the task already at TODO and we did
+        # not rewrite frontmatter, there is nothing to commit. Skip the
+        # commit/push instead of letting "_commit_and_push_retry_reset"
+        # raise _TaskNotRetryable on "nothing to commit" — Redis is
+        # already clean, so this is a successful reset, not a partial.
+        if wrote_frontmatter:
+            commit_subject = f"[RESET] {task_id} cleared by operator"
+            try:
+                await asyncio.to_thread(
+                    _commit_and_push_retry_reset,
+                    repo_root,
+                    relative_task,
+                    commit_subject,
+                    repo_config.branch,
+                )
+            except (
+                _TaskNotRetryable,
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+            ):
+                try:
+                    await asyncio.to_thread(
+                        _reset_retry_worktree, repo_root, repo_config.branch
+                    )
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                    pass
+                return _reset_partial_response(
+                    keys_to_delete,
+                    closed_pr_number,
+                    error="Redis cleared, frontmatter NOT pushed (push failed)",
+                )
+
+        # PR-334: close the orphan PR only after the destructive git path has
+        # succeeded. Closing earlier means a later checkout/write/push failure
+        # surfaces 503 partial_reset with the PR already closed and no
+        # rollback available — operators are left with frontmatter still
+        # pointing at the stuck state and an unexpectedly closed PR.
+        if close_orphan_pr:
+            closed_pr_number = await _reset_close_orphan_pr(
+                name, task_id, repo_config, redis_client
+            )
+
+        try:
+            await _app.publish_wake(redis_client, name, "reset")
+        except Exception:
+            _app.logger.warning(
+                "publish_wake failed for %s; daemon will pick up reset on next tick",
+                name,
+                exc_info=True,
+            )
+
+        return JSONResponse(
+            {
+                "deleted_keys": keys_to_delete,
+                "closed_pr_number": closed_pr_number,
+                "frontmatter_pushed": True,
+            }
         )
     finally:
         await _release_repo_retry_reservation(
