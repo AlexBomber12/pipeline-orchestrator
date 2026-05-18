@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import builtins
+import fcntl
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -116,6 +118,39 @@ def test_write_audit_record_swallows_oserror(
     )
     target = _today_filename(audit_dir)
     assert not target.exists()
+
+
+def test_write_audit_record_fsyncs_before_unlock(
+    audit_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lock must be held through flush+fsync so concurrent writers cannot
+    acquire LOCK_EX while a previous record is still buffered."""
+    events: list[str] = []
+    real_flock = fcntl.flock
+    real_fsync = os.fsync
+
+    def trace_flock(fd: int, op: int) -> None:
+        if op == fcntl.LOCK_EX:
+            events.append("LOCK_EX")
+        elif op == fcntl.LOCK_UN:
+            events.append("LOCK_UN")
+        real_flock(fd, op)
+
+    def trace_fsync(fd: int) -> None:
+        events.append("fsync")
+        real_fsync(fd)
+
+    monkeypatch.setattr(operator_actions.fcntl, "flock", trace_flock)
+    monkeypatch.setattr(operator_actions.os, "fsync", trace_fsync)
+
+    write_audit_record(
+        action="reset_task",
+        repo_slug="example__alpha",
+        task_id="PR-322",
+        payload={"deleted_keys": []},
+    )
+
+    assert events == ["LOCK_EX", "fsync", "LOCK_UN"]
 
 
 def test_concurrent_writes_do_not_corrupt_file(audit_dir: Path) -> None:

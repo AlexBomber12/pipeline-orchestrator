@@ -1694,6 +1694,46 @@ def test_reset_endpoint_writes_audit_record(
     assert payload["closed_pr_number"] is None
 
 
+def test_audit_record_frontmatter_pushed_false_when_no_push(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR-336 P3: when checkout already leaves the task at TODO the
+    endpoint skips commit/push; the audit log must reflect that no
+    push happened rather than claiming success."""
+    repo_dir = _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _ResetRedis()
+    _seed_all_keys(redis_client, "example__alpha", "PR-322")
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+    monkeypatch.setattr(repo_control.subprocess, "run", _ok_subprocess)
+
+    task_path = repo_dir / "tasks" / "PR-322.md"
+
+    def fake_checkout(
+        repo_root: Path, base_branch: str, relative_task: Path
+    ) -> None:
+        # Simulate `git checkout origin/main -- tasks/PR-322.md` landing
+        # the base-branch version where status is already TODO.
+        task_path.write_text(
+            "---\nstatus: TODO\n---\n\n# PR-322: Reset me\n\nBody\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(
+        repo_control, "_checkout_retry_base_task", fake_checkout
+    )
+
+    audit_dir = tmp_path / "audit" / "operator-actions"
+    monkeypatch.setattr(operator_actions, "AUDIT_DIR", audit_dir)
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 200
+    target = _audit_file_today(audit_dir)
+    record = json.loads(target.read_text(encoding="utf-8").splitlines()[0])
+    assert record["payload"]["frontmatter_pushed"] is False
+
+
 def test_audit_record_retains_pre_reset_retry_count(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

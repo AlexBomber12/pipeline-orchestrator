@@ -10,6 +10,7 @@ from __future__ import annotations
 import fcntl
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,12 @@ def write_audit_record(
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             try:
                 f.write(line)
+                # Hold the lock through flush+fsync so another worker
+                # cannot acquire LOCK_EX and interleave its own line
+                # while ours is still buffered in userspace or the OS
+                # page cache.
+                f.flush()
+                os.fsync(f.fileno())
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
     except OSError:

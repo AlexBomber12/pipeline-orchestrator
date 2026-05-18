@@ -1611,7 +1611,10 @@ async def reset_task(
             payload={
                 "deleted_keys": keys_to_delete,
                 "closed_pr_number": closed_pr_number,
-                "frontmatter_pushed": True,
+                # Reflect the actual git outcome: when checkout already
+                # left the task at TODO we skip the commit/push, so the
+                # audit log must not claim a push happened.
+                "frontmatter_pushed": wrote_frontmatter,
                 "retry_count_at_reset": diagnostic_snapshot.get("retry_count"),
                 "subsource_at_reset": subsource_at_reset,
             },
