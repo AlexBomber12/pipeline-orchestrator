@@ -1,0 +1,6 @@
+{# HTMX partial wrapper: invokes the diagnostic_panel macro with the
+   context fields the partial endpoint provides. Kept separate from the
+   macro module so direct macro callers (tests, future template
+   integrations) can render without an additional render step. #}
+{% from "components/diagnostic_panel.html" import diagnostic_panel %}
+{{ diagnostic_panel(diagnostic, retry_cap, reset_button_enabled) }}

@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from redis.exceptions import RedisError
 
 from src.cancellation.storage import (
@@ -186,24 +186,28 @@ async def _resolve_pr_for_task(
     }
 
 
-@router.get("/api/diagnostic/{name}/{task_id}")
-async def diagnostic_state(
+async def _build_diagnostic_payload(
     name: str,
     task_id: str,
     request: Request,
-) -> JSONResponse:
-    """Return all per-task Redis state for ``task_id`` as one JSON document."""
+) -> tuple[int, dict[str, Any]]:
+    """Gather the diagnostic payload for ``task_id``.
+
+    Returns ``(status_code, body)``. The JSON endpoint and the HTMX
+    partial endpoint share this helper so a single source produces both
+    the machine-readable and the rendered-template surfaces.
+    """
     if not _TASK_PR_ID_PATTERN.match(task_id):
-        return JSONResponse({"error": "invalid task id"}, status_code=400)
+        return 400, {"error": "invalid task id"}
 
     cfg = load_config(_app.CONFIG_PATH)
     repo_config = _find_repo_config_by_name(cfg, name)
     if repo_config is None:
-        return JSONResponse({"error": "repo not found"}, status_code=404)
+        return 404, {"error": "repo not found"}
 
     redis_client = getattr(request.app.state, "redis", None)
     if redis_client is None:
-        return JSONResponse({"error": "redis unavailable"}, status_code=503)
+        return 503, {"error": "redis unavailable"}
 
     try:
         raw_state = await redis_client.get(pipeline_state(name))
@@ -241,7 +245,7 @@ async def diagnostic_state(
             ),
         }
     except RedisError:
-        return JSONResponse({"error": "redis unavailable"}, status_code=503)
+        return 503, {"error": "redis unavailable"}
 
     state: RepoState | None = None
     if raw_state is not None:
@@ -290,7 +294,53 @@ async def diagnostic_state(
         "current_pr": await _resolve_pr_for_task(repo_config, task_id, state),
         "ttls": ttls,
     }
-    return JSONResponse(payload)
+    return 200, payload
+
+
+@router.get("/api/diagnostic/{name}/{task_id}")
+async def diagnostic_state(
+    name: str,
+    task_id: str,
+    request: Request,
+) -> JSONResponse:
+    """Return all per-task Redis state for ``task_id`` as one JSON document."""
+    status, payload = await _build_diagnostic_payload(name, task_id, request)
+    return JSONResponse(payload, status_code=status)
+
+
+@router.get(
+    "/partials/repo/{name}/tasks/{task_id}/diagnostic",
+    response_class=HTMLResponse,
+)
+async def diagnostic_partial(
+    name: str,
+    task_id: str,
+    request: Request,
+) -> Response:
+    """Render the diagnostic panel for ``task_id`` as an HTML fragment.
+
+    Companion HTMX surface for the JSON endpoint. The reset button is
+    suppressed (``reset_button_enabled=False``) until PR-334 ships the
+    destructive action; the macro still accepts the flag so future
+    callers can opt in without a template rewrite.
+    """
+    status, payload = await _build_diagnostic_payload(name, task_id, request)
+    if status != 200:
+        message = payload.get("error", "diagnostic unavailable")
+        return HTMLResponse(
+            f'<p class="text-xs italic text-fail">{message}</p>',
+            status_code=status,
+        )
+    cfg = load_config(_app.CONFIG_PATH)
+    return _app.templates.TemplateResponse(
+        request,
+        "components/diagnostic_partial.html",
+        {
+            "diagnostic": payload,
+            "retry_cap": cfg.daemon.retry_button_cap,
+            "reset_button_enabled": False,
+        },
+    )
 
 
 # End-of-file import mirrors repo_control: the route decorator must run
