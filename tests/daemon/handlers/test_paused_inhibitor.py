@@ -481,6 +481,71 @@ def test_handle_paused_flag_on_ignores_stale_user_pause_after_play() -> None:
     )
 
 
+def test_handle_paused_flag_on_empty_snapshot_with_live_rate_limit_stays_paused() -> None:
+    """Empty inhibitor snapshot + future rate-limit scalar → stay PAUSED.
+
+    Regression for review feedback on PR-330b:
+    ``runner._serialize_latest_state`` force-sets
+    ``state.active_inhibitors`` to ``[]`` when
+    ``derive_active_inhibitors`` raises (Redis read error, future
+    field-shape drift). Trusting that snapshot would treat a
+    genuinely-rate-limited repo as "all clear", wipe
+    ``rate_limited_until`` / per-coder markers, and let the daemon
+    immediately dispatch against an active limit. The unified gate
+    must cross-check the snapshot against the legacy rate-limit
+    scalars (the source of truth for the window) and stay PAUSED when
+    a future expiry remains.
+    """
+    runner = h._make_runner()
+    _enable_flag(runner)
+    _seed_paused(runner)
+    runner.state.user_paused = False
+    future = datetime.now(timezone.utc) + timedelta(minutes=30)
+    runner.state.rate_limited_until = future
+    runner.state.rate_limit_reactive = True
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders = {"claude"}
+    runner.state.rate_limited_coder_until = {"claude": future}
+    runner.state.active_inhibitors = []
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.rate_limited_until == future
+    assert runner.state.rate_limit_reactive is True
+    assert runner.state.rate_limit_reactive_coder == "claude"
+    assert runner.state.rate_limited_coders == {"claude"}
+    assert runner.state.rate_limited_coder_until == {"claude": future}
+    assert any(
+        "empty inhibitor snapshot disagrees with live rate-limit scalars"
+        in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_paused_flag_on_empty_snapshot_with_per_coder_future_limit_stays_paused() -> None:
+    """Empty snapshot + future per-coder expiry → stay PAUSED.
+
+    Companion to the global-scalar variant: the guard also fires when
+    only ``rate_limited_coder_until`` has a future entry (per-coder
+    pause path), since ``derive_active_inhibitors`` would have emitted
+    a RATE_LIMIT inhibitor for that coder under normal operation.
+    """
+    runner = h._make_runner()
+    _enable_flag(runner)
+    _seed_paused(runner)
+    runner.state.user_paused = False
+    future = datetime.now(timezone.utc) + timedelta(minutes=15)
+    runner.state.rate_limited_until = None
+    runner.state.rate_limited_coder_until = {"codex": future}
+    runner.state.active_inhibitors = []
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.rate_limited_coder_until == {"codex": future}
+
+
 def test_handle_paused_flag_on_resumes_to_idle_when_pr_branch_diverges() -> None:
     """Unified resume: divergent PR/task branches → IDLE (queue re-selection).
 
