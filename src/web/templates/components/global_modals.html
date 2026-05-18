@@ -1,0 +1,169 @@
+{# PR-340: daemon-wide pause/resume/stop controls. The buttons live in the
+   dashboard header so deploy and incident-response operators get single-
+   click access; Pause All and Stop All open confirmation modals because
+   both transition every configured repo at once. Resume All is reversible
+   and fires immediately without confirmation.
+
+   The component bundles the buttons, the <dialog> modals, and the inline
+   openers in one file so base.html only has to include this once. The
+   openers are exposed as globals (``window.openPauseAllModal``,
+   ``window.openStopAllModal``) because the buttons use inline
+   ``onclick=...`` handlers per the spec; this matches the existing
+   ``reset_modal.html`` pattern of inline ``<script>`` blocks rather than
+   an external static file (the FastAPI app does not mount /static). #}
+<div class="header-global-controls flex gap-2 items-center" data-global-controls>
+    <button data-action="pause-all"
+            type="button"
+            onclick="openPauseAllModal()"
+            class="text-xs px-3 py-1 rounded border border-warn/50 text-warn hover:bg-warn/10">
+        Pause All
+    </button>
+    <button data-action="resume-all"
+            type="button"
+            hx-post="/daemon/resume"
+            hx-target="body"
+            hx-swap="none"
+            hx-on::after-request="window.location.reload()"
+            class="text-xs px-3 py-1 rounded border border-ok/50 text-ok hover:bg-ok/10">
+        Resume All
+    </button>
+    <button data-action="stop-all"
+            type="button"
+            onclick="openStopAllModal()"
+            class="text-xs px-3 py-1 rounded border border-fail/50 text-fail hover:bg-fail/10">
+        Stop All
+    </button>
+</div>
+
+<dialog id="pause-all-modal" data-pause-all-modal
+        class="modal bg-surface-2 rounded-lg p-6 max-w-md w-full border border-warn/50 text-gray-200">
+    <h3 class="text-lg font-semibold mb-2 text-warn">Pause all repos</h3>
+    <p class="text-sm">
+        All repos transition to PAUSED state. Coders mid-cycle FINISH their current PR
+        cycle naturally (no kill). New work does not start until Resume All.
+    </p>
+    <p class="text-xs text-gray-400 mt-2">Affected repos: <span data-affected-count id="pause-all-affected-count">-</span></p>
+    <div class="flex gap-2 mt-3">
+        <button type="button"
+                data-pause-all-confirm
+                hx-post="/daemon/pause"
+                hx-target="body"
+                hx-swap="none"
+                hx-on::after-request="window.location.reload()"
+                class="px-4 py-2 rounded bg-warn/10 text-warn border border-warn/50">
+            Confirm pause all
+        </button>
+        <button type="button"
+                data-pause-all-cancel
+                onclick="document.getElementById('pause-all-modal').close()"
+                class="px-4 py-2 rounded bg-surface-3 text-gray-300 border border-white/10">
+            Cancel
+        </button>
+    </div>
+</dialog>
+
+<dialog id="stop-all-modal" data-stop-all-modal
+        class="modal bg-surface-2 rounded-lg p-6 max-w-md w-full border border-fail/50 text-gray-200">
+    <h3 class="text-lg font-semibold mb-2 text-fail">Stop all repos - destructive</h3>
+    <p class="text-sm">
+        All in-flight coders KILLED via SIGTERM within 5 seconds (then SIGKILL).
+        Working trees may be left dirty. Resume All does NOT auto-recover dirty trees;
+        operator must reset working dir manually after Stop All.
+    </p>
+    <p class="text-xs text-gray-400 mt-2">
+        This is the deploy-time emergency stop. Use Pause All for graceful shutdown.
+    </p>
+    <div class="flex gap-2 mt-3">
+        <button type="button"
+                data-stop-all-confirm
+                hx-post="/daemon/stop"
+                hx-target="body"
+                hx-swap="none"
+                hx-on::after-request="window.location.reload()"
+                class="px-4 py-2 rounded bg-fail/10 text-fail border border-fail/50">
+            Confirm stop all
+        </button>
+        <button type="button"
+                data-stop-all-cancel
+                onclick="document.getElementById('stop-all-modal').close()"
+                class="px-4 py-2 rounded bg-surface-3 text-gray-300 border border-white/10">
+            Cancel
+        </button>
+    </div>
+</dialog>
+
+<script>
+    // PR-340: Pause All opener shows the modal immediately with a "-"
+    // placeholder in the affected-count slot, then updates that slot
+    // asynchronously once /daemon/drain-progress resolves. Awaiting the
+    // fetch before calling showModal() would make the button look dead
+    // whenever the daemon is slow or hung — exactly when the operator
+    // needs the graceful pause control. A fetch failure resolves to "?"
+    // so the operator can still hit Confirm; the dashboard's HTMX POST
+    // will surface any backend failure separately. Stop All opens
+    // immediately because the destructive copy already communicates the
+    // blast radius and does not need a live count to be meaningful.
+    window.openPauseAllModal = function openPauseAllModal() {
+        const modal = document.getElementById('pause-all-modal');
+        const countEl = document.getElementById('pause-all-affected-count');
+        if (countEl) {
+            countEl.textContent = '-';
+        }
+        if (modal && typeof modal.showModal === 'function') {
+            modal.showModal();
+        }
+        fetch('/daemon/drain-progress').then(function (r) {
+            if (!r.ok) {
+                if (countEl) {
+                    countEl.textContent = '?';
+                }
+                return null;
+            }
+            return r.json();
+        }).then(function (data) {
+            if (!data || !countEl) {
+                return;
+            }
+            const repos = Array.isArray(data.repos) ? data.repos : [];
+            countEl.textContent = String(repos.length);
+        }).catch(function () {
+            if (countEl) {
+                countEl.textContent = '?';
+            }
+        });
+    };
+
+    window.openStopAllModal = function openStopAllModal() {
+        const modal = document.getElementById('stop-all-modal');
+        if (modal && typeof modal.showModal === 'function') {
+            modal.showModal();
+        }
+    };
+
+    // PR-340: in-flight UX. While the confirm button's HTMX request is
+    // pending the operator should see that the action is running and not
+    // be able to fire it a second time. The buttons live inside the
+    // <dialog> elements that close on htmx:afterRequest -> reload, so the
+    // listener only needs to flip ``disabled`` and a text label between
+    // beforeRequest and afterRequest. Scoped to ``[data-global-controls]``
+    // siblings via the dialogs' data attributes so unrelated HTMX swaps
+    // elsewhere on the page do not toggle these buttons.
+    (function () {
+        const confirmButtons = document.querySelectorAll(
+            '[data-pause-all-confirm], [data-stop-all-confirm]'
+        );
+        confirmButtons.forEach(function (button) {
+            const originalText = button.textContent;
+            button.addEventListener('htmx:beforeRequest', function () {
+                button.disabled = true;
+                button.dataset.loading = 'true';
+                button.textContent = 'Working…';
+            });
+            button.addEventListener('htmx:afterRequest', function () {
+                button.disabled = false;
+                delete button.dataset.loading;
+                button.textContent = originalText;
+            });
+        });
+    })();
+</script>
