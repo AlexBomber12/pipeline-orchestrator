@@ -1229,7 +1229,39 @@ async def _reset_has_any_redis_state(
         if await redis_client.get(key) is not None:
             return True
     score = await redis_client.zscore(index_key(repo_slug), task_id)
-    return score is not None
+    if score is not None:
+        return True
+    return await _reset_has_status_write_failed_marker(
+        redis_client, repo_slug, task_id
+    )
+
+
+async def _reset_has_status_write_failed_marker(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    task_id: str,
+) -> bool:
+    # Daemon can park a task via status_write_failed_tasks:{repo} or the
+    # legacy recovered_tasks:{repo} set alone — the per-task fallback keys
+    # may be absent. If the eligibility probe ignored that, reset would
+    # exit early with 400 and never clear the marker, leaving the task
+    # forced back to ERROR on the next dispatch.
+    for key in (
+        status_write_failed_tasks(repo_slug),
+        legacy_recovered_tasks(repo_slug),
+    ):
+        decoded = _decode_redis_text(await redis_client.get(key))
+        if decoded is None:
+            continue
+        try:
+            task_ids = json.loads(decoded)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(task_ids, list):
+            continue
+        if any(str(item) == task_id for item in task_ids):
+            return True
+    return False
 
 
 async def _reset_close_orphan_pr(
