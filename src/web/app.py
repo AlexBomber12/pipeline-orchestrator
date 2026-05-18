@@ -128,6 +128,7 @@ templates.env.globals["upload_feedback_target"] = (
 # backward-compatible re-exports tests rely on).
 from src.web.routes import daemon_control as _daemon_control_routes  # noqa: E402
 from src.web.routes import dashboard as _dashboard_routes  # noqa: E402
+from src.web.routes import diagnostic as _diagnostic_routes  # noqa: E402
 from src.web.routes import onboarding as _onboarding_routes  # noqa: E402
 from src.web.routes import repo_control as _repo_control_routes  # noqa: E402
 from src.web.routes import settings as _settings_routes  # noqa: E402
@@ -383,3 +384,4 @@ app.include_router(_settings_routes.router)
 app.include_router(_uploads_routes.router)
 app.include_router(_onboarding_routes.router)
 app.include_router(_daemon_control_routes.router)
+app.include_router(_diagnostic_routes.router)
