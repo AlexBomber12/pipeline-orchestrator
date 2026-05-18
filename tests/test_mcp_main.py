@@ -15,6 +15,7 @@ def test_all_mcp_tools_registered_on_canonical_instance() -> None:
         "suggest_next_pr_number",
         "get_task_schema",
         "get_agents_md_template",
+        "get_repo_task_status",
     }
 
 
