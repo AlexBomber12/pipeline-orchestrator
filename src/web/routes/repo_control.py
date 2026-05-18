@@ -1398,6 +1398,14 @@ async def reset_task(
         except RedisError:
             return JSONResponse({"error": "redis unavailable"}, status_code=503)
 
+        # PR-334: scheduler gates on the persisted status-write-failed set
+        # (status_write_failed_tasks:{repo} / recovered_tasks:{repo}); the
+        # per-task fallback marker dropped above is never read. Clear the
+        # persisted set entry so a reset task can be dispatched again. The
+        # helper swallows Redis errors; treat marker cleanup as best-effort
+        # in line with retry's behavior.
+        await _clear_status_write_failed_retry_marker(redis_client, name, task_id)
+
         closed_pr_number: int | None = None
         if close_orphan_pr:
             closed_pr_number = await _reset_close_orphan_pr(
@@ -1418,10 +1426,12 @@ async def reset_task(
                 error="Redis cleared, frontmatter NOT pushed (checkout failed)",
             )
 
+        wrote_frontmatter = False
         try:
             post_checkout_status = _read_task_frontmatter_status(task_path)
             if post_checkout_status != TaskStatus.TODO:
                 write_frontmatter_status(task_path, "TODO")
+                wrote_frontmatter = True
         except (OSError, ValueError, UnicodeError):
             return _reset_partial_response(
                 keys_to_delete,
@@ -1429,31 +1439,37 @@ async def reset_task(
                 error="Redis cleared, frontmatter NOT pushed (write failed)",
             )
 
-        commit_subject = f"[RESET] {task_id} cleared by operator"
-        try:
-            await asyncio.to_thread(
-                _commit_and_push_retry_reset,
-                repo_root,
-                relative_task,
-                commit_subject,
-                repo_config.branch,
-            )
-        except (
-            _TaskNotRetryable,
-            subprocess.CalledProcessError,
-            subprocess.TimeoutExpired,
-        ):
+        # PR-334: when checkout leaves the task already at TODO and we did
+        # not rewrite frontmatter, there is nothing to commit. Skip the
+        # commit/push instead of letting "_commit_and_push_retry_reset"
+        # raise _TaskNotRetryable on "nothing to commit" — Redis is
+        # already clean, so this is a successful reset, not a partial.
+        if wrote_frontmatter:
+            commit_subject = f"[RESET] {task_id} cleared by operator"
             try:
                 await asyncio.to_thread(
-                    _reset_retry_worktree, repo_root, repo_config.branch
+                    _commit_and_push_retry_reset,
+                    repo_root,
+                    relative_task,
+                    commit_subject,
+                    repo_config.branch,
                 )
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-                pass
-            return _reset_partial_response(
-                keys_to_delete,
-                closed_pr_number,
-                error="Redis cleared, frontmatter NOT pushed (push failed)",
-            )
+            except (
+                _TaskNotRetryable,
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+            ):
+                try:
+                    await asyncio.to_thread(
+                        _reset_retry_worktree, repo_root, repo_config.branch
+                    )
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                    pass
+                return _reset_partial_response(
+                    keys_to_delete,
+                    closed_pr_number,
+                    error="Redis cleared, frontmatter NOT pushed (push failed)",
+                )
 
         try:
             await _app.publish_wake(redis_client, name, "reset")

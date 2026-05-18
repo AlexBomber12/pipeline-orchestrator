@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,11 @@ from src.cancellation.storage import (
     current_run_started_at_key,
     index_key,
 )
-from src.keyspace import pipeline_state
+from src.keyspace import (
+    legacy_recovered_tasks,
+    pipeline_state,
+    status_write_failed_tasks,
+)
 from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
 from src.web import app as web_app
 from src.web.app import app
@@ -103,6 +108,13 @@ class _ResetRedis:
 
     async def get(self, key: str) -> str | None:
         return self.store.get(key)
+
+    async def set(self, key: str, value: str) -> bool:
+        self.store[key] = value
+        return True
+
+    async def delete(self, key: str) -> int:
+        return 1 if self.store.pop(key, None) is not None else 0
 
     async def zscore(self, key: str, member: str) -> float | None:
         zset = self.zsets.get(key)
@@ -1179,3 +1191,141 @@ def test_reset_returns_503_when_reservation_redis_error(
 
     assert response.status_code == 503
     assert response.json() == {"error": "redis unavailable"}
+
+
+def test_reset_clears_status_write_failed_set_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scheduler reads ``status_write_failed_tasks:{repo}`` to force
+    parked tasks back to ERROR. Reset must drop the task PR id from that
+    set so the daemon can dispatch the task again."""
+    _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _ResetRedis()
+    _seed_all_keys(redis_client, "example__alpha", "PR-322")
+    swf_key = status_write_failed_tasks("example__alpha")
+    redis_client.store[swf_key] = json.dumps(["PR-322", "PR-999"])
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+    monkeypatch.setattr(repo_control.subprocess, "run", _ok_subprocess)
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 200
+    assert json.loads(redis_client.store[swf_key]) == ["PR-999"]
+
+
+def test_reset_deletes_status_write_failed_set_when_last_member(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the reset task is the only member of the persisted set, the
+    whole key must be deleted so the scheduler stops forcing the parked
+    bucket."""
+    _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _ResetRedis()
+    _seed_all_keys(redis_client, "example__alpha", "PR-322")
+    swf_key = status_write_failed_tasks("example__alpha")
+    redis_client.store[swf_key] = json.dumps(["PR-322"])
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+    monkeypatch.setattr(repo_control.subprocess, "run", _ok_subprocess)
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 200
+    assert swf_key not in redis_client.store
+
+
+def test_reset_clears_legacy_recovered_tasks_set_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pre-PR-281 deployments persist the marker under ``recovered_tasks``;
+    reset must also drop the task id from that legacy key."""
+    _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _ResetRedis()
+    _seed_all_keys(redis_client, "example__alpha", "PR-322")
+    legacy_key = legacy_recovered_tasks("example__alpha")
+    redis_client.store[legacy_key] = json.dumps(["PR-322"])
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+    monkeypatch.setattr(repo_control.subprocess, "run", _ok_subprocess)
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 200
+    assert legacy_key not in redis_client.store
+
+
+def test_reset_succeeds_without_commit_when_checkout_leaves_task_todo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the only thing that needed cleanup was Redis state, the
+    checkout step leaves the task file at TODO. Reset must skip the
+    commit/push step (there is nothing to commit) and return 200, not
+    503 partial_reset."""
+    # Local task is already TODO on disk; only Redis state is dirty.
+    _write_config_and_task(tmp_path, monkeypatch, status="TODO")
+    redis_client = _ResetRedis()
+    _seed_all_keys(redis_client, "example__alpha", "PR-322")
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    captured: list[list[str]] = []
+
+    def fake_run(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured.append(list(args))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["frontmatter_pushed"] is True
+    # No commit or push should have been attempted: the only mutation was
+    # the Redis cleanup, and the task file was already at TODO.
+    flat_args = [arg for cmd in captured for arg in cmd]
+    assert "commit" not in flat_args
+    assert "push" not in flat_args
+
+
+def test_reset_skips_commit_push_when_checkout_reverts_to_todo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Local task is ERROR but the origin task is already TODO. After
+    checkout overwrites the working copy with origin, the file is at
+    TODO; reset must detect the no-op and not let
+    _commit_and_push_retry_reset raise _TaskNotRetryable for "nothing
+    to commit"."""
+    repo_dir = _write_config_and_task(tmp_path, monkeypatch, status="ERROR")
+    task_path = repo_dir / "tasks" / "PR-322.md"
+    redis_client = _ResetRedis()
+    _seed_all_keys(redis_client, "example__alpha", "PR-322")
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    captured: list[list[str]] = []
+
+    def fake_run(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured.append(list(args))
+        # Simulate the final "git checkout origin/main -- tasks/PR-322.md"
+        # rewriting the working copy with origin's TODO version.
+        if "checkout" in args and "--" in args:
+            task_path.write_text(
+                "---\nstatus: TODO\n---\n\n# PR-322: Reset me\n\nBody\n",
+                encoding="utf-8",
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["frontmatter_pushed"] is True
+    flat_args = [arg for cmd in captured for arg in cmd]
+    assert "commit" not in flat_args
+    assert "push" not in flat_args
+    # Sanity: working tree now matches origin (TODO).
+    assert "status: TODO" in task_path.read_text(encoding="utf-8")
