@@ -517,10 +517,90 @@ def test_handle_paused_flag_on_empty_snapshot_with_live_rate_limit_stays_paused(
     assert runner.state.rate_limited_coders == {"claude"}
     assert runner.state.rate_limited_coder_until == {"claude": future}
     assert any(
-        "empty inhibitor snapshot disagrees with live rate-limit scalars"
+        "inhibitor snapshot disagrees with live rate-limit scalars"
         in e["event"]
         for e in runner.state.history
     )
+
+
+def test_handle_paused_flag_on_slowdown_only_snapshot_with_live_rate_limit_stays_paused() -> None:
+    """Slowdown-only snapshot + future rate-limit scalar → stay PAUSED.
+
+    Regression for review feedback on PR-330b: keying the
+    stale-snapshot guard on the raw ``blocking`` list missed the case
+    where ``active_inhibitors`` contains only filtered non-blockers
+    (e.g. ``GITHUB_BUDGET_SLOWDOWN``) while ``rate_limited_until`` or
+    ``rate_limited_coder_until`` still points to a future window. With
+    ``not blocking`` False the guard fell through, cleared every
+    ``rate_limited_*`` field, and transitioned to IDLE — resuming
+    dispatch against an active rate limit. The guard must key off the
+    post-filter blocking set (``hard_blocking``) so a snapshot that
+    looks empty for dispatch purposes still flags the disagreement.
+    """
+    runner = h._make_runner()
+    _enable_flag(runner)
+    _seed_paused(runner)
+    runner.state.user_paused = False
+    future = datetime.now(timezone.utc) + timedelta(minutes=30)
+    runner.state.rate_limited_until = future
+    runner.state.rate_limit_reactive = True
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders = {"claude"}
+    runner.state.rate_limited_coder_until = {"claude": future}
+    runner.state.active_inhibitors = [
+        WorkInhibitor(
+            inhibitor_type=InhibitorType.GITHUB_BUDGET_SLOWDOWN,
+            expires_at=future,
+            reason_text="GitHub budget slowdown",
+            source_key="github:rate_limit:budget",
+        )
+    ]
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.rate_limited_until == future
+    assert runner.state.rate_limit_reactive is True
+    assert runner.state.rate_limit_reactive_coder == "claude"
+    assert runner.state.rate_limited_coders == {"claude"}
+    assert runner.state.rate_limited_coder_until == {"claude": future}
+    assert any(
+        "inhibitor snapshot disagrees with live rate-limit scalars"
+        in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_paused_flag_on_slowdown_only_snapshot_with_per_coder_future_limit_stays_paused() -> None:
+    """Slowdown-only snapshot + future per-coder expiry → stay PAUSED.
+
+    Per-coder variant of the slowdown-only regression: when only
+    ``rate_limited_coder_until`` has a future entry,
+    ``derive_active_inhibitors`` would normally emit a ``RATE_LIMIT``
+    inhibitor for that coder. Its absence alongside slowdown-only
+    snapshot contents indicates a publish-time disagreement that the
+    guard must catch.
+    """
+    runner = h._make_runner()
+    _enable_flag(runner)
+    _seed_paused(runner)
+    runner.state.user_paused = False
+    future = datetime.now(timezone.utc) + timedelta(minutes=15)
+    runner.state.rate_limited_until = None
+    runner.state.rate_limited_coder_until = {"codex": future}
+    runner.state.active_inhibitors = [
+        WorkInhibitor(
+            inhibitor_type=InhibitorType.GITHUB_BUDGET_SLOWDOWN,
+            expires_at=future,
+            reason_text="GitHub budget slowdown",
+            source_key="github:rate_limit:budget",
+        )
+    ]
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.rate_limited_coder_until == {"codex": future}
 
 
 def test_handle_paused_flag_on_empty_snapshot_with_per_coder_future_limit_stays_paused() -> None:

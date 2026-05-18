@@ -989,14 +989,20 @@ class IdleMixin:
                     )
                     self._paused_inhibited_logged = True
                 return
-            # Cross-check the empty snapshot with the rate-limit scalars
-            # (the legacy source of truth): if any window is still in
-            # the future, treat the empty snapshot as a publish-time
+            # Cross-check the post-filter snapshot with the rate-limit
+            # scalars (the legacy source of truth): if any window is
+            # still in the future, treat the snapshot as a publish-time
             # failure and keep the runner PAUSED so the next cycle can
             # re-derive cleanly. Without this guard the IDLE transition
             # below would wipe ``rate_limited_until`` /
             # ``rate_limited_coder_until`` markers and let the daemon
-            # immediately dispatch against the live limit.
+            # immediately dispatch against the live limit. Key the guard
+            # off ``hard_blocking`` rather than the raw ``blocking``
+            # list: a snapshot that contains only filtered non-blockers
+            # (e.g. ``GITHUB_BUDGET_SLOWDOWN``, or a stale ``USER_PAUSE``
+            # already discarded above) still indicates the snapshot
+            # disagrees with a live rate-limit scalar and must not be
+            # trusted to clear the scalars.
             now = datetime.now(timezone.utc)
 
             def _is_future(value: datetime | None) -> bool:
@@ -1006,7 +1012,7 @@ class IdleMixin:
                 return aware > now
 
             stale_snapshot = (
-                not blocking
+                not hard_blocking
                 and not self.state.user_paused
                 and (
                     _is_future(self.state.rate_limited_until)
@@ -1019,7 +1025,7 @@ class IdleMixin:
             if stale_snapshot:
                 if not getattr(self, "_paused_inhibited_logged", False):
                     self.log_event(
-                        "[INFRA] PAUSED: empty inhibitor snapshot disagrees "
+                        "[INFRA] PAUSED: inhibitor snapshot disagrees "
                         "with live rate-limit scalars, staying paused"
                     )
                     self._paused_inhibited_logged = True
