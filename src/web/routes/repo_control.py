@@ -55,6 +55,10 @@ router = APIRouter()
 
 _HISTORY_LIMIT = 100
 _TASK_PR_ID_PATTERN = re.compile(r"^PR-[A-Za-z0-9_.-]+$")
+# Reset is for stuck tasks (DOING, ERROR). When status is TODO or DONE and
+# Redis carries no per-task state, the task is not stuck and reset would
+# either be a no-op (TODO) or destructively re-queue completed work (DONE).
+_RESET_NON_STUCK_STATUSES = frozenset({TaskStatus.TODO, TaskStatus.DONE})
 _QUEUE_NOT_READY_FRAGMENT = (
     '<p class="text-sm italic text-gray-500">Queue not yet computed; '
     "daemon syncing.</p>"
@@ -1354,7 +1358,8 @@ async def reset_task(
     race the worktree mutations. Returns 409 if the repo is already busy
     or if a concurrent writer touches one of the watched keys between
     read and execute. Returns 400 if there is nothing to reset
-    (frontmatter already TODO and Redis state empty). Returns 503 with
+    (frontmatter at a non-stuck status — ``TODO`` or ``DONE`` — and
+    Redis state empty). Returns 503 with
     a ``partial_reset`` flag if Redis succeeds but the subsequent git
     push fails — Redis state is gone but frontmatter has not been pushed.
     """
@@ -1394,9 +1399,14 @@ async def reset_task(
     except RedisError:
         return JSONResponse({"error": "redis unavailable"}, status_code=503)
 
-    if current_status == TaskStatus.TODO and not had_redis_state:
+    if current_status in _RESET_NON_STUCK_STATUSES and not had_redis_state:
         return JSONResponse(
-            {"error": "task already TODO, nothing to reset"},
+            {
+                "error": (
+                    f"task is {current_status.value} with no stuck state, "
+                    "nothing to reset"
+                )
+            },
             status_code=400,
         )
 

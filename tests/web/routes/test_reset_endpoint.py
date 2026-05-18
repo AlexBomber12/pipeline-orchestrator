@@ -442,7 +442,49 @@ def test_reset_returns_400_when_task_already_todo(
         response = client.post("/api/reset-task/example__alpha/PR-322")
 
     assert response.status_code == 400
-    assert response.json()["error"] == "task already TODO, nothing to reset"
+    assert response.json()["error"] == (
+        "task is TODO with no stuck state, nothing to reset"
+    )
+
+
+def test_reset_returns_400_when_task_already_done_without_stuck_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A DONE task with no retry/cancellation state must not be re-queued
+    # by reset: doing so would duplicate runs of already-merged work.
+    _write_config_and_task(tmp_path, monkeypatch, status="DONE")
+    redis_client = _ResetRedis()
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 400
+    assert response.json()["error"] == (
+        "task is DONE with no stuck state, nothing to reset"
+    )
+
+
+def test_reset_proceeds_when_task_done_but_redis_has_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # When a task is DONE on disk but Redis still carries stale per-task
+    # state (e.g. crash between status flip and Redis cleanup), reset is
+    # the operator's escape hatch — it must proceed, not 400.
+    _write_config_and_task(tmp_path, monkeypatch, status="DONE")
+    redis_client = _ResetRedis()
+    keys = _seed_all_keys(redis_client, "example__alpha", "PR-322")
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+    monkeypatch.setattr(repo_control.subprocess, "run", _ok_subprocess)
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert sorted(body["deleted_keys"]) == sorted(keys)
+    for key in keys:
+        assert key not in redis_client.store
 
 
 def test_reset_invalid_task_id_returns_400(
@@ -1364,7 +1406,9 @@ def test_reset_returns_400_when_parked_marker_belongs_to_other_task(
         response = client.post("/api/reset-task/example__alpha/PR-322")
 
     assert response.status_code == 400
-    assert response.json()["error"] == "task already TODO, nothing to reset"
+    assert response.json()["error"] == (
+        "task is TODO with no stuck state, nothing to reset"
+    )
 
 
 def test_reset_succeeds_without_commit_when_checkout_leaves_task_todo(
