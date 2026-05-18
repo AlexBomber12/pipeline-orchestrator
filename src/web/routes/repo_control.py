@@ -1291,27 +1291,38 @@ async def _reset_has_status_write_failed_marker(
 
 
 async def _capture_reset_diagnostic_snapshot(
-    redis_client: aioredis.Redis,
+    pipe: aioredis.client.Pipeline,
     repo_slug: str,
     task_id: str,
 ) -> dict[str, Any]:
     """Snapshot pre-destruction retry_count and cancellation_cause.
 
-    Read before the Reset pipeline executes so the audit record retains
-    the state about to be wiped from Redis. Both reads are best-effort;
-    a Redis hiccup must not block the reset itself.
+    Read on the pipeline that holds the WATCH for the destructive
+    DELETE, after ``pipe.watch(...)`` and before ``pipe.multi()``. Both
+    keys (``metrics:retry_count``, ``cancellation:``) are already part
+    of ``_reset_keys_for_task`` and therefore watched, so a concurrent
+    writer that mutates either between this read and EXEC aborts the
+    transaction (``WatchError``). The caller surfaces 409 and the audit
+    record is skipped rather than logging stale forensic data that
+    misrepresents the state actually cleared.
     """
-    retry_count = await _get_retry_count(redis_client, repo_slug, task_id)
-    try:
-        cause = await get_cancellation_cause(redis_client, repo_slug, task_id)
-    except Exception:
-        cause = None
+    raw_retry = await pipe.get(_retry_count_key(repo_slug, task_id))
+    retry_count = _decode_retry_count(raw_retry)
+
+    raw_cause = await pipe.get(cause_key(repo_slug, task_id))
     cause_dump: dict[str, Any] = {}
-    if cause is not None:
-        cause_dump = {
-            "category": cause.category,
-            "payload": cause.payload if isinstance(cause.payload, dict) else {},
-        }
+    if raw_cause is not None:
+        try:
+            cause = CancellationCause.from_redis(raw_cause)
+        except (ValueError, TypeError, UnicodeDecodeError):
+            cause = None
+        if cause is not None:
+            cause_dump = {
+                "category": cause.category,
+                "payload": (
+                    cause.payload if isinstance(cause.payload, dict) else {}
+                ),
+            }
     return {
         "retry_count": retry_count,
         "cancellation_cause": cause_dump,
@@ -1472,15 +1483,6 @@ async def reset_task(
             status_code=400,
         )
 
-    # PR-336: snapshot diagnostic state before destruction so the audit
-    # record preserves the retry_count and subsource that motivated the
-    # operator's reset. The helper swallows Redis errors internally so a
-    # Redis hiccup degrades to an empty snapshot rather than blocking the
-    # reset.
-    diagnostic_snapshot = await _capture_reset_diagnostic_snapshot(
-        redis_client, name, task_id
-    )
-
     try:
         previous_user_paused = await _reserve_repo_for_retry(
             redis_client,
@@ -1492,11 +1494,22 @@ async def reset_task(
     except RedisError:
         return JSONResponse({"error": "redis unavailable"}, status_code=503)
 
+    diagnostic_snapshot: dict[str, Any] = {}
     try:
         cancellation_index = index_key(name)
         try:
             async with redis_client.pipeline(transaction=True) as pipe:
                 await pipe.watch(*keys_to_delete, cancellation_index)
+                # PR-336 follow-up: snapshot retry_count and cancellation
+                # cause inside the same watched window as the destructive
+                # DELETE. Both keys are watched, so any concurrent mutation
+                # between this read and EXEC aborts the transaction and the
+                # audit record is skipped — preventing stale
+                # retry_count_at_reset/subsource_at_reset values from being
+                # logged as the state that was cleared.
+                diagnostic_snapshot = await _capture_reset_diagnostic_snapshot(
+                    pipe, name, task_id
+                )
                 pipe.multi()
                 for key in keys_to_delete:
                     pipe.delete(key)

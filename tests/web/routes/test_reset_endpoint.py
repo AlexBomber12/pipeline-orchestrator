@@ -75,6 +75,15 @@ class _ResetPipeline:
     def multi(self) -> None:
         self.in_multi = True
 
+    async def get(self, key: str) -> str | None:
+        # Mirrors redis-py's pipeline immediate-mode: after WATCH and
+        # before MULTI, commands execute on the connection holding the
+        # watch and return values directly. Reset's diagnostic snapshot
+        # reads happen here.
+        if self.in_multi:
+            raise AssertionError("get inside MULTI not supported")
+        return self.store.get(key)
+
     def delete(self, key: str) -> None:
         self.queued.append(("delete", key))
 
@@ -1766,3 +1775,110 @@ def test_audit_record_retains_pre_reset_retry_count(
     payload = record["payload"]
     assert payload["retry_count_at_reset"] == 3
     assert payload["subsource_at_reset"] == "review_timeout"
+
+
+def test_audit_snapshot_reads_inside_watch_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR-336 follow-up: snapshot reads must run on the WATCH-holding
+    pipeline AFTER ``watch(...)`` and BEFORE ``multi()`` so they share
+    the watched-key window with the destructive DELETE. Verify by
+    intercepting pipeline ``get`` and recording the pipeline state at
+    read time."""
+    _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _ResetRedis()
+    _seed_all_keys(redis_client, "example__alpha", "PR-322")
+    redis_client.store[_retry_count_key("example__alpha", "PR-322")] = "5"
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+    monkeypatch.setattr(repo_control.subprocess, "run", _ok_subprocess)
+
+    audit_dir = tmp_path / "audit" / "operator-actions"
+    monkeypatch.setattr(operator_actions, "AUDIT_DIR", audit_dir)
+
+    observed: list[tuple[str, bool, bool]] = []
+    original_pipeline = redis_client.pipeline
+
+    def instrumented_pipeline(transaction: bool = False) -> _ResetPipeline:
+        pipe = original_pipeline(transaction=transaction)
+        original_get = pipe.get
+
+        async def tracking_get(key: str) -> str | None:
+            observed.append((key, bool(pipe.watched), pipe.in_multi))
+            return await original_get(key)
+
+        pipe.get = tracking_get  # type: ignore[assignment]
+        return pipe
+
+    redis_client.pipeline = instrumented_pipeline  # type: ignore[assignment]
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 200
+    snapshot_reads = [
+        entry
+        for entry in observed
+        if entry[0]
+        in {
+            _retry_count_key("example__alpha", "PR-322"),
+            cause_key("example__alpha", "PR-322"),
+        }
+    ]
+    assert snapshot_reads, "expected snapshot to read retry_count and cause"
+    for _key, watched_set, in_multi in snapshot_reads:
+        assert watched_set, "snapshot must read after WATCH"
+        assert not in_multi, "snapshot must read before MULTI"
+
+
+def test_audit_record_handles_corrupt_cancellation_cause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR-336 follow-up: snapshot must not crash if the watched
+    cancellation cause is unparseable JSON — forensic corruption must
+    degrade to an empty subsource rather than aborting the reset, which
+    is the operator's last-resort escape hatch."""
+    _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _ResetRedis()
+    _seed_all_keys(redis_client, "example__alpha", "PR-322")
+    redis_client.store[cause_key("example__alpha", "PR-322")] = "{not json"
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+    monkeypatch.setattr(repo_control.subprocess, "run", _ok_subprocess)
+
+    audit_dir = tmp_path / "audit" / "operator-actions"
+    monkeypatch.setattr(operator_actions, "AUDIT_DIR", audit_dir)
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 200
+    target = _audit_file_today(audit_dir)
+    record = json.loads(target.read_text(encoding="utf-8").splitlines()[0])
+    assert record["payload"]["subsource_at_reset"] is None
+
+
+def test_audit_record_skipped_on_concurrent_modification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR-336 follow-up: a WATCH abort (concurrent writer mutates a
+    watched key between snapshot read and EXEC) must not produce an
+    audit record. Logging stale forensic data is worse than no record,
+    because operators rely on the audit log to reconstruct the cleared
+    state."""
+    _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _ResetRedis()
+    _seed_all_keys(redis_client, "example__alpha", "PR-322")
+    redis_client.raise_on_execute = True
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+    monkeypatch.setattr(repo_control.subprocess, "run", _ok_subprocess)
+
+    audit_dir = tmp_path / "audit" / "operator-actions"
+    monkeypatch.setattr(operator_actions, "AUDIT_DIR", audit_dir)
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 409
+    target = _audit_file_today(audit_dir)
+    assert not target.exists(), (
+        "audit file must not be created when the reset transaction aborts"
+    )
