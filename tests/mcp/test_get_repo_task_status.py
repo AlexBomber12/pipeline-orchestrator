@@ -282,6 +282,71 @@ def test_handles_non_utf8_file_with_fallback_to_todo(tmp_path):
     assert result == {"PR-900": "DONE", "PR-901": "TODO"}
 
 
+def test_inline_hash_without_whitespace_is_not_a_comment(tmp_path):
+    """``status: DONE#merged`` (no whitespace before ``#``) must not be
+    truncated to ``DONE``. The canonical normalization in
+    ``src/queue_parser.py`` only treats ``#`` as an inline comment
+    when it sits at the start of the value or follows whitespace, so
+    a glued-on ``#merged`` makes the whole token unrecognized and the
+    file falls back to TODO.
+    """
+    from src.mcp.tools import functional
+
+    fake_root = tmp_path / "data" / "repos"
+    tasks = fake_root / "owner__repo" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "PR-850.md").write_text(
+        "---\nstatus: DONE#merged\n---\n\n# PR-850: stub\n",
+        encoding="utf-8",
+    )
+
+    with patch.object(functional, "_REPOS_ROOT", fake_root):
+        result = functional.get_repo_task_status("owner__repo")
+
+    assert result == {"PR-850": "TODO"}
+
+
+def test_inline_hash_after_whitespace_is_stripped_as_comment(tmp_path):
+    """``status: DONE # merged`` keeps the canonical ``DONE`` value;
+    the whitespace-preceded ``#`` is treated as an inline comment.
+    """
+    from src.mcp.tools import functional
+
+    fake_root = tmp_path / "data" / "repos"
+    tasks = fake_root / "owner__repo" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "PR-851.md").write_text(
+        "---\nstatus: DONE # merged\n---\n\n# PR-851: stub\n",
+        encoding="utf-8",
+    )
+
+    with patch.object(functional, "_REPOS_ROOT", fake_root):
+        result = functional.get_repo_task_status("owner__repo")
+
+    assert result == {"PR-851": "DONE"}
+
+
+def test_quoted_status_preserves_inline_hash(tmp_path):
+    """A quoted ``status:`` value preserves an embedded ``#`` rather
+    than treating it as a comment. ``"DONE#merged"`` therefore stays
+    unrecognized and falls back to TODO.
+    """
+    from src.mcp.tools import functional
+
+    fake_root = tmp_path / "data" / "repos"
+    tasks = fake_root / "owner__repo" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "PR-852.md").write_text(
+        '---\nstatus: "DONE#merged"\n---\n\n# PR-852: stub\n',
+        encoding="utf-8",
+    )
+
+    with patch.object(functional, "_REPOS_ROOT", fake_root):
+        result = functional.get_repo_task_status("owner__repo")
+
+    assert result == {"PR-852": "TODO"}
+
+
 def test_get_repo_task_status_registered_with_mcp_server():
     """Tool appears in the MCP server's tool registry after import."""
     import asyncio

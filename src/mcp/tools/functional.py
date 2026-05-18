@@ -156,6 +156,37 @@ def suggest_next_pr_number(repo: str) -> int:
     return max_num + 1
 
 
+def _strip_inline_comment_and_quotes(value: str) -> str:
+    """Mirror ``_normalize_frontmatter_status`` in ``src.queue_parser``.
+
+    A ``#`` is treated as an inline comment delimiter only when it is at
+    the start of the value or preceded by whitespace, and only outside
+    of any surrounding single- or double-quoted region. After the
+    optional comment strip, leading/trailing whitespace and a single
+    matching pair of surrounding quotes are removed.
+    """
+    quote: str | None = None
+    for index, char in enumerate(value):
+        if char in {"'", '"'}:
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+        elif char == "#" and quote is None and (
+            index == 0 or value[index - 1].isspace()
+        ):
+            value = value[:index]
+            break
+    stripped = value.strip()
+    if (
+        len(stripped) >= 2
+        and stripped[0] == stripped[-1]
+        and stripped[0] in {"'", '"'}
+    ):
+        return stripped[1:-1]
+    return stripped
+
+
 def _read_frontmatter_status(task_path: Path) -> str:
     """Read the canonical uppercase status from a task file frontmatter.
 
@@ -195,7 +226,7 @@ def _read_frontmatter_status(task_path: Path) -> str:
         status_match = _FRONTMATTER_STATUS_LINE.match(raw_line.rstrip())
         if status_match is None:
             continue
-        raw_status = status_match.group(1).split("#", 1)[0].strip().strip("\"'")
+        raw_status = _strip_inline_comment_and_quotes(status_match.group(1))
 
     if raw_status is None:
         return "TODO"
