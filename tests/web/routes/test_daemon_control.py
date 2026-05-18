@@ -312,11 +312,34 @@ def test_daemon_pause_recovers_from_state_decode_failure(
     assert rewritten.state == PipelineState.IDLE
 
 
-def test_daemon_pause_recovers_from_redis_get_failure(
+def test_daemon_pause_skips_write_on_redis_get_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A transient ``pipe.get`` failure must not overwrite live repo state.
+
+    Falling back to a synthesized default would erase ``current_task``,
+    ``current_pr``, and rate-limit metadata on the active repo. The
+    endpoint instead skips the write for that repo (the outer
+    try/except logs and continues the sweep), leaving the existing
+    payload intact for the next pause attempt once Redis recovers.
+    """
     _write_config(tmp_path, monkeypatch, repo_urls=[_REPO_URLS[0]])
     redis_client = _FakeRedis()
+    _seed_state(
+        redis_client,
+        _REPO_SLUGS[0],
+        url=_REPO_URLS[0],
+        state=PipelineState.CODING,
+        user_paused=False,
+        current_task=QueueTask(
+            pr_id="PR-100",
+            title="Active task",
+            status=TaskStatus.DOING,
+            task_file="tasks/PR-100.md",
+            branch="pr-100",
+        ),
+    )
+    seeded_payload = redis_client.values[pipeline_state(_REPO_SLUGS[0])]
     redis_client.get_error = RuntimeError("redis read down")
     _stub_redis(monkeypatch, redis_client)
 
@@ -324,8 +347,14 @@ def test_daemon_pause_recovers_from_redis_get_failure(
         response = client.post("/daemon/pause")
 
     assert response.status_code == 200
-    rewritten = _stored_state(redis_client, _REPO_SLUGS[0])
-    assert rewritten.user_paused is True
+    # Sweep still reports the repo as affected; the outer handler logs
+    # the failure and moves on rather than aborting the request.
+    assert response.json() == {"affected": [_REPO_SLUGS[0]], "count": 1}
+    # The seeded state is unchanged — no synthesized default clobbered
+    # the live ``current_task`` / ``user_paused`` fields.
+    assert (
+        redis_client.values[pipeline_state(_REPO_SLUGS[0])] == seeded_payload
+    )
 
 
 def test_daemon_resume_clears_user_paused_for_all(

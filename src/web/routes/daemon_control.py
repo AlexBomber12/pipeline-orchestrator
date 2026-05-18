@@ -111,13 +111,13 @@ async def _write_user_paused(
     )
 
     async def _transaction(pipe: Any) -> None:
-        try:
-            raw = await pipe.get(state_key)
-        except Exception:
-            logger.warning(
-                "Failed to read state for %s", name, exc_info=True
-            )
-            raw = None
+        # Let read errors propagate out to the outer try/except so the
+        # repo's pause/resume update is skipped on transient Redis read
+        # failures. Swallowing the error here and falling back to a
+        # default ``RepoState`` would erase live fields like
+        # ``current_task``, ``current_pr``, and rate-limit metadata for
+        # an active repo when the read hiccups.
+        raw = await pipe.get(state_key)
         if raw is None:
             state = _default_repo_state(name, url)
         else:
