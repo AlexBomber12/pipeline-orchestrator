@@ -1223,13 +1223,28 @@ def _reset_keys_for_task(repo_slug: str, task_id: str) -> list[str]:
     ]
 
 
+def _reset_stuck_state_keys(repo_slug: str, task_id: str) -> list[str]:
+    # Retry-history keys (metrics:retry_count, metrics:retry_fingerprint) live
+    # for 30 days for any task that was ever retried, including DONE tasks.
+    # Treating them as "stuck" state would let reset re-queue completed work
+    # whose only Redis footprint is normal retry history. Reset must only
+    # authorize on per-task state the daemon actively keeps to indicate a
+    # task is stuck (cancellation cause, in-flight run marker, parked-task
+    # fallback marker). Retry-history keys are still cleared opportunistically
+    # in _reset_keys_for_task.
+    return [
+        cause_key(repo_slug, task_id),
+        current_run_started_at_key(repo_slug, task_id),
+        _reset_status_write_failed_retry_key(repo_slug, task_id),
+    ]
+
+
 async def _reset_has_any_redis_state(
     redis_client: aioredis.Redis,
     repo_slug: str,
     task_id: str,
-    keys: list[str],
 ) -> bool:
-    for key in keys:
+    for key in _reset_stuck_state_keys(repo_slug, task_id):
         if await redis_client.get(key) is not None:
             return True
     score = await redis_client.zscore(index_key(repo_slug), task_id)
@@ -1400,7 +1415,7 @@ async def reset_task(
 
     try:
         had_redis_state = await _reset_has_any_redis_state(
-            redis_client, name, task_id, keys_to_delete
+            redis_client, name, task_id
         )
     except RedisError:
         return JSONResponse({"error": "redis unavailable"}, status_code=503)
@@ -1455,10 +1470,6 @@ async def reset_task(
         await _clear_status_write_failed_retry_marker(redis_client, name, task_id)
 
         closed_pr_number: int | None = None
-        if close_orphan_pr:
-            closed_pr_number = await _reset_close_orphan_pr(
-                name, task_id, repo_config, redis_client
-            )
 
         try:
             await asyncio.to_thread(
@@ -1518,6 +1529,16 @@ async def reset_task(
                     closed_pr_number,
                     error="Redis cleared, frontmatter NOT pushed (push failed)",
                 )
+
+        # PR-334: close the orphan PR only after the destructive git path has
+        # succeeded. Closing earlier means a later checkout/write/push failure
+        # surfaces 503 partial_reset with the PR already closed and no
+        # rollback available — operators are left with frontmatter still
+        # pointing at the stuck state and an unexpectedly closed PR.
+        if close_orphan_pr:
+            closed_pr_number = await _reset_close_orphan_pr(
+                name, task_id, repo_config, redis_client
+            )
 
         try:
             await _app.publish_wake(redis_client, name, "reset")

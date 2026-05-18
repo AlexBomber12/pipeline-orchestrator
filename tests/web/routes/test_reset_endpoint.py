@@ -487,6 +487,112 @@ def test_reset_proceeds_when_task_done_but_redis_has_state(
         assert key not in redis_client.store
 
 
+def test_reset_returns_400_when_done_task_only_has_retry_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Retry-history keys live for 30 days for any task that was ever
+    # retried, including DONE tasks. Treating them as "stuck" state would
+    # let reset re-queue completed work whose only Redis footprint is
+    # normal retry history. Only daemon-managed stuck-state keys
+    # (cancellation cause, in-flight run marker, parked-task fallback
+    # marker) authorize reset.
+    _write_config_and_task(tmp_path, monkeypatch, status="DONE")
+    redis_client = _ResetRedis()
+    redis_client.store[_retry_count_key("example__alpha", "PR-322")] = "2"
+    redis_client.store[_retry_fp_key("example__alpha", "PR-322")] = "abc"
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 400
+    assert response.json()["error"] == (
+        "task is DONE with no stuck state, nothing to reset"
+    )
+    # Retry-history keys must remain — reset refused, no opportunistic
+    # cleanup happened.
+    assert _retry_count_key("example__alpha", "PR-322") in redis_client.store
+    assert _retry_fp_key("example__alpha", "PR-322") in redis_client.store
+
+
+def test_reset_cleans_up_retry_history_when_authorized_by_stuck_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Once reset is authorized by a real stuck-state marker (here:
+    # cancellation cause), the retry-history keys must still be dropped
+    # opportunistically so the next dispatch starts from a clean slate.
+    _write_config_and_task(tmp_path, monkeypatch, status="ERROR")
+    redis_client = _ResetRedis()
+    redis_client.store[cause_key("example__alpha", "PR-322")] = "seed"
+    redis_client.store[_retry_count_key("example__alpha", "PR-322")] = "3"
+    redis_client.store[_retry_fp_key("example__alpha", "PR-322")] = "abc"
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+    monkeypatch.setattr(repo_control.subprocess, "run", _ok_subprocess)
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 200
+    assert _retry_count_key("example__alpha", "PR-322") not in redis_client.store
+    assert _retry_fp_key("example__alpha", "PR-322") not in redis_client.store
+
+
+def test_reset_does_not_close_orphan_pr_when_push_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Closing the orphan PR is irreversible. If the destructive git path
+    # later fails (push rejected), operators would be left with the
+    # frontmatter still pointing at the stuck status AND an unexpectedly
+    # closed PR. The endpoint must defer PR closure until after a
+    # successful push.
+    _write_config_and_task(tmp_path, monkeypatch, status="ERROR")
+    redis_client = _ResetRedis()
+    _seed_all_keys(redis_client, "example__alpha", "PR-322")
+    state = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.ERROR,
+        current_task=QueueTask(
+            pr_id="PR-322",
+            title="t",
+            status=TaskStatus.ERROR,
+        ),
+        current_pr=PRInfo(number=444, branch="b"),
+    )
+    redis_client.store[pipeline_state("example__alpha")] = state.model_dump_json()
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    def boom_pr_state(*_args: Any, **_kwargs: Any) -> dict[str, str | None]:
+        raise AssertionError(
+            "gh pr_state must not run before the destructive git path succeeds"
+        )
+
+    monkeypatch.setattr(repo_control.gh_prs, "pr_state", boom_pr_state)
+
+    gh_close_invoked = False
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal gh_close_invoked
+        if args and args[0] == "gh" and "close" in args:
+            gh_close_invoked = True
+        if "push" in args:
+            raise subprocess.CalledProcessError(1, args, "", "push rejected")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/reset-task/example__alpha/PR-322?close_orphan_pr=true"
+        )
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["partial_reset"] is True
+    assert body["closed_pr_number"] is None
+    assert gh_close_invoked is False
+
+
 def test_reset_invalid_task_id_returns_400(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
