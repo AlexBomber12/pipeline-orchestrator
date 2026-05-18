@@ -136,6 +136,29 @@ def _aioredis(redis_client: _ResetRedis) -> object:
     )()
 
 
+@pytest.fixture(autouse=True)
+def _bypass_repo_retry_reservation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default to a no-op repo-retry reservation guard.
+
+    Reset acquires the same repo-level reservation retry uses so that
+    daemon/coder git activity cannot race destructive git mutations.
+    The reservation helpers transact against ``RepoState`` Redis keys,
+    which the in-memory test fake does not implement. Tests that
+    exercise reservation behavior re-patch these helpers explicitly.
+    """
+
+    async def _noop_reserve(_redis: Any, _name: str, _url: str) -> bool:
+        return False
+
+    async def _noop_release(_redis: Any, _name: str, _previous: bool) -> None:
+        return None
+
+    monkeypatch.setattr(repo_control, "_reserve_repo_for_retry", _noop_reserve)
+    monkeypatch.setattr(
+        repo_control, "_release_repo_retry_reservation", _noop_release
+    )
+
+
 def _write_config_and_task(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -548,14 +571,17 @@ def test_reset_returns_503_on_has_state_redis_error(
     assert response.json() == {"error": "redis unavailable"}
 
 
-def test_reset_has_state_zscore_failure_treated_as_no_state(
+def test_reset_returns_503_on_zscore_redis_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A Redis failure during the cancellation-index probe must surface
+    as 503 rather than be misread as "nothing to reset" (400)."""
     _write_config_and_task(tmp_path, monkeypatch, status="TODO")
     redis_client = _ResetRedis()
+    from redis.exceptions import RedisError
 
     async def boom_zscore(key: str, member: str) -> float | None:
-        raise RuntimeError("zset unavailable")
+        raise RedisError("zset unavailable")
 
     redis_client.zscore = boom_zscore  # type: ignore[assignment]
     monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
@@ -563,8 +589,8 @@ def test_reset_has_state_zscore_failure_treated_as_no_state(
     with TestClient(app) as client:
         response = client.post("/api/reset-task/example__alpha/PR-322")
 
-    # Frontmatter TODO + zscore-treated-as-None => 400 nothing to reset.
-    assert response.status_code == 400
+    assert response.status_code == 503
+    assert response.json() == {"error": "redis unavailable"}
 
 
 def test_reset_returns_503_on_checkout_failure(
@@ -1014,3 +1040,142 @@ async def test_reset_safe_for_concurrent_calls(
     # Ensure exactly one call mutated state.
     assert call_count["n"] >= 1
     _ = asyncio  # keep import used (pytest-asyncio shims async fixtures)
+
+
+def test_reset_returns_409_when_repo_busy_for_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reset must refuse to start git mutations when the repo-level
+    retry reservation cannot be acquired."""
+    _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _ResetRedis()
+    _seed_all_keys(redis_client, "example__alpha", "PR-322")
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    async def busy_reserve(_redis: Any, _name: str, _url: str) -> bool:
+        raise repo_control._RepoStateMutationError(
+            "Repository retry already in progress; retry later.",
+            status_code=409,
+        )
+
+    release_calls: list[tuple[str, bool]] = []
+
+    async def track_release(_redis: Any, name: str, previous: bool) -> None:
+        release_calls.append((name, previous))
+
+    monkeypatch.setattr(repo_control, "_reserve_repo_for_retry", busy_reserve)
+    monkeypatch.setattr(
+        repo_control, "_release_repo_retry_reservation", track_release
+    )
+
+    def boom_subprocess(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("no git/gh CLI invocation expected when busy")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", boom_subprocess)
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": "Repository retry already in progress; retry later."
+    }
+    # Reservation never acquired -> release must not run.
+    assert release_calls == []
+    # Redis state must be untouched when the reservation refuses.
+    for key in _seed_all_keys(redis_client, "example__alpha", "PR-322"):
+        assert key in redis_client.store
+
+
+def test_reset_releases_reservation_on_happy_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _ResetRedis()
+    _seed_all_keys(redis_client, "example__alpha", "PR-322")
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+    monkeypatch.setattr(repo_control.subprocess, "run", _ok_subprocess)
+
+    reserve_calls: list[tuple[str, str]] = []
+    release_calls: list[tuple[str, bool]] = []
+
+    async def tracking_reserve(_redis: Any, name: str, url: str) -> bool:
+        reserve_calls.append((name, url))
+        return False
+
+    async def tracking_release(_redis: Any, name: str, previous: bool) -> None:
+        release_calls.append((name, previous))
+
+    monkeypatch.setattr(repo_control, "_reserve_repo_for_retry", tracking_reserve)
+    monkeypatch.setattr(
+        repo_control, "_release_repo_retry_reservation", tracking_release
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 200
+    assert reserve_calls == [("example__alpha", "https://github.com/example/alpha.git")]
+    assert release_calls == [("example__alpha", False)]
+
+
+def test_reset_releases_reservation_on_push_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even when the destructive path fails, the reservation must be
+    released so the daemon is not left paused."""
+    _write_config_and_task(tmp_path, monkeypatch, status="ERROR")
+    redis_client = _ResetRedis()
+    _seed_all_keys(redis_client, "example__alpha", "PR-322")
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    release_calls: list[tuple[str, bool]] = []
+
+    async def reserve(_redis: Any, _name: str, _url: str) -> bool:
+        return True
+
+    async def track_release(_redis: Any, name: str, previous: bool) -> None:
+        release_calls.append((name, previous))
+
+    monkeypatch.setattr(repo_control, "_reserve_repo_for_retry", reserve)
+    monkeypatch.setattr(
+        repo_control, "_release_repo_retry_reservation", track_release
+    )
+
+    def fake_run(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if "push" in args:
+            raise subprocess.CalledProcessError(1, args, "", "push rejected")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 503
+    assert response.json()["partial_reset"] is True
+    assert release_calls == [("example__alpha", True)]
+
+
+def test_reset_returns_503_when_reservation_redis_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A RedisError raised by the reservation acquire path must surface
+    as 503 rather than crash the request."""
+    _write_config_and_task(tmp_path, monkeypatch)
+    redis_client = _ResetRedis()
+    _seed_all_keys(redis_client, "example__alpha", "PR-322")
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    from redis.exceptions import RedisError
+
+    async def boom_reserve(_redis: Any, _name: str, _url: str) -> bool:
+        raise RedisError("reservation set failed")
+
+    monkeypatch.setattr(repo_control, "_reserve_repo_for_retry", boom_reserve)
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 503
+    assert response.json() == {"error": "redis unavailable"}
