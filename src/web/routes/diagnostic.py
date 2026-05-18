@@ -56,7 +56,12 @@ def _decode_text(raw: object) -> str | None:
     if raw is None:
         return None
     if isinstance(raw, bytes):
-        return raw.decode("utf-8")
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            # Diagnostic must not 500 when a Redis key holds non-UTF8 bytes;
+            # the endpoint exists precisely for triage under inconsistent state.
+            return None
     return str(raw)
 
 

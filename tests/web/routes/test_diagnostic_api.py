@@ -521,6 +521,36 @@ def test_diagnostic_decodes_bytes_redis_values(
     assert body["retry_fingerprint"] == "deadbeef"
 
 
+def test_diagnostic_non_utf8_bytes_degrade_to_null(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_config(tmp_path, monkeypatch)
+    redis_client = _FakeRedis()
+    _stub_aioredis(monkeypatch, redis_client)
+    # Simulate decode_responses=False client returning non-UTF8 bytes
+    # across every key that flows through _decode_text/_decode_int.
+    redis_client.values[retry_count_key("example__alpha", "PR-322")] = b"\xff\xfe"  # type: ignore[assignment]
+    redis_client.values[
+        diagnostic_routes._retry_fingerprint_key("example__alpha", "PR-322")
+    ] = b"\xff\xfe"  # type: ignore[assignment]
+    redis_client.values[
+        current_run_started_at_key("example__alpha", "PR-322")
+    ] = b"\xff\xfe"  # type: ignore[assignment]
+    redis_client.values[
+        diagnostic_routes._attempt_count_key("example__alpha", "PR-322")
+    ] = b"\xff\xfe"  # type: ignore[assignment]
+    redis_client.values[status_write_failed_tasks("example__alpha")] = b"\xff\xfe"  # type: ignore[assignment]
+
+    resp = _get("example__alpha", "PR-322")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["retry_count"] == 0
+    assert body["retry_fingerprint"] is None
+    assert body["current_run_started_at"] is None
+    assert body["attempt_count"] == 0
+    assert body["status_write_failed"] is False
+
+
 def test_diagnostic_no_frontmatter_returns_null_status(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
