@@ -10,6 +10,7 @@
    delimiter. Slugifying with `-` collides because `-` is itself a valid pr_id
    character: PR-1.2 and PR-1-2 would otherwise share an id. #}
 {% set target_id = 'task-content-' ~ status_key ~ '-' ~ task.pr_id %}
+{% set diagnostic_id = 'diagnostic-' ~ status_key ~ '-' ~ task.pr_id %}
 <li class="rounded border border-white/5 bg-surface-3 px-3 py-2">
     <button type="button"
             class="secondary-interactive flex w-full flex-col gap-1 text-left text-xs sm:flex-row sm:items-baseline sm:gap-3"
@@ -29,6 +30,17 @@
         <span class="font-mono text-[11px] text-gray-500 sm:text-right">{{ task.branch }}</span>
         {% endif %}
     </button>
+    <div class="mt-1 flex justify-end">
+        <button type="button"
+                class="secondary-interactive text-[11px] text-gray-400 hover:text-accent"
+                hx-get="/partials/repo/{{ repo_name }}/tasks/{{ task.pr_id }}/diagnostic"
+                hx-target="[id='{{ diagnostic_id }}']"
+                hx-swap="innerHTML"
+                data-diagnostic-trigger>
+            Diagnostic
+        </button>
+    </div>
+    <div id="{{ diagnostic_id }}" class="mt-1 empty:hidden"></div>
     {% if status_key == 'error' %}
     {% set next_retry = task.retry_count + 1 %}
     <div class="mt-2 flex items-center justify-end gap-2">
