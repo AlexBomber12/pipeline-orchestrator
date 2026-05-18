@@ -169,3 +169,71 @@ def test_repost_at_json_round_trip_old_payload_defaults_none() -> None:
     state = RepoState.model_validate_json(legacy_payload)
 
     assert state.review_timeout_repost_at is None
+
+
+# PR-358 review feedback (P3): per-push reset semantics. Pushing a new
+# commit on the same PR number/branch is a fresh review iteration that
+# earns its own one-shot repost slot. Per-iteration debounces unrelated
+# to pushes (``last_stale_retrigger_at`` / ``last_codex_retrigger_at``)
+# must persist across the HEAD change — they protect against API floods
+# regardless of how many pushes the operator makes.
+
+
+def test_setattr_resets_repost_flag_on_new_head_sha() -> None:
+    state = _state(
+        current_pr=PRInfo(number=1, branch="pr-001", head_sha="aaa1111")
+    )
+    state.review_timeout_repost_attempted = True
+    state.review_timeout_repost_at = datetime.now(timezone.utc)
+
+    state.current_pr = PRInfo(
+        number=1, branch="pr-001", head_sha="bbb2222"
+    )
+
+    assert state.review_timeout_repost_attempted is False
+    assert state.review_timeout_repost_at is None
+
+
+def test_setattr_preserves_retrigger_debounces_on_new_head_sha() -> None:
+    state = _state(
+        current_pr=PRInfo(number=1, branch="pr-001", head_sha="aaa1111")
+    )
+    stale_stamp = datetime.now(timezone.utc)
+    codex_stamp = datetime.now(timezone.utc)
+    state.last_stale_retrigger_at = stale_stamp
+    state.last_codex_retrigger_at = codex_stamp
+
+    state.current_pr = PRInfo(
+        number=1, branch="pr-001", head_sha="bbb2222"
+    )
+
+    assert state.last_stale_retrigger_at == stale_stamp
+    assert state.last_codex_retrigger_at == codex_stamp
+
+
+def test_setattr_preserves_repost_flag_on_unchanged_head_sha() -> None:
+    state = _state(
+        current_pr=PRInfo(number=1, branch="pr-001", head_sha="aaa1111")
+    )
+    state.review_timeout_repost_attempted = True
+    stamp = datetime.now(timezone.utc)
+    state.review_timeout_repost_at = stamp
+
+    state.current_pr = PRInfo(
+        number=1, branch="pr-001", head_sha="aaa1111", title="refreshed"
+    )
+
+    assert state.review_timeout_repost_attempted is True
+    assert state.review_timeout_repost_at == stamp
+
+
+def test_setattr_preserves_repost_flag_on_empty_head_sha() -> None:
+    """Transient empty ``head_sha`` must not be treated as a new HEAD."""
+    state = _state(
+        current_pr=PRInfo(number=1, branch="pr-001", head_sha="aaa1111")
+    )
+    state.review_timeout_repost_attempted = True
+
+    state.current_pr = PRInfo(number=1, branch="pr-001", head_sha="")
+
+    assert state.review_timeout_repost_attempted is True

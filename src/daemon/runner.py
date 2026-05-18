@@ -2420,6 +2420,17 @@ class PipelineRunner(
                 if await self._review_timeout_park_cleared():
                     self.state.skip_ai_error_diagnose = False
                     self.state.error_message = None
+                    # PR-358 review feedback (P1): leaving the review_timeout
+                    # park is a per-PR-iteration boundary too. The
+                    # ``__setattr__`` PR-transition hook fires only on a
+                    # number/branch change, so a Retry that re-enters WATCH
+                    # against the same PR branch would otherwise carry the
+                    # repost flag forward and skip the one-shot repost on
+                    # the next timeout — making Retry ineffective for this
+                    # failure mode. Reset both fields in lockstep so the
+                    # restarted iteration has a clean elapsed_min floor.
+                    self.state.review_timeout_repost_attempted = False
+                    self.state.review_timeout_repost_at = None
                     self.state.state = PipelineState.IDLE
                     self.log_event(
                         "[ESCALATE] review_timeout park cleared by "

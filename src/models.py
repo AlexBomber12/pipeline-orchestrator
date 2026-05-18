@@ -266,6 +266,19 @@ class RepoState(BaseModel):
                 super().__setattr__("last_codex_retrigger_at", None)
                 super().__setattr__("review_timeout_repost_attempted", False)
                 super().__setattr__("review_timeout_repost_at", None)
+            elif self._is_new_head_sha(current_pr, value):
+                # PR-358 review feedback (P3): a new HEAD on the same PR
+                # number/branch is a fresh review iteration — the operator
+                # (or daemon FIX loop) pushed new code and Codex needs to
+                # re-review it. The repost gate is effectively per-review-
+                # iteration, so each push earns a new one-shot ``@codex
+                # review`` repost slot before escalation to terminal ERROR.
+                # Reset only the repost flag and its anchor; the
+                # ``last_*_retrigger_at`` debounces have their own
+                # API-flood semantics independent of pushes and must
+                # persist across HEAD changes.
+                super().__setattr__("review_timeout_repost_attempted", False)
+                super().__setattr__("review_timeout_repost_at", None)
         if name == "current_task" and value is None:
             super().__setattr__("current_pr", None)
             super().__setattr__("error_message", None)
@@ -290,3 +303,24 @@ class RepoState(BaseModel):
             old_pr.number != new_pr.number
             or old_pr.branch != new_pr.branch
         )
+
+    @staticmethod
+    def _is_new_head_sha(old_pr: object, new_pr: object) -> bool:
+        """Return True when ``current_pr`` is being refreshed onto a new HEAD SHA.
+
+        PR-358 review feedback (P3): used by the ``__setattr__`` hook to
+        reset the per-review-iteration ``review_timeout_repost_*`` fields
+        when a new push lands on the same PR number/branch. The check
+        runs only when ``_is_new_pr_transition`` is False (same PR), so
+        both inputs are guaranteed to be ``PRInfo`` instances by that
+        time; the type guard is defensive against future callers. An
+        empty ``head_sha`` on either side is treated as "not a new HEAD"
+        because the ``gh`` payload can legitimately omit the SHA on
+        transient errors, and we do not want a transient ``""`` to wipe
+        the repost gate mid-window.
+        """
+        if not isinstance(old_pr, PRInfo) or not isinstance(new_pr, PRInfo):
+            return False
+        if not old_pr.head_sha or not new_pr.head_sha:
+            return False
+        return old_pr.head_sha != new_pr.head_sha

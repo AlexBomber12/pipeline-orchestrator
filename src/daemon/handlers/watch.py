@@ -385,12 +385,29 @@ class WatchMixin:
         # yet or the cache lags). Without a daemon-owned floor the second
         # WATCH cycle reads the stale ``found.last_activity`` and escalates
         # immediately instead of granting a fresh review window.
-        repost_at = self.state.review_timeout_repost_at
-        if repost_at is not None:
-            if repost_at.tzinfo is None:
-                repost_at = repost_at.replace(tzinfo=timezone.utc)
-            if repost_at > last_activity:
-                last_activity = repost_at
+        #
+        # PR-358 review feedback (P2): also raise the floor for the two
+        # in-cycle retrigger paths (``_maybe_retrigger_stale_review`` and
+        # ``_maybe_retrigger_on_codex_bot_error``) that fire earlier in
+        # this same ``handle_watch`` pass. Both update their respective
+        # ``last_*_retrigger_at`` stamps when they post ``@codex review``;
+        # ``found.last_activity`` still reflects GitHub's pre-retrigger
+        # ``updatedAt`` because the cached payload was fetched at the top
+        # of this cycle and the new comment has not yet propagated. Without
+        # promoting those stamps to floors, a cycle that just posted via
+        # a retrigger would re-enter the forced repost branch below and
+        # emit a second back-to-back ``@codex review`` for the same hang.
+        for stamp in (
+            self.state.review_timeout_repost_at,
+            self.state.last_stale_retrigger_at,
+            self.state.last_codex_retrigger_at,
+        ):
+            if stamp is None:
+                continue
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            if stamp > last_activity:
+                last_activity = stamp
         now = datetime.now(timezone.utc)
         elapsed_min = (now - last_activity).total_seconds() / 60
         timeout_min = (

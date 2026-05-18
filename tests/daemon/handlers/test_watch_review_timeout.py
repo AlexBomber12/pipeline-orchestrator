@@ -531,6 +531,134 @@ def test_repost_payload_includes_repost_attempted_field(
     assert payload["repost_attempted"] is True
 
 
+def test_stale_retrigger_floor_suppresses_back_to_back_repost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-358 review feedback (P2): in-cycle retrigger blocks forced repost.
+
+    If ``_maybe_retrigger_stale_review`` posted ``@codex review`` earlier
+    in the same WATCH pass, the GitHub-fetched ``found.last_activity``
+    still reflects the pre-retrigger ``updatedAt`` because the cached
+    payload was captured at the top of the cycle. Without including
+    ``last_stale_retrigger_at`` in the ``elapsed_min`` floor, the
+    forced-repost branch would fire on the same cycle and emit a second
+    back-to-back ``@codex review`` for the same hang.
+    """
+    pr = _stale_pr(minutes_old=60)
+    runner = _seed_runner_in_watch(monkeypatch, pr)
+    # Pretend the stale retrigger fired moments ago in this same cycle.
+    runner.state.last_stale_retrigger_at = datetime.now(timezone.utc)
+    calls = _stub_repost(runner, result=True)
+
+    transition_calls: list[Any] = []
+
+    async def fake_transition(*args, **kwargs):
+        transition_calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        PipelineRunner, "_transition_to_error", fake_transition
+    )
+
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert calls == [], (
+        "Forced repost must not fire when a stale retrigger already "
+        "posted @codex review in the same cycle."
+    )
+    assert transition_calls == []
+    assert runner.state.review_timeout_repost_attempted is False
+
+
+def test_codex_bot_error_retrigger_floor_suppresses_back_to_back_repost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-358 review feedback (P2): same floor applies to codex-bot-error retrigger."""
+    pr = _stale_pr(minutes_old=60)
+    runner = _seed_runner_in_watch(monkeypatch, pr)
+    runner.state.last_codex_retrigger_at = datetime.now(timezone.utc)
+    calls = _stub_repost(runner, result=True)
+
+    transition_calls: list[Any] = []
+
+    async def fake_transition(*args, **kwargs):
+        transition_calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        PipelineRunner, "_transition_to_error", fake_transition
+    )
+
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert calls == []
+    assert transition_calls == []
+    assert runner.state.review_timeout_repost_attempted is False
+
+
+def test_repost_flag_resets_on_new_head_sha_same_pr() -> None:
+    """PR-358 review feedback (P3): each push earns a new repost slot.
+
+    A new commit on the same PR number/branch is a new review iteration.
+    Without resetting the repost gate on HEAD change, the next
+    ``review_timeout`` would skip the one-shot repost and escalate
+    straight to terminal ERROR on the first hit, even though the new
+    HEAD is genuinely a new review cycle that deserves its own attempt.
+    """
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=465, branch="pr-465", head_sha="aaa1111"
+    )
+    runner.state.review_timeout_repost_attempted = True
+    runner.state.review_timeout_repost_at = datetime.now(timezone.utc)
+
+    runner.state.current_pr = PRInfo(
+        number=465, branch="pr-465", head_sha="bbb2222"
+    )
+
+    assert runner.state.review_timeout_repost_attempted is False
+    assert runner.state.review_timeout_repost_at is None
+
+
+def test_repost_flag_preserved_on_same_head_sha_same_pr() -> None:
+    """A WATCH refresh that observes the same HEAD must NOT reset the gate."""
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=465, branch="pr-465", head_sha="aaa1111"
+    )
+    runner.state.review_timeout_repost_attempted = True
+    stamp = datetime.now(timezone.utc)
+    runner.state.review_timeout_repost_at = stamp
+
+    runner.state.current_pr = PRInfo(
+        number=465, branch="pr-465", head_sha="aaa1111", title="refreshed"
+    )
+
+    assert runner.state.review_timeout_repost_attempted is True
+    assert runner.state.review_timeout_repost_at == stamp
+
+
+def test_repost_flag_preserved_when_head_sha_unknown_on_either_side() -> None:
+    """Transient empty ``head_sha`` must not wipe the repost gate.
+
+    ``get_open_prs`` can legitimately return a ``PRInfo`` with
+    ``head_sha=""`` on transient errors. Treating that as a HEAD
+    change would clobber the gate mid-window every time the upstream
+    payload omitted the SHA.
+    """
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=465, branch="pr-465", head_sha="aaa1111"
+    )
+    runner.state.review_timeout_repost_attempted = True
+
+    runner.state.current_pr = PRInfo(
+        number=465, branch="pr-465", head_sha=""
+    )
+
+    assert runner.state.review_timeout_repost_attempted is True
+
+
 def test_publish_state_called_after_successful_repost(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

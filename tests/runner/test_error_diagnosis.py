@@ -25,6 +25,7 @@ by stubbing the diagnosis async helpers and the usage-provider snapshot.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 
 # PR-224a: imports needed by tests moved from tests/test_runner.py
 import random  # noqa: F401
@@ -1991,6 +1992,60 @@ def test_run_cycle_in_error_with_park_flag_releases_when_cause_deleted(
         "review_timeout park cleared by operator" in entry.get("event", "")
         for entry in runner.state.history
     )
+
+
+def test_run_cycle_review_timeout_park_release_resets_repost_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-358 review feedback (P1): retried task gets a fresh repost slot.
+
+    When the operator presses Retry, ``_review_timeout_park_cleared``
+    returns True and ``run_cycle`` transitions ERROR -> IDLE. If the
+    retried task re-enters WATCH on the same PR number/branch (no
+    intervening CODING that would reassign ``current_pr``), the
+    ``__setattr__`` PR-transition hook never fires and the repost flag
+    persists at True. The next ``review_timeout`` would then short-circuit
+    straight to terminal ERROR — making Retry ineffective for this
+    failure mode. The retry release path must reset both repost fields.
+    """
+    runner = h._make_runner()
+    runner._recovered = True
+    runner._scaffolded = True
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = (
+        "PR #9 hung after 25m (review=PENDING, ci=SUCCESS)"
+    )
+    runner.state.skip_ai_error_diagnose = True
+    runner.state.review_timeout_repost_attempted = True
+    runner.state.review_timeout_repost_at = datetime.now(timezone.utc)
+    runner.state.current_pr = PRInfo(number=9, branch="pr-009")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-009",
+        title="t",
+        status=TaskStatus.TODO,
+        branch="pr-009",
+    )
+
+    async def fake_ensure_repo_cloned() -> None:
+        return None
+
+    async def fake_publish_state() -> None:
+        return None
+
+    async def fake_handle_idle() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
+    monkeypatch.setattr(runner, "preflight", h._preflight_true_stub)
+    monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+    monkeypatch.setattr(runner, "handle_idle", fake_handle_idle)
+
+    asyncio.run(runner.run_cycle())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.skip_ai_error_diagnose is False
+    assert runner.state.review_timeout_repost_attempted is False
+    assert runner.state.review_timeout_repost_at is None
 
 
 @pytest.mark.parametrize(
