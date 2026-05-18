@@ -1,0 +1,378 @@
+"""PR-358: WATCH review_timeout single-shot ``@codex review`` repost tests.
+
+When WATCH hits ``review_timeout`` for the first time on a PR iteration,
+the daemon must post ``@codex review`` once (bypassing the same-HEAD and
+PR-author dedup gates), restart the review window, and stay in WATCH.
+On the second hit (flag already True) the existing terminal ERROR path
+fires with ``repost_attempted: True`` in the cancellation payload.
+
+The flag is reset to ``False`` on PR-iteration boundaries: FIX entry,
+MERGE entry, new ``current_pr`` assignment, and ``current_task = None``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import httpx
+import pytest
+
+from src.daemon.runner import PipelineRunner
+from src.models import (
+    CIStatus,
+    PipelineState,
+    PRInfo,
+    QueueTask,
+    ReviewStatus,
+    TaskStatus,
+)
+
+from tests.runner import _helpers as h
+
+
+def _stale_pr(
+    *,
+    number: int = 5,
+    minutes_old: int = 90,
+    review: ReviewStatus = ReviewStatus.PENDING,
+    ci: CIStatus = CIStatus.SUCCESS,
+) -> PRInfo:
+    return PRInfo(
+        number=number,
+        branch=f"pr-{number:03d}",
+        ci_status=ci,
+        review_status=review,
+        last_activity=datetime.now(timezone.utc) - timedelta(minutes=minutes_old),
+    )
+
+
+def _seed_runner_in_watch(
+    monkeypatch: pytest.MonkeyPatch,
+    pr: PRInfo,
+    *,
+    repost_attempted: bool = False,
+) -> PipelineRunner:
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    runner = h._make_runner(review_timeout_min=30)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    runner.state.current_task = QueueTask(
+        pr_id=f"PR-{pr.number:03d}",
+        title="t",
+        status=TaskStatus.DOING,
+        branch=pr.branch,
+    )
+    runner.state.review_timeout_repost_attempted = repost_attempted
+
+    async def fake_commit(self, current_task, status, reason):
+        return True
+
+    monkeypatch.setattr(
+        PipelineRunner, "_commit_task_status_change", fake_commit
+    )
+    return runner
+
+
+def _stub_repost(
+    runner: PipelineRunner,
+    *,
+    result: bool | Exception,
+) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+
+    def fake_post(
+        pr_number: int,
+        *,
+        bypass_same_head_dedup: bool = False,
+        bypass_author_dedup: bool = False,
+    ) -> bool:
+        calls.append(
+            {
+                "pr_number": pr_number,
+                "bypass_same_head_dedup": bypass_same_head_dedup,
+                "bypass_author_dedup": bypass_author_dedup,
+            }
+        )
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    runner._post_codex_review = fake_post  # type: ignore[method-assign]
+    return calls
+
+
+def test_first_timeout_posts_repost_stays_in_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = _stale_pr(minutes_old=45)
+    runner = _seed_runner_in_watch(monkeypatch, pr)
+    calls = _stub_repost(runner, result=True)
+
+    transition_calls: list[Any] = []
+
+    async def fake_transition(*args, **kwargs):
+        transition_calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        PipelineRunner, "_transition_to_error", fake_transition
+    )
+
+    before = datetime.now(timezone.utc)
+    asyncio.run(runner.handle_watch())
+    after = datetime.now(timezone.utc)
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.review_timeout_repost_attempted is True
+    assert len(calls) == 1
+    assert calls[0]["pr_number"] == pr.number
+    assert calls[0]["bypass_same_head_dedup"] is True
+    assert calls[0]["bypass_author_dedup"] is True
+    assert transition_calls == []
+    last_activity = runner.state.current_pr.last_activity
+    assert last_activity is not None
+    assert before <= last_activity <= after
+
+
+def test_first_timeout_failed_repost_falls_through_to_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = _stale_pr(minutes_old=45)
+    runner = _seed_runner_in_watch(monkeypatch, pr)
+    _stub_repost(runner, result=False)
+
+    recorded: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_safe_record(redis_client, repo_slug, task_id, cause, *, log=None):
+        recorded.append((cause.category, dict(cause.payload)))
+
+    monkeypatch.setattr(
+        "src.daemon.runner.safe_record_cancellation_cause",
+        fake_safe_record,
+    )
+
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.review_timeout_repost_attempted is False
+    assert recorded, "expected cancellation_cause to be recorded"
+    category, payload = recorded[0]
+    assert category == "ERROR"
+    assert payload["subsource"] == "review_timeout"
+    assert payload["repost_attempted"] is False
+
+
+def test_first_timeout_repost_raises_falls_through_to_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = _stale_pr(minutes_old=45)
+    runner = _seed_runner_in_watch(monkeypatch, pr)
+    _stub_repost(runner, result=httpx.RequestError("connection reset"))
+
+    recorded: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_safe_record(redis_client, repo_slug, task_id, cause, *, log=None):
+        recorded.append((cause.category, dict(cause.payload)))
+
+    monkeypatch.setattr(
+        "src.daemon.runner.safe_record_cancellation_cause",
+        fake_safe_record,
+    )
+
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert recorded
+    _category, payload = recorded[0]
+    assert payload["subsource"] == "review_timeout"
+    assert payload["repost_attempted"] is False
+    assert any(
+        "raised RequestError" in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_second_timeout_after_successful_repost_transitions_to_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = _stale_pr(minutes_old=60)
+    runner = _seed_runner_in_watch(
+        monkeypatch, pr, repost_attempted=True
+    )
+    calls = _stub_repost(runner, result=True)
+
+    recorded: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_safe_record(redis_client, repo_slug, task_id, cause, *, log=None):
+        recorded.append((cause.category, dict(cause.payload)))
+
+    monkeypatch.setattr(
+        "src.daemon.runner.safe_record_cancellation_cause",
+        fake_safe_record,
+    )
+
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert calls == [], "second cycle must not call _post_codex_review again"
+    assert recorded
+    _category, payload = recorded[0]
+    assert payload["subsource"] == "review_timeout"
+    assert payload["repost_attempted"] is True
+
+
+def test_below_timeout_no_repost_no_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = _stale_pr(minutes_old=10)
+    runner = _seed_runner_in_watch(monkeypatch, pr)
+    calls = _stub_repost(runner, result=True)
+
+    transition_calls: list[Any] = []
+
+    async def fake_transition(*args, **kwargs):
+        transition_calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        PipelineRunner, "_transition_to_error", fake_transition
+    )
+
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.review_timeout_repost_attempted is False
+    assert calls == []
+    assert transition_calls == []
+    assert any("waiting" in e["event"] for e in runner.state.history)
+
+
+def test_repost_flag_resets_on_fix_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    runner.state.review_timeout_repost_attempted = True
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=42,
+        branch="pr-042",
+        is_cross_repository=True,
+    )
+
+    async def fake_refresh_auth(self) -> None:
+        return None
+
+    monkeypatch.setattr(
+        PipelineRunner, "_refresh_auth_status_cache", fake_refresh_auth
+    )
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.review_timeout_repost_attempted is False
+
+
+def test_repost_flag_resets_on_merge_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    runner.state.review_timeout_repost_attempted = True
+    runner.state.state = PipelineState.MERGE
+    runner.state.current_pr = PRInfo(
+        number=42,
+        branch="pr-042",
+        is_cross_repository=True,
+    )
+
+    async def fake_external_merge(self) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        PipelineRunner,
+        "_handle_cross_repository_merge",
+        fake_external_merge,
+        raising=False,
+    )
+
+    # Cross-repo PR path inside handle_merge short-circuits before any
+    # GitHub or git interaction, so the flag reset at handler entry is
+    # observable without further stubbing.
+    try:
+        asyncio.run(runner.handle_merge())
+    except Exception:
+        # Cross-repo handling may attempt additional steps depending on
+        # repo state; the only invariant under test is the flag reset
+        # at the handler entry point.
+        pass
+
+    assert runner.state.review_timeout_repost_attempted is False
+
+
+def test_repost_flag_resets_on_new_pr_assignment() -> None:
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=465, branch="pr-465")
+    runner.state.review_timeout_repost_attempted = True
+
+    runner.state.current_pr = PRInfo(number=466, branch="pr-466")
+
+    assert runner.state.review_timeout_repost_attempted is False
+
+
+def test_repost_flag_resets_on_current_task_none() -> None:
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-465",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-465",
+    )
+    runner.state.review_timeout_repost_attempted = True
+
+    runner.state.current_task = None
+
+    assert runner.state.review_timeout_repost_attempted is False
+
+
+def test_repost_payload_includes_repost_attempted_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = _stale_pr(minutes_old=60)
+    runner = _seed_runner_in_watch(
+        monkeypatch, pr, repost_attempted=True
+    )
+    _stub_repost(runner, result=True)
+
+    recorded: list[dict[str, Any]] = []
+
+    async def fake_safe_record(redis_client, repo_slug, task_id, cause, *, log=None):
+        recorded.append(dict(cause.payload))
+
+    monkeypatch.setattr(
+        "src.daemon.runner.safe_record_cancellation_cause",
+        fake_safe_record,
+    )
+
+    asyncio.run(runner.handle_watch())
+
+    assert recorded
+    payload = recorded[0]
+    assert "repost_attempted" in payload
+    assert payload["repost_attempted"] is True
+
+
+def test_publish_state_called_after_successful_repost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = _stale_pr(minutes_old=45)
+    runner = _seed_runner_in_watch(monkeypatch, pr)
+    _stub_repost(runner, result=True)
+
+    publish_calls: list[int] = []
+
+    async def fake_publish(self) -> None:
+        publish_calls.append(1)
+
+    monkeypatch.setattr(PipelineRunner, "publish_state", fake_publish)
+
+    asyncio.run(runner.handle_watch())
+
+    assert publish_calls, "publish_state must be invoked after the repost"

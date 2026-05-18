@@ -592,6 +592,12 @@ def test_handle_watch_timeout_transitions_to_error_with_cause(
                 "elapsed_min": 90,
                 "ci_status": "PENDING",
                 "review_status": "EYES",
+                # PR-358: the daemon attempts a single ``@codex review``
+                # repost before the terminal ERROR transition; the test
+                # leaves ``_post_codex_review`` unmocked so the call
+                # fails (no gh auth) and the cancellation payload
+                # records the failure with ``repost_attempted: False``.
+                "repost_attempted": False,
             },
         )
     ]

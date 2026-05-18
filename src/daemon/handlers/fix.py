@@ -219,6 +219,11 @@ class FixMixin(BreachMixin):
     async def handle_fix(self) -> None:
         """Run ``FIX FEEDBACK`` via the active coder CLI and return to WATCH."""
         self._stop_requested = False
+        # PR-358: a FIX entry begins a new review iteration; clear the
+        # single-shot review_timeout repost flag so the next WATCH
+        # iteration after this FIX can post one repost again if Codex
+        # falls silent on the new push.
+        self.state.review_timeout_repost_attempted = False
         logger.info(
             "[BRANCH] handle_fix: %s",
             BranchContext.from_runner(self).log_summary(),

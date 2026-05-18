@@ -196,6 +196,12 @@ class RepoState(BaseModel):
     coder: str | None = None
     last_stale_retrigger_at: datetime | None = None
     last_codex_retrigger_at: datetime | None = None
+    # PR-358: set True after WATCH posts the single ``@codex review`` repost
+    # on the first ``review_timeout`` hit for a PR iteration. The second hit
+    # observes the flag and transitions to terminal ERROR. Reset to False on
+    # PR-iteration boundaries (new ``current_pr`` assignment via __setattr__,
+    # FIX entry, MERGE entry) and on ``current_task = None``.
+    review_timeout_repost_attempted: bool = False
     # PR-316 review feedback: when True, ``run_cycle`` keeps the runner
     # parked in ERROR without invoking ``handle_error``. Set by WATCH on
     # ``review_timeout`` so the AI diagnose loop does not burn budget on
@@ -247,9 +253,11 @@ class RepoState(BaseModel):
             if self._is_new_pr_transition(current_pr, value):
                 super().__setattr__("last_stale_retrigger_at", None)
                 super().__setattr__("last_codex_retrigger_at", None)
+                super().__setattr__("review_timeout_repost_attempted", False)
         if name == "current_task" and value is None:
             super().__setattr__("current_pr", None)
             super().__setattr__("error_message", None)
+            super().__setattr__("review_timeout_repost_attempted", False)
         if name == "current_queue":
             super().__setattr__(
                 "current_queue_snapshot_at",

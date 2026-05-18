@@ -383,6 +383,44 @@ class WatchMixin:
             else self.app_config.daemon.review_timeout_min
         )
         if elapsed_min >= timeout_min:
+            # PR-358: on the first review_timeout hit for this PR iteration,
+            # force-post ``@codex review`` once and restart the review
+            # window. The second hit (flag already True) falls through to
+            # the terminal ERROR path below. Closes the regression from
+            # PR-276/PR-277 (HUNG state removal) which lost the
+            # "post @codex review once before escalating" behavior.
+            if not self.state.review_timeout_repost_attempted:
+                try:
+                    posted = self._post_codex_review(
+                        found.number,
+                        bypass_same_head_dedup=True,
+                        bypass_author_dedup=True,
+                    )
+                except Exception as exc:
+                    self.log_event(
+                        f"[WATCH] PR #{found.number} hung after "
+                        f"{elapsed_min:.0f}m; @codex review repost raised "
+                        f"{type(exc).__name__}: {exc}. Falling through to "
+                        f"terminal ERROR."
+                    )
+                    posted = False
+                if posted:
+                    self.state.review_timeout_repost_attempted = True
+                    if self.state.current_pr is not None:
+                        self.state.current_pr.last_activity = datetime.now(
+                            timezone.utc
+                        )
+                    self.log_event(
+                        f"[WATCH] PR #{found.number} hung after "
+                        f"{elapsed_min:.0f}m; posted @codex review repost "
+                        f"(1/1), restarting review window."
+                    )
+                    await self.publish_state()
+                    return
+                # Post failed (network, gh auth, etc). Fall through to
+                # terminal ERROR below so the operator sees the park
+                # instead of an invisible hang.
+
             # PR-316 (OBS-DD): WATCH review_timeout was previously routed
             # through ``_escalate_and_skip`` to IDLE, which let the picker
             # re-select the same status:TODO task and route it back into
@@ -427,6 +465,9 @@ class WatchMixin:
                         "elapsed_min": int(elapsed_min),
                         "ci_status": ci.value,
                         "review_status": review.value,
+                        "repost_attempted": (
+                            self.state.review_timeout_repost_attempted
+                        ),
                     },
                 ),
             )
