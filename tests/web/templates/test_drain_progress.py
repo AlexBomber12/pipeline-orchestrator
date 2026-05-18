@@ -227,15 +227,21 @@ async def test_build_drain_progress_estimated_remaining_for_coding() -> None:
 
 
 @pytest.mark.asyncio
-async def test_build_drain_progress_estimated_remaining_for_fix() -> None:
+async def test_build_drain_progress_estimated_remaining_for_fix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
     last_push = started + timedelta(seconds=120)
     now = last_push + timedelta(seconds=600)
-    pr = PRInfo(number=1, branch="b", last_activity=last_push)
+    pr = PRInfo(number=1, branch="b", last_activity=started)
     state = _state(
         current_task=_task(),
         current_pr=pr,
         history=[_history_entry(state="FIX", time=started)],
+    )
+    monkeypatch.setattr(
+        "src.web.routes.dashboard.gh_prs.get_pr_last_push_time",
+        lambda owner_repo, pr_number: last_push,
     )
     view = await dashboard_routes._build_drain_progress(
         redis_client=None,
@@ -248,6 +254,171 @@ async def test_build_drain_progress_estimated_remaining_for_fix() -> None:
     assert view["elapsed_sec"] == pytest.approx(600.0)
     # 1800 - 600 = 1200 sec = 20 minutes
     assert view["est_remaining_sec"] == pytest.approx(1200.0)
+
+
+@pytest.mark.asyncio
+async def test_build_drain_progress_fix_ignores_pr_updated_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Codex commented shortly before Pause All (advancing PR ``updatedAt`` /
+    # ``last_activity``) while the head branch had not been pushed for most
+    # of the idle window. The card must reflect the supervisor's branch-push
+    # anchor (~full window elapsed), not the comment-driven PR activity time
+    # which would report a near-fresh window.
+    started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+    last_push = started + timedelta(seconds=60)
+    recent_comment = started + timedelta(seconds=1770)
+    now = started + timedelta(seconds=1780)
+    pr = PRInfo(number=1, branch="b", last_activity=recent_comment)
+    state = _state(
+        current_task=_task(),
+        current_pr=pr,
+        history=[_history_entry(state="FIX", time=started)],
+    )
+    monkeypatch.setattr(
+        "src.web.routes.dashboard.gh_prs.get_pr_last_push_time",
+        lambda owner_repo, pr_number: last_push,
+    )
+    view = await dashboard_routes._build_drain_progress(
+        redis_client=None,
+        state=state,
+        config=_config(fix_idle_timeout_sec=1800),
+        now=now,
+    )
+    assert view is not None
+    assert view["elapsed_sec"] == pytest.approx(1720.0)
+    assert view["est_remaining_sec"] == pytest.approx(80.0)
+
+
+@pytest.mark.asyncio
+async def test_build_drain_progress_fix_falls_back_to_history_when_push_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # GitHub activity API returns ``None`` (transient outage, unauthenticated
+    # gh, etc.). The helper falls back to the FIX history start so the
+    # elapsed reading still works rather than suppressing the indicator.
+    started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+    now = started + timedelta(seconds=300)
+    pr = PRInfo(number=1, branch="b")
+    state = _state(
+        current_task=_task(),
+        current_pr=pr,
+        history=[_history_entry(state="FIX", time=started)],
+    )
+    monkeypatch.setattr(
+        "src.web.routes.dashboard.gh_prs.get_pr_last_push_time",
+        lambda owner_repo, pr_number: None,
+    )
+    view = await dashboard_routes._build_drain_progress(
+        redis_client=None,
+        state=state,
+        config=_config(fix_idle_timeout_sec=1800),
+        now=now,
+    )
+    assert view is not None
+    assert view["phase"] == "FIX"
+    assert view["elapsed_sec"] == pytest.approx(300.0)
+
+
+@pytest.mark.asyncio
+async def test_build_drain_progress_fix_falls_back_when_push_older_than_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Push is older than the configured idle window — supervisor would
+    # reset its baseline to FIX entry under this shape (OBS-DK behavior),
+    # so the card matches that by anchoring at FIX history start instead
+    # of reporting an "elapsed > timeout" reading driven by a stale push.
+    started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+    stale_push = started - timedelta(seconds=3000)
+    now = started + timedelta(seconds=120)
+    pr = PRInfo(number=1, branch="b")
+    state = _state(
+        current_task=_task(),
+        current_pr=pr,
+        history=[_history_entry(state="FIX", time=started)],
+    )
+    monkeypatch.setattr(
+        "src.web.routes.dashboard.gh_prs.get_pr_last_push_time",
+        lambda owner_repo, pr_number: stale_push,
+    )
+    view = await dashboard_routes._build_drain_progress(
+        redis_client=None,
+        state=state,
+        config=_config(fix_idle_timeout_sec=1800),
+        now=now,
+    )
+    assert view is not None
+    assert view["elapsed_sec"] == pytest.approx(120.0)
+    assert view["est_remaining_sec"] == pytest.approx(1680.0)
+
+
+@pytest.mark.asyncio
+async def test_build_drain_progress_fix_falls_back_when_repo_url_unparseable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A repo registered with a non-GitHub URL (legacy seed, manual import)
+    # must not crash the dashboard; the helper falls back to the FIX
+    # history anchor and the indicator still renders.
+    started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+    now = started + timedelta(seconds=180)
+    pr = PRInfo(number=1, branch="b")
+    state = RepoState(
+        url="not-a-github-url",
+        name="octo__demo",
+        state=PipelineState.PAUSED,
+        user_paused=True,
+        current_task=_task(),
+        history=[_history_entry(state="FIX", time=started)],
+    )
+    state.current_pr = pr
+
+    def _should_not_be_called(owner_repo: str, pr_number: int) -> datetime | None:
+        raise AssertionError("get_pr_last_push_time must be skipped on bad URL")
+
+    monkeypatch.setattr(
+        "src.web.routes.dashboard.gh_prs.get_pr_last_push_time",
+        _should_not_be_called,
+    )
+    view = await dashboard_routes._build_drain_progress(
+        redis_client=None,
+        state=state,
+        config=_config(fix_idle_timeout_sec=1800),
+        now=now,
+    )
+    assert view is not None
+    assert view["elapsed_sec"] == pytest.approx(180.0)
+
+
+@pytest.mark.asyncio
+async def test_build_drain_progress_fix_falls_back_when_gh_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ``gh_prs.get_pr_last_push_time`` runs as a real subprocess in
+    # production; any subprocess failure must fail open to the FIX history
+    # anchor rather than suppress the indicator.
+    started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+    now = started + timedelta(seconds=420)
+    pr = PRInfo(number=1, branch="b")
+    state = _state(
+        current_task=_task(),
+        current_pr=pr,
+        history=[_history_entry(state="FIX", time=started)],
+    )
+
+    def _boom(owner_repo: str, pr_number: int) -> datetime | None:
+        raise RuntimeError("gh down")
+
+    monkeypatch.setattr(
+        "src.web.routes.dashboard.gh_prs.get_pr_last_push_time", _boom
+    )
+    view = await dashboard_routes._build_drain_progress(
+        redis_client=None,
+        state=state,
+        config=_config(fix_idle_timeout_sec=1800),
+        now=now,
+    )
+    assert view is not None
+    assert view["elapsed_sec"] == pytest.approx(420.0)
 
 
 @pytest.mark.asyncio
@@ -355,21 +526,27 @@ async def test_build_drain_progress_active_coding_drain_with_user_paused() -> No
 
 
 @pytest.mark.asyncio
-async def test_build_drain_progress_active_fix_drain_with_user_paused() -> None:
+async def test_build_drain_progress_active_fix_drain_with_user_paused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Mirror of the CODING active-drain case for FIX: the runner stays
     # in ``state == FIX`` until the fix cycle hands off, so the helper
-    # must accept that shape too. Elapsed is anchored to
-    # ``current_pr.last_activity`` (last push) per the FIX branch.
+    # must accept that shape too. Elapsed is anchored to the branch's
+    # last-push time — the same signal ``monitor_fix_idle`` uses.
     started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
     last_push = started + timedelta(seconds=120)
     now = last_push + timedelta(seconds=600)
-    pr = PRInfo(number=1, branch="b", last_activity=last_push)
+    pr = PRInfo(number=1, branch="b")
     state = _state(
         state=PipelineState.FIX,
         user_paused=True,
         current_task=_task(),
         current_pr=pr,
         history=[_history_entry(state="FIX", time=started)],
+    )
+    monkeypatch.setattr(
+        "src.web.routes.dashboard.gh_prs.get_pr_last_push_time",
+        lambda owner_repo, pr_number: last_push,
     )
     view = await dashboard_routes._build_drain_progress(
         redis_client=None,
@@ -529,17 +706,24 @@ async def test_build_drain_progress_returns_none_when_history_time_unparseable()
 
 
 @pytest.mark.asyncio
-async def test_build_drain_progress_normalizes_naive_last_activity_to_utc() -> None:
-    # ``current_pr.last_activity`` is typically aware but a legacy payload
-    # may carry a naive datetime. The FIX branch must coerce it to UTC
-    # before subtraction so the elapsed-since-last-push reading works.
+async def test_build_drain_progress_normalizes_naive_push_to_utc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ``get_pr_last_push_time`` normally returns an aware datetime but a
+    # parser edge case could emit a naive one. The FIX branch must coerce
+    # it to UTC before subtraction so the elapsed-since-last-push reading
+    # works rather than raising on naive/aware arithmetic.
     naive_last_push = datetime(2026, 5, 18, 12, 0, 0)
     now = datetime(2026, 5, 18, 12, 10, 0, tzinfo=timezone.utc)
-    pr = PRInfo(number=1, branch="b", last_activity=naive_last_push)
+    pr = PRInfo(number=1, branch="b")
     state = _state(
         current_task=_task(),
         current_pr=pr,
         history=[_history_entry(state="FIX", time=now - timedelta(seconds=1200))],
+    )
+    monkeypatch.setattr(
+        "src.web.routes.dashboard.gh_prs.get_pr_last_push_time",
+        lambda owner_repo, pr_number: naive_last_push,
     )
     view = await dashboard_routes._build_drain_progress(
         redis_client=None,

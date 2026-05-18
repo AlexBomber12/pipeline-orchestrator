@@ -46,6 +46,8 @@ from src.daemon.github_rate_limit import (
     recent_cycle_burns,
 )
 from src.events.sse import format_sse_comment, format_sse_event
+from src.github import gh_runner
+from src.github import prs as gh_prs
 from src.keyspace import cli_log_latest, daemon_panic_state
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
@@ -1143,6 +1145,43 @@ def _phase_started_at(history: list[Any], phase: str) -> datetime | None:
     return run_start
 
 
+async def _fix_branch_last_push_at(state: RepoState) -> datetime | None:
+    """Return the FIX PR's branch last-push timestamp, or ``None``.
+
+    Mirrors the anchor source used by ``monitor_fix_idle`` so the card's
+    FIX drain elapsed reading tracks the same deadline the supervisor
+    enforces. Uses ``gh_prs.get_pr_last_push_time`` (the GitHub activity
+    API), which reflects when the head ref was actually updated. Distinct
+    from ``current_pr.last_activity`` (PR ``updatedAt``), which also
+    advances on comments and reviews — anchoring on that field would
+    report nearly the full timeout remaining for a PR that just received
+    a Codex comment shortly before Pause All, even though the supervisor
+    is about to kill the coder for branch idleness.
+
+    Fails open with ``None`` on any error so a transient GitHub outage
+    cannot suppress the indicator entirely; callers fall back to the FIX
+    cycle's history start instead.
+    """
+    pr = state.current_pr
+    if pr is None or pr.number <= 0:
+        return None
+    try:
+        owner_repo = gh_runner.get_repo_full_name(state.url)
+    except ValueError:
+        return None
+    try:
+        push_at = await asyncio.to_thread(
+            gh_prs.get_pr_last_push_time, owner_repo, pr.number
+        )
+    except Exception:
+        return None
+    if push_at is None:
+        return None
+    if push_at.tzinfo is None:
+        push_at = push_at.replace(tzinfo=timezone.utc)
+    return push_at
+
+
 async def _build_drain_progress(
     redis_client: aioredis.Redis | None,
     state: RepoState,
@@ -1171,12 +1210,21 @@ async def _build_drain_progress(
     existing "Paused, Nm remaining" indicator stays the only signal
     there.
 
-    ``coding_started_at`` is read from the Redis
-    ``current_run_started_at`` marker that ``handle_coding`` writes on
-    dispatch; if that marker is missing (Redis down, marker expired) the
-    helper falls back to the timestamp of the most recent CODING/FIX
-    entry in history so the elapsed reading still works after a daemon
-    restart. ``est_remaining_sec`` is clamped at zero so elapsed runs
+    For CODING the elapsed anchor is the Redis ``current_run_started_at``
+    marker written by ``handle_coding`` on dispatch; if the marker is
+    missing (Redis down or expired) the helper falls back to the most
+    recent CODING entry in history so the reading still works after a
+    daemon restart.
+
+    For FIX the elapsed anchor is the branch's last-push time fetched via
+    the GitHub activity API — the same source ``monitor_fix_idle`` uses
+    to drive its idle deadline. Anchoring on ``current_pr.last_activity``
+    (PR ``updatedAt``) would advance on comments and reviews and would
+    overstate the remaining time. When the push API is unavailable or
+    reports a push older than ``fix_idle_timeout_sec`` (matching the
+    supervisor's reset-on-stale-baseline behavior), the helper falls back
+    to the most recent FIX history entry so the reading reflects FIX
+    cycle age. ``est_remaining_sec`` is clamped at zero so elapsed runs
     that already exceeded the configured timeout do not render negative.
     """
     if state.current_task is None:
@@ -1208,16 +1256,21 @@ async def _build_drain_progress(
     # ``_phase_started_at``) both normalize naive datetimes to UTC, so
     # ``started_at`` is guaranteed aware here.
     if phase == PipelineState.FIX.value:
-        anchor = (
-            state.current_pr.last_activity
-            if state.current_pr is not None
-            and state.current_pr.last_activity is not None
-            else started_at
-        )
-        if anchor.tzinfo is None:
-            anchor = anchor.replace(tzinfo=timezone.utc)
-        elapsed = (current_time - anchor).total_seconds()
         timeout_sec = config.daemon.fix_idle_timeout_sec
+        # ``_phase_started_at`` and ``get_current_run_started_at`` both
+        # return aware datetimes (or ``None``), so ``fix_started_at`` is
+        # guaranteed aware here without an explicit UTC coercion.
+        fix_started_at = (
+            _phase_started_at(state.history, phase) or started_at
+        )
+        push_at = await _fix_branch_last_push_at(state)
+        if push_at is not None and (
+            (current_time - push_at).total_seconds() < timeout_sec
+        ):
+            anchor = push_at
+        else:
+            anchor = fix_started_at
+        elapsed = (current_time - anchor).total_seconds()
     else:
         elapsed = (current_time - started_at).total_seconds()
         timeout_sec = config.daemon.planned_pr_timeout_sec
