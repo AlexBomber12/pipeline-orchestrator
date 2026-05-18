@@ -86,21 +86,29 @@ def _replace_frontmatter_status(content: str, status: str) -> str:
     """Return *content* with its frontmatter ``status`` set to *status*.
 
     If *content* lacks a complete ``---`` block, a minimal one is prepended.
-    Other frontmatter fields are preserved.
+    Other frontmatter fields are preserved. Leading blank lines before the
+    opening ``---`` are tolerated (matching ``parse_task_header`` and
+    ``read_frontmatter_status``) so an upload that starts with whitespace
+    above a valid frontmatter block is edited in place instead of getting
+    a second, conflicting frontmatter prepended.
     """
     lines = content.splitlines(keepends=True)
-    if not lines or lines[0].rstrip() != "---":
+    opening_index = next(
+        (index for index, raw_line in enumerate(lines) if raw_line.strip()),
+        None,
+    )
+    if opening_index is None or lines[opening_index].rstrip() != "---":
         return f"---\nstatus: {status}\n---\n\n{content}"
     closing_index: int | None = None
-    for index, line in enumerate(lines[1:], start=1):
-        if line.rstrip() == "---":
+    for index in range(opening_index + 1, len(lines)):
+        if lines[index].rstrip() == "---":
             closing_index = index
             break
     if closing_index is None:
         return f"---\nstatus: {status}\n---\n\n{content}"
     rewrote = False
     new_fm_lines: list[str] = []
-    for line in lines[1:closing_index]:
+    for line in lines[opening_index + 1 : closing_index]:
         if _FRONTMATTER_STATUS_LINE.match(line.rstrip()):
             ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
             new_fm_lines.append(f"status: {status}{ending}")
@@ -110,7 +118,11 @@ def _replace_frontmatter_status(content: str, status: str) -> str:
     if not rewrote:
         ending = "\n" if not new_fm_lines or new_fm_lines[-1].endswith("\n") else ""
         new_fm_lines.append(f"status: {status}{ending or chr(10)}")
-    return lines[0] + "".join(new_fm_lines) + "".join(lines[closing_index:])
+    return (
+        "".join(lines[: opening_index + 1])
+        + "".join(new_fm_lines)
+        + "".join(lines[closing_index:])
+    )
 
 
 def preserve_terminal_status_on_collision(

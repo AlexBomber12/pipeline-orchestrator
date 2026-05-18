@@ -464,6 +464,50 @@ def test_upload_preserves_done_with_leading_blank_lines_on_existing(
     assert "Regenerated" in staged
 
 
+def test_upload_preserves_done_when_upload_has_leading_blank_lines(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    # ``parse_task_header`` skips leading blank lines before the opening
+    # ``---`` of the frontmatter block, so an upload like ``\n\n---\n...``
+    # is still a valid task spec. The collision-preserve rewrite must edit
+    # that block in place instead of prepending a second frontmatter section
+    # that would leave the uploaded ``status: TODO`` in the body.
+    (repo_dir / "tasks" / "PR-322.md").write_text(
+        _task_text("PR-322", status="DONE", title="Already merged"),
+        encoding="utf-8",
+    )
+    upload_payload = "\n\n" + _task_text(
+        "PR-322", status="TODO", title="Regenerated spec"
+    )
+    files = [
+        (
+            "files",
+            (
+                "PR-322.md",
+                upload_payload.encode("utf-8"),
+                "text/markdown",
+            ),
+        )
+    ]
+
+    resp = _post(files)
+
+    assert resp.status_code == 200
+    staged = _staged_text(uploads_dir, "PR-322.md")
+    assert staged.count("---\nstatus:") == 1
+    assert "status: DONE" in staged
+    assert "status: TODO" not in staged
+    assert "Regenerated spec" in staged
+
+
+def test_replace_frontmatter_status_skips_leading_blank_lines() -> None:
+    upload = "\n\n---\nstatus: TODO\n---\n\nbody\n"
+    rewritten = upload_validation._replace_frontmatter_status(upload, "DONE")
+    assert rewritten == "\n\n---\nstatus: DONE\n---\n\nbody\n"
+
+
 def test_upload_preserves_done_when_existing_has_duplicate_status_keys(
     one_repo_config: Path,
     repo_dir: Path,
