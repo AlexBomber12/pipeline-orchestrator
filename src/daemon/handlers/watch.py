@@ -375,6 +375,39 @@ class WatchMixin:
         last_activity = found.last_activity or self.state.last_updated
         if last_activity.tzinfo is None:
             last_activity = last_activity.replace(tzinfo=timezone.utc)
+        # PR-358 review feedback: anchor the restarted review window to a
+        # RepoState field rather than ``current_pr.last_activity``. The
+        # locally-stamped ``current_pr.last_activity = now`` set after a
+        # successful repost is wiped on the next poll by
+        # ``self.state.current_pr = found`` (the GitHub-fetched ``PRInfo``
+        # whose ``last_activity`` reflects GitHub's ``updatedAt``, which may
+        # still carry the pre-repost value if the comment hasn't propagated
+        # yet or the cache lags). Without a daemon-owned floor the second
+        # WATCH cycle reads the stale ``found.last_activity`` and escalates
+        # immediately instead of granting a fresh review window.
+        #
+        # PR-358 review feedback (P2): also raise the floor for the two
+        # in-cycle retrigger paths (``_maybe_retrigger_stale_review`` and
+        # ``_maybe_retrigger_on_codex_bot_error``) that fire earlier in
+        # this same ``handle_watch`` pass. Both update their respective
+        # ``last_*_retrigger_at`` stamps when they post ``@codex review``;
+        # ``found.last_activity`` still reflects GitHub's pre-retrigger
+        # ``updatedAt`` because the cached payload was fetched at the top
+        # of this cycle and the new comment has not yet propagated. Without
+        # promoting those stamps to floors, a cycle that just posted via
+        # a retrigger would re-enter the forced repost branch below and
+        # emit a second back-to-back ``@codex review`` for the same hang.
+        for stamp in (
+            self.state.review_timeout_repost_at,
+            self.state.last_stale_retrigger_at,
+            self.state.last_codex_retrigger_at,
+        ):
+            if stamp is None:
+                continue
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            if stamp > last_activity:
+                last_activity = stamp
         now = datetime.now(timezone.utc)
         elapsed_min = (now - last_activity).total_seconds() / 60
         timeout_min = (
@@ -383,6 +416,50 @@ class WatchMixin:
             else self.app_config.daemon.review_timeout_min
         )
         if elapsed_min >= timeout_min:
+            # PR-358: on the first review_timeout hit for this PR iteration,
+            # force-post ``@codex review`` once and restart the review
+            # window. The second hit (flag already True) falls through to
+            # the terminal ERROR path below. Closes the regression from
+            # PR-276/PR-277 (HUNG state removal) which lost the
+            # "post @codex review once before escalating" behavior.
+            if not self.state.review_timeout_repost_attempted:
+                try:
+                    posted = self._post_codex_review(
+                        found.number,
+                        bypass_same_head_dedup=True,
+                        bypass_author_dedup=True,
+                    )
+                except Exception as exc:
+                    self.log_event(
+                        f"[WATCH] PR #{found.number} hung after "
+                        f"{elapsed_min:.0f}m; @codex review repost raised "
+                        f"{type(exc).__name__}: {exc}. Falling through to "
+                        f"terminal ERROR."
+                    )
+                    posted = False
+                if posted:
+                    repost_now = datetime.now(timezone.utc)
+                    self.state.review_timeout_repost_attempted = True
+                    # The RepoState timestamp is the durable anchor read by
+                    # next cycle's ``elapsed_min`` computation. Stamping
+                    # ``current_pr.last_activity`` in tandem keeps the
+                    # dashboard's PR card in sync with the restart even
+                    # though that field is overwritten by the next
+                    # GitHub-fetched ``PRInfo``.
+                    self.state.review_timeout_repost_at = repost_now
+                    if self.state.current_pr is not None:
+                        self.state.current_pr.last_activity = repost_now
+                    self.log_event(
+                        f"[WATCH] PR #{found.number} hung after "
+                        f"{elapsed_min:.0f}m; posted @codex review repost "
+                        f"(1/1), restarting review window."
+                    )
+                    await self.publish_state()
+                    return
+                # Post failed (network, gh auth, etc). Fall through to
+                # terminal ERROR below so the operator sees the park
+                # instead of an invisible hang.
+
             # PR-316 (OBS-DD): WATCH review_timeout was previously routed
             # through ``_escalate_and_skip`` to IDLE, which let the picker
             # re-select the same status:TODO task and route it back into
@@ -427,6 +504,9 @@ class WatchMixin:
                         "elapsed_min": int(elapsed_min),
                         "ci_status": ci.value,
                         "review_status": review.value,
+                        "repost_attempted": (
+                            self.state.review_timeout_repost_attempted
+                        ),
                     },
                 ),
             )
@@ -727,7 +807,18 @@ class WatchMixin:
             bypass_same_head_dedup=True,
             bypass_author_dedup=True,
         )
-        self.state.last_stale_retrigger_at = now
+        # PR-358 review feedback (P2): stamp the floor only when an actual
+        # ``@codex review`` comment exists for this head — either freshly
+        # posted by the daemon (``posted=True``) or already present from
+        # the PR author / a prior same-head post (``success=True,
+        # posted=False`` via the dedup short-circuits). A transient ``gh``
+        # failure returns ``success=False`` and must NOT lift the
+        # review_timeout floor, otherwise the next WATCH cycle reads the
+        # stamp as a fresh review request, resets ``elapsed_min`` to ~0,
+        # and defers terminal-ERROR escalation by a full timeout window
+        # for a hang the daemon never actually retriggered.
+        if success:
+            self.state.last_stale_retrigger_at = now
         if posted:
             getattr(self, "_stale_retrigger_skip_reasons", {}).pop(pr_number, None)
             current_pr.watch_retrigger_count = next_count
