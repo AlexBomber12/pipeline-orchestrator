@@ -35,17 +35,20 @@ def read_frontmatter_status(content: str) -> str | None:
     lines = content.splitlines()
     if not lines or lines[0].rstrip() != "---":
         return None
+    status: str | None = None
     for line in lines[1:]:
         stripped = line.rstrip()
         if stripped == "---":
-            return None
+            return status
+        if status is not None:
+            continue
         match = _FRONTMATTER_STATUS_LINE.match(stripped)
         if match:
             value = match.group(1).strip()
             if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
                 value = value[1:-1]
             value = value.strip().upper()
-            return value or None
+            status = value or None
     return None
 
 

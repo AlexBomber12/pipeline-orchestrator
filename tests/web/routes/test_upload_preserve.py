@@ -249,6 +249,27 @@ def test_upload_preserves_when_existing_has_no_frontmatter(
     assert staged.startswith("---\nstatus: TODO\n---")
 
 
+def test_upload_replaces_malformed_existing_file_with_unclosed_frontmatter(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    # Existing file has ``status: DONE`` inside an unclosed frontmatter block —
+    # treat as malformed and allow full replacement, otherwise operators cannot
+    # repair corrupted task files via re-upload.
+    body = _task_body("PR-322")
+    (repo_dir / "tasks" / "PR-322.md").write_text(
+        f"---\nstatus: DONE\n{body}",
+        encoding="utf-8",
+    )
+
+    resp = _post([_task_upload("PR-322", status="TODO", title="Repair upload")])
+
+    assert resp.status_code == 200
+    staged = _staged_text(uploads_dir, "PR-322.md")
+    assert staged == _task_text("PR-322", status="TODO", title="Repair upload")
+
+
 def test_upload_zip_partial_preserve(
     one_repo_config: Path,
     repo_dir: Path,
@@ -340,6 +361,11 @@ def test_read_frontmatter_status_block_without_status_field() -> None:
 
 def test_read_frontmatter_status_open_block_never_closed() -> None:
     text = "---\nother: value\nstill: open\n"
+    assert upload_validation.read_frontmatter_status(text) is None
+
+
+def test_read_frontmatter_status_status_inside_unclosed_block() -> None:
+    text = "---\nstatus: DONE\nstill: open\n"
     assert upload_validation.read_frontmatter_status(text) is None
 
 
