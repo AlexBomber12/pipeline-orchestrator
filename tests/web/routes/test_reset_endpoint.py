@@ -465,6 +465,48 @@ def test_reset_returns_400_when_task_already_done_without_stuck_state(
     )
 
 
+def test_reset_returns_400_when_task_has_no_frontmatter_and_no_redis_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Missing frontmatter is treated as TODO elsewhere in the daemon; a
+    # frontmatter-less task with no Redis stuck-state must not bypass the
+    # "nothing to reset" guard and trigger destructive checkout/push.
+    _write_config_and_task(tmp_path, monkeypatch, status=None)
+    redis_client = _ResetRedis()
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 400
+    assert response.json()["error"] == (
+        "task is TODO (no frontmatter) with no stuck state, nothing to reset"
+    )
+    # No git subprocess was invoked because the guard fired before the
+    # destructive path; the checkout helper is the first git call site.
+    assert redis_client.pipelines == []
+
+
+def test_reset_proceeds_when_task_has_no_frontmatter_but_redis_has_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # When frontmatter is missing but Redis carries real stuck-state
+    # markers (e.g. cancellation cause), reset is still authorized — the
+    # operator escape hatch must work even when the task file was never
+    # given a YAML header.
+    _write_config_and_task(tmp_path, monkeypatch, status=None)
+    redis_client = _ResetRedis()
+    redis_client.store[cause_key("example__alpha", "PR-322")] = "seed"
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+    monkeypatch.setattr(repo_control.subprocess, "run", _ok_subprocess)
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 200
+    assert cause_key("example__alpha", "PR-322") not in redis_client.store
+
+
 def test_reset_proceeds_when_task_done_but_redis_has_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

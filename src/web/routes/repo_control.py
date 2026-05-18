@@ -1379,8 +1379,8 @@ async def reset_task(
     race the worktree mutations. Returns 409 if the repo is already busy
     or if a concurrent writer touches one of the watched keys between
     read and execute. Returns 400 if there is nothing to reset
-    (frontmatter at a non-stuck status — ``TODO`` or ``DONE`` — and
-    Redis state empty). Returns 503 with
+    (frontmatter at a non-stuck status — ``TODO``, ``DONE``, or missing
+    entirely (treated as ``TODO``) — and Redis state empty). Returns 503 with
     a ``partial_reset`` flag if Redis succeeds but the subsequent git
     push fails — Redis state is gone but frontmatter has not been pushed.
     """
@@ -1420,11 +1420,23 @@ async def reset_task(
     except RedisError:
         return JSONResponse({"error": "redis unavailable"}, status_code=503)
 
-    if current_status in _RESET_NON_STUCK_STATUSES and not had_redis_state:
+    # Missing frontmatter is treated as TODO elsewhere (see
+    # _is_retryable_task_status), so a task with no frontmatter must not
+    # bypass the "nothing to reset" guard and trigger a destructive
+    # checkout/write/push when Redis carries no stuck-state markers.
+    effective_status = (
+        current_status if current_status is not None else TaskStatus.TODO
+    )
+    if effective_status in _RESET_NON_STUCK_STATUSES and not had_redis_state:
+        status_label = (
+            current_status.value
+            if current_status is not None
+            else "TODO (no frontmatter)"
+        )
         return JSONResponse(
             {
                 "error": (
-                    f"task is {current_status.value} with no stuck state, "
+                    f"task is {status_label} with no stuck state, "
                     "nothing to reset"
                 )
             },
