@@ -580,6 +580,48 @@ def test_handle_paused_flag_on_empty_snapshot_with_user_paused_stays_paused() ->
     )
 
 
+def test_handle_paused_flag_on_user_paused_with_only_slowdown_stays_paused() -> None:
+    """Manual pause must not be bypassed by non-blocking slowdown entries.
+
+    Regression for review feedback on PR-330b: ``state.user_paused`` is
+    refreshed at cycle start while ``active_inhibitors`` is rebuilt at
+    cycle end, so right after an operator presses Pause the snapshot
+    can hold only ``GITHUB_BUDGET_SLOWDOWN`` (a polling-cadence
+    throttle the unified gate filters out for dispatch decisions). The
+    previous empty-snapshot guard short-circuited only when
+    ``blocking`` was empty, so a snapshot containing slowdown alone
+    fell through to the IDLE/WATCH transition and resumed against an
+    operator-held pause. The scalar must be honored independently of
+    the snapshot contents.
+    """
+    runner = h._make_runner()
+    _enable_flag(runner)
+    _seed_paused(runner)
+    runner.state.user_paused = True
+    runner.state.active_inhibitors = [
+        WorkInhibitor(
+            inhibitor_type=InhibitorType.GITHUB_BUDGET_SLOWDOWN,
+            expires_at=_future(),
+            reason_text="GitHub budget slowdown",
+            source_key="github:rate_limit:budget",
+        )
+    ]
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert any(
+        e["event"].startswith("[INFRA] PAUSED inhibited by")
+        and "user_pause" in e["event"]
+        for e in runner.state.history
+    )
+    assert not any(
+        e["event"] == "[INFRA] PAUSED inhibitors cleared -> IDLE."
+        or e["event"] == "[INFRA] PAUSED inhibitors cleared -> WATCH."
+        for e in runner.state.history
+    )
+
+
 def test_handle_paused_flag_on_resumes_to_idle_when_pr_branch_diverges() -> None:
     """Unified resume: divergent PR/task branches → IDLE (queue re-selection).
 

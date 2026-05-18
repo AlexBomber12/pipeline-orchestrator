@@ -939,25 +939,44 @@ class IdleMixin:
         # until PR-330d flips production; canary repos opt in earlier
         # via ``feature_flags.use_unified_inhibitor_check``.
         if self.repo_config.feature_flags.use_unified_inhibitor_check:
+            # ``state.user_paused`` is refreshed from Redis at cycle
+            # START (``_run_cycle_body``), but
+            # ``state.active_inhibitors`` is only rebuilt at cycle END
+            # by ``publish_state``. In the one-cycle window right after
+            # an operator presses Pause, ``user_paused=True`` while the
+            # snapshot still holds the previous cycle's entries — which
+            # may be empty, or contain only non-blocking entries such
+            # as ``GITHUB_BUDGET_SLOWDOWN``. The ``hard_blocking``
+            # filter below strips slowdown for dispatch decisions, so
+            # gating the manual-pause guard on the post-filter set
+            # would let non-blocking slowdown lingering in the snapshot
+            # bypass the operator pause and resume to IDLE/WATCH.
+            # Honor the scalar directly here so the manual pause cannot
+            # be bypassed regardless of the snapshot contents — this is
+            # also the source of truth the legacy path read.
+            if self.state.user_paused:
+                if not getattr(self, "_paused_inhibited_logged", False):
+                    self.log_event(
+                        "[INFRA] PAUSED inhibited by ['user_pause']"
+                    )
+                    self._paused_inhibited_logged = True
+                return
             _, blocking = is_work_inhibited(self.state, coder=None)
-            # ``state.active_inhibitors`` is rebuilt by ``publish_state``
-            # at the END of each cycle, but ``_run_cycle_body`` refreshes
-            # ``state.user_paused`` from Redis at cycle START. When an
-            # operator presses Play, ``user_paused`` flips to ``False``
-            # while a stale ``USER_PAUSE`` entry from the previous publish
-            # still sits in ``active_inhibitors`` (it carries no
-            # ``expires_at`` so ``is_blocking_now`` keeps treating it as
-            # live). Ignoring that stale entry here lets the unified gate
-            # match the legacy path, which read the fresh scalar
-            # directly and resumed in the same tick.
+            # Ignore stale ``USER_PAUSE`` entries from the previous
+            # publish: ``user_paused`` is ``False`` here (manual-pause
+            # short-circuit above), so any ``USER_PAUSE`` left in the
+            # snapshot is post-Play lag that ``is_blocking_now`` would
+            # otherwise treat as live (no ``expires_at``).
+            # ``GITHUB_BUDGET_SLOWDOWN`` is a polling-cadence throttle,
+            # not a dispatch block, and was never part of the legacy
+            # PAUSED exit conditions.
             hard_blocking = [
                 inh
                 for inh in blocking
                 if inh.inhibitor_type
-                != InhibitorType.GITHUB_BUDGET_SLOWDOWN
-                and not (
-                    inh.inhibitor_type == InhibitorType.USER_PAUSE
-                    and not self.state.user_paused
+                not in (
+                    InhibitorType.GITHUB_BUDGET_SLOWDOWN,
+                    InhibitorType.USER_PAUSE,
                 )
             ]
             if hard_blocking:
@@ -967,22 +986,6 @@ class IdleMixin:
                 if not getattr(self, "_paused_inhibited_logged", False):
                     self.log_event(
                         f"[INFRA] PAUSED inhibited by {blocking_types}"
-                    )
-                    self._paused_inhibited_logged = True
-                return
-            # Guard against ``publish_state`` failure mode: when
-            # ``derive_active_inhibitors`` raises, ``runner._serialize_latest_state``
-            # force-sets ``state.active_inhibitors`` to ``[]``. A live
-            # manual pause (``state.user_paused=True``) is the source of
-            # truth for USER_PAUSE — trusting the empty snapshot would
-            # resume against an operator-held pause. Honor the scalar
-            # directly so the unified gate matches the legacy path,
-            # which read ``state.user_paused`` without consulting the
-            # inhibitor list.
-            if not blocking and self.state.user_paused:
-                if not getattr(self, "_paused_inhibited_logged", False):
-                    self.log_event(
-                        "[INFRA] PAUSED inhibited by ['user_pause']"
                     )
                     self._paused_inhibited_logged = True
                 return
