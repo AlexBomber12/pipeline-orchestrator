@@ -972,16 +972,28 @@ class IdleMixin:
                 return
             # Guard against ``publish_state`` failure mode: when
             # ``derive_active_inhibitors`` raises, ``runner._serialize_latest_state``
-            # force-sets ``state.active_inhibitors`` to ``[]``. Trusting
-            # that empty snapshot here would treat a genuinely
-            # rate-limited repo as "all clear" and wipe the legacy
-            # ``rate_limited_until`` / ``rate_limited_coder_until``
-            # markers below, letting the daemon immediately dispatch
-            # against the live limit. Cross-check the snapshot with the
-            # rate-limit scalars (the legacy source of truth): if any
-            # window is still in the future, treat the empty snapshot
-            # as a publish-time failure and keep the runner PAUSED so
-            # the next cycle can re-derive cleanly.
+            # force-sets ``state.active_inhibitors`` to ``[]``. A live
+            # manual pause (``state.user_paused=True``) is the source of
+            # truth for USER_PAUSE — trusting the empty snapshot would
+            # resume against an operator-held pause. Honor the scalar
+            # directly so the unified gate matches the legacy path,
+            # which read ``state.user_paused`` without consulting the
+            # inhibitor list.
+            if not blocking and self.state.user_paused:
+                if not getattr(self, "_paused_inhibited_logged", False):
+                    self.log_event(
+                        "[INFRA] PAUSED inhibited by ['user_pause']"
+                    )
+                    self._paused_inhibited_logged = True
+                return
+            # Cross-check the empty snapshot with the rate-limit scalars
+            # (the legacy source of truth): if any window is still in
+            # the future, treat the empty snapshot as a publish-time
+            # failure and keep the runner PAUSED so the next cycle can
+            # re-derive cleanly. Without this guard the IDLE transition
+            # below would wipe ``rate_limited_until`` /
+            # ``rate_limited_coder_until`` markers and let the daemon
+            # immediately dispatch against the live limit.
             now = datetime.now(timezone.utc)
 
             def _is_future(value: datetime | None) -> bool:

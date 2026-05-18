@@ -546,6 +546,40 @@ def test_handle_paused_flag_on_empty_snapshot_with_per_coder_future_limit_stays_
     assert runner.state.rate_limited_coder_until == {"codex": future}
 
 
+def test_handle_paused_flag_on_empty_snapshot_with_user_paused_stays_paused() -> None:
+    """Empty inhibitor snapshot + ``user_paused=True`` → stay PAUSED.
+
+    Regression for review feedback on PR-330b:
+    ``runner._serialize_latest_state`` force-sets
+    ``state.active_inhibitors`` to ``[]`` when
+    ``derive_active_inhibitors`` raises. The previous ``stale_snapshot``
+    guard only fired when ``user_paused`` was ``False``, so a real
+    operator-held pause would fall through to the IDLE/WATCH transition
+    below. ``state.user_paused`` is the scalar source of truth for the
+    USER_PAUSE inhibitor — the unified gate must honor it independently
+    of the inhibitor snapshot, matching the legacy path which read the
+    scalar directly.
+    """
+    runner = h._make_runner()
+    _enable_flag(runner)
+    _seed_paused(runner)
+    runner.state.user_paused = True
+    runner.state.active_inhibitors = []
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert any(
+        e["event"].startswith("[INFRA] PAUSED inhibited by")
+        and "user_pause" in e["event"]
+        for e in runner.state.history
+    )
+    assert not any(
+        e["event"] == "[INFRA] PAUSED inhibitors cleared -> IDLE."
+        for e in runner.state.history
+    )
+
+
 def test_handle_paused_flag_on_resumes_to_idle_when_pr_branch_diverges() -> None:
     """Unified resume: divergent PR/task branches → IDLE (queue re-selection).
 
