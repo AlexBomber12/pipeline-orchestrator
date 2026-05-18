@@ -25,12 +25,35 @@ _FRONTMATTER_STATUS_LINE = re.compile(r"^status:\s*(.+?)\s*$", re.IGNORECASE)
 _TERMINAL_FRONTMATTER_STATUSES = frozenset({"DONE", "ERROR"})
 
 
+def _strip_inline_frontmatter_comment(value: str) -> str:
+    """Drop an inline ``#`` comment from a frontmatter value.
+
+    Mirrors ``queue_parser._normalize_frontmatter_status`` so the upload
+    collision guard agrees with the canonical task parser on values like
+    ``status: done # reviewer override``. ``#`` only starts a comment when
+    it sits outside a quoted span and is preceded by whitespace (or is the
+    first character).
+    """
+    quote: str | None = None
+    for index, char in enumerate(value):
+        if char in {"'", '"'}:
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+        elif char == "#" and quote is None and (
+            index == 0 or value[index - 1].isspace()
+        ):
+            return value[:index]
+    return value
+
+
 def read_frontmatter_status(content: str) -> str | None:
     """Return the uppercase frontmatter ``status`` for *content*, or ``None``.
 
-    Tolerant of quoted values and trailing whitespace. Returns ``None`` when
-    there is no leading ``---`` block, no closing ``---``, or no ``status``
-    field inside the block.
+    Tolerant of quoted values, inline ``#`` comments, and trailing whitespace.
+    Returns ``None`` when there is no leading ``---`` block, no closing
+    ``---``, or no ``status`` field inside the block.
     """
     lines = content.splitlines()
     if not lines or lines[0].rstrip() != "---":
@@ -44,7 +67,7 @@ def read_frontmatter_status(content: str) -> str | None:
             continue
         match = _FRONTMATTER_STATUS_LINE.match(stripped)
         if match:
-            value = match.group(1).strip()
+            value = _strip_inline_frontmatter_comment(match.group(1)).strip()
             if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
                 value = value[1:-1]
             value = value.strip().upper()

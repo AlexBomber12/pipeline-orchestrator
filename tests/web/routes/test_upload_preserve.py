@@ -346,6 +346,41 @@ def test_upload_preserves_done_status_with_quoted_value(
     assert "Regenerated" in staged
 
 
+def test_upload_preserves_done_status_with_trailing_comment(
+    one_repo_config: Path,
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    # The canonical task parser accepts ``status: done # reviewer override``
+    # (see queue_parser._normalize_frontmatter_status). The upload guard
+    # must agree so the inline comment does not bypass terminal-status
+    # preservation.
+    body = _task_body("PR-322")
+    (repo_dir / "tasks" / "PR-322.md").write_text(
+        f"---\nstatus: done # reviewer override\n---\n\n{body}",
+        encoding="utf-8",
+    )
+
+    resp = _post([_task_upload("PR-322", status="TODO", title="Regenerated")])
+
+    assert resp.status_code == 200
+    staged = _staged_text(uploads_dir, "PR-322.md")
+    assert "status: DONE" in staged.splitlines()[1]
+    assert "Regenerated" in staged
+
+
+def test_read_frontmatter_status_strips_inline_comment() -> None:
+    text = "---\nstatus: done # reviewer override\n---\n\nbody\n"
+    assert upload_validation.read_frontmatter_status(text) == "DONE"
+
+
+def test_read_frontmatter_status_keeps_hash_inside_quotes() -> None:
+    text = "---\nstatus: 'done # not a comment'\n---\n\nbody\n"
+    assert (
+        upload_validation.read_frontmatter_status(text) == "DONE # NOT A COMMENT"
+    )
+
+
 def test_read_frontmatter_status_no_frontmatter() -> None:
     assert upload_validation.read_frontmatter_status("# heading\n") is None
 
