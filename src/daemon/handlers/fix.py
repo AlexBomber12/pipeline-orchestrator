@@ -222,8 +222,12 @@ class FixMixin(BreachMixin):
         # PR-358: a FIX entry begins a new review iteration; clear the
         # single-shot review_timeout repost flag so the next WATCH
         # iteration after this FIX can post one repost again if Codex
-        # falls silent on the new push.
+        # falls silent on the new push. The companion timestamp (used as
+        # the durable elapsed_min floor on the next iteration) clears in
+        # lockstep so a stale repost anchor cannot suppress a legitimate
+        # timeout in the new window.
         self.state.review_timeout_repost_attempted = False
+        self.state.review_timeout_repost_at = None
         logger.info(
             "[BRANCH] handle_fix: %s",
             BranchContext.from_runner(self).log_summary(),

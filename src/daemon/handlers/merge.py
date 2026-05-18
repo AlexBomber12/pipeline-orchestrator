@@ -44,9 +44,11 @@ class MergeMixin:
             return
 
         # PR-358: review APPROVED -> MERGE ends the review-timeout window
-        # for this PR. Clear the single-shot repost flag so the field
-        # stays in a clean state across the natural per-iteration boundary.
+        # for this PR. Clear the single-shot repost flag and its companion
+        # timestamp (the durable elapsed_min floor) so both fields stay in
+        # a clean state across the natural per-iteration boundary.
         self.state.review_timeout_repost_attempted = False
+        self.state.review_timeout_repost_at = None
 
         logger.info(
             "[BRANCH] handle_merge: %s",

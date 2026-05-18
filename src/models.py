@@ -202,6 +202,17 @@ class RepoState(BaseModel):
     # PR-iteration boundaries (new ``current_pr`` assignment via __setattr__,
     # FIX entry, MERGE entry) and on ``current_task = None``.
     review_timeout_repost_attempted: bool = False
+    # PR-358 review feedback: wall-clock time at which WATCH posted the
+    # single-shot ``@codex review`` repost. ``elapsed_min`` reads this as a
+    # floor against ``current_pr.last_activity`` so the restarted review
+    # window survives the GitHub PR refresh that overwrites ``current_pr``
+    # each cycle. Without this anchor the locally-stamped
+    # ``current_pr.last_activity = now`` is wiped on the next poll
+    # (``self.state.current_pr = found`` runs before ``elapsed_min`` reads
+    # ``found.last_activity``), causing an immediate second-timeout
+    # escalation instead of a full new review window. Reset on the same
+    # boundaries as ``review_timeout_repost_attempted``.
+    review_timeout_repost_at: datetime | None = None
     # PR-316 review feedback: when True, ``run_cycle`` keeps the runner
     # parked in ERROR without invoking ``handle_error``. Set by WATCH on
     # ``review_timeout`` so the AI diagnose loop does not burn budget on
@@ -254,10 +265,12 @@ class RepoState(BaseModel):
                 super().__setattr__("last_stale_retrigger_at", None)
                 super().__setattr__("last_codex_retrigger_at", None)
                 super().__setattr__("review_timeout_repost_attempted", False)
+                super().__setattr__("review_timeout_repost_at", None)
         if name == "current_task" and value is None:
             super().__setattr__("current_pr", None)
             super().__setattr__("error_message", None)
             super().__setattr__("review_timeout_repost_attempted", False)
+            super().__setattr__("review_timeout_repost_at", None)
         if name == "current_queue":
             super().__setattr__(
                 "current_queue_snapshot_at",

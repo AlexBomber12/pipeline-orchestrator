@@ -133,6 +133,174 @@ def test_first_timeout_posts_repost_stays_in_watch(
     last_activity = runner.state.current_pr.last_activity
     assert last_activity is not None
     assert before <= last_activity <= after
+    # PR-358 review feedback: durable anchor read by next cycle's
+    # ``elapsed_min`` computation. Without this, the locally-stamped
+    # ``current_pr.last_activity`` is wiped on the next poll by the
+    # GitHub-fetched ``PRInfo`` and the second cycle escalates immediately.
+    repost_at = runner.state.review_timeout_repost_at
+    assert repost_at is not None
+    assert before <= repost_at <= after
+
+
+def test_second_cycle_after_successful_repost_does_not_immediately_escalate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-358 review feedback regression guard.
+
+    After a successful repost the next WATCH cycle must NOT transition to
+    terminal ERROR even when GitHub still returns the pre-repost
+    ``updatedAt`` on the freshly-fetched ``PRInfo``. The durable
+    ``RepoState.review_timeout_repost_at`` is the floor that elapsed_min
+    reads, so the local restart survives the PR refresh that overwrites
+    ``current_pr`` each cycle.
+    """
+    stale_last_activity = datetime.now(timezone.utc) - timedelta(minutes=45)
+    pr_first_cycle = PRInfo(
+        number=11,
+        branch="pr-011",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.PENDING,
+        last_activity=stale_last_activity,
+    )
+    pr_second_cycle = PRInfo(
+        number=11,
+        branch="pr-011",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.PENDING,
+        # GitHub still reports the same pre-repost updatedAt — the
+        # @codex review comment has not yet propagated, or the cached
+        # payload lags the actual mutation.
+        last_activity=stale_last_activity,
+    )
+
+    cycle_prs = [pr_first_cycle, pr_second_cycle]
+
+    def fake_get_open_prs(repo, **kw):
+        return [cycle_prs.pop(0)] if cycle_prs else [pr_second_cycle]
+
+    monkeypatch.setattr("src.github.prs.get_open_prs", fake_get_open_prs)
+    runner = h._make_runner(review_timeout_min=30)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=11, branch="pr-011")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-011",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-011",
+    )
+
+    async def fake_commit(self, current_task, status, reason):
+        return True
+
+    monkeypatch.setattr(
+        PipelineRunner, "_commit_task_status_change", fake_commit
+    )
+
+    transition_calls: list[Any] = []
+
+    async def fake_transition(*args, **kwargs):
+        transition_calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        PipelineRunner, "_transition_to_error", fake_transition
+    )
+
+    _stub_repost(runner, result=True)
+
+    asyncio.run(runner.handle_watch())
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.review_timeout_repost_attempted is True
+    repost_at = runner.state.review_timeout_repost_at
+    assert repost_at is not None
+    assert transition_calls == []
+
+    asyncio.run(runner.handle_watch())
+    assert runner.state.state == PipelineState.WATCH, (
+        "Second cycle must not escalate to ERROR while the review_timeout "
+        "floor anchored by review_timeout_repost_at is fresh."
+    )
+    assert transition_calls == []
+
+
+def test_repost_at_naive_datetime_normalized_to_utc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persisted naive datetime (e.g. legacy JSON payload missing tzinfo)
+    is normalized to UTC before the floor comparison so the elapsed_min
+    arithmetic does not crash on a mixed tz-aware/naive subtraction.
+    """
+    stale_last_activity = datetime.now(timezone.utc) - timedelta(minutes=45)
+    pr = PRInfo(
+        number=12,
+        branch="pr-012",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.PENDING,
+        last_activity=stale_last_activity,
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    runner = h._make_runner(review_timeout_min=30)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=12, branch="pr-012")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-012",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-012",
+    )
+    runner.state.review_timeout_repost_attempted = True
+    # Naive datetime simulates a JSON payload that lost tzinfo.
+    runner.state.review_timeout_repost_at = datetime.now(timezone.utc).replace(
+        tzinfo=None
+    )
+
+    transition_calls: list[Any] = []
+
+    async def fake_transition(*args, **kwargs):
+        transition_calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        PipelineRunner, "_transition_to_error", fake_transition
+    )
+
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert transition_calls == []
+
+
+def test_repost_at_floor_yields_to_genuinely_stale_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The floor lifts elapsed_min only when the repost timestamp is more
+    recent than ``last_activity``. Once enough wall time has passed
+    *since* the repost (second hit), the floor itself is far enough in
+    the past that elapsed_min crosses the timeout threshold and the
+    terminal ERROR path fires — repost_attempted=True in the payload.
+    """
+    pr = _stale_pr(minutes_old=60)
+    runner = _seed_runner_in_watch(monkeypatch, pr, repost_attempted=True)
+    runner.state.review_timeout_repost_at = (
+        datetime.now(timezone.utc) - timedelta(minutes=45)
+    )
+    _stub_repost(runner, result=True)
+
+    recorded: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_safe_record(redis_client, repo_slug, task_id, cause, *, log=None):
+        recorded.append((cause.category, dict(cause.payload)))
+
+    monkeypatch.setattr(
+        "src.daemon.runner.safe_record_cancellation_cause",
+        fake_safe_record,
+    )
+
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert recorded
+    _category, payload = recorded[0]
+    assert payload["subsource"] == "review_timeout"
+    assert payload["repost_attempted"] is True
 
 
 def test_first_timeout_failed_repost_falls_through_to_error(
@@ -252,6 +420,7 @@ def test_repost_flag_resets_on_fix_entry(
 ) -> None:
     runner = h._make_runner()
     runner.state.review_timeout_repost_attempted = True
+    runner.state.review_timeout_repost_at = datetime.now(timezone.utc)
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(
         number=42,
@@ -269,6 +438,7 @@ def test_repost_flag_resets_on_fix_entry(
     asyncio.run(runner.handle_fix())
 
     assert runner.state.review_timeout_repost_attempted is False
+    assert runner.state.review_timeout_repost_at is None
 
 
 def test_repost_flag_resets_on_merge_entry(
@@ -276,6 +446,7 @@ def test_repost_flag_resets_on_merge_entry(
 ) -> None:
     runner = h._make_runner()
     runner.state.review_timeout_repost_attempted = True
+    runner.state.review_timeout_repost_at = datetime.now(timezone.utc)
     runner.state.state = PipelineState.MERGE
     runner.state.current_pr = PRInfo(
         number=42,
@@ -305,6 +476,7 @@ def test_repost_flag_resets_on_merge_entry(
         pass
 
     assert runner.state.review_timeout_repost_attempted is False
+    assert runner.state.review_timeout_repost_at is None
 
 
 def test_repost_flag_resets_on_new_pr_assignment() -> None:

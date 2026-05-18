@@ -375,6 +375,22 @@ class WatchMixin:
         last_activity = found.last_activity or self.state.last_updated
         if last_activity.tzinfo is None:
             last_activity = last_activity.replace(tzinfo=timezone.utc)
+        # PR-358 review feedback: anchor the restarted review window to a
+        # RepoState field rather than ``current_pr.last_activity``. The
+        # locally-stamped ``current_pr.last_activity = now`` set after a
+        # successful repost is wiped on the next poll by
+        # ``self.state.current_pr = found`` (the GitHub-fetched ``PRInfo``
+        # whose ``last_activity`` reflects GitHub's ``updatedAt``, which may
+        # still carry the pre-repost value if the comment hasn't propagated
+        # yet or the cache lags). Without a daemon-owned floor the second
+        # WATCH cycle reads the stale ``found.last_activity`` and escalates
+        # immediately instead of granting a fresh review window.
+        repost_at = self.state.review_timeout_repost_at
+        if repost_at is not None:
+            if repost_at.tzinfo is None:
+                repost_at = repost_at.replace(tzinfo=timezone.utc)
+            if repost_at > last_activity:
+                last_activity = repost_at
         now = datetime.now(timezone.utc)
         elapsed_min = (now - last_activity).total_seconds() / 60
         timeout_min = (
@@ -405,11 +421,17 @@ class WatchMixin:
                     )
                     posted = False
                 if posted:
+                    repost_now = datetime.now(timezone.utc)
                     self.state.review_timeout_repost_attempted = True
+                    # The RepoState timestamp is the durable anchor read by
+                    # next cycle's ``elapsed_min`` computation. Stamping
+                    # ``current_pr.last_activity`` in tandem keeps the
+                    # dashboard's PR card in sync with the restart even
+                    # though that field is overwritten by the next
+                    # GitHub-fetched ``PRInfo``.
+                    self.state.review_timeout_repost_at = repost_now
                     if self.state.current_pr is not None:
-                        self.state.current_pr.last_activity = datetime.now(
-                            timezone.utc
-                        )
+                        self.state.current_pr.last_activity = repost_now
                     self.log_event(
                         f"[WATCH] PR #{found.number} hung after "
                         f"{elapsed_min:.0f}m; posted @codex review repost "
