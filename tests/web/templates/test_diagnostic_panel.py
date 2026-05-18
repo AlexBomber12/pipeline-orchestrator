@@ -247,8 +247,9 @@ def test_diagnostic_partial_returns_rendered_panel(
     assert "Diagnostic state for" in resp.text
     assert "PR-322" in resp.text
     assert "Retry count" in resp.text
-    # Reset button is hidden until PR-334 ships the destructive action.
-    assert "Reset task" not in resp.text
+    # PR-335: the reset button now renders because the typed-confirmation
+    # modal gates the destructive endpoint shipped in PR-334.
+    assert "Reset task (destructive)" in resp.text
 
 
 def test_diagnostic_partial_rejects_invalid_task_id(
