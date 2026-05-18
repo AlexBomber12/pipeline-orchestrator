@@ -1124,6 +1124,40 @@ def _drained_from_phase(history: list[Any]) -> str | None:
     return None
 
 
+def _drain_was_user_stopped(history: list[Any]) -> bool:
+    """Return True when the most recent transition to PAUSED was a user stop.
+
+    The Stop All path (``/daemon/stop`` →
+    ``PipelineRunner._monitor_stop_request``) flips the same
+    ``user_paused=True`` flag the pause path uses and then the CODING/FIX
+    handlers park the repo in PAUSED while keeping ``current_task`` and
+    the prior CODING/FIX history. Both inputs therefore satisfy the
+    drain-badge gate even though the coder was already terminated by the
+    stop, so without this check the badge would render
+    ``Draining: CODING/FIX...`` for a repo with no in-flight coder
+    process to drain.
+
+    Scans ``history`` backwards: a PAUSED entry whose event carries the
+    ``aborted: user stop requested`` marker (emitted by both CODING and
+    FIX stop branches on the transition) means the current PAUSED window
+    came from a stop. A CODING/FIX entry encountered first means the
+    most recent transition was a pause (no stop event logged between the
+    last run and now), so the drain badge stays on. Intermediate PAUSED
+    entries without the marker (e.g. ``handle_paused``'s "Press Play to
+    resume" notice) are skipped so a subsequent dashboard tick still
+    detects the original stop.
+    """
+    for entry in reversed(history):
+        raw_state = str(entry.get("state", ""))
+        if raw_state in {PipelineState.CODING.value, PipelineState.FIX.value}:
+            return False
+        if raw_state != PipelineState.PAUSED.value:
+            continue
+        if "aborted: user stop requested" in str(entry.get("event", "")):
+            return True
+    return False
+
+
 def _phase_started_at(history: list[Any], phase: str) -> datetime | None:
     """Return the start time of the most recent run of ``phase`` in history.
 
@@ -1221,6 +1255,15 @@ async def _build_drain_progress(
     a misleading "Draining: CODING/FIX..." indicator based on stale
     history on a repo with no in-flight coder process to drain.
 
+    Stop All takes the same ``user_paused=True`` route via
+    ``PipelineRunner._monitor_stop_request`` and the CODING/FIX stop
+    branches transition straight to PAUSED while keeping
+    ``current_task`` and the CODING/FIX history. Suppress the drain
+    badge when ``_drain_was_user_stopped`` detects the
+    ``aborted: user stop requested`` marker on the most recent PAUSED
+    transition — the coder was already terminated, so a drain reading
+    would be misleading for the stop workflow.
+
     For CODING the elapsed anchor is the Redis ``current_run_started_at``
     marker written by ``handle_coding`` on dispatch; if the marker is
     missing (Redis down or expired) the helper falls back to the most
@@ -1246,6 +1289,8 @@ async def _build_drain_progress(
         return None
     current_time = now if now is not None else datetime.now(timezone.utc)
     if state.state == PipelineState.PAUSED:
+        if _drain_was_user_stopped(state.history):
+            return None
         phase = _drained_from_phase(state.history)
         if phase is None:
             return None

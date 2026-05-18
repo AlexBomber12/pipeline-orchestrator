@@ -510,6 +510,129 @@ async def test_build_drain_progress_returns_none_when_rate_limit_marker_expired(
 
 
 @pytest.mark.asyncio
+async def test_build_drain_progress_returns_none_when_user_stopped_coding() -> None:
+    # Stop All flips ``user_paused=True`` via
+    # ``PipelineRunner._monitor_stop_request`` and the CODING stop branch
+    # transitions to PAUSED while keeping ``current_task`` and the CODING
+    # history. The coder was already terminated, so a drain reading would
+    # be misleading; the dashboard must suppress the badge for the stop
+    # workflow even though the (state, user_paused, current_task) tuple
+    # matches the pause-induced shape.
+    started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+    state = _state(
+        current_task=_task(),
+        history=[
+            _history_entry(state="CODING", time=started),
+            _history_entry(
+                state="PAUSED",
+                time=started + timedelta(seconds=30),
+                event="[CODING] CODING aborted: user stop requested.",
+            ),
+        ],
+    )
+    view = await dashboard_routes._build_drain_progress(
+        redis_client=None,
+        state=state,
+        config=_config(),
+        now=started + timedelta(seconds=60),
+    )
+    assert view is None
+
+
+@pytest.mark.asyncio
+async def test_build_drain_progress_returns_none_when_user_stopped_fix() -> None:
+    # Mirror of the CODING stop case for FIX: the FIX stop branch logs
+    # ``[FIX] FIX aborted: user stop requested.`` on the PAUSED
+    # transition, so the same marker scan applies.
+    started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+    state = _state(
+        current_task=_task(),
+        history=[
+            _history_entry(state="FIX", time=started),
+            _history_entry(
+                state="PAUSED",
+                time=started + timedelta(seconds=30),
+                event="[FIX] FIX aborted: user stop requested.",
+            ),
+        ],
+    )
+    view = await dashboard_routes._build_drain_progress(
+        redis_client=None,
+        state=state,
+        config=_config(),
+        now=started + timedelta(seconds=60),
+    )
+    assert view is None
+
+
+@pytest.mark.asyncio
+async def test_build_drain_progress_returns_none_when_stopped_then_paused_again() -> None:
+    # After a stop, ``handle_paused`` logs "[INFRA] Paused. Press Play
+    # to resume." while ``state == PAUSED``. The detector must skip
+    # those follow-up PAUSED entries (they do not carry the stop
+    # marker) and still recognize the earlier abort event, otherwise the
+    # drain badge would reappear on the next dashboard tick.
+    started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+    state = _state(
+        current_task=_task(),
+        history=[
+            _history_entry(state="CODING", time=started),
+            _history_entry(
+                state="PAUSED",
+                time=started + timedelta(seconds=30),
+                event="[CODING] CODING aborted: user stop requested.",
+            ),
+            _history_entry(
+                state="PAUSED",
+                time=started + timedelta(seconds=40),
+                event="[INFRA] Paused. Press Play to resume.",
+            ),
+        ],
+    )
+    view = await dashboard_routes._build_drain_progress(
+        redis_client=None,
+        state=state,
+        config=_config(),
+        now=started + timedelta(seconds=120),
+    )
+    assert view is None
+
+
+@pytest.mark.asyncio
+async def test_build_drain_progress_renders_when_pause_followed_a_prior_stop() -> None:
+    # An earlier stop landed in PAUSED, then the operator resumed and
+    # the runner started a fresh CODING cycle that Pause All caught.
+    # The current drain is genuine, so the badge must render even
+    # though the older abort marker is still present in history. The
+    # detector stops walking at the more recent CODING entry before
+    # reaching the stale stop event.
+    older = datetime(2026, 5, 18, 11, 0, 0, tzinfo=timezone.utc)
+    fresh_start = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+    state = _state(
+        current_task=_task(),
+        history=[
+            _history_entry(state="CODING", time=older),
+            _history_entry(
+                state="PAUSED",
+                time=older + timedelta(seconds=30),
+                event="[CODING] CODING aborted: user stop requested.",
+            ),
+            _history_entry(state="IDLE", time=older + timedelta(minutes=10)),
+            _history_entry(state="CODING", time=fresh_start),
+        ],
+    )
+    view = await dashboard_routes._build_drain_progress(
+        redis_client=None,
+        state=state,
+        config=_config(planned_pr_timeout_sec=3600),
+        now=fresh_start + timedelta(seconds=120),
+    )
+    assert view is not None
+    assert view["phase"] == "CODING"
+    assert view["elapsed_sec"] == pytest.approx(120.0)
+
+
+@pytest.mark.asyncio
 async def test_build_drain_progress_returns_none_when_history_lacks_coding_or_fix() -> None:
     started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
     state = _state(
