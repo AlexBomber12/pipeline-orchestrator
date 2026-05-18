@@ -486,10 +486,13 @@ async def test_build_drain_progress_returns_none_when_rate_limited_until_in_futu
 
 
 @pytest.mark.asyncio
-async def test_build_drain_progress_returns_view_when_rate_limit_already_expired() -> None:
-    # A ``rate_limited_until`` in the past is a stale field — the
-    # "Paused, Nm remaining" template branch no longer renders it, so
-    # the drain badge is free to surface the operator-initiated drain.
+async def test_build_drain_progress_returns_none_when_rate_limit_marker_expired() -> None:
+    # ``handle_paused`` short-circuits on ``user_paused`` and never
+    # clears ``rate_limited_until``, so the timestamp lingers in the
+    # past on a Pause-All-on-rate-limit-pause repo. The runner is
+    # already quiesced behind the manual pause and no coder process is
+    # draining; surfacing "Draining: CODING/FIX..." from stale history
+    # would mislead the operator.
     started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
     now = started + timedelta(seconds=60)
     state = _state(
@@ -503,8 +506,7 @@ async def test_build_drain_progress_returns_view_when_rate_limit_already_expired
         config=_config(),
         now=now,
     )
-    assert view is not None
-    assert view["phase"] == "CODING"
+    assert view is None
 
 
 @pytest.mark.asyncio

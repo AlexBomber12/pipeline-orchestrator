@@ -1212,10 +1212,14 @@ async def _build_drain_progress(
     rate-limit PAUSED, the pause endpoint flips ``user_paused=True`` but
     the daemon's rate-limit paths leave ``current_task`` attached and the
     earlier CODING/FIX history intact, so the ``user_paused`` gate alone
-    accepts that repo. ``rate_limited_until`` in the future means the
-    "Paused, Nm remaining" badge is already covering the wait — suppress
-    the drain badge there to avoid stacking two competing indicators on
-    a repo with no in-flight coder process to drain.
+    accepts that repo. Any ``rate_limited_until`` marker on such a repo
+    indicates the runner was already quiesced by the rate limit before
+    Pause All landed — ``handle_paused`` short-circuits on
+    ``user_paused`` and never clears the field, so the timestamp lingers
+    even after it has expired in wall-clock terms. Suppress the drain
+    badge whenever the marker is set (past or future) to avoid stacking
+    a misleading "Draining: CODING/FIX..." indicator based on stale
+    history on a repo with no in-flight coder process to drain.
 
     For CODING the elapsed anchor is the Redis ``current_run_started_at``
     marker written by ``handle_coding`` on dispatch; if the marker is
@@ -1238,12 +1242,9 @@ async def _build_drain_progress(
         return None
     if not state.user_paused:
         return None
-    current_time = now if now is not None else datetime.now(timezone.utc)
-    if (
-        state.rate_limited_until is not None
-        and state.rate_limited_until > current_time
-    ):
+    if state.rate_limited_until is not None:
         return None
+    current_time = now if now is not None else datetime.now(timezone.utc)
     if state.state == PipelineState.PAUSED:
         phase = _drained_from_phase(state.history)
         if phase is None:
