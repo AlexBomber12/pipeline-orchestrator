@@ -1254,7 +1254,13 @@ async def _reset_has_status_write_failed_marker(
         status_write_failed_tasks(repo_slug),
         legacy_recovered_tasks(repo_slug),
     ):
-        decoded = _decode_redis_text(await redis_client.get(key))
+        raw = await redis_client.get(key)
+        try:
+            decoded = _decode_redis_text(raw)
+        except UnicodeDecodeError:
+            # Corrupt non-UTF-8 bytes mirror the invalid-JSON path:
+            # treat as absent so reset stays usable for recovery.
+            continue
         if decoded is None:
             continue
         try:

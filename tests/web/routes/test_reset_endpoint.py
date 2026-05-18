@@ -1373,6 +1373,23 @@ def test_reset_skips_invalid_json_parked_marker(
     assert response.status_code == 400
 
 
+def test_reset_skips_invalid_utf8_parked_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Corrupt non-UTF-8 bytes in the parked-task set must not crash the
+    eligibility probe; the marker is treated as absent (matches the
+    invalid-JSON path) so reset still returns 400 instead of 500."""
+    _write_config_and_task(tmp_path, monkeypatch, status="TODO")
+    redis_client = _ResetRedis()
+    redis_client.store[status_write_failed_tasks("example__alpha")] = b"\xff\xfe\x00bad"
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        response = client.post("/api/reset-task/example__alpha/PR-322")
+
+    assert response.status_code == 400
+
+
 def test_reset_skips_non_list_parked_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
