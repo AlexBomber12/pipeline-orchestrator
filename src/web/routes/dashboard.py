@@ -1208,7 +1208,14 @@ async def _build_drain_progress(
 
     Rate-limit pauses skip the check via the ``user_paused`` gate so the
     existing "Paused, Nm remaining" indicator stays the only signal
-    there.
+    there. When an operator clicks Pause All while a repo is already
+    rate-limit PAUSED, the pause endpoint flips ``user_paused=True`` but
+    the daemon's rate-limit paths leave ``current_task`` attached and the
+    earlier CODING/FIX history intact, so the ``user_paused`` gate alone
+    accepts that repo. ``rate_limited_until`` in the future means the
+    "Paused, Nm remaining" badge is already covering the wait — suppress
+    the drain badge there to avoid stacking two competing indicators on
+    a repo with no in-flight coder process to drain.
 
     For CODING the elapsed anchor is the Redis ``current_run_started_at``
     marker written by ``handle_coding`` on dispatch; if the marker is
@@ -1231,6 +1238,12 @@ async def _build_drain_progress(
         return None
     if not state.user_paused:
         return None
+    current_time = now if now is not None else datetime.now(timezone.utc)
+    if (
+        state.rate_limited_until is not None
+        and state.rate_limited_until > current_time
+    ):
+        return None
     if state.state == PipelineState.PAUSED:
         phase = _drained_from_phase(state.history)
         if phase is None:
@@ -1239,7 +1252,6 @@ async def _build_drain_progress(
         phase = state.state.value
     else:
         return None
-    current_time = now if now is not None else datetime.now(timezone.utc)
     started_at: datetime | None = None
     if redis_client is not None:
         try:

@@ -462,6 +462,52 @@ async def test_build_drain_progress_returns_none_without_user_pause() -> None:
 
 
 @pytest.mark.asyncio
+async def test_build_drain_progress_returns_none_when_rate_limited_until_in_future() -> None:
+    # Pause All on a repo that is already PAUSED for a coder rate limit
+    # flips ``user_paused=True`` but leaves ``current_task`` and the
+    # earlier CODING/FIX history intact. The "Paused, Nm remaining" badge
+    # is already covering that wait, so the drain badge must stay silent
+    # rather than stacking a second competing indicator on a repo with no
+    # in-flight coder process to drain.
+    started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+    now = started + timedelta(seconds=60)
+    state = _state(
+        current_task=_task(),
+        history=[_history_entry(state="CODING", time=started)],
+    )
+    state.rate_limited_until = now + timedelta(minutes=15)
+    view = await dashboard_routes._build_drain_progress(
+        redis_client=None,
+        state=state,
+        config=_config(),
+        now=now,
+    )
+    assert view is None
+
+
+@pytest.mark.asyncio
+async def test_build_drain_progress_returns_view_when_rate_limit_already_expired() -> None:
+    # A ``rate_limited_until`` in the past is a stale field — the
+    # "Paused, Nm remaining" template branch no longer renders it, so
+    # the drain badge is free to surface the operator-initiated drain.
+    started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+    now = started + timedelta(seconds=60)
+    state = _state(
+        current_task=_task(),
+        history=[_history_entry(state="CODING", time=started)],
+    )
+    state.rate_limited_until = now - timedelta(seconds=1)
+    view = await dashboard_routes._build_drain_progress(
+        redis_client=None,
+        state=state,
+        config=_config(),
+        now=now,
+    )
+    assert view is not None
+    assert view["phase"] == "CODING"
+
+
+@pytest.mark.asyncio
 async def test_build_drain_progress_returns_none_when_history_lacks_coding_or_fix() -> None:
     started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
     state = _state(
@@ -761,6 +807,34 @@ async def test_build_drain_progress_map_skips_repos_without_drain() -> None:
     )
     assert set(result) == {"octo__alpha"}
     assert result["octo__alpha"]["phase"] == "CODING"
+
+
+@pytest.mark.asyncio
+async def test_build_drain_progress_map_skips_rate_limited_paused_repos() -> None:
+    # Pause All on a repo already PAUSED for a coder rate limit must not
+    # produce a drain entry in the map. The "Paused, Nm remaining" badge
+    # is already covering the wait; a second indicator would render
+    # alongside it and confuse the operator about what is being drained.
+    started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+    now = started + timedelta(seconds=60)
+    rate_limited = _state(
+        repo_name="octo__alpha",
+        current_task=_task(pr_id="PR-001"),
+        history=[_history_entry(state="CODING", time=started)],
+    )
+    rate_limited.rate_limited_until = now + timedelta(minutes=15)
+    drained = _state(
+        repo_name="octo__beta",
+        current_task=_task(pr_id="PR-002"),
+        history=[_history_entry(state="CODING", time=started)],
+    )
+    result = await dashboard_routes._build_drain_progress_map(
+        redis_client=None,
+        states=[rate_limited, drained],
+        config=_config(),
+        now=now,
+    )
+    assert set(result) == {"octo__beta"}
 
 
 @pytest.mark.asyncio
