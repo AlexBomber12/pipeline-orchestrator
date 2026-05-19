@@ -5,7 +5,7 @@ These cover the four ``daemon.*`` fields exposed under the Settings
 
 * ``coder_filesystem_isolation`` (bool, bubblewrap toggle)
 * ``git_bundle_backup_enabled`` (bool, bundle-before-merge toggle)
-* ``git_bundle_backup_daily_retention`` (int, 1-365 days)
+* ``git_bundle_backup_daily_retention`` (int, 1-365 most-recent bundles to keep)
 * ``main_commit_audit_interval_idle_cycles`` (int, 1-100 cycles)
 
 The endpoint reuses the ruamel.yaml round-trip writer from PR-344a, so
