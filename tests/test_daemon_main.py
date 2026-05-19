@@ -34,6 +34,9 @@ def _disable_config_watcher(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         main_module, "watch_config_file_changes", _noop_watcher
     )
+    monkeypatch.setattr(
+        main_module, "watch_config_changes", _noop_watcher
+    )
 
 
 class _FakeRedisClient:

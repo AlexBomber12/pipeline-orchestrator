@@ -90,6 +90,55 @@ async def _set_config_dirty_flags(
     return all_ok
 
 
+async def watch_config_changes(
+    config_paths: list[Path],
+    on_change_callback: Callable[[], None],
+) -> None:
+    """Fire ``on_change_callback`` on inotify events for any of ``config_paths``.
+
+    Reduces config-edit-to-active latency from the 5-cycle poll worst case
+    (~25s) to under 2 seconds: the kernel wakes the watcher the moment the
+    file body lands. The callback is invoked at most once per inotify
+    batch (a single rename + write atomic-replace fires many ``Change``
+    entries; only the first relevant one matters here). Falls back to the
+    existing poll-based reload by returning silently when:
+
+    * ``watchfiles`` is not importable (CI environment without the dep, a
+      platform without inotify support, etc.); or
+    * none of the requested paths exist at startup (the daemon booted
+      before ``config.yml`` was mounted).
+
+    Callback exceptions are logged and swallowed so the watcher loop
+    keeps monitoring — a broken reload path must not silently disable
+    every future config edit detection.
+    """
+    try:
+        from watchfiles import Change, awatch
+    except ImportError:
+        logger.info(
+            "watchfiles unavailable; relying on poll-based config reload"
+        )
+        return
+
+    paths = [str(p) for p in config_paths if p.exists()]
+    if not paths:
+        logger.info(
+            "No existing config paths to watch; inotify reload disabled"
+        )
+        return
+
+    async for changes in awatch(*paths, recursive=False):
+        for change_type, changed_path in changes:
+            if change_type not in (Change.modified, Change.added):
+                continue
+            logger.info("Inotify config change detected: %s", changed_path)
+            try:
+                on_change_callback()
+            except Exception:
+                logger.exception("Config reload callback raised")
+            break
+
+
 async def watch_config_file_changes(
     redis_client: Any,
     get_repo_names: Callable[[], Iterable[str]],

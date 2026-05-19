@@ -39,7 +39,11 @@ from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
 from src.config import AppConfig, RepoConfig, load_config, normalize_repo_url
 from src.daemon.cascade_monitor import check_cascade_escalate_state
-from src.daemon.config_watcher import watch_config_file_changes
+from src.daemon.config_watcher import (
+    _resolve_config_path,
+    watch_config_changes,
+    watch_config_file_changes,
+)
 from src.daemon.migrations.escalate_to_error import (
     migrate_escalate_to_error_on_startup,
 )
@@ -745,6 +749,22 @@ async def main() -> None:
     _background_tasks.add(watcher_task)
     watcher_task.add_done_callback(_background_tasks.discard)
 
+    # Inotify trigger short-circuits the 5-cycle poll so a config edit
+    # lands within seconds instead of up to ``CONFIG_RELOAD_CYCLES *
+    # poll_interval_sec`` (25s with the default cadence). The poll path
+    # below is kept intact as the fallback when watchfiles is missing or
+    # inotify is not available.
+    inotify_reload_event = asyncio.Event()
+    inotify_config_paths = [_resolve_config_path()]
+    providers_path = Path("config/providers.yml")
+    if providers_path.exists():
+        inotify_config_paths.append(providers_path)
+    inotify_task = asyncio.create_task(
+        watch_config_changes(inotify_config_paths, inotify_reload_event.set)
+    )
+    _background_tasks.add(inotify_task)
+    inotify_task.add_done_callback(_background_tasks.discard)
+
     last_run: dict[str, float] = {}
     last_config_check = time.monotonic()
     pubsub: Any | None = None
@@ -752,7 +772,13 @@ async def main() -> None:
     while True:
         now_mono = time.monotonic()
         reload_interval = CONFIG_RELOAD_CYCLES * config.daemon.poll_interval_sec
-        if now_mono - last_config_check >= reload_interval:
+        inotify_triggered = inotify_reload_event.is_set()
+        if (
+            now_mono - last_config_check >= reload_interval
+            or inotify_triggered
+        ):
+            if inotify_triggered:
+                inotify_reload_event.clear()
             last_config_check = now_mono
             try:
                 new_config = load_config()
