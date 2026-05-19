@@ -19,6 +19,7 @@
                 <button hx-post="/settings/webhook/test"
                         hx-target="#webhook-test-status"
                         hx-swap="innerHTML"
+                        hx-include="[name='guardrail_notification_webhook_url']"
                         hx-indicator="#webhook-test-spinner"
                         class="text-xs px-3 py-1 rounded border border-accent/50 text-accent hover:bg-accent/10 whitespace-nowrap"
                         type="button">

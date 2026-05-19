@@ -390,7 +390,13 @@ async def test_webhook(request: Request) -> HTMLResponse:
     users.
     """
     cfg = load_config(_app.CONFIG_PATH)
-    url = cfg.daemon.guardrail_notification_webhook_url
+    form = await request.form()
+    submitted_url = form.get("guardrail_notification_webhook_url")
+    url = (
+        str(submitted_url).strip()
+        if submitted_url is not None
+        else cfg.daemon.guardrail_notification_webhook_url
+    )
     if not url:
         return HTMLResponse(
             '<span class="text-fail">No URL configured</span>',
@@ -398,9 +404,9 @@ async def test_webhook(request: Request) -> HTMLResponse:
         )
 
     test_payload = {
-        "event_type": "webhook_test",
+        "event": "webhook_test",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "message": "Synthetic test from pipeline-orchestrator settings page",
+        "text": "Synthetic test from pipeline-orchestrator settings page",
         "daemon_version": _get_daemon_version(),
     }
     timeout_sec = cfg.daemon.guardrail_notification_timeout_seconds
@@ -433,7 +439,7 @@ async def test_webhook(request: Request) -> HTMLResponse:
             f'<span class="text-fail">✗ HTTP {response.status_code}: '
             f"{excerpt}</span>"
         )
-    except httpx.RequestError as exc:
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
         elapsed_ms = (time.monotonic() - start) * 1000
         error_excerpt = f"{type(exc).__name__}: {str(exc)[:100]}"
         await asyncio.to_thread(

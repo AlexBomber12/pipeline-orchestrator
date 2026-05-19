@@ -163,10 +163,18 @@ def test_test_endpoint_returns_ok_on_2xx_response(
     monkeypatch.setattr(settings_routes.httpx, "AsyncClient", fake_client)
 
     with TestClient(app) as client:
-        response = client.post("/settings/webhook/test")
+        response = client.post(
+            "/settings/webhook/test",
+            data={
+                "guardrail_notification_webhook_url": (
+                    "https://hooks.example.test/current"
+                )
+            },
+        )
 
     assert response.status_code == 200
     assert "✓ HTTP 200" in response.text
+    assert fake_client.posted[0][0] == "https://hooks.example.test/current"
 
 
 def test_test_endpoint_returns_fail_on_4xx_response(
@@ -248,7 +256,35 @@ def test_test_endpoint_writes_audit_record_on_failure(
     assert record["http_status"] == 500
 
 
-def test_test_payload_includes_event_type_field(
+def test_test_endpoint_returns_invalid_url_message_and_audits(
+    base_config: Path, audit_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _Client(_WebhookClient):
+        async def post(
+            self,
+            url: str,
+            json: dict[str, Any],
+            timeout: float | None = None,
+        ) -> httpx.Response:
+            raise httpx.InvalidURL("Invalid IPv6 URL")
+
+    monkeypatch.setattr(settings_routes.httpx, "AsyncClient", _Client)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/settings/webhook/test",
+            data={"guardrail_notification_webhook_url": "https://[::1"},
+        )
+
+    assert response.status_code == 200
+    assert "InvalidURL" in response.text
+    record = _read_webhook_test_records(audit_dir)[0]
+    assert record["event_type"] == "webhook_test"
+    assert record["http_status"] is None
+    assert "InvalidURL" in record["response_excerpt"]
+
+
+def test_test_payload_uses_production_event_and_text_fields(
     base_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake_client = _make_response_client(200, "ok")
@@ -258,7 +294,11 @@ def test_test_payload_includes_event_type_field(
         response = client.post("/settings/webhook/test")
 
     assert response.status_code == 200
-    assert fake_client.posted[0][1]["event_type"] == "webhook_test"
+    payload = fake_client.posted[0][1]
+    assert payload["event"] == "webhook_test"
+    assert payload["text"] == "Synthetic test from pipeline-orchestrator settings page"
+    assert "event_type" not in payload
+    assert "message" not in payload
 
 
 def test_test_endpoint_respects_configured_timeout(
@@ -302,4 +342,5 @@ def test_button_renders_in_settings_after_url_field(base_config: Path) -> None:
     button_index = body.index('hx-post="/settings/webhook/test"')
     assert notification_start < url_index < button_index
     assert "Test webhook" in body
+    assert "hx-include=" in body
     assert 'id="webhook-test-status"' in body
