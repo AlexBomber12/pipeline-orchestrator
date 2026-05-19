@@ -607,6 +607,8 @@ async def _wait_or_wake(
     last_run: dict[str, float],
     slug_to_key: dict[str, str],
     runners: dict[str, PipelineRunner] | None = None,
+    *,
+    wake_event: asyncio.Event | None = None,
 ) -> bool:
     """Sleep ``tick`` seconds or wake early on a wake-channel message.
 
@@ -616,23 +618,41 @@ async def _wait_or_wake(
     before returning so the caller cannot rebuild the subscriber faster
     than the configured cadence — otherwise a Redis disconnect would
     drive a tight reconnect loop. Falls back to a pure sleep when
-    ``pubsub`` is None so the daemon never blocks on a missing subscriber.
+    ``pubsub`` is None and no ``wake_event`` was supplied so the daemon
+    never blocks on a missing subscriber.
+
+    ``wake_event``, when provided, is a third wake source alongside the
+    pubsub message and the tick deadline. The main loop passes the
+    inotify reload event here so a ``config.yml`` edit interrupts the
+    sleep immediately — without this, the inotify-driven reload would
+    wait up to the configured ``daemon.poll_interval_sec`` (default 60s)
+    before the next iteration observed the event, defeating the
+    "near-immediate hot reload" the inotify path is meant to provide.
+    The caller is responsible for clearing the event between waits.
     """
-    if pubsub is None:
+    if pubsub is None and wake_event is None:
         await asyncio.sleep(tick)
         return True
 
     sleep_task = asyncio.create_task(asyncio.sleep(tick))
-    wake_task = asyncio.create_task(
-        pubsub.get_message(ignore_subscribe_messages=True, timeout=None)
-    )
+    waiters: set[asyncio.Task[Any]] = {sleep_task}
+    wake_task: asyncio.Task[Any] | None = None
+    if pubsub is not None:
+        wake_task = asyncio.create_task(
+            pubsub.get_message(ignore_subscribe_messages=True, timeout=None)
+        )
+        waiters.add(wake_task)
+    event_task: asyncio.Task[Any] | None = None
+    if wake_event is not None:
+        event_task = asyncio.create_task(wake_event.wait())
+        waiters.add(event_task)
     done, pending = await asyncio.wait(
-        {sleep_task, wake_task},
+        waiters,
         return_when=asyncio.FIRST_COMPLETED,
     )
 
     healthy = True
-    if wake_task in done:
+    if wake_task is not None and wake_task in done:
         wake_exc = wake_task.exception()
         if wake_exc is not None:
             healthy = False
@@ -903,7 +923,12 @@ async def main() -> None:
 
         try:
             healthy = await _wait_or_wake(
-                pubsub, max(tick, 1), last_run, slug_to_key, runners
+                pubsub,
+                max(tick, 1),
+                last_run,
+                slug_to_key,
+                runners,
+                wake_event=inotify_reload_event,
             )
         finally:
             # Wait_or_wake yields to the event loop, giving any newly

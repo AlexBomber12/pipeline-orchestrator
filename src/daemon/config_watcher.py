@@ -90,6 +90,21 @@ async def _set_config_dirty_flags(
     return all_ok
 
 
+def _normalize_path(path: Path | str) -> str:
+    """Return an absolute, resolved string form of ``path``.
+
+    Used to compare watchfiles event paths against the configured target
+    set without false negatives from relative-vs-absolute or symlink
+    differences. Falls back to the unresolved string when ``resolve()``
+    raises (e.g. the file vanished between event delivery and lookup),
+    so a transient resolve error never blocks the event filter.
+    """
+    try:
+        return str(Path(path).resolve())
+    except OSError:
+        return str(Path(path))
+
+
 async def watch_config_changes(
     config_paths: list[Path],
     on_change_callback: Callable[[], None],
@@ -111,6 +126,15 @@ async def watch_config_changes(
     Callback exceptions are logged and swallowed so the watcher loop
     keeps monitoring — a broken reload path must not silently disable
     every future config edit detection.
+
+    The watcher subscribes to each target file's *parent directory* and
+    filters events back to the target paths instead of watching the
+    files directly. Many editors and config writers use atomic save
+    (write tmp + rename over the target), which replaces the original
+    inode; a file-level inotify watch goes deaf after the first such
+    save because the kernel watch is bound to the inode it opened, not
+    the path. Watching the parent directory keeps subsequent edits
+    visible.
     """
     try:
         from watchfiles import Change, awatch
@@ -120,16 +144,21 @@ async def watch_config_changes(
         )
         return
 
-    paths = [str(p) for p in config_paths if p.exists()]
-    if not paths:
+    existing_paths = [p for p in config_paths if p.exists()]
+    if not existing_paths:
         logger.info(
             "No existing config paths to watch; inotify reload disabled"
         )
         return
 
-    async for changes in awatch(*paths, recursive=False):
+    target_paths = {_normalize_path(p) for p in existing_paths}
+    parent_dirs = sorted({_normalize_path(p.parent) for p in existing_paths})
+
+    async for changes in awatch(*parent_dirs, recursive=False):
         for change_type, changed_path in changes:
             if change_type not in (Change.modified, Change.added):
+                continue
+            if _normalize_path(changed_path) not in target_paths:
                 continue
             logger.info("Inotify config change detected: %s", changed_path)
             try:

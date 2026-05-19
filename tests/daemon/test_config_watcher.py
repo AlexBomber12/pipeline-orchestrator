@@ -421,3 +421,91 @@ def test_watcher_skips_deleted_change_type(
     asyncio.run(driver())
     # The deleted batch was skipped; the modified batch fired exactly once.
     assert fired == [1]
+
+
+def test_watcher_survives_atomic_save_via_rename(tmp_path: Path) -> None:
+    """Replacing ``config.yml`` via rename must not deafen the watcher.
+
+    Many editors and config writers save atomically: write a sibling
+    tmp file, then rename it over the target. That unlinks the
+    original inode the watcher was tied to. A file-level inotify watch
+    stops reporting subsequent edits once the inode it bound to is
+    gone, while a parent-directory watch keeps reporting later edits
+    on the same target path.
+    """
+    target = tmp_path / "config.yml"
+    _write(target, "x: 1\n")
+    fired: list[int] = []
+
+    async def driver() -> None:
+        task = asyncio.create_task(
+            config_watcher.watch_config_changes(
+                [target], lambda: fired.append(1)
+            )
+        )
+        # Give the watcher time to subscribe to the parent dir before
+        # the first rename.
+        await asyncio.sleep(0.2)
+        first_tmp = tmp_path / "config.yml.new1"
+        _write(first_tmp, "x: 2\n")
+        first_tmp.replace(target)
+        await _wait_until(lambda: len(fired) >= 1)
+        # Second atomic save against the new inode — the prior code
+        # path that watched the file directly went deaf here because
+        # the original inode was already unlinked by the first rename.
+        second_tmp = tmp_path / "config.yml.new2"
+        _write(second_tmp, "x: 3\n")
+        second_tmp.replace(target)
+        await _wait_until(lambda: len(fired) >= 2)
+        await _cancel(task)
+
+    asyncio.run(driver())
+    assert len(fired) >= 2, fired
+
+
+def test_watcher_filters_unrelated_siblings_in_same_directory(
+    tmp_path: Path,
+) -> None:
+    """Sibling files in the watched parent dir must not fire the callback.
+
+    Switching to parent-directory watching means the watcher sees events
+    for every file in the directory; the filter must drop everything
+    that does not normalise to one of the configured target paths.
+    """
+    target = tmp_path / "config.yml"
+    sibling = tmp_path / "unrelated.txt"
+    _write(target, "x: 1\n")
+    _write(sibling, "hello\n")
+    fired: list[int] = []
+
+    async def driver() -> None:
+        task = asyncio.create_task(
+            config_watcher.watch_config_changes(
+                [target], lambda: fired.append(1)
+            )
+        )
+        await asyncio.sleep(0.2)
+        _write(sibling, "world\n")
+        # Give plenty of time for any spurious event to propagate.
+        await asyncio.sleep(0.5)
+        await _cancel(task)
+
+    asyncio.run(driver())
+    assert fired == []
+
+
+def test_watcher_normalize_path_handles_resolve_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_normalize_path`` falls back to the unresolved string on OSError.
+
+    The filter is invoked on every inotify event; a transient resolve
+    failure (path vanished between event delivery and lookup) must not
+    crash the watcher loop.
+    """
+
+    def boom(self: Path, *args: Any, **kwargs: Any) -> Path:
+        raise OSError("simulated resolve failure")
+
+    monkeypatch.setattr(Path, "resolve", boom)
+    assert config_watcher._normalize_path("/tmp/example.yml") == "/tmp/example.yml"

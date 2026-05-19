@@ -1792,6 +1792,77 @@ async def test_wait_or_wake_lets_sleep_win_when_no_messages() -> None:
     assert last_run["alpha-key"] == 100.0
 
 
+async def test_wait_or_wake_interrupts_sleep_on_wake_event() -> None:
+    """A ``wake_event`` set during the tick must wake the sleep immediately.
+
+    Without this, an inotify-driven config reload would still wait the
+    full ``daemon.poll_interval_sec`` (default 60s) before the main loop
+    observed the event at the top of the next iteration.
+    """
+    pubsub = _ScriptedPubSub([])
+    last_run = {"alpha-key": 100.0}
+    slug_to_key = {"alpha": "alpha-key"}
+    event = asyncio.Event()
+    event.set()
+
+    loop = asyncio.get_event_loop()
+    start = loop.time()
+    healthy = await main_module._wait_or_wake(
+        pubsub,
+        60.0,
+        last_run,
+        slug_to_key,
+        wake_event=event,
+    )
+    elapsed = loop.time() - start
+
+    assert healthy is True
+    # last_run is left alone — inotify-driven wakes are not per-runner.
+    assert last_run["alpha-key"] == 100.0
+    assert elapsed < 1.0, elapsed
+
+
+async def test_wait_or_wake_event_wakes_without_pubsub() -> None:
+    """With ``pubsub=None`` the event must still short-circuit the sleep."""
+    event = asyncio.Event()
+    event.set()
+    last_run: dict[str, float] = {}
+
+    loop = asyncio.get_event_loop()
+    start = loop.time()
+    healthy = await main_module._wait_or_wake(
+        None, 60.0, last_run, {}, wake_event=event
+    )
+    elapsed = loop.time() - start
+
+    assert healthy is True
+    assert elapsed < 1.0, elapsed
+
+
+async def test_wait_or_wake_no_event_keeps_legacy_sleep_path() -> None:
+    """``wake_event=None`` keeps the simple ``asyncio.sleep(tick)`` fallback.
+
+    Regression guard for the early-return in ``_wait_or_wake``: when
+    neither pubsub nor wake_event are wired, the function must defer
+    to the cheap unwrapped sleep instead of building a task set.
+    """
+    last_run: dict[str, float] = {"k": 5.0}
+    slept: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        await real_sleep(0)
+
+    with patch.object(main_module.asyncio, "sleep", fake_sleep):
+        healthy = await main_module._wait_or_wake(
+            None, 3.0, last_run, {}, wake_event=None
+        )
+
+    assert healthy is True
+    assert slept == [3.0]
+
+
 async def test_close_pubsub_handles_none_and_errors() -> None:
     await main_module._close_pubsub(None)
 
