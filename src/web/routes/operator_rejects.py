@@ -26,39 +26,52 @@ async def _read_operator_rejects(
     *,
     limit: int,
 ) -> list[dict[str, str | None]]:
-    task_ids = await redis_client.zrevrange(index_key(repo_name), 0, -1)
     rejects: list[dict[str, str | None]] = []
-    for raw_task_id in task_ids or []:
-        task_id = _decode_task_id(raw_task_id)
-        try:
-            cause = await get_cancellation_cause(
-                redis_client,
-                repo_name,
-                task_id,
-                refresh_ttl=False,
-            )
-        except Exception:
-            continue
-        if cause is None or not isinstance(cause.payload, dict):
-            continue
-        if cause.payload.get("subsource") != "operator_reject":
-            continue
-        excerpt = cause.payload.get("operator_reject_excerpt", "")
-        if not isinstance(excerpt, str):
-            excerpt = str(excerpt)
-        rule = cause.payload.get("operator_reject_rule")
-        if rule is not None and not isinstance(rule, str):
-            rule = str(rule)
-        rejects.append(
-            {
-                "task_id": task_id,
-                "canceled_at": cause.created_at,
-                "rule": rule,
-                "excerpt": excerpt[:200],
-            }
+    page_size = limit
+    start = 0
+    while len(rejects) < limit:
+        task_ids = await redis_client.zrevrange(
+            index_key(repo_name), start, start + page_size - 1
         )
-        if len(rejects) >= limit:
+        if not task_ids:
             break
+        for raw_task_id in task_ids:
+            try:
+                task_id = _decode_task_id(raw_task_id)
+            except UnicodeDecodeError:
+                continue
+            try:
+                cause = await get_cancellation_cause(
+                    redis_client,
+                    repo_name,
+                    task_id,
+                    refresh_ttl=False,
+                )
+            except Exception:
+                continue
+            if cause is None or not isinstance(cause.payload, dict):
+                continue
+            if cause.payload.get("subsource") != "operator_reject":
+                continue
+            excerpt = cause.payload.get("operator_reject_excerpt", "")
+            if not isinstance(excerpt, str):
+                excerpt = str(excerpt)
+            rule = cause.payload.get("operator_reject_rule")
+            if rule is not None and not isinstance(rule, str):
+                rule = str(rule)
+            rejects.append(
+                {
+                    "task_id": task_id,
+                    "canceled_at": cause.created_at,
+                    "rule": rule,
+                    "excerpt": excerpt[:200],
+                }
+            )
+            if len(rejects) >= limit:
+                break
+        if len(task_ids) < page_size:
+            break
+        start += page_size
     return rejects
 
 

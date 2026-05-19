@@ -22,7 +22,8 @@ REPO_URL = "https://github.com/AlexBomber12/pipeline-orchestrator.git"
 class _RejectRedis:
     def __init__(self) -> None:
         self.values: dict[str, str] = {}
-        self.zsets: dict[str, dict[str, float]] = {}
+        self.zsets: dict[str, dict[object, float]] = {}
+        self.zrevrange_calls: list[tuple[str, int, int]] = []
 
     async def ping(self) -> bool:
         return True
@@ -39,7 +40,8 @@ class _RejectRedis:
         self.values[key] = value
         return True
 
-    async def zrevrange(self, key: str, start: int, stop: int) -> list[str]:
+    async def zrevrange(self, key: str, start: int, stop: int) -> list[object]:
+        self.zrevrange_calls.append((key, start, stop))
         members = sorted(
             self.zsets.get(key, {}).items(),
             key=lambda item: item[1],
@@ -263,6 +265,38 @@ def test_rejects_page_respects_limit_param(
     assert response.text.count("data-operator-reject-row") == 10
     assert "PR-099" in response.text
     assert "PR-089" not in response.text
+    assert redis_client.zrevrange_calls == [(index_key(REPO_NAME), 0, 9)]
+
+
+def test_rejects_page_paginates_until_limit_is_filled(
+    base_config: Path,
+    redis_client: _RejectRedis,
+) -> None:
+    base = datetime(2026, 5, 19, 12, tzinfo=timezone.utc)
+    _record_cancellation(
+        redis_client,
+        "PR-crash",
+        payload={"subsource": "crash", "operator_reject_excerpt": "crash"},
+        created_at=base + timedelta(minutes=3),
+    )
+    for index in range(3):
+        _record_cancellation(
+            redis_client,
+            f"PR-reject-{index}",
+            payload=_operator_payload(excerpt=f"reject {index}"),
+            created_at=base + timedelta(minutes=2 - index),
+        )
+
+    response = _get_rejects_page(limit=2)
+
+    assert response.status_code == 200
+    assert response.text.count("data-operator-reject-row") == 2
+    assert "PR-reject-0" in response.text
+    assert "PR-reject-1" in response.text
+    assert redis_client.zrevrange_calls == [
+        (index_key(REPO_NAME), 0, 1),
+        (index_key(REPO_NAME), 2, 3),
+    ]
 
 
 def test_rejects_page_decodes_bytes_task_ids_and_coerces_payload_fields(
@@ -325,6 +359,29 @@ def test_rejects_page_handles_corrupt_cancellation_record(
     now = datetime(2026, 5, 19, 12, tzinfo=timezone.utc)
     redis_client.values[cause_key(REPO_NAME, "PR-bad")] = "{not json"
     redis_client.zsets.setdefault(index_key(REPO_NAME), {})["PR-bad"] = now.timestamp()
+    _record_cancellation(
+        redis_client,
+        "PR-good",
+        payload=_operator_payload(excerpt="good reject"),
+        created_at=now - timedelta(minutes=1),
+    )
+
+    response = _get_rejects_page()
+
+    assert response.status_code == 200
+    assert response.text.count("data-operator-reject-row") == 1
+    assert "PR-good" in response.text
+    assert "good reject" in response.text
+
+
+def test_rejects_page_skips_non_utf8_index_members(
+    base_config: Path,
+    redis_client: _RejectRedis,
+) -> None:
+    now = datetime(2026, 5, 19, 12, tzinfo=timezone.utc)
+    redis_client.zsets.setdefault(index_key(REPO_NAME), {})[b"\xff\xfe"] = (
+        now.timestamp()
+    )
     _record_cancellation(
         redis_client,
         "PR-good",
