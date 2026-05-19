@@ -151,6 +151,64 @@ async def test_publish_repo_event_also_writes_disk(
     assert record["payload"] == {"state": "WATCH"}
 
 
+async def test_publish_repo_event_uses_single_now_for_redis_and_disk(
+    isolate_events_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Redis message and disk row must share one timestamp.
+
+    Guards against a drift between the Redis message and the disk
+    mirror when a publish happens near UTC midnight: the JSONL row
+    must land in the same daily partition as the timestamp embedded
+    in the Redis event.
+    """
+
+    class _FakeRedis:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def lpush(self, key: str, value: str) -> int:
+            self.messages.append(value)
+            return 1
+
+        async def ltrim(self, key: str, start: int, stop: int) -> None:
+            return None
+
+        async def publish(self, channel: str, message: str) -> int:
+            return 1
+
+        async def aclose(self) -> None:
+            return None
+
+    near_midnight = datetime(2026, 5, 19, 23, 59, 59, 999_000, tzinfo=timezone.utc)
+    calls = iter(
+        [
+            near_midnight,
+            datetime(2026, 5, 20, 0, 0, 0, 1_000, tzinfo=timezone.utc),
+        ]
+    )
+
+    def _fake_now() -> datetime:
+        try:
+            return next(calls)
+        except StopIteration:
+            return datetime(2026, 5, 20, 0, 0, 1, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(publisher, "_utc_now", _fake_now)
+
+    redis = _FakeRedis()
+    await publisher.publish_repo_event(
+        "owner__repo", "state_changed", {"state": "WATCH"}, redis_client=redis
+    )
+
+    redis_payload = json.loads(redis.messages[0])
+    assert redis_payload["timestamp"] == "2026-05-19T23:59:59.999000Z"
+
+    target = isolate_events_dir / "owner__repo" / "2026-05-19.jsonl"
+    assert target.exists(), "Disk row must land in the same daily partition as Redis"
+    record = json.loads(_read_lines(target)[0])
+    assert record["timestamp"] == near_midnight.isoformat()
+
+
 def test_disk_log_resilient_to_event_with_non_serializable_payload(
     isolate_events_dir: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
