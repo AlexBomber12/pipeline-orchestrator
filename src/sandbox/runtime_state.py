@@ -33,6 +33,8 @@ import shutil
 from enum import Enum
 from typing import Any
 
+from src.daemon.sandbox import is_bubblewrap_available
+
 logger = logging.getLogger(__name__)
 
 #: Redis key the daemon writes after each :func:`detect_sandbox_state`
@@ -121,7 +123,18 @@ async def refresh_sandbox_state(
     Redis write failures are logged and swallowed: a transient Redis
     outage must not prevent daemon startup, and the next refresh
     (config reload or next restart) gets another chance.
+
+    The dispatch-path cache in :func:`src.daemon.sandbox.is_bubblewrap_available`
+    is invalidated before re-probing. That helper is wrapped in
+    ``@functools.cache``, so a ``False`` result captured by an early coder
+    dispatch would otherwise survive for the daemon's lifetime. Without
+    clearing it, an operator who installs ``bwrap`` and triggers a config
+    reload would see this function publish ``active`` to Redis while the
+    dispatch path kept honoring the stale ``False`` and silently launched
+    coders unsandboxed — exactly the install/reload scenario the badge is
+    meant to make trustworthy.
     """
+    is_bubblewrap_available.cache_clear()
     state = await detect_sandbox_state(coder_filesystem_isolation)
     try:
         await redis_client.set(REDIS_SANDBOX_STATE_KEY, state.value)

@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from src.daemon import sandbox as daemon_sandbox
 from src.sandbox import runtime_state
 from src.sandbox.runtime_state import (
     REDIS_SANDBOX_STATE_KEY,
@@ -16,6 +17,20 @@ from src.sandbox.runtime_state import (
     detect_sandbox_state,
     refresh_sandbox_state,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_dispatch_bwrap_cache() -> None:
+    """Reset the dispatch-path bwrap cache between tests.
+
+    ``src.daemon.sandbox.is_bubblewrap_available`` is wrapped in
+    ``@functools.cache`` so any test that calls it (directly or via
+    ``refresh_sandbox_state``) would otherwise leak its answer into the
+    next test and produce order-dependent assertions.
+    """
+    daemon_sandbox.is_bubblewrap_available.cache_clear()
+    yield
+    daemon_sandbox.is_bubblewrap_available.cache_clear()
 
 
 class _FakeProc:
@@ -272,6 +287,64 @@ async def test_refresh_swallows_redis_set_errors(
         REDIS_SANDBOX_STATE_KEY in rec.getMessage()
         for rec in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_refresh_invalidates_dispatch_bwrap_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refresh must clear the dispatch-path bwrap availability cache.
+
+    The coder dispatch path consults
+    :func:`src.daemon.sandbox.is_bubblewrap_available`, which caches its
+    result for the daemon's process lifetime. Without an explicit
+    invalidation on refresh, a pre-install dispatch that warmed the cache
+    to ``False`` would keep launching coders unsandboxed even after the
+    operator installed ``bwrap`` and triggered a config reload that
+    flipped the badge to ``active`` — defeating the whole point of the
+    3-state badge.
+    """
+    # Warm the dispatch cache with a stale ``False`` as if an early
+    # coder dispatch already probed a bwrap-less host.
+    monkeypatch.setattr(daemon_sandbox.shutil, "which", lambda _: None)
+    assert daemon_sandbox.is_bubblewrap_available() is False
+    assert daemon_sandbox.is_bubblewrap_available.cache_info().currsize == 1
+
+    # Refresh probes via runtime_state's own detector — make that report
+    # ``active`` while leaving the dispatch cache primed with the stale
+    # ``False`` to prove refresh actively invalidates it.
+    monkeypatch.setattr(runtime_state.shutil, "which", lambda _: "/usr/bin/bwrap")
+    _install_subprocess_factory(monkeypatch, _FakeProc(returncode=0))
+    fake = _FakeRedis()
+
+    result = await refresh_sandbox_state(fake, True)
+
+    assert result is SandboxState.ACTIVE
+    # The dispatch cache must have been cleared so the next coder
+    # invocation re-probes and agrees with the published badge.
+    assert daemon_sandbox.is_bubblewrap_available.cache_info().currsize == 0
+
+
+@pytest.mark.asyncio
+async def test_refresh_invalidates_dispatch_cache_even_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cache invalidation must run on every refresh, including DISABLED.
+
+    Operators sometimes flip ``coder_filesystem_isolation`` off after a
+    transient install issue; if the dispatch cache still held the prior
+    answer, a subsequent flip back to ``true`` would not re-probe in
+    time. Always-clear keeps the dispatch path and the badge aligned.
+    """
+    monkeypatch.setattr(daemon_sandbox.shutil, "which", lambda _: None)
+    assert daemon_sandbox.is_bubblewrap_available() is False
+    assert daemon_sandbox.is_bubblewrap_available.cache_info().currsize == 1
+
+    fake = _FakeRedis()
+    result = await refresh_sandbox_state(fake, False)
+
+    assert result is SandboxState.DISABLED
+    assert daemon_sandbox.is_bubblewrap_available.cache_info().currsize == 0
 
 
 def test_sandbox_state_is_str_enum() -> None:
