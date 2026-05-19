@@ -11,6 +11,12 @@
 {% macro cancellation_card(cause) %}
 {% set subsource = cause.payload.get('subsource', '') %}
 {% set legacy_category = cause.payload.get('legacy_category', '') %}
+{# PR-351: ``recovery_backup_branch`` is attached by
+   ``_augment_causes_with_dependents`` when the crash-recovery push fell
+   back to a ``crash-backup/{task_id}/{timestamp}`` ref. Pre-PR-351
+   records and dataclass-direct test renders surface as Undefined here,
+   which Jinja2 evaluates as falsy so the surface block is skipped
+   without a template error. #}
 <article class="cancellation-card category-{{ cause.category | lower }} subsource-{{ subsource or 'unknown' }}">
     <header class="cancellation-header">
         <span class="category-badge">{{ cause.category }}</span>
@@ -109,6 +115,17 @@
             <span class="cause-badge cause-error">Error</span>
             {% endif %}
             <p>{{ cause.payload.get('reason_text') or cause.payload.get('error_message') or cause.payload.get('excerpt') or 'Cancellation reason not recorded.' }}</p>
+        {% endif %}
+        {% if cause.recovery_backup_branch %}
+        <div class="recovery-backup-branch text-xs text-warn mt-2"
+             data-recovery-backup-branch="{{ cause.recovery_backup_branch }}">
+            Crash backup available on branch
+            <code class="px-1 rounded bg-surface-3">{{ cause.recovery_backup_branch }}</code>
+            <button type="button"
+                    data-clipboard-target="recovery_backup_branch"
+                    data-clipboard-value="{{ cause.recovery_backup_branch }}"
+                    class="ml-2 text-accent text-xs">Copy</button>
+        </div>
         {% endif %}
     </div>
 </article>

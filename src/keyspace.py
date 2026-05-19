@@ -55,6 +55,17 @@ def legacy_recovered_tasks(repo_name: str) -> str:
     return f"recovered_tasks:{repo_name}"
 
 
+def recovery_backup_branch(repo_name: str, task_id: str) -> str:
+    """Backup-branch pointer recorded when the PR-351 recovery push fallback
+    succeeded for a task whose primary feature-branch push was rejected by
+    GitHub branch protection or a non-fast-forward state. Surfaces in the
+    dashboard cancellation card so operators can recover work via
+    ``git fetch && git checkout <branch>`` even when the feature-branch
+    push was rejected.
+    """
+    return f"recovery:backup_branch:{repo_name}:{task_id}"
+
+
 def upload_pending_pattern() -> str:
     """Glob pattern matching all ``upload:*:pending`` keys."""
     return "upload:*:pending"

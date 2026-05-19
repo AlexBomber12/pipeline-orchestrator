@@ -48,7 +48,7 @@ from src.daemon.github_rate_limit import (
 from src.events.sse import format_sse_comment, format_sse_event
 from src.github import gh_runner
 from src.github import prs as gh_prs
-from src.keyspace import cli_log_latest, daemon_panic_state
+from src.keyspace import cli_log_latest, daemon_panic_state, recovery_backup_branch
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
 from src.subsource_registry import all_subsources, group_for
@@ -1713,7 +1713,9 @@ async def api_repo_events(name: str, request: Request) -> Response:
 
 
 async def _augment_causes_with_dependents(
-    repo: str, causes: list
+    repo: str,
+    causes: list,
+    redis_client: aioredis.Redis,
 ) -> list[dict[str, Any]]:
     """Return ``causes`` as dicts with a ``dependents_count`` field attached.
 
@@ -1722,6 +1724,13 @@ async def _augment_causes_with_dependents(
     by downstream-blast radius. Computation is best-effort: a missing
     or unreadable queue degrades to zero counts rather than failing
     the surfacing of the cards themselves.
+
+    PR-351: when ``redis_client`` is provided, each cause also carries a
+    ``recovery_backup_branch`` field pointing at the
+    ``crash-backup/{task_id}/{timestamp}`` fallback branch recorded when
+    the crash-recovery push was rejected by the feature branch. Best-
+    effort: Redis read failures degrade to ``None`` rather than dropping
+    the card.
     """
     canceled_ids = {c.task_id for c in causes}
     counts = await compute_repo_dependents_count(
@@ -1731,8 +1740,31 @@ async def _augment_causes_with_dependents(
     for cause in causes:
         record = asdict(cause)
         record["dependents_count"] = counts.get(cause.task_id, 0)
+        record["recovery_backup_branch"] = await _read_recovery_backup_branch(
+            redis_client, repo, cause.task_id
+        )
         augmented.append(record)
     return augmented
+
+
+async def _read_recovery_backup_branch(
+    redis_client: aioredis.Redis,
+    repo: str,
+    task_id: str,
+) -> str | None:
+    """Return the PR-351 crash-backup branch name for ``task_id`` or ``None``.
+
+    Read failures degrade silently so the cancellation card still renders
+    even when the Redis key is unreachable; the operator simply loses the
+    backup-branch surface for that record. The web Redis client is
+    configured with ``decode_responses=True`` so the stored branch name
+    comes back as a string.
+    """
+    try:
+        raw = await redis_client.get(recovery_backup_branch(repo, task_id))
+    except Exception:
+        return None
+    return raw
 
 
 @router.get("/api/cancellations/{repo}")
@@ -1770,7 +1802,7 @@ async def api_cancellations(repo: str, request: Request) -> JSONResponse:
         return JSONResponse([])
     return JSONResponse(
         await _augment_causes_with_dependents(
-            repo, causes[:_CANCELLATIONS_MAX]
+            repo, causes[:_CANCELLATIONS_MAX], redis_client
         )
     )
 
@@ -2036,7 +2068,9 @@ async def partial_repo_cancellations(
             if group_for(_filter_subsource(cause)) == subsource_filter
         ]
     augmented = (
-        await _augment_causes_with_dependents(name, causes) if causes else []
+        await _augment_causes_with_dependents(name, causes, redis_client)
+        if causes
+        else []
     )
     return _app.templates.TemplateResponse(
         request,
