@@ -218,6 +218,63 @@ def test_primary_push_rejected_falls_back_to_backup(
 
 
 # ---------------------------------------------------------------------------
+# _preserve_crashed_run_commits: fetch-first non-fast-forward → fallback
+# ---------------------------------------------------------------------------
+
+
+def test_primary_push_fetch_first_falls_back_to_backup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Feature branch advanced on remote → ``(fetch first)`` triggers fallback.
+
+    When the feature branch has advanced on origin and the local clone
+    has not fetched the update, ``git push origin <branch>:<branch>``
+    emits ``! [rejected] ... (fetch first)`` rather than the literal
+    ``non-fast-forward`` token. The PR-351 fallback must still fire so
+    the crashed-run commits are preserved on a ``crash-backup/...``
+    ref instead of being silently dropped.
+    """
+    runner = _make_runner_with_doing()
+    pushes: list[str] = []
+    fetch_first_stderr = (
+        "To origin\n"
+        " ! [rejected]        pr-042-inflight -> pr-042-inflight (fetch first)\n"
+        "error: failed to push some refs to 'origin'\n"
+        "hint: Updates were rejected because the remote contains work"
+        " that you do not have locally.\n"
+    )
+
+    def handler(cmd: list[str], **kwargs: Any) -> Any:
+        if cmd[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="abc\n", stderr=""
+            )
+        if cmd[:2] == ["git", "push"]:
+            refspec = cmd[-1]
+            pushes.append(refspec)
+            if refspec == "pr-042-inflight:pr-042-inflight":
+                raise _rejected_push_error(fetch_first_stderr)
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout="", stderr=""
+        )
+
+    _stub_subprocess(monkeypatch, handler)
+
+    result = runner._preserve_crashed_run_commits("pr-042-inflight")
+
+    assert result is True
+    assert pushes[0] == "pr-042-inflight:pr-042-inflight"
+    assert pushes[1].startswith("pr-042-inflight:crash-backup/PR-042/")
+    assert runner._pending_backup_branch_write is not None
+    task_id, backup_branch = runner._pending_backup_branch_write
+    assert task_id == "PR-042"
+    assert backup_branch.startswith("crash-backup/PR-042/")
+
+
+# ---------------------------------------------------------------------------
 # _attempt_backup_branch_push: naming pattern
 # ---------------------------------------------------------------------------
 
@@ -617,6 +674,12 @@ def test_read_recovery_backup_branch_tolerates_redis_failure() -> None:
     [
         " ! [remote rejected] pr-042 -> pr-042 (push declined)",
         " ! [rejected]        pr-042 -> pr-042 (non-fast-forward)",
+        (
+            " ! [rejected]        pr-042 -> pr-042 (fetch first)\n"
+            "error: failed to push some refs to 'origin'\n"
+            "hint: Updates were rejected because the remote contains work"
+            " that you do not have locally."
+        ),
     ],
 )
 def test_push_rejected_by_remote_matches_known_signatures(stderr: str) -> None:

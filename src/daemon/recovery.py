@@ -774,13 +774,13 @@ class RecoveryMixin:
         or non-fast-forward state, attempt a fallback push to a unique
         ``crash-backup/{task_id}/{timestamp}`` branch instead of giving
         up. The rejected-needle match is git-CLI-version-dependent (the
-        stderr strings ``remote rejected`` and ``non-fast-forward`` are
-        emitted by git 2.40+, the production version pin) and may need
-        re-verification if production pins a newer release. The fallback
-        branch name is recorded on ``self._pending_backup_branch_write``
-        so the async caller can persist it under the
-        ``recovery:backup_branch:{repo}:{task_id}`` Redis key with a
-        30-day TTL.
+        stderr strings ``remote rejected``, ``non-fast-forward``, and
+        ``fetch first`` are emitted by git 2.40+, the production version
+        pin) and may need re-verification if production pins a newer
+        release. The fallback branch name is recorded on
+        ``self._pending_backup_branch_write`` so the async caller can
+        persist it under the ``recovery:backup_branch:{repo}:{task_id}``
+        Redis key with a 30-day TTL.
         """
         self._pending_backup_branch_write = None
         if branch == self.repo_config.branch:
@@ -843,14 +843,27 @@ class RecoveryMixin:
     def _push_rejected_by_remote(stderr: str) -> bool:
         """Return ``True`` when the push stderr matches the rejected pattern.
 
-        Detects the two stderr signatures git 2.40+ emits when the remote
-        refuses a non-force push: a branch-protection rejection
-        (``remote rejected``) and a non-fast-forward rejection
-        (``non-fast-forward``). A new git release that rewords either
-        message would silently disable the PR-351 fallback path, so the
-        match needs periodic verification against the production git pin.
+        Detects the three stderr signatures git 2.40+ emits when the
+        remote refuses a non-force push: a branch-protection rejection
+        (``remote rejected``), a non-fast-forward rejection against a
+        ref the client already has fetched (``non-fast-forward``), and
+        a non-fast-forward rejection when the client has not fetched
+        the remote-side advance yet (``fetch first``). The third case
+        is the common operational shape — when the feature branch has
+        advanced on the remote, ``git push origin <branch>:<branch>``
+        reports ``! [rejected] ... (fetch first)`` rather than the
+        literal ``non-fast-forward`` token, so omitting it would
+        silently disable the PR-351 fallback for the very case it was
+        designed to recover. A new git release that rewords any of
+        these messages would silently disable the fallback path, so
+        the match needs periodic verification against the production
+        git pin.
         """
-        return "remote rejected" in stderr or "non-fast-forward" in stderr
+        return (
+            "remote rejected" in stderr
+            or "non-fast-forward" in stderr
+            or "fetch first" in stderr
+        )
 
     def _attempt_backup_branch_push(
         self, branch: str, primary_stderr: str
