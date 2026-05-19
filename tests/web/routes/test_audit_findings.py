@@ -92,8 +92,6 @@ def _finding(index: int) -> dict[str, Any]:
         "pr_number": None,
         "violation_category": "direct_commit_no_pr",
         "rule": "Commit landed without a PR.",
-        "committed_at": f"2026-05-19T10:0{index}:00Z",
-        "author_name": f"Author {index}",
     }
 
 
@@ -129,6 +127,26 @@ def test_audit_page_lists_findings(
 
     assert response.status_code == 200
     assert response.text.count("data-audit-finding-row") == 3
+    assert "direct_commit_no_pr" in response.text
+
+
+def test_audit_page_uses_persisted_finding_fields(
+    base_config: Path,
+    redis_client: _AuditRedis,
+) -> None:
+    finding = _finding(1)
+    redis_client.lists[_findings_key()] = [json.dumps(finding, sort_keys=True)]
+
+    with TestClient(app) as client:
+        response = client.get(f"/repo/{REPO_NAME}/audit")
+
+    assert response.status_code == 200
+    assert "<th class=\"py-2 text-left\">Category</th>" in response.text
+    assert "<th class=\"py-2 text-left\">Parents</th>" in response.text
+    assert "<th class=\"py-2 text-left\">Timestamp</th>" not in response.text
+    assert "<th class=\"py-2 text-left\">Author</th>" not in response.text
+    assert f"<td class=\"py-2 text-xs\">{finding['parent_count']}</td>" in response.text
+    assert finding["violation_category"] in response.text
 
 
 def test_audit_page_links_to_github_commit(

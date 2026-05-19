@@ -10,17 +10,16 @@
     <table class="w-full text-sm">
         <thead class="border-b border-white/10 text-xs text-gray-400">
             <tr>
-                <th class="py-2 text-left">Timestamp</th>
-                <th class="py-2 text-left">Author</th>
                 <th class="py-2 text-left">SHA</th>
                 <th class="py-2 text-left">Message</th>
+                <th class="py-2 text-left">Category</th>
+                <th class="py-2 text-left">Parents</th>
+                <th class="py-2 text-left">PR</th>
             </tr>
         </thead>
         <tbody>
             {% for f in findings %}
             <tr class="border-b border-white/5" data-audit-finding-row>
-                <td class="py-2 text-xs">{{ f.committed_at or "" }}</td>
-                <td class="py-2 text-xs">{{ f.author_name or "" }}</td>
                 <td class="py-2 font-mono text-xs">
                     <a href="https://github.com/{{ github_owner_repo }}/commit/{{ f.sha }}"
                        target="_blank"
@@ -28,6 +27,9 @@
                        class="text-accent">{{ f.sha[:8] }}</a>
                 </td>
                 <td class="py-2 text-xs">{{ f.message_first_line }}</td>
+                <td class="py-2 text-xs">{{ f.violation_category }}</td>
+                <td class="py-2 text-xs">{{ f.parent_count }}</td>
+                <td class="py-2 text-xs">{{ f.pr_number or "" }}</td>
             </tr>
             {% endfor %}
         </tbody>
