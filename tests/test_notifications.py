@@ -31,6 +31,9 @@ def _send(**overrides: Any) -> None:
 
 
 class _OkResponse:
+    status_code = 200
+    text = "ok"
+
     def raise_for_status(self) -> None:
         return None
 
@@ -65,6 +68,9 @@ def _make_raising_client(exc: Exception) -> type:
 
 def _make_error_response_client(exc: Exception) -> type:
     class _ErrorResponse:
+        status_code = 500
+        text = "Internal Server Error"
+
         def raise_for_status(self) -> None:
             raise exc
 
