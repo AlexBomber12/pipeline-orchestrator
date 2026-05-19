@@ -234,3 +234,58 @@ def test_redis_state_refreshed_on_config_reload(
     assert redis_client.store[REDIS_SANDBOX_STATE_KEY] == (
         SandboxState.UNAVAILABLE.value
     )
+
+
+def test_redis_state_refreshed_when_reload_event_yields_same_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Reload event with an identical AppConfig (touch config.yml or an
+    # edit to a watched file that does not change the parsed config) must
+    # still re-probe the sandbox so a bwrap install/removal mid-run is
+    # picked up by the dashboard badge.
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(
+            poll_interval_sec=1, coder_filesystem_isolation=True
+        ),
+    )
+
+    def fake_load_config() -> AppConfig:
+        return config
+
+    redis_client = _CapturingRedis()
+    _patch_common(
+        monkeypatch, fake_load_config, redis_client, sleep_iterations=2
+    )
+    monkeypatch.setattr(main_module, "CONFIG_RELOAD_CYCLES", 1)
+
+    # First probe sees bwrap (active); second probe (post-reload) finds
+    # the binary gone (unavailable) to simulate an uninstall between the
+    # daemon's startup probe and a later same-config reload event.
+    probe_returns = [SandboxState.ACTIVE, SandboxState.UNAVAILABLE]
+    probe_calls = {"n": 0}
+
+    async def _fake_detect(coder_filesystem_isolation: bool) -> SandboxState:
+        n = probe_calls["n"]
+        probe_calls["n"] += 1
+        return probe_returns[min(n, len(probe_returns) - 1)]
+
+    monkeypatch.setattr(
+        "src.sandbox.runtime_state.detect_sandbox_state", _fake_detect
+    )
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    history = [
+        value
+        for key, value in redis_client.set_history
+        if key == REDIS_SANDBOX_STATE_KEY
+    ]
+    assert history == [
+        SandboxState.ACTIVE.value,
+        SandboxState.UNAVAILABLE.value,
+    ], history
+    assert redis_client.store[REDIS_SANDBOX_STATE_KEY] == (
+        SandboxState.UNAVAILABLE.value
+    )
