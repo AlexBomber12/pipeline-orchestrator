@@ -15,7 +15,9 @@ forbidden by the grep success criterion in the task spec.
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
+import pytest
 from src.metrics import RunRecord
 from src.models import PipelineState, QueueTask, TaskStatus
 
@@ -223,3 +225,43 @@ def test_transition_to_error_finalizes_active_run_record() -> None:
 
     assert len(saved) == 1
     assert saved[0].exit_reason == "error"
+
+
+def test_transition_to_error_existing_cause_check_does_not_refresh_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-345 fix-feedback: the dedupe lookup must not pin the prior cause.
+
+    ``_transition_to_error`` reads the current cancellation cause to decide
+    whether to record a fresh ``crash`` one; that read is a daemon-side
+    bookkeeping check, not an operator surfacing the record. If it
+    inherited the ``refresh_ttl=True`` default the forensic-window 90-day
+    TTL would be applied on every ERROR transition for the active task,
+    masking natural eviction. Assert the check forwards
+    ``refresh_ttl=False``.
+    """
+    runner = h._make_runner()
+    _install_publish_state_spy(runner)
+    _install_save_run_record_spy(runner)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-345",
+        title="t",
+        status=TaskStatus.DOING,
+    )
+
+    captured: dict[str, object] = {}
+
+    async def spy(
+        redis_client: Any,
+        repo_slug: str,
+        task_id: str,
+        *,
+        refresh_ttl: bool = True,
+    ) -> None:
+        captured["refresh_ttl"] = refresh_ttl
+        return None
+
+    monkeypatch.setattr("src.daemon.runner.get_cancellation_cause", spy)
+    asyncio.run(runner._transition_to_error("boom"))
+
+    assert captured == {"refresh_ttl": False}

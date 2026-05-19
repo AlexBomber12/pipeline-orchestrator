@@ -632,7 +632,7 @@ class RecoveryMixin:
         """
         try:
             cause = await get_cancellation_cause(
-                self.redis, self.name, task_pr_id
+                self.redis, self.name, task_pr_id, refresh_ttl=False
             )
         except Exception as exc:
             self.log_event(
