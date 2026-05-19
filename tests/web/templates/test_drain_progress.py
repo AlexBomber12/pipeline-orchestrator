@@ -10,6 +10,8 @@ layers so a regression in either fails the gate.
 
 from __future__ import annotations
 
+import threading
+import time as _time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -1002,3 +1004,92 @@ async def test_build_drain_progress_map_includes_active_coding_drain() -> None:
     assert set(result) == {"octo__alpha", "octo__beta"}
     assert result["octo__alpha"]["phase"] == "CODING"
     assert result["octo__beta"]["phase"] == "FIX"
+
+
+@pytest.mark.asyncio
+async def test_build_drain_progress_fix_falls_back_when_gh_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ``gh_prs.get_pr_last_push_time`` shells out to ``gh`` (default 30s
+    # per call, up to two API calls). A slow/unreachable GitHub must not
+    # block the dashboard refresh; the helper bounds the wait via
+    # ``_DRAIN_PUSH_TIMEOUT_SEC`` and falls back to the FIX history anchor
+    # exactly as it does for any other failure.
+    monkeypatch.setattr(
+        "src.web.routes.dashboard._DRAIN_PUSH_TIMEOUT_SEC", 0.05
+    )
+    started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+    now = started + timedelta(seconds=240)
+    pr = PRInfo(number=1, branch="b")
+    state = _state(
+        current_task=_task(),
+        current_pr=pr,
+        history=[_history_entry(state="FIX", time=started)],
+    )
+
+    def _slow(owner_repo: str, pr_number: int) -> datetime | None:
+        _time.sleep(0.5)
+        return started
+
+    monkeypatch.setattr(
+        "src.web.routes.dashboard.gh_prs.get_pr_last_push_time", _slow
+    )
+    started_at_wall = _time.monotonic()
+    view = await dashboard_routes._build_drain_progress(
+        redis_client=None,
+        state=state,
+        config=_config(fix_idle_timeout_sec=1800),
+        now=now,
+    )
+    elapsed_wall = _time.monotonic() - started_at_wall
+    assert view is not None
+    # Fell back to the FIX history anchor rather than the push timestamp.
+    assert view["elapsed_sec"] == pytest.approx(240.0)
+    # Returned roughly at the timeout, well before the slow stub's 0.5s.
+    assert elapsed_wall < 0.4
+
+
+@pytest.mark.asyncio
+async def test_build_drain_progress_map_runs_per_repo_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Two FIX-phase drains both reach ``gh_prs.get_pr_last_push_time``;
+    # without ``asyncio.gather`` the dashboard would serialize the GitHub
+    # calls and hang for the operator during Pause All. A
+    # ``threading.Barrier`` of size 2 deadlocks under serial dispatch and
+    # passes under concurrent dispatch, so a successful return proves both
+    # calls were in flight at the same time.
+    started = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+    now = started + timedelta(seconds=600)
+    barrier = threading.Barrier(2, timeout=3)
+    push_at = started + timedelta(seconds=60)
+
+    def _wait_at_barrier(owner_repo: str, pr_number: int) -> datetime | None:
+        barrier.wait()
+        return push_at
+
+    monkeypatch.setattr(
+        "src.web.routes.dashboard.gh_prs.get_pr_last_push_time",
+        _wait_at_barrier,
+    )
+
+    def _fix_state(repo_name: str, pr_number: int) -> RepoState:
+        state = _state(
+            repo_name=repo_name,
+            current_task=_task(pr_id=f"PR-{pr_number:03d}"),
+            current_pr=PRInfo(number=pr_number, branch=f"b{pr_number}"),
+            history=[_history_entry(state="FIX", time=started)],
+        )
+        return state
+
+    states = [_fix_state("octo__alpha", 1), _fix_state("octo__beta", 2)]
+    result = await dashboard_routes._build_drain_progress_map(
+        redis_client=None,
+        states=states,
+        config=_config(fix_idle_timeout_sec=1800),
+        now=now,
+    )
+    assert set(result) == {"octo__alpha", "octo__beta"}
+    # Both anchored on the push timestamp returned past the barrier.
+    assert result["octo__alpha"]["elapsed_sec"] == pytest.approx(540.0)
+    assert result["octo__beta"]["elapsed_sec"] == pytest.approx(540.0)

@@ -1179,6 +1179,9 @@ def _phase_started_at(history: list[Any], phase: str) -> datetime | None:
     return run_start
 
 
+_DRAIN_PUSH_TIMEOUT_SEC = 2.0
+
+
 async def _fix_branch_last_push_at(state: RepoState) -> datetime | None:
     """Return the FIX PR's branch last-push timestamp, or ``None``.
 
@@ -1192,9 +1195,16 @@ async def _fix_branch_last_push_at(state: RepoState) -> datetime | None:
     a Codex comment shortly before Pause All, even though the supervisor
     is about to kill the coder for branch idleness.
 
-    Fails open with ``None`` on any error so a transient GitHub outage
-    cannot suppress the indicator entirely; callers fall back to the FIX
-    cycle's history start instead.
+    The helper shells out through ``gh_runner.run_gh`` (default per-call
+    timeout 30s, up to two API calls per invocation), so a slow or
+    unreachable GitHub would otherwise serialize the entire dashboard
+    render behind this single repo. Bound the wait at
+    ``_DRAIN_PUSH_TIMEOUT_SEC`` and treat a timeout the same as any other
+    failure: fail open with ``None`` so callers fall back to the FIX
+    cycle's history start instead. The blocking subprocess keeps running
+    in its thread-pool slot until ``gh`` returns or hits its own timeout,
+    but this coroutine no longer waits on it, so card rendering stays
+    responsive during a GitHub outage.
     """
     pr = state.current_pr
     if pr is None or pr.number <= 0:
@@ -1204,8 +1214,11 @@ async def _fix_branch_last_push_at(state: RepoState) -> datetime | None:
     except ValueError:
         return None
     try:
-        push_at = await asyncio.to_thread(
-            gh_prs.get_pr_last_push_time, owner_repo, pr.number
+        push_at = await asyncio.wait_for(
+            asyncio.to_thread(
+                gh_prs.get_pr_last_push_time, owner_repo, pr.number
+            ),
+            timeout=_DRAIN_PUSH_TIMEOUT_SEC,
         )
     except Exception:
         return None
@@ -1352,21 +1365,32 @@ async def _build_drain_progress_map(
 
     Only repos that survive the ``_build_drain_progress`` gate appear in
     the map so the template can read ``drain_progress.get(repo.name)``
-    and render only when an entry exists. Iterates serially because the
-    only async I/O is the per-repo Redis ``get_current_run_started_at``
-    call and the candidate set (PAUSED+user_paused+current_task) is
-    small in practice.
+    and render only when an entry exists. The per-repo work runs
+    concurrently via ``asyncio.gather`` because a FIX-phase drain fetches
+    the branch last-push timestamp from GitHub through ``gh_prs``; if a
+    single slow ``gh`` CLI call serialized into the next repo, several
+    in-flight FIX drains after Pause All would compound into a multi-
+    second hang on every dashboard refresh. ``return_exceptions=True``
+    keeps an unexpected failure on one repo from poisoning the entire
+    map — that repo simply does not appear in the result.
     """
     if not states:
         return {}
     current_time = now if now is not None else datetime.now(timezone.utc)
+    results = await asyncio.gather(
+        *(
+            _build_drain_progress(
+                redis_client, state, config, now=current_time
+            )
+            for state in states
+        ),
+        return_exceptions=True,
+    )
     out: dict[str, dict[str, Any]] = {}
-    for state in states:
-        view = await _build_drain_progress(
-            redis_client, state, config, now=current_time
-        )
-        if view is not None:
-            out[state.name] = view
+    for state, view in zip(states, results):
+        if isinstance(view, BaseException) or view is None:
+            continue
+        out[state.name] = view
     return out
 
 
