@@ -149,12 +149,19 @@ async def record_cancellation_cause(
     cause.repo_slug = repo_slug
     serialized = cause.to_redis()
     score = datetime.fromisoformat(cause.created_at).timestamp()
-    expiry_cutoff = datetime.now(timezone.utc).timestamp() - TTL_SECONDS
+    # PR-345 follow-up: the index must cover the full 90-day forensic window
+    # because read-side TTL refreshes can keep a cause key alive long past the
+    # initial 30-day budget. Pruning at the 30-day mark would evict a
+    # refreshed member (whose ZSCORE is the original created_at) even though
+    # its cause key is still retained, breaking history/pending-list flows
+    # that start from cancellation_index. Set the ZSET TTL to the same window
+    # so the index does not vanish under refreshed records either.
+    expiry_cutoff = datetime.now(timezone.utc).timestamp() - READ_REFRESH_TTL_SECONDS
     pipe = redis_client.pipeline()
     pipe.set(cause_key(repo_slug, task_id), serialized, ex=TTL_SECONDS)
     pipe.zadd(index_key(repo_slug), {task_id: score})
     pipe.zremrangebyscore(index_key(repo_slug), "-inf", f"({expiry_cutoff}")
-    pipe.expire(index_key(repo_slug), TTL_SECONDS)
+    pipe.expire(index_key(repo_slug), READ_REFRESH_TTL_SECONDS)
     await pipe.execute()
 
 

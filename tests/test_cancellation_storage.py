@@ -472,10 +472,13 @@ async def test_list_recent_skips_expired_payloads_and_prunes_index() -> None:
     assert "PR-700" not in redis.zsets.get(index_key("alpha"), {})
 
 
-async def test_record_prunes_index_entries_older_than_ttl() -> None:
+async def test_record_prunes_index_entries_older_than_forensic_window() -> None:
     redis = _FakeRedis()
     now = datetime.now(timezone.utc)
-    ancient_ts = (now - timedelta(seconds=TTL_SECONDS + 3600)).timestamp()
+    # Entry whose score predates the full 90-day forensic window — no read
+    # refresh could have kept it eligible — is fair game to prune. Entries
+    # within the window must survive (see PR-345 follow-up regression test).
+    ancient_ts = (now - timedelta(seconds=READ_REFRESH_TTL_SECONDS + 3600)).timestamp()
     redis.zsets[index_key("alpha")] = {"PR-EXPIRED": ancient_ts}
 
     await record_cancellation_cause(
@@ -514,7 +517,7 @@ async def test_list_recent_orders_by_parsed_timestamp_across_offsets() -> None:
     assert [c.task_id for c in recent] == ["PR-LATER", "PR-EARLY"]
 
 
-async def test_record_sets_ttl_on_index_key() -> None:
+async def test_record_sets_forensic_window_ttl_on_index_key() -> None:
     redis = _FakeRedis()
     await record_cancellation_cause(
         redis,
@@ -522,7 +525,9 @@ async def test_record_sets_ttl_on_index_key() -> None:
         "PR-TTL",
         CancellationCause(category="INFRA"),
     )
-    assert redis.ttls[index_key("alpha")] == TTL_SECONDS
+    # PR-345 follow-up: the index ZSET must outlive the 30-day cause-key
+    # budget so refreshed members stay reachable through the forensic window.
+    assert redis.ttls[index_key("alpha")] == READ_REFRESH_TTL_SECONDS
 
 
 async def test_list_recent_decodes_bytes_task_ids() -> None:
@@ -750,10 +755,63 @@ async def test_list_recent_does_not_refresh_underlying_ttls() -> None:
         ),
     )
     assert redis.ttls[cause_key("alpha", "PR-307")] == TTL_SECONDS
+    index_ttl_after_write = redis.ttls[index_key("alpha")]
 
     await list_recent_cancellations(
         redis, "alpha", base - timedelta(hours=1)
     )
 
+    # Cause-key TTL untouched by scan (no refresh); index TTL also untouched
+    # since the scan did not invoke a refresh path.
     assert redis.ttls[cause_key("alpha", "PR-307")] == TTL_SECONDS
-    assert redis.ttls[index_key("alpha")] == TTL_SECONDS
+    assert redis.ttls[index_key("alpha")] == index_ttl_after_write
+
+
+async def test_subsequent_write_preserves_refreshed_index_member() -> None:
+    """Regression: a 35-day-old refreshed member must survive the next write.
+
+    Before PR-345 follow-up, ``record_cancellation_cause`` pruned index
+    members whose score was older than the 30-day initial budget. A read at
+    day 35 refreshes the cause key to 90 days and re-adds the index entry at
+    the original ``created_at`` score; the next cancellation recorded for
+    the same repo then evicted that refreshed member from the index, hiding
+    it from history/pending-list flows that start at ``cancellation_index``.
+    The prune cutoff now uses the 90-day forensic window so refreshed
+    members stay surfaced.
+    """
+    redis = _FakeRedis()
+    now = datetime.now(timezone.utc)
+    old_created_at = (now - timedelta(days=35)).isoformat()
+    _seed_cause_with_ttl(
+        redis,
+        "alpha",
+        "PR-OLD",
+        created_at=old_created_at,
+        ttl=TTL_SECONDS,
+    )
+    # Operator reads the 35-day-old record: refresh extends cause-key TTL to
+    # 90 days and re-adds the index member at the original created_at score.
+    refreshed = await get_cancellation_cause(redis, "alpha", "PR-OLD")
+    assert refreshed is not None
+    assert redis.ttls[cause_key("alpha", "PR-OLD")] == READ_REFRESH_TTL_SECONDS
+
+    # A new cancellation arrives for the same repo. The write-path index
+    # housekeeping must not drop the refreshed member just because its score
+    # is older than the 30-day initial budget.
+    await record_cancellation_cause(
+        redis,
+        "alpha",
+        "PR-NEW",
+        CancellationCause(category="ERROR", created_at=now.isoformat()),
+    )
+
+    bucket = redis.zsets[index_key("alpha")]
+    assert "PR-OLD" in bucket
+    assert "PR-NEW" in bucket
+
+    # History flow that starts at the index can still surface the refreshed
+    # record (cause key was not deleted; index member was preserved).
+    recent = await list_recent_cancellations(
+        redis, "alpha", now - timedelta(days=90)
+    )
+    assert {c.task_id for c in recent} == {"PR-OLD", "PR-NEW"}

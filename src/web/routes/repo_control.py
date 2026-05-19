@@ -25,6 +25,7 @@ from redis.exceptions import RedisError
 
 from src.audit.operator_actions import write_audit_record
 from src.cancellation.storage import (
+    READ_REFRESH_TTL_SECONDS,
     TTL_SECONDS,
     CancellationCause,
     cause_key,
@@ -2164,7 +2165,13 @@ async def _reject_guardrail_decision(
     )
     serialized = new_cause.to_redis()
     score = datetime.fromisoformat(new_cause.created_at).timestamp()
-    expiry_cutoff = datetime.now(timezone.utc).timestamp() - TTL_SECONDS
+    # PR-345 follow-up: prune index members using the 90-day forensic window
+    # so refreshed entries (cause key extended on operator read) survive the
+    # write-side housekeeping. Keep this in lockstep with
+    # ``record_cancellation_cause``; the two paths share index semantics.
+    expiry_cutoff = (
+        datetime.now(timezone.utc).timestamp() - READ_REFRESH_TTL_SECONDS
+    )
     # CAS-guard the operator_reject write: a concurrent approve can
     # CAS-delete the guardrail cause between our initial read and this
     # write, and an unguarded ``set`` would resurrect a cancellation key
@@ -2187,7 +2194,7 @@ async def _reject_guardrail_decision(
             pipe.set(cause_key(name, pr_id), serialized, ex=TTL_SECONDS)
             pipe.zadd(index_key(name), {pr_id: score})
             pipe.zremrangebyscore(index_key(name), "-inf", f"({expiry_cutoff}")
-            pipe.expire(index_key(name), TTL_SECONDS)
+            pipe.expire(index_key(name), READ_REFRESH_TTL_SECONDS)
             try:
                 await pipe.execute()
             except aioredis.WatchError:
