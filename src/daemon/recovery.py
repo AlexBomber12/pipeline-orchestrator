@@ -21,6 +21,7 @@ from src.cancellation import (
     classify_cancellation_subsource,
     get_cancellation_cause,
     get_current_run_started_at,
+    safe_record_cancellation_cause,
 )
 from src.daemon import git_ops
 from src.github import gh_runner
@@ -530,6 +531,22 @@ class RecoveryMixin:
             # dashboard surfaces whether the previous run died abruptly
             # or was deliberately parked by a detector.
             branch_kind = await self._dispatch_recovery_branch(doing.pr_id)
+            # PR-351 follow-up: the canonical mid-CODING SIGKILL/OOM exits
+            # before ``_transition_to_error`` can write a cause, so no
+            # ``CancellationCause`` lands in Redis. The dashboard surfaces
+            # the new ``recovery_backup_branch`` field only by augmenting
+            # rows returned from ``list_recent_cancellations``; without a
+            # cause record there is no card to attach the backup-branch
+            # pointer to, and operators never see the
+            # ``crash-backup/...`` ref. Synthesize a ``crash`` cause here
+            # so the cancellation card renders alongside the backup
+            # branch surface. Skipped when a cause already exists (the
+            # daemon wrote one before exit, or a previous recovery cycle
+            # already synthesized one) and on the operator-attention
+            # branch (a deliberate detector park already wrote its own
+            # cause).
+            if branch_kind == "crash":
+                await self._record_crash_cancellation_if_missing(doing.pr_id)
             self._crashed_task_pr_ids.add(doing.pr_id)
             # PR-266b crash-no-PR fix: reflect the cancellation in the
             # in-memory tasks list so the headers-mode current_queue
@@ -882,6 +899,55 @@ class RecoveryMixin:
         )
         self._pending_backup_branch_write = (task_id, backup_branch)
         return backup_branch
+
+    async def _record_crash_cancellation_if_missing(self, task_id: str) -> None:
+        """Write a synthetic ``crash`` ``CancellationCause`` when none exists.
+
+        The canonical mid-CODING daemon exit (SIGKILL, OOM, container
+        restart) skips Python teardown, so ``_transition_to_error`` never
+        runs and Redis carries no cause record for the dead task. The
+        dashboard renders the PR-351 ``recovery_backup_branch`` surface
+        only by augmenting rows returned from
+        ``list_recent_cancellations`` — with no cause record, there is
+        no cancellation card to join the backup-branch pointer onto and
+        the operator never sees the ``crash-backup/...`` ref. Recording
+        a synthetic crash cause here closes that gap.
+
+        Skips when a cause already exists (the daemon wrote one before
+        exit, or an earlier recovery cycle already synthesized one) so
+        we never clobber a more precise pre-crash record with this
+        generic one. Best-effort throughout: read failures default to
+        "no existing cause" so the write still happens, and the write
+        itself uses ``safe_record_cancellation_cause`` so a Redis outage
+        does not abort recovery.
+        """
+        try:
+            existing = await get_cancellation_cause(
+                self.redis, self.name, task_id, refresh_ttl=False
+            )
+        except Exception:
+            existing = None
+        if existing is not None:
+            return
+        cause = CancellationCause(
+            category="ERROR",
+            payload={
+                "subsource": "crash",
+                "error_message": (
+                    "Daemon exited mid-CODING before a cancellation cause "
+                    "could be written; cause synthesized on the next "
+                    "startup recovery cycle so the cancellation card and "
+                    "crash-backup branch surface render together."
+                ),
+            },
+        )
+        await safe_record_cancellation_cause(
+            self.redis,
+            self.name,
+            task_id,
+            cause,
+            log=self.log_event,
+        )
 
     async def _persist_pending_backup_branch_write(self) -> None:
         """Flush the PR-351 fallback-branch pointer to Redis.

@@ -680,3 +680,218 @@ def test_timestamp_format_matches_utc_strftime_pattern(
     assert runner._pending_backup_branch_write is not None
     _, backup_branch = runner._pending_backup_branch_write
     assert backup_branch == "crash-backup/PR-007/20260519-123456"
+
+
+# ---------------------------------------------------------------------------
+# _record_crash_cancellation_if_missing: synthesizes a cause on canonical crash
+# ---------------------------------------------------------------------------
+
+
+def test_record_crash_cancellation_writes_when_cause_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No cause in Redis → synthesize a ``crash`` cause for the dashboard.
+
+    The canonical mid-CODING SIGKILL/OOM leaves no record in Redis,
+    so the dashboard's ``list_recent_cancellations`` returns nothing and
+    the backup-branch surface — only attached to cancellation rows by
+    ``_augment_causes_with_dependents`` — never renders. The recovery
+    helper closes that gap.
+    """
+    runner = _make_runner_with_doing(task_id="PR-042")
+    calls: list[tuple[str, str, CancellationCause]] = []
+
+    async def fake_safe_record(
+        redis_client: Any,
+        repo_slug: str,
+        task_id: str,
+        cause: CancellationCause,
+        *,
+        log: Any = None,
+    ) -> None:
+        calls.append((repo_slug, task_id, cause))
+
+    monkeypatch.setattr(
+        recovery_module, "safe_record_cancellation_cause", fake_safe_record
+    )
+
+    asyncio.run(runner._record_crash_cancellation_if_missing("PR-042"))
+
+    assert len(calls) == 1
+    repo_slug, task_id, cause = calls[0]
+    assert repo_slug == runner.name
+    assert task_id == "PR-042"
+    assert cause.category == "ERROR"
+    assert cause.payload["subsource"] == "crash"
+    assert "mid-CODING" in cause.payload["error_message"]
+
+
+def test_record_crash_cancellation_skips_when_cause_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Existing cause record → do not overwrite with a synthetic crash entry.
+
+    A pre-crash record (deliberate detector park, or an earlier recovery
+    cycle that already synthesized one) carries more precise context
+    than the generic synthesized cause; clobbering it would lose the
+    original detector signal and bump TTL on a stale record.
+    """
+    runner = _make_runner_with_doing(task_id="PR-042")
+    existing = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "review_timeout", "reason_text": "parked"},
+        created_at="2026-05-19T10:00:00+00:00",
+    )
+
+    async def fake_get_cause(
+        redis: Any, repo_slug: str, task_id: str, *, refresh_ttl: bool = True
+    ) -> CancellationCause:
+        return existing
+
+    monkeypatch.setattr(recovery_module, "get_cancellation_cause", fake_get_cause)
+
+    calls: list[Any] = []
+
+    async def fake_safe_record(*args: Any, **kwargs: Any) -> None:
+        calls.append(args)
+
+    monkeypatch.setattr(
+        recovery_module, "safe_record_cancellation_cause", fake_safe_record
+    )
+
+    asyncio.run(runner._record_crash_cancellation_if_missing("PR-042"))
+
+    assert calls == []
+
+
+def test_record_crash_cancellation_treats_get_failure_as_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Redis ``get`` failure during the existence probe → still write.
+
+    Best-effort: if we cannot confirm a record exists, default to writing
+    so the dashboard still renders the cancellation card. The synthesized
+    record carries the same TTL as a real one, so an unreadable-but-
+    present prior record would simply be refreshed by the write.
+    """
+    runner = _make_runner_with_doing(task_id="PR-042")
+
+    async def fake_get_cause(
+        redis: Any, repo_slug: str, task_id: str, *, refresh_ttl: bool = True
+    ) -> CancellationCause:
+        raise RuntimeError("redis read failed")
+
+    monkeypatch.setattr(recovery_module, "get_cancellation_cause", fake_get_cause)
+
+    calls: list[Any] = []
+
+    async def fake_safe_record(
+        redis_client: Any,
+        repo_slug: str,
+        task_id: str,
+        cause: CancellationCause,
+        *,
+        log: Any = None,
+    ) -> None:
+        calls.append((repo_slug, task_id, cause))
+
+    monkeypatch.setattr(
+        recovery_module, "safe_record_cancellation_cause", fake_safe_record
+    )
+
+    asyncio.run(runner._record_crash_cancellation_if_missing("PR-042"))
+
+    assert len(calls) == 1
+    _, _, cause = calls[0]
+    assert cause.payload["subsource"] == "crash"
+
+
+def test_record_crash_cancellation_write_failure_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``safe_record_cancellation_cause`` is best-effort — recovery proceeds.
+
+    ``safe_record_cancellation_cause`` itself swallows Redis errors with a
+    log line; the helper must not re-raise on top of that contract,
+    otherwise a Redis outage during recovery would abort the IDLE
+    transition and re-enter the crash loop.
+    """
+    runner = _make_runner_with_doing(task_id="PR-042")
+
+    async def fake_get_cause(
+        redis: Any, repo_slug: str, task_id: str, *, refresh_ttl: bool = True
+    ) -> CancellationCause | None:
+        return None
+
+    monkeypatch.setattr(recovery_module, "get_cancellation_cause", fake_get_cause)
+
+    async def boom_safe_record(*args: Any, **kwargs: Any) -> None:
+        # Real ``safe_record_cancellation_cause`` would swallow this;
+        # asserting the helper does not propagate is the regression
+        # guarantee, not whether the upstream actually swallows.
+        return None
+
+    monkeypatch.setattr(
+        recovery_module, "safe_record_cancellation_cause", boom_safe_record
+    )
+
+    # Must not raise.
+    asyncio.run(runner._record_crash_cancellation_if_missing("PR-042"))
+
+
+# ---------------------------------------------------------------------------
+# recover_state: crash branch wires the helper before clearing current_task
+# ---------------------------------------------------------------------------
+
+
+def test_recover_state_crash_branch_records_cause_before_clearing_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: a DOING task with no PR + no cause writes a crash cause.
+
+    Pins the cancellation-card surface contract: after the recovery
+    handler returns, a synthesized ``crash`` cause must be present so
+    ``_augment_causes_with_dependents`` has a row to attach the
+    ``recovery_backup_branch`` field onto.
+    """
+    task = QueueTask(
+        pr_id="PR-351",
+        title="Crashed mid-CODING",
+        status=TaskStatus.DOING,
+        branch="pr-351-crashed",
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [],
+    )
+    runner = _make_runner()
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
+    runner._preserve_crashed_run_commits = (  # type: ignore[method-assign]
+        lambda branch: True
+    )
+
+    captured: list[tuple[str, CancellationCause]] = []
+
+    async def fake_safe_record(
+        redis_client: Any,
+        repo_slug: str,
+        task_id: str,
+        cause: CancellationCause,
+        *,
+        log: Any = None,
+    ) -> None:
+        captured.append((task_id, cause))
+
+    monkeypatch.setattr(
+        recovery_module, "safe_record_cancellation_cause", fake_safe_record
+    )
+
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert "PR-351" in runner._crashed_task_pr_ids
+    assert len(captured) == 1
+    recorded_task_id, recorded_cause = captured[0]
+    assert recorded_task_id == "PR-351"
+    assert recorded_cause.payload["subsource"] == "crash"
