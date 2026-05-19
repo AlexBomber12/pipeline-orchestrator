@@ -51,6 +51,10 @@ from src.github import prs as gh_prs
 from src.keyspace import cli_log_latest, daemon_panic_state, recovery_backup_branch
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
+from src.sandbox.runtime_state import (
+    REDIS_SANDBOX_STATE_KEY,
+    SandboxState,
+)
 from src.subsource_registry import all_subsources, group_for
 from src.subsource_registry import lookup as _subsource_lookup
 from src.utils import repo_slug_from_url
@@ -1410,6 +1414,39 @@ async def _build_drain_progress_map(
     return out
 
 
+async def _read_sandbox_state(redis_client: Any, config: AppConfig) -> str:
+    """Return the sandbox-state string the dashboard badge should render.
+
+    Preferred source is the daemon-written
+    :data:`~src.sandbox.runtime_state.REDIS_SANDBOX_STATE_KEY`, which
+    reflects the actual smoke-test result on the daemon host. When
+    Redis is unreachable, the value is missing (web booted before the
+    daemon ran its first probe), or the value is not a recognized
+    :class:`~src.sandbox.runtime_state.SandboxState`, fall back to the
+    config flag so the badge still distinguishes ``disabled`` (off in
+    config) from ``unavailable`` (on in config but probe absent or
+    invalid). Without that fallback the badge would render an empty
+    string and the operator would lose the at-a-glance status entirely
+    on a first boot.
+    """
+    raw: Any = None
+    if redis_client is not None:
+        try:
+            raw = await redis_client.get(REDIS_SANDBOX_STATE_KEY)
+        except Exception:
+            raw = None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    if isinstance(raw, str):
+        try:
+            return SandboxState(raw).value
+        except ValueError:
+            pass
+    if not config.daemon.coder_filesystem_isolation:
+        return SandboxState.DISABLED.value
+    return SandboxState.UNAVAILABLE.value
+
+
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
@@ -1429,6 +1466,7 @@ async def index(request: Request) -> HTMLResponse:
     drain_progress = await _build_drain_progress_map(
         redis_client, states, config
     )
+    sandbox_state = await _read_sandbox_state(redis_client, config)
     return _app.templates.TemplateResponse(
         request,
         "index.html",
@@ -1444,6 +1482,7 @@ async def index(request: Request) -> HTMLResponse:
             "cancellation_subsources": cancellation_subsources,
             "subsource_lookup": _subsource_lookup,
             "drain_progress": drain_progress,
+            "sandbox_state": sandbox_state,
         },
     )
 
