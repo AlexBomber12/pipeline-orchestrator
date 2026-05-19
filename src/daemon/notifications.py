@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import re
 import time
-from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -38,15 +37,12 @@ async def _post_json_with_audit(
     payload_size_bytes = len(json.dumps(payload).encode("utf-8"))
     status: int | None = None
     response_excerpt = ""
-    retry_scheduled_at: datetime | None = None
     start = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             response = await client.post(webhook_url, json=payload)
         status = getattr(response, "status_code", None)
         response_excerpt = str(getattr(response, "text", ""))[:200]
-        if status is not None and status >= 500:
-            retry_scheduled_at = datetime.now(timezone.utc)
         response.raise_for_status()
         return response
     except httpx.RequestError as exc:
@@ -62,7 +58,6 @@ async def _post_json_with_audit(
             http_status=status,
             response_excerpt=response_excerpt,
             elapsed_ms=elapsed_ms,
-            retry_scheduled_at=retry_scheduled_at,
         )
 
 

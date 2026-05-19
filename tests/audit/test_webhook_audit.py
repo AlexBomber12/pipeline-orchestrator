@@ -32,7 +32,6 @@ def audit_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     target = tmp_path / "audit" / "webhooks"
     monkeypatch.setattr(webhook_log, "WEBHOOK_AUDIT_DIR", target)
     monkeypatch.setattr(webhook_log, "datetime", _FixedDatetime)
-    monkeypatch.setattr(notifications, "datetime", _FixedDatetime)
     return target
 
 
@@ -127,6 +126,22 @@ def test_audit_writes_on_http_500(
 
     record = _read_records(audit_dir, "guardrail_violation")[0]
     assert record["http_status"] == 500
+    assert "retry_scheduled_at" not in record
+
+
+def test_audit_records_explicit_retry_timestamp(audit_dir: Path) -> None:
+    write_webhook_audit(
+        event_type="guardrail_violation",
+        webhook_url="https://hooks.example.test/secret",
+        payload_size_bytes=1024,
+        attempt_number=1,
+        http_status=500,
+        response_excerpt="Internal Server Error",
+        elapsed_ms=42,
+        retry_scheduled_at=FIXED_NOW,
+    )
+
+    record = _read_records(audit_dir, "guardrail_violation")[0]
     assert record["retry_scheduled_at"] == FIXED_NOW.isoformat()
 
 
