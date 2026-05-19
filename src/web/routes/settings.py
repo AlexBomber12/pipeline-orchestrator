@@ -40,6 +40,15 @@ SPEND_CEILING_FIELDS = (
     "spend_ceiling_weekly_percent",
     "spend_ceiling_warning_percent",
 )
+# Session/weekly are ``int | None`` in ``DaemonConfig``; blank input disables
+# the ceiling by deleting the key so the Pydantic default (None) applies.
+# Warning has a non-None default and must stay present, so it is excluded.
+OPTIONAL_SPEND_CEILING_FIELDS = frozenset(
+    {
+        "spend_ceiling_session_percent",
+        "spend_ceiling_weekly_percent",
+    }
+)
 
 _BOOL_TRUE = {"true", "1", "yes", "on"}
 _BOOL_FALSE = {"false", "0", "no", "off"}
@@ -578,19 +587,32 @@ async def update_config_field(request: Request, field: str) -> HTMLResponse:
         )
     form = await request.form()
     raw = form.get(field)
-    if raw is None or not isinstance(raw, str) or raw.strip() == "":
-        return HTMLResponse(f"{field} is required", status_code=400)
-    try:
-        value = _coerce_percent(raw, field)
-    except ValueError as exc:
-        return HTMLResponse(str(exc), status_code=400)
+    is_blank = isinstance(raw, str) and raw.strip() == ""
+    # Operators clear the Session/Weekly inputs to disable just that ceiling;
+    # HTMX posts the blank value, so treat it as a deletion request rather
+    # than a 400 (which would leave the previous value in config.yml with no
+    # way to remove it short of a full reset).
+    if is_blank and field in OPTIONAL_SPEND_CEILING_FIELDS:
+        try:
+            delete_daemon_fields(_app.CONFIG_PATH, [field])
+        except OSError as exc:
+            return HTMLResponse(
+                f"Failed to write config.yml: {exc}", status_code=503
+            )
+    else:
+        if raw is None or not isinstance(raw, str) or raw.strip() == "":
+            return HTMLResponse(f"{field} is required", status_code=400)
+        try:
+            value = _coerce_percent(raw, field)
+        except ValueError as exc:
+            return HTMLResponse(str(exc), status_code=400)
 
-    try:
-        write_daemon_field(_app.CONFIG_PATH, field, value)
-    except OSError as exc:
-        return HTMLResponse(
-            f"Failed to write config.yml: {exc}", status_code=503
-        )
+        try:
+            write_daemon_field(_app.CONFIG_PATH, field, value)
+        except OSError as exc:
+            return HTMLResponse(
+                f"Failed to write config.yml: {exc}", status_code=503
+            )
 
     redis_client = getattr(request.app.state, "redis", None)
     if redis_client is not None:

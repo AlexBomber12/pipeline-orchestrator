@@ -263,6 +263,125 @@ def test_update_missing_form_field_returns_400(base_config: Path) -> None:
     assert response.status_code == 400
 
 
+def test_update_session_blank_clears_existing_value(base_config: Path) -> None:
+    """Blank session input deletes the key so the None default applies again."""
+    base_config.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/alpha.git\n"
+        "    branch: main\n"
+        "daemon:\n"
+        "  poll_interval_sec: 60\n"
+        "  spend_ceiling_session_percent: 70\n",
+        encoding="utf-8",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/settings/config/spend_ceiling_session_percent",
+            data={"spend_ceiling_session_percent": ""},
+        )
+
+    assert response.status_code == 200
+    body = base_config.read_text(encoding="utf-8")
+    assert "spend_ceiling_session_percent" not in body
+    cfg = load_config(str(base_config))
+    assert cfg.daemon.spend_ceiling_session_percent is None
+
+
+def test_update_weekly_blank_clears_existing_value(base_config: Path) -> None:
+    """Blank weekly input deletes the key so the None default applies again."""
+    base_config.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/alpha.git\n"
+        "    branch: main\n"
+        "daemon:\n"
+        "  poll_interval_sec: 60\n"
+        "  spend_ceiling_weekly_percent: 90\n",
+        encoding="utf-8",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/settings/config/spend_ceiling_weekly_percent",
+            data={"spend_ceiling_weekly_percent": ""},
+        )
+
+    assert response.status_code == 200
+    body = base_config.read_text(encoding="utf-8")
+    assert "spend_ceiling_weekly_percent" not in body
+    cfg = load_config(str(base_config))
+    assert cfg.daemon.spend_ceiling_weekly_percent is None
+
+
+def test_update_blank_session_preserves_weekly(base_config: Path) -> None:
+    """Clearing one optional ceiling must not disturb the other."""
+    base_config.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/alpha.git\n"
+        "    branch: main\n"
+        "daemon:\n"
+        "  poll_interval_sec: 60\n"
+        "  spend_ceiling_session_percent: 70\n"
+        "  spend_ceiling_weekly_percent: 90\n",
+        encoding="utf-8",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/settings/config/spend_ceiling_session_percent",
+            data={"spend_ceiling_session_percent": ""},
+        )
+
+    assert response.status_code == 200
+    cfg = load_config(str(base_config))
+    assert cfg.daemon.spend_ceiling_session_percent is None
+    assert cfg.daemon.spend_ceiling_weekly_percent == 90
+
+
+def test_update_warning_blank_still_returns_400(base_config: Path) -> None:
+    """Warning has a non-None default, so blank must remain a 400 error."""
+    base_config.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/alpha.git\n"
+        "    branch: main\n"
+        "daemon:\n"
+        "  poll_interval_sec: 60\n"
+        "  spend_ceiling_warning_percent: 70\n",
+        encoding="utf-8",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/settings/config/spend_ceiling_warning_percent",
+            data={"spend_ceiling_warning_percent": ""},
+        )
+
+    assert response.status_code == 400
+    cfg = load_config(str(base_config))
+    assert cfg.daemon.spend_ceiling_warning_percent == 70
+
+
+def test_update_blank_session_503_on_disk_error(
+    base_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing ``delete_daemon_fields`` on the blank path surfaces as 503."""
+    from src.web.routes import settings as settings_routes
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(settings_routes, "delete_daemon_fields", boom)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/settings/config/spend_ceiling_session_percent",
+            data={"spend_ceiling_session_percent": ""},
+        )
+
+    assert response.status_code == 503
+    assert "Failed to write config.yml" in response.text
+
+
 def test_reset_rerenders_section_with_default_values(base_config: Path) -> None:
     """The reset endpoint returns the spend-ceiling partial for HTMX swap."""
     with TestClient(app) as client:
