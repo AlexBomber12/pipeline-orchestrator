@@ -198,6 +198,78 @@ def test_audit_writes_on_2xx_success(
     assert "retry_scheduled_at" not in record
 
 
+def test_audit_ignores_response_decode_error_on_2xx(
+    audit_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = httpx.Request("POST", "https://example.test/hook")
+
+    class _Response:
+        status_code = 200
+
+        @property
+        def text(self) -> str:
+            raise httpx.DecodingError("bad encoding", request=request)
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class _Client:
+        def __init__(self, timeout: float) -> None: ...
+        async def __aenter__(self) -> _Client: return self
+        async def __aexit__(self, *args: object) -> None: return None
+        async def post(self, url: str, json: dict[str, Any]) -> _Response:
+            return _Response()
+
+    monkeypatch.setattr(notifications.httpx, "AsyncClient", _Client)
+
+    asyncio.run(
+        notifications._post_json_with_audit(
+            event_type="guardrail_violation",
+            webhook_url="https://example.test/hook",
+            payload={"event": "guardrail_escalation"},
+            timeout_seconds=1,
+        )
+    )
+
+    record = _read_records(audit_dir, "guardrail_violation")[0]
+    assert record["http_status"] == 200
+    assert "decode_error: DecodingError" in record["response_excerpt"]
+
+
+def test_audit_write_runs_off_event_loop(
+    audit_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
+
+    async def fake_to_thread(
+        func: Any, /, *args: Any, **kwargs: Any
+    ) -> Any:
+        calls.append((func, args, kwargs))
+        return func(*args, **kwargs)
+
+    class _Client:
+        def __init__(self, timeout: float) -> None: ...
+        async def __aenter__(self) -> _Client: return self
+        async def __aexit__(self, *args: object) -> None: return None
+        async def post(self, url: str, json: dict[str, Any]) -> httpx.Response:
+            return httpx.Response(200, text="ok", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(notifications.httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(notifications.asyncio, "to_thread", fake_to_thread)
+
+    asyncio.run(
+        notifications._post_json_with_audit(
+            event_type="guardrail_violation",
+            webhook_url="https://example.test/hook",
+            payload={"event": "guardrail_escalation"},
+            timeout_seconds=1,
+        )
+    )
+
+    assert calls[0][0] is notifications.write_webhook_audit
+    assert _read_records(audit_dir, "guardrail_violation")[0]["http_status"] == 200
+
+
 def test_audit_payload_size_matches_httpx_json_encoding(
     audit_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

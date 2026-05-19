@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -37,6 +38,13 @@ def _httpx_json_payload_size_bytes(payload: dict[str, Any]) -> int:
     )
 
 
+def _safe_response_excerpt(response: httpx.Response) -> str:
+    try:
+        return getattr(response, "text", "")[:200]
+    except httpx.DecodingError as exc:
+        return f"decode_error: {type(exc).__name__}: {str(exc)[:100]}"
+
+
 async def _post_json_with_audit(
     *,
     event_type: str,
@@ -54,15 +62,20 @@ async def _post_json_with_audit(
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             response = await client.post(webhook_url, json=payload)
         status = getattr(response, "status_code", None)
-        response_excerpt = str(getattr(response, "text", ""))[:200]
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError:
+            response_excerpt = _safe_response_excerpt(response)
+            raise
+        response_excerpt = _safe_response_excerpt(response)
         return response
     except httpx.RequestError as exc:
         response_excerpt = f"request_error: {type(exc).__name__}: {str(exc)[:100]}"
         raise
     finally:
         elapsed_ms = (time.monotonic() - start) * 1000
-        write_webhook_audit(
+        await asyncio.to_thread(
+            write_webhook_audit,
             event_type=event_type,
             webhook_url=webhook_url,
             payload_size_bytes=payload_size_bytes,
