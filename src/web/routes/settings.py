@@ -10,6 +10,7 @@ that respond to ``/settings/*``, ``/partials/settings/*``, or
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from fastapi import APIRouter, Form, Request
@@ -49,6 +50,33 @@ OPTIONAL_SPEND_CEILING_FIELDS = frozenset(
         "spend_ceiling_weekly_percent",
     }
 )
+
+# PR-344b: guardrail webhook fields exposed via the Settings UI. The
+# four names mirror ``DaemonConfig`` so HTMX inputs round-trip through
+# ``write_daemon_field`` without a remap layer. The two URL fields are
+# ``str | None`` in the model and follow the same blank-clears-the-key
+# convention as the optional spend ceilings.
+NOTIFICATION_WEBHOOK_FIELDS = (
+    "guardrail_notification_webhook_url",
+    "guardrail_notification_min_tier",
+    "guardrail_notification_timeout_seconds",
+    "dashboard_base_url",
+)
+OPTIONAL_NOTIFICATION_WEBHOOK_FIELDS = frozenset(
+    {
+        "guardrail_notification_webhook_url",
+        "dashboard_base_url",
+    }
+)
+
+EDITABLE_CONFIG_FIELDS = frozenset(
+    SPEND_CEILING_FIELDS + NOTIFICATION_WEBHOOK_FIELDS
+)
+OPTIONAL_EDITABLE_CONFIG_FIELDS = (
+    OPTIONAL_SPEND_CEILING_FIELDS | OPTIONAL_NOTIFICATION_WEBHOOK_FIELDS
+)
+
+_HTTP_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 _BOOL_TRUE = {"true", "1", "yes", "on"}
 _BOOL_FALSE = {"false", "0", "no", "off"}
@@ -571,28 +599,71 @@ def _coerce_percent(value: str, field: str) -> int:
     return parsed
 
 
+def _coerce_http_url(value: str, field: str) -> str:
+    """Validate an http(s) URL string for a webhook/dashboard config field.
+
+    Strips surrounding whitespace and requires an ``http://`` or
+    ``https://`` prefix. The error message never echoes the submitted
+    value back: a paste-and-typo on a Slack webhook URL would otherwise
+    end up in the operator's browser tab and HTTP access logs as a
+    plaintext secret. The blank-string case is handled by the caller via
+    ``delete_daemon_fields`` so this function rejects any non-prefixed
+    input as a 400.
+    """
+    cleaned = value.strip()
+    if not _HTTP_URL_RE.match(cleaned):
+        raise ValueError(f"{field} must start with http:// or https://")
+    return cleaned
+
+
+def _coerce_config_field(field: str, raw: str) -> Any:
+    """Dispatch ``raw`` to the validator for ``field``.
+
+    All four notification fields and the three spend-ceiling fields run
+    through this helper so the endpoint stays uniform. The dispatch table
+    mirrors the Pydantic constraints declared on ``DaemonConfig`` so a
+    value accepted here loads cleanly on the next inotify reload.
+    """
+    if field in SPEND_CEILING_FIELDS:
+        return _coerce_percent(raw, field)
+    if field in ("guardrail_notification_webhook_url", "dashboard_base_url"):
+        return _coerce_http_url(raw, field)
+    if field == "guardrail_notification_min_tier":
+        # DaemonConfig declares ``ge=1, le=2`` — the consumer in
+        # ``runner.py`` compares ``parsed["tier"] >= min_tier``, so the
+        # value is an int, not a string enum. Operators see "P1"/"P2"
+        # labels in the dropdown; the submitted form value is the int.
+        return _coerce_int(raw, field, min_value=1, max_value=2)
+    if field == "guardrail_notification_timeout_seconds":
+        # Model field is ``float`` with ``ge=1.0, le=30.0``; accept
+        # integers in that range. ruamel.yaml writes the value as-is, and
+        # Pydantic coerces int→float on the next load.
+        return _coerce_int(raw, field, min_value=1, max_value=30)
+    raise ValueError(f"Unhandled field: {field}")
+
+
 @router.post("/settings/config/{field}", response_class=HTMLResponse)
 async def update_config_field(request: Request, field: str) -> HTMLResponse:
     """Update a single allow-listed ``daemon.*`` field via ruamel round-trip.
 
-    Restricted to ``spend_ceiling_*`` fields. Other ``daemon.*`` mutations
+    Allow-list covers ``spend_ceiling_*`` (PR-344a) and the four
+    guardrail-notification fields (PR-344b). Other ``daemon.*`` mutations
     go through ``PUT /settings/daemon``, which validates the full
     ``DaemonConfig`` via Pydantic but loses comments on save. This endpoint
     trades the broader validation surface for comment preservation, which
     matters for fields operators read alongside the YAML body.
     """
-    if field not in SPEND_CEILING_FIELDS:
+    if field not in EDITABLE_CONFIG_FIELDS:
         return HTMLResponse(
             "Field not editable via this endpoint", status_code=400
         )
     form = await request.form()
     raw = form.get(field)
     is_blank = isinstance(raw, str) and raw.strip() == ""
-    # Operators clear the Session/Weekly inputs to disable just that ceiling;
-    # HTMX posts the blank value, so treat it as a deletion request rather
-    # than a 400 (which would leave the previous value in config.yml with no
-    # way to remove it short of a full reset).
-    if is_blank and field in OPTIONAL_SPEND_CEILING_FIELDS:
+    # Operators clear optional inputs (session/weekly ceilings; webhook URL
+    # or dashboard URL) to disable that signal; HTMX posts the blank value,
+    # so treat it as a deletion request rather than a 400.
+    if is_blank and field in OPTIONAL_EDITABLE_CONFIG_FIELDS:
         try:
             delete_daemon_fields(_app.CONFIG_PATH, [field])
         except OSError as exc:
@@ -603,7 +674,7 @@ async def update_config_field(request: Request, field: str) -> HTMLResponse:
         if raw is None or not isinstance(raw, str) or raw.strip() == "":
             return HTMLResponse(f"{field} is required", status_code=400)
         try:
-            value = _coerce_percent(raw, field)
+            value = _coerce_config_field(field, raw)
         except ValueError as exc:
             return HTMLResponse(str(exc), status_code=400)
 

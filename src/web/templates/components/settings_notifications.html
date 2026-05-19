@@ -1,0 +1,56 @@
+<section class="space-y-4" id="settings-notifications">
+    <h2 class="text-xl font-semibold tracking-tight mb-4">Notifications</h2>
+    <div class="rounded-lg border border-white/5 bg-surface-2 p-5 space-y-4">
+        <p class="text-xs text-gray-400">
+            Guardrail-violation events POSTed to this URL. Empty URL disables notifications.
+        </p>
+
+        <label class="flex flex-col gap-1 text-sm">
+            <span class="text-gray-400">Webhook URL</span>
+            <input type="url"
+                   name="guardrail_notification_webhook_url"
+                   value="{{ daemon.guardrail_notification_webhook_url or '' }}"
+                   hx-post="/settings/config/guardrail_notification_webhook_url"
+                   hx-trigger="change"
+                   hx-swap="none"
+                   placeholder="https://hooks.slack.com/services/..."
+                   class="primary-interactive w-full bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
+        </label>
+
+        <label class="flex flex-col gap-1 text-sm">
+            <span class="text-gray-400">Minimum severity tier</span>
+            <select name="guardrail_notification_min_tier"
+                    hx-post="/settings/config/guardrail_notification_min_tier"
+                    hx-trigger="change"
+                    hx-swap="none"
+                    class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
+                {% for tier in [1, 2] %}
+                <option value="{{ tier }}" {% if daemon.guardrail_notification_min_tier == tier %}selected{% endif %}>P{{ tier }}</option>
+                {% endfor %}
+            </select>
+        </label>
+
+        <label class="flex flex-col gap-1 text-sm">
+            <span class="text-gray-400">HTTP timeout (sec)</span>
+            <input type="number" min="1" max="30" step="1"
+                   name="guardrail_notification_timeout_seconds"
+                   value="{{ daemon.guardrail_notification_timeout_seconds|int }}"
+                   hx-post="/settings/config/guardrail_notification_timeout_seconds"
+                   hx-trigger="change"
+                   hx-swap="none"
+                   class="primary-interactive w-24 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
+        </label>
+
+        <label class="flex flex-col gap-1 text-sm">
+            <span class="text-gray-400">Dashboard base URL</span>
+            <input type="url"
+                   name="dashboard_base_url"
+                   value="{{ daemon.dashboard_base_url or '' }}"
+                   hx-post="/settings/config/dashboard_base_url"
+                   hx-trigger="change"
+                   hx-swap="none"
+                   placeholder="https://orchestrator.alexbomber.com"
+                   class="primary-interactive w-full bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
+        </label>
+    </div>
+</section>
