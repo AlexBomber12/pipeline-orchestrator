@@ -15,6 +15,7 @@ Routing is split across submodules:
   status, coder dropdown.
 * ``src.web.routes.uploads`` — task file upload route.
 * ``src.web.routes.onboarding`` — AGENTS.md reconciliation preview/apply.
+* ``src.web.routes.operator_rejects`` — operator-reject history.
 
 Re-exports of helpers moved out are resolved lazily via :func:`__getattr__`
 so existing tests that reach for ``web_app.X`` continue to work after the
@@ -132,6 +133,7 @@ from src.web.routes import daemon_control as _daemon_control_routes  # noqa: E40
 from src.web.routes import dashboard as _dashboard_routes  # noqa: E402
 from src.web.routes import diagnostic as _diagnostic_routes  # noqa: E402
 from src.web.routes import onboarding as _onboarding_routes  # noqa: E402
+from src.web.routes import operator_rejects as _operator_rejects_routes  # noqa: E402
 from src.web.routes import repo_control as _repo_control_routes  # noqa: E402
 from src.web.routes import settings as _settings_routes  # noqa: E402
 from src.web.routes import uploads as _uploads_routes  # noqa: E402
@@ -388,3 +390,4 @@ app.include_router(_uploads_routes.router)
 app.include_router(_onboarding_routes.router)
 app.include_router(_daemon_control_routes.router)
 app.include_router(_diagnostic_routes.router)
+app.include_router(_operator_rejects_routes.router)
