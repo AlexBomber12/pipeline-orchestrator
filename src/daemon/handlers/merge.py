@@ -55,6 +55,14 @@ class MergeMixin:
             BranchContext.from_runner(self).log_summary(),
         )
 
+        # PR-352: handle_watch dispatches here while state.state is still
+        # WATCH. The phase publishes below must write state=MERGE for the
+        # dashboard's ``repo.state.value == 'MERGE'`` gate to render the
+        # subtitle, and for the RepoState.__setattr__ hook to clear
+        # ``merge_phase`` on the terminal MERGE→IDLE/WATCH/ERROR
+        # transitions later in this method.
+        self.state.state = PipelineState.MERGE
+
         number = self.state.current_pr.number
         pr_branch = self.state.current_pr.branch
         base = self.repo_config.branch
@@ -115,6 +123,14 @@ class MergeMixin:
                                 "merge", "--abort",
                                 check=False,
                             )
+                            # PR-352: state was flipped to MERGE on entry
+                            # so phase publishes render correctly. The
+                            # proactive rate-limit abort path is a clean
+                            # retry — drop back to WATCH so the next cycle
+                            # re-enters the merge gate, and let the
+                            # MERGE→WATCH transition clear ``merge_phase``
+                            # via the RepoState ``__setattr__`` hook.
+                            self.state.state = PipelineState.WATCH
                             return
                         self.log_event(
                             "[MERGE] Merge conflict with main, resolving..."

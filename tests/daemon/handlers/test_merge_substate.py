@@ -58,6 +58,20 @@ def _capture_phases(
     )
 
 
+def _capture_state_and_phase(
+    runner: PipelineRunner,
+    sink: list[tuple[PipelineState, str | None]],
+) -> None:
+    """Stub ``publish_state`` to record ``(state, merge_phase)`` per call."""
+
+    async def fake_publish(self) -> None:  # type: ignore[no-untyped-def]
+        sink.append((self.state.state, self.state.merge_phase))
+
+    runner.publish_state = fake_publish.__get__(  # type: ignore[assignment]
+        runner, PipelineRunner
+    )
+
+
 def _stub_successful_merge(monkeypatch: pytest.MonkeyPatch) -> None:
     """Wire fakes so ``handle_merge`` walks the happy path top to bottom."""
 
@@ -309,3 +323,81 @@ def test_merge_phase_default_none() -> None:
     )
 
     assert state.merge_phase is None
+
+
+def test_handle_merge_entered_from_watch_publishes_state_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``handle_watch`` enters ``handle_merge`` while state.state is WATCH.
+
+    Without the state flip to MERGE at the top of ``handle_merge``, every
+    phase publish would write ``merge_phase`` alongside ``state=WATCH``,
+    which is the exact gate the dashboard subtitle checks. Pin that every
+    publish carrying a non-None ``merge_phase`` is paired with
+    ``state=MERGE`` so the dashboard renders, and that the terminal
+    transition to IDLE clears the phase via the
+    ``RepoState.__setattr__`` hook.
+    """
+    _stub_successful_merge(monkeypatch)
+    runner = _seed_runner_in_merge()
+    # Simulate the realistic auto-merge entry point: handle_watch reaches
+    # the merge branch with state.state still WATCH.
+    runner.state.state = PipelineState.WATCH
+    observed: list[tuple[PipelineState, str | None]] = []
+    _capture_state_and_phase(runner, observed)
+
+    asyncio.run(runner.handle_merge())
+
+    phase_publishes = [(s, p) for s, p in observed if p is not None]
+    assert phase_publishes, "expected at least one phase publish"
+    for s, _p in phase_publishes:
+        assert s == PipelineState.MERGE
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.merge_phase is None
+
+
+def test_handle_merge_from_watch_clears_phase_on_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Entry from WATCH must still let the MERGE→ERROR hook clear phase."""
+
+    def fake_git(repo_path: str, *args: str, **kwargs: object):
+        if args[:1] == ("merge",) and len(args) > 1 and str(args[1]).startswith(
+            "origin/"
+        ):
+            return h._FakeCompletedProcess(
+                stdout="Already up to date.\n", returncode=0
+            )
+        if args[:2] == ("rev-parse", "HEAD"):
+            return h._FakeCompletedProcess(stdout="deadbeef\n", returncode=0)
+        return h._FakeCompletedProcess(stdout="", returncode=0)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(merge_module, "retry_transient", lambda op, **_: op())
+    monkeypatch.setattr(
+        "src.github.cache._invalidate_etag_cache", lambda prefix: None
+    )
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: "")
+
+    def boom(repo: str, num: int) -> None:
+        raise RuntimeError("merge_pr failed mid-flight")
+
+    monkeypatch.setattr("src.github.prs.merge_pr", boom)
+    monkeypatch.setattr(
+        PipelineRunner,
+        "_mark_task_done_in_snapshot",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        runner_module.subprocess,
+        "run",
+        lambda *a, **kw: h._FakeCompletedProcess(stdout="", returncode=0),
+    )
+
+    runner = _seed_runner_in_merge()
+    runner.state.state = PipelineState.WATCH
+
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.merge_phase is None
