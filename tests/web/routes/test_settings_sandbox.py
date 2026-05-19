@@ -111,7 +111,7 @@ def base_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def test_settings_renders_sandbox_section(base_config: Path) -> None:
-    """All four sandbox/backup inputs render on the settings page."""
+    """All sandbox/backup inputs render on the settings page."""
     with TestClient(app) as client:
         response = client.get("/settings")
 
@@ -119,6 +119,7 @@ def test_settings_renders_sandbox_section(base_config: Path) -> None:
     body = response.text
     assert 'name="coder_filesystem_isolation"' in body
     assert 'name="git_bundle_backup_enabled"' in body
+    assert 'name="git_bundle_backup_dir"' in body
     assert 'name="git_bundle_backup_daily_retention"' in body
     assert 'name="main_commit_audit_interval_idle_cycles"' in body
     assert "Sandbox and backup" in body
@@ -190,6 +191,17 @@ def test_toggle_sandbox_unchecked_defaults_to_false(base_config: Path) -> None:
 
 
 def test_toggle_backup_enabled_persists(base_config: Path) -> None:
+    """Enabling backups requires a directory; set it first, then toggle on."""
+    base_config.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/alpha.git\n"
+        "    branch: main\n"
+        "daemon:\n"
+        "  poll_interval_sec: 60\n"
+        "  git_bundle_backup_dir: /data/backups\n",
+        encoding="utf-8",
+    )
+
     with TestClient(app) as client:
         response = client.post(
             "/settings/config/git_bundle_backup_enabled",
@@ -199,6 +211,133 @@ def test_toggle_backup_enabled_persists(base_config: Path) -> None:
     assert response.status_code == 200
     cfg = load_config(str(base_config))
     assert cfg.daemon.git_bundle_backup_enabled is True
+
+
+def test_enable_backup_rejected_when_dir_missing(base_config: Path) -> None:
+    """Enabling backups without a configured directory must return 400.
+
+    The IDLE scheduler skips bundles when either flag or directory is
+    unset, so accepting the toggle alone would advertise "backups on"
+    while no bundle is ever created. Reject the request and leave the
+    flag untouched.
+    """
+    with TestClient(app) as client:
+        response = client.post(
+            "/settings/config/git_bundle_backup_enabled",
+            data={"git_bundle_backup_enabled": "true"},
+        )
+
+    assert response.status_code == 400
+    assert "git_bundle_backup_dir" in response.text
+    cfg = load_config(str(base_config))
+    assert cfg.daemon.git_bundle_backup_enabled is False
+    assert cfg.daemon.git_bundle_backup_dir is None
+
+
+def test_disable_backup_allowed_when_dir_missing(base_config: Path) -> None:
+    """The dir requirement only gates enable; disabling must always work."""
+    base_config.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/alpha.git\n"
+        "    branch: main\n"
+        "daemon:\n"
+        "  poll_interval_sec: 60\n"
+        "  git_bundle_backup_enabled: true\n",
+        encoding="utf-8",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/settings/config/git_bundle_backup_enabled",
+            data={"git_bundle_backup_enabled": "false"},
+        )
+
+    assert response.status_code == 200
+    cfg = load_config(str(base_config))
+    assert cfg.daemon.git_bundle_backup_enabled is False
+
+
+def test_backup_dir_persists_and_rerenders_section(base_config: Path) -> None:
+    """Setting the directory writes the key and returns the refreshed section."""
+    with TestClient(app) as client:
+        response = client.post(
+            "/settings/config/git_bundle_backup_dir",
+            data={"git_bundle_backup_dir": "/data/backups"},
+        )
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'id="settings-sandbox-backup"' in body
+    # With the directory configured, the warning badge and the
+    # checkbox's disabled attribute should both be gone.
+    assert "backup directory required" not in body
+    assert 'name="git_bundle_backup_enabled"' in body
+    cfg = load_config(str(base_config))
+    assert cfg.daemon.git_bundle_backup_dir == "/data/backups"
+
+
+def test_backup_dir_blank_clears_key_and_disables_toggle(
+    base_config: Path,
+) -> None:
+    """Blank submission removes the key so Pydantic falls back to None."""
+    base_config.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/alpha.git\n"
+        "    branch: main\n"
+        "daemon:\n"
+        "  poll_interval_sec: 60\n"
+        "  git_bundle_backup_dir: /data/backups\n",
+        encoding="utf-8",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/settings/config/git_bundle_backup_dir",
+            data={"git_bundle_backup_dir": ""},
+        )
+
+    assert response.status_code == 200
+    body = response.text
+    assert "backup directory required" in body
+    assert "disabled" in body
+    cfg = load_config(str(base_config))
+    assert cfg.daemon.git_bundle_backup_dir is None
+
+
+def test_backup_dir_rejects_relative_path(base_config: Path) -> None:
+    """Relative paths are rejected so the daemon never resolves against cwd."""
+    with TestClient(app) as client:
+        response = client.post(
+            "/settings/config/git_bundle_backup_dir",
+            data={"git_bundle_backup_dir": "backups"},
+        )
+
+    assert response.status_code == 400
+    assert "absolute path" in response.text
+    cfg = load_config(str(base_config))
+    assert cfg.daemon.git_bundle_backup_dir is None
+
+
+def test_backup_dir_rejects_path_with_newline(base_config: Path) -> None:
+    """Newlines/NUL bytes cannot appear in a filesystem path."""
+    with TestClient(app) as client:
+        response = client.post(
+            "/settings/config/git_bundle_backup_dir",
+            data={"git_bundle_backup_dir": "/data/backups\nrogue"},
+        )
+
+    assert response.status_code == 400
+    cfg = load_config(str(base_config))
+    assert cfg.daemon.git_bundle_backup_dir is None
+
+
+def test_settings_warns_when_backup_dir_unset(base_config: Path) -> None:
+    """Page render shows the warning badge by default so operators see it."""
+    with TestClient(app) as client:
+        response = client.get("/settings")
+
+    assert response.status_code == 200
+    assert "backup directory required" in response.text
 
 
 def test_backup_retention_validates_range(base_config: Path) -> None:

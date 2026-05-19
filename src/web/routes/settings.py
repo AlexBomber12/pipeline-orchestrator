@@ -75,12 +75,21 @@ OPTIONAL_NOTIFICATION_WEBHOOK_FIELDS = frozenset(
 # exists in ``DaemonConfig``; ``git_bundle_backup_daily_retention`` is
 # the actual knob (and the one a Pydantic reload will honor), so the UI
 # binds to that name with the spec's 1-365 day range applied here.
+# ``git_bundle_backup_dir`` is required by the IDLE scheduler alongside
+# the enabled flag (see ``_run_git_bundle_backup_if_due``: bundles are
+# skipped unless both are set), so the UI exposes the directory too —
+# otherwise a default install can flip the toggle on with no effect.
 SANDBOX_BACKUP_FIELDS = (
     "coder_filesystem_isolation",
     "git_bundle_backup_enabled",
+    "git_bundle_backup_dir",
     "git_bundle_backup_daily_retention",
     "main_commit_audit_interval_idle_cycles",
 )
+# ``git_bundle_backup_dir`` is ``str | None`` in ``DaemonConfig``; a
+# blank input clears the key so Pydantic reloads None and the scheduler
+# treats backups as unconfigured.
+OPTIONAL_SANDBOX_BACKUP_FIELDS = frozenset({"git_bundle_backup_dir"})
 # HTML checkboxes omit the field entirely when unchecked. The endpoint
 # resolves an absent value to ``False`` for these fields instead of the
 # default "field is required" 400, otherwise the UI could never toggle a
@@ -96,7 +105,9 @@ EDITABLE_CONFIG_FIELDS = frozenset(
     SPEND_CEILING_FIELDS + NOTIFICATION_WEBHOOK_FIELDS + SANDBOX_BACKUP_FIELDS
 )
 OPTIONAL_EDITABLE_CONFIG_FIELDS = (
-    OPTIONAL_SPEND_CEILING_FIELDS | OPTIONAL_NOTIFICATION_WEBHOOK_FIELDS
+    OPTIONAL_SPEND_CEILING_FIELDS
+    | OPTIONAL_NOTIFICATION_WEBHOOK_FIELDS
+    | OPTIONAL_SANDBOX_BACKUP_FIELDS
 )
 
 _HTTP_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
@@ -644,6 +655,24 @@ def _coerce_percent(value: str, field: str) -> int:
     return parsed
 
 
+def _coerce_absolute_path(value: str, field: str) -> str:
+    """Validate an absolute filesystem path for a directory config field.
+
+    ``git_bundle_backup_dir`` is joined with the repo name and passed to
+    ``Path(...)`` by the backup scheduler; a relative path would resolve
+    against the daemon process cwd, which differs between local runs and
+    the container, and a value containing a NUL byte would crash the
+    open call. Reject both up front so the operator gets a 400 instead
+    of a silent misconfiguration that the scheduler skips at runtime.
+    """
+    cleaned = value.strip()
+    if "\x00" in cleaned or "\n" in cleaned:
+        raise ValueError(f"{field} must not contain newlines or NUL bytes")
+    if not cleaned.startswith("/"):
+        raise ValueError(f"{field} must be an absolute path (start with /)")
+    return cleaned
+
+
 def _coerce_http_url(value: str, field: str) -> str:
     """Validate an http(s) URL string for a webhook/dashboard config field.
 
@@ -686,6 +715,8 @@ def _coerce_config_field(field: str, raw: str) -> Any:
         return _coerce_int(raw, field, min_value=1, max_value=30)
     if field in BOOLEAN_CONFIG_FIELDS:
         return _coerce_bool(raw, field)
+    if field == "git_bundle_backup_dir":
+        return _coerce_absolute_path(raw, field)
     if field == "git_bundle_backup_daily_retention":
         return _coerce_int(raw, field, min_value=1, max_value=365)
     if field == "main_commit_audit_interval_idle_cycles":
@@ -736,6 +767,22 @@ async def update_config_field(request: Request, field: str) -> HTMLResponse:
         except ValueError as exc:
             return HTMLResponse(str(exc), status_code=400)
 
+        # The IDLE scheduler (`_run_git_bundle_backup_if_due`) skips
+        # backups unless both the enabled flag and the directory are
+        # set. Enabling the toggle without a configured directory would
+        # therefore claim "backups are on" while no bundle is ever
+        # created. Reject the write so the operator must set the
+        # directory first.
+        if (
+            field == "git_bundle_backup_enabled"
+            and value is True
+            and not load_config(_app.CONFIG_PATH).daemon.git_bundle_backup_dir
+        ):
+            return HTMLResponse(
+                "git_bundle_backup_dir must be set before enabling backups",
+                status_code=400,
+            )
+
         try:
             write_daemon_field(_app.CONFIG_PATH, field, value)
         except OSError as exc:
@@ -753,12 +800,13 @@ async def update_config_field(request: Request, field: str) -> HTMLResponse:
             event_type="settings",
         )
     # Toggling isolation flips the badge state (disabled ↔ unavailable ↔
-    # active). The other allow-listed fields have no badge, so they keep
-    # the lightweight "Updated" body and the input's existing
-    # ``hx-swap="none"`` discards it. The sandbox section is re-rendered
-    # here as the swap target the checkbox points at, so the operator
-    # sees the new badge without a page reload.
-    if field == "coder_filesystem_isolation":
+    # active). Setting/clearing ``git_bundle_backup_dir`` flips the
+    # "backup directory required" warning and the enabled-toggle's
+    # ``disabled`` attribute, so it shares the same re-render path. The
+    # remaining allow-listed fields have no badge or gating, so they
+    # keep the lightweight "Updated" body and the input's existing
+    # ``hx-swap="none"`` discards it.
+    if field in ("coder_filesystem_isolation", "git_bundle_backup_dir"):
         cfg = load_config(_app.CONFIG_PATH)
         return _app.templates.TemplateResponse(
             request,

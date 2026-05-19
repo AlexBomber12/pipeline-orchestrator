@@ -28,17 +28,36 @@
             <input type="checkbox"
                    name="git_bundle_backup_enabled"
                    {% if daemon.git_bundle_backup_enabled %}checked{% endif %}
+                   {% if not daemon.git_bundle_backup_dir %}disabled{% endif %}
                    hx-post="/settings/config/git_bundle_backup_enabled"
                    hx-trigger="change"
                    hx-swap="none"
                    value="true"
                    class="w-4 h-4">
             <span class="text-sm">Git bundle backups before merge</span>
+            {% if not daemon.git_bundle_backup_dir %}
+            <span class="text-xs px-2 py-0.5 rounded bg-warn/10 text-warn">backup directory required</span>
+            {% endif %}
         </label>
         <p class="text-xs text-gray-400 ml-6">
-            Bundle written to /data/backups/ before each merge_pr call. Defensive against
-            force-push mistakes.
+            Bundle written to the backup directory below before each merge_pr call.
+            Defensive against force-push mistakes. Both the directory and this toggle
+            must be set for bundles to be created.
         </p>
+
+        <label class="flex flex-col gap-1 text-sm">
+            <span class="text-gray-400">Backup directory (absolute path, e.g. /data/backups)</span>
+            <input type="text"
+                   name="git_bundle_backup_dir"
+                   value="{{ daemon.git_bundle_backup_dir or '' }}"
+                   placeholder="/data/backups"
+                   hx-post="/settings/config/git_bundle_backup_dir"
+                   hx-trigger="change"
+                   hx-target="#settings-sandbox-backup"
+                   hx-swap="outerHTML"
+                   class="primary-interactive w-64 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
+            <span class="text-xs text-gray-400">Leave blank to disable backups entirely.</span>
+        </label>
 
         <label class="flex flex-col gap-1 text-sm">
             <span class="text-gray-400">Backup retention (days)</span>
