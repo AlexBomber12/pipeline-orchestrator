@@ -764,6 +764,256 @@ def test_record_crash_cancellation_skips_when_cause_exists(
     assert calls == []
 
 
+def test_record_crash_cancellation_replaces_stale_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Existing cause predates the current dispatch → overwrite with crash.
+
+    When ``safe_delete_cancellation_cause`` failed on a previous retry
+    (or the record's TTL was refreshed by an operator-facing read),
+    a stale cause survives into the next dispatch. ``_dispatch_recovery_
+    branch`` correctly identifies the mid-CODING exit as a crash because
+    the cause predates ``current_run_started_at``, but if this helper
+    bails on cause-present alone, ``list_recent_cancellations`` keeps
+    the old ``created_at`` score and the crash card never enters the
+    7-day dashboard window — hiding the new ``recovery_backup_branch``
+    pointer even though the fallback push succeeded.
+    """
+    runner = _make_runner_with_doing(task_id="PR-042")
+    stale = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "review_timeout", "reason_text": "parked"},
+        created_at="2026-04-01T10:00:00+00:00",
+    )
+
+    async def fake_get_cause(
+        redis: Any, repo_slug: str, task_id: str, *, refresh_ttl: bool = True
+    ) -> CancellationCause:
+        return stale
+
+    async def fake_started_at(
+        redis: Any, repo_slug: str, task_id: str
+    ) -> datetime:
+        return datetime(2026, 5, 19, 12, 0, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(recovery_module, "get_cancellation_cause", fake_get_cause)
+    monkeypatch.setattr(
+        recovery_module, "get_current_run_started_at", fake_started_at
+    )
+
+    captured: list[CancellationCause] = []
+
+    async def fake_safe_record(
+        redis_client: Any,
+        repo_slug: str,
+        task_id: str,
+        cause: CancellationCause,
+        *,
+        log: Any = None,
+    ) -> None:
+        captured.append(cause)
+
+    monkeypatch.setattr(
+        recovery_module, "safe_record_cancellation_cause", fake_safe_record
+    )
+
+    asyncio.run(runner._record_crash_cancellation_if_missing("PR-042"))
+
+    assert len(captured) == 1
+    assert captured[0].payload["subsource"] == "crash"
+
+
+def test_record_crash_cancellation_preserves_fresh_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cause ``created_at`` is at/after ``current_run_started_at`` → skip.
+
+    The cause was recorded during this dispatch (e.g. ``_transition_to_
+    error`` ran for an in-process failure before recovery picked up).
+    The precise pre-crash record stays put; the synth path would only
+    add noise.
+    """
+    runner = _make_runner_with_doing(task_id="PR-042")
+    fresh = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "review_timeout", "reason_text": "parked"},
+        created_at="2026-05-19T12:30:00+00:00",
+    )
+
+    async def fake_get_cause(
+        redis: Any, repo_slug: str, task_id: str, *, refresh_ttl: bool = True
+    ) -> CancellationCause:
+        return fresh
+
+    async def fake_started_at(
+        redis: Any, repo_slug: str, task_id: str
+    ) -> datetime:
+        return datetime(2026, 5, 19, 12, 0, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(recovery_module, "get_cancellation_cause", fake_get_cause)
+    monkeypatch.setattr(
+        recovery_module, "get_current_run_started_at", fake_started_at
+    )
+
+    calls: list[Any] = []
+
+    async def fake_safe_record(*args: Any, **kwargs: Any) -> None:
+        calls.append(args)
+
+    monkeypatch.setattr(
+        recovery_module, "safe_record_cancellation_cause", fake_safe_record
+    )
+
+    asyncio.run(runner._record_crash_cancellation_if_missing("PR-042"))
+
+    assert calls == []
+
+
+def test_record_crash_cancellation_preserves_cause_when_started_at_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Redis read error on ``current_run_started_at`` → keep existing cause.
+
+    Conservative inverse of ``_cause_belongs_to_current_run``: we only
+    overwrite a record we can prove is stale. A transient Redis failure
+    or a missing dispatch marker leaves the existing precise pre-crash
+    record intact rather than risking a clobber on top of a fresh one.
+    """
+    runner = _make_runner_with_doing(task_id="PR-042")
+    existing = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "review_timeout"},
+        created_at="2026-04-01T10:00:00+00:00",
+    )
+
+    async def fake_get_cause(
+        redis: Any, repo_slug: str, task_id: str, *, refresh_ttl: bool = True
+    ) -> CancellationCause:
+        return existing
+
+    async def boom_started_at(
+        redis: Any, repo_slug: str, task_id: str
+    ) -> datetime:
+        raise RuntimeError("redis read failed")
+
+    monkeypatch.setattr(recovery_module, "get_cancellation_cause", fake_get_cause)
+    monkeypatch.setattr(
+        recovery_module, "get_current_run_started_at", boom_started_at
+    )
+
+    calls: list[Any] = []
+
+    async def fake_safe_record(*args: Any, **kwargs: Any) -> None:
+        calls.append(args)
+
+    monkeypatch.setattr(
+        recovery_module, "safe_record_cancellation_cause", fake_safe_record
+    )
+
+    asyncio.run(runner._record_crash_cancellation_if_missing("PR-042"))
+
+    assert calls == []
+
+
+def test_record_crash_cancellation_handles_naive_created_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A naive (tz-less) ``created_at`` is treated as UTC for staleness.
+
+    Older records may have been serialized without timezone info; the
+    helper must still be able to prove staleness against the tz-aware
+    ``current_run_started_at`` rather than crashing on the comparison.
+    """
+    runner = _make_runner_with_doing(task_id="PR-042")
+    stale_naive = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "review_timeout"},
+        created_at="2026-04-01T10:00:00",
+    )
+
+    async def fake_get_cause(
+        redis: Any, repo_slug: str, task_id: str, *, refresh_ttl: bool = True
+    ) -> CancellationCause:
+        return stale_naive
+
+    async def fake_started_at(
+        redis: Any, repo_slug: str, task_id: str
+    ) -> datetime:
+        return datetime(2026, 5, 19, 12, 0, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(recovery_module, "get_cancellation_cause", fake_get_cause)
+    monkeypatch.setattr(
+        recovery_module, "get_current_run_started_at", fake_started_at
+    )
+
+    captured: list[CancellationCause] = []
+
+    async def fake_safe_record(
+        redis_client: Any,
+        repo_slug: str,
+        task_id: str,
+        cause: CancellationCause,
+        *,
+        log: Any = None,
+    ) -> None:
+        captured.append(cause)
+
+    monkeypatch.setattr(
+        recovery_module, "safe_record_cancellation_cause", fake_safe_record
+    )
+
+    asyncio.run(runner._record_crash_cancellation_if_missing("PR-042"))
+
+    assert len(captured) == 1
+    assert captured[0].payload["subsource"] == "crash"
+
+
+def test_record_crash_cancellation_preserves_cause_with_malformed_created_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Corrupt cause timestamp → keep existing, do not synthesize over it.
+
+    A malformed ``created_at`` is suspicious but unverifiable: we cannot
+    prove the record is stale without a parseable timestamp, so the
+    conservative default preserves it. Operators can investigate the
+    corrupt record directly via Redis.
+    """
+    runner = _make_runner_with_doing(task_id="PR-042")
+    corrupt = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "review_timeout"},
+        created_at="not-an-iso-timestamp",
+    )
+
+    async def fake_get_cause(
+        redis: Any, repo_slug: str, task_id: str, *, refresh_ttl: bool = True
+    ) -> CancellationCause:
+        return corrupt
+
+    async def fake_started_at(
+        redis: Any, repo_slug: str, task_id: str
+    ) -> datetime:
+        return datetime(2026, 5, 19, 12, 0, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(recovery_module, "get_cancellation_cause", fake_get_cause)
+    monkeypatch.setattr(
+        recovery_module, "get_current_run_started_at", fake_started_at
+    )
+
+    calls: list[Any] = []
+
+    async def fake_safe_record(*args: Any, **kwargs: Any) -> None:
+        calls.append(args)
+
+    monkeypatch.setattr(
+        recovery_module, "safe_record_cancellation_cause", fake_safe_record
+    )
+
+    asyncio.run(runner._record_crash_cancellation_if_missing("PR-042"))
+
+    assert calls == []
+
+
 def test_record_crash_cancellation_treats_get_failure_as_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

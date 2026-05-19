@@ -901,7 +901,8 @@ class RecoveryMixin:
         return backup_branch
 
     async def _record_crash_cancellation_if_missing(self, task_id: str) -> None:
-        """Write a synthetic ``crash`` ``CancellationCause`` when none exists.
+        """Write a synthetic ``crash`` ``CancellationCause`` when none exists
+        or when the existing record is provably stale.
 
         The canonical mid-CODING daemon exit (SIGKILL, OOM, container
         restart) skips Python teardown, so ``_transition_to_error`` never
@@ -913,13 +914,28 @@ class RecoveryMixin:
         the operator never sees the ``crash-backup/...`` ref. Recording
         a synthetic crash cause here closes that gap.
 
-        Skips when a cause already exists (the daemon wrote one before
-        exit, or an earlier recovery cycle already synthesized one) so
-        we never clobber a more precise pre-crash record with this
-        generic one. Best-effort throughout: read failures default to
-        "no existing cause" so the write still happens, and the write
-        itself uses ``safe_record_cancellation_cause`` so a Redis outage
-        does not abort recovery.
+        Skips when a fresh cause already exists (the daemon wrote one
+        before exit, or an earlier recovery cycle already synthesized
+        one) so we never clobber a more precise pre-crash record with
+        this generic one. Replaces a provably stale cause — one whose
+        ``created_at`` predates the per-task ``current_run_started_at``
+        timestamp — so the index score advances to "now" and
+        ``list_recent_cancellations`` returns the new row inside the
+        7-day dashboard window. Without that replacement, a retry whose
+        ``safe_delete_cancellation_cause`` previously failed (or whose
+        record TTL was refreshed) keeps the old score in the index, the
+        crash card stays buried under the original timestamp, and the
+        new ``recovery_backup_branch`` pointer attached by
+        ``_augment_causes_with_dependents`` never reaches the operator.
+
+        Staleness is proved only when ``current_run_started_at`` exists
+        and ``cause.created_at < started_at``; every other branch
+        (missing started_at, Redis read error, malformed timestamp)
+        keeps the existing record because we cannot prove it predates
+        the current dispatch. Best-effort throughout: read failures
+        default to "no existing cause" so the write still happens, and
+        the write itself uses ``safe_record_cancellation_cause`` so a
+        Redis outage does not abort recovery.
         """
         try:
             existing = await get_cancellation_cause(
@@ -927,7 +943,9 @@ class RecoveryMixin:
             )
         except Exception:
             existing = None
-        if existing is not None:
+        if existing is not None and not await self._cancellation_cause_predates_current_run(
+            existing, task_id
+        ):
             return
         cause = CancellationCause(
             category="ERROR",
@@ -948,6 +966,40 @@ class RecoveryMixin:
             cause,
             log=self.log_event,
         )
+
+    async def _cancellation_cause_predates_current_run(
+        self, cause: CancellationCause, task_id: str
+    ) -> bool:
+        """Return ``True`` only when ``cause`` is provably from a prior run.
+
+        Conservative inverse of ``_cause_belongs_to_current_run``: that
+        helper drives the dispatch branch and degrades unproven cases to
+        the safer crash flow, so ``False`` there covers Redis errors,
+        missing ``current_run_started_at``, and malformed timestamps as
+        well as proven staleness. The synth-cause overwrite path cannot
+        use the same default — overwriting on Redis-read failure or a
+        missing dispatch marker would clobber a precise pre-crash cause
+        any time the marker is unavailable (post-deploy first dispatch,
+        Redis blip during recovery, etc.). Inverting the conservative
+        default here means we only replace the existing record when we
+        have positive evidence ``cause.created_at`` predates the current
+        dispatch.
+        """
+        try:
+            started_at = await get_current_run_started_at(
+                self.redis, self.name, task_id
+            )
+        except Exception:
+            return False
+        if started_at is None:
+            return False
+        try:
+            cause_created_at = datetime.fromisoformat(cause.created_at)
+        except (TypeError, ValueError):
+            return False
+        if cause_created_at.tzinfo is None:
+            cause_created_at = cause_created_at.replace(tzinfo=timezone.utc)
+        return cause_created_at < started_at
 
     async def _persist_pending_backup_branch_write(self) -> None:
         """Flush the PR-351 fallback-branch pointer to Redis.
