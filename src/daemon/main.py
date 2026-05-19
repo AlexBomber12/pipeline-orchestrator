@@ -39,7 +39,11 @@ from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
 from src.config import AppConfig, RepoConfig, load_config, normalize_repo_url
 from src.daemon.cascade_monitor import check_cascade_escalate_state
-from src.daemon.config_watcher import watch_config_file_changes
+from src.daemon.config_watcher import (
+    _resolve_config_path,
+    watch_config_changes,
+    watch_config_file_changes,
+)
 from src.daemon.migrations.escalate_to_error import (
     migrate_escalate_to_error_on_startup,
 )
@@ -603,6 +607,8 @@ async def _wait_or_wake(
     last_run: dict[str, float],
     slug_to_key: dict[str, str],
     runners: dict[str, PipelineRunner] | None = None,
+    *,
+    wake_event: asyncio.Event | None = None,
 ) -> bool:
     """Sleep ``tick`` seconds or wake early on a wake-channel message.
 
@@ -612,23 +618,41 @@ async def _wait_or_wake(
     before returning so the caller cannot rebuild the subscriber faster
     than the configured cadence — otherwise a Redis disconnect would
     drive a tight reconnect loop. Falls back to a pure sleep when
-    ``pubsub`` is None so the daemon never blocks on a missing subscriber.
+    ``pubsub`` is None and no ``wake_event`` was supplied so the daemon
+    never blocks on a missing subscriber.
+
+    ``wake_event``, when provided, is a third wake source alongside the
+    pubsub message and the tick deadline. The main loop passes the
+    inotify reload event here so a ``config.yml`` edit interrupts the
+    sleep immediately — without this, the inotify-driven reload would
+    wait up to the configured ``daemon.poll_interval_sec`` (default 60s)
+    before the next iteration observed the event, defeating the
+    "near-immediate hot reload" the inotify path is meant to provide.
+    The caller is responsible for clearing the event between waits.
     """
-    if pubsub is None:
+    if pubsub is None and wake_event is None:
         await asyncio.sleep(tick)
         return True
 
     sleep_task = asyncio.create_task(asyncio.sleep(tick))
-    wake_task = asyncio.create_task(
-        pubsub.get_message(ignore_subscribe_messages=True, timeout=None)
-    )
+    waiters: set[asyncio.Task[Any]] = {sleep_task}
+    wake_task: asyncio.Task[Any] | None = None
+    if pubsub is not None:
+        wake_task = asyncio.create_task(
+            pubsub.get_message(ignore_subscribe_messages=True, timeout=None)
+        )
+        waiters.add(wake_task)
+    event_task: asyncio.Task[Any] | None = None
+    if wake_event is not None:
+        event_task = asyncio.create_task(wake_event.wait())
+        waiters.add(event_task)
     done, pending = await asyncio.wait(
-        {sleep_task, wake_task},
+        waiters,
         return_when=asyncio.FIRST_COMPLETED,
     )
 
     healthy = True
-    if wake_task in done:
+    if wake_task is not None and wake_task in done:
         wake_exc = wake_task.exception()
         if wake_exc is not None:
             healthy = False
@@ -745,6 +769,22 @@ async def main() -> None:
     _background_tasks.add(watcher_task)
     watcher_task.add_done_callback(_background_tasks.discard)
 
+    # Inotify trigger short-circuits the 5-cycle poll so a config edit
+    # lands within seconds instead of up to ``CONFIG_RELOAD_CYCLES *
+    # poll_interval_sec`` (25s with the default cadence). The poll path
+    # below is kept intact as the fallback when watchfiles is missing or
+    # inotify is not available.
+    inotify_reload_event = asyncio.Event()
+    inotify_config_paths = [_resolve_config_path()]
+    providers_path = Path("config/providers.yml")
+    if providers_path.exists():
+        inotify_config_paths.append(providers_path)
+    inotify_task = asyncio.create_task(
+        watch_config_changes(inotify_config_paths, inotify_reload_event.set)
+    )
+    _background_tasks.add(inotify_task)
+    inotify_task.add_done_callback(_background_tasks.discard)
+
     last_run: dict[str, float] = {}
     last_config_check = time.monotonic()
     pubsub: Any | None = None
@@ -752,7 +792,13 @@ async def main() -> None:
     while True:
         now_mono = time.monotonic()
         reload_interval = CONFIG_RELOAD_CYCLES * config.daemon.poll_interval_sec
-        if now_mono - last_config_check >= reload_interval:
+        inotify_triggered = inotify_reload_event.is_set()
+        if (
+            now_mono - last_config_check >= reload_interval
+            or inotify_triggered
+        ):
+            if inotify_triggered:
+                inotify_reload_event.clear()
             last_config_check = now_mono
             try:
                 new_config = load_config()
@@ -877,7 +923,12 @@ async def main() -> None:
 
         try:
             healthy = await _wait_or_wake(
-                pubsub, max(tick, 1), last_run, slug_to_key, runners
+                pubsub,
+                max(tick, 1),
+                last_run,
+                slug_to_key,
+                runners,
+                wake_event=inotify_reload_event,
             )
         finally:
             # Wait_or_wake yields to the event loop, giving any newly
