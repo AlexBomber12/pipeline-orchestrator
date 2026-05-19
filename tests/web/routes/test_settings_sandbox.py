@@ -77,6 +77,23 @@ def _stub_auth_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
 
 
+@pytest.fixture(autouse=True)
+def _stub_bubblewrap_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default the bubblewrap smoke test to False during settings tests.
+
+    ``_sandbox_actual_state`` calls
+    :func:`src.daemon.sandbox.is_bubblewrap_available`, which launches a
+    real ``bwrap`` subprocess to confirm the kernel will let it create a
+    sandbox. CI hosts vary on whether ``bwrap`` is installed and whether
+    user namespaces are permitted, so the default here is to report the
+    runtime as unavailable; individual tests override to True to assert
+    the "active" badge path.
+    """
+    monkeypatch.setattr(
+        settings_routes, "is_bubblewrap_available", lambda: False
+    )
+
+
 @pytest.fixture
 def base_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Minimal config.yml with a ``daemon:`` block and one repo."""
@@ -248,10 +265,18 @@ def test_audit_interval_accepts_valid(base_config: Path) -> None:
     )
 
 
-def test_sandbox_badge_unavailable_when_bwrap_missing(
-    base_config: Path, monkeypatch: pytest.MonkeyPatch
+def test_sandbox_badge_unavailable_when_bwrap_smoke_test_fails(
+    base_config: Path,
 ) -> None:
-    """Badge says "bwrap unavailable" when isolation is on but the binary missing."""
+    """Badge says "bwrap unavailable" when the runtime probe fails.
+
+    The autouse fixture already stubs ``is_bubblewrap_available`` to
+    return ``False``, mirroring the dispatch-path behaviour on a host
+    where ``bwrap`` is on ``PATH`` but kernel namespaces/seccomp block
+    the smoke test. With isolation toggled on, the badge must flag this
+    as unavailable so the operator sees that coders will fall through
+    to the unsandboxed path.
+    """
     base_config.write_text(
         "repositories:\n"
         "  - url: https://github.com/example/alpha.git\n"
@@ -261,8 +286,6 @@ def test_sandbox_badge_unavailable_when_bwrap_missing(
         "  coder_filesystem_isolation: true\n",
         encoding="utf-8",
     )
-
-    monkeypatch.setattr(settings_routes.shutil, "which", lambda _name: None)
 
     with TestClient(app) as client:
         response = client.get("/settings")
@@ -271,9 +294,10 @@ def test_sandbox_badge_unavailable_when_bwrap_missing(
     assert "bwrap unavailable" in response.text
 
 
-def test_sandbox_badge_active_when_enabled_and_bwrap_present(
+def test_sandbox_badge_active_when_runtime_probe_passes(
     base_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Badge says "active" when ``is_bubblewrap_available`` reports True."""
     base_config.write_text(
         "repositories:\n"
         "  - url: https://github.com/example/alpha.git\n"
@@ -284,7 +308,9 @@ def test_sandbox_badge_active_when_enabled_and_bwrap_present(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(settings_routes.shutil, "which", lambda _name: "/usr/bin/bwrap")
+    monkeypatch.setattr(
+        settings_routes, "is_bubblewrap_available", lambda: True
+    )
 
     with TestClient(app) as client:
         response = client.get("/settings")
@@ -296,16 +322,94 @@ def test_sandbox_badge_active_when_enabled_and_bwrap_present(
 
 
 def test_sandbox_badge_omitted_when_isolation_disabled(
-    base_config: Path, monkeypatch: pytest.MonkeyPatch
+    base_config: Path,
 ) -> None:
     """When the toggle is off, neither badge variant should render."""
-    monkeypatch.setattr(settings_routes.shutil, "which", lambda _name: None)
-
     with TestClient(app) as client:
         response = client.get("/settings")
 
     assert response.status_code == 200
     body = response.text
+    assert "bwrap unavailable" not in body
+    assert ">active<" not in body
+
+
+def test_toggle_sandbox_response_re_renders_badge_unavailable(
+    base_config: Path,
+) -> None:
+    """Toggling isolation on with bwrap unavailable returns a refreshed badge.
+
+    Without the re-render, the input's ``hx-swap`` would discard the
+    response and the badge rendered at page load would remain. The
+    endpoint must hand back the section markup so HTMX can swap it in
+    and the operator sees that enabling isolation did not actually
+    activate sandboxing on this host.
+    """
+    with TestClient(app) as client:
+        response = client.post(
+            "/settings/config/coder_filesystem_isolation",
+            data={"coder_filesystem_isolation": "true"},
+        )
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'id="settings-sandbox-backup"' in body
+    assert 'name="coder_filesystem_isolation"' in body
+    assert "bwrap unavailable" in body
+    assert ">active<" not in body
+
+
+def test_toggle_sandbox_response_re_renders_badge_active(
+    base_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Toggling isolation on with bwrap available returns the active badge."""
+    monkeypatch.setattr(
+        settings_routes, "is_bubblewrap_available", lambda: True
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/settings/config/coder_filesystem_isolation",
+            data={"coder_filesystem_isolation": "true"},
+        )
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'id="settings-sandbox-backup"' in body
+    assert ">active<" in body
+    assert "bwrap unavailable" not in body
+
+
+def test_toggle_sandbox_off_response_drops_badge(
+    base_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Disabling isolation must produce a section with no badge.
+
+    When isolation flips to off, the badge should vanish even if the
+    page was rendered with an "active" badge a moment before.
+    """
+    base_config.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/alpha.git\n"
+        "    branch: main\n"
+        "daemon:\n"
+        "  poll_interval_sec: 60\n"
+        "  coder_filesystem_isolation: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        settings_routes, "is_bubblewrap_available", lambda: True
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/settings/config/coder_filesystem_isolation",
+            data={"coder_filesystem_isolation": "false"},
+        )
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'id="settings-sandbox-backup"' in body
     assert "bwrap unavailable" not in body
     assert ">active<" not in body
 

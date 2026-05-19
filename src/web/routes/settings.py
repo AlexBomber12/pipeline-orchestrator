@@ -11,7 +11,6 @@ that respond to ``/settings/*``, ``/partials/settings/*``, or
 from __future__ import annotations
 
 import re
-import shutil
 from typing import Any
 
 from fastapi import APIRouter, Form, Request
@@ -24,6 +23,7 @@ from src.config import (
     DaemonConfig,
     load_config,
 )
+from src.daemon.sandbox import is_bubblewrap_available
 from src.utils import repo_slug_from_url
 from src.web.services.auth_probe import (
     _collect_auth_status,
@@ -118,14 +118,19 @@ def _sandbox_actual_state(daemon: DaemonConfig) -> str:
     """Return the runtime sandbox state for the Settings badge.
 
     ``disabled`` when isolation is toggled off, ``unavailable`` when
-    isolation is on but the ``bwrap`` binary is missing from PATH (the
-    daemon will refuse to start a coder in that state), and ``active``
-    otherwise. Template suppresses the badge entirely when this returns
+    isolation is on but ``bwrap`` cannot actually create a sandbox on
+    this host (binary missing from PATH, user namespaces disabled,
+    seccomp profile blocking the smoke test, etc.), and ``active``
+    otherwise. The availability probe is the same
+    :func:`src.daemon.sandbox.is_bubblewrap_available` smoke test the
+    coder dispatch path runs before wrapping a command, so the badge
+    cannot say "active" while coders silently launch outside the
+    sandbox. Template suppresses the badge entirely when this returns
     ``disabled`` so the checkbox label stays unornamented.
     """
     if not daemon.coder_filesystem_isolation:
         return "disabled"
-    if shutil.which("bwrap") is None:
+    if not is_bubblewrap_available():
         return "unavailable"
     return "active"
 
@@ -746,6 +751,22 @@ async def update_config_field(request: Request, field: str) -> HTMLResponse:
             redis_client=redis_client,
             affected_repo_names=repo_names,
             event_type="settings",
+        )
+    # Toggling isolation flips the badge state (disabled ↔ unavailable ↔
+    # active). The other allow-listed fields have no badge, so they keep
+    # the lightweight "Updated" body and the input's existing
+    # ``hx-swap="none"`` discards it. The sandbox section is re-rendered
+    # here as the swap target the checkbox points at, so the operator
+    # sees the new badge without a page reload.
+    if field == "coder_filesystem_isolation":
+        cfg = load_config(_app.CONFIG_PATH)
+        return _app.templates.TemplateResponse(
+            request,
+            "components/settings_sandbox_backup.html",
+            {
+                "daemon": cfg.daemon,
+                "sandbox_actual_state": _sandbox_actual_state(cfg.daemon),
+            },
         )
     return HTMLResponse("Updated", status_code=200)
 

@@ -8,7 +8,8 @@
                    {% if daemon.coder_filesystem_isolation %}checked{% endif %}
                    hx-post="/settings/config/coder_filesystem_isolation"
                    hx-trigger="change"
-                   hx-swap="none"
+                   hx-target="#settings-sandbox-backup"
+                   hx-swap="outerHTML"
                    value="true"
                    class="w-4 h-4">
             <span class="text-sm">Coder filesystem isolation (bubblewrap)</span>
