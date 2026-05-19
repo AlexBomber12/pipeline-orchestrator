@@ -15,6 +15,8 @@ from src.web.routes import repo_control
 class _PanelRedis:
     def __init__(self, store: dict[str, str]) -> None:
         self.store = store
+        self.zsets: dict[str, dict[str, float]] = {}
+        self.ttls: dict[str, int] = {}
 
     async def ping(self) -> bool:
         return True
@@ -30,6 +32,21 @@ class _PanelRedis:
 
     async def zrem(self, key: str, *members: str) -> int:
         return 0
+
+    async def zadd(self, key: str, mapping: dict[str, float]) -> int:
+        bucket = self.zsets.setdefault(key, {})
+        added = 0
+        for member, score in mapping.items():
+            if member not in bucket:
+                added += 1
+            bucket[member] = float(score)
+        return added
+
+    async def expire(self, key: str, seconds: int) -> bool:
+        if key in self.store or key in self.zsets:
+            self.ttls[key] = seconds
+            return True
+        return False
 
 
 def _aioredis(redis_client: _PanelRedis) -> object:

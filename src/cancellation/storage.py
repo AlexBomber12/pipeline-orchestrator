@@ -38,6 +38,11 @@ CATEGORIES = ("ERROR",)
 
 TTL_SECONDS = 30 * 24 * 3600
 
+# PR-345: forensic-window TTL applied when an operator-facing read touches a
+# cancellation record. Reads that signal operator interest push the record
+# out to 90 days; records nobody touches for 30 days still evict naturally.
+READ_REFRESH_TTL_SECONDS = 90 * 24 * 3600
+
 
 @dataclass
 class CancellationCause:
@@ -157,11 +162,46 @@ async def get_cancellation_cause(
     redis_client: Any,
     repo_slug: str,
     task_id: str,
+    *,
+    refresh_ttl: bool = True,
 ) -> CancellationCause | None:
-    raw = await redis_client.get(cause_key(repo_slug, task_id))
+    """Fetch a cancellation cause; on hit, extend the forensic TTL.
+
+    PR-345: operator-facing reads signal interest in a record. When
+    ``refresh_ttl`` is true (the default), the cause key and its index
+    entry are pushed out to ``READ_REFRESH_TTL_SECONDS`` so investigations
+    spanning the 30-day initial window are not cut short by eviction. The
+    index ZSCORE is preserved at the original ``created_at`` so the record
+    keeps its chronological place. Daemon callers in tight scan loops
+    (notably the list helpers in this module) pass ``refresh_ttl=False``
+    to avoid extending TTL on every iteration. A miss never refreshes; we
+    must not write EXPIRE against an absent key.
+    """
+    key = cause_key(repo_slug, task_id)
+    raw = await redis_client.get(key)
     if raw is None:
         return None
-    return CancellationCause.from_redis(raw)
+    cause = CancellationCause.from_redis(raw)
+    if refresh_ttl:
+        await _refresh_forensic_ttl(redis_client, repo_slug, task_id, cause, key)
+    return cause
+
+
+async def _refresh_forensic_ttl(
+    redis_client: Any,
+    repo_slug: str,
+    task_id: str,
+    cause: CancellationCause,
+    key: str,
+) -> None:
+    await redis_client.expire(key, READ_REFRESH_TTL_SECONDS)
+    try:
+        score = datetime.fromisoformat(cause.created_at).timestamp()
+    except (TypeError, ValueError):
+        return
+    idx = index_key(repo_slug)
+    await redis_client.zadd(idx, {task_id: score})
+    await redis_client.expire(idx, READ_REFRESH_TTL_SECONDS)
 
 
 async def delete_cancellation_cause(
@@ -303,7 +343,9 @@ async def list_recent_cancellations(
     for tid in task_ids or []:
         if isinstance(tid, bytes):
             tid = tid.decode("utf-8")
-        cause = await get_cancellation_cause(redis_client, repo_slug, tid)
+        cause = await get_cancellation_cause(
+            redis_client, repo_slug, tid, refresh_ttl=False
+        )
         if cause is None:
             stale.append(tid)
         else:
@@ -350,7 +392,9 @@ async def list_pending_guardrail_decisions(
         for tid in batch:
             if isinstance(tid, bytes):
                 tid = tid.decode("utf-8")
-            cause = await get_cancellation_cause(redis_client, repo_slug, tid)
+            cause = await get_cancellation_cause(
+                redis_client, repo_slug, tid, refresh_ttl=False
+            )
             if cause is None:
                 stale.append(tid)
                 continue

@@ -8,6 +8,7 @@ import pytest
 from src.cancellation import storage
 from src.cancellation.storage import (
     CATEGORIES,
+    READ_REFRESH_TTL_SECONDS,
     TTL_SECONDS,
     CancellationCause,
     cause_key,
@@ -109,6 +110,26 @@ class _FakeRedis:
                 del bucket[member]
                 removed += 1
         return removed
+
+    async def zadd(self, key: str, mapping: dict[str, float]) -> int:
+        bucket = self.zsets.setdefault(key, {})
+        added = 0
+        for member, score in mapping.items():
+            if member not in bucket:
+                added += 1
+            bucket[member] = float(score)
+        return added
+
+    async def zscore(self, key: str, member: str) -> float | None:
+        bucket = self.zsets.get(key, {})
+        score = bucket.get(member)
+        return None if score is None else float(score)
+
+    async def expire(self, key: str, seconds: int) -> bool:
+        if key in self.zsets or key in self.values:
+            self.ttls[key] = seconds
+            return True
+        return False
 
     def _zremrangebyscore(self, key: str, min_score, max_score) -> int:
         bucket = self.zsets.get(key)
@@ -556,3 +577,183 @@ def test_module_reexports_match_storage() -> None:
 def test_from_redis_accepts_bytes_or_str(raw) -> None:
     cause = CancellationCause.from_redis(raw)
     assert cause.category == "CRASH"
+
+
+# PR-345: TTL-refresh-on-read for the 90-day forensic window.
+
+
+def _seed_cause_with_ttl(
+    redis: _FakeRedis,
+    repo: str,
+    pr_id: str,
+    *,
+    created_at: str,
+    ttl: int = TTL_SECONDS,
+) -> CancellationCause:
+    cause = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "fix_iteration_cap"},
+        created_at=created_at,
+        task_id=pr_id,
+        repo_slug=repo,
+    )
+    redis.values[cause_key(repo, pr_id)] = cause.to_redis()
+    redis.ttls[cause_key(repo, pr_id)] = ttl
+    score = datetime.fromisoformat(created_at).timestamp()
+    redis.zsets.setdefault(index_key(repo), {})[pr_id] = score
+    redis.ttls[index_key(repo)] = ttl
+    return cause
+
+
+async def test_read_refreshes_ttl_when_default_true() -> None:
+    redis = _FakeRedis()
+    _seed_cause_with_ttl(
+        redis,
+        "alpha",
+        "PR-300",
+        created_at="2026-05-04T10:00:00+00:00",
+        ttl=TTL_SECONDS,
+    )
+
+    fetched = await get_cancellation_cause(redis, "alpha", "PR-300")
+
+    assert fetched is not None
+    assert redis.ttls[cause_key("alpha", "PR-300")] == READ_REFRESH_TTL_SECONDS
+    assert READ_REFRESH_TTL_SECONDS == 90 * 24 * 3600
+
+
+async def test_read_does_not_refresh_when_refresh_ttl_false() -> None:
+    redis = _FakeRedis()
+    _seed_cause_with_ttl(
+        redis,
+        "alpha",
+        "PR-301",
+        created_at="2026-05-04T10:00:00+00:00",
+        ttl=TTL_SECONDS,
+    )
+
+    fetched = await get_cancellation_cause(
+        redis, "alpha", "PR-301", refresh_ttl=False
+    )
+
+    assert fetched is not None
+    assert redis.ttls[cause_key("alpha", "PR-301")] == TTL_SECONDS
+    assert redis.ttls[index_key("alpha")] == TTL_SECONDS
+
+
+async def test_read_refresh_extends_index_zset_ttl() -> None:
+    redis = _FakeRedis()
+    _seed_cause_with_ttl(
+        redis,
+        "alpha",
+        "PR-302",
+        created_at="2026-05-04T10:00:00+00:00",
+        ttl=TTL_SECONDS,
+    )
+
+    await get_cancellation_cause(redis, "alpha", "PR-302")
+
+    assert redis.ttls[index_key("alpha")] == READ_REFRESH_TTL_SECONDS
+
+
+async def test_read_refresh_does_not_change_canceled_at_score() -> None:
+    redis = _FakeRedis()
+    cause = _seed_cause_with_ttl(
+        redis,
+        "alpha",
+        "PR-303",
+        created_at="2026-05-04T10:00:00+00:00",
+        ttl=TTL_SECONDS,
+    )
+    original_score = datetime.fromisoformat(cause.created_at).timestamp()
+
+    await get_cancellation_cause(redis, "alpha", "PR-303")
+
+    assert await redis.zscore(index_key("alpha"), "PR-303") == original_score
+
+
+async def test_read_returns_none_for_missing_key_without_issuing_expire() -> None:
+    redis = _FakeRedis()
+    expire_calls: list[tuple[str, int]] = []
+    original_expire = redis.expire
+
+    async def _tracking_expire(key: str, seconds: int) -> bool:
+        expire_calls.append((key, seconds))
+        return await original_expire(key, seconds)
+
+    redis.expire = _tracking_expire  # type: ignore[assignment]
+
+    assert await get_cancellation_cause(redis, "alpha", "PR-404") is None
+    assert expire_calls == []
+
+
+async def test_read_handles_concurrent_refresh_safely() -> None:
+    import asyncio
+
+    redis = _FakeRedis()
+    cause = _seed_cause_with_ttl(
+        redis,
+        "alpha",
+        "PR-305",
+        created_at="2026-05-04T10:00:00+00:00",
+        ttl=TTL_SECONDS,
+    )
+    original_score = datetime.fromisoformat(cause.created_at).timestamp()
+
+    results = await asyncio.gather(
+        *(get_cancellation_cause(redis, "alpha", "PR-305") for _ in range(10))
+    )
+
+    assert all(r is not None and r.task_id == "PR-305" for r in results)
+    assert redis.ttls[cause_key("alpha", "PR-305")] == READ_REFRESH_TTL_SECONDS
+    assert redis.ttls[index_key("alpha")] == READ_REFRESH_TTL_SECONDS
+    assert redis.zsets[index_key("alpha")] == {"PR-305": original_score}
+    assert CancellationCause.from_redis(
+        redis.values[cause_key("alpha", "PR-305")]
+    ) == cause
+
+
+async def test_read_refresh_skips_index_when_created_at_unparseable() -> None:
+    redis = _FakeRedis()
+    bad_cause = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "crash"},
+        created_at="not-a-timestamp",
+        task_id="PR-306",
+        repo_slug="alpha",
+    )
+    redis.values[cause_key("alpha", "PR-306")] = bad_cause.to_redis()
+    redis.ttls[cause_key("alpha", "PR-306")] = TTL_SECONDS
+
+    fetched = await get_cancellation_cause(redis, "alpha", "PR-306")
+
+    assert fetched is not None
+    # The cause-key TTL was still bumped (best-effort) but the index is left
+    # alone because the score cannot be reconstructed from a malformed
+    # created_at; a stale score would mis-order the record.
+    assert redis.ttls[cause_key("alpha", "PR-306")] == READ_REFRESH_TTL_SECONDS
+    assert index_key("alpha") not in redis.zsets
+
+
+async def test_list_recent_does_not_refresh_underlying_ttls() -> None:
+    """Internal scan helper passes refresh_ttl=False to avoid amplification."""
+    redis = _FakeRedis()
+    base = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+    await record_cancellation_cause(
+        redis,
+        "alpha",
+        "PR-307",
+        CancellationCause(
+            category="ERROR",
+            payload={"subsource": "crash"},
+            created_at=base.isoformat(),
+        ),
+    )
+    assert redis.ttls[cause_key("alpha", "PR-307")] == TTL_SECONDS
+
+    await list_recent_cancellations(
+        redis, "alpha", base - timedelta(hours=1)
+    )
+
+    assert redis.ttls[cause_key("alpha", "PR-307")] == TTL_SECONDS
+    assert redis.ttls[index_key("alpha")] == TTL_SECONDS

@@ -35,6 +35,7 @@ class _FakeRedis:
     def __init__(self) -> None:
         self.values: dict[str, str] = {}
         self.ttls: dict[str, int] = {}
+        self.zsets: dict[str, dict[str, float]] = {}
         self.get_error: Exception | None = None
         self.ttl_error: Exception | None = None
 
@@ -63,6 +64,21 @@ class _FakeRedis:
         if key not in self.values:
             return -2
         return self.ttls.get(key, -1)
+
+    async def zadd(self, key: str, mapping: dict[str, float]) -> int:
+        bucket = self.zsets.setdefault(key, {})
+        added = 0
+        for member, score in mapping.items():
+            if member not in bucket:
+                added += 1
+            bucket[member] = float(score)
+        return added
+
+    async def expire(self, key: str, seconds: int) -> bool:
+        if key in self.values or key in self.zsets:
+            self.ttls[key] = seconds
+            return True
+        return False
 
     async def aclose(self) -> None:
         return None
@@ -240,7 +256,10 @@ def test_diagnostic_returns_all_fields_for_stuck_task(
     assert body["skip_ai_error_diagnose"] is False
     assert body["_error_diagnose_count"] == 0
     assert body["_error_skip_count"] == 0
-    assert body["ttls"]["cancellation_cause"] == 2_592_000
+    # PR-345: visiting the diagnostic endpoint signals operator interest, so
+    # the cancellation cause TTL is bumped from 30d (initial budget) to 90d
+    # before the TTL section is read back.
+    assert body["ttls"]["cancellation_cause"] == 90 * 24 * 3600
 
 
 def test_diagnostic_returns_nulls_for_missing_keys(
@@ -384,7 +403,35 @@ def test_diagnostic_ttls_section_includes_keys_with_remaining_ttl(
     body = _get("example__alpha", "PR-322").json()
     assert isinstance(body["ttls"]["cancellation_cause"], int)
     assert body["ttls"]["cancellation_cause"] > 0
-    assert body["ttls"]["cancellation_cause"] == 1234
+    # PR-345: the diagnostic endpoint read refreshes the cause TTL to 90 days,
+    # so the 1234s seed is replaced before the TTL section is rendered.
+    assert body["ttls"]["cancellation_cause"] == 90 * 24 * 3600
+
+
+def test_diagnostic_endpoint_triggers_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR-345: visiting the diagnostic panel pushes the cause TTL out to 90d."""
+    from src.cancellation.storage import READ_REFRESH_TTL_SECONDS
+
+    _write_config(tmp_path, monkeypatch)
+    redis_client = _FakeRedis()
+    _stub_aioredis(monkeypatch, redis_client)
+    _record_cause(
+        redis_client,
+        "example__alpha",
+        "PR-345",
+        {"subsource": "fix_iteration_cap"},
+        ttl=2_592_000,
+    )
+    cause_key_str = cause_key("example__alpha", "PR-345")
+    assert redis_client.ttls[cause_key_str] == 2_592_000
+
+    resp = _get("example__alpha", "PR-345")
+
+    assert resp.status_code == 200
+    assert redis_client.ttls[cause_key_str] == READ_REFRESH_TTL_SECONDS
+    assert READ_REFRESH_TTL_SECONDS == 90 * 24 * 3600
 
 
 def test_diagnostic_rejects_invalid_task_id(

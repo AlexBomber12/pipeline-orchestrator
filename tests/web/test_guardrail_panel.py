@@ -176,6 +176,7 @@ class _FakeRedis:
     def __init__(self) -> None:
         self.zsets: dict[str, dict[str, float]] = {}
         self.values: dict[str, str] = {}
+        self.ttls: dict[str, int] = {}
         self._raise_on_zrange = False
 
     async def ping(self) -> bool:
@@ -196,6 +197,21 @@ class _FakeRedis:
     async def zrem(self, key: str, *members: str) -> int:
         zset = self.zsets.get(key, {})
         return sum(1 for m in members if zset.pop(m, None) is not None)
+
+    async def zadd(self, key: str, mapping: dict[str, float]) -> int:
+        bucket = self.zsets.setdefault(key, {})
+        added = 0
+        for member, score in mapping.items():
+            if member not in bucket:
+                added += 1
+            bucket[member] = float(score)
+        return added
+
+    async def expire(self, key: str, seconds: int) -> bool:
+        if key in self.values or key in self.zsets:
+            self.ttls[key] = seconds
+            return True
+        return False
 
     async def aclose(self) -> None:
         return None
