@@ -1,0 +1,50 @@
+<section class="space-y-4" id="settings-spend-ceiling">
+    <h2 class="text-xl font-semibold tracking-tight mb-4">Spending controls</h2>
+    <div class="rounded-lg border border-white/5 bg-surface-2 p-5 space-y-4">
+        <p class="text-xs text-gray-400">
+            Percent of estimated session/weekly budget at which the daemon auto-pauses dispatch.
+            100% halts new dispatch until the budget cycle resets. Leave session/weekly blank to disable the ceiling.
+        </p>
+
+        <label class="flex flex-col gap-1 text-sm">
+            <span class="text-gray-400">Session ceiling (%)</span>
+            <input type="number" min="1" max="100" step="1"
+                   name="spend_ceiling_session_percent"
+                   value="{{ daemon.spend_ceiling_session_percent if daemon.spend_ceiling_session_percent is not none else '' }}"
+                   hx-post="/settings/config/spend_ceiling_session_percent"
+                   hx-trigger="change"
+                   hx-swap="none"
+                   class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
+        </label>
+
+        <label class="flex flex-col gap-1 text-sm">
+            <span class="text-gray-400">Weekly ceiling (%)</span>
+            <input type="number" min="1" max="100" step="1"
+                   name="spend_ceiling_weekly_percent"
+                   value="{{ daemon.spend_ceiling_weekly_percent if daemon.spend_ceiling_weekly_percent is not none else '' }}"
+                   hx-post="/settings/config/spend_ceiling_weekly_percent"
+                   hx-trigger="change"
+                   hx-swap="none"
+                   class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
+        </label>
+
+        <label class="flex flex-col gap-1 text-sm">
+            <span class="text-gray-400">Warning threshold (%)</span>
+            <input type="number" min="1" max="100" step="1"
+                   name="spend_ceiling_warning_percent"
+                   value="{{ daemon.spend_ceiling_warning_percent }}"
+                   hx-post="/settings/config/spend_ceiling_warning_percent"
+                   hx-trigger="change"
+                   hx-swap="none"
+                   class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
+        </label>
+
+        <button type="button"
+                hx-post="/settings/config/reset/spend_ceiling"
+                hx-target="#settings-spend-ceiling"
+                hx-swap="outerHTML"
+                class="text-xs text-gray-400 underline">
+            Reset to defaults
+        </button>
+    </div>
+</section>

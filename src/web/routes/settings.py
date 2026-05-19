@@ -27,9 +27,28 @@ from src.web.services.auth_probe import (
     _collect_auth_status,
     _get_cached_auth_status,
 )
+from src.web.services.config_writer import (
+    delete_daemon_fields,
+    write_daemon_field,
+)
 from src.web.services.repo_state import _find_repo_config_by_name
 
 router = APIRouter()
+
+SPEND_CEILING_FIELDS = (
+    "spend_ceiling_session_percent",
+    "spend_ceiling_weekly_percent",
+    "spend_ceiling_warning_percent",
+)
+# Session/weekly are ``int | None`` in ``DaemonConfig``; blank input disables
+# the ceiling by deleting the key so the Pydantic default (None) applies.
+# Warning has a non-None default and must stay present, so it is excluded.
+OPTIONAL_SPEND_CEILING_FIELDS = frozenset(
+    {
+        "spend_ceiling_session_percent",
+        "spend_ceiling_weekly_percent",
+    }
+)
 
 _BOOL_TRUE = {"true", "1", "yes", "on"}
 _BOOL_FALSE = {"false", "0", "no", "off"}
@@ -538,6 +557,109 @@ async def put_settings_repo(
             event_type="settings",
         )
     return _render_settings_repo_list(request)
+
+
+def _coerce_percent(value: str, field: str) -> int:
+    """Parse a 1-100 integer percent value or raise ``ValueError``.
+
+    Range matches the Pydantic constraint on
+    ``DaemonConfig.spend_ceiling_*_percent`` (``ge=1, le=100``), so a value
+    accepted here is guaranteed to load cleanly on the daemon's next
+    inotify-driven reload.
+    """
+    parsed = _coerce_int(value, field, min_value=1, max_value=100)
+    return parsed
+
+
+@router.post("/settings/config/{field}", response_class=HTMLResponse)
+async def update_config_field(request: Request, field: str) -> HTMLResponse:
+    """Update a single allow-listed ``daemon.*`` field via ruamel round-trip.
+
+    Restricted to ``spend_ceiling_*`` fields. Other ``daemon.*`` mutations
+    go through ``PUT /settings/daemon``, which validates the full
+    ``DaemonConfig`` via Pydantic but loses comments on save. This endpoint
+    trades the broader validation surface for comment preservation, which
+    matters for fields operators read alongside the YAML body.
+    """
+    if field not in SPEND_CEILING_FIELDS:
+        return HTMLResponse(
+            "Field not editable via this endpoint", status_code=400
+        )
+    form = await request.form()
+    raw = form.get(field)
+    is_blank = isinstance(raw, str) and raw.strip() == ""
+    # Operators clear the Session/Weekly inputs to disable just that ceiling;
+    # HTMX posts the blank value, so treat it as a deletion request rather
+    # than a 400 (which would leave the previous value in config.yml with no
+    # way to remove it short of a full reset).
+    if is_blank and field in OPTIONAL_SPEND_CEILING_FIELDS:
+        try:
+            delete_daemon_fields(_app.CONFIG_PATH, [field])
+        except OSError as exc:
+            return HTMLResponse(
+                f"Failed to write config.yml: {exc}", status_code=503
+            )
+    else:
+        if raw is None or not isinstance(raw, str) or raw.strip() == "":
+            return HTMLResponse(f"{field} is required", status_code=400)
+        try:
+            value = _coerce_percent(raw, field)
+        except ValueError as exc:
+            return HTMLResponse(str(exc), status_code=400)
+
+        try:
+            write_daemon_field(_app.CONFIG_PATH, field, value)
+        except OSError as exc:
+            return HTMLResponse(
+                f"Failed to write config.yml: {exc}", status_code=503
+            )
+
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is not None:
+        cfg = load_config(_app.CONFIG_PATH)
+        repo_names = [repo_slug_from_url(repo.url) for repo in cfg.repositories]
+        await _app.apply_config_mutation(
+            redis_client=redis_client,
+            affected_repo_names=repo_names,
+            event_type="settings",
+        )
+    return HTMLResponse("Updated", status_code=200)
+
+
+@router.post(
+    "/settings/config/reset/spend_ceiling", response_class=HTMLResponse
+)
+async def reset_spend_ceiling(request: Request) -> HTMLResponse:
+    """Reset all three ``spend_ceiling_*`` fields to their Pydantic defaults.
+
+    Deletes the keys from ``config.yml`` so Pydantic's defaults
+    (``None`` for session/weekly, ``80`` for warning) take effect on the
+    next ``load_config``. Re-renders the Spending controls section as an
+    HTMX outerHTML swap target.
+    """
+    try:
+        delete_daemon_fields(_app.CONFIG_PATH, list(SPEND_CEILING_FIELDS))
+    except OSError as exc:
+        return HTMLResponse(
+            f"Failed to write config.yml: {exc}", status_code=503
+        )
+
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is not None:
+        cfg = load_config(_app.CONFIG_PATH)
+        repo_names = [repo_slug_from_url(repo.url) for repo in cfg.repositories]
+        await _app.apply_config_mutation(
+            redis_client=redis_client,
+            affected_repo_names=repo_names,
+            event_type="settings",
+        )
+
+    cfg = load_config(_app.CONFIG_PATH)
+    return _app.templates.TemplateResponse(
+        request,
+        "components/settings_spend_ceiling.html",
+        {"daemon": cfg.daemon},
+    )
 
 
 @router.put("/settings/repo/{name}", response_class=HTMLResponse)
