@@ -59,6 +59,13 @@ class MergeMixin:
         pr_branch = self.state.current_pr.branch
         base = self.repo_config.branch
         if not self.state.current_pr.is_cross_repository:
+            # PR-352: dashboard sub-phase visibility during the long MERGE
+            # cycle. The pre-merge sync (fetch + merge base + optional
+            # conflict resolution + push) is the longest phase; surfacing
+            # it lets the operator distinguish "waiting on CI" from
+            # "stuck in post-merge cleanup".
+            self.state.merge_phase = "pre_merge_sync"
+            await self.publish_state()
             try:
                 retry_transient(
                     lambda: git_ops._git(
@@ -237,6 +244,8 @@ class MergeMixin:
 
         merged_diff_stats = self._compute_diff_stats(base)
         self.log_event(f"[MERGE] Merging PR #{number}.")
+        self.state.merge_phase = "ready_to_merge"
+        await self.publish_state()
         try:
             gh_runner.run_gh(
                 ["pr", "ready", str(number)],
@@ -249,6 +258,8 @@ class MergeMixin:
                 self.owner_repo,
                 exc,
             )
+        self.state.merge_phase = "merging"
+        await self.publish_state()
         try:
             gh_prs.merge_pr(self.owner_repo, number)
         except Exception as exc:
@@ -260,6 +271,8 @@ class MergeMixin:
             )
             return
 
+        self.state.merge_phase = "post_merge_cleanup"
+        await self.publish_state()
         current_task = self.state.current_task
         if current_task is not None and current_task.task_file:
             try:
