@@ -25,6 +25,18 @@ _TIER1_CATEGORIES: frozenset[str] = frozenset({
 })
 
 
+def _httpx_json_payload_size_bytes(payload: dict[str, Any]) -> int:
+    """Return byte count for the JSON body HTTPX sends for ``json=``."""
+    return len(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    )
+
+
 async def _post_json_with_audit(
     *,
     event_type: str,
@@ -34,7 +46,7 @@ async def _post_json_with_audit(
     attempt_number: int = 1,
 ) -> httpx.Response:
     """POST JSON to a webhook and audit the delivery attempt."""
-    payload_size_bytes = len(json.dumps(payload).encode("utf-8"))
+    payload_size_bytes = _httpx_json_payload_size_bytes(payload)
     status: int | None = None
     response_excerpt = ""
     start = time.monotonic()

@@ -198,6 +198,40 @@ def test_audit_writes_on_2xx_success(
     assert "retry_scheduled_at" not in record
 
 
+def test_audit_payload_size_matches_httpx_json_encoding(
+    audit_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _Client:
+        def __init__(self, timeout: float) -> None: ...
+        async def __aenter__(self) -> _Client: return self
+        async def __aexit__(self, *args: object) -> None: return None
+        async def post(self, url: str, json: dict[str, Any]) -> httpx.Response:
+            return httpx.Response(200, text="ok", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(notifications.httpx, "AsyncClient", _Client)
+    payload = {"message": "hello café", "items": [1, 2]}
+
+    asyncio.run(
+        notifications._post_json_with_audit(
+            event_type="guardrail_violation",
+            webhook_url="https://example.test/hook",
+            payload=payload,
+            timeout_seconds=1,
+        )
+    )
+
+    expected_size = len(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    )
+    record = _read_records(audit_dir, "guardrail_violation")[0]
+    assert record["payload_size_bytes"] == expected_size
+
+
 def test_audit_concurrent_writes_intact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
