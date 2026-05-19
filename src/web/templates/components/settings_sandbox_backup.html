@@ -1,0 +1,65 @@
+<section class="space-y-4" id="settings-sandbox-backup">
+    <h2 class="text-xl font-semibold tracking-tight mb-4">Sandbox and backup</h2>
+    <div class="rounded-lg border border-white/5 bg-surface-2 p-5 space-y-4">
+
+        <label class="flex items-center gap-2">
+            <input type="checkbox"
+                   name="coder_filesystem_isolation"
+                   {% if daemon.coder_filesystem_isolation %}checked{% endif %}
+                   hx-post="/settings/config/coder_filesystem_isolation"
+                   hx-trigger="change"
+                   hx-swap="none"
+                   value="true"
+                   class="w-4 h-4">
+            <span class="text-sm">Coder filesystem isolation (bubblewrap)</span>
+            {% if sandbox_actual_state == 'unavailable' %}
+            <span class="text-xs px-2 py-0.5 rounded bg-warn/10 text-warn">bwrap unavailable</span>
+            {% elif sandbox_actual_state == 'active' %}
+            <span class="text-xs px-2 py-0.5 rounded bg-ok/10 text-ok">active</span>
+            {% endif %}
+        </label>
+        <p class="text-xs text-gray-400 ml-6">
+            When enabled, coders run in a bubblewrap sandbox limiting host filesystem
+            access. Requires bwrap binary present.
+        </p>
+
+        <label class="flex items-center gap-2">
+            <input type="checkbox"
+                   name="git_bundle_backup_enabled"
+                   {% if daemon.git_bundle_backup_enabled %}checked{% endif %}
+                   hx-post="/settings/config/git_bundle_backup_enabled"
+                   hx-trigger="change"
+                   hx-swap="none"
+                   value="true"
+                   class="w-4 h-4">
+            <span class="text-sm">Git bundle backups before merge</span>
+        </label>
+        <p class="text-xs text-gray-400 ml-6">
+            Bundle written to /data/backups/ before each merge_pr call. Defensive against
+            force-push mistakes.
+        </p>
+
+        <label class="flex flex-col gap-1 text-sm">
+            <span class="text-gray-400">Backup retention (days)</span>
+            <input type="number" min="1" max="365" step="1"
+                   name="git_bundle_backup_daily_retention"
+                   value="{{ daemon.git_bundle_backup_daily_retention }}"
+                   hx-post="/settings/config/git_bundle_backup_daily_retention"
+                   hx-trigger="change"
+                   hx-swap="none"
+                   class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
+        </label>
+
+        <label class="flex flex-col gap-1 text-sm">
+            <span class="text-gray-400">Main commit audit interval (idle cycles)</span>
+            <input type="number" min="1" max="100" step="1"
+                   name="main_commit_audit_interval_idle_cycles"
+                   value="{{ daemon.main_commit_audit_interval_idle_cycles }}"
+                   hx-post="/settings/config/main_commit_audit_interval_idle_cycles"
+                   hx-trigger="change"
+                   hx-swap="none"
+                   class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
+            <span class="text-xs text-gray-400">How often daemon runs main-branch commit audit.</span>
+        </label>
+    </div>
+</section>

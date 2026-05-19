@@ -11,6 +11,7 @@ that respond to ``/settings/*``, ``/partials/settings/*``, or
 from __future__ import annotations
 
 import re
+import shutil
 from typing import Any
 
 from fastapi import APIRouter, Form, Request
@@ -69,8 +70,30 @@ OPTIONAL_NOTIFICATION_WEBHOOK_FIELDS = frozenset(
     }
 )
 
+# PR-344c: sandbox/backup/audit fields exposed via the Settings UI. The
+# spec named ``git_bundle_backup_retention_days`` but no such field
+# exists in ``DaemonConfig``; ``git_bundle_backup_daily_retention`` is
+# the actual knob (and the one a Pydantic reload will honor), so the UI
+# binds to that name with the spec's 1-365 day range applied here.
+SANDBOX_BACKUP_FIELDS = (
+    "coder_filesystem_isolation",
+    "git_bundle_backup_enabled",
+    "git_bundle_backup_daily_retention",
+    "main_commit_audit_interval_idle_cycles",
+)
+# HTML checkboxes omit the field entirely when unchecked. The endpoint
+# resolves an absent value to ``False`` for these fields instead of the
+# default "field is required" 400, otherwise the UI could never toggle a
+# sandbox/backup flag off.
+BOOLEAN_CONFIG_FIELDS = frozenset(
+    {
+        "coder_filesystem_isolation",
+        "git_bundle_backup_enabled",
+    }
+)
+
 EDITABLE_CONFIG_FIELDS = frozenset(
-    SPEND_CEILING_FIELDS + NOTIFICATION_WEBHOOK_FIELDS
+    SPEND_CEILING_FIELDS + NOTIFICATION_WEBHOOK_FIELDS + SANDBOX_BACKUP_FIELDS
 )
 OPTIONAL_EDITABLE_CONFIG_FIELDS = (
     OPTIONAL_SPEND_CEILING_FIELDS | OPTIONAL_NOTIFICATION_WEBHOOK_FIELDS
@@ -89,6 +112,22 @@ def _coerce_bool(value: str, field: str) -> bool:
     if lowered in _BOOL_FALSE:
         return False
     raise ValueError(f"{field} must be a boolean")
+
+
+def _sandbox_actual_state(daemon: DaemonConfig) -> str:
+    """Return the runtime sandbox state for the Settings badge.
+
+    ``disabled`` when isolation is toggled off, ``unavailable`` when
+    isolation is on but the ``bwrap`` binary is missing from PATH (the
+    daemon will refuse to start a coder in that state), and ``active``
+    otherwise. Template suppresses the badge entirely when this returns
+    ``disabled`` so the checkbox label stays unornamented.
+    """
+    if not daemon.coder_filesystem_isolation:
+        return "disabled"
+    if shutil.which("bwrap") is None:
+        return "unavailable"
+    return "active"
 
 
 def _coerce_int(
@@ -273,6 +312,7 @@ async def settings_page(request: Request) -> HTMLResponse:
             "daemon": cfg.daemon,
             "coders": coder_rows,
             "auth": auth,
+            "sandbox_actual_state": _sandbox_actual_state(cfg.daemon),
         },
     )
 
@@ -639,6 +679,12 @@ def _coerce_config_field(field: str, raw: str) -> Any:
         # integers in that range. ruamel.yaml writes the value as-is, and
         # Pydantic coerces int→float on the next load.
         return _coerce_int(raw, field, min_value=1, max_value=30)
+    if field in BOOLEAN_CONFIG_FIELDS:
+        return _coerce_bool(raw, field)
+    if field == "git_bundle_backup_daily_retention":
+        return _coerce_int(raw, field, min_value=1, max_value=365)
+    if field == "main_commit_audit_interval_idle_cycles":
+        return _coerce_int(raw, field, min_value=1, max_value=100)
     raise ValueError(f"Unhandled field: {field}")
 
 
@@ -660,6 +706,13 @@ async def update_config_field(request: Request, field: str) -> HTMLResponse:
     form = await request.form()
     raw = form.get(field)
     is_blank = isinstance(raw, str) and raw.strip() == ""
+    # HTML checkboxes send no form data when unchecked. Default the
+    # absent value to "false" so the operator can toggle the flag off via
+    # the UI; without this, an unchecked POST would 400 with "field is
+    # required" and the toggle would never persist.
+    if raw is None and field in BOOLEAN_CONFIG_FIELDS:
+        raw = "false"
+        is_blank = False
     # Operators clear optional inputs (session/weekly ceilings; webhook URL
     # or dashboard URL) to disable that signal; HTMX posts the blank value,
     # so treat it as a deletion request rather than a 400.
