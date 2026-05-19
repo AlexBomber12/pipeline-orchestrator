@@ -42,6 +42,7 @@ def test_publish_state_skips_progress_update_when_value_was_already_published(
         runner.state.state.value,
         (),
         (None, None, False),
+        None,
     )
     runner._set_queue_progress(1, 2)
 
@@ -193,6 +194,7 @@ def test_publish_state_emits_state_change_on_first_publish(
         runner.state.state.value,
         (),
         (None, None, False),
+        None,
     )
 
 
@@ -279,6 +281,49 @@ def test_publish_state_emits_state_change_on_pr_field_change_in_watch(
     state_events = [event for event in published if event[1] == "state_change"]
     assert len(state_events) == 4
     assert all(event[2] == {"state": "WATCH"} for event in state_events)
+
+
+def test_publish_state_emits_state_change_on_merge_phase_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-352: while the runner stays in MERGE, ``handle_merge`` advances
+    ``state.merge_phase`` through pre_merge_sync → ready_to_merge → merging
+    → post_merge_cleanup. ``state.state`` stays MERGE and the PR/usage
+    fields do not move during these sub-steps, so without ``merge_phase``
+    in the SSE signature the dashboard cards would stay on the previous
+    phase until the 30s polling fallback fires."""
+    published: list[tuple[str, str, dict[str, object], object | None]] = []
+
+    async def _fake_publish_repo_event(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, object],
+        redis_client: object | None = None,
+    ) -> None:
+        published.append((repo_name, event_type, payload, redis_client))
+
+    monkeypatch.setattr(runner_module, "publish_repo_event", _fake_publish_repo_event)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.MERGE
+    runner.state.merge_phase = "pre_merge_sync"
+    asyncio.run(runner.publish_state())
+
+    # Identical phase on the next cycle -> no extra publish.
+    asyncio.run(runner.publish_state())
+
+    runner.state.merge_phase = "ready_to_merge"
+    asyncio.run(runner.publish_state())
+
+    runner.state.merge_phase = "merging"
+    asyncio.run(runner.publish_state())
+
+    runner.state.merge_phase = "post_merge_cleanup"
+    asyncio.run(runner.publish_state())
+
+    state_events = [event for event in published if event[1] == "state_change"]
+    assert len(state_events) == 4
+    assert all(event[2] == {"state": "MERGE"} for event in state_events)
 
 
 def test_publish_state_emits_state_change_on_usage_field_change(
@@ -380,6 +425,7 @@ def test_publish_state_change_for_inactive_repo_emits_idle(
         PipelineState.IDLE.value,
         (),
         (None, None, False),
+        None,
     )
 
 
@@ -458,6 +504,7 @@ def test_publish_state_change_swallows_publish_failure(
         runner.state.state.value,
         (),
         (None, None, False),
+        None,
     )
 
 
@@ -481,6 +528,7 @@ def test_publish_state_drains_pending_event_log_entries(
         runner.state.state.value,
         (),
         (None, None, False),
+        None,
     )
     runner.log_event("first event")
     runner.log_event("second event")
@@ -527,6 +575,7 @@ def test_publish_pending_event_log_entries_requeues_on_failure(
         runner.state.state.value,
         (),
         (None, None, False),
+        None,
     )
     monkeypatch.setattr(
         runner_module.logger,
@@ -578,6 +627,7 @@ def test_publish_pending_event_log_entries_retry_drains_remainder(
         runner.state.state.value,
         (),
         (None, None, False),
+        None,
     )
     runner.log_event("first event")
     runner.log_event("second event")

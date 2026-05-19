@@ -363,7 +363,7 @@ class PipelineRunner(
         self._queue_progress_dirty = False
         self._last_published_queue_progress: tuple[int, int] | None = None
         self._last_published_state_signature: (
-            tuple[str, tuple, tuple] | None
+            tuple[str, tuple, tuple, str | None] | None
         ) = None
         self._pending_event_log_entries: list[dict[str, object]] = []
         self._usage_degraded_logged = False
@@ -1069,10 +1069,17 @@ class PipelineRunner(
             self.state.usage_weekly_percent,
             self.state.usage_api_degraded,
         )
+        # PR-352: include merge_phase so MERGE sub-phase transitions
+        # (pre_merge_sync -> ready_to_merge -> merging -> post_merge_cleanup)
+        # fire repo:state_change. Without it the dashboard card stays on the
+        # previous phase through a slow gh_prs.merge_pr or post-merge cleanup
+        # until the 30s polling fallback, because state.state stays MERGE and
+        # the PR/usage fields don't move during these sub-steps.
         signature = (
             current_state,
             self._summary_pr_signature(),
             usage_signature,
+            self.state.merge_phase,
         )
         if signature == self._last_published_state_signature:
             return

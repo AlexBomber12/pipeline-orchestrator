@@ -229,6 +229,12 @@ class RepoState(BaseModel):
     # include the typed list so consumers (PR-329 dispatcher, PR-331
     # Resume UI) do not each re-derive the throttle stack independently.
     active_inhibitors: list[WorkInhibitor] = Field(default_factory=list)
+    # PR-352: dashboard sub-phase string set by the MERGE handler at each
+    # phase transition (pre_merge_sync, ready_to_merge, merging,
+    # post_merge_cleanup). Cleared on any transition out of MERGE via
+    # ``__setattr__`` so the rendered badge subtitle disappears the moment
+    # the state machine leaves MERGE. ``None`` outside MERGE.
+    merge_phase: str | None = None
 
     @field_validator("state", mode="before")
     @classmethod
@@ -284,6 +290,13 @@ class RepoState(BaseModel):
             super().__setattr__("error_message", None)
             super().__setattr__("review_timeout_repost_attempted", False)
             super().__setattr__("review_timeout_repost_at", None)
+        if name == "state":
+            current_state = getattr(self, "state", None)
+            if (
+                current_state == PipelineState.MERGE
+                and value != PipelineState.MERGE
+            ):
+                super().__setattr__("merge_phase", None)
         if name == "current_queue":
             super().__setattr__(
                 "current_queue_snapshot_at",
