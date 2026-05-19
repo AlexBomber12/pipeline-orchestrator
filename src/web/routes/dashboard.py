@@ -34,6 +34,7 @@ from src.cancellation.availability import (
 from src.cancellation.storage import (
     GuardrailPending,
     get_cancellation_cause,
+    get_current_run_started_at,
     list_pending_guardrail_decisions,
 )
 from src.coders import build_coder_registry
@@ -45,6 +46,8 @@ from src.daemon.github_rate_limit import (
     recent_cycle_burns,
 )
 from src.events.sse import format_sse_comment, format_sse_event
+from src.github import gh_runner
+from src.github import prs as gh_prs
 from src.keyspace import cli_log_latest, daemon_panic_state
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
@@ -1104,6 +1107,293 @@ async def _build_cancellation_subsources(
     return out
 
 
+def _drained_from_phase(history: list[Any]) -> str | None:
+    """Return the most recent CODING or FIX phase that preceded PAUSED.
+
+    Scans ``history`` backwards looking for the most recent entry whose
+    ``state`` is CODING or FIX. The walk skips PAUSED entries (the
+    operator's pause is what we are draining out of) so the search finds
+    the phase the runner was executing immediately before the pause.
+    Returns ``None`` when no CODING/FIX entry exists — the indicator
+    stays hidden because there is nothing meaningful to drain.
+    """
+    for entry in reversed(history):
+        raw_state = str(entry.get("state", ""))
+        if raw_state in {PipelineState.CODING.value, PipelineState.FIX.value}:
+            return raw_state
+    return None
+
+
+def _drain_was_user_stopped(history: list[Any]) -> bool:
+    """Return True when the most recent transition to PAUSED was a user stop.
+
+    The Stop All path (``/daemon/stop`` →
+    ``PipelineRunner._monitor_stop_request``) flips the same
+    ``user_paused=True`` flag the pause path uses and then the CODING/FIX
+    handlers park the repo in PAUSED while keeping ``current_task`` and
+    the prior CODING/FIX history. Both inputs therefore satisfy the
+    drain-badge gate even though the coder was already terminated by the
+    stop, so without this check the badge would render
+    ``Draining: CODING/FIX...`` for a repo with no in-flight coder
+    process to drain.
+
+    Scans ``history`` backwards: a PAUSED entry whose event carries the
+    ``aborted: user stop requested`` marker (emitted by both CODING and
+    FIX stop branches on the transition) means the current PAUSED window
+    came from a stop. A CODING/FIX entry encountered first means the
+    most recent transition was a pause (no stop event logged between the
+    last run and now), so the drain badge stays on. Intermediate PAUSED
+    entries without the marker (e.g. ``handle_paused``'s "Press Play to
+    resume" notice) are skipped so a subsequent dashboard tick still
+    detects the original stop.
+    """
+    for entry in reversed(history):
+        raw_state = str(entry.get("state", ""))
+        if raw_state in {PipelineState.CODING.value, PipelineState.FIX.value}:
+            return False
+        if raw_state != PipelineState.PAUSED.value:
+            continue
+        if "aborted: user stop requested" in str(entry.get("event", "")):
+            return True
+    return False
+
+
+def _phase_started_at(history: list[Any], phase: str) -> datetime | None:
+    """Return the start time of the most recent run of ``phase`` in history.
+
+    A "run" is the first entry in the most recent consecutive block of
+    ``phase`` entries — same shape as ``_most_recent_transition_into``
+    used by the alerts panel. Falls back to ``None`` when ``history`` has
+    no parseable entry for ``phase``, in which case the caller uses the
+    Redis-stored dispatch timestamp instead.
+    """
+    run_start: datetime | None = None
+    prev_state: str | None = None
+    for entry in history:
+        current = str(entry.get("state", ""))
+        if current == phase and prev_state != phase:
+            parsed = _parse_history_time(str(entry.get("time", "")))
+            if parsed is not None:
+                run_start = parsed
+        prev_state = current
+    return run_start
+
+
+_DRAIN_PUSH_TIMEOUT_SEC = 2.0
+
+
+async def _fix_branch_last_push_at(state: RepoState) -> datetime | None:
+    """Return the FIX PR's branch last-push timestamp, or ``None``.
+
+    Mirrors the anchor source used by ``monitor_fix_idle`` so the card's
+    FIX drain elapsed reading tracks the same deadline the supervisor
+    enforces. Uses ``gh_prs.get_pr_last_push_time`` (the GitHub activity
+    API), which reflects when the head ref was actually updated. Distinct
+    from ``current_pr.last_activity`` (PR ``updatedAt``), which also
+    advances on comments and reviews — anchoring on that field would
+    report nearly the full timeout remaining for a PR that just received
+    a Codex comment shortly before Pause All, even though the supervisor
+    is about to kill the coder for branch idleness.
+
+    The helper shells out through ``gh_runner.run_gh`` (default per-call
+    timeout 30s, up to two API calls per invocation), so a slow or
+    unreachable GitHub would otherwise serialize the entire dashboard
+    render behind this single repo. Bound the wait at
+    ``_DRAIN_PUSH_TIMEOUT_SEC`` and treat a timeout the same as any other
+    failure: fail open with ``None`` so callers fall back to the FIX
+    cycle's history start instead. The blocking subprocess keeps running
+    in its thread-pool slot until ``gh`` returns or hits its own timeout,
+    but this coroutine no longer waits on it, so card rendering stays
+    responsive during a GitHub outage.
+    """
+    pr = state.current_pr
+    if pr is None or pr.number <= 0:
+        return None
+    try:
+        owner_repo = gh_runner.get_repo_full_name(state.url)
+    except ValueError:
+        return None
+    try:
+        push_at = await asyncio.wait_for(
+            asyncio.to_thread(
+                gh_prs.get_pr_last_push_time, owner_repo, pr.number
+            ),
+            timeout=_DRAIN_PUSH_TIMEOUT_SEC,
+        )
+    except Exception:
+        return None
+    if push_at is None:
+        return None
+    if push_at.tzinfo is None:
+        push_at = push_at.replace(tzinfo=timezone.utc)
+    return push_at
+
+
+async def _build_drain_progress(
+    redis_client: aioredis.Redis | None,
+    state: RepoState,
+    config: AppConfig,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Return drain-progress view data for a single repo, or ``None``.
+
+    The indicator surfaces when the operator's Pause All caught the
+    runner mid-CODING or mid-FIX. ``/daemon/pause`` flips
+    ``user_paused=True`` and wakes the runner, but it does not move the
+    repo into ``PAUSED``; the runner keeps publishing the active
+    CODING/FIX state until the current cycle naturally hands off
+    (CODING→WATCH, FIX→IDLE/MERGE). Two shapes therefore qualify as an
+    in-flight drain and the gate accepts both:
+
+    * ``state == PAUSED`` with ``user_paused`` set and a ``current_task``
+      attached — the runner has already finished its cycle and parked
+      the repo in PAUSED.
+    * ``state in {CODING, FIX}`` with ``user_paused`` set and a
+      ``current_task`` attached — the runner is still inside the cycle
+      that Pause All asked to wind down.
+
+    Rate-limit pauses skip the check via the ``user_paused`` gate so the
+    existing "Paused, Nm remaining" indicator stays the only signal
+    there. When an operator clicks Pause All while a repo is already
+    rate-limit PAUSED, the pause endpoint flips ``user_paused=True`` but
+    the daemon's rate-limit paths leave ``current_task`` attached and the
+    earlier CODING/FIX history intact, so the ``user_paused`` gate alone
+    accepts that repo. Any ``rate_limited_until`` marker on such a repo
+    indicates the runner was already quiesced by the rate limit before
+    Pause All landed — ``handle_paused`` short-circuits on
+    ``user_paused`` and never clears the field, so the timestamp lingers
+    even after it has expired in wall-clock terms. Suppress the drain
+    badge whenever the marker is set (past or future) to avoid stacking
+    a misleading "Draining: CODING/FIX..." indicator based on stale
+    history on a repo with no in-flight coder process to drain.
+
+    Stop All takes the same ``user_paused=True`` route via
+    ``PipelineRunner._monitor_stop_request`` and the CODING/FIX stop
+    branches transition straight to PAUSED while keeping
+    ``current_task`` and the CODING/FIX history. Suppress the drain
+    badge when ``_drain_was_user_stopped`` detects the
+    ``aborted: user stop requested`` marker on the most recent PAUSED
+    transition — the coder was already terminated, so a drain reading
+    would be misleading for the stop workflow.
+
+    For CODING the elapsed anchor is the Redis ``current_run_started_at``
+    marker written by ``handle_coding`` on dispatch; if the marker is
+    missing (Redis down or expired) the helper falls back to the most
+    recent CODING entry in history so the reading still works after a
+    daemon restart.
+
+    For FIX the elapsed anchor is the branch's last-push time fetched via
+    the GitHub activity API — the same source ``monitor_fix_idle`` uses
+    to drive its idle deadline. Anchoring on ``current_pr.last_activity``
+    (PR ``updatedAt``) would advance on comments and reviews and would
+    overstate the remaining time. When the push API is unavailable or
+    reports a push older than ``fix_idle_timeout_sec`` (matching the
+    supervisor's reset-on-stale-baseline behavior), the helper falls back
+    to the most recent FIX history entry so the reading reflects FIX
+    cycle age. ``est_remaining_sec`` is clamped at zero so elapsed runs
+    that already exceeded the configured timeout do not render negative.
+    """
+    if state.current_task is None:
+        return None
+    if not state.user_paused:
+        return None
+    if state.rate_limited_until is not None:
+        return None
+    current_time = now if now is not None else datetime.now(timezone.utc)
+    if state.state == PipelineState.PAUSED:
+        if _drain_was_user_stopped(state.history):
+            return None
+        phase = _drained_from_phase(state.history)
+        if phase is None:
+            return None
+    elif state.state in (PipelineState.CODING, PipelineState.FIX):
+        phase = state.state.value
+    else:
+        return None
+    started_at: datetime | None = None
+    if redis_client is not None:
+        try:
+            started_at = await get_current_run_started_at(
+                redis_client, state.name, state.current_task.pr_id
+            )
+        except Exception:
+            started_at = None
+    if started_at is None:
+        started_at = _phase_started_at(state.history, phase)
+    if started_at is None:
+        return None
+    # ``get_current_run_started_at`` and ``_parse_history_time`` (used by
+    # ``_phase_started_at``) both normalize naive datetimes to UTC, so
+    # ``started_at`` is guaranteed aware here.
+    if phase == PipelineState.FIX.value:
+        timeout_sec = config.daemon.fix_idle_timeout_sec
+        # ``_phase_started_at`` and ``get_current_run_started_at`` both
+        # return aware datetimes (or ``None``), so ``fix_started_at`` is
+        # guaranteed aware here without an explicit UTC coercion.
+        fix_started_at = (
+            _phase_started_at(state.history, phase) or started_at
+        )
+        push_at = await _fix_branch_last_push_at(state)
+        if push_at is not None and (
+            (current_time - push_at).total_seconds() < timeout_sec
+        ):
+            anchor = push_at
+        else:
+            anchor = fix_started_at
+        elapsed = (current_time - anchor).total_seconds()
+    else:
+        elapsed = (current_time - started_at).total_seconds()
+        timeout_sec = config.daemon.planned_pr_timeout_sec
+    elapsed = max(0.0, elapsed)
+    est_remaining = max(0.0, float(timeout_sec) - elapsed)
+    return {
+        "phase": phase,
+        "elapsed_sec": elapsed,
+        "est_remaining_sec": est_remaining,
+    }
+
+
+async def _build_drain_progress_map(
+    redis_client: aioredis.Redis | None,
+    states: list[RepoState],
+    config: AppConfig,
+    *,
+    now: datetime | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Return ``{repo_name: drain_progress_view}`` for the dashboard grid.
+
+    Only repos that survive the ``_build_drain_progress`` gate appear in
+    the map so the template can read ``drain_progress.get(repo.name)``
+    and render only when an entry exists. The per-repo work runs
+    concurrently via ``asyncio.gather`` because a FIX-phase drain fetches
+    the branch last-push timestamp from GitHub through ``gh_prs``; if a
+    single slow ``gh`` CLI call serialized into the next repo, several
+    in-flight FIX drains after Pause All would compound into a multi-
+    second hang on every dashboard refresh. ``return_exceptions=True``
+    keeps an unexpected failure on one repo from poisoning the entire
+    map — that repo simply does not appear in the result.
+    """
+    if not states:
+        return {}
+    current_time = now if now is not None else datetime.now(timezone.utc)
+    results = await asyncio.gather(
+        *(
+            _build_drain_progress(
+                redis_client, state, config, now=current_time
+            )
+            for state in states
+        ),
+        return_exceptions=True,
+    )
+    out: dict[str, dict[str, Any]] = {}
+    for state, view in zip(states, results):
+        if isinstance(view, BaseException) or view is None:
+            continue
+        out[state.name] = view
+    return out
+
+
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
@@ -1111,6 +1401,7 @@ async def index(request: Request) -> HTMLResponse:
     states, redis_warning = await _app.get_all_repo_states(
         redis_client, _app.CONFIG_PATH
     )
+    config = await asyncio.to_thread(load_config, _app.CONFIG_PATH)
     stats = _compute_stats(states)
     alerts = _build_alerts(states)
     latest_alert = min(alerts, key=lambda a: a["duration_seconds"]) if alerts else None
@@ -1118,6 +1409,9 @@ async def index(request: Request) -> HTMLResponse:
     panic_state = await _read_panic_state_for_banner(redis_client)
     cancellation_subsources = await _build_cancellation_subsources(
         redis_client, states
+    )
+    drain_progress = await _build_drain_progress_map(
+        redis_client, states, config
     )
     return _app.templates.TemplateResponse(
         request,
@@ -1133,6 +1427,7 @@ async def index(request: Request) -> HTMLResponse:
             "panic_state": panic_state,
             "cancellation_subsources": cancellation_subsources,
             "subsource_lookup": _subsource_lookup,
+            "drain_progress": drain_progress,
         },
     )
 
@@ -1488,9 +1783,13 @@ async def partial_repo_list(request: Request) -> HTMLResponse:
     states, redis_warning = await _app.get_all_repo_states(
         redis_client, _app.CONFIG_PATH
     )
+    config = await asyncio.to_thread(load_config, _app.CONFIG_PATH)
     resources = await _build_resources_view(redis_client, states)
     cancellation_subsources = await _build_cancellation_subsources(
         redis_client, states
+    )
+    drain_progress = await _build_drain_progress_map(
+        redis_client, states, config
     )
     return _app.templates.TemplateResponse(
         request,
@@ -1501,6 +1800,7 @@ async def partial_repo_list(request: Request) -> HTMLResponse:
             "resources": resources,
             "cancellation_subsources": cancellation_subsources,
             "subsource_lookup": _subsource_lookup,
+            "drain_progress": drain_progress,
         },
     )
 
