@@ -642,9 +642,13 @@ async def _task_view(
         # ERROR group into a guardrail subgroup (operator decision needed)
         # vs other (automatic failure). Best-effort: Redis errors leave the
         # task in the "other" bucket rather than 5xx-ing the panel.
+        # PR-345 follow-up: ``refresh_ttl=False`` — this is an aggregate
+        # display read across every ERROR task, not an explicit per-record
+        # investigation, so it must not push records out to the 90-day
+        # forensic ceiling on every panel render.
         try:
             cause = await get_cancellation_cause(
-                redis_client, repo_name, task.pr_id
+                redis_client, repo_name, task.pr_id, refresh_ttl=False
             )
         except Exception:
             cause = None

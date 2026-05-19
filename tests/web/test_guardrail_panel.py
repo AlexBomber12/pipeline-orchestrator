@@ -477,6 +477,42 @@ async def test_build_view_keeps_entry_when_cause_vanished_between_reads(
     assert out[0]["excerpt"] == ""
 
 
+async def test_recover_guardrail_metadata_does_not_refresh_ttl(
+    monkeypatch,
+) -> None:
+    """PR-345 follow-up: ``_recover_guardrail_metadata`` runs inside the
+    repo-detail panel render path, which is polled every 30s by
+    ``/partials/repo/{name}``. Passive polling must not extend the
+    forensic TTL on every poll cycle, so the recovery fetch passes
+    ``refresh_ttl=False`` and the default refresh stays reserved for
+    explicit diagnostic reads.
+    """
+    redis = _FakeRedis()
+    _put_guardrail_reason_text_only(
+        redis,
+        "example__alpha",
+        "PR-296",
+        reason_text="GUARDRAIL: cat: text",
+        ts=float(_BASE_TS),
+    )
+
+    captured: list[bool] = []
+
+    async def spy(
+        redis_client, repo_slug, task_id, *, refresh_ttl: bool = True
+    ):
+        captured.append(refresh_ttl)
+        return None
+
+    monkeypatch.setattr(dashboard_routes, "get_cancellation_cause", spy)
+    await dashboard_routes._build_guardrail_pending_view(
+        redis, "example__alpha", _bare_state()
+    )
+
+    assert captured, "expected _recover_guardrail_metadata to fetch the cause"
+    assert all(value is False for value in captured)
+
+
 # ----- partial template rendering -----
 
 

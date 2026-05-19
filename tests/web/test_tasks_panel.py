@@ -358,7 +358,9 @@ def test_error_group_redis_read_error_falls_into_other(
     the "other" bucket the same way a missing record does."""
     from src.web.routes import repo_control as repo_control_module
 
-    async def boom(redis_client, repo_slug, task_id):  # pragma: no cover
+    async def boom(
+        redis_client, repo_slug, task_id, *, refresh_ttl: bool = True
+    ):  # pragma: no cover
         raise ConnectionError("redis unreachable")
 
     _setup_panel(tmp_path, monkeypatch, retry_count=0)
@@ -406,3 +408,44 @@ def test_error_group_legacy_no_cause_record_falls_into_other(
         "error-subgroup-other", 1
     )[0]
     assert "PR-422" not in guardrail_section
+
+
+def test_tasks_panel_subsource_read_does_not_refresh_ttl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-345 follow-up: the tasks panel renders an aggregate ERROR view
+    that reads each task's cancellation cause to pick the subsource
+    bucket. This is a display read, not an explicit per-record
+    investigation, so it must pass ``refresh_ttl=False`` — otherwise
+    opening the queue would pin every ERROR record's TTL to the 90-day
+    forensic ceiling.
+    """
+    from src.web.routes import repo_control as repo_control_module
+
+    captured: list[bool] = []
+
+    async def spy(
+        redis_client, repo_slug, task_id, *, refresh_ttl: bool = True
+    ):
+        captured.append(refresh_ttl)
+        return None
+
+    _setup_multi_error_panel(
+        tmp_path,
+        monkeypatch,
+        error_tasks=[
+            ("PR-431", "guardrail"),
+            ("PR-432", "coder_escalate"),
+        ],
+    )
+    monkeypatch.setattr(
+        repo_control_module, "get_cancellation_cause", spy
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks")
+
+    assert response.status_code == 200
+    assert captured, "expected get_cancellation_cause to be invoked"
+    assert all(value is False for value in captured)
