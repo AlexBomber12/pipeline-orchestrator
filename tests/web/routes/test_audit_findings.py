@@ -202,6 +202,26 @@ def test_audit_page_handles_corrupt_redis_value(
     assert "No direct-to-main commits" in response.text
 
 
+def test_audit_page_ignores_findings_without_valid_sha(
+    base_config: Path,
+    redis_client: _AuditRedis,
+) -> None:
+    redis_client.lists[_findings_key()] = [
+        json.dumps({"message_first_line": "missing sha"}),
+        json.dumps({"sha": None, "message_first_line": "null sha"}),
+        json.dumps(_finding(1)),
+    ]
+
+    with TestClient(app) as client:
+        response = client.get(f"/repo/{REPO_NAME}/audit")
+
+    assert response.status_code == 200
+    assert response.text.count("data-audit-finding-row") == 1
+    assert "direct commit 1" in response.text
+    assert "missing sha" not in response.text
+    assert "null sha" not in response.text
+
+
 def test_audit_page_link_visible_in_repo_card() -> None:
     repo = RepoState(
         url=REPO_URL,
@@ -250,6 +270,9 @@ async def test_read_audit_findings_filters_bad_list_entries() -> None:
                 b"\xff\xfe",
                 "{not json",
                 json.dumps(["not", "a", "dict"]),
+                json.dumps({"message_first_line": "missing sha"}),
+                json.dumps({"sha": "", "message_first_line": "empty sha"}),
+                json.dumps({"sha": None, "message_first_line": "null sha"}),
                 json.dumps(_finding(1)),
             ]
         }
@@ -263,7 +286,18 @@ async def test_read_audit_findings_filters_bad_list_entries() -> None:
 @pytest.mark.asyncio
 async def test_read_audit_findings_accepts_legacy_json_payloads() -> None:
     key = _findings_key()
-    redis_client = _AuditRedis(values={key: json.dumps([_finding(1), "skip"])})
+    redis_client = _AuditRedis(
+        values={
+            key: json.dumps(
+                [
+                    _finding(1),
+                    "skip",
+                    {"message_first_line": "missing sha"},
+                    {"sha": None, "message_first_line": "null sha"},
+                ]
+            )
+        }
+    )
 
     findings = await audit_routes._read_audit_findings(redis_client, REPO_NAME, "main")
 
@@ -275,6 +309,9 @@ async def test_read_audit_findings_accepts_legacy_json_payloads() -> None:
     ]
 
     redis_client.values[key] = json.dumps("not a finding")
+    assert await audit_routes._read_audit_findings(redis_client, REPO_NAME, "main") == []
+
+    redis_client.values[key] = json.dumps({"message_first_line": "missing sha"})
     assert await audit_routes._read_audit_findings(redis_client, REPO_NAME, "main") == []
 
 

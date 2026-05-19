@@ -34,7 +34,16 @@ def _parse_finding(raw: object) -> dict[str, Any] | None:
         parsed = json.loads(text)
     except json.JSONDecodeError:
         return None
-    return parsed if isinstance(parsed, dict) else None
+    return _valid_finding(parsed)
+
+
+def _valid_finding(parsed: object) -> dict[str, Any] | None:
+    if not isinstance(parsed, dict):
+        return None
+    sha = parsed.get("sha")
+    if not isinstance(sha, str) or not sha:
+        return None
+    return parsed
 
 
 def _parse_findings_payload(raw: object) -> list[dict[str, Any]]:
@@ -46,9 +55,13 @@ def _parse_findings_payload(raw: object) -> list[dict[str, Any]]:
     except json.JSONDecodeError:
         return []
     if isinstance(parsed, list):
-        return [item for item in parsed if isinstance(item, dict)]
-    if isinstance(parsed, dict):
-        return [parsed]
+        return [
+            finding
+            for item in parsed
+            if (finding := _valid_finding(item)) is not None
+        ]
+    if (finding := _valid_finding(parsed)) is not None:
+        return [finding]
     return []
 
 
