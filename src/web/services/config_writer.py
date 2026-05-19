@@ -24,8 +24,17 @@ from ruamel.yaml.comments import CommentedMap
 
 
 def _load(path: Path) -> CommentedMap:
+    """Return ``config.yml`` as a ruamel ``CommentedMap``.
+
+    A missing file yields an empty mapping rather than ``FileNotFoundError``
+    so a fresh deployment can create ``config.yml`` from the first UI write,
+    matching the semantics of ``src.config._load_config_raw`` / ``save_config``
+    used by the other settings mutations.
+    """
     yaml = YAML()
     yaml.preserve_quotes = True
+    if not path.is_file():
+        return CommentedMap()
     with path.open("r", encoding="utf-8") as fh:
         data = yaml.load(fh)
     if data is None:
@@ -68,6 +77,7 @@ def _dump_atomic(path: Path, data: CommentedMap) -> None:
 def write_daemon_field(path: str | Path, field: str, value: Any) -> None:
     """Set ``daemon.<field> = value`` in ``config.yml``, preserving comments."""
     target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
     data = _load(target)
     daemon = data.get("daemon")
     if not isinstance(daemon, CommentedMap):

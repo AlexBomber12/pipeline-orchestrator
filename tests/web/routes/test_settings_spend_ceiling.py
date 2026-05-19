@@ -313,3 +313,47 @@ def test_reset_returns_503_when_disk_write_fails(
 
     assert response.status_code == 503
     assert "Failed to write config.yml" in response.text
+
+
+def test_update_creates_config_when_file_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POSTing a spend-ceiling field must create config.yml on a fresh deploy.
+
+    Mirrors ``save_config`` behavior in the daemon/repo settings paths:
+    when ``CONFIG_PATH`` does not exist yet, the endpoint persists the
+    value by creating the file rather than returning a 503.
+    """
+    monkeypatch.chdir(tmp_path)
+    cfg = tmp_path / "config.yml"
+    assert not cfg.exists()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/settings/config/spend_ceiling_warning_percent",
+            data={"spend_ceiling_warning_percent": "65"},
+        )
+
+    assert response.status_code == 200
+    assert cfg.exists()
+    loaded = load_config(str(cfg))
+    assert loaded.daemon.spend_ceiling_warning_percent == 65
+
+
+def test_reset_is_noop_when_config_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reset on a missing config.yml succeeds without creating a stub file.
+
+    Pydantic defaults already apply when no file exists, so the reset
+    endpoint must short-circuit instead of returning 503.
+    """
+    monkeypatch.chdir(tmp_path)
+    cfg = tmp_path / "config.yml"
+    assert not cfg.exists()
+
+    with TestClient(app) as client:
+        response = client.post("/settings/config/reset/spend_ceiling")
+
+    assert response.status_code == 200
+    assert not cfg.exists()

@@ -83,6 +83,32 @@ def test_load_empty_file_yields_empty_mapping(tmp_path: Path) -> None:
     assert "spend_ceiling_warning_percent: 70" in body
 
 
+def test_write_creates_config_when_file_missing(tmp_path: Path) -> None:
+    """A missing config.yml must be created on first write.
+
+    Mirrors ``src.config.save_config``: a fresh deployment that has never
+    persisted any setting (so no ``config.yml`` exists at ``CONFIG_PATH``)
+    must still accept a spend-ceiling write without surfacing a 503.
+    """
+    cfg = tmp_path / "fresh" / "config.yml"
+    assert not cfg.exists()
+    write_daemon_field(cfg, "spend_ceiling_warning_percent", 65)
+    body = cfg.read_text(encoding="utf-8")
+    assert "daemon:" in body
+    assert "spend_ceiling_warning_percent: 65" in body
+
+
+def test_delete_is_noop_when_config_missing(tmp_path: Path) -> None:
+    """A missing config.yml is a clean no-op for reset.
+
+    Deleting absent keys must not crash and must not create a stub file:
+    Pydantic defaults already apply once the file is absent.
+    """
+    cfg = tmp_path / "config.yml"
+    delete_daemon_fields(cfg, ["spend_ceiling_warning_percent"])
+    assert not cfg.exists()
+
+
 def test_load_non_mapping_root_raises_value_error(tmp_path: Path) -> None:
     """A YAML list at the root is a hard error: config.yml must be a mapping."""
     cfg = tmp_path / "config.yml"
