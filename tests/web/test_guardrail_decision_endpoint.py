@@ -127,6 +127,32 @@ class _GuardrailRedis:
         self.zremmed.append((key, members))
         return removed
 
+    async def zrangebyscore(
+        self, key: str, min_score: Any, max_score: Any
+    ) -> list[str]:
+        bucket = self.zsets.get(key, {})
+
+        def _bound(value: Any, default: float) -> tuple[float, bool]:
+            if value in ("-inf", "+inf"):
+                return float(value), False
+            if isinstance(value, str) and value.startswith("("):
+                return float(value[1:]), True
+            return float(value), False
+
+        lower, lower_excl = _bound(min_score, float("-inf"))
+        upper, upper_excl = _bound(max_score, float("inf"))
+        items = [
+            tid
+            for tid, score in bucket.items()
+            if (score > lower if lower_excl else score >= lower)
+            and (score < upper if upper_excl else score <= upper)
+        ]
+        items.sort(key=lambda tid: bucket[tid])
+        return items
+
+    async def exists(self, key: str) -> int:
+        return int(key in self.store)
+
     async def transaction(
         self, callback: Any, *keys: str, value_from_callable: bool = False
     ) -> Any:

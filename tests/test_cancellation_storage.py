@@ -93,12 +93,14 @@ class _FakeRedis:
 
     async def zrangebyscore(self, key: str, min_score, max_score) -> list[str]:
         bucket = self.zsets.get(key, {})
-        if max_score == "+inf":
-            upper = float("inf")
-        else:
-            upper = float(max_score)
-        lower = float(min_score)
-        items = [tid for tid, score in bucket.items() if lower <= score <= upper]
+        lower, lower_excl = self._parse_bound(min_score, default=float("-inf"))
+        upper, upper_excl = self._parse_bound(max_score, default=float("inf"))
+        items = [
+            tid
+            for tid, score in bucket.items()
+            if (score > lower if lower_excl else score >= lower)
+            and (score < upper if upper_excl else score <= upper)
+        ]
         items.sort(key=lambda tid: bucket[tid])
         return items
 
@@ -130,6 +132,9 @@ class _FakeRedis:
             self.ttls[key] = seconds
             return True
         return False
+
+    async def exists(self, key: str) -> int:
+        return int(key in self.values)
 
     def _zremrangebyscore(self, key: str, min_score, max_score) -> int:
         bucket = self.zsets.get(key)
@@ -765,6 +770,72 @@ async def test_list_recent_does_not_refresh_underlying_ttls() -> None:
     # since the scan did not invoke a refresh path.
     assert redis.ttls[cause_key("alpha", "PR-307")] == TTL_SECONDS
     assert redis.ttls[index_key("alpha")] == index_ttl_after_write
+
+
+async def test_prune_decodes_bytes_candidates() -> None:
+    """Bytes-encoded task ids returned by Redis must round-trip through prune.
+
+    The async Redis client returns task ids as ``bytes`` when
+    ``decode_responses=False`` is in effect for a given key; the prune
+    helper feeds the decoded id back into ``cause_key`` so the EXISTS
+    lookup must use the string form.
+    """
+    redis = _FakeRedis()
+    now = datetime.now(timezone.utc)
+    ancient_ts = (now - timedelta(seconds=READ_REFRESH_TTL_SECONDS + 3600)).timestamp()
+    redis.zsets[index_key("alpha")] = {"PR-BYTES": ancient_ts}
+
+    async def _bytes_zrangebyscore(key: str, min_score, max_score) -> list[bytes]:
+        return [b"PR-BYTES"]
+
+    redis.zrangebyscore = _bytes_zrangebyscore  # type: ignore[assignment]
+
+    await storage.prune_dead_index_members(redis, "alpha")
+
+    assert "PR-BYTES" not in redis.zsets[index_key("alpha")]
+
+
+async def test_record_does_not_prune_refreshed_member_with_stale_score() -> None:
+    """Refreshed records whose ZSCORE predates the 90-day window stay indexed.
+
+    PR-345 follow-up: ``_refresh_forensic_ttl`` preserves the original
+    ``created_at`` as the ZSET score, so a record read at day 35 has a
+    live cause key (TTL refreshed to day 125) but a score still at day 0.
+    The naive score-based prune at write time would evict that member at
+    day 95 because its score predates ``now - 90 days``, hiding it from
+    history/pending flows that start at ``cancellation_index``. The
+    liveness-based prune skips members whose cause key still exists.
+    """
+    redis = _FakeRedis()
+    now = datetime.now(timezone.utc)
+    stale_score = (now - timedelta(days=95)).timestamp()
+    refreshed_cause = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "fix_iteration_cap"},
+        created_at=(now - timedelta(days=95)).isoformat(),
+        task_id="PR-REFRESHED",
+        repo_slug="alpha",
+    )
+    redis.values[cause_key("alpha", "PR-REFRESHED")] = refreshed_cause.to_redis()
+    redis.ttls[cause_key("alpha", "PR-REFRESHED")] = READ_REFRESH_TTL_SECONDS
+    redis.zsets[index_key("alpha")] = {"PR-REFRESHED": stale_score}
+    redis.ttls[index_key("alpha")] = READ_REFRESH_TTL_SECONDS
+
+    await record_cancellation_cause(
+        redis,
+        "alpha",
+        "PR-FRESH",
+        CancellationCause(category="ERROR", created_at=now.isoformat()),
+    )
+
+    bucket = redis.zsets[index_key("alpha")]
+    assert "PR-REFRESHED" in bucket
+    assert "PR-FRESH" in bucket
+
+    recent = await list_recent_cancellations(
+        redis, "alpha", now - timedelta(days=100)
+    )
+    assert {c.task_id for c in recent} == {"PR-REFRESHED", "PR-FRESH"}
 
 
 async def test_subsequent_write_preserves_refreshed_index_member() -> None:

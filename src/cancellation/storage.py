@@ -149,20 +149,44 @@ async def record_cancellation_cause(
     cause.repo_slug = repo_slug
     serialized = cause.to_redis()
     score = datetime.fromisoformat(cause.created_at).timestamp()
-    # PR-345 follow-up: the index must cover the full 90-day forensic window
-    # because read-side TTL refreshes can keep a cause key alive long past the
-    # initial 30-day budget. Pruning at the 30-day mark would evict a
-    # refreshed member (whose ZSCORE is the original created_at) even though
-    # its cause key is still retained, breaking history/pending-list flows
-    # that start from cancellation_index. Set the ZSET TTL to the same window
-    # so the index does not vanish under refreshed records either.
-    expiry_cutoff = datetime.now(timezone.utc).timestamp() - READ_REFRESH_TTL_SECONDS
     pipe = redis_client.pipeline()
     pipe.set(cause_key(repo_slug, task_id), serialized, ex=TTL_SECONDS)
     pipe.zadd(index_key(repo_slug), {task_id: score})
-    pipe.zremrangebyscore(index_key(repo_slug), "-inf", f"({expiry_cutoff}")
     pipe.expire(index_key(repo_slug), READ_REFRESH_TTL_SECONDS)
     await pipe.execute()
+    await prune_dead_index_members(redis_client, repo_slug)
+
+
+async def prune_dead_index_members(
+    redis_client: Any,
+    repo_slug: str,
+) -> None:
+    """Drop index entries whose cause key has actually expired.
+
+    PR-345 follow-up: ZSCORE in ``cancellation_index`` is the original
+    ``created_at`` and is preserved across read-side refreshes so the
+    record keeps its chronological place. That makes score-based pruning
+    unsafe — a refreshed cause key can stay alive for 90 days past the
+    last read while its index member still carries an old score, so a
+    naive ``zremrangebyscore`` evicts live records from history and
+    pending flows. Liveness is the only reliable signal: the candidate
+    set is members whose score predates the maximum possible cause-key
+    lifetime (``READ_REFRESH_TTL_SECONDS``); for each candidate we
+    confirm the cause key is gone before ``ZREM``-ing.
+    """
+    idx = index_key(repo_slug)
+    cutoff_ts = datetime.now(timezone.utc).timestamp() - READ_REFRESH_TTL_SECONDS
+    candidates = await redis_client.zrangebyscore(idx, "-inf", f"({cutoff_ts}")
+    if not candidates:
+        return
+    dead: list[str] = []
+    for tid in candidates:
+        if isinstance(tid, bytes):
+            tid = tid.decode("utf-8")
+        if not await redis_client.exists(cause_key(repo_slug, tid)):
+            dead.append(tid)
+    if dead:
+        await redis_client.zrem(idx, *dead)
 
 
 async def get_cancellation_cause(
