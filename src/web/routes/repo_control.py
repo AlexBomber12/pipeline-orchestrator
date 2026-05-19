@@ -2199,13 +2199,26 @@ async def _reject_guardrail_decision(
                     "Concurrent state change detected; please retry the decision",
                     status_code=409,
                 )
-        # Best-effort liveness-based housekeeping shares semantics with
-        # ``record_cancellation_cause``; runs outside MULTI/EXEC because
-        # EXISTS-driven liveness checks need readback values that the
-        # transaction queue cannot return.
-        await prune_dead_index_members(redis_client, name)
     except RedisError:
         return HTMLResponse("Redis unavailable", status_code=503)
+
+    # Best-effort liveness-based housekeeping shares semantics with
+    # ``record_cancellation_cause`` and runs outside MULTI/EXEC because
+    # EXISTS-driven liveness checks need readback values the transaction
+    # queue cannot return. A RedisError here must NOT abort the reject
+    # flow: the CAS write has already flipped the cause to
+    # ``operator_reject``, so returning 503 would skip the PR close
+    # side-effect, and a retry would see no pending guardrail decision —
+    # leaving the rejected PR open with the operator's decision already
+    # persisted.
+    try:
+        await prune_dead_index_members(redis_client, name)
+    except RedisError:
+        _app.logger.warning(
+            "Failed to prune cancellation index for %s after reject CAS"
+            " write succeeded; continuing with PR close",
+            name, exc_info=True,
+        )
 
     if pr_number is not None and owner_repo is not None:
         await _gh_best_effort(
