@@ -71,6 +71,7 @@
         <div class="mb-3 flex min-h-12 flex-col gap-3 pr-40 sm:flex-row sm:items-center sm:justify-between">
             <div class="flex min-w-0 items-center gap-2">
                 <a href="/repo/{{ repo.name }}" class="font-mono text-sm text-white truncate hover:text-accent transition-colors">{{ repo.name }}</a>
+                <a href="/repo/{{ repo.name }}/audit" class="text-xs text-gray-400 underline">audit</a>
                 <span class="inline-flex items-center gap-2">
                     {% if is_synthetic %}
                     <span class="w-2.5 h-2.5 rounded-full bg-warn pulse-dot shrink-0" data-state-dot></span>
