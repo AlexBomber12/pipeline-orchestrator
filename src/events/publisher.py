@@ -9,6 +9,7 @@ from typing import Any
 
 import redis.asyncio as aioredis
 
+from src.events.disk_log import append_event_to_disk
 from src.keyspace import repo_events_channel, repo_events_history
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
@@ -64,6 +65,7 @@ async def publish_repo_event(
         await client.lpush(_history_name(repo_name), message)
         await client.ltrim(_history_name(repo_name), 0, EVENT_HISTORY_LIMIT - 1)
         await client.publish(_channel_name(repo_name), message)
+        append_event_to_disk(repo_name, event_type, payload)
     finally:
         if owns_client:
             await client.aclose()
