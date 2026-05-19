@@ -1846,6 +1846,44 @@ def test_review_timeout_park_cleared_returns_false_on_redis_error(
     assert asyncio.run(runner._review_timeout_park_cleared()) is False
 
 
+def test_review_timeout_park_cleared_does_not_refresh_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-345 fix-feedback: the ERROR-cycle poll must not pin the cause.
+
+    ``run_cycle`` calls ``_review_timeout_park_cleared`` on every ERROR
+    cycle while the operator-park flag is set. If that poll inherited the
+    ``refresh_ttl=True`` default it would reset the cause TTL to the 90-day
+    forensic window each cycle and the record would never expire — the
+    park would never clear naturally for review-timeout/operator parks
+    that nobody opens in the UI. Assert the poll forwards
+    ``refresh_ttl=False`` to ``get_cancellation_cause``.
+    """
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-345",
+        title="t",
+        status=TaskStatus.ERROR,
+    )
+
+    captured: dict[str, object] = {}
+
+    async def spy(
+        redis_client: Any,
+        repo_slug: str,
+        task_id: str,
+        *,
+        refresh_ttl: bool = True,
+    ) -> None:
+        captured["refresh_ttl"] = refresh_ttl
+        return None
+
+    monkeypatch.setattr("src.daemon.runner.get_cancellation_cause", spy)
+    asyncio.run(runner._review_timeout_park_cleared())
+
+    assert captured == {"refresh_ttl": False}
+
+
 def test_run_cycle_clears_review_timeout_park_flag_on_non_error_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

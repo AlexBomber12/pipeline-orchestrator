@@ -25,6 +25,7 @@ from redis.exceptions import RedisError
 
 from src.audit.operator_actions import write_audit_record
 from src.cancellation.storage import (
+    READ_REFRESH_TTL_SECONDS,
     TTL_SECONDS,
     CancellationCause,
     cause_key,
@@ -33,6 +34,7 @@ from src.cancellation.storage import (
     get_cancellation_cause,
     index_key,
     list_pending_guardrail_decisions,
+    prune_dead_index_members,
     record_cancellation_cause,
 )
 from src.config import load_config
@@ -641,9 +643,13 @@ async def _task_view(
         # ERROR group into a guardrail subgroup (operator decision needed)
         # vs other (automatic failure). Best-effort: Redis errors leave the
         # task in the "other" bucket rather than 5xx-ing the panel.
+        # PR-345 follow-up: ``refresh_ttl=False`` — this is an aggregate
+        # display read across every ERROR task, not an explicit per-record
+        # investigation, so it must not push records out to the 90-day
+        # forensic ceiling on every panel render.
         try:
             cause = await get_cancellation_cause(
-                redis_client, repo_name, task.pr_id
+                redis_client, repo_name, task.pr_id, refresh_ttl=False
             )
         except Exception:
             cause = None
@@ -2164,7 +2170,6 @@ async def _reject_guardrail_decision(
     )
     serialized = new_cause.to_redis()
     score = datetime.fromisoformat(new_cause.created_at).timestamp()
-    expiry_cutoff = datetime.now(timezone.utc).timestamp() - TTL_SECONDS
     # CAS-guard the operator_reject write: a concurrent approve can
     # CAS-delete the guardrail cause between our initial read and this
     # write, and an unguarded ``set`` would resurrect a cancellation key
@@ -2186,8 +2191,7 @@ async def _reject_guardrail_decision(
             pipe.multi()
             pipe.set(cause_key(name, pr_id), serialized, ex=TTL_SECONDS)
             pipe.zadd(index_key(name), {pr_id: score})
-            pipe.zremrangebyscore(index_key(name), "-inf", f"({expiry_cutoff}")
-            pipe.expire(index_key(name), TTL_SECONDS)
+            pipe.expire(index_key(name), READ_REFRESH_TTL_SECONDS)
             try:
                 await pipe.execute()
             except aioredis.WatchError:
@@ -2197,6 +2201,24 @@ async def _reject_guardrail_decision(
                 )
     except RedisError:
         return HTMLResponse("Redis unavailable", status_code=503)
+
+    # Best-effort liveness-based housekeeping shares semantics with
+    # ``record_cancellation_cause`` and runs outside MULTI/EXEC because
+    # EXISTS-driven liveness checks need readback values the transaction
+    # queue cannot return. A RedisError here must NOT abort the reject
+    # flow: the CAS write has already flipped the cause to
+    # ``operator_reject``, so returning 503 would skip the PR close
+    # side-effect, and a retry would see no pending guardrail decision —
+    # leaving the rejected PR open with the operator's decision already
+    # persisted.
+    try:
+        await prune_dead_index_members(redis_client, name)
+    except RedisError:
+        _app.logger.warning(
+            "Failed to prune cancellation index for %s after reject CAS"
+            " write succeeded; continuing with PR close",
+            name, exc_info=True,
+        )
 
     if pr_number is not None and owner_repo is not None:
         await _gh_best_effort(

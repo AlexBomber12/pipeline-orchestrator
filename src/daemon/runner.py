@@ -1415,7 +1415,7 @@ class PipelineRunner(
             existing: CancellationCause | None
             try:
                 existing = await get_cancellation_cause(
-                    self.redis, self.name, task.pr_id
+                    self.redis, self.name, task.pr_id, refresh_ttl=False
                 )
             except Exception:
                 existing = None
@@ -1575,7 +1575,7 @@ class PipelineRunner(
             return True
         try:
             cause = await get_cancellation_cause(
-                self.redis, self.name, task.pr_id
+                self.redis, self.name, task.pr_id, refresh_ttl=False
             )
         except Exception:
             return False

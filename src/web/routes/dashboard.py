@@ -233,12 +233,18 @@ async def _recover_guardrail_metadata(
     rule and excerpt. Re-fetch the cause and apply the same fallback the
     approve/reject endpoints use; degrade silently to the original entry
     if the cause has already vanished (TTL expiry, concurrent decision).
+
+    ``refresh_ttl=False`` because this helper runs on the 30s passive poll
+    of ``/partials/repo/{name}``: an open dashboard would otherwise extend
+    every guardrail-pending record to the 90-day forensic ceiling on every
+    poll cycle. Explicit operator action (the diagnostic endpoint) carries
+    the default refresh.
     """
     if entry.rule and entry.excerpt:
         return entry
     try:
         cause = await get_cancellation_cause(
-            redis_client, repo_name, entry.task_id
+            redis_client, repo_name, entry.task_id, refresh_ttl=False
         )
     except Exception:
         return entry
@@ -1076,6 +1082,13 @@ async def _build_cancellation_subsources(
     is one Redis RTT instead of N×RTT — this helper runs on both the full
     dashboard render and the ``/partials/repo-list`` refresh path, so the
     serialized variant made the UI scale linearly with the ERROR repo count.
+
+    ``refresh_ttl=False`` because this helper feeds the 30s passive poll of
+    ``/partials/repo-list``: leaving the dashboard open would otherwise pin
+    every ERROR record's TTL at the 90-day forensic ceiling indefinitely.
+    The forensic refresh is reserved for explicit diagnostic reads (the
+    per-task diagnostic endpoint), so records nobody investigates still
+    evict naturally at the 30-day write-side budget.
     """
     if redis_client is None:
         return {}
@@ -1089,7 +1102,10 @@ async def _build_cancellation_subsources(
     results = await asyncio.gather(
         *(
             get_cancellation_cause(
-                redis_client, s.name, s.current_task.pr_id
+                redis_client,
+                s.name,
+                s.current_task.pr_id,
+                refresh_ttl=False,
             )
             for s in targets
         ),

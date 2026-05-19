@@ -117,6 +117,17 @@ class _FakeRedisWithPipeline:
         self.zsets.setdefault(key, {})
         return 0
 
+    async def zrangebyscore(
+        self, key: str, min_score: Any, max_score: Any
+    ) -> list[str]:
+        # Liveness-based prune only inspects members with very old scores;
+        # tests in this file write fresh causes whose scores never fall into
+        # that range, so an empty result is the right default.
+        return []
+
+    async def exists(self, key: str) -> int:
+        return int(key in self.values)
+
 
 def _captured_safe_record(monkeypatch: pytest.MonkeyPatch) -> list[CancellationCause]:
     """Patch safe_record_cancellation_cause everywhere it is imported."""
