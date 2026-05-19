@@ -25,7 +25,7 @@ from src.cancellation import (
 from src.daemon import git_ops
 from src.github import gh_runner
 from src.github import prs as gh_prs
-from src.keyspace import pipeline_state
+from src.keyspace import pipeline_state, recovery_backup_branch
 from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
 from src.queue_parser import QueueValidationError, parse_task_header
 from src.task_status import (
@@ -479,6 +479,8 @@ class RecoveryMixin:
                         log_prefix="[INFRA]",
                     )
                     return
+                # PR-351: see crash-recovery branch below for rationale.
+                await self._persist_pending_backup_branch_write()
                 self.state.current_pr = None
                 self.state.state = PipelineState.IDLE
                 self.log_event(
@@ -508,6 +510,12 @@ class RecoveryMixin:
                     log_prefix="[INFRA]",
                 )
                 return
+            # PR-351: if the preserve push fell back to a ``crash-backup``
+            # branch (primary push rejected by branch protection or non-
+            # fast-forward state), persist the pointer to Redis so the
+            # dashboard cancellation card can surface the branch name for
+            # operator recovery.
+            await self._persist_pending_backup_branch_write()
             # Capture branch surfaces before clearing ``current_task``
             # so the cancellation diagnostic names the task branch the
             # crash was associated with rather than ``<absent>``.
@@ -738,12 +746,26 @@ class RecoveryMixin:
         if Claude later resets the local branch.
 
         Returns ``True`` when it is safe for the caller to proceed with
-        re-running CODING (no local branch to preserve, or push
+        re-running CODING (no local branch to preserve, push succeeded,
+        or the PR-351 fallback push to a ``crash-backup/`` branch
         succeeded). Returns ``False`` when the caller MUST NOT proceed:
         the task targets the base branch (malformed task header that
         would let Claude reset ``main``) or the preserve push failed in
         a way that may have left commits orphan-only on local.
+
+        PR-351: when the primary push is rejected by branch protection
+        or non-fast-forward state, attempt a fallback push to a unique
+        ``crash-backup/{task_id}/{timestamp}`` branch instead of giving
+        up. The rejected-needle match is git-CLI-version-dependent (the
+        stderr strings ``remote rejected`` and ``non-fast-forward`` are
+        emitted by git 2.40+, the production version pin) and may need
+        re-verification if production pins a newer release. The fallback
+        branch name is recorded on ``self._pending_backup_branch_write``
+        so the async caller can persist it under the
+        ``recovery:backup_branch:{repo}:{task_id}`` Redis key with a
+        30-day TTL.
         """
+        self._pending_backup_branch_write = None
         if branch == self.repo_config.branch:
             self.log_event(
                 f"[INFRA] Refusing to preserve crashed-run commits on "
@@ -777,11 +799,18 @@ class RecoveryMixin:
                 f"{branch}:{branch}",
                 timeout=120,
             )
-        except (
-            subprocess.CalledProcessError,
-            subprocess.TimeoutExpired,
-            OSError,
-        ) as exc:
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr or ""
+            if self._push_rejected_by_remote(stderr):
+                backup_branch = self._attempt_backup_branch_push(branch, stderr)
+                if backup_branch is not None:
+                    return True
+            self.log_event(
+                f"[INFRA] Failed to preserve unpushed commits on "
+                f"{branch}: {exc}."
+            )
+            return False
+        except (subprocess.TimeoutExpired, OSError) as exc:
             self.log_event(
                 f"[INFRA] Failed to preserve unpushed commits on "
                 f"{branch}: {exc}."
@@ -792,6 +821,94 @@ class RecoveryMixin:
             f"[INFRA] Preserved crashed-run commits on {branch}."
         )
         return True
+
+    @staticmethod
+    def _push_rejected_by_remote(stderr: str) -> bool:
+        """Return ``True`` when the push stderr matches the rejected pattern.
+
+        Detects the two stderr signatures git 2.40+ emits when the remote
+        refuses a non-force push: a branch-protection rejection
+        (``remote rejected``) and a non-fast-forward rejection
+        (``non-fast-forward``). A new git release that rewords either
+        message would silently disable the PR-351 fallback path, so the
+        match needs periodic verification against the production git pin.
+        """
+        return "remote rejected" in stderr or "non-fast-forward" in stderr
+
+    def _attempt_backup_branch_push(
+        self, branch: str, primary_stderr: str
+    ) -> str | None:
+        """Push ``branch`` to a ``crash-backup/{task_id}/{timestamp}`` ref.
+
+        Called from ``_preserve_crashed_run_commits`` when the primary
+        push to ``origin/{branch}`` was rejected. The task id is read
+        from ``self.state.current_task`` so existing test patches that
+        monkey-patch the parent method with ``lambda branch: ...`` keep
+        working without signature churn.
+
+        Returns the fallback branch name when the push succeeds (with
+        the pending Redis write recorded on
+        ``self._pending_backup_branch_write``), or ``None`` when the
+        fallback cannot be attempted (no current task) or also fails.
+        """
+        current_task = self.state.current_task
+        if current_task is None:
+            return None
+        task_id = current_task.pr_id
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        backup_branch = f"crash-backup/{task_id}/{timestamp}"
+        try:
+            git_ops._git(
+                self.repo_path,
+                "push",
+                "origin",
+                f"{branch}:{backup_branch}",
+                timeout=120,
+            )
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+        ) as exc:
+            self.log_event(
+                f"[INFRA] Crash-backup fallback push to "
+                f"{backup_branch} also failed: {exc}."
+            )
+            return None
+        self.log_event(
+            f"[INFRA] Primary push rejected ({primary_stderr.strip() or 'rejected'}); "
+            f"preserved crashed-run commits on fallback branch "
+            f"{backup_branch}."
+        )
+        self._pending_backup_branch_write = (task_id, backup_branch)
+        return backup_branch
+
+    async def _persist_pending_backup_branch_write(self) -> None:
+        """Flush the PR-351 fallback-branch pointer to Redis.
+
+        ``_preserve_crashed_run_commits`` is synchronous, so it stashes
+        the ``(task_id, branch)`` pair on ``self`` and lets the async
+        recovery caller persist it once the rest of the crash path has
+        decided to proceed. Best-effort: a Redis write failure logs but
+        does not abort recovery — the work is still preserved on
+        origin, only the dashboard surface is degraded.
+        """
+        pending = getattr(self, "_pending_backup_branch_write", None)
+        if not pending:
+            return
+        self._pending_backup_branch_write = None
+        task_id, backup_branch = pending
+        try:
+            await self.redis.set(
+                recovery_backup_branch(self.name, task_id),
+                backup_branch,
+                ex=30 * 86400,
+            )
+        except Exception as exc:
+            self.log_event(
+                f"[INFRA] Failed to record crash-backup branch for "
+                f"{task_id}: {exc}."
+            )
 
     def _rehydrate_last_push_at(self, pr: PRInfo) -> None:
         """Seed ``_last_push_at`` from the PR's head commit's committer
