@@ -60,6 +60,7 @@ def append_event_to_disk(
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
                 handle.write(line)
+                handle.flush()
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     except (OSError, TypeError, ValueError):
