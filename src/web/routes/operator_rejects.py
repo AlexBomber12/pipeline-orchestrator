@@ -53,10 +53,14 @@ async def _read_operator_rejects(
                 continue
             if cause.payload.get("subsource") != "operator_reject":
                 continue
-            excerpt = cause.payload.get("operator_reject_excerpt", "")
+            excerpt = cause.payload.get("original_excerpt")
+            if excerpt is None:
+                excerpt = cause.payload.get("operator_reject_excerpt", "")
             if not isinstance(excerpt, str):
                 excerpt = str(excerpt)
-            rule = cause.payload.get("operator_reject_rule")
+            rule = cause.payload.get("original_rule")
+            if rule is None:
+                rule = cause.payload.get("operator_reject_rule")
             if rule is not None and not isinstance(rule, str):
                 rule = str(rule)
             rejects.append(

@@ -113,10 +113,10 @@ def _operator_payload(
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "subsource": "operator_reject",
-        "operator_reject_excerpt": excerpt,
+        "original_excerpt": excerpt,
     }
     if rule is not None:
-        payload["operator_reject_rule"] = rule
+        payload["original_rule"] = rule
     return payload
 
 
@@ -299,7 +299,7 @@ def test_rejects_page_paginates_until_limit_is_filled(
     ]
 
 
-def test_rejects_page_decodes_bytes_task_ids_and_coerces_payload_fields(
+def test_rejects_page_decodes_bytes_task_ids_and_coerces_persisted_payload_fields(
     base_config: Path,
     redis_client: _RejectRedis,
 ) -> None:
@@ -309,8 +309,8 @@ def test_rejects_page_decodes_bytes_task_ids_and_coerces_payload_fields(
         category="ERROR",
         payload={
             "subsource": "operator_reject",
-            "operator_reject_rule": 123,
-            "operator_reject_excerpt": 456,
+            "original_rule": 123,
+            "original_excerpt": 456,
         },
         created_at=created_at.isoformat(),
         task_id=task_id,
@@ -327,6 +327,33 @@ def test_rejects_page_decodes_bytes_task_ids_and_coerces_payload_fields(
     assert "PR-bytes" in response.text
     assert '<td class="py-2 text-xs">123</td>' in response.text
     assert '<td class="py-2 text-xs text-gray-300">456</td>' in response.text
+
+
+def test_rejects_page_supports_legacy_operator_reject_payload_keys(
+    base_config: Path,
+    redis_client: _RejectRedis,
+) -> None:
+    created_at = datetime(2026, 5, 19, 12, tzinfo=timezone.utc)
+    _record_cancellation(
+        redis_client,
+        "PR-legacy",
+        payload={
+            "subsource": "operator_reject",
+            "operator_reject_rule": "legacy_rule",
+            "operator_reject_excerpt": "legacy excerpt",
+        },
+        created_at=created_at,
+    )
+
+    response = _get_rejects_page()
+
+    assert response.status_code == 200
+    assert "PR-legacy" in response.text
+    assert '<td class="py-2 text-xs">legacy_rule</td>' in response.text
+    assert (
+        '<td class="py-2 text-xs text-gray-300">legacy excerpt</td>'
+        in response.text
+    )
 
 
 def test_rejects_page_skips_non_dict_payload(
