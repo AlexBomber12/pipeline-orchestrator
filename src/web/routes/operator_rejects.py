@@ -30,9 +30,12 @@ async def _read_operator_rejects(
     page_size = limit
     start = 0
     while len(rejects) < limit:
-        task_ids = await redis_client.zrevrange(
-            index_key(repo_name), start, start + page_size - 1
-        )
+        try:
+            task_ids = await redis_client.zrevrange(
+                index_key(repo_name), start, start + page_size - 1
+            )
+        except Exception:
+            return rejects
         if not task_ids:
             break
         for raw_task_id in task_ids:

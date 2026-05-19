@@ -24,6 +24,7 @@ class _RejectRedis:
         self.values: dict[str, str] = {}
         self.zsets: dict[str, dict[object, float]] = {}
         self.zrevrange_calls: list[tuple[str, int, int]] = []
+        self.zrevrange_error: Exception | None = None
 
     async def ping(self) -> bool:
         return True
@@ -42,6 +43,8 @@ class _RejectRedis:
 
     async def zrevrange(self, key: str, start: int, stop: int) -> list[object]:
         self.zrevrange_calls.append((key, start, stop))
+        if self.zrevrange_error is not None:
+            raise self.zrevrange_error
         members = sorted(
             self.zsets.get(key, {}).items(),
             key=lambda item: item[1],
@@ -399,6 +402,19 @@ def test_rejects_page_handles_corrupt_cancellation_record(
     assert response.text.count("data-operator-reject-row") == 1
     assert "PR-good" in response.text
     assert "good reject" in response.text
+
+
+def test_rejects_page_handles_cancellation_index_read_failure(
+    base_config: Path,
+    redis_client: _RejectRedis,
+) -> None:
+    redis_client.zrevrange_error = RuntimeError("redis unavailable")
+
+    response = _get_rejects_page()
+
+    assert response.status_code == 200
+    assert "No operator rejects recorded for this repo." in response.text
+    assert redis_client.zrevrange_calls == [(index_key(REPO_NAME), 0, 49)]
 
 
 def test_rejects_page_skips_non_utf8_index_members(
