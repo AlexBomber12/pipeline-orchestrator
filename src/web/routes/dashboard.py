@@ -1859,6 +1859,28 @@ async def api_cancellations(repo: str, request: Request) -> JSONResponse:
     )
 
 
+@router.get("/partials/sandbox-badge", response_class=HTMLResponse)
+async def partial_sandbox_badge(request: Request) -> HTMLResponse:
+    """Return the sandbox badge fragment with a freshly read state.
+
+    The badge on the index page is wrapped in an HTMX-polled container
+    that hits this endpoint. Without it, the badge would only reflect
+    the value of ``daemon:sandbox_state`` at the moment the page was
+    rendered: a daemon-driven probe refresh (config reload, bwrap
+    install/removal) would not propagate to an already-open dashboard
+    until a full browser reload, defeating the live transition the
+    spec calls for.
+    """
+    redis_client = getattr(request.app.state, "redis", None)
+    config = await asyncio.to_thread(load_config, _app.CONFIG_PATH)
+    sandbox_state = await _read_sandbox_state(redis_client, config)
+    return _app.templates.TemplateResponse(
+        request,
+        "components/sandbox_badge.html",
+        {"sandbox_state": sandbox_state},
+    )
+
+
 @router.get("/partials/redis-banner", response_class=HTMLResponse)
 async def partial_redis_banner(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)

@@ -225,6 +225,93 @@ def test_dashboard_falls_back_to_unavailable_when_redis_returns_garbage_with_iso
     assert 'data-sandbox-badge="unavailable"' in response.text
 
 
+def test_partial_sandbox_badge_returns_current_redis_state(
+    isolation_on_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The /partials/sandbox-badge endpoint exists so the dashboard can
+    # re-read daemon:sandbox_state via an HTMX trigger after a config
+    # reload or bwrap install/removal updates the cached probe. Without
+    # this endpoint the badge would only reflect the page-render value.
+    redis_client = _DashboardRedis(
+        {REDIS_SANDBOX_STATE_KEY: SandboxState.ACTIVE.value}
+    )
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        response = client.get("/partials/sandbox-badge")
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'data-sandbox-badge="active"' in body
+    assert "sandbox: active" in body
+    assert "bg-ok/10" in body
+
+
+def test_partial_sandbox_badge_reflects_state_transition(
+    isolation_on_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Simulate the live-transition scenario the reviewer flagged: the
+    # operator opens the dashboard while the daemon reports ``active``,
+    # then bwrap is removed and the daemon's next probe writes
+    # ``unavailable``. The HTMX-driven partial must pick up the new
+    # value without a full browser reload.
+    redis_client = _DashboardRedis(
+        {REDIS_SANDBOX_STATE_KEY: SandboxState.ACTIVE.value}
+    )
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        first = client.get("/partials/sandbox-badge")
+        assert first.status_code == 200
+        assert 'data-sandbox-badge="active"' in first.text
+
+        redis_client.store[REDIS_SANDBOX_STATE_KEY] = (
+            SandboxState.UNAVAILABLE.value
+        )
+        second = client.get("/partials/sandbox-badge")
+
+    assert second.status_code == 200
+    assert 'data-sandbox-badge="unavailable"' in second.text
+    assert 'data-sandbox-badge="active"' not in second.text
+
+
+def test_partial_sandbox_badge_honors_config_off(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Even if Redis still holds a stale ``active`` probe, the partial
+    # must respect the current config flag — matching the behavior of
+    # the initial page render so a manual toggle off cannot stay green.
+    redis_client = _DashboardRedis(
+        {REDIS_SANDBOX_STATE_KEY: SandboxState.ACTIVE.value}
+    )
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        response = client.get("/partials/sandbox-badge")
+
+    assert response.status_code == 200
+    assert 'data-sandbox-badge="disabled"' in response.text
+
+
+def test_dashboard_wraps_badge_in_htmx_polling_container(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The dashboard must wrap the badge in a container that polls the
+    # /partials/sandbox-badge endpoint so daemon-driven state changes
+    # propagate to an already-open page without a full reload.
+    redis_client = _DashboardRedis()
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'id="sandbox-badge-wrapper"' in body
+    assert 'hx-get="/partials/sandbox-badge"' in body
+    assert "every 30s" in body
+
+
 @pytest.mark.asyncio
 async def test_read_sandbox_state_handles_bytes_payload() -> None:
     class _BytesRedis:
