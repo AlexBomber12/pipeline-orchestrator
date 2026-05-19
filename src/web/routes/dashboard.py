@@ -1428,7 +1428,20 @@ async def _read_sandbox_state(redis_client: Any, config: AppConfig) -> str:
     invalid). Without that fallback the badge would render an empty
     string and the operator would lose the at-a-glance status entirely
     on a first boot.
+
+    The current ``coder_filesystem_isolation`` config flag takes
+    precedence over the cached Redis probe so a freshly flipped flag
+    cannot be contradicted by stale daemon state (daemon down,
+    inotify reload not yet processed, Redis serving the previous
+    boot's value). When the flag is ``false`` the badge always renders
+    ``disabled``; when the flag is ``true`` only an ``active`` or
+    ``unavailable`` cached probe is honored and a stale ``disabled``
+    falls through to the ``unavailable`` fallback so the operator
+    never sees a green badge while config says off, or a gray badge
+    while config says on.
     """
+    if not config.daemon.coder_filesystem_isolation:
+        return SandboxState.DISABLED.value
     raw: Any = None
     if redis_client is not None:
         try:
@@ -1439,11 +1452,11 @@ async def _read_sandbox_state(redis_client: Any, config: AppConfig) -> str:
         raw = raw.decode("utf-8", errors="replace")
     if isinstance(raw, str):
         try:
-            return SandboxState(raw).value
+            cached = SandboxState(raw)
         except ValueError:
-            pass
-    if not config.daemon.coder_filesystem_isolation:
-        return SandboxState.DISABLED.value
+            cached = None
+        if cached in (SandboxState.ACTIVE, SandboxState.UNAVAILABLE):
+            return cached.value
     return SandboxState.UNAVAILABLE.value
 
 

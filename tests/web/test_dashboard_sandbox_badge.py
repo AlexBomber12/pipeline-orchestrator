@@ -48,8 +48,19 @@ def empty_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return cfg
 
 
+@pytest.fixture
+def isolation_on_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories: []\ndaemon:\n  coder_filesystem_isolation: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    return cfg
+
+
 def test_dashboard_renders_active_badge_when_state_is_active(
-    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+    isolation_on_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     redis_client = _DashboardRedis(
         {REDIS_SANDBOX_STATE_KEY: SandboxState.ACTIVE.value}
@@ -68,7 +79,7 @@ def test_dashboard_renders_active_badge_when_state_is_active(
 
 
 def test_dashboard_renders_unavailable_badge_when_state_is_unavailable(
-    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+    isolation_on_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     redis_client = _DashboardRedis(
         {REDIS_SANDBOX_STATE_KEY: SandboxState.UNAVAILABLE.value}
@@ -84,6 +95,48 @@ def test_dashboard_renders_unavailable_badge_when_state_is_unavailable(
     assert "sandbox: unavailable" in body
     assert "bg-fail/10" in body
     assert "text-fail" in body
+
+
+def test_dashboard_forces_disabled_when_config_off_overrides_stale_active(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Config flag is off but Redis still holds the previous daemon
+    # boot's "active" probe (daemon down, inotify reload not yet
+    # processed, etc.). The current config wins: badge must render
+    # "disabled" so the dashboard cannot show a green sandbox while
+    # operators have explicitly turned it off.
+    redis_client = _DashboardRedis(
+        {REDIS_SANDBOX_STATE_KEY: SandboxState.ACTIVE.value}
+    )
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'data-sandbox-badge="disabled"' in body
+    assert 'data-sandbox-badge="active"' not in body
+
+
+def test_dashboard_forces_unavailable_when_config_on_overrides_stale_disabled(
+    isolation_on_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Config flag just flipped to on but Redis still holds the previous
+    # daemon boot's "disabled" value. Trusting that cached value would
+    # mis-render a gray badge while operators have enabled the sandbox.
+    # Fall through to the safe "unavailable" fallback until the daemon
+    # re-probes.
+    redis_client = _DashboardRedis(
+        {REDIS_SANDBOX_STATE_KEY: SandboxState.DISABLED.value}
+    )
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert 'data-sandbox-badge="unavailable"' in response.text
 
 
 def test_dashboard_renders_disabled_badge_when_state_is_disabled(
@@ -156,18 +209,65 @@ def test_dashboard_falls_back_when_redis_returns_garbage(
     assert 'data-sandbox-badge="disabled"' in response.text
 
 
+def test_dashboard_falls_back_to_unavailable_when_redis_returns_garbage_with_isolation_on(
+    isolation_on_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Config flag on; Redis value is not a recognized SandboxState. The
+    # garbage parses as ValueError and falls through to the safe
+    # "unavailable" view rather than crashing the render.
+    redis_client = _DashboardRedis({REDIS_SANDBOX_STATE_KEY: "not-a-state"})
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert 'data-sandbox-badge="unavailable"' in response.text
+
+
 @pytest.mark.asyncio
 async def test_read_sandbox_state_handles_bytes_payload() -> None:
     class _BytesRedis:
         async def get(self, key: str) -> bytes:
             return SandboxState.ACTIVE.value.encode("utf-8")
 
-    from src.config import AppConfig
+    from src.config import AppConfig, DaemonConfig
 
     state = await dashboard_routes._read_sandbox_state(
-        _BytesRedis(), AppConfig()
+        _BytesRedis(),
+        AppConfig(daemon=DaemonConfig(coder_filesystem_isolation=True)),
     )
     assert state == SandboxState.ACTIVE.value
+
+
+@pytest.mark.asyncio
+async def test_read_sandbox_state_config_off_overrides_redis_active() -> None:
+    class _ActiveRedis:
+        async def get(self, key: str) -> str:
+            return SandboxState.ACTIVE.value
+
+    from src.config import AppConfig, DaemonConfig
+
+    state = await dashboard_routes._read_sandbox_state(
+        _ActiveRedis(),
+        AppConfig(daemon=DaemonConfig(coder_filesystem_isolation=False)),
+    )
+    assert state == SandboxState.DISABLED.value
+
+
+@pytest.mark.asyncio
+async def test_read_sandbox_state_config_on_rejects_stale_disabled() -> None:
+    class _DisabledRedis:
+        async def get(self, key: str) -> str:
+            return SandboxState.DISABLED.value
+
+    from src.config import AppConfig, DaemonConfig
+
+    state = await dashboard_routes._read_sandbox_state(
+        _DisabledRedis(),
+        AppConfig(daemon=DaemonConfig(coder_filesystem_isolation=True)),
+    )
+    assert state == SandboxState.UNAVAILABLE.value
 
 
 @pytest.mark.asyncio
@@ -176,14 +276,16 @@ async def test_read_sandbox_state_swallows_redis_errors() -> None:
         async def get(self, key: str) -> str:
             raise RuntimeError("redis down")
 
-    from src.config import AppConfig
+    from src.config import AppConfig, DaemonConfig
 
-    # Falls back to 'disabled' because the default AppConfig has
-    # isolation off; the Redis exception must not propagate.
+    # With isolation enabled the Redis read path is exercised; the
+    # exception must be swallowed and the badge must fall back to the
+    # safe "unavailable" view rather than propagating the error.
     state = await dashboard_routes._read_sandbox_state(
-        _BoomRedis(), AppConfig()
+        _BoomRedis(),
+        AppConfig(daemon=DaemonConfig(coder_filesystem_isolation=True)),
     )
-    assert state == SandboxState.DISABLED.value
+    assert state == SandboxState.UNAVAILABLE.value
 
 
 @pytest.mark.asyncio
