@@ -10,12 +10,20 @@ that respond to ``/settings/*``, ``/partials/settings/*``, or
 
 from __future__ import annotations
 
+import asyncio
+import html
+import json
 import re
+import time
+from datetime import datetime, timezone
+from importlib import metadata
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from src.audit.webhook_log import write_webhook_audit
 from src.coder_registry import CoderPlugin
 from src.coders import build_coder_registry
 from src.config import (
@@ -114,6 +122,25 @@ _HTTP_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 _BOOL_TRUE = {"true", "1", "yes", "on"}
 _BOOL_FALSE = {"false", "0", "no", "off"}
+
+
+def _get_daemon_version() -> str:
+    """Return the installed package version for synthetic webhook payloads."""
+    try:
+        return metadata.version("pipeline-orchestrator")
+    except metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def _json_payload_size_bytes(payload: dict[str, Any]) -> int:
+    return len(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    )
 
 
 def _coerce_bool(value: str, field: str) -> bool:
@@ -351,6 +378,82 @@ async def partial_settings_coders(request: Request) -> HTMLResponse:
         "components/settings_coders_wrapper.html",
         context,
     )
+
+
+@router.post("/settings/webhook/test", response_class=HTMLResponse)
+async def test_webhook(request: Request) -> HTMLResponse:
+    """POST a synthetic test payload to the configured operator webhook.
+
+    The URL is operator-configured, so this endpoint can target internal
+    hosts. That SSRF shape is acceptable while the dashboard remains
+    LAN-only and operator-only; revisit before exposing it to less-trusted
+    users.
+    """
+    cfg = load_config(_app.CONFIG_PATH)
+    form = await request.form()
+    submitted_url = form.get("guardrail_notification_webhook_url")
+    url = (
+        str(submitted_url).strip()
+        if submitted_url is not None
+        else cfg.daemon.guardrail_notification_webhook_url
+    )
+    if not url:
+        return HTMLResponse(
+            '<span class="text-fail">No URL configured</span>',
+            status_code=200,
+        )
+
+    test_payload = {
+        "event": "webhook_test",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "text": "Synthetic test from pipeline-orchestrator settings page",
+        "daemon_version": _get_daemon_version(),
+    }
+    timeout_sec = cfg.daemon.guardrail_notification_timeout_seconds
+    payload_size_bytes = _json_payload_size_bytes(test_payload)
+    start = time.monotonic()
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                url, json=test_payload, timeout=timeout_sec
+            )
+        elapsed_ms = (time.monotonic() - start) * 1000
+        response_excerpt = response.text[:200]
+        await asyncio.to_thread(
+            write_webhook_audit,
+            event_type="webhook_test",
+            webhook_url=url,
+            payload_size_bytes=payload_size_bytes,
+            attempt_number=1,
+            http_status=response.status_code,
+            response_excerpt=response_excerpt,
+            elapsed_ms=elapsed_ms,
+        )
+        if response.is_success:
+            return HTMLResponse(
+                f'<span class="text-ok">✓ HTTP {response.status_code} '
+                f"in {elapsed_ms:.0f}ms</span>"
+            )
+        excerpt = html.escape(response.text[:80])
+        return HTMLResponse(
+            f'<span class="text-fail">✗ HTTP {response.status_code}: '
+            f"{excerpt}</span>"
+        )
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
+        elapsed_ms = (time.monotonic() - start) * 1000
+        error_excerpt = f"{type(exc).__name__}: {str(exc)[:100]}"
+        await asyncio.to_thread(
+            write_webhook_audit,
+            event_type="webhook_test",
+            webhook_url=url,
+            payload_size_bytes=payload_size_bytes,
+            attempt_number=1,
+            http_status=None,
+            response_excerpt=error_excerpt,
+            elapsed_ms=elapsed_ms,
+        )
+        rendered_error = html.escape(f"{type(exc).__name__}: {str(exc)[:80]}")
+        return HTMLResponse(f'<span class="text-fail">✗ {rendered_error}</span>')
 
 
 @router.put("/settings/daemon", response_class=HTMLResponse)
