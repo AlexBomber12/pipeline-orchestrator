@@ -55,6 +55,26 @@ def _split_parent_of(pr_id: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _merged_split_parent_aliases(
+    *,
+    structured_pr_ids: set[str],
+    merged_pr_ids: set[str],
+) -> set[str]:
+    """Return split parents whose known split children are all merged."""
+    children_by_parent: dict[str, set[str]] = {}
+    for pr_id in structured_pr_ids | merged_pr_ids:
+        parent = _split_parent_of(pr_id)
+        if parent is None:
+            continue
+        children_by_parent.setdefault(parent, set()).add(pr_id)
+
+    return {
+        parent
+        for parent, children in children_by_parent.items()
+        if parent not in structured_pr_ids and children <= merged_pr_ids
+    }
+
+
 class IdleMixin:
     """Handle IDLE state: sync, pick next task, dispatch to CODING."""
 
@@ -327,11 +347,10 @@ class IdleMixin:
     ) -> tuple[list, dict[str, list[str]]]:
         unresolved_deps_map: dict[str, list[str]] = {}
         structured_pr_ids = {header.pr_id for header in headers}
-        merged_parent_aliases = {
-            parent
-            for merged_pr_id in merged_pr_ids
-            if (parent := _split_parent_of(merged_pr_id)) is not None
-        }
+        merged_parent_aliases = _merged_split_parent_aliases(
+            structured_pr_ids=structured_pr_ids,
+            merged_pr_ids=merged_pr_ids,
+        )
 
         changed = True
         while changed:
@@ -417,6 +436,11 @@ class IdleMixin:
             task_dir,
             merged_pr_ids,
         )
+        structured_pr_ids = {header.pr_id for header in headers}
+        merged_parent_aliases = _merged_split_parent_aliases(
+            structured_pr_ids=structured_pr_ids,
+            merged_pr_ids=merged_pr_ids,
+        )
 
         try:
             dag_headers = [
@@ -426,6 +450,7 @@ class IdleMixin:
                         dependency
                         for dependency in header.depends_on
                         if dependency not in merged_pr_ids
+                        and dependency not in merged_parent_aliases
                     ],
                 )
                 for header in headers
