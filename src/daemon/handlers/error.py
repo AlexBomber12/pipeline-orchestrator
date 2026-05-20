@@ -168,6 +168,10 @@ class ErrorMixin:
             )
             await _clear_cause_for_retry()
             self.state.state = PipelineState.IDLE
+            await self._clear_error_message_on_recovery(
+                log_prefix="[ERROR]",
+                reason="infra error soft-skip to IDLE",
+            )
             await self.publish_state()
             return
         category = _classify_error(context)
@@ -181,6 +185,10 @@ class ErrorMixin:
             )
             await _clear_cause_for_retry()
             self.state.state = PipelineState.IDLE
+            await self._clear_error_message_on_recovery(
+                log_prefix="[ERROR]",
+                reason="rate-limit soft-skip to IDLE",
+            )
             await self.publish_state()
             return
         if category == ErrorCategory.TIMEOUT:
@@ -193,6 +201,10 @@ class ErrorMixin:
             )
             await _clear_cause_for_retry()
             self.state.state = PipelineState.IDLE
+            await self._clear_error_message_on_recovery(
+                log_prefix="[ERROR]",
+                reason="timeout soft-skip to IDLE",
+            )
             await self.publish_state()
             return
         selected = self._get_auxiliary_coder()

@@ -1162,7 +1162,7 @@ def test_handle_error_skips_diagnose_for_infra_error(msg: str, monkeypatch: pyte
 
     assert cli_calls == []
     assert runner.state.state == PipelineState.IDLE
-    assert runner.state.error_message == msg
+    assert runner.state.error_message is None
     assert runner._error_skip_context is None
     assert runner._error_skip_count == 0
     assert runner._error_skip_active is False
@@ -1215,10 +1215,11 @@ def test_handle_error_infra_bypass_repeats_without_invoking_cli(
         h._async_cli_result_with_side_effect(cli_calls, "diagnose", 0, "SKIP", ""),
     )
     runner = h._make_runner()
-    runner.state.state = PipelineState.ERROR
-    runner.state.error_message = "ensure_repo_cloned failed: git fetch origin main failed after 3 attempts"
+    msg = "ensure_repo_cloned failed: git fetch origin main failed after 3 attempts"
 
     for _ in range(5):
+        runner.state.state = PipelineState.ERROR
+        runner.state.error_message = msg
         asyncio.run(runner.handle_error())
 
     assert cli_calls == []
@@ -1516,8 +1517,7 @@ def test_handle_error_infra_bypass_resets_state_to_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Infra-error bypass must transition state to IDLE for the next cycle to
-    pick the failed task back up, while preserving error_message for the
-    operator dashboard until the next successful cycle clears it."""
+    pick the failed task back up, while clearing the stale dashboard banner."""
     h._patch_subprocess(monkeypatch)
     runner = h._make_runner()
     runner.state.state = PipelineState.ERROR
@@ -1526,7 +1526,7 @@ def test_handle_error_infra_bypass_resets_state_to_idle(
     asyncio.run(runner.handle_error())
 
     assert runner.state.state == PipelineState.IDLE
-    assert runner.state.error_message == ("ensure_repo_cloned failed: git fetch origin main failed after 3 attempts")
+    assert runner.state.error_message is None
 
 
 def test_handle_error_rate_limit_bypass_resets_state_to_idle(
@@ -1542,7 +1542,7 @@ def test_handle_error_rate_limit_bypass_resets_state_to_idle(
     asyncio.run(runner.handle_error())
 
     assert runner.state.state == PipelineState.IDLE
-    assert runner.state.error_message == "API rate limit exceeded"
+    assert runner.state.error_message is None
 
 
 def test_handle_error_timeout_bypass_resets_state_to_idle(
@@ -1558,7 +1558,7 @@ def test_handle_error_timeout_bypass_resets_state_to_idle(
     asyncio.run(runner.handle_error())
 
     assert runner.state.state == PipelineState.IDLE
-    assert runner.state.error_message == "claude CLI timeout after 900s"
+    assert runner.state.error_message is None
 
 
 def test_handle_error_recovers_within_two_cycles_after_tls_timeout(
