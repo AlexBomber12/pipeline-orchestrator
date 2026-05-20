@@ -316,6 +316,14 @@ def test_paused_card_with_no_inhibitors_no_stack() -> None:
     assert "data-inhibitor-stack" not in html
 
 
+def test_user_paused_card_with_no_inhibitors_keeps_resume() -> None:
+    html = _render_card(_state(user_paused=True))
+
+    assert "data-inhibitor-stack" not in html
+    assert 'hx-post="/repos/example__alpha/resume"' in html
+    assert 'aria-label="Resume daemon"' in html
+
+
 def test_idle_card_no_inhibitor_stack() -> None:
     html = _render_card(
         _state(
