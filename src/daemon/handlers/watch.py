@@ -11,6 +11,7 @@ import logging
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from src.cancellation import CancellationCause
 from src.daemon import guardrails
@@ -18,8 +19,10 @@ from src.github import cache as gh_cache
 from src.github import checks as gh_checks
 from src.github import gh_runner
 from src.github import prs as gh_prs
+from src.inhibitor import InhibitorType, is_work_inhibited
 from src.keyspace import ci_infra_retried
 from src.models import CIStatus, FeedbackCheckResult, PipelineState, ReviewStatus
+from src.queue_parser import parse_task_header
 
 logger = logging.getLogger(__name__)
 _STALE_RETRIGGER_DEBOUNCE = timedelta(hours=1)
@@ -775,6 +778,14 @@ class WatchMixin:
             if now - last_retrigger_at < _STALE_RETRIGGER_DEBOUNCE:
                 return self._stale_skip(pr_number, "debounce", f"{prefix}debounce window active.")
 
+        retrigger_coder = self._watch_retrigger_coder()
+        if self._watch_retrigger_inhibited(retrigger_coder):
+            return self._stale_skip(
+                pr_number,
+                f"rate-limit-{retrigger_coder}",
+                f"{prefix}{retrigger_coder} work inhibited.",
+            )
+
         state_label = current_pr.review_status.value
         cap = self.app_config.daemon.watch_retrigger_cap
         prior_count = current_pr.watch_retrigger_count
@@ -877,6 +888,14 @@ class WatchMixin:
         if latest_error_at is None:
             return False
 
+        retrigger_coder = self._watch_retrigger_coder()
+        if self._watch_retrigger_inhibited(retrigger_coder):
+            self.log_event(
+                f"[WATCH] Codex bot error retrigger skipped for PR "
+                f"#{pr_number}: {retrigger_coder} work inhibited."
+            )
+            return False
+
         last_retrigger_at = self.state.last_codex_retrigger_at
         if last_retrigger_at is not None:
             if last_retrigger_at.tzinfo is None:
@@ -900,6 +919,66 @@ class WatchMixin:
         if success:
             self.state.last_codex_retrigger_at = datetime.now(timezone.utc)
         return posted
+
+    def _watch_retrigger_coder(self) -> str:
+        """Return the coder whose limit should gate WATCH retriggers."""
+        current_pr = self.state.current_pr
+        current_task = self.state.current_task
+        if (
+            current_pr is not None
+            and current_task is not None
+            and current_task.branch == current_pr.branch
+            and current_task.task_file
+        ):
+            try:
+                header = parse_task_header(
+                    Path(self.repo_path) / current_task.task_file
+                )
+            except Exception:
+                header = None
+            if header is not None and header.coder != "any":
+                return header.coder
+
+        candidate = (
+            self.state.coder
+            or getattr(self.repo_config.coder, "value", self.repo_config.coder)
+            or self.app_config.daemon.coder.value
+        )
+        return str(candidate)
+
+    def _watch_retrigger_inhibited(self, coder: str) -> bool:
+        """Return whether WATCH should skip a review retrigger for ``coder``."""
+        if self.repo_config.feature_flags.use_unified_inhibitor_check:
+            blocked, blocking = is_work_inhibited(self.state, coder=coder)
+            hard_blocking = [
+                inh
+                for inh in blocking
+                if inh.inhibitor_type
+                not in (
+                    InhibitorType.GITHUB_BUDGET_SLOWDOWN,
+                    InhibitorType.GITHUB_BUDGET_PAUSE,
+                )
+            ]
+            return blocked and bool(hard_blocking)
+
+        now = datetime.now(timezone.utc)
+        until = self.state.rate_limited_coder_until.get(coder)
+        if until is not None:
+            if until.tzinfo is None:
+                until = until.replace(tzinfo=timezone.utc)
+            return until > now
+        if (
+            self.state.rate_limited_until is not None
+            and self.state.rate_limit_reactive_coder is None
+            and coder == "claude"
+        ):
+            until = self.state.rate_limited_until
+            if until.tzinfo is None:
+                until = until.replace(tzinfo=timezone.utc)
+            return until > now
+        if self.state.rate_limit_reactive_coder == coder:
+            return True
+        return coder in self.state.rate_limited_coders
 
     async def _infra_retry_attempted(
         self, pr_number: int, head_sha: str

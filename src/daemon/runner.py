@@ -60,6 +60,7 @@ from src.daemon import (
 )
 from src.daemon.git_ops import _repo_looks_scaffolded, repo_owner_from_url
 from src.daemon.github_rate_limit import (
+    BUDGET_REDIS_KEY,
     RateLimitBudget,
     clear_graphql_budget,
     clear_rest_budget,
@@ -102,7 +103,12 @@ from src.events import publish_repo_event
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.github import rate_limit as gh_rate_limit
-from src.inhibitor import derive_active_inhibitors
+from src.inhibitor import (
+    InhibitorType,
+    WorkInhibitor,
+    derive_active_inhibitors,
+    is_work_inhibited,
+)
 from src.keyspace import (
     cli_log_history,
     cli_log_latest,
@@ -2227,6 +2233,98 @@ class PipelineRunner(
         instances so the bookkeeping matches the dirty-tree and FIX
         iteration-cap recovery sites.
         """
+        if self.repo_config.feature_flags.use_unified_inhibitor_check:
+            budget = await self._refresh_github_api_budget()
+            try:
+                self.state.active_inhibitors = await derive_active_inhibitors(
+                    self.state, self.redis, self.app_config.daemon
+                )
+            except Exception:
+                logger.warning(
+                    "[%s] derive_active_inhibitors failed during budget check",
+                    self.name,
+                    exc_info=True,
+                )
+            _blocked, blocking = is_work_inhibited(self.state, coder=None)
+            blocking_types = {inh.inhibitor_type for inh in blocking}
+            budget_inhibitors = {
+                InhibitorType.GITHUB_BUDGET_PAUSE,
+                InhibitorType.GITHUB_BUDGET_SLOWDOWN,
+            }
+            if budget is not None:
+                self.state.active_inhibitors = [
+                    inh
+                    for inh in self.state.active_inhibitors
+                    if inh.inhibitor_type not in budget_inhibitors
+                ]
+                budget_type = None
+                reason_text = ""
+                if datetime.now(timezone.utc) < budget.reset_at:
+                    github_pct = budget.remaining_percent
+                    if (
+                        github_pct
+                        < self.app_config.daemon.github_api_pause_threshold_percent
+                    ):
+                        budget_type = InhibitorType.GITHUB_BUDGET_PAUSE
+                        reason_text = f"GitHub budget at {github_pct:.0f}%"
+                    elif (
+                        github_pct
+                        < self.app_config.daemon.github_api_slowdown_threshold_percent
+                    ):
+                        budget_type = InhibitorType.GITHUB_BUDGET_SLOWDOWN
+                        reason_text = (
+                            f"GitHub budget at {github_pct:.0f}%, slowdown active"
+                        )
+                if budget_type is not None:
+                    self.state.active_inhibitors.append(
+                        WorkInhibitor(
+                            inhibitor_type=budget_type,
+                            expires_at=budget.reset_at,
+                            reason_text=reason_text,
+                            source_key=BUDGET_REDIS_KEY,
+                        )
+                    )
+                    _blocked, blocking = is_work_inhibited(
+                        self.state, coder=None
+                    )
+                else:
+                    _blocked, blocking = is_work_inhibited(
+                        self.state, coder=None
+                    )
+                blocking_types = {inh.inhibitor_type for inh in blocking}
+            if InhibitorType.GITHUB_BUDGET_PAUSE in blocking_types:
+                was_zero = self._github_api_pause_attempts == 0
+                self._github_api_pause_policy.increment(self)
+                if was_zero:
+                    await self._github_api_pause_policy.maybe_escalate(self)
+                return False
+
+            if self._github_api_pause_attempts > 0:
+                self._github_api_pause_policy.reset(self)
+
+            if InhibitorType.GITHUB_BUDGET_SLOWDOWN in blocking_types:
+                was_zero = self._github_api_slowdown_attempts == 0
+                self._github_api_slowdown_policy.increment(self)
+                if was_zero:
+                    await self._github_api_slowdown_policy.maybe_escalate(self)
+                if (
+                    self._is_extended_idle_active()
+                    or self.state.state == PipelineState.WATCH
+                ):
+                    return True
+                multiplier = max(
+                    1,
+                    self.app_config.daemon.github_api_slowdown_multiplier,
+                )
+                proceed = self._github_api_slowdown_cycle % multiplier == 0
+                self._github_api_slowdown_cycle += 1
+                return proceed
+
+            if self._github_api_slowdown_attempts > 0:
+                self._github_api_slowdown_policy.reset(self)
+                self._github_api_slowdown_cycle = 0
+            return True
+
         budget = await self._refresh_github_api_budget()
         if budget is None:
             return True

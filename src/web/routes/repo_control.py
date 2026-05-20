@@ -40,6 +40,7 @@ from src.cancellation.storage import (
 from src.config import load_config
 from src.github import gh_runner
 from src.github import prs as gh_prs
+from src.inhibitor import derive_active_inhibitors
 from src.keyspace import (
     control_stop,
     legacy_recovered_tasks,
@@ -99,6 +100,7 @@ _PAUSE_CONTROL_EVENT_PREFIXES = (
     "Resume requested.",
     "Stop requested.",
 )
+_OPERATOR_CLEARABLE_INHIBITORS = frozenset({"user_pause", "user_stop"})
 
 _QueueSource = Literal["snapshot"]
 
@@ -831,6 +833,83 @@ async def _update_repo_pause_state(
         )
 
     return state
+
+
+async def _render_repo_card(request: Request, name: str) -> HTMLResponse:
+    redis_client = getattr(request.app.state, "redis", None)
+    state = await _app.get_repo_state(name, redis_client, _app.CONFIG_PATH)
+    if redis_client is not None:
+        try:
+            cfg = await asyncio.to_thread(load_config, _app.CONFIG_PATH)
+            state.active_inhibitors = await derive_active_inhibitors(
+                state, redis_client, cfg.daemon
+            )
+        except Exception:
+            _app.logger.warning(
+                "Failed to refresh inhibitors while rendering repo card for %s",
+                name,
+                exc_info=True,
+            )
+            state.active_inhibitors = []
+    return _app.templates.TemplateResponse(
+        request,
+        "components/repo_cards.html",
+        {
+            "repos": [state],
+            "redis_warning": None,
+            "resources": {},
+            "cancellation_subsources": {},
+            "subsource_lookup": _app._subsource_lookup,
+            "drain_progress": {},
+            "inhibitor_labels": _app.INHIBITOR_LABELS,
+            "card_only": True,
+        },
+    )
+
+
+@router.post("/repos/{name}/inhibitors/clear/{inhibitor_type}")
+async def clear_inhibitor(
+    request: Request, name: str, inhibitor_type: str
+) -> Response:
+    if inhibitor_type not in _OPERATOR_CLEARABLE_INHIBITORS:
+        return HTMLResponse("Inhibitor not operator-clearable", status_code=400)
+
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        return HTMLResponse("Redis not configured", status_code=503)
+
+    try:
+        redis_client, _state_key, _repo_url = await _apply_repo_control_update(
+            request, name
+        )
+    except _RepoStateMutationError as exc:
+        return HTMLResponse(exc.message, status_code=exc.status_code)
+
+    if inhibitor_type == "user_pause":
+        result = await _update_repo_pause_state(
+            request,
+            name,
+            user_paused=False,
+            event_message="Operator pause cleared.",
+        )
+        if isinstance(result, Response):
+            return result
+    else:
+        try:
+            await redis_client.delete(control_stop(name))
+        except Exception:
+            return HTMLResponse("Failed to clear stop request", status_code=503)
+
+    try:
+        await _app.publish_wake(redis_client, name, "inhibitor_cleared")
+    except Exception:
+        _app.logger.warning(
+            "publish_wake failed for %s; daemon will pick up inhibitor clear on next tick",
+            name,
+            exc_info=True,
+        )
+
+    return await _render_repo_card(request, name)
 
 
 @router.post("/repos/{name}/pause")

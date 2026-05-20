@@ -51,11 +51,11 @@ daemon:
   operator_active_hours_end: 21
   operator_timezone: Europe/Rome
 
-# PR-329: per-repo dispatcher feature flag. ``use_unified_inhibitor_check``
+# WorkInhibitor cutover flag. ``use_unified_inhibitor_check``
 # routes dispatcher decisions through ``src.inhibitor.is_work_inhibited``
 # instead of the legacy if-branches that read throttle keys directly.
-# Default ``false`` keeps the legacy path live; flip per repo for the
-# PR-330 canary rollout.
+# Default ``true`` completes the PR-330 canary rollout. Set a per-repo
+# override to ``false`` only for targeted rollback of a problematic repo.
 #
 # Do NOT add a ``repositories:`` block here to flip the flag on one repo:
 # overlay merging replaces lists wholesale (see ``_deep_merge`` in

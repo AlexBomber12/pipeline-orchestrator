@@ -734,6 +734,16 @@ class IdleMixin:
         # default until PR-330d flips production; canary repos opt in
         # earlier via ``feature_flags.use_unified_inhibitor_check``.
         if self.repo_config.feature_flags.use_unified_inhibitor_check:
+            # ``state.user_paused`` is refreshed from Redis at cycle
+            # START, while ``state.active_inhibitors`` is rebuilt at
+            # publish time. After an operator presses Play, the scalar
+            # can already be False while the previous published
+            # ``USER_PAUSE`` inhibitor is still present in the snapshot.
+            # Match the legacy IDLE guard by treating the scalar as the
+            # source of truth for manual pause.
+            if self.state.user_paused:
+                self.log_event("[INFRA] IDLE inhibited by ['user_pause']")
+                return
             ctx = SelectionContext(
                 registry=self._registry,
                 repo_config=self.repo_config,
@@ -764,6 +774,10 @@ class IdleMixin:
                     for inh in blocking
                     if inh.inhibitor_type
                     != InhibitorType.GITHUB_BUDGET_SLOWDOWN
+                    and (
+                        inh.inhibitor_type != InhibitorType.USER_PAUSE
+                        or self.state.user_paused
+                    )
                 ]
                 if not hard_blocking:
                     blocking_by_coder.clear()
@@ -926,6 +940,211 @@ class IdleMixin:
 
     async def handle_paused(self) -> None:
         """Wait for rate limit window to expire, then resume previous flow."""
+        # PR-330b: per-repo feature flag selects the unified inhibitor
+        # exit check over the legacy ``user_paused``/``rate_limited_until``
+        # branches. PAUSED is a global state for repo-wide inhibitors,
+        # but per-coder rate limits still follow the legacy fallback
+        # behavior: a pause for one coder may resume when another coder
+        # is eligible.
+        # ``GITHUB_BUDGET_SLOWDOWN`` is excluded for the same reason as
+        # the IDLE gate: it is a polling-cadence throttle enforced at
+        # ``_check_github_api_budget`` and was never part of the legacy
+        # PAUSED entry/exit conditions. The flag stays False by default
+        # until PR-330d flips production; canary repos opt in earlier
+        # via ``feature_flags.use_unified_inhibitor_check``.
+        if self.repo_config.feature_flags.use_unified_inhibitor_check:
+            # ``state.user_paused`` is refreshed from Redis at cycle
+            # START (``_run_cycle_body``), but
+            # ``state.active_inhibitors`` is only rebuilt at cycle END
+            # by ``publish_state``. In the one-cycle window right after
+            # an operator presses Pause, ``user_paused=True`` while the
+            # snapshot still holds the previous cycle's entries — which
+            # may be empty, or contain only non-blocking entries such
+            # as ``GITHUB_BUDGET_SLOWDOWN``. The ``hard_blocking``
+            # filter below strips slowdown for dispatch decisions, so
+            # gating the manual-pause guard on the post-filter set
+            # would let non-blocking slowdown lingering in the snapshot
+            # bypass the operator pause and resume to IDLE/WATCH.
+            # Honor the scalar directly here so the manual pause cannot
+            # be bypassed regardless of the snapshot contents — this is
+            # also the source of truth the legacy path read.
+            if self.state.user_paused:
+                if not getattr(self, "_paused_inhibited_logged", False):
+                    self.log_event(
+                        "[INFRA] PAUSED inhibited by ['user_pause']"
+                    )
+                    self._paused_inhibited_logged = True
+                return
+            await self._refresh_auth_status_cache()
+            selected = self._select_coder()
+            coder_name = (
+                selected[0]
+                if selected is not None
+                else self.state.rate_limit_reactive_coder or "claude"
+            )
+            _, blocking = is_work_inhibited(self.state, coder=coder_name)
+            # Ignore stale ``USER_PAUSE`` entries from the previous
+            # publish: ``user_paused`` is ``False`` here (manual-pause
+            # short-circuit above), so any ``USER_PAUSE`` left in the
+            # snapshot is post-Play lag that ``is_blocking_now`` would
+            # otherwise treat as live (no ``expires_at``).
+            # ``GITHUB_BUDGET_SLOWDOWN`` is a polling-cadence throttle,
+            # not a dispatch block, and was never part of the legacy
+            # PAUSED exit conditions.
+            hard_blocking = [
+                inh
+                for inh in blocking
+                if inh.inhibitor_type
+                not in (
+                    InhibitorType.GITHUB_BUDGET_SLOWDOWN,
+                    InhibitorType.USER_PAUSE,
+                )
+            ]
+            if hard_blocking:
+                blocking_types = sorted(
+                    {inh.inhibitor_type.value for inh in hard_blocking}
+                )
+                if not getattr(self, "_paused_inhibited_logged", False):
+                    self.log_event(
+                        f"[INFRA] PAUSED inhibited by {blocking_types}"
+                    )
+                    self._paused_inhibited_logged = True
+                return
+            # Cross-check the post-filter snapshot with the rate-limit
+            # scalars (the legacy source of truth): if any window is
+            # still in the future, treat the snapshot as a publish-time
+            # failure and keep the runner PAUSED so the next cycle can
+            # re-derive cleanly. Without this guard the IDLE transition
+            # below would wipe ``rate_limited_until`` /
+            # ``rate_limited_coder_until`` markers and let the daemon
+            # immediately dispatch against the live limit. Key the guard
+            # off ``hard_blocking`` rather than the raw ``blocking``
+            # list: a snapshot that contains only filtered non-blockers
+            # (e.g. ``GITHUB_BUDGET_SLOWDOWN``, or a stale ``USER_PAUSE``
+            # already discarded above) still indicates the snapshot
+            # disagrees with a live rate-limit scalar and must not be
+            # trusted to clear the scalars.
+            now = datetime.now(timezone.utc)
+
+            def _is_future(value: datetime | None) -> bool:
+                if value is None:
+                    return False
+                aware = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+                return aware > now
+
+            pause_coder = self.state.rate_limit_reactive_coder or "claude"
+            diagnosis_pause = (
+                self.state.error_message is not None
+                and pause_coder == "claude"
+            )
+            relevant_legacy_pause = (
+                self.state.rate_limited_until
+                if diagnosis_pause or pause_coder == coder_name
+                else None
+            )
+            relevant_per_coder_pause = self.state.rate_limited_coder_until.get(
+                coder_name
+            )
+            stale_snapshot = (
+                not hard_blocking
+                and not self.state.user_paused
+                and (
+                    _is_future(relevant_legacy_pause)
+                    or _is_future(relevant_per_coder_pause)
+                )
+            )
+            if stale_snapshot:
+                if not getattr(self, "_paused_inhibited_logged", False):
+                    self.log_event(
+                        "[INFRA] PAUSED: inhibitor snapshot disagrees "
+                        "with live rate-limit scalars, staying paused"
+                    )
+                    self._paused_inhibited_logged = True
+                return
+            self._paused_inhibited_logged = False
+            # Mirror the legacy expired-window resume below: stale
+            # rate-limit metadata must be cleared before the IDLE
+            # transition, otherwise ``run_cycle`` keeps reading
+            # ``rate_limited_until != None`` as a live pause signal
+            # (forcing ``ERROR -> PAUSED`` and similar branches) until
+            # ``_check_rate_limit`` happens to run. Inhibitors with
+            # ``expires_at`` already cleared themselves out of
+            # ``derive_active_inhibitors``; the scalar fields persist.
+            # The per-coder typed dict and legacy set are cleared for
+            # the same reason: ``selector._is_rate_limited`` consults
+            # ``rate_limited_coder_until`` first and falls through to
+            # ``rate_limited_coders`` on a miss, so a stale entry left
+            # in either container would keep ``eligible_coders``
+            # returning empty for a repo pinned to that coder (logging
+            # ``no eligible coder`` on every IDLE tick) even though
+            # the unified gate has already accepted the resume.
+            preserved_coder_until = {
+                coder: until
+                for coder, until in self.state.rate_limited_coder_until.items()
+                if coder != coder_name and _is_future(until)
+            }
+            if (
+                self.state.rate_limited_until is not None
+                and _is_future(self.state.rate_limited_until)
+                and not diagnosis_pause
+                and pause_coder != coder_name
+            ):
+                preserved_coder_until.setdefault(
+                    pause_coder, self.state.rate_limited_until
+                )
+            preserved_coders = {
+                coder
+                for coder in self.state.rate_limited_coders
+                if coder != coder_name
+                and (
+                    coder not in self.state.rate_limited_coder_until
+                    or _is_future(self.state.rate_limited_coder_until[coder])
+                )
+            } | set(preserved_coder_until)
+            self.state.rate_limited_until = None
+            self.state.rate_limit_reactive = False
+            self.state.rate_limit_reactive_coder = None
+            self.state.rate_limited_coders = preserved_coders
+            self.state.rate_limited_coder_until = preserved_coder_until
+            # Route any lingering ``error_message`` through the
+            # rate-limit recovery resolver before the IDLE transition.
+            # ``run_cycle`` parks runners in PAUSED when an ERROR cycle
+            # finds ``rate_limited_until`` set, preserving the original
+            # ``error_message``. When the inhibitors clear, a
+            # non-rate-limit message means the underlying fault is
+            # still unresolved and the runner must return to ERROR
+            # instead of silently dispatching from IDLE — the legacy
+            # expired-window path enforces this and the unified path
+            # must match.
+            self._error_diagnose_policy.reset(self)
+            if await self._resolve_rate_limit_error_state(
+                log_prefix="[RATE-LIMIT]",
+                label="PAUSED inhibitors cleared, resuming",
+            ):
+                return
+            # Mirror the legacy WATCH-vs-IDLE resume split: a mid-watch
+            # pause leaves ``current_pr``/``current_task`` pointing at
+            # the same branch, and the legacy expired-window path
+            # resumes directly to WATCH instead of re-entering the IDLE
+            # task-selection/sync loop. Forcing IDLE here would defer
+            # monitoring of the active PR (or, if queue selection picked
+            # a different actionable task, redirect execution entirely).
+            if (
+                self.state.current_pr is not None
+                and self.state.current_task is not None
+                and self.state.current_pr.branch
+                == self.state.current_task.branch
+            ):
+                self.state.state = PipelineState.WATCH
+                self.log_event(
+                    "[INFRA] PAUSED inhibitors cleared -> WATCH."
+                )
+            else:
+                self.state.state = PipelineState.IDLE
+                self.log_event(
+                    "[INFRA] PAUSED inhibitors cleared -> IDLE."
+                )
+            return
         if self.state.user_paused:
             if not getattr(self, "_user_pause_logged", False):
                 self.log_event("[INFRA] Paused. Press Play to resume.")

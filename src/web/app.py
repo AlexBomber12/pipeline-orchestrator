@@ -7,6 +7,7 @@ Redis the dashboard renders a default ``IDLE`` state derived from
 
 Routing is split across submodules:
 
+* ``src.web.routes.audit`` — direct-commit audit findings.
 * ``src.web.routes.dashboard`` — dashboard rendering and HTMX partials.
 * ``src.web.routes.repo_control`` — repo control mutations
   (pause/resume/stop/coder/tasks).
@@ -14,6 +15,7 @@ Routing is split across submodules:
   status, coder dropdown.
 * ``src.web.routes.uploads`` — task file upload route.
 * ``src.web.routes.onboarding`` — AGENTS.md reconciliation preview/apply.
+* ``src.web.routes.operator_rejects`` — operator-reject history.
 
 Re-exports of helpers moved out are resolved lazily via :func:`__getattr__`
 so existing tests that reach for ``web_app.X`` continue to work after the
@@ -126,10 +128,12 @@ templates.env.globals["upload_feedback_target"] = (
 # attributes on a partially initialized module whenever the route module is
 # the entry point of the import (see PEP 562 ``__getattr__`` below for the
 # backward-compatible re-exports tests rely on).
+from src.web.routes import audit as _audit_routes  # noqa: E402
 from src.web.routes import daemon_control as _daemon_control_routes  # noqa: E402
 from src.web.routes import dashboard as _dashboard_routes  # noqa: E402
 from src.web.routes import diagnostic as _diagnostic_routes  # noqa: E402
 from src.web.routes import onboarding as _onboarding_routes  # noqa: E402
+from src.web.routes import operator_rejects as _operator_rejects_routes  # noqa: E402
 from src.web.routes import repo_control as _repo_control_routes  # noqa: E402
 from src.web.routes import settings as _settings_routes  # noqa: E402
 from src.web.routes import uploads as _uploads_routes  # noqa: E402
@@ -166,6 +170,7 @@ _DASHBOARD_REEXPORTS = frozenset(
         "_format_duration_ms",
         "_format_guardrail_relative_time",
         "_format_history_time",
+        "INHIBITOR_LABELS",
         "_most_recent_transition_into",
         "_parse_history_time",
         "_parse_iso8601",
@@ -178,6 +183,7 @@ _DASHBOARD_REEXPORTS = frozenset(
         "_resource_zone",
         "_serialize_guardrail_pending",
         "_serialize_run_record",
+        "_subsource_lookup",
         "_truncate_guardrail_excerpt",
     }
 )
@@ -379,9 +385,11 @@ async def operator_heartbeat_middleware(request, call_next):
 
 
 app.include_router(_dashboard_routes.router)
+app.include_router(_audit_routes.router)
 app.include_router(_repo_control_routes.router)
 app.include_router(_settings_routes.router)
 app.include_router(_uploads_routes.router)
 app.include_router(_onboarding_routes.router)
 app.include_router(_daemon_control_routes.router)
 app.include_router(_diagnostic_routes.router)
+app.include_router(_operator_rejects_routes.router)

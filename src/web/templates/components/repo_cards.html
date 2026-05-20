@@ -47,6 +47,7 @@
 </div>
 {% endif %}
 
+{% set _card_only = card_only | default(false) %}
 {% if not repos %}
 <div class="rounded-lg border border-white/5 bg-surface-2 p-8 text-center">
     <p class="text-gray-300 font-medium mb-1">No repositories configured</p>
@@ -56,7 +57,9 @@
     </p>
 </div>
 {% else %}
+{% if not _card_only %}
 <div class="grid gap-4 md:grid-cols-2">
+{% endif %}
     {% for repo in repos %}
     {% set is_synthetic = repo.error_message in init_messages %}
     {% set style = repo_state.state_styles.get(repo.state.value, repo_state.state_styles['IDLE']) %}
@@ -71,6 +74,8 @@
         <div class="mb-3 flex min-h-12 flex-col gap-3 pr-40 sm:flex-row sm:items-center sm:justify-between">
             <div class="flex min-w-0 items-center gap-2">
                 <a href="/repo/{{ repo.name }}" class="font-mono text-sm text-white truncate hover:text-accent transition-colors">{{ repo.name }}</a>
+                <a href="/repo/{{ repo.name }}/audit" class="text-xs text-gray-400 underline">audit</a>
+                <a href="/repo/{{ repo.name }}/rejects" class="text-xs text-gray-400 underline">rejects</a>
                 <span class="inline-flex items-center gap-2">
                     {% if is_synthetic %}
                     <span class="w-2.5 h-2.5 rounded-full bg-warn pulse-dot shrink-0" data-state-dot></span>
@@ -95,7 +100,7 @@
                 </span>
             </div>
             <div class="absolute top-0 right-0 flex flex-nowrap items-center justify-end gap-2 p-4">
-                {{ repo_controls(repo) }}
+                {{ repo_controls(repo, '', true) }}
                 <form hx-post="/repos/{{ repo.name }}/upload-tasks"
                       hx-encoding="multipart/form-data"
                       hx-indicator="#global-spinner"
@@ -176,7 +181,37 @@
         {% if repo.usage_api_degraded %}
         <div class="text-xs text-warn italic mt-1" title="Usage API has failed 10+ consecutive times">Usage API degraded</div>
         {% endif %}
-        {% if repo.state.value == 'PAUSED' and repo.rate_limited_until and repo.rate_limited_until > utcnow() %}
+        {% set _active_inhibitors = repo.active_inhibitors | default([]) %}
+        {% if repo.state.value == 'PAUSED' and _active_inhibitors %}
+        {% set _inhibitor_labels = inhibitor_labels | default({}) %}
+        <div class="inhibitor-stack mt-2 flex flex-wrap gap-1" data-inhibitor-stack>
+            {% for inh in _active_inhibitors %}
+            {% set _type = inh.inhibitor_type.value if inh.inhibitor_type.value is defined else inh.inhibitor_type %}
+            {% set is_operator_clearable = _type in ('user_pause', 'user_stop') %}
+            {% set inhibitor_label = _inhibitor_labels.get(_type, _type) %}
+            <span class="inhibitor-badge inline-flex items-center gap-1 rounded border border-warn/30 bg-warn/10 px-2 py-0.5 text-xs text-warn"
+                  data-inhibitor="{{ _type }}"
+                  title="{{ inh.reason_text }}">
+                {{ inhibitor_label }}
+                {% if inh.expires_at %}
+                {% set remaining_sec = (inh.expires_at - utcnow()).total_seconds() | int %}
+                {% set remaining_min = ((remaining_sec if remaining_sec > 0 else 0) / 60) | round(0, 'ceil') | int %}
+                <span class="text-gray-400">{{ remaining_min }}m</span>
+                {% endif %}
+                {% if is_operator_clearable %}
+                <button type="button"
+                        hx-post="/repos/{{ repo.name }}/inhibitors/clear/{{ _type }}"
+                        hx-target="closest [data-repo-card]"
+                        hx-swap="outerHTML"
+                        aria-label="Clear {{ inhibitor_label }}"
+                        title="Clear {{ inhibitor_label }}"
+                        class="ml-1 text-fail hover:text-white"
+                        onclick="event.stopPropagation()">×</button>
+                {% endif %}
+            </span>
+            {% endfor %}
+        </div>
+        {% elif repo.state.value == 'PAUSED' and repo.rate_limited_until and repo.rate_limited_until > utcnow() %}
         {% set remaining_sec = (repo.rate_limited_until - utcnow()).total_seconds() | int %}
         {% set remaining_min = (remaining_sec / 60) | round(0, 'ceil') | int %}
         <div class="text-xs text-warn italic mt-1">Paused, {{ remaining_min }}m remaining</div>
@@ -195,5 +230,7 @@
         <div id="upload-feedback-{{ repo.name }}"></div>
     </div>
     {% endfor %}
+{% if not _card_only %}
 </div>
+{% endif %}
 {% endif %}

@@ -7,14 +7,29 @@
 
         <label class="flex flex-col gap-1 text-sm">
             <span class="text-gray-400">Webhook URL</span>
-            <input type="url"
-                   name="guardrail_notification_webhook_url"
-                   value="{{ daemon.guardrail_notification_webhook_url or '' }}"
-                   hx-post="/settings/config/guardrail_notification_webhook_url"
-                   hx-trigger="change"
-                   hx-swap="none"
-                   placeholder="https://hooks.slack.com/services/..."
-                   class="primary-interactive w-full bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
+            <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <input type="url"
+                       name="guardrail_notification_webhook_url"
+                       value="{{ daemon.guardrail_notification_webhook_url or '' }}"
+                       hx-post="/settings/config/guardrail_notification_webhook_url"
+                       hx-trigger="change"
+                       hx-swap="none"
+                       placeholder="https://hooks.slack.com/services/..."
+                       class="primary-interactive w-full bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
+                <button hx-post="/settings/webhook/test"
+                        hx-target="#webhook-test-status"
+                        hx-swap="innerHTML"
+                        hx-include="[name='guardrail_notification_webhook_url']"
+                        hx-indicator="#webhook-test-spinner"
+                        class="text-xs px-3 py-1 rounded border border-accent/50 text-accent hover:bg-accent/10 whitespace-nowrap"
+                        type="button">
+                    Test webhook
+                </button>
+            </div>
+            <span class="flex min-h-5 items-center gap-2">
+                <span id="webhook-test-spinner" class="htmx-indicator text-xs text-warn">⏳ sending...</span>
+                <span id="webhook-test-status" class="text-xs"></span>
+            </span>
         </label>
 
         <label class="flex flex-col gap-1 text-sm">
