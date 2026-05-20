@@ -20,7 +20,8 @@ EVIDENCE_DIR = REPO_DIR / "tests/e2e/evidence"
 collect_ignore = ["data"]
 
 
-def _stop_daemon_and_wait_paused(slug: str, timeout_sec: int = 30) -> None:
+# 30 seconds proved insufficient on the shared testbed where dispatch was observed at ~39 seconds.
+def _stop_daemon_and_wait_paused(slug: str, timeout_sec: int = 60) -> None:
     response = requests.post(f"{TEST_DASHBOARD_URL}/repos/{slug}/stop", timeout=10)
     if response.status_code not in (200, 204):
         raise RuntimeError(f"failed to stop daemon for {slug}: status_code={response.status_code}")
