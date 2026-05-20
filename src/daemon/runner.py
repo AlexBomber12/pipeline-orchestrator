@@ -2235,9 +2235,17 @@ class PipelineRunner(
         """
         if self.repo_config.feature_flags.use_unified_inhibitor_check:
             budget = await self._refresh_github_api_budget()
-            self.state.active_inhibitors = await derive_active_inhibitors(
-                self.state, self.redis, self.app_config.daemon
-            )
+            try:
+                self.state.active_inhibitors = await derive_active_inhibitors(
+                    self.state, self.redis, self.app_config.daemon
+                )
+            except Exception:
+                logger.warning(
+                    "[%s] derive_active_inhibitors failed during budget check",
+                    self.name,
+                    exc_info=True,
+                )
+                self.state.active_inhibitors = []
             _blocked, blocking = is_work_inhibited(self.state, coder=None)
             blocking_types = {inh.inhibitor_type for inh in blocking}
             budget_inhibitors = {

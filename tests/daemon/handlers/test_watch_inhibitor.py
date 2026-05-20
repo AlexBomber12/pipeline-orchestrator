@@ -209,6 +209,31 @@ def test_handle_watch_unified_refreshed_budget_overrides_stale_inhibitor(
     assert budget_types == [InhibitorType.GITHUB_BUDGET_PAUSE]
 
 
+def test_handle_watch_unified_budget_check_tolerates_derive_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    _set_flag(runner, True)
+    runner.state.state = PipelineState.WATCH
+    runner.app_config.daemon.github_api_pause_threshold_percent = 5
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+    fetched = h._budget(remaining=150, limit=5000)  # 3%
+    monkeypatch.setattr(
+        "src.github.rate_limit.fetch_rate_limit_buckets",
+        lambda: (fetched, None),
+    )
+
+    async def _raise(*_args: object, **_kwargs: object) -> list[WorkInhibitor]:
+        raise RuntimeError("redis unavailable")
+
+    monkeypatch.setattr("src.daemon.runner.derive_active_inhibitors", _raise)
+
+    assert asyncio.run(runner._check_github_api_budget()) is False
+    assert [
+        inh.inhibitor_type for inh in runner.state.active_inhibitors
+    ] == [InhibitorType.GITHUB_BUDGET_PAUSE]
+
+
 def test_handle_watch_slowdown_multiplier_at_5_pct_legacy() -> None:
     runner = h._make_runner(poll_interval_sec=60)
     _set_flag(runner, False)
