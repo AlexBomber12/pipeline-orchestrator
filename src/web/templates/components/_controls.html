@@ -16,9 +16,9 @@
 </svg>
 {%- endmacro %}
 
-{% macro repo_controls(repo, extra_classes='') -%}
+{% macro repo_controls(repo, extra_classes='', suppress_paused_resume=false) -%}
 {% set active_states = ['CODING', 'WATCH', 'FIX', 'MERGE'] %}
-{% set show_play = repo.user_paused or (repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done) %}
+{% set show_play = (repo.user_paused and not (suppress_paused_resume and repo.state.value == 'PAUSED')) or (repo.state.value == 'IDLE' and repo.queue_total > repo.queue_done) %}
 {% set show_pause = (repo.state.value in active_states) and not repo.user_paused %}
 {% set show_stop = repo.state.value in active_states %}
 {% set escaped_name = css_escape(repo.name) %}
