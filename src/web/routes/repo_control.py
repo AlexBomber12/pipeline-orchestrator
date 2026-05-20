@@ -842,7 +842,7 @@ async def _render_repo_card(request: Request, name: str) -> HTMLResponse:
         try:
             cfg = await asyncio.to_thread(load_config, _app.CONFIG_PATH)
             state.active_inhibitors = await derive_active_inhibitors(
-                state, redis_client, cfg
+                state, redis_client, cfg.daemon
             )
         except Exception:
             _app.logger.warning(

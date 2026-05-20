@@ -199,6 +199,30 @@ def test_clear_inhibitor_user_pause_returns_200(
     assert updated.user_paused is False
 
 
+def test_clear_inhibitor_user_pause_preserves_remaining_inhibitors(
+    repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    future = datetime.now(timezone.utc) + timedelta(minutes=15)
+    stored = _state(
+        active_inhibitors=[
+            _inhibitor(InhibitorType.USER_PAUSE),
+            _inhibitor(InhibitorType.RATE_LIMIT, expires_at=future),
+        ],
+        user_paused=True,
+    )
+    stored.rate_limited_coder_until["claude"] = future
+    redis = _FakeRedis({pipeline_state("example__alpha"): stored.model_dump_json()})
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis(redis))
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/inhibitors/clear/user_pause")
+
+    assert response.status_code == 200
+    assert 'data-inhibitor="user_pause"' not in response.text
+    assert 'data-inhibitor="rate_limit"' in response.text
+    assert "Rate-limited" in response.text
+
+
 def test_clear_inhibitor_user_stop_returns_200(
     repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -306,6 +330,38 @@ def test_clear_inhibitor_succeeds_when_publish_wake_fails(
     assert response.status_code == 200
     assert any(
         "publish_wake failed for example__alpha" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_clear_inhibitor_render_falls_back_when_derivation_fails(
+    repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    stored = _state(active_inhibitors=[_inhibitor(InhibitorType.USER_STOP)])
+    redis = _FakeRedis(
+        {
+            pipeline_state("example__alpha"): stored.model_dump_json(),
+            control_stop("example__alpha"): "1",
+        }
+    )
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis(redis))
+
+    async def _raise(*_args: object, **_kwargs: object) -> list[WorkInhibitor]:
+        raise RuntimeError("derive failed")
+
+    monkeypatch.setattr(repo_control, "derive_active_inhibitors", _raise)
+
+    with TestClient(app) as client:
+        with caplog.at_level("WARNING", logger=web_app.logger.name):
+            response = client.post("/repos/example__alpha/inhibitors/clear/user_stop")
+
+    assert response.status_code == 200
+    assert "data-inhibitor-stack" not in response.text
+    assert any(
+        "Failed to refresh inhibitors while rendering repo card for example__alpha"
+        in record.getMessage()
         for record in caplog.records
     )
 
