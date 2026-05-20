@@ -128,6 +128,50 @@ def test_handle_watch_unified_refreshes_budget_before_inhibitor_check(
     ] == [InhibitorType.GITHUB_BUDGET_PAUSE]
 
 
+@pytest.mark.parametrize(
+    ("remaining", "expected", "proceed"),
+    [
+        (150, InhibitorType.GITHUB_BUDGET_PAUSE, False),
+        (500, InhibitorType.GITHUB_BUDGET_SLOWDOWN, True),
+        (4500, None, True),
+    ],
+)
+def test_handle_watch_unified_uses_refreshed_budget_when_redis_read_misses(
+    remaining: int,
+    expected: InhibitorType | None,
+    proceed: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    _set_flag(runner, True)
+    runner.state.state = PipelineState.WATCH
+    runner.app_config.daemon.github_api_pause_threshold_percent = 5
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+    fetched = h._budget(remaining=remaining, limit=5000)
+    monkeypatch.setattr(
+        "src.github.rate_limit.fetch_rate_limit_buckets",
+        lambda: (fetched, None),
+    )
+
+    async def _missing(_key: str) -> None:
+        return None
+
+    runner.redis.get = _missing  # type: ignore[method-assign]
+
+    assert asyncio.run(runner._check_github_api_budget()) is proceed
+
+    budget_types = [
+        inh.inhibitor_type
+        for inh in runner.state.active_inhibitors
+        if inh.inhibitor_type
+        in (
+            InhibitorType.GITHUB_BUDGET_PAUSE,
+            InhibitorType.GITHUB_BUDGET_SLOWDOWN,
+        )
+    ]
+    assert budget_types == ([] if expected is None else [expected])
+
+
 def test_handle_watch_slowdown_multiplier_at_5_pct_legacy() -> None:
     runner = h._make_runner(poll_interval_sec=60)
     _set_flag(runner, False)

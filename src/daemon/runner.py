@@ -60,6 +60,7 @@ from src.daemon import (
 )
 from src.daemon.git_ops import _repo_looks_scaffolded, repo_owner_from_url
 from src.daemon.github_rate_limit import (
+    BUDGET_REDIS_KEY,
     RateLimitBudget,
     clear_graphql_budget,
     clear_rest_budget,
@@ -102,7 +103,12 @@ from src.events import publish_repo_event
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.github import rate_limit as gh_rate_limit
-from src.inhibitor import InhibitorType, derive_active_inhibitors, is_work_inhibited
+from src.inhibitor import (
+    InhibitorType,
+    WorkInhibitor,
+    derive_active_inhibitors,
+    is_work_inhibited,
+)
 from src.keyspace import (
     cli_log_history,
     cli_log_latest,
@@ -2228,12 +2234,49 @@ class PipelineRunner(
         iteration-cap recovery sites.
         """
         if self.repo_config.feature_flags.use_unified_inhibitor_check:
-            await self._refresh_github_api_budget()
+            budget = await self._refresh_github_api_budget()
             self.state.active_inhibitors = await derive_active_inhibitors(
                 self.state, self.redis, self.app_config.daemon
             )
             _blocked, blocking = is_work_inhibited(self.state, coder=None)
             blocking_types = {inh.inhibitor_type for inh in blocking}
+            budget_inhibitors = {
+                InhibitorType.GITHUB_BUDGET_PAUSE,
+                InhibitorType.GITHUB_BUDGET_SLOWDOWN,
+            }
+            if (
+                budget is not None
+                and datetime.now(timezone.utc) < budget.reset_at
+                and blocking_types.isdisjoint(budget_inhibitors)
+            ):
+                github_pct = budget.remaining_percent
+                if github_pct < self.app_config.daemon.github_api_pause_threshold_percent:
+                    budget_type = InhibitorType.GITHUB_BUDGET_PAUSE
+                    reason_text = f"GitHub budget at {github_pct:.0f}%"
+                elif (
+                    github_pct
+                    < self.app_config.daemon.github_api_slowdown_threshold_percent
+                ):
+                    budget_type = InhibitorType.GITHUB_BUDGET_SLOWDOWN
+                    reason_text = (
+                        f"GitHub budget at {github_pct:.0f}%, slowdown active"
+                    )
+                else:
+                    budget_type = None
+                    reason_text = ""
+                if budget_type is not None:
+                    self.state.active_inhibitors.append(
+                        WorkInhibitor(
+                            inhibitor_type=budget_type,
+                            expires_at=budget.reset_at,
+                            reason_text=reason_text,
+                            source_key=BUDGET_REDIS_KEY,
+                        )
+                    )
+                    _blocked, blocking = is_work_inhibited(
+                        self.state, coder=None
+                    )
+                    blocking_types = {inh.inhibitor_type for inh in blocking}
             if InhibitorType.GITHUB_BUDGET_PAUSE in blocking_types:
                 was_zero = self._github_api_pause_attempts == 0
                 self._github_api_pause_policy.increment(self)
