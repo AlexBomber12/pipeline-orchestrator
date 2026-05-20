@@ -115,8 +115,9 @@ _DAEMON_ENV_OVERRIDES = {
 class FeatureFlags(BaseModel):
     # PR-329: dispatcher migration to ``is_work_inhibited`` is gated per
     # repo so canary rollout (PR-330) can flip one repo at a time without
-    # touching the rest. Default False keeps the legacy if-branches live.
-    use_unified_inhibitor_check: bool = False
+    # touching the rest. Default True completes the WorkInhibitor cutover;
+    # per-repo overrides to False remain available for targeted rollback.
+    use_unified_inhibitor_check: bool = True
 
 
 class RepoConfig(BaseModel):

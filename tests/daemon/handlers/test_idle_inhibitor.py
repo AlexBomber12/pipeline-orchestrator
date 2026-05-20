@@ -185,6 +185,10 @@ def test_handle_idle_flag_on_uses_helper(
     """Unified path returns when every registered coder is blocked."""
     runner = h._make_runner()
     _enable_flag(runner)
+    # ``USER_PAUSE`` is backed by the fresh scalar field; the active
+    # inhibitor snapshot may lag a Play press by one cycle.
+    if kind == InhibitorType.USER_PAUSE:
+        runner.state.user_paused = True
     runner.state.active_inhibitors = _inhibitors_for(kind)
 
     asyncio.run(runner.handle_idle())
@@ -194,6 +198,34 @@ def test_handle_idle_flag_on_uses_helper(
     assert any(
         e["event"].startswith("[INFRA] IDLE inhibited by")
         and kind.value in e["event"]
+        for e in runner.state.history
+    )
+
+
+def test_handle_idle_flag_on_ignores_stale_user_pause_after_play(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale ``USER_PAUSE`` snapshot must not block dispatch after Play.
+
+    ``_run_cycle_body`` refreshes ``state.user_paused`` from Redis before
+    calling ``handle_idle``, but ``active_inhibitors`` is refreshed at
+    publish time. Right after resume, the scalar can be False while the
+    previous cycle's ``USER_PAUSE`` entry is still in the snapshot. The
+    unified gate must match the legacy IDLE path and dispatch in that
+    same cycle.
+    """
+    _stub_dispatchable_world(monkeypatch)
+    runner = h._make_runner()
+    _enable_flag(runner)
+    runner.state.user_paused = False
+    runner.state.active_inhibitors = [_inhibitor(InhibitorType.USER_PAUSE)]
+
+    asyncio.run(runner.handle_idle())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert not any(
+        e["event"].startswith("[INFRA] IDLE inhibited by")
         for e in runner.state.history
     )
 

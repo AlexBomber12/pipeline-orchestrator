@@ -15,7 +15,7 @@ from typing import Any, Awaitable, Callable
 
 import pytest
 from src.coders import claude as claude_plugin_module
-from src.config import AppConfig, DaemonConfig, RepoConfig
+from src.config import AppConfig, DaemonConfig, FeatureFlags, RepoConfig
 from src.daemon import git_ops as git_ops_module
 from src.daemon import runner as runner_module
 from src.daemon import selector as selector_module
@@ -329,6 +329,7 @@ def _repo_cfg(**overrides: Any) -> RepoConfig:
         "auto_merge": True,
         "review_timeout_min": 30,
         "poll_interval_sec": 60,
+        "feature_flags": FeatureFlags(use_unified_inhibitor_check=False),
     }
     base.update(overrides)
     return RepoConfig(**base)
