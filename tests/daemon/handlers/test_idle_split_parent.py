@@ -66,7 +66,7 @@ def test_dependency_satisfied_by_any_of_multiple_sub_tasks(
     assert unresolved_deps_map == {}
 
 
-def test_dependency_blocked_by_partial_split_with_pending_sibling(
+def test_dependency_satisfied_by_partial_split_first_sub_only(
     tmp_path: Path,
 ) -> None:
     unresolved_deps_map = _unresolved_for(
@@ -80,10 +80,10 @@ def test_dependency_blocked_by_partial_split_with_pending_sibling(
         ],
     )
 
-    assert unresolved_deps_map == {"PR-N": ["PR-305"]}
+    assert unresolved_deps_map == {}
 
 
-def test_dependency_blocked_by_partial_split_with_legacy_pending_sibling(
+def test_dependency_satisfied_with_legacy_pending_sibling(
     tmp_path: Path,
 ) -> None:
     unresolved_deps_map = _unresolved_for(
@@ -93,7 +93,7 @@ def test_dependency_blocked_by_partial_split_with_legacy_pending_sibling(
         skipped_legacy_pr_ids={"PR-305b"},
     )
 
-    assert unresolved_deps_map == {"PR-N": ["PR-305"]}
+    assert unresolved_deps_map == {}
 
 
 def test_unsplit_parent_still_works(tmp_path: Path) -> None:
@@ -160,25 +160,19 @@ def test_random_letter_in_pr_id_not_treated_as_sub_task(
     assert unresolved_deps_map == {"PR-N": ["PR-305"]}
 
 
-def test_parent_alias_excludes_pending_known_split_children() -> None:
-    assert (
-        _merged_split_parent_aliases(
-            structured_pr_ids={"PR-305b"},
-            merged_pr_ids={"PR-305a"},
-        )
-        == set()
-    )
+def test_parent_alias_includes_parent_with_pending_known_split_children() -> None:
+    assert _merged_split_parent_aliases(
+        structured_pr_ids={"PR-305b"},
+        merged_pr_ids={"PR-305a"},
+    ) == {"PR-305"}
 
 
-def test_parent_alias_excludes_pending_legacy_split_children() -> None:
-    assert (
-        _merged_split_parent_aliases(
-            structured_pr_ids=set(),
-            merged_pr_ids={"PR-305a"},
-            skipped_legacy_pr_ids={"PR-305b"},
-        )
-        == set()
-    )
+def test_parent_alias_includes_parent_with_pending_legacy_split_children() -> None:
+    assert _merged_split_parent_aliases(
+        structured_pr_ids=set(),
+        merged_pr_ids={"PR-305a"},
+        skipped_legacy_pr_ids={"PR-305b"},
+    ) == {"PR-305"}
 
 
 def test_parent_alias_excludes_legacy_parent_even_when_child_merged() -> None:

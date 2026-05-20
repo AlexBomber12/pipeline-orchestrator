@@ -61,22 +61,17 @@ def _merged_split_parent_aliases(
     merged_pr_ids: set[str],
     skipped_legacy_pr_ids: set[str] | None = None,
 ) -> set[str]:
-    """Return split parents whose known split children are all merged."""
+    """Return split parents satisfied by at least one merged split child."""
     skipped_legacy_pr_ids = skipped_legacy_pr_ids or set()
-    children_by_parent: dict[str, set[str]] = {}
-    for pr_id in structured_pr_ids | merged_pr_ids | skipped_legacy_pr_ids:
+    parent_aliases: set[str] = set()
+    for pr_id in merged_pr_ids:
         parent = _split_parent_of(pr_id)
         if parent is None:
             continue
-        children_by_parent.setdefault(parent, set()).add(pr_id)
-
-    return {
-        parent
-        for parent, children in children_by_parent.items()
-        if parent not in structured_pr_ids
-        and parent not in skipped_legacy_pr_ids
-        and children <= merged_pr_ids
-    }
+        if parent in structured_pr_ids or parent in skipped_legacy_pr_ids:
+            continue
+        parent_aliases.add(parent)
+    return parent_aliases
 
 
 class IdleMixin:
