@@ -246,9 +246,13 @@ class ErrorMixin:
         self._error_skip_context = None
         self._error_skip_policy.reset(self)
         self._error_skip_active = False
+        task_id = retry_task.pr_id if retry_task is not None else ""
+        if task_id and await self._is_diagnose_exhausted(task_id):
+            return
         self._error_diagnose_policy.increment(self)
         if await self._error_diagnose_policy.maybe_escalate(self):
             # Threshold callback already logged the ceiling message.
+            await self._mark_diagnose_exhausted(task_id)
             return
         dirty_before = ""
         try:

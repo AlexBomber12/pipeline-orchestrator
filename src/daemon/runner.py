@@ -508,6 +508,35 @@ class PipelineRunner(
             "[ERROR] diagnose_error: max attempts (3) reached, staying ERROR."
         )
 
+    async def _is_diagnose_exhausted(self, task_id: str) -> bool:
+        """Return True when diagnose_error has already hit its task ceiling."""
+        if not task_id:
+            return False
+        key = f"diagnose_exhausted:{self.name}:{task_id}"
+        return await self.redis.get(key) is not None
+
+    async def _mark_diagnose_exhausted(self, task_id: str) -> None:
+        """Persist that diagnose_error has exhausted retries for this task."""
+        if not task_id:
+            return
+        key = f"diagnose_exhausted:{self.name}:{task_id}"
+        await self.redis.set(
+            key,
+            datetime.now(timezone.utc).isoformat(),
+            ex=7 * 24 * 3600,
+        )
+
+    async def _clear_diagnose_exhausted(self, task_id: str) -> None:
+        """Clear the diagnose exhaustion marker when a task leaves ERROR.
+
+        Recovery paths that move the same task out of parked ERROR must call
+        this helper so a future ERROR for that task can diagnose once again.
+        """
+        if not task_id:
+            return
+        key = f"diagnose_exhausted:{self.name}:{task_id}"
+        await self.redis.delete(key)
+
     @property
     def app_config(self) -> AppConfig:
         return self._app_config
@@ -1361,6 +1390,9 @@ class PipelineRunner(
             return
         previous = self.state.error_message
         self.state.error_message = None
+        current_task = self.state.current_task
+        task_id = current_task.pr_id if current_task is not None else ""
+        await self._clear_diagnose_exhausted(task_id)
         self.log_event(
             f"{log_prefix} cleared error_message ({reason}): "
             f"{previous[:120]}"

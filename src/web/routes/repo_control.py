@@ -79,6 +79,10 @@ _DEFERRED_CODER_SWITCH_STATES = {
     PipelineState.MERGE,
     PipelineState.PAUSED,
 }
+
+
+def _diagnose_exhausted_key(repo_slug: str, task_id: str) -> str:
+    return f"diagnose_exhausted:{repo_slug}:{task_id}"
 _ACTIVE_RUN_STATES = {
     PipelineState.PREFLIGHT,
     PipelineState.CODING,
@@ -1247,6 +1251,10 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
 
         try:
             await delete_cancellation_cause(redis_client, name, pr_id)
+        except Exception:
+            pass
+        try:
+            await redis_client.delete(_diagnose_exhausted_key(name, pr_id))
         except Exception:
             pass
         await _clear_status_write_failed_retry_marker(redis_client, name, pr_id)
