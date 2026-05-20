@@ -223,6 +223,38 @@ def _add_validation_error(
     errors_by_file.setdefault(fname, []).append(issue)
 
 
+def _dependency_validation_errors(
+    parsed_headers: dict[str, TaskHeader],
+    *,
+    existing_task_ids: set[str],
+    pending_task_ids: set[str],
+    batch_task_ids: set[str],
+    merged_pr_ids: set[str],
+) -> dict[str, list[str]]:
+    merged_parent_aliases = merged_split_parent_aliases(
+        structured_pr_ids=existing_task_ids | pending_task_ids | batch_task_ids,
+        merged_pr_ids=merged_pr_ids,
+    )
+    visible_task_ids = (
+        existing_task_ids
+        | pending_task_ids
+        | batch_task_ids
+        | merged_pr_ids
+        | merged_parent_aliases
+    )
+    errors_by_file: dict[str, list[str]] = {}
+    for fname, header in parsed_headers.items():
+        for dependency in header.depends_on:
+            if dependency not in visible_task_ids:
+                _add_validation_error(
+                    errors_by_file,
+                    fname,
+                    f"Depends on {dependency} which is not in this upload "
+                    "and not in tasks/.",
+                )
+    return errors_by_file
+
+
 @router.post("/repos/{name}/upload-tasks", response_class=HTMLResponse)
 async def upload_tasks(
     request: Request,
@@ -480,26 +512,15 @@ async def upload_tasks(
             merged_pr_ids = set()
     else:
         merged_pr_ids = set()
-    merged_parent_aliases = merged_split_parent_aliases(
-        structured_pr_ids=existing_task_ids | pending_task_ids | batch_task_ids,
-        merged_pr_ids=merged_pr_ids,
+    errors_by_file.update(
+        _dependency_validation_errors(
+            parsed_headers,
+            existing_task_ids=existing_task_ids,
+            pending_task_ids=pending_task_ids,
+            batch_task_ids=batch_task_ids,
+            merged_pr_ids=merged_pr_ids,
+        )
     )
-    visible_task_ids = (
-        existing_task_ids
-        | pending_task_ids
-        | batch_task_ids
-        | merged_pr_ids
-        | merged_parent_aliases
-    )
-    for fname, header in parsed_headers.items():
-        for dependency in header.depends_on:
-            if dependency not in visible_task_ids:
-                _add_validation_error(
-                    errors_by_file,
-                    fname,
-                    f"Depends on {dependency} which is not in this upload "
-                    "and not in tasks/.",
-                )
 
     if errors_by_file:
         validation_errors = [
@@ -661,6 +682,26 @@ async def upload_tasks(
                 existing_raw = await redis_client.get(pending_key)
             except Exception:
                 existing_raw = None
+
+            locked_dependency_errors = _dependency_validation_errors(
+                parsed_headers,
+                existing_task_ids=existing_task_ids,
+                pending_task_ids=_pending_upload_task_ids(existing_raw),
+                batch_task_ids=batch_task_ids,
+                merged_pr_ids=merged_pr_ids,
+            )
+            if locked_dependency_errors:
+                validation_errors = [
+                    {"file": fname, "errors": issues}
+                    for fname, issues in sorted(locked_dependency_errors.items())
+                ]
+                return _render_upload_error(
+                    request,
+                    _format_task_validation_errors(validation_errors),
+                    400,
+                    repo_name=name,
+                    validation_errors=validation_errors,
+                )
 
             if existing_raw:
                 try:
