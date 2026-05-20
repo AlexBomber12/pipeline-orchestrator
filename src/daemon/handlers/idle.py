@@ -734,6 +734,16 @@ class IdleMixin:
         # default until PR-330d flips production; canary repos opt in
         # earlier via ``feature_flags.use_unified_inhibitor_check``.
         if self.repo_config.feature_flags.use_unified_inhibitor_check:
+            # ``state.user_paused`` is refreshed from Redis at cycle
+            # START, while ``state.active_inhibitors`` is rebuilt at
+            # publish time. After an operator presses Play, the scalar
+            # can already be False while the previous published
+            # ``USER_PAUSE`` inhibitor is still present in the snapshot.
+            # Match the legacy IDLE guard by treating the scalar as the
+            # source of truth for manual pause.
+            if self.state.user_paused:
+                self.log_event("[INFRA] IDLE inhibited by ['user_pause']")
+                return
             ctx = SelectionContext(
                 registry=self._registry,
                 repo_config=self.repo_config,
@@ -764,6 +774,10 @@ class IdleMixin:
                     for inh in blocking
                     if inh.inhibitor_type
                     != InhibitorType.GITHUB_BUDGET_SLOWDOWN
+                    and (
+                        inh.inhibitor_type != InhibitorType.USER_PAUSE
+                        or self.state.user_paused
+                    )
                 ]
                 if not hard_blocking:
                     blocking_by_coder.clear()
