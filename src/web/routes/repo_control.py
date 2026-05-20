@@ -40,6 +40,7 @@ from src.cancellation.storage import (
 from src.config import load_config
 from src.github import gh_runner
 from src.github import prs as gh_prs
+from src.inhibitor import derive_active_inhibitors
 from src.keyspace import (
     control_stop,
     legacy_recovered_tasks,
@@ -837,6 +838,19 @@ async def _update_repo_pause_state(
 async def _render_repo_card(request: Request, name: str) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
     state = await _app.get_repo_state(name, redis_client, _app.CONFIG_PATH)
+    if redis_client is not None:
+        try:
+            cfg = await asyncio.to_thread(load_config, _app.CONFIG_PATH)
+            state.active_inhibitors = await derive_active_inhibitors(
+                state, redis_client, cfg
+            )
+        except Exception:
+            _app.logger.warning(
+                "Failed to refresh inhibitors while rendering repo card for %s",
+                name,
+                exc_info=True,
+            )
+            state.active_inhibitors = []
     return _app.templates.TemplateResponse(
         request,
         "components/repo_cards.html",
@@ -863,6 +877,13 @@ async def clear_inhibitor(
     redis_client = getattr(request.app.state, "redis", None)
     if redis_client is None:
         return HTMLResponse("Redis not configured", status_code=503)
+
+    try:
+        redis_client, _state_key, _repo_url = await _apply_repo_control_update(
+            request, name
+        )
+    except _RepoStateMutationError as exc:
+        return HTMLResponse(exc.message, status_code=exc.status_code)
 
     if inhibitor_type == "user_pause":
         result = await _update_repo_pause_state(

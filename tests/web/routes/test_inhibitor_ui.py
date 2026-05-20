@@ -193,6 +193,8 @@ def test_clear_inhibitor_user_pause_returns_200(
         response = client.post("/repos/example__alpha/inhibitors/clear/user_pause")
 
     assert response.status_code == 200
+    assert 'data-inhibitor="user_pause"' not in response.text
+    assert "Operator paused" not in response.text
     updated = RepoState.model_validate_json(redis.store[pipeline_state("example__alpha")])
     assert updated.user_paused is False
 
@@ -213,7 +215,22 @@ def test_clear_inhibitor_user_stop_returns_200(
         response = client.post("/repos/example__alpha/inhibitors/clear/user_stop")
 
     assert response.status_code == 200
+    assert 'data-inhibitor="user_stop"' not in response.text
+    assert "Operator stopped" not in response.text
     assert control_stop("example__alpha") not in redis.store
+
+
+def test_clear_inhibitor_user_stop_unknown_repo_returns_404(
+    repo_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    redis = _FakeRedis()
+    monkeypatch.setattr(web_app, "aioredis", _stub_aioredis(redis))
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__missing/inhibitors/clear/user_stop")
+
+    assert response.status_code == 404
+    assert response.text == "Repository not found"
 
 
 def test_clear_inhibitor_non_clearable_returns_400(
