@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -14,7 +15,14 @@ from src.inhibitor import (
     WorkInhibitor,
     derive_active_inhibitors,
 )
-from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus
+from src.models import (
+    CIStatus,
+    PipelineState,
+    PRInfo,
+    QueueTask,
+    ReviewStatus,
+    TaskStatus,
+)
 from tests.runner import _helpers as h
 
 
@@ -505,3 +513,62 @@ def test_watch_retrigger_legacy_uses_reactive_coder_marker() -> None:
     runner.state.rate_limit_reactive_coder = "codex"
 
     assert runner._watch_retrigger_inhibited("codex") is True
+
+
+def test_watch_retrigger_coder_prefers_active_task_header(
+    tmp_path: Path,
+) -> None:
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    task_file = tmp_path / "tasks" / "PR-330c.md"
+    task_file.parent.mkdir()
+    task_file.write_text(
+        "---\n"
+        "status: todo\n"
+        "---\n\n"
+        "# PR-330c: Watch migration\n\n"
+        "Branch: pr-330c-handle-watch-migration\n"
+        "- Type: refactor\n"
+        "- Complexity: medium\n"
+        "- Depends on: PR-330b\n"
+        "- Priority: 3\n"
+        "- Coder: codex\n",
+        encoding="utf-8",
+    )
+    runner.state.coder = "claude"
+    runner.state.current_pr = PRInfo(
+        number=491,
+        branch="pr-330c-handle-watch-migration",
+        pr_id="PR-330c",
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-330c",
+        title="Watch migration",
+        status=TaskStatus.DOING,
+        task_file="tasks/PR-330c.md",
+        branch="pr-330c-handle-watch-migration",
+    )
+
+    assert runner._watch_retrigger_coder() == "codex"
+
+
+def test_watch_retrigger_coder_falls_back_when_task_header_missing(
+    tmp_path: Path,
+) -> None:
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.coder = "claude"
+    runner.state.current_pr = PRInfo(
+        number=491,
+        branch="pr-330c-handle-watch-migration",
+        pr_id="PR-330c",
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-330c",
+        title="Watch migration",
+        status=TaskStatus.DOING,
+        task_file="tasks/PR-330c.md",
+        branch="pr-330c-handle-watch-migration",
+    )
+
+    assert runner._watch_retrigger_coder() == "claude"

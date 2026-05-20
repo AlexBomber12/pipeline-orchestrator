@@ -11,6 +11,7 @@ import logging
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from src.cancellation import CancellationCause
 from src.daemon import guardrails
@@ -21,6 +22,7 @@ from src.github import prs as gh_prs
 from src.inhibitor import InhibitorType, is_work_inhibited
 from src.keyspace import ci_infra_retried
 from src.models import CIStatus, FeedbackCheckResult, PipelineState, ReviewStatus
+from src.queue_parser import parse_task_header
 
 logger = logging.getLogger(__name__)
 _STALE_RETRIGGER_DEBOUNCE = timedelta(hours=1)
@@ -920,6 +922,23 @@ class WatchMixin:
 
     def _watch_retrigger_coder(self) -> str:
         """Return the coder whose limit should gate WATCH retriggers."""
+        current_pr = self.state.current_pr
+        current_task = self.state.current_task
+        if (
+            current_pr is not None
+            and current_task is not None
+            and current_task.branch == current_pr.branch
+            and current_task.task_file
+        ):
+            try:
+                header = parse_task_header(
+                    Path(self.repo_path) / current_task.task_file
+                )
+            except Exception:
+                header = None
+            if header is not None and header.coder != "any":
+                return header.coder
+
         candidate = (
             self.state.coder
             or getattr(self.repo_config.coder, "value", self.repo_config.coder)
