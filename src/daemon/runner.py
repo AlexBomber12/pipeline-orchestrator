@@ -535,7 +535,15 @@ class PipelineRunner(
         if not task_id:
             return
         key = f"diagnose_exhausted:{self.name}:{task_id}"
-        await self.redis.delete(key)
+        try:
+            await self.redis.delete(key)
+        except Exception as exc:
+            logger.warning(
+                "[%s] diagnose exhaustion cleanup failed for %s: %s",
+                self.name,
+                task_id,
+                exc,
+            )
 
     @property
     def app_config(self) -> AppConfig:

@@ -136,6 +136,28 @@ def test_clear_error_message_on_recovery_clears_sentinel() -> None:
     assert key in runner.redis.deleted
 
 
+def test_clear_error_message_on_recovery_ignores_sentinel_delete_failure() -> None:
+    class FailingDeleteRedis(h._FakeRedis):
+        async def delete(self, key: str) -> int:
+            raise RuntimeError(f"redis unavailable for {key}")
+
+    runner = _make_error_runner()
+    runner.redis = FailingDeleteRedis()
+
+    asyncio.run(
+        runner._clear_error_message_on_recovery(
+            log_prefix="[ERROR]",
+            reason="diagnose_error FIX retry",
+        )
+    )
+
+    assert runner.state.error_message is None
+    assert any(
+        "cleared error_message (diagnose_error FIX retry)" in item["event"]
+        for item in runner.state.history
+    )
+
+
 def test_sentinel_methods_ignore_empty_task_id() -> None:
     runner = _make_error_runner()
 
