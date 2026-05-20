@@ -680,6 +680,48 @@ def test_get_merged_pr_ids_limits_probe_to_requested_candidates(
     assert any(arg.startswith("--grep=^(") for arg in calls[0])
 
 
+def test_get_merged_pr_ids_candidate_probe_includes_split_child_ids(
+    monkeypatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(*args, **kwargs) -> subprocess.CompletedProcess[str]:
+        calls.append(args[0])
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout="PR-305a: split child merged\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("src.task_status.subprocess.run", fake_run)
+
+    assert get_merged_pr_ids("/repo", "main", {"PR-305"}) == {"PR-305a"}
+    grep_arg = next(arg for arg in calls[0] if arg.startswith("--grep="))
+    assert "PR\\-305([a-z](-[0-9]+)?)?" in grep_arg
+
+
+def test_get_merged_pr_ids_candidate_probe_keeps_split_child_exact(
+    monkeypatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(*args, **kwargs) -> subprocess.CompletedProcess[str]:
+        calls.append(args[0])
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout="PR-305a: split child merged\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("src.task_status.subprocess.run", fake_run)
+
+    assert get_merged_pr_ids("/repo", "main", {"PR-305a"}) == {"PR-305a"}
+    grep_arg = next(arg for arg in calls[0] if arg.startswith("--grep="))
+    assert "PR\\-305a([a-z](-[0-9]+)?)?" not in grep_arg
+
+
 def test_get_merged_pr_ids_candidate_probe_does_not_cap_duplicate_matches(
     monkeypatch,
 ) -> None:

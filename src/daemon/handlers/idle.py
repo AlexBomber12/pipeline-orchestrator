@@ -49,6 +49,31 @@ _IDLE_MERGED_PR_304_WARN_AT = 10
 _IDLE_MERGED_PR_304_WARN_EVERY = 50
 
 
+def _split_parent_of(pr_id: str) -> str | None:
+    """Return the unsuffixed parent PR ID for a split sub-task variant."""
+    match = re.match(r"^(PR-\d+(?:\.\d+)?)[a-z](?:-\d+)?$", pr_id)
+    return match.group(1) if match else None
+
+
+def _merged_split_parent_aliases(
+    *,
+    structured_pr_ids: set[str],
+    merged_pr_ids: set[str],
+    skipped_legacy_pr_ids: set[str] | None = None,
+) -> set[str]:
+    """Return split parents satisfied by at least one merged split child."""
+    skipped_legacy_pr_ids = skipped_legacy_pr_ids or set()
+    parent_aliases: set[str] = set()
+    for pr_id in merged_pr_ids:
+        parent = _split_parent_of(pr_id)
+        if parent is None:
+            continue
+        if parent in structured_pr_ids or parent in skipped_legacy_pr_ids:
+            continue
+        parent_aliases.add(parent)
+    return parent_aliases
+
+
 class IdleMixin:
     """Handle IDLE state: sync, pick next task, dispatch to CODING."""
 
@@ -321,6 +346,11 @@ class IdleMixin:
     ) -> tuple[list, dict[str, list[str]]]:
         unresolved_deps_map: dict[str, list[str]] = {}
         structured_pr_ids = {header.pr_id for header in headers}
+        merged_parent_aliases = _merged_split_parent_aliases(
+            structured_pr_ids=structured_pr_ids,
+            merged_pr_ids=merged_pr_ids,
+            skipped_legacy_pr_ids=skipped_legacy_pr_ids,
+        )
 
         changed = True
         while changed:
@@ -328,7 +358,10 @@ class IdleMixin:
             for header in headers:
                 unresolved_deps = set(unresolved_deps_map.get(header.pr_id, ()))
                 for dependency in header.depends_on:
-                    if dependency in merged_pr_ids:
+                    if (
+                        dependency in merged_pr_ids
+                        or dependency in merged_parent_aliases
+                    ):
                         continue
                     if dependency in skipped_legacy_pr_ids:
                         unresolved_deps.add(dependency)
@@ -403,6 +436,12 @@ class IdleMixin:
             task_dir,
             merged_pr_ids,
         )
+        structured_pr_ids = {header.pr_id for header in headers}
+        merged_parent_aliases = _merged_split_parent_aliases(
+            structured_pr_ids=structured_pr_ids,
+            merged_pr_ids=merged_pr_ids,
+            skipped_legacy_pr_ids=skipped_legacy_pr_ids,
+        )
 
         try:
             dag_headers = [
@@ -412,6 +451,7 @@ class IdleMixin:
                         dependency
                         for dependency in header.depends_on
                         if dependency not in merged_pr_ids
+                        and dependency not in merged_parent_aliases
                     ],
                 )
                 for header in headers
