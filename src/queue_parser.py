@@ -56,8 +56,18 @@ TYPE_SYNONYMS: dict[str, str] = {
     "chore": "refactor",
     "feat": "feature",
     "task": "feature",
+    "infra": "config",
 }
-_COMPLEXITY_VALUES = {"low", "medium", "high"}
+COMPLEXITY_SYNONYMS: dict[str, str] = {
+    "small": "low",
+    "large": "high",
+    "s": "low",
+    "m": "medium",
+    "l": "high",
+    "xs": "low",
+    "xl": "high",
+}
+_COMPLEXITY_VALUES: frozenset[str] = frozenset({"low", "medium", "high"})
 _CODER_VALUES = {"claude", "codex", "any"}
 
 
@@ -315,22 +325,28 @@ def parse_task_header(path: str | Path) -> TaskHeader:
     task_type = fields.get("type")
     if not task_type:
         issues.append(f"{task_path}: missing Type")
-    elif task_type in TYPE_SYNONYMS:
-        task_type = TYPE_SYNONYMS[task_type]
-    elif task_type not in _TASK_TYPE_VALUES:
-        issues.append(
-            f"{task_path}: invalid Type {task_type!r}; expected one of "
-            f"{sorted(_TASK_TYPE_VALUES)}"
-        )
+    else:
+        task_type = task_type.lower()
+        if task_type in TYPE_SYNONYMS:
+            task_type = TYPE_SYNONYMS[task_type]
+        elif task_type not in _TASK_TYPE_VALUES:
+            issues.append(
+                f"{task_path}: invalid Type {task_type!r}; expected one of "
+                f"{sorted(_TASK_TYPE_VALUES)}"
+            )
 
     complexity = fields.get("complexity")
     if not complexity:
         issues.append(f"{task_path}: missing Complexity")
-    elif complexity not in _COMPLEXITY_VALUES:
-        issues.append(
-            f"{task_path}: invalid Complexity {complexity!r}; expected one of "
-            f"{sorted(_COMPLEXITY_VALUES)}"
-        )
+    else:
+        complexity = complexity.lower()
+        if complexity in COMPLEXITY_SYNONYMS:
+            complexity = COMPLEXITY_SYNONYMS[complexity]
+        elif complexity not in _COMPLEXITY_VALUES:
+            issues.append(
+                f"{task_path}: invalid Complexity {complexity!r}; expected one of "
+                f"{sorted(_COMPLEXITY_VALUES)}"
+            )
 
     depends_raw = fields.get("depends on")
     if depends_raw is None:
