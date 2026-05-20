@@ -216,6 +216,21 @@ def test_publish_state_called_after_release(
     assert publish_calls == ["publish"]
 
 
+def test_external_resolution_clears_pr_without_current_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = _watch_pr(number=9)
+    runner = _seed_watch_runner(monkeypatch, pr, pr_state="CLOSED")
+    runner.state.current_task = None
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.current_pr is None
+
+
 def test_disappeared_pr_uses_direct_terminal_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

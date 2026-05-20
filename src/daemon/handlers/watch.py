@@ -1062,6 +1062,7 @@ class WatchMixin:
             await self._save_current_run_record("closed_unmerged")
         self._current_run_record = None
         self.state.current_task = None
+        self.state.current_pr = None
         self._reset_runner_local_task_counters()
         self.state.state = PipelineState.IDLE
         await self.publish_state()
