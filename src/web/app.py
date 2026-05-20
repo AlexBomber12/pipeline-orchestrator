@@ -170,6 +170,7 @@ _DASHBOARD_REEXPORTS = frozenset(
         "_format_duration_ms",
         "_format_guardrail_relative_time",
         "_format_history_time",
+        "INHIBITOR_LABELS",
         "_most_recent_transition_into",
         "_parse_history_time",
         "_parse_iso8601",
@@ -182,6 +183,7 @@ _DASHBOARD_REEXPORTS = frozenset(
         "_resource_zone",
         "_serialize_guardrail_pending",
         "_serialize_run_record",
+        "_subsource_lookup",
         "_truncate_guardrail_excerpt",
     }
 )

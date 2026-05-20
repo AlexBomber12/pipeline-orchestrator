@@ -73,6 +73,16 @@ _METRICS_PANEL_LIMIT = 20
 _METRICS_SCAN_LIMIT = 100
 _CANCELLATIONS_WINDOW_DAYS = 7
 _CANCELLATIONS_MAX = 50
+INHIBITOR_LABELS = {
+    "user_pause": "Operator paused",
+    "user_stop": "Operator stopped",
+    "rate_limit": "Rate-limited",
+    "spend_ceiling": "Spend ceiling",
+    "github_budget_pause": "GitHub budget",
+    "github_budget_slowdown": "GitHub slowdown",
+    "cascade_panic": "Cascade panic",
+    "error_rate_auto_pause": "Auto-paused (ERROR rate)",
+}
 
 # Valid bucket values accepted by the cancellation history dropdown,
 # derived from the subsource registry so adding a 12th subsource to the
@@ -608,6 +618,7 @@ async def _repo_template_context(
         "active_repo_coder_label": _repo_coder_label(active_repo_coder),
         "inherit_coder": _daemon_default_coder_name(config),
         "coder_update_message": coder_update_message,
+        "inhibitor_labels": INHIBITOR_LABELS,
         "metrics_records": (
             await _recent_repo_metrics_payload(name, redis_client)
             if include_metrics
@@ -1444,6 +1455,7 @@ async def index(request: Request) -> HTMLResponse:
             "cancellation_subsources": cancellation_subsources,
             "subsource_lookup": _subsource_lookup,
             "drain_progress": drain_progress,
+            "inhibitor_labels": INHIBITOR_LABELS,
         },
     )
 
@@ -1849,6 +1861,7 @@ async def partial_repo_list(request: Request) -> HTMLResponse:
             "cancellation_subsources": cancellation_subsources,
             "subsource_lookup": _subsource_lookup,
             "drain_progress": drain_progress,
+            "inhibitor_labels": INHIBITOR_LABELS,
         },
     )
 
