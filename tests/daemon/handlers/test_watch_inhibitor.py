@@ -172,6 +172,43 @@ def test_handle_watch_unified_uses_refreshed_budget_when_redis_read_misses(
     assert budget_types == ([] if expected is None else [expected])
 
 
+def test_handle_watch_unified_refreshed_budget_overrides_stale_inhibitor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    _set_flag(runner, True)
+    runner.state.state = PipelineState.WATCH
+    runner.app_config.daemon.github_api_pause_threshold_percent = 5
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+    stale = _github_budget(InhibitorType.GITHUB_BUDGET_SLOWDOWN)
+    fetched = h._budget(remaining=150, limit=5000)  # 3%
+    monkeypatch.setattr(
+        "src.github.rate_limit.fetch_rate_limit_buckets",
+        lambda: (fetched, None),
+    )
+
+    async def _stale_inhibitors(*_args: object, **_kwargs: object) -> list[WorkInhibitor]:
+        return [stale]
+
+    monkeypatch.setattr(
+        "src.daemon.runner.derive_active_inhibitors",
+        _stale_inhibitors,
+    )
+
+    assert asyncio.run(runner._check_github_api_budget()) is False
+
+    budget_types = [
+        inh.inhibitor_type
+        for inh in runner.state.active_inhibitors
+        if inh.inhibitor_type
+        in (
+            InhibitorType.GITHUB_BUDGET_PAUSE,
+            InhibitorType.GITHUB_BUDGET_SLOWDOWN,
+        )
+    ]
+    assert budget_types == [InhibitorType.GITHUB_BUDGET_PAUSE]
+
+
 def test_handle_watch_slowdown_multiplier_at_5_pct_legacy() -> None:
     runner = h._make_runner(poll_interval_sec=60)
     _set_flag(runner, False)

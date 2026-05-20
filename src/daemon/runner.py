@@ -2244,26 +2244,30 @@ class PipelineRunner(
                 InhibitorType.GITHUB_BUDGET_PAUSE,
                 InhibitorType.GITHUB_BUDGET_SLOWDOWN,
             }
-            if (
-                budget is not None
-                and datetime.now(timezone.utc) < budget.reset_at
-                and blocking_types.isdisjoint(budget_inhibitors)
-            ):
-                github_pct = budget.remaining_percent
-                if github_pct < self.app_config.daemon.github_api_pause_threshold_percent:
-                    budget_type = InhibitorType.GITHUB_BUDGET_PAUSE
-                    reason_text = f"GitHub budget at {github_pct:.0f}%"
-                elif (
-                    github_pct
-                    < self.app_config.daemon.github_api_slowdown_threshold_percent
-                ):
-                    budget_type = InhibitorType.GITHUB_BUDGET_SLOWDOWN
-                    reason_text = (
-                        f"GitHub budget at {github_pct:.0f}%, slowdown active"
-                    )
-                else:
-                    budget_type = None
-                    reason_text = ""
+            if budget is not None:
+                self.state.active_inhibitors = [
+                    inh
+                    for inh in self.state.active_inhibitors
+                    if inh.inhibitor_type not in budget_inhibitors
+                ]
+                budget_type = None
+                reason_text = ""
+                if datetime.now(timezone.utc) < budget.reset_at:
+                    github_pct = budget.remaining_percent
+                    if (
+                        github_pct
+                        < self.app_config.daemon.github_api_pause_threshold_percent
+                    ):
+                        budget_type = InhibitorType.GITHUB_BUDGET_PAUSE
+                        reason_text = f"GitHub budget at {github_pct:.0f}%"
+                    elif (
+                        github_pct
+                        < self.app_config.daemon.github_api_slowdown_threshold_percent
+                    ):
+                        budget_type = InhibitorType.GITHUB_BUDGET_SLOWDOWN
+                        reason_text = (
+                            f"GitHub budget at {github_pct:.0f}%, slowdown active"
+                        )
                 if budget_type is not None:
                     self.state.active_inhibitors.append(
                         WorkInhibitor(
@@ -2276,7 +2280,11 @@ class PipelineRunner(
                     _blocked, blocking = is_work_inhibited(
                         self.state, coder=None
                     )
-                    blocking_types = {inh.inhibitor_type for inh in blocking}
+                else:
+                    _blocked, blocking = is_work_inhibited(
+                        self.state, coder=None
+                    )
+                blocking_types = {inh.inhibitor_type for inh in blocking}
             if InhibitorType.GITHUB_BUDGET_PAUSE in blocking_types:
                 was_zero = self._github_api_pause_attempts == 0
                 self._github_api_pause_policy.increment(self)
