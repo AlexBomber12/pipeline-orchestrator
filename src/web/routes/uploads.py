@@ -146,12 +146,18 @@ def _pending_upload_task_ids(raw_manifest: str | bytes | None) -> set[str]:
     except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
         return set()
     files = manifest.get("files", [])
-    if not isinstance(files, list):
+    staging_dir_raw = manifest.get("staging_dir")
+    if not isinstance(files, list) or not isinstance(staging_dir_raw, str):
         return set()
+    staging_dir = Path(staging_dir_raw)
     return {
         Path(str(fname)).stem
         for fname in files
-        if isinstance(fname, str) and re.fullmatch(_TASK_UPLOAD_PATTERN, fname)
+        if (
+            isinstance(fname, str)
+            and re.fullmatch(_TASK_UPLOAD_PATTERN, fname)
+            and (staging_dir / fname).is_file()
+        )
     }
 
 
@@ -460,16 +466,19 @@ async def upload_tasks(
         for header in parsed_headers.values()
         for dependency in header.depends_on
     }
-    try:
-        merged_pr_ids = set(
-            await asyncio.to_thread(
-                get_merged_pr_ids,
-                repo_path,
-                repo_branch,
-                dependency_candidates,
+    if dependency_candidates:
+        try:
+            merged_pr_ids = set(
+                await asyncio.to_thread(
+                    get_merged_pr_ids,
+                    repo_path,
+                    repo_branch,
+                    dependency_candidates,
+                )
             )
-        )
-    except Exception:
+        except Exception:
+            merged_pr_ids = set()
+    else:
         merged_pr_ids = set()
     merged_parent_aliases = merged_split_parent_aliases(
         structured_pr_ids=existing_task_ids | pending_task_ids | batch_task_ids,

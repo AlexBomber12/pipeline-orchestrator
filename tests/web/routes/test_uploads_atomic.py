@@ -162,6 +162,20 @@ def test_dependency_closure_satisfied_by_merged_split_child(
     assert (_staging_dir(uploads_dir) / "PR-306.md").is_file()
 
 
+def test_upload_skips_merged_history_probe_without_dependencies(
+    monkeypatch: pytest.MonkeyPatch, uploads_dir: Path
+) -> None:
+    def _fail_if_called(*args: object) -> set[str]:
+        raise AssertionError("get_merged_pr_ids should not run without dependencies")
+
+    monkeypatch.setattr(upload_routes, "get_merged_pr_ids", _fail_if_called)
+
+    resp = _post_upload([_task_file(name="PR-001.md", pr_id="PR-001")])
+
+    assert resp.status_code == 200
+    assert (_staging_dir(uploads_dir) / "PR-001.md").is_file()
+
+
 def test_dependency_closure_satisfied_by_pending_upload(
     uploads_dir: Path,
 ) -> None:
@@ -196,12 +210,45 @@ def test_dependency_closure_satisfied_by_pending_upload(
     assert (new_staging / "PR-002.md").is_file()
 
 
-def test_pending_upload_task_ids_ignores_invalid_manifest() -> None:
+def test_dependency_closure_rejects_missing_pending_manifest_file(
+    uploads_dir: Path,
+) -> None:
+    pending_staging = uploads_dir / "example__alpha" / "pending"
+    pending_staging.mkdir(parents=True)
+    with TestClient(app) as client:
+        client.app.state.redis._store[upload_pending("example__alpha")] = json.dumps(
+            {
+                "repo": "example__alpha",
+                "files": ["PR-001.md"],
+                "staging_dir": str(pending_staging),
+            }
+        )
+
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[
+                _task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-001")
+            ],
+        )
+
+    assert resp.status_code == 400
+    assert "Depends on PR-001 which is not in this upload and not in tasks/" in resp.text
+
+
+def test_pending_upload_task_ids_ignores_invalid_manifest(tmp_path: Path) -> None:
+    staging_dir = tmp_path / "pending"
+    staging_dir.mkdir()
+    (staging_dir / "PR-001.md").write_text("# task\n", encoding="utf-8")
     assert upload_routes._pending_upload_task_ids(None) == set()
     assert upload_routes._pending_upload_task_ids("{not-json") == set()
     assert upload_routes._pending_upload_task_ids('{"files": "PR-001.md"}') == set()
     assert upload_routes._pending_upload_task_ids(
-        json.dumps({"files": ["PR-001.md", "QUEUE.md", 123]})
+        json.dumps(
+            {
+                "files": ["PR-001.md", "QUEUE.md", 123, "PR-002.md"],
+                "staging_dir": str(staging_dir),
+            }
+        )
     ) == {"PR-001"}
 
 
