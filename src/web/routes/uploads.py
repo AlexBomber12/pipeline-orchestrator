@@ -20,7 +20,7 @@ import zipfile
 import zlib
 from pathlib import Path
 
-from fastapi import APIRouter, Request, UploadFile
+from fastapi import APIRouter, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse
 
 from src.cancellation import (
@@ -29,11 +29,14 @@ from src.cancellation import (
 )
 from src.events import publish_wake
 from src.keyspace import pipeline_state, upload_pending
+from src.mcp.scans import scan_for_conflicts
 from src.models import RepoState, TaskStatus
 from src.queue_parser import (
     QueueValidationError,
+    TaskHeader,
     parse_task_header,
 )
+from src.task_status import get_merged_pr_ids
 from src.utils import repo_slug_from_url
 from src.web.services.upload_validation import (
     _ALLOWED_TASK_PATTERN,
@@ -58,12 +61,20 @@ def _get_upload_lock(repo_name: str) -> asyncio.Lock:
 
 
 def _render_upload_error(
-    request: Request, message: str, status_code: int, repo_name: str = ""
+    request: Request,
+    message: str,
+    status_code: int,
+    repo_name: str = "",
+    validation_errors: list[dict[str, object]] | None = None,
 ) -> HTMLResponse:
     response = _app.templates.TemplateResponse(
         request,
         "components/upload_error.html",
-        {"message": message, "message_lines": _format_upload_message_lines(message)},
+        {
+            "message": message,
+            "message_lines": _format_upload_message_lines(message),
+            "validation_errors": validation_errors or [],
+        },
         status_code=status_code,
     )
     if repo_name:
@@ -73,12 +84,21 @@ def _render_upload_error(
 
 
 def _render_upload_success(
-    request: Request, message: str, repo_name: str
+    request: Request,
+    message: str,
+    repo_name: str,
+    uploaded_files: list[str] | None = None,
+    commit_subject: str = "",
 ) -> HTMLResponse:
     response = _app.templates.TemplateResponse(
         request,
         "components/upload_success.html",
-        {"message": message, "message_lines": _format_upload_message_lines(message)},
+        {
+            "message": message,
+            "message_lines": _format_upload_message_lines(message),
+            "uploaded_files": uploaded_files or [],
+            "commit_subject": commit_subject,
+        },
     )
     response.headers["HX-Retarget"] = _upload_feedback_target(repo_name)
     response.headers["HX-Reswap"] = "innerHTML"
@@ -107,15 +127,85 @@ def _is_task_in_error_state(repo_state: RepoState, task_id: str) -> bool:
     return False
 
 
+def _existing_task_ids(tasks_dir: Path) -> set[str]:
+    if not tasks_dir.is_dir():
+        return set()
+    return {
+        path.stem
+        for path in tasks_dir.glob("PR-*.md")
+        if path.is_file()
+    }
+
+
+def _validate_zip_member(entry_name: str) -> str | None:
+    parts = entry_name.replace("\\", "/").split("/")
+    if entry_name.startswith("/") or ".." in parts:
+        return f"Zip entry '{entry_name}' must not use absolute paths or '..'."
+    if "/" in entry_name or "\\" in entry_name:
+        return f"Zip entry '{entry_name}' must not contain path separators."
+    if not re.match(_ALLOWED_TASK_PATTERN, entry_name):
+        return (
+            f"Invalid file name: '{entry_name}'. Only AGENTS.md, "
+            "CLAUDE.md, and PR-*.md allowed."
+        )
+    return None
+
+
+def _format_task_validation_errors(
+    validation_errors: list[dict[str, object]],
+) -> str:
+    capped = validation_errors[:50]
+    truncated = len(validation_errors) - len(capped)
+    first_issue = ""
+    if len(validation_errors) == 1 and len(validation_errors[0]["errors"]) == 1:
+        fname = str(validation_errors[0]["file"])
+        issue = str(validation_errors[0]["errors"][0])
+        separator = " " if issue.startswith("is ") else ": "
+        suffix = " field." if issue == "missing Depends on" else ""
+        first_issue = f"{fname}{separator}{issue}{suffix}"
+    lines = [
+        f"Task file validation failed: {first_issue}"
+        if first_issue
+        else "Task file validation failed:"
+    ]
+    for entry in capped:
+        fname = str(entry["file"])
+        for issue_obj in entry["errors"]:
+            issue = str(issue_obj)
+            separator = " " if issue.startswith("is ") else ": "
+            lines.append(f"{fname}{separator}{issue}")
+    if truncated > 0:
+        lines.append(f"... and {truncated} more error(s) (truncated)")
+    all_issues = [
+        str(issue)
+        for entry in validation_errors
+        for issue in entry["errors"]
+    ]
+    if any("missing Depends on" in issue for issue in all_issues):
+        lines.append("Use 'Depends on: none' for tasks with no dependencies.")
+    return "\n".join(lines)
+
+
+def _add_validation_error(
+    errors_by_file: dict[str, list[str]], fname: str, issue: str
+) -> None:
+    errors_by_file.setdefault(fname, []).append(issue)
+
+
 @router.post("/repos/{name}/upload-tasks", response_class=HTMLResponse)
 async def upload_tasks(
-    request: Request, name: str, files: list[UploadFile] = []
+    request: Request,
+    name: str,
+    files: list[UploadFile] = [],
+    subject: str = Form(""),
 ) -> HTMLResponse:
     cfg = _app.load_config(_app.CONFIG_PATH)
     found = False
+    repo_branch = "main"
     for repo in cfg.repositories:
         if repo_slug_from_url(repo.url) == name:
             found = True
+            repo_branch = repo.branch
             break
 
     if not found:
@@ -193,23 +283,17 @@ async def upload_tasks(
                 zip_chunks.append(chunk)
             try:
                 with zipfile.ZipFile(io.BytesIO(b"".join(zip_chunks))) as archive:
+                    safe_members: list[zipfile.ZipInfo] = []
                     extracted_file_count = 0
                     for entry in archive.infolist():
                         entry_name = entry.filename
                         if entry.is_dir():
                             continue
-                        if "/" in entry_name or "\\" in entry_name:
+                        member_error = _validate_zip_member(entry_name)
+                        if member_error is not None:
                             return _render_upload_error(
                                 request,
-                                f"Zip entry '{entry_name}' must not contain path separators.",
-                                422,
-                                repo_name=name,
-                            )
-                        if not re.match(_ALLOWED_TASK_PATTERN, entry_name):
-                            return _render_upload_error(
-                                request,
-                                f"Invalid file name: '{entry_name}'. Only AGENTS.md, "
-                                "CLAUDE.md, and PR-*.md allowed.",
+                                member_error,
                                 422,
                                 repo_name=name,
                             )
@@ -217,36 +301,7 @@ async def upload_tasks(
                             return _render_upload_error(
                                 request, "Total upload size exceeds 1 MB", 422, repo_name=name
                             )
-                        try:
-                            chunks: list[bytes] = []
-                            entry_size = 0
-                            with archive.open(entry) as zipped_file:
-                                while True:
-                                    chunk = zipped_file.read(_CHUNK)
-                                    if not chunk:
-                                        break
-                                    entry_size += len(chunk)
-                                    if staged_size + entry_size > max_total_bytes:
-                                        return _render_upload_error(
-                                            request, "Total upload size exceeds 1 MB", 422, repo_name=name
-                                        )
-                                    chunks.append(chunk)
-                        except (
-                            EOFError,
-                            NotImplementedError,
-                            OSError,
-                            RuntimeError,
-                            zlib.error,
-                        ):
-                            return _render_upload_error(
-                                request,
-                                f"Uploaded zip '{fname}' contains corrupt, encrypted, "
-                                "unsupported, or unreadable entries.",
-                                400,
-                                repo_name=name,
-                            )
-                        staged_size += entry_size
-                        file_contents.append((entry_name, b''.join(chunks)))
+                        safe_members.append(entry)
                         extracted_file_count += 1
                     if extracted_file_count == 0:
                         return _render_upload_error(
@@ -255,6 +310,39 @@ async def upload_tasks(
                             422,
                             repo_name=name,
                         )
+                    with tempfile.TemporaryDirectory(prefix="upload-", dir="/tmp"):
+                        for entry in safe_members:
+                            entry_name = entry.filename
+                            try:
+                                chunks = []
+                                entry_size = 0
+                                with archive.open(entry) as zipped_file:
+                                    while True:
+                                        chunk = zipped_file.read(_CHUNK)
+                                        if not chunk:
+                                            break
+                                        entry_size += len(chunk)
+                                        if staged_size + entry_size > max_total_bytes:
+                                            return _render_upload_error(
+                                                request, "Total upload size exceeds 1 MB", 422, repo_name=name
+                                            )
+                                        chunks.append(chunk)
+                            except (
+                                EOFError,
+                                NotImplementedError,
+                                OSError,
+                                RuntimeError,
+                                zlib.error,
+                            ):
+                                return _render_upload_error(
+                                    request,
+                                    f"Uploaded zip '{fname}' contains corrupt, encrypted, "
+                                    "unsupported, or unreadable entries.",
+                                    400,
+                                    repo_name=name,
+                                )
+                            staged_size += entry_size
+                            file_contents.append((entry_name, b"".join(chunks)))
             except (UnicodeDecodeError, zipfile.BadZipFile):
                 return _render_upload_error(
                     request, f"Uploaded zip '{fname}' is corrupt or unreadable.", 400, repo_name=name
@@ -292,19 +380,16 @@ async def upload_tasks(
         if re.fullmatch(_TASK_UPLOAD_PATTERN, fname):
             task_uploads[fname] = content
 
-    aggregated_issues: list[str] = []
+    errors_by_file: dict[str, list[str]] = {}
     parsed_task_ids: dict[str, str] = {}
     parsed_task_texts: dict[str, str] = {}
+    parsed_headers: dict[str, TaskHeader] = {}
     for fname, content in task_uploads.items():
         try:
             task_text = content.decode("utf-8")
         except UnicodeDecodeError:
-            return _render_upload_error(
-                request,
-                f"{fname} is not valid UTF-8",
-                400,
-                repo_name=name,
-            )
+            _add_validation_error(errors_by_file, fname, "is not valid UTF-8")
+            continue
         with tempfile.TemporaryDirectory() as tmpdir:
             task_path = Path(tmpdir) / fname
             task_path.write_text(task_text, encoding="utf-8")
@@ -312,42 +397,74 @@ async def upload_tasks(
                 header = parse_task_header(task_path)
                 parsed_task_ids[fname] = header.pr_id
                 parsed_task_texts[fname] = task_text
+                parsed_headers[fname] = header
             except QueueValidationError as exc:
                 for issue in exc.issues:
-                    aggregated_issues.append(
-                        issue.replace(str(task_path), fname)
+                    _add_validation_error(
+                        errors_by_file,
+                        fname,
+                        issue.replace(f"{task_path}: ", ""),
                     )
-
-    if aggregated_issues:
-        # Cap at 50 entries so a misbehaving batch upload cannot fill the
-        # dashboard error toast with thousands of lines. The Depends-on
-        # hint is keyed off the full aggregated list, not the capped slice,
-        # so a relevant issue beyond the truncation boundary still surfaces
-        # the guidance line.
-        has_missing_depends_on = any(
-            "missing Depends on" in issue for issue in aggregated_issues
-        )
-        capped = aggregated_issues[:50]
-        truncated = len(aggregated_issues) - len(capped)
-        if (
-            len(aggregated_issues) == 1
-            and has_missing_depends_on
-        ):
-            return _render_upload_error(
-                request,
-                f"Task file validation failed: {capped[0]} field.\n"
-                "Use 'Depends on: none' for tasks with no dependencies.",
-                400,
-                repo_name=name,
+                continue
+        for violation in scan_for_conflicts(task_text):
+            _add_validation_error(
+                errors_by_file,
+                fname,
+                f"AGENTS.md anti-pattern {violation.violation_type}: "
+                f"{violation.rule}",
             )
-        body = "Task file validation failed:\n" + "\n".join(capped)
-        if truncated > 0:
-            body += f"\n... and {truncated} more error(s) (truncated)"
-        if has_missing_depends_on:
-            body += "\nUse 'Depends on: none' for tasks with no dependencies."
-        return _render_upload_error(request, body, 400, repo_name=name)
 
-    hash_rejections: list[str] = []
+    batch_task_ids = {header.pr_id for header in parsed_headers.values()}
+    existing_task_ids = _existing_task_ids(Path(repo_path) / "tasks")
+    dependency_candidates = {
+        dependency
+        for header in parsed_headers.values()
+        for dependency in header.depends_on
+    }
+    try:
+        merged_pr_ids = set(
+            await asyncio.to_thread(
+                get_merged_pr_ids,
+                repo_path,
+                repo_branch,
+                dependency_candidates,
+            )
+        )
+    except Exception:
+        merged_pr_ids = set()
+    visible_task_ids = existing_task_ids | batch_task_ids | merged_pr_ids
+    for fname, header in parsed_headers.items():
+        for dependency in header.depends_on:
+            if dependency not in visible_task_ids:
+                _add_validation_error(
+                    errors_by_file,
+                    fname,
+                    f"Depends on {dependency} which is not in this upload "
+                    "and not in tasks/.",
+                )
+
+    if errors_by_file:
+        validation_errors = [
+            {"file": fname, "errors": issues}
+            for fname, issues in sorted(errors_by_file.items())
+        ]
+        status_code = (
+            409
+            if all(
+                str(issue).startswith("File unchanged.")
+                for entry in validation_errors
+                for issue in entry["errors"]
+            )
+            else 400
+        )
+        return _render_upload_error(
+            request,
+            _format_task_validation_errors(validation_errors),
+            status_code,
+            repo_name=name,
+            validation_errors=validation_errors,
+        )
+
     accepted_file_contents: list[tuple[str, bytes]] = []
     accepted_task_hashes: dict[str, str] = {}
     for fname, content in file_contents:
@@ -369,19 +486,35 @@ async def upload_tasks(
             existing_hash == uploaded_hash
             and _is_task_in_error_state(repo_state, task_id)
         ):
-            hash_rejections.append(
-                f"{fname}: File unchanged. Use Retry button to re-attempt without changes."
+            _add_validation_error(
+                errors_by_file,
+                fname,
+                "File unchanged. Use Retry button to re-attempt without changes.",
             )
             continue
         accepted_file_contents.append((fname, content))
         accepted_task_hashes[task_id] = uploaded_hash
 
-    if hash_rejections and not accepted_file_contents:
+    if errors_by_file:
+        validation_errors = [
+            {"file": fname, "errors": issues}
+            for fname, issues in sorted(errors_by_file.items())
+        ]
+        status_code = (
+            409
+            if all(
+                str(issue).startswith("File unchanged.")
+                for entry in validation_errors
+                for issue in entry["errors"]
+            )
+            else 400
+        )
         return _render_upload_error(
             request,
-            "\n".join(hash_rejections),
-            409,
+            _format_task_validation_errors(validation_errors),
+            status_code,
             repo_name=name,
+            validation_errors=validation_errors,
         )
 
     file_contents = accepted_file_contents
@@ -500,6 +633,11 @@ async def upload_tasks(
                 "files": manifest_filenames,
                 "staging_dir": str(staging_dir),
                 "task_hashes": manifest_task_hashes,
+                "commit_subject": (
+                    subject.strip()
+                    if subject.strip()
+                    else f"tasks: upload batch ({len(uploaded_filenames)} files)"
+                ),
             }
             try:
                 await redis_client.set(
@@ -530,14 +668,17 @@ async def upload_tasks(
         )
 
     success_message = _build_upload_success_message(uploaded_filenames, repo_state.state)
-    if hash_rejections:
-        return _render_upload_error(
-            request,
-            success_message + "\n" + "\n".join(hash_rejections),
-            409,
-            repo_name=name,
-        )
-    return _render_upload_success(request, success_message, repo_name=name)
+    return _render_upload_success(
+        request,
+        success_message,
+        repo_name=name,
+        uploaded_files=sorted(uploaded_filenames),
+        commit_subject=(
+            subject.strip()
+            if subject.strip()
+            else f"tasks: upload batch ({len(uploaded_filenames)} files)"
+        ),
+    )
 
 
 # Imported at end-of-file so all ``@router`` decorators above have already

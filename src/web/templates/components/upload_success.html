@@ -11,5 +11,11 @@
         {% for line in message_lines %}
         <p>{{ line }}</p>
         {% endfor %}
+        {% if uploaded_files %}
+        <p>Batch files: {{ uploaded_files | join(", ") }}.</p>
+        {% endif %}
+        {% if commit_subject %}
+        <p>Commit subject: {{ commit_subject }}</p>
+        {% endif %}
     </div>
 </div>

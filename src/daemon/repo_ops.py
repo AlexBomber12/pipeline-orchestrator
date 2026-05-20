@@ -242,6 +242,14 @@ return 0
         staging_dir = Path(manifest["staging_dir"]) if "staging_dir" in manifest else Path("/data/uploads") / self.name
         filenames: list[str] = manifest.get("files", [])
         task_hashes = manifest.get("task_hashes", {})
+        commit_subject = manifest.get("commit_subject")
+        include_commit_body = isinstance(commit_subject, str) and bool(
+            commit_subject.strip()
+        )
+        if not isinstance(commit_subject, str) or not commit_subject.strip():
+            commit_subject = "chore: upload sprint tasks via dashboard"
+        else:
+            commit_subject = commit_subject.strip()
         if not isinstance(task_hashes, dict):
             task_hashes = {}
         if not filenames or not staging_dir.is_dir():
@@ -291,11 +299,16 @@ return 0
                 "add",
                 *[str(_uploaded_repo_path(fn)) for fn in stageable_filenames],
             )
+            commit_body = "\n".join(
+                _uploaded_repo_path(fn).as_posix()
+                for fn in sorted(stageable_filenames)
+            )
+            commit_args = ["commit", "-m", commit_subject]
+            if include_commit_body and commit_body:
+                commit_args.extend(["-m", commit_body])
             commit_result = git_ops._git(
                 self.repo_path,
-                "commit",
-                "-m",
-                "chore: upload sprint tasks via dashboard",
+                *commit_args,
                 check=False,
             )
             if commit_result.returncode != 0:

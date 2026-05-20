@@ -622,10 +622,9 @@ def test_batch_upload_partial_rejection(
         )
 
     assert resp.status_code == 409
-    assert "Accepted 2 task files (PR-002 through PR-003)." in resp.text
+    assert "Task file validation failed:" in resp.text
     assert "PR-001.md: File unchanged." in resp.text
-    staging = next((uploads_dir / "example__alpha").iterdir())
-    assert {path.name for path in staging.iterdir()} == {"PR-002.md", "PR-003.md"}
+    assert not (uploads_dir / "example__alpha").exists()
 
 
 def test_upload_blocks_when_hash_lookup_fails(
@@ -1314,10 +1313,26 @@ def test_upload_accepts_task_with_dependencies(
     repo_dir: Path,
     uploads_dir: Path,
 ) -> None:
+    tasks_dir = repo_dir / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        _task_bytes("PR-001.md", pr_id="PR-001").decode("utf-8"),
+        encoding="utf-8",
+    )
+    (tasks_dir / "PR-002.md").write_text(
+        _task_bytes("PR-002.md", pr_id="PR-002").decode("utf-8"),
+        encoding="utf-8",
+    )
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_task_file(depends_on="PR-001, PR-002")],
+            files=[
+                _task_file(
+                    name="PR-003.md",
+                    pr_id="PR-003",
+                    depends_on="PR-001, PR-002",
+                )
+            ],
         )
 
     assert resp.status_code == 200
