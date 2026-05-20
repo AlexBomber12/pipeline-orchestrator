@@ -41,6 +41,12 @@ def _github_budget(kind: InhibitorType) -> WorkInhibitor:
     )
 
 
+def _seed_github_budget(runner: Any, remaining: int, limit: int = 5000) -> None:
+    budget = h._budget(remaining=remaining, limit=limit)
+    h._set_budget(runner, budget)
+    asyncio.run(write_budget(runner.redis, budget))
+
+
 def _rate_limit(coder: str) -> WorkInhibitor:
     return WorkInhibitor(
         inhibitor_type=InhibitorType.RATE_LIMIT,
@@ -84,6 +90,7 @@ def test_handle_watch_skips_polling_when_github_budget_pause_unified(
     runner = h._make_runner()
     _set_flag(runner, True)
     runner.state.state = PipelineState.WATCH
+    _seed_github_budget(runner, remaining=150)  # 3%
     runner.state.active_inhibitors = [
         _github_budget(InhibitorType.GITHUB_BUDGET_PAUSE)
     ]
@@ -95,6 +102,30 @@ def test_handle_watch_skips_polling_when_github_budget_pause_unified(
     asyncio.run(_run_cycle_without_repo_io(runner))
 
     assert runner._github_api_pause_attempts == 1
+
+
+def test_handle_watch_unified_refreshes_budget_before_inhibitor_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    _set_flag(runner, True)
+    runner.state.state = PipelineState.WATCH
+    runner.app_config.daemon.github_api_pause_threshold_percent = 5
+    runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+    runner.state.active_inhibitors = []
+    fetched = h._budget(remaining=150, limit=5000)  # 3%
+    monkeypatch.setattr(
+        "src.github.rate_limit.fetch_rate_limit_buckets",
+        lambda: (fetched, None),
+    )
+
+    proceed = asyncio.run(runner._check_github_api_budget())
+
+    assert proceed is False
+    assert runner._github_api_pause_attempts == 1
+    assert [
+        inh.inhibitor_type for inh in runner.state.active_inhibitors
+    ] == [InhibitorType.GITHUB_BUDGET_PAUSE]
 
 
 def test_handle_watch_slowdown_multiplier_at_5_pct_legacy() -> None:
@@ -125,6 +156,7 @@ def test_handle_watch_slowdown_multiplier_at_5_pct_unified() -> None:
         datetime.now(timezone.utc) - timedelta(minutes=10)
     )
     runner.app_config.daemon.github_api_slowdown_multiplier = 5
+    _seed_github_budget(runner, remaining=500)  # 10%
     runner.state.active_inhibitors = [
         _github_budget(InhibitorType.GITHUB_BUDGET_SLOWDOWN)
     ]
@@ -161,6 +193,7 @@ def test_handle_watch_github_budget_boundaries(
 
     if flag:
         asyncio.run(write_budget(runner.redis, budget))
+        h._set_budget(runner, budget)
         runner.state.active_inhibitors = asyncio.run(
             derive_active_inhibitors(
                 runner.state,
@@ -200,6 +233,7 @@ def test_handle_watch_unified_slowdown_skips_non_watch_cycles() -> None:
     _set_flag(runner, True)
     runner.state.state = PipelineState.IDLE
     runner.app_config.daemon.github_api_slowdown_multiplier = 5
+    _seed_github_budget(runner, remaining=500)  # 10%
     runner.state.active_inhibitors = [
         _github_budget(InhibitorType.GITHUB_BUDGET_SLOWDOWN)
     ]

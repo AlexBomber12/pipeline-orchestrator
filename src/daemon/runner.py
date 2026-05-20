@@ -2228,6 +2228,10 @@ class PipelineRunner(
         iteration-cap recovery sites.
         """
         if self.repo_config.feature_flags.use_unified_inhibitor_check:
+            await self._refresh_github_api_budget()
+            self.state.active_inhibitors = await derive_active_inhibitors(
+                self.state, self.redis, self.app_config.daemon
+            )
             _blocked, blocking = is_work_inhibited(self.state, coder=None)
             blocking_types = {inh.inhibitor_type for inh in blocking}
             if InhibitorType.GITHUB_BUDGET_PAUSE in blocking_types:
