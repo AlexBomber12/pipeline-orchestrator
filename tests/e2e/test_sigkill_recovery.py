@@ -68,7 +68,8 @@ def test_sigkill_during_coding_recovers_correctly(
         status = upload_zip(zip_path)
         assert status in (200, 201), f"upload failed with status {status}"
 
-        pre_kill_entry = wait_for_state(["CODING"], timeout_sec=30)
+        # Shared testbed dispatch was observed at ~39 seconds, so 30 seconds raced CODING.
+        pre_kill_entry = wait_for_state(["CODING"], timeout_sec=60)
         pre_kill_last_updated = pre_kill_entry.get("last_updated")
         assert pre_kill_last_updated, (
             f"pre-kill CODING state has no last_updated: {pre_kill_entry!r}"
