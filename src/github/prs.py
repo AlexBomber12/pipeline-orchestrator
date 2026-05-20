@@ -380,6 +380,31 @@ def pr_state(repo: str, pr_number: int) -> dict[str, str | None] | None:
     }
 
 
+def get_pr_state(repo: str, pr_number: int) -> str | None:
+    """Return PR state string: ``OPEN``, ``MERGED``, ``CLOSED``, or ``None``.
+
+    GitHub's canonical ``state`` field uses ``CLOSED`` for closed without
+    merge and ``MERGED`` after merge. Both terminal states release the daemon's
+    active WATCH task.
+    """
+    try:
+        result = gh_runner.run_gh(
+            [
+                "pr",
+                "view",
+                str(pr_number),
+                "--json",
+                "state",
+                "-q",
+                ".state",
+            ],
+            repo=repo,
+        )
+    except Exception:
+        return None
+    return result.strip() if isinstance(result, str) else None
+
+
 def is_pr_merged(repo: str, pr_number: int) -> bool | None:
     """Return True if PR is merged, False if closed without merge, None on lookup failure."""
 

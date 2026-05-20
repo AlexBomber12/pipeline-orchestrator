@@ -7,6 +7,7 @@ Mixin methods:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -156,27 +157,38 @@ class WatchMixin:
         if found is not None:
             self._observe_watch_event_signature(found)
         if found is None:
+            pr_state = await asyncio.to_thread(
+                gh_prs.get_pr_state,
+                self.owner_repo,
+                current_number,
+            )
+            if pr_state in ("MERGED", "CLOSED"):
+                await self._handle_external_pr_resolution(current_pr, pr_state)
+                return
             merged = gh_prs.is_pr_merged(self.owner_repo, current_number)
             if merged is True:
-                await self._save_current_run_record("success_merged")
-                self.log_event(
-                    f"[WATCH] PR #{current_number} merged externally -> IDLE."
-                )
-            elif merged is False:
-                await self._save_current_run_record("closed_unmerged")
-                self.log_event(
-                    f"[WATCH] PR #{current_number} closed without merge "
-                    f"-> IDLE."
-                )
-            else:
-                self.log_event(
-                    f"[WATCH] PR #{current_number} no longer open (state "
-                    f"unknown) -> IDLE."
-                )
+                await self._handle_external_pr_resolution(current_pr, "MERGED")
+                return
+            if merged is False:
+                await self._handle_external_pr_resolution(current_pr, "CLOSED")
+                return
+            self.log_event(
+                f"[WATCH] PR #{current_number} no longer open (state "
+                f"unknown) -> IDLE."
+            )
             self._current_run_record = None
             self.state.current_task = None
             self._reset_runner_local_task_counters()
             self.state.state = PipelineState.IDLE
+            return
+
+        pr_state = await asyncio.to_thread(
+            gh_prs.get_pr_state,
+            self.owner_repo,
+            found.number,
+        )
+        if pr_state in ("MERGED", "CLOSED"):
+            await self._handle_external_pr_resolution(found, pr_state)
             return
 
         merged_shas, merged_push_count = current_pr.merge_observed_pushes(found)
@@ -1013,6 +1025,46 @@ class WatchMixin:
             return True, True
         elapsed = time.time() - marker_ts
         return True, elapsed >= _INFRA_RETRY_GRACE_SECONDS
+
+    async def _handle_external_pr_resolution(
+        self,
+        found: object,
+        pr_state: str,
+    ) -> None:
+        """Release WATCH when the current PR is terminal on GitHub."""
+        pr_number = getattr(found, "number", None)
+        legacy_fragment = (
+            "merged externally -> IDLE"
+            if pr_state == "MERGED"
+            else "closed without merge -> IDLE"
+        )
+        self.log_event(
+            f"[WATCH] PR #{pr_number} externally resolved as {pr_state}; "
+            f"releasing task and returning to IDLE ({legacy_fragment})."
+        )
+        if pr_state == "MERGED":
+            current_task = self.state.current_task
+            if current_task is not None and current_task.task_file:
+                try:
+                    await self._commit_task_status_change(
+                        current_task,
+                        "DONE",
+                        "PR merged externally during WATCH",
+                    )
+                except Exception as exc:
+                    self.log_event(
+                        f"[ERROR] Failed to write status:DONE to "
+                        f"{current_task.task_file}: {exc}"
+                    )
+            self._mark_task_done_in_snapshot()
+            await self._save_current_run_record("success_merged")
+        elif pr_state == "CLOSED":
+            await self._save_current_run_record("closed_unmerged")
+        self._current_run_record = None
+        self.state.current_task = None
+        self._reset_runner_local_task_counters()
+        self.state.state = PipelineState.IDLE
+        await self.publish_state()
 
     async def _mark_infra_retry_attempted(
         self, pr_number: int, head_sha: str
