@@ -57,6 +57,69 @@ def test_observe_watch_event_signature_resets_retrigger_count() -> None:
     assert runner.state.current_pr.watch_retrigger_count == 0
 
 
+def test_external_resolution_clears_current_pr_without_task() -> None:
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_task = None
+    runner.state.current_pr = PRInfo(number=443, branch="pr-443")
+    publishes: list[str] = []
+
+    async def fake_publish() -> None:
+        publishes.append("published")
+
+    runner.publish_state = fake_publish  # type: ignore[method-assign]
+
+    asyncio.run(
+        runner._handle_external_pr_resolution(
+            PRInfo(number=443, branch="pr-443"),
+            "CLOSED",
+        )
+    )
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.current_pr is None
+    assert publishes == ["published"]
+
+
+def test_retry_failed_workflow_returns_true_after_rerun(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    fetch_calls: list[str] = []
+    rerun_calls: list[list[str]] = []
+
+    def fake_fetch(repo: str, head_sha: str):
+        fetch_calls.append(head_sha)
+        return (
+            [
+                {
+                    "conclusion": "FAILURE",
+                    "details_url": (
+                        "https://github.com/o/r/actions/runs/123456/job/1"
+                    ),
+                }
+            ],
+            [],
+            True,
+        )
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> str:
+        rerun_calls.append(args)
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_checks, "_fetch_ci_status_rest", fake_fetch)
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
+
+    assert runner._retry_failed_workflow(443, "abcdef123") is True
+    assert fetch_calls == ["abcdef123"]
+    assert rerun_calls == [["run", "rerun", "--failed", "123456"]]
+    assert any(
+        "infra retry: re-ran failed jobs of 1 workflow run(s)" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
 def test_handle_watch_approved_and_green_merges(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
