@@ -149,6 +149,19 @@ def test_dependency_closure_satisfied_by_merged_on_github(
     assert (_staging_dir(uploads_dir) / "PR-002.md").is_file()
 
 
+def test_dependency_closure_satisfied_by_merged_split_child(
+    monkeypatch: pytest.MonkeyPatch, uploads_dir: Path
+) -> None:
+    monkeypatch.setattr(upload_routes, "get_merged_pr_ids", lambda *args: {"PR-305a"})
+
+    resp = _post_upload(
+        [_task_file(name="PR-306.md", pr_id="PR-306", depends_on="PR-305")]
+    )
+
+    assert resp.status_code == 200
+    assert (_staging_dir(uploads_dir) / "PR-306.md").is_file()
+
+
 def test_error_response_lists_all_failures(uploads_dir: Path) -> None:
     resp = _post_upload(
         [

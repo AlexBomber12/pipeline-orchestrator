@@ -39,6 +39,7 @@ from src.task_status import (
     _resolve_merged_state,
     derive_task_status,
     find_matching_open_pr,
+    merged_split_parent_aliases,
 )
 
 # Number of consecutive HTTP 304 cycles on get_merged_prs before the IDLE
@@ -47,31 +48,6 @@ from src.task_status import (
 # edge-cache stalemates while still surfacing genuine multi-minute outages.
 _IDLE_MERGED_PR_304_WARN_AT = 10
 _IDLE_MERGED_PR_304_WARN_EVERY = 50
-
-
-def _split_parent_of(pr_id: str) -> str | None:
-    """Return the unsuffixed parent PR ID for a split sub-task variant."""
-    match = re.match(r"^(PR-\d+(?:\.\d+)?)[a-z](?:-\d+)?$", pr_id)
-    return match.group(1) if match else None
-
-
-def _merged_split_parent_aliases(
-    *,
-    structured_pr_ids: set[str],
-    merged_pr_ids: set[str],
-    skipped_legacy_pr_ids: set[str] | None = None,
-) -> set[str]:
-    """Return split parents satisfied by at least one merged split child."""
-    skipped_legacy_pr_ids = skipped_legacy_pr_ids or set()
-    parent_aliases: set[str] = set()
-    for pr_id in merged_pr_ids:
-        parent = _split_parent_of(pr_id)
-        if parent is None:
-            continue
-        if parent in structured_pr_ids or parent in skipped_legacy_pr_ids:
-            continue
-        parent_aliases.add(parent)
-    return parent_aliases
 
 
 class IdleMixin:
@@ -346,7 +322,7 @@ class IdleMixin:
     ) -> tuple[list, dict[str, list[str]]]:
         unresolved_deps_map: dict[str, list[str]] = {}
         structured_pr_ids = {header.pr_id for header in headers}
-        merged_parent_aliases = _merged_split_parent_aliases(
+        merged_parent_aliases = merged_split_parent_aliases(
             structured_pr_ids=structured_pr_ids,
             merged_pr_ids=merged_pr_ids,
             skipped_legacy_pr_ids=skipped_legacy_pr_ids,
@@ -437,7 +413,7 @@ class IdleMixin:
             merged_pr_ids,
         )
         structured_pr_ids = {header.pr_id for header in headers}
-        merged_parent_aliases = _merged_split_parent_aliases(
+        merged_parent_aliases = merged_split_parent_aliases(
             structured_pr_ids=structured_pr_ids,
             merged_pr_ids=merged_pr_ids,
             skipped_legacy_pr_ids=skipped_legacy_pr_ids,

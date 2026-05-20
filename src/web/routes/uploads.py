@@ -36,7 +36,7 @@ from src.queue_parser import (
     TaskHeader,
     parse_task_header,
 )
-from src.task_status import get_merged_pr_ids
+from src.task_status import get_merged_pr_ids, merged_split_parent_aliases
 from src.utils import repo_slug_from_url
 from src.web.services.upload_validation import (
     _ALLOWED_TASK_PATTERN,
@@ -432,7 +432,16 @@ async def upload_tasks(
         )
     except Exception:
         merged_pr_ids = set()
-    visible_task_ids = existing_task_ids | batch_task_ids | merged_pr_ids
+    merged_parent_aliases = merged_split_parent_aliases(
+        structured_pr_ids=existing_task_ids | batch_task_ids,
+        merged_pr_ids=merged_pr_ids,
+    )
+    visible_task_ids = (
+        existing_task_ids
+        | batch_task_ids
+        | merged_pr_ids
+        | merged_parent_aliases
+    )
     for fname, header in parsed_headers.items():
         for dependency in header.depends_on:
             if dependency not in visible_task_ids:
