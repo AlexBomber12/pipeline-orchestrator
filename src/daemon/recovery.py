@@ -21,11 +21,12 @@ from src.cancellation import (
     classify_cancellation_subsource,
     get_cancellation_cause,
     get_current_run_started_at,
+    safe_record_cancellation_cause,
 )
 from src.daemon import git_ops
 from src.github import gh_runner
 from src.github import prs as gh_prs
-from src.keyspace import pipeline_state
+from src.keyspace import pipeline_state, recovery_backup_branch
 from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
 from src.queue_parser import QueueValidationError, parse_task_header
 from src.task_status import (
@@ -479,6 +480,8 @@ class RecoveryMixin:
                         log_prefix="[INFRA]",
                     )
                     return
+                # PR-351: see crash-recovery branch below for rationale.
+                await self._persist_pending_backup_branch_write()
                 self.state.current_pr = None
                 self.state.state = PipelineState.IDLE
                 self.log_event(
@@ -508,6 +511,12 @@ class RecoveryMixin:
                     log_prefix="[INFRA]",
                 )
                 return
+            # PR-351: if the preserve push fell back to a ``crash-backup``
+            # branch (primary push rejected by branch protection or non-
+            # fast-forward state), persist the pointer to Redis so the
+            # dashboard cancellation card can surface the branch name for
+            # operator recovery.
+            await self._persist_pending_backup_branch_write()
             # Capture branch surfaces before clearing ``current_task``
             # so the cancellation diagnostic names the task branch the
             # crash was associated with rather than ``<absent>``.
@@ -522,6 +531,22 @@ class RecoveryMixin:
             # dashboard surfaces whether the previous run died abruptly
             # or was deliberately parked by a detector.
             branch_kind = await self._dispatch_recovery_branch(doing.pr_id)
+            # PR-351 follow-up: the canonical mid-CODING SIGKILL/OOM exits
+            # before ``_transition_to_error`` can write a cause, so no
+            # ``CancellationCause`` lands in Redis. The dashboard surfaces
+            # the new ``recovery_backup_branch`` field only by augmenting
+            # rows returned from ``list_recent_cancellations``; without a
+            # cause record there is no card to attach the backup-branch
+            # pointer to, and operators never see the
+            # ``crash-backup/...`` ref. Synthesize a ``crash`` cause here
+            # so the cancellation card renders alongside the backup
+            # branch surface. Skipped when a cause already exists (the
+            # daemon wrote one before exit, or a previous recovery cycle
+            # already synthesized one) and on the operator-attention
+            # branch (a deliberate detector park already wrote its own
+            # cause).
+            if branch_kind == "crash":
+                await self._record_crash_cancellation_if_missing(doing.pr_id)
             self._crashed_task_pr_ids.add(doing.pr_id)
             # PR-266b crash-no-PR fix: reflect the cancellation in the
             # in-memory tasks list so the headers-mode current_queue
@@ -632,7 +657,7 @@ class RecoveryMixin:
         """
         try:
             cause = await get_cancellation_cause(
-                self.redis, self.name, task_pr_id
+                self.redis, self.name, task_pr_id, refresh_ttl=False
             )
         except Exception as exc:
             self.log_event(
@@ -738,12 +763,26 @@ class RecoveryMixin:
         if Claude later resets the local branch.
 
         Returns ``True`` when it is safe for the caller to proceed with
-        re-running CODING (no local branch to preserve, or push
+        re-running CODING (no local branch to preserve, push succeeded,
+        or the PR-351 fallback push to a ``crash-backup/`` branch
         succeeded). Returns ``False`` when the caller MUST NOT proceed:
         the task targets the base branch (malformed task header that
         would let Claude reset ``main``) or the preserve push failed in
         a way that may have left commits orphan-only on local.
+
+        PR-351: when the primary push is rejected by branch protection
+        or non-fast-forward state, attempt a fallback push to a unique
+        ``crash-backup/{task_id}/{timestamp}`` branch instead of giving
+        up. The rejected-needle match is git-CLI-version-dependent (the
+        stderr strings ``remote rejected``, ``non-fast-forward``, and
+        ``fetch first`` are emitted by git 2.40+, the production version
+        pin) and may need re-verification if production pins a newer
+        release. The fallback branch name is recorded on
+        ``self._pending_backup_branch_write`` so the async caller can
+        persist it under the ``recovery:backup_branch:{repo}:{task_id}``
+        Redis key with a 30-day TTL.
         """
+        self._pending_backup_branch_write = None
         if branch == self.repo_config.branch:
             self.log_event(
                 f"[INFRA] Refusing to preserve crashed-run commits on "
@@ -777,11 +816,18 @@ class RecoveryMixin:
                 f"{branch}:{branch}",
                 timeout=120,
             )
-        except (
-            subprocess.CalledProcessError,
-            subprocess.TimeoutExpired,
-            OSError,
-        ) as exc:
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr or ""
+            if self._push_rejected_by_remote(stderr):
+                backup_branch = self._attempt_backup_branch_push(branch, stderr)
+                if backup_branch is not None:
+                    return True
+            self.log_event(
+                f"[INFRA] Failed to preserve unpushed commits on "
+                f"{branch}: {exc}."
+            )
+            return False
+        except (subprocess.TimeoutExpired, OSError) as exc:
             self.log_event(
                 f"[INFRA] Failed to preserve unpushed commits on "
                 f"{branch}: {exc}."
@@ -792,6 +838,208 @@ class RecoveryMixin:
             f"[INFRA] Preserved crashed-run commits on {branch}."
         )
         return True
+
+    @staticmethod
+    def _push_rejected_by_remote(stderr: str) -> bool:
+        """Return ``True`` when the push stderr matches the rejected pattern.
+
+        Detects the three stderr signatures git 2.40+ emits when the
+        remote refuses a non-force push: a branch-protection rejection
+        (``remote rejected``), a non-fast-forward rejection against a
+        ref the client already has fetched (``non-fast-forward``), and
+        a non-fast-forward rejection when the client has not fetched
+        the remote-side advance yet (``fetch first``). The third case
+        is the common operational shape — when the feature branch has
+        advanced on the remote, ``git push origin <branch>:<branch>``
+        reports ``! [rejected] ... (fetch first)`` rather than the
+        literal ``non-fast-forward`` token, so omitting it would
+        silently disable the PR-351 fallback for the very case it was
+        designed to recover. A new git release that rewords any of
+        these messages would silently disable the fallback path, so
+        the match needs periodic verification against the production
+        git pin.
+        """
+        return (
+            "remote rejected" in stderr
+            or "non-fast-forward" in stderr
+            or "fetch first" in stderr
+        )
+
+    def _attempt_backup_branch_push(
+        self, branch: str, primary_stderr: str
+    ) -> str | None:
+        """Push ``branch`` to a ``crash-backup/{task_id}/{timestamp}`` ref.
+
+        Called from ``_preserve_crashed_run_commits`` when the primary
+        push to ``origin/{branch}`` was rejected. The task id is read
+        from ``self.state.current_task`` so existing test patches that
+        monkey-patch the parent method with ``lambda branch: ...`` keep
+        working without signature churn.
+
+        Returns the fallback branch name when the push succeeds (with
+        the pending Redis write recorded on
+        ``self._pending_backup_branch_write``), or ``None`` when the
+        fallback cannot be attempted (no current task) or also fails.
+        """
+        current_task = self.state.current_task
+        if current_task is None:
+            return None
+        task_id = current_task.pr_id
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        backup_branch = f"crash-backup/{task_id}/{timestamp}"
+        try:
+            git_ops._git(
+                self.repo_path,
+                "push",
+                "origin",
+                f"{branch}:{backup_branch}",
+                timeout=120,
+            )
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+        ) as exc:
+            self.log_event(
+                f"[INFRA] Crash-backup fallback push to "
+                f"{backup_branch} also failed: {exc}."
+            )
+            return None
+        self.log_event(
+            f"[INFRA] Primary push rejected ({primary_stderr.strip() or 'rejected'}); "
+            f"preserved crashed-run commits on fallback branch "
+            f"{backup_branch}."
+        )
+        self._pending_backup_branch_write = (task_id, backup_branch)
+        return backup_branch
+
+    async def _record_crash_cancellation_if_missing(self, task_id: str) -> None:
+        """Write a synthetic ``crash`` ``CancellationCause`` when none exists
+        or when the existing record is provably stale.
+
+        The canonical mid-CODING daemon exit (SIGKILL, OOM, container
+        restart) skips Python teardown, so ``_transition_to_error`` never
+        runs and Redis carries no cause record for the dead task. The
+        dashboard renders the PR-351 ``recovery_backup_branch`` surface
+        only by augmenting rows returned from
+        ``list_recent_cancellations`` — with no cause record, there is
+        no cancellation card to join the backup-branch pointer onto and
+        the operator never sees the ``crash-backup/...`` ref. Recording
+        a synthetic crash cause here closes that gap.
+
+        Skips when a fresh cause already exists (the daemon wrote one
+        before exit, or an earlier recovery cycle already synthesized
+        one) so we never clobber a more precise pre-crash record with
+        this generic one. Replaces a provably stale cause — one whose
+        ``created_at`` predates the per-task ``current_run_started_at``
+        timestamp — so the index score advances to "now" and
+        ``list_recent_cancellations`` returns the new row inside the
+        7-day dashboard window. Without that replacement, a retry whose
+        ``safe_delete_cancellation_cause`` previously failed (or whose
+        record TTL was refreshed) keeps the old score in the index, the
+        crash card stays buried under the original timestamp, and the
+        new ``recovery_backup_branch`` pointer attached by
+        ``_augment_causes_with_dependents`` never reaches the operator.
+
+        Staleness is proved only when ``current_run_started_at`` exists
+        and ``cause.created_at < started_at``; every other branch
+        (missing started_at, Redis read error, malformed timestamp)
+        keeps the existing record because we cannot prove it predates
+        the current dispatch. Best-effort throughout: read failures
+        default to "no existing cause" so the write still happens, and
+        the write itself uses ``safe_record_cancellation_cause`` so a
+        Redis outage does not abort recovery.
+        """
+        try:
+            existing = await get_cancellation_cause(
+                self.redis, self.name, task_id, refresh_ttl=False
+            )
+        except Exception:
+            existing = None
+        if existing is not None and not await self._cancellation_cause_predates_current_run(
+            existing, task_id
+        ):
+            return
+        cause = CancellationCause(
+            category="ERROR",
+            payload={
+                "subsource": "crash",
+                "error_message": (
+                    "Daemon exited mid-CODING before a cancellation cause "
+                    "could be written; cause synthesized on the next "
+                    "startup recovery cycle so the cancellation card and "
+                    "crash-backup branch surface render together."
+                ),
+            },
+        )
+        await safe_record_cancellation_cause(
+            self.redis,
+            self.name,
+            task_id,
+            cause,
+            log=self.log_event,
+        )
+
+    async def _cancellation_cause_predates_current_run(
+        self, cause: CancellationCause, task_id: str
+    ) -> bool:
+        """Return ``True`` only when ``cause`` is provably from a prior run.
+
+        Conservative inverse of ``_cause_belongs_to_current_run``: that
+        helper drives the dispatch branch and degrades unproven cases to
+        the safer crash flow, so ``False`` there covers Redis errors,
+        missing ``current_run_started_at``, and malformed timestamps as
+        well as proven staleness. The synth-cause overwrite path cannot
+        use the same default — overwriting on Redis-read failure or a
+        missing dispatch marker would clobber a precise pre-crash cause
+        any time the marker is unavailable (post-deploy first dispatch,
+        Redis blip during recovery, etc.). Inverting the conservative
+        default here means we only replace the existing record when we
+        have positive evidence ``cause.created_at`` predates the current
+        dispatch.
+        """
+        try:
+            started_at = await get_current_run_started_at(
+                self.redis, self.name, task_id
+            )
+        except Exception:
+            return False
+        if started_at is None:
+            return False
+        try:
+            cause_created_at = datetime.fromisoformat(cause.created_at)
+        except (TypeError, ValueError):
+            return False
+        if cause_created_at.tzinfo is None:
+            cause_created_at = cause_created_at.replace(tzinfo=timezone.utc)
+        return cause_created_at < started_at
+
+    async def _persist_pending_backup_branch_write(self) -> None:
+        """Flush the PR-351 fallback-branch pointer to Redis.
+
+        ``_preserve_crashed_run_commits`` is synchronous, so it stashes
+        the ``(task_id, branch)`` pair on ``self`` and lets the async
+        recovery caller persist it once the rest of the crash path has
+        decided to proceed. Best-effort: a Redis write failure logs but
+        does not abort recovery — the work is still preserved on
+        origin, only the dashboard surface is degraded.
+        """
+        pending = getattr(self, "_pending_backup_branch_write", None)
+        if not pending:
+            return
+        self._pending_backup_branch_write = None
+        task_id, backup_branch = pending
+        try:
+            await self.redis.set(
+                recovery_backup_branch(self.name, task_id),
+                backup_branch,
+                ex=30 * 86400,
+            )
+        except Exception as exc:
+            self.log_event(
+                f"[INFRA] Failed to record crash-backup branch for "
+                f"{task_id}: {exc}."
+            )
 
     def _rehydrate_last_push_at(self, pr: PRInfo) -> None:
         """Seed ``_last_push_at`` from the PR's head commit's committer

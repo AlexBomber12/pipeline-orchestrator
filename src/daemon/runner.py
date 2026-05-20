@@ -114,7 +114,7 @@ from src.keyspace import (
     upload_pending,
 )
 from src.metrics import MetricsStore, RunRecord
-from src.models import PipelineState, RepoState
+from src.models import PipelineState, RepoState, TaskStatus
 from src.queue_parser import (
     TYPE_SYNONYMS,
     QueueValidationError,
@@ -363,7 +363,7 @@ class PipelineRunner(
         self._queue_progress_dirty = False
         self._last_published_queue_progress: tuple[int, int] | None = None
         self._last_published_state_signature: (
-            tuple[str, tuple, tuple] | None
+            tuple[str, tuple, tuple, str | None] | None
         ) = None
         self._pending_event_log_entries: list[dict[str, object]] = []
         self._usage_degraded_logged = False
@@ -1069,10 +1069,17 @@ class PipelineRunner(
             self.state.usage_weekly_percent,
             self.state.usage_api_degraded,
         )
+        # PR-352: include merge_phase so MERGE sub-phase transitions
+        # (pre_merge_sync -> ready_to_merge -> merging -> post_merge_cleanup)
+        # fire repo:state_change. Without it the dashboard card stays on the
+        # previous phase through a slow gh_prs.merge_pr or post-merge cleanup
+        # until the 30s polling fallback, because state.state stays MERGE and
+        # the PR/usage fields don't move during these sub-steps.
         signature = (
             current_state,
             self._summary_pr_signature(),
             usage_signature,
+            self.state.merge_phase,
         )
         if signature == self._last_published_state_signature:
             return
@@ -1415,7 +1422,7 @@ class PipelineRunner(
             existing: CancellationCause | None
             try:
                 existing = await get_cancellation_cause(
-                    self.redis, self.name, task.pr_id
+                    self.redis, self.name, task.pr_id, refresh_ttl=False
                 )
             except Exception:
                 existing = None
@@ -1575,7 +1582,7 @@ class PipelineRunner(
             return True
         try:
             cause = await get_cancellation_cause(
-                self.redis, self.name, task.pr_id
+                self.redis, self.name, task.pr_id, refresh_ttl=False
             )
         except Exception:
             return False
@@ -1754,7 +1761,16 @@ class PipelineRunner(
         }
 
     async def _mark_status_write_failed_task(self, current_task: Any) -> None:
-        """Keep an explicitly parked task skipped when status commit fails."""
+        """Keep an explicitly parked task skipped when status commit fails.
+
+        Inline-updates ``state.current_queue`` so the dashboard sees the
+        ERROR status immediately on the next 5-second poll. Without this
+        sync, the override only lands at boot via
+        ``_apply_recovery_decisions``, so operators see no Retry button
+        until docker restart. The override logic mirrors
+        ``recovery.py:_apply_recovery_decisions`` to keep the two paths
+        in lockstep.
+        """
         pr_id = getattr(current_task, "pr_id", "")
         if not pr_id:
             return
@@ -1764,6 +1780,35 @@ class PipelineRunner(
             f"{pr_id}; task file re-upload is required to retry."
         )
         await self._persist_status_write_failed_task_pr_ids()
+
+        snapshot = self.state.current_queue
+        if not snapshot:
+            await self.publish_state()
+            return
+        changed = False
+        for index, queued in enumerate(snapshot):
+            if queued.pr_id != pr_id:
+                continue
+            if queued.status == TaskStatus.DONE:
+                # Defensive: a status_write_failed marker should never
+                # collide with a DONE task, but if it does, do not
+                # downgrade. Mirror the discard behavior in
+                # ``recovery.py:_apply_recovery_decisions``.
+                self._status_write_failed_task_pr_ids.discard(pr_id)
+                await self._persist_status_write_failed_task_pr_ids()
+                break
+            if queued.status != TaskStatus.ERROR:
+                snapshot[index] = queued.model_copy(
+                    update={"status": TaskStatus.ERROR}
+                )
+                changed = True
+            break
+        if changed:
+            # Reassign so ``RepoState.__setattr__`` re-stamps
+            # ``current_queue_snapshot_at`` (snapshot freshness token
+            # used by ``/api/repo/{name}/queue`` to gate cache).
+            self.state.current_queue = list(snapshot)
+        await self.publish_state()
 
     def _track_current_coder_process(
         self, proc: asyncio.subprocess.Process
@@ -2420,6 +2465,17 @@ class PipelineRunner(
                 if await self._review_timeout_park_cleared():
                     self.state.skip_ai_error_diagnose = False
                     self.state.error_message = None
+                    # PR-358 review feedback (P1): leaving the review_timeout
+                    # park is a per-PR-iteration boundary too. The
+                    # ``__setattr__`` PR-transition hook fires only on a
+                    # number/branch change, so a Retry that re-enters WATCH
+                    # against the same PR branch would otherwise carry the
+                    # repost flag forward and skip the one-shot repost on
+                    # the next timeout — making Retry ineffective for this
+                    # failure mode. Reset both fields in lockstep so the
+                    # restarted iteration has a clean elapsed_min floor.
+                    self.state.review_timeout_repost_attempted = False
+                    self.state.review_timeout_repost_at = None
                     self.state.state = PipelineState.IDLE
                     self.log_event(
                         "[ESCALATE] review_timeout park cleared by "

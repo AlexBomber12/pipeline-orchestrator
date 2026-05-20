@@ -9,3 +9,4 @@ pyyaml==6.0.2
 ruamel.yaml==0.18.10
 pydantic==2.11.3
 mcp[cli]==1.27.0
+watchfiles==1.1.1

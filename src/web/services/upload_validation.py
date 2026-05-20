@@ -21,6 +21,134 @@ _ALLOWED_TASK_PATTERN = (
     rf"^(AGENTS\.md|CLAUDE\.md|{_TASK_UPLOAD_PATTERN[1:-1]})$"
 )
 _STAGING_MAX_AGE_HOURS = 24
+_FRONTMATTER_STATUS_LINE = re.compile(r"^status:\s*(.+?)\s*$", re.IGNORECASE)
+_TERMINAL_FRONTMATTER_STATUSES = frozenset({"DONE"})
+
+
+def _strip_inline_frontmatter_comment(value: str) -> str:
+    """Drop an inline ``#`` comment from a frontmatter value.
+
+    Mirrors ``queue_parser._normalize_frontmatter_status`` so the upload
+    collision guard agrees with the canonical task parser on values like
+    ``status: done # reviewer override``. ``#`` only starts a comment when
+    it sits outside a quoted span and is preceded by whitespace (or is the
+    first character).
+    """
+    quote: str | None = None
+    for index, char in enumerate(value):
+        if char in {"'", '"'}:
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+        elif char == "#" and quote is None and (
+            index == 0 or value[index - 1].isspace()
+        ):
+            return value[:index]
+    return value
+
+
+def read_frontmatter_status(content: str) -> str | None:
+    """Return the uppercase frontmatter ``status`` for *content*, or ``None``.
+
+    Tolerant of quoted values, inline ``#`` comments, and trailing whitespace.
+    Returns ``None`` when there is no leading ``---`` block, no closing
+    ``---``, or no ``status`` field inside the block.
+
+    Mirrors ``queue_parser.parse_task_header``: leading blank lines before the
+    opening ``---`` are skipped, and when multiple ``status:`` lines appear
+    inside the block the LAST one wins (so collision preservation agrees with
+    the daemon's view of the on-disk task status).
+    """
+    lines = content.splitlines()
+    opening_index: int | None = next(
+        (index for index, raw_line in enumerate(lines) if raw_line.strip()),
+        None,
+    )
+    if opening_index is None or lines[opening_index].rstrip() != "---":
+        return None
+    status: str | None = None
+    for line in lines[opening_index + 1 :]:
+        stripped = line.rstrip()
+        if stripped == "---":
+            return status
+        match = _FRONTMATTER_STATUS_LINE.match(stripped)
+        if match:
+            value = _strip_inline_frontmatter_comment(match.group(1)).strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            value = value.strip().upper()
+            status = value or None
+    return None
+
+
+def _replace_frontmatter_status(content: str, status: str) -> str:
+    """Return *content* with its frontmatter ``status`` set to *status*.
+
+    If *content* lacks a complete ``---`` block, a minimal one is prepended.
+    Other frontmatter fields are preserved. Leading blank lines before the
+    opening ``---`` are tolerated (matching ``parse_task_header`` and
+    ``read_frontmatter_status``) so an upload that starts with whitespace
+    above a valid frontmatter block is edited in place instead of getting
+    a second, conflicting frontmatter prepended.
+    """
+    lines = content.splitlines(keepends=True)
+    opening_index = next(
+        (index for index, raw_line in enumerate(lines) if raw_line.strip()),
+        None,
+    )
+    if opening_index is None or lines[opening_index].rstrip() != "---":
+        return f"---\nstatus: {status}\n---\n\n{content}"
+    closing_index: int | None = None
+    for index in range(opening_index + 1, len(lines)):
+        if lines[index].rstrip() == "---":
+            closing_index = index
+            break
+    if closing_index is None:
+        return f"---\nstatus: {status}\n---\n\n{content}"
+    rewrote = False
+    new_fm_lines: list[str] = []
+    for line in lines[opening_index + 1 : closing_index]:
+        if _FRONTMATTER_STATUS_LINE.match(line.rstrip()):
+            ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+            new_fm_lines.append(f"status: {status}{ending}")
+            rewrote = True
+        else:
+            new_fm_lines.append(line)
+    if not rewrote:
+        ending = "\n" if not new_fm_lines or new_fm_lines[-1].endswith("\n") else ""
+        new_fm_lines.append(f"status: {status}{ending or chr(10)}")
+    return (
+        "".join(lines[: opening_index + 1])
+        + "".join(new_fm_lines)
+        + "".join(lines[closing_index:])
+    )
+
+
+def preserve_terminal_status_on_collision(
+    existing_path: Path, upload_content: str
+) -> tuple[str, str | None]:
+    """Return ``(content_to_stage, preserved_status_or_None)``.
+
+    If *existing_path* exists with frontmatter ``status: DONE``, the uploaded
+    body is kept but the terminal status is re-attached so the next daemon
+    commit cannot regress a merged task to ``TODO``. ``status: ERROR`` is
+    intentionally NOT preserved: re-uploading a task spec is the documented
+    retry signal (``src/daemon/repo_ops.py``), and the daemon needs the
+    incoming ``status: TODO`` so the task becomes dispatchable again instead
+    of staying pinned in ERROR. Returns the upload content unchanged in every
+    other case.
+    """
+    if not existing_path.is_file():
+        return upload_content, None
+    try:
+        existing_text = existing_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return upload_content, None
+    existing_status = read_frontmatter_status(existing_text)
+    if existing_status not in _TERMINAL_FRONTMATTER_STATUSES:
+        return upload_content, None
+    return _replace_frontmatter_status(upload_content, existing_status), existing_status
 
 
 def _escape_css_identifier(value: str) -> str:

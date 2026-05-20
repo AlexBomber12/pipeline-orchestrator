@@ -1,9 +1,9 @@
 """Functional MCP tools.
 
-Tools with logic beyond a simple passthrough wrap. Both tools are
+Tools with logic beyond a simple passthrough wrap. All tools are
 read-only with respect to filesystem state: ``validate_task_spec``
-parses in-memory content; ``suggest_next_pr_number`` scans a
-read-only mounted directory.
+parses in-memory content; ``suggest_next_pr_number`` and
+``get_repo_task_status`` scan a read-only mounted directory.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import logging
 import re
 import tempfile
 from pathlib import Path
+from typing import Annotated
 
 from src.mcp.scans import scan_for_conflicts
 from src.mcp.server import mcp
@@ -31,6 +32,13 @@ _REPOS_ROOT = Path("/data/repos")
 # integer group is mandatory; the letter suffix (a/b/c for split PRs
 # like PR-219a) is optional.
 _PR_FILENAME = re.compile(r"^PR-(\d+)[a-z]?\.md$")
+
+# Frontmatter status reader regex. Mirrors the canonical reader in
+# ``src/web/routes/repo_control.py`` so the MCP module stays free of
+# FastAPI imports. See PR-338.
+_FRONTMATTER_DELIMITER = "---"
+_FRONTMATTER_STATUS_LINE = re.compile(r"^status:\s*(.+?)\s*$")
+_CANONICAL_STATUSES = {"TODO", "DONE", "ERROR"}
 
 # Mirrors ``_REPO_SLUG_PATTERN`` in ``src/web/routes/onboarding.py``. A
 # slug must start with an alphanumeric, contain only ``[A-Za-z0-9_.-]``
@@ -146,3 +154,123 @@ def suggest_next_pr_number(repo: str) -> int:
         max_num = max(max_num, int(match.group(1)))
 
     return max_num + 1
+
+
+def _strip_inline_comment_and_quotes(value: str) -> str:
+    """Mirror ``_normalize_frontmatter_status`` in ``src.queue_parser``.
+
+    A ``#`` is treated as an inline comment delimiter only when it is at
+    the start of the value or preceded by whitespace, and only outside
+    of any surrounding single- or double-quoted region. After the
+    optional comment strip, leading/trailing whitespace and a single
+    matching pair of surrounding quotes are removed.
+    """
+    quote: str | None = None
+    for index, char in enumerate(value):
+        if char in {"'", '"'}:
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+        elif char == "#" and quote is None and (
+            index == 0 or value[index - 1].isspace()
+        ):
+            value = value[:index]
+            break
+    stripped = value.strip()
+    if (
+        len(stripped) >= 2
+        and stripped[0] == stripped[-1]
+        and stripped[0] in {"'", '"'}
+    ):
+        return stripped[1:-1]
+    return stripped
+
+
+def _read_frontmatter_status(task_path: Path) -> str:
+    """Read the canonical uppercase status from a task file frontmatter.
+
+    Returns ``"TODO"`` when frontmatter is absent or unterminated, the
+    status key is missing, the value is unrecognized, or the file
+    cannot be read or decoded. Mirrors ``parse_task_header`` in
+    ``src/queue_parser.py``: status is only read from a CLOSED
+    frontmatter block, and when multiple ``status:`` lines appear the
+    LAST one wins. Kept local so the MCP package does not pull in
+    FastAPI imports.
+    """
+    try:
+        lines = task_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return "TODO"
+
+    first_content_index = next(
+        (index for index, raw_line in enumerate(lines) if raw_line.strip()),
+        None,
+    )
+    if (
+        first_content_index is None
+        or lines[first_content_index].rstrip() != _FRONTMATTER_DELIMITER
+    ):
+        return "TODO"
+
+    frontmatter_end_index: int | None = None
+    for index in range(first_content_index + 1, len(lines)):
+        if lines[index].rstrip() == _FRONTMATTER_DELIMITER:
+            frontmatter_end_index = index
+            break
+    if frontmatter_end_index is None:
+        return "TODO"
+
+    raw_status: str | None = None
+    for raw_line in lines[first_content_index + 1 : frontmatter_end_index]:
+        status_match = _FRONTMATTER_STATUS_LINE.match(raw_line.rstrip())
+        if status_match is None:
+            continue
+        raw_status = _strip_inline_comment_and_quotes(status_match.group(1))
+
+    if raw_status is None:
+        return "TODO"
+    canonical = raw_status.upper()
+    if canonical in _CANONICAL_STATUSES:
+        return canonical
+    return "TODO"
+
+
+@mcp.tool()
+def get_repo_task_status(
+    repo_slug: Annotated[
+        str,
+        "Repo slug in owner__repo form (e.g. AlexBomber12__pipeline-orchestrator).",
+    ],
+) -> dict[str, str]:
+    """Return a map of ``task_id`` to canonical frontmatter status.
+
+    Scans ``/data/repos/<repo_slug>/tasks/`` for ``PR-*.md`` files and
+    reads each task's YAML frontmatter ``status:`` field. Values are
+    normalized to uppercase canonical tokens (``TODO``, ``DONE``,
+    ``ERROR``); files without frontmatter or with unreadable contents
+    are reported as ``TODO``.
+
+    LLM clients call this before preparing a spec-upload zip so that
+    already-merged specs are not regressed to ``status: TODO``. The
+    server-side upload guard from PR-337 still catches anything that
+    slips through; this tool is the source-side prevention layer
+    (PR-FUTURE-MCP-STATUS, OBS-DA).
+
+    Returns an empty dict when the repo or its ``tasks/`` directory
+    does not exist. Raises ``ValueError`` for slugs that do not match
+    the canonical ``owner__repo`` pattern.
+    """
+    if not _REPO_SLUG_PATTERN.fullmatch(repo_slug):
+        raise ValueError(f"Invalid repo_slug: {repo_slug!r}")
+
+    tasks_dir = _REPOS_ROOT / repo_slug / "tasks"
+    if not tasks_dir.is_dir():
+        return {}
+
+    result: dict[str, str] = {}
+    for spec_path in tasks_dir.glob("PR-*.md"):
+        if not spec_path.is_file():
+            continue
+        result[spec_path.stem] = _read_frontmatter_status(spec_path)
+    return result

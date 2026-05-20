@@ -489,3 +489,52 @@ def test_dispatch_naive_cause_created_at_treated_as_utc(
         ev.startswith("[INFRA] Task PR-318 parked for operator attention,")
         for ev in events
     ), events
+
+
+def test_dispatch_recovery_branch_does_not_refresh_cause_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-345 fix-feedback: recovery classification must not pin the cause.
+
+    ``recover_state`` runs on every daemon restart and inspects the
+    cancellation cause to classify the DOING-no-PR branch. If that read
+    inherited the ``refresh_ttl=True`` default it would extend the cause
+    to the 90-day forensic window whenever the daemon restarts, defeating
+    natural eviction at 30 days. Verify recovery forwards
+    ``refresh_ttl=False``.
+    """
+    runner = _crashed_doing_runner(monkeypatch)
+    cause_created_at = datetime.now(timezone.utc)
+    _seed_current_run_started_at(
+        runner, cause_created_at - timedelta(seconds=30)
+    )
+    _seed_cause(
+        runner,
+        CancellationCause(
+            category="ERROR",
+            payload={"subsource": "review_timeout", "reason_text": "parked"},
+            created_at=cause_created_at.isoformat(),
+        ),
+    )
+
+    captured: list[dict[str, object]] = []
+    from src.cancellation.storage import get_cancellation_cause as real_get
+
+    async def spy(
+        redis_client: Any,
+        repo_slug: str,
+        task_id: str,
+        *,
+        refresh_ttl: bool = True,
+    ) -> Any:
+        captured.append({"task_id": task_id, "refresh_ttl": refresh_ttl})
+        return await real_get(
+            redis_client, repo_slug, task_id, refresh_ttl=refresh_ttl
+        )
+
+    monkeypatch.setattr("src.daemon.recovery.get_cancellation_cause", spy)
+    asyncio.run(runner.recover_state())
+
+    relevant = [c for c in captured if c["task_id"] == "PR-318"]
+    assert relevant, captured
+    assert all(c["refresh_ttl"] is False for c in relevant), relevant

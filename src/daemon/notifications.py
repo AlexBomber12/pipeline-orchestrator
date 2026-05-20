@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
+import time
 from typing import Any
 
 import httpx
+
+from src.audit.webhook_log import write_webhook_audit
 
 _GUARDRAIL_PREFIXES = ("GUARDRAIL:", "[GUARDRAIL]")
 _TIER_TOKEN_RE = re.compile(r"^tier=(\d+)\s+")
@@ -19,6 +24,66 @@ _TIER1_CATEGORIES: frozenset[str] = frozenset({
     "branch_protection_modification", "dangerous_action_external_install",
     "permissions_escalation", "workflow_destruction",
 })
+
+
+def _httpx_json_payload_size_bytes(payload: dict[str, Any]) -> int:
+    """Return byte count for the JSON body HTTPX sends for ``json=``."""
+    return len(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    )
+
+
+def _safe_response_excerpt(response: httpx.Response) -> str:
+    try:
+        return getattr(response, "text", "")[:200]
+    except httpx.DecodingError as exc:
+        return f"decode_error: {type(exc).__name__}: {str(exc)[:100]}"
+
+
+async def _post_json_with_audit(
+    *,
+    event_type: str,
+    webhook_url: str,
+    payload: dict[str, Any],
+    timeout_seconds: float,
+    attempt_number: int = 1,
+) -> httpx.Response:
+    """POST JSON to a webhook and audit the delivery attempt."""
+    payload_size_bytes = _httpx_json_payload_size_bytes(payload)
+    status: int | None = None
+    response_excerpt = ""
+    start = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            response = await client.post(webhook_url, json=payload)
+        status = getattr(response, "status_code", None)
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError:
+            response_excerpt = _safe_response_excerpt(response)
+            raise
+        response_excerpt = _safe_response_excerpt(response)
+        return response
+    except httpx.RequestError as exc:
+        response_excerpt = f"request_error: {type(exc).__name__}: {str(exc)[:100]}"
+        raise
+    finally:
+        elapsed_ms = (time.monotonic() - start) * 1000
+        await asyncio.to_thread(
+            write_webhook_audit,
+            event_type=event_type,
+            webhook_url=webhook_url,
+            payload_size_bytes=payload_size_bytes,
+            attempt_number=attempt_number,
+            http_status=status,
+            response_excerpt=response_excerpt,
+            elapsed_ms=elapsed_ms,
+        )
 
 
 async def send_spend_ceiling_warning(
@@ -44,9 +109,12 @@ async def send_spend_ceiling_warning(
             f"{warning_percent}% of cap)."
         ),
     }
-    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-        response = await client.post(webhook_url, json=payload)
-        response.raise_for_status()
+    await _post_json_with_audit(
+        event_type="spend_ceiling_warning",
+        webhook_url=webhook_url,
+        payload=payload,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 async def send_guardrail_notification(
@@ -100,9 +168,12 @@ async def send_guardrail_notification(
         "dashboard_url": dashboard_link,
         "text": text_summary,
     }
-    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-        response = await client.post(webhook_url, json=payload)
-        response.raise_for_status()
+    await _post_json_with_audit(
+        event_type="guardrail_violation",
+        webhook_url=webhook_url,
+        payload=payload,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def _parse_guardrail_cause_for_notification(

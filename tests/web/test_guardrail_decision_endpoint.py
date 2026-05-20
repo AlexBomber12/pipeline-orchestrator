@@ -127,6 +127,32 @@ class _GuardrailRedis:
         self.zremmed.append((key, members))
         return removed
 
+    async def zrangebyscore(
+        self, key: str, min_score: Any, max_score: Any
+    ) -> list[str]:
+        bucket = self.zsets.get(key, {})
+
+        def _bound(value: Any, default: float) -> tuple[float, bool]:
+            if value in ("-inf", "+inf"):
+                return float(value), False
+            if isinstance(value, str) and value.startswith("("):
+                return float(value[1:]), True
+            return float(value), False
+
+        lower, lower_excl = _bound(min_score, float("-inf"))
+        upper, upper_excl = _bound(max_score, float("inf"))
+        items = [
+            tid
+            for tid, score in bucket.items()
+            if (score > lower if lower_excl else score >= lower)
+            and (score < upper if upper_excl else score <= upper)
+        ]
+        items.sort(key=lambda tid: bucket[tid])
+        return items
+
+    async def exists(self, key: str) -> int:
+        return int(key in self.store)
+
     async def transaction(
         self, callback: Any, *keys: str, value_from_callable: bool = False
     ) -> Any:
@@ -1891,3 +1917,47 @@ def test_guardrail_decision_approve_commit_failure_reset_failure_still_returns_5
     assert resp.status_code == 503
     assert "Failed to commit guardrail decision" in resp.text
     assert cause_key("example__alpha", "PR-305c") in redis_client.store
+
+
+def test_guardrail_decision_reject_prune_failure_does_not_abort_reject(
+    tmp_path, monkeypatch
+) -> None:
+    """A RedisError from the post-write prune must not block PR close.
+
+    The CAS-guarded write has already flipped the cause to
+    ``operator_reject``. Surfacing 503 from a best-effort prune would
+    skip ``gh pr close``, and a retry would see no pending guardrail
+    decision (cause is no longer ``guardrail``), leaving the rejected
+    PR open while the operator's decision is already persisted.
+    """
+    _, redis_client = _setup(
+        tmp_path,
+        monkeypatch,
+        store={
+            "pipeline:example__alpha": _seed_state(),
+            cause_key("example__alpha", "PR-305c"): _seed_cause(
+                {"subsource": "guardrail"}
+            ),
+        },
+    )
+    from redis.exceptions import RedisError as _RedisError
+
+    async def boom_zrangebyscore(
+        key: str, min_score: Any, max_score: Any
+    ) -> list[str]:
+        raise _RedisError("conn dropped")
+
+    monkeypatch.setattr(redis_client, "zrangebyscore", boom_zrangebyscore)
+    gh_calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        gh_calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    resp = _post("reject")
+    assert resp.status_code == 204
+    close_calls = [c for c in gh_calls if c[:3] == ["gh", "pr", "close"]]
+    assert close_calls, "gh pr close must still run when prune fails"
+    raw = redis_client.store[cause_key("example__alpha", "PR-305c")]
+    assert CancellationCause.from_redis(raw).payload["subsource"] == "operator_reject"

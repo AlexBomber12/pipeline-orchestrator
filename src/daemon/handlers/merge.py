@@ -43,15 +43,37 @@ class MergeMixin:
             self.state.state = PipelineState.IDLE
             return
 
+        # PR-358: review APPROVED -> MERGE ends the review-timeout window
+        # for this PR. Clear the single-shot repost flag and its companion
+        # timestamp (the durable elapsed_min floor) so both fields stay in
+        # a clean state across the natural per-iteration boundary.
+        self.state.review_timeout_repost_attempted = False
+        self.state.review_timeout_repost_at = None
+
         logger.info(
             "[BRANCH] handle_merge: %s",
             BranchContext.from_runner(self).log_summary(),
         )
 
+        # PR-352: handle_watch dispatches here while state.state is still
+        # WATCH. The phase publishes below must write state=MERGE for the
+        # dashboard's ``repo.state.value == 'MERGE'`` gate to render the
+        # subtitle, and for the RepoState.__setattr__ hook to clear
+        # ``merge_phase`` on the terminal MERGE→IDLE/WATCH/ERROR
+        # transitions later in this method.
+        self.state.state = PipelineState.MERGE
+
         number = self.state.current_pr.number
         pr_branch = self.state.current_pr.branch
         base = self.repo_config.branch
         if not self.state.current_pr.is_cross_repository:
+            # PR-352: dashboard sub-phase visibility during the long MERGE
+            # cycle. The pre-merge sync (fetch + merge base + optional
+            # conflict resolution + push) is the longest phase; surfacing
+            # it lets the operator distinguish "waiting on CI" from
+            # "stuck in post-merge cleanup".
+            self.state.merge_phase = "pre_merge_sync"
+            await self.publish_state()
             try:
                 retry_transient(
                     lambda: git_ops._git(
@@ -101,6 +123,14 @@ class MergeMixin:
                                 "merge", "--abort",
                                 check=False,
                             )
+                            # PR-352: state was flipped to MERGE on entry
+                            # so phase publishes render correctly. The
+                            # proactive rate-limit abort path is a clean
+                            # retry — drop back to WATCH so the next cycle
+                            # re-enters the merge gate, and let the
+                            # MERGE→WATCH transition clear ``merge_phase``
+                            # via the RepoState ``__setattr__`` hook.
+                            self.state.state = PipelineState.WATCH
                             return
                         self.log_event(
                             "[MERGE] Merge conflict with main, resolving..."
@@ -230,6 +260,8 @@ class MergeMixin:
 
         merged_diff_stats = self._compute_diff_stats(base)
         self.log_event(f"[MERGE] Merging PR #{number}.")
+        self.state.merge_phase = "ready_to_merge"
+        await self.publish_state()
         try:
             gh_runner.run_gh(
                 ["pr", "ready", str(number)],
@@ -242,6 +274,8 @@ class MergeMixin:
                 self.owner_repo,
                 exc,
             )
+        self.state.merge_phase = "merging"
+        await self.publish_state()
         try:
             gh_prs.merge_pr(self.owner_repo, number)
         except Exception as exc:
@@ -253,6 +287,8 @@ class MergeMixin:
             )
             return
 
+        self.state.merge_phase = "post_merge_cleanup"
+        await self.publish_state()
         current_task = self.state.current_task
         if current_task is not None and current_task.task_file:
             try:

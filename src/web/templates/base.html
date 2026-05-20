@@ -749,6 +749,7 @@
                    class="text-sm font-medium secondary-interactive {% if title == 'Settings' %}text-accent{% else %}text-gray-400{% endif %}">
                     Settings
                 </a>
+                {% include "components/global_modals.html" %}
                 <button
                     id="availability-chip"
                     type="button"
@@ -1119,6 +1120,83 @@
             } catch (_error) {}
 
             refresh();
+        })();
+    </script>
+
+    <script>
+        // PR-351: Copy-to-clipboard handler for ``[data-clipboard-value]``
+        // buttons (e.g. the crash-backup branch label on the cancellation
+        // card). One delegated listener on ``document`` covers htmx swaps
+        // without re-binding. ``navigator.clipboard.writeText`` is the
+        // happy path; an off-screen ``<textarea>`` + ``execCommand('copy')``
+        // is the fallback for non-secure contexts where the async API is
+        // gated. The button label flips to "Copied!" for ~1.5s as visible
+        // confirmation, then restores so repeat clicks still read as Copy.
+        (function () {
+            function legacyCopy(value) {
+                const ta = document.createElement('textarea');
+                ta.value = value;
+                ta.setAttribute('readonly', '');
+                ta.style.position = 'absolute';
+                ta.style.left = '-9999px';
+                document.body.appendChild(ta);
+                ta.select();
+                let ok = false;
+                try {
+                    ok = document.execCommand('copy');
+                } catch (_error) {
+                    ok = false;
+                }
+                document.body.removeChild(ta);
+                return ok;
+            }
+
+            async function copyValue(value) {
+                if (navigator.clipboard && window.isSecureContext) {
+                    try {
+                        await navigator.clipboard.writeText(value);
+                        return true;
+                    } catch (_error) {
+                        // fall through to the legacy path
+                    }
+                }
+                return legacyCopy(value);
+            }
+
+            function flashFeedback(button, success) {
+                const original = button.dataset.clipboardOriginalText;
+                if (original === undefined) {
+                    button.dataset.clipboardOriginalText = button.textContent;
+                }
+                button.textContent = success ? 'Copied!' : 'Copy failed';
+                if (button._clipboardRestoreTimer) {
+                    window.clearTimeout(button._clipboardRestoreTimer);
+                }
+                button._clipboardRestoreTimer = window.setTimeout(function () {
+                    const restore = button.dataset.clipboardOriginalText;
+                    if (restore !== undefined) {
+                        button.textContent = restore;
+                    }
+                    button._clipboardRestoreTimer = null;
+                }, 1500);
+            }
+
+            document.addEventListener('click', function (event) {
+                const target = event.target instanceof Element
+                    ? event.target.closest('[data-clipboard-value]')
+                    : null;
+                if (!target) {
+                    return;
+                }
+                const value = target.getAttribute('data-clipboard-value');
+                if (!value) {
+                    return;
+                }
+                event.preventDefault();
+                copyValue(value).then(function (ok) {
+                    flashFeedback(target, ok);
+                });
+            });
         })();
     </script>
 </body>

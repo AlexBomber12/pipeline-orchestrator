@@ -196,6 +196,23 @@ class RepoState(BaseModel):
     coder: str | None = None
     last_stale_retrigger_at: datetime | None = None
     last_codex_retrigger_at: datetime | None = None
+    # PR-358: set True after WATCH posts the single ``@codex review`` repost
+    # on the first ``review_timeout`` hit for a PR iteration. The second hit
+    # observes the flag and transitions to terminal ERROR. Reset to False on
+    # PR-iteration boundaries (new ``current_pr`` assignment via __setattr__,
+    # FIX entry, MERGE entry) and on ``current_task = None``.
+    review_timeout_repost_attempted: bool = False
+    # PR-358 review feedback: wall-clock time at which WATCH posted the
+    # single-shot ``@codex review`` repost. ``elapsed_min`` reads this as a
+    # floor against ``current_pr.last_activity`` so the restarted review
+    # window survives the GitHub PR refresh that overwrites ``current_pr``
+    # each cycle. Without this anchor the locally-stamped
+    # ``current_pr.last_activity = now`` is wiped on the next poll
+    # (``self.state.current_pr = found`` runs before ``elapsed_min`` reads
+    # ``found.last_activity``), causing an immediate second-timeout
+    # escalation instead of a full new review window. Reset on the same
+    # boundaries as ``review_timeout_repost_attempted``.
+    review_timeout_repost_at: datetime | None = None
     # PR-316 review feedback: when True, ``run_cycle`` keeps the runner
     # parked in ERROR without invoking ``handle_error``. Set by WATCH on
     # ``review_timeout`` so the AI diagnose loop does not burn budget on
@@ -212,6 +229,12 @@ class RepoState(BaseModel):
     # include the typed list so consumers (PR-329 dispatcher, PR-331
     # Resume UI) do not each re-derive the throttle stack independently.
     active_inhibitors: list[WorkInhibitor] = Field(default_factory=list)
+    # PR-352: dashboard sub-phase string set by the MERGE handler at each
+    # phase transition (pre_merge_sync, ready_to_merge, merging,
+    # post_merge_cleanup). Cleared on any transition out of MERGE via
+    # ``__setattr__`` so the rendered badge subtitle disappears the moment
+    # the state machine leaves MERGE. ``None`` outside MERGE.
+    merge_phase: str | None = None
 
     @field_validator("state", mode="before")
     @classmethod
@@ -247,9 +270,33 @@ class RepoState(BaseModel):
             if self._is_new_pr_transition(current_pr, value):
                 super().__setattr__("last_stale_retrigger_at", None)
                 super().__setattr__("last_codex_retrigger_at", None)
+                super().__setattr__("review_timeout_repost_attempted", False)
+                super().__setattr__("review_timeout_repost_at", None)
+            elif self._is_new_head_sha(current_pr, value):
+                # PR-358 review feedback (P3): a new HEAD on the same PR
+                # number/branch is a fresh review iteration — the operator
+                # (or daemon FIX loop) pushed new code and Codex needs to
+                # re-review it. The repost gate is effectively per-review-
+                # iteration, so each push earns a new one-shot ``@codex
+                # review`` repost slot before escalation to terminal ERROR.
+                # Reset only the repost flag and its anchor; the
+                # ``last_*_retrigger_at`` debounces have their own
+                # API-flood semantics independent of pushes and must
+                # persist across HEAD changes.
+                super().__setattr__("review_timeout_repost_attempted", False)
+                super().__setattr__("review_timeout_repost_at", None)
         if name == "current_task" and value is None:
             super().__setattr__("current_pr", None)
             super().__setattr__("error_message", None)
+            super().__setattr__("review_timeout_repost_attempted", False)
+            super().__setattr__("review_timeout_repost_at", None)
+        if name == "state":
+            current_state = getattr(self, "state", None)
+            if (
+                current_state == PipelineState.MERGE
+                and value != PipelineState.MERGE
+            ):
+                super().__setattr__("merge_phase", None)
         if name == "current_queue":
             super().__setattr__(
                 "current_queue_snapshot_at",
@@ -269,3 +316,24 @@ class RepoState(BaseModel):
             old_pr.number != new_pr.number
             or old_pr.branch != new_pr.branch
         )
+
+    @staticmethod
+    def _is_new_head_sha(old_pr: object, new_pr: object) -> bool:
+        """Return True when ``current_pr`` is being refreshed onto a new HEAD SHA.
+
+        PR-358 review feedback (P3): used by the ``__setattr__`` hook to
+        reset the per-review-iteration ``review_timeout_repost_*`` fields
+        when a new push lands on the same PR number/branch. The check
+        runs only when ``_is_new_pr_transition`` is False (same PR), so
+        both inputs are guaranteed to be ``PRInfo`` instances by that
+        time; the type guard is defensive against future callers. An
+        empty ``head_sha`` on either side is treated as "not a new HEAD"
+        because the ``gh`` payload can legitimately omit the SHA on
+        transient errors, and we do not want a transient ``""`` to wipe
+        the repost gate mid-window.
+        """
+        if not isinstance(old_pr, PRInfo) or not isinstance(new_pr, PRInfo):
+            return False
+        if not old_pr.head_sha or not new_pr.head_sha:
+            return False
+        return old_pr.head_sha != new_pr.head_sha

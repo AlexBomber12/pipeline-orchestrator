@@ -118,3 +118,14 @@ Validation runs at upload time (dashboard) and on the daemon's IDLE
 selector. Unknown values for any field cause the task to be rejected.
 For batch uploads, validation collects errors across all files and
 returns one aggregated report instead of stopping at the first failure.
+
+## MCP tool for status-aware spec preparation
+
+LLM clients preparing a spec-upload zip should call the MCP tool
+`get_repo_task_status(repo_slug)` before zip assembly. It returns a
+`task_id -> status` map (uppercase `TODO` / `DONE` / `ERROR`) for every
+`PR-*.md` in the target repo's `tasks/` directory, sourced from each
+file's frontmatter. Filter out (or preserve the existing status of)
+already-`DONE` specs so a regenerated zip does not regress merged work
+back to `status: TODO`. The server-side upload guard from PR-337 is the
+backstop; this tool is the source-side prevention layer.

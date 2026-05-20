@@ -71,6 +71,8 @@
         <div class="mb-3 flex min-h-12 flex-col gap-3 pr-40 sm:flex-row sm:items-center sm:justify-between">
             <div class="flex min-w-0 items-center gap-2">
                 <a href="/repo/{{ repo.name }}" class="font-mono text-sm text-white truncate hover:text-accent transition-colors">{{ repo.name }}</a>
+                <a href="/repo/{{ repo.name }}/audit" class="text-xs text-gray-400 underline">audit</a>
+                <a href="/repo/{{ repo.name }}/rejects" class="text-xs text-gray-400 underline">rejects</a>
                 <span class="inline-flex items-center gap-2">
                     {% if is_synthetic %}
                     <span class="w-2.5 h-2.5 rounded-full bg-warn pulse-dot shrink-0" data-state-dot></span>
@@ -81,6 +83,12 @@
                     <span class="text-xs font-medium px-2 py-0.5 rounded border {{ style.badge }} {% if style.pulse %}pulse-badge{% endif %}" data-state-label>
                         {{ repo.state.value }}
                     </span>
+                    {# PR-352: sub-phase subtitle under MERGE badge so the operator
+                       can distinguish pre_merge_sync / ready_to_merge / merging /
+                       post_merge_cleanup at a dashboard glance. #}
+                    {% if repo.state.value == 'MERGE' and repo.merge_phase %}
+                    <span class="text-xs text-gray-400 ml-2 italic" data-merge-phase>{{ repo.merge_phase | replace('_', ' ') }}</span>
+                    {% endif %}
                     {% set _cancellation_subsource = (cancellation_subsources or {}).get(repo.name) %}
                     {% if repo.state.value == 'ERROR' and _cancellation_subsource %}
                     {{ subsource_badge.subsource_badge(_cancellation_subsource, subsource_lookup) }}
@@ -176,6 +184,15 @@
         <div class="text-xs text-warn italic mt-1">Paused, {{ remaining_min }}m remaining</div>
         {% elif repo.state.value == 'PAUSED' %}
         <div class="text-xs text-warn italic mt-1">Paused, resuming soon...</div>
+        {% endif %}
+        {% set _drain = (drain_progress or {}).get(repo.name) %}
+        {% if _drain %}
+        <div class="text-xs text-warn italic mt-1" data-drain-progress>
+            Draining: {{ _drain.phase }} for {{ _drain.elapsed_sec | int }}s
+            {% if _drain.est_remaining_sec is not none -%}
+            , est ~{{ (_drain.est_remaining_sec / 60) | round(0, 'floor') | int }} min remaining
+            {%- endif %}
+        </div>
         {% endif %}
         <div id="upload-feedback-{{ repo.name }}"></div>
     </div>

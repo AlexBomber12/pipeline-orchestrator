@@ -82,7 +82,9 @@ def _patch_cause(
     raise_exc: bool = False,
     cause: CancellationCause | None = None,
 ) -> None:
-    async def fake_get_cause(redis_client, repo_slug, task_id):
+    async def fake_get_cause(
+        redis_client, repo_slug, task_id, *, refresh_ttl: bool = True
+    ):
         if raise_exc:
             raise RuntimeError("redis down")
         if cause is not None:
@@ -286,7 +288,9 @@ async def test_build_cancellation_subsources_runs_lookups_concurrently(
     inflight = 0
     peak = 0
 
-    async def fake_get_cause(redis_client, repo_slug, task_id):
+    async def fake_get_cause(
+        redis_client, repo_slug, task_id, *, refresh_ttl: bool = True
+    ):
         nonlocal inflight, peak
         inflight += 1
         peak = max(peak, inflight)
@@ -316,3 +320,42 @@ async def test_build_cancellation_subsources_runs_lookups_concurrently(
 
     assert len(result) == 5
     assert peak == 5
+
+
+@pytest.mark.asyncio
+async def test_build_cancellation_subsources_does_not_refresh_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-345 follow-up: the dashboard cards render on a 30s passive poll
+    of ``/partials/repo-list``. Leaving the dashboard open must not
+    perpetually pin every ERROR record's TTL to the 90-day forensic
+    ceiling, so this helper passes ``refresh_ttl=False`` and reserves the
+    default refresh for explicit diagnostic reads.
+    """
+    captured: list[bool] = []
+
+    async def fake_get_cause(
+        redis_client, repo_slug, task_id, *, refresh_ttl: bool = True
+    ):
+        captured.append(refresh_ttl)
+        return CancellationCause(
+            category="ERROR",
+            payload={"subsource": "fix_iteration_cap"},
+            created_at=datetime.now(timezone.utc).isoformat(),
+            task_id=task_id,
+            repo_slug=repo_slug,
+        )
+
+    monkeypatch.setattr(
+        dashboard_routes, "get_cancellation_cause", fake_get_cause
+    )
+
+    states = [
+        _make_error_state(name=f"example__r{i}", pr_id=f"PR-{i}")
+        for i in range(3)
+    ]
+    await dashboard_routes._build_cancellation_subsources(
+        _StubAioredisClient(), states
+    )
+
+    assert captured == [False, False, False]

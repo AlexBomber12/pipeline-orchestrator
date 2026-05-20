@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="mx-auto max-w-4xl p-6">
+    <h1 class="mb-4 text-2xl font-semibold">Direct-commit audit: {{ repo_name }} ({{ branch }})</h1>
+    {% if last_audit_at %}
+    <p class="mb-4 text-xs text-gray-400">Last audit: {{ last_audit_at }}</p>
+    {% endif %}
+
+    {% if findings %}
+    <table class="w-full text-sm">
+        <thead class="border-b border-white/10 text-xs text-gray-400">
+            <tr>
+                <th class="py-2 text-left">SHA</th>
+                <th class="py-2 text-left">Message</th>
+                <th class="py-2 text-left">Category</th>
+                <th class="py-2 text-left">Parents</th>
+                <th class="py-2 text-left">PR</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for f in findings %}
+            <tr class="border-b border-white/5" data-audit-finding-row>
+                <td class="py-2 font-mono text-xs">
+                    <a href="https://github.com/{{ github_owner_repo }}/commit/{{ f.sha }}"
+                       target="_blank"
+                       rel="noopener noreferrer"
+                       class="text-accent">{{ f.sha[:8] }}</a>
+                </td>
+                <td class="py-2 text-xs">{{ f.message_first_line }}</td>
+                <td class="py-2 text-xs">{{ f.violation_category }}</td>
+                <td class="py-2 text-xs">{{ f.parent_count }}</td>
+                <td class="py-2 text-xs">{{ f.pr_number or "" }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p class="text-sm text-gray-400">No direct-to-main commits found in the audit window.</p>
+    {% endif %}
+</div>
+{% endblock %}

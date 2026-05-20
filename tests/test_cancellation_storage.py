@@ -8,6 +8,7 @@ import pytest
 from src.cancellation import storage
 from src.cancellation.storage import (
     CATEGORIES,
+    READ_REFRESH_TTL_SECONDS,
     TTL_SECONDS,
     CancellationCause,
     cause_key,
@@ -92,12 +93,14 @@ class _FakeRedis:
 
     async def zrangebyscore(self, key: str, min_score, max_score) -> list[str]:
         bucket = self.zsets.get(key, {})
-        if max_score == "+inf":
-            upper = float("inf")
-        else:
-            upper = float(max_score)
-        lower = float(min_score)
-        items = [tid for tid, score in bucket.items() if lower <= score <= upper]
+        lower, lower_excl = self._parse_bound(min_score, default=float("-inf"))
+        upper, upper_excl = self._parse_bound(max_score, default=float("inf"))
+        items = [
+            tid
+            for tid, score in bucket.items()
+            if (score > lower if lower_excl else score >= lower)
+            and (score < upper if upper_excl else score <= upper)
+        ]
         items.sort(key=lambda tid: bucket[tid])
         return items
 
@@ -109,6 +112,29 @@ class _FakeRedis:
                 del bucket[member]
                 removed += 1
         return removed
+
+    async def zadd(self, key: str, mapping: dict[str, float]) -> int:
+        bucket = self.zsets.setdefault(key, {})
+        added = 0
+        for member, score in mapping.items():
+            if member not in bucket:
+                added += 1
+            bucket[member] = float(score)
+        return added
+
+    async def zscore(self, key: str, member: str) -> float | None:
+        bucket = self.zsets.get(key, {})
+        score = bucket.get(member)
+        return None if score is None else float(score)
+
+    async def expire(self, key: str, seconds: int) -> bool:
+        if key in self.zsets or key in self.values:
+            self.ttls[key] = seconds
+            return True
+        return False
+
+    async def exists(self, key: str) -> int:
+        return int(key in self.values)
 
     def _zremrangebyscore(self, key: str, min_score, max_score) -> int:
         bucket = self.zsets.get(key)
@@ -451,10 +477,13 @@ async def test_list_recent_skips_expired_payloads_and_prunes_index() -> None:
     assert "PR-700" not in redis.zsets.get(index_key("alpha"), {})
 
 
-async def test_record_prunes_index_entries_older_than_ttl() -> None:
+async def test_record_prunes_index_entries_older_than_forensic_window() -> None:
     redis = _FakeRedis()
     now = datetime.now(timezone.utc)
-    ancient_ts = (now - timedelta(seconds=TTL_SECONDS + 3600)).timestamp()
+    # Entry whose score predates the full 90-day forensic window — no read
+    # refresh could have kept it eligible — is fair game to prune. Entries
+    # within the window must survive (see PR-345 follow-up regression test).
+    ancient_ts = (now - timedelta(seconds=READ_REFRESH_TTL_SECONDS + 3600)).timestamp()
     redis.zsets[index_key("alpha")] = {"PR-EXPIRED": ancient_ts}
 
     await record_cancellation_cause(
@@ -493,7 +522,7 @@ async def test_list_recent_orders_by_parsed_timestamp_across_offsets() -> None:
     assert [c.task_id for c in recent] == ["PR-LATER", "PR-EARLY"]
 
 
-async def test_record_sets_ttl_on_index_key() -> None:
+async def test_record_sets_forensic_window_ttl_on_index_key() -> None:
     redis = _FakeRedis()
     await record_cancellation_cause(
         redis,
@@ -501,7 +530,9 @@ async def test_record_sets_ttl_on_index_key() -> None:
         "PR-TTL",
         CancellationCause(category="INFRA"),
     )
-    assert redis.ttls[index_key("alpha")] == TTL_SECONDS
+    # PR-345 follow-up: the index ZSET must outlive the 30-day cause-key
+    # budget so refreshed members stay reachable through the forensic window.
+    assert redis.ttls[index_key("alpha")] == READ_REFRESH_TTL_SECONDS
 
 
 async def test_list_recent_decodes_bytes_task_ids() -> None:
@@ -556,3 +587,302 @@ def test_module_reexports_match_storage() -> None:
 def test_from_redis_accepts_bytes_or_str(raw) -> None:
     cause = CancellationCause.from_redis(raw)
     assert cause.category == "CRASH"
+
+
+# PR-345: TTL-refresh-on-read for the 90-day forensic window.
+
+
+def _seed_cause_with_ttl(
+    redis: _FakeRedis,
+    repo: str,
+    pr_id: str,
+    *,
+    created_at: str,
+    ttl: int = TTL_SECONDS,
+) -> CancellationCause:
+    cause = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "fix_iteration_cap"},
+        created_at=created_at,
+        task_id=pr_id,
+        repo_slug=repo,
+    )
+    redis.values[cause_key(repo, pr_id)] = cause.to_redis()
+    redis.ttls[cause_key(repo, pr_id)] = ttl
+    score = datetime.fromisoformat(created_at).timestamp()
+    redis.zsets.setdefault(index_key(repo), {})[pr_id] = score
+    redis.ttls[index_key(repo)] = ttl
+    return cause
+
+
+async def test_read_refreshes_ttl_when_default_true() -> None:
+    redis = _FakeRedis()
+    _seed_cause_with_ttl(
+        redis,
+        "alpha",
+        "PR-300",
+        created_at="2026-05-04T10:00:00+00:00",
+        ttl=TTL_SECONDS,
+    )
+
+    fetched = await get_cancellation_cause(redis, "alpha", "PR-300")
+
+    assert fetched is not None
+    assert redis.ttls[cause_key("alpha", "PR-300")] == READ_REFRESH_TTL_SECONDS
+    assert READ_REFRESH_TTL_SECONDS == 90 * 24 * 3600
+
+
+async def test_read_does_not_refresh_when_refresh_ttl_false() -> None:
+    redis = _FakeRedis()
+    _seed_cause_with_ttl(
+        redis,
+        "alpha",
+        "PR-301",
+        created_at="2026-05-04T10:00:00+00:00",
+        ttl=TTL_SECONDS,
+    )
+
+    fetched = await get_cancellation_cause(
+        redis, "alpha", "PR-301", refresh_ttl=False
+    )
+
+    assert fetched is not None
+    assert redis.ttls[cause_key("alpha", "PR-301")] == TTL_SECONDS
+    assert redis.ttls[index_key("alpha")] == TTL_SECONDS
+
+
+async def test_read_refresh_extends_index_zset_ttl() -> None:
+    redis = _FakeRedis()
+    _seed_cause_with_ttl(
+        redis,
+        "alpha",
+        "PR-302",
+        created_at="2026-05-04T10:00:00+00:00",
+        ttl=TTL_SECONDS,
+    )
+
+    await get_cancellation_cause(redis, "alpha", "PR-302")
+
+    assert redis.ttls[index_key("alpha")] == READ_REFRESH_TTL_SECONDS
+
+
+async def test_read_refresh_does_not_change_canceled_at_score() -> None:
+    redis = _FakeRedis()
+    cause = _seed_cause_with_ttl(
+        redis,
+        "alpha",
+        "PR-303",
+        created_at="2026-05-04T10:00:00+00:00",
+        ttl=TTL_SECONDS,
+    )
+    original_score = datetime.fromisoformat(cause.created_at).timestamp()
+
+    await get_cancellation_cause(redis, "alpha", "PR-303")
+
+    assert await redis.zscore(index_key("alpha"), "PR-303") == original_score
+
+
+async def test_read_returns_none_for_missing_key_without_issuing_expire() -> None:
+    redis = _FakeRedis()
+    expire_calls: list[tuple[str, int]] = []
+    original_expire = redis.expire
+
+    async def _tracking_expire(key: str, seconds: int) -> bool:
+        expire_calls.append((key, seconds))
+        return await original_expire(key, seconds)
+
+    redis.expire = _tracking_expire  # type: ignore[assignment]
+
+    assert await get_cancellation_cause(redis, "alpha", "PR-404") is None
+    assert expire_calls == []
+
+
+async def test_read_handles_concurrent_refresh_safely() -> None:
+    import asyncio
+
+    redis = _FakeRedis()
+    cause = _seed_cause_with_ttl(
+        redis,
+        "alpha",
+        "PR-305",
+        created_at="2026-05-04T10:00:00+00:00",
+        ttl=TTL_SECONDS,
+    )
+    original_score = datetime.fromisoformat(cause.created_at).timestamp()
+
+    results = await asyncio.gather(
+        *(get_cancellation_cause(redis, "alpha", "PR-305") for _ in range(10))
+    )
+
+    assert all(r is not None and r.task_id == "PR-305" for r in results)
+    assert redis.ttls[cause_key("alpha", "PR-305")] == READ_REFRESH_TTL_SECONDS
+    assert redis.ttls[index_key("alpha")] == READ_REFRESH_TTL_SECONDS
+    assert redis.zsets[index_key("alpha")] == {"PR-305": original_score}
+    assert CancellationCause.from_redis(
+        redis.values[cause_key("alpha", "PR-305")]
+    ) == cause
+
+
+async def test_read_refresh_skips_index_when_created_at_unparseable() -> None:
+    redis = _FakeRedis()
+    bad_cause = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "crash"},
+        created_at="not-a-timestamp",
+        task_id="PR-306",
+        repo_slug="alpha",
+    )
+    redis.values[cause_key("alpha", "PR-306")] = bad_cause.to_redis()
+    redis.ttls[cause_key("alpha", "PR-306")] = TTL_SECONDS
+
+    fetched = await get_cancellation_cause(redis, "alpha", "PR-306")
+
+    assert fetched is not None
+    # The cause-key TTL was still bumped (best-effort) but the index is left
+    # alone because the score cannot be reconstructed from a malformed
+    # created_at; a stale score would mis-order the record.
+    assert redis.ttls[cause_key("alpha", "PR-306")] == READ_REFRESH_TTL_SECONDS
+    assert index_key("alpha") not in redis.zsets
+
+
+async def test_list_recent_does_not_refresh_underlying_ttls() -> None:
+    """Internal scan helper passes refresh_ttl=False to avoid amplification."""
+    redis = _FakeRedis()
+    base = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+    await record_cancellation_cause(
+        redis,
+        "alpha",
+        "PR-307",
+        CancellationCause(
+            category="ERROR",
+            payload={"subsource": "crash"},
+            created_at=base.isoformat(),
+        ),
+    )
+    assert redis.ttls[cause_key("alpha", "PR-307")] == TTL_SECONDS
+    index_ttl_after_write = redis.ttls[index_key("alpha")]
+
+    await list_recent_cancellations(
+        redis, "alpha", base - timedelta(hours=1)
+    )
+
+    # Cause-key TTL untouched by scan (no refresh); index TTL also untouched
+    # since the scan did not invoke a refresh path.
+    assert redis.ttls[cause_key("alpha", "PR-307")] == TTL_SECONDS
+    assert redis.ttls[index_key("alpha")] == index_ttl_after_write
+
+
+async def test_prune_decodes_bytes_candidates() -> None:
+    """Bytes-encoded task ids returned by Redis must round-trip through prune.
+
+    The async Redis client returns task ids as ``bytes`` when
+    ``decode_responses=False`` is in effect for a given key; the prune
+    helper feeds the decoded id back into ``cause_key`` so the EXISTS
+    lookup must use the string form.
+    """
+    redis = _FakeRedis()
+    now = datetime.now(timezone.utc)
+    ancient_ts = (now - timedelta(seconds=READ_REFRESH_TTL_SECONDS + 3600)).timestamp()
+    redis.zsets[index_key("alpha")] = {"PR-BYTES": ancient_ts}
+
+    async def _bytes_zrangebyscore(key: str, min_score, max_score) -> list[bytes]:
+        return [b"PR-BYTES"]
+
+    redis.zrangebyscore = _bytes_zrangebyscore  # type: ignore[assignment]
+
+    await storage.prune_dead_index_members(redis, "alpha")
+
+    assert "PR-BYTES" not in redis.zsets[index_key("alpha")]
+
+
+async def test_record_does_not_prune_refreshed_member_with_stale_score() -> None:
+    """Refreshed records whose ZSCORE predates the 90-day window stay indexed.
+
+    PR-345 follow-up: ``_refresh_forensic_ttl`` preserves the original
+    ``created_at`` as the ZSET score, so a record read at day 35 has a
+    live cause key (TTL refreshed to day 125) but a score still at day 0.
+    The naive score-based prune at write time would evict that member at
+    day 95 because its score predates ``now - 90 days``, hiding it from
+    history/pending flows that start at ``cancellation_index``. The
+    liveness-based prune skips members whose cause key still exists.
+    """
+    redis = _FakeRedis()
+    now = datetime.now(timezone.utc)
+    stale_score = (now - timedelta(days=95)).timestamp()
+    refreshed_cause = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "fix_iteration_cap"},
+        created_at=(now - timedelta(days=95)).isoformat(),
+        task_id="PR-REFRESHED",
+        repo_slug="alpha",
+    )
+    redis.values[cause_key("alpha", "PR-REFRESHED")] = refreshed_cause.to_redis()
+    redis.ttls[cause_key("alpha", "PR-REFRESHED")] = READ_REFRESH_TTL_SECONDS
+    redis.zsets[index_key("alpha")] = {"PR-REFRESHED": stale_score}
+    redis.ttls[index_key("alpha")] = READ_REFRESH_TTL_SECONDS
+
+    await record_cancellation_cause(
+        redis,
+        "alpha",
+        "PR-FRESH",
+        CancellationCause(category="ERROR", created_at=now.isoformat()),
+    )
+
+    bucket = redis.zsets[index_key("alpha")]
+    assert "PR-REFRESHED" in bucket
+    assert "PR-FRESH" in bucket
+
+    recent = await list_recent_cancellations(
+        redis, "alpha", now - timedelta(days=100)
+    )
+    assert {c.task_id for c in recent} == {"PR-REFRESHED", "PR-FRESH"}
+
+
+async def test_subsequent_write_preserves_refreshed_index_member() -> None:
+    """Regression: a 35-day-old refreshed member must survive the next write.
+
+    Before PR-345 follow-up, ``record_cancellation_cause`` pruned index
+    members whose score was older than the 30-day initial budget. A read at
+    day 35 refreshes the cause key to 90 days and re-adds the index entry at
+    the original ``created_at`` score; the next cancellation recorded for
+    the same repo then evicted that refreshed member from the index, hiding
+    it from history/pending-list flows that start at ``cancellation_index``.
+    The prune cutoff now uses the 90-day forensic window so refreshed
+    members stay surfaced.
+    """
+    redis = _FakeRedis()
+    now = datetime.now(timezone.utc)
+    old_created_at = (now - timedelta(days=35)).isoformat()
+    _seed_cause_with_ttl(
+        redis,
+        "alpha",
+        "PR-OLD",
+        created_at=old_created_at,
+        ttl=TTL_SECONDS,
+    )
+    # Operator reads the 35-day-old record: refresh extends cause-key TTL to
+    # 90 days and re-adds the index member at the original created_at score.
+    refreshed = await get_cancellation_cause(redis, "alpha", "PR-OLD")
+    assert refreshed is not None
+    assert redis.ttls[cause_key("alpha", "PR-OLD")] == READ_REFRESH_TTL_SECONDS
+
+    # A new cancellation arrives for the same repo. The write-path index
+    # housekeeping must not drop the refreshed member just because its score
+    # is older than the 30-day initial budget.
+    await record_cancellation_cause(
+        redis,
+        "alpha",
+        "PR-NEW",
+        CancellationCause(category="ERROR", created_at=now.isoformat()),
+    )
+
+    bucket = redis.zsets[index_key("alpha")]
+    assert "PR-OLD" in bucket
+    assert "PR-NEW" in bucket
+
+    # History flow that starts at the index can still surface the refreshed
+    # record (cause key was not deleted; index member was preserved).
+    recent = await list_recent_cancellations(
+        redis, "alpha", now - timedelta(days=90)
+    )
+    assert {c.task_id for c in recent} == {"PR-OLD", "PR-NEW"}

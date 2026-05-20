@@ -502,6 +502,13 @@ def test_main_loop_spawns_watcher_task(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(main_module, "watch_config_file_changes", fake_watcher)
 
+    async def _noop_inotify_watcher(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        main_module, "watch_config_changes", _noop_inotify_watcher
+    )
+
     clock = [0.0]
     monkeypatch.setattr(main_module.time, "monotonic", lambda: clock[0])
 
