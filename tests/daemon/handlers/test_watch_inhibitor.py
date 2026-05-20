@@ -217,6 +217,7 @@ def test_handle_watch_unified_budget_check_tolerates_derive_failure(
     runner.state.state = PipelineState.WATCH
     runner.app_config.daemon.github_api_pause_threshold_percent = 5
     runner.app_config.daemon.github_api_slowdown_threshold_percent = 20
+    runner.state.active_inhibitors = [_rate_limit("claude")]
     fetched = h._budget(remaining=150, limit=5000)  # 3%
     monkeypatch.setattr(
         "src.github.rate_limit.fetch_rate_limit_buckets",
@@ -229,9 +230,10 @@ def test_handle_watch_unified_budget_check_tolerates_derive_failure(
     monkeypatch.setattr("src.daemon.runner.derive_active_inhibitors", _raise)
 
     assert asyncio.run(runner._check_github_api_budget()) is False
-    assert [
-        inh.inhibitor_type for inh in runner.state.active_inhibitors
-    ] == [InhibitorType.GITHUB_BUDGET_PAUSE]
+    assert [inh.inhibitor_type for inh in runner.state.active_inhibitors] == [
+        InhibitorType.RATE_LIMIT,
+        InhibitorType.GITHUB_BUDGET_PAUSE,
+    ]
 
 
 def test_handle_watch_slowdown_multiplier_at_5_pct_legacy() -> None:

@@ -2245,7 +2245,6 @@ class PipelineRunner(
                     self.name,
                     exc_info=True,
                 )
-                self.state.active_inhibitors = []
             _blocked, blocking = is_work_inhibited(self.state, coder=None)
             blocking_types = {inh.inhibitor_type for inh in blocking}
             budget_inhibitors = {
