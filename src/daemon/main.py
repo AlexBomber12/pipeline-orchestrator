@@ -54,6 +54,7 @@ from src.daemon.migrations.run_record_backfill import (
 from src.daemon.runner import PipelineRunner
 from src.events.wake import repo_from_channel, subscribe_wake
 from src.models import PipelineState
+from src.sandbox.runtime_state import refresh_sandbox_state
 from src.usage import UsageProvider
 
 logging.basicConfig(
@@ -737,6 +738,10 @@ async def main() -> None:
         run_record_backfill_counts,
     )
 
+    await refresh_sandbox_state(
+        redis_client, config.daemon.coder_filesystem_isolation
+    )
+
     logger.info(
         "Daemon starting with %d repositories", len(config.repositories)
     )
@@ -826,6 +831,15 @@ async def main() -> None:
                         await _cleanup_in_flight_for_removed(
                             in_flight, removed_keys
                         )
+                # Refresh sandbox state on every reload event, not just when
+                # AppConfig differs: bwrap install/removal on the host does
+                # not change the parsed config, so a same-config reload
+                # (touch config.yml, edit providers.yml) must still re-probe
+                # the badge or the dashboard stays stuck on a stale value.
+                await refresh_sandbox_state(
+                    redis_client,
+                    config.daemon.coder_filesystem_isolation,
+                )
 
         try:
             panic_active = await check_cascade_escalate_state(

@@ -51,6 +51,10 @@ from src.github import prs as gh_prs
 from src.keyspace import cli_log_latest, daemon_panic_state, recovery_backup_branch
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
+from src.sandbox.runtime_state import (
+    REDIS_SANDBOX_STATE_KEY,
+    SandboxState,
+)
 from src.subsource_registry import all_subsources, group_for
 from src.subsource_registry import lookup as _subsource_lookup
 from src.utils import repo_slug_from_url
@@ -1421,6 +1425,52 @@ async def _build_drain_progress_map(
     return out
 
 
+async def _read_sandbox_state(redis_client: Any, config: AppConfig) -> str:
+    """Return the sandbox-state string the dashboard badge should render.
+
+    Preferred source is the daemon-written
+    :data:`~src.sandbox.runtime_state.REDIS_SANDBOX_STATE_KEY`, which
+    reflects the actual smoke-test result on the daemon host. When
+    Redis is unreachable, the value is missing (web booted before the
+    daemon ran its first probe), or the value is not a recognized
+    :class:`~src.sandbox.runtime_state.SandboxState`, fall back to the
+    config flag so the badge still distinguishes ``disabled`` (off in
+    config) from ``unavailable`` (on in config but probe absent or
+    invalid). Without that fallback the badge would render an empty
+    string and the operator would lose the at-a-glance status entirely
+    on a first boot.
+
+    The current ``coder_filesystem_isolation`` config flag takes
+    precedence over the cached Redis probe so a freshly flipped flag
+    cannot be contradicted by stale daemon state (daemon down,
+    inotify reload not yet processed, Redis serving the previous
+    boot's value). When the flag is ``false`` the badge always renders
+    ``disabled``; when the flag is ``true`` only an ``active`` or
+    ``unavailable`` cached probe is honored and a stale ``disabled``
+    falls through to the ``unavailable`` fallback so the operator
+    never sees a green badge while config says off, or a gray badge
+    while config says on.
+    """
+    if not config.daemon.coder_filesystem_isolation:
+        return SandboxState.DISABLED.value
+    raw: Any = None
+    if redis_client is not None:
+        try:
+            raw = await redis_client.get(REDIS_SANDBOX_STATE_KEY)
+        except Exception:
+            raw = None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    if isinstance(raw, str):
+        try:
+            cached = SandboxState(raw)
+        except ValueError:
+            cached = None
+        if cached in (SandboxState.ACTIVE, SandboxState.UNAVAILABLE):
+            return cached.value
+    return SandboxState.UNAVAILABLE.value
+
+
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)
@@ -1440,6 +1490,7 @@ async def index(request: Request) -> HTMLResponse:
     drain_progress = await _build_drain_progress_map(
         redis_client, states, config
     )
+    sandbox_state = await _read_sandbox_state(redis_client, config)
     return _app.templates.TemplateResponse(
         request,
         "index.html",
@@ -1455,6 +1506,7 @@ async def index(request: Request) -> HTMLResponse:
             "cancellation_subsources": cancellation_subsources,
             "subsource_lookup": _subsource_lookup,
             "drain_progress": drain_progress,
+            "sandbox_state": sandbox_state,
             "inhibitor_labels": INHIBITOR_LABELS,
         },
     )
@@ -1816,6 +1868,28 @@ async def api_cancellations(repo: str, request: Request) -> JSONResponse:
         await _augment_causes_with_dependents(
             repo, causes[:_CANCELLATIONS_MAX], redis_client
         )
+    )
+
+
+@router.get("/partials/sandbox-badge", response_class=HTMLResponse)
+async def partial_sandbox_badge(request: Request) -> HTMLResponse:
+    """Return the sandbox badge fragment with a freshly read state.
+
+    The badge on the index page is wrapped in an HTMX-polled container
+    that hits this endpoint. Without it, the badge would only reflect
+    the value of ``daemon:sandbox_state`` at the moment the page was
+    rendered: a daemon-driven probe refresh (config reload, bwrap
+    install/removal) would not propagate to an already-open dashboard
+    until a full browser reload, defeating the live transition the
+    spec calls for.
+    """
+    redis_client = getattr(request.app.state, "redis", None)
+    config = await asyncio.to_thread(load_config, _app.CONFIG_PATH)
+    sandbox_state = await _read_sandbox_state(redis_client, config)
+    return _app.templates.TemplateResponse(
+        request,
+        "components/sandbox_badge.html",
+        {"sandbox_state": sandbox_state},
     )
 
 

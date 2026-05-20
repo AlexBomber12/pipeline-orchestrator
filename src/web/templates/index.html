@@ -4,6 +4,13 @@
 
 {% block content %}
 {% include "components/cascade_panic_banner.html" %}
+<div class="flex items-center justify-end mb-3"
+     hx-get="/partials/sandbox-badge"
+     hx-trigger="every 30s"
+     hx-swap="innerHTML"
+     id="sandbox-badge-wrapper">
+    {% include "components/sandbox_badge.html" %}
+</div>
 {# Cards refresh on state_change AND history_updated: pause/resume/stop
    mutate repo.user_paused (which controls play/pause/stop visibility) and
    emit history_updated, so without the second trigger the controls would

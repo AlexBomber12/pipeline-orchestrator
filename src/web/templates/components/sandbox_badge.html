@@ -1,0 +1,17 @@
+{#
+  Three-state bubblewrap sandbox badge.
+
+  - 'disabled'     gray  — config flag off, no runtime check performed
+  - 'active'       green — bwrap present and smoke test passed
+  - 'unavailable'  red   — config flag on but bwrap missing or smoke test failed
+#}
+{% set sandbox_badge_classes = {
+    'disabled': 'bg-gray-500/10 text-gray-400',
+    'active': 'bg-ok/10 text-ok',
+    'unavailable': 'bg-fail/10 text-fail',
+} %}
+<span data-sandbox-badge="{{ sandbox_state }}"
+      class="text-xs px-2 py-0.5 rounded border border-white/5 font-mono {{ sandbox_badge_classes.get(sandbox_state, sandbox_badge_classes['unavailable']) }}"
+      title="Bubblewrap sandbox state: {{ sandbox_state }}">
+    sandbox: {{ sandbox_state }}
+</span>
