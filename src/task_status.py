@@ -20,6 +20,7 @@ from src.queue_parser import (
 
 _PR_ID_PATTERN = _PR_ID_RE.pattern.removeprefix("^").removesuffix("$")
 _MERGED_SUBJECT_RE = re.compile(rf"^(?P<pr_id>{_PR_ID_PATTERN}):(?:\s|$)")
+_SPLIT_PARENT_ID_RE = re.compile(r"^PR-\d+(?:\.\d+)?$")
 _LEGACY_FALLBACK_SUFFIXES = {
     ": missing Branch",
     ": missing Type",
@@ -248,7 +249,9 @@ def _scan_candidate_merged_pr_ids(
     timeout: int = 10,
 ) -> set[str] | None:
     """Return matching merged PR ids, or ``None`` when the ref cannot be read."""
-    pattern = "|".join(re.escape(pr_id) for pr_id in sorted(candidate_pr_ids))
+    pattern = "|".join(
+        _candidate_merged_pr_grep_pattern(pr_id) for pr_id in sorted(candidate_pr_ids)
+    )
     result = subprocess.run(
         [
             "git",
@@ -283,6 +286,13 @@ def _scan_candidate_merged_pr_ids(
         if match:
             found.add(match.group("pr_id"))
     return found
+
+
+def _candidate_merged_pr_grep_pattern(pr_id: str) -> str:
+    escaped_pr_id = re.escape(pr_id)
+    if _SPLIT_PARENT_ID_RE.fullmatch(pr_id):
+        return rf"{escaped_pr_id}([a-z](-[0-9]+)?)?"
+    return escaped_pr_id
 
 
 def derive_queue_task_statuses(
