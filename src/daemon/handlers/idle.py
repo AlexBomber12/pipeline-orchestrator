@@ -49,6 +49,12 @@ _IDLE_MERGED_PR_304_WARN_AT = 10
 _IDLE_MERGED_PR_304_WARN_EVERY = 50
 
 
+def _split_parent_of(pr_id: str) -> str | None:
+    """Return the unsuffixed parent PR ID for a split sub-task variant."""
+    match = re.match(r"^(PR-\d+(?:\.\d+)?)[a-z](?:-\d+)?$", pr_id)
+    return match.group(1) if match else None
+
+
 class IdleMixin:
     """Handle IDLE state: sync, pick next task, dispatch to CODING."""
 
@@ -321,6 +327,11 @@ class IdleMixin:
     ) -> tuple[list, dict[str, list[str]]]:
         unresolved_deps_map: dict[str, list[str]] = {}
         structured_pr_ids = {header.pr_id for header in headers}
+        merged_parent_aliases = {
+            parent
+            for merged_pr_id in merged_pr_ids
+            if (parent := _split_parent_of(merged_pr_id)) is not None
+        }
 
         changed = True
         while changed:
@@ -328,7 +339,10 @@ class IdleMixin:
             for header in headers:
                 unresolved_deps = set(unresolved_deps_map.get(header.pr_id, ()))
                 for dependency in header.depends_on:
-                    if dependency in merged_pr_ids:
+                    if (
+                        dependency in merged_pr_ids
+                        or dependency in merged_parent_aliases
+                    ):
                         continue
                     if dependency in skipped_legacy_pr_ids:
                         unresolved_deps.add(dependency)
