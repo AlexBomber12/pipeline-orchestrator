@@ -32,14 +32,15 @@ defaults to `true`, so repositories use the unified
 `src.inhibitor.is_work_inhibited` path unless they opt out.
 
 If a regression affects one repository, keep the daemon-wide default on
-and add a per-repo override in `user_state.yml` or the repo's config
-entry:
+and add a per-repo override to that repository's entry in `config.yml`:
 
 ```yaml
 feature_flags:
   use_unified_inhibitor_check: false
 ```
 
-Reload the daemon config through the normal inotify path, or restart the
-daemon container. Verify the rollback by checking the dashboard event log
-for legacy throttle decisions on the affected repository.
+Do not put this rollback override in `user_state.yml`; the current
+runtime config loader does not read that file. Reload the daemon config
+through the normal inotify path, or restart the daemon container. Verify
+the rollback by checking the dashboard event log for legacy throttle
+decisions on the affected repository.
