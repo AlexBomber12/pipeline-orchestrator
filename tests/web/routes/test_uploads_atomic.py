@@ -162,6 +162,81 @@ def test_dependency_closure_satisfied_by_merged_split_child(
     assert (_staging_dir(uploads_dir) / "PR-306.md").is_file()
 
 
+def test_dependency_closure_satisfied_by_pending_upload(
+    uploads_dir: Path,
+) -> None:
+    pending_staging = uploads_dir / "example__alpha" / "pending"
+    pending_staging.mkdir(parents=True)
+    (pending_staging / "PR-001.md").write_bytes(
+        _task_bytes("PR-001.md", pr_id="PR-001")
+    )
+    with TestClient(app) as client:
+        client.app.state.redis._store[upload_pending("example__alpha")] = json.dumps(
+            {
+                "repo": "example__alpha",
+                "files": ["PR-001.md"],
+                "staging_dir": str(pending_staging),
+            }
+        )
+
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[
+                _task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-001")
+            ],
+        )
+        manifest = json.loads(
+            client.app.state.redis._store[upload_pending("example__alpha")]
+        )
+
+    assert resp.status_code == 200
+    assert sorted(manifest["files"]) == ["PR-001.md", "PR-002.md"]
+    new_staging = Path(manifest["staging_dir"])
+    assert (new_staging / "PR-001.md").is_file()
+    assert (new_staging / "PR-002.md").is_file()
+
+
+def test_pending_upload_task_ids_ignores_invalid_manifest() -> None:
+    assert upload_routes._pending_upload_task_ids(None) == set()
+    assert upload_routes._pending_upload_task_ids("{not-json") == set()
+    assert upload_routes._pending_upload_task_ids('{"files": "PR-001.md"}') == set()
+    assert upload_routes._pending_upload_task_ids(
+        json.dumps({"files": ["PR-001.md", "QUEUE.md", 123]})
+    ) == {"PR-001"}
+
+
+def test_dependency_closure_continues_when_pending_lookup_fails(
+    uploads_dir: Path,
+) -> None:
+    class _PendingExplodes:
+        async def get(self, key: str) -> str | None:
+            if key == upload_pending("example__alpha"):
+                raise RuntimeError("boom")
+            return '{"url":"","name":"example__alpha","state":"IDLE"}'
+
+        async def set(self, key: str, value: str, **kwargs: object) -> None:
+            return None
+
+        async def scan_iter(self, match: str | None = None):
+            if False:
+                yield ""
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(app) as client:
+        client.app.state.redis = _PendingExplodes()
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[
+                _task_file(name="PR-001.md", pr_id="PR-001"),
+                _task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-001"),
+            ],
+        )
+
+    assert resp.status_code == 200
+
+
 def test_error_response_lists_all_failures(uploads_dir: Path) -> None:
     resp = _post_upload(
         [
@@ -283,3 +358,15 @@ def test_commit_message_custom() -> None:
 
     assert resp.status_code == 200
     assert manifest["commit_subject"] == "My batch"
+
+
+def test_commit_message_rejects_queue_pr_prefix() -> None:
+    with TestClient(app) as client:
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            data={"subject": "PR-305: upload batch"},
+            files=[_task_file(name="PR-001.md", pr_id="PR-001")],
+        )
+
+    assert resp.status_code == 400
+    assert "must not start with a queue PR ID prefix" in resp.text

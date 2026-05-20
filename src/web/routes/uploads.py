@@ -28,6 +28,7 @@ from src.cancellation import (
     task_spec_content_hash,
 )
 from src.events import publish_wake
+from src.github.prs import extract_queue_pr_id
 from src.keyspace import pipeline_state, upload_pending
 from src.mcp.scans import scan_for_conflicts
 from src.models import RepoState, TaskStatus
@@ -135,6 +136,30 @@ def _existing_task_ids(tasks_dir: Path) -> set[str]:
         for path in tasks_dir.glob("PR-*.md")
         if path.is_file()
     }
+
+
+def _pending_upload_task_ids(raw_manifest: str | bytes | None) -> set[str]:
+    if not raw_manifest:
+        return set()
+    try:
+        manifest = json.loads(raw_manifest)
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return set()
+    files = manifest.get("files", [])
+    if not isinstance(files, list):
+        return set()
+    return {
+        Path(str(fname)).stem
+        for fname in files
+        if isinstance(fname, str) and re.fullmatch(_TASK_UPLOAD_PATTERN, fname)
+    }
+
+
+def _upload_commit_subject(subject: str, uploaded_count: int) -> str:
+    custom_subject = subject.strip()
+    if custom_subject:
+        return custom_subject
+    return f"tasks: upload batch ({uploaded_count} files)"
 
 
 def _validate_zip_member(entry_name: str) -> str | None:
@@ -253,6 +278,14 @@ async def upload_tasks(
         )
     if not files:
         return _render_upload_error(request, "No files uploaded", 422, repo_name=name)
+
+    if subject.strip() and extract_queue_pr_id(subject) is not None:
+        return _render_upload_error(
+            request,
+            "Upload commit subject must not start with a queue PR ID prefix.",
+            400,
+            repo_name=name,
+        )
 
     max_total_bytes = _app._UPLOAD_MAX_TOTAL_BYTES
 
@@ -416,6 +449,12 @@ async def upload_tasks(
 
     batch_task_ids = {header.pr_id for header in parsed_headers.values()}
     existing_task_ids = _existing_task_ids(Path(repo_path) / "tasks")
+    try:
+        pending_task_ids = _pending_upload_task_ids(
+            await redis_client.get(upload_pending(name))
+        )
+    except Exception:
+        pending_task_ids = set()
     dependency_candidates = {
         dependency
         for header in parsed_headers.values()
@@ -433,11 +472,12 @@ async def upload_tasks(
     except Exception:
         merged_pr_ids = set()
     merged_parent_aliases = merged_split_parent_aliases(
-        structured_pr_ids=existing_task_ids | batch_task_ids,
+        structured_pr_ids=existing_task_ids | pending_task_ids | batch_task_ids,
         merged_pr_ids=merged_pr_ids,
     )
     visible_task_ids = (
         existing_task_ids
+        | pending_task_ids
         | batch_task_ids
         | merged_pr_ids
         | merged_parent_aliases
@@ -642,10 +682,9 @@ async def upload_tasks(
                 "files": manifest_filenames,
                 "staging_dir": str(staging_dir),
                 "task_hashes": manifest_task_hashes,
-                "commit_subject": (
-                    subject.strip()
-                    if subject.strip()
-                    else f"tasks: upload batch ({len(uploaded_filenames)} files)"
+                "commit_subject": _upload_commit_subject(
+                    subject,
+                    len(uploaded_filenames),
                 ),
             }
             try:
@@ -682,10 +721,9 @@ async def upload_tasks(
         success_message,
         repo_name=name,
         uploaded_files=sorted(uploaded_filenames),
-        commit_subject=(
-            subject.strip()
-            if subject.strip()
-            else f"tasks: upload batch ({len(uploaded_filenames)} files)"
+        commit_subject=_upload_commit_subject(
+            subject,
+            len(uploaded_filenames),
         ),
     )
 
