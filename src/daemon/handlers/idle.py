@@ -928,10 +928,10 @@ class IdleMixin:
         """Wait for rate limit window to expire, then resume previous flow."""
         # PR-330b: per-repo feature flag selects the unified inhibitor
         # exit check over the legacy ``user_paused``/``rate_limited_until``
-        # branches. PAUSED is a global state — any inhibitor (per-coder
-        # or global) keeps the repo paused, so the gate calls
-        # ``is_work_inhibited`` with ``coder=None`` and treats a clean
-        # inhibitor list as the signal to transition back to IDLE.
+        # branches. PAUSED is a global state for repo-wide inhibitors,
+        # but per-coder rate limits still follow the legacy fallback
+        # behavior: a pause for one coder may resume when another coder
+        # is eligible.
         # ``GITHUB_BUDGET_SLOWDOWN`` is excluded for the same reason as
         # the IDLE gate: it is a polling-cadence throttle enforced at
         # ``_check_github_api_budget`` and was never part of the legacy
@@ -961,7 +961,14 @@ class IdleMixin:
                     )
                     self._paused_inhibited_logged = True
                 return
-            _, blocking = is_work_inhibited(self.state, coder=None)
+            await self._refresh_auth_status_cache()
+            selected = self._select_coder()
+            coder_name = (
+                selected[0]
+                if selected is not None
+                else self.state.rate_limit_reactive_coder or "claude"
+            )
+            _, blocking = is_work_inhibited(self.state, coder=coder_name)
             # Ignore stale ``USER_PAUSE`` entries from the previous
             # publish: ``user_paused`` is ``False`` here (manual-pause
             # short-circuit above), so any ``USER_PAUSE`` left in the
@@ -1011,15 +1018,25 @@ class IdleMixin:
                 aware = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
                 return aware > now
 
+            pause_coder = self.state.rate_limit_reactive_coder or "claude"
+            diagnosis_pause = (
+                self.state.error_message is not None
+                and pause_coder == "claude"
+            )
+            relevant_legacy_pause = (
+                self.state.rate_limited_until
+                if diagnosis_pause or pause_coder == coder_name
+                else None
+            )
+            relevant_per_coder_pause = self.state.rate_limited_coder_until.get(
+                coder_name
+            )
             stale_snapshot = (
                 not hard_blocking
                 and not self.state.user_paused
                 and (
-                    _is_future(self.state.rate_limited_until)
-                    or any(
-                        _is_future(until)
-                        for until in self.state.rate_limited_coder_until.values()
-                    )
+                    _is_future(relevant_legacy_pause)
+                    or _is_future(relevant_per_coder_pause)
                 )
             )
             if stale_snapshot:
@@ -1047,11 +1064,34 @@ class IdleMixin:
             # returning empty for a repo pinned to that coder (logging
             # ``no eligible coder`` on every IDLE tick) even though
             # the unified gate has already accepted the resume.
+            preserved_coder_until = {
+                coder: until
+                for coder, until in self.state.rate_limited_coder_until.items()
+                if coder != coder_name and _is_future(until)
+            }
+            if (
+                self.state.rate_limited_until is not None
+                and _is_future(self.state.rate_limited_until)
+                and not diagnosis_pause
+                and pause_coder != coder_name
+            ):
+                preserved_coder_until.setdefault(
+                    pause_coder, self.state.rate_limited_until
+                )
+            preserved_coders = {
+                coder
+                for coder in self.state.rate_limited_coders
+                if coder != coder_name
+                and (
+                    coder not in self.state.rate_limited_coder_until
+                    or _is_future(self.state.rate_limited_coder_until[coder])
+                )
+            } | set(preserved_coder_until)
             self.state.rate_limited_until = None
             self.state.rate_limit_reactive = False
             self.state.rate_limit_reactive_coder = None
-            self.state.rate_limited_coders.clear()
-            self.state.rate_limited_coder_until.clear()
+            self.state.rate_limited_coders = preserved_coders
+            self.state.rate_limited_coder_until = preserved_coder_until
             # Route any lingering ``error_message`` through the
             # rate-limit recovery resolver before the IDLE transition.
             # ``run_cycle`` parks runners in PAUSED when an ERROR cycle

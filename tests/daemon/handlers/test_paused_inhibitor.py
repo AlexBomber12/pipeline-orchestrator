@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from src.config import FeatureFlags
+from src.config import CoderType, FeatureFlags
 from src.inhibitor import InhibitorType, WorkInhibitor
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 
@@ -253,12 +253,12 @@ def test_handle_paused_flag_on_slowdown_alone_exits_to_idle() -> None:
     )
 
 
-def test_handle_paused_flag_on_per_coder_rate_limit_keeps_paused() -> None:
-    """A per-coder rate limit (any coder) keeps the repo PAUSED.
+def test_handle_paused_flag_on_selected_coder_rate_limit_keeps_paused() -> None:
+    """A per-coder rate limit for the selected coder keeps the repo PAUSED.
 
-    PAUSED is a global state, so the unified gate calls
-    ``is_work_inhibited`` with ``coder=None`` — every active inhibitor
-    matches, including per-coder entries for a single coder.
+    Per-coder rate limits are scoped to the coder that would otherwise
+    dispatch. This preserves the legacy fallback behavior while still
+    preventing dispatch against the limited coder.
     """
     runner = h._make_runner()
     _enable_flag(runner)
@@ -266,10 +266,10 @@ def test_handle_paused_flag_on_per_coder_rate_limit_keeps_paused() -> None:
     runner.state.active_inhibitors = [
         WorkInhibitor(
             inhibitor_type=InhibitorType.RATE_LIMIT,
-            coder_affected="codex",
+            coder_affected="claude",
             expires_at=_future(),
-            reason_text="codex rate-limited",
-            source_key="state:octo__demo.rate_limited_coder_until.codex",
+            reason_text="claude rate-limited",
+            source_key="state:octo__demo.rate_limited_coder_until.claude",
         )
     ]
 
@@ -281,6 +281,36 @@ def test_handle_paused_flag_on_per_coder_rate_limit_keeps_paused() -> None:
         and "rate_limit" in e["event"]
         for e in runner.state.history
     )
+
+
+def test_handle_paused_flag_on_other_coder_rate_limit_resumes_and_preserves_marker() -> None:
+    """Unified PAUSED exit preserves fallback to another eligible coder."""
+    runner = h._make_runner(coder=CoderType.CODEX)
+    _enable_flag(runner)
+    _seed_paused(runner)
+    future = datetime.now(timezone.utc) + timedelta(minutes=20)
+    runner.state.rate_limited_until = future
+    runner.state.rate_limit_reactive = True
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coders = {"claude"}
+    runner.state.active_inhibitors = [
+        WorkInhibitor(
+            inhibitor_type=InhibitorType.RATE_LIMIT,
+            coder_affected="claude",
+            expires_at=future,
+            reason_text="claude rate-limited",
+            source_key="state:octo__demo.rate_limited_until",
+        )
+    ]
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive is False
+    assert runner.state.rate_limit_reactive_coder is None
+    assert runner.state.rate_limited_coders == {"claude"}
+    assert runner.state.rate_limited_coder_until == {"claude": future}
 
 
 def test_handle_paused_flag_on_clears_stale_rate_limit_metadata() -> None:
@@ -506,6 +536,9 @@ def test_handle_paused_flag_on_empty_snapshot_with_live_rate_limit_stays_paused(
     runner.state.rate_limit_reactive_coder = "claude"
     runner.state.rate_limited_coders = {"claude"}
     runner.state.rate_limited_coder_until = {"claude": future}
+    runner.repo_config = runner.repo_config.model_copy(
+        update={"disabled_coders": ["codex"]}
+    )
     runner.state.active_inhibitors = []
 
     asyncio.run(runner.handle_paused())
@@ -547,6 +580,9 @@ def test_handle_paused_flag_on_slowdown_only_snapshot_with_live_rate_limit_stays
     runner.state.rate_limit_reactive_coder = "claude"
     runner.state.rate_limited_coders = {"claude"}
     runner.state.rate_limited_coder_until = {"claude": future}
+    runner.repo_config = runner.repo_config.model_copy(
+        update={"disabled_coders": ["codex"]}
+    )
     runner.state.active_inhibitors = [
         WorkInhibitor(
             inhibitor_type=InhibitorType.GITHUB_BUDGET_SLOWDOWN,
@@ -587,7 +623,10 @@ def test_handle_paused_flag_on_slowdown_only_snapshot_with_per_coder_future_limi
     runner.state.user_paused = False
     future = datetime.now(timezone.utc) + timedelta(minutes=15)
     runner.state.rate_limited_until = None
-    runner.state.rate_limited_coder_until = {"codex": future}
+    runner.state.rate_limited_coder_until = {"claude": future}
+    runner.repo_config = runner.repo_config.model_copy(
+        update={"disabled_coders": ["codex"]}
+    )
     runner.state.active_inhibitors = [
         WorkInhibitor(
             inhibitor_type=InhibitorType.GITHUB_BUDGET_SLOWDOWN,
@@ -600,7 +639,7 @@ def test_handle_paused_flag_on_slowdown_only_snapshot_with_per_coder_future_limi
     asyncio.run(runner.handle_paused())
 
     assert runner.state.state == PipelineState.PAUSED
-    assert runner.state.rate_limited_coder_until == {"codex": future}
+    assert runner.state.rate_limited_coder_until == {"claude": future}
 
 
 def test_handle_paused_flag_on_empty_snapshot_with_per_coder_future_limit_stays_paused() -> None:
@@ -617,13 +656,16 @@ def test_handle_paused_flag_on_empty_snapshot_with_per_coder_future_limit_stays_
     runner.state.user_paused = False
     future = datetime.now(timezone.utc) + timedelta(minutes=15)
     runner.state.rate_limited_until = None
-    runner.state.rate_limited_coder_until = {"codex": future}
+    runner.state.rate_limited_coder_until = {"claude": future}
+    runner.repo_config = runner.repo_config.model_copy(
+        update={"disabled_coders": ["codex"]}
+    )
     runner.state.active_inhibitors = []
 
     asyncio.run(runner.handle_paused())
 
     assert runner.state.state == PipelineState.PAUSED
-    assert runner.state.rate_limited_coder_until == {"codex": future}
+    assert runner.state.rate_limited_coder_until == {"claude": future}
 
 
 def test_handle_paused_flag_on_empty_snapshot_with_user_paused_stays_paused() -> None:
