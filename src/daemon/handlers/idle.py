@@ -59,10 +59,12 @@ def _merged_split_parent_aliases(
     *,
     structured_pr_ids: set[str],
     merged_pr_ids: set[str],
+    skipped_legacy_pr_ids: set[str] | None = None,
 ) -> set[str]:
     """Return split parents whose known split children are all merged."""
+    skipped_legacy_pr_ids = skipped_legacy_pr_ids or set()
     children_by_parent: dict[str, set[str]] = {}
-    for pr_id in structured_pr_ids | merged_pr_ids:
+    for pr_id in structured_pr_ids | merged_pr_ids | skipped_legacy_pr_ids:
         parent = _split_parent_of(pr_id)
         if parent is None:
             continue
@@ -71,7 +73,9 @@ def _merged_split_parent_aliases(
     return {
         parent
         for parent, children in children_by_parent.items()
-        if parent not in structured_pr_ids and children <= merged_pr_ids
+        if parent not in structured_pr_ids
+        and parent not in skipped_legacy_pr_ids
+        and children <= merged_pr_ids
     }
 
 
@@ -350,6 +354,7 @@ class IdleMixin:
         merged_parent_aliases = _merged_split_parent_aliases(
             structured_pr_ids=structured_pr_ids,
             merged_pr_ids=merged_pr_ids,
+            skipped_legacy_pr_ids=skipped_legacy_pr_ids,
         )
 
         changed = True
@@ -440,6 +445,7 @@ class IdleMixin:
         merged_parent_aliases = _merged_split_parent_aliases(
             structured_pr_ids=structured_pr_ids,
             merged_pr_ids=merged_pr_ids,
+            skipped_legacy_pr_ids=skipped_legacy_pr_ids,
         )
 
         try:
