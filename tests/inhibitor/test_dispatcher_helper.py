@@ -142,12 +142,12 @@ def test_is_work_inhibited_skips_expired_keeps_active() -> None:
     assert [i.coder_affected for i in blocking] == ["codex"]
 
 
-def test_feature_flag_default_false() -> None:
+def test_feature_flag_default_true() -> None:
     flags = FeatureFlags()
-    assert flags.use_unified_inhibitor_check is False
+    assert flags.use_unified_inhibitor_check is True
 
     repo = RepoConfig(url="https://github.com/octo/demo")
-    assert repo.feature_flags.use_unified_inhibitor_check is False
+    assert repo.feature_flags.use_unified_inhibitor_check is True
 
 
 def test_feature_flag_loadable_from_yaml(tmp_path: Path) -> None:

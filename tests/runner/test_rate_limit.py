@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 from src import codex_cli
 from src.coders import claude as claude_plugin_module
-from src.config import CoderType
+from src.config import CoderType, FeatureFlags
 from src.daemon import fix_supervision as fix_supervision_module
 from src.daemon import git_ops as git_ops_module
 from src.daemon import runner as runner_module
@@ -727,6 +727,9 @@ def test_handle_paused_invalidates_usage_caches_when_switching_coders(
     h._patch_subprocess(monkeypatch)
 
     runner = h._make_runner()
+    runner.repo_config.feature_flags = FeatureFlags(
+        use_unified_inhibitor_check=False
+    )
     claude_provider = h._FakeUsageProvider(snapshot=None)
     codex_provider = h._FakeUsageProvider(snapshot=None)
     runner._claude_usage_provider = claude_provider
@@ -1468,6 +1471,9 @@ def test_handle_paused_waits_when_window_active(
     h._patch_subprocess(monkeypatch)
 
     runner = h._make_runner()
+    runner.repo_config.feature_flags = FeatureFlags(
+        use_unified_inhibitor_check=False
+    )
     runner.state.state = PipelineState.PAUSED
     runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=20)
 
@@ -1609,6 +1615,9 @@ def test_handle_paused_handles_missing_rate_limited_until(
     h._patch_subprocess(monkeypatch)
 
     runner = h._make_runner()
+    runner.repo_config.feature_flags = FeatureFlags(
+        use_unified_inhibitor_check=False
+    )
     runner.state.state = PipelineState.PAUSED
     runner.state.rate_limited_until = None
 
@@ -2954,6 +2963,9 @@ def test_cleanup_breach_marker_ignores_unlink_oserror(
 
 def test_handle_idle_returns_immediately_when_user_paused() -> None:
     runner = h._make_runner()
+    runner.repo_config.feature_flags = FeatureFlags(
+        use_unified_inhibitor_check=False
+    )
     runner.state.user_paused = True
 
     asyncio.run(runner.handle_idle())
@@ -2963,6 +2975,9 @@ def test_handle_idle_returns_immediately_when_user_paused() -> None:
 
 def test_handle_paused_logs_user_pause_only_once() -> None:
     runner = h._make_runner()
+    runner.repo_config.feature_flags = FeatureFlags(
+        use_unified_inhibitor_check=False
+    )
     runner.state.user_paused = True
 
     asyncio.run(runner.handle_paused())

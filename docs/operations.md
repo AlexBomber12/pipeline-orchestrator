@@ -24,3 +24,22 @@ status:ERROR), the operator has two recovery affordances:
 Both affordances are mutually exclusive: Retry is for unchanged content
 ("try again, environment may have transient issue"); re-upload is for
 changed content ("operator iterated on the spec itself").
+
+## WorkInhibitor rollback
+
+The WorkInhibitor cutover is complete: `use_unified_inhibitor_check`
+defaults to `true`, so repositories use the unified
+`src.inhibitor.is_work_inhibited` path unless they opt out.
+
+If a regression affects one repository, keep the daemon-wide default on
+and add a per-repo override in `user_state.yml` or the repo's config
+entry:
+
+```yaml
+feature_flags:
+  use_unified_inhibitor_check: false
+```
+
+Reload the daemon config through the normal inotify path, or restart the
+daemon container. Verify the rollback by checking the dashboard event log
+for legacy throttle decisions on the affected repository.
