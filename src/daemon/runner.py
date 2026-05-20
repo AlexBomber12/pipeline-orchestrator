@@ -102,7 +102,7 @@ from src.events import publish_repo_event
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.github import rate_limit as gh_rate_limit
-from src.inhibitor import derive_active_inhibitors
+from src.inhibitor import InhibitorType, derive_active_inhibitors, is_work_inhibited
 from src.keyspace import (
     cli_log_history,
     cli_log_latest,
@@ -2227,6 +2227,42 @@ class PipelineRunner(
         instances so the bookkeeping matches the dirty-tree and FIX
         iteration-cap recovery sites.
         """
+        if self.repo_config.feature_flags.use_unified_inhibitor_check:
+            _blocked, blocking = is_work_inhibited(self.state, coder=None)
+            blocking_types = {inh.inhibitor_type for inh in blocking}
+            if InhibitorType.GITHUB_BUDGET_PAUSE in blocking_types:
+                was_zero = self._github_api_pause_attempts == 0
+                self._github_api_pause_policy.increment(self)
+                if was_zero:
+                    await self._github_api_pause_policy.maybe_escalate(self)
+                return False
+
+            if self._github_api_pause_attempts > 0:
+                self._github_api_pause_policy.reset(self)
+
+            if InhibitorType.GITHUB_BUDGET_SLOWDOWN in blocking_types:
+                was_zero = self._github_api_slowdown_attempts == 0
+                self._github_api_slowdown_policy.increment(self)
+                if was_zero:
+                    await self._github_api_slowdown_policy.maybe_escalate(self)
+                if (
+                    self._is_extended_idle_active()
+                    or self.state.state == PipelineState.WATCH
+                ):
+                    return True
+                multiplier = max(
+                    1,
+                    self.app_config.daemon.github_api_slowdown_multiplier,
+                )
+                proceed = self._github_api_slowdown_cycle % multiplier == 0
+                self._github_api_slowdown_cycle += 1
+                return proceed
+
+            if self._github_api_slowdown_attempts > 0:
+                self._github_api_slowdown_policy.reset(self)
+                self._github_api_slowdown_cycle = 0
+            return True
+
         budget = await self._refresh_github_api_budget()
         if budget is None:
             return True
