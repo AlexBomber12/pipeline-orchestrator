@@ -29,7 +29,7 @@ from src.cancellation import (
 )
 from src.events import publish_wake
 from src.github.prs import extract_queue_pr_id
-from src.keyspace import pipeline_state, upload_pending
+from src.keyspace import pipeline_state, upload_pending, upload_pending_count
 from src.mcp.scans import scan_for_conflicts
 from src.models import RepoState, TaskStatus
 from src.queue_parser import (
@@ -214,6 +214,13 @@ def _upload_commit_subject(subject: str, uploaded_count: int) -> str:
     if custom_subject:
         return custom_subject
     return f"tasks: upload batch ({uploaded_count} files)"
+
+
+async def _clear_upload_pending_count(redis_client: object, repo_name: str) -> None:
+    try:
+        await redis_client.delete(upload_pending_count(repo_name))  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
 
 def _validate_zip_member(entry_name: str) -> str | None:
@@ -814,6 +821,13 @@ async def upload_tasks(
                     pending_key,
                     json.dumps(manifest),
                 )
+                if repo_state.state.value == "IDLE":
+                    await _clear_upload_pending_count(redis_client, name)
+                else:
+                    await redis_client.set(
+                        upload_pending_count(name),
+                        str(len(manifest_filenames)),
+                    )
             except Exception:
                 return _render_upload_error(
                     request,

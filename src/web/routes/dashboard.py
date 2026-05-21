@@ -48,7 +48,12 @@ from src.daemon.github_rate_limit import (
 from src.events.sse import format_sse_comment, format_sse_event
 from src.github import gh_runner
 from src.github import prs as gh_prs
-from src.keyspace import cli_log_latest, daemon_panic_state, recovery_backup_branch
+from src.keyspace import (
+    cli_log_latest,
+    daemon_panic_state,
+    recovery_backup_branch,
+    upload_pending_count,
+)
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
 from src.sandbox.runtime_state import (
@@ -130,6 +135,37 @@ _ACTIVE_RUN_STATES = {
     PipelineState.MERGE,
     PipelineState.PAUSED,
 }
+
+
+async def get_upload_pending_count(
+    repo_slug: str,
+    redis_client: aioredis.Redis | None,
+) -> int:
+    """Return the count of files waiting in the pending-upload buffer."""
+    if redis_client is None:
+        return 0
+    try:
+        val = await redis_client.get(upload_pending_count(repo_slug))
+    except Exception:
+        return 0
+    if val is None:
+        return 0
+    try:
+        return int(val.decode() if isinstance(val, bytes) else val)
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _attach_upload_pending_counts(
+    states: list[RepoState],
+    redis_client: aioredis.Redis | None,
+) -> list[RepoState]:
+    counts = await asyncio.gather(
+        *[get_upload_pending_count(state.name, redis_client) for state in states]
+    )
+    for state, count in zip(states, counts):
+        state.upload_pending_count = count
+    return states
 
 
 def _page_rendered_at_iso() -> str:
@@ -585,6 +621,9 @@ async def _repo_template_context(
         config_path = _app.CONFIG_PATH
     config = await asyncio.to_thread(load_config, config_path)
     state = await _app.get_repo_state(name, redis_client, config_path)
+    state.upload_pending_count = await get_upload_pending_count(
+        name, redis_client
+    )
     repo_config = _find_repo_config_by_name(config, name)
     effective_coder = _effective_coder_name(repo_config, config)
     active_rate_limit_coder = _active_rate_limit_coder(state, effective_coder)
@@ -1478,6 +1517,7 @@ async def index(request: Request) -> HTMLResponse:
     states, redis_warning = await _app.get_all_repo_states(
         redis_client, _app.CONFIG_PATH
     )
+    states = await _attach_upload_pending_counts(states, redis_client)
     config = await asyncio.to_thread(load_config, _app.CONFIG_PATH)
     stats = _compute_stats(states)
     alerts = _build_alerts(states)
@@ -1518,6 +1558,7 @@ async def api_states(request: Request) -> JSONResponse:
     states, _warning = await _app.get_all_repo_states(
         redis_client, _app.CONFIG_PATH
     )
+    states = await _attach_upload_pending_counts(states, redis_client)
     return JSONResponse([s.model_dump(mode="json") for s in states])
 
 
@@ -1527,6 +1568,7 @@ async def api_stats(request: Request) -> JSONResponse:
     states, _warning = await _app.get_all_repo_states(
         redis_client, _app.CONFIG_PATH
     )
+    states = await _attach_upload_pending_counts(states, redis_client)
     return JSONResponse(_compute_stats(states))
 
 
@@ -1544,6 +1586,7 @@ async def api_alerts(request: Request) -> JSONResponse:
     states, _warning = await _app.get_all_repo_states(
         redis_client, _app.CONFIG_PATH
     )
+    states = await _attach_upload_pending_counts(states, redis_client)
     count = sum(1 for s in states if s.state in _ALERT_STATES)
     return JSONResponse({"has_alerts": count > 0, "count": count})
 
@@ -1917,6 +1960,7 @@ async def partial_repo_list(request: Request) -> HTMLResponse:
     states, redis_warning = await _app.get_all_repo_states(
         redis_client, _app.CONFIG_PATH
     )
+    states = await _attach_upload_pending_counts(states, redis_client)
     config = await asyncio.to_thread(load_config, _app.CONFIG_PATH)
     resources = await _build_resources_view(redis_client, states)
     cancellation_subsources = await _build_cancellation_subsources(

@@ -97,6 +97,16 @@
                     {{ subsource_badge.subsource_badge(_cancellation_subsource, subsource_lookup) }}
                     {% endif %}
                     {% endif %}
+                    {% if repo.upload_pending_count and repo.upload_pending_count > 0 %}
+                    <span class="ml-2 inline-flex items-center gap-1 rounded border border-warn/40 bg-warn/10 px-2 py-0.5 text-[11px] text-warn"
+                          title="{{ repo.upload_pending_count }} files extracted to working tree, awaiting IDLE state to commit"
+                          data-upload-pending-badge>
+                        <svg class="h-3 w-3" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                            <path fill-rule="evenodd" d="M10 18a8 8 0 1 0 0-16 8 8 0 0 0 0 16Zm.75-12.25a.75.75 0 0 0-1.5 0V10c0 .2.08.39.22.53l2.75 2.75a.75.75 0 1 0 1.06-1.06l-2.53-2.53V5.75Z" clip-rule="evenodd" />
+                        </svg>
+                        Upload pending ({{ repo.upload_pending_count }})
+                    </span>
+                    {% endif %}
                 </span>
             </div>
             <div class="absolute top-0 right-0 flex flex-nowrap items-center justify-end gap-2 p-4">
