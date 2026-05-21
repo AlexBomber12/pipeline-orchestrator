@@ -686,11 +686,14 @@ async def _build_tasks_panel_context(
     retry_cap: int,
 ) -> dict[str, object]:
     async def _views_for(status: TaskStatus) -> list[dict[str, object]]:
-        return [
+        views = [
             await _task_view(task, name, redis_client)
             for task in tasks
             if task.status == status
         ]
+        if status == TaskStatus.DONE:
+            views.sort(key=lambda view: view.get("merged_at") or "", reverse=True)
+        return views
 
     grouped = {
         "doing": await _views_for(TaskStatus.DOING),
