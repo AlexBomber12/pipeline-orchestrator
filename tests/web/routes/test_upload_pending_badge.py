@@ -447,7 +447,7 @@ def test_pending_count_cleared_on_commit_failure(
 
 def test_pending_count_clear_ignores_redis_error(tmp_path: Path) -> None:
     runner = _Runner(tmp_path)
-    runner.redis.get_error = RuntimeError("redis down")
+    runner.redis.eval_error = RuntimeError("redis down")
 
     asyncio.run(
         runner._clear_upload_pending_count_if_manifest_matches(
@@ -455,6 +455,37 @@ def test_pending_count_clear_ignores_redis_error(tmp_path: Path) -> None:
             "{}",
         )
     )
+
+
+def test_pending_count_clear_uses_atomic_manifest_match(tmp_path: Path) -> None:
+    runner = _Runner(tmp_path)
+    manifest_key = upload_pending(runner.name)
+    count_key = upload_pending_count(runner.name)
+    old_manifest = '{"files":["PR-001.md"]}'
+    new_manifest = '{"files":["PR-002.md"]}'
+    runner.redis.store[manifest_key] = old_manifest
+    runner.redis.store[count_key] = "1"
+
+    async def inject_new_manifest(script: str, numkeys: int, *args: Any) -> int:
+        del script, numkeys
+        runner.redis.store[manifest_key] = new_manifest
+        key, delete_key, expected = args
+        if runner.redis.store.get(key) == expected:
+            runner.redis.store.pop(delete_key, None)
+            return 1
+        return 0
+
+    runner.redis.eval = inject_new_manifest  # type: ignore[assignment]
+
+    asyncio.run(
+        runner._clear_upload_pending_count_if_manifest_matches(
+            manifest_key,
+            old_manifest,
+        )
+    )
+
+    assert runner.redis.store[manifest_key] == new_manifest
+    assert runner.redis.store[count_key] == "1"
 
 
 def test_dashboard_payload_includes_pending_count() -> None:

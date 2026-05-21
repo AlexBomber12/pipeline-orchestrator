@@ -191,6 +191,13 @@ end
 return 0
 """
 
+    _DELETE_PENDING_COUNT_IF_MANIFEST_MATCHES_LUA = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[2])
+end
+return 0
+"""
+
     async def _delete_upload_if_unchanged(self, key: str, expected: bytes | str) -> bool:
         """Delete ``key`` only if its value still matches ``expected``."""
         try:
@@ -214,9 +221,13 @@ return 0
     ) -> None:
         """Clear the visible pending count unless a newer upload replaced it."""
         try:
-            current = await self.redis.get(manifest_key)
-            if current == expected_manifest:
-                await self.redis.delete(upload_pending_count(self.name))
+            await self.redis.eval(
+                self._DELETE_PENDING_COUNT_IF_MANIFEST_MATCHES_LUA,
+                2,
+                manifest_key,
+                upload_pending_count(self.name),
+                expected_manifest,
+            )
         except Exception:
             logger.warning("%s: failed clearing upload pending count", self.name)
 

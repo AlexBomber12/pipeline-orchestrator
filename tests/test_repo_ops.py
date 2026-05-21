@@ -57,9 +57,13 @@ class _FakeRedis:
         if self.eval_error is not None:
             raise self.eval_error
         if args and len(args) >= 2 and self.eval_result:
-            key, expected = args[0], args[1]
+            key = args[0]
+            if len(args) >= 3:
+                delete_key, expected = args[1], args[2]
+            else:
+                delete_key, expected = key, args[1]
             if self.store.get(key) == expected:
-                self.store.pop(key, None)
+                self.store.pop(delete_key, None)
         return self.eval_result
 
 
