@@ -635,12 +635,19 @@ async def _task_view(
     task: QueueTask,
     repo_name: str,
     redis_client: aioredis.Redis | None,
+    *,
+    allow_git_merged_at_fallback: bool = True,
 ) -> dict[str, object]:
     retry_count = 0
     cancellation_subsource: str | None = None
     merged_at: str | None = None
     if task.status == TaskStatus.DONE:
-        merged_at = await _resolve_task_merged_at(task, repo_name, redis_client)
+        merged_at = await _resolve_task_merged_at(
+            task,
+            repo_name,
+            redis_client,
+            allow_git_fallback=allow_git_merged_at_fallback,
+        )
     if task.status == TaskStatus.ERROR and redis_client is not None:
         retry_fingerprint = None
         resolved = await _resolve_repo_task_path(repo_name, task.pr_id)
@@ -688,11 +695,13 @@ async def _resolve_task_merged_at(
     task: QueueTask,
     repo_name: str,
     redis_client: aioredis.Redis | None,
+    *,
+    allow_git_fallback: bool = True,
 ) -> str | None:
     redis_merged_at = await _load_done_index_merged_at(
         repo_name, task.pr_id, redis_client
     )
-    if redis_merged_at:
+    if redis_merged_at or not allow_git_fallback:
         return redis_merged_at
     return await asyncio.to_thread(_load_git_merged_at, repo_name, task.pr_id)
 
@@ -804,7 +813,12 @@ async def _build_tasks_panel_context(
 ) -> dict[str, object]:
     async def _views_for(status: TaskStatus) -> list[dict[str, object]]:
         views = [
-            await _task_view(task, name, redis_client)
+            await _task_view(
+                task,
+                name,
+                redis_client,
+                allow_git_merged_at_fallback=False,
+            )
             for task in tasks
             if task.status == status
         ]

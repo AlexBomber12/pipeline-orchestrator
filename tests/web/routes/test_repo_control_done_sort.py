@@ -40,6 +40,18 @@ async def _panel_context(
     )
 
 
+async def _panel_context_with_redis(
+    tasks: list[QueueTask],
+    redis_client: object | None,
+) -> dict[str, object]:
+    return await repo_control._build_tasks_panel_context(
+        "example__alpha",
+        tasks,
+        redis_client=redis_client,  # type: ignore[arg-type]
+        retry_cap=3,
+    )
+
+
 def _status_order(context: dict[str, object], status: str) -> list[str]:
     tasks_by_status = context["tasks_by_status"]
     assert isinstance(tasks_by_status, dict)
@@ -77,6 +89,25 @@ async def test_done_list_with_missing_merged_at_falls_back() -> None:
         tasks,
         {"PR-001": "2026-05-01T10:00:00+00:00"},
     )
+
+    assert _status_order(context, "done") == ["PR-001", "PR-002"]
+
+
+@pytest.mark.asyncio
+async def test_done_panel_does_not_fall_back_to_git(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tasks = [
+        _task("PR-001", TaskStatus.DONE),
+        _task("PR-002", TaskStatus.DONE),
+    ]
+
+    def fail_git_lookup(repo_name: str, pr_id: str) -> str | None:
+        raise AssertionError("DONE panel must not run per-task git log fallback")
+
+    monkeypatch.setattr(repo_control, "_load_git_merged_at", fail_git_lookup)
+
+    context = await _panel_context_with_redis(tasks, FailingRedis())
 
     assert _status_order(context, "done") == ["PR-001", "PR-002"]
 
@@ -164,6 +195,26 @@ async def test_done_index_missing_or_unavailable_returns_none() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_resolve_task_merged_at_can_fall_back_to_git(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        repo_control,
+        "_load_git_merged_at",
+        lambda repo_name, pr_id: "2026-05-07T10:00:00+00:00",
+    )
+
+    assert (
+        await repo_control._resolve_task_merged_at(
+            _task("PR-001", TaskStatus.DONE),
+            "example__alpha",
+            FakeRedis({}),  # type: ignore[arg-type]
+        )
+        == "2026-05-07T10:00:00+00:00"
+    )
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
@@ -182,6 +233,15 @@ def test_extract_merged_at_shapes(raw: object, expected: str | None) -> None:
 
 def test_load_git_merged_at_rejects_invalid_task_id() -> None:
     assert repo_control._load_git_merged_at("example__alpha", "not-a-pr") is None
+
+
+def test_load_git_merged_at_returns_none_for_missing_repo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "REPOS_DIR", str(tmp_path))
+
+    assert repo_control._load_git_merged_at("example__alpha", "PR-001") is None
 
 
 def test_load_git_merged_at_handles_config_failure(
