@@ -132,10 +132,19 @@ def _existing_task_ids(tasks_dir: Path) -> set[str]:
     if not tasks_dir.is_dir():
         return set()
     return {
-        path.stem
+        header.pr_id
         for path in tasks_dir.glob("PR-*.md")
         if path.is_file()
+        for header in [_parse_existing_task_header(path)]
+        if header is not None
     }
+
+
+def _parse_existing_task_header(path: Path) -> TaskHeader | None:
+    try:
+        return parse_task_header(path)
+    except (OSError, QueueValidationError, UnicodeDecodeError):
+        return None
 
 
 def _pending_upload_task_ids(raw_manifest: str | bytes | None) -> set[str]:
@@ -151,13 +160,15 @@ def _pending_upload_task_ids(raw_manifest: str | bytes | None) -> set[str]:
         return set()
     staging_dir = Path(staging_dir_raw)
     return {
-        Path(str(fname)).stem
+        header.pr_id
         for fname in files
         if (
             isinstance(fname, str)
             and re.fullmatch(_TASK_UPLOAD_PATTERN, fname)
             and (staging_dir / fname).is_file()
         )
+        for header in [_parse_existing_task_header(staging_dir / fname)]
+        if header is not None
     }
 
 

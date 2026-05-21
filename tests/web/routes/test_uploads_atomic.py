@@ -155,6 +155,43 @@ def test_dependency_closure_satisfied_by_existing_tasks_dir(
     assert (_staging_dir(uploads_dir) / "PR-002.md").is_file()
 
 
+def test_dependency_closure_uses_existing_task_header_pr_id(
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    tasks_dir = repo_dir / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_bytes(
+        _task_bytes("PR-001.md", pr_id="PR-999")
+    )
+
+    accepted = _post_upload(
+        [_task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-999")]
+    )
+
+    assert accepted.status_code == 200
+    assert (_staging_dir(uploads_dir) / "PR-002.md").is_file()
+
+
+def test_dependency_closure_ignores_existing_filename_when_header_differs(
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    tasks_dir = repo_dir / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_bytes(
+        _task_bytes("PR-001.md", pr_id="PR-999")
+    )
+
+    rejected = _post_upload(
+        [_task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-001")]
+    )
+
+    assert rejected.status_code == 400
+    assert "Depends on PR-001 which is not in this upload and not in tasks/" in rejected.text
+    assert not (uploads_dir / "example__alpha").exists()
+
+
 def test_dependency_closure_satisfied_by_merged_on_github(
     monkeypatch: pytest.MonkeyPatch, uploads_dir: Path
 ) -> None:
@@ -380,7 +417,9 @@ def test_dependency_closure_locked_recheck_refreshes_tasks_dir(
 def test_pending_upload_task_ids_ignores_invalid_manifest(tmp_path: Path) -> None:
     staging_dir = tmp_path / "pending"
     staging_dir.mkdir()
-    (staging_dir / "PR-001.md").write_text("# task\n", encoding="utf-8")
+    (staging_dir / "PR-001.md").write_bytes(
+        _task_bytes("PR-001.md", pr_id="PR-999")
+    )
     assert upload_routes._pending_upload_task_ids(None) == set()
     assert upload_routes._pending_upload_task_ids("{not-json") == set()
     assert upload_routes._pending_upload_task_ids('{"files": "PR-001.md"}') == set()
@@ -391,7 +430,7 @@ def test_pending_upload_task_ids_ignores_invalid_manifest(tmp_path: Path) -> Non
                 "staging_dir": str(staging_dir),
             }
         )
-    ) == {"PR-001"}
+    ) == {"PR-999"}
 
 
 def test_dependency_closure_continues_when_pending_lookup_fails(
