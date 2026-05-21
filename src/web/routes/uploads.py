@@ -52,6 +52,7 @@ from src.web.services.upload_validation import (
 router = APIRouter()
 
 _upload_locks: dict[str, asyncio.Lock] = {}
+_MISSING = object()
 
 _ENQUEUE_UPLOAD_PENDING_LUA = """
 redis.call("set", KEYS[1], ARGV[1])
@@ -61,13 +62,6 @@ else
     redis.call("set", KEYS[2], ARGV[2])
 end
 return 1
-"""
-
-_ROLLBACK_UPLOAD_PENDING_LUA = """
-if redis.call("get", KEYS[1]) == ARGV[1] then
-    return redis.call("del", KEYS[1])
-end
-return 0
 """
 
 
@@ -233,29 +227,30 @@ def _upload_commit_subject(subject: str, uploaded_count: int) -> str:
     return f"tasks: upload batch ({uploaded_count} files)"
 
 
+def _redis_text(value: object) -> object:
+    if isinstance(value, bytes):
+        return value.decode()
+    return value
+
+
 async def _rollback_upload_manifest(
     redis_client: object,
     pending_key: str,
     manifest_json: str,
+    previous_manifest: object,
 ) -> None:
-    """Best-effort rollback for fallback clients without Redis Lua support."""
-    try:
-        await redis_client.eval(  # type: ignore[attr-defined]
-            _ROLLBACK_UPLOAD_PENDING_LUA,
-            1,
-            pending_key,
-            manifest_json,
-        )
-        return
-    except (AttributeError, NotImplementedError):
-        pass
-    except Exception:
-        return
-
+    """Best-effort restore for fallback clients without Redis Lua support."""
     try:
         current = await redis_client.get(pending_key)  # type: ignore[attr-defined]
-        if current == manifest_json:
+        if _redis_text(current) != manifest_json:
+            return
+        if previous_manifest is None:
             await redis_client.delete(pending_key)  # type: ignore[attr-defined]
+        else:
+            await redis_client.set(  # type: ignore[attr-defined]
+                pending_key,
+                previous_manifest,
+            )
     except Exception:
         pass
 
@@ -267,6 +262,7 @@ async def _enqueue_upload_manifest(
     manifest_json: str,
     count_key: str,
     pending_count: int | None,
+    previous_manifest: object = _MISSING,
 ) -> None:
     """Atomically publish the upload manifest and dashboard pending count."""
     count_value = "" if pending_count is None else str(pending_count)
@@ -283,6 +279,8 @@ async def _enqueue_upload_manifest(
     except (AttributeError, NotImplementedError):
         pass
 
+    if previous_manifest is _MISSING:
+        previous_manifest = await redis_client.get(pending_key)  # type: ignore[attr-defined]
     await redis_client.set(pending_key, manifest_json)  # type: ignore[attr-defined]
     try:
         if pending_count is None:
@@ -293,7 +291,12 @@ async def _enqueue_upload_manifest(
         else:
             await redis_client.set(count_key, count_value)  # type: ignore[attr-defined]
     except Exception:
-        await _rollback_upload_manifest(redis_client, pending_key, manifest_json)
+        await _rollback_upload_manifest(
+            redis_client,
+            pending_key,
+            manifest_json,
+            previous_manifest,
+        )
         raise
 
 
@@ -902,6 +905,7 @@ async def upload_tasks(
                         if repo_state.state.value == "IDLE"
                         else len(manifest_filenames)
                     ),
+                    previous_manifest=existing_raw,
                 )
             except Exception:
                 return _render_upload_error(

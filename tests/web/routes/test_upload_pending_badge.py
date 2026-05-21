@@ -196,58 +196,107 @@ def test_enqueue_upload_manifest_uses_lua_when_available() -> None:
     ]
 
 
-def test_rollback_upload_manifest_uses_lua_when_available() -> None:
-    class _EvalRedis:
+def test_rollback_upload_manifest_deletes_matching_bytes_manifest() -> None:
+    class _RollbackRedis:
         def __init__(self) -> None:
-            self.calls: list[tuple[str, int, tuple[str, ...]]] = []
+            self.store: dict[str, object] = {
+                upload_pending("example__alpha"): b'{"files":["PR-001.md"]}'
+            }
 
-        async def eval(self, script: str, numkeys: int, *args: str) -> int:
-            self.calls.append((script, numkeys, args))
-            return 1
+        async def get(self, key: str) -> object:
+            return self.store.get(key)
 
-    redis_client = _EvalRedis()
+        async def delete(self, key: str) -> int:
+            existed = key in self.store
+            self.store.pop(key, None)
+            return int(existed)
+
+    redis_client = _RollbackRedis()
 
     asyncio.run(
         upload_routes._rollback_upload_manifest(
             redis_client,
             upload_pending("example__alpha"),
             '{"files":["PR-001.md"]}',
+            None,
         )
     )
 
-    assert redis_client.calls == [
-        (
-            upload_routes._ROLLBACK_UPLOAD_PENDING_LUA,
-            1,
-            (
-                upload_pending("example__alpha"),
-                '{"files":["PR-001.md"]}',
-            ),
+    assert upload_pending("example__alpha") not in redis_client.store
+
+
+def test_enqueue_upload_manifest_restores_previous_manifest_on_count_failure() -> None:
+    pending_key = upload_pending("example__alpha")
+    count_key = upload_pending_count("example__alpha")
+    previous_manifest = b'{"files":["PR-000.md"]}'
+
+    class _CountFailRedis:
+        def __init__(self) -> None:
+            self.store: dict[str, object] = {pending_key: previous_manifest}
+
+        async def get(self, key: str) -> object:
+            return self.store.get(key)
+
+        async def set(self, key: str, value: object, **kwargs: object) -> None:
+            del kwargs
+            if key == count_key:
+                raise RuntimeError("count write failed")
+            self.store[key] = value
+
+        async def delete(self, key: str) -> int:
+            existed = key in self.store
+            self.store.pop(key, None)
+            return int(existed)
+
+    redis_client = _CountFailRedis()
+
+    with pytest.raises(RuntimeError, match="count write failed"):
+        asyncio.run(
+            upload_routes._enqueue_upload_manifest(
+                redis_client,
+                pending_key=pending_key,
+                manifest_json='{"files":["PR-001.md"]}',
+                count_key=count_key,
+                pending_count=1,
+            )
         )
-    ]
+
+    assert redis_client.store[pending_key] == previous_manifest
 
 
-def test_rollback_upload_manifest_ignores_lua_error() -> None:
-    class _EvalRedis:
-        async def eval(self, script: str, numkeys: int, *args: str) -> int:
-            del script, numkeys, args
-            raise RuntimeError("redis down")
+def test_rollback_upload_manifest_leaves_newer_manifest() -> None:
+    pending_key = upload_pending("example__alpha")
+
+    class _RollbackRedis:
+        def __init__(self) -> None:
+            self.store: dict[str, object] = {
+                pending_key: '{"files":["PR-999.md"]}'
+            }
+
+        async def get(self, key: str) -> object:
+            return self.store.get(key)
+
+        async def delete(self, key: str) -> int:
+            existed = key in self.store
+            self.store.pop(key, None)
+            return int(existed)
+
+    redis_client = _RollbackRedis()
 
     asyncio.run(
         upload_routes._rollback_upload_manifest(
-            _EvalRedis(),
-            upload_pending("example__alpha"),
+            redis_client,
+            pending_key,
             '{"files":["PR-001.md"]}',
+            None,
         )
     )
+
+    assert redis_client.store[pending_key] == '{"files":["PR-999.md"]}'
 
 
 def test_rollback_upload_manifest_ignores_fallback_lookup_error() -> None:
     class _FallbackRedis:
-        async def eval(self, script: str, numkeys: int, *args: str) -> int:
-            del script, numkeys, args
-            raise AttributeError("eval unsupported")
-
         async def get(self, key: str) -> str | None:
             del key
             raise RuntimeError("redis down")
@@ -257,6 +306,7 @@ def test_rollback_upload_manifest_ignores_fallback_lookup_error() -> None:
             _FallbackRedis(),
             upload_pending("example__alpha"),
             '{"files":["PR-001.md"]}',
+            None,
         )
     )
 
