@@ -643,12 +643,13 @@ class WatchMixin:
                 f"[WATCH] PR #{pr_number} quarantine label check failed: {exc}."
             )
             return
-        if isinstance(result, str):
-            labels = [label.strip() for label in result.splitlines()]
-        elif isinstance(result, list):
-            labels = [str(label).strip() for label in result]
-        else:
-            labels = []
+        if not isinstance(result, str):
+            self.log_event(
+                f"[WATCH] PR #{pr_number} quarantine label check returned "
+                f"unexpected {type(result).__name__}; keeping quarantine."
+            )
+            return
+        labels = [label.strip() for label in result.splitlines()]
         if any(label.startswith("quarantine:") for label in labels if label):
             return
         self.state.quarantined_prs.discard(pr_number)
@@ -1082,6 +1083,8 @@ class WatchMixin:
             f"[WATCH] PR #{pr_number} externally resolved as {pr_state}; "
             f"releasing task and returning to IDLE ({legacy_fragment})."
         )
+        if isinstance(pr_number, int):
+            self.state.quarantined_prs.discard(pr_number)
         if pr_state == "MERGED":
             current_task = self.state.current_task
             if current_task is not None and current_task.task_file:

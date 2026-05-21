@@ -62,6 +62,7 @@ def test_external_resolution_clears_current_pr_without_task() -> None:
     runner.state.state = PipelineState.WATCH
     runner.state.current_task = None
     runner.state.current_pr = PRInfo(number=443, branch="pr-443")
+    runner.state.quarantined_prs.add(443)
     publishes: list[str] = []
 
     async def fake_publish() -> None:
@@ -79,6 +80,7 @@ def test_external_resolution_clears_current_pr_without_task() -> None:
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
     assert runner.state.current_pr is None
+    assert 443 not in runner.state.quarantined_prs
     assert publishes == ["published"]
 
 

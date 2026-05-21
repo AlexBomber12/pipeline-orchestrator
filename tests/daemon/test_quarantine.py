@@ -277,7 +277,7 @@ def test_label_removal_check_keeps_labeled_pr(monkeypatch: pytest.MonkeyPatch) -
     runner.state.quarantined_prs.add(10)
     monkeypatch.setattr(
         "src.github.gh_runner.run_gh",
-        lambda *a, **kw: ["quarantine:large_diff"],
+        lambda *a, **kw: "quarantine:large_diff\n",
     )
 
     asyncio.run(runner._detect_external_quarantine_release(10))
@@ -285,16 +285,22 @@ def test_label_removal_check_keeps_labeled_pr(monkeypatch: pytest.MonkeyPatch) -
     assert 10 in runner.state.quarantined_prs
 
 
-def test_label_removal_check_treats_unknown_output_as_released(
+@pytest.mark.parametrize("gh_output", [object(), [], {"labels": []}])
+def test_label_removal_check_keeps_quarantine_on_unknown_output(
     monkeypatch: pytest.MonkeyPatch,
+    gh_output: object,
 ) -> None:
     runner = h._make_runner()
     runner.state.quarantined_prs.add(10)
-    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: object())
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: gh_output)
 
     asyncio.run(runner._detect_external_quarantine_release(10))
 
-    assert 10 not in runner.state.quarantined_prs
+    assert 10 in runner.state.quarantined_prs
+    assert any(
+        "keeping quarantine" in e["event"]
+        for e in runner.state.history
+    )
 
 
 def test_audit_entry_written_on_apply(
