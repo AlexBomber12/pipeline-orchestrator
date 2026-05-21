@@ -535,6 +535,45 @@ def test_process_pending_uploads_persists_task_hash_after_push(
     assert key not in runner.redis.store
 
 
+def test_process_pending_uploads_uses_manifest_commit_subject_and_body(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = _Runner(tmp_path)
+    repo_dir = Path(runner.repo_path)
+    repo_dir.mkdir(parents=True)
+    staging = tmp_path / "uploads" / "demo"
+    staging.mkdir(parents=True)
+    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
+    (staging / "PR-002.md").write_text("# PR-002\n", encoding="utf-8")
+    runner.redis.store[f"upload:{runner.name}:pending"] = json.dumps(
+        {
+            "files": ["PR-002.md", "PR-001.md"],
+            "staging_dir": str(staging),
+            "commit_subject": "My batch",
+        }
+    )
+    git_calls: list[tuple[Any, ...]] = []
+
+    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
+        git_calls.append((repo_path, *args))
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", fake_git)
+    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
+    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
+
+    assert _run(runner.process_pending_uploads()) is True
+    assert (
+        runner.repo_path,
+        "commit",
+        "-m",
+        "My batch",
+        "-m",
+        "tasks/PR-001.md\ntasks/PR-002.md",
+    ) in git_calls
+
+
 def test_process_pending_uploads_ignores_malformed_task_hashes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -4,10 +4,9 @@ from pathlib import Path
 
 from src.daemon.handlers.idle import (
     IdleMixin,
-    _merged_split_parent_aliases,
-    _split_parent_of,
 )
 from src.queue_parser import TaskHeader
+from src.task_status import merged_split_parent_aliases, split_parent_of
 
 
 def _header(pr_id: str, depends_on: list[str]) -> TaskHeader:
@@ -161,14 +160,14 @@ def test_random_letter_in_pr_id_not_treated_as_sub_task(
 
 
 def test_parent_alias_includes_parent_with_pending_known_split_children() -> None:
-    assert _merged_split_parent_aliases(
+    assert merged_split_parent_aliases(
         structured_pr_ids={"PR-305b"},
         merged_pr_ids={"PR-305a"},
     ) == {"PR-305"}
 
 
 def test_parent_alias_includes_parent_with_pending_legacy_split_children() -> None:
-    assert _merged_split_parent_aliases(
+    assert merged_split_parent_aliases(
         structured_pr_ids=set(),
         merged_pr_ids={"PR-305a"},
         skipped_legacy_pr_ids={"PR-305b"},
@@ -177,7 +176,7 @@ def test_parent_alias_includes_parent_with_pending_legacy_split_children() -> No
 
 def test_parent_alias_excludes_legacy_parent_even_when_child_merged() -> None:
     assert (
-        _merged_split_parent_aliases(
+        merged_split_parent_aliases(
             structured_pr_ids=set(),
             merged_pr_ids={"PR-305a"},
             skipped_legacy_pr_ids={"PR-305"},
@@ -187,7 +186,7 @@ def test_parent_alias_excludes_legacy_parent_even_when_child_merged() -> None:
 
 
 def test_parent_alias_includes_parent_after_all_known_children_merge() -> None:
-    assert _merged_split_parent_aliases(
+    assert merged_split_parent_aliases(
         structured_pr_ids={"PR-305a", "PR-305b"},
         merged_pr_ids={"PR-305a", "PR-305b"},
     ) == {"PR-305"}
@@ -195,7 +194,7 @@ def test_parent_alias_includes_parent_after_all_known_children_merge() -> None:
 
 def test_parent_alias_excludes_structured_parent_even_when_child_merged() -> None:
     assert (
-        _merged_split_parent_aliases(
+        merged_split_parent_aliases(
             structured_pr_ids={"PR-305", "PR-305a"},
             merged_pr_ids={"PR-305a"},
         )
@@ -204,6 +203,6 @@ def test_parent_alias_excludes_structured_parent_even_when_child_merged() -> Non
 
 
 def test_helper_returns_none_for_non_sub_task() -> None:
-    assert _split_parent_of("PR-305") is None
-    assert _split_parent_of("foo") is None
-    assert _split_parent_of("") is None
+    assert split_parent_of("PR-305") is None
+    assert split_parent_of("foo") is None
+    assert split_parent_of("") is None

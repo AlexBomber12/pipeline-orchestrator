@@ -10,5 +10,19 @@
         {% for line in message_lines %}
         <p>{{ line }}</p>
         {% endfor %}
+        {% if validation_errors %}
+        <div class="mt-2 space-y-2">
+            {% for entry in validation_errors %}
+            <div>
+                <p class="font-semibold">{{ entry.file }}</p>
+                <ul class="ml-4 list-disc space-y-1">
+                    {% for issue in entry.errors %}
+                    <li>{{ issue }}</li>
+                    {% endfor %}
+                </ul>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
     </div>
 </div>

@@ -36,6 +36,31 @@ class MergedState:
     api_available: bool
 
 
+def split_parent_of(pr_id: str) -> str | None:
+    """Return the unsuffixed parent PR ID for a split sub-task variant."""
+    match = re.match(r"^(PR-\d+(?:\.\d+)?)[a-z](?:-\d+)?$", pr_id)
+    return match.group(1) if match else None
+
+
+def merged_split_parent_aliases(
+    *,
+    structured_pr_ids: set[str],
+    merged_pr_ids: set[str],
+    skipped_legacy_pr_ids: set[str] | None = None,
+) -> set[str]:
+    """Return split parents satisfied by at least one merged split child."""
+    skipped_legacy_pr_ids = skipped_legacy_pr_ids or set()
+    parent_aliases: set[str] = set()
+    for pr_id in merged_pr_ids:
+        parent = split_parent_of(pr_id)
+        if parent is None:
+            continue
+        if parent in structured_pr_ids or parent in skipped_legacy_pr_ids:
+            continue
+        parent_aliases.add(parent)
+    return parent_aliases
+
+
 def _resolve_merged_state(
     repo_path: str,
     base_branch: str,
