@@ -2308,8 +2308,8 @@ def test_repo_card_has_onclick(
     assert 'hx-target="#upload-feedback-example__alpha"' in body
     assert 'hx-disabled-elt="#upload-example__alpha"' in body
     assert 'id="upload-feedback-example__alpha"' in body
-    assert 'id="upload-indicator-example__alpha"' not in body
-    assert "Uploading..." not in body
+    assert 'hx-indicator="#upload-indicator-example__alpha"' in body
+    assert 'id="upload-indicator-example__alpha"' in body
 
 
 def test_repo_card_escapes_dotted_repo_name_in_hx_selectors(
@@ -2332,9 +2332,10 @@ def test_repo_card_escapes_dotted_repo_name_in_hx_selectors(
     body = response.text
     assert 'hx-target="#upload-feedback-example__my\\.repo"' in body
     assert 'hx-disabled-elt="#upload-example__my\\.repo"' in body
+    assert 'hx-indicator="#upload-indicator-example__my\\.repo"' in body
     assert 'id="upload-feedback-example__my.repo"' in body
     assert 'id="upload-example__my.repo"' in body
-    assert "upload-indicator-example__my" not in body
+    assert 'id="upload-indicator-example__my.repo"' in body
 
 
 def test_repo_card_renders_pause_and_stop_controls_for_active_repo(
@@ -2407,15 +2408,17 @@ def test_repo_card_buttons_single_row_no_wrap(
     assert "flex w-full flex-wrap items-center justify-between" not in body
 
 
-def test_repo_card_upload_uses_global_spinner(
+def test_repo_card_upload_uses_per_card_spinner(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     body = _render_repo_list_body(monkeypatch)
 
-    assert 'hx-indicator="#global-spinner"' in body
-    assert "upload-indicator-example__alpha" not in body
-    assert "upload-indicator-example__beta" not in body
-    assert "Uploading..." not in body
+    assert 'hx-indicator="#global-spinner"' not in body
+    assert 'hx-indicator="#upload-indicator-example__alpha"' in body
+    assert 'hx-indicator="#upload-indicator-example__beta"' in body
+    assert 'id="upload-indicator-example__alpha"' in body
+    assert 'id="upload-indicator-example__beta"' in body
+    assert "Uploading..." in body
 
 
 def test_repo_card_button_order(
@@ -3933,7 +3936,7 @@ def test_repo_controls_use_global_spinner_without_inline_indicators(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Pause/Stop buttons are covered by the base global spinner, so the
-    partial must not render per-repo htmx-indicator elements."""
+    partial must not render per-control htmx-indicator elements."""
     now = datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc)
     alpha = RepoState(
         url="https://github.com/example/alpha.git",
@@ -3965,8 +3968,7 @@ def test_repo_controls_use_global_spinner_without_inline_indicators(
         assert f'hx-post="/repos/{name}/stop"' in body
         assert f"controls-pause-spinner-{name}" not in body
         assert f"controls-stop-spinner-{name}" not in body
-    assert "htmx-indicator" not in body
-    assert "animate-spin" not in body
+        assert f'id="upload-indicator-{name}"' in body
 
 
 def test_repo_controls_resume_button_has_spinner(
