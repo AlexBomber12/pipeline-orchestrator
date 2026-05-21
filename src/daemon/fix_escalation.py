@@ -27,6 +27,24 @@ _ESCALATE_MARKER_PREFIX = "ESCALATE:"
 _ESCALATE_EMPTY_REASON = "(no reason provided)"
 
 
+def _exception_text(exc: Exception) -> str:
+    parts = [str(exc)]
+    for attr in ("stderr", "output"):
+        value = getattr(exc, attr, None)
+        if not value:
+            continue
+        if isinstance(value, bytes):
+            value = value.decode(errors="replace")
+        text = str(value)
+        if text not in parts:
+            parts.append(text)
+    return " ".join(parts)
+
+
+def _is_label_already_exists_error(exc: Exception) -> bool:
+    return "already exists" in _exception_text(exc).lower()
+
+
 def parse_escalate_marker(stdout: str) -> str | None:
     """Return the coder-supplied ESCALATE reason, or ``None``.
 
@@ -78,9 +96,11 @@ def ensure_escalated_label(
             repo=runner.owner_repo,
         )
     except Exception as exc:
-        runner.log_event(
-            f"[FIX] {label_create_log_prefix} label create skipped: {exc}."
-        )
+        if not _is_label_already_exists_error(exc):
+            runner.log_event(
+                f"[FIX] {label_create_log_prefix} label create failed: "
+                f"{_exception_text(exc)}."
+            )
     try:
         gh_runner.run_gh(
             ["pr", "edit", str(pr_number), "--add-label", "escalated"],
@@ -118,9 +138,11 @@ def apply_canceled_label(runner: "PipelineRunner", pr_number: int) -> None:
             repo=runner.owner_repo,
         )
     except Exception as exc:
-        runner.log_event(
-            f"[FIX] FIX no-push canceled label create skipped: {exc}."
-        )
+        if not _is_label_already_exists_error(exc):
+            runner.log_event(
+                "[FIX] FIX no-push canceled label create failed: "
+                f"{_exception_text(exc)}."
+            )
     try:
         gh_runner.run_gh(
             ["pr", "edit", str(pr_number), "--add-label", "canceled"],
@@ -296,7 +318,10 @@ async def escalate_fix_iteration_cap(
             repo=runner.owner_repo,
         )
     except Exception as exc:
-        runner.log_event(f"[FIX] FIX cap label create skipped: {exc}.")
+        if not _is_label_already_exists_error(exc):
+            runner.log_event(
+                f"[FIX] FIX cap label create failed: {_exception_text(exc)}."
+            )
     try:
         gh_runner.run_gh(
             ["pr", "edit", str(pr_number), "--add-label", "escalated"],

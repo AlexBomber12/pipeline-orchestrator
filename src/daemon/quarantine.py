@@ -5,6 +5,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from src.audit.operator_actions import write_operator_action_audit
+from src.daemon.fix_escalation import (
+    _exception_text,
+    _is_label_already_exists_error,
+)
 from src.daemon.guardrails import GuardrailViolation
 from src.github import gh_runner
 
@@ -52,7 +56,10 @@ def apply_quarantine_label_for_violation(
             repo=runner.owner_repo,
         )
     except Exception as exc:
-        runner.log_event(f"[GUARDRAIL] label create skipped: {exc}.")
+        if not _is_label_already_exists_error(exc):
+            runner.log_event(
+                f"[GUARDRAIL] label create failed: {_exception_text(exc)}."
+            )
     try:
         gh_runner.run_gh(
             ["pr", "edit", str(pr_number), "--add-label", label],

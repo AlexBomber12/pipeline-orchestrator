@@ -247,7 +247,7 @@ def test_apply_canceled_label_label_create_failure_logs_and_continues(
     runner = h._make_runner()
     fix_escalation.apply_canceled_label(runner, 700)
     assert any(
-        "FIX no-push canceled label create skipped: label exists"
+        "FIX no-push canceled label create failed: label exists"
         in entry["event"]
         for entry in runner.state.history
     )
