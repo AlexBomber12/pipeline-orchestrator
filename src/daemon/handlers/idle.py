@@ -902,11 +902,13 @@ class IdleMixin:
                     cycles_since_warn % _IDLE_MERGED_PR_304_WARN_EVERY == 0
                 ):
                     self.log_event(
-                        f"[INFRA] IDLE: merged PR check returned HTTP 304 "
+                        f"IDLE: merged PR check returned HTTP 304 "
                         f"for {streak} consecutive cycles; merged-PR "
                         f"detection degraded (squash/custom-title merges "
                         f"may be missed) while falling back to local "
-                        f"heuristics."
+                        f"heuristics.",
+                        tier="infra",
+                        kind="etag_304",
                     )
                 merged_prs = []
             else:

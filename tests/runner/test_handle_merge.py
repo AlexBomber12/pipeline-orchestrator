@@ -62,7 +62,11 @@ def test_merge_logs_cleanup_failure(
         status=TaskStatus.DOING,
     )
     events: list[str] = []
-    monkeypatch.setattr(runner, "log_event", events.append)
+
+    def record_event(message: str, **_kwargs: object) -> None:
+        events.append(message)
+
+    monkeypatch.setattr(runner, "log_event", record_event)
 
     async def fail_delete(key: str) -> int:
         raise RuntimeError("redis down")

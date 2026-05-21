@@ -75,9 +75,15 @@ def _iter_log_event_calls():
             yield path, node
 
 
+def _has_structured_tier(node: ast.Call) -> bool:
+    return any(keyword.arg == "tier" for keyword in node.keywords)
+
+
 def test_every_log_event_call_starts_with_known_category() -> None:
     offenders: list[str] = []
     for path, node in _iter_log_event_calls():
+        if _has_structured_tier(node):
+            continue
         leading = _leading_literal(node.args[0])
         if leading is None:
             # Runtime value (e.g. forwarded error_message). The call site

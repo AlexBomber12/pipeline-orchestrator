@@ -45,11 +45,14 @@ def append_event_to_disk(
     raising ``TypeError``.
     """
     now = timestamp or datetime.now(timezone.utc)
+    entry = payload.get("entry") if isinstance(payload.get("entry"), dict) else {}
     record = {
         "timestamp": now.isoformat(),
         "event_type": event_type,
         "repo_slug": repo_slug,
         "payload": payload,
+        "tier": payload.get("tier") or entry.get("tier"),
+        "kind": payload.get("kind") or entry.get("kind"),
     }
     try:
         line = json.dumps(record, separators=(",", ":"), default=str) + "\n"
