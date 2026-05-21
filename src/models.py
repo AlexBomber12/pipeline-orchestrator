@@ -99,6 +99,9 @@ class PRInfo(BaseModel):
     # fork (no credentials, different remote), so it must refuse
     # rather than silently publish to the wrong branch on origin.
     is_cross_repository: bool = False
+    # Quarantine labels currently present on the GitHub PR. Recovery and
+    # WATCH use this durable GitHub surface to rebuild in-memory merge gates.
+    quarantine_labels: set[str] = Field(default_factory=set)
     # PR-290a (OBS-CR diff scan): head SHA at which the most recent
     # successful PR diff scan completed. SHA-keyed rather than
     # timestamp-keyed so a fresh coder push (new HEAD SHA) re-arms the
@@ -235,6 +238,7 @@ class RepoState(BaseModel):
     # ``__setattr__`` so the rendered badge subtitle disappears the moment
     # the state machine leaves MERGE. ``None`` outside MERGE.
     merge_phase: str | None = None
+    quarantined_prs: set[int] = Field(default_factory=set)
 
     @field_validator("state", mode="before")
     @classmethod

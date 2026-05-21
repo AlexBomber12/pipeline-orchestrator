@@ -356,6 +356,28 @@ class RecoveryMixin:
         self.state.current_queue = list(tasks)
         return True
 
+    def _rehydrate_quarantined_prs_from_labels(self, prs: list[PRInfo]) -> None:
+        """Rebuild in-memory quarantine gates from GitHub PR labels."""
+        labeled = {
+            pr.number
+            for pr in prs
+            if any(
+                label.startswith("quarantine:")
+                for label in getattr(pr, "quarantine_labels", set())
+            )
+        }
+        if not labeled:
+            return
+        before = set(self.state.quarantined_prs)
+        self.state.quarantined_prs.update(labeled)
+        restored = self.state.quarantined_prs - before
+        if restored:
+            restored_list = ", ".join(f"#{number}" for number in sorted(restored))
+            self.log_event(
+                f"[INFRA] Rehydrated quarantine for PR(s) {restored_list} "
+                "from GitHub labels."
+            )
+
     async def _apply_recovery_decisions(
         self, tasks: list[QueueTask], prs: list[PRInfo]
     ) -> None:
@@ -367,6 +389,7 @@ class RecoveryMixin:
             sum(1 for t in tasks if t.status == TaskStatus.DONE),
             len(tasks),
         )
+        self._rehydrate_quarantined_prs_from_labels(prs)
 
         # PR-186 Codex P1: rehydrate the crashed-task set from any ERROR
         # entries in the parsed queue. The crashed-task cancellation is what

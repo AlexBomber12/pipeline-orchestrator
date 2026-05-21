@@ -23,7 +23,7 @@ from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from redis.exceptions import RedisError
 
-from src.audit.operator_actions import write_audit_record
+from src.audit.operator_actions import write_audit_record, write_operator_action_audit
 from src.cancellation.storage import (
     READ_REFRESH_TTL_SECONDS,
     TTL_SECONDS,
@@ -71,6 +71,14 @@ _QUEUE_NOT_READY_JSON = {"error": "Queue not yet computed"}
 _RETRY_TTL_SECONDS = 30 * 24 * 3600
 _RETRY_RESERVATION_TTL_SECONDS = 30 * 60
 _RETRY_GIT_TIMEOUT_SECONDS = 60
+
+
+def _split_gh_label_output(result: object) -> list[str]:
+    if isinstance(result, str):
+        return [label.strip() for label in result.splitlines() if label.strip()]
+    if isinstance(result, list):
+        return [str(label).strip() for label in result if str(label).strip()]
+    return []
 
 _DEFERRED_CODER_SWITCH_STATES = {
     PipelineState.CODING,
@@ -869,6 +877,115 @@ async def _render_repo_card(request: Request, name: str) -> HTMLResponse:
             "card_only": True,
         },
     )
+
+
+@router.post("/repos/{name}/quarantine/{pr_number}/release")
+async def release_quarantine(
+    name: str,
+    pr_number: int,
+    request: Request,
+) -> JSONResponse:
+    """Operator-triggered release of a quarantined PR."""
+    cfg = load_config(_app.CONFIG_PATH)
+    repo_config = _find_repo_config_by_name(cfg, name)
+    if repo_config is None:
+        return JSONResponse({"error": "repo not found"}, status_code=404)
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        return JSONResponse({"error": "redis unavailable"}, status_code=503)
+
+    state_key = pipeline_state(name)
+    try:
+        raw_state = await redis_client.get(state_key)
+    except RedisError:
+        return JSONResponse({"error": "redis unavailable"}, status_code=503)
+    if raw_state is None:
+        return JSONResponse({"status": "not_quarantined", "pr": pr_number})
+    try:
+        state = RepoState.model_validate_json(raw_state)
+    except Exception:
+        return JSONResponse({"error": "repository state unavailable"}, status_code=503)
+    if pr_number not in state.quarantined_prs:
+        return JSONResponse({"status": "not_quarantined", "pr": pr_number})
+
+    try:
+        owner_repo = gh_runner.get_repo_full_name(repo_config.url)
+    except ValueError:
+        owner_repo = None
+    if owner_repo is not None:
+        try:
+            labels = _split_gh_label_output(
+                gh_runner.run_gh(
+                    [
+                        "pr",
+                        "view",
+                        str(pr_number),
+                        "--json",
+                        "labels",
+                        "-q",
+                        ".labels[].name",
+                    ],
+                    repo=owner_repo,
+                )
+            )
+            for label in labels:
+                if label.startswith("quarantine:"):
+                    gh_runner.run_gh(
+                        [
+                            "pr",
+                            "edit",
+                            str(pr_number),
+                            "--remove-label",
+                            label,
+                        ],
+                        repo=owner_repo,
+                    )
+        except Exception as exc:
+            _app.logger.warning(
+                "Failed to remove quarantine labels for %s PR #%s: %s",
+                name,
+                pr_number,
+                exc,
+            )
+
+    event_message = f"Quarantine released for PR #{pr_number}."
+
+    async def _transaction(pipe: Any) -> RepoState | None:
+        raw = await pipe.get(state_key)
+        if raw is None:
+            return None
+        current = RepoState.model_validate_json(raw)
+        if pr_number not in current.quarantined_prs:
+            return current
+        current.quarantined_prs.discard(pr_number)
+        _append_history_entry(current, event_message)
+        pipe.multi()
+        pipe.set(state_key, current.model_dump_json())
+        return current
+
+    try:
+        updated_state = await redis_client.transaction(
+            _transaction,
+            state_key,
+            value_from_callable=True,
+        )
+    except Exception:
+        return JSONResponse({"error": "failed to update state"}, status_code=503)
+
+    write_operator_action_audit(
+        action="quarantine_release",
+        repo=name,
+        pr=pr_number,
+        operator_session_id=request.headers.get("X-Session-Id", "unknown"),
+    )
+    if updated_state is not None:
+        await _publish_history_entry_event(
+            name,
+            updated_state,
+            event_message,
+            redis_client,
+        )
+    return JSONResponse({"status": "released", "pr": pr_number})
 
 
 @router.post("/repos/{name}/inhibitors/clear/{inhibitor_type}")

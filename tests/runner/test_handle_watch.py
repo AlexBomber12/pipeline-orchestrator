@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import types
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -62,6 +63,7 @@ def test_external_resolution_clears_current_pr_without_task() -> None:
     runner.state.state = PipelineState.WATCH
     runner.state.current_task = None
     runner.state.current_pr = PRInfo(number=443, branch="pr-443")
+    runner.state.quarantined_prs.add(443)
     publishes: list[str] = []
 
     async def fake_publish() -> None:
@@ -79,6 +81,7 @@ def test_external_resolution_clears_current_pr_without_task() -> None:
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
     assert runner.state.current_pr is None
+    assert 443 not in runner.state.quarantined_prs
     assert publishes == ["published"]
 
 
@@ -153,6 +156,78 @@ def test_handle_watch_approved_and_green_merges(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_pr is None
     assert runner.state.current_task is None
+
+
+def test_handle_watch_rehydrates_quarantine_before_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    pr = PRInfo(
+        number=5,
+        branch="pr-001",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.APPROVED,
+        head_sha="green001",
+        diff_scanned_at_sha="green001",
+        quarantine_labels={"quarantine:large_diff"},
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    monkeypatch.setattr(
+        "src.github.gh_runner.run_gh",
+        lambda cmd, **kw: "quarantine:large_diff\n",
+    )
+
+    merged: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        "src.github.prs.merge_pr",
+        lambda repo, number: merged.append((repo, number)),
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+    )
+
+    asyncio.run(runner.handle_watch())
+
+    assert merged == []
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.quarantined_prs == {5}
+    assert any(
+        "quarantine rehydrated from GitHub labels" in entry["event"]
+        for entry in runner.state.history
+    )
+    assert any(
+        "is quarantined; refusing to merge" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_watch_quarantine_rehydrate_ignores_invalid_or_existing_pr() -> None:
+    runner = h._make_runner()
+    invalid = types.SimpleNamespace(
+        number="5",
+        quarantine_labels={"quarantine:large_diff"},
+    )
+
+    asyncio.run(runner._rehydrate_quarantine_from_pr_labels(invalid))
+
+    assert runner.state.quarantined_prs == set()
+
+    runner.state.quarantined_prs.add(5)
+    existing = PRInfo(
+        number=5,
+        branch="pr-001",
+        quarantine_labels={"quarantine:large_diff"},
+    )
+
+    asyncio.run(runner._rehydrate_quarantine_from_pr_labels(existing))
+
+    assert runner.state.quarantined_prs == {5}
 
 
 def test_handle_watch_without_current_pr_returns_to_idle() -> None:

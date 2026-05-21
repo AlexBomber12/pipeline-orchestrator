@@ -16,6 +16,7 @@ from pathlib import Path
 
 from src.cancellation import CancellationCause
 from src.daemon import guardrails
+from src.daemon.quarantine import apply_quarantine_label_for_violation
 from src.github import cache as gh_cache
 from src.github import checks as gh_checks
 from src.github import gh_runner
@@ -190,6 +191,8 @@ class WatchMixin:
         if pr_state in ("MERGED", "CLOSED"):
             await self._handle_external_pr_resolution(found, pr_state)
             return
+        await self._rehydrate_quarantine_from_pr_labels(found)
+        await self._detect_external_quarantine_release(found.number)
 
         merged_shas, merged_push_count = current_pr.merge_observed_pushes(found)
         # PR-290a follow-up: ``get_open_prs`` returns a fresh ``PRInfo``
@@ -602,6 +605,8 @@ class WatchMixin:
                 f"[GUARDRAIL] tier={first.tier} {first.category}: "
                 f"{first.excerpt}"
             )
+            self.state.quarantined_prs.add(current_pr.number)
+            apply_quarantine_label_for_violation(self, current_pr.number, first)
             await self._transition_to_error(
                 message,
                 log_prefix="[WATCH]",
@@ -616,6 +621,59 @@ class WatchMixin:
                 ),
             )
         return True
+
+    async def _rehydrate_quarantine_from_pr_labels(self, pr: object) -> None:
+        """Restore in-memory quarantine when the open PR still has the label."""
+        labels = getattr(pr, "quarantine_labels", set()) or set()
+        if not any(label.startswith("quarantine:") for label in labels):
+            return
+        pr_number = getattr(pr, "number", None)
+        if not isinstance(pr_number, int):
+            return
+        if pr_number in self.state.quarantined_prs:
+            return
+        self.state.quarantined_prs.add(pr_number)
+        self.log_event(
+            f"[WATCH] PR #{pr_number} quarantine rehydrated from GitHub labels."
+        )
+        await self.publish_state()
+
+    async def _detect_external_quarantine_release(self, pr_number: int) -> None:
+        """Clear in-memory quarantine when GitHub quarantine labels are gone."""
+        if pr_number not in self.state.quarantined_prs:
+            return
+        try:
+            result = gh_runner.run_gh(
+                [
+                    "pr",
+                    "view",
+                    str(pr_number),
+                    "--json",
+                    "labels",
+                    "-q",
+                    ".labels[].name",
+                ],
+                repo=self.owner_repo,
+            )
+        except Exception as exc:
+            self.log_event(
+                f"[WATCH] PR #{pr_number} quarantine label check failed: {exc}."
+            )
+            return
+        if not isinstance(result, str):
+            self.log_event(
+                f"[WATCH] PR #{pr_number} quarantine label check returned "
+                f"unexpected {type(result).__name__}; keeping quarantine."
+            )
+            return
+        labels = [label.strip() for label in result.splitlines()]
+        if any(label.startswith("quarantine:") for label in labels if label):
+            return
+        self.state.quarantined_prs.discard(pr_number)
+        self.log_event(
+            f"[WATCH] PR #{pr_number} quarantine released externally."
+        )
+        await self.publish_state()
 
     async def _maybe_reclassify_stuck_pending(self, found: object) -> None:
         """Upgrade ``found.ci_status`` to FAILURE when CI has been PENDING too long.
@@ -1042,6 +1100,8 @@ class WatchMixin:
             f"[WATCH] PR #{pr_number} externally resolved as {pr_state}; "
             f"releasing task and returning to IDLE ({legacy_fragment})."
         )
+        if isinstance(pr_number, int):
+            self.state.quarantined_prs.discard(pr_number)
         if pr_state == "MERGED":
             current_task = self.state.current_task
             if current_task is not None and current_task.task_file:

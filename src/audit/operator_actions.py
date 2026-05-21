@@ -3,6 +3,9 @@
 Append-only JSONL log of destructive operator actions for forensic
 review. File rotation daily by filename. fcntl.flock guards concurrent
 writes from multiple uvicorn workers.
+
+Flat operator events include ``quarantine_apply`` and
+``quarantine_release``.
 """
 
 from __future__ import annotations
@@ -60,3 +63,38 @@ def write_audit_record(
         logger.warning(
             "Audit write failed for %s/%s", repo_slug, task_id, exc_info=True
         )
+
+
+def write_operator_action_audit(
+    action: str,
+    repo: str,
+    pr: int | None = None,
+    operator_session_id: str | None = None,
+    **payload: Any,
+) -> None:
+    """Append one flat JSONL record for PR-level operator actions."""
+    now = datetime.now(timezone.utc)
+    record: dict[str, Any] = {
+        "ts": now.isoformat(),
+        "event": action,
+        "repo": repo,
+    }
+    if pr is not None:
+        record["pr"] = pr
+    if operator_session_id is not None:
+        record["operator_session_id"] = operator_session_id
+    record.update(payload)
+    line = json.dumps(record, separators=(",", ":")) + "\n"
+    try:
+        AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+        filename = AUDIT_DIR / f"{now.strftime('%Y-%m-%d')}.jsonl"
+        with open(filename, "a", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.write(line)
+                f.flush()
+                os.fsync(f.fileno())
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        logger.warning("Audit write failed for %s", repo, exc_info=True)

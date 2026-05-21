@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from src.github import prs as gh_prs
+from src.models import ReviewStatus
 
 
 class _FakeCompletedProcess:
@@ -53,3 +54,44 @@ def test_get_pr_diff_propagates_subprocess_errors(
 
     with pytest.raises(subprocess.CalledProcessError):
         gh_prs.get_pr_diff("octo/demo", 7)
+
+
+def test_get_open_prs_preserves_quarantine_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        gh_prs.gh_runner,
+        "run_gh",
+        lambda cmd, **kwargs: [
+            {
+                "number": 7,
+                "title": "PR-007: guarded",
+                "headRefName": "pr-007-guarded",
+                "headRefOid": "abc123",
+                "url": "https://github.com/octo/demo/pull/7",
+                "updatedAt": "2026-05-21T00:00:00Z",
+                "commits": [{"oid": "abc123"}],
+                "author": {"login": "alice"},
+                "isCrossRepository": False,
+                "labels": [
+                    {"name": "quarantine:large_diff"},
+                    {"name": "needs-review"},
+                ],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        gh_prs.checks,
+        "_fetch_ci_status_rest",
+        lambda repo, sha: ([], [], True),
+    )
+    monkeypatch.setattr(
+        gh_prs.reviews,
+        "get_pr_review_status",
+        lambda repo, number, pr_author, head_sha: ReviewStatus.PENDING,
+    )
+
+    [pr] = gh_prs.get_open_prs("octo/demo")
+
+    assert pr.number == 7
+    assert pr.quarantine_labels == {"quarantine:large_diff"}
