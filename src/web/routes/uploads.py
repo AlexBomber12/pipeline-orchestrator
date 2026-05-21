@@ -223,6 +223,14 @@ def _add_validation_error(
     errors_by_file.setdefault(fname, []).append(issue)
 
 
+def _extend_validation_errors(
+    errors_by_file: dict[str, list[str]],
+    new_errors: dict[str, list[str]],
+) -> None:
+    for fname, issues in new_errors.items():
+        errors_by_file.setdefault(fname, []).extend(issues)
+
+
 def _dependency_validation_errors(
     parsed_headers: dict[str, TaskHeader],
     *,
@@ -512,7 +520,8 @@ async def upload_tasks(
             merged_pr_ids = set()
     else:
         merged_pr_ids = set()
-    errors_by_file.update(
+    _extend_validation_errors(
+        errors_by_file,
         _dependency_validation_errors(
             parsed_headers,
             existing_task_ids=existing_task_ids,

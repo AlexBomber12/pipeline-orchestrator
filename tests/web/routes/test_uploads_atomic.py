@@ -121,6 +121,25 @@ def test_dependency_closure_missing_in_batch_and_disk(uploads_dir: Path) -> None
     assert not (uploads_dir / "example__alpha").exists()
 
 
+def test_dependency_closure_preserves_existing_file_errors(
+    uploads_dir: Path,
+) -> None:
+    task_text = (
+        _task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-999")[1][1]
+        .decode("utf-8")
+        + "\ngh pr create --draft\n"
+    )
+
+    resp = _post_upload(
+        [("files", ("PR-002.md", task_text.encode("utf-8"), "text/markdown"))]
+    )
+
+    assert resp.status_code == 400
+    assert "AGENTS.md anti-pattern" in resp.text
+    assert "Depends on PR-999 which is not in this upload and not in tasks/" in resp.text
+    assert not (uploads_dir / "example__alpha").exists()
+
+
 def test_dependency_closure_satisfied_by_existing_tasks_dir(
     repo_dir: Path, uploads_dir: Path
 ) -> None:
