@@ -894,17 +894,18 @@ async def upload_tasks(
                 ),
             }
             manifest_json = json.dumps(manifest)
+            pending_count = (
+                len(manifest_filenames)
+                if existing_raw is not None or repo_state.state.value != "IDLE"
+                else None
+            )
             try:
                 await _enqueue_upload_manifest(
                     redis_client,
                     pending_key=pending_key,
                     manifest_json=manifest_json,
                     count_key=upload_pending_count(name),
-                    pending_count=(
-                        None
-                        if repo_state.state.value == "IDLE"
-                        else len(manifest_filenames)
-                    ),
+                    pending_count=pending_count,
                     previous_manifest=existing_raw,
                 )
             except Exception:

@@ -105,6 +105,41 @@ def test_upload_during_idle_no_pending_badge() -> None:
     assert "Upload pending" not in html
 
 
+def test_idle_upload_extending_pending_manifest_keeps_pending_count(
+    uploads_dir: Path,
+) -> None:
+    old_staging = uploads_dir / "example__alpha" / "existing"
+    old_staging.mkdir(parents=True)
+    (old_staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
+
+    with TestClient(app) as client:
+        client.app.state.redis._store[upload_pending("example__alpha")] = (
+            json.dumps(
+                {
+                    "repo": "example__alpha",
+                    "files": ["PR-001.md"],
+                    "staging_dir": str(old_staging),
+                }
+            )
+        )
+        client.app.state.redis._store[
+            upload_pending_count("example__alpha")
+        ] = "1"
+
+        response = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_task_file(name="PR-002.md", pr_id="PR-002")],
+        )
+
+        assert response.status_code == 200
+        assert (
+            client.app.state.redis._store[
+                upload_pending_count("example__alpha")
+            ]
+            == "2"
+        )
+
+
 def test_upload_during_coding_sets_pending_count() -> None:
     with TestClient(app) as client:
         client.app.state.redis._store[pipeline_state("example__alpha")] = (
