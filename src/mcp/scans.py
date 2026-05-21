@@ -158,6 +158,24 @@ _ANTI_PATTERNS: list[tuple[str, re.Pattern, str]] = [
         "AGENTS.md prohibits opening PRs in draft state. PR-196.",
     ),
     (
+        "draft_pull_request_text",
+        re.compile(r"\bcreate (a |the )?draft pull request\b", re.IGNORECASE),
+        "AGENTS.md prohibits opening PRs in draft state. PR-196.",
+    ),
+    (
+        "draft_pr_convert",
+        re.compile(
+            r"\bconvert\s+(?:PR\s+|the PR\s+|pull request\s+)?to draft\b",
+            re.IGNORECASE,
+        ),
+        "AGENTS.md prohibits opening PRs in draft state. PR-196.",
+    ),
+    (
+        "draft_pr_open_as",
+        re.compile(r"\bopen\s+(?:it\s+)?as (a )?draft\b", re.IGNORECASE),
+        "AGENTS.md prohibits opening PRs in draft state. PR-196.",
+    ),
+    (
         "force_push_main",
         # Detect ``git push`` lines that force-push to ``main``. Both
         # arms walk only the tokens that belong to the ``git push``
