@@ -53,16 +53,17 @@ class _FakeRedis:
         return 0
 
     async def eval(self, script: str, numkeys: int, *args: Any) -> Any:
-        del script, numkeys
         if self.eval_error is not None:
             raise self.eval_error
         if args and len(args) >= 2 and self.eval_result:
             key = args[0]
-            if len(args) >= 3:
-                delete_key, expected = args[1], args[2]
+            if numkeys >= 2:
+                delete_key, expected = args[1], args[numkeys]
             else:
                 delete_key, expected = key, args[1]
             if self.store.get(key) == expected:
+                if "return redis.call(\"del\", KEYS[1])" in script:
+                    self.store.pop(key, None)
                 self.store.pop(delete_key, None)
         return self.eval_result
 
@@ -390,18 +391,48 @@ def test_delete_upload_if_unchanged_uses_eval_and_fallback(
 ) -> None:
     runner = _Runner(tmp_path)
     key = "upload:demo:pending"
+    count_key = "upload_pending_count:demo"
     expected = '{"files":["QUEUE.md"]}'
 
+    runner.redis.store[key] = expected
+    runner.redis.store[count_key] = "1"
     runner.redis.eval_result = 1
-    assert _run(runner._delete_upload_if_unchanged(key, expected)) is True
+    assert (
+        _run(
+            runner._delete_upload_if_unchanged(
+                key,
+                expected,
+                also_delete_key=count_key,
+            )
+        )
+        is True
+    )
+    assert key not in runner.redis.store
+    assert count_key not in runner.redis.store
 
     runner.redis.eval_result = 0
     assert _run(runner._delete_upload_if_unchanged(key, expected)) is False
 
     runner.redis.eval_error = RuntimeError("eval failed")
     runner.redis.store[key] = expected
+    runner.redis.store[count_key] = "1"
     assert _run(runner._delete_upload_if_unchanged(key, expected)) is True
     assert key not in runner.redis.store
+    assert count_key in runner.redis.store
+
+    runner.redis.store[key] = expected
+    assert (
+        _run(
+            runner._delete_upload_if_unchanged(
+                key,
+                expected,
+                also_delete_key=count_key,
+            )
+        )
+        is True
+    )
+    assert key not in runner.redis.store
+    assert count_key not in runner.redis.store
 
     runner.redis.store[key] = "newer"
     assert _run(runner._delete_upload_if_unchanged(key, expected)) is False
@@ -697,7 +728,7 @@ def test_process_pending_uploads_returns_none_when_newer_manifest_exists(
     monkeypatch.setattr(
         runner,
         "_delete_upload_if_unchanged",
-        lambda upload_key, expected: asyncio.sleep(0, result=False),
+        lambda upload_key, expected, **kwargs: asyncio.sleep(0, result=False),
     )
 
     assert _run(runner.process_pending_uploads()) is None

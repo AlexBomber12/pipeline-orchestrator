@@ -457,6 +457,13 @@ def test_pending_count_clear_ignores_redis_error(tmp_path: Path) -> None:
     )
 
 
+def test_pending_count_delete_ignores_redis_error(tmp_path: Path) -> None:
+    runner = _Runner(tmp_path)
+    runner.redis.delete_error = RuntimeError("redis down")
+
+    asyncio.run(runner._delete_upload_pending_count())
+
+
 def test_pending_count_clear_uses_atomic_manifest_match(tmp_path: Path) -> None:
     runner = _Runner(tmp_path)
     manifest_key = upload_pending(runner.name)
