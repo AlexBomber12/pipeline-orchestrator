@@ -87,6 +87,93 @@ def test_draft_pr_text_negated_typographic_apostrophe_not_flagged():
     assert "draft_pr_text" not in types
 
 
+def test_draft_pull_request_text_caught():
+    body = "Create a draft pull request while iterating, then mark ready."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pull_request_text" in types
+
+
+def test_draft_pull_request_text_with_uppercase():
+    body = "CREATE THE DRAFT PULL REQUEST before running final checks."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pull_request_text" in types
+
+
+def test_draft_pull_request_text_negated_not_caught():
+    body = "Do not create a draft pull request; open it ready."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pull_request_text" not in types
+
+
+def test_draft_pull_request_text_in_code_block_not_caught():
+    body = "Example only:\n```text\nCreate a draft pull request.\n```\n"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pull_request_text" not in types
+
+
+def test_draft_pr_convert_caught_bare():
+    body = "After opening the PR, convert to draft while tests run."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_convert" in types
+
+
+def test_draft_pr_convert_with_pr_word():
+    body = "After opening, convert PR to draft until review is ready."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_convert" in types
+
+
+def test_draft_pr_convert_with_pull_request():
+    body = "After opening, convert pull request to draft."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_convert" in types
+
+
+def test_draft_pr_open_as_caught():
+    body = "Use gh to open as draft during the first pass."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_open_as" in types
+
+
+def test_draft_pr_open_as_with_article():
+    body = "Use gh to open as a draft during the first pass."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_open_as" in types
+
+
+def test_draft_pr_open_as_with_it():
+    body = "Create the PR, then open it as a draft."
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pr_open_as" in types
+
+
+def test_existing_draft_patterns_still_work():
+    body = (
+        "Run gh pr create --draft --title wip.\n"
+        "Create a draft PR while iterating.\n"
+    )
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert {"draft_pr_flag", "draft_pr_text"}.issubset(types)
+
+
+def test_no_false_positives_on_unrelated_text():
+    body = "Write a draft email and save the design draft for review."
+    violations = scan_for_conflicts(body)
+    draft_types = {v.violation_type for v in violations if "draft" in v.violation_type}
+    assert draft_types == set()
+
+
 def test_force_push_main_detected():
     body = "If history diverges, run git push --force origin main."
     violations = scan_for_conflicts(body)
