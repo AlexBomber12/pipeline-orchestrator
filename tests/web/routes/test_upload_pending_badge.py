@@ -196,6 +196,46 @@ def test_enqueue_upload_manifest_uses_lua_when_available() -> None:
     ]
 
 
+def test_enqueue_upload_manifest_falls_back_when_lua_fails() -> None:
+    pending_key = upload_pending("example__alpha")
+    count_key = upload_pending_count("example__alpha")
+
+    class _EvalFailRedis:
+        def __init__(self) -> None:
+            self.store: dict[str, object] = {}
+
+        async def eval(self, script: str, numkeys: int, *args: str) -> int:
+            del script, numkeys, args
+            raise RuntimeError("eval disabled")
+
+        async def get(self, key: str) -> object:
+            return self.store.get(key)
+
+        async def set(self, key: str, value: object, **kwargs: object) -> None:
+            del kwargs
+            self.store[key] = value
+
+        async def delete(self, key: str) -> int:
+            existed = key in self.store
+            self.store.pop(key, None)
+            return int(existed)
+
+    redis_client = _EvalFailRedis()
+
+    asyncio.run(
+        upload_routes._enqueue_upload_manifest(
+            redis_client,
+            pending_key=pending_key,
+            manifest_json='{"files":["PR-001.md"]}',
+            count_key=count_key,
+            pending_count=1,
+        )
+    )
+
+    assert redis_client.store[pending_key] == '{"files":["PR-001.md"]}'
+    assert redis_client.store[count_key] == "1"
+
+
 def test_rollback_upload_manifest_deletes_matching_bytes_manifest() -> None:
     class _RollbackRedis:
         def __init__(self) -> None:

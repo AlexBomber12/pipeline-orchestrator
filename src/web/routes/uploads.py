@@ -276,7 +276,7 @@ async def _enqueue_upload_manifest(
             count_value,
         )
         return
-    except (AttributeError, NotImplementedError):
+    except Exception:
         pass
 
     if previous_manifest is _MISSING:
