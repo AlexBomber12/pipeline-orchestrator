@@ -199,8 +199,15 @@ class HungMixin:
             gh_comments.post_comment(
                 self.owner_repo, pr_number, "@codex review"
             )
+            kind = (
+                "force_repost"
+                if bypass_same_head_dedup or bypass_author_dedup
+                else "review_post"
+            )
             self.log_event(
-                f"[INFRA] Posted @codex review on PR #{pr_number}."
+                f"Posted @codex review on PR #{pr_number}.",
+                tier="infra",
+                kind=kind,
             )
             return True, True, None
         except Exception as exc:

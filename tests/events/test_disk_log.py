@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-
 from src.events import disk_log, publisher
 
 
@@ -103,11 +102,20 @@ def test_record_shape_correct(isolate_events_dir: Path) -> None:
 
     target = isolate_events_dir / "owner__repo" / "2026-05-19.jsonl"
     record = json.loads(_read_lines(target)[0])
-    assert set(record.keys()) == {"timestamp", "event_type", "repo_slug", "payload"}
+    assert set(record.keys()) == {
+        "timestamp",
+        "event_type",
+        "repo_slug",
+        "payload",
+        "tier",
+        "kind",
+    }
     assert record["timestamp"] == when.isoformat()
     assert record["event_type"] == "state_changed"
     assert record["repo_slug"] == "owner__repo"
     assert record["payload"] == {"state": "WATCH"}
+    assert record["tier"] is None
+    assert record["kind"] is None
 
 
 def test_default_events_dir_when_env_unset(

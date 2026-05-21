@@ -968,7 +968,13 @@ async def _apply_repo_control_update(
     return redis_client, pipeline_state(name), repo.url
 
 
-def _append_history_entry(state: RepoState, event: str) -> None:
+def _append_history_entry(
+    state: RepoState,
+    event: str,
+    *,
+    tier: str | None = None,
+    kind: str | None = None,
+) -> None:
     """Mirror ``Runner.log_event`` for web control-plane history entries."""
     now = datetime.now(timezone.utc).isoformat()
     current_state = state.state.value
@@ -977,6 +983,8 @@ def _append_history_entry(state: RepoState, event: str) -> None:
         last_entry is not None
         and last_entry.get("state") == current_state
         and last_entry.get("event") == event
+        and last_entry.get("tier") == tier
+        and last_entry.get("kind") == kind
     ):
         last_entry["count"] = int(last_entry.get("count", 1)) + 1
         last_entry["last_seen_at"] = now
@@ -987,6 +995,8 @@ def _append_history_entry(state: RepoState, event: str) -> None:
             "time": now,
             "state": current_state,
             "event": event,
+            "tier": tier,
+            "kind": kind,
             "count": 1,
             "last_seen_at": now,
         }
@@ -1000,16 +1010,24 @@ async def _publish_history_entry_event(
     state: RepoState,
     event_message: str,
     redis_client: aioredis.Redis,
+    *,
+    tier: str | None = None,
+    kind: str | None = None,
 ) -> None:
     """Publish a live history update for repo-detail subscribers."""
     try:
+        payload = {
+            "state": state.state.value,
+            "event": event_message,
+        }
+        if tier is not None:
+            payload["tier"] = tier
+        if kind is not None:
+            payload["kind"] = kind
         await _app.publish_repo_event(
             name,
             "history_updated",
-            {
-                "state": state.state.value,
-                "event": event_message,
-            },
+            payload,
             redis_client,
         )
     except Exception:
@@ -1205,7 +1223,12 @@ async def release_quarantine(
         if pr_number not in current.quarantined_prs:
             return current
         current.quarantined_prs.discard(pr_number)
-        _append_history_entry(current, event_message)
+        _append_history_entry(
+            current,
+            event_message,
+            tier="operator",
+            kind="quarantine_release",
+        )
         pipe.multi()
         pipe.set(state_key, current.model_dump_json())
         return current
@@ -1231,6 +1254,8 @@ async def release_quarantine(
             updated_state,
             event_message,
             redis_client,
+            tier="operator",
+            kind="quarantine_release",
         )
     return JSONResponse({"status": "released", "pr": pr_number})
 
@@ -1630,6 +1655,42 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
                 name,
                 exc_info=True,
             )
+        event_message = f"Operator retry queued for {pr_id}."
+
+        async def _record_retry_event(pipe: Any) -> RepoState | None:
+            raw = await pipe.get(pipeline_state(name))
+            current = (
+                RepoState.model_validate_json(raw)
+                if raw is not None
+                else _default_repo_state(name, repo_config.url)
+            )
+            _append_history_entry(
+                current,
+                event_message,
+                tier="operator",
+                kind="retry",
+            )
+            pipe.multi()
+            pipe.set(pipeline_state(name), current.model_dump_json())
+            return current
+
+        try:
+            updated_state = await redis_client.transaction(
+                _record_retry_event,
+                pipeline_state(name),
+                value_from_callable=True,
+            )
+            if updated_state is not None:
+                await _publish_history_entry_event(
+                    name,
+                    updated_state,
+                    event_message,
+                    redis_client,
+                    tier="operator",
+                    kind="retry",
+                )
+        except Exception:  # pragma: no cover - best-effort history event
+            _app.logger.warning("Failed to record retry event", exc_info=True)
 
         tasks, _snapshot_at = await _load_current_queue_snapshot(name)
         if tasks is None:

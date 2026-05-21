@@ -284,7 +284,11 @@ class FixMixin(BreachMixin):
             current_pr
         ):
             return
-        self.log_event(f"[FIX] [{coder_name}] entering FIX.")
+        self.log_event(
+            f"[{coder_name}] entering FIX.",
+            tier="state",
+            kind="transition",
+        )
         await self.publish_state()
         if self._current_run_record is not None:
             self._current_run_record.fix_iterations += 1
@@ -610,8 +614,10 @@ class FixMixin(BreachMixin):
             cause = f"GUARDRAIL: {first.category}: {first.excerpt}"
             for violation in violations:
                 self.log_event(
-                    f"[FIX] [GUARDRAIL] tier={violation.tier} "
-                    f"{violation.category}: {violation.excerpt}"
+                    f"tier={violation.tier} "
+                    f"{violation.category}: {violation.excerpt}",
+                    tier="guardrail",
+                    kind=violation.category,
                 )
             if await pause_for_stop_after_bookkeeping():
                 return

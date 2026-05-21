@@ -163,6 +163,8 @@ class EventEntry(TypedDict, total=False):
     time: str
     state: str
     event: str
+    tier: NotRequired[str | None]
+    kind: NotRequired[str | None]
     count: NotRequired[int]
     last_seen_at: NotRequired[str]
 

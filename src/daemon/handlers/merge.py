@@ -267,7 +267,11 @@ class MergeMixin:
                 return
 
         merged_diff_stats = self._compute_diff_stats(base)
-        self.log_event(f"[MERGE] Merging PR #{number}.")
+        self.log_event(
+            f"Merging PR #{number}.",
+            tier="state",
+            kind="transition",
+        )
         self.state.merge_phase = "ready_to_merge"
         await self.publish_state()
         try:
@@ -340,7 +344,11 @@ class MergeMixin:
         self.state.current_task = None
         self._reset_runner_local_task_counters()
         self.state.state = PipelineState.IDLE
-        self.log_event(f"[MERGE] Merged PR #{number} -> IDLE.")
+        self.log_event(
+            f"Merged PR #{number} -> IDLE.",
+            tier="merge",
+            kind="pr_merge",
+        )
 
     def _build_outcome_record(self, merged_at: datetime) -> dict:
         """Assemble the outcome dict for the just-merged PR.

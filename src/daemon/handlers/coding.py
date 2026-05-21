@@ -651,8 +651,10 @@ class CodingMixin:
             cause = f"GUARDRAIL: {first.category}: {first.excerpt}"
             for violation in violations:
                 self.log_event(
-                    f"[CODING] [GUARDRAIL] tier={violation.tier} "
-                    f"{violation.category}: {violation.excerpt}"
+                    f"tier={violation.tier} "
+                    f"{violation.category}: {violation.excerpt}",
+                    tier="guardrail",
+                    kind=violation.category,
                 )
             if await pause_for_stop_if_requested():
                 return
@@ -756,7 +758,11 @@ class CodingMixin:
         self.state.state = PipelineState.WATCH
         self._rehydrate_last_push_at(candidate)
         await self._save_current_run_record("coding_complete")
-        self.log_event(f"[CODING] Opened PR #{candidate.number} -> WATCH.")
+        self.log_event(
+            f"Opened PR #{candidate.number} -> WATCH.",
+            tier="state",
+            kind="transition",
+        )
         if self._should_skip_codex_review_post(candidate.number):
             self.log_event(
                 "[CODING] Codex auto-trigger detected, skipping duplicate "

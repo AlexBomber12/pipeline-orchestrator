@@ -601,14 +601,22 @@ class WatchMixin:
         current_pr.diff_scanned_at_sha = current_pr.head_sha
         if violations:
             first = violations[0]
-            message = (
+            transition_message = (
                 f"[GUARDRAIL] tier={first.tier} {first.category}: "
                 f"{first.excerpt}"
+            )
+            message = (
+                f"tier={first.tier} {first.category}: {first.excerpt}"
+            )
+            self.log_event(
+                message,
+                tier="guardrail",
+                kind=first.category,
             )
             self.state.quarantined_prs.add(current_pr.number)
             apply_quarantine_label_for_violation(self, current_pr.number, first)
             await self._transition_to_error(
-                message,
+                transition_message,
                 log_prefix="[WATCH]",
                 cancellation_cause=CancellationCause(
                     category="ERROR",

@@ -14,6 +14,18 @@ from src.keyspace import repo_events_channel, repo_events_history
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 EVENT_HISTORY_LIMIT = 50
+EVENT_TIERS = frozenset(
+    {
+        "infra",
+        "coder",
+        "state",
+        "guardrail",
+        "cancel",
+        "merge",
+        "panic",
+        "operator",
+    }
+)
 
 
 def _channel_name(repo_name: str) -> str:
@@ -46,6 +58,12 @@ def build_repo_event(
         "data": payload,
         "timestamp": _isoformat_z(now or _utc_now()),
     }
+
+
+def validate_event_tier(tier: str | None) -> None:
+    """Reject unknown structured event tiers."""
+    if tier is not None and tier not in EVENT_TIERS:
+        raise ValueError(f"Unknown event tier: {tier}")
 
 
 async def publish_repo_event(

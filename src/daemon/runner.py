@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import subprocess
@@ -100,6 +101,7 @@ from src.daemon.selector import (
     select_coder,
 )
 from src.events import publish_repo_event
+from src.events.publisher import validate_event_tier
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.github import rate_limit as gh_rate_limit
@@ -1487,6 +1489,13 @@ class PipelineRunner(
                     cause,
                     log=self.log_event,
                 )
+                subsource = cause.payload.get("subsource") if cause.payload else None
+                if isinstance(subsource, str) and subsource:
+                    self.log_event(
+                        f"Cancellation cause recorded for {task.pr_id}.",
+                        tier="cancel",
+                        kind=subsource,
+                    )
         if (
             message.startswith(("GUARDRAIL", "[GUARDRAIL]"))
             and task is not None
@@ -2044,7 +2053,13 @@ class PipelineRunner(
             first_lines = combined.strip()[:200]
             self.log_event(f"[INFRA] {label}: {first_lines}.")
 
-    def log_event(self, event: str) -> None:
+    def log_event(
+        self,
+        event: str,
+        *,
+        tier: str | None = None,
+        kind: str | None = None,
+    ) -> None:
         """Append an event to ``state.history`` (capped) and log it.
 
         Consecutive events whose only difference is a numeric counter
@@ -2053,17 +2068,28 @@ class PipelineRunner(
         ``event`` is replaced with the latest text so updated counter
         values stay visible, and ``last_seen_at`` is refreshed.
         """
+        validate_event_tier(tier)
+        if (tier is not None or kind is not None) and os.environ.get(
+            "DEBUG_EVENT_LOG_BRACKETS"
+        ):
+            assert not re.match(r"^\[[^\]]+\]\s+", event), (
+                "structured event messages must not include bracket prefixes"
+            )
         now = datetime.now(timezone.utc).isoformat()
         state = self.state.state.value
         last_entry = self.state.history[-1] if self.state.history else None
         if (
             last_entry is not None
             and last_entry.get("state") == state
+            and last_entry.get("tier") == tier
+            and last_entry.get("kind") == kind
             and _normalize_for_dedup(last_entry.get("event", ""))
             == _normalize_for_dedup(event)
         ):
             last_entry["count"] = int(last_entry.get("count", 1)) + 1
             last_entry["event"] = event
+            last_entry["tier"] = tier
+            last_entry["kind"] = kind
             last_entry["last_seen_at"] = now
             self._pending_event_log_entries.append(dict(last_entry))
         else:
@@ -2071,6 +2097,8 @@ class PipelineRunner(
                 "time": now,
                 "state": state,
                 "event": event,
+                "tier": tier,
+                "kind": kind,
                 "count": 1,
                 "last_seen_at": now,
             }
