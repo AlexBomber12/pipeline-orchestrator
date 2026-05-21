@@ -327,15 +327,9 @@ def scan_for_conflicts(task_spec_body: str) -> list[ConflictViolation]:
     # as ``git push --force \<newline>    origin main`` matches the
     # same patterns as its single-line equivalent.
     normalized = re.sub(r"\\\n[ \t]*", " ", task_spec_body)
-    fenced_code_spans = [
-        match.span()
-        for match in re.finditer(r"(?ms)^```.*?(?:^```\s*$|\Z)", normalized)
-    ]
     violations: list[ConflictViolation] = []
     for vtype, pattern, rule in _ANTI_PATTERNS:
         for match in pattern.finditer(normalized):
-            if any(start <= match.start() < end for start, end in fenced_code_spans):
-                continue
             if _is_negated(normalized, match.start()):
                 continue
             line_start = normalized.rfind("\n", 0, match.start()) + 1

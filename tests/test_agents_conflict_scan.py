@@ -108,8 +108,15 @@ def test_draft_pull_request_text_negated_not_caught():
     assert "draft_pull_request_text" not in types
 
 
-def test_draft_pull_request_text_in_code_block_not_caught():
-    body = "Example only:\n```text\nCreate a draft pull request.\n```\n"
+def test_draft_pull_request_text_in_code_block_caught():
+    body = "Steps:\n```text\nCreate a draft pull request.\n```\n"
+    violations = scan_for_conflicts(body)
+    types = {v.violation_type for v in violations}
+    assert "draft_pull_request_text" in types
+
+
+def test_negated_draft_pull_request_text_in_code_block_not_caught():
+    body = "Policy example:\n```text\nDo not create a draft pull request.\n```\n"
     violations = scan_for_conflicts(body)
     types = {v.violation_type for v in violations}
     assert "draft_pull_request_text" not in types
