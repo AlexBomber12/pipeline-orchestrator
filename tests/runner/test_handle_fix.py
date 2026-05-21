@@ -1024,7 +1024,7 @@ def test_handle_fix_no_push_deadlock_label_failures_do_not_block_idle(
 
     def fake_run_gh(cmd: list[str], **kwargs: Any) -> str:
         if cmd[:3] == ["label", "create", "canceled"]:
-            raise RuntimeError("label already exists")
+            raise RuntimeError("label unavailable")
         if cmd[:2] == ["pr", "edit"]:
             raise RuntimeError("gh down")
         return ""
@@ -1048,7 +1048,7 @@ def test_handle_fix_no_push_deadlock_label_failures_do_not_block_idle(
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
     assert any(
-        "FIX no-push canceled label create skipped: label already exists"
+        "FIX no-push canceled label create failed: label unavailable"
         in entry["event"]
         for entry in runner.state.history
     )
@@ -1250,12 +1250,12 @@ def test_handle_fix_coder_escalate_label_apply_failure_parks_in_error(
     assert "failed to apply `escalated` label" in runner.state.error_message
     assert "infra error" in runner.state.error_message
     assert posted and posted[0][1] == 306
-    assert any(
-        "FIX coder ESCALATE label create skipped: label already exists" in entry["event"]
-        for entry in runner.state.history
+    assert not any(
+        "label create skipped" in entry["event"] for entry in runner.state.history
     )
     assert any(
-        "failed to apply escalated label to PR #306: gh down" in entry["event"] for entry in runner.state.history
+        "failed to apply escalated label to PR #306: gh down" in entry["event"]
+        for entry in runner.state.history
     )
 
 
