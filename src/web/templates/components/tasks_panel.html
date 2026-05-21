@@ -30,6 +30,15 @@
         <span class="font-mono text-[11px] text-gray-500 sm:text-right">{{ task.branch }}</span>
         {% endif %}
     </button>
+    {% if status_key == 'done' and task.metrics %}
+    <div class="mt-1 flex flex-wrap gap-3 text-[11px] text-gray-500">
+        {% if task.metrics.coder %}<span>{{ task.metrics.coder }}</span>{% endif %}
+        {% if task.metrics.model %}<span class="font-mono">{{ task.metrics.model }}</span>{% endif %}
+        {% if task.metrics.duration_ms %}<span>{{ ((task.metrics.duration_ms | int) / 1000) | round(0) | int }}s</span>{% endif %}
+        {% if task.metrics.fix_iterations %}<span>{{ task.metrics.fix_iterations }} fix</span>{% endif %}
+        {% if task.metrics.exit_reason %}<span class="text-gray-600">{{ task.metrics.exit_reason }}</span>{% endif %}
+    </div>
+    {% endif %}
     <div class="mt-1 flex justify-end">
         <button type="button"
                 class="secondary-interactive text-[11px] text-gray-400 hover:text-accent"
