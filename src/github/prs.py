@@ -181,6 +181,13 @@ def get_open_prs(
         check_runs, status_payload, fetch_ok = checks._fetch_ci_status_rest(
             repo, head_sha
         )
+        labels = entry.get("labels") or []
+        quarantine_labels = {
+            label.get("name", "")
+            for label in labels
+            if isinstance(label, dict)
+            and (label.get("name") or "").startswith("quarantine:")
+        }
         prs.append(
             PRInfo(
                 number=number,
@@ -208,9 +215,10 @@ def get_open_prs(
                 is_escalated=any(
                     isinstance(label, dict)
                     and (label.get("name") or "").lower() == "escalated"
-                    for label in (entry.get("labels") or [])
+                    for label in labels
                 ),
                 is_cross_repository=bool(entry.get("isCrossRepository", False)),
+                quarantine_labels=quarantine_labels,
             )
         )
     return prs
@@ -237,6 +245,12 @@ def _get_open_prs_rest(
         title = entry.get("title", "")
         head_sha = head.get("sha", "")
         labels = entry.get("labels") or []
+        quarantine_labels = {
+            label.get("name", "")
+            for label in labels
+            if isinstance(label, dict)
+            and (label.get("name") or "").startswith("quarantine:")
+        }
         prs.append(
             PRInfo(
                 number=number,
@@ -266,6 +280,7 @@ def _get_open_prs_rest(
                     for label in labels
                 ),
                 is_cross_repository=bool(head.get("repo", {}).get("fork", False)),
+                quarantine_labels=quarantine_labels,
             )
         )
     return prs

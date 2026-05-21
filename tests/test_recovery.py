@@ -167,6 +167,36 @@ def test_recover_doing_task_with_matching_pr_recovers_to_watch(
     )
 
 
+def test_recover_rehydrates_quarantine_from_pr_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup recovery must rebuild merge quarantine from GitHub labels."""
+    task = _doing_task()
+    matching_pr = PRInfo(
+        number=17,
+        branch="pr-042-inflight",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        quarantine_labels={"quarantine:large_diff"},
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [matching_pr])
+
+    runner = _make_runner()
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
+
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 17
+    assert runner.state.quarantined_prs == {17}
+    assert any(
+        "Rehydrated quarantine for PR(s) #17 from GitHub labels"
+        in e["event"]
+        for e in runner.state.history
+    )
+
+
 def test_recover_state_sets_queue_counters(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

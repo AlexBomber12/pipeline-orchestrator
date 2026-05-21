@@ -191,6 +191,7 @@ class WatchMixin:
         if pr_state in ("MERGED", "CLOSED"):
             await self._handle_external_pr_resolution(found, pr_state)
             return
+        await self._rehydrate_quarantine_from_pr_labels(found)
         await self._detect_external_quarantine_release(found.number)
 
         merged_shas, merged_push_count = current_pr.merge_observed_pushes(found)
@@ -620,6 +621,22 @@ class WatchMixin:
                 ),
             )
         return True
+
+    async def _rehydrate_quarantine_from_pr_labels(self, pr: object) -> None:
+        """Restore in-memory quarantine when the open PR still has the label."""
+        labels = getattr(pr, "quarantine_labels", set()) or set()
+        if not any(label.startswith("quarantine:") for label in labels):
+            return
+        pr_number = getattr(pr, "number", None)
+        if not isinstance(pr_number, int):
+            return
+        if pr_number in self.state.quarantined_prs:
+            return
+        self.state.quarantined_prs.add(pr_number)
+        self.log_event(
+            f"[WATCH] PR #{pr_number} quarantine rehydrated from GitHub labels."
+        )
+        await self.publish_state()
 
     async def _detect_external_quarantine_release(self, pr_number: int) -> None:
         """Clear in-memory quarantine when GitHub quarantine labels are gone."""
