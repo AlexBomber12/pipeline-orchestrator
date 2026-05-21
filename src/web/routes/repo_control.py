@@ -635,9 +635,19 @@ async def _task_view(
     task: QueueTask,
     repo_name: str,
     redis_client: aioredis.Redis | None,
+    *,
+    allow_git_merged_at_fallback: bool = True,
 ) -> dict[str, object]:
     retry_count = 0
     cancellation_subsource: str | None = None
+    merged_at: str | None = None
+    if task.status == TaskStatus.DONE:
+        merged_at = await _resolve_task_merged_at(
+            task,
+            repo_name,
+            redis_client,
+            allow_git_fallback=allow_git_merged_at_fallback,
+        )
     if task.status == TaskStatus.ERROR and redis_client is not None:
         retry_fingerprint = None
         resolved = await _resolve_repo_task_path(repo_name, task.pr_id)
@@ -671,11 +681,127 @@ async def _task_view(
             raw_subsource = cause.payload.get("subsource")
             if isinstance(raw_subsource, str) and raw_subsource:
                 cancellation_subsource = raw_subsource
-    return {
+    view: dict[str, object] = {
         **task.model_dump(mode="json"),
         "retry_count": retry_count,
         "cancellation_subsource": cancellation_subsource,
     }
+    if merged_at is not None:
+        view["merged_at"] = merged_at
+    return view
+
+
+async def _resolve_task_merged_at(
+    task: QueueTask,
+    repo_name: str,
+    redis_client: aioredis.Redis | None,
+    *,
+    allow_git_fallback: bool = True,
+) -> str | None:
+    redis_merged_at = await _load_done_index_merged_at(
+        repo_name, task.pr_id, redis_client
+    )
+    if redis_merged_at or not allow_git_fallback:
+        return redis_merged_at
+    return await asyncio.to_thread(_load_git_merged_at, repo_name, task.pr_id)
+
+
+async def _load_done_index_merged_at(
+    repo_name: str,
+    pr_id: str,
+    redis_client: aioredis.Redis | None,
+) -> str | None:
+    if redis_client is None:
+        return None
+    try:
+        raw = await redis_client.hget(f"done_index:{repo_name}", pr_id)
+    except Exception:
+        return None
+    return _extract_merged_at(raw)
+
+
+def _extract_merged_at(raw: object) -> str | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if isinstance(decoded, str) and decoded:
+        return decoded
+    if not isinstance(decoded, dict):
+        return None
+    merged_at = decoded.get("merged_at") or decoded.get("mergedAt")
+    return merged_at if isinstance(merged_at, str) and merged_at else None
+
+
+def _load_git_merged_at(repo_name: str, pr_id: str) -> str | None:
+    if not _TASK_PR_ID_PATTERN.fullmatch(pr_id):
+        return None
+    repo_root = Path(_app.REPOS_DIR) / repo_name
+    if not repo_root.is_dir():
+        return None
+
+    base_branch = "main"
+    try:
+        cfg = load_config(_app.CONFIG_PATH)
+        repo = _find_repo_config_by_name(cfg, repo_name)
+        if repo is not None:
+            base_branch = repo.branch
+    except Exception:
+        pass
+
+    for target_ref in (f"origin/{base_branch}", base_branch):
+        merged_at = _git_log_merged_at_for_ref(repo_root, target_ref, pr_id)
+        if merged_at is not None:
+            return merged_at
+    return None
+
+
+def _git_log_merged_at_for_ref(
+    repo_root: Path,
+    target_ref: str,
+    pr_id: str,
+) -> str | None:
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "log",
+                target_ref,
+                "-n",
+                "1",
+                "--format=%cI%x00%s",
+                "--extended-regexp",
+                f"--grep=^{re.escape(pr_id)}:",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    line = result.stdout.splitlines()[0] if result.stdout.splitlines() else ""
+    merged_at, _separator, subject = line.partition("\x00")
+    if not merged_at or not _merged_task_subject_re(pr_id).match(subject):
+        return None
+    return merged_at
+
+
+def _merged_task_subject_re(pr_id: str) -> re.Pattern[str]:
+    return re.compile(rf"^{re.escape(pr_id)}:(?:\s|$)")
 
 
 async def _build_tasks_panel_context(
@@ -686,11 +812,19 @@ async def _build_tasks_panel_context(
     retry_cap: int,
 ) -> dict[str, object]:
     async def _views_for(status: TaskStatus) -> list[dict[str, object]]:
-        return [
-            await _task_view(task, name, redis_client)
+        views = [
+            await _task_view(
+                task,
+                name,
+                redis_client,
+                allow_git_merged_at_fallback=False,
+            )
             for task in tasks
             if task.status == status
         ]
+        if status == TaskStatus.DONE:
+            views.sort(key=lambda view: view.get("merged_at") or "", reverse=True)
+        return views
 
     grouped = {
         "doing": await _views_for(TaskStatus.DOING),
