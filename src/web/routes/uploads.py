@@ -143,8 +143,45 @@ def _existing_task_ids(tasks_dir: Path) -> set[str]:
 def _parse_existing_task_header(path: Path) -> TaskHeader | None:
     try:
         return parse_task_header(path)
-    except (OSError, QueueValidationError, UnicodeDecodeError):
+    except QueueValidationError:
+        return _parse_legacy_existing_task_header(path)
+    except (OSError, UnicodeDecodeError):
         return None
+
+
+def _parse_legacy_existing_task_header(path: Path) -> TaskHeader | None:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    header_match: re.Match[str] | None = None
+    branch = ""
+    for raw_line in lines:
+        line = raw_line.rstrip()
+        if header_match is None:
+            header_match = re.match(r"^#\s+(PR-[A-Za-z0-9_.-]+):\s*(.+?)\s*$", line)
+            continue
+        if not line.strip():
+            continue
+        branch_match = re.match(r"^Branch\s*:\s*(.*?)\s*$", line)
+        if branch_match:
+            branch = branch_match.group(1).strip()
+            break
+        if line.startswith("#") or line.startswith("- "):
+            break
+    if header_match is None or not branch:
+        return None
+    return TaskHeader(
+        pr_id=header_match.group(1),
+        title=header_match.group(2),
+        branch=branch,
+        task_type="feature",
+        complexity="medium",
+        depends_on=[],
+        priority=3,
+        coder="any",
+    )
 
 
 def _pending_upload_task_ids(raw_manifest: str | bytes | None) -> set[str]:

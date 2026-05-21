@@ -192,6 +192,58 @@ def test_dependency_closure_ignores_existing_filename_when_header_differs(
     assert not (uploads_dir / "example__alpha").exists()
 
 
+def test_dependency_closure_accepts_legacy_existing_task_header(
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    tasks_dir = repo_dir / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "# PR-001: Legacy task\n\n"
+        "Branch: pr-001-legacy-task\n",
+        encoding="utf-8",
+    )
+
+    resp = _post_upload(
+        [_task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-001")]
+    )
+
+    assert resp.status_code == 200
+    assert (_staging_dir(uploads_dir) / "PR-002.md").is_file()
+
+
+def test_parse_existing_task_header_returns_none_for_unreadable_path(
+    tmp_path: Path,
+) -> None:
+    assert upload_routes._parse_existing_task_header(tmp_path) is None
+
+
+def test_parse_existing_task_header_returns_none_when_legacy_read_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise_validation_error(path: Path) -> None:
+        raise upload_routes.QueueValidationError([f"{path}: missing Branch"])
+
+    monkeypatch.setattr(upload_routes, "parse_task_header", _raise_validation_error)
+
+    assert upload_routes._parse_existing_task_header(tmp_path) is None
+
+
+def test_parse_existing_task_header_returns_none_for_interrupted_legacy_header(
+    tmp_path: Path,
+) -> None:
+    task_file = tmp_path / "PR-001.md"
+    task_file.write_text(
+        "# PR-001: Legacy task\n\n"
+        "- Type: feature\n"
+        "Branch: pr-001-legacy-task\n",
+        encoding="utf-8",
+    )
+
+    assert upload_routes._parse_existing_task_header(task_file) is None
+
+
 def test_dependency_closure_satisfied_by_merged_on_github(
     monkeypatch: pytest.MonkeyPatch, uploads_dir: Path
 ) -> None:
