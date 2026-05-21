@@ -211,10 +211,17 @@ class _FakeRedis:
 
     async def eval(self, script: str, numkeys: int, *args: Any) -> int:
         key = args[0]
-        expected = args[1]
+        if numkeys >= 2:
+            delete_key = args[1]
+            expected = args[numkeys]
+        else:
+            delete_key = key
+            expected = args[1]
         current = self.store.get(key)
         if current == expected:
-            del self.store[key]
+            if "return redis.call(\"del\", KEYS[1])" in script:
+                self.store.pop(key, None)
+            self.store.pop(delete_key, None)
             return 1
         return 0
 

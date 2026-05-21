@@ -29,7 +29,7 @@ from src.cancellation import (
 )
 from src.events import publish_wake
 from src.github.prs import extract_queue_pr_id
-from src.keyspace import pipeline_state, upload_pending
+from src.keyspace import pipeline_state, upload_pending, upload_pending_count
 from src.mcp.scans import scan_for_conflicts
 from src.models import RepoState, TaskStatus
 from src.queue_parser import (
@@ -52,6 +52,17 @@ from src.web.services.upload_validation import (
 router = APIRouter()
 
 _upload_locks: dict[str, asyncio.Lock] = {}
+_MISSING = object()
+
+_ENQUEUE_UPLOAD_PENDING_LUA = """
+redis.call("set", KEYS[1], ARGV[1])
+if ARGV[2] == "" then
+    redis.call("del", KEYS[2])
+else
+    redis.call("set", KEYS[2], ARGV[2])
+end
+return 1
+"""
 
 
 def _get_upload_lock(repo_name: str) -> asyncio.Lock:
@@ -214,6 +225,79 @@ def _upload_commit_subject(subject: str, uploaded_count: int) -> str:
     if custom_subject:
         return custom_subject
     return f"tasks: upload batch ({uploaded_count} files)"
+
+
+def _redis_text(value: object) -> object:
+    if isinstance(value, bytes):
+        return value.decode()
+    return value
+
+
+async def _rollback_upload_manifest(
+    redis_client: object,
+    pending_key: str,
+    manifest_json: str,
+    previous_manifest: object,
+) -> None:
+    """Best-effort restore for fallback clients without Redis Lua support."""
+    try:
+        current = await redis_client.get(pending_key)  # type: ignore[attr-defined]
+        if _redis_text(current) != manifest_json:
+            return
+        if previous_manifest is None:
+            await redis_client.delete(pending_key)  # type: ignore[attr-defined]
+        else:
+            await redis_client.set(  # type: ignore[attr-defined]
+                pending_key,
+                previous_manifest,
+            )
+    except Exception:
+        pass
+
+
+async def _enqueue_upload_manifest(
+    redis_client: object,
+    *,
+    pending_key: str,
+    manifest_json: str,
+    count_key: str,
+    pending_count: int | None,
+    previous_manifest: object = _MISSING,
+) -> None:
+    """Atomically publish the upload manifest and dashboard pending count."""
+    count_value = "" if pending_count is None else str(pending_count)
+    try:
+        await redis_client.eval(  # type: ignore[attr-defined]
+            _ENQUEUE_UPLOAD_PENDING_LUA,
+            2,
+            pending_key,
+            count_key,
+            manifest_json,
+            count_value,
+        )
+        return
+    except Exception:
+        pass
+
+    if previous_manifest is _MISSING:
+        previous_manifest = await redis_client.get(pending_key)  # type: ignore[attr-defined]
+    await redis_client.set(pending_key, manifest_json)  # type: ignore[attr-defined]
+    try:
+        if pending_count is None:
+            try:
+                await redis_client.delete(count_key)  # type: ignore[attr-defined]
+            except AttributeError:
+                pass
+        else:
+            await redis_client.set(count_key, count_value)  # type: ignore[attr-defined]
+    except Exception:
+        await _rollback_upload_manifest(
+            redis_client,
+            pending_key,
+            manifest_json,
+            previous_manifest,
+        )
+        raise
 
 
 def _validate_zip_member(entry_name: str) -> str | None:
@@ -809,10 +893,20 @@ async def upload_tasks(
                     len(uploaded_filenames),
                 ),
             }
+            manifest_json = json.dumps(manifest)
+            pending_count = (
+                len(manifest_filenames)
+                if existing_raw is not None or repo_state.state.value != "IDLE"
+                else None
+            )
             try:
-                await redis_client.set(
-                    pending_key,
-                    json.dumps(manifest),
+                await _enqueue_upload_manifest(
+                    redis_client,
+                    pending_key=pending_key,
+                    manifest_json=manifest_json,
+                    count_key=upload_pending_count(name),
+                    pending_count=pending_count,
+                    previous_manifest=existing_raw,
                 )
             except Exception:
                 return _render_upload_error(
