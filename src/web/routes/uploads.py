@@ -53,6 +53,23 @@ router = APIRouter()
 
 _upload_locks: dict[str, asyncio.Lock] = {}
 
+_ENQUEUE_UPLOAD_PENDING_LUA = """
+redis.call("set", KEYS[1], ARGV[1])
+if ARGV[2] == "" then
+    redis.call("del", KEYS[2])
+else
+    redis.call("set", KEYS[2], ARGV[2])
+end
+return 1
+"""
+
+_ROLLBACK_UPLOAD_PENDING_LUA = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+end
+return 0
+"""
+
 
 def _get_upload_lock(repo_name: str) -> asyncio.Lock:
     """Return the per-repo asyncio lock used to serialize upload writes."""
@@ -216,11 +233,68 @@ def _upload_commit_subject(subject: str, uploaded_count: int) -> str:
     return f"tasks: upload batch ({uploaded_count} files)"
 
 
-async def _clear_upload_pending_count(redis_client: object, repo_name: str) -> None:
+async def _rollback_upload_manifest(
+    redis_client: object,
+    pending_key: str,
+    manifest_json: str,
+) -> None:
+    """Best-effort rollback for fallback clients without Redis Lua support."""
     try:
-        await redis_client.delete(upload_pending_count(repo_name))  # type: ignore[attr-defined]
+        await redis_client.eval(  # type: ignore[attr-defined]
+            _ROLLBACK_UPLOAD_PENDING_LUA,
+            1,
+            pending_key,
+            manifest_json,
+        )
+        return
+    except (AttributeError, NotImplementedError):
+        pass
+    except Exception:
+        return
+
+    try:
+        current = await redis_client.get(pending_key)  # type: ignore[attr-defined]
+        if current == manifest_json:
+            await redis_client.delete(pending_key)  # type: ignore[attr-defined]
     except Exception:
         pass
+
+
+async def _enqueue_upload_manifest(
+    redis_client: object,
+    *,
+    pending_key: str,
+    manifest_json: str,
+    count_key: str,
+    pending_count: int | None,
+) -> None:
+    """Atomically publish the upload manifest and dashboard pending count."""
+    count_value = "" if pending_count is None else str(pending_count)
+    try:
+        await redis_client.eval(  # type: ignore[attr-defined]
+            _ENQUEUE_UPLOAD_PENDING_LUA,
+            2,
+            pending_key,
+            count_key,
+            manifest_json,
+            count_value,
+        )
+        return
+    except (AttributeError, NotImplementedError):
+        pass
+
+    await redis_client.set(pending_key, manifest_json)  # type: ignore[attr-defined]
+    try:
+        if pending_count is None:
+            try:
+                await redis_client.delete(count_key)  # type: ignore[attr-defined]
+            except AttributeError:
+                pass
+        else:
+            await redis_client.set(count_key, count_value)  # type: ignore[attr-defined]
+    except Exception:
+        await _rollback_upload_manifest(redis_client, pending_key, manifest_json)
+        raise
 
 
 def _validate_zip_member(entry_name: str) -> str | None:
@@ -816,18 +890,19 @@ async def upload_tasks(
                     len(uploaded_filenames),
                 ),
             }
+            manifest_json = json.dumps(manifest)
             try:
-                await redis_client.set(
-                    pending_key,
-                    json.dumps(manifest),
+                await _enqueue_upload_manifest(
+                    redis_client,
+                    pending_key=pending_key,
+                    manifest_json=manifest_json,
+                    count_key=upload_pending_count(name),
+                    pending_count=(
+                        None
+                        if repo_state.state.value == "IDLE"
+                        else len(manifest_filenames)
+                    ),
                 )
-                if repo_state.state.value == "IDLE":
-                    await _clear_upload_pending_count(redis_client, name)
-                else:
-                    await redis_client.set(
-                        upload_pending_count(name),
-                        str(len(manifest_filenames)),
-                    )
             except Exception:
                 return _render_upload_error(
                     request,
