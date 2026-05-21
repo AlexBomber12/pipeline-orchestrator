@@ -27,6 +27,7 @@ from src.coder_registry import CoderPlugin
 from src.daemon import git_ops
 from src.daemon.guardrails import scan_stdout
 from src.daemon.handlers import CoderUnavailable
+from src.daemon.quarantine import apply_quarantine_label_for_violation
 from src.github import cache as gh_cache
 from src.github import gh_runner
 from src.github import prs as gh_prs
@@ -655,6 +656,10 @@ class CodingMixin:
                 )
             if await pause_for_stop_if_requested():
                 return
+            if self.state.current_pr is not None:
+                pr_number = self.state.current_pr.number
+                self.state.quarantined_prs.add(pr_number)
+                apply_quarantine_label_for_violation(self, pr_number, first)
             await self._transition_to_error(
                 cause,
                 publish=False,

@@ -66,6 +66,14 @@ class MergeMixin:
         number = self.state.current_pr.number
         pr_branch = self.state.current_pr.branch
         base = self.repo_config.branch
+        if number in self.state.quarantined_prs:
+            self.log_event(
+                f"[MERGE] PR #{number} is quarantined; refusing to merge "
+                f"({len(self.state.quarantined_prs)} quarantined in this repo)."
+            )
+            self.state.state = PipelineState.WATCH
+            await self.publish_state()
+            return
         if not self.state.current_pr.is_cross_repository:
             # PR-352: dashboard sub-phase visibility during the long MERGE
             # cycle. The pre-merge sync (fetch + merge base + optional

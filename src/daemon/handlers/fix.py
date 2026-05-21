@@ -22,6 +22,7 @@ from src.daemon import (
 )
 from src.daemon.guardrails import scan_stdout
 from src.daemon.handlers.breach import BreachMixin
+from src.daemon.quarantine import apply_quarantine_label_for_violation
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
 from src.github import comments as gh_comments
 from src.github import gh_runner
@@ -614,6 +615,10 @@ class FixMixin(BreachMixin):
                 )
             if await pause_for_stop_after_bookkeeping():
                 return
+            if self.state.current_pr is not None:
+                pr_number = self.state.current_pr.number
+                self.state.quarantined_prs.add(pr_number)
+                apply_quarantine_label_for_violation(self, pr_number, first)
             await self._transition_to_error(
                 cause,
                 save_run_record_as=None,

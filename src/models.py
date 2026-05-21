@@ -235,6 +235,7 @@ class RepoState(BaseModel):
     # ``__setattr__`` so the rendered badge subtitle disappears the moment
     # the state machine leaves MERGE. ``None`` outside MERGE.
     merge_phase: str | None = None
+    quarantined_prs: set[int] = Field(default_factory=set)
 
     @field_validator("state", mode="before")
     @classmethod

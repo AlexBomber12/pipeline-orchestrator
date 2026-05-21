@@ -16,6 +16,7 @@ from pathlib import Path
 
 from src.cancellation import CancellationCause
 from src.daemon import guardrails
+from src.daemon.quarantine import apply_quarantine_label_for_violation
 from src.github import cache as gh_cache
 from src.github import checks as gh_checks
 from src.github import gh_runner
@@ -190,6 +191,7 @@ class WatchMixin:
         if pr_state in ("MERGED", "CLOSED"):
             await self._handle_external_pr_resolution(found, pr_state)
             return
+        await self._detect_external_quarantine_release(found.number)
 
         merged_shas, merged_push_count = current_pr.merge_observed_pushes(found)
         # PR-290a follow-up: ``get_open_prs`` returns a fresh ``PRInfo``
@@ -602,6 +604,8 @@ class WatchMixin:
                 f"[GUARDRAIL] tier={first.tier} {first.category}: "
                 f"{first.excerpt}"
             )
+            self.state.quarantined_prs.add(current_pr.number)
+            apply_quarantine_label_for_violation(self, current_pr.number, first)
             await self._transition_to_error(
                 message,
                 log_prefix="[WATCH]",
@@ -616,6 +620,42 @@ class WatchMixin:
                 ),
             )
         return True
+
+    async def _detect_external_quarantine_release(self, pr_number: int) -> None:
+        """Clear in-memory quarantine when GitHub quarantine labels are gone."""
+        if pr_number not in self.state.quarantined_prs:
+            return
+        try:
+            result = gh_runner.run_gh(
+                [
+                    "pr",
+                    "view",
+                    str(pr_number),
+                    "--json",
+                    "labels",
+                    "-q",
+                    ".labels[].name",
+                ],
+                repo=self.owner_repo,
+            )
+        except Exception as exc:
+            self.log_event(
+                f"[WATCH] PR #{pr_number} quarantine label check failed: {exc}."
+            )
+            return
+        if isinstance(result, str):
+            labels = [label.strip() for label in result.splitlines()]
+        elif isinstance(result, list):
+            labels = [str(label).strip() for label in result]
+        else:
+            labels = []
+        if any(label.startswith("quarantine:") for label in labels if label):
+            return
+        self.state.quarantined_prs.discard(pr_number)
+        self.log_event(
+            f"[WATCH] PR #{pr_number} quarantine released externally."
+        )
+        await self.publish_state()
 
     async def _maybe_reclassify_stuck_pending(self, found: object) -> None:
         """Upgrade ``found.ci_status`` to FAILURE when CI has been PENDING too long.
