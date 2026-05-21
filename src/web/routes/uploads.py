@@ -692,12 +692,27 @@ async def upload_tasks(
             except Exception:
                 existing_raw = None
 
+            locked_existing_task_ids = _existing_task_ids(Path(repo_path) / "tasks")
+            if dependency_candidates:
+                try:
+                    locked_merged_pr_ids = set(
+                        await asyncio.to_thread(
+                            get_merged_pr_ids,
+                            repo_path,
+                            repo_branch,
+                            dependency_candidates,
+                        )
+                    )
+                except Exception:
+                    locked_merged_pr_ids = set()
+            else:
+                locked_merged_pr_ids = set()
             locked_dependency_errors = _dependency_validation_errors(
                 parsed_headers,
-                existing_task_ids=existing_task_ids,
+                existing_task_ids=locked_existing_task_ids,
                 pending_task_ids=_pending_upload_task_ids(existing_raw),
                 batch_task_ids=batch_task_ids,
-                merged_pr_ids=merged_pr_ids,
+                merged_pr_ids=locked_merged_pr_ids,
             )
             if locked_dependency_errors:
                 validation_errors = [

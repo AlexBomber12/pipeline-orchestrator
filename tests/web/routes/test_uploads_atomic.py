@@ -313,6 +313,70 @@ def test_dependency_closure_rechecks_pending_manifest_inside_upload_lock(
     )
 
 
+def test_dependency_closure_locked_recheck_refreshes_tasks_dir(
+    repo_dir: Path,
+    uploads_dir: Path,
+) -> None:
+    pending_staging = uploads_dir / "example__alpha" / "pending"
+    pending_staging.mkdir(parents=True)
+    (pending_staging / "PR-001.md").write_bytes(
+        _task_bytes("PR-001.md", pr_id="PR-001")
+    )
+    pending_manifest = json.dumps(
+        {
+            "repo": "example__alpha",
+            "files": ["PR-001.md"],
+            "staging_dir": str(pending_staging),
+        }
+    )
+
+    class _PendingMovesToTasksRedis:
+        def __init__(self) -> None:
+            self.pending_reads = 0
+            self.manifest: str | None = None
+
+        async def get(self, key: str) -> str | None:
+            if key == "pipeline:example__alpha":
+                return '{"url":"","name":"example__alpha","state":"IDLE"}'
+            if key == upload_pending("example__alpha"):
+                self.pending_reads += 1
+                if self.pending_reads == 1:
+                    return pending_manifest
+                tasks_dir = repo_dir / "tasks"
+                tasks_dir.mkdir(exist_ok=True)
+                (tasks_dir / "PR-001.md").write_bytes(
+                    _task_bytes("PR-001.md", pr_id="PR-001")
+                )
+                return None
+            return None
+
+        async def set(self, key: str, value: str, **kwargs: object) -> None:
+            if key == upload_pending("example__alpha"):
+                self.manifest = value
+
+        async def scan_iter(self, match: str | None = None):
+            if False:
+                yield ""
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(app) as client:
+        redis_client = _PendingMovesToTasksRedis()
+        client.app.state.redis = redis_client
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[
+                _task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-001")
+            ],
+        )
+
+    assert resp.status_code == 200
+    assert redis_client.manifest is not None
+    manifest = json.loads(redis_client.manifest)
+    assert manifest["files"] == ["PR-002.md"]
+
+
 def test_pending_upload_task_ids_ignores_invalid_manifest(tmp_path: Path) -> None:
     staging_dir = tmp_path / "pending"
     staging_dir.mkdir()
