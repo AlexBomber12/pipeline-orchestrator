@@ -688,9 +688,13 @@ class WatchMixin:
             task_id = getattr(pr, "pr_id", "") or ""
         if not isinstance(pr_number, int):
             return
+        has_guardrail_suppression = False
         if task_id:  # pragma: no cover
             record = await self._suppression_record_for_task(task_id)
-            if record is None or record.reason != SuppressionReason.GUARDRAIL:
+            has_guardrail_suppression = (
+                record is not None and record.reason == SuppressionReason.GUARDRAIL
+            )
+            if not has_guardrail_suppression and pr_number not in self.state.quarantined_prs:
                 return
         elif pr_number not in self.state.quarantined_prs:
             return
@@ -721,7 +725,7 @@ class WatchMixin:
         labels = [label.strip() for label in result.splitlines()]
         if any(label.startswith("quarantine:") for label in labels if label):
             return
-        if task_id:
+        if task_id and has_guardrail_suppression:
             await self._clear_task_suppression(task_id)  # pragma: no cover
         self.state.quarantined_prs.discard(pr_number)
         self.log_event(

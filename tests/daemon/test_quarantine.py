@@ -272,6 +272,23 @@ def test_label_removal_check_soft_fails(monkeypatch: pytest.MonkeyPatch) -> None
     assert any("quarantine label check failed" in e["event"] for e in runner.state.history)
 
 
+def test_label_removal_releases_legacy_quarantine_set_with_pr_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    runner.state.quarantined_prs.add(10)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: "")
+
+    asyncio.run(
+        runner._detect_external_quarantine_release(
+            PRInfo(number=10, branch="pr-382", pr_id="PR-382")
+        )
+    )
+
+    assert 10 not in runner.state.quarantined_prs
+    assert any("quarantine released externally" in e["event"] for e in runner.state.history)
+
+
 def test_label_removal_check_keeps_labeled_pr(monkeypatch: pytest.MonkeyPatch) -> None:
     runner = h._make_runner()
     runner.state.quarantined_prs.add(10)
