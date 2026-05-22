@@ -1785,22 +1785,19 @@ class PipelineRunner(
         task = self.state.current_task
         task_id = task.pr_id if task is not None else None
 
-        if reason is None:
-            frontmatter_status, _blocked = (
-                self._frontmatter_error_status_for_current_task()
+        frontmatter_status, _blocked = self._frontmatter_error_status_for_current_task()
+        if frontmatter_status == "todo":
+            self.state.skip_ai_error_diagnose = False
+            self.state.error_message = None
+            self.state.review_timeout_repost_attempted = False
+            self.state.review_timeout_repost_at = None
+            self.state.state = PipelineState.IDLE
+            self._last_error_park_log_key = None
+            self.log_event(
+                "[ESCALATE] operator-cleared ERROR task frontmatter "
+                "-> IDLE."
             )
-            if frontmatter_status == "todo":
-                self.state.skip_ai_error_diagnose = False
-                self.state.error_message = None
-                self.state.review_timeout_repost_attempted = False
-                self.state.review_timeout_repost_at = None
-                self.state.state = PipelineState.IDLE
-                self._last_error_park_log_key = None
-                self.log_event(
-                    "[ESCALATE] operator-cleared ERROR task frontmatter "
-                    "-> IDLE."
-                )
-                return
+            return
 
         if reason is not None and is_operator_clearable(reason):
             if task_id is not None and not from_frontmatter:
@@ -1821,6 +1818,28 @@ class PipelineRunner(
                 self._last_error_park_log_key = key
                 self.log_event(
                     f"[ESCALATE] {reason.value} operator-clearable ERROR "
+                    "park active; waiting for Retry or reupload."
+                )
+            return
+
+        if self.state.skip_ai_error_diagnose:
+            if await self._review_timeout_park_cleared():
+                self.state.skip_ai_error_diagnose = False
+                self.state.error_message = None
+                self.state.review_timeout_repost_attempted = False
+                self.state.review_timeout_repost_at = None
+                self.state.state = PipelineState.IDLE
+                self._last_error_park_log_key = None
+                self.log_event(
+                    "[ESCALATE] review_timeout park cleared by "
+                    "operator -> IDLE."
+                )
+                return
+            key = (task_id, SuppressionReason.REVIEW_TIMEOUT.value)
+            if self._last_error_park_log_key != key:
+                self._last_error_park_log_key = key
+                self.log_event(
+                    "[ESCALATE] review_timeout operator-clearable ERROR "
                     "park active; waiting for Retry or reupload."
                 )
             return

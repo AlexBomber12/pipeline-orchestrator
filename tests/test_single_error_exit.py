@@ -244,6 +244,89 @@ def test_reupload_releases_park_from_error(
     assert runner.state.state == PipelineState.IDLE
 
 
+def test_frontmatter_todo_releases_even_with_stale_store_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner(tmp_path)
+    _stub_cycle(monkeypatch, runner)
+    _clear_task_frontmatter(runner)
+
+    async def stale_record(_task_id: str) -> SimpleNamespace:
+        return SimpleNamespace(reason=SuppressionReason.GUARDRAIL)
+
+    monkeypatch.setattr(runner, "_suppression_record_for_task", stale_record)
+
+    asyncio.run(runner._run_cycle_body())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message is None
+    assert any(
+        "operator-cleared ERROR task frontmatter -> IDLE" in event
+        for event in _events(runner)
+    )
+
+
+def test_review_timeout_skip_flag_parks_under_single_error_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner(tmp_path)
+    _stub_cycle(monkeypatch, runner)
+    runner.state.skip_ai_error_diagnose = True
+    _suppress(runner, SuppressionReason.REVIEW_TIMEOUT)
+    calls = 0
+
+    async def fake_handle_error() -> None:
+        nonlocal calls
+        calls += 1
+
+    async def not_cleared() -> bool:
+        return False
+
+    monkeypatch.setattr(runner, "handle_error", fake_handle_error)
+    monkeypatch.setattr(runner, "_review_timeout_park_cleared", not_cleared)
+
+    asyncio.run(runner._run_cycle_body())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.skip_ai_error_diagnose is True
+    assert calls == 0
+    assert any(
+        "review_timeout operator-clearable ERROR park active" in event
+        for event in _events(runner)
+    )
+
+
+def test_review_timeout_skip_flag_releases_under_single_error_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner(tmp_path)
+    _stub_cycle(monkeypatch, runner)
+    runner.state.skip_ai_error_diagnose = True
+    runner.state.review_timeout_repost_attempted = True
+    runner.state.review_timeout_repost_at = datetime.now(timezone.utc)
+    _suppress(runner, SuppressionReason.REVIEW_TIMEOUT)
+
+    async def cleared() -> bool:
+        return True
+
+    monkeypatch.setattr(runner, "_review_timeout_park_cleared", cleared)
+
+    asyncio.run(runner._run_cycle_body())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.skip_ai_error_diagnose is False
+    assert runner.state.error_message is None
+    assert runner.state.review_timeout_repost_attempted is False
+    assert runner.state.review_timeout_repost_at is None
+    assert any(
+        "review_timeout park cleared by operator -> IDLE" in event
+        for event in _events(runner)
+    )
+
+
 def test_frontmatter_fallback_after_redis_loss(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
