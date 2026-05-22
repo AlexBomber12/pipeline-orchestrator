@@ -8,6 +8,7 @@ from typing import Any
 
 from src.cancellation import (
     CancellationCause,
+    classify_cancellation_subsource,
     get_cancellation_cause,
     list_recent_cancellations,
     safe_delete_cancellation_cause,
@@ -70,7 +71,7 @@ class RedisSuppressionStore:
 
     def _record_from_cause(self, cause: CancellationCause) -> SuppressionRecord:
         payload = cause.payload if isinstance(cause.payload, dict) else {}
-        reason = self._reason_from_payload(payload)
+        reason = self._reason_from_cause(cause, payload)
         detail = dict(payload)
         detail.pop("subsource", None)
         return SuppressionRecord(
@@ -81,10 +82,17 @@ class RedisSuppressionStore:
             approved_once=bool(payload.get("approved_once", False)),
         )
 
-    def _reason_from_payload(self, payload: dict[str, Any]) -> SuppressionReason:
+    def _reason_from_cause(
+        self,
+        cause: CancellationCause,
+        payload: dict[str, Any],
+    ) -> SuppressionReason:
         subsource = payload.get("subsource")
         if isinstance(subsource, str) and lookup(subsource) is not None:
             return SuppressionReason(subsource)
+        classified = classify_cancellation_subsource(cause, log=lambda _msg: None)
+        if lookup(classified) is not None:
+            return SuppressionReason(classified)
         self._log_unknown_subsource_once(subsource)
         return SuppressionReason.CRASH
 

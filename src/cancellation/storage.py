@@ -136,6 +136,16 @@ def task_spec_content_hash(task_text: str) -> str:
     return hashlib.sha256("".join(normalized).encode("utf-8")).hexdigest()
 
 
+def _sort_created_at(cause: CancellationCause) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(cause.created_at)
+    except (TypeError, ValueError):
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 async def record_cancellation_cause(
     redis_client: Any,
     repo_slug: str,
@@ -383,7 +393,7 @@ async def list_recent_cancellations(
             causes.append(cause)
     if stale:
         await redis_client.zrem(index_key(repo_slug), *stale)
-    causes.sort(key=lambda c: datetime.fromisoformat(c.created_at), reverse=True)
+    causes.sort(key=_sort_created_at, reverse=True)
     return causes
 
 

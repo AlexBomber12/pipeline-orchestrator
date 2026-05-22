@@ -130,6 +130,47 @@ async def test_unknown_subsource_defensive_crash(caplog) -> None:
     assert len(warnings) == 1
 
 
+async def test_legacy_category_without_subsource_derives_reason() -> None:
+    redis = _FakeRedis()
+    store = RedisSuppressionStore(redis)
+    await record_cancellation_cause(
+        redis,
+        "alpha",
+        "PR-LEGACY-TIMEOUT",
+        CancellationCause(
+            category="TIMEOUT",
+            payload={"note": "pre-migration"},
+            created_at="2026-05-04T12:00:00+00:00",
+        ),
+    )
+
+    record = await store.is_suppressed("alpha", "PR-LEGACY-TIMEOUT")
+
+    assert record is not None
+    assert record.reason == SuppressionReason.REVIEW_TIMEOUT
+    assert record.detail == {"note": "pre-migration"}
+
+
+async def test_payload_legacy_category_without_subsource_derives_reason() -> None:
+    redis = _FakeRedis()
+    store = RedisSuppressionStore(redis)
+    await record_cancellation_cause(
+        redis,
+        "alpha",
+        "PR-MIGRATED-LEGACY",
+        CancellationCause(
+            category="ERROR",
+            payload={"legacy_category": "TIMEOUT"},
+            created_at="2026-05-04T12:00:00+00:00",
+        ),
+    )
+
+    record = await store.is_suppressed("alpha", "PR-MIGRATED-LEGACY")
+
+    assert record is not None
+    assert record.reason == SuppressionReason.REVIEW_TIMEOUT
+
+
 async def test_created_at_parsing_handles_invalid_and_naive_values() -> None:
     redis = _FakeRedis()
     store = RedisSuppressionStore(redis)
@@ -159,6 +200,43 @@ async def test_created_at_parsing_handles_invalid_and_naive_values() -> None:
     assert bad.created_at is None
     assert naive is not None
     assert naive.created_at == datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+
+
+async def test_list_suppressed_tolerates_malformed_created_at() -> None:
+    redis = _FakeRedis()
+    store = RedisSuppressionStore(redis)
+    base = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+    malformed = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "guardrail", "kind": "malformed"},
+        created_at="not-a-timestamp",
+        task_id="PR-BAD-TIME",
+        repo_slug="alpha",
+    )
+    redis.values[cause_key("alpha", "PR-BAD-TIME")] = malformed.to_redis()
+    redis.zsets[index_key("alpha")] = {"PR-BAD-TIME": base.timestamp()}
+    await record_cancellation_cause(
+        redis,
+        "alpha",
+        "PR-GOOD-TIME",
+        CancellationCause(
+            category="ERROR",
+            payload={"subsource": "guardrail", "kind": "valid"},
+            created_at=(base + timedelta(minutes=1)).isoformat(),
+        ),
+    )
+
+    records = await store.list_suppressed(
+        "alpha",
+        since=base - timedelta(minutes=1),
+    )
+
+    assert [record.task_id for record in records] == [
+        "PR-GOOD-TIME",
+        "PR-BAD-TIME",
+    ]
+    assert [record.detail["kind"] for record in records] == ["valid", "malformed"]
+    assert records[1].created_at is None
 
 
 async def test_expired_cause_not_active() -> None:

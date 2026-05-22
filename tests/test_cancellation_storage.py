@@ -522,6 +522,29 @@ async def test_list_recent_orders_by_parsed_timestamp_across_offsets() -> None:
     assert [c.task_id for c in recent] == ["PR-LATER", "PR-EARLY"]
 
 
+async def test_list_recent_orders_naive_timestamps_as_utc() -> None:
+    redis = _FakeRedis()
+    base = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+    await record_cancellation_cause(
+        redis,
+        "alpha",
+        "PR-NAIVE",
+        CancellationCause(category="CRASH", created_at="2026-05-04T12:30:00"),
+    )
+    await record_cancellation_cause(
+        redis,
+        "alpha",
+        "PR-AWARE",
+        CancellationCause(
+            category="CRASH",
+            created_at=(base + timedelta(minutes=45)).isoformat(),
+        ),
+    )
+
+    recent = await list_recent_cancellations(redis, "alpha", base)
+    assert [c.task_id for c in recent] == ["PR-AWARE", "PR-NAIVE"]
+
+
 async def test_record_sets_forensic_window_ttl_on_index_key() -> None:
     redis = _FakeRedis()
     await record_cancellation_cause(
