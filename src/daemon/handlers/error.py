@@ -509,6 +509,7 @@ class ErrorMixin:
                 reason="diagnose_error FIX retry",
             )
             self.state.state = PipelineState.IDLE
+            self._error_diagnose_policy.reset(self)
             if retry_task_id is not None:
                 await self._reset_suppression_detail_count(
                     retry_task_id, "diagnose_attempts"

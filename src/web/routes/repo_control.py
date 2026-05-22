@@ -52,6 +52,7 @@ from src.queue_parser import (
     write_frontmatter_status,
 )
 from src.subsource_registry import SuppressionReason
+from src.suppression.redis_store import RedisSuppressionStore
 from src.web.services.coder import _effective_coder_name
 from src.web.services.repo_state import (
     _default_repo_state,
@@ -82,6 +83,31 @@ def _split_gh_label_output(result: object) -> list[str]:
     if isinstance(result, list):
         return [str(label).strip() for label in result if str(label).strip()]
     return []
+
+
+async def _suppressed_task_ids_for_pr(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    pr_number: int,
+) -> set[str]:
+    """Return suppressed task ids whose detail maps them to ``pr_number``."""
+    try:
+        records = await RedisSuppressionStore(redis_client).list_suppressed(
+            repo_slug,
+            since=datetime.fromtimestamp(0, tz=timezone.utc),
+        )
+    except Exception:
+        return set()
+    task_ids: set[str] = set()
+    for record in records:
+        detail_pr = record.detail.get("pr_number")
+        try:
+            detail_pr_number = int(detail_pr)
+        except (TypeError, ValueError):
+            continue
+        if detail_pr_number == pr_number:
+            task_ids.add(record.task_id)
+    return task_ids
 
 _DEFERRED_CODER_SWITCH_STATES = {
     PipelineState.CODING,
@@ -1158,10 +1184,14 @@ async def release_quarantine(
         state = RepoState.model_validate_json(raw_state)
     except Exception:
         return JSONResponse({"error": "repository state unavailable"}, status_code=503)
-    task_id = ""
+    task_ids: set[str] = set()
     if state.current_pr is not None and state.current_pr.number == pr_number:  # pragma: no cover
-        task_id = state.current_pr.pr_id or ""
-    if not task_id and pr_number not in state.quarantined_prs:
+        if state.current_pr.pr_id:
+            task_ids.add(state.current_pr.pr_id)
+    task_ids.update(
+        await _suppressed_task_ids_for_pr(redis_client, name, pr_number)
+    )
+    if not task_ids and pr_number not in state.quarantined_prs:
         return JSONResponse({"status": "not_quarantined", "pr": pr_number})
 
     try:
@@ -1230,7 +1260,7 @@ async def release_quarantine(
         )
     except Exception:
         return JSONResponse({"error": "failed to update state"}, status_code=503)
-    if task_id:  # pragma: no cover
+    for task_id in task_ids:
         try:
             await delete_cancellation_cause(redis_client, name, task_id)
         except Exception:

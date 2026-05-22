@@ -136,6 +136,25 @@ def test_clear_error_message_on_recovery_clears_sentinel() -> None:
     assert key in runner.redis.deleted
 
 
+def test_handle_error_fix_resets_diagnose_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    runner = _make_error_runner()
+    runner._error_diagnose_count = 2
+
+    async def _diagnose(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        return 0, "FIX\nRoot cause found", ""
+
+    monkeypatch.setattr(runner._registry.get("claude"), "diagnose_error", _diagnose)
+    monkeypatch.setattr(runner._registry.get("codex"), "diagnose_error", _diagnose)
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner._error_diagnose_count == 0
+
+
 def test_clear_error_message_on_recovery_ignores_sentinel_delete_failure() -> None:
     class FailingDeleteRedis(h._FakeRedis):
         async def delete(self, key: str) -> int:
