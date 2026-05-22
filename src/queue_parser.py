@@ -34,7 +34,7 @@ _PR_ID_RE = re.compile(r"^PR-[A-Za-z0-9_.-]+$")
 _FIELD_RE = re.compile(r"^-\s*([A-Za-z ]+?)\s*:\s*(.*?)\s*$")
 _TASK_BRANCH_RE = re.compile(r"^Branch\s*:\s*(.*?)\s*$")
 _FRONTMATTER_STATUS_RE = re.compile(r"^status:\s*(.+?)\s*$")
-_FRONTMATTER_BLOCKED_REASON_RE = re.compile(r"^blocked_reason:\s*(.+?)\s*$")
+_FRONTMATTER_BLOCKED_REASON_RE = re.compile(r"^blocked_reason:\s*(.*?)\s*$")
 _STATUS_LINE_RE = re.compile(
     r"^(-\s*status\s*:\s*)(\S*)(.*)$", re.IGNORECASE
 )

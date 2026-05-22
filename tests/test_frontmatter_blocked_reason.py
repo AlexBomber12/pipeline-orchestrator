@@ -130,6 +130,16 @@ def test_unknown_reason_rejected(tmp_path: Path) -> None:
         parse_task_header(task)
 
 
+def test_empty_reason_rejected(tmp_path: Path) -> None:
+    task = _write_task(
+        tmp_path,
+        f"---\nstatus: ERROR\nblocked_reason:\n---\n\n{_task_body()}",
+    )
+
+    with pytest.raises(QueueValidationError, match="invalid blocked_reason"):
+        parse_task_header(task)
+
+
 def test_error_without_reason_defaults(tmp_path: Path) -> None:
     task = _write_task(tmp_path, f"---\nstatus: TODO\n---\n\n{_task_body()}")
 
