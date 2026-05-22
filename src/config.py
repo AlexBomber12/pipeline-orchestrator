@@ -118,6 +118,9 @@ class FeatureFlags(BaseModel):
     # touching the rest. Default True completes the WorkInhibitor cutover;
     # per-repo overrides to False remain available for targeted rollback.
     use_unified_inhibitor_check: bool = True
+    # PR-380: single operator-clearable ERROR exit is canaried per repo.
+    # Default False preserves the legacy ERROR branch until explicitly flipped.
+    use_single_error_exit: bool = False
 
 
 class RepoConfig(BaseModel):
