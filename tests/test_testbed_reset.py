@@ -71,6 +71,8 @@ def test_clear_testbed_redis_state_runs_keys_then_del(monkeypatch) -> None:
                 "DEL",
                 "pipeline:slug",
                 "upload:slug:pending",
+                "error_rate:slug",
+                "error_rate_last_auto_pause:slug",
                 "control:slug:a",
                 "control:slug:b",
             ),

@@ -259,6 +259,8 @@ def clear_testbed_redis_state(slug: str) -> int:
                 "DEL",
                 f"pipeline:{slug}",
                 f"upload:{slug}:pending",
+                f"error_rate:{slug}",
+                f"error_rate_last_auto_pause:{slug}",
                 *control_keys,
             ],
             capture_output=True,
