@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 import pytest
+from src.config import FeatureFlags
 from src.models import PipelineState, QueueTask, TaskStatus
 from tests.runner import _helpers as h
 
@@ -118,6 +119,19 @@ def test_clear_sentinel_helper_idempotent() -> None:
     asyncio.run(runner._clear_diagnose_exhausted("PR-001"))
 
     assert runner.redis.deleted == [_sentinel_key(runner, "PR-001")]
+
+
+def test_clear_sentinel_helper_deletes_redis_key_with_single_error_exit() -> None:
+    runner = h._make_runner(feature_flags=FeatureFlags(use_single_error_exit=True))
+    runner._error_diagnose_count = 3
+
+    asyncio.run(runner._mark_diagnose_exhausted("PR-001"))
+    assert _sentinel_key(runner, "PR-001") in runner.redis.store
+
+    asyncio.run(runner._clear_diagnose_exhausted("PR-001"))
+
+    assert _sentinel_key(runner, "PR-001") not in runner.redis.store
+    assert asyncio.run(runner._suppression_record_for_task("PR-001")) is None
 
 
 def test_clear_error_message_on_recovery_clears_sentinel() -> None:

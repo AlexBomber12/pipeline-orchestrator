@@ -11,7 +11,7 @@ from redis.exceptions import RedisError
 from src.audit import operator_actions
 from src.cancellation.storage import cause_key, index_key
 from src.keyspace import pipeline_state
-from src.models import PipelineState, RepoState, PRInfo
+from src.models import PipelineState, PRInfo, RepoState
 from src.subsource_registry import SuppressionReason
 from src.web import app as web_app
 from src.web.app import app
@@ -194,6 +194,32 @@ def test_suppressed_task_ids_for_pr_ignores_invalid_pr_detail() -> None:
     )
 
     assert found == set()
+
+
+def test_suppressed_task_ids_for_pr_requires_guardrail_reason() -> None:
+    redis = _Redis()
+    _seed_suppression(
+        redis,
+        "PR-rate-limit",
+        {
+            "subsource": SuppressionReason.RATE_LIMIT.value,
+            "pr_number": 442,
+        },
+    )
+    _seed_suppression(
+        redis,
+        "PR-guardrail",
+        {
+            "subsource": SuppressionReason.GUARDRAIL.value,
+            "pr_number": 442,
+        },
+    )
+
+    found = asyncio.run(
+        repo_control._suppressed_task_ids_for_pr(redis, "example__alpha", 442)
+    )
+
+    assert found == {"PR-guardrail"}
 
 
 def test_release_endpoint_clears_non_current_pr_suppression(

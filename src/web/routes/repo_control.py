@@ -100,6 +100,8 @@ async def _suppressed_task_ids_for_pr(
         return set()
     task_ids: set[str] = set()
     for record in records:
+        if record.reason != SuppressionReason.GUARDRAIL:
+            continue
         detail_pr = record.detail.get("pr_number")
         try:
             detail_pr_number = int(detail_pr)

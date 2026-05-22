@@ -579,9 +579,6 @@ class PipelineRunner(
         """
         if not task_id:  # pragma: no cover
             return
-        if self.repo_config.feature_flags.use_single_error_exit:
-            await self._clear_task_suppression(task_id)
-            return
         key = f"diagnose_exhausted:{self.name}:{task_id}"
         try:
             await self.redis.delete(key)
@@ -592,6 +589,9 @@ class PipelineRunner(
                 task_id,
                 exc,
             )
+        if self.repo_config.feature_flags.use_single_error_exit:
+            await self._clear_task_suppression(task_id)
+            return
 
     async def _suppression_detail_count(self, task_id: str, field: str) -> int:  # pragma: no cover
         if not task_id:
