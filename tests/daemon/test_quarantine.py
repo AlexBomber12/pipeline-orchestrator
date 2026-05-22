@@ -14,7 +14,14 @@ from src.daemon.guardrails import GuardrailViolation
 from src.daemon.handlers import merge as merge_module
 from src.daemon.handlers import watch as watch_module
 from src.daemon.quarantine import apply_quarantine_label_for_violation
-from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus
+from src.models import (
+    CIStatus,
+    PipelineState,
+    PRInfo,
+    QueueTask,
+    ReviewStatus,
+    TaskStatus,
+)
 from tests.runner import _helpers as h
 
 
@@ -287,6 +294,35 @@ def test_label_removal_releases_legacy_quarantine_set_with_pr_id(
 
     assert 10 not in runner.state.quarantined_prs
     assert any("quarantine released externally" in e["event"] for e in runner.state.history)
+
+
+def test_label_removal_clears_suppression_with_current_task_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-382",
+        title="PR-382",
+        status=TaskStatus.ERROR,
+    )
+    runner.state.quarantined_prs.add(10)
+    asyncio.run(
+        runner._suppress_task(
+            "PR-382",
+            runner_module.SuppressionReason.GUARDRAIL,
+            {"pr_number": 10},
+        )
+    )
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: "")
+
+    asyncio.run(
+        runner._detect_external_quarantine_release(
+            PRInfo(number=10, branch="renamed-title", pr_id="")
+        )
+    )
+
+    assert 10 not in runner.state.quarantined_prs
+    assert asyncio.run(runner._suppression_record_for_task("PR-382")) is None
 
 
 def test_label_removal_check_keeps_labeled_pr(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -25,7 +25,6 @@ by stubbing the diagnosis async helpers and the usage-provider snapshot.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 
 # PR-224a: imports needed by tests moved from tests/test_runner.py
 import random  # noqa: F401
@@ -33,6 +32,7 @@ import re  # noqa: F401
 import subprocess
 import time  # noqa: F401
 import types  # noqa: F401
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +44,7 @@ from src.daemon import git_ops as git_ops_module
 from src.daemon import runner as runner_module
 from src.daemon.handlers import coding as coding_module  # noqa: F401,F811
 from src.daemon.handlers import error as error_module  # noqa: F401,F811
-from src.daemon.handlers import idle as idle_module  # noqa: F811
+from src.daemon.handlers import idle as idle_module  # noqa: F401,F811
 from src.daemon.handlers import merge as merge_module  # noqa: F401,F811
 from src.daemon.handlers import watch as watch_module  # noqa: F401,F811
 from src.daemon.runner import ErrorCategory, _classify_error
@@ -189,6 +189,38 @@ def test_same_context_soft_skip_3_cycles_return_idle(
     assert runner._error_skip_count == 3
     assert runner._error_skip_active is True
     assert diag_calls == []
+
+
+def test_rate_limited_diagnosis_soft_skip_clears_retry_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The provider-driven soft-skip is an IDLE retry path."""
+    _block_diagnose_calls(monkeypatch)
+    runner = h._make_runner()
+    _force_claude_rate_limited_provider(runner)
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = _SOFT_SKIP_CONTEXT
+    runner.state.current_task = QueueTask(
+        pr_id="PR-382",
+        title="PR-382",
+        status=TaskStatus.ERROR,
+    )
+    deleted: list[tuple[str, str]] = []
+
+    async def fake_delete(
+        redis_client: Any,
+        repo_slug: str,
+        task_id: str,
+        **kwargs: Any,
+    ) -> None:
+        deleted.append((repo_slug, task_id))
+
+    monkeypatch.setattr(error_module, "safe_delete_cancellation_cause", fake_delete)
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert deleted == [(runner.name, "PR-382")]
 
 
 # ---------------------------------------------------------------------------

@@ -685,7 +685,9 @@ class WatchMixin:
             task_id = ""
         else:
             pr_number = getattr(pr, "number", None)
-            task_id = getattr(pr, "pr_id", "") or ""
+            task_id = getattr(pr, "pr_id", "") or (
+                self.state.current_task.pr_id if self.state.current_task else ""
+            )
         if not isinstance(pr_number, int):
             return
         has_guardrail_suppression = False

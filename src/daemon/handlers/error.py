@@ -286,6 +286,7 @@ class ErrorMixin:
                 f"[ERROR] Skipping AI diagnosis: "
                 f"{coder_name.capitalize()} rate limited."
             )
+            await _clear_cause_for_retry()
             self.state.state = PipelineState.IDLE
             await self._clear_error_message_on_recovery(
                 log_prefix="[ERROR]",
