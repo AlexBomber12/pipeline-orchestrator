@@ -229,7 +229,9 @@ def all_subsources() -> frozenset[str]:
 
 def canonical_subsources() -> frozenset[str]:
     """Return canonical subsource names."""
-    return all_subsources()
+    return frozenset(
+        name for name, metadata in _REGISTRY.items() if metadata.is_canonical
+    )
 
 
 def group_for(name: str) -> str | None:

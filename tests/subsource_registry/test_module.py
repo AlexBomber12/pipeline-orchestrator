@@ -21,7 +21,12 @@ def test_registry_contains_all_subsources() -> None:
 
 
 def test_canonical_subsources_match_vocabulary() -> None:
-    assert canonical_subsources() == SUBSOURCE_VOCABULARY
+    assert canonical_subsources() < SUBSOURCE_VOCABULARY
+    assert {
+        "daemon",
+        "watch_retrigger_cap",
+        "operator_reject",
+    }.isdisjoint(canonical_subsources())
 
 
 @pytest.mark.parametrize("name", sorted(all_subsources()))

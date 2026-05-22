@@ -206,7 +206,12 @@ def _collect_template_subsource_branches(path: Path) -> set[str]:
 
 
 def test_canonical_subsources_match_vocabulary_frozenset():
-    assert canonical_subsources() == SUBSOURCE_VOCABULARY
+    assert canonical_subsources() < SUBSOURCE_VOCABULARY
+    assert {
+        "daemon",
+        "watch_retrigger_cap",
+        "operator_reject",
+    }.isdisjoint(canonical_subsources())
 
 
 def test_every_python_subsource_literal_is_registered():
