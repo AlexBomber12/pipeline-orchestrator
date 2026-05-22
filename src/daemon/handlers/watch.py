@@ -531,6 +531,7 @@ class WatchMixin:
                         ),
                     },
                 ),
+                commit_task_status=False,
             )
             # PR-316 review feedback: park terminally for operator action.
             # ``run_cycle`` checks this flag in the ERROR branch and skips

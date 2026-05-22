@@ -602,6 +602,7 @@ class FixMixin(BreachMixin):
                         "active_phase": PipelineState.FIX.value,
                     },
                 ),
+                commit_task_status=True,
             )
             await self._save_cli_log("", "", "FIX idle timeout")
             if await pause_for_stop_after_bookkeeping():
@@ -634,6 +635,7 @@ class FixMixin(BreachMixin):
                     category="ERROR",
                     payload={"subsource": "guardrail", "reason_text": cause},
                 ),
+                commit_task_status=True,
             )
             return
         await capture_stop_requested_after_exit()
