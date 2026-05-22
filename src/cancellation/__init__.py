@@ -36,26 +36,15 @@ from src.cancellation.storage import (
     task_spec_hash_key,
 )
 from src.daemon import error_rate_tracker
+from src.subsource_registry import all_subsources
 
 logger = logging.getLogger(__name__)
 
 _RETRY_EXHAUSTION_RE = re.compile(r"failed after (\d+) attempts")
 
-# The PR-315 stable subsource vocabulary, mirrored from
-# ``src/cancellation/storage.py``'s module docstring. Kept in sync with the
-# DOCUMENTED_SUBSOURCES set asserted by ``tests/cancellation``.
-SUBSOURCE_VOCABULARY: frozenset[str] = frozenset(
-    {
-        "crash",
-        "coder_escalate",
-        "guardrail",
-        "review_timeout",
-        "fix_idle_timeout",
-        "fix_iteration_cap",
-        "no_push_deadlock",
-        "infra_failure",
-    }
-)
+# Derived from ``src.subsource_registry`` so validation and UI metadata share
+# one taxonomy definition.
+SUBSOURCE_VOCABULARY: frozenset[str] = all_subsources()
 
 # Pre-PR-315 ``category`` values mapped onto the canonical post-migration
 # subsource. Used to defensively recover a usable dispatch hint from a
