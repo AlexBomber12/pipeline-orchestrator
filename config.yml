@@ -11,6 +11,7 @@ repositories:
   # per-repo overrides to false remain available for targeted rollback.
   feature_flags:
     use_unified_inhibitor_check: true
+    use_single_error_exit: false
 - url: https://github.com/AlexBomber12/megaraid-dashboard
   branch: main
   auto_merge: true
@@ -23,6 +24,7 @@ repositories:
   # per-repo overrides to false remain available for targeted rollback.
   feature_flags:
     use_unified_inhibitor_check: true
+    use_single_error_exit: false
 - url: https://github.com/AlexBomber12/sms-gateway-v2
   branch: main
   auto_merge: true
@@ -35,6 +37,7 @@ repositories:
   # per-repo overrides to false remain available for targeted rollback.
   feature_flags:
     use_unified_inhibitor_check: true
+    use_single_error_exit: false
 daemon:
   poll_interval_sec: 60
   review_timeout_min: 20

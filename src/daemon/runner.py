@@ -41,6 +41,7 @@ from src.cancellation import (
 from src.cancellation import (
     CancellationCause,
     get_cancellation_cause,
+    safe_delete_cancellation_cause,
     safe_record_cancellation_cause,
     truncate_for_payload,
 )
@@ -129,7 +130,12 @@ from src.queue_parser import (
     parse_task_header,
     write_frontmatter_status,
 )
-from src.subsource_registry import SuppressionReason, error_category_to_reason
+from src.subsource_registry import (
+    SuppressionReason,
+    error_category_to_reason,
+    is_operator_clearable,
+)
+from src.suppression.redis_store import RedisSuppressionStore
 from src.usage import UsageProvider
 from src.utils import repo_slug_from_url
 
@@ -418,6 +424,7 @@ class PipelineRunner(
         # must stay parked even if their old PR remains visible.
         self._status_write_failed_task_pr_ids: set[str] = set()
         self._status_write_failed_task_pr_ids_persist_failed = False
+        self._last_error_park_log_key: tuple[str | None, str] | None = None
         self._user_pause_logged = False
         self._pending_repo_config: RepoConfig | None = None
         self._pending_app_config: AppConfig | None = None
@@ -1671,18 +1678,68 @@ class PipelineRunner(
             commit_task_status=True,
         )
 
-    async def _review_timeout_park_cleared(self) -> bool:
-        """Return True when the operator-park cancellation cause is gone.
+    async def _suppression_record_for_task(self, task_id: str):
+        """Return the active suppression record from the port, if any."""
+        store = RedisSuppressionStore(self.redis)
+        return await store.is_suppressed(self.name, task_id)
 
-        ``run_cycle`` calls this on every ERROR cycle while the
-        ``skip_ai_error_diagnose`` flag is set so the operator's Retry
-        button — which deletes the cancellation cause via
-        ``repo_control.retry_repo_task`` — releases the park without an
-        AI diagnose round-trip. A missing ``current_task`` means there is
-        nothing left to wait on (the runner already dropped the handle),
-        so report cleared. Redis read errors keep the runner parked and
-        retry on the next cycle.
-        """
+    def _frontmatter_error_status_for_current_task(
+        self,
+    ) -> tuple[str | None, SuppressionReason | None]:
+        """Read durable task frontmatter status and blocked reason."""
+        task = self.state.current_task
+        task_file = getattr(task, "task_file", None)
+        if task is None or not task_file:
+            return None, None
+        task_path = Path(task_file)
+        if task_path.is_absolute() or ".." in task_path.parts:
+            return None, None
+        try:
+            repo_root = Path(self.repo_path).resolve()
+            resolved = (repo_root / task_path).resolve()
+            resolved.relative_to(repo_root)
+            header = parse_task_header(resolved)
+        except Exception:
+            return None, None
+        blocked_reason = header.blocked_reason
+        if blocked_reason is None:
+            return header.frontmatter_status, None
+        try:
+            return header.frontmatter_status, SuppressionReason(blocked_reason)
+        except ValueError:  # pragma: no cover - parse_task_header validates blocked_reason
+            return header.frontmatter_status, None
+
+    async def _error_suppression_reason(
+        self,
+    ) -> tuple[SuppressionReason | None, bool]:
+        """Return ``(reason, from_frontmatter)`` for the current ERROR task."""
+        task = self.state.current_task
+        if task is None:
+            return None, False
+        task_id = getattr(task, "pr_id", "")
+        if not task_id:
+            return None, False
+        try:
+            record = await self._suppression_record_for_task(task_id)
+        except Exception:
+            record = None
+        if record is not None:
+            return record.reason, False
+        _status, blocked_reason = self._frontmatter_error_status_for_current_task()
+        if blocked_reason is not None:
+            return blocked_reason, True
+        return None, False
+
+    async def _suppression_cleared(self, task_id: str) -> bool:
+        """Return True when the suppression store has no active record."""
+        try:
+            record = await self._suppression_record_for_task(task_id)
+        except Exception:
+            return False
+        return record is None
+
+    async def _review_timeout_park_cleared(self) -> bool:
+        """Legacy wrapper for the review-timeout park-clear check."""
         task = self.state.current_task
         if task is None:
             return True
@@ -1693,6 +1750,86 @@ class PipelineRunner(
         except Exception:
             return False
         return cause is None
+
+    async def _exit_error_to_idle_for_retry(self, reason: SuppressionReason | None) -> None:
+        """Leave ERROR for a plain retry when AI diagnosis is disabled."""
+        task = self.state.current_task
+        task_id = task.pr_id if task is not None else None
+        if task_id is not None:
+            await safe_delete_cancellation_cause(
+                self.redis,
+                self.name,
+                task_id,
+                log=self.log_event,
+            )
+            await self._clear_diagnose_exhausted(task_id)
+        self.state.skip_ai_error_diagnose = False
+        self.state.error_message = None
+        self.state.state = PipelineState.IDLE
+        label = reason.value if reason is not None else "unknown"
+        self.log_event(
+            "[ERROR] AI diagnosis disabled for self-healing ERROR "
+            f"({label}) -> IDLE for retry."
+        )
+
+    async def _handle_single_error_exit(self) -> None:
+        """Feature-flagged ERROR dispatcher with one visible exit per cycle."""
+        if self.state.rate_limited_until is not None:
+            self.state.state = PipelineState.PAUSED
+            self.log_event(
+                "[RATE-LIMIT] Legacy ERROR + rate_limited_until -> PAUSED."
+            )
+            return
+
+        reason, from_frontmatter = await self._error_suppression_reason()
+        task = self.state.current_task
+        task_id = task.pr_id if task is not None else None
+
+        if reason is None:
+            frontmatter_status, _blocked = (
+                self._frontmatter_error_status_for_current_task()
+            )
+            if frontmatter_status == "todo":
+                self.state.skip_ai_error_diagnose = False
+                self.state.error_message = None
+                self.state.review_timeout_repost_attempted = False
+                self.state.review_timeout_repost_at = None
+                self.state.state = PipelineState.IDLE
+                self._last_error_park_log_key = None
+                self.log_event(
+                    "[ESCALATE] operator-cleared ERROR task frontmatter "
+                    "-> IDLE."
+                )
+                return
+
+        if reason is not None and is_operator_clearable(reason):
+            if task_id is not None and not from_frontmatter:
+                if await self._suppression_cleared(task_id):
+                    self.state.skip_ai_error_diagnose = False
+                    self.state.error_message = None
+                    self.state.review_timeout_repost_attempted = False
+                    self.state.review_timeout_repost_at = None
+                    self.state.state = PipelineState.IDLE
+                    self._last_error_park_log_key = None
+                    self.log_event(
+                        f"[ESCALATE] {reason.value} park cleared by "
+                        "operator -> IDLE."
+                    )
+                    return
+            key = (task_id, reason.value)
+            if self._last_error_park_log_key != key:
+                self._last_error_park_log_key = key
+                self.log_event(
+                    f"[ESCALATE] {reason.value} operator-clearable ERROR "
+                    "park active; waiting for Retry or reupload."
+                )
+            return
+
+        self._last_error_park_log_key = None
+        if self.app_config.daemon.error_handler_use_ai:
+            await self.handle_error()
+        else:
+            await self._exit_error_to_idle_for_retry(reason)
 
     async def _commit_task_status_change(
         self,
@@ -2700,7 +2837,9 @@ class PipelineRunner(
         elif current == PipelineState.PAUSED:
             await self.handle_paused()
         elif current == PipelineState.ERROR:
-            if self.state.rate_limited_until is not None:
+            if self.repo_config.feature_flags.use_single_error_exit:
+                await self._handle_single_error_exit()
+            elif self.state.rate_limited_until is not None:
                 self.state.state = PipelineState.PAUSED
                 self.log_event(
                     "[RATE-LIMIT] Legacy ERROR + rate_limited_until "

@@ -48,6 +48,7 @@ class SubsourceMetadata:
     group_bucket: GroupBucket
     legacy_category: str | None
     is_canonical: bool
+    is_operator_clearable: bool
 
 
 _REGISTRY: dict[str, SubsourceMetadata] = {
@@ -59,6 +60,7 @@ _REGISTRY: dict[str, SubsourceMetadata] = {
         group_bucket="daemon",
         legacy_category="CRASH",
         is_canonical=True,
+        is_operator_clearable=False,
     ),
     SuppressionReason.CODER_ESCALATE.value: SubsourceMetadata(
         name=SuppressionReason.CODER_ESCALATE.value,
@@ -68,6 +70,7 @@ _REGISTRY: dict[str, SubsourceMetadata] = {
         group_bucket="coder",
         legacy_category="ESCALATE",
         is_canonical=True,
+        is_operator_clearable=True,
     ),
     SuppressionReason.GUARDRAIL.value: SubsourceMetadata(
         name=SuppressionReason.GUARDRAIL.value,
@@ -77,6 +80,7 @@ _REGISTRY: dict[str, SubsourceMetadata] = {
         group_bucket="guardrail",
         legacy_category="ESCALATE",
         is_canonical=True,
+        is_operator_clearable=True,
     ),
     SuppressionReason.REVIEW_TIMEOUT.value: SubsourceMetadata(
         name=SuppressionReason.REVIEW_TIMEOUT.value,
@@ -86,6 +90,7 @@ _REGISTRY: dict[str, SubsourceMetadata] = {
         group_bucket="daemon",
         legacy_category="TIMEOUT",
         is_canonical=True,
+        is_operator_clearable=False,
     ),
     SuppressionReason.FIX_IDLE_TIMEOUT.value: SubsourceMetadata(
         name=SuppressionReason.FIX_IDLE_TIMEOUT.value,
@@ -95,6 +100,7 @@ _REGISTRY: dict[str, SubsourceMetadata] = {
         group_bucket="daemon",
         legacy_category="TIMEOUT",
         is_canonical=True,
+        is_operator_clearable=False,
     ),
     SuppressionReason.FIX_ITERATION_CAP.value: SubsourceMetadata(
         name=SuppressionReason.FIX_ITERATION_CAP.value,
@@ -104,6 +110,7 @@ _REGISTRY: dict[str, SubsourceMetadata] = {
         group_bucket="daemon",
         legacy_category="TIMEOUT",
         is_canonical=True,
+        is_operator_clearable=True,
     ),
     SuppressionReason.NO_PUSH_DEADLOCK.value: SubsourceMetadata(
         name=SuppressionReason.NO_PUSH_DEADLOCK.value,
@@ -113,6 +120,7 @@ _REGISTRY: dict[str, SubsourceMetadata] = {
         group_bucket="daemon",
         legacy_category="NO_PUSH_DEADLOCK",
         is_canonical=True,
+        is_operator_clearable=True,
     ),
     SuppressionReason.INFRA_FAILURE.value: SubsourceMetadata(
         name=SuppressionReason.INFRA_FAILURE.value,
@@ -122,6 +130,7 @@ _REGISTRY: dict[str, SubsourceMetadata] = {
         group_bucket="daemon",
         legacy_category="INFRA",
         is_canonical=True,
+        is_operator_clearable=False,
     ),
     SuppressionReason.DAEMON.value: SubsourceMetadata(
         name=SuppressionReason.DAEMON.value,
@@ -131,6 +140,7 @@ _REGISTRY: dict[str, SubsourceMetadata] = {
         group_bucket="daemon",
         legacy_category="ESCALATE",
         is_canonical=False,
+        is_operator_clearable=False,
     ),
     SuppressionReason.WATCH_RETRIGGER_CAP.value: SubsourceMetadata(
         name=SuppressionReason.WATCH_RETRIGGER_CAP.value,
@@ -140,6 +150,7 @@ _REGISTRY: dict[str, SubsourceMetadata] = {
         group_bucket="daemon",
         legacy_category=None,
         is_canonical=False,
+        is_operator_clearable=False,
     ),
     SuppressionReason.OPERATOR_REJECT.value: SubsourceMetadata(
         name=SuppressionReason.OPERATOR_REJECT.value,
@@ -149,6 +160,7 @@ _REGISTRY: dict[str, SubsourceMetadata] = {
         group_bucket="operator_reject",
         legacy_category=None,
         is_canonical=False,
+        is_operator_clearable=True,
     ),
     SuppressionReason.DIAGNOSE_EXHAUSTED.value: SubsourceMetadata(
         name=SuppressionReason.DIAGNOSE_EXHAUSTED.value,
@@ -158,6 +170,7 @@ _REGISTRY: dict[str, SubsourceMetadata] = {
         group_bucket="daemon",
         legacy_category=None,
         is_canonical=True,
+        is_operator_clearable=True,
     ),
     SuppressionReason.OPERATOR_STOPPED.value: SubsourceMetadata(
         name=SuppressionReason.OPERATOR_STOPPED.value,
@@ -167,6 +180,7 @@ _REGISTRY: dict[str, SubsourceMetadata] = {
         group_bucket="operator_reject",
         legacy_category=None,
         is_canonical=True,
+        is_operator_clearable=True,
     ),
     SuppressionReason.RATE_LIMIT.value: SubsourceMetadata(
         name=SuppressionReason.RATE_LIMIT.value,
@@ -176,8 +190,18 @@ _REGISTRY: dict[str, SubsourceMetadata] = {
         group_bucket="daemon",
         legacy_category=None,
         is_canonical=True,
+        is_operator_clearable=False,
     ),
 }
+
+# ERROR loop routing table:
+# - operator-clearable reasons park in ERROR until Retry/reupload clears the
+#   suppression: coder_escalate, guardrail, fix_iteration_cap,
+#   no_push_deadlock, operator_reject, diagnose_exhausted, operator_stopped.
+# - all other reasons continue through the self-healing path: crash,
+#   review_timeout, fix_idle_timeout, infra_failure, daemon,
+#   watch_retrigger_cap, rate_limit. With AI diagnosis disabled, that path
+#   exits to IDLE for a plain retry instead of silently staying ERROR.
 
 
 def _assert_registry_matches_enum() -> None:
@@ -232,6 +256,16 @@ def canonical_subsources() -> frozenset[str]:
     return frozenset(
         name for name, metadata in _REGISTRY.items() if metadata.is_canonical
     )
+
+
+def is_operator_clearable(reason: SuppressionReason | str) -> bool:
+    """Return True when ``reason`` must wait for an operator clear action."""
+    try:
+        key = SuppressionReason(reason).value
+    except ValueError:
+        return False
+    meta = _REGISTRY.get(key)
+    return bool(meta and meta.is_operator_clearable)
 
 
 def group_for(name: str) -> str | None:
