@@ -104,7 +104,12 @@ def test_transition_writes_status_error(
     task_path = _install_tmp_repo(runner, tmp_path, task)
     runner.state.current_task = task
 
-    asyncio.run(runner._transition_to_error("subprocess crashed"))
+    asyncio.run(
+        runner._transition_to_error(
+            "subprocess crashed",
+            commit_task_status=True,
+        )
+    )
 
     header = parse_task_header(task_path)
     assert header.frontmatter_status == "error"
@@ -130,6 +135,7 @@ def test_guardrail_transition_writes_guardrail_reason(
                 category="ERROR",
                 payload={"subsource": "guardrail"},
             ),
+            commit_task_status=True,
         )
     )
 
@@ -148,7 +154,12 @@ def test_retry_button_visible_after_transition(
     task_path = _install_tmp_repo(runner, tmp_path, task)
     runner.state.current_task = task
 
-    asyncio.run(runner._transition_to_error("subprocess crashed"))
+    asyncio.run(
+        runner._transition_to_error(
+            "subprocess crashed",
+            commit_task_status=True,
+        )
+    )
     header = parse_task_header(task_path)
     template = web_app.templates.get_template("components/tasks_panel.html")
     rendered = template.render(
@@ -240,7 +251,12 @@ def test_coarse_before_rich(monkeypatch: pytest.MonkeyPatch) -> None:
         fake_record,
     )
 
-    asyncio.run(runner._transition_to_error("subprocess crashed"))
+    asyncio.run(
+        runner._transition_to_error(
+            "subprocess crashed",
+            commit_task_status=True,
+        )
+    )
 
     assert events == ["coarse", "rich"]
     assert runner.state.state == PipelineState.ERROR
@@ -261,7 +277,12 @@ def test_coarse_write_failure_retried(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runner, "_commit_task_status_change", fake_commit)
     _capture_rich_write(monkeypatch)
 
-    asyncio.run(runner._transition_to_error("git fetch origin failed"))
+    asyncio.run(
+        runner._transition_to_error(
+            "git fetch origin failed",
+            commit_task_status=True,
+        )
+    )
 
     assert runner.state.state == PipelineState.ERROR
     assert runner._status_write_failed_task_pr_ids == {"PR-379"}
@@ -276,6 +297,28 @@ def test_coarse_write_failure_retried(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert attempts == ["commit", "commit", "commit"]
     assert runner._status_write_failed_task_pr_ids == set()
+
+
+def test_transition_does_not_write_task_status_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    _stub_publish_and_save(runner)
+    runner.state.current_task = _task()
+    writes: list[str] = []
+
+    async def fake_commit(*_args: Any, **_kwargs: Any) -> bool:
+        writes.append("commit")
+        return True
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", fake_commit)
+    _capture_rich_write(monkeypatch)
+
+    asyncio.run(runner._transition_to_error("git fetch origin failed"))
+
+    assert writes == []
+    assert runner._status_write_failed_task_pr_ids == set()
+    assert runner.state.state == PipelineState.ERROR
 
 
 def test_coarse_write_retry_uses_crash_when_cause_read_fails(

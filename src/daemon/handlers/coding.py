@@ -670,6 +670,7 @@ class CodingMixin:
                     category="ERROR",
                     payload={"subsource": "guardrail", "reason_text": cause},
                 ),
+                commit_task_status=True,
             )
             return
         if not await pause_for_stop_if_requested():

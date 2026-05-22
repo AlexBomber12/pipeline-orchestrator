@@ -1454,7 +1454,7 @@ class PipelineRunner(
         log_prefix: str = "[ERROR]",
         log_message: str | None = None,
         cancellation_cause: CancellationCause | None = None,
-        commit_task_status: bool = True,
+        commit_task_status: bool = False,
     ) -> None:
         """Atomic transition to ERROR with consistent telemetry.
 
@@ -1478,10 +1478,11 @@ class PipelineRunner(
         Redis errors never block the ERROR transition.
 
         ``commit_task_status`` controls the coarse durable frontmatter
-        write. The default is True so every ERROR transition writes
-        ``status: ERROR`` plus ``blocked_reason`` before the richer Redis
-        cause. Callers that already performed the same write pass False to
-        avoid a duplicate commit.
+        write. Terminal park flows pass True so ``status: ERROR`` plus
+        ``blocked_reason`` is written before the richer Redis cause. The
+        default is False because ordinary ERROR transitions still route
+        through ``handle_error``, whose infra/rate-limit/timeout paths can
+        soft-skip back to IDLE for retry.
 
         First-cause-wins (PR-253 fix): if a cause is already recorded for
         this ``task_id``, do not overwrite it. Retry-heavy flows
@@ -1667,6 +1668,7 @@ class PipelineRunner(
                 category="ERROR",
                 payload=payload,
             ),
+            commit_task_status=True,
         )
 
     async def _review_timeout_park_cleared(self) -> bool:
