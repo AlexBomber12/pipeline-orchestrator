@@ -635,16 +635,6 @@ class FixMixin(BreachMixin):
                     SuppressionReason.GUARDRAIL,
                     {"pr_number": pr_number, "reason_text": cause},
                 )
-                await safe_record_cancellation_cause(
-                    self.redis,
-                    self.name,
-                    task_id,
-                    CancellationCause(
-                        category="ERROR",
-                        payload={"subsource": "guardrail", "reason_text": cause},
-                    ),
-                    log=self.log_event,
-                )
                 apply_quarantine_label_for_violation(self, pr_number, first)
             await self._transition_to_error(
                 cause,

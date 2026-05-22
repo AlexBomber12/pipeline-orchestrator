@@ -12,19 +12,16 @@ from __future__ import annotations
 
 import asyncio
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
-
-from datetime import datetime, timedelta, timezone
-
 from src.cancellation import (
     CancellationCause,
     classify_infra_exception,
 )
-from src.daemon import fix_escalation
-from src.daemon import fix_supervision
+from src.daemon import fix_escalation, fix_supervision
 from src.models import (
     CIStatus,
     PipelineState,
@@ -33,9 +30,8 @@ from src.models import (
     ReviewStatus,
     TaskStatus,
 )
-
+from src.subsource_registry import SuppressionReason
 from tests.runner import _helpers as h
-
 
 SRC_ROOT = Path(__file__).resolve().parent.parent.parent / "src"
 
@@ -196,7 +192,7 @@ def test_coder_escalate_detector_writes_coder_escalate_subsource(
 def test_guardrail_detector_writes_guardrail_subsource(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The fix-side guardrail violation path emits ``subsource="guardrail"``."""
+    """The fix-side guardrail path records a guardrail suppression."""
     captured = _captured_safe_record(monkeypatch)
 
     head_calls = iter(["head1", "head1"])
@@ -214,11 +210,11 @@ def test_guardrail_detector_writes_guardrail_subsource(
 
     asyncio.run(runner.handle_fix())
 
-    guardrail_writes = [
-        c for c in captured if c.payload.get("subsource") == "guardrail"
-    ]
-    assert guardrail_writes, "expected a guardrail-subsource cause to be recorded"
-    assert all(c.category == "ERROR" for c in guardrail_writes)
+    record = asyncio.run(runner._suppression_record_for_task("PR-GUARD"))
+    assert record is not None
+    assert record.reason == SuppressionReason.GUARDRAIL
+    assert record.detail["pr_number"] == 305
+    assert not [c for c in captured if c.payload.get("subsource") == "guardrail"]
     assert "guardrail" in DOCUMENTED_SUBSOURCES
 
 

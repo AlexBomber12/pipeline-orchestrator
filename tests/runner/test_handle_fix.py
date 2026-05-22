@@ -138,6 +138,50 @@ def test_fix_post_coder_guardrail_violation_transitions_to_error(
     assert posted == []
 
 
+def test_fix_guardrail_suppression_keeps_pr_number_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        claude_cli,
+        "fix_review_async",
+        h._async_cli_result(0, "gh repo create octo/demo\n", ""),
+    )
+    duplicate_writes: list[str] = []
+
+    async def fake_transition_to_error(
+        message: str,
+        **kwargs: object,
+    ) -> None:
+        return None
+
+    async def fake_record(*args: object, **kwargs: object) -> None:
+        duplicate_writes.append("recorded")
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-382", pr_id="PR-382")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-382",
+        title="PR-382",
+        status=TaskStatus.ERROR,
+    )
+    monkeypatch.setattr(runner, "_transition_to_error", fake_transition_to_error)
+    monkeypatch.setattr(fix_module, "safe_record_cancellation_cause", fake_record)
+    monkeypatch.setattr(
+        fix_module,
+        "apply_quarantine_label_for_violation",
+        lambda *args, **kwargs: True,
+    )
+
+    asyncio.run(runner.handle_fix())
+
+    record = asyncio.run(runner._suppression_record_for_task("PR-382"))
+    assert record is not None
+    assert record.detail["pr_number"] == 77
+    assert duplicate_writes == []
+
+
 def test_fix_post_coder_guardrail_violation_scans_stderr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
