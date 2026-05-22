@@ -394,23 +394,25 @@ return 0
                 f"[INFRA] Uploaded {task_count} task files to tasks/ "
                 f"and pushed to {branch}."
             )
-            # PR-186: Re-uploading a task file is the user's signal to retry
-            # a previously-crashed task. Clear the in-memory ERROR mark
-            # for any uploaded PR-id so the next IDLE cycle picks the task
-            # again instead of treating it as still crashed. Also flip the
-            # working-tree ``tasks/QUEUE.md`` row from ERROR to TODO for
-            # those PR-ids: the next IDLE regenerates the queue from
-            # headers, but a daemon restart between this upload and that
-            # regeneration would otherwise see the stale ERROR row,
-            # rehydrate ``_crashed_task_pr_ids`` from it, and re-cancel the
-            # task — losing the retry signal until the user uploads again.
+            # Re-uploading a task file is the user's signal to retry a
+            # previously parked task. Flag-on repos clear the suppression via
+            # the cancellation record below; flag-off repos still clear the
+            # legacy in-memory crash marker here.
             uploaded_pr_ids = {
                 Path(name).stem
                 for name in stageable_filenames
                 if name.startswith("PR-") and name.endswith(".md")
             }
             crashed_pr_ids = getattr(self, "_crashed_task_pr_ids", None)
-            if crashed_pr_ids:
+            use_single_error_exit = getattr(
+                getattr(self.repo_config, "feature_flags", None),
+                "use_single_error_exit",
+                False,
+            )
+            if (
+                crashed_pr_ids
+                and not use_single_error_exit
+            ):
                 crashed_pr_ids.difference_update(uploaded_pr_ids)
             clear_status_write_failed = getattr(
                 self,
