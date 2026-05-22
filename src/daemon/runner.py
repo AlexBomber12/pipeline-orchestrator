@@ -129,6 +129,7 @@ from src.queue_parser import (
     parse_task_header,
     write_frontmatter_status,
 )
+from src.subsource_registry import SuppressionReason
 from src.usage import UsageProvider
 from src.utils import repo_slug_from_url
 
@@ -1680,6 +1681,11 @@ class PipelineRunner(
         subject = f"[STATUS] {display_pr_id} marked {status}: {short_reason}"
         message = f"{subject}\n\n[skip ci]"
         base = self.repo_config.branch
+        blocked_reason = await self._blocked_reason_for_status_change(
+            current_task,
+            status,
+            reason,
+        )
 
         try:
             git_ops._git(self.repo_path, "fetch", "origin", base, timeout=60)
@@ -1691,7 +1697,11 @@ class PipelineRunner(
                 f"origin/{base}",
                 timeout=60,
             )
-            write_frontmatter_status(Path(self.repo_path) / task_file, status)
+            write_frontmatter_status(
+                Path(self.repo_path) / task_file,
+                status,
+                blocked_reason,
+            )
             git_ops._git(self.repo_path, "add", "--", task_file, timeout=30)
             diff = git_ops._git(
                 self.repo_path,
@@ -1722,6 +1732,44 @@ class PipelineRunner(
                 f"{task_file}: {exc}."
             )
             return False
+
+    async def _blocked_reason_for_status_change(
+        self,
+        current_task: Any,
+        status: str,
+        reason: str,
+    ) -> str | None:
+        """Resolve the durable coarse reason for daemon ERROR status writes."""
+        if status != "ERROR":
+            return None
+
+        pr_id = getattr(current_task, "pr_id", "")
+        if pr_id:
+            try:
+                cause = await get_cancellation_cause(
+                    self.redis,
+                    self.name,
+                    pr_id,
+                    refresh_ttl=False,
+                )
+            except Exception:
+                cause = None
+            subsource = (
+                getattr(cause, "payload", {}).get("subsource") if cause else None
+            )
+            try:
+                return SuppressionReason(subsource).value
+            except ValueError:
+                pass
+
+        reason_lower = reason.lower()
+        if "no-push" in reason_lower:
+            return SuppressionReason.NO_PUSH_DEADLOCK.value
+        if "review=" in reason_lower and "ci=" in reason_lower:
+            return SuppressionReason.REVIEW_TIMEOUT.value
+        if "closed externally" in reason_lower:
+            return SuppressionReason.CRASH.value
+        return SuppressionReason.CRASH.value
 
     async def _persist_status_write_failed_task_pr_ids(self) -> None:
         """Persist status-write fallback markers across daemon restarts."""

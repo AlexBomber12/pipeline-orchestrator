@@ -119,9 +119,9 @@ def _mutate_frontmatter_status(
         data.insert(len(data), "status", status)
 
     if status == "ERROR":
-        reason = (
-            _coerce_blocked_reason(blocked_reason) or SuppressionReason.CRASH.value
-        )
+        reason = _coerce_blocked_reason(blocked_reason)
+        if reason is None:
+            raise ValueError("blocked_reason is required for ERROR status")
         if "blocked_reason" in data:
             data["blocked_reason"] = reason
         else:
@@ -137,10 +137,9 @@ def write_frontmatter_status(
 ) -> None:
     """Write task frontmatter status and optional durable blocked reason.
 
-    ``ERROR`` writes always include ``blocked_reason``; callers that do not yet
-    know the reason default to ``crash`` so ERROR tasks never lack a coarse
-    durable reason. Non-ERROR writes remove the field to avoid stale blockers
-    after operator recovery.
+    ``ERROR`` writes always include an explicit ``blocked_reason`` so ERROR
+    tasks never lack a coarse durable reason. Non-ERROR writes remove the field
+    to avoid stale blockers after operator recovery.
     """
     if status not in _WRITER_STATUS_VALUES:
         raise ValueError(f"unknown frontmatter status {status!r}")
@@ -477,6 +476,10 @@ def parse_task_header(path: str | Path) -> TaskHeader:
             issues.append(
                 f"{task_path}: invalid blocked_reason {blocked_reason!r}; "
                 f"expected one of {sorted(reason.value for reason in SuppressionReason)}"
+            )
+        if frontmatter_status != "error":
+            issues.append(
+                f"{task_path}: blocked_reason requires frontmatter status 'error'"
             )
 
     if issues:

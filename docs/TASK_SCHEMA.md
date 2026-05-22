@@ -59,11 +59,11 @@ suppression detail. Rich detail such as excerpts, counters, and
 frontmatter.
 
 The daemon writes `status` and `blocked_reason` together when parking a
-task in ERROR. If an ERROR write has no more specific reason, emitters
-default `blocked_reason` to `crash` so an ERROR task never lacks a coarse
-reason. When a task returns to `status: TODO` through Retry or re-upload,
-the daemon removes `blocked_reason` to avoid carrying stale suppression
-state on recovered work.
+task in ERROR. ERROR writers must provide the canonical coarse reason
+that matches the terminal failure source so an ERROR task never lacks or
+misstates its durable reason. When a task returns to `status: TODO`
+through Retry or re-upload, the daemon removes `blocked_reason` to avoid
+carrying stale suppression state on recovered work.
 
 ## Cancellation Availability
 

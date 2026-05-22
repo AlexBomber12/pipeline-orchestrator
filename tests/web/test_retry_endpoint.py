@@ -1506,10 +1506,14 @@ def test_retry_releases_counter_when_error_status_restore_fails(
 
     original_write_frontmatter_status = repo_control.write_frontmatter_status
 
-    def fake_write_frontmatter_status(task_path: Path, status: str) -> None:
+    def fake_write_frontmatter_status(
+        task_path: Path,
+        status: str,
+        blocked_reason: object = None,
+    ) -> None:
         if status == "ERROR":
             raise OSError("cannot restore")
-        original_write_frontmatter_status(task_path, status)
+        original_write_frontmatter_status(task_path, status, blocked_reason)
 
     monkeypatch.setattr(
         repo_control,

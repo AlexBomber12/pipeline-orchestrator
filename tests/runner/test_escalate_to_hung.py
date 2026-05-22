@@ -17,8 +17,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from src.cancellation import CancellationCause
 from src.keyspace import status_write_failed_tasks
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
+from src.subsource_registry import SuppressionReason
 
 from tests.runner import _helpers as h
 
@@ -508,6 +510,89 @@ def test_commit_task_status_change_force_checkouts_base_with_dirty_pr_branch(
         "--oneline",
         "-1",
     )
+
+
+def test_commit_task_status_change_uses_cancellation_subsource(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-708")
+
+    async def fake_get_cause(*args: Any, **kwargs: Any) -> CancellationCause:
+        return CancellationCause(
+            category="ERROR",
+            payload={"subsource": SuppressionReason.GUARDRAIL.value},
+        )
+
+    monkeypatch.setattr("src.daemon.runner.get_cancellation_cause", fake_get_cause)
+    runner = h._make_runner()
+    runner.repo_path = str(repo)
+    task = QueueTask(
+        pr_id="PR-708",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-test",
+        task_file="tasks/PR-708.md",
+    )
+
+    asyncio.run(runner._commit_task_status_change(task, "ERROR", "failed hard"))
+
+    assert (repo / "tasks" / "PR-708.md").read_text(encoding="utf-8").startswith(
+        "---\nstatus: ERROR\nblocked_reason: guardrail\n---\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "expected"),
+    [
+        ("DONE", "merged", None),
+        ("ERROR", "FIX no-push deadlock", SuppressionReason.NO_PUSH_DEADLOCK.value),
+        ("ERROR", "PR #1 hung after 20m (review=EYES, ci=PENDING)", "review_timeout"),
+        ("ERROR", "PR closed externally during FIX", SuppressionReason.CRASH.value),
+    ],
+)
+def test_blocked_reason_for_status_change_falls_back_from_reason_text(
+    status: str,
+    reason: str,
+    expected: str | None,
+) -> None:
+    runner = h._make_runner()
+    task = QueueTask(
+        pr_id="PR-709",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-test",
+        task_file="tasks/PR-709.md",
+    )
+
+    actual = asyncio.run(
+        runner._blocked_reason_for_status_change(task, status, reason)
+    )
+
+    assert actual == expected
+
+
+def test_blocked_reason_for_status_change_handles_cause_lookup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_get_cause(*args: Any, **kwargs: Any) -> CancellationCause:
+        raise RuntimeError("redis unavailable")
+
+    monkeypatch.setattr("src.daemon.runner.get_cancellation_cause", fail_get_cause)
+    runner = h._make_runner()
+    task = QueueTask(
+        pr_id="PR-710",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-test",
+        task_file="tasks/PR-710.md",
+    )
+
+    actual = asyncio.run(
+        runner._blocked_reason_for_status_change(task, "ERROR", "failed hard")
+    )
+
+    assert actual == SuppressionReason.CRASH.value
 
 
 def test_commit_task_status_change_truncates_long_reason(

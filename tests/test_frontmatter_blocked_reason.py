@@ -130,6 +130,16 @@ def test_unknown_reason_rejected(tmp_path: Path) -> None:
         parse_task_header(task)
 
 
+def test_reason_without_error_status_rejected(tmp_path: Path) -> None:
+    task = _write_task(
+        tmp_path,
+        f"---\nstatus: TODO\nblocked_reason: guardrail\n---\n\n{_task_body()}",
+    )
+
+    with pytest.raises(QueueValidationError, match="requires frontmatter status"):
+        parse_task_header(task)
+
+
 def test_empty_reason_rejected(tmp_path: Path) -> None:
     task = _write_task(
         tmp_path,
@@ -140,14 +150,11 @@ def test_empty_reason_rejected(tmp_path: Path) -> None:
         parse_task_header(task)
 
 
-def test_error_without_reason_defaults(tmp_path: Path) -> None:
+def test_error_without_reason_rejected_by_writer(tmp_path: Path) -> None:
     task = _write_task(tmp_path, f"---\nstatus: TODO\n---\n\n{_task_body()}")
 
-    write_frontmatter_status(task, "ERROR")
-
-    text = task.read_text(encoding="utf-8")
-    assert "blocked_reason: crash\n" in text
-    assert parse_task_header(task).blocked_reason == "crash"
+    with pytest.raises(ValueError, match="blocked_reason is required"):
+        write_frontmatter_status(task, "ERROR")
 
 
 @pytest.mark.parametrize("reason", list(SuppressionReason))
