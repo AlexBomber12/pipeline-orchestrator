@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 from src.keyspace import status_write_failed_tasks
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
+from src.subsource_registry import SuppressionReason
 
 from tests.runner import _helpers as h
 
@@ -500,7 +501,7 @@ def test_commit_task_status_change_force_checkouts_base_with_dirty_pr_branch(
     asyncio.run(runner._commit_task_status_change(task, "ERROR", "failed hard"))
 
     assert (repo / "tasks" / "PR-707.md").read_text(encoding="utf-8").startswith(
-        "---\nstatus: ERROR\n---\n"
+        "---\nstatus: ERROR\nblocked_reason: crash\n---\n"
     )
     assert "[STATUS] PR-707 marked ERROR: failed hard" in _git(
         repo,
@@ -508,6 +509,70 @@ def test_commit_task_status_change_force_checkouts_base_with_dirty_pr_branch(
         "--oneline",
         "-1",
     )
+
+
+def test_commit_task_status_change_uses_explicit_blocked_reason(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-708")
+    runner = h._make_runner()
+    runner.repo_path = str(repo)
+    task = QueueTask(
+        pr_id="PR-708",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-test",
+        task_file="tasks/PR-708.md",
+    )
+
+    asyncio.run(
+        runner._commit_task_status_change(
+            task,
+            "ERROR",
+            "failed hard",
+            blocked_reason=SuppressionReason.GUARDRAIL,
+        )
+    )
+
+    assert (repo / "tasks" / "PR-708.md").read_text(encoding="utf-8").startswith(
+        "---\nstatus: ERROR\nblocked_reason: guardrail\n---\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "expected"),
+    [
+        ("DONE", "merged", None),
+        ("ERROR", "FIX no-push deadlock", SuppressionReason.NO_PUSH_DEADLOCK.value),
+        ("ERROR", "PR #1 hung after 20m (review=EYES, ci=PENDING)", "review_timeout"),
+        ("ERROR", "PR closed externally during FIX", SuppressionReason.CRASH.value),
+    ],
+)
+def test_blocked_reason_for_status_change_falls_back_from_reason_text(
+    status: str,
+    reason: str,
+    expected: str | None,
+) -> None:
+    runner = h._make_runner()
+    actual = asyncio.run(
+        runner._blocked_reason_for_status_change(status, reason)
+    )
+
+    assert actual == expected
+
+
+def test_blocked_reason_for_status_change_rejects_invalid_explicit_reason() -> None:
+    runner = h._make_runner()
+
+    actual = asyncio.run(
+        runner._blocked_reason_for_status_change(
+            "ERROR",
+            "failed hard",
+            blocked_reason="not_a_real_reason",
+        )
+    )
+
+    assert actual == SuppressionReason.CRASH.value
 
 
 def test_commit_task_status_change_truncates_long_reason(

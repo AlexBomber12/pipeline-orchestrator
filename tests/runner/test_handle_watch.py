@@ -703,7 +703,7 @@ def test_handle_watch_timeout_transitions_to_error_with_cause(
         branch="pr-001",
     )
 
-    async def fake_commit(self, current_task, status, reason):
+    async def fake_commit(self, current_task, status, reason, **kwargs):
         return True
 
     monkeypatch.setattr(
@@ -763,7 +763,7 @@ def test_watch_review_timeout_writes_frontmatter_status_error(
 
     commit_calls: list[tuple[Any, str, str]] = []
 
-    async def fake_commit(self, current_task, status, reason):
+    async def fake_commit(self, current_task, status, reason, **kwargs):
         commit_calls.append((current_task, status, reason))
         return True
 
@@ -828,7 +828,7 @@ def test_watch_review_timeout_does_not_apply_escalated_label(
         fake_label,
     )
 
-    async def fake_commit(self, current_task, status, reason):
+    async def fake_commit(self, current_task, status, reason, **kwargs):
         return True
 
     monkeypatch.setattr(
@@ -869,7 +869,7 @@ def test_watch_review_timeout_status_write_exception_marks_task(
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
 
-    async def fake_commit_raise(self, current_task, status, reason):
+    async def fake_commit_raise(self, current_task, status, reason, **kwargs):
         raise RuntimeError("git unavailable")
 
     monkeypatch.setattr(
@@ -925,7 +925,7 @@ def test_watch_review_timeout_status_write_failure_marks_task(
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
 
-    async def fake_commit_fail(self, current_task, status, reason):
+    async def fake_commit_fail(self, current_task, status, reason, **kwargs):
         return False
 
     monkeypatch.setattr(

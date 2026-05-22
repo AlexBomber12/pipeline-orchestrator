@@ -48,7 +48,12 @@ from src.keyspace import (
     status_write_failed_tasks,
 )
 from src.models import PipelineState, QueueTask, RepoState, TaskStatus
-from src.queue_parser import write_frontmatter_status
+from src.queue_parser import (
+    QueueValidationError,
+    parse_task_header,
+    write_frontmatter_status,
+)
+from src.subsource_registry import SuppressionReason
 from src.web.services.coder import _effective_coder_name
 from src.web.services.repo_state import (
     _default_repo_state,
@@ -570,9 +575,20 @@ def _head_commit_subject(repo_root: Path) -> str:
     return result.stdout.strip()
 
 
-def _restore_retry_error_status(task_path: Path) -> None:
+def _read_task_blocked_reason(task_path: Path) -> str | None:
     try:
-        write_frontmatter_status(task_path, "ERROR")
+        return parse_task_header(task_path).blocked_reason
+    except (OSError, UnicodeError, QueueValidationError):
+        return None
+
+
+def _restore_retry_error_status(task_path: Path, blocked_reason: str | None) -> None:
+    try:
+        write_frontmatter_status(
+            task_path,
+            "ERROR",
+            blocked_reason or SuppressionReason.CRASH,
+        )
     except (OSError, ValueError):
         pass
 
@@ -1583,6 +1599,7 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
         if not _is_retryable_task_status(current_status, snapshot_status):
             return HTMLResponse("Task is not in ERROR", status_code=409)
         rewrote_status = current_status != TaskStatus.TODO
+        retry_blocked_reason = _read_task_blocked_reason(task_path)
 
         try:
             next_count = await _increment_retry_count(
@@ -1618,7 +1635,7 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
             )
         except _TaskNotRetryable:
             if rewrote_status:
-                _restore_retry_error_status(task_path)
+                _restore_retry_error_status(task_path, retry_blocked_reason)
             if retry_reserved:
                 await _release_retry_reservation(redis_client, name, pr_id)
             return HTMLResponse("Task is not in ERROR", status_code=409)
@@ -1633,7 +1650,7 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 reset_failed = True
             if rewrote_status and reset_failed:
-                _restore_retry_error_status(task_path)
+                _restore_retry_error_status(task_path, retry_blocked_reason)
             if retry_reserved:
                 await _release_retry_reservation(redis_client, name, pr_id)
             return HTMLResponse("Failed to commit retry change", status_code=503)

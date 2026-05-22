@@ -4,16 +4,17 @@ from pathlib import Path
 
 import pytest
 from src.queue_parser import write_frontmatter_status
+from src.subsource_registry import SuppressionReason
 
 
 def test_write_status_error_to_file_without_frontmatter(tmp_path: Path) -> None:
     task = tmp_path / "PR-001.md"
     task.write_text("# PR-001: Test\n\nBody\n", encoding="utf-8")
 
-    write_frontmatter_status(task, "ERROR")
+    write_frontmatter_status(task, "ERROR", SuppressionReason.CRASH)
 
     assert task.read_text(encoding="utf-8").startswith(
-        "---\nstatus: ERROR\n---\n\n"
+        "---\nstatus: ERROR\nblocked_reason: crash\n---\n\n"
     )
 
 
@@ -21,10 +22,10 @@ def test_write_status_replaces_existing_field(tmp_path: Path) -> None:
     task = tmp_path / "PR-001.md"
     task.write_text("---\nstatus: TODO\n---\n\nBody\n", encoding="utf-8")
 
-    write_frontmatter_status(task, "ERROR")
+    write_frontmatter_status(task, "ERROR", SuppressionReason.CRASH)
 
     assert task.read_text(encoding="utf-8") == (
-        "---\nstatus: ERROR\n---\n\nBody\n"
+        "---\nstatus: ERROR\nblocked_reason: crash\n---\n\nBody\n"
     )
 
 
@@ -34,10 +35,10 @@ def test_write_status_replaces_existing_field_with_crlf_frontmatter(
     task = tmp_path / "PR-001.md"
     task.write_text("---\r\nstatus: TODO\r\n---\r\n\r\nBody\r\n", encoding="utf-8")
 
-    write_frontmatter_status(task, "ERROR")
+    write_frontmatter_status(task, "ERROR", SuppressionReason.CRASH)
 
     assert task.read_bytes() == (
-        b"---\nstatus: ERROR\n---\n\r\nBody\r\n"
+        b"---\nstatus: ERROR\nblocked_reason: crash\n---\n\r\nBody\r\n"
     )
 
 
@@ -78,7 +79,7 @@ def test_write_status_preserves_body_content(tmp_path: Path) -> None:
     body = "\n# PR-001: Test\n\nLine with trailing spaces  \n\n"
     task.write_text("---\nstatus: TODO\n---\n" + body, encoding="utf-8")
 
-    write_frontmatter_status(task, "ERROR")
+    write_frontmatter_status(task, "ERROR", SuppressionReason.CRASH)
 
     assert task.read_text(encoding="utf-8").split("---\n", 2)[2] == body
 
@@ -89,10 +90,10 @@ def test_write_status_prepends_when_frontmatter_is_unclosed(
     task = tmp_path / "PR-001.md"
     task.write_text("---\nstatus: TODO\n\n# body\n", encoding="utf-8")
 
-    write_frontmatter_status(task, "ERROR")
+    write_frontmatter_status(task, "ERROR", SuppressionReason.CRASH)
 
     assert task.read_text(encoding="utf-8").startswith(
-        "---\nstatus: ERROR\n---\n\n---\nstatus: TODO\n"
+        "---\nstatus: ERROR\nblocked_reason: crash\n---\n\n---\nstatus: TODO\n"
     )
 
 

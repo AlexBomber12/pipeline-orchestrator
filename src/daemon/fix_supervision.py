@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 from src.cancellation import CancellationCause, safe_record_cancellation_cause
 from src.github import prs as gh_prs
 from src.models import PipelineState
+from src.subsource_registry import SuppressionReason
 
 if TYPE_CHECKING:
     from src.daemon.runner import PipelineRunner
@@ -241,6 +242,7 @@ async def handle_external_terminal_pr_state(
                 current_task,
                 "ERROR",
                 "PR closed externally during FIX",
+                blocked_reason=SuppressionReason.CRASH,
             )
         except Exception as exc:  # pragma: no cover - defensive status-write logging.
             runner.log_event(

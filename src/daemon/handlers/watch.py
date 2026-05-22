@@ -25,6 +25,7 @@ from src.inhibitor import InhibitorType, is_work_inhibited
 from src.keyspace import ci_infra_retried
 from src.models import CIStatus, FeedbackCheckResult, PipelineState, ReviewStatus
 from src.queue_parser import parse_task_header
+from src.subsource_registry import SuppressionReason
 
 logger = logging.getLogger(__name__)
 _STALE_RETRIGGER_DEBOUNCE = timedelta(hours=1)
@@ -498,7 +499,10 @@ class WatchMixin:
             if current_task is not None:
                 try:
                     status_written = await self._commit_task_status_change(
-                        current_task, "ERROR", message
+                        current_task,
+                        "ERROR",
+                        message,
+                        blocked_reason=SuppressionReason.REVIEW_TIMEOUT,
                     )
                 except Exception as exc:
                     self.log_event(

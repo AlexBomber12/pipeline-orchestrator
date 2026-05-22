@@ -79,7 +79,7 @@ def test_commit_and_park_in_error_writes_status_error_and_transitions(
 
     status_writes: list[tuple[Any, str, str]] = []
 
-    async def fake_commit(self, task, status, reason):  # type: ignore[no-untyped-def]
+    async def fake_commit(self, task, status, reason, **kwargs):  # type: ignore[no-untyped-def]
         status_writes.append((task, status, reason))
         return True
 
@@ -178,7 +178,7 @@ def test_commit_and_park_in_error_preserves_existing_cause(
     prior_cause.repo_slug = runner.name
     runner.redis.store[cause_key(runner.name, "PR-902")] = prior_cause.to_redis()
 
-    async def noop_commit(self, task, status, reason):  # type: ignore[no-untyped-def]
+    async def noop_commit(self, task, status, reason, **kwargs):  # type: ignore[no-untyped-def]
         return True
 
     monkeypatch.setattr(
@@ -214,7 +214,7 @@ def test_commit_and_park_in_error_no_current_task_skips_status_write(
 
     commit_calls: list[Any] = []
 
-    async def fake_commit(self, task, status, reason):  # type: ignore[no-untyped-def]
+    async def fake_commit(self, task, status, reason, **kwargs):  # type: ignore[no-untyped-def]
         commit_calls.append(task)
         return True
 
@@ -250,7 +250,7 @@ def test_commit_and_park_in_error_marks_status_write_fallback_on_failure(
         task_file="tasks/PR-903.md",
     )
 
-    async def fake_commit(self, task, status, reason):  # type: ignore[no-untyped-def]
+    async def fake_commit(self, task, status, reason, **kwargs):  # type: ignore[no-untyped-def]
         return False
 
     monkeypatch.setattr(
@@ -307,7 +307,7 @@ def test_commit_and_park_in_error_saves_run_record_before_status_checkout(
         fake_rev_parse,
     )
 
-    async def fake_commit(self, task, status, reason):  # type: ignore[no-untyped-def]
+    async def fake_commit(self, task, status, reason, **kwargs):  # type: ignore[no-untyped-def]
         # Mirror the production behavior: checkout/reset to origin/<base>
         # advances HEAD to the base-branch SHA before the function returns.
         head_state["sha"] = "base-branch-sha"
@@ -350,7 +350,7 @@ def test_commit_and_park_in_error_logs_status_write_exception(
         task_file="tasks/PR-904.md",
     )
 
-    async def fail_commit(self, task, status, reason):  # type: ignore[no-untyped-def]
+    async def fail_commit(self, task, status, reason, **kwargs):  # type: ignore[no-untyped-def]
         raise RuntimeError("checkout refused")
 
     monkeypatch.setattr(
@@ -392,7 +392,7 @@ def _make_coding_runner_with_task(monkeypatch: pytest.MonkeyPatch) -> Any:
         task_file="tasks/PR-CODING.md",
     )
 
-    async def noop_commit(self, task, status, reason):  # type: ignore[no-untyped-def]
+    async def noop_commit(self, task, status, reason, **kwargs):  # type: ignore[no-untyped-def]
         return True
 
     monkeypatch.setattr(
@@ -466,7 +466,7 @@ def test_idle_pinned_coder_unavailable_parks_in_error(
         branch="pr-idle",
     )
 
-    async def noop_commit(self, task, status, reason):  # type: ignore[no-untyped-def]
+    async def noop_commit(self, task, status, reason, **kwargs):  # type: ignore[no-untyped-def]
         return True
 
     monkeypatch.setattr(
@@ -523,7 +523,7 @@ def test_fix_coder_escalate_marker_parks_in_error_with_coder_escalate(
         branch="pr-910",
     )
 
-    async def noop_commit(self, task, status, reason):  # type: ignore[no-untyped-def]
+    async def noop_commit(self, task, status, reason, **kwargs):  # type: ignore[no-untyped-def]
         return True
 
     monkeypatch.setattr(
@@ -574,7 +574,7 @@ def test_fix_iteration_cap_parks_in_error_with_fix_iteration_cap(
         branch="pr-911",
     )
 
-    async def noop_commit(self, task, status, reason):  # type: ignore[no-untyped-def]
+    async def noop_commit(self, task, status, reason, **kwargs):  # type: ignore[no-untyped-def]
         return True
 
     monkeypatch.setattr(
