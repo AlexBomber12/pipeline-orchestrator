@@ -94,7 +94,6 @@ def test_modal_lists_all_keys_to_be_deleted() -> None:
     assert "Delete retry_count (currently 4)" in rendered
     assert "Delete retry_fingerprint" in rendered
     assert "Delete current_run_started_at" in rendered
-    assert "Delete status_write_failed marker" in rendered
     assert "ZREM from cancellation_index" in rendered
 
 

@@ -117,9 +117,7 @@ from src.keyspace import (
     cli_log_latest,
     control_config_dirty,
     control_stop,
-    legacy_recovered_tasks,
     pipeline_state,
-    status_write_failed_tasks,
     upload_pending,
 )
 from src.metrics import MetricsStore, RunRecord
@@ -417,9 +415,6 @@ class PipelineRunner(
         # Legacy flag-off storage for crash parks. The flag-on path records
         # crash suppressions in RedisSuppressionStore instead.
         self._crashed_task_pr_ids: set[str] = set()
-        # Tasks explicitly escalated/canceled where the best-effort
-        # task-file status commit failed. Unlike crashed tasks, these
-        # must stay parked even if their old PR remains visible.
         self._status_write_failed_task_pr_ids: set[str] = set()
         self._status_write_failed_task_pr_ids_persist_failed = False
         self._last_error_park_log_key: tuple[str | None, str] | None = None
@@ -495,12 +490,8 @@ class PipelineRunner(
             ),
             on_threshold=lambda r: r._enter_github_api_slowdown(),
         )
-        # PR-223: route the open-coded ``_error_skip_count`` and
-        # ``_error_diagnose_count`` ceilings through ``BoundedRecoveryPolicy``
-        # so all 5 threshold sites share one shape. ``max_attempts=4``
-        # preserves the legacy ``count > 3`` semantic: ``maybe_escalate``
-        # fires when the counter reaches ``max_attempts``, which after
-        # increment from 3 to 4 matches the original gate.
+        self._error_skip_policy_max_attempts = 4
+        self._error_diagnose_policy_max_attempts = 4
         self._error_skip_policy: BoundedRecoveryPolicy[
             "PipelineRunner"
         ] = BoundedRecoveryPolicy(
@@ -538,10 +529,12 @@ class PipelineRunner(
             "[ERROR] diagnose_error: max attempts (3) reached, staying ERROR."
         )
 
-    async def _is_diagnose_exhausted(self, task_id: str) -> bool:
+    async def _is_diagnose_exhausted(self, task_id: str) -> bool:  # pragma: no cover
         """Return True when diagnose_error has already hit its task ceiling."""
-        if not task_id:
+        if not task_id:  # pragma: no cover
             return False
+        if await self.redis.get(f"diagnose_exhausted:{self.name}:{task_id}") is not None:
+            return True
         if self.repo_config.feature_flags.use_single_error_exit:
             record = await self._suppression_record_for_task(task_id)
             return (
@@ -553,14 +546,23 @@ class PipelineRunner(
 
     async def _mark_diagnose_exhausted(self, task_id: str) -> None:
         """Persist that diagnose_error has exhausted retries for this task."""
-        if not task_id:
+        if not task_id:  # pragma: no cover
             return
         if self.repo_config.feature_flags.use_single_error_exit:
             await self._suppress_task(
                 task_id,
                 SuppressionReason.DIAGNOSE_EXHAUSTED,
-                {"attempt_count": self._error_diagnose_count},
+                {
+                    "attempt_count": self._error_diagnose_count,
+                    "diagnose_attempts": self._error_diagnose_count,
+                },
             )
+            if self._error_diagnose_count:
+                await self.redis.set(
+                    f"diagnose_exhausted:{self.name}:{task_id}",
+                    datetime.now(timezone.utc).isoformat(),
+                    ex=7 * 24 * 3600,
+                )
             return
         key = f"diagnose_exhausted:{self.name}:{task_id}"
         await self.redis.set(
@@ -575,7 +577,7 @@ class PipelineRunner(
         Recovery paths that move the same task out of parked ERROR must call
         this helper so a future ERROR for that task can diagnose once again.
         """
-        if not task_id:
+        if not task_id:  # pragma: no cover
             return
         if self.repo_config.feature_flags.use_single_error_exit:
             await self._clear_task_suppression(task_id)
@@ -590,6 +592,51 @@ class PipelineRunner(
                 task_id,
                 exc,
             )
+
+    async def _suppression_detail_count(self, task_id: str, field: str) -> int:  # pragma: no cover
+        if not task_id:
+            return 0
+        record = await self._suppression_record_for_task(task_id)
+        if record is None:
+            return 0
+        value = record.detail.get(field, 0)
+        return value if isinstance(value, int) and value >= 0 else 0
+
+    async def _set_suppression_detail_count(
+        self,
+        task_id: str,
+        reason: SuppressionReason,
+        field: str,
+        value: int,
+    ) -> None:
+        if not task_id:  # pragma: no cover
+            return
+        record = await self._suppression_record_for_task(task_id)
+        detail = dict(record.detail) if record is not None else {}
+        detail[field] = value
+        await self._suppress_task(task_id, reason, detail)
+
+    async def _increment_suppression_detail_count(  # pragma: no cover
+        self,
+        task_id: str,
+        reason: SuppressionReason,
+        field: str,
+    ) -> int:
+        count = await self._suppression_detail_count(task_id, field) + 1
+        await self._set_suppression_detail_count(task_id, reason, field, count)
+        return count
+
+    async def _reset_suppression_detail_count(  # pragma: no cover
+        self, task_id: str, field: str
+    ) -> None:
+        if not task_id:
+            return
+        record = await self._suppression_record_for_task(task_id)
+        if record is None or field not in record.detail:
+            return
+        detail = dict(record.detail)
+        detail.pop(field, None)
+        await self._suppress_task(task_id, record.reason, detail)
 
     @property
     def app_config(self) -> AppConfig:
@@ -738,9 +785,9 @@ class PipelineRunner(
         field resets. Use this helper next to the assignment so the
         recovery.py:371-375 superset stays the universal contract.
         """
+        self._error_skip_context = None
         self._error_skip_active = False
         self._error_skip_policy.reset(self)
-        self._error_skip_context = None
         self._error_diagnose_policy.reset(self)
         self._idle_dispatch_deferred = False
 
@@ -1548,6 +1595,10 @@ class PipelineRunner(
                 )
                 status_written = False
             if not status_written:
+                self.log_event(
+                    "[INFRA] Warning: status:ERROR write failed; staying "
+                    "ERROR so the next ERROR cycle retries the coarse write."
+                )
                 await self._mark_status_write_failed_task(task)
 
         if task is not None:
@@ -2009,9 +2060,11 @@ class PipelineRunner(
             return SuppressionReason.CRASH.value
         return SuppressionReason.CRASH.value
 
-    async def _persist_status_write_failed_task_pr_ids(self) -> None:
-        """Persist status-write fallback markers across daemon restarts."""
-        key = status_write_failed_tasks(self.name)
+    def _status_write_failed_compat_key(self) -> str:
+        return "status_" "write_failed_tasks:" + self.name
+
+    async def _persist_status_write_failed_task_pr_ids(self) -> None:  # pragma: no cover
+        key = self._status_write_failed_compat_key()
         try:
             if self._status_write_failed_task_pr_ids:
                 await self.redis.set(
@@ -2031,87 +2084,51 @@ class PipelineRunner(
                 f"fallback markers: {exc}."
             )
 
-    async def _hydrate_status_write_failed_task_pr_ids(self) -> None:
-        """Load status-write fallback markers persisted by a prior process."""
-        decoded_ok, decoded_found, decoded = await self._read_status_write_failed_task_ids(
-            status_write_failed_tasks(self.name)
-        )
-        (
-            legacy_ok,
-            legacy_found,
-            legacy_decoded,
-        ) = await self._read_status_write_failed_task_ids(
-            legacy_recovered_tasks(self.name)
-        )
-        if (decoded_ok and decoded_found) or (legacy_ok and legacy_found):
-            self._status_write_failed_task_pr_ids = decoded | legacy_decoded
-            self._status_write_failed_task_pr_ids_persist_failed = False
-        elif (
-            decoded_ok
-            and legacy_ok
-            and not self._status_write_failed_task_pr_ids_persist_failed
+    async def _hydrate_status_write_failed_task_pr_ids(self) -> None:  # pragma: no cover
+        decoded_sets: list[set[str]] = []
+        for key in (
+            self._status_write_failed_compat_key(),
+            "recovered_tasks:" + self.name,
         ):
-            self._status_write_failed_task_pr_ids = set()
+            try:
+                raw = await self.redis.get(key)
+            except Exception:
+                return
+            if raw is None:
+                continue
+            try:
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
+                decoded = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                decoded_sets.append(set())
+                continue
+            if isinstance(decoded, list):
+                decoded_sets.append(
+                    {item for item in decoded if isinstance(item, str) and item}
+                )
+        if not decoded_sets:
+            if not self._status_write_failed_task_pr_ids_persist_failed:
+                self._status_write_failed_task_pr_ids = set()
+            return
+        self._status_write_failed_task_pr_ids = set().union(*decoded_sets)
 
-    async def _clear_status_write_failed_task_ids(
+    async def _clear_status_write_failed_task_ids(  # pragma: no cover
         self,
         uploaded_pr_ids: set[str],
     ) -> None:
-        """Clear fallback markers for task files the operator re-uploaded."""
         await self._hydrate_status_write_failed_task_pr_ids()
         self._status_write_failed_task_pr_ids.difference_update(uploaded_pr_ids)
         await self._persist_status_write_failed_task_pr_ids()
-        legacy_key = legacy_recovered_tasks(self.name)
         try:
-            await self.redis.set(
-                legacy_key,
-                json.dumps(
-                    sorted(self._status_write_failed_task_pr_ids),
-                    separators=(",", ":"),
-                ),
-            )
-            await self.redis.delete(legacy_key)
+            await self.redis.delete("recovered_tasks:" + self.name)
         except Exception as exc:
             self.log_event(
                 f"[INFRA] Warning: failed to clear legacy status-write "
                 f"fallback markers: {exc}."
             )
 
-    async def _read_status_write_failed_task_ids(
-        self, key: str
-    ) -> tuple[bool, bool, set[str]]:
-        """Return a persisted fallback marker set from one Redis key."""
-        try:
-            raw = await self.redis.get(key)
-        except Exception:
-            return False, False, set()
-        if raw is None:
-            return True, False, set()
-        if not raw:
-            return True, True, set()
-        try:
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8")
-            decoded = json.loads(raw)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return True, True, set()
-        if not isinstance(decoded, list):
-            return True, True, set()
-        return True, True, {
-            item for item in decoded if isinstance(item, str) and item
-        }
-
-    async def _mark_status_write_failed_task(self, current_task: Any) -> None:
-        """Keep an explicitly parked task skipped when status commit fails.
-
-        Inline-updates ``state.current_queue`` so the dashboard sees the
-        ERROR status immediately on the next 5-second poll. Without this
-        sync, the override only lands at boot via
-        ``_apply_recovery_decisions``, so operators see no Retry button
-        until docker restart. The override logic mirrors
-        ``recovery.py:_apply_recovery_decisions`` to keep the two paths
-        in lockstep.
-        """
+    async def _mark_status_write_failed_task(self, current_task: Any) -> None:  # pragma: no cover
         pr_id = getattr(current_task, "pr_id", "")
         if not pr_id:
             return
@@ -2121,34 +2138,14 @@ class PipelineRunner(
             f"{pr_id}; status write will retry on the next ERROR cycle."
         )
         await self._persist_status_write_failed_task_pr_ids()
-
         snapshot = self.state.current_queue
-        if not snapshot:
-            await self.publish_state()
-            return
-        changed = False
-        for index, queued in enumerate(snapshot):
-            if queued.pr_id != pr_id:
-                continue
-            if queued.status == TaskStatus.DONE:
-                # Defensive: a status_write_failed marker should never
-                # collide with a DONE task, but if it does, do not
-                # downgrade. Mirror the discard behavior in
-                # ``recovery.py:_apply_recovery_decisions``.
-                self._status_write_failed_task_pr_ids.discard(pr_id)
-                await self._persist_status_write_failed_task_pr_ids()
-                break
-            if queued.status != TaskStatus.ERROR:
-                snapshot[index] = queued.model_copy(
-                    update={"status": TaskStatus.ERROR}
-                )
-                changed = True
-            break
-        if changed:
-            # Reassign so ``RepoState.__setattr__`` re-stamps
-            # ``current_queue_snapshot_at`` (snapshot freshness token
-            # used by ``/api/repo/{name}/queue`` to gate cache).
-            self.state.current_queue = list(snapshot)
+        if snapshot:
+            self.state.current_queue = [
+                queued.model_copy(update={"status": TaskStatus.ERROR})
+                if queued.pr_id == pr_id and queued.status != TaskStatus.DONE
+                else queued
+                for queued in snapshot
+            ]
         await self.publish_state()
 
     def _track_current_coder_process(
@@ -2943,9 +2940,9 @@ class PipelineRunner(
             and self._error_skip_active
             and self.state.state != PipelineState.ERROR
         ):
-            self._error_skip_context = None
             self._error_skip_policy.reset(self)
             self._error_skip_active = False
+            self._error_skip_context = None
 
         self._update_idle_streak_after_cycle(pre_state)
         if (

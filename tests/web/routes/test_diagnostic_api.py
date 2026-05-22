@@ -16,7 +16,7 @@ from src.cancellation.storage import (
     current_run_started_at_key,
     retry_count_key,
 )
-from src.keyspace import pipeline_state, status_write_failed_tasks
+from src.keyspace import pipeline_state
 from src.models import (
     CIStatus,
     PipelineState,
@@ -218,10 +218,6 @@ def test_diagnostic_returns_all_fields_for_stuck_task(
     redis_client.values[
         diagnostic_routes._attempt_count_key("example__alpha", "PR-322")
     ] = "4"
-    redis_client.values[status_write_failed_tasks("example__alpha")] = (
-        '["PR-322", "PR-999"]'
-    )
-
     body = _get("example__alpha", "PR-322").json()
     expected_keys = {
         "repo_slug",
@@ -234,10 +230,7 @@ def test_diagnostic_returns_all_fields_for_stuck_task(
         "retry_fingerprint_matches_current_spec",
         "current_run_started_at",
         "attempt_count",
-        "status_write_failed",
         "skip_ai_error_diagnose",
-        "_error_diagnose_count",
-        "_error_skip_count",
         "current_pr",
         "ttls",
     }
@@ -252,10 +245,7 @@ def test_diagnostic_returns_all_fields_for_stuck_task(
     assert body["retry_fingerprint_matches_current_spec"] is False
     assert body["current_run_started_at"] == "2026-05-17T08:23:00+00:00"
     assert body["attempt_count"] == 4
-    assert body["status_write_failed"] is True
     assert body["skip_ai_error_diagnose"] is False
-    assert body["_error_diagnose_count"] == 0
-    assert body["_error_skip_count"] == 0
     # PR-345: visiting the diagnostic endpoint signals operator interest, so
     # the cancellation cause TTL is bumped from 30d (initial budget) to 90d
     # before the TTL section is read back.
@@ -278,7 +268,6 @@ def test_diagnostic_returns_nulls_for_missing_keys(
     assert body["retry_fingerprint_matches_current_spec"] is False
     assert body["current_run_started_at"] is None
     assert body["attempt_count"] == 0
-    assert body["status_write_failed"] is False
     assert body["skip_ai_error_diagnose"] is False
     assert body["current_pr"] is None
     assert body["ttls"] == {
@@ -497,30 +486,6 @@ def test_diagnostic_skip_ai_error_diagnose_propagated_from_state(
     assert body["skip_ai_error_diagnose"] is True
 
 
-def test_diagnostic_status_write_failed_malformed_payload_is_false(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _write_config(tmp_path, monkeypatch)
-    redis_client = _FakeRedis()
-    _stub_aioredis(monkeypatch, redis_client)
-    redis_client.values[status_write_failed_tasks("example__alpha")] = "not json"
-
-    body = _get("example__alpha", "PR-322").json()
-    assert body["status_write_failed"] is False
-
-
-def test_diagnostic_status_write_failed_non_list_is_false(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _write_config(tmp_path, monkeypatch)
-    redis_client = _FakeRedis()
-    _stub_aioredis(monkeypatch, redis_client)
-    redis_client.values[status_write_failed_tasks("example__alpha")] = '{"x": 1}'
-
-    body = _get("example__alpha", "PR-322").json()
-    assert body["status_write_failed"] is False
-
-
 def test_diagnostic_fingerprint_matches_current_spec(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -586,8 +551,6 @@ def test_diagnostic_non_utf8_bytes_degrade_to_null(
     redis_client.values[
         diagnostic_routes._attempt_count_key("example__alpha", "PR-322")
     ] = b"\xff\xfe"  # type: ignore[assignment]
-    redis_client.values[status_write_failed_tasks("example__alpha")] = b"\xff\xfe"  # type: ignore[assignment]
-
     resp = _get("example__alpha", "PR-322")
     assert resp.status_code == 200
     body = resp.json()
@@ -595,7 +558,6 @@ def test_diagnostic_non_utf8_bytes_degrade_to_null(
     assert body["retry_fingerprint"] is None
     assert body["current_run_started_at"] is None
     assert body["attempt_count"] == 0
-    assert body["status_write_failed"] is False
 
 
 def test_diagnostic_no_frontmatter_returns_null_status(

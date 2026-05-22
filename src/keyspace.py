@@ -50,16 +50,6 @@ def upload_pending_count(repo_name: str) -> str:
     return f"upload_pending_count:{repo_name}"
 
 
-def status_write_failed_tasks(repo_name: str) -> str:
-    """PR IDs parked after status:ERROR could not be committed."""
-    return f"status_write_failed_tasks:{repo_name}"
-
-
-def legacy_recovered_tasks(repo_name: str) -> str:
-    """Legacy PR IDs parked by pre-PR-281 recovery fallback state."""
-    return f"recovered_tasks:{repo_name}"
-
-
 def recovery_backup_branch(repo_name: str, task_id: str) -> str:
     """Backup-branch pointer recorded when the PR-351 recovery push fallback
     succeeded for a task whose primary feature-branch push was rejected by

@@ -217,6 +217,9 @@ async def escalate_fix_no_push_deadlock(
             )
             status_written = False
         if not status_written:
+            runner.log_event(
+                "[INFRA] Warning: status:ERROR write failed; staying ERROR for retry."
+            )
             await runner._mark_status_write_failed_task(current_task)
 
     runner.state.current_task = None

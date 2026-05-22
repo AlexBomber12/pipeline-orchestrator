@@ -32,6 +32,7 @@ from src.github import cache as gh_cache
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.models import PipelineState
+from src.subsource_registry import SuppressionReason
 
 
 def _resolve_task_file_under_repo(repo_path: str, task_file: str) -> Path:
@@ -405,6 +406,11 @@ class CodingMixin:
             if self._stop_requested:
                 if current_pr_id is not None:
                     self._user_stopped_task_pr_ids.add(current_pr_id)
+                    await self._suppress_task(
+                        current_pr_id,
+                        SuppressionReason.OPERATOR_STOPPED,
+                        {"source": "stop_requested_during_coder_run"},
+                    )
                 self.state.state = PipelineState.PAUSED
                 await self._clear_error_message_on_recovery(
                     log_prefix="[CODING]",
@@ -633,6 +639,11 @@ class CodingMixin:
                 return False
             if current_pr_id is not None:
                 self._user_stopped_task_pr_ids.add(current_pr_id)
+                await self._suppress_task(
+                    current_pr_id,
+                    SuppressionReason.OPERATOR_STOPPED,
+                    {"source": "stop_requested_after_coder_exit"},
+                )
             self.state.state = PipelineState.PAUSED
             await self._clear_error_message_on_recovery(
                 log_prefix="[CODING]",
@@ -661,6 +672,15 @@ class CodingMixin:
             if self.state.current_pr is not None:
                 pr_number = self.state.current_pr.number
                 self.state.quarantined_prs.add(pr_number)
+                task_id = (
+                    self.state.current_pr.pr_id
+                    or (self.state.current_task.pr_id if self.state.current_task else "")
+                )
+                await self._suppress_task(
+                    task_id,
+                    SuppressionReason.GUARDRAIL,
+                    {"pr_number": pr_number, "reason_text": cause},
+                )
                 apply_quarantine_label_for_violation(self, pr_number, first)
             await self._transition_to_error(
                 cause,

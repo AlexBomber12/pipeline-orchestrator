@@ -25,6 +25,7 @@ from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.models import PipelineState, TaskStatus
 from src.retry import retry_transient
+from src.subsource_registry import SuppressionReason
 
 # Upper bound on how long an open queue-sync remediation PR may sit
 # unresolved before ``_resolve_pending_queue_sync`` escalates to
@@ -66,10 +67,16 @@ class MergeMixin:
         number = self.state.current_pr.number
         pr_branch = self.state.current_pr.branch
         base = self.repo_config.branch
-        if number in self.state.quarantined_prs:
+        record = await self._suppression_record_for_task(
+            self.state.current_pr.pr_id or ""
+        )
+        if (
+            number in self.state.quarantined_prs
+            or record is not None
+            and record.reason == SuppressionReason.GUARDRAIL
+        ):
             self.log_event(
-                f"[MERGE] PR #{number} is quarantined; refusing to merge "
-                f"({len(self.state.quarantined_prs)} quarantined in this repo)."
+                f"[MERGE] PR #{number} is quarantined; refusing to merge."
             )
             self.state.state = PipelineState.WATCH
             await self.publish_state()

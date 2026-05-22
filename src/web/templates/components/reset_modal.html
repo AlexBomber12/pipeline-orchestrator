@@ -24,7 +24,6 @@
                 <li>Delete retry_count (currently {{ diagnostic.retry_count }})</li>
                 <li>Delete retry_fingerprint</li>
                 <li>Delete current_run_started_at</li>
-                <li>Delete status_write_failed marker</li>
                 <li>ZREM from cancellation_index</li>
                 {% if orphan_pr %}
                 <li class="text-warn">Close orphan PR #{{ orphan_pr.number }} on GitHub</li>

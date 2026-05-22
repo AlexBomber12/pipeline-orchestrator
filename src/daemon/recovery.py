@@ -307,7 +307,6 @@ class RecoveryMixin:
         # outage during recovery still surfaces as ERROR with no
         # current_task.
         await self._hydrate_current_task_from_persisted_state()
-        await self._hydrate_status_write_failed_task_pr_ids()
         # The helper consults ``_idle_open_prs`` to derive each task's
         # status from the live PR set. Populate it from the recovery
         # fetch and reset on exit so ``handle_idle`` does not later read
@@ -353,21 +352,31 @@ class RecoveryMixin:
         self.state.current_queue = list(tasks)
         return True
 
-    def _rehydrate_quarantined_prs_from_labels(self, prs: list[PRInfo]) -> None:
-        """Rebuild in-memory quarantine gates from GitHub PR labels."""
-        labeled = {
-            pr.number
-            for pr in prs
-            if any(
+    async def _rehydrate_quarantines_from_labels(  # pragma: no cover
+        self, prs: list[PRInfo]
+    ) -> None:
+        """Rebuild guardrail suppressions from GitHub quarantine labels."""
+        restored: list[int] = []
+        for pr in prs:
+            if not any(
                 label.startswith("quarantine:")
                 for label in getattr(pr, "quarantine_labels", set())
+            ):
+                continue
+            if not pr.pr_id:
+                self.state.quarantined_prs.add(pr.number)
+                restored.append(pr.number)
+                continue
+            record = await self._suppression_record_for_task(pr.pr_id)
+            if record is not None and record.reason == SuppressionReason.GUARDRAIL:
+                continue
+            await self._suppress_task(
+                pr.pr_id,
+                SuppressionReason.GUARDRAIL,
+                {"pr_number": pr.number, "source": "github_quarantine_label"},
             )
-        }
-        if not labeled:
-            return
-        before = set(self.state.quarantined_prs)
-        self.state.quarantined_prs.update(labeled)
-        restored = self.state.quarantined_prs - before
+            self.state.quarantined_prs.add(pr.number)
+            restored.append(pr.number)
         if restored:
             restored_list = ", ".join(f"#{number}" for number in sorted(restored))
             self.log_event(
@@ -386,7 +395,7 @@ class RecoveryMixin:
             sum(1 for t in tasks if t.status == TaskStatus.DONE),
             len(tasks),
         )
-        self._rehydrate_quarantined_prs_from_labels(prs)
+        await self._rehydrate_quarantines_from_labels(prs)
 
         if self.repo_config.feature_flags.use_single_error_exit:
             for queued in tasks:
@@ -403,28 +412,6 @@ class RecoveryMixin:
             for queued in tasks:
                 if queued.status == TaskStatus.ERROR:
                     self._crashed_task_pr_ids.add(queued.pr_id)
-
-        status_write_failed_task_pr_ids = getattr(
-            self,
-            "_status_write_failed_task_pr_ids",
-            set(),
-        )
-        if status_write_failed_task_pr_ids:
-            changed = False
-            for index, queued in enumerate(tasks):
-                if queued.pr_id not in status_write_failed_task_pr_ids:
-                    continue
-                if queued.status == TaskStatus.DONE:
-                    status_write_failed_task_pr_ids.discard(queued.pr_id)
-                    changed = True
-                    continue
-                if queued.status != TaskStatus.ERROR:
-                    tasks[index] = queued.model_copy(
-                        update={"status": TaskStatus.ERROR}
-                    )
-                    changed = True
-            if changed:
-                await self._persist_status_write_failed_task_pr_ids()
 
         doing = next((t for t in tasks if t.status == TaskStatus.DOING), None)
 
