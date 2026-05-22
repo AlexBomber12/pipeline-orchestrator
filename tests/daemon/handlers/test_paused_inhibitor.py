@@ -23,6 +23,7 @@ import pytest
 
 from src.config import CoderType, FeatureFlags
 from src.inhibitor import InhibitorType, WorkInhibitor
+from src.keyspace import control_stop
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 
 from tests.runner import _helpers as h
@@ -507,6 +508,68 @@ def test_handle_paused_flag_on_ignores_stale_user_pause_after_play() -> None:
     )
     assert not any(
         e["event"].startswith("[INFRA] PAUSED inhibited by")
+        for e in runner.state.history
+    )
+
+
+def test_handle_paused_flag_on_ignores_stale_user_stop_after_play() -> None:
+    """A cleared stop control key must not leave PAUSED stuck forever."""
+    runner = h._make_runner()
+    _enable_flag(runner)
+    _seed_paused(runner)
+    runner.state.user_paused = False
+    runner.state.active_inhibitors = [
+        WorkInhibitor(
+            inhibitor_type=InhibitorType.USER_STOP,
+            expires_at=_future(),
+            reason_text="Operator requested stop",
+            source_key=control_stop(runner.name),
+        )
+    ]
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert any(
+        e["event"] == "[INFRA] PAUSED inhibitors cleared -> IDLE."
+        for e in runner.state.history
+    )
+    assert not any(
+        e["event"].startswith("[INFRA] PAUSED inhibited by")
+        for e in runner.state.history
+    )
+
+
+def test_handle_paused_flag_on_preserves_user_stop_when_stop_key_read_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Redis read failure must not accidentally clear a stop inhibitor."""
+    runner = h._make_runner()
+    _enable_flag(runner)
+    _seed_paused(runner)
+    runner.state.user_paused = False
+    runner.state.active_inhibitors = [
+        WorkInhibitor(
+            inhibitor_type=InhibitorType.USER_STOP,
+            expires_at=_future(),
+            reason_text="Operator requested stop",
+            source_key=control_stop(runner.name),
+        )
+    ]
+
+    async def raise_on_stop_key(key: str) -> str | None:
+        if key == control_stop(runner.name):
+            raise RuntimeError("redis unavailable")
+        return runner.redis.store.get(key)
+
+    monkeypatch.setattr(runner.redis, "get", raise_on_stop_key)
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert any(
+        e["event"].startswith("[INFRA] PAUSED inhibited by")
+        and "user_stop" in e["event"]
         for e in runner.state.history
     )
 

@@ -27,6 +27,7 @@ from src.daemon.selector import SelectionContext, candidate_coders
 from src.dag import get_eligible_tasks
 from src.github import prs as gh_prs
 from src.inhibitor import InhibitorType, WorkInhibitor, is_work_inhibited
+from src.keyspace import control_stop
 from src.models import PipelineState, QueueTask, TaskStatus
 from src.onboarding.markdown_sections import MarkerError
 from src.onboarding.reconciliation import reconcile_agents_md
@@ -987,21 +988,45 @@ class IdleMixin:
                 else self.state.rate_limit_reactive_coder or "claude"
             )
             _, blocking = is_work_inhibited(self.state, coder=coder_name)
+            stop_key = control_stop(self.name)
+            stale_stop_key = False
+            if any(
+                inh.inhibitor_type == InhibitorType.USER_STOP
+                and inh.source_key == stop_key
+                for inh in blocking
+            ):
+                try:
+                    stale_stop_key = not bool(await self.redis.get(stop_key))
+                except Exception:
+                    stale_stop_key = False
             # Ignore stale ``USER_PAUSE`` entries from the previous
             # publish: ``user_paused`` is ``False`` here (manual-pause
             # short-circuit above), so any ``USER_PAUSE`` left in the
             # snapshot is post-Play lag that ``is_blocking_now`` would
             # otherwise treat as live (no ``expires_at``).
+            # ``USER_STOP`` is also a Redis-backed control signal: the
+            # stop endpoint sets ``control:<repo>:stop`` and the resume
+            # endpoint deletes it. A PAUSED snapshot may still contain
+            # the previous publish's stop inhibitor after Play; if the
+            # canonical key is gone, the stop request is stale and must
+            # not keep the repo paused indefinitely.
             # ``GITHUB_BUDGET_SLOWDOWN`` is a polling-cadence throttle,
             # not a dispatch block, and was never part of the legacy
             # PAUSED exit conditions.
             hard_blocking = [
                 inh
                 for inh in blocking
-                if inh.inhibitor_type
-                not in (
-                    InhibitorType.GITHUB_BUDGET_SLOWDOWN,
-                    InhibitorType.USER_PAUSE,
+                if not (
+                    inh.inhibitor_type
+                    in (
+                        InhibitorType.GITHUB_BUDGET_SLOWDOWN,
+                        InhibitorType.USER_PAUSE,
+                    )
+                    or (
+                        stale_stop_key
+                        and inh.inhibitor_type == InhibitorType.USER_STOP
+                        and inh.source_key == stop_key
+                    )
                 )
             ]
             if hard_blocking:
