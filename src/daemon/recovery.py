@@ -29,6 +29,7 @@ from src.github import prs as gh_prs
 from src.keyspace import pipeline_state, recovery_backup_branch
 from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
 from src.queue_parser import QueueValidationError, parse_task_header
+from src.subsource_registry import SuppressionReason
 from src.task_status import (
     _resolve_merged_state,
     derive_task_status,
@@ -85,10 +86,6 @@ class RecoveryMixin:
 
         if not headers:
             return None
-
-        for header in headers:
-            if header.frontmatter_status == "error":
-                self._crashed_task_pr_ids.add(header.pr_id)
 
         merged_state = _resolve_merged_state(
             self.repo_path,
@@ -391,19 +388,21 @@ class RecoveryMixin:
         )
         self._rehydrate_quarantined_prs_from_labels(prs)
 
-        # PR-186 Codex P1: rehydrate the crashed-task set from any ERROR
-        # entries in the parsed queue. The crashed-task cancellation is what
-        # tells ``_select_next_task_from_dag`` to skip the task on the next
-        # IDLE cycle; without this rehydrate, a daemon restart after one
-        # IDLE cycle has already written ERROR to QUEUE.md would start
-        # with an empty set, ``recover_state`` would see no DOING entry to
-        # re-mark, and the selector would recompute the task as TODO and
-        # dispatch it again — defeating the "manual re-upload required"
-        # contract and reintroducing the crash loop. The set is cleared
-        # only when the user re-uploads the task file (see ``repo_ops``).
-        for queued in tasks:
-            if queued.status == TaskStatus.ERROR:
-                self._crashed_task_pr_ids.add(queued.pr_id)
+        if self.repo_config.feature_flags.use_single_error_exit:
+            for queued in tasks:
+                if queued.status != TaskStatus.ERROR:
+                    continue
+                record = await self._suppression_record_for_task(queued.pr_id)
+                if record is None:
+                    await self._suppress_task(
+                        queued.pr_id,
+                        SuppressionReason.CRASH,
+                        {"source": "recovery_error_status"},
+                    )
+        else:
+            for queued in tasks:
+                if queued.status == TaskStatus.ERROR:
+                    self._crashed_task_pr_ids.add(queued.pr_id)
 
         status_write_failed_task_pr_ids = getattr(
             self,
@@ -570,7 +569,18 @@ class RecoveryMixin:
             # cause).
             if branch_kind == "crash":
                 await self._record_crash_cancellation_if_missing(doing.pr_id)
-            self._crashed_task_pr_ids.add(doing.pr_id)
+            if self.repo_config.feature_flags.use_single_error_exit:
+                if branch_kind == "crash":
+                    await self._suppress_task(
+                        doing.pr_id,
+                        SuppressionReason.CRASH,
+                        {
+                            "source": "recovery_doing_without_pr",
+                            "branch": doing.branch,
+                        },
+                    )
+            else:
+                self._crashed_task_pr_ids.add(doing.pr_id)
             # PR-266b crash-no-PR fix: reflect the cancellation in the
             # in-memory tasks list so the headers-mode current_queue
             # snapshot does not display ``DOING`` for a task the runner

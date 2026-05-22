@@ -414,10 +414,8 @@ class PipelineRunner(
         self._current_coder_process: asyncio.subprocess.Process | None = None
         self._stop_requested = False
         self._user_stopped_task_pr_ids: set[str] = set()
-        # PR-186: Tasks marked ERROR by recovery after a crash. The next
-        # IDLE cycle treats these as ERROR and skips them so the same
-        # task is not re-picked into a crash loop. Cleared when the user
-        # re-uploads the task file.
+        # Legacy flag-off storage for crash parks. The flag-on path records
+        # crash suppressions in RedisSuppressionStore instead.
         self._crashed_task_pr_ids: set[str] = set()
         # Tasks explicitly escalated/canceled where the best-effort
         # task-file status commit failed. Unlike crashed tasks, these
@@ -544,12 +542,25 @@ class PipelineRunner(
         """Return True when diagnose_error has already hit its task ceiling."""
         if not task_id:
             return False
+        if self.repo_config.feature_flags.use_single_error_exit:
+            record = await self._suppression_record_for_task(task_id)
+            return (
+                record is not None
+                and record.reason == SuppressionReason.DIAGNOSE_EXHAUSTED
+            )
         key = f"diagnose_exhausted:{self.name}:{task_id}"
         return await self.redis.get(key) is not None
 
     async def _mark_diagnose_exhausted(self, task_id: str) -> None:
         """Persist that diagnose_error has exhausted retries for this task."""
         if not task_id:
+            return
+        if self.repo_config.feature_flags.use_single_error_exit:
+            await self._suppress_task(
+                task_id,
+                SuppressionReason.DIAGNOSE_EXHAUSTED,
+                {"attempt_count": self._error_diagnose_count},
+            )
             return
         key = f"diagnose_exhausted:{self.name}:{task_id}"
         await self.redis.set(
@@ -565,6 +576,9 @@ class PipelineRunner(
         this helper so a future ERROR for that task can diagnose once again.
         """
         if not task_id:
+            return
+        if self.repo_config.feature_flags.use_single_error_exit:
+            await self._clear_task_suppression(task_id)
             return
         key = f"diagnose_exhausted:{self.name}:{task_id}"
         try:
@@ -1683,6 +1697,33 @@ class PipelineRunner(
         store = RedisSuppressionStore(self.redis)
         return await store.is_suppressed(self.name, task_id)
 
+    async def _suppress_task(
+        self,
+        task_id: str,
+        reason: SuppressionReason,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        """Record a task suppression through the suppression port."""
+        if not task_id:
+            return
+        store = RedisSuppressionStore(self.redis)
+        await store.suppress(self.name, task_id, reason, detail or {})
+
+    async def _clear_task_suppression(self, task_id: str) -> None:
+        """Clear a task suppression through the suppression port."""
+        if not task_id:
+            return
+        store = RedisSuppressionStore(self.redis)
+        await store.clear(self.name, task_id)
+
+    def _task_suppression_blocks_selection(self, reason: SuppressionReason) -> bool:
+        """Return True when a suppression should keep a task out of IDLE picks."""
+        return reason in {
+            SuppressionReason.CRASH,
+            SuppressionReason.REVIEW_TIMEOUT,
+            SuppressionReason.DIAGNOSE_EXHAUSTED,
+        } or is_operator_clearable(reason)
+
     def _frontmatter_error_status_for_current_task(
         self,
     ) -> tuple[str | None, SuppressionReason | None]:
@@ -1762,7 +1803,10 @@ class PipelineRunner(
                 task_id,
                 log=self.log_event,
             )
-            await self._clear_diagnose_exhausted(task_id)
+            if self.repo_config.feature_flags.use_single_error_exit:
+                await self._clear_task_suppression(task_id)
+            else:
+                await self._clear_diagnose_exhausted(task_id)
         self.state.skip_ai_error_diagnose = False
         self.state.error_message = None
         self.state.state = PipelineState.IDLE
@@ -1799,29 +1843,6 @@ class PipelineRunner(
             )
             return
 
-        if reason is not None and is_operator_clearable(reason):
-            if task_id is not None and not from_frontmatter:
-                if await self._suppression_cleared(task_id):
-                    self.state.skip_ai_error_diagnose = False
-                    self.state.error_message = None
-                    self.state.review_timeout_repost_attempted = False
-                    self.state.review_timeout_repost_at = None
-                    self.state.state = PipelineState.IDLE
-                    self._last_error_park_log_key = None
-                    self.log_event(
-                        f"[ESCALATE] {reason.value} park cleared by "
-                        "operator -> IDLE."
-                    )
-                    return
-            key = (task_id, reason.value)
-            if self._last_error_park_log_key != key:
-                self._last_error_park_log_key = key
-                self.log_event(
-                    f"[ESCALATE] {reason.value} operator-clearable ERROR "
-                    "park active; waiting for Retry or reupload."
-                )
-            return
-
         if self.state.skip_ai_error_diagnose:
             if await self._review_timeout_park_cleared():
                 self.state.skip_ai_error_diagnose = False
@@ -1840,6 +1861,29 @@ class PipelineRunner(
                 self._last_error_park_log_key = key
                 self.log_event(
                     "[ESCALATE] review_timeout operator-clearable ERROR "
+                    "park active; waiting for Retry or reupload."
+                )
+            return
+
+        if reason is not None and self._task_suppression_blocks_selection(reason):
+            if task_id is not None and not from_frontmatter:
+                if await self._suppression_cleared(task_id):
+                    self.state.skip_ai_error_diagnose = False
+                    self.state.error_message = None
+                    self.state.review_timeout_repost_attempted = False
+                    self.state.review_timeout_repost_at = None
+                    self.state.state = PipelineState.IDLE
+                    self._last_error_park_log_key = None
+                    self.log_event(
+                        f"[ESCALATE] {reason.value} park cleared by "
+                        "operator -> IDLE."
+                    )
+                    return
+            key = (task_id, reason.value)
+            if self._last_error_park_log_key != key:
+                self._last_error_park_log_key = key
+                self.log_event(
+                    f"[ESCALATE] {reason.value} operator-clearable ERROR "
                     "park active; waiting for Retry or reupload."
                 )
             return

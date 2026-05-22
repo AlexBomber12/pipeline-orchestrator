@@ -540,7 +540,8 @@ class WatchMixin:
             # FIX/SKIP). Operator Retry deletes the cancellation cause,
             # which ``run_cycle`` detects to clear the flag and transition
             # back to IDLE.
-            self.state.skip_ai_error_diagnose = True
+            if not self.repo_config.feature_flags.use_single_error_exit:
+                self.state.skip_ai_error_diagnose = True
         else:
             self.log_event(
                 f"[WATCH] PR #{found.number} waiting "

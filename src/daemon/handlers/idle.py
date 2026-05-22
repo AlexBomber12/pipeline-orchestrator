@@ -508,29 +508,43 @@ class IdleMixin:
             frontmatter_statuses = {
                 header.pr_id: header.frontmatter_status for header in headers
             }
-            # PR-186: Recovery marks DOING-without-PR tasks crashed before
-            # transitioning to IDLE. Override their derived status to
-            # ERROR here so get_eligible_tasks excludes them and the
-            # snapshot surfaces the ERROR state to the dashboard.
-            # Existing DONE rulings (e.g. the merged PR landed before
-            # recovery resumed) win — DONE is terminal, never downgraded
-            # to ERROR. A DOING ruling means ``derive_task_status``
-            # matched a now-visible open PR (e.g. ``get_open_prs`` was
-            # stale on the recovery cycle and the PR surfaced later);
-            # preserving DOING lets the runner resume WATCH/merge for
-            # that real PR rather than stranding it behind the crashed
-            # flag, and clearing the flag ensures the next selector pick
-            # treats the task as live again.
-            for pr_id in list(statuses.keys()):
-                if pr_id not in crashed_task_pr_ids:
-                    continue
-                if frontmatter_statuses.get(pr_id) == "todo":
-                    crashed_task_pr_ids.discard(pr_id)
-                    continue
-                if statuses[pr_id] in (TaskStatus.DONE, TaskStatus.DOING):
-                    crashed_task_pr_ids.discard(pr_id)
-                    continue
-                statuses[pr_id] = TaskStatus.ERROR
+            if self.repo_config.feature_flags.use_single_error_exit:
+                for pr_id in list(statuses.keys()):
+                    record = await self._suppression_record_for_task(pr_id)
+                    if record is None:
+                        continue
+                    if frontmatter_statuses.get(pr_id) == "todo":
+                        await self._clear_task_suppression(pr_id)
+                        continue
+                    if statuses[pr_id] in (TaskStatus.DONE, TaskStatus.DOING):
+                        await self._clear_task_suppression(pr_id)
+                        continue
+                    if self._task_suppression_blocks_selection(record.reason):
+                        statuses[pr_id] = TaskStatus.ERROR
+            else:
+                # PR-186: Recovery marks DOING-without-PR tasks crashed before
+                # transitioning to IDLE. Override their derived status to
+                # ERROR here so get_eligible_tasks excludes them and the
+                # snapshot surfaces the ERROR state to the dashboard.
+                # Existing DONE rulings (e.g. the merged PR landed before
+                # recovery resumed) win — DONE is terminal, never downgraded
+                # to ERROR. A DOING ruling means ``derive_task_status``
+                # matched a now-visible open PR (e.g. ``get_open_prs`` was
+                # stale on the recovery cycle and the PR surfaced later);
+                # preserving DOING lets the runner resume WATCH/merge for
+                # that real PR rather than stranding it behind the crashed
+                # flag, and clearing the flag ensures the next selector pick
+                # treats the task as live again.
+                for pr_id in list(statuses.keys()):
+                    if pr_id not in crashed_task_pr_ids:
+                        continue
+                    if frontmatter_statuses.get(pr_id) == "todo":
+                        crashed_task_pr_ids.discard(pr_id)
+                        continue
+                    if statuses[pr_id] in (TaskStatus.DONE, TaskStatus.DOING):
+                        crashed_task_pr_ids.discard(pr_id)
+                        continue
+                    statuses[pr_id] = TaskStatus.ERROR
             # If an explicit escalation/cancel path could not write the
             # durable task-file status, keep the task parked in memory
             # until the operator re-uploads it. A still-open PR must not
