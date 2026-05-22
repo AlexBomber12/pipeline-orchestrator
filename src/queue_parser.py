@@ -12,6 +12,7 @@ from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 
 from src.models import QueueTask, TaskStatus
+from src.subsource_registry import SuppressionReason
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ _PR_ID_RE = re.compile(r"^PR-[A-Za-z0-9_.-]+$")
 _FIELD_RE = re.compile(r"^-\s*([A-Za-z ]+?)\s*:\s*(.*?)\s*$")
 _TASK_BRANCH_RE = re.compile(r"^Branch\s*:\s*(.*?)\s*$")
 _FRONTMATTER_STATUS_RE = re.compile(r"^status:\s*(.+?)\s*$")
+_FRONTMATTER_BLOCKED_REASON_RE = re.compile(r"^blocked_reason:\s*(.+?)\s*$")
 _STATUS_LINE_RE = re.compile(
     r"^(-\s*status\s*:\s*)(\S*)(.*)$", re.IGNORECASE
 )
@@ -91,10 +93,58 @@ def _normalize_frontmatter_status(value: str) -> str:
     return status
 
 
-def write_frontmatter_status(task_path: Path, status: str) -> None:
-    """Write canonical task frontmatter status while preserving body text."""
+def _normalize_frontmatter_scalar(value: str) -> str:
+    return _normalize_frontmatter_status(value)
+
+
+def _coerce_blocked_reason(
+    blocked_reason: SuppressionReason | str | None,
+) -> str | None:
+    if blocked_reason is None:
+        return None
+    try:
+        return SuppressionReason(blocked_reason).value
+    except ValueError as exc:
+        raise ValueError(f"unknown blocked_reason {blocked_reason!r}") from exc
+
+
+def _mutate_frontmatter_status(
+    data: CommentedMap,
+    status: str,
+    blocked_reason: SuppressionReason | str | None,
+) -> None:
+    if "status" in data:
+        data["status"] = status
+    else:
+        data.insert(len(data), "status", status)
+
+    if status == "ERROR":
+        reason = (
+            _coerce_blocked_reason(blocked_reason) or SuppressionReason.CRASH.value
+        )
+        if "blocked_reason" in data:
+            data["blocked_reason"] = reason
+        else:
+            data.insert(len(data), "blocked_reason", reason)
+    elif "blocked_reason" in data:
+        del data["blocked_reason"]
+
+
+def write_frontmatter_status(
+    task_path: Path,
+    status: str,
+    blocked_reason: SuppressionReason | str | None = None,
+) -> None:
+    """Write task frontmatter status and optional durable blocked reason.
+
+    ``ERROR`` writes always include ``blocked_reason``; callers that do not yet
+    know the reason default to ``crash`` so ERROR tasks never lack a coarse
+    durable reason. Non-ERROR writes remove the field to avoid stale blockers
+    after operator recovery.
+    """
     if status not in _WRITER_STATUS_VALUES:
         raise ValueError(f"unknown frontmatter status {status!r}")
+    reason = _coerce_blocked_reason(blocked_reason)
 
     with task_path.open("r", encoding="utf-8", newline="") as handle:
         text = handle.read()
@@ -102,8 +152,12 @@ def write_frontmatter_status(task_path: Path, status: str) -> None:
     yaml.preserve_quotes = True
 
     if not text.startswith(("---\n", "---\r\n")):
+        data = CommentedMap()
+        _mutate_frontmatter_status(data, status, reason)
+        stream = StringIO()
+        yaml.dump(data, stream)
         with task_path.open("w", encoding="utf-8", newline="") as handle:
-            handle.write(f"---\nstatus: {status}\n---\n\n{text}")
+            handle.write(f"---\n{stream.getvalue()}---\n\n{text}")
         return
 
     lines = text.splitlines(keepends=True)
@@ -116,8 +170,12 @@ def write_frontmatter_status(task_path: Path, status: str) -> None:
         None,
     )
     if closing_index is None:
+        data = CommentedMap()
+        _mutate_frontmatter_status(data, status, reason)
+        stream = StringIO()
+        yaml.dump(data, stream)
         with task_path.open("w", encoding="utf-8", newline="") as handle:
-            handle.write(f"---\nstatus: {status}\n---\n\n{text}")
+            handle.write(f"---\n{stream.getvalue()}---\n\n{text}")
         return
 
     frontmatter = "".join(lines[1:closing_index])
@@ -125,10 +183,7 @@ def write_frontmatter_status(task_path: Path, status: str) -> None:
     data = yaml.load(frontmatter) if frontmatter.strip() else None
     if not isinstance(data, CommentedMap):
         data = CommentedMap()
-    if "status" in data:
-        data["status"] = status
-    else:
-        data.insert(len(data), "status", status)
+    _mutate_frontmatter_status(data, status, reason)
 
     stream = StringIO()
     yaml.dump(data, stream)
@@ -147,6 +202,7 @@ class TaskHeader:
     priority: int
     coder: str
     frontmatter_status: str | None = None
+    blocked_reason: str | None = None
 
 
 def parse_queue(
@@ -263,6 +319,7 @@ def parse_task_header(path: str | Path) -> TaskHeader:
     fields: dict[str, str] = {}
     in_header_block = False
     frontmatter_status: str | None = None
+    blocked_reason: str | None = None
     header_start_index = 0
 
     first_content_index = next(
@@ -279,10 +336,19 @@ def parse_task_header(path: str | Path) -> TaskHeader:
         if frontmatter_end_index is not None:
             header_start_index = frontmatter_end_index + 1
             for raw_line in lines[first_content_index + 1 : frontmatter_end_index]:
-                status_match = _FRONTMATTER_STATUS_RE.match(raw_line.rstrip())
+                frontmatter_line = raw_line.rstrip()
+                status_match = _FRONTMATTER_STATUS_RE.match(frontmatter_line)
                 if status_match:
                     frontmatter_status = _normalize_frontmatter_status(
                         status_match.group(1)
+                    )
+                    continue
+                blocked_reason_match = _FRONTMATTER_BLOCKED_REASON_RE.match(
+                    frontmatter_line
+                )
+                if blocked_reason_match:
+                    blocked_reason = _normalize_frontmatter_scalar(
+                        blocked_reason_match.group(1)
                     )
 
     for raw_line in lines[header_start_index:]:
@@ -404,6 +470,14 @@ def parse_task_header(path: str | Path) -> TaskHeader:
             f"{task_path}: invalid frontmatter status {frontmatter_status!r}; "
             "expected one of ['done', 'error', 'todo']"
         )
+    if blocked_reason is not None:
+        try:
+            SuppressionReason(blocked_reason)
+        except ValueError:
+            issues.append(
+                f"{task_path}: invalid blocked_reason {blocked_reason!r}; "
+                f"expected one of {sorted(reason.value for reason in SuppressionReason)}"
+            )
 
     if issues:
         raise QueueValidationError(issues)
@@ -418,6 +492,7 @@ def parse_task_header(path: str | Path) -> TaskHeader:
         priority=priority,
         coder=coder,
         frontmatter_status=frontmatter_status,
+        blocked_reason=blocked_reason,
     )
 
 

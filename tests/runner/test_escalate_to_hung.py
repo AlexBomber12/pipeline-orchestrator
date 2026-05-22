@@ -500,7 +500,7 @@ def test_commit_task_status_change_force_checkouts_base_with_dirty_pr_branch(
     asyncio.run(runner._commit_task_status_change(task, "ERROR", "failed hard"))
 
     assert (repo / "tasks" / "PR-707.md").read_text(encoding="utf-8").startswith(
-        "---\nstatus: ERROR\n---\n"
+        "---\nstatus: ERROR\nblocked_reason: crash\n---\n"
     )
     assert "[STATUS] PR-707 marked ERROR: failed hard" in _git(
         repo,

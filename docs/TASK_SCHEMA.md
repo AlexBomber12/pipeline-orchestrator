@@ -39,9 +39,31 @@ must write the canonical uppercase values. Operator-uploaded specs should
 include `status: TODO` for explicit intent. The daemon owns terminal
 status writes; operators never edit the status field directly.
 
-For one release cycle, the parser still accepts the legacy tokens
-`queued`, `in_progress`, `in_review`, `merged`, `blocked`, and
-`canceled`. These values are deprecated and will be removed by PR-280.
+## Frontmatter blocked_reason field
+
+`blocked_reason` is a daemon-owned companion field for `status: ERROR`:
+
+```yaml
+---
+status: ERROR
+blocked_reason: guardrail
+---
+```
+
+It carries exactly one canonical `SuppressionReason` enum value, such as
+`crash`, `guardrail`, `review_timeout`, or `infra_failure`. Operators do
+not set it by hand. The field is the durable coarse failure layer stored
+in git so the system remains fail-safe if Redis loses the richer
+suppression detail. Rich detail such as excerpts, counters, and
+`approved_once` stays in Redis and must not be copied into task
+frontmatter.
+
+The daemon writes `status` and `blocked_reason` together when parking a
+task in ERROR. If an ERROR write has no more specific reason, emitters
+default `blocked_reason` to `crash` so an ERROR task never lacks a coarse
+reason. When a task returns to `status: TODO` through Retry or re-upload,
+the daemon removes `blocked_reason` to avoid carrying stale suppression
+state on recovered work.
 
 ## Cancellation Availability
 

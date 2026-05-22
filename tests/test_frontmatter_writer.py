@@ -13,7 +13,7 @@ def test_write_status_error_to_file_without_frontmatter(tmp_path: Path) -> None:
     write_frontmatter_status(task, "ERROR")
 
     assert task.read_text(encoding="utf-8").startswith(
-        "---\nstatus: ERROR\n---\n\n"
+        "---\nstatus: ERROR\nblocked_reason: crash\n---\n\n"
     )
 
 
@@ -24,7 +24,7 @@ def test_write_status_replaces_existing_field(tmp_path: Path) -> None:
     write_frontmatter_status(task, "ERROR")
 
     assert task.read_text(encoding="utf-8") == (
-        "---\nstatus: ERROR\n---\n\nBody\n"
+        "---\nstatus: ERROR\nblocked_reason: crash\n---\n\nBody\n"
     )
 
 
@@ -37,7 +37,7 @@ def test_write_status_replaces_existing_field_with_crlf_frontmatter(
     write_frontmatter_status(task, "ERROR")
 
     assert task.read_bytes() == (
-        b"---\nstatus: ERROR\n---\n\r\nBody\r\n"
+        b"---\nstatus: ERROR\nblocked_reason: crash\n---\n\r\nBody\r\n"
     )
 
 
@@ -92,7 +92,7 @@ def test_write_status_prepends_when_frontmatter_is_unclosed(
     write_frontmatter_status(task, "ERROR")
 
     assert task.read_text(encoding="utf-8").startswith(
-        "---\nstatus: ERROR\n---\n\n---\nstatus: TODO\n"
+        "---\nstatus: ERROR\nblocked_reason: crash\n---\n\n---\nstatus: TODO\n"
     )
 
 
