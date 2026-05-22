@@ -129,7 +129,7 @@ from src.queue_parser import (
     parse_task_header,
     write_frontmatter_status,
 )
-from src.subsource_registry import SuppressionReason
+from src.subsource_registry import SuppressionReason, error_category_to_reason
 from src.usage import UsageProvider
 from src.utils import repo_slug_from_url
 
@@ -214,6 +214,28 @@ def _subsource_from_cancellation(
     if isinstance(subsource, str) and subsource:
         return subsource
     return None
+
+
+def _suppression_reason_from_cancellation(
+    cause: CancellationCause | None,
+) -> SuppressionReason:
+    """Return the durable blocked_reason for an ERROR transition cause."""
+    if cause is None:
+        return SuppressionReason.CRASH
+
+    if cause.payload:
+        subsource = cause.payload.get("subsource")
+        if isinstance(subsource, str):
+            try:
+                return SuppressionReason(subsource)
+            except ValueError:
+                pass
+
+    try:
+        category = ErrorCategory(cause.category.lower())
+    except ValueError:
+        return SuppressionReason.CRASH
+    return error_category_to_reason(category)
 
 _HISTORY_LIMIT = 100
 _STOP_POLL_INTERVAL_SEC = 0.5
@@ -555,6 +577,12 @@ class PipelineRunner(
     @app_config.setter
     def app_config(self, value: AppConfig) -> None:
         self._app_config = value
+
+    def _suppression_reason_from_cancellation(
+        self,
+        cause: CancellationCause | None,
+    ) -> SuppressionReason:
+        return _suppression_reason_from_cancellation(cause)
 
     def set_usage_providers(
         self,
@@ -1426,6 +1454,7 @@ class PipelineRunner(
         log_prefix: str = "[ERROR]",
         log_message: str | None = None,
         cancellation_cause: CancellationCause | None = None,
+        commit_task_status: bool = True,
     ) -> None:
         """Atomic transition to ERROR with consistent telemetry.
 
@@ -1442,10 +1471,17 @@ class PipelineRunner(
         keeps a one-line callsite.
 
         ``cancellation_cause`` (PR-253) overrides the default CRASH cause
-        record written to Redis. Callers that already classified the
-        failure as TIMEOUT or INFRA pass the structured cause directly so
-        the dashboard surfaces the specific category. The write is
-        best-effort — Redis errors never block the ERROR transition.
+        record written to Redis and drives the durable task
+        ``blocked_reason``. Callers that already classified the failure as
+        TIMEOUT or INFRA pass the structured cause directly so the dashboard
+        surfaces the specific category. The Redis write is best-effort —
+        Redis errors never block the ERROR transition.
+
+        ``commit_task_status`` controls the coarse durable frontmatter
+        write. The default is True so every ERROR transition writes
+        ``status: ERROR`` plus ``blocked_reason`` before the richer Redis
+        cause. Callers that already performed the same write pass False to
+        avoid a duplicate commit.
 
         First-cause-wins (PR-253 fix): if a cause is already recorded for
         this ``task_id``, do not overwrite it. Retry-heavy flows
@@ -1467,6 +1503,31 @@ class PipelineRunner(
                 cause_subsource=_subsource_from_cancellation(cancellation_cause),
             )
         task = self.state.current_task
+        cause = cancellation_cause or CancellationCause(
+            category="ERROR",
+            payload={
+                "subsource": "crash",
+                "error_message": truncate_for_payload(message),
+            },
+        )
+        blocked_reason = _suppression_reason_from_cancellation(cause)
+        if task is not None and commit_task_status:
+            try:
+                status_written = await self._commit_task_status_change(
+                    task,
+                    "ERROR",
+                    message,
+                    blocked_reason=blocked_reason,
+                )
+            except Exception as exc:
+                self.log_event(
+                    f"[ERROR] Failed to write status:ERROR to "
+                    f"{getattr(task, 'task_file', None)}: {exc}"
+                )
+                status_written = False
+            if not status_written:
+                await self._mark_status_write_failed_task(task)
+
         if task is not None:
             existing: CancellationCause | None
             try:
@@ -1476,22 +1537,23 @@ class PipelineRunner(
             except Exception:
                 existing = None
             if existing is None:
-                cause = cancellation_cause or CancellationCause(
-                    category="ERROR",
-                    payload={
-                        "subsource": "crash",
-                        "error_message": truncate_for_payload(message),
-                    },
-                )
-                await safe_record_cancellation_cause(
-                    self.redis,
-                    self.name,
-                    task.pr_id,
-                    cause,
-                    log=self.log_event,
-                )
+                recorded = False
+                try:
+                    await safe_record_cancellation_cause(
+                        self.redis,
+                        self.name,
+                        task.pr_id,
+                        cause,
+                        log=self.log_event,
+                    )
+                    recorded = True
+                except Exception as exc:
+                    self.log_event(
+                        "[INFRA] Warning: failed to record cancellation "
+                        f"cause for {task.pr_id}: {exc}."
+                    )
                 subsource = cause.payload.get("subsource") if cause.payload else None
-                if isinstance(subsource, str) and subsource:
+                if recorded and isinstance(subsource, str) and subsource:
                     self.log_event(
                         f"Cancellation cause recorded for {task.pr_id}.",
                         tier="cancel",
@@ -1561,9 +1623,9 @@ class PipelineRunner(
         1. Transition through ``_transition_to_error`` with a structured
            ``CancellationCause`` (subsource from the PR-315 vocabulary) so
            OBS-BE attribution stays correct.
-        2. Write ``status:ERROR`` to the task frontmatter so the IDLE
-           picker stops re-selecting the now-failed task — the
-           loop-breaking fix.
+        2. Let ``_transition_to_error`` write ``status:ERROR`` to the task
+           frontmatter so the IDLE picker stops re-selecting the
+           now-failed task — the loop-breaking fix.
 
         PR-317 review feedback (P1): this helper does NOT set
         ``skip_ai_error_diagnose``. That flag is reserved for the WATCH
@@ -1585,7 +1647,6 @@ class PipelineRunner(
         ``iteration_count``).
         """
         prior_state = self.state.state
-        current_task = self.state.current_task
         payload: dict[str, Any] = {
             "subsource": subsource,
             "reason_text": message,
@@ -1607,22 +1668,6 @@ class PipelineRunner(
                 payload=payload,
             ),
         )
-        if current_task is not None:
-            try:
-                status_written = await self._commit_task_status_change(
-                    current_task,
-                    "ERROR",
-                    message,
-                    blocked_reason=subsource,
-                )
-            except Exception as exc:
-                self.log_event(
-                    f"[ERROR] Failed to write status:ERROR to "
-                    f"{current_task.task_file}: {exc}"
-                )
-                status_written = False
-            if not status_written:
-                await self._mark_status_write_failed_task(current_task)
 
     async def _review_timeout_park_cleared(self) -> bool:
         """Return True when the operator-park cancellation cause is gone.
@@ -1871,7 +1916,7 @@ class PipelineRunner(
         self._status_write_failed_task_pr_ids.add(pr_id)
         self.log_event(
             f"[INFRA] Warning: using in-memory ERROR fallback for "
-            f"{pr_id}; task file re-upload is required to retry."
+            f"{pr_id}; status write will retry on the next ERROR cycle."
         )
         await self._persist_status_write_failed_task_pr_ids()
 
