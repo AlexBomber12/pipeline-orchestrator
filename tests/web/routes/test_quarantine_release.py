@@ -252,6 +252,34 @@ def test_release_endpoint_clears_non_current_pr_suppression(
     assert cause_key("example__alpha", "PR-442") not in redis.store
 
 
+def test_release_endpoint_does_not_release_unquarantined_current_pr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(tmp_path, monkeypatch)
+    redis = _Redis()
+    _seed_with_current_pr(
+        redis,
+        current_pr=PRInfo(number=442, branch="pr-442", pr_id="PR-442"),
+    )
+    _seed_suppression(
+        redis,
+        "PR-442",
+        {
+            "subsource": SuppressionReason.CRASH.value,
+            "pr_number": 442,
+        },
+    )
+
+    with TestClient(app) as client:
+        client.app.state.redis = redis
+        response = client.post("/repos/example__alpha/quarantine/442/release")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "not_quarantined", "pr": 442}
+    assert cause_key("example__alpha", "PR-442") in redis.store
+
+
 def test_release_endpoint_tolerates_suppression_delete_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

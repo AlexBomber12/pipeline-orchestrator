@@ -1187,7 +1187,11 @@ async def release_quarantine(
     except Exception:
         return JSONResponse({"error": "repository state unavailable"}, status_code=503)
     task_ids: set[str] = set()
-    if state.current_pr is not None and state.current_pr.number == pr_number:  # pragma: no cover
+    if (
+        state.current_pr is not None
+        and state.current_pr.number == pr_number
+        and pr_number in state.quarantined_prs
+    ):  # pragma: no cover
         if state.current_pr.pr_id:
             task_ids.add(state.current_pr.pr_id)
     task_ids.update(
