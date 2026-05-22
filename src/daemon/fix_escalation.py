@@ -19,6 +19,7 @@ from src.cancellation import (
 from src.github import comments as gh_comments
 from src.github import gh_runner
 from src.models import PipelineState, PRInfo
+from src.subsource_registry import SuppressionReason
 
 if TYPE_CHECKING:
     from src.daemon.runner import PipelineRunner
@@ -207,6 +208,7 @@ async def escalate_fix_no_push_deadlock(
                 current_task,
                 "ERROR",
                 "FIX no-push deadlock",
+                blocked_reason=SuppressionReason.NO_PUSH_DEADLOCK,
             )
         except Exception as exc:  # pragma: no cover - defensive status-write logging.
             runner.log_event(

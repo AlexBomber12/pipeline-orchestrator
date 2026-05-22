@@ -18,7 +18,6 @@ from typing import Any
 
 import httpx
 import pytest
-
 from src.daemon.runner import PipelineRunner
 from src.models import (
     CIStatus,
@@ -28,7 +27,6 @@ from src.models import (
     ReviewStatus,
     TaskStatus,
 )
-
 from tests.runner import _helpers as h
 
 
@@ -66,7 +64,7 @@ def _seed_runner_in_watch(
     )
     runner.state.review_timeout_repost_attempted = repost_attempted
 
-    async def fake_commit(self, current_task, status, reason):
+    async def fake_commit(self, current_task, status, reason, **kwargs):
         return True
 
     monkeypatch.setattr(
@@ -189,7 +187,7 @@ def test_second_cycle_after_successful_repost_does_not_immediately_escalate(
         branch="pr-011",
     )
 
-    async def fake_commit(self, current_task, status, reason):
+    async def fake_commit(self, current_task, status, reason, **kwargs):
         return True
 
     monkeypatch.setattr(
@@ -646,7 +644,7 @@ def test_failed_stale_retrigger_does_not_lift_timeout_floor(
 
     runner._post_codex_review_result = fake_post  # type: ignore[assignment]
 
-    async def fake_commit(self, current_task, status, reason):
+    async def fake_commit(self, current_task, status, reason, **kwargs):
         return True
 
     monkeypatch.setattr(

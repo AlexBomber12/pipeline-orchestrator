@@ -13,10 +13,10 @@ import asyncio
 from typing import Any
 
 import pytest
-
 from src.cancellation import CancellationCause
 from src.daemon import fix_escalation
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
+
 from tests.runner import _helpers as h
 
 
@@ -121,7 +121,10 @@ def test_escalate_fix_no_push_deadlock_transitions_to_idle_and_clears_task(
     status_writes: list[tuple[QueueTask, str, str]] = []
 
     async def fake_commit_status(
-        current_task: QueueTask, status: str, reason: str
+        current_task: QueueTask,
+        status: str,
+        reason: str,
+        **kwargs: object,
     ) -> bool:
         status_writes.append((current_task, status, reason))
         return True

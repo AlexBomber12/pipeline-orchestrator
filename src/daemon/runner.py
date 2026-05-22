@@ -1610,7 +1610,10 @@ class PipelineRunner(
         if current_task is not None:
             try:
                 status_written = await self._commit_task_status_change(
-                    current_task, "ERROR", message
+                    current_task,
+                    "ERROR",
+                    message,
+                    blocked_reason=subsource,
                 )
             except Exception as exc:
                 self.log_event(
@@ -1649,6 +1652,7 @@ class PipelineRunner(
         current_task: Any,
         status: str,
         reason: str,
+        blocked_reason: SuppressionReason | str | None = None,
     ) -> bool:
         """Best-effort commit of daemon-written task frontmatter status."""
         task_file = getattr(current_task, "task_file", None)
@@ -1682,9 +1686,9 @@ class PipelineRunner(
         message = f"{subject}\n\n[skip ci]"
         base = self.repo_config.branch
         blocked_reason = await self._blocked_reason_for_status_change(
-            current_task,
             status,
             reason,
+            blocked_reason,
         )
 
         try:
@@ -1735,30 +1739,17 @@ class PipelineRunner(
 
     async def _blocked_reason_for_status_change(
         self,
-        current_task: Any,
         status: str,
         reason: str,
+        blocked_reason: SuppressionReason | str | None = None,
     ) -> str | None:
         """Resolve the durable coarse reason for daemon ERROR status writes."""
         if status != "ERROR":
             return None
 
-        pr_id = getattr(current_task, "pr_id", "")
-        if pr_id:
+        if blocked_reason is not None:
             try:
-                cause = await get_cancellation_cause(
-                    self.redis,
-                    self.name,
-                    pr_id,
-                    refresh_ttl=False,
-                )
-            except Exception:
-                cause = None
-            subsource = (
-                getattr(cause, "payload", {}).get("subsource") if cause else None
-            )
-            try:
-                return SuppressionReason(subsource).value
+                return SuppressionReason(blocked_reason).value
             except ValueError:
                 pass
 
