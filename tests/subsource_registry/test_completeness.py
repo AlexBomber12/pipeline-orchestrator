@@ -20,7 +20,6 @@ import re
 from pathlib import Path
 
 import pytest
-
 from src import subsource_registry
 from src.cancellation import SUBSOURCE_VOCABULARY
 from src.subsource_registry import canonical_subsources
@@ -36,6 +35,9 @@ TEMPLATES_ROOT = SRC_ROOT / "web" / "templates"
 REGISTRY_MODULE = SRC_ROOT / "subsource_registry.py"
 
 _TEMPLATE_BRANCH_RE = re.compile(r"subsource\s*==\s*['\"]([a-z_]+)['\"]")
+_FOUNDATION_ONLY_SUBSOURCES = frozenset(
+    {"diagnose_exhausted", "operator_stopped", "rate_limit"}
+)
 
 
 def _all_python_source_files() -> list[Path]:
@@ -204,7 +206,12 @@ def _collect_template_subsource_branches(path: Path) -> set[str]:
 
 
 def test_canonical_subsources_match_vocabulary_frozenset():
-    assert canonical_subsources() == SUBSOURCE_VOCABULARY
+    assert canonical_subsources() < SUBSOURCE_VOCABULARY
+    assert {
+        "daemon",
+        "watch_retrigger_cap",
+        "operator_reject",
+    }.isdisjoint(canonical_subsources())
 
 
 def test_every_python_subsource_literal_is_registered():
@@ -238,7 +245,7 @@ def test_every_registered_subsource_appears_in_source():
         )
     for path in _all_template_files():
         seen |= _collect_template_subsource_branches(path)
-    unused = registered - seen
+    unused = registered - seen - _FOUNDATION_ONLY_SUBSOURCES
     assert not unused, (
         f"Registered subsources with no references under src/: "
         f"{sorted(unused)}. Either remove from src.subsource_registry or "

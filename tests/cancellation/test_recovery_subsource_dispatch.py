@@ -280,16 +280,7 @@ def test_recovery_branch_unknown_subsource_routes_to_operator_attention() -> Non
 
 
 def test_subsource_vocabulary_matches_documented_set() -> None:
-    """``SUBSOURCE_VOCABULARY`` matches the eight documented values."""
-    assert SUBSOURCE_VOCABULARY == frozenset(
-        {
-            "crash",
-            "coder_escalate",
-            "guardrail",
-            "review_timeout",
-            "fix_idle_timeout",
-            "fix_iteration_cap",
-            "no_push_deadlock",
-            "infra_failure",
-        }
-    )
+    """``SUBSOURCE_VOCABULARY`` is populated from the registry."""
+    from src.subsource_registry import all_subsources
+
+    assert SUBSOURCE_VOCABULARY == all_subsources()

@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 
 import pytest
-
 from src.cancellation import SUBSOURCE_VOCABULARY
 from src.subsource_registry import (
     SubsourceMetadata,
@@ -17,12 +16,17 @@ _KNOWN_GROUP_BUCKETS = {"coder", "daemon", "guardrail", "operator_reject"}
 _KNOWN_SEVERITIES = {"low", "medium", "high"}
 
 
-def test_registry_contains_all_11_subsources() -> None:
-    assert len(all_subsources()) == 11
+def test_registry_contains_all_subsources() -> None:
+    assert len(all_subsources()) == 14
 
 
 def test_canonical_subsources_match_vocabulary() -> None:
-    assert canonical_subsources() == SUBSOURCE_VOCABULARY
+    assert canonical_subsources() < SUBSOURCE_VOCABULARY
+    assert {
+        "daemon",
+        "watch_retrigger_cap",
+        "operator_reject",
+    }.isdisjoint(canonical_subsources())
 
 
 @pytest.mark.parametrize("name", sorted(all_subsources()))
@@ -46,12 +50,27 @@ def test_each_entry_has_nonempty_user_label_and_recovery_hint(name: str) -> None
 
 
 def test_legacy_category_present_for_pre_migration_subsources_only() -> None:
-    for canonical_name in canonical_subsources():
-        meta = lookup(canonical_name)
+    for legacy_name in (
+        "crash",
+        "coder_escalate",
+        "guardrail",
+        "review_timeout",
+        "fix_idle_timeout",
+        "fix_iteration_cap",
+        "no_push_deadlock",
+        "infra_failure",
+    ):
+        meta = lookup(legacy_name)
         assert meta is not None
         assert meta.legacy_category is not None
 
-    for postdate_name in ("watch_retrigger_cap", "operator_reject"):
+    for postdate_name in (
+        "watch_retrigger_cap",
+        "operator_reject",
+        "diagnose_exhausted",
+        "operator_stopped",
+        "rate_limit",
+    ):
         meta = lookup(postdate_name)
         assert meta is not None
         assert meta.legacy_category is None
