@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import stat as stat_module
 import tempfile
 import threading
 import typing
@@ -315,6 +316,8 @@ def _config_file_signature(path: Path) -> _ConfigFileSignature:
     try:
         stat = path.stat()
     except OSError:
+        return _ConfigFileSignature(mtime_ns=0, ctime_ns=0, size=0, content_hash="")
+    if not stat_module.S_ISREG(stat.st_mode):
         return _ConfigFileSignature(mtime_ns=0, ctime_ns=0, size=0, content_hash="")
     content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
     return _ConfigFileSignature(

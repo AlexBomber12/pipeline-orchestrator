@@ -252,6 +252,15 @@ def test_non_directory_config_parent_treated_as_missing(tmp_path: Path) -> None:
     assert cfg == AppConfig()
 
 
+def test_directory_config_path_treated_as_missing(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config-dir"
+    cfg_path.mkdir()
+
+    cfg = load_config(str(cfg_path))
+
+    assert cfg == AppConfig()
+
+
 def test_explicit_symlink_path_uses_overlay_next_to_link(tmp_path: Path) -> None:
     real_dir = tmp_path / "real"
     link_dir = tmp_path / "link"
