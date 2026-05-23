@@ -723,6 +723,7 @@ class IdleMixin:
     async def handle_idle(self) -> None:
         """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""
         self._idle_degraded_done_check_logged = False
+        self._error_diagnose_policy.reset(self)
         # The 304 streak counts only cycles that actually reached
         # ``get_merged_prs`` and saw HTTP 304. Reset by default so any
         # other outcome — success, non-304 failure, or an early return

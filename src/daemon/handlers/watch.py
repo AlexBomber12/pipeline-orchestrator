@@ -666,17 +666,32 @@ class WatchMixin:
         task_id = getattr(pr, "pr_id", "") or (
             self.state.current_task.pr_id if self.state.current_task else ""
         )
-        if not isinstance(pr_number, int) or not task_id:
+        if not isinstance(pr_number, int):
+            return
+        was_quarantined = pr_number in self.state.quarantined_prs
+        self.state.quarantined_prs.add(pr_number)
+        if not task_id:
+            if not was_quarantined:
+                self.log_event(
+                    f"[WATCH] PR #{pr_number} quarantine rehydrated from "
+                    "GitHub labels; task id unavailable."
+                )
+                await self.publish_state()
             return
         record = await self._suppression_record_for_task(task_id)
         if record is not None and record.reason == SuppressionReason.GUARDRAIL:
+            if not was_quarantined:
+                self.log_event(
+                    f"[WATCH] PR #{pr_number} quarantine rehydrated from "
+                    "GitHub labels."
+                )
+                await self.publish_state()
             return
         await self._suppress_task(
             task_id,
             SuppressionReason.GUARDRAIL,
             {"pr_number": pr_number, "source": "github_quarantine_label"},
         )
-        self.state.quarantined_prs.add(pr_number)
         self.log_event(
             f"[WATCH] PR #{pr_number} quarantine rehydrated from GitHub labels."
         )

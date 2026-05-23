@@ -62,12 +62,14 @@ def test_handle_idle_no_tasks_leaves_state_idle(
     monkeypatch.setattr("src.github.prs.get_merged_prs", lambda repo, branch, refresh=False: [])
 
     runner = h._make_runner()
+    runner._error_diagnose_count = 3
     asyncio.run(runner.handle_idle())
 
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
     assert runner.state.queue_done == 0
     assert runner.state.queue_total == 0
+    assert runner._error_diagnose_count == 0
     assert any("No tasks" in e["event"] for e in runner.state.history)
     # sync_to_main must run fetch -> checkout -> reset --hard in order so
     # that parse_queue reads QUEUE.md from the tip of origin/{branch}, not

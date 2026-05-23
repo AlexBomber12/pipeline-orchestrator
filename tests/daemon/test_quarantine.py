@@ -279,6 +279,26 @@ def test_label_removal_check_soft_fails(monkeypatch: pytest.MonkeyPatch) -> None
     assert any("quarantine label check failed" in e["event"] for e in runner.state.history)
 
 
+def test_label_rehydrate_projects_quarantine_without_task_id() -> None:
+    runner = h._make_runner()
+
+    asyncio.run(
+        runner._rehydrate_quarantine_from_pr_labels(
+            PRInfo(
+                number=10,
+                branch="pr-unknown",
+                quarantine_labels={"quarantine:large_diff"},
+            )
+        )
+    )
+
+    assert 10 in runner.state.quarantined_prs
+    assert any(
+        "task id unavailable" in e["event"]
+        for e in runner.state.history
+    )
+
+
 def test_label_removal_releases_legacy_quarantine_set_with_pr_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
