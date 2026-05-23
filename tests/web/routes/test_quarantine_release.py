@@ -279,6 +279,54 @@ def test_release_endpoint_clears_legacy_current_pr_guardrail_suppression(
     assert cause_key("example__alpha", "PR-442") not in redis.store
 
 
+def test_release_endpoint_clears_single_legacy_guardrail_suppression(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(tmp_path, monkeypatch)
+    redis = _Redis()
+    _seed(redis, 442)
+    _seed_suppression(
+        redis,
+        "PR-legacy",
+        {"subsource": SuppressionReason.GUARDRAIL.value},
+    )
+    monkeypatch.setattr(repo_control.gh_runner, "run_gh", lambda *a, **kw: "")
+
+    with TestClient(app) as client:
+        client.app.state.redis = redis
+        response = client.post("/repos/example__alpha/quarantine/442/release")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "released"
+    assert cause_key("example__alpha", "PR-legacy") not in redis.store
+
+
+def test_release_endpoint_keeps_ambiguous_legacy_guardrail_suppressions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(tmp_path, monkeypatch)
+    redis = _Redis()
+    _seed(redis, 442)
+    for task_id in ("PR-legacy-a", "PR-legacy-b"):
+        _seed_suppression(
+            redis,
+            task_id,
+            {"subsource": SuppressionReason.GUARDRAIL.value},
+        )
+    monkeypatch.setattr(repo_control.gh_runner, "run_gh", lambda *a, **kw: "")
+
+    with TestClient(app) as client:
+        client.app.state.redis = redis
+        response = client.post("/repos/example__alpha/quarantine/442/release")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "released"
+    assert cause_key("example__alpha", "PR-legacy-a") in redis.store
+    assert cause_key("example__alpha", "PR-legacy-b") in redis.store
+
+
 def test_release_endpoint_does_not_release_unquarantined_current_pr(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

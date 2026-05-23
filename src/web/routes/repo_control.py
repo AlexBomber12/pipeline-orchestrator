@@ -90,6 +90,7 @@ async def _suppressed_task_ids_for_pr(
     repo_slug: str,
     pr_number: int,
     fallback_task_ids: set[str] | None = None,
+    allow_single_unmapped: bool = False,
 ) -> set[str]:
     """Return suppressed task ids whose detail maps them to ``pr_number``."""
     try:
@@ -101,6 +102,7 @@ async def _suppressed_task_ids_for_pr(
         return set()
     task_ids: set[str] = set()
     fallback_task_ids = fallback_task_ids or set()
+    unmapped_guardrail_task_ids: set[str] = set()
     for record in records:
         if record.reason != SuppressionReason.GUARDRAIL:
             continue
@@ -110,9 +112,17 @@ async def _suppressed_task_ids_for_pr(
         except (TypeError, ValueError):
             if record.task_id in fallback_task_ids:
                 task_ids.add(record.task_id)
+            else:
+                unmapped_guardrail_task_ids.add(record.task_id)
             continue
         if detail_pr_number == pr_number:
             task_ids.add(record.task_id)
+    if (
+        not task_ids
+        and allow_single_unmapped
+        and len(unmapped_guardrail_task_ids) == 1
+    ):
+        task_ids.update(unmapped_guardrail_task_ids)
     return task_ids
 
 _DEFERRED_CODER_SWITCH_STATES = {
@@ -1241,6 +1251,7 @@ async def release_quarantine(
             name,
             pr_number,
             fallback_task_ids=fallback_task_ids,
+            allow_single_unmapped=pr_number in state.quarantined_prs,
         )
     )
     if not task_ids and pr_number not in state.quarantined_prs:
