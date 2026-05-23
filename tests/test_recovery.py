@@ -30,10 +30,18 @@ class _FakeRedis:
 
     def __init__(self) -> None:
         self.writes: list[tuple[str, str]] = []
+        self.store: dict[str, str] = {}
         self.lists: dict[str, list[str]] = {}
 
     async def set(self, key: str, value: str) -> None:
         self.writes.append((key, value))
+        self.store[key] = value
+
+    async def get(self, key: str) -> str | None:
+        return self.store.get(key)
+
+    async def delete(self, key: str) -> int:
+        return int(self.store.pop(key, None) is not None)
 
     async def lpush(self, key: str, value: str) -> int:
         bucket = self.lists.setdefault(key, [])
@@ -165,6 +173,27 @@ def test_recover_doing_task_with_matching_pr_recovers_to_watch(
     assert any(
         "Recovered: DOING task PR-042" in e["event"] and "WATCH PR #17" in e["event"] for e in runner.state.history
     )
+
+
+def test_recover_state_rehydrates_status_write_failed_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _doing_task()
+    matching_pr = PRInfo(
+        number=17,
+        branch="pr-042-inflight",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [matching_pr])
+
+    runner = _make_runner()
+    runner.redis.store[f"status_write_failed_tasks:{runner.name}"] = '["PR-042"]'
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
+
+    asyncio.run(runner.recover_state())
+
+    assert runner._status_write_failed_task_pr_ids == {"PR-042"}
 
 
 def test_recover_rehydrates_quarantine_from_pr_labels(
