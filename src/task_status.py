@@ -100,14 +100,9 @@ def derive_task_status(
     *,
     current_task_pr_id: str | None = None,
 ) -> TaskStatus:
-    """Derive task status from canonical frontmatter, then git/PR state."""
-    frontmatter_statuses = {
-        "done": TaskStatus.DONE,
-        "error": TaskStatus.ERROR,
-        "todo": TaskStatus.TODO,
-    }
-    if task_header.frontmatter_status in frontmatter_statuses:
-        return frontmatter_statuses[task_header.frontmatter_status]
+    """Derive task status from frontmatter suppression and GitHub merge state."""
+    if task_header.frontmatter_status == "error":
+        return TaskStatus.ERROR
     if (
         task_header.branch
         and task_header.branch in state.merged_branches
