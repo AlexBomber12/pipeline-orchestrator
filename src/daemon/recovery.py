@@ -370,6 +370,8 @@ class RecoveryMixin:
                 continue
             record = await self._suppression_record_for_task(pr.pr_id)
             if record is not None and record.reason == SuppressionReason.GUARDRAIL:
+                self.state.quarantined_prs.add(pr.number)
+                restored.append(pr.number)
                 continue
             await self._suppress_task(
                 pr.pr_id,

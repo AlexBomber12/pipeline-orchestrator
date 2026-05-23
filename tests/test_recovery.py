@@ -22,6 +22,8 @@ from src.models import (
     TaskStatus,
 )
 from src.queue_parser import QueueValidationError
+from src.subsource_registry import SuppressionReason
+from src.suppression import SuppressionRecord
 from src.task_status import MergedState
 
 
@@ -224,6 +226,43 @@ def test_recover_rehydrates_quarantine_from_pr_labels(
         in e["event"]
         for e in runner.state.history
     )
+
+
+def test_recover_projects_quarantine_when_guardrail_suppression_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _doing_task()
+    matching_pr = PRInfo(
+        number=17,
+        branch="pr-042-inflight",
+        pr_id="PR-042",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+        quarantine_labels={"quarantine:large_diff"},
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [matching_pr])
+
+    runner = _make_runner()
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
+
+    async def existing_guardrail_record(task_id: str) -> SuppressionRecord | None:
+        if task_id == "PR-042":
+            return SuppressionRecord(
+                task_id="PR-042",
+                reason=SuppressionReason.GUARDRAIL,
+                detail={},
+            )
+        return None
+
+    monkeypatch.setattr(
+        runner,
+        "_suppression_record_for_task",
+        existing_guardrail_record,
+    )
+
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.quarantined_prs == {17}
 
 
 def test_recover_state_sets_queue_counters(
