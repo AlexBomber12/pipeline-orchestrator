@@ -95,6 +95,13 @@ class _GetFailsRedis(_GuardrailRedis):
         raise RedisError("down")
 
 
+class _StateGetFailsRedis(_GuardrailRedis):
+    async def get(self, key: str) -> str | None:
+        if key == "pipeline:example__alpha":
+            raise RedisError("state down")
+        return await super().get(key)
+
+
 class _TransactionFailsRedis(_GuardrailRedis):
     async def transaction(
         self,
@@ -103,6 +110,27 @@ class _TransactionFailsRedis(_GuardrailRedis):
         value_from_callable: bool = False,
     ) -> Any:
         raise RedisError("down")
+
+
+class _StateChangesBeforeTransactionRedis(_GuardrailRedis):
+    async def transaction(
+        self,
+        callback: Any,
+        *keys: str,
+        value_from_callable: bool = False,
+    ) -> Any:
+        raw = self.store["pipeline:example__alpha"]
+        state = RepoState.model_validate_json(raw)
+        state.state = PipelineState.CODING
+        state.current_task = QueueTask(
+            pr_id="PR-999",
+            title="New active task",
+            status=TaskStatus.DOING,
+            task_file="tasks/PR-999.md",
+        )
+        self.store["pipeline:example__alpha"] = state.model_dump_json()
+        result = await callback(self)
+        return result if value_from_callable else None
 
 
 class _DeleteFailsRedis(_GuardrailRedis):
@@ -257,6 +285,109 @@ def test_accept_once_sets_flag_and_clears(
     task_text = (repo_dir / "tasks" / "PR-384.md").read_text(encoding="utf-8")
     assert "status: TODO" in task_text
     assert "blocked_reason" not in task_text
+
+
+def test_accept_once_requires_active_error_task(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    repo_dir, redis_client = _setup_repo(tmp_path, monkeypatch)
+    state = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
+    state.current_task = QueueTask(
+        pr_id="PR-999",
+        title="Different task",
+        status=TaskStatus.ERROR,
+        task_file="tasks/PR-999.md",
+    )
+    redis_client.store["pipeline:example__alpha"] = state.model_dump_json()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/repos/example__alpha/tasks/PR-384/guardrail/accept-once"
+        )
+
+    assert response.status_code == 409
+    raw = redis_client.store[cause_key("example__alpha", "PR-384")]
+    assert "approved_once" not in json.loads(raw)["payload"]
+    task_text = (repo_dir / "tasks" / "PR-384.md").read_text(encoding="utf-8")
+    assert "status: ERROR" in task_text
+
+
+def test_accept_once_state_get_failure_returns_503(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    _setup_repo(tmp_path, monkeypatch)
+    source = web_app.aioredis.from_url("", decode_responses=True)
+    redis_client = _StateGetFailsRedis(dict(source.store))
+    redis_client.zsets = dict(source.zsets)
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/repos/example__alpha/tasks/PR-384/guardrail/accept-once"
+        )
+
+    assert response.status_code == 503
+
+
+def test_accept_once_missing_state_returns_409(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    _setup_repo(tmp_path, monkeypatch)
+    source = web_app.aioredis.from_url("", decode_responses=True)
+    redis_client = _GuardrailRedis(dict(source.store))
+    redis_client.store.pop("pipeline:example__alpha")
+    redis_client.zsets = dict(source.zsets)
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/repos/example__alpha/tasks/PR-384/guardrail/accept-once"
+        )
+
+    assert response.status_code == 409
+
+
+def test_accept_once_bad_state_returns_503(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    _setup_repo(tmp_path, monkeypatch)
+    source = web_app.aioredis.from_url("", decode_responses=True)
+    redis_client = _GuardrailRedis(dict(source.store))
+    redis_client.store["pipeline:example__alpha"] = "not-json"
+    redis_client.zsets = dict(source.zsets)
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/repos/example__alpha/tasks/PR-384/guardrail/accept-once"
+        )
+
+    assert response.status_code == 503
+
+
+def test_accept_once_requires_repo_error_state(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    repo_dir, redis_client = _setup_repo(tmp_path, monkeypatch)
+    state = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
+    state.state = PipelineState.IDLE
+    redis_client.store["pipeline:example__alpha"] = state.model_dump_json()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/repos/example__alpha/tasks/PR-384/guardrail/accept-once"
+        )
+
+    assert response.status_code == 409
+    raw = redis_client.store[cause_key("example__alpha", "PR-384")]
+    assert "approved_once" not in json.loads(raw)["payload"]
+    task_text = (repo_dir / "tasks" / "PR-384.md").read_text(encoding="utf-8")
+    assert "status: ERROR" in task_text
 
 
 def test_accept_once_warns_will_retrigger() -> None:
@@ -472,6 +603,14 @@ def test_guardrail_accept_missing_task_returns_404(
     monkeypatch: Any,
 ) -> None:
     _repo_dir, redis_client = _setup_repo(tmp_path, monkeypatch)
+    state = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
+    state.current_task = QueueTask(
+        pr_id="PR-999",
+        title="Missing task",
+        status=TaskStatus.ERROR,
+        task_file="tasks/PR-999.md",
+    )
+    redis_client.store["pipeline:example__alpha"] = state.model_dump_json()
     cause = CancellationCause(
         category="ERROR",
         payload={"subsource": "guardrail", "excerpt": "missing task"},
@@ -683,6 +822,26 @@ def test_reset_transaction_failure_returns_503(
         response = client.post("/repos/example__alpha/reset-to-idle")
 
     assert response.status_code == 503
+
+
+def test_reset_revalidates_error_task_inside_transaction(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    _setup_repo(tmp_path, monkeypatch)
+    source = web_app.aioredis.from_url("", decode_responses=True)
+    redis_client = _StateChangesBeforeTransactionRedis(dict(source.store))
+    redis_client.zsets = dict(source.zsets)
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/reset-to-idle")
+
+    assert response.status_code == 409
+    state = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
+    assert state.state == PipelineState.CODING
+    assert state.current_task is not None
+    assert state.current_task.pr_id == "PR-999"
 
 
 def test_reset_swallows_history_and_publish_failure(

@@ -77,6 +77,10 @@ _RETRY_RESERVATION_TTL_SECONDS = 30 * 60
 _RETRY_GIT_TIMEOUT_SECONDS = 60
 
 
+class _ResetStateChanged(RuntimeError):
+    """Raised when reset-to-idle loses its active ERROR task gate."""
+
+
 def _split_gh_label_output(result: object) -> list[str]:
     if isinstance(result, str):
         return [label.strip() for label in result.splitlines() if label.strip()]
@@ -1880,6 +1884,23 @@ async def accept_guardrail_park_once(
     if cause is None:
         return HTMLResponse(_NO_PENDING_GUARDRAIL, status_code=404)
 
+    try:
+        raw_state = await redis_client.get(pipeline_state(name))
+    except RedisError:
+        return HTMLResponse("Redis unavailable", status_code=503)
+    if raw_state is None:
+        return HTMLResponse("Task is not active in ERROR", status_code=409)
+    try:
+        state = RepoState.model_validate_json(raw_state)
+    except Exception:
+        return HTMLResponse("Repository state unavailable", status_code=503)
+    if (
+        state.state != PipelineState.ERROR
+        or state.current_task is None
+        or state.current_task.pr_id != pr_id
+    ):
+        return HTMLResponse("Task is not active in ERROR", status_code=409)
+
     resolved = await _resolve_repo_task_path(name, pr_id)
     if resolved is None:
         return HTMLResponse("Task file not found", status_code=404)
@@ -1967,6 +1988,12 @@ async def reset_repo_to_idle(request: Request, name: str) -> JSONResponse:
             if raw is not None
             else _default_repo_state(name, repo_config.url)
         )
+        if (
+            current.state != PipelineState.ERROR
+            or current.current_task is None
+            or current.current_task.pr_id != task_id
+        ):
+            raise _ResetStateChanged
         current.state = PipelineState.IDLE
         current.current_task = None
         current.current_pr = None
@@ -1997,6 +2024,8 @@ async def reset_repo_to_idle(request: Request, name: str) -> JSONResponse:
         )
     except RedisError:
         return JSONResponse({"error": "redis unavailable"}, status_code=503)
+    except _ResetStateChanged:
+        return JSONResponse({"error": "repo ERROR task changed"}, status_code=409)
 
     try:
         await _publish_history_entry_event(
