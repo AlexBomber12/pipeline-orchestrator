@@ -38,6 +38,15 @@ def _gh_env() -> dict[str, str] | None:
     return env
 
 
+def _git_env() -> dict[str, str]:
+    """Return git env that ignores checkout's repository-scoped extraheader."""
+    env = os.environ.copy()
+    env["GIT_CONFIG_COUNT"] = "1"
+    env["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraheader"
+    env["GIT_CONFIG_VALUE_0"] = ""
+    return env
+
+
 def close_all_open_prs() -> int:
     """Close every open PR on testbed with --delete-branch. Returns count closed.
 
@@ -183,6 +192,7 @@ def wipe_tasks_dir_on_main() -> bool:
             text=True,
             check=False,
             timeout=60,
+            env=_git_env(),
         )
         if clone.returncode != 0:
             raise RuntimeError(
@@ -227,6 +237,7 @@ def wipe_tasks_dir_on_main() -> bool:
             text=True,
             check=False,
             timeout=30,
+            env=_git_env(),
         )
         if push.returncode != 0:
             raise RuntimeError(

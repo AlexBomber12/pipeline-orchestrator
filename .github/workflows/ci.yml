@@ -80,8 +80,14 @@ jobs:
               oauth_token: ${TESTBED_TOKEN}
               git_protocol: https
           EOF
+          cat > tests/e2e/data/auth/.gitconfig <<EOF
+          [url "https://x-access-token:${TESTBED_TOKEN}@github.com/"]
+              insteadOf = https://github.com/
+          EOF
           chmod 600 tests/e2e/data/auth/gh/hosts.yml
-          sudo chown -R 1000:1000 tests/e2e/data/auth tests/e2e/data/repos tests/e2e/data/uploads
+          chmod 600 tests/e2e/data/auth/.gitconfig
+          mkdir -p tests/e2e/data/events
+          sudo chown -R 1000:1000 tests/e2e/data/auth tests/e2e/data/repos tests/e2e/data/uploads tests/e2e/data/events
 
       - name: Bring up test stack
         run: docker compose -f docker-compose.test.yml up -d --wait

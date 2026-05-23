@@ -26,6 +26,7 @@ from tests.e2e.lib.testbed_reset import (
     TESTBED_URL,
     _clone_url,
     _gh_env,
+    _git_env,
     clear_testbed_redis_state,
     close_all_open_prs,
     delete_non_main_branches,
@@ -386,6 +387,14 @@ def test_gh_env_pins_both_cli_token_names(monkeypatch) -> None:
     assert env["GITHUB_TOKEN"] == "ghs_testbed"
 
 
+def test_git_env_clears_checkout_extraheader() -> None:
+    env = _git_env()
+
+    assert env["GIT_CONFIG_COUNT"] == "1"
+    assert env["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
+    assert env["GIT_CONFIG_VALUE_0"] == ""
+
+
 def test_close_all_open_prs_passes_pinned_gh_env(monkeypatch) -> None:
     monkeypatch.setenv("GH_TOKEN", "ghs_testbed")
     listing = _completed(stdout="")
@@ -421,9 +430,12 @@ def test_wipe_tasks_dir_uses_authenticated_clone_url_when_token_set(
 
             if cmd[:2] == ["git", "clone"]:
                 captured["clone_cmd"] = list(cmd)
+                captured["clone_env"] = kw.get("env")
                 target = cmd[-1]
                 _P(target).mkdir(parents=True, exist_ok=True)
                 (_P(target) / "tasks").mkdir(parents=True, exist_ok=True)
+            if cmd[:4] == ["git", "-C", str(tmp_path / "repo"), "push"]:
+                captured["push_env"] = kw.get("env")
             return next(seq)
 
         run.side_effect = fake_run
@@ -434,6 +446,8 @@ def test_wipe_tasks_dir_uses_authenticated_clone_url_when_token_set(
     assert clone_cmd[4] == (
         f"https://x-access-token:ghs_xyz@github.com/{TESTBED_REPO}.git"
     )
+    assert captured["clone_env"]["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
+    assert captured["push_env"]["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
 
 
 def test_reset_testbed_full_aggregates_all_helpers() -> None:
