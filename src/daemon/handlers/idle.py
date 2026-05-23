@@ -500,7 +500,7 @@ class IdleMixin:
             for pr_id in list(statuses.keys()):
                 if pr_id not in self._status_write_failed_task_pr_ids:
                     continue
-                if statuses[pr_id] in (TaskStatus.DONE, TaskStatus.DOING):
+                if statuses[pr_id] == TaskStatus.DONE:
                     self._status_write_failed_task_pr_ids.discard(pr_id)
                     await self._persist_status_write_failed_task_pr_ids()
                     continue

@@ -521,6 +521,48 @@ def test_select_next_task_drops_status_write_failed_marker_for_done_task(
     assert runner._status_write_failed_task_pr_ids == set()
 
 
+def test_select_next_task_keeps_status_write_failed_marker_for_doing_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.undo()
+    task_dir = tmp_path / "tasks"
+    task_dir.mkdir()
+    (task_dir / "PR-001.md").write_text(
+        "---\n"
+        "status: TODO\n"
+        "---\n\n"
+        "# PR-001: Open but parked\n"
+        "Branch: pr-001-open\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "_resolve_merged_state",
+        lambda *args, **kwargs: _merged_state(),
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "derive_task_status",
+        lambda header, merged_pr_ids, open_prs, merged_prs, **kwargs: TaskStatus.DOING,
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = [PRInfo(number=1, branch="pr-001-open", pr_id="PR-001")]
+    runner._idle_merged_prs = []
+    runner._status_write_failed_task_pr_ids.add("PR-001")
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is None
+    assert runner._idle_dag_statuses["PR-001"] == TaskStatus.ERROR
+    assert runner._status_write_failed_task_pr_ids == {"PR-001"}
+
+
 def test_handle_idle_sets_queue_counters_with_mixed_statuses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
