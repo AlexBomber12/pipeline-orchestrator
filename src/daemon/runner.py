@@ -533,15 +533,18 @@ class PipelineRunner(
         """Return True when diagnose_error has already hit its task ceiling."""
         if not task_id:  # pragma: no cover
             return False
-        if await self.redis.get(f"diagnose_exhausted:{self.name}:{task_id}") is not None:
-            return True
+        key = f"diagnose_exhausted:{self.name}:{task_id}"
         if self.repo_config.feature_flags.use_single_error_exit:
             record = await self._suppression_record_for_task(task_id)
-            return (
+            is_exhausted = (
                 record is not None
                 and record.reason == SuppressionReason.DIAGNOSE_EXHAUSTED
             )
-        key = f"diagnose_exhausted:{self.name}:{task_id}"
+            if is_exhausted:
+                return True
+            if await self.redis.get(key) is not None:
+                await self.redis.delete(key)
+            return False
         return await self.redis.get(key) is not None
 
     async def _mark_diagnose_exhausted(self, task_id: str) -> None:

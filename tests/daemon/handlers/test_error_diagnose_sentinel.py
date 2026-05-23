@@ -134,6 +134,15 @@ def test_clear_sentinel_helper_deletes_redis_key_with_single_error_exit() -> Non
     assert asyncio.run(runner._suppression_record_for_task("PR-001")) is None
 
 
+def test_single_error_exit_ignores_stale_sentinel_without_suppression() -> None:
+    runner = h._make_runner(feature_flags=FeatureFlags(use_single_error_exit=True))
+    key = _sentinel_key(runner, "PR-001")
+    runner.redis.store[key] = "2026-05-20T00:00:00+00:00"
+
+    assert asyncio.run(runner._is_diagnose_exhausted("PR-001")) is False
+    assert key not in runner.redis.store
+
+
 def test_clear_error_message_on_recovery_clears_sentinel() -> None:
     runner = _make_error_runner()
     key = _sentinel_key(runner, "PR-001")
