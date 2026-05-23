@@ -497,14 +497,18 @@ class IdleMixin:
             frontmatter_statuses = {
                 header.pr_id: header.frontmatter_status for header in headers
             }
+            for pr_id in list(statuses.keys()):
+                if pr_id not in self._status_write_failed_task_pr_ids:
+                    continue
+                if statuses[pr_id] in (TaskStatus.DONE, TaskStatus.DOING):
+                    self._status_write_failed_task_pr_ids.discard(pr_id)
+                    await self._persist_status_write_failed_task_pr_ids()
+                    continue
+                statuses[pr_id] = TaskStatus.ERROR
+
             if self.repo_config.feature_flags.use_single_error_exit:
                 for pr_id in list(statuses.keys()):
                     if pr_id in self._status_write_failed_task_pr_ids:
-                        if statuses[pr_id] in (TaskStatus.DONE, TaskStatus.DOING):
-                            self._status_write_failed_task_pr_ids.discard(pr_id)
-                            await self._persist_status_write_failed_task_pr_ids()
-                            continue
-                        statuses[pr_id] = TaskStatus.ERROR
                         continue
                     record = await self._suppression_record_for_task(pr_id)
                     if record is None:

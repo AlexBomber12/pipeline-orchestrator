@@ -441,6 +441,42 @@ def test_select_next_task_keeps_status_write_failed_task_in_error(
     assert runner._idle_dag_statuses["PR-001"] == TaskStatus.ERROR
 
 
+def test_select_next_task_keeps_status_write_failed_task_in_error_without_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.undo()
+    task_dir = tmp_path / "tasks"
+    task_dir.mkdir()
+    (task_dir / "PR-001.md").write_text(
+        "---\n"
+        "status: TODO\n"
+        "---\n\n"
+        "# PR-001: Status write failed\n"
+        "Branch: pr-001-status-write-failed\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "_resolve_merged_state",
+        lambda *args, **kwargs: _merged_state(),
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+    runner._status_write_failed_task_pr_ids.add("PR-001")
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is None
+    assert runner._idle_dag_statuses["PR-001"] == TaskStatus.ERROR
+
+
 def test_select_next_task_drops_status_write_failed_marker_for_done_task(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
