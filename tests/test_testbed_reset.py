@@ -25,6 +25,7 @@ from tests.e2e.lib.testbed_reset import (
     TESTBED_REPO,
     TESTBED_URL,
     _clone_url,
+    _gh_env,
     clear_testbed_redis_state,
     close_all_open_prs,
     delete_non_main_branches,
@@ -366,6 +367,35 @@ def test_clone_url_embeds_gh_token_when_set(monkeypatch) -> None:
     assert _clone_url() == (
         f"https://x-access-token:ghs_secret@github.com/{TESTBED_REPO}.git"
     )
+
+
+def test_gh_env_returns_none_without_token(monkeypatch) -> None:
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+
+    assert _gh_env() is None
+
+
+def test_gh_env_pins_both_cli_token_names(monkeypatch) -> None:
+    monkeypatch.setenv("GH_TOKEN", "  ghs_testbed  ")
+    monkeypatch.setenv("GITHUB_TOKEN", "stale-default-token")
+
+    env = _gh_env()
+
+    assert env is not None
+    assert env["GH_TOKEN"] == "ghs_testbed"
+    assert env["GITHUB_TOKEN"] == "ghs_testbed"
+
+
+def test_close_all_open_prs_passes_pinned_gh_env(monkeypatch) -> None:
+    monkeypatch.setenv("GH_TOKEN", "ghs_testbed")
+    listing = _completed(stdout="")
+
+    with patch.object(testbed_reset.subprocess, "run") as run:
+        run.side_effect = [listing]
+        assert close_all_open_prs() == 0
+
+    assert run.call_args.kwargs["env"]["GH_TOKEN"] == "ghs_testbed"
+    assert run.call_args.kwargs["env"]["GITHUB_TOKEN"] == "ghs_testbed"
 
 
 def test_wipe_tasks_dir_uses_authenticated_clone_url_when_token_set(
