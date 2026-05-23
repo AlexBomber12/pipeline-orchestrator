@@ -133,6 +133,51 @@ class _StateChangesBeforeTransactionRedis(_GuardrailRedis):
         return result if value_from_callable else None
 
 
+class _SecondTransactionFailsRedis(_GuardrailRedis):
+    def __init__(self, store: dict[str, str] | None = None) -> None:
+        super().__init__(store)
+        self.transactions = 0
+
+    async def transaction(
+        self,
+        callback: Any,
+        *keys: str,
+        value_from_callable: bool = False,
+    ) -> Any:
+        self.transactions += 1
+        if self.transactions == 2:
+            raise RedisError("down")
+        result = await callback(self)
+        return result if value_from_callable else None
+
+
+class _StateChangesBeforeFinalTransactionRedis(_GuardrailRedis):
+    def __init__(self, store: dict[str, str] | None = None) -> None:
+        super().__init__(store)
+        self.transactions = 0
+
+    async def transaction(
+        self,
+        callback: Any,
+        *keys: str,
+        value_from_callable: bool = False,
+    ) -> Any:
+        self.transactions += 1
+        if self.transactions == 2:
+            raw = self.store["pipeline:example__alpha"]
+            state = RepoState.model_validate_json(raw)
+            state.state = PipelineState.CODING
+            state.current_task = QueueTask(
+                pr_id="PR-999",
+                title="New active task",
+                status=TaskStatus.DOING,
+                task_file="tasks/PR-999.md",
+            )
+            self.store["pipeline:example__alpha"] = state.model_dump_json()
+        result = await callback(self)
+        return result if value_from_callable else None
+
+
 class _DeleteFailsRedis(_GuardrailRedis):
     async def delete(self, key: str) -> int:
         raise RuntimeError("delete failed")
@@ -864,6 +909,42 @@ def test_reset_revalidates_error_task_inside_transaction(
         tmp_path / "repos" / "example__alpha" / "tasks" / "PR-384.md"
     ).read_text(encoding="utf-8")
     assert "status: ERROR" in task_text
+
+
+def test_reset_handles_final_transaction_failure(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    _setup_repo(tmp_path, monkeypatch)
+    source = web_app.aioredis.from_url("", decode_responses=True)
+    redis_client = _SecondTransactionFailsRedis(dict(source.store))
+    redis_client.zsets = dict(source.zsets)
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/reset-to-idle")
+
+    assert response.status_code == 503
+
+
+def test_reset_revalidates_reserved_task_before_idle_transition(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    _setup_repo(tmp_path, monkeypatch)
+    source = web_app.aioredis.from_url("", decode_responses=True)
+    redis_client = _StateChangesBeforeFinalTransactionRedis(dict(source.store))
+    redis_client.zsets = dict(source.zsets)
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/reset-to-idle")
+
+    assert response.status_code == 409
+    state = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
+    assert state.state == PipelineState.CODING
+    assert state.current_task is not None
+    assert state.current_task.pr_id == "PR-999"
 
 
 def test_reset_swallows_history_and_publish_failure(
