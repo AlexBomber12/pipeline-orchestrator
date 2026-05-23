@@ -89,6 +89,7 @@ async def _suppressed_task_ids_for_pr(
     redis_client: aioredis.Redis,
     repo_slug: str,
     pr_number: int,
+    fallback_task_ids: set[str] | None = None,
 ) -> set[str]:
     """Return suppressed task ids whose detail maps them to ``pr_number``."""
     try:
@@ -99,6 +100,7 @@ async def _suppressed_task_ids_for_pr(
     except Exception:
         return set()
     task_ids: set[str] = set()
+    fallback_task_ids = fallback_task_ids or set()
     for record in records:
         if record.reason != SuppressionReason.GUARDRAIL:
             continue
@@ -106,6 +108,8 @@ async def _suppressed_task_ids_for_pr(
         try:
             detail_pr_number = int(detail_pr)
         except (TypeError, ValueError):
+            if record.task_id in fallback_task_ids:
+                task_ids.add(record.task_id)
             continue
         if detail_pr_number == pr_number:
             task_ids.add(record.task_id)
@@ -1223,9 +1227,21 @@ async def release_quarantine(
         state = RepoState.model_validate_json(raw_state)
     except Exception:
         return JSONResponse({"error": "repository state unavailable"}, status_code=503)
+    fallback_task_ids: set[str] = set()
+    if (
+        state.current_pr is not None
+        and state.current_pr.number == pr_number
+        and state.current_pr.pr_id is not None
+    ):
+        fallback_task_ids.add(state.current_pr.pr_id)
     task_ids: set[str] = set()
     task_ids.update(
-        await _suppressed_task_ids_for_pr(redis_client, name, pr_number)
+        await _suppressed_task_ids_for_pr(
+            redis_client,
+            name,
+            pr_number,
+            fallback_task_ids=fallback_task_ids,
+        )
     )
     if not task_ids and pr_number not in state.quarantined_prs:
         return JSONResponse({"status": "not_quarantined", "pr": pr_number})
