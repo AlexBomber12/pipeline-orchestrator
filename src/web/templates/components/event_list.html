@@ -1,14 +1,4 @@
-{% set state_styles = {
-    'IDLE':      {'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30'},
-    'PREFLIGHT': {'badge': 'bg-gray-500/10 text-gray-300 border-gray-500/30'},
-    'CODING':    {'badge': 'bg-accent/10 text-accent border-accent/30'},
-    'WATCH':     {'badge': 'bg-warn/10 text-warn border-warn/30'},
-    'FIX':       {'badge': 'bg-warn/10 text-warn border-warn/30'},
-    'MERGE':     {'badge': 'bg-ok/10 text-ok border-ok/30'},
-    'HUNG':      {'badge': 'bg-hung/10 text-hung border-hung/30'},
-    'ERROR':     {'badge': 'bg-fail/10 text-fail border-fail/30'},
-    'PAUSED':    {'badge': 'bg-warn/10 text-warn border-warn/30'},
-} %}
+{% import "components/_repo_state_styles.html" as repo_state %}
 {% set tier_styles = {
     'infra': 'bg-info/10 text-info border-info/30',
     'coder': 'bg-purple-500/10 text-purple-300 border-purple-500/30',
@@ -32,7 +22,7 @@
 <ul class="divide-y divide-white/5 font-mono text-xs">
     {% for entry in events|reverse %}
     {% set entry_state = entry.get('state', 'IDLE') %}
-    {% set entry_style = state_styles.get(entry_state, state_styles['IDLE']) %}
+    {% set entry_style = repo_state.state_styles.get(entry_state, repo_state.state_styles['IDLE']) %}
     {% set entry_count = entry.get('count', 1) %}
     {% set first_seen = entry.get('time', '') %}
     {% set last_seen = entry.get('last_seen_at', first_seen) %}
