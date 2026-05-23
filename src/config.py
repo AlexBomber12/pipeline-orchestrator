@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import tempfile
@@ -122,6 +123,7 @@ class _ConfigFileSignature:
     mtime_ns: int
     ctime_ns: int
     size: int
+    content_hash: str
 
 
 @dataclass(frozen=True)
@@ -313,11 +315,13 @@ def _config_file_signature(path: Path) -> _ConfigFileSignature:
     try:
         stat = path.stat()
     except OSError:
-        return _ConfigFileSignature(mtime_ns=0, ctime_ns=0, size=0)
+        return _ConfigFileSignature(mtime_ns=0, ctime_ns=0, size=0, content_hash="")
+    content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
     return _ConfigFileSignature(
         mtime_ns=stat.st_mtime_ns,
         ctime_ns=stat.st_ctime_ns,
         size=stat.st_size,
+        content_hash=content_hash,
     )
 
 

@@ -129,6 +129,20 @@ def test_cache_miss_when_content_changes_with_preserved_mtime(
     assert calls == 2
 
 
+def test_config_file_signature_tracks_same_size_content_change(
+    tmp_path: Path,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    _write_config(cfg_path, 5)
+    before = config_module._config_file_signature(cfg_path)
+    _rewrite_preserving_mtime(cfg_path, 7)
+    after = config_module._config_file_signature(cfg_path)
+
+    assert after.mtime_ns == before.mtime_ns
+    assert after.size == before.size
+    assert after.content_hash != before.content_hash
+
+
 def test_overlay_mtime_change_invalidates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
