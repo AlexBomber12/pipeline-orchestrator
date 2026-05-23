@@ -228,6 +228,16 @@ def test_missing_overlay_treated_as_absent(
     assert calls == 2
 
 
+def test_non_directory_config_parent_treated_as_missing(tmp_path: Path) -> None:
+    parent_file = tmp_path / "not-a-directory"
+    parent_file.write_text("not a directory", encoding="utf-8")
+    cfg_path = parent_file / "config.yml"
+
+    cfg = load_config(str(cfg_path))
+
+    assert cfg == AppConfig()
+
+
 def test_explicit_symlink_path_uses_overlay_next_to_link(tmp_path: Path) -> None:
     real_dir = tmp_path / "real"
     link_dir = tmp_path / "link"

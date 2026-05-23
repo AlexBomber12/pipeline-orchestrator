@@ -312,7 +312,7 @@ def _config_file_signature(path: Path) -> _ConfigFileSignature:
     """Return cache-relevant file metadata, treating a missing file as absent."""
     try:
         stat = path.stat()
-    except FileNotFoundError:
+    except OSError:
         return _ConfigFileSignature(mtime_ns=0, ctime_ns=0, size=0)
     return _ConfigFileSignature(
         mtime_ns=stat.st_mtime_ns,
