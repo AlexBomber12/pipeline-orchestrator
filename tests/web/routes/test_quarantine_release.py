@@ -11,7 +11,7 @@ from redis.exceptions import RedisError
 from src.audit import operator_actions
 from src.cancellation.storage import cause_key, index_key
 from src.keyspace import pipeline_state
-from src.models import PipelineState, PRInfo, RepoState
+from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
 from src.subsource_registry import SuppressionReason
 from src.web import app as web_app
 from src.web.app import app
@@ -279,19 +279,35 @@ def test_release_endpoint_clears_legacy_current_pr_guardrail_suppression(
     assert cause_key("example__alpha", "PR-442") not in redis.store
 
 
-def test_release_endpoint_clears_single_legacy_guardrail_suppression(
+def test_release_endpoint_clears_legacy_guardrail_suppression_by_branch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _write_config(tmp_path, monkeypatch)
     redis = _Redis()
     _seed(redis, 442)
+    state = RepoState.model_validate_json(redis.store[pipeline_state("example__alpha")])
+    state.current_queue = [
+        QueueTask(
+            pr_id="PR-legacy",
+            title="Legacy guardrail",
+            status=TaskStatus.ERROR,
+            branch="pr-legacy",
+        )
+    ]
+    redis.store[pipeline_state("example__alpha")] = state.model_dump_json()
     _seed_suppression(
         redis,
         "PR-legacy",
         {"subsource": SuppressionReason.GUARDRAIL.value},
     )
-    monkeypatch.setattr(repo_control.gh_runner, "run_gh", lambda *a, **kw: "")
+
+    def fake_run_gh(args: list[str], **kwargs: object) -> str:
+        if "headRefName" in args:
+            return "pr-legacy\n"
+        return ""
+
+    monkeypatch.setattr(repo_control.gh_runner, "run_gh", fake_run_gh)
 
     with TestClient(app) as client:
         client.app.state.redis = redis
@@ -302,7 +318,7 @@ def test_release_endpoint_clears_single_legacy_guardrail_suppression(
     assert cause_key("example__alpha", "PR-legacy") not in redis.store
 
 
-def test_release_endpoint_keeps_ambiguous_legacy_guardrail_suppressions(
+def test_release_endpoint_keeps_unmapped_legacy_guardrail_suppressions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

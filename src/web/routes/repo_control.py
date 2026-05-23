@@ -90,7 +90,6 @@ async def _suppressed_task_ids_for_pr(
     repo_slug: str,
     pr_number: int,
     fallback_task_ids: set[str] | None = None,
-    allow_single_unmapped: bool = False,
 ) -> set[str]:
     """Return suppressed task ids whose detail maps them to ``pr_number``."""
     try:
@@ -102,7 +101,6 @@ async def _suppressed_task_ids_for_pr(
         return set()
     task_ids: set[str] = set()
     fallback_task_ids = fallback_task_ids or set()
-    unmapped_guardrail_task_ids: set[str] = set()
     for record in records:
         if record.reason != SuppressionReason.GUARDRAIL:
             continue
@@ -112,17 +110,9 @@ async def _suppressed_task_ids_for_pr(
         except (TypeError, ValueError):
             if record.task_id in fallback_task_ids:
                 task_ids.add(record.task_id)
-            else:
-                unmapped_guardrail_task_ids.add(record.task_id)
             continue
         if detail_pr_number == pr_number:
             task_ids.add(record.task_id)
-    if (
-        not task_ids
-        and allow_single_unmapped
-        and len(unmapped_guardrail_task_ids) == 1
-    ):
-        task_ids.update(unmapped_guardrail_task_ids)
     return task_ids
 
 _DEFERRED_CODER_SWITCH_STATES = {
@@ -1237,6 +1227,31 @@ async def release_quarantine(
         state = RepoState.model_validate_json(raw_state)
     except Exception:
         return JSONResponse({"error": "repository state unavailable"}, status_code=503)
+
+    try:
+        owner_repo = gh_runner.get_repo_full_name(repo_config.url)
+    except ValueError:
+        owner_repo = None
+    pr_branch: str | None = None
+    if owner_repo is not None:
+        try:
+            raw_branch = gh_runner.run_gh(
+                [
+                    "pr",
+                    "view",
+                    str(pr_number),
+                    "--json",
+                    "headRefName",
+                    "-q",
+                    ".headRefName",
+                ],
+                repo=owner_repo,
+            )
+            if isinstance(raw_branch, str) and raw_branch.strip():
+                pr_branch = raw_branch.strip()
+        except Exception:
+            pr_branch = None
+
     fallback_task_ids: set[str] = set()
     if (
         state.current_pr is not None
@@ -1244,6 +1259,12 @@ async def release_quarantine(
         and state.current_pr.pr_id is not None
     ):
         fallback_task_ids.add(state.current_pr.pr_id)
+    if pr_branch and state.current_queue:
+        fallback_task_ids.update(
+            task.pr_id
+            for task in state.current_queue
+            if task.branch == pr_branch
+        )
     task_ids: set[str] = set()
     task_ids.update(
         await _suppressed_task_ids_for_pr(
@@ -1251,16 +1272,11 @@ async def release_quarantine(
             name,
             pr_number,
             fallback_task_ids=fallback_task_ids,
-            allow_single_unmapped=pr_number in state.quarantined_prs,
         )
     )
     if not task_ids and pr_number not in state.quarantined_prs:
         return JSONResponse({"status": "not_quarantined", "pr": pr_number})
 
-    try:
-        owner_repo = gh_runner.get_repo_full_name(repo_config.url)
-    except ValueError:
-        owner_repo = None
     if owner_repo is not None:
         try:
             labels = _split_gh_label_output(
