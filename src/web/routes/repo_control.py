@@ -1924,6 +1924,10 @@ async def accept_guardrail_park_once(
     except Exception:
         pass
     try:
+        await _clear_status_write_failed_marker(redis_client, name, pr_id)
+    except Exception:
+        pass
+    try:
         await _app.publish_wake(redis_client, name, "guardrail_accept_once")
     except Exception:
         _app.logger.warning(
@@ -1984,8 +1988,6 @@ async def reset_repo_to_idle(request: Request, name: str) -> JSONResponse:
             or current.current_task.pr_id != task_id
         ):
             raise _ResetStateChanged
-        await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
-        await _clear_operator_park_for_task(redis_client, name, task_id)
         current.state = PipelineState.IDLE
         current.current_task = None
         current.current_pr = None
@@ -2018,11 +2020,15 @@ async def reset_repo_to_idle(request: Request, name: str) -> JSONResponse:
         return JSONResponse({"error": "redis unavailable"}, status_code=503)
     except _ResetStateChanged:
         return JSONResponse({"error": "repo ERROR task changed"}, status_code=409)
+
+    try:
+        await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
     except (OSError, ValueError) as exc:
         return JSONResponse(
             {"error": f"failed to update task status: {exc}"},
             status_code=503,
         )
+    await _clear_operator_park_for_task(redis_client, name, task_id)
 
     try:
         await _publish_history_entry_event(

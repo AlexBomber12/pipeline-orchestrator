@@ -273,6 +273,10 @@ def test_accept_once_sets_flag_and_clears(
     monkeypatch: Any,
 ) -> None:
     repo_dir, redis_client = _setup_repo(tmp_path, monkeypatch)
+    marker_key = "status_write_failed_tasks:example__alpha"
+    legacy_key = "recovered_tasks:example__alpha"
+    redis_client.store[marker_key] = '["PR-384","PR-999"]'
+    redis_client.store[legacy_key] = '["PR-384","PR-888"]'
 
     with TestClient(app) as client:
         response = client.post(
@@ -285,6 +289,8 @@ def test_accept_once_sets_flag_and_clears(
     task_text = (repo_dir / "tasks" / "PR-384.md").read_text(encoding="utf-8")
     assert "status: TODO" in task_text
     assert "blocked_reason" not in task_text
+    assert redis_client.store[marker_key] == '["PR-999"]'
+    assert redis_client.store[legacy_key] == '["PR-888"]'
 
 
 def test_accept_once_requires_active_error_task(
@@ -663,7 +669,15 @@ def test_guardrail_accept_swallows_delete_and_publish_failure(
     async def fail_publish(redis: Any, repo_name: str, event_type: str) -> None:
         raise RuntimeError("publish failed")
 
+    async def fail_marker_cleanup(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("marker failed")
+
     monkeypatch.setattr(web_app, "publish_wake", fail_publish)
+    monkeypatch.setattr(
+        repo_control,
+        "_clear_status_write_failed_marker",
+        fail_marker_cleanup,
+    )
 
     with TestClient(app) as client:
         response = client.post(
