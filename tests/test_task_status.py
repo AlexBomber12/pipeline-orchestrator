@@ -85,14 +85,14 @@ def test_derive_done_when_pr_id_is_in_merged_history() -> None:
     assert status == TaskStatus.DONE
 
 
-def test_derive_task_status_done_frontmatter() -> None:
+def test_derive_task_status_done_frontmatter_does_not_short_circuit() -> None:
     status = derive_task_status(
         _header("pr-085-status-from-git", frontmatter_status="done"),
         _merged_state(),
         [],
     )
 
-    assert status == TaskStatus.DONE
+    assert status == TaskStatus.TODO
 
 
 def test_derive_task_status_error_frontmatter() -> None:
@@ -111,14 +111,14 @@ def test_derive_task_status_error_frontmatter() -> None:
     assert status == TaskStatus.ERROR
 
 
-def test_derive_task_status_todo_frontmatter() -> None:
+def test_derive_task_status_todo_frontmatter_does_not_block_github_done() -> None:
     status = derive_task_status(
         _header("pr-085-status-from-git", frontmatter_status="todo"),
         _merged_state({"PR-085"}),
         [],
     )
 
-    assert status == TaskStatus.TODO
+    assert status == TaskStatus.DONE
 
 
 def test_derive_task_status_legacy_value_no_longer_recognized() -> None:

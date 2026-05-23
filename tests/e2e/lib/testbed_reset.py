@@ -27,6 +27,26 @@ def _clone_url() -> str:
     return f"https://x-access-token:{token}@github.com/{TESTBED_REPO}.git"
 
 
+def _gh_env() -> dict[str, str] | None:
+    """Return an env that pins gh to the integration testbed token when set."""
+    token = os.environ.get("GH_TOKEN", "").strip()
+    if not token:
+        return None
+    env = os.environ.copy()
+    env["GH_TOKEN"] = token
+    env["GITHUB_TOKEN"] = token
+    return env
+
+
+def _git_env() -> dict[str, str]:
+    """Return git env that ignores checkout's repository-scoped extraheader."""
+    env = os.environ.copy()
+    env["GIT_CONFIG_COUNT"] = "1"
+    env["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraheader"
+    env["GIT_CONFIG_VALUE_0"] = ""
+    return env
+
+
 def close_all_open_prs() -> int:
     """Close every open PR on testbed with --delete-branch. Returns count closed.
 
@@ -47,6 +67,7 @@ def close_all_open_prs() -> int:
         text=True,
         check=False,
         timeout=30,
+        env=_gh_env(),
     )
     if listing.returncode != 0:
         # Surface listing failures (typically gh auth/API errors) instead of
@@ -77,6 +98,7 @@ def close_all_open_prs() -> int:
             text=True,
             check=False,
             timeout=30,
+            env=_gh_env(),
         )
         if result.returncode == 0:
             closed += 1
@@ -93,6 +115,7 @@ def close_all_open_prs() -> int:
                 text=True,
                 check=False,
                 timeout=30,
+                env=_gh_env(),
             )
     return closed
 
@@ -119,6 +142,7 @@ def delete_non_main_branches() -> int:
         text=True,
         check=False,
         timeout=30,
+        env=_gh_env(),
     )
     if listing.returncode != 0:
         # Surface listing failures so we never silently treat an auth/API
@@ -145,6 +169,7 @@ def delete_non_main_branches() -> int:
             text=True,
             check=False,
             timeout=30,
+            env=_gh_env(),
         )
         if result.returncode == 0:
             deleted += 1
@@ -167,6 +192,7 @@ def wipe_tasks_dir_on_main() -> bool:
             text=True,
             check=False,
             timeout=60,
+            env=_git_env(),
         )
         if clone.returncode != 0:
             raise RuntimeError(
@@ -211,6 +237,7 @@ def wipe_tasks_dir_on_main() -> bool:
             text=True,
             check=False,
             timeout=30,
+            env=_git_env(),
         )
         if push.returncode != 0:
             raise RuntimeError(
