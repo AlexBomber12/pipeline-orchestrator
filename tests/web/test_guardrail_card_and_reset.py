@@ -828,7 +828,7 @@ def test_reset_transaction_failure_returns_503(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
-    _setup_repo(tmp_path, monkeypatch)
+    repo_dir, _redis_client = _setup_repo(tmp_path, monkeypatch)
     source = web_app.aioredis.from_url("", decode_responses=True)
     redis_client = _TransactionFailsRedis(dict(source.store))
     redis_client.zsets = dict(source.zsets)
@@ -838,6 +838,8 @@ def test_reset_transaction_failure_returns_503(
         response = client.post("/repos/example__alpha/reset-to-idle")
 
     assert response.status_code == 503
+    task_text = (repo_dir / "tasks" / "PR-384.md").read_text(encoding="utf-8")
+    assert "status: ERROR" in task_text
 
 
 def test_reset_revalidates_error_task_inside_transaction(

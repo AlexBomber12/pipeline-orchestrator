@@ -1973,6 +1973,18 @@ async def reset_repo_to_idle(request: Request, name: str) -> JSONResponse:
         return JSONResponse({"error": "task file not found"}, status_code=404)
     task_path, _task_filename = resolved
 
+    try:
+        original_task_text = await asyncio.to_thread(
+            task_path.read_text,
+            encoding="utf-8",
+        )
+        await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
+    except (OSError, ValueError) as exc:
+        return JSONResponse(
+            {"error": f"failed to update task status: {exc}"},
+            status_code=503,
+        )
+
     event_message = f"Operator reset repo to IDLE; {task_id} returned to TODO."
 
     async def _transition(pipe: Any) -> RepoState:
@@ -2017,17 +2029,19 @@ async def reset_repo_to_idle(request: Request, name: str) -> JSONResponse:
             value_from_callable=True,
         )
     except RedisError:
+        await asyncio.to_thread(
+            task_path.write_text,
+            original_task_text,
+            encoding="utf-8",
+        )
         return JSONResponse({"error": "redis unavailable"}, status_code=503)
     except _ResetStateChanged:
-        return JSONResponse({"error": "repo ERROR task changed"}, status_code=409)
-
-    try:
-        await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
-    except (OSError, ValueError) as exc:
-        return JSONResponse(
-            {"error": f"failed to update task status: {exc}"},
-            status_code=503,
+        await asyncio.to_thread(
+            task_path.write_text,
+            original_task_text,
+            encoding="utf-8",
         )
+        return JSONResponse({"error": "repo ERROR task changed"}, status_code=409)
     await _clear_operator_park_for_task(redis_client, name, task_id)
 
     try:
