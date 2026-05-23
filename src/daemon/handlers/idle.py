@@ -386,6 +386,8 @@ class IdleMixin:
         if not headers:
             return None
 
+        await self._hydrate_status_write_failed_task_pr_ids()
+
         state = _resolve_merged_state(
             self.repo_path,
             self.repo_config.branch,
