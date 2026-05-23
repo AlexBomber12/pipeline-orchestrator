@@ -54,6 +54,7 @@ from src.models import (
     QueueTask,  # noqa: F811
     TaskStatus,  # noqa: F811
 )
+from src.subsource_registry import SuppressionReason
 from src.usage import UsageSnapshot
 
 from tests.runner import _helpers as h
@@ -221,6 +222,39 @@ def test_rate_limited_diagnosis_soft_skip_clears_retry_cause(
 
     assert runner.state.state == PipelineState.IDLE
     assert deleted == [(runner.name, "PR-382")]
+
+
+def test_rate_limited_diagnosis_soft_skip_preserves_suppression_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _block_diagnose_calls(monkeypatch)
+    runner = h._make_runner()
+    _force_claude_rate_limited_provider(runner)
+    runner._error_skip_policy_max_attempts = 1
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = _SOFT_SKIP_CONTEXT
+    runner.state.current_task = QueueTask(
+        pr_id="PR-382",
+        title="PR-382",
+        status=TaskStatus.ERROR,
+    )
+    asyncio.run(
+        runner._suppress_task(
+            "PR-382",
+            SuppressionReason.CRASH,
+            {"blocked_reason": "crash"},
+        )
+    )
+
+    asyncio.run(runner.handle_error())
+
+    record = asyncio.run(runner._suppression_record_for_task("PR-382"))
+    assert record is not None
+    assert record.reason == SuppressionReason.CRASH
+    assert record.detail == {
+        "blocked_reason": "crash",
+        "soft_skip_attempts": 1,
+    }
 
 
 # ---------------------------------------------------------------------------

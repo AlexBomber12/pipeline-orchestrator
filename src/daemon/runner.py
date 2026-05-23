@@ -617,7 +617,11 @@ class PipelineRunner(
         record = await self._suppression_record_for_task(task_id)
         detail = dict(record.detail) if record is not None else {}
         detail[field] = value
-        await self._suppress_task(task_id, reason, detail)
+        await self._suppress_task(
+            task_id,
+            record.reason if record is not None else reason,
+            detail,
+        )
 
     async def _increment_suppression_detail_count(  # pragma: no cover
         self,
