@@ -348,6 +348,26 @@ async def _clear_status_write_failed_marker(
             await redis_client.delete(key)
 
 
+async def _clear_operator_park_for_task(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    task_id: str,
+) -> None:
+    """Clear Redis-side park markers that keep an operator task blocked."""
+    try:
+        await RedisSuppressionStore(redis_client).clear(repo_slug, task_id)
+    except Exception:
+        pass
+    try:
+        await redis_client.delete(_diagnose_exhausted_key(repo_slug, task_id))
+    except Exception:
+        pass
+    try:
+        await _clear_status_write_failed_marker(redis_client, repo_slug, task_id)
+    except Exception:
+        pass
+
+
 async def _reserve_repo_for_retry(
     redis_client: aioredis.Redis,
     repo_slug: str,
@@ -1742,18 +1762,7 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
                 await _release_retry_reservation(redis_client, name, pr_id)
             return HTMLResponse("Failed to commit retry change", status_code=503)
 
-        try:
-            await delete_cancellation_cause(redis_client, name, pr_id)
-        except Exception:
-            pass
-        try:
-            await redis_client.delete(_diagnose_exhausted_key(name, pr_id))
-        except Exception:
-            pass
-        try:
-            await _clear_status_write_failed_marker(redis_client, name, pr_id)
-        except Exception:
-            pass
+        await _clear_operator_park_for_task(redis_client, name, pr_id)
         try:
             await _app.publish_wake(redis_client, name, "retry")
         except Exception:
@@ -1833,6 +1842,183 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
             name,
             previous_user_paused,
         )
+
+
+@router.post("/repos/{name}/tasks/{pr_id}/guardrail/reject", response_class=HTMLResponse)
+async def reject_guardrail_park(name: str, pr_id: str) -> Response:
+    """Confirm the guardrail park remains until the spec is edited."""
+    if not _TASK_PR_ID_PATTERN.match(pr_id):
+        return HTMLResponse("Invalid task identifier", status_code=400)
+    return HTMLResponse(
+        "Edit the spec before retrying, or the guardrail will trigger again."
+    )
+
+
+@router.post("/repos/{name}/tasks/{pr_id}/guardrail/accept-once", response_class=HTMLResponse)
+async def accept_guardrail_park_once(
+    request: Request,
+    name: str,
+    pr_id: str,
+) -> Response:
+    """Mark a guardrail suppression accepted once and return the task to TODO."""
+    if not _TASK_PR_ID_PATTERN.match(pr_id):
+        return HTMLResponse("Invalid task identifier", status_code=400)
+
+    cfg = load_config(_app.CONFIG_PATH)
+    if _find_repo_config_by_name(cfg, name) is None:
+        return HTMLResponse("Repository not found", status_code=404)
+
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        return HTMLResponse("Redis unavailable", status_code=503)
+
+    try:
+        raw_cause = await redis_client.get(cause_key(name, pr_id))
+    except RedisError:
+        return HTMLResponse("Redis unavailable", status_code=503)
+    cause = _validated_guardrail_cause(raw_cause)
+    if cause is None:
+        return HTMLResponse(_NO_PENDING_GUARDRAIL, status_code=404)
+
+    resolved = await _resolve_repo_task_path(name, pr_id)
+    if resolved is None:
+        return HTMLResponse("Task file not found", status_code=404)
+    task_path, _task_filename = resolved
+
+    detail = dict(cause.payload)
+    detail.pop("subsource", None)
+    detail["approved_once"] = True
+    await RedisSuppressionStore(redis_client).suppress(
+        name,
+        pr_id,
+        SuppressionReason.GUARDRAIL,
+        detail,
+    )
+    try:
+        await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
+    except (OSError, ValueError) as exc:
+        return HTMLResponse(f"Failed to update task status: {exc}", status_code=503)
+    try:
+        await redis_client.delete(_diagnose_exhausted_key(name, pr_id))
+    except Exception:
+        pass
+    try:
+        await _app.publish_wake(redis_client, name, "guardrail_accept_once")
+    except Exception:
+        _app.logger.warning(
+            "publish_wake failed for %s; daemon will pick up next tick",
+            name,
+            exc_info=True,
+        )
+    return HTMLResponse("", status_code=204)
+
+
+@router.post("/repos/{name}/reset-to-idle", response_class=JSONResponse)
+async def reset_repo_to_idle(request: Request, name: str) -> JSONResponse:
+    """Force an ERROR repo to IDLE and return the current task to TODO."""
+    cfg = load_config(_app.CONFIG_PATH)
+    repo_config = _find_repo_config_by_name(cfg, name)
+    if repo_config is None:
+        return JSONResponse({"error": "repo not found"}, status_code=404)
+
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        return JSONResponse({"error": "redis unavailable"}, status_code=503)
+
+    state_key = pipeline_state(name)
+    try:
+        raw_state = await redis_client.get(state_key)
+    except RedisError:
+        return JSONResponse({"error": "redis unavailable"}, status_code=503)
+    if raw_state is None:
+        state = _default_repo_state(name, repo_config.url)
+    else:
+        try:
+            state = RepoState.model_validate_json(raw_state)
+        except Exception:
+            return JSONResponse({"error": "repository state unavailable"}, status_code=503)
+    if state.state != PipelineState.ERROR:
+        return JSONResponse({"error": "repo is not in ERROR"}, status_code=409)
+    if state.current_task is None:
+        return JSONResponse({"error": "repo has no current task"}, status_code=409)
+
+    task_id = state.current_task.pr_id
+    resolved = await _resolve_repo_task_path(name, task_id)
+    if resolved is None:
+        return JSONResponse({"error": "task file not found"}, status_code=404)
+    task_path, _task_filename = resolved
+
+    try:
+        await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
+    except (OSError, ValueError) as exc:
+        return JSONResponse(
+            {"error": f"failed to update task status: {exc}"},
+            status_code=503,
+        )
+
+    await _clear_operator_park_for_task(redis_client, name, task_id)
+
+    event_message = f"Operator reset repo to IDLE; {task_id} returned to TODO."
+
+    async def _transition(pipe: Any) -> RepoState:
+        raw = await pipe.get(state_key)
+        current = (
+            RepoState.model_validate_json(raw)
+            if raw is not None
+            else _default_repo_state(name, repo_config.url)
+        )
+        current.state = PipelineState.IDLE
+        current.current_task = None
+        current.current_pr = None
+        current.error_message = None
+        current.skip_ai_error_diagnose = False
+        if current.current_queue is not None:
+            current.current_queue = [
+                task.model_copy(update={"status": TaskStatus.TODO})
+                if task.pr_id == task_id
+                else task
+                for task in current.current_queue
+            ]
+        _append_history_entry(
+            current,
+            event_message,
+            tier="operator",
+            kind="reset",
+        )
+        pipe.multi()
+        pipe.set(state_key, current.model_dump_json())
+        return current
+
+    try:
+        updated_state = await redis_client.transaction(
+            _transition,
+            state_key,
+            value_from_callable=True,
+        )
+    except RedisError:
+        return JSONResponse({"error": "redis unavailable"}, status_code=503)
+
+    try:
+        await _publish_history_entry_event(
+            name,
+            updated_state,
+            event_message,
+            redis_client,
+            tier="operator",
+            kind="reset",
+        )
+    except Exception:
+        pass
+    try:
+        await _app.publish_wake(redis_client, name, "reset")
+    except Exception:
+        _app.logger.warning(
+            "publish_wake failed for %s; daemon will pick up reset on next tick",
+            name,
+            exc_info=True,
+        )
+
+    return JSONResponse({"state": "IDLE", "task_id": task_id})
 
 
 def _reset_keys_for_task(repo_slug: str, task_id: str) -> list[str]:
