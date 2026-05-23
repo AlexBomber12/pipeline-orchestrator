@@ -193,6 +193,24 @@ class _SecondTransactionFailsRedis(_GuardrailRedis):
         return result if value_from_callable else None
 
 
+class _SecondAndLaterTransactionFailsRedis(_GuardrailRedis):
+    def __init__(self, store: dict[str, str] | None = None) -> None:
+        super().__init__(store)
+        self.transactions = 0
+
+    async def transaction(
+        self,
+        callback: Any,
+        *keys: str,
+        value_from_callable: bool = False,
+    ) -> Any:
+        self.transactions += 1
+        if self.transactions >= 2:
+            raise RedisError("down")
+        result = await callback(self)
+        return result if value_from_callable else None
+
+
 class _StateChangesBeforeFinalTransactionRedis(_GuardrailRedis):
     def __init__(self, store: dict[str, str] | None = None) -> None:
         super().__init__(store)
@@ -216,6 +234,42 @@ class _StateChangesBeforeFinalTransactionRedis(_GuardrailRedis):
                 task_file="tasks/PR-999.md",
             )
             self.store["pipeline:example__alpha"] = state.model_dump_json()
+        result = await callback(self)
+        return result if value_from_callable else None
+
+
+class _StateMissingBeforeFinalAcceptTransactionRedis(_GuardrailRedis):
+    def __init__(self, store: dict[str, str] | None = None) -> None:
+        super().__init__(store)
+        self.transactions = 0
+
+    async def transaction(
+        self,
+        callback: Any,
+        *keys: str,
+        value_from_callable: bool = False,
+    ) -> Any:
+        self.transactions += 1
+        if self.transactions == 2:
+            self.store.pop("pipeline:example__alpha", None)
+        result = await callback(self)
+        return result if value_from_callable else None
+
+
+class _BadStateBeforeFinalAcceptTransactionRedis(_GuardrailRedis):
+    def __init__(self, store: dict[str, str] | None = None) -> None:
+        super().__init__(store)
+        self.transactions = 0
+
+    async def transaction(
+        self,
+        callback: Any,
+        *keys: str,
+        value_from_callable: bool = False,
+    ) -> Any:
+        self.transactions += 1
+        if self.transactions == 2:
+            self.store["pipeline:example__alpha"] = "not-json"
         result = await callback(self)
         return result if value_from_callable else None
 
@@ -376,6 +430,11 @@ def test_accept_once_sets_flag_and_clears(
     task_text = (repo_dir / "tasks" / "PR-384.md").read_text(encoding="utf-8")
     assert "status: TODO" in task_text
     assert "blocked_reason" not in task_text
+    state = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
+    assert state.state == PipelineState.IDLE
+    assert state.current_task is None
+    assert state.current_queue is not None
+    assert state.current_queue[0].status == TaskStatus.TODO
     assert redis_client.store[marker_key] == '["PR-999"]'
     assert redis_client.store[legacy_key] == '["PR-888"]'
 
@@ -554,6 +613,57 @@ def test_accept_once_transaction_failure_returns_503(
     assert response.status_code == 503
     task_text = (repo_dir / "tasks" / "PR-384.md").read_text(encoding="utf-8")
     assert "status: ERROR" in task_text
+
+
+@pytest.mark.parametrize(
+    "redis_cls",
+    [
+        _StateMissingBeforeFinalAcceptTransactionRedis,
+        _BadStateBeforeFinalAcceptTransactionRedis,
+        _StateChangesBeforeFinalTransactionRedis,
+    ],
+)
+def test_accept_once_revalidates_final_idle_transition(
+    tmp_path: Path,
+    monkeypatch: Any,
+    redis_cls: type[_GuardrailRedis],
+) -> None:
+    repo_dir, _redis_client = _setup_repo(tmp_path, monkeypatch)
+    source = web_app.aioredis.from_url("", decode_responses=True)
+    redis_client = redis_cls(dict(source.store))
+    redis_client.zsets = dict(source.zsets)
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/repos/example__alpha/tasks/PR-384/guardrail/accept-once"
+        )
+
+    assert response.status_code == 409
+    raw = redis_client.store[cause_key("example__alpha", "PR-384")]
+    assert json.loads(raw)["payload"]["approved_once"] is True
+    task_text = (repo_dir / "tasks" / "PR-384.md").read_text(encoding="utf-8")
+    assert "status: TODO" in task_text
+
+
+def test_accept_once_final_transition_failure_returns_503(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    repo_dir, _redis_client = _setup_repo(tmp_path, monkeypatch)
+    source = web_app.aioredis.from_url("", decode_responses=True)
+    redis_client = _SecondTransactionFailsRedis(dict(source.store))
+    redis_client.zsets = dict(source.zsets)
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/repos/example__alpha/tasks/PR-384/guardrail/accept-once"
+        )
+
+    assert response.status_code == 503
+    task_text = (repo_dir / "tasks" / "PR-384.md").read_text(encoding="utf-8")
+    assert "status: TODO" in task_text
 
 
 def test_accept_once_warns_will_retrigger() -> None:
@@ -858,7 +968,11 @@ def test_guardrail_accept_swallows_delete_and_publish_failure(
     async def fail_marker_cleanup(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("marker failed")
 
+    async def fail_history(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("history failed")
+
     monkeypatch.setattr(web_app, "publish_wake", fail_publish)
+    monkeypatch.setattr(repo_control, "_publish_history_entry_event", fail_history)
     monkeypatch.setattr(
         repo_control,
         "_clear_status_write_failed_marker",
@@ -1097,6 +1211,22 @@ def test_reset_rolls_back_state_when_task_restore_fails(
     state = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
     assert state.state == PipelineState.ERROR
     assert state.error_message == "Guardrail park"
+
+
+def test_reset_final_failure_catches_rollback_redis_error(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    _repo_dir, _redis_client = _setup_repo(tmp_path, monkeypatch)
+    source = web_app.aioredis.from_url("", decode_responses=True)
+    redis_client = _SecondAndLaterTransactionFailsRedis(dict(source.store))
+    redis_client.zsets = dict(source.zsets)
+    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/reset-to-idle")
+
+    assert response.status_code == 503
 
 
 def test_reset_revalidates_reserved_task_before_idle_transition(

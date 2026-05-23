@@ -1889,8 +1889,9 @@ async def accept_guardrail_park_once(
     if cause is None:
         return HTMLResponse(_NO_PENDING_GUARDRAIL, status_code=404)
 
+    state_key = pipeline_state(name)
     try:
-        raw_state = await redis_client.get(pipeline_state(name))
+        raw_state = await redis_client.get(state_key)
     except RedisError:
         return HTMLResponse("Redis unavailable", status_code=503)
     if raw_state is None:
@@ -1926,7 +1927,7 @@ async def accept_guardrail_park_once(
         watched_raw_cause = await pipe.get(cause_key(name, pr_id))
         if _validated_guardrail_cause(watched_raw_cause) is None:
             raise _GuardrailAcceptChanged
-        watched_raw_state = await pipe.get(pipeline_state(name))
+        watched_raw_state = await pipe.get(state_key)
         if watched_raw_state is None:
             raise _GuardrailAcceptChanged
         try:
@@ -1946,7 +1947,7 @@ async def accept_guardrail_park_once(
         await redis_client.transaction(
             _mark_accepted_once,
             cause_key(name, pr_id),
-            pipeline_state(name),
+            state_key,
         )
     except RedisError:
         return HTMLResponse("Redis unavailable", status_code=503)
@@ -1971,12 +1972,76 @@ async def accept_guardrail_park_once(
             )
         return HTMLResponse(f"Failed to update task status: {exc}", status_code=503)
 
+    event_message = f"Operator accepted guardrail once; {pr_id} returned to TODO."
+
+    async def _transition_accept_once(pipe: Any) -> RepoState:
+        raw = await pipe.get(state_key)
+        if raw is None:
+            raise _GuardrailAcceptChanged
+        try:
+            current = RepoState.model_validate_json(raw)
+        except Exception as exc:
+            raise _GuardrailAcceptChanged from exc
+        if (
+            current.state != PipelineState.ERROR
+            or current.current_task is None
+            or current.current_task.pr_id != pr_id
+        ):
+            raise _GuardrailAcceptChanged
+        current.state = PipelineState.IDLE
+        current.user_paused = False
+        current.current_task = None
+        current.current_pr = None
+        current.error_message = None
+        current.skip_ai_error_diagnose = False
+        if current.current_queue is not None:
+            current.current_queue = [
+                task.model_copy(update={"status": TaskStatus.TODO})
+                if task.pr_id == pr_id
+                else task
+                for task in current.current_queue
+            ]
+        _append_history_entry(
+            current,
+            event_message,
+            tier="operator",
+            kind="guardrail_accept_once",
+        )
+        pipe.multi()
+        pipe.set(state_key, current.model_dump_json())
+        return current
+
+    try:
+        updated_state = await redis_client.transaction(
+            _transition_accept_once,
+            state_key,
+            value_from_callable=True,
+        )
+    except RedisError:
+        return HTMLResponse("Redis unavailable", status_code=503)
+    except _GuardrailAcceptChanged:
+        return HTMLResponse(
+            "Concurrent state change detected; please retry the decision",
+            status_code=409,
+        )
+
     try:
         await redis_client.delete(_diagnose_exhausted_key(name, pr_id))
     except Exception:
         pass
     try:
         await _clear_status_write_failed_marker(redis_client, name, pr_id)
+    except Exception:
+        pass
+    try:
+        await _publish_history_entry_event(
+            name,
+            updated_state,
+            event_message,
+            redis_client,
+            tier="operator",
+            kind="guardrail_accept_once",
+        )
     except Exception:
         pass
     try:
@@ -2094,7 +2159,15 @@ async def reset_repo_to_idle(request: Request, name: str) -> JSONResponse:
                 exc_info=True,
             )
         finally:
-            await _rollback_reset_state()
+            try:
+                await _rollback_reset_state()
+            except RedisError:
+                _app.logger.warning(
+                    "Failed to roll back reset state for %s %s",
+                    name,
+                    task_id,
+                    exc_info=True,
+                )
 
     try:
         original_task_text = await asyncio.to_thread(
