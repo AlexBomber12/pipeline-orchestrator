@@ -122,6 +122,12 @@ _DEFERRED_CODER_SWITCH_STATES = {
 
 def _diagnose_exhausted_key(repo_slug: str, task_id: str) -> str:
     return f"diagnose_exhausted:{repo_slug}:{task_id}"
+
+
+def _status_write_failed_key(repo_slug: str) -> str:
+    return f"status_write_failed_tasks:{repo_slug}"
+
+
 _ACTIVE_RUN_STATES = {
     PipelineState.PREFLIGHT,
     PipelineState.CODING,
@@ -305,6 +311,37 @@ async def _await_if_needed(result: Any) -> Any:
     if inspect.isawaitable(result):
         return await result
     return result
+
+
+async def _clear_status_write_failed_marker(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    task_id: str,
+) -> None:
+    key = _status_write_failed_key(repo_slug)
+    raw = await redis_client.get(key)
+    if raw is None:
+        return
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return
+    if not isinstance(decoded, list):
+        return
+    remaining = [item for item in decoded if item != task_id]
+    if len(remaining) == len(decoded):
+        return
+    if remaining:
+        await _await_if_needed(
+            redis_client.set(
+                key,
+                json.dumps(remaining, separators=(",", ":")),
+            )
+        )
+    else:
+        await redis_client.delete(key)
 
 
 async def _reserve_repo_for_retry(
@@ -1668,6 +1705,10 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
             pass
         try:
             await redis_client.delete(_diagnose_exhausted_key(name, pr_id))
+        except Exception:
+            pass
+        try:
+            await _clear_status_write_failed_marker(redis_client, name, pr_id)
         except Exception:
             pass
         try:
