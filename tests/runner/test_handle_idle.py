@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 from src.coders import claude as claude_plugin_module
+from src.config import FeatureFlags
 from src.daemon import git_ops as git_ops_module
 from src.daemon import main_commit_audit
 from src.daemon import runner as runner_module
@@ -400,6 +401,44 @@ def test_select_next_task_clears_crashed_marker_when_frontmatter_is_todo(
     assert task.pr_id == "PR-001"
     assert task.status == TaskStatus.TODO
     assert "PR-001" not in runner._crashed_task_pr_ids
+
+
+def test_select_next_task_keeps_status_write_failed_task_in_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.undo()
+    task_dir = tmp_path / "tasks"
+    task_dir.mkdir()
+    (task_dir / "PR-001.md").write_text(
+        "---\n"
+        "status: TODO\n"
+        "---\n\n"
+        "# PR-001: Status write failed\n"
+        "Branch: pr-001-status-write-failed\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "_resolve_merged_state",
+        lambda *args, **kwargs: _merged_state(),
+    )
+
+    runner = h._make_runner(
+        feature_flags=FeatureFlags(use_single_error_exit=True)
+    )
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+    runner._status_write_failed_task_pr_ids.add("PR-001")
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is None
+    assert runner._idle_dag_statuses["PR-001"] == TaskStatus.ERROR
 
 
 def test_handle_idle_sets_queue_counters_with_mixed_statuses(

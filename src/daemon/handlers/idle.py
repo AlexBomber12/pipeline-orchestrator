@@ -499,6 +499,9 @@ class IdleMixin:
             }
             if self.repo_config.feature_flags.use_single_error_exit:
                 for pr_id in list(statuses.keys()):
+                    if pr_id in self._status_write_failed_task_pr_ids:
+                        statuses[pr_id] = TaskStatus.ERROR
+                        continue
                     record = await self._suppression_record_for_task(pr_id)
                     if record is None:
                         continue
