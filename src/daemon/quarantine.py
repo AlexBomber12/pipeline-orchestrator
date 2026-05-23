@@ -38,8 +38,8 @@ def apply_quarantine_label_for_violation(
 ) -> bool:
     """Apply a quarantine label and write a GUARDRAIL comment on the PR.
 
-    GitHub-side writes are best effort. The durable daemon protection is
-    ``RepoState.quarantined_prs`` plus the MERGE gate.
+    GitHub-side writes are best effort. The durable daemon protection is the
+    guardrail suppression record plus the MERGE gate.
     """
     label = quarantine_label_for_category(violation.category)
     try:

@@ -41,9 +41,6 @@
         <dt class="text-gray-400">Attempt count</dt>
         <dd class="font-mono">{{ diagnostic.attempt_count or 0 }}</dd>
 
-        <dt class="text-gray-400">Status write failed</dt>
-        <dd class="font-mono">{{ "yes" if diagnostic.status_write_failed else "no" }}</dd>
-
         <dt class="text-gray-400">Skip AI diagnose</dt>
         <dd class="font-mono">{{ "yes" if diagnostic.skip_ai_error_diagnose else "no" }}</dd>
 

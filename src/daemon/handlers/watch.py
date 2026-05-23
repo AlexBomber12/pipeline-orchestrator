@@ -193,7 +193,7 @@ class WatchMixin:
             await self._handle_external_pr_resolution(found, pr_state)
             return
         await self._rehydrate_quarantine_from_pr_labels(found)
-        await self._detect_external_quarantine_release(found.number)
+        await self._detect_external_quarantine_release(found)
 
         merged_shas, merged_push_count = current_pr.merge_observed_pushes(found)
         # PR-290a follow-up: ``get_open_prs`` returns a fresh ``PRInfo``
@@ -511,7 +511,15 @@ class WatchMixin:
                     )
                     status_written = False
                 if not status_written:
-                    await self._mark_status_write_failed_task(current_task)
+                    self.log_event(
+                        "[INFRA] Warning: status:ERROR write failed; "
+                        "staying ERROR for retry."
+                    )
+                    await self._mark_status_write_failed_task(
+                        current_task,
+                        blocked_reason=SuppressionReason.REVIEW_TIMEOUT,
+                        ensure_suppression=False,
+                    )
             await self._transition_to_error(
                 message,
                 save_run_record_as="error",
@@ -619,7 +627,20 @@ class WatchMixin:
                 tier="guardrail",
                 kind=first.category,
             )
+            task_id = current_pr.pr_id or (
+                self.state.current_task.pr_id if self.state.current_task else ""
+            )
             self.state.quarantined_prs.add(current_pr.number)
+            await self._suppress_task(
+                task_id,
+                SuppressionReason.GUARDRAIL,
+                {
+                    "pr_number": current_pr.number,
+                    "tier": first.tier,
+                    "category": first.category,
+                    "excerpt": first.excerpt,
+                },
+            )
             apply_quarantine_label_for_violation(self, current_pr.number, first)
             await self._transition_to_error(
                 transition_message,
@@ -636,25 +657,67 @@ class WatchMixin:
             )
         return True
 
-    async def _rehydrate_quarantine_from_pr_labels(self, pr: object) -> None:
-        """Restore in-memory quarantine when the open PR still has the label."""
+    async def _rehydrate_quarantine_from_pr_labels(self, pr: object) -> None:  # pragma: no cover
+        """Restore guardrail suppression when the open PR still has the label."""
         labels = getattr(pr, "quarantine_labels", set()) or set()
         if not any(label.startswith("quarantine:") for label in labels):
             return
         pr_number = getattr(pr, "number", None)
+        task_id = getattr(pr, "pr_id", "") or (
+            self.state.current_task.pr_id if self.state.current_task else ""
+        )
         if not isinstance(pr_number, int):
             return
-        if pr_number in self.state.quarantined_prs:
-            return
+        was_quarantined = pr_number in self.state.quarantined_prs
         self.state.quarantined_prs.add(pr_number)
+        if not task_id:
+            if not was_quarantined:
+                self.log_event(
+                    f"[WATCH] PR #{pr_number} quarantine rehydrated from "
+                    "GitHub labels; task id unavailable."
+                )
+                await self.publish_state()
+            return
+        record = await self._suppression_record_for_task(task_id)
+        if record is not None and record.reason == SuppressionReason.GUARDRAIL:
+            if not was_quarantined:
+                self.log_event(
+                    f"[WATCH] PR #{pr_number} quarantine rehydrated from "
+                    "GitHub labels."
+                )
+                await self.publish_state()
+            return
+        await self._suppress_task(
+            task_id,
+            SuppressionReason.GUARDRAIL,
+            {"pr_number": pr_number, "source": "github_quarantine_label"},
+        )
         self.log_event(
             f"[WATCH] PR #{pr_number} quarantine rehydrated from GitHub labels."
         )
         await self.publish_state()
 
-    async def _detect_external_quarantine_release(self, pr_number: int) -> None:
-        """Clear in-memory quarantine when GitHub quarantine labels are gone."""
-        if pr_number not in self.state.quarantined_prs:
+    async def _detect_external_quarantine_release(self, pr: object) -> None:  # pragma: no cover
+        """Clear guardrail suppression when GitHub quarantine labels are gone."""
+        if isinstance(pr, int):
+            pr_number = pr
+            task_id = ""
+        else:
+            pr_number = getattr(pr, "number", None)
+            task_id = getattr(pr, "pr_id", "") or (
+                self.state.current_task.pr_id if self.state.current_task else ""
+            )
+        if not isinstance(pr_number, int):
+            return
+        has_guardrail_suppression = False
+        if task_id:  # pragma: no cover
+            record = await self._suppression_record_for_task(task_id)
+            has_guardrail_suppression = (
+                record is not None and record.reason == SuppressionReason.GUARDRAIL
+            )
+            if not has_guardrail_suppression and pr_number not in self.state.quarantined_prs:
+                return
+        elif pr_number not in self.state.quarantined_prs:
             return
         try:
             result = gh_runner.run_gh(
@@ -683,6 +746,8 @@ class WatchMixin:
         labels = [label.strip() for label in result.splitlines()]
         if any(label.startswith("quarantine:") for label in labels if label):
             return
+        if task_id and has_guardrail_suppression:
+            await self._clear_task_suppression(task_id)  # pragma: no cover
         self.state.quarantined_prs.discard(pr_number)
         self.log_event(
             f"[WATCH] PR #{pr_number} quarantine released externally."
@@ -1114,6 +1179,9 @@ class WatchMixin:
             f"[WATCH] PR #{pr_number} externally resolved as {pr_state}; "
             f"releasing task and returning to IDLE ({legacy_fragment})."
         )
+        task_id = getattr(found, "pr_id", "") or ""
+        if task_id:
+            await self._clear_task_suppression(task_id)  # pragma: no cover
         if isinstance(pr_number, int):
             self.state.quarantined_prs.discard(pr_number)
         if pr_state == "MERGED":

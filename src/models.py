@@ -228,6 +228,7 @@ class RepoState(BaseModel):
     # past a transition out of ERROR and silently disable normal
     # ``handle_error`` dispatch on a later unrelated error.
     skip_ai_error_diagnose: bool = False
+    quarantined_prs: set[int] = Field(default_factory=set)
     # PR-328: typed list of currently-active inhibitors, populated by
     # ``publish_state`` via ``derive_active_inhibitors``. Purely
     # informational at this point — dashboard JSON and template context
@@ -241,7 +242,6 @@ class RepoState(BaseModel):
     # the state machine leaves MERGE. ``None`` outside MERGE.
     merge_phase: str | None = None
     upload_pending_count: int = 0
-    quarantined_prs: set[int] = Field(default_factory=set)
 
     @field_validator("state", mode="before")
     @classmethod

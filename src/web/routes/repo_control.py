@@ -43,9 +43,7 @@ from src.github import prs as gh_prs
 from src.inhibitor import derive_active_inhibitors
 from src.keyspace import (
     control_stop,
-    legacy_recovered_tasks,
     pipeline_state,
-    status_write_failed_tasks,
 )
 from src.models import PipelineState, QueueTask, RepoState, TaskStatus
 from src.queue_parser import (
@@ -54,6 +52,7 @@ from src.queue_parser import (
     write_frontmatter_status,
 )
 from src.subsource_registry import SuppressionReason
+from src.suppression.redis_store import RedisSuppressionStore
 from src.web.services.coder import _effective_coder_name
 from src.web.services.repo_state import (
     _default_repo_state,
@@ -85,6 +84,37 @@ def _split_gh_label_output(result: object) -> list[str]:
         return [str(label).strip() for label in result if str(label).strip()]
     return []
 
+
+async def _suppressed_task_ids_for_pr(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    pr_number: int,
+    fallback_task_ids: set[str] | None = None,
+) -> set[str]:
+    """Return suppressed task ids whose detail maps them to ``pr_number``."""
+    try:
+        records = await RedisSuppressionStore(redis_client).list_suppressed(
+            repo_slug,
+            since=datetime.fromtimestamp(0, tz=timezone.utc),
+        )
+    except Exception:
+        return set()
+    task_ids: set[str] = set()
+    fallback_task_ids = fallback_task_ids or set()
+    for record in records:
+        if record.reason != SuppressionReason.GUARDRAIL:
+            continue
+        detail_pr = record.detail.get("pr_number")
+        try:
+            detail_pr_number = int(detail_pr)
+        except (TypeError, ValueError):
+            if record.task_id in fallback_task_ids:
+                task_ids.add(record.task_id)
+            continue
+        if detail_pr_number == pr_number:
+            task_ids.add(record.task_id)
+    return task_ids
+
 _DEFERRED_CODER_SWITCH_STATES = {
     PipelineState.CODING,
     PipelineState.WATCH,
@@ -96,6 +126,12 @@ _DEFERRED_CODER_SWITCH_STATES = {
 
 def _diagnose_exhausted_key(repo_slug: str, task_id: str) -> str:
     return f"diagnose_exhausted:{repo_slug}:{task_id}"
+
+
+def _status_write_failed_key(repo_slug: str) -> str:
+    return f"status_write_failed_tasks:{repo_slug}"
+
+
 _ACTIVE_RUN_STATES = {
     PipelineState.PREFLIGHT,
     PipelineState.CODING,
@@ -279,6 +315,37 @@ async def _await_if_needed(result: Any) -> Any:
     if inspect.isawaitable(result):
         return await result
     return result
+
+
+async def _clear_status_write_failed_marker(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    task_id: str,
+) -> None:
+    for key in (_status_write_failed_key(repo_slug), f"recovered_tasks:{repo_slug}"):
+        raw = await redis_client.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(decoded, list):
+            continue
+        remaining = [item for item in decoded if item != task_id]
+        if len(remaining) == len(decoded):
+            continue
+        if remaining:
+            await _await_if_needed(
+                redis_client.set(
+                    key,
+                    json.dumps(remaining, separators=(",", ":")),
+                )
+            )
+        else:
+            await redis_client.delete(key)
 
 
 async def _reserve_repo_for_retry(
@@ -465,32 +532,6 @@ async def _release_retry_reservation(
 ) -> None:
     try:
         await _decrement_retry_count(redis_client, repo_slug, task_id)
-    except Exception:
-        pass
-
-
-async def _clear_status_write_failed_retry_marker(
-    redis_client: aioredis.Redis,
-    repo_slug: str,
-    task_id: str,
-) -> None:
-    """Remove a successfully retried task from the status-write-failed set."""
-    keys = (status_write_failed_tasks(repo_slug), legacy_recovered_tasks(repo_slug))
-    try:
-        for key in keys:
-            decoded = _decode_redis_text(await redis_client.get(key))
-            if decoded is None:
-                continue
-            task_ids = json.loads(decoded)
-            if not isinstance(task_ids, list):
-                continue
-            if all(str(item) != task_id for item in task_ids):
-                continue
-            remaining = sorted({str(item) for item in task_ids if str(item) != task_id})
-            if remaining:
-                await _await_if_needed(redis_client.set(key, json.dumps(remaining)))
-            else:
-                await _await_if_needed(redis_client.delete(key))
     except Exception:
         pass
 
@@ -1186,13 +1227,56 @@ async def release_quarantine(
         state = RepoState.model_validate_json(raw_state)
     except Exception:
         return JSONResponse({"error": "repository state unavailable"}, status_code=503)
-    if pr_number not in state.quarantined_prs:
-        return JSONResponse({"status": "not_quarantined", "pr": pr_number})
 
     try:
         owner_repo = gh_runner.get_repo_full_name(repo_config.url)
     except ValueError:
         owner_repo = None
+    pr_branch: str | None = None
+    if owner_repo is not None:
+        try:
+            raw_branch = gh_runner.run_gh(
+                [
+                    "pr",
+                    "view",
+                    str(pr_number),
+                    "--json",
+                    "headRefName",
+                    "-q",
+                    ".headRefName",
+                ],
+                repo=owner_repo,
+            )
+            if isinstance(raw_branch, str) and raw_branch.strip():
+                pr_branch = raw_branch.strip()
+        except Exception:
+            pr_branch = None
+
+    fallback_task_ids: set[str] = set()
+    if (
+        state.current_pr is not None
+        and state.current_pr.number == pr_number
+        and state.current_pr.pr_id is not None
+    ):
+        fallback_task_ids.add(state.current_pr.pr_id)
+    if pr_branch and state.current_queue:
+        fallback_task_ids.update(
+            task.pr_id
+            for task in state.current_queue
+            if task.branch == pr_branch
+        )
+    task_ids: set[str] = set()
+    task_ids.update(
+        await _suppressed_task_ids_for_pr(
+            redis_client,
+            name,
+            pr_number,
+            fallback_task_ids=fallback_task_ids,
+        )
+    )
+    if not task_ids and pr_number not in state.quarantined_prs:
+        return JSONResponse({"status": "not_quarantined", "pr": pr_number})
+
     if owner_repo is not None:
         try:
             labels = _split_gh_label_output(
@@ -1236,8 +1320,6 @@ async def release_quarantine(
         if raw is None:
             return None
         current = RepoState.model_validate_json(raw)
-        if pr_number not in current.quarantined_prs:
-            return current
         current.quarantined_prs.discard(pr_number)
         _append_history_entry(
             current,
@@ -1257,6 +1339,11 @@ async def release_quarantine(
         )
     except Exception:
         return JSONResponse({"error": "failed to update state"}, status_code=503)
+    for task_id in task_ids:
+        try:
+            await delete_cancellation_cause(redis_client, name, task_id)
+        except Exception:
+            pass
 
     write_operator_action_audit(
         action="quarantine_release",
@@ -1663,7 +1750,10 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
             await redis_client.delete(_diagnose_exhausted_key(name, pr_id))
         except Exception:
             pass
-        await _clear_status_write_failed_retry_marker(redis_client, name, pr_id)
+        try:
+            await _clear_status_write_failed_marker(redis_client, name, pr_id)
+        except Exception:
+            pass
         try:
             await _app.publish_wake(redis_client, name, "retry")
         except Exception:
@@ -1745,17 +1835,12 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
         )
 
 
-def _reset_status_write_failed_retry_key(repo_slug: str, task_id: str) -> str:
-    return f"metrics:status_write_failed_retry:{repo_slug}:{task_id}"
-
-
 def _reset_keys_for_task(repo_slug: str, task_id: str) -> list[str]:
     return [
         cause_key(repo_slug, task_id),
         _retry_count_key(repo_slug, task_id),
         _retry_fingerprint_key(repo_slug, task_id),
         current_run_started_at_key(repo_slug, task_id),
-        _reset_status_write_failed_retry_key(repo_slug, task_id),
     ]
 
 
@@ -1765,13 +1850,11 @@ def _reset_stuck_state_keys(repo_slug: str, task_id: str) -> list[str]:
     # Treating them as "stuck" state would let reset re-queue completed work
     # whose only Redis footprint is normal retry history. Reset must only
     # authorize on per-task state the daemon actively keeps to indicate a
-    # task is stuck (cancellation cause, in-flight run marker, parked-task
-    # fallback marker). Retry-history keys are still cleared opportunistically
-    # in _reset_keys_for_task.
+    # task is stuck (cancellation cause, in-flight run marker). Retry-history
+    # keys are still cleared opportunistically in _reset_keys_for_task.
     return [
         cause_key(repo_slug, task_id),
         current_run_started_at_key(repo_slug, task_id),
-        _reset_status_write_failed_retry_key(repo_slug, task_id),
     ]
 
 
@@ -1786,42 +1869,6 @@ async def _reset_has_any_redis_state(
     score = await redis_client.zscore(index_key(repo_slug), task_id)
     if score is not None:
         return True
-    return await _reset_has_status_write_failed_marker(
-        redis_client, repo_slug, task_id
-    )
-
-
-async def _reset_has_status_write_failed_marker(
-    redis_client: aioredis.Redis,
-    repo_slug: str,
-    task_id: str,
-) -> bool:
-    # Daemon can park a task via status_write_failed_tasks:{repo} or the
-    # legacy recovered_tasks:{repo} set alone — the per-task fallback keys
-    # may be absent. If the eligibility probe ignored that, reset would
-    # exit early with 400 and never clear the marker, leaving the task
-    # forced back to ERROR on the next dispatch.
-    for key in (
-        status_write_failed_tasks(repo_slug),
-        legacy_recovered_tasks(repo_slug),
-    ):
-        raw = await redis_client.get(key)
-        try:
-            decoded = _decode_redis_text(raw)
-        except UnicodeDecodeError:
-            # Corrupt non-UTF-8 bytes mirror the invalid-JSON path:
-            # treat as absent so reset stays usable for recovery.
-            continue
-        if decoded is None:
-            continue
-        try:
-            task_ids = json.loads(decoded)
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(task_ids, list):
-            continue
-        if any(str(item) == task_id for item in task_ids):
-            return True
     return False
 
 
@@ -2058,14 +2105,6 @@ async def reset_task(
                     )
         except RedisError:
             return JSONResponse({"error": "redis unavailable"}, status_code=503)
-
-        # PR-334: scheduler gates on the persisted status-write-failed set
-        # (status_write_failed_tasks:{repo} / recovered_tasks:{repo}); the
-        # per-task fallback marker dropped above is never read. Clear the
-        # persisted set entry so a reset task can be dispatched again. The
-        # helper swallows Redis errors; treat marker cleanup as best-effort
-        # in line with retry's behavior.
-        await _clear_status_write_failed_retry_marker(redis_client, name, task_id)
 
         closed_pr_number: int | None = None
 

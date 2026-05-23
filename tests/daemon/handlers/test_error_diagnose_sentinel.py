@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 import pytest
+from src.config import FeatureFlags
 from src.models import PipelineState, QueueTask, TaskStatus
 from tests.runner import _helpers as h
 
@@ -120,6 +121,28 @@ def test_clear_sentinel_helper_idempotent() -> None:
     assert runner.redis.deleted == [_sentinel_key(runner, "PR-001")]
 
 
+def test_clear_sentinel_helper_deletes_redis_key_with_single_error_exit() -> None:
+    runner = h._make_runner(feature_flags=FeatureFlags(use_single_error_exit=True))
+    runner._error_diagnose_count = 3
+
+    asyncio.run(runner._mark_diagnose_exhausted("PR-001"))
+    assert _sentinel_key(runner, "PR-001") in runner.redis.store
+
+    asyncio.run(runner._clear_diagnose_exhausted("PR-001"))
+
+    assert _sentinel_key(runner, "PR-001") not in runner.redis.store
+    assert asyncio.run(runner._suppression_record_for_task("PR-001")) is None
+
+
+def test_single_error_exit_ignores_stale_sentinel_without_suppression() -> None:
+    runner = h._make_runner(feature_flags=FeatureFlags(use_single_error_exit=True))
+    key = _sentinel_key(runner, "PR-001")
+    runner.redis.store[key] = "2026-05-20T00:00:00+00:00"
+
+    assert asyncio.run(runner._is_diagnose_exhausted("PR-001")) is False
+    assert key not in runner.redis.store
+
+
 def test_clear_error_message_on_recovery_clears_sentinel() -> None:
     runner = _make_error_runner()
     key = _sentinel_key(runner, "PR-001")
@@ -134,6 +157,25 @@ def test_clear_error_message_on_recovery_clears_sentinel() -> None:
 
     assert key not in runner.redis.store
     assert key in runner.redis.deleted
+
+
+def test_handle_error_fix_resets_diagnose_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    runner = _make_error_runner()
+    runner._error_diagnose_count = 2
+
+    async def _diagnose(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        return 0, "FIX\nRoot cause found", ""
+
+    monkeypatch.setattr(runner._registry.get("claude"), "diagnose_error", _diagnose)
+    monkeypatch.setattr(runner._registry.get("codex"), "diagnose_error", _diagnose)
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner._error_diagnose_count == 0
 
 
 def test_clear_error_message_on_recovery_ignores_sentinel_delete_failure() -> None:

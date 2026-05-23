@@ -21,11 +21,7 @@ from src.cancellation.storage import (
     current_run_started_at_key,
     index_key,
 )
-from src.keyspace import (
-    legacy_recovered_tasks,
-    pipeline_state,
-    status_write_failed_tasks,
-)
+from src.keyspace import pipeline_state
 from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
 from src.web import app as web_app
 from src.web.app import app
@@ -38,10 +34,6 @@ def _retry_count_key(slug: str, task_id: str) -> str:
 
 def _retry_fp_key(slug: str, task_id: str) -> str:
     return f"metrics:retry_fingerprint:{slug}:{task_id}"
-
-
-def _swrf_key(slug: str, task_id: str) -> str:
-    return f"metrics:status_write_failed_retry:{slug}:{task_id}"
 
 
 class _ResetPipeline:
@@ -219,7 +211,6 @@ def _seed_all_keys(redis_client: _ResetRedis, slug: str, task_id: str) -> list[s
         _retry_count_key(slug, task_id),
         _retry_fp_key(slug, task_id),
         current_run_started_at_key(slug, task_id),
-        _swrf_key(slug, task_id),
     ]
     for key in keys:
         redis_client.store[key] = "seed"
@@ -1396,109 +1387,6 @@ def test_reset_returns_503_when_reservation_redis_error(
     assert response.json() == {"error": "redis unavailable"}
 
 
-def test_reset_clears_status_write_failed_set_entry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The scheduler reads ``status_write_failed_tasks:{repo}`` to force
-    parked tasks back to ERROR. Reset must drop the task PR id from that
-    set so the daemon can dispatch the task again."""
-    _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _ResetRedis()
-    _seed_all_keys(redis_client, "example__alpha", "PR-322")
-    swf_key = status_write_failed_tasks("example__alpha")
-    redis_client.store[swf_key] = json.dumps(["PR-322", "PR-999"])
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-    monkeypatch.setattr(repo_control.subprocess, "run", _ok_subprocess)
-
-    with TestClient(app) as client:
-        response = client.post("/api/reset-task/example__alpha/PR-322")
-
-    assert response.status_code == 200
-    assert json.loads(redis_client.store[swf_key]) == ["PR-999"]
-
-
-def test_reset_deletes_status_write_failed_set_when_last_member(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """When the reset task is the only member of the persisted set, the
-    whole key must be deleted so the scheduler stops forcing the parked
-    bucket."""
-    _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _ResetRedis()
-    _seed_all_keys(redis_client, "example__alpha", "PR-322")
-    swf_key = status_write_failed_tasks("example__alpha")
-    redis_client.store[swf_key] = json.dumps(["PR-322"])
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-    monkeypatch.setattr(repo_control.subprocess, "run", _ok_subprocess)
-
-    with TestClient(app) as client:
-        response = client.post("/api/reset-task/example__alpha/PR-322")
-
-    assert response.status_code == 200
-    assert swf_key not in redis_client.store
-
-
-def test_reset_clears_legacy_recovered_tasks_set_entry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Pre-PR-281 deployments persist the marker under ``recovered_tasks``;
-    reset must also drop the task id from that legacy key."""
-    _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _ResetRedis()
-    _seed_all_keys(redis_client, "example__alpha", "PR-322")
-    legacy_key = legacy_recovered_tasks("example__alpha")
-    redis_client.store[legacy_key] = json.dumps(["PR-322"])
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-    monkeypatch.setattr(repo_control.subprocess, "run", _ok_subprocess)
-
-    with TestClient(app) as client:
-        response = client.post("/api/reset-task/example__alpha/PR-322")
-
-    assert response.status_code == 200
-    assert legacy_key not in redis_client.store
-
-
-def test_reset_proceeds_when_only_status_write_failed_marker_present(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The daemon can park a task using only ``status_write_failed_tasks``
-    (per-task fallback keys absent, cancellation zset empty, frontmatter
-    already TODO). The reset endpoint must still clear that marker so the
-    task can be dispatched again instead of bailing out with 400."""
-    _write_config_and_task(tmp_path, monkeypatch, status="TODO")
-    redis_client = _ResetRedis()
-    swf_key = status_write_failed_tasks("example__alpha")
-    redis_client.store[swf_key] = json.dumps(["PR-322"])
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-    monkeypatch.setattr(repo_control.subprocess, "run", _ok_subprocess)
-
-    with TestClient(app) as client:
-        response = client.post("/api/reset-task/example__alpha/PR-322")
-
-    assert response.status_code == 200
-    assert swf_key not in redis_client.store
-
-
-def test_reset_proceeds_when_only_legacy_recovered_marker_present(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Same eligibility guard as the status-write-failed case, but for
-    pre-PR-281 deployments that still write the legacy
-    ``recovered_tasks:{repo}`` key."""
-    _write_config_and_task(tmp_path, monkeypatch, status="TODO")
-    redis_client = _ResetRedis()
-    legacy_key = legacy_recovered_tasks("example__alpha")
-    redis_client.store[legacy_key] = json.dumps(["PR-322"])
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-    monkeypatch.setattr(repo_control.subprocess, "run", _ok_subprocess)
-
-    with TestClient(app) as client:
-        response = client.post("/api/reset-task/example__alpha/PR-322")
-
-    assert response.status_code == 200
-    assert legacy_key not in redis_client.store
-
-
 def test_reset_proceeds_when_only_cancellation_index_entry_present(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1516,77 +1404,6 @@ def test_reset_proceeds_when_only_cancellation_index_entry_present(
 
     assert response.status_code == 200
     assert "PR-322" not in redis_client.zsets[index_key("example__alpha")]
-
-
-def test_reset_skips_invalid_json_parked_marker(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A corrupt JSON payload in the parked-task set must not crash the
-    eligibility probe; we fall through as if the marker were absent."""
-    _write_config_and_task(tmp_path, monkeypatch, status="TODO")
-    redis_client = _ResetRedis()
-    redis_client.store[status_write_failed_tasks("example__alpha")] = "{not json"
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    with TestClient(app) as client:
-        response = client.post("/api/reset-task/example__alpha/PR-322")
-
-    assert response.status_code == 400
-
-
-def test_reset_skips_invalid_utf8_parked_marker(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Corrupt non-UTF-8 bytes in the parked-task set must not crash the
-    eligibility probe; the marker is treated as absent (matches the
-    invalid-JSON path) so reset still returns 400 instead of 500."""
-    _write_config_and_task(tmp_path, monkeypatch, status="TODO")
-    redis_client = _ResetRedis()
-    redis_client.store[status_write_failed_tasks("example__alpha")] = b"\xff\xfe\x00bad"
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    with TestClient(app) as client:
-        response = client.post("/api/reset-task/example__alpha/PR-322")
-
-    assert response.status_code == 400
-
-
-def test_reset_skips_non_list_parked_marker(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """If the marker decodes to something other than a list (corrupt
-    deployment), the probe ignores it instead of throwing."""
-    _write_config_and_task(tmp_path, monkeypatch, status="TODO")
-    redis_client = _ResetRedis()
-    redis_client.store[status_write_failed_tasks("example__alpha")] = json.dumps(
-        {"task": "PR-322"}
-    )
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    with TestClient(app) as client:
-        response = client.post("/api/reset-task/example__alpha/PR-322")
-
-    assert response.status_code == 400
-
-
-def test_reset_returns_400_when_parked_marker_belongs_to_other_task(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Marker membership must be task-scoped: a parked entry for a
-    different task id does not unlock reset for this one."""
-    _write_config_and_task(tmp_path, monkeypatch, status="TODO")
-    redis_client = _ResetRedis()
-    swf_key = status_write_failed_tasks("example__alpha")
-    redis_client.store[swf_key] = json.dumps(["PR-999"])
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    with TestClient(app) as client:
-        response = client.post("/api/reset-task/example__alpha/PR-322")
-
-    assert response.status_code == 400
-    assert response.json()["error"] == (
-        "task is TODO with no stuck state, nothing to reset"
-    )
 
 
 def test_reset_succeeds_without_commit_when_checkout_leaves_task_todo(

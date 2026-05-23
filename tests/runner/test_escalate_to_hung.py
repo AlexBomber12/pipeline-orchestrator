@@ -1,13 +1,4 @@
-"""``_commit_and_park_in_error`` primitive + status-write fallback tests.
-
-PR-317 deleted the prior ``_escalate_and_skip`` primitive. The remaining
-tests in this file cover (a) the status-write fallback bookkeeping that
-``_commit_and_park_in_error`` relies on, (b) the merge-side
-``_commit_task_status_change`` durability path, and (c) the few
-filesystem-level commit guarantees that span multiple call sites.
-The primitive-direct behavior is now exercised in
-``test_commit_and_park_in_error.py``.
-"""
+"""Merge-side task status durability and filesystem commit guarantees."""
 
 from __future__ import annotations
 
@@ -17,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from src.keyspace import status_write_failed_tasks
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 from src.subsource_registry import SuppressionReason
 
@@ -100,164 +90,6 @@ def _patch_label_calls(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     return gh_calls
-
-
-def test_commit_and_park_in_error_sets_status_write_fallback_when_commit_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A failed task status write must still park the task until re-upload."""
-    _patch_label_calls(monkeypatch)
-    runner = h._make_runner()
-    runner.state.current_pr = PRInfo(number=501, branch="pr-501")
-    runner.state.current_task = QueueTask(
-        pr_id="PR-501",
-        title="t",
-        status=TaskStatus.DOING,
-        branch="pr-501",
-        task_file="tasks/PR-501.md",
-    )
-    _install_publish_state_spy(runner)
-
-    async def fake_commit(*args: Any, **kwargs: Any) -> bool:
-        return False
-
-    monkeypatch.setattr(runner, "_commit_task_status_change", fake_commit)
-
-    asyncio.run(
-        runner._commit_and_park_in_error(
-            "park after write failure",
-            subsource="infra_failure",
-        )
-    )
-
-    assert runner.state.state == PipelineState.ERROR
-    assert runner._status_write_failed_task_pr_ids == {"PR-501"}
-    assert runner.redis.store[status_write_failed_tasks(runner.name)] == (
-        '["PR-501"]'
-    )
-    assert any(
-        "using in-memory ERROR fallback for PR-501" in entry["event"]
-        for entry in runner.state.history
-    )
-
-
-def test_mark_status_write_failed_task_ignores_missing_pr_id() -> None:
-    runner = h._make_runner()
-
-    asyncio.run(runner._mark_status_write_failed_task(object()))
-
-    assert runner._status_write_failed_task_pr_ids == set()
-    assert runner.state.history == []
-
-
-def test_persist_status_write_failed_task_ids_deletes_empty_set() -> None:
-    runner = h._make_runner()
-    key = status_write_failed_tasks(runner.name)
-    runner.redis.store[key] = '["PR-001"]'
-
-    asyncio.run(runner._persist_status_write_failed_task_pr_ids())
-
-    assert key not in runner.redis.store
-    assert key in runner.redis.deleted
-
-
-def test_persist_status_write_failed_task_ids_logs_redis_failure() -> None:
-    runner = h._make_runner()
-
-    async def fail_delete(key: str) -> int:
-        raise RuntimeError("redis down")
-
-    runner.redis.delete = fail_delete  # type: ignore[method-assign]
-
-    asyncio.run(runner._persist_status_write_failed_task_pr_ids())
-
-    assert runner._status_write_failed_task_pr_ids_persist_failed is True
-    assert any(
-        "failed to persist status-write fallback markers: redis down"
-        in entry["event"]
-        for entry in runner.state.history
-    )
-
-
-@pytest.mark.parametrize(
-    "raw",
-    [
-        b'["PR-001", "", 12, "PR-002"]',
-        "",
-        "{not json",
-        '{"not":"a list"}',
-    ],
-)
-def test_hydrate_status_write_failed_task_ids_handles_stored_shapes(
-    raw: bytes | str,
-) -> None:
-    runner = h._make_runner()
-    runner.redis.store[status_write_failed_tasks(runner.name)] = raw  # type: ignore[assignment]
-
-    asyncio.run(runner._hydrate_status_write_failed_task_pr_ids())
-
-    if isinstance(raw, bytes):
-        assert runner._status_write_failed_task_pr_ids == {"PR-001", "PR-002"}
-    else:
-        assert runner._status_write_failed_task_pr_ids == set()
-
-
-def test_hydrate_status_write_failed_task_ids_replaces_stale_memory() -> None:
-    runner = h._make_runner()
-    runner._status_write_failed_task_pr_ids = {"PR-OLD"}
-    runner.redis.store[status_write_failed_tasks(runner.name)] = '["PR-NEW"]'
-
-    asyncio.run(runner._hydrate_status_write_failed_task_pr_ids())
-
-    assert runner._status_write_failed_task_pr_ids == {"PR-NEW"}
-
-
-def test_hydrate_status_write_failed_task_ids_keeps_memory_on_missing_keys() -> None:
-    runner = h._make_runner()
-    runner._status_write_failed_task_pr_ids = {"PR-OLD"}
-    runner._status_write_failed_task_pr_ids_persist_failed = True
-
-    asyncio.run(runner._hydrate_status_write_failed_task_pr_ids())
-
-    assert runner._status_write_failed_task_pr_ids == {"PR-OLD"}
-
-
-def test_hydrate_status_write_failed_task_ids_keeps_memory_on_redis_failure() -> None:
-    runner = h._make_runner()
-    runner._status_write_failed_task_pr_ids = {"PR-OLD"}
-
-    async def fail_get(key: str) -> str | None:
-        raise RuntimeError("redis down")
-
-    runner.redis.get = fail_get  # type: ignore[method-assign]
-
-    asyncio.run(runner._hydrate_status_write_failed_task_pr_ids())
-
-    assert runner._status_write_failed_task_pr_ids == {"PR-OLD"}
-
-
-def test_clear_status_write_failed_task_ids_logs_legacy_delete_failure() -> None:
-    runner = h._make_runner()
-    runner._status_write_failed_task_pr_ids.add("PR-001")
-    legacy_key = status_write_failed_tasks(runner.name).replace(
-        "status_write_failed_tasks:",
-        "recovered_tasks:",
-    )
-
-    async def fail_delete(key: str) -> int:
-        raise RuntimeError("redis down")
-
-    runner.redis.delete = fail_delete  # type: ignore[method-assign]
-
-    asyncio.run(runner._clear_status_write_failed_task_ids({"PR-001"}))
-
-    assert runner._status_write_failed_task_pr_ids == set()
-    assert runner.redis.store[legacy_key] == "[]"
-    assert any(
-        "failed to clear legacy status-write fallback markers: redis down"
-        in entry["event"]
-        for entry in runner.state.history
-    )
 
 
 def test_merge_writes_status_done_to_file(

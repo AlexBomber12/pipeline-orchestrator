@@ -23,6 +23,7 @@ from src.daemon import git_ops
 from src.diagnosis import parse_diagnosis
 from src.models import PipelineState
 from src.retry import retry_transient
+from src.subsource_registry import SuppressionReason
 
 logger = logging.getLogger(__name__)
 _CLAUDE_CLI_COAUTHOR = "Co-authored-by: Claude CLI <noreply@anthropic.com>"
@@ -162,9 +163,7 @@ class ErrorMixin:
                 retry_task,
                 "ERROR",
                 context,
-                blocked_reason=self._suppression_reason_from_cancellation(
-                    cause
-                ),
+                blocked_reason=self._suppression_reason_from_cancellation(cause),
             )
             if not status_written:
                 self.log_event(
@@ -206,6 +205,7 @@ class ErrorMixin:
         if category == ErrorCategory.RATE_LIMIT:
             self._error_skip_context = None
             self._error_skip_policy.reset(self)
+            self._error_diagnose_policy.reset(self)
             self._error_skip_active = False
             self.log_event(
                 "[ERROR] Skipping AI diagnosis for rate-limit error, "
@@ -222,6 +222,7 @@ class ErrorMixin:
         if category == ErrorCategory.TIMEOUT:
             self._error_skip_context = None
             self._error_skip_policy.reset(self)
+            self._error_diagnose_policy.reset(self)
             self._error_skip_active = False
             self.log_event(
                 "[ERROR] Skipping AI diagnosis for timeout error, "
@@ -261,13 +262,24 @@ class ErrorMixin:
             >= self.app_config.daemon.rate_limit_weekly_pause_percent
         ):
             if context != self._error_skip_context:
+                if retry_task_id is not None:
+                    await self._reset_suppression_detail_count(  # pragma: no cover
+                        retry_task_id, "soft_skip_attempts"
+                    )
                 self._error_skip_policy.reset(self)
                 self._error_skip_context = context
             self._error_skip_policy.increment(self)
+            skip_count = self._error_skip_count
+            if retry_task_id is not None:
+                await self._set_suppression_detail_count(  # pragma: no cover
+                    retry_task_id,
+                    SuppressionReason.RATE_LIMIT,
+                    "soft_skip_attempts",
+                    skip_count,
+                )
             self._error_skip_active = True
-            if await self._error_skip_policy.maybe_escalate(self):
-                # Threshold callback already logged "[ERROR] max
-                # soft-skip retries (3) reached, staying ERROR."
+            if skip_count >= self._error_skip_policy_max_attempts:
+                self._on_error_skip_threshold()
                 return
 
             self.log_event(
@@ -289,9 +301,21 @@ class ErrorMixin:
         task_id = retry_task.pr_id if retry_task is not None else ""
         if task_id and await self._is_diagnose_exhausted(task_id):
             return
-        self._error_diagnose_policy.increment(self)
-        if await self._error_diagnose_policy.maybe_escalate(self):
-            # Threshold callback already logged the ceiling message.
+        diagnose_count = 0
+        if task_id:
+            self._error_diagnose_policy.increment(self)
+            diagnose_count = self._error_diagnose_count
+            await self._set_suppression_detail_count(
+                task_id,
+                SuppressionReason.CRASH,
+                "diagnose_attempts",
+                diagnose_count,
+            )
+        else:
+            self._error_diagnose_policy.increment(self)
+            diagnose_count = self._error_diagnose_count
+        if diagnose_count >= self._error_diagnose_policy_max_attempts:
+            self._on_error_diagnose_threshold()
             await self._mark_diagnose_exhausted(task_id)
             return
         dirty_before = ""
@@ -487,6 +511,10 @@ class ErrorMixin:
             )
             self.state.state = PipelineState.IDLE
             self._error_diagnose_policy.reset(self)
+            if retry_task_id is not None:
+                await self._reset_suppression_detail_count(
+                    retry_task_id, "diagnose_attempts"
+                )
             self.log_event(
                 f"[ERROR] diagnose_error: FIX -> IDLE ({summary[:80]})."
             )

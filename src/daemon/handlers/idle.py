@@ -27,6 +27,7 @@ from src.daemon.selector import SelectionContext, candidate_coders
 from src.dag import get_eligible_tasks
 from src.github import prs as gh_prs
 from src.inhibitor import InhibitorType, WorkInhibitor, is_work_inhibited
+from src.keyspace import control_stop
 from src.models import PipelineState, QueueTask, TaskStatus
 from src.onboarding.markdown_sections import MarkerError
 from src.onboarding.reconciliation import reconcile_agents_md
@@ -385,6 +386,8 @@ class IdleMixin:
         if not headers:
             return None
 
+        await self._hydrate_status_write_failed_task_pr_ids()
+
         state = _resolve_merged_state(
             self.repo_path,
             self.repo_config.branch,
@@ -477,18 +480,6 @@ class IdleMixin:
             if current_task_pr_id in stopped_task_pr_ids:
                 current_task_pr_id = None
             crashed_task_pr_ids = getattr(self, "_crashed_task_pr_ids", set())
-            hydrate_status_write_failed = getattr(
-                self,
-                "_hydrate_status_write_failed_task_pr_ids",
-                None,
-            )
-            if hydrate_status_write_failed is not None:
-                await hydrate_status_write_failed()
-            status_write_failed_task_pr_ids = getattr(
-                self,
-                "_status_write_failed_task_pr_ids",
-                set(),
-            )
             statuses = {
                 header.pr_id: derive_task_status(
                     header,
@@ -508,8 +499,19 @@ class IdleMixin:
             frontmatter_statuses = {
                 header.pr_id: header.frontmatter_status for header in headers
             }
+            for pr_id in list(statuses.keys()):
+                if pr_id not in self._status_write_failed_task_pr_ids:
+                    continue
+                if statuses[pr_id] == TaskStatus.DONE:
+                    self._status_write_failed_task_pr_ids.discard(pr_id)
+                    await self._persist_status_write_failed_task_pr_ids()
+                    continue
+                statuses[pr_id] = TaskStatus.ERROR
+
             if self.repo_config.feature_flags.use_single_error_exit:
                 for pr_id in list(statuses.keys()):
+                    if pr_id in self._status_write_failed_task_pr_ids:
+                        continue
                     record = await self._suppression_record_for_task(pr_id)
                     if record is None:
                         continue
@@ -545,31 +547,16 @@ class IdleMixin:
                         crashed_task_pr_ids.discard(pr_id)
                         continue
                     statuses[pr_id] = TaskStatus.ERROR
-            # If an explicit escalation/cancel path could not write the
-            # durable task-file status, keep the task parked in memory
-            # until the operator re-uploads it. A still-open PR must not
-            # make the task live again.
-            for pr_id in list(statuses.keys()):
-                if pr_id not in status_write_failed_task_pr_ids:
-                    continue
-                if statuses[pr_id] == TaskStatus.DONE:
-                    status_write_failed_task_pr_ids.discard(pr_id)
-                    continue
-                statuses[pr_id] = TaskStatus.ERROR
             eligible = [
                 header
                 for header in get_eligible_tasks(eligibility_headers, statuses)
                 if header.pr_id in dag_header_ids
             ]
             stopped_eligible = [
-                header
-                for header in eligible
-                if header.pr_id in stopped_task_pr_ids
+                header for header in eligible if header.pr_id in stopped_task_pr_ids
             ]
             eligible = [
-                header
-                for header in eligible
-                if header.pr_id not in stopped_task_pr_ids
+                header for header in eligible if header.pr_id not in stopped_task_pr_ids
             ]
         except ValueError as exc:
             raise QueueValidationError([str(exc)]) from exc
@@ -735,8 +722,8 @@ class IdleMixin:
 
     async def handle_idle(self) -> None:
         """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""
-        self._error_diagnose_policy.reset(self)
         self._idle_degraded_done_check_logged = False
+        self._error_diagnose_policy.reset(self)
         # The 304 streak counts only cycles that actually reached
         # ``get_merged_prs`` and saw HTTP 304. Reset by default so any
         # other outcome — success, non-304 failure, or an early return
@@ -1015,21 +1002,45 @@ class IdleMixin:
                 else self.state.rate_limit_reactive_coder or "claude"
             )
             _, blocking = is_work_inhibited(self.state, coder=coder_name)
+            stop_key = control_stop(self.name)
+            stale_stop_key = False
+            if any(
+                inh.inhibitor_type == InhibitorType.USER_STOP
+                and inh.source_key == stop_key
+                for inh in blocking
+            ):
+                try:
+                    stale_stop_key = not bool(await self.redis.get(stop_key))
+                except Exception:
+                    stale_stop_key = False
             # Ignore stale ``USER_PAUSE`` entries from the previous
             # publish: ``user_paused`` is ``False`` here (manual-pause
             # short-circuit above), so any ``USER_PAUSE`` left in the
             # snapshot is post-Play lag that ``is_blocking_now`` would
             # otherwise treat as live (no ``expires_at``).
+            # ``USER_STOP`` is also a Redis-backed control signal: the
+            # stop endpoint sets ``control:<repo>:stop`` and the resume
+            # endpoint deletes it. A PAUSED snapshot may still contain
+            # the previous publish's stop inhibitor after Play; if the
+            # canonical key is gone, the stop request is stale and must
+            # not keep the repo paused indefinitely.
             # ``GITHUB_BUDGET_SLOWDOWN`` is a polling-cadence throttle,
             # not a dispatch block, and was never part of the legacy
             # PAUSED exit conditions.
             hard_blocking = [
                 inh
                 for inh in blocking
-                if inh.inhibitor_type
-                not in (
-                    InhibitorType.GITHUB_BUDGET_SLOWDOWN,
-                    InhibitorType.USER_PAUSE,
+                if not (
+                    inh.inhibitor_type
+                    in (
+                        InhibitorType.GITHUB_BUDGET_SLOWDOWN,
+                        InhibitorType.USER_PAUSE,
+                    )
+                    or (
+                        stale_stop_key
+                        and inh.inhibitor_type == InhibitorType.USER_STOP
+                        and inh.source_key == stop_key
+                    )
                 )
             ]
             if hard_blocking:
@@ -1148,7 +1159,6 @@ class IdleMixin:
             # instead of silently dispatching from IDLE — the legacy
             # expired-window path enforces this and the unified path
             # must match.
-            self._error_diagnose_policy.reset(self)
             if await self._resolve_rate_limit_error_state(
                 log_prefix="[RATE-LIMIT]",
                 label="PAUSED inhibitors cleared, resuming",
@@ -1202,7 +1212,6 @@ class IdleMixin:
         )
         clearable = other_coder
         if clearable:
-            self._error_diagnose_policy.reset(self)
             self._claude_usage_provider.invalidate_cache()
             self._codex_usage_provider.invalidate_cache()
             label = (
@@ -1245,7 +1254,6 @@ class IdleMixin:
         self.state.rate_limited_until = None
         self.state.rate_limit_reactive = False
         self.state.rate_limit_reactive_coder = None
-        self._error_diagnose_policy.reset(self)
         if await self._resolve_rate_limit_error_state(
             log_prefix="[RATE-LIMIT]", label="Rate limit expired, resuming"
         ):

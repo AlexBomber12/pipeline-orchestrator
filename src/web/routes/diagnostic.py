@@ -30,7 +30,7 @@ from src.cancellation.storage import (
 from src.config import load_config
 from src.github import gh_runner
 from src.github import prs as gh_prs
-from src.keyspace import pipeline_state, status_write_failed_tasks
+from src.keyspace import pipeline_state
 from src.models import RepoState
 from src.subsource_registry import lookup as lookup_subsource
 from src.web.services.repo_state import _find_repo_config_by_name
@@ -133,18 +133,6 @@ async def _maybe_ttl(redis_client: Any, key: str) -> int | None:
     return None
 
 
-def _status_write_failed_for(raw: str | None, task_id: str) -> bool:
-    if raw is None:
-        return False
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return False
-    if not isinstance(parsed, list):
-        return False
-    return any(str(item) == task_id for item in parsed)
-
-
 def _extract_subsource(cause: Any) -> str | None:
     if cause is None or not isinstance(cause.payload, dict):
         return None
@@ -226,7 +214,6 @@ async def _build_diagnostic_payload(
             current_run_started_at_key(name, task_id)
         )
         attempt_raw = await redis_client.get(_attempt_count_key(name, task_id))
-        status_write_raw = await redis_client.get(status_write_failed_tasks(name))
         ttls = {
             "cancellation_cause": await _maybe_ttl(
                 redis_client, cause_key(name, task_id)
@@ -283,14 +270,9 @@ async def _build_diagnostic_payload(
         "retry_fingerprint_matches_current_spec": fingerprint_matches,
         "current_run_started_at": _decode_text(started_raw),
         "attempt_count": _decode_int(attempt_raw),
-        "status_write_failed": _status_write_failed_for(
-            _decode_text(status_write_raw), task_id
-        ),
         "skip_ai_error_diagnose": (
             state.skip_ai_error_diagnose if state is not None else False
         ),
-        "_error_diagnose_count": 0,
-        "_error_skip_count": 0,
         "current_pr": await _resolve_pr_for_task(repo_config, task_id, state),
         "ttls": ttls,
     }

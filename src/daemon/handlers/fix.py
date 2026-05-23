@@ -28,6 +28,7 @@ from src.github import comments as gh_comments
 from src.github import gh_runner
 from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus
 from src.retry import retry_transient
+from src.subsource_registry import SuppressionReason
 
 logger = logging.getLogger(__name__)
 
@@ -625,6 +626,15 @@ class FixMixin(BreachMixin):
             if self.state.current_pr is not None:
                 pr_number = self.state.current_pr.number
                 self.state.quarantined_prs.add(pr_number)
+                task_id = (
+                    self.state.current_pr.pr_id
+                    or (self.state.current_task.pr_id if self.state.current_task else "")
+                )
+                await self._suppress_task(
+                    task_id,
+                    SuppressionReason.GUARDRAIL,
+                    {"pr_number": pr_number, "reason_text": cause},
+                )
                 apply_quarantine_label_for_violation(self, pr_number, first)
             await self._transition_to_error(
                 cause,
