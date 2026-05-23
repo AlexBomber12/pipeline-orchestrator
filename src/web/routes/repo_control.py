@@ -2009,9 +2009,7 @@ async def reset_repo_to_idle(request: Request, name: str) -> JSONResponse:
     except _ResetStateChanged:
         return JSONResponse({"error": "repo ERROR task changed"}, status_code=409)
 
-    try:
-        await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
-    except (OSError, ValueError) as exc:
+    async def _rollback_reset_state() -> None:
         async def _rollback_reset(pipe: Any) -> None:
             raw = await pipe.get(state_key)
             current = (
@@ -2029,6 +2027,15 @@ async def reset_repo_to_idle(request: Request, name: str) -> JSONResponse:
                 pipe.set(state_key, original_state_json)
 
         await redis_client.transaction(_rollback_reset, state_key)
+
+    try:
+        original_task_text = await asyncio.to_thread(
+            task_path.read_text,
+            encoding="utf-8",
+        )
+        await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
+    except (OSError, ValueError) as exc:
+        await _rollback_reset_state()
         return JSONResponse(
             {"error": f"failed to update task status: {exc}"},
             status_code=503,
@@ -2078,8 +2085,20 @@ async def reset_repo_to_idle(request: Request, name: str) -> JSONResponse:
             value_from_callable=True,
         )
     except RedisError:
+        await asyncio.to_thread(
+            task_path.write_text,
+            original_task_text,
+            encoding="utf-8",
+        )
+        await _rollback_reset_state()
         return JSONResponse({"error": "redis unavailable"}, status_code=503)
     except _ResetStateChanged:
+        await asyncio.to_thread(
+            task_path.write_text,
+            original_task_text,
+            encoding="utf-8",
+        )
+        await _rollback_reset_state()
         return JSONResponse({"error": "repo ERROR task changed"}, status_code=409)
     await _clear_operator_park_for_task(redis_client, name, task_id)
 

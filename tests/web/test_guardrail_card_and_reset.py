@@ -915,7 +915,7 @@ def test_reset_handles_final_transaction_failure(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
-    _setup_repo(tmp_path, monkeypatch)
+    repo_dir, _redis_client = _setup_repo(tmp_path, monkeypatch)
     source = web_app.aioredis.from_url("", decode_responses=True)
     redis_client = _SecondTransactionFailsRedis(dict(source.store))
     redis_client.zsets = dict(source.zsets)
@@ -925,6 +925,10 @@ def test_reset_handles_final_transaction_failure(
         response = client.post("/repos/example__alpha/reset-to-idle")
 
     assert response.status_code == 503
+    state = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
+    assert state.state == PipelineState.ERROR
+    task_text = (repo_dir / "tasks" / "PR-384.md").read_text(encoding="utf-8")
+    assert "status: ERROR" in task_text
 
 
 def test_reset_revalidates_reserved_task_before_idle_transition(
@@ -945,6 +949,10 @@ def test_reset_revalidates_reserved_task_before_idle_transition(
     assert state.state == PipelineState.CODING
     assert state.current_task is not None
     assert state.current_task.pr_id == "PR-999"
+    task_text = (
+        tmp_path / "repos" / "example__alpha" / "tasks" / "PR-384.md"
+    ).read_text(encoding="utf-8")
+    assert "status: ERROR" in task_text
 
 
 def test_reset_swallows_history_and_publish_failure(
