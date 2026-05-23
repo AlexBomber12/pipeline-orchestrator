@@ -322,30 +322,30 @@ async def _clear_status_write_failed_marker(
     repo_slug: str,
     task_id: str,
 ) -> None:
-    key = _status_write_failed_key(repo_slug)
-    raw = await redis_client.get(key)
-    if raw is None:
-        return
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8")
-    try:
-        decoded = json.loads(raw)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return
-    if not isinstance(decoded, list):
-        return
-    remaining = [item for item in decoded if item != task_id]
-    if len(remaining) == len(decoded):
-        return
-    if remaining:
-        await _await_if_needed(
-            redis_client.set(
-                key,
-                json.dumps(remaining, separators=(",", ":")),
+    for key in (_status_write_failed_key(repo_slug), f"recovered_tasks:{repo_slug}"):
+        raw = await redis_client.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(decoded, list):
+            continue
+        remaining = [item for item in decoded if item != task_id]
+        if len(remaining) == len(decoded):
+            continue
+        if remaining:
+            await _await_if_needed(
+                redis_client.set(
+                    key,
+                    json.dumps(remaining, separators=(",", ":")),
+                )
             )
-        )
-    else:
-        await redis_client.delete(key)
+        else:
+            await redis_client.delete(key)
 
 
 async def _reserve_repo_for_retry(

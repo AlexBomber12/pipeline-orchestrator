@@ -85,13 +85,35 @@ def test_retry_endpoint_clears_status_write_failed_marker(
         include_sentinel=False,
     )
     marker_key = "status_write_failed_tasks:example__alpha"
+    legacy_key = "recovered_tasks:example__alpha"
     redis_client.store[marker_key] = '["PR-001","PR-999"]'
+    redis_client.store[legacy_key] = '["PR-001","PR-888"]'
 
     with TestClient(app) as client:
         response = client.post("/repos/example__alpha/tasks/PR-001/retry")
 
     assert response.status_code == 200
     assert redis_client.store[marker_key] == '["PR-999"]'
+    assert redis_client.store[legacy_key] == '["PR-888"]'
+
+
+def test_retry_endpoint_clears_legacy_recovered_task_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_client, _sentinel_key = _seed_retryable_sentinel(
+        tmp_path,
+        monkeypatch,
+        include_sentinel=False,
+    )
+    legacy_key = "recovered_tasks:example__alpha"
+    redis_client.store[legacy_key] = '["PR-001"]'
+
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/tasks/PR-001/retry")
+
+    assert response.status_code == 200
+    assert legacy_key not in redis_client.store
 
 
 def test_status_write_failed_marker_helper_defensive_branches() -> None:
