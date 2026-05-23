@@ -41,7 +41,7 @@ def _rewrite_preserving_mtime(path: Path, poll_interval: int) -> None:
     os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
 
 
-def test_cache_hit_returns_identical_config(
+def test_cache_hit_returns_copy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -61,8 +61,22 @@ def test_cache_hit_returns_identical_config(
     second = load_config(str(cfg_path))
 
     assert second == first
-    assert second is first
+    assert second is not first
     assert calls == 1
+
+
+def test_mutating_returned_config_does_not_change_cached_config(
+    tmp_path: Path,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    _write_config(cfg_path, 5)
+
+    first = load_config(str(cfg_path))
+    first.daemon.poll_interval_sec = 99
+
+    second = load_config(str(cfg_path))
+
+    assert second.daemon.poll_interval_sec == 5
 
 
 def test_cache_miss_on_mtime_change(

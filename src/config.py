@@ -365,7 +365,7 @@ def load_config(path: str | None = None) -> AppConfig:
             and cached.overlay_signature == overlay_signature
             and cached.env_fingerprint == env_fingerprint
         ):
-            return cached.config
+            return cached.config.model_copy(deep=True)
 
     raw = _load_config_raw(str(base_path))
 
@@ -397,7 +397,7 @@ def load_config(path: str | None = None) -> AppConfig:
             overlay_signature=overlay_signature,
             env_fingerprint=env_fingerprint,
         )
-    return config
+    return config.model_copy(deep=True)
 
 
 def _load_overlay_raw(base_path: Path) -> dict[str, Any]:
