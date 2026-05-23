@@ -75,6 +75,15 @@ _QUEUE_NOT_READY_JSON = {"error": "Queue not yet computed"}
 _RETRY_TTL_SECONDS = 30 * 24 * 3600
 _RETRY_RESERVATION_TTL_SECONDS = 30 * 60
 _RETRY_GIT_TIMEOUT_SECONDS = 60
+_RESET_IN_PROGRESS_MESSAGE = "Operator reset to IDLE in progress"
+
+
+class _ResetStateChanged(RuntimeError):
+    """Raised when reset-to-idle loses its active ERROR task gate."""
+
+
+class _GuardrailAcceptChanged(RuntimeError):
+    """Raised when accept-once loses its active guardrail ERROR task gate."""
 
 
 def _split_gh_label_output(result: object) -> list[str]:
@@ -346,6 +355,26 @@ async def _clear_status_write_failed_marker(
             )
         else:
             await redis_client.delete(key)
+
+
+async def _clear_operator_park_for_task(
+    redis_client: aioredis.Redis,
+    repo_slug: str,
+    task_id: str,
+) -> None:
+    """Clear Redis-side park markers that keep an operator task blocked."""
+    try:
+        await RedisSuppressionStore(redis_client).clear(repo_slug, task_id)
+    except Exception:
+        pass
+    try:
+        await redis_client.delete(_diagnose_exhausted_key(repo_slug, task_id))
+    except Exception:
+        pass
+    try:
+        await _clear_status_write_failed_marker(redis_client, repo_slug, task_id)
+    except Exception:
+        pass
 
 
 async def _reserve_repo_for_retry(
@@ -1742,18 +1771,7 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
                 await _release_retry_reservation(redis_client, name, pr_id)
             return HTMLResponse("Failed to commit retry change", status_code=503)
 
-        try:
-            await delete_cancellation_cause(redis_client, name, pr_id)
-        except Exception:
-            pass
-        try:
-            await redis_client.delete(_diagnose_exhausted_key(name, pr_id))
-        except Exception:
-            pass
-        try:
-            await _clear_status_write_failed_marker(redis_client, name, pr_id)
-        except Exception:
-            pass
+        await _clear_operator_park_for_task(redis_client, name, pr_id)
         try:
             await _app.publish_wake(redis_client, name, "retry")
         except Exception:
@@ -1833,6 +1851,409 @@ async def retry_repo_task(request: Request, name: str, pr_id: str) -> Response:
             name,
             previous_user_paused,
         )
+
+
+@router.post("/repos/{name}/tasks/{pr_id}/guardrail/reject", response_class=HTMLResponse)
+async def reject_guardrail_park(name: str, pr_id: str) -> Response:
+    """Confirm the guardrail park remains until the spec is edited."""
+    if not _TASK_PR_ID_PATTERN.match(pr_id):
+        return HTMLResponse("Invalid task identifier", status_code=400)
+    return HTMLResponse(
+        "Edit the spec before retrying, or the guardrail will trigger again."
+    )
+
+
+@router.post("/repos/{name}/tasks/{pr_id}/guardrail/accept-once", response_class=HTMLResponse)
+async def accept_guardrail_park_once(
+    request: Request,
+    name: str,
+    pr_id: str,
+) -> Response:
+    """Mark a guardrail suppression accepted once and return the task to TODO."""
+    if not _TASK_PR_ID_PATTERN.match(pr_id):
+        return HTMLResponse("Invalid task identifier", status_code=400)
+
+    cfg = load_config(_app.CONFIG_PATH)
+    if _find_repo_config_by_name(cfg, name) is None:
+        return HTMLResponse("Repository not found", status_code=404)
+
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        return HTMLResponse("Redis unavailable", status_code=503)
+
+    try:
+        raw_cause = await redis_client.get(cause_key(name, pr_id))
+    except RedisError:
+        return HTMLResponse("Redis unavailable", status_code=503)
+    cause = _validated_guardrail_cause(raw_cause)
+    if cause is None:
+        return HTMLResponse(_NO_PENDING_GUARDRAIL, status_code=404)
+
+    state_key = pipeline_state(name)
+    try:
+        raw_state = await redis_client.get(state_key)
+    except RedisError:
+        return HTMLResponse("Redis unavailable", status_code=503)
+    if raw_state is None:
+        return HTMLResponse("Task is not active in ERROR", status_code=409)
+    try:
+        state = RepoState.model_validate_json(raw_state)
+    except Exception:
+        return HTMLResponse("Repository state unavailable", status_code=503)
+    if (
+        state.state != PipelineState.ERROR
+        or state.current_task is None
+        or state.current_task.pr_id != pr_id
+    ):
+        return HTMLResponse("Task is not active in ERROR", status_code=409)
+
+    resolved = await _resolve_repo_task_path(name, pr_id)
+    if resolved is None:
+        return HTMLResponse("Task file not found", status_code=404)
+    task_path, _task_filename = resolved
+
+    detail = dict(cause.payload)
+    detail.pop("subsource", None)
+    detail["approved_once"] = True
+    accepted_cause = CancellationCause(
+        category=cause.category,
+        payload={**detail, "subsource": SuppressionReason.GUARDRAIL.value},
+        created_at=cause.created_at,
+        task_id=pr_id,
+        repo_slug=name,
+    )
+
+    async def _mark_accepted_once(pipe: Any) -> None:
+        watched_raw_cause = await pipe.get(cause_key(name, pr_id))
+        if _validated_guardrail_cause(watched_raw_cause) is None:
+            raise _GuardrailAcceptChanged
+        watched_raw_state = await pipe.get(state_key)
+        if watched_raw_state is None:
+            raise _GuardrailAcceptChanged
+        try:
+            watched_state = RepoState.model_validate_json(watched_raw_state)
+        except Exception as exc:
+            raise _GuardrailAcceptChanged from exc
+        if (
+            watched_state.state != PipelineState.ERROR
+            or watched_state.current_task is None
+            or watched_state.current_task.pr_id != pr_id
+        ):
+            raise _GuardrailAcceptChanged
+        pipe.multi()
+        pipe.set(cause_key(name, pr_id), accepted_cause.to_redis(), ex=TTL_SECONDS)
+
+    try:
+        await redis_client.transaction(
+            _mark_accepted_once,
+            cause_key(name, pr_id),
+            state_key,
+        )
+    except RedisError:
+        return HTMLResponse("Redis unavailable", status_code=503)
+    except _GuardrailAcceptChanged:
+        return HTMLResponse(
+            "Concurrent state change detected; please retry the decision",
+            status_code=409,
+        )
+
+    try:
+        await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
+    except (OSError, ValueError) as exc:
+        try:
+            await record_cancellation_cause(redis_client, name, pr_id, cause)
+        except Exception:
+            _app.logger.warning(
+                "Failed to restore guardrail cause for %s %s after"
+                " accept-once frontmatter failure",
+                name,
+                pr_id,
+                exc_info=True,
+            )
+        return HTMLResponse(f"Failed to update task status: {exc}", status_code=503)
+
+    event_message = f"Operator accepted guardrail once; {pr_id} returned to TODO."
+
+    async def _transition_accept_once(pipe: Any) -> RepoState:
+        raw = await pipe.get(state_key)
+        if raw is None:
+            raise _GuardrailAcceptChanged
+        try:
+            current = RepoState.model_validate_json(raw)
+        except Exception as exc:
+            raise _GuardrailAcceptChanged from exc
+        if (
+            current.state != PipelineState.ERROR
+            or current.current_task is None
+            or current.current_task.pr_id != pr_id
+        ):
+            raise _GuardrailAcceptChanged
+        current.state = PipelineState.IDLE
+        current.user_paused = False
+        current.current_task = None
+        current.current_pr = None
+        current.error_message = None
+        current.skip_ai_error_diagnose = False
+        if current.current_queue is not None:
+            current.current_queue = [
+                task.model_copy(update={"status": TaskStatus.TODO})
+                if task.pr_id == pr_id
+                else task
+                for task in current.current_queue
+            ]
+        _append_history_entry(
+            current,
+            event_message,
+            tier="operator",
+            kind="guardrail_accept_once",
+        )
+        pipe.multi()
+        pipe.set(state_key, current.model_dump_json())
+        return current
+
+    try:
+        updated_state = await redis_client.transaction(
+            _transition_accept_once,
+            state_key,
+            value_from_callable=True,
+        )
+    except RedisError:
+        return HTMLResponse("Redis unavailable", status_code=503)
+    except _GuardrailAcceptChanged:
+        return HTMLResponse(
+            "Concurrent state change detected; please retry the decision",
+            status_code=409,
+        )
+
+    try:
+        await redis_client.delete(_diagnose_exhausted_key(name, pr_id))
+    except Exception:
+        pass
+    try:
+        await _clear_status_write_failed_marker(redis_client, name, pr_id)
+    except Exception:
+        pass
+    try:
+        await _publish_history_entry_event(
+            name,
+            updated_state,
+            event_message,
+            redis_client,
+            tier="operator",
+            kind="guardrail_accept_once",
+        )
+    except Exception:
+        pass
+    try:
+        await _app.publish_wake(redis_client, name, "guardrail_accept_once")
+    except Exception:
+        _app.logger.warning(
+            "publish_wake failed for %s; daemon will pick up next tick",
+            name,
+            exc_info=True,
+        )
+    return HTMLResponse("", status_code=204)
+
+
+@router.post("/repos/{name}/reset-to-idle", response_class=JSONResponse)
+async def reset_repo_to_idle(request: Request, name: str) -> JSONResponse:
+    """Force an ERROR repo to IDLE and return the current task to TODO."""
+    cfg = load_config(_app.CONFIG_PATH)
+    repo_config = _find_repo_config_by_name(cfg, name)
+    if repo_config is None:
+        return JSONResponse({"error": "repo not found"}, status_code=404)
+
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        return JSONResponse({"error": "redis unavailable"}, status_code=503)
+
+    state_key = pipeline_state(name)
+    try:
+        raw_state = await redis_client.get(state_key)
+    except RedisError:
+        return JSONResponse({"error": "redis unavailable"}, status_code=503)
+    if raw_state is None:
+        state = _default_repo_state(name, repo_config.url)
+    else:
+        try:
+            state = RepoState.model_validate_json(raw_state)
+        except Exception:
+            return JSONResponse({"error": "repository state unavailable"}, status_code=503)
+    if state.state != PipelineState.ERROR:
+        return JSONResponse({"error": "repo is not in ERROR"}, status_code=409)
+    if state.current_task is None:
+        return JSONResponse({"error": "repo has no current task"}, status_code=409)
+
+    task_id = state.current_task.pr_id
+    resolved = await _resolve_repo_task_path(name, task_id)
+    if resolved is None:
+        return JSONResponse({"error": "task file not found"}, status_code=404)
+    task_path, _task_filename = resolved
+
+    event_message = f"Operator reset repo to IDLE; {task_id} returned to TODO."
+
+    original_state_json = state.model_dump_json()
+
+    async def _reserve_reset(pipe: Any) -> RepoState:
+        raw = await pipe.get(state_key)
+        current = (
+            RepoState.model_validate_json(raw)
+            if raw is not None
+            else _default_repo_state(name, repo_config.url)
+        )
+        if (
+            current.state != PipelineState.ERROR
+            or current.current_task is None
+            or current.current_task.pr_id != task_id
+        ):
+            raise _ResetStateChanged
+        current.state = PipelineState.PAUSED
+        current.user_paused = True
+        current.error_message = _RESET_IN_PROGRESS_MESSAGE
+        pipe.multi()
+        pipe.set(state_key, current.model_dump_json())
+        return current
+
+    try:
+        await redis_client.transaction(
+            _reserve_reset,
+            state_key,
+            value_from_callable=True,
+        )
+    except RedisError:
+        return JSONResponse({"error": "redis unavailable"}, status_code=503)
+    except _ResetStateChanged:
+        return JSONResponse({"error": "repo ERROR task changed"}, status_code=409)
+
+    async def _rollback_reset_state() -> None:
+        async def _rollback_reset(pipe: Any) -> None:
+            raw = await pipe.get(state_key)
+            current = (
+                RepoState.model_validate_json(raw)
+                if raw is not None
+                else _default_repo_state(name, repo_config.url)
+            )
+            if (
+                current.state == PipelineState.PAUSED
+                and current.current_task is not None
+                and current.current_task.pr_id == task_id
+                and current.error_message == _RESET_IN_PROGRESS_MESSAGE
+            ):
+                pipe.multi()
+                pipe.set(state_key, original_state_json)
+
+        await redis_client.transaction(_rollback_reset, state_key)
+
+    async def _restore_task_text_and_rollback_reset() -> None:
+        try:
+            await asyncio.to_thread(
+                task_path.write_text,
+                original_task_text,
+                encoding="utf-8",
+            )
+        except OSError:
+            _app.logger.warning(
+                "Failed to restore task text for %s %s during reset rollback",
+                name,
+                task_id,
+                exc_info=True,
+            )
+        finally:
+            try:
+                await _rollback_reset_state()
+            except RedisError:
+                _app.logger.warning(
+                    "Failed to roll back reset state for %s %s",
+                    name,
+                    task_id,
+                    exc_info=True,
+                )
+
+    try:
+        original_task_text = await asyncio.to_thread(
+            task_path.read_text,
+            encoding="utf-8",
+        )
+        await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
+    except (OSError, ValueError) as exc:
+        await _rollback_reset_state()
+        return JSONResponse(
+            {"error": f"failed to update task status: {exc}"},
+            status_code=503,
+        )
+
+    async def _transition(pipe: Any) -> RepoState:
+        raw = await pipe.get(state_key)
+        current = (
+            RepoState.model_validate_json(raw)
+            if raw is not None
+            else _default_repo_state(name, repo_config.url)
+        )
+        if (
+            current.state != PipelineState.PAUSED
+            or current.current_task is None
+            or current.current_task.pr_id != task_id
+            or current.error_message != _RESET_IN_PROGRESS_MESSAGE
+        ):
+            raise _ResetStateChanged
+        current.state = PipelineState.IDLE
+        current.user_paused = False
+        current.current_task = None
+        current.current_pr = None
+        current.error_message = None
+        current.skip_ai_error_diagnose = False
+        if current.current_queue is not None:
+            current.current_queue = [
+                task.model_copy(update={"status": TaskStatus.TODO})
+                if task.pr_id == task_id
+                else task
+                for task in current.current_queue
+            ]
+        _append_history_entry(
+            current,
+            event_message,
+            tier="operator",
+            kind="reset",
+        )
+        pipe.multi()
+        pipe.set(state_key, current.model_dump_json())
+        return current
+
+    try:
+        updated_state = await redis_client.transaction(
+            _transition,
+            state_key,
+            value_from_callable=True,
+        )
+    except RedisError:
+        await _restore_task_text_and_rollback_reset()
+        return JSONResponse({"error": "redis unavailable"}, status_code=503)
+    except _ResetStateChanged:
+        await _restore_task_text_and_rollback_reset()
+        return JSONResponse({"error": "repo ERROR task changed"}, status_code=409)
+    await _clear_operator_park_for_task(redis_client, name, task_id)
+
+    try:
+        await _publish_history_entry_event(
+            name,
+            updated_state,
+            event_message,
+            redis_client,
+            tier="operator",
+            kind="reset",
+        )
+    except Exception:
+        pass
+    try:
+        await _app.publish_wake(redis_client, name, "reset")
+    except Exception:
+        _app.logger.warning(
+            "publish_wake failed for %s; daemon will pick up reset on next tick",
+            name,
+            exc_info=True,
+        )
+
+    return JSONResponse({"state": "IDLE", "task_id": task_id})
 
 
 def _reset_keys_for_task(repo_slug: str, task_id: str) -> list[str]:
