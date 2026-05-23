@@ -214,6 +214,29 @@ def test_missing_overlay_treated_as_absent(
     assert calls == 2
 
 
+def test_explicit_symlink_path_uses_overlay_next_to_link(tmp_path: Path) -> None:
+    real_dir = tmp_path / "real"
+    link_dir = tmp_path / "link"
+    real_dir.mkdir()
+    link_dir.mkdir()
+    real_config = real_dir / "config.yml"
+    explicit_config = link_dir / "config.yml"
+    _write_config(real_config, 5)
+    explicit_config.symlink_to(real_config)
+    (real_dir / config_module.OVERLAY_FILENAME).write_text(
+        "daemon:\n  poll_interval_sec: 6\n",
+        encoding="utf-8",
+    )
+    (link_dir / config_module.OVERLAY_FILENAME).write_text(
+        "daemon:\n  poll_interval_sec: 9\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(str(explicit_config))
+
+    assert cfg.daemon.poll_interval_sec == 9
+
+
 def test_config_writer_invalidates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

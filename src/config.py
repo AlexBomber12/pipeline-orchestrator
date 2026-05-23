@@ -350,7 +350,7 @@ def load_config(path: str | None = None) -> AppConfig:
     selected_path = (
         path if path is not None else os.environ.get("PO_CONFIG_PATH", "config.yml")
     )
-    base_path = Path(selected_path).resolve()
+    base_path = Path(selected_path).absolute()
     overlay_path = base_path.parent / OVERLAY_FILENAME
     cache_key = str(base_path)
     base_signature = _config_file_signature(base_path)
