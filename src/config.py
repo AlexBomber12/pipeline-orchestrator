@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import threading
 import typing
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -110,6 +112,24 @@ _DAEMON_ENV_OVERRIDES = {
     "PO_FIX_ITERATION_CAP": "fix_iteration_cap",
     "PO_STALE_REVIEW_THRESHOLD_MIN": "stale_review_threshold_min",
 }
+
+
+_EnvOverrideFingerprint = tuple[tuple[str, str | None], ...]
+
+
+@dataclass(frozen=True)
+class _ConfigCacheEntry:
+    config: "AppConfig"
+    base_mtime: int
+    overlay_mtime: int
+    env_fingerprint: _EnvOverrideFingerprint
+
+
+# Guards cache dict mutation only (microsecond hold). Disk reads and Pydantic
+# validation run outside the lock so async web callers never queue behind a
+# slow parse.
+_config_cache_lock = threading.Lock()
+_config_cache: dict[str, _ConfigCacheEntry] = {}
 
 
 class FeatureFlags(BaseModel):
@@ -275,6 +295,28 @@ def _load_config_raw(path: str = "config.yml") -> dict[str, Any]:
     return raw
 
 
+def invalidate_config_cache() -> None:
+    """Clear cached ``load_config`` results after a known config write."""
+    with _config_cache_lock:
+        _config_cache.clear()
+
+
+def _config_file_mtime(path: Path) -> int:
+    """Return ``path`` mtime, treating a missing file as an absent input."""
+    try:
+        return path.stat().st_mtime_ns
+    except FileNotFoundError:
+        return 0
+
+
+def _daemon_env_override_fingerprint() -> _EnvOverrideFingerprint:
+    """Return the runtime env values that affect ``load_config`` output."""
+    return tuple(
+        (env_name, os.environ.get(env_name))
+        for env_name in sorted(_DAEMON_ENV_OVERRIDES)
+    )
+
+
 def load_config(path: str | None = None) -> AppConfig:
     """Read a YAML config file and return an AppConfig.
 
@@ -293,10 +335,29 @@ def load_config(path: str | None = None) -> AppConfig:
     is gitignored by convention so production overrides survive
     ``git reset`` without polluting the committed config.
     """
-    resolved_path = path if path is not None else os.environ.get("PO_CONFIG_PATH", "config.yml")
-    raw = _load_config_raw(resolved_path)
+    selected_path = (
+        path if path is not None else os.environ.get("PO_CONFIG_PATH", "config.yml")
+    )
+    base_path = Path(selected_path).resolve()
+    overlay_path = base_path.parent / OVERLAY_FILENAME
+    cache_key = str(base_path)
+    base_mtime = _config_file_mtime(base_path)
+    overlay_mtime = _config_file_mtime(overlay_path)
+    env_fingerprint = _daemon_env_override_fingerprint()
 
-    overlay = _load_overlay_raw(Path(resolved_path))
+    with _config_cache_lock:
+        cached = _config_cache.get(cache_key)
+        if (
+            cached is not None
+            and cached.base_mtime == base_mtime
+            and cached.overlay_mtime == overlay_mtime
+            and cached.env_fingerprint == env_fingerprint
+        ):
+            return cached.config
+
+    raw = _load_config_raw(str(base_path))
+
+    overlay = _load_overlay_raw(base_path)
     if overlay:
         unknown = _collect_unknown_overlay_keys(overlay, AppConfig)
         for key in unknown:
@@ -316,7 +377,15 @@ def load_config(path: str | None = None) -> AppConfig:
 
     _apply_daemon_env_overrides(raw)
 
-    return AppConfig.model_validate(raw)
+    config = AppConfig.model_validate(raw)
+    with _config_cache_lock:
+        _config_cache[cache_key] = _ConfigCacheEntry(
+            config=config,
+            base_mtime=base_mtime,
+            overlay_mtime=overlay_mtime,
+            env_fingerprint=env_fingerprint,
+        )
+    return config
 
 
 def _load_overlay_raw(base_path: Path) -> dict[str, Any]:

@@ -22,6 +22,8 @@ from typing import Any
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 
+from src.config import invalidate_config_cache
+
 
 def _load(path: Path) -> CommentedMap:
     """Return ``config.yml`` as a ruamel ``CommentedMap``.
@@ -85,6 +87,7 @@ def write_daemon_field(path: str | Path, field: str, value: Any) -> None:
         data["daemon"] = daemon
     daemon[field] = value
     _dump_atomic(target, data)
+    invalidate_config_cache()
 
 
 def delete_daemon_fields(path: str | Path, fields: list[str]) -> None:
@@ -98,3 +101,4 @@ def delete_daemon_fields(path: str | Path, fields: list[str]) -> None:
         if field in daemon:
             del daemon[field]
     _dump_atomic(target, data)
+    invalidate_config_cache()
