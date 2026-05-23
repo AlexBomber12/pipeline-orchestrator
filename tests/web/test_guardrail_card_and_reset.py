@@ -633,7 +633,7 @@ def test_guardrail_accept_write_failure_returns_503(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
-    _setup_repo(tmp_path, monkeypatch)
+    _repo_dir, redis_client = _setup_repo(tmp_path, monkeypatch)
     monkeypatch.setattr(
         repo_control,
         "write_frontmatter_status",
@@ -646,6 +646,8 @@ def test_guardrail_accept_write_failure_returns_503(
         )
 
     assert response.status_code == 503
+    raw = redis_client.store[cause_key("example__alpha", "PR-384")]
+    assert "approved_once" not in json.loads(raw)["payload"]
 
 
 def test_guardrail_accept_swallows_delete_and_publish_failure(
@@ -842,6 +844,10 @@ def test_reset_revalidates_error_task_inside_transaction(
     assert state.state == PipelineState.CODING
     assert state.current_task is not None
     assert state.current_task.pr_id == "PR-999"
+    task_text = (
+        tmp_path / "repos" / "example__alpha" / "tasks" / "PR-384.md"
+    ).read_text(encoding="utf-8")
+    assert "status: ERROR" in task_text
 
 
 def test_reset_swallows_history_and_publish_failure(

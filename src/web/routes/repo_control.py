@@ -1906,6 +1906,10 @@ async def accept_guardrail_park_once(
         return HTMLResponse("Task file not found", status_code=404)
     task_path, _task_filename = resolved
 
+    try:
+        await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
+    except (OSError, ValueError) as exc:
+        return HTMLResponse(f"Failed to update task status: {exc}", status_code=503)
     detail = dict(cause.payload)
     detail.pop("subsource", None)
     detail["approved_once"] = True
@@ -1915,10 +1919,6 @@ async def accept_guardrail_park_once(
         SuppressionReason.GUARDRAIL,
         detail,
     )
-    try:
-        await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
-    except (OSError, ValueError) as exc:
-        return HTMLResponse(f"Failed to update task status: {exc}", status_code=503)
     try:
         await redis_client.delete(_diagnose_exhausted_key(name, pr_id))
     except Exception:
@@ -1969,16 +1969,6 @@ async def reset_repo_to_idle(request: Request, name: str) -> JSONResponse:
         return JSONResponse({"error": "task file not found"}, status_code=404)
     task_path, _task_filename = resolved
 
-    try:
-        await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
-    except (OSError, ValueError) as exc:
-        return JSONResponse(
-            {"error": f"failed to update task status: {exc}"},
-            status_code=503,
-        )
-
-    await _clear_operator_park_for_task(redis_client, name, task_id)
-
     event_message = f"Operator reset repo to IDLE; {task_id} returned to TODO."
 
     async def _transition(pipe: Any) -> RepoState:
@@ -1994,6 +1984,8 @@ async def reset_repo_to_idle(request: Request, name: str) -> JSONResponse:
             or current.current_task.pr_id != task_id
         ):
             raise _ResetStateChanged
+        await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
+        await _clear_operator_park_for_task(redis_client, name, task_id)
         current.state = PipelineState.IDLE
         current.current_task = None
         current.current_pr = None
@@ -2026,6 +2018,11 @@ async def reset_repo_to_idle(request: Request, name: str) -> JSONResponse:
         return JSONResponse({"error": "redis unavailable"}, status_code=503)
     except _ResetStateChanged:
         return JSONResponse({"error": "repo ERROR task changed"}, status_code=409)
+    except (OSError, ValueError) as exc:
+        return JSONResponse(
+            {"error": f"failed to update task status: {exc}"},
+            status_code=503,
+        )
 
     try:
         await _publish_history_entry_event(
