@@ -82,6 +82,10 @@ class _ResetStateChanged(RuntimeError):
     """Raised when reset-to-idle loses its active ERROR task gate."""
 
 
+class _GuardrailAcceptChanged(RuntimeError):
+    """Raised when accept-once loses its active guardrail ERROR task gate."""
+
+
 def _split_gh_label_output(result: object) -> list[str]:
     if isinstance(result, str):
         return [label.strip() for label in result.splitlines() if label.strip()]
@@ -1907,19 +1911,66 @@ async def accept_guardrail_park_once(
         return HTMLResponse("Task file not found", status_code=404)
     task_path, _task_filename = resolved
 
-    try:
-        await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
-    except (OSError, ValueError) as exc:
-        return HTMLResponse(f"Failed to update task status: {exc}", status_code=503)
     detail = dict(cause.payload)
     detail.pop("subsource", None)
     detail["approved_once"] = True
-    await RedisSuppressionStore(redis_client).suppress(
-        name,
-        pr_id,
-        SuppressionReason.GUARDRAIL,
-        detail,
+    accepted_cause = CancellationCause(
+        category=cause.category,
+        payload={**detail, "subsource": SuppressionReason.GUARDRAIL.value},
+        created_at=cause.created_at,
+        task_id=pr_id,
+        repo_slug=name,
     )
+
+    async def _mark_accepted_once(pipe: Any) -> None:
+        watched_raw_cause = await pipe.get(cause_key(name, pr_id))
+        if _validated_guardrail_cause(watched_raw_cause) is None:
+            raise _GuardrailAcceptChanged
+        watched_raw_state = await pipe.get(pipeline_state(name))
+        if watched_raw_state is None:
+            raise _GuardrailAcceptChanged
+        try:
+            watched_state = RepoState.model_validate_json(watched_raw_state)
+        except Exception as exc:
+            raise _GuardrailAcceptChanged from exc
+        if (
+            watched_state.state != PipelineState.ERROR
+            or watched_state.current_task is None
+            or watched_state.current_task.pr_id != pr_id
+        ):
+            raise _GuardrailAcceptChanged
+        pipe.multi()
+        pipe.set(cause_key(name, pr_id), accepted_cause.to_redis(), ex=TTL_SECONDS)
+
+    try:
+        await redis_client.transaction(
+            _mark_accepted_once,
+            cause_key(name, pr_id),
+            pipeline_state(name),
+        )
+    except RedisError:
+        return HTMLResponse("Redis unavailable", status_code=503)
+    except _GuardrailAcceptChanged:
+        return HTMLResponse(
+            "Concurrent state change detected; please retry the decision",
+            status_code=409,
+        )
+
+    try:
+        await asyncio.to_thread(write_frontmatter_status, task_path, "TODO")
+    except (OSError, ValueError) as exc:
+        try:
+            await record_cancellation_cause(redis_client, name, pr_id, cause)
+        except Exception:
+            _app.logger.warning(
+                "Failed to restore guardrail cause for %s %s after"
+                " accept-once frontmatter failure",
+                name,
+                pr_id,
+                exc_info=True,
+            )
+        return HTMLResponse(f"Failed to update task status: {exc}", status_code=503)
+
     try:
         await redis_client.delete(_diagnose_exhausted_key(name, pr_id))
     except Exception:
@@ -2028,6 +2079,23 @@ async def reset_repo_to_idle(request: Request, name: str) -> JSONResponse:
 
         await redis_client.transaction(_rollback_reset, state_key)
 
+    async def _restore_task_text_and_rollback_reset() -> None:
+        try:
+            await asyncio.to_thread(
+                task_path.write_text,
+                original_task_text,
+                encoding="utf-8",
+            )
+        except OSError:
+            _app.logger.warning(
+                "Failed to restore task text for %s %s during reset rollback",
+                name,
+                task_id,
+                exc_info=True,
+            )
+        finally:
+            await _rollback_reset_state()
+
     try:
         original_task_text = await asyncio.to_thread(
             task_path.read_text,
@@ -2085,20 +2153,10 @@ async def reset_repo_to_idle(request: Request, name: str) -> JSONResponse:
             value_from_callable=True,
         )
     except RedisError:
-        await asyncio.to_thread(
-            task_path.write_text,
-            original_task_text,
-            encoding="utf-8",
-        )
-        await _rollback_reset_state()
+        await _restore_task_text_and_rollback_reset()
         return JSONResponse({"error": "redis unavailable"}, status_code=503)
     except _ResetStateChanged:
-        await asyncio.to_thread(
-            task_path.write_text,
-            original_task_text,
-            encoding="utf-8",
-        )
-        await _rollback_reset_state()
+        await _restore_task_text_and_rollback_reset()
         return JSONResponse({"error": "repo ERROR task changed"}, status_code=409)
     await _clear_operator_park_for_task(redis_client, name, task_id)
 
