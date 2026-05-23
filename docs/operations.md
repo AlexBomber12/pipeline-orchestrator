@@ -5,6 +5,29 @@ Pipeline-orchestrator reads runtime connection settings such as
 longer has rollout flags: daemon startup always reconstructs queue state
 from structured `tasks/PR-*.md` headers.
 
+## Task format migration
+
+Task files are migrating from legacy status headers to explicit YAML
+frontmatter. The offline operator script is dry-run by default:
+
+```bash
+python3 scripts/migrate_task_format.py --repo /data/repos/AlexBomber12__pipeline-orchestrator
+```
+
+Review the per-file status output, then apply the migration per managed
+repository:
+
+```bash
+python3 scripts/migrate_task_format.py --repo /data/repos/AlexBomber12__pipeline-orchestrator --apply
+python3 scripts/migrate_task_format.py --repo /data/repos/AlexBomber12__pipeline-orchestrator --verify
+```
+
+Repeat the same dry-run, apply, and verify sequence for
+`megaraid-dashboard` and `sms-gateway-v2`. Apply mode writes backups
+under `artifacts/task-format-backups/<timestamp>/` and prints the exact
+backup path. Do not ship the legacy parser removal until `--verify`
+passes on every repository.
+
 ## Recovery from ERROR
 
 When a task ships its terminal failure state to ERROR (frontmatter
