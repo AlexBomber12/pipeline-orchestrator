@@ -1627,7 +1627,15 @@ class PipelineRunner(
                         cause,
                         log=self.log_event,
                     )
-                    recorded = True
+                    recorded = (
+                        await get_cancellation_cause(
+                            self.redis,
+                            self.name,
+                            task.pr_id,
+                            refresh_ttl=False,
+                        )
+                        is not None
+                    )
                 except Exception as exc:
                     self.log_event(
                         "[INFRA] Warning: failed to record cancellation "
