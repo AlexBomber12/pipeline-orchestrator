@@ -118,10 +118,17 @@ _EnvOverrideFingerprint = tuple[tuple[str, str | None], ...]
 
 
 @dataclass(frozen=True)
+class _ConfigFileSignature:
+    mtime_ns: int
+    ctime_ns: int
+    size: int
+
+
+@dataclass(frozen=True)
 class _ConfigCacheEntry:
     config: "AppConfig"
-    base_mtime: int
-    overlay_mtime: int
+    base_signature: _ConfigFileSignature
+    overlay_signature: _ConfigFileSignature
     env_fingerprint: _EnvOverrideFingerprint
 
 
@@ -301,12 +308,17 @@ def invalidate_config_cache() -> None:
         _config_cache.clear()
 
 
-def _config_file_mtime(path: Path) -> int:
-    """Return ``path`` mtime, treating a missing file as an absent input."""
+def _config_file_signature(path: Path) -> _ConfigFileSignature:
+    """Return cache-relevant file metadata, treating a missing file as absent."""
     try:
-        return path.stat().st_mtime_ns
+        stat = path.stat()
     except FileNotFoundError:
-        return 0
+        return _ConfigFileSignature(mtime_ns=0, ctime_ns=0, size=0)
+    return _ConfigFileSignature(
+        mtime_ns=stat.st_mtime_ns,
+        ctime_ns=stat.st_ctime_ns,
+        size=stat.st_size,
+    )
 
 
 def _daemon_env_override_fingerprint() -> _EnvOverrideFingerprint:
@@ -341,16 +353,16 @@ def load_config(path: str | None = None) -> AppConfig:
     base_path = Path(selected_path).resolve()
     overlay_path = base_path.parent / OVERLAY_FILENAME
     cache_key = str(base_path)
-    base_mtime = _config_file_mtime(base_path)
-    overlay_mtime = _config_file_mtime(overlay_path)
+    base_signature = _config_file_signature(base_path)
+    overlay_signature = _config_file_signature(overlay_path)
     env_fingerprint = _daemon_env_override_fingerprint()
 
     with _config_cache_lock:
         cached = _config_cache.get(cache_key)
         if (
             cached is not None
-            and cached.base_mtime == base_mtime
-            and cached.overlay_mtime == overlay_mtime
+            and cached.base_signature == base_signature
+            and cached.overlay_signature == overlay_signature
             and cached.env_fingerprint == env_fingerprint
         ):
             return cached.config
@@ -381,8 +393,8 @@ def load_config(path: str | None = None) -> AppConfig:
     with _config_cache_lock:
         _config_cache[cache_key] = _ConfigCacheEntry(
             config=config,
-            base_mtime=base_mtime,
-            overlay_mtime=overlay_mtime,
+            base_signature=base_signature,
+            overlay_signature=overlay_signature,
             env_fingerprint=env_fingerprint,
         )
     return config
@@ -595,6 +607,7 @@ def save_config(config: AppConfig, path: str = "config.yml") -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp_path, target)
+        invalidate_config_cache()
     except Exception:
         # Best-effort cleanup of the tmp file if the replace never happened.
         try:

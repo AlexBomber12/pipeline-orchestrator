@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 import src.config as config_module
-from src.config import invalidate_config_cache, load_config
+from src.config import AppConfig, invalidate_config_cache, load_config, save_config
 from src.web.services import config_writer
 
 
@@ -33,6 +33,12 @@ def _write_config(path: Path, poll_interval: int) -> None:
 def _bump_mtime(path: Path) -> None:
     new_time = time.time() + 2
     os.utime(path, (new_time, new_time))
+
+
+def _rewrite_preserving_mtime(path: Path, poll_interval: int) -> None:
+    stat = path.stat()
+    _write_config(path, poll_interval)
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
 
 
 def test_cache_hit_returns_identical_config(
@@ -79,6 +85,32 @@ def test_cache_miss_on_mtime_change(
     _write_config(cfg_path, 7)
     _bump_mtime(cfg_path)
 
+    assert load_config(str(cfg_path)).daemon.poll_interval_sec == 7
+    assert calls == 2
+
+
+def test_cache_miss_when_content_changes_with_preserved_mtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    _write_config(cfg_path, 5)
+    calls = 0
+    real_load_raw = config_module._load_config_raw
+
+    def counted_load_raw(path: str = "config.yml") -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return real_load_raw(path)
+
+    monkeypatch.setattr(config_module, "_load_config_raw", counted_load_raw)
+
+    assert load_config(str(cfg_path)).daemon.poll_interval_sec == 5
+    before = cfg_path.stat()
+    _rewrite_preserving_mtime(cfg_path, 7)
+    after = cfg_path.stat()
+
+    assert after.st_mtime_ns == before.st_mtime_ns
     assert load_config(str(cfg_path)).daemon.poll_interval_sec == 7
     assert calls == 2
 
@@ -196,6 +228,24 @@ def test_config_writer_invalidates(
     monkeypatch.setattr(config_writer, "invalidate_config_cache", counted_invalidate)
 
     config_writer.write_daemon_field(cfg_path, "poll_interval_sec", 12)
+
+    assert calls == 1
+
+
+def test_save_config_invalidates_after_successful_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    calls = 0
+
+    def counted_invalidate() -> None:
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(config_module, "invalidate_config_cache", counted_invalidate)
+
+    save_config(AppConfig(), str(cfg_path))
 
     assert calls == 1
 
