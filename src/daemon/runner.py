@@ -1583,6 +1583,7 @@ class PipelineRunner(
             },
         )
         blocked_reason = _suppression_reason_from_cancellation(cause)
+        status_write_failed = False
         if task is not None and commit_task_status:
             try:
                 status_written = await self._commit_task_status_change(
@@ -1602,7 +1603,7 @@ class PipelineRunner(
                     "[INFRA] Warning: status:ERROR write failed; staying "
                     "ERROR so the next ERROR cycle retries the coarse write."
                 )
-                await self._mark_status_write_failed_task(task)
+                status_write_failed = True
 
         if task is not None:
             existing: CancellationCause | None
@@ -1635,6 +1636,20 @@ class PipelineRunner(
                         tier="cancel",
                         kind=subsource,
                     )
+                if status_write_failed:
+                    await self._mark_status_write_failed_task(
+                        task,
+                        blocked_reason=blocked_reason,
+                        detail=cause.payload if isinstance(cause.payload, dict) else {},
+                        ensure_suppression=not recorded,
+                    )
+            elif status_write_failed:
+                await self._mark_status_write_failed_task(
+                    task,
+                    blocked_reason=blocked_reason,
+                    detail=cause.payload if isinstance(cause.payload, dict) else {},
+                    ensure_suppression=False,
+                )
         if (
             message.startswith(("GUARDRAIL", "[GUARDRAIL]"))
             and task is not None
@@ -2131,11 +2146,24 @@ class PipelineRunner(
                 f"fallback markers: {exc}."
             )
 
-    async def _mark_status_write_failed_task(self, current_task: Any) -> None:  # pragma: no cover
+    async def _mark_status_write_failed_task(
+        self,
+        current_task: Any,
+        *,
+        blocked_reason: SuppressionReason | None = None,
+        detail: dict[str, Any] | None = None,
+        ensure_suppression: bool = True,
+    ) -> None:  # pragma: no cover
         pr_id = getattr(current_task, "pr_id", "")
         if not pr_id:
             return
         self._status_write_failed_task_pr_ids.add(pr_id)
+        if ensure_suppression and await self._suppression_record_for_task(pr_id) is None:
+            await self._suppress_task(
+                pr_id,
+                blocked_reason or SuppressionReason.CRASH,
+                detail or {"source": "status_write_failed"},
+            )
         self.log_event(
             f"[INFRA] Warning: using in-memory ERROR fallback for "
             f"{pr_id}; status write will retry on the next ERROR cycle."

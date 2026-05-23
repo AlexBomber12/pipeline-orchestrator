@@ -515,7 +515,11 @@ class WatchMixin:
                         "[INFRA] Warning: status:ERROR write failed; "
                         "staying ERROR for retry."
                     )
-                    await self._mark_status_write_failed_task(current_task)
+                    await self._mark_status_write_failed_task(
+                        current_task,
+                        blocked_reason=SuppressionReason.REVIEW_TIMEOUT,
+                        ensure_suppression=False,
+                    )
             await self._transition_to_error(
                 message,
                 save_run_record_as="error",

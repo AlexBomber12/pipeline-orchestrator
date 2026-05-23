@@ -880,7 +880,7 @@ def test_watch_review_timeout_status_write_exception_marks_task(
 
     marked: list[Any] = []
 
-    async def fake_mark(self, current_task: Any) -> None:
+    async def fake_mark(self, current_task: Any, **kwargs: Any) -> None:
         marked.append(current_task)
 
     monkeypatch.setattr(
@@ -936,7 +936,7 @@ def test_watch_review_timeout_status_write_failure_marks_task(
 
     marked: list[Any] = []
 
-    async def fake_mark(self, current_task: Any) -> None:
+    async def fake_mark(self, current_task: Any, **kwargs: Any) -> None:
         marked.append(current_task)
 
     monkeypatch.setattr(

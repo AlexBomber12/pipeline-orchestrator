@@ -299,6 +299,23 @@ def test_coarse_write_failure_retried(monkeypatch: pytest.MonkeyPatch) -> None:
     assert runner._status_write_failed_task_pr_ids == set()
 
 
+def test_status_write_failed_marker_creates_suppression_when_needed() -> None:
+    runner = h._make_runner()
+    task = _task()
+
+    asyncio.run(
+        runner._mark_status_write_failed_task(
+            task,
+            blocked_reason=SuppressionReason.CRASH,
+            detail={"subsource": "crash"},
+        )
+    )
+
+    record = asyncio.run(runner._suppression_record_for_task("PR-379"))
+    assert record is not None
+    assert record.reason == SuppressionReason.CRASH
+
+
 def test_transition_does_not_write_task_status_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
