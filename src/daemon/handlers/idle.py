@@ -15,6 +15,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.cancellation import task_spec_content_hash
 from src.daemon.backups import create_repo_bundle, prune_old_bundles
 from src.daemon.main_commit_audit import (
     audit_main_commit_shas,
@@ -500,6 +501,17 @@ class IdleMixin:
                 ):
                     await self._clear_task_suppression(pr_id)
                     continue
+                if (
+                    frontmatter_statuses.get(pr_id) == "todo"
+                    and is_status_write_failed
+                    and self._status_write_failed_task_was_reuploaded(
+                        pr_id,
+                        task_files,
+                        record.detail,
+                    )
+                ):
+                    await self._clear_task_suppression(pr_id)
+                    continue
                 if self._task_suppression_blocks_selection(record.reason):
                     statuses[pr_id] = TaskStatus.ERROR
             if not self.repo_config.feature_flags.use_single_error_exit:
@@ -578,6 +590,24 @@ class IdleMixin:
                 unresolved_deps_map.get(picked.pr_id, []),
             )
         return None
+
+    def _status_write_failed_task_was_reuploaded(
+        self,
+        pr_id: str,
+        task_files: dict[str, str],
+        detail: dict[str, object],
+    ) -> bool:
+        recorded_hash = detail.get("task_spec_hash")
+        task_file = task_files.get(pr_id)
+        if not isinstance(recorded_hash, str) or not task_file:
+            return False
+        try:
+            task_text = (Path(self.repo_path) / task_file).read_text(
+                encoding="utf-8"
+            )
+        except OSError:
+            return False
+        return task_spec_content_hash(task_text) != recorded_hash
 
     def _queue_task_from_header(
         self,

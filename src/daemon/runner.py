@@ -43,6 +43,7 @@ from src.cancellation import (
     get_cancellation_cause,
     safe_delete_cancellation_cause,
     safe_record_cancellation_cause,
+    task_spec_content_hash,
     truncate_for_payload,
 )
 from src.cancellation.availability import (
@@ -2104,6 +2105,19 @@ class PipelineRunner(
         )
         suppression_detail = dict(detail or {})
         suppression_detail.setdefault("source", "status_write_failed")
+        task_file = getattr(current_task, "task_file", None)
+        if task_file:
+            try:
+                task_text = (Path(self.repo_path) / task_file).read_text(
+                    encoding="utf-8"
+                )
+            except OSError:
+                task_text = ""
+            if task_text:
+                suppression_detail.setdefault(
+                    "task_spec_hash",
+                    task_spec_content_hash(task_text),
+                )
         if blocked_reason is not None and blocked_reason != suppression_reason:
             suppression_detail.setdefault("blocked_reason", blocked_reason.value)
         record = await self._suppression_record_for_task(pr_id)
