@@ -28,12 +28,12 @@ def _unresolved_for(
     depends_on: list[str],
     merged_pr_ids: set[str],
     extra_headers: list[TaskHeader] | None = None,
-    skipped_legacy_pr_ids: set[str] | None = None,
+    skipped_unstructured_pr_ids: set[str] | None = None,
 ) -> dict[str, list[str]]:
     _, unresolved_deps_map = (
         IdleMixin._filter_dag_headers_with_available_dependencies(
             [_header("PR-N", depends_on), *(extra_headers or [])],
-            skipped_legacy_pr_ids=skipped_legacy_pr_ids or set(),
+            skipped_unstructured_pr_ids=skipped_unstructured_pr_ids or set(),
             task_dir=tmp_path,
             merged_pr_ids=merged_pr_ids,
         )
@@ -82,14 +82,14 @@ def test_dependency_satisfied_by_partial_split_first_sub_only(
     assert unresolved_deps_map == {}
 
 
-def test_dependency_satisfied_with_legacy_pending_sibling(
+def test_dependency_satisfied_with_unstructured_pending_sibling(
     tmp_path: Path,
 ) -> None:
     unresolved_deps_map = _unresolved_for(
         tmp_path,
         depends_on=["PR-305"],
         merged_pr_ids={"PR-305a"},
-        skipped_legacy_pr_ids={"PR-305b"},
+        skipped_unstructured_pr_ids={"PR-305b"},
     )
 
     assert unresolved_deps_map == {}
@@ -166,20 +166,20 @@ def test_parent_alias_includes_parent_with_pending_known_split_children() -> Non
     ) == {"PR-305"}
 
 
-def test_parent_alias_includes_parent_with_pending_legacy_split_children() -> None:
+def test_parent_alias_includes_parent_with_pending_unstructured_split_children() -> None:
     assert merged_split_parent_aliases(
         structured_pr_ids=set(),
         merged_pr_ids={"PR-305a"},
-        skipped_legacy_pr_ids={"PR-305b"},
+        skipped_unstructured_pr_ids={"PR-305b"},
     ) == {"PR-305"}
 
 
-def test_parent_alias_excludes_legacy_parent_even_when_child_merged() -> None:
+def test_parent_alias_excludes_unstructured_parent_even_when_child_merged() -> None:
     assert (
         merged_split_parent_aliases(
             structured_pr_ids=set(),
             merged_pr_ids={"PR-305a"},
-            skipped_legacy_pr_ids={"PR-305"},
+            skipped_unstructured_pr_ids={"PR-305"},
         )
         == set()
     )

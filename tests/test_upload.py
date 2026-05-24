@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import io
 import json
 import re
@@ -120,6 +119,10 @@ def _task_file(
     task_type: str = "feature",
 ) -> tuple[str, tuple[str, bytes, str]]:
     header = [
+        "---",
+        "status: TODO",
+        "---",
+        "",
         f"# {pr_id}: Example task",
         "",
         f"Branch: {pr_id.lower()}-example-task",
@@ -158,6 +161,10 @@ def _zip_file_entries(
 
 def _task_bytes(name: str = "PR-001.md", *, pr_id: str = "PR-001") -> bytes:
     return _task_file(name, pr_id=pr_id)[1][1]
+
+
+def _task_hash(content: bytes) -> str:
+    return task_spec_content_hash(content.decode("utf-8"))
 
 
 def _post_upload(files: list[tuple[str, tuple[str, bytes, str]]]):
@@ -449,7 +456,7 @@ def test_reupload_identical_content_returns_409(
     uploads_dir: Path,
 ) -> None:
     content = _task_bytes()
-    expected_hash = hashlib.sha256(content).hexdigest()
+    expected_hash = _task_hash(content)
     with TestClient(app) as client:
         redis = client.app.state.redis
         redis._store["pipeline:example__alpha"] = _error_state_payload()
@@ -511,7 +518,7 @@ def test_reupload_changed_content_proceeds(
         redis = client.app.state.redis
         redis._store["pipeline:example__alpha"] = _error_state_payload()
         redis._store[task_spec_hash_key("example__alpha", "PR-001")] = (
-            hashlib.sha256(original).hexdigest()
+            _task_hash(original)
         )
         redis._store[retry_count_key("example__alpha", "PR-001")] = "3"
 
@@ -522,7 +529,7 @@ def test_reupload_changed_content_proceeds(
 
         assert (
             redis._store[task_spec_hash_key("example__alpha", "PR-001")]
-            == hashlib.sha256(original).hexdigest()
+            == _task_hash(original)
         )
         assert redis._store[retry_count_key("example__alpha", "PR-001")] == "3"
 
@@ -534,7 +541,7 @@ def test_reupload_changed_content_proceeds(
         client.app.state.redis._store["upload:example__alpha:pending"]
     )
     assert manifest["task_hashes"] == {
-        "PR-001": hashlib.sha256(changed).hexdigest()
+        "PR-001": _task_hash(changed)
     }
 
 
@@ -565,7 +572,7 @@ def test_identical_hash_non_error_task_proceeds(
     with TestClient(app) as client:
         redis = client.app.state.redis
         redis._store[task_spec_hash_key("example__alpha", "PR-001")] = (
-            hashlib.sha256(content).hexdigest()
+            _task_hash(content)
         )
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
@@ -609,7 +616,7 @@ def test_batch_upload_partial_rejection(
             }
         )
         redis._store[task_spec_hash_key("example__alpha", "PR-001")] = (
-            hashlib.sha256(unchanged).hexdigest()
+            _task_hash(unchanged)
         )
 
         resp = client.post(
@@ -660,7 +667,7 @@ def test_upload_blocks_when_pending_manifest_write_fails(
 
     original = _task_bytes()
     changed = original + b"\nChanged by operator.\n"
-    original_hash = hashlib.sha256(original).hexdigest()
+    original_hash = _task_hash(original)
     with TestClient(app) as client:
         client.app.state.redis = _PendingSetFails()
         client.app.state.redis._store["pipeline:example__alpha"] = _error_state_payload()
@@ -712,7 +719,7 @@ def test_upload_preserves_existing_pending_manifest_task_hashes(
     manifest = json.loads(client.app.state.redis._store["upload:example__alpha:pending"])
     assert manifest["task_hashes"] == {
         "PR-000": "old-hash",
-        "PR-001": hashlib.sha256(_task_bytes()).hexdigest(),
+        "PR-001": _task_hash(_task_bytes()),
     }
     assert old_staging.is_dir()
     assert {path.name for path in (uploads_dir / "example__alpha").iterdir()} == {

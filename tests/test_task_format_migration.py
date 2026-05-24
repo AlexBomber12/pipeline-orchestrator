@@ -55,7 +55,8 @@ def test_legacy_no_status_becomes_todo(tmp_path: Path) -> None:
 
 def test_all_header_fields_preserved(tmp_path: Path) -> None:
     path = _write_task(tmp_path / "tasks", _legacy_task(status="ERROR"))
-    before = parse_task_header(path)
+    before = migrate_task_format._parse_or_legacy_issues(path)
+    assert not isinstance(before, tuple)
 
     migrate_task_format.migrate_tasks(path.parent, apply=True, stdout=StringIO())
 

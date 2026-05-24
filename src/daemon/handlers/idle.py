@@ -302,22 +302,9 @@ class IdleMixin:
         )
 
     @staticmethod
-    def _is_legacy_unstructured_task_error(exc: QueueValidationError) -> bool:
-        allowed_suffixes = {
-            ": missing Branch",
-            ": missing Type",
-            ": missing Complexity",
-            ": missing Depends on",
-        }
-        return bool(exc.issues) and all(
-            any(issue.endswith(suffix) for suffix in allowed_suffixes)
-            for issue in exc.issues
-        )
-
-    @staticmethod
     def _filter_dag_headers_with_available_dependencies(
         headers: list,
-        skipped_legacy_pr_ids: set[str],
+        skipped_unstructured_pr_ids: set[str],
         task_dir: Path,
         merged_pr_ids: set[str],
     ) -> tuple[list, dict[str, list[str]]]:
@@ -326,7 +313,7 @@ class IdleMixin:
         merged_parent_aliases = merged_split_parent_aliases(
             structured_pr_ids=structured_pr_ids,
             merged_pr_ids=merged_pr_ids,
-            skipped_legacy_pr_ids=skipped_legacy_pr_ids,
+            skipped_unstructured_pr_ids=skipped_unstructured_pr_ids,
         )
 
         changed = True
@@ -340,7 +327,7 @@ class IdleMixin:
                         or dependency in merged_parent_aliases
                     ):
                         continue
-                    if dependency in skipped_legacy_pr_ids:
+                    if dependency in skipped_unstructured_pr_ids:
                         unresolved_deps.add(dependency)
                         continue
                     if dependency not in structured_pr_ids:
@@ -365,19 +352,16 @@ class IdleMixin:
             return None
 
         headers = []
-        skipped_legacy_pr_ids: set[str] = set()
+        skipped_unstructured_pr_ids: set[str] = set()
         task_files: dict[str, str] = {}
         repo_root = Path(self.repo_path)
         for task_file in sorted(task_dir.glob("PR-*.md")):
             try:
                 header = parse_task_header(task_file)
             except QueueValidationError as exc:
-                if not (
-                    self._is_missing_task_header_error(exc)
-                    or self._is_legacy_unstructured_task_error(exc)
-                ):
+                if not self._is_missing_task_header_error(exc):
                     raise
-                skipped_legacy_pr_ids.add(task_file.stem)
+                skipped_unstructured_pr_ids.add(task_file.stem)
                 continue
             self._validate_task_file_header_match(task_file, header.pr_id)
             headers.append(header)
@@ -411,7 +395,7 @@ class IdleMixin:
         merged_pr_ids = state.merged_pr_ids
         headers, unresolved_deps_map = self._filter_dag_headers_with_available_dependencies(
             headers,
-            skipped_legacy_pr_ids,
+            skipped_unstructured_pr_ids,
             task_dir,
             merged_pr_ids,
         )
@@ -419,7 +403,7 @@ class IdleMixin:
         merged_parent_aliases = merged_split_parent_aliases(
             structured_pr_ids=structured_pr_ids,
             merged_pr_ids=merged_pr_ids,
-            skipped_legacy_pr_ids=skipped_legacy_pr_ids,
+            skipped_unstructured_pr_ids=skipped_unstructured_pr_ids,
         )
 
         try:

@@ -19,14 +19,10 @@ def _write_task_file(task_dir: Path, task: dict[str, Any]) -> None:
         return
     depends_on = task.get("depends_on", [])
     depends_value = ", ".join(depends_on) if depends_on else "none"
-    frontmatter = []
+    frontmatter = ["---"]
     if task.get("frontmatter_status"):
-        frontmatter = [
-            "---",
-            f"status: {task['frontmatter_status']}",
-            "---",
-            "",
-        ]
+        frontmatter.append(f"status: {task['frontmatter_status']}")
+    frontmatter.extend(["---", ""])
     path.write_text(
         "\n".join(
             frontmatter
@@ -126,7 +122,18 @@ def test_helper_returns_empty_when_no_pr_files(tmp_path: Path) -> None:
     assert runner._parse_tasks_from_headers() is None
 
 
-def test_helper_skips_legacy_unstructured(
+def test_helper_skips_file_without_task_header(tmp_path: Path) -> None:
+    runner = h._make_runner()
+    repo = tmp_path / "repo"
+    tasks_dir = repo / "tasks"
+    tasks_dir.mkdir(parents=True)
+    (tasks_dir / "PR-001.md").write_text("\n", encoding="utf-8")
+    runner.repo_path = str(repo)
+
+    assert runner._parse_tasks_from_headers() is None
+
+
+def test_helper_rejects_legacy_unstructured(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -160,10 +167,8 @@ def test_helper_skips_legacy_unstructured(
     }
     runner, _repo = _runner_for_fixture(tmp_path, before, monkeypatch)
 
-    tasks = runner._parse_tasks_from_headers()
-
-    assert tasks is not None
-    assert [task.pr_id for task in tasks] == ["PR-001", "PR-003", "PR-004"]
+    with pytest.raises(QueueValidationError, match="legacy header format"):
+        runner._parse_tasks_from_headers()
 
 
 def test_helper_applies_merged_state_via_resolve(

@@ -111,13 +111,11 @@ def test_file_without_reason_parses_none(tmp_path: Path) -> None:
     assert parse_task_header(task).blocked_reason is None
 
 
-def test_legacy_file_unaffected(tmp_path: Path) -> None:
+def test_legacy_file_rejected_with_actionable_error(tmp_path: Path) -> None:
     task = _write_task(tmp_path, _task_body())
 
-    header = parse_task_header(task)
-
-    assert header.frontmatter_status is None
-    assert header.blocked_reason is None
+    with pytest.raises(QueueValidationError, match="legacy header format"):
+        parse_task_header(task)
 
 
 def test_unknown_reason_rejected(tmp_path: Path) -> None:

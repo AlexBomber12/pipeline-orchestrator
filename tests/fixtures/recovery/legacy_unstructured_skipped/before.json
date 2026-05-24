@@ -10,16 +10,6 @@
       "complexity": "low"
     },
     {
-      "pr_id": "PR-032",
-      "title": "Legacy unstructured",
-      "branch": "pr-032-legacy",
-      "depends_on": [],
-      "priority": 1,
-      "type": "feature",
-      "complexity": "low",
-      "legacy_unstructured": true
-    },
-    {
       "pr_id": "PR-030",
       "title": "Structured first",
       "branch": "pr-030-structured",

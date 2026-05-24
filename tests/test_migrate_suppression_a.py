@@ -37,7 +37,7 @@ def _header(pr_id: str = "PR-381") -> TaskHeader:
 
 
 def _write_task(repo: Path, pr_id: str, *, status: str | None = None) -> None:
-    frontmatter = f"---\nstatus: {status}\n---\n\n" if status else ""
+    frontmatter = f"---\nstatus: {status}\n---\n\n" if status else "---\n---\n\n"
     (repo / "tasks").mkdir(parents=True, exist_ok=True)
     (repo / "tasks" / f"{pr_id}.md").write_text(
         frontmatter

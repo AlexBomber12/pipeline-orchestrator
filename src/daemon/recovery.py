@@ -68,10 +68,7 @@ class RecoveryMixin:
             try:
                 header = parse_task_header(task_file)
             except QueueValidationError as exc:
-                if not (
-                    self._is_missing_task_header_error(exc)
-                    or self._is_legacy_unstructured_task_error(exc)
-                ):
+                if not self._is_missing_task_header_error(exc):
                     raise
                 continue
             if header.pr_id != task_file.stem:

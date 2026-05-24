@@ -11,7 +11,6 @@ from src.models import PRInfo, QueueTask, TaskStatus
 from src.queue_parser import QueueValidationError, TaskHeader
 from src.task_status import (
     MergedState,
-    _load_legacy_task_header,
     _load_task_header,
     _resolve_merged_state,
     derive_queue_task_statuses,
@@ -64,6 +63,7 @@ def _write_task_file(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir(exist_ok=True)
     (tasks_dir / f"{pr_id}.md").write_text(
+        "---\n---\n"
         f"# {pr_id}: {title}\n\n"
         f"Branch: {branch}\n"
         "- Type: feature\n"
@@ -863,36 +863,43 @@ def test_find_matching_merged_pr_ignores_mismatched_identity_when_branch_is_miss
     assert match is None
 
 
-def test_load_task_header_falls_back_for_legacy_task_files(
+def test_load_task_header_reads_frontmatter_task_files(
     tmp_path: Path,
 ) -> None:
     task_file = tmp_path / "tasks" / "PR-001.md"
     task_file.parent.mkdir()
     task_file.write_text(
-        "# PR-001: Legacy task\n\n"
-        "Branch: pr-001-legacy-task\n",
+        "---\nstatus: TODO\n---\n"
+        "# PR-001: Frontmatter task\n\n"
+        "Branch: pr-001-frontmatter-task\n"
+        "- Type: feature\n"
+        "- Complexity: medium\n"
+        "- Depends on: PR-000\n"
+        "- Priority: 3\n"
+        "- Coder: any\n",
         encoding="utf-8",
     )
     task = QueueTask(
         pr_id="PR-001",
-        title="Legacy task",
+        title="Frontmatter task",
         status=TaskStatus.TODO,
         task_file="tasks/PR-001.md",
         depends_on=["PR-000"],
-        branch="pr-001-legacy-task",
+        branch="pr-001-frontmatter-task",
     )
 
     header = _load_task_header(task, str(tmp_path))
 
     assert header == TaskHeader(
         pr_id="PR-001",
-        title="Legacy task",
-        branch="pr-001-legacy-task",
+        title="Frontmatter task",
+        branch="pr-001-frontmatter-task",
         task_type="feature",
         complexity="medium",
         depends_on=["PR-000"],
         priority=3,
         coder="any",
+        frontmatter_status="todo",
     )
 
 
@@ -942,46 +949,44 @@ def test_load_task_header_falls_back_to_queue_metadata_without_task_file() -> No
     )
 
 
-def test_load_task_header_falls_back_when_legacy_file_missing_branch(
+def test_load_task_header_rejects_malformed_frontmatter_file(
     tmp_path: Path,
 ) -> None:
     task_file = tmp_path / "tasks" / "PR-001.md"
     task_file.parent.mkdir()
     task_file.write_text(
-        "# PR-001: Legacy task\n\n",
+        "---\nstatus: TODO\n---\n"
+        "# PR-001: Missing branch\n\n"
+        "- Type: feature\n"
+        "- Complexity: medium\n"
+        "- Depends on: PR-000\n",
         encoding="utf-8",
     )
     task = QueueTask(
         pr_id="PR-001",
-        title="Legacy task",
+        title="Missing branch",
         status=TaskStatus.TODO,
         task_file="tasks/PR-001.md",
         depends_on=["PR-000"],
-        branch="pr-001-legacy-task",
+        branch="pr-001-missing-branch",
     )
 
-    header = _load_task_header(task, str(tmp_path))
-
-    assert header == TaskHeader(
-        pr_id="PR-001",
-        title="Legacy task",
-        branch="pr-001-legacy-task",
-        task_type="feature",
-        complexity="medium",
-        depends_on=["PR-000"],
-        priority=3,
-        coder="any",
-    )
+    with pytest.raises(QueueValidationError, match="missing Branch"):
+        _load_task_header(task, str(tmp_path))
 
 
-def test_load_task_header_rejects_mismatched_legacy_task_files(
+def test_load_task_header_returns_frontmatter_even_when_queue_entry_differs(
     tmp_path: Path,
 ) -> None:
     task_file = tmp_path / "tasks" / "PR-999.md"
     task_file.parent.mkdir()
     task_file.write_text(
+        "---\nstatus: TODO\n---\n"
         "# PR-999: Wrong task\n\n"
-        "Branch: pr-999-wrong-task\n",
+        "Branch: pr-999-wrong-task\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n",
         encoding="utf-8",
     )
     task = QueueTask(
@@ -993,97 +998,30 @@ def test_load_task_header_rejects_mismatched_legacy_task_files(
         branch="pr-001-queued-task",
     )
 
-    with pytest.raises(QueueValidationError) as excinfo:
+    header = _load_task_header(task, str(tmp_path))
+
+    assert header.pr_id == "PR-999"
+
+
+def test_status_derivation_frontmatter_only(tmp_path: Path) -> None:
+    task_file = tmp_path / "tasks" / "PR-001.md"
+    task_file.parent.mkdir()
+    task_file.write_text(
+        "# PR-001: Legacy task\n\n"
+        "Branch: pr-001-legacy-task\n",
+        encoding="utf-8",
+    )
+    task = QueueTask(
+        pr_id="PR-001",
+        title="Legacy task",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-001.md",
+        depends_on=[],
+        branch="pr-001-legacy-task",
+    )
+
+    with pytest.raises(QueueValidationError, match="legacy header format"):
         _load_task_header(task, str(tmp_path))
-
-    assert excinfo.value.issues == [
-        "tasks/PR-999.md: header PR ID 'PR-999' does not match queue entry 'PR-001'"
-    ]
-
-
-def test_load_legacy_task_header_returns_none_for_nonlegacy_issues(
-    tmp_path: Path,
-) -> None:
-    task_file = tmp_path / "tasks" / "PR-001.md"
-    task_file.parent.mkdir()
-    task_file.write_text(
-        "# PR-001: Legacy task\n\n"
-        "Branch: pr-001-legacy-task\n",
-        encoding="utf-8",
-    )
-    task = QueueTask(
-        pr_id="PR-001",
-        title="Legacy task",
-        status=TaskStatus.TODO,
-        task_file="tasks/PR-001.md",
-        depends_on=[],
-        branch="pr-001-legacy-task",
-    )
-
-    header = _load_legacy_task_header(
-        task,
-        task_file,
-        QueueValidationError(["tasks/PR-001.md: header missing Priority"]),
-    )
-
-    assert header is None
-
-
-def test_load_legacy_task_header_returns_none_when_branch_is_interrupted_by_section(
-    tmp_path: Path,
-) -> None:
-    task_file = tmp_path / "tasks" / "PR-001.md"
-    task_file.parent.mkdir()
-    task_file.write_text(
-        "# PR-001: Legacy task\n\n"
-        "## Notes\n"
-        "Branch: pr-001-legacy-task\n",
-        encoding="utf-8",
-    )
-    task = QueueTask(
-        pr_id="PR-001",
-        title="Legacy task",
-        status=TaskStatus.TODO,
-        task_file="tasks/PR-001.md",
-        depends_on=[],
-        branch="",
-    )
-
-    header = _load_legacy_task_header(
-        task,
-        task_file,
-        QueueValidationError(["tasks/PR-001.md: missing Branch"]),
-    )
-
-    assert header is None
-
-
-def test_load_legacy_task_header_returns_none_without_matching_header_line(
-    tmp_path: Path,
-) -> None:
-    task_file = tmp_path / "tasks" / "PR-001.md"
-    task_file.parent.mkdir()
-    task_file.write_text(
-        "PR-001: Legacy task\n\n"
-        "Branch: pr-001-legacy-task\n",
-        encoding="utf-8",
-    )
-    task = QueueTask(
-        pr_id="PR-001",
-        title="Legacy task",
-        status=TaskStatus.TODO,
-        task_file="tasks/PR-001.md",
-        depends_on=[],
-        branch="pr-001-legacy-task",
-    )
-
-    header = _load_legacy_task_header(
-        task,
-        task_file,
-        QueueValidationError(["tasks/PR-001.md: missing Branch"]),
-    )
-
-    assert header is None
 
 
 def test_derive_queue_task_statuses_does_not_trust_stale_done_queue_status(

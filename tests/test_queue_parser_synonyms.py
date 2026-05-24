@@ -14,7 +14,9 @@ def _write_task_file(
 ) -> Path:
     task_path = tmp_path / "PR-999.md"
     task_path.write_text(
-        f"""# PR-999: Synonym coverage
+        f"""---
+---
+# PR-999: Synonym coverage
 
 Branch: pr-999-synonym-coverage
 - Type: {task_type}
@@ -127,7 +129,11 @@ def test_validate_task_spec_accepts_synonyms() -> None:
     from src.mcp.tools.functional import validate_task_spec
 
     result = validate_task_spec(
-        """# PR-999: Synonym validation
+        """---
+status: TODO
+---
+
+# PR-999: Synonym validation
 
 Branch: pr-999-synonym-validation
 - Type: infra

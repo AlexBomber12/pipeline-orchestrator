@@ -51,12 +51,14 @@ def _write_queue(tmp_path: Path, content: str = SAMPLE_QUEUE) -> str:
 
 def _write_task_file(tmp_path: Path, content: str) -> Path:
     task_path = tmp_path / "PR-999.md"
+    if not content.startswith("---\n"):
+        content = f"---\n---\n{content}"
     task_path.write_text(content, encoding="utf-8")
     return task_path
 
 
 def _frontmatter_task(status: str | None = None) -> str:
-    frontmatter = "" if status is None else f"---\nstatus: {status}\n---\n"
+    frontmatter = "---\n---\n" if status is None else f"---\nstatus: {status}\n---\n"
     return (
         f"{frontmatter}# PR-100: Frontmatter status\n\n"
         "Branch: pr-100-frontmatter-status\n"
@@ -221,20 +223,33 @@ def test_parser_rejects_legacy_frontmatter_tokens(
         parse_task_header(_write_task_file(tmp_path, _frontmatter_task(status)))
 
 
-def test_parse_task_header_without_frontmatter(tmp_path: Path) -> None:
-    header = parse_task_header(_write_task_file(tmp_path, _frontmatter_task()))
-
-    assert header == TaskHeader(
-        pr_id="PR-100",
-        title="Frontmatter status",
-        branch="pr-100-frontmatter-status",
-        task_type="feature",
-        complexity="medium",
-        depends_on=[],
-        priority=2,
-        coder="codex",
+def test_legacy_file_actionable_error(tmp_path: Path) -> None:
+    task_path = tmp_path / "PR-999.md"
+    task_path.write_text(
+        _frontmatter_task().removeprefix("---\n---\n"),
+        encoding="utf-8",
     )
-    assert header.frontmatter_status is None
+
+    with pytest.raises(
+        QueueValidationError,
+        match=r"legacy header format; run scripts/migrate_task_format.py --apply",
+    ):
+        parse_task_header(task_path)
+
+
+def test_legacy_constants_removed() -> None:
+    import src.queue_parser as queue_parser
+    import src.task_status as task_status
+
+    assert not hasattr(queue_parser, "_LEGACY_FALLBACK_SUFFIXES")
+    assert not hasattr(task_status, "_LEGACY_FALLBACK_SUFFIXES")
+
+
+def test_schema_doc_no_legacy_tokens() -> None:
+    schema = Path("docs/TASK_SCHEMA.md").read_text(encoding="utf-8")
+
+    assert "legacy tokens" not in schema.lower()
+    assert "one release cycle" not in schema.lower()
 
 
 def test_parse_task_header_invalid_frontmatter_status(tmp_path: Path) -> None:
@@ -254,6 +269,14 @@ def test_parse_task_header_rejects_missing_header(tmp_path: Path) -> None:
 - Depends on: none
 """,
     )
+
+    with pytest.raises(QueueValidationError, match="missing task header"):
+        parse_task_header(task_path)
+
+
+def test_parse_task_header_rejects_empty_file(tmp_path: Path) -> None:
+    task_path = tmp_path / "PR-999.md"
+    task_path.write_text("\n", encoding="utf-8")
 
     with pytest.raises(QueueValidationError, match="missing task header"):
         parse_task_header(task_path)

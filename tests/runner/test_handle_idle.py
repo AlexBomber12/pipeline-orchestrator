@@ -710,6 +710,7 @@ def test_handle_idle_dag_skips_files_without_headers(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
+        "---\n---\n"
         "# PR-001: Structured\n\n"
         "Branch: pr-001-structured\n"
         "- Type: feature\n"
@@ -764,6 +765,7 @@ def test_idle_does_not_write_queue_md(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
+        "---\n---\n"
         "# PR-001: Structured\n\n"
         "Branch: pr-001-structured\n"
         "- Type: feature\n"
@@ -809,6 +811,7 @@ def test_handle_idle_dag_surfaces_malformed_task_headers(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
+        "---\n---\n"
         "# PR-001: Broken structured task\n\n"
         "Branch: pr-001-broken\n"
         "- Type: definitely-not-valid\n"
@@ -948,6 +951,7 @@ def test_handle_idle_transitions_to_error_when_pinned_coder_unavailable(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-200.md").write_text(
+        "---\n---\n"
         "# PR-200: Pinned to codex\n\n"
         "Branch: pr-200-pinned\n"
         "- Type: feature\n"
@@ -1862,6 +1866,7 @@ def test_select_next_task_from_dag_prefers_doing_task(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
+        "---\n---\n"
         "# PR-001: In flight task\n\n"
         "Branch: pr-001-in-flight\n"
         "- Type: feature\n"
@@ -1870,6 +1875,7 @@ def test_select_next_task_from_dag_prefers_doing_task(
         encoding="utf-8",
     )
     (tasks_dir / "PR-002.md").write_text(
+        "---\n---\n"
         "# PR-002: Fresh task\n\nBranch: pr-002-fresh\n- Type: feature\n- Complexity: low\n- Depends on: none\n",
         encoding="utf-8",
     )
@@ -1909,6 +1915,7 @@ def test_select_next_task_from_dag_marks_current_task_doing_without_open_pr(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
+        "---\n---\n"
         "# PR-001: Active task\n\n"
         "Branch: pr-001-active\n"
         "- Type: feature\n"
@@ -1956,6 +1963,7 @@ def test_select_next_task_from_dag_skips_user_stopped_current_task(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
+        "---\n---\n"
         "# PR-001: Stopped task\n\n"
         "Branch: pr-001-stopped\n"
         "- Type: feature\n"
@@ -1966,6 +1974,7 @@ def test_select_next_task_from_dag_skips_user_stopped_current_task(
         encoding="utf-8",
     )
     (tasks_dir / "PR-002.md").write_text(
+        "---\n---\n"
         "# PR-002: Follow-up task\n\n"
         "Branch: pr-002-follow-up\n"
         "- Type: feature\n"
@@ -2017,6 +2026,7 @@ def test_select_next_task_from_dag_retries_user_stopped_task_when_only_choice(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
+        "---\n---\n"
         "# PR-001: Stopped task\n\n"
         "Branch: pr-001-stopped\n"
         "- Type: feature\n"
@@ -2064,6 +2074,7 @@ def test_select_next_task_from_dag_watches_user_stopped_task_with_open_pr(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
+        "---\n---\n"
         "# PR-001: Open PR task\n\n"
         "Branch: pr-001-open\n"
         "- Type: feature\n"
@@ -2111,6 +2122,7 @@ def test_select_next_task_from_dag_rejects_header_filename_mismatch(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
+        "---\n---\n"
         "# PR-999: Wrong task\n\nBranch: pr-999-wrong-task\n- Type: feature\n- Complexity: low\n- Depends on: none\n",
         encoding="utf-8",
     )
@@ -3112,6 +3124,7 @@ def test_picker_does_not_pick_task_with_unresolved_deps(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
+        "---\n---\n"
         "# PR-001: Blocked\n\n"
         "Branch: pr-001\n"
         "- Type: feature\n"
@@ -3158,6 +3171,7 @@ def test_picker_keeps_unresolved_cycle_idle(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
+        "---\n---\n"
         "# PR-001: First blocked\n\n"
         "Branch: pr-001\n"
         "- Type: feature\n"
@@ -3168,6 +3182,7 @@ def test_picker_keeps_unresolved_cycle_idle(
         encoding="utf-8",
     )
     (tasks_dir / "PR-002.md").write_text(
+        "---\n---\n"
         "# PR-002: Second blocked\n\n"
         "Branch: pr-002\n"
         "- Type: feature\n"
@@ -3385,6 +3400,7 @@ def test_select_next_task_from_dag_wraps_dag_cycle_errors(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
+        "---\n---\n"
         "# PR-001: Cyclic\n\n"
         "Branch: pr-001-cyclic\n"
         "- Type: feature\n"
@@ -3420,6 +3436,7 @@ def test_select_next_task_from_dag_returns_none_when_nothing_is_eligible(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
+        "---\n---\n"
         "# PR-001: Waiting\n\n"
         "Branch: pr-001-waiting\n"
         "- Type: feature\n"
@@ -4059,6 +4076,7 @@ def test_idle_cycle_does_not_emit_agents_scan_events(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-009.md").write_text(
+        "---\n---\n"
         "# PR-009: Old spec\n\nSkip CI on this branch.\n",
         encoding="utf-8",
     )
@@ -4112,6 +4130,7 @@ def test_agents_scan_method_emits_events_when_specs_drift(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-007.md").write_text(
+        "---\n---\n"
         "# PR-007: Old spec\n\nSkip CI on this branch.\n",
         encoding="utf-8",
     )
@@ -4156,6 +4175,7 @@ def test_agents_scan_method_clean_tasks_dir_emits_no_events(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-008.md").write_text(
+        "---\n---\n"
         "# PR-008: Clean spec\n\nNo anti-patterns here.\n",
         encoding="utf-8",
     )
@@ -4321,6 +4341,7 @@ def test_agents_scan_method_suppresses_unchanged_output(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-077.md").write_text(
+        "---\n---\n"
         "# PR-077: Old spec\n\nSkip CI on this branch.\n",
         encoding="utf-8",
     )
@@ -4376,6 +4397,7 @@ def test_agents_scan_method_re_emits_when_drift_changes(
     tasks_dir.mkdir()
     spec = tasks_dir / "PR-088.md"
     spec.write_text(
+        "---\n---\n"
         "# PR-088: Old spec\n\nSkip CI on this branch.\n",
         encoding="utf-8",
     )
@@ -4398,6 +4420,7 @@ def test_agents_scan_method_re_emits_when_drift_changes(
     ])
 
     spec.write_text(
+        "---\n---\n"
         "# PR-088: Old spec\n\nRun git commit --no-verify to skip hooks.\n",
         encoding="utf-8",
     )

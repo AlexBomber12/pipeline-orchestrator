@@ -21,12 +21,6 @@ from src.queue_parser import (
 _PR_ID_PATTERN = _PR_ID_RE.pattern.removeprefix("^").removesuffix("$")
 _MERGED_SUBJECT_RE = re.compile(rf"^(?P<pr_id>{_PR_ID_PATTERN}):(?:\s|$)")
 _SPLIT_PARENT_ID_RE = re.compile(r"^PR-\d+(?:\.\d+)?$")
-_LEGACY_FALLBACK_SUFFIXES = {
-    ": missing Branch",
-    ": missing Type",
-    ": missing Complexity",
-    ": missing Depends on",
-}
 
 
 @dataclass(frozen=True)
@@ -46,16 +40,16 @@ def merged_split_parent_aliases(
     *,
     structured_pr_ids: set[str],
     merged_pr_ids: set[str],
-    skipped_legacy_pr_ids: set[str] | None = None,
+    skipped_unstructured_pr_ids: set[str] | None = None,
 ) -> set[str]:
     """Return split parents satisfied by at least one merged split child."""
-    skipped_legacy_pr_ids = skipped_legacy_pr_ids or set()
+    skipped_unstructured_pr_ids = skipped_unstructured_pr_ids or set()
     parent_aliases: set[str] = set()
     for pr_id in merged_pr_ids:
         parent = split_parent_of(pr_id)
         if parent is None:
             continue
-        if parent in structured_pr_ids or parent in skipped_legacy_pr_ids:
+        if parent in structured_pr_ids or parent in skipped_unstructured_pr_ids:
             continue
         parent_aliases.add(parent)
     return parent_aliases
@@ -375,75 +369,12 @@ def _load_task_header(task: QueueTask, repo_path: str) -> TaskHeader:
     if task.task_file:
         task_path = Path(repo_path) / task.task_file
         if task_path.is_file():
-            try:
-                return parse_task_header(task_path)
-            except QueueValidationError as exc:
-                legacy_header = _load_legacy_task_header(task, task_path, exc)
-                if legacy_header is not None:
-                    return legacy_header
-                raise
+            return parse_task_header(task_path)
 
     return TaskHeader(
         pr_id=task.pr_id,
         title=task.title,
         branch=task.branch or "",
-        task_type="feature",
-        complexity="medium",
-        depends_on=list(task.depends_on),
-        priority=3,
-        coder="any",
-    )
-
-
-def _load_legacy_task_header(
-    task: QueueTask,
-    task_path: Path,
-    exc: QueueValidationError,
-) -> TaskHeader | None:
-    """Return a narrow fallback only for known legacy task-file headers."""
-    if not exc.issues or any(
-        not any(issue.endswith(suffix) for suffix in _LEGACY_FALLBACK_SUFFIXES)
-        for issue in exc.issues
-    ):
-        return None
-
-    header_match: re.Match[str] | None = None
-    branch: str | None = None
-    for raw_line in task_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.rstrip()
-        if header_match is None:
-            header_match = re.match(r"^#\s+(PR-[A-Za-z0-9_.-]+):\s*(.+?)\s*$", line)
-            continue
-        if not line.strip():
-            continue
-        branch_match = re.match(r"^Branch\s*:\s*(.*?)\s*$", line)
-        if branch_match:
-            branch = branch_match.group(1).strip()
-            break
-        if line.startswith("#") or line.startswith("- "):
-            break
-
-    if header_match is None:
-        return None
-
-    branch = branch or task.branch
-    if not branch:
-        return None
-
-    header_pr_id = header_match.group(1)
-    if header_pr_id != task.pr_id:
-        task_ref = task.task_file or str(task_path)
-        raise QueueValidationError(
-            [
-                f"{task_ref}: header PR ID {header_pr_id!r} "
-                f"does not match queue entry {task.pr_id!r}"
-            ]
-        )
-
-    return TaskHeader(
-        pr_id=header_pr_id,
-        title=header_match.group(2),
-        branch=branch,
         task_type="feature",
         complexity="medium",
         depends_on=list(task.depends_on),

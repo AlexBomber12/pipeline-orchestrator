@@ -325,30 +325,48 @@ def parse_task_header(path: str | Path) -> TaskHeader:
         (index for index, raw_line in enumerate(lines) if raw_line.strip()),
         None,
     )
-    if first_content_index is not None and lines[first_content_index].rstrip() == "---":
-        frontmatter_end_index: int | None = None
-        for index in range(first_content_index + 1, len(lines)):
-            if lines[index].rstrip() == "---":
-                frontmatter_end_index = index
-                break
-
-        if frontmatter_end_index is not None:
-            header_start_index = frontmatter_end_index + 1
-            for raw_line in lines[first_content_index + 1 : frontmatter_end_index]:
-                frontmatter_line = raw_line.rstrip()
-                status_match = _FRONTMATTER_STATUS_RE.match(frontmatter_line)
-                if status_match:
-                    frontmatter_status = _normalize_frontmatter_status(
-                        status_match.group(1)
-                    )
-                    continue
-                blocked_reason_match = _FRONTMATTER_BLOCKED_REASON_RE.match(
-                    frontmatter_line
+    if first_content_index is None:
+        raise QueueValidationError(
+            [f"{task_path}: missing task header like '# PR-123: Title'"]
+        )
+    if lines[first_content_index].rstrip() != "---":
+        for raw_line in lines[first_content_index:]:
+            if _TASK_HEADER_RE.match(raw_line.rstrip()):
+                raise QueueValidationError(
+                    [
+                        f"Task file {task_path} is in legacy header format; "
+                        "run scripts/migrate_task_format.py --apply."
+                    ]
                 )
-                if blocked_reason_match:
-                    blocked_reason = _normalize_frontmatter_scalar(
-                        blocked_reason_match.group(1)
-                    )
+        raise QueueValidationError(
+            [f"{task_path}: missing task header like '# PR-123: Title'"]
+        )
+
+    frontmatter_end_index: int | None = None
+    for index in range(first_content_index + 1, len(lines)):
+        if lines[index].rstrip() == "---":
+            frontmatter_end_index = index
+            break
+
+    if frontmatter_end_index is None:
+        raise QueueValidationError([f"{task_path}: missing closing frontmatter '---'"])
+
+    header_start_index = frontmatter_end_index + 1
+    for raw_line in lines[first_content_index + 1 : frontmatter_end_index]:
+        frontmatter_line = raw_line.rstrip()
+        status_match = _FRONTMATTER_STATUS_RE.match(frontmatter_line)
+        if status_match:
+            frontmatter_status = _normalize_frontmatter_status(
+                status_match.group(1)
+            )
+            continue
+        blocked_reason_match = _FRONTMATTER_BLOCKED_REASON_RE.match(
+            frontmatter_line
+        )
+        if blocked_reason_match:
+            blocked_reason = _normalize_frontmatter_scalar(
+                blocked_reason_match.group(1)
+            )
 
     for raw_line in lines[header_start_index:]:
         line = raw_line.rstrip()

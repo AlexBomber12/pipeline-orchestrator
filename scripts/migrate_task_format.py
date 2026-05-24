@@ -160,16 +160,38 @@ def _is_legacy_validation_error(exc: QueueValidationError) -> bool:
 
 def _legacy_issue_kinds(path: Path, issues: list[str]) -> tuple[str, ...]:
     prefix = f"{path}: "
-    return tuple(issue.removeprefix(prefix) for issue in issues)
+    kinds: list[str] = []
+    for issue in issues:
+        without_expected_prefix = issue.removeprefix(prefix)
+        if without_expected_prefix != issue:
+            kinds.append(without_expected_prefix)
+            continue
+        _path, separator, kind = issue.partition(": ")
+        kinds.append(kind if separator else issue)
+    return tuple(kinds)
 
 
 def _parse_or_legacy_issues(path: Path) -> TaskHeader | tuple[str, ...]:
+    content = path.read_text(encoding="utf-8")
+    parse_path = path
+    temp_path: Path | None = None
+    if not has_frontmatter(content):
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.parse.", suffix=".tmp", dir=str(path.parent), text=True
+        )
+        temp_path = Path(temp_name)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(f"---\n---\n{content}")
+        parse_path = temp_path
     try:
-        return parse_task_header(path)
+        return parse_task_header(parse_path)
     except QueueValidationError as exc:
         if _is_legacy_validation_error(exc):
             return _legacy_issue_kinds(path, exc.issues)
         raise
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def _atomic_write(path: Path, content: str) -> None:

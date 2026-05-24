@@ -9,7 +9,11 @@ import pytest
 
 # ---- validate_task_spec ----
 
-_VALID_SPEC = """# PR-999: Example task
+_VALID_SPEC = """---
+status: TODO
+---
+
+# PR-999: Example task
 
 Branch: pr-999-example
 - Type: refactor
