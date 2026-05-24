@@ -511,6 +511,7 @@ class IdleMixin:
                     elif (
                         frontmatter_is_todo
                         and statuses[pr_id] != TaskStatus.DOING
+                        and pr_id in recently_uploaded_task_pr_ids
                     ):
                         status_write_failed_task_pr_ids.discard(pr_id)
                         recently_uploaded_task_pr_ids.discard(pr_id)
