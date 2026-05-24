@@ -141,8 +141,8 @@ class CodingMixin:
            selector sees fresh statuses; ``_start_current_run_record``
            runs before the branch guard so the missing-branch ERROR
            transition still emits run telemetry; and
-           ``_check_rate_limit`` runs before the branch guard so an
-           active or renewed rate-limit window pauses the runner instead
+           ``usage_gate`` runs before the branch guard so an
+           active or renewed usage pause window pauses the runner instead
            of being overridden by the ERROR transition.
         2. ``_run_coder_with_supervision`` — subprocess plus stop and
            breach monitors; resolves user-stop and breach pauses.
@@ -171,15 +171,12 @@ class CodingMixin:
         )
         self._start_current_run_record(coder_name, plugin_run_kwargs["model"])
 
-        # Run the rate-limit gate before the branch guard so an active
+        # Run the usage gate before the branch guard so an active
         # or renewed pause window is honored as PAUSED. If this ran
         # after the guard, a malformed task would short-circuit through
         # ``_transition_to_error`` and bypass the cooldown that
-        # ``_check_rate_limit`` is responsible for enforcing.
-        if not await self._check_rate_limit(proactive_coder=coder_name):
-            await self._save_current_run_record("rate_limit")
-            return
-        if not await self._check_spend_ceiling(coder_name):
+        # ``usage_gate`` is responsible for enforcing.
+        if not await self.usage_gate(proactive_coder=coder_name):
             await self._save_current_run_record("rate_limit")
             return
 

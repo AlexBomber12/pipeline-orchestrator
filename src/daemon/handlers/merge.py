@@ -130,7 +130,7 @@ class MergeMixin:
                             )
                             return
                         coder_name, _plugin = selected
-                        if not await self._check_rate_limit(
+                        if not await self.usage_gate(
                             proactive_coder=coder_name
                         ):
                             git_ops._git(

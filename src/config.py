@@ -200,8 +200,12 @@ class DaemonConfig(BaseModel):
     fix_poll_interval_sec: int = Field(default=30, ge=1)
     coder_terminate_grace_sec: int = Field(default=5, ge=1)
     planned_pr_timeout_sec: int = Field(default=3600, ge=60)
+    # Unified usage gate pause predicates. These legacy field names remain
+    # parseable for the production overlay; internally the usage gate reads
+    # through the ``usage_gate_*`` properties below.
     rate_limit_session_pause_percent: int = Field(default=95, ge=0, le=100)
     rate_limit_weekly_pause_percent: int = Field(default=100, ge=0, le=100)
+    # Deprecated aliases for the usage gate's spend-ceiling pause predicate.
     spend_ceiling_session_percent: int | None = Field(default=None, ge=1, le=100)
     spend_ceiling_weekly_percent: int | None = Field(default=None, ge=1, le=100)
     spend_ceiling_warning_percent: int = Field(default=80, ge=1, le=100)
@@ -257,6 +261,22 @@ class DaemonConfig(BaseModel):
     git_bundle_backup_daily_retention: int = Field(default=7, ge=1)
     git_bundle_backup_weekly_retention: int = Field(default=4, ge=0)
     coder_filesystem_isolation: bool = Field(default=False)
+
+    @property
+    def usage_gate_rate_limit_session_pause_percent(self) -> int:
+        return self.rate_limit_session_pause_percent
+
+    @property
+    def usage_gate_rate_limit_weekly_pause_percent(self) -> int:
+        return self.rate_limit_weekly_pause_percent
+
+    @property
+    def usage_gate_spend_ceiling_session_percent(self) -> int | None:
+        return self.spend_ceiling_session_percent
+
+    @property
+    def usage_gate_spend_ceiling_weekly_percent(self) -> int | None:
+        return self.spend_ceiling_weekly_percent
 
 
 class WebConfig(BaseModel):

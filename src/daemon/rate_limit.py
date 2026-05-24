@@ -1,8 +1,8 @@
 """Rate-limit detection and proactive usage checks.
 
 Mixin methods:
-    _proactive_usage_check — check usage API before CLI invocation
-    _check_rate_limit      — unified rate-limit gate (proactive + reactive)
+    usage_gate             — unified proactive usage gate
+    _check_rate_limit      — compatibility entrypoint for usage_gate callers
     _detect_rate_limit     — parse stderr for rate-limit signals
 """
 
@@ -40,6 +40,17 @@ class GlobalPauseVerdict:
     expired: bool
     diagnosis_pause: bool
     legacy_pause: bool
+
+
+@dataclass(frozen=True)
+class UsageThresholdBreach:
+    """A proactive usage threshold breach from the unified usage gate."""
+
+    source: str
+    limit_kind: str
+    current_percent: int
+    cap_percent: int
+    resets_at: int
 
 
 RATE_LIMIT_BRANCH_MAP = (
@@ -95,61 +106,103 @@ class RateLimitMixin:
         return await asyncio.to_thread(provider.fetch)
 
     async def _check_spend_ceiling(self, coder_name: str) -> bool:
-        """Return True if dispatch may proceed under configured spend ceilings."""
+        """Compatibility wrapper for the spend predicate inside ``usage_gate``."""
         config = self.app_config.daemon
-        session_cap = config.spend_ceiling_session_percent
-        weekly_cap = config.spend_ceiling_weekly_percent
-        if session_cap is None and weekly_cap is None:
+        if (
+            config.usage_gate_spend_ceiling_session_percent is None
+            and config.usage_gate_spend_ceiling_weekly_percent is None
+        ):
             return True
 
         snapshot = await self._fetch_usage_snapshot(coder_name)
         if snapshot is None:
             return True
 
-        if (
-            session_cap is not None
-            and snapshot.session_percent >= session_cap
-        ):
-            await self._enter_spend_ceiling_paused(
-                coder_name=coder_name,
-                limit_kind="session",
-                current_percent=snapshot.session_percent,
-                cap_percent=session_cap,
-                resets_at=snapshot.session_resets_at,
-            )
-            return False
-        if weekly_cap is not None and snapshot.weekly_percent >= weekly_cap:
-            await self._enter_spend_ceiling_paused(
-                coder_name=coder_name,
-                limit_kind="weekly",
-                current_percent=snapshot.weekly_percent,
-                cap_percent=weekly_cap,
-                resets_at=snapshot.weekly_resets_at,
-            )
+        breach = self._spend_ceiling_threshold_breach(snapshot)
+        if breach is not None:
+            await self._apply_usage_gate_pause(coder_name=coder_name, breach=breach)
             return False
 
         await self._maybe_send_ceiling_warning(coder_name, snapshot)
         return True
 
-    async def _enter_spend_ceiling_paused(
+    def _rate_limit_threshold_breach(
+        self,
+        snapshot: UsageSnapshot,
+    ) -> UsageThresholdBreach | None:
+        config = self.app_config.daemon
+        session_threshold = config.usage_gate_rate_limit_session_pause_percent
+        weekly_threshold = config.usage_gate_rate_limit_weekly_pause_percent
+        if snapshot.session_percent >= session_threshold:
+            return UsageThresholdBreach(
+                source="rate-limit",
+                limit_kind="session",
+                current_percent=snapshot.session_percent,
+                cap_percent=session_threshold,
+                resets_at=snapshot.session_resets_at,
+            )
+        if snapshot.weekly_percent >= weekly_threshold:
+            return UsageThresholdBreach(
+                source="rate-limit",
+                limit_kind="weekly",
+                current_percent=snapshot.weekly_percent,
+                cap_percent=weekly_threshold,
+                resets_at=snapshot.weekly_resets_at,
+            )
+        return None
+
+    def _spend_ceiling_threshold_breach(
+        self,
+        snapshot: UsageSnapshot,
+    ) -> UsageThresholdBreach | None:
+        config = self.app_config.daemon
+        session_cap = config.usage_gate_spend_ceiling_session_percent
+        weekly_cap = config.usage_gate_spend_ceiling_weekly_percent
+        if session_cap is not None and snapshot.session_percent >= session_cap:
+            return UsageThresholdBreach(
+                source="spend-ceiling",
+                limit_kind="session",
+                current_percent=snapshot.session_percent,
+                cap_percent=session_cap,
+                resets_at=snapshot.session_resets_at,
+            )
+        if weekly_cap is not None and snapshot.weekly_percent >= weekly_cap:
+            return UsageThresholdBreach(
+                source="spend-ceiling",
+                limit_kind="weekly",
+                current_percent=snapshot.weekly_percent,
+                cap_percent=weekly_cap,
+                resets_at=snapshot.weekly_resets_at,
+            )
+        return None
+
+    async def _apply_usage_gate_pause(
         self,
         *,
         coder_name: str,
-        limit_kind: str,
-        current_percent: int,
-        cap_percent: int,
-        resets_at: int,
+        breach: UsageThresholdBreach,
     ) -> None:
-        """Transition to PAUSED using the same reset machinery as rate limits."""
-        until = datetime.fromtimestamp(resets_at, tz=timezone.utc)
+        until = datetime.fromtimestamp(breach.resets_at, tz=timezone.utc)
         self._record_rate_limit(coder_name, until, reactive=False)
-        self.state.error_message = None
+        if breach.source == "rate-limit" and self.state.state == PipelineState.ERROR:
+            pass
+        else:
+            self.state.error_message = None
         self.state.state = PipelineState.PAUSED
-        self.log_event(
-            f"[RATE-LIMIT] [SPEND-CEILING] {coder_name} {limit_kind} cap reached "
-            f"({current_percent}%/{cap_percent}%); paused until reset."
-        )
-        await self.publish_state()
+        if breach.source == "spend-ceiling":
+            self.log_event(
+                f"[RATE-LIMIT] [SPEND-CEILING] {coder_name} {breach.limit_kind} "
+                f"cap reached ({breach.current_percent}%/{breach.cap_percent}%); "
+                "paused until reset."
+            )
+        else:
+            self.log_event(
+                f"[RATE-LIMIT] [{coder_name}] Proactive pause: "
+                f"{breach.limit_kind} usage at {breach.current_percent}%, "
+                f"resumes at {until.isoformat()}."
+            )
+        if breach.source == "spend-ceiling":
+            await self.publish_state()
 
     async def _maybe_send_ceiling_warning(
         self,
@@ -389,33 +442,25 @@ class RateLimitMixin:
                 )
             return True
         self._usage_degraded_logged = False
-        session_threshold = self.app_config.daemon.rate_limit_session_pause_percent
-        weekly_threshold = self.app_config.daemon.rate_limit_weekly_pause_percent
-        breached = None
-        resets_at = 0
-        if snapshot.session_percent >= session_threshold:
-            breached = "session"
-            resets_at = snapshot.session_resets_at
-        elif snapshot.weekly_percent >= weekly_threshold:
-            breached = "weekly"
-            resets_at = snapshot.weekly_resets_at
-        if breached is None:
-            return True
-        until = datetime.fromtimestamp(resets_at, tz=timezone.utc)
-        self._record_rate_limit(coder_name, until, reactive=False)
-        # Only preserve error_message when pausing from ERROR state so
-        # handle_paused correctly resumes to ERROR; clear stale error
-        # context from non-ERROR states to avoid incorrect ERROR resume.
-        if self.state.state != PipelineState.ERROR:
-            self.state.error_message = None
-        self.state.state = PipelineState.PAUSED
-        self.log_event(
-            f"[RATE-LIMIT] [{coder_name}] Proactive pause: {breached} "
-            f"usage at "
-            f"{snapshot.session_percent if breached == 'session' else snapshot.weekly_percent}%, "
-            f"resumes at {until.isoformat()}."
-        )
-        return False
+        breach = self._rate_limit_threshold_breach(snapshot)
+        if breach is None:
+            breach = self._spend_ceiling_threshold_breach(snapshot)
+        if breach is not None:
+            await self._apply_usage_gate_pause(coder_name=coder_name, breach=breach)
+            return False
+
+        await self._maybe_send_ceiling_warning(coder_name, snapshot)
+        return True
+
+    async def usage_gate(self, proactive_coder: str | None = None) -> bool:
+        """Return True if dispatch may proceed under the unified usage gate.
+
+        The gate keeps the existing pause-window orchestration from the
+        rate-limit gate and runs proactive predicates against one usage
+        snapshot: rate-limit pause thresholds first, then spend-ceiling
+        thresholds and warning behavior.
+        """
+        return await self._check_rate_limit(proactive_coder=proactive_coder)
 
     async def _check_rate_limit(self, proactive_coder: str | None = None) -> bool:
         """Return True if CLI calls are allowed, False if rate-limited.
