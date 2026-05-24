@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from src.config import AppConfig, CoderType, DaemonConfig, RepoConfig
 from src.daemon import runner as runner_module
+from src.daemon.rate_limit import RATE_LIMIT_BRANCH_MAP
 from src.daemon.runner import PipelineRunner
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 from src.usage import UsageSnapshot
@@ -109,6 +110,195 @@ def _todo_task(branch: str) -> QueueTask:
         title="Coverage task",
         status=TaskStatus.TODO,
         branch=branch,
+    )
+
+
+def test_branch_map_complete() -> None:
+    expected_concerns = (
+        "effective-coder",
+        "effective-pause",
+        "global-pause",
+        "legacy-pause",
+        "diagnosis-pause",
+        "global-expired",
+        "cross-coder",
+        "active-global",
+        "effective-only",
+        "no-pause",
+    )
+
+    assert len(RATE_LIMIT_BRANCH_MAP) >= 37
+    for concern in expected_concerns:
+        assert any(entry.startswith(f"{concern}:") for entry in RATE_LIMIT_BRANCH_MAP)
+
+
+def test_legacy_pause_predicate(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _make_runner(monkeypatch)
+    now = datetime.now(timezone.utc)
+
+    assert runner._legacy_pause_active(now) is False
+
+    runner.state.rate_limited_until = now + timedelta(minutes=5)
+    runner.state.rate_limit_reactive_coder = None
+    assert runner._legacy_pause_active(now) is True
+
+    runner.state.rate_limit_reactive_coder = "claude"
+    assert runner._legacy_pause_active(now) is False
+
+    runner.state.rate_limit_reactive_coder = None
+    runner.state.rate_limited_until = now - timedelta(seconds=1)
+    assert runner._legacy_pause_active(now) is False
+
+
+def test_effective_coder_pause_predicate(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _make_runner(monkeypatch)
+    now = datetime.now(timezone.utc)
+
+    verdict = runner._effective_coder_pause("codex", now)
+    assert verdict.coder_name == "codex"
+    assert verdict.until is None
+    assert verdict.active is False
+    assert verdict.expired is False
+
+    active_until = now + timedelta(minutes=5)
+    runner.state.rate_limited_coder_until["codex"] = active_until
+    verdict = runner._effective_coder_pause("codex", now)
+    assert verdict.until == active_until
+    assert verdict.active is True
+    assert verdict.expired is False
+
+    expired_until = now - timedelta(minutes=1)
+    runner.state.rate_limited_coder_until["codex"] = expired_until
+    verdict = runner._effective_coder_pause("codex", now)
+    assert verdict.until == expired_until
+    assert verdict.active is False
+    assert verdict.expired is True
+
+
+def test_cross_coder_clearable_predicate(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _make_runner(monkeypatch)
+    now = datetime.now(timezone.utc)
+
+    assert runner._cross_coder_clearable(
+        "codex",
+        "claude",
+        now,
+        diagnosis_pause=False,
+    ) is True
+    assert runner._cross_coder_clearable(
+        "codex",
+        "codex",
+        now,
+        diagnosis_pause=False,
+    ) is False
+    assert runner._cross_coder_clearable(
+        "codex",
+        "claude",
+        now,
+        diagnosis_pause=True,
+    ) is False
+
+
+def test_cross_coder_clearable_with_different_reset_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner(monkeypatch, coder=CoderType.CODEX)
+    now = datetime.now(timezone.utc)
+    claude_until = now + timedelta(minutes=20)
+    codex_until = now + timedelta(minutes=5)
+    runner.state.rate_limited_until = claude_until
+    runner.state.rate_limit_reactive_coder = "claude"
+    runner.state.rate_limited_coder_until = {
+        "claude": claude_until,
+        "codex": codex_until,
+    }
+
+    global_pause = runner._global_pause_verdict(now)
+    assert global_pause is not None
+    effective_pause = runner._effective_coder_pause("codex", now)
+
+    assert global_pause.pause_coder == "claude"
+    assert global_pause.until == claude_until
+    assert effective_pause.until == codex_until
+    assert runner._cross_coder_clearable(
+        "codex",
+        global_pause.pause_coder,
+        now,
+        diagnosis_pause=global_pause.diagnosis_pause,
+    ) is True
+
+
+def test_state_apply_isolated(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _make_runner(monkeypatch)
+    now = datetime.now(timezone.utc)
+    until = now + timedelta(minutes=5)
+
+    before_state = runner.state.model_copy(deep=True)
+    assert runner._effective_coder_pause("claude", now).active is False
+    assert runner._legacy_pause_active(now) is False
+    assert runner._cross_coder_clearable(
+        "codex",
+        "claude",
+        now,
+        diagnosis_pause=False,
+    ) is True
+    assert runner.state == before_state
+
+    runner._apply_pause_state(
+        coder_name="claude",
+        until=until,
+        now=now,
+        update_global=True,
+    )
+
+    assert runner.state != before_state
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.rate_limited_until == until
+    assert runner.state.rate_limit_reactive_coder == "claude"
+
+
+@pytest.mark.parametrize(
+    ("repo_coder", "proactive_coder", "global_coder", "global_delta", "effective_delta", "expected"),
+    [
+        (CoderType.CODEX, None, None, None, None, True),
+        (CoderType.CODEX, None, "codex", 10, None, False),
+        (CoderType.CODEX, "claude", "claude", 10, None, False),
+        (CoderType.CODEX, None, "claude", 10, None, True),
+        (CoderType.CODEX, "codex", "claude", 10, 5, False),
+        (CoderType.CODEX, "codex", "claude", -1, 5, False),
+        (CoderType.CODEX, "codex", "codex", -1, None, True),
+        (CoderType.CLAUDE, "codex", None, 10, None, True),
+    ],
+)
+def test_orchestrator_matches_documented_outcomes(
+    monkeypatch: pytest.MonkeyPatch,
+    repo_coder: CoderType,
+    proactive_coder: str | None,
+    global_coder: str | None,
+    global_delta: int | None,
+    effective_delta: int | None,
+    expected: bool,
+) -> None:
+    runner = _make_runner(monkeypatch, coder=repo_coder)
+    now = datetime.now(timezone.utc)
+    effective_coder = proactive_coder or repo_coder.value
+
+    if global_delta is not None:
+        runner.state.rate_limited_until = now + timedelta(minutes=global_delta)
+        runner.state.rate_limit_reactive_coder = global_coder
+        if global_coder is not None:
+            runner.state.rate_limited_coder_until[global_coder] = (
+                runner.state.rate_limited_until
+            )
+    if effective_delta is not None:
+        runner.state.rate_limited_coder_until[effective_coder] = (
+            now + timedelta(minutes=effective_delta)
+        )
+        runner.state.rate_limited_coders.add(effective_coder)
+
+    assert (
+        asyncio.run(runner._check_rate_limit(proactive_coder=proactive_coder))
+        is expected
     )
 
 

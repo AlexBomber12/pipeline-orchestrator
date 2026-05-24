@@ -12,11 +12,75 @@ import asyncio
 import math
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from src.daemon.notifications import send_spend_ceiling_warning
 from src.models import PipelineState
 from src.usage import UsageSnapshot
+
+
+@dataclass(frozen=True)
+class PauseVerdict:
+    """Pure pause decision for one coder at one instant."""
+
+    coder_name: str
+    until: datetime | None
+    active: bool
+    expired: bool
+
+
+@dataclass(frozen=True)
+class GlobalPauseVerdict:
+    """Pure decision for the process-wide pause marker."""
+
+    pause_coder: str
+    until: datetime
+    active: bool
+    expired: bool
+    diagnosis_pause: bool
+    legacy_pause: bool
+
+
+RATE_LIMIT_BRANCH_MAP = (
+    "effective-coder: proactive_coder overrides repo and selector coder",
+    "effective-coder: repo_config.coder overrides selector coder",
+    "effective-coder: selector coder is used when repo coder is unset",
+    "effective-pause: no per-coder pause is present",
+    "effective-pause: per-coder pause is active",
+    "effective-pause: per-coder pause is expired and clearable",
+    "global-pause: no process-wide pause is present",
+    "legacy-pause: process-wide pause without coder attribution maps to claude",
+    "global-pause: attributed process-wide pause uses its recorded coder",
+    "global-pause: per-coder window overrides process-wide until for pause coder",
+    "global-pause: process-wide until is used when no per-coder window exists",
+    "diagnosis-pause: claude pause with error_message blocks any effective coder",
+    "global-expired: expired process-wide pause clears pause coder metadata",
+    "global-expired: legacy process-wide fields are cleared when attribution is absent",
+    "global-expired: provider caches are invalidated before fallback",
+    "global-expired: active effective-coder pause is reapplied",
+    "global-expired: no effective-coder pause falls through to proactive check",
+    "cross-coder: diagnosis pauses are not clearable",
+    "cross-coder: matching pause coder is not clearable",
+    "cross-coder: other coder pause is clearable",
+    "cross-coder: clearable pause still blocks when effective coder has active pause",
+    "cross-coder: paused state returns to WATCH when current PR branch matches task",
+    "cross-coder: paused state returns to IDLE without matching watch context",
+    "cross-coder: non-PAUSED state is preserved while clearing other coder pause",
+    "cross-coder: legacy other-coder pause is copied into per-coder metadata",
+    "cross-coder: existing per-coder metadata is preserved",
+    "cross-coder: process-wide pause fields are cleared",
+    "cross-coder: provider caches are invalidated before fallback",
+    "cross-coder: clearable pause falls through to proactive check",
+    "active-global: active matching pause transitions state to PAUSED",
+    "active-global: already PAUSED state remains PAUSED",
+    "active-global: active matching pause logs remaining seconds",
+    "effective-only: active effective-coder pause without global pause is applied",
+    "effective-only: effective-coder pause sets process-wide until",
+    "effective-only: effective-coder pause sets reactive coder attribution",
+    "effective-only: effective-coder pause transitions state to PAUSED",
+    "no-pause: no active pause falls through to proactive usage check",
+)
 
 
 class RateLimitMixin:
@@ -181,6 +245,120 @@ class RateLimitMixin:
             return self.state.rate_limited_until
         return None
 
+    def _effective_rate_limit_coder(self, proactive_coder: str | None) -> str:
+        if proactive_coder is not None:
+            return proactive_coder
+        if self.repo_config.coder is not None:
+            return self.repo_config.coder.value
+        return self._get_coder()[0]
+
+    def _legacy_pause_active(self, now: datetime) -> bool:
+        until = self.state.rate_limited_until
+        return (
+            until is not None
+            and self.state.rate_limit_reactive_coder is None
+            and now < until
+        )
+
+    def _effective_coder_pause(self, coder_name: str, now: datetime) -> PauseVerdict:
+        until = self._rate_limit_until_for(coder_name)
+        if until is None:
+            return PauseVerdict(
+                coder_name=coder_name,
+                until=None,
+                active=False,
+                expired=False,
+            )
+        return PauseVerdict(
+            coder_name=coder_name,
+            until=until,
+            active=now < until,
+            expired=now >= until,
+        )
+
+    def _global_pause_verdict(self, now: datetime) -> GlobalPauseVerdict | None:
+        if self.state.rate_limited_until is None:
+            return None
+        # Legacy pauses (pre-PR-066) have no coder attribution; treat them
+        # as Claude since that was the only coder.
+        pause_coder = self.state.rate_limit_reactive_coder or "claude"
+        pause_until = (
+            self._rate_limit_until_for(pause_coder)
+            or self.state.rate_limited_until
+        )
+        diagnosis_pause = (
+            self.state.error_message is not None
+            and pause_coder == "claude"
+        )
+        return GlobalPauseVerdict(
+            pause_coder=pause_coder,
+            until=pause_until,
+            active=now < pause_until,
+            expired=now >= pause_until,
+            diagnosis_pause=diagnosis_pause,
+            legacy_pause=self.state.rate_limit_reactive_coder is None,
+        )
+
+    def _cross_coder_clearable(
+        self,
+        effective_coder: str,
+        pause_coder: str,
+        now: datetime,
+        *,
+        diagnosis_pause: bool,
+    ) -> bool:
+        del now
+        return not diagnosis_pause and pause_coder != effective_coder
+
+    def _apply_pause_state(
+        self,
+        *,
+        coder_name: str | None,
+        until: datetime,
+        now: datetime,
+        update_global: bool,
+    ) -> None:
+        if update_global:
+            self.state.rate_limited_until = until
+            self.state.rate_limit_reactive_coder = coder_name
+        if self.state.state != PipelineState.PAUSED:
+            self.state.state = PipelineState.PAUSED
+        remaining = (until - now).total_seconds()
+        self.log_event(
+            f"[RATE-LIMIT] Rate limited, resuming in "
+            f"{int(remaining)}s."
+        )
+
+    def _restore_state_after_cross_coder_clear(self) -> None:
+        if self.state.state != PipelineState.PAUSED:
+            return
+        if (
+            self.state.current_pr is not None
+            and self.state.current_task is not None
+            and self.state.current_pr.branch == self.state.current_task.branch
+        ):
+            self.state.state = PipelineState.WATCH
+        else:
+            self.state.state = PipelineState.IDLE
+
+    def _preserve_pause_coder_window(
+        self,
+        pause_coder: str,
+        pause_until: datetime,
+    ) -> None:
+        if pause_coder not in self.state.rate_limited_coder_until:
+            self.state.rate_limited_coders.add(pause_coder)
+            self.state.rate_limited_coder_until[pause_coder] = pause_until
+
+    def _clear_global_pause_fields(self) -> None:
+        self.state.rate_limited_until = None
+        self.state.rate_limit_reactive = False
+        self.state.rate_limit_reactive_coder = None
+
+    def _invalidate_usage_caches(self) -> None:
+        self._claude_usage_provider.invalidate_cache()
+        self._codex_usage_provider.invalidate_cache()
+
     async def _proactive_usage_check(self, proactive_coder: str | None = None) -> bool:
         """Return True if CLI calls are allowed, False if usage threshold breached.
 
@@ -245,116 +423,82 @@ class RateLimitMixin:
         *proactive_coder* is forwarded to ``_proactive_usage_check`` so
         callers that always invoke a specific CLI can check the right quota.
         """
-        if proactive_coder is not None:
-            effective_coder = proactive_coder
-        elif self.repo_config.coder is not None:
-            effective_coder = self.repo_config.coder.value
-        else:
-            effective_coder = self._get_coder()[0]
+        effective_coder = self._effective_rate_limit_coder(proactive_coder)
         now = datetime.now(timezone.utc)
-        effective_until = self._rate_limit_until_for(effective_coder)
-        if effective_until is not None and now >= effective_until:
+        effective_pause = self._effective_coder_pause(effective_coder, now)
+        if effective_pause.expired:
             self._clear_rate_limit(effective_coder)
-            effective_until = None
-        if self.state.rate_limited_until is not None:
-            # Legacy pauses (pre-PR-066) have no coder attribution;
-            # treat them as Claude since that was the only coder.
-            pause_coder = self.state.rate_limit_reactive_coder or "claude"
-            pause_until = (
-                self._rate_limit_until_for(pause_coder)
-                or self.state.rate_limited_until
-            )
-            # Diagnosis pauses always use Claude — honour regardless of
-            # the repo's configured coder.
-            diagnosis_pause = (
-                self.state.error_message is not None
-                and pause_coder == "claude"
-            )
-            if now >= pause_until:
-                self._clear_rate_limit(pause_coder)
+            effective_pause = self._effective_coder_pause(effective_coder, now)
+
+        global_pause = self._global_pause_verdict(now)
+        if global_pause is not None:
+            if global_pause.expired:
+                self._clear_rate_limit(global_pause.pause_coder)
                 if self.state.rate_limit_reactive_coder is None:
                     self.state.rate_limited_until = None
                     self.state.rate_limit_reactive = False
-                effective_until = self._rate_limit_until_for(effective_coder)
-                self._claude_usage_provider.invalidate_cache()
-                self._codex_usage_provider.invalidate_cache()
+                effective_pause = self._effective_coder_pause(effective_coder, now)
+                self._invalidate_usage_caches()
                 self.log_event(
                     "[RATE-LIMIT] Rate limit window expired, resuming."
                 )
-                if effective_until is not None:
-                    self.state.rate_limited_until = effective_until
-                    self.state.rate_limit_reactive_coder = effective_coder
-                    if self.state.state != PipelineState.PAUSED:
-                        self.state.state = PipelineState.PAUSED
-                    remaining = (effective_until - now).total_seconds()
-                    self.log_event(
-                        f"[RATE-LIMIT] Rate limited, resuming in "
-                        f"{int(remaining)}s."
+                if effective_pause.until is not None:
+                    self._apply_pause_state(
+                        coder_name=effective_coder,
+                        until=effective_pause.until,
+                        now=now,
+                        update_global=True,
                     )
                     return False
                 return await self._proactive_usage_check(proactive_coder=proactive_coder)
+
             # A pause from a *different* effective coder doesn't apply.
             # When proactive_coder is set (e.g. "claude" for merge/diagnosis),
             # only pauses matching that coder block; otherwise the repo's
             # configured coder is used.
-            other_coder = (
-                not diagnosis_pause
-                and pause_coder != effective_coder
-            )
-            clearable = other_coder
-            if clearable:
-                if effective_until is not None:
-                    self.state.rate_limited_until = effective_until
-                    self.state.rate_limit_reactive_coder = effective_coder
-                    if self.state.state != PipelineState.PAUSED:
-                        self.state.state = PipelineState.PAUSED
-                    remaining = (effective_until - now).total_seconds()
-                    self.log_event(
-                        f"[RATE-LIMIT] Rate limited, resuming in "
-                        f"{int(remaining)}s."
+            if self._cross_coder_clearable(
+                effective_coder,
+                global_pause.pause_coder,
+                now,
+                diagnosis_pause=global_pause.diagnosis_pause,
+            ):
+                if effective_pause.until is not None:
+                    self._apply_pause_state(
+                        coder_name=effective_coder,
+                        until=effective_pause.until,
+                        now=now,
+                        update_global=True,
                     )
                     return False
-                if self.state.state == PipelineState.PAUSED:
-                    if (
-                        self.state.current_pr is not None
-                        and self.state.current_task is not None
-                        and self.state.current_pr.branch == self.state.current_task.branch
-                    ):
-                        self.state.state = PipelineState.WATCH
-                    else:
-                        self.state.state = PipelineState.IDLE
-                if pause_coder not in self.state.rate_limited_coder_until:
-                    self.state.rate_limited_coders.add(pause_coder)
-                    self.state.rate_limited_coder_until[pause_coder] = pause_until
-                self.state.rate_limited_until = None
-                self.state.rate_limit_reactive = False
-                self.state.rate_limit_reactive_coder = None
-                self._claude_usage_provider.invalidate_cache()
-                self._codex_usage_provider.invalidate_cache()
+                self._restore_state_after_cross_coder_clear()
+                self._preserve_pause_coder_window(
+                    global_pause.pause_coder,
+                    global_pause.until,
+                )
+                self._clear_global_pause_fields()
+                self._invalidate_usage_caches()
                 self.log_event(
                     f"[RATE-LIMIT] {effective_coder.capitalize()} active "
-                    f"while {pause_coder} remains rate-limited until "
-                    f"{pause_until.isoformat()}."
+                    f"while {global_pause.pause_coder} remains rate-limited until "
+                    f"{global_pause.until.isoformat()}."
                 )
                 return await self._proactive_usage_check(proactive_coder=proactive_coder)
-            if now < pause_until:
-                if self.state.state != PipelineState.PAUSED:
-                    self.state.state = PipelineState.PAUSED
-                remaining = (pause_until - now).total_seconds()
-                self.log_event(
-                    f"[RATE-LIMIT] Rate limited, resuming in "
-                    f"{int(remaining)}s."
+
+            if global_pause.active:
+                self._apply_pause_state(
+                    coder_name=None,
+                    until=global_pause.until,
+                    now=now,
+                    update_global=False,
                 )
                 return False
-        if effective_until is not None:
-            self.state.rate_limited_until = effective_until
-            self.state.rate_limit_reactive_coder = effective_coder
-            if self.state.state != PipelineState.PAUSED:
-                self.state.state = PipelineState.PAUSED
-            remaining = (effective_until - now).total_seconds()
-            self.log_event(
-                f"[RATE-LIMIT] Rate limited, resuming in "
-                f"{int(remaining)}s."
+
+        if effective_pause.until is not None:
+            self._apply_pause_state(
+                coder_name=effective_coder,
+                until=effective_pause.until,
+                now=now,
+                update_global=True,
             )
             return False
         return await self._proactive_usage_check(proactive_coder=proactive_coder)
