@@ -236,9 +236,7 @@ class FixMixin(BreachMixin):
         )
         await self._refresh_auth_status_cache()
         coder_name, plugin = self._get_coder(allow_exploration=False)
-        if not await self._check_rate_limit(proactive_coder=coder_name):
-            return
-        if not await self._check_spend_ceiling(coder_name):
+        if not await self.usage_gate(proactive_coder=coder_name):
             return
 
         if (
