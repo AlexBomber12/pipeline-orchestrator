@@ -544,6 +544,7 @@ def test_process_pending_uploads_persists_task_hash_after_push(
     assert _run(runner.process_pending_uploads()) is True
     assert runner.redis.store[task_spec_hash_key("demo", "PR-001")] == "new-hash"
     assert runner.redis.store[retry_count_key("demo", "PR-001")] == "0"
+    assert runner._recently_uploaded_task_pr_ids == {"PR-001"}
     assert key not in runner.redis.store
 
 

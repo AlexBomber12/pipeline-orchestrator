@@ -501,6 +501,7 @@ def test_select_next_task_from_dag_clears_reuploaded_status_write_failed_task(
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
+    runner._recently_uploaded_task_pr_ids = {"PR-001"}
     task = QueueTask(
         pr_id="PR-001",
         title="Status write failed",
@@ -521,6 +522,7 @@ def test_select_next_task_from_dag_clears_reuploaded_status_write_failed_task(
     assert selected is not None
     assert selected.pr_id == "PR-001"
     assert asyncio.run(runner._suppression_record_for_task("PR-001")) is None
+    assert runner._recently_uploaded_task_pr_ids == set()
 
 
 def test_select_next_task_from_dag_preserves_doing_for_crashed_task_with_visible_pr(

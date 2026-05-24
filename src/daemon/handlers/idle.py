@@ -488,6 +488,11 @@ class IdleMixin:
                 is_status_write_failed = (
                     record.detail.get("source") == "status_write_failed"
                 )
+                recently_uploaded_task_pr_ids = getattr(
+                    self,
+                    "_recently_uploaded_task_pr_ids",
+                    set(),
+                )
                 if statuses[pr_id] == TaskStatus.DONE or (
                     statuses[pr_id] == TaskStatus.DOING
                     and not is_status_write_failed
@@ -504,9 +509,10 @@ class IdleMixin:
                     frontmatter_statuses.get(pr_id) == "todo"
                     and is_status_write_failed
                     and statuses[pr_id] != TaskStatus.DOING
-                    and isinstance(record.detail.get("task_spec_hash"), str)
+                    and pr_id in recently_uploaded_task_pr_ids
                 ):
                     await self._clear_task_suppression(pr_id)
+                    recently_uploaded_task_pr_ids.discard(pr_id)
                     continue
                 if self._task_suppression_blocks_selection(record.reason):
                     statuses[pr_id] = TaskStatus.ERROR

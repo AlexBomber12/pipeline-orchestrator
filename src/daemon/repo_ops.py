@@ -415,6 +415,7 @@ return 0
             ):
                 crashed_pr_ids.difference_update(uploaded_pr_ids)
             if uploaded_pr_ids:
+                self._recently_uploaded_task_pr_ids = set(uploaded_pr_ids)
                 for pr_id in uploaded_pr_ids:
                     await safe_delete_cancellation_cause(
                         self.redis,
