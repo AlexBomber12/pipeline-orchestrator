@@ -36,6 +36,7 @@ from src.queue_parser import (
     TaskHeader,
     parse_task_header,
 )
+from src.subsource_registry import SuppressionReason
 from src.task_status import (
     _resolve_merged_state,
     derive_task_status,
@@ -498,6 +499,7 @@ class IdleMixin:
                     None,
                     "todo",
                 )
+                suppression_read_failed = False
                 try:
                     record = await self._suppression_record_for_task(pr_id)
                 except Exception as exc:
@@ -506,6 +508,7 @@ class IdleMixin:
                         f"for {pr_id}: {exc}."
                     )
                     record = None
+                    suppression_read_failed = True
                 if record is None:
                     if pr_id not in status_write_failed_task_pr_ids:
                         continue
@@ -527,6 +530,20 @@ class IdleMixin:
                         status_write_failed_task_pr_ids.discard(pr_id)
                         recently_uploaded_task_pr_ids.discard(pr_id)
                         continue
+                    if not suppression_read_failed:
+                        try:
+                            await self._suppress_task(
+                                pr_id,
+                                SuppressionReason.CRASH,
+                                {"source": "status_write_failed"},
+                            )
+                            status_write_failed_task_pr_ids.discard(pr_id)
+                        except Exception as exc:
+                            self.log_event(
+                                "[INFRA] Warning: failed to backfill "
+                                "status-write fallback suppression for "
+                                f"{pr_id}: {exc}."
+                            )
                     statuses[pr_id] = TaskStatus.ERROR
                     continue
                 is_status_write_failed = (
