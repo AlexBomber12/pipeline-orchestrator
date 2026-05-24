@@ -81,7 +81,7 @@ def test_escalate_fix_no_push_deadlock_writes_cancellation_cause(
 
     asyncio.run(fix_escalation.escalate_fix_no_push_deadlock(runner, pr))
 
-    assert len(recorded) == 1
+    assert len(recorded) == 2
     repo_slug, task_id, cause = recorded[0]
     assert repo_slug == runner.name
     assert task_id == "PR-500"
@@ -91,6 +91,12 @@ def test_escalate_fix_no_push_deadlock_writes_cancellation_cause(
         "attempts": 3,
         "pr_number": 500,
         "head_sha": "deadbeef",
+    }
+    assert recorded[1][0] == runner.name
+    assert recorded[1][1] == "PR-500"
+    assert recorded[1][2].payload == {
+        "source": "status_write_failed",
+        "subsource": "no_push_deadlock",
     }
 
 

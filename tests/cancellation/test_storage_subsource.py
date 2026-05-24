@@ -326,6 +326,22 @@ def test_review_timeout_detector_writes_review_timeout_subsource(
     runner = h._make_runner(review_timeout_min=30)
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-rev-timeout")
+    runner.state.review_timeout_repost_attempted = True
+
+    async def no_stale_retrigger(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_maybe_retrigger_stale_review", no_stale_retrigger)
+    monkeypatch.setattr(
+        runner,
+        "_maybe_retrigger_on_codex_bot_error",
+        lambda *_args, **_kwargs: False,
+    )
+
+    async def status_write_ok(*_args: Any, **_kwargs: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", status_write_ok)
     runner.state.current_task = QueueTask(
         pr_id="PR-REV-TIMEOUT",
         title="t",

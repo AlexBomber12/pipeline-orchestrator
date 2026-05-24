@@ -8,7 +8,6 @@ from typing import Any
 import pytest
 from src.cancellation import CancellationCause
 from src.daemon import runner as runner_module
-from src.daemon.handlers import error as error_module
 from src.daemon.handlers.error import ErrorCategory
 from src.models import PipelineState, QueueTask, TaskStatus
 from src.queue_parser import parse_task_header
@@ -277,6 +276,24 @@ def test_status_write_failed_marker_creates_suppression_when_needed() -> None:
     record = asyncio.run(runner._suppression_record_for_task("PR-379"))
     assert record is not None
     assert record.reason == SuppressionReason.CRASH
+
+
+def test_status_write_failed_fallback_suppresses_when_cause_record_missing() -> None:
+    runner = h._make_runner()
+    task = _task()
+
+    asyncio.run(
+        runner._mark_status_write_failed_task(
+            task,
+            blocked_reason=SuppressionReason.NO_PUSH_DEADLOCK,
+            ensure_suppression=False,
+        )
+    )
+
+    record = asyncio.run(runner._suppression_record_for_task("PR-379"))
+    assert record is not None
+    assert record.reason == SuppressionReason.NO_PUSH_DEADLOCK
+    assert runner._task_suppression_blocks_selection(record.reason) is True
 
 
 def test_transition_backfills_suppression_when_safe_record_is_best_effort(
