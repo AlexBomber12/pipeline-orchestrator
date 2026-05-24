@@ -480,7 +480,7 @@ def test_select_next_task_from_dag_clears_reuploaded_status_write_failed_task(
     tasks_dir.mkdir()
     task_path = tasks_dir / "PR-001.md"
     task_text = (
-        "---\nstatus: TODO\n---\n"
+        "---\n---\n"
         "# PR-001: Status write failed\n\n"
         "Branch: pr-001-status-write-failed\n"
         "- Type: feature\n"
