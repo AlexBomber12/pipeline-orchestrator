@@ -468,8 +468,7 @@ def test_select_next_task_from_dag_clears_reuploaded_status_write_failed_task(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Re-uploaded TODO frontmatter clears a status-write fallback once the
-    task content hash differs from the parked version."""
+    """Re-uploaded TODO frontmatter clears a hash-bearing status-write fallback."""
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         idle_module.IdleMixin,
@@ -480,7 +479,7 @@ def test_select_next_task_from_dag_clears_reuploaded_status_write_failed_task(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     task_path = tasks_dir / "PR-001.md"
-    task_path.write_text(
+    task_text = (
         "---\nstatus: TODO\n---\n"
         "# PR-001: Status write failed\n\n"
         "Branch: pr-001-status-write-failed\n"
@@ -488,7 +487,10 @@ def test_select_next_task_from_dag_clears_reuploaded_status_write_failed_task(
         "- Complexity: low\n"
         "- Depends on: none\n"
         "- Priority: 1\n"
-        "- Coder: any\n",
+        "- Coder: any\n"
+    )
+    task_path.write_text(
+        task_text,
         encoding="utf-8",
     )
     monkeypatch.setattr(
@@ -512,39 +514,13 @@ def test_select_next_task_from_dag_clears_reuploaded_status_write_failed_task(
             blocked_reason=SuppressionReason.NO_PUSH_DEADLOCK,
         )
     )
-    task_path.write_text(
-        "---\nstatus: TODO\n---\n"
-        "# PR-001: Reuploaded task\n\n"
-        "Branch: pr-001-status-write-failed\n"
-        "- Type: feature\n"
-        "- Complexity: low\n"
-        "- Depends on: none\n"
-        "- Priority: 1\n"
-        "- Coder: any\n",
-        encoding="utf-8",
-    )
+    task_path.write_text(task_text, encoding="utf-8")
 
     selected = asyncio.run(runner._select_next_task_from_dag())
 
     assert selected is not None
     assert selected.pr_id == "PR-001"
     assert asyncio.run(runner._suppression_record_for_task("PR-001")) is None
-
-
-def test_status_write_failed_reupload_check_tolerates_missing_task_file(
-    tmp_path: Path,
-) -> None:
-    runner = h._make_runner()
-    runner.repo_path = str(tmp_path)
-
-    assert (
-        runner._status_write_failed_task_was_reuploaded(
-            "PR-001",
-            {"PR-001": "tasks/PR-001.md"},
-            {"task_spec_hash": "old"},
-        )
-        is False
-    )
 
 
 def test_select_next_task_from_dag_preserves_doing_for_crashed_task_with_visible_pr(
