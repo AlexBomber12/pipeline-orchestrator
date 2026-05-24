@@ -525,6 +525,82 @@ def test_select_next_task_from_dag_clears_reuploaded_status_write_failed_task(
     assert runner._recently_uploaded_task_pr_ids == set()
 
 
+def test_select_next_task_from_dag_retains_reupload_marker_while_doing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A re-upload marker remains pending until the fallback suppression clears."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    task_text = (
+        "---\n---\n"
+        "# PR-001: Status write failed\n\n"
+        "Branch: pr-001-status-write-failed\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n"
+    )
+    (tasks_dir / "PR-001.md").write_text(task_text, encoding="utf-8")
+    (tasks_dir / "PR-002.md").write_text(
+        "---\n---\n"
+        "# PR-002: Healthy follow-up\n\n"
+        "Branch: pr-002-healthy\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 2\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "_resolve_merged_state",
+        lambda *args, **kwargs: _merged_state(),
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._recently_uploaded_task_pr_ids = {"PR-001"}
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="Status write failed",
+        status=TaskStatus.DOING,
+        branch="pr-001-status-write-failed",
+        task_file="tasks/PR-001.md",
+    )
+    asyncio.run(
+        runner._mark_status_write_failed_task(
+            runner.state.current_task,
+            blocked_reason=SuppressionReason.NO_PUSH_DEADLOCK,
+        )
+    )
+
+    selected = asyncio.run(runner._select_next_task_from_dag())
+
+    assert selected is not None
+    assert selected.pr_id == "PR-002"
+    assert runner._idle_dag_statuses["PR-001"] == TaskStatus.ERROR
+    assert runner._recently_uploaded_task_pr_ids == {"PR-001"}
+    assert asyncio.run(runner._suppression_record_for_task("PR-001")) is not None
+
+    runner.state.current_task = None
+    selected = asyncio.run(runner._select_next_task_from_dag())
+
+    assert selected is not None
+    assert selected.pr_id == "PR-001"
+    assert asyncio.run(runner._suppression_record_for_task("PR-001")) is None
+    assert runner._recently_uploaded_task_pr_ids == set()
+
+
 def test_select_next_task_from_dag_preserves_doing_for_crashed_task_with_visible_pr(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

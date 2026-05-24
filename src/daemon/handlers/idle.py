@@ -486,6 +486,7 @@ class IdleMixin:
                 "_recently_uploaded_task_pr_ids",
                 set(),
             )
+            pending_recently_uploaded_task_pr_ids: set[str] = set()
             for pr_id in list(statuses.keys()):
                 record = await self._suppression_record_for_task(pr_id)
                 if record is None:
@@ -513,6 +514,13 @@ class IdleMixin:
                 if (
                     frontmatter_is_todo
                     and is_status_write_failed
+                    and statuses[pr_id] == TaskStatus.DOING
+                    and pr_id in recently_uploaded_task_pr_ids
+                ):
+                    pending_recently_uploaded_task_pr_ids.add(pr_id)
+                if (
+                    frontmatter_is_todo
+                    and is_status_write_failed
                     and statuses[pr_id] != TaskStatus.DOING
                     and pr_id in recently_uploaded_task_pr_ids
                 ):
@@ -521,7 +529,9 @@ class IdleMixin:
                     continue
                 if self._task_suppression_blocks_selection(record.reason):
                     statuses[pr_id] = TaskStatus.ERROR
-            recently_uploaded_task_pr_ids.clear()
+            recently_uploaded_task_pr_ids.intersection_update(
+                pending_recently_uploaded_task_pr_ids
+            )
             if not self.repo_config.feature_flags.use_single_error_exit:
                 # PR-186: Recovery marks DOING-without-PR tasks crashed before
                 # transitioning to IDLE. Override their derived status to
