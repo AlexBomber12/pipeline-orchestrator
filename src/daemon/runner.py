@@ -2192,15 +2192,15 @@ class PipelineRunner(
         keys = (
             (
                 "status_" f"write_failed_tasks:{self.name}",
-                {"source": "status_write_failed", "legacy_key": True},
+                {"legacy_source": "status_write_failed"},
             ),
             (
                 "recovered_" f"tasks:{self.name}",
-                {"source": "recovered_task", "legacy_key": True},
+                {"legacy_source": "recovered_task"},
             ),
             (
                 "legacy_" f"recovered_" f"tasks:{self.name}",
-                {"source": "legacy_recovered_task", "legacy_key": True},
+                {"legacy_source": "legacy_recovered_task"},
             ),
         )
         for key, detail in keys:
@@ -2211,11 +2211,17 @@ class PipelineRunner(
                     pr_ids = []
                 for pr_id in pr_ids:
                     if isinstance(pr_id, str) and pr_id:
-                        await self._suppress_task(
-                            pr_id,
-                            SuppressionReason.CRASH,
-                            detail,
-                        )
+                        record = await self._suppression_record_for_task(pr_id)
+                        if record is None:
+                            await self._suppress_task(
+                                pr_id,
+                                SuppressionReason.CRASH,
+                                {
+                                    "source": "status_write_failed",
+                                    "legacy_key": True,
+                                    **detail,
+                                },
+                            )
                 await self.redis.delete(key)
             except Exception as exc:
                 self.log_event(

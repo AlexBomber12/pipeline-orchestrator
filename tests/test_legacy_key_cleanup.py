@@ -63,6 +63,7 @@ async def test_stale_key_cleanup_idempotent() -> None:
         record = await runner._suppression_record_for_task(pr_id)
         assert record is not None
         assert record.reason == SuppressionReason.CRASH
+        assert record.detail["source"] == "status_write_failed"
         assert record.detail["legacy_key"] is True
 
 
@@ -114,6 +115,26 @@ async def test_cleanup_drops_malformed_legacy_payload() -> None:
 
     assert key not in runner.redis.store
     assert await runner._suppression_record_for_task("PR-001") is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_preserves_existing_suppression_record() -> None:
+    runner = _make_runner()
+    key = f"recovered_tasks:{runner.name}"
+    runner.redis.store[key] = '["PR-001"]'
+    await runner._suppress_task(
+        "PR-001",
+        SuppressionReason.REVIEW_TIMEOUT,
+        {"source": "review_timeout"},
+    )
+
+    await runner._cleanup_stale_legacy_key_markers()
+
+    assert key not in runner.redis.store
+    record = await runner._suppression_record_for_task("PR-001")
+    assert record is not None
+    assert record.reason == SuppressionReason.REVIEW_TIMEOUT
+    assert record.detail["source"] == "review_timeout"
 
 
 @pytest.mark.asyncio
