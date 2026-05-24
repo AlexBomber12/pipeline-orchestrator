@@ -510,7 +510,7 @@ class IdleMixin:
                         pending_recently_uploaded_task_pr_ids.add(pr_id)
                     elif (
                         frontmatter_is_todo
-                        and pr_id in recently_uploaded_task_pr_ids
+                        and statuses[pr_id] != TaskStatus.DOING
                     ):
                         status_write_failed_task_pr_ids.discard(pr_id)
                         recently_uploaded_task_pr_ids.discard(pr_id)
