@@ -2120,7 +2120,14 @@ class PipelineRunner(
                 )
         if blocked_reason is not None and blocked_reason != suppression_reason:
             suppression_detail.setdefault("blocked_reason", blocked_reason.value)
-        record = await self._suppression_record_for_task(pr_id)
+        try:
+            record = await self._suppression_record_for_task(pr_id)
+        except Exception as exc:
+            self.log_event(
+                f"[INFRA] Warning: failed to read suppression for "
+                f"status-write fallback {pr_id}: {exc}."
+            )
+            record = None
         # A status-write failure must never leave the task selectable. If the
         # primary cause write failed, there may be no existing suppression even
         # when callers pass ``ensure_suppression=False`` to avoid duplicate
@@ -2130,11 +2137,17 @@ class PipelineRunner(
             or not self._task_suppression_blocks_selection(record.reason)
         )
         if needs_suppression:
-            await self._suppress_task(
-                pr_id,
-                suppression_reason,
-                suppression_detail,
-            )
+            try:
+                await self._suppress_task(
+                    pr_id,
+                    suppression_reason,
+                    suppression_detail,
+                )
+            except Exception as exc:
+                self.log_event(
+                    f"[INFRA] Warning: failed to record status-write "
+                    f"fallback suppression for {pr_id}: {exc}."
+                )
         self.log_event(
             f"[INFRA] Warning: status:ERROR write failed for {pr_id}; "
             "task is parked by suppression."

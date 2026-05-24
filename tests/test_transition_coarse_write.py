@@ -296,6 +296,48 @@ def test_status_write_failed_fallback_suppresses_when_cause_record_missing() -> 
     assert runner._task_suppression_blocks_selection(record.reason) is True
 
 
+def test_status_write_failed_fallback_tolerates_suppression_store_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    task = _task()
+    runner.state.current_queue = [task]
+    published: list[bool] = []
+
+    async def fail_record(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("redis unavailable")
+
+    async def fail_suppress(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("redis still unavailable")
+
+    async def publish() -> None:
+        published.append(True)
+
+    monkeypatch.setattr(runner, "_suppression_record_for_task", fail_record)
+    monkeypatch.setattr(runner, "_suppress_task", fail_suppress)
+    monkeypatch.setattr(runner, "publish_state", publish)
+
+    asyncio.run(
+        runner._mark_status_write_failed_task(
+            task,
+            blocked_reason=SuppressionReason.NO_PUSH_DEADLOCK,
+        )
+    )
+
+    assert runner.state.current_queue[0].status == TaskStatus.ERROR
+    assert published == [True]
+    assert any(
+        "failed to read suppression for status-write fallback PR-379"
+        in event["event"]
+        for event in runner.state.history
+    )
+    assert any(
+        "failed to record status-write fallback suppression for PR-379"
+        in event["event"]
+        for event in runner.state.history
+    )
+
+
 def test_transition_backfills_suppression_when_safe_record_is_best_effort(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
