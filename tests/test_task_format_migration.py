@@ -187,6 +187,29 @@ def test_apply_creates_backup_for_noop_frontmatter_run(tmp_path: Path) -> None:
     assert (backups_dir / "PR-999.md").read_text(encoding="utf-8") == content
 
 
+def test_apply_rejects_existing_backup_file(tmp_path: Path) -> None:
+    content = _legacy_task(status="DONE")
+    path = _write_task(tmp_path / "tasks", content)
+    backups_dir = tmp_path / "backups"
+    migrate_task_format.migrate_tasks(
+        path.parent,
+        apply=True,
+        backups_dir=backups_dir,
+        stdout=StringIO(),
+    )
+    path.write_text("---\nstatus: ERROR\n---\n\n" + content, encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="backup already exists"):
+        migrate_task_format.migrate_tasks(
+            path.parent,
+            apply=True,
+            backups_dir=backups_dir,
+            stdout=StringIO(),
+        )
+
+    assert (backups_dir / "PR-999.md").read_text(encoding="utf-8") == content
+
+
 def test_verify_detects_mismatch(tmp_path: Path) -> None:
     path = _write_task(tmp_path / "tasks", _legacy_task(status="DONE"))
     backups_dir = tmp_path / "backups"

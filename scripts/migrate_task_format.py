@@ -166,12 +166,14 @@ def backup_path_for(backups_dir: Path, tasks_dir: Path, task_path: Path) -> Path
 def create_backup(backups_dir: Path, tasks_dir: Path, task_path: Path) -> Path:
     backup_path = backup_path_for(backups_dir, tasks_dir, task_path)
     backup_path.parent.mkdir(parents=True, exist_ok=True)
+    if backup_path.exists():
+        raise FileExistsError(f"backup already exists: {backup_path}")
     shutil.copy2(task_path, backup_path)
     return backup_path
 
 
 def default_backups_dir(tasks_dir: Path) -> Path:
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     return tasks_dir.parent / "artifacts" / "task-format-backups" / timestamp
 
 
