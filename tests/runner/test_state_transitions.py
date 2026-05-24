@@ -2321,7 +2321,8 @@ def test_handle_external_terminal_pr_state_closed_sets_status_write_fallback(
 
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
-    assert runner._status_write_failed_task_pr_ids == {"PR-056"}
+    record = asyncio.run(runner._suppression_record_for_task("PR-056"))
+    assert record is not None
 
 
 def test_handle_coding_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:

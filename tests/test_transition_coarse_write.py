@@ -262,43 +262,6 @@ def test_coarse_before_rich(monkeypatch: pytest.MonkeyPatch) -> None:
     assert runner.state.state == PipelineState.ERROR
 
 
-def test_coarse_write_failure_retried(monkeypatch: pytest.MonkeyPatch) -> None:
-    runner = h._make_runner()
-    _stub_publish_and_save(runner)
-    task = _task()
-    runner.state.current_task = task
-    runner.state.current_queue = [task]
-    attempts: list[str] = []
-
-    async def fake_commit(*_args: Any, **_kwargs: Any) -> bool:
-        attempts.append("commit")
-        return len(attempts) > 2
-
-    monkeypatch.setattr(runner, "_commit_task_status_change", fake_commit)
-    _capture_rich_write(monkeypatch)
-
-    asyncio.run(
-        runner._transition_to_error(
-            "git fetch origin failed",
-            commit_task_status=True,
-        )
-    )
-
-    assert runner.state.state == PipelineState.ERROR
-    assert runner._status_write_failed_task_pr_ids == {"PR-379"}
-
-    asyncio.run(runner.handle_error("git fetch origin failed"))
-
-    assert attempts == ["commit", "commit"]
-    assert runner.state.state == PipelineState.ERROR
-    assert runner._status_write_failed_task_pr_ids == {"PR-379"}
-
-    asyncio.run(runner.handle_error("git fetch origin failed"))
-
-    assert attempts == ["commit", "commit", "commit"]
-    assert runner._status_write_failed_task_pr_ids == set()
-
-
 def test_status_write_failed_marker_creates_suppression_when_needed() -> None:
     runner = h._make_runner()
     task = _task()
@@ -347,7 +310,6 @@ def test_transition_backfills_suppression_when_safe_record_is_best_effort(
     )
 
     record = asyncio.run(runner._suppression_record_for_task("PR-379"))
-    assert runner._status_write_failed_task_pr_ids == {"PR-379"}
     assert record is not None
     assert record.reason == SuppressionReason.CRASH
 
@@ -370,37 +332,7 @@ def test_transition_does_not_write_task_status_by_default(
     asyncio.run(runner._transition_to_error("git fetch origin failed"))
 
     assert writes == []
-    assert runner._status_write_failed_task_pr_ids == set()
     assert runner.state.state == PipelineState.ERROR
-
-
-def test_coarse_write_retry_uses_crash_when_cause_read_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner = h._make_runner()
-    _stub_publish_and_save(runner)
-    task = _task()
-    runner.state.current_task = task
-    runner._status_write_failed_task_pr_ids.add(task.pr_id)
-    blocked_reasons: list[SuppressionReason | str | None] = []
-
-    async def fake_get_cause(*_args: Any, **_kwargs: Any) -> None:
-        raise RuntimeError("redis down")
-
-    async def fake_commit(
-        *_args: Any,
-        blocked_reason: SuppressionReason | str | None = None,
-        **_kwargs: Any,
-    ) -> bool:
-        blocked_reasons.append(blocked_reason)
-        return False
-
-    monkeypatch.setattr(error_module, "get_cancellation_cause", fake_get_cause)
-    monkeypatch.setattr(runner, "_commit_task_status_change", fake_commit)
-
-    asyncio.run(runner.handle_error("still failing"))
-
-    assert blocked_reasons == [SuppressionReason.CRASH]
 
 
 @pytest.mark.parametrize(

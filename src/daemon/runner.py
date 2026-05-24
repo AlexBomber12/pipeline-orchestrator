@@ -415,8 +415,6 @@ class PipelineRunner(
         # Legacy flag-off storage for crash parks. The flag-on path records
         # crash suppressions in RedisSuppressionStore instead.
         self._crashed_task_pr_ids: set[str] = set()
-        self._status_write_failed_task_pr_ids: set[str] = set()
-        self._status_write_failed_task_pr_ids_persist_failed = False
         self._last_error_park_log_key: tuple[str | None, str] | None = None
         self._user_pause_logged = False
         self._pending_repo_config: RepoConfig | None = None
@@ -2090,74 +2088,6 @@ class PipelineRunner(
             return SuppressionReason.CRASH.value
         return SuppressionReason.CRASH.value
 
-    def _status_write_failed_compat_key(self) -> str:
-        return "status_" "write_failed_tasks:" + self.name
-
-    async def _persist_status_write_failed_task_pr_ids(self) -> None:  # pragma: no cover
-        key = self._status_write_failed_compat_key()
-        try:
-            if self._status_write_failed_task_pr_ids:
-                await self.redis.set(
-                    key,
-                    json.dumps(
-                        sorted(self._status_write_failed_task_pr_ids),
-                        separators=(",", ":"),
-                    ),
-                )
-            else:
-                await self.redis.delete(key)
-            self._status_write_failed_task_pr_ids_persist_failed = False
-        except Exception as exc:
-            self._status_write_failed_task_pr_ids_persist_failed = True
-            self.log_event(
-                f"[INFRA] Warning: failed to persist status-write "
-                f"fallback markers: {exc}."
-            )
-
-    async def _hydrate_status_write_failed_task_pr_ids(self) -> None:  # pragma: no cover
-        decoded_sets: list[set[str]] = []
-        for key in (
-            self._status_write_failed_compat_key(),
-            "recovered_tasks:" + self.name,
-        ):
-            try:
-                raw = await self.redis.get(key)
-            except Exception:
-                return
-            if raw is None:
-                continue
-            try:
-                if isinstance(raw, bytes):
-                    raw = raw.decode("utf-8")
-                decoded = json.loads(raw)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                decoded_sets.append(set())
-                continue
-            if isinstance(decoded, list):
-                decoded_sets.append(
-                    {item for item in decoded if isinstance(item, str) and item}
-                )
-        if not decoded_sets:
-            if not self._status_write_failed_task_pr_ids_persist_failed:
-                self._status_write_failed_task_pr_ids = set()
-            return
-        self._status_write_failed_task_pr_ids = set().union(*decoded_sets)
-
-    async def _clear_status_write_failed_task_ids(  # pragma: no cover
-        self,
-        uploaded_pr_ids: set[str],
-    ) -> None:
-        await self._hydrate_status_write_failed_task_pr_ids()
-        self._status_write_failed_task_pr_ids.difference_update(uploaded_pr_ids)
-        await self._persist_status_write_failed_task_pr_ids()
-        try:
-            await self.redis.delete("recovered_tasks:" + self.name)
-        except Exception as exc:
-            self.log_event(
-                f"[INFRA] Warning: failed to clear legacy status-write "
-                f"fallback markers: {exc}."
-            )
-
     async def _mark_status_write_failed_task(
         self,
         current_task: Any,
@@ -2169,7 +2099,6 @@ class PipelineRunner(
         pr_id = getattr(current_task, "pr_id", "")
         if not pr_id:
             return
-        self._status_write_failed_task_pr_ids.add(pr_id)
         if ensure_suppression and await self._suppression_record_for_task(pr_id) is None:
             await self._suppress_task(
                 pr_id,
@@ -2177,10 +2106,9 @@ class PipelineRunner(
                 detail or {"source": "status_write_failed"},
             )
         self.log_event(
-            f"[INFRA] Warning: using in-memory ERROR fallback for "
-            f"{pr_id}; status write will retry on the next ERROR cycle."
+            f"[INFRA] Warning: status:ERROR write failed for {pr_id}; "
+            "task is parked by suppression."
         )
-        await self._persist_status_write_failed_task_pr_ids()
         snapshot = self.state.current_queue
         if snapshot:
             self.state.current_queue = [
@@ -2190,6 +2118,22 @@ class PipelineRunner(
                 for queued in snapshot
             ]
         await self.publish_state()
+
+    async def _cleanup_stale_legacy_key_markers(self) -> None:
+        """Best-effort startup sweep for legacy Redis key families."""
+        patterns = (
+            "status_" "write_failed_tasks:*",
+            "recovered_" "tasks:*",
+            "legacy_" "recovered_" "tasks:*",
+        )
+        try:
+            for pattern in patterns:
+                async for key in self.redis.scan_iter(match=pattern):
+                    await self.redis.delete(key)
+        except Exception as exc:
+            self.log_event(
+                f"[INFRA] Warning: failed to clean stale legacy Redis keys: {exc}."
+            )
 
     def _track_current_coder_process(
         self, proc: asyncio.subprocess.Process
@@ -2838,6 +2782,7 @@ class PipelineRunner(
         if not self.state.user_paused:
             self._user_pause_logged = False
         if not self._recovered:
+            await self._cleanup_stale_legacy_key_markers()
             recovery_complete = await self.recover_state()
             if not recovery_complete:
                 has_pending = False

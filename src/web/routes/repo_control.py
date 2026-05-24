@@ -137,10 +137,6 @@ def _diagnose_exhausted_key(repo_slug: str, task_id: str) -> str:
     return f"diagnose_exhausted:{repo_slug}:{task_id}"
 
 
-def _status_write_failed_key(repo_slug: str) -> str:
-    return f"status_write_failed_tasks:{repo_slug}"
-
-
 _ACTIVE_RUN_STATES = {
     PipelineState.PREFLIGHT,
     PipelineState.CODING,
@@ -326,37 +322,6 @@ async def _await_if_needed(result: Any) -> Any:
     return result
 
 
-async def _clear_status_write_failed_marker(
-    redis_client: aioredis.Redis,
-    repo_slug: str,
-    task_id: str,
-) -> None:
-    for key in (_status_write_failed_key(repo_slug), f"recovered_tasks:{repo_slug}"):
-        raw = await redis_client.get(key)
-        if raw is None:
-            continue
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8")
-        try:
-            decoded = json.loads(raw)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
-        if not isinstance(decoded, list):
-            continue
-        remaining = [item for item in decoded if item != task_id]
-        if len(remaining) == len(decoded):
-            continue
-        if remaining:
-            await _await_if_needed(
-                redis_client.set(
-                    key,
-                    json.dumps(remaining, separators=(",", ":")),
-                )
-            )
-        else:
-            await redis_client.delete(key)
-
-
 async def _clear_operator_park_for_task(
     redis_client: aioredis.Redis,
     repo_slug: str,
@@ -369,10 +334,6 @@ async def _clear_operator_park_for_task(
         pass
     try:
         await redis_client.delete(_diagnose_exhausted_key(repo_slug, task_id))
-    except Exception:
-        pass
-    try:
-        await _clear_status_write_failed_marker(redis_client, repo_slug, task_id)
     except Exception:
         pass
 
@@ -2027,10 +1988,6 @@ async def accept_guardrail_park_once(
 
     try:
         await redis_client.delete(_diagnose_exhausted_key(name, pr_id))
-    except Exception:
-        pass
-    try:
-        await _clear_status_write_failed_marker(redis_client, name, pr_id)
     except Exception:
         pass
     try:

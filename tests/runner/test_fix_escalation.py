@@ -177,7 +177,6 @@ def test_escalate_fix_no_push_deadlock_sets_fallback_when_status_write_fails(
 
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
-    assert runner._status_write_failed_task_pr_ids == {"PR-504"}
 
 
 def test_escalate_fix_no_push_deadlock_storage_failure_does_not_block_idle(

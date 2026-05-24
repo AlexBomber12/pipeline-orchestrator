@@ -304,7 +304,6 @@ class RecoveryMixin:
         # outage during recovery still surfaces as ERROR with no
         # current_task.
         await self._hydrate_current_task_from_persisted_state()
-        await self._hydrate_status_write_failed_task_pr_ids()
         # The helper consults ``_idle_open_prs`` to derive each task's
         # status from the live PR set. Populate it from the recovery
         # fetch and reset on exit so ``handle_idle`` does not later read

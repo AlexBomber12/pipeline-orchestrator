@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from enum import Enum
 
 from src.branch_context import BranchContext
-from src.cancellation import get_cancellation_cause, safe_delete_cancellation_cause
+from src.cancellation import safe_delete_cancellation_cause
 from src.daemon import git_ops
 from src.diagnosis import parse_diagnosis
 from src.models import PipelineState
@@ -148,32 +148,6 @@ class ErrorMixin:
         # task_id for the 30-day TTL.
         retry_task = self.state.current_task
         retry_task_id = retry_task.pr_id if retry_task is not None else None
-
-        if (
-            retry_task is not None
-            and retry_task_id in self._status_write_failed_task_pr_ids
-        ):
-            try:
-                cause = await get_cancellation_cause(
-                    self.redis, self.name, retry_task_id, refresh_ttl=False
-                )
-            except Exception:
-                cause = None
-            status_written = await self._commit_task_status_change(
-                retry_task,
-                "ERROR",
-                context,
-                blocked_reason=self._suppression_reason_from_cancellation(cause),
-            )
-            if not status_written:
-                self.log_event(
-                    "[INFRA] Warning: retryable status:ERROR write still "
-                    f"failing for {retry_task_id}; staying ERROR."
-                )
-                await self.publish_state()
-                return
-            self._status_write_failed_task_pr_ids.discard(retry_task_id)
-            await self._persist_status_write_failed_task_pr_ids()
 
         async def _clear_cause_for_retry() -> None:
             if retry_task_id is not None:

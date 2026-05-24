@@ -414,10 +414,6 @@ def test_accept_once_sets_flag_and_clears(
     monkeypatch: Any,
 ) -> None:
     repo_dir, redis_client = _setup_repo(tmp_path, monkeypatch)
-    marker_key = "status_write_failed_tasks:example__alpha"
-    legacy_key = "recovered_tasks:example__alpha"
-    redis_client.store[marker_key] = '["PR-384","PR-999"]'
-    redis_client.store[legacy_key] = '["PR-384","PR-888"]'
 
     with TestClient(app) as client:
         response = client.post(
@@ -435,8 +431,6 @@ def test_accept_once_sets_flag_and_clears(
     assert state.current_task is None
     assert state.current_queue is not None
     assert state.current_queue[0].status == TaskStatus.TODO
-    assert redis_client.store[marker_key] == '["PR-999"]'
-    assert redis_client.store[legacy_key] == '["PR-888"]'
 
 
 def test_accept_once_requires_active_error_task(
@@ -764,11 +758,6 @@ async def test_clear_operator_park_swallows_cleanup_failures(
             raise RuntimeError("clear failed")
 
     monkeypatch.setattr(repo_control, "RedisSuppressionStore", _Store)
-    monkeypatch.setattr(
-        repo_control,
-        "_clear_status_write_failed_marker",
-        lambda *args: (_ for _ in ()).throw(RuntimeError("marker failed")),
-    )
 
     await repo_control._clear_operator_park_for_task(
         _DeleteFailsRedis(),
@@ -965,19 +954,11 @@ def test_guardrail_accept_swallows_delete_and_publish_failure(
     async def fail_publish(redis: Any, repo_name: str, event_type: str) -> None:
         raise RuntimeError("publish failed")
 
-    async def fail_marker_cleanup(*args: Any, **kwargs: Any) -> None:
-        raise RuntimeError("marker failed")
-
     async def fail_history(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("history failed")
 
     monkeypatch.setattr(web_app, "publish_wake", fail_publish)
     monkeypatch.setattr(repo_control, "_publish_history_entry_event", fail_history)
-    monkeypatch.setattr(
-        repo_control,
-        "_clear_status_write_failed_marker",
-        fail_marker_cleanup,
-    )
 
     with TestClient(app) as client:
         response = client.post(

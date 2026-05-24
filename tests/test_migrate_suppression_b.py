@@ -74,7 +74,7 @@ async def test_counters_become_detail() -> None:
 def test_recovery_boot_no_status_write_failed_hydrate() -> None:
     runner = _runner()
 
-    assert hasattr(runner, "_hydrate_status_write_failed_task_pr_ids")
+    assert not hasattr(runner, "_hydrate_status_write_failed_task_pr_ids")
     assert "status_write_failed_tasks:" + runner.name not in runner.redis.store
 
 

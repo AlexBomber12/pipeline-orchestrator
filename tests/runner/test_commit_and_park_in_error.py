@@ -240,7 +240,7 @@ def test_commit_and_park_in_error_marks_status_write_fallback_on_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When ``_commit_task_status_change`` returns False the runner records
-    the in-memory fallback marker so the picker stays away from the task."""
+    a suppression so the picker stays away from the task."""
     runner = h._make_runner()
     runner.state.current_task = QueueTask(
         pr_id="PR-903",
@@ -266,7 +266,8 @@ def test_commit_and_park_in_error_marks_status_write_fallback_on_failure(
         )
     )
 
-    assert runner._status_write_failed_task_pr_ids == {"PR-903"}
+    record = asyncio.run(runner._suppression_record_for_task("PR-903"))
+    assert record is not None
 
 
 def test_commit_and_park_in_error_saves_run_record_before_status_checkout(
@@ -366,7 +367,8 @@ def test_commit_and_park_in_error_logs_status_write_exception(
         )
     )
 
-    assert runner._status_write_failed_task_pr_ids == {"PR-904"}
+    record = asyncio.run(runner._suppression_record_for_task("PR-904"))
+    assert record is not None
     assert any(
         "[ERROR] Failed to write status:ERROR to tasks/PR-904.md: checkout refused"
         in entry["event"]

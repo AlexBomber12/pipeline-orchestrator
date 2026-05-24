@@ -414,13 +414,6 @@ return 0
                 and not use_single_error_exit
             ):
                 crashed_pr_ids.difference_update(uploaded_pr_ids)
-            clear_status_write_failed = getattr(
-                self,
-                "_clear_status_write_failed_task_ids",
-                None,
-            )
-            if uploaded_pr_ids and clear_status_write_failed is not None:
-                await clear_status_write_failed(uploaded_pr_ids)
             if uploaded_pr_ids:
                 for pr_id in uploaded_pr_ids:
                     await safe_delete_cancellation_cause(

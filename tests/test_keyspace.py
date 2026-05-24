@@ -45,6 +45,17 @@ def test_upload_pending_format() -> None:
     assert keyspace.upload_pending("owner__repo") == "upload:owner__repo:pending"
 
 
+def test_upload_pending_count_format() -> None:
+    assert keyspace.upload_pending_count("alpha") == "upload_pending_count:alpha"
+
+
+def test_recovery_backup_branch_format() -> None:
+    assert (
+        keyspace.recovery_backup_branch("alpha", "PR-388")
+        == "recovery:backup_branch:alpha:PR-388"
+    )
+
+
 def test_upload_pending_pattern_is_glob() -> None:
     assert keyspace.upload_pending_pattern() == "upload:*:pending"
 
@@ -57,6 +68,13 @@ def test_cli_log_history_format() -> None:
     assert (
         keyspace.cli_log_history("alpha", "2026-05-02T12:00:00Z")
         == "cli_log:alpha:2026-05-02T12:00:00Z"
+    )
+
+
+def test_ci_infra_retried_format() -> None:
+    assert (
+        keyspace.ci_infra_retried("alpha", 12, "abc123")
+        == "ci_infra_retried:alpha:12:abc123"
     )
 
 
@@ -83,3 +101,12 @@ def test_helpers_handle_owner_repo_slug_form() -> None:
     assert keyspace.control_stop(name).split(":")[1] == name
     assert keyspace.upload_pending(name).split(":")[1] == name
     assert keyspace.repo_events_channel(name).split(":")[1] == name
+
+
+def test_daemon_panic_state_format() -> None:
+    assert keyspace.daemon_panic_state() == "daemon:panic_state"
+
+
+def test_orphaned_helpers_removed() -> None:
+    assert not hasattr(keyspace, "legacy_recovered_tasks")
+    assert not hasattr(keyspace, "status_write_failed_tasks")

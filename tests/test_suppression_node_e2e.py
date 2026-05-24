@@ -144,7 +144,6 @@ def _assert_no_legacy_storage(runner: Any, task_id: str) -> None:
         "recovered_tasks:",
         "diagnose_exhausted:",
     )
-    assert runner._status_write_failed_task_pr_ids == set()
     assert not getattr(runner.state, "quarantined_prs", set())
     assert not getattr(runner, "_stopped_task_pr_ids", set())
     assert not getattr(runner, "_crashed_task_pr_ids", set())

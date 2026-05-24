@@ -177,27 +177,6 @@ def test_recover_doing_task_with_matching_pr_recovers_to_watch(
     )
 
 
-def test_recover_state_rehydrates_status_write_failed_marker(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    task = _doing_task()
-    matching_pr = PRInfo(
-        number=17,
-        branch="pr-042-inflight",
-        ci_status=CIStatus.PENDING,
-        review_status=ReviewStatus.PENDING,
-    )
-    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [matching_pr])
-
-    runner = _make_runner()
-    runner.redis.store[f"status_write_failed_tasks:{runner.name}"] = '["PR-042"]'
-    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
-
-    asyncio.run(runner.recover_state())
-
-    assert runner._status_write_failed_task_pr_ids == {"PR-042"}
-
-
 def test_recover_rehydrates_quarantine_from_pr_labels(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
