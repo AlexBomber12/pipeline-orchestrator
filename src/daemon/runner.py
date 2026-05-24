@@ -2128,11 +2128,10 @@ class PipelineRunner(
                 f"status-write fallback {pr_id}: {exc}."
             )
             record = None
-        # A status-write failure must never leave the task selectable. If the
-        # primary cause write failed, there may be no existing suppression even
-        # when callers pass ``ensure_suppression=False`` to avoid duplicate
-        # writes on the happy path.
-        needs_suppression = (
+        # Some callers immediately persist a richer cancellation cause after
+        # this marker. Respect their first-cause-wins path and only create the
+        # fallback suppression when explicitly asked to do so.
+        needs_suppression = ensure_suppression and (
             record is None
             or not self._task_suppression_blocks_selection(record.reason)
         )
