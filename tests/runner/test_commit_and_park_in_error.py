@@ -27,6 +27,7 @@ from src.cancellation import CancellationCause
 from src.cancellation.storage import cause_key
 from src.daemon import fix_escalation
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
+from src.subsource_registry import SuppressionReason
 
 from tests.runner import _helpers as h
 
@@ -268,6 +269,9 @@ def test_commit_and_park_in_error_marks_status_write_fallback_on_failure(
 
     record = asyncio.run(runner._suppression_record_for_task("PR-903"))
     assert record is not None
+    assert record.reason == SuppressionReason.CRASH
+    assert record.detail["blocked_reason"] == SuppressionReason.INFRA_FAILURE.value
+    assert runner._task_suppression_blocks_selection(record.reason) is True
 
 
 def test_commit_and_park_in_error_saves_run_record_before_status_checkout(

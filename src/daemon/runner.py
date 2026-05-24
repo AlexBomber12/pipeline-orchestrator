@@ -2099,11 +2099,27 @@ class PipelineRunner(
         pr_id = getattr(current_task, "pr_id", "")
         if not pr_id:
             return
-        if ensure_suppression and await self._suppression_record_for_task(pr_id) is None:
+        suppression_reason = self._status_write_failed_suppression_reason(
+            blocked_reason
+        )
+        suppression_detail = dict(detail or {"source": "status_write_failed"})
+        if blocked_reason is not None and blocked_reason != suppression_reason:
+            suppression_detail.setdefault("blocked_reason", blocked_reason.value)
+        record = await self._suppression_record_for_task(pr_id)
+        # ``ensure_suppression=False`` still skips creating a new record, but
+        # a status-write failure must never leave an existing non-blocking
+        # suppression such as ``infra_failure`` selectable.
+        needs_suppression = (
+            record is None
+            and ensure_suppression
+            or record is not None
+            and not self._task_suppression_blocks_selection(record.reason)
+        )
+        if needs_suppression:
             await self._suppress_task(
                 pr_id,
-                blocked_reason or SuppressionReason.CRASH,
-                detail or {"source": "status_write_failed"},
+                suppression_reason,
+                suppression_detail,
             )
         self.log_event(
             f"[INFRA] Warning: status:ERROR write failed for {pr_id}; "
@@ -2118,6 +2134,17 @@ class PipelineRunner(
                 for queued in snapshot
             ]
         await self.publish_state()
+
+    def _status_write_failed_suppression_reason(
+        self,
+        blocked_reason: SuppressionReason | None,
+    ) -> SuppressionReason:
+        """Return a selection-blocking suppression for status-write fallback."""
+        if blocked_reason is not None and self._task_suppression_blocks_selection(
+            blocked_reason
+        ):
+            return blocked_reason
+        return SuppressionReason.CRASH
 
     async def _cleanup_stale_legacy_key_markers(self) -> None:
         """Best-effort startup sweep for legacy Redis key families."""
