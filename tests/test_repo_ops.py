@@ -548,6 +548,38 @@ def test_process_pending_uploads_persists_task_hash_after_push(
     assert key not in runner.redis.store
 
 
+def test_process_pending_uploads_preserves_pending_reupload_markers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = _Runner(tmp_path)
+    repo_dir = Path(runner.repo_path)
+    repo_dir.mkdir(parents=True)
+    staging = tmp_path / "uploads" / "demo"
+    staging.mkdir(parents=True)
+    (staging / "PR-002.md").write_text("# PR-002\n", encoding="utf-8")
+    key = f"upload:{runner.name}:pending"
+    runner.redis.store[key] = json.dumps(
+        {
+            "files": ["PR-002.md"],
+            "staging_dir": str(staging),
+        }
+    )
+    runner._recently_uploaded_task_pr_ids = {"PR-001"}
+
+    monkeypatch.setattr(
+        repo_ops.git_ops,
+        "_git",
+        lambda *args, **kwargs: _FakeCompletedProcess(),
+    )
+    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
+    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
+
+    assert _run(runner.process_pending_uploads()) is True
+    assert runner._recently_uploaded_task_pr_ids == {"PR-001", "PR-002"}
+    assert key not in runner.redis.store
+
+
 def test_process_pending_uploads_uses_manifest_commit_subject_and_body(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
