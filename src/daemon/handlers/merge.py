@@ -144,8 +144,11 @@ class MergeMixin:
                             # retry — drop back to WATCH so the next cycle
                             # re-enters the merge gate, and let the
                             # MERGE→WATCH transition clear ``merge_phase``
-                            # via the RepoState ``__setattr__`` hook.
-                            self.state.state = PipelineState.WATCH
+                            # via the RepoState ``__setattr__`` hook. When
+                            # the unified gate installed a spend-ceiling pause,
+                            # preserve PAUSED so the pause window is honored.
+                            if self.state.state != PipelineState.PAUSED:
+                                self.state.state = PipelineState.WATCH
                             return
                         self.log_event(
                             "[MERGE] Merge conflict with main, resolving..."

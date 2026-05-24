@@ -376,6 +376,58 @@ def test_handle_merge_aborts_when_conflict_resolution_is_rate_limited(
     assert not claude_calls
 
 
+def test_handle_merge_preserves_usage_gate_pause_when_conflict_resolution_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git_calls: list[tuple[str, ...]] = []
+
+    def fake_git(
+        repo_path: str,
+        *args: str,
+        **kwargs: Any,
+    ) -> h._FakeCompletedProcess:
+        git_calls.append(args)
+        if args[:2] == ("merge", "origin/main"):
+            return h._FakeCompletedProcess(
+                args=["git", *args],
+                returncode=1,
+                stdout="CONFLICT (content): merge conflict in foo",
+            )
+        return h._FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    async def fake_usage_gate(*args: Any, **kwargs: Any) -> bool:
+        runner.state.state = PipelineState.PAUSED
+        runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(
+            minutes=30
+        )
+        return False
+
+    claude_calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(
+        claude_cli,
+        "run_claude_async",
+        lambda *args, **kwargs: claude_calls.append(args),
+    )
+
+    runner = h._make_runner()
+    runner.usage_gate = fake_usage_gate  # type: ignore[method-assign]
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+    )
+
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.rate_limited_until is not None
+    assert ("merge", "--abort") in git_calls
+    assert not claude_calls
+
+
 def test_handle_merge_pauses_when_conflict_resolution_hits_rate_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
