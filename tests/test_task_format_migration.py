@@ -4,7 +4,6 @@ from io import StringIO
 from pathlib import Path
 
 import pytest
-
 from scripts import migrate_task_format
 from src.queue_parser import parse_task_header
 
@@ -138,6 +137,27 @@ def test_apply_creates_backup(tmp_path: Path) -> None:
     assert (backups_dir / "PR-999.md").read_text(encoding="utf-8") == content
 
 
+def test_apply_backs_up_unchanged_frontmatter_when_any_task_changes(
+    tmp_path: Path,
+) -> None:
+    tasks_dir = tmp_path / "tasks"
+    legacy_content = _legacy_task(status="DONE")
+    frontmatter_content = "---\nstatus: TODO\n---\n\n" + _legacy_task()
+    _write_task(tasks_dir, legacy_content, "PR-999.md")
+    frontmatter_path = tasks_dir / "PR-998.md"
+    frontmatter_path.write_text(frontmatter_content, encoding="utf-8")
+    backups_dir = tmp_path / "backups"
+
+    migrate_task_format.migrate_tasks(
+        tasks_dir,
+        apply=True,
+        backups_dir=backups_dir,
+        stdout=StringIO(),
+    )
+
+    assert (backups_dir / "PR-998.md").read_text(encoding="utf-8") == frontmatter_content
+
+
 def test_verify_detects_mismatch(tmp_path: Path) -> None:
     path = _write_task(tmp_path / "tasks", _legacy_task(status="DONE"))
     backups_dir = tmp_path / "backups"
@@ -154,6 +174,25 @@ def test_verify_detects_mismatch(tmp_path: Path) -> None:
     path.write_text(corrupted, encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="verify failed"):
+        migrate_task_format.verify_tasks(
+            path.parent,
+            backups_dir=backups_dir,
+            stdout=StringIO(),
+        )
+
+
+def test_verify_fails_when_backup_missing(tmp_path: Path) -> None:
+    path = _write_task(tmp_path / "tasks", _legacy_task(status="DONE"))
+    backups_dir = tmp_path / "backups"
+    migrate_task_format.migrate_tasks(
+        path.parent,
+        apply=True,
+        backups_dir=backups_dir,
+        stdout=StringIO(),
+    )
+    (backups_dir / "PR-999.md").unlink()
+
+    with pytest.raises(RuntimeError, match="missing backup"):
         migrate_task_format.verify_tasks(
             path.parent,
             backups_dir=backups_dir,

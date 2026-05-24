@@ -19,7 +19,6 @@ if str(REPO_ROOT) not in sys.path:
 from src.models import TaskStatus  # noqa: E402
 from src.queue_parser import QueueValidationError, TaskHeader, parse_task_header  # noqa: E402
 
-
 VALID_FRONTMATTER_STATUSES = {"TODO", "DONE", "ERROR"}
 LEGACY_FALLBACK_SUFFIXES = {
     ": missing Branch",
@@ -180,11 +179,19 @@ def migrate_tasks(
     tasks_dir = tasks_dir.resolve()
     files = task_files(tasks_dir)
     selected_backups_dir = backups_dir or (default_backups_dir(tasks_dir) if apply else None)
+    should_backup_all = apply and any(
+        not has_frontmatter(path.read_text(encoding="utf-8")) for path in files
+    )
     changed = 0
     print(
         f"{'apply' if apply else 'dry-run'}: scanning {len(files)} task files in {tasks_dir}",
         file=stdout,
     )
+
+    if should_backup_all:
+        assert selected_backups_dir is not None
+        for task_path in files:
+            create_backup(selected_backups_dir, tasks_dir, task_path)
 
     for task_path in files:
         _parse_or_legacy_issues(task_path)
@@ -200,8 +207,6 @@ def migrate_tasks(
             file=stdout,
         )
         if apply:
-            assert selected_backups_dir is not None
-            create_backup(selected_backups_dir, tasks_dir, task_path)
             _atomic_write(task_path, after)
 
     if apply and changed:
@@ -260,7 +265,7 @@ def verify_tasks(
     for task_path in files:
         backup_path = backup_path_for(selected_backups_dir, tasks_dir, task_path)
         if not backup_path.exists():
-            _parse_or_legacy_issues(task_path)
+            mismatches.append(f"{task_path.name}: missing backup")
             continue
 
         before_content = backup_path.read_text(encoding="utf-8")
@@ -273,7 +278,10 @@ def verify_tasks(
     if mismatches:
         for mismatch in mismatches:
             print(mismatch, file=stdout)
-        raise RuntimeError(f"verify failed: {len(mismatches)} mismatched task files")
+        raise RuntimeError(
+            f"verify failed: {len(mismatches)} mismatched task files; "
+            f"first: {mismatches[0]}"
+        )
 
     print(f"verify ok: compared={compared} checked={len(files)}", file=stdout)
     return MigrationResult(len(files), 0, selected_backups_dir)
