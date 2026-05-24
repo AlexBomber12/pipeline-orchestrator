@@ -443,6 +443,12 @@ def test_select_next_task_from_dag_skips_status_write_failed_suppression(
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="Status write failed",
+        status=TaskStatus.DOING,
+        branch="pr-001-status-write-failed",
+    )
     asyncio.run(
         runner._suppress_task(
             "PR-001",

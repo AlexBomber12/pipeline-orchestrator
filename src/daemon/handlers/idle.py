@@ -485,12 +485,18 @@ class IdleMixin:
                 record = await self._suppression_record_for_task(pr_id)
                 if record is None:
                     continue
-                if statuses[pr_id] in (TaskStatus.DONE, TaskStatus.DOING):
+                is_status_write_failed = (
+                    record.detail.get("source") == "status_write_failed"
+                )
+                if statuses[pr_id] == TaskStatus.DONE or (
+                    statuses[pr_id] == TaskStatus.DOING
+                    and not is_status_write_failed
+                ):
                     await self._clear_task_suppression(pr_id)
                     continue
                 if (
                     frontmatter_statuses.get(pr_id) == "todo"
-                    and record.detail.get("source") != "status_write_failed"
+                    and not is_status_write_failed
                 ):
                     await self._clear_task_suppression(pr_id)
                     continue
