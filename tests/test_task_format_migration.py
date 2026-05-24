@@ -428,3 +428,14 @@ def test_apply_validates_all_statuses_before_writing(tmp_path: Path) -> None:
     assert first.read_text(encoding="utf-8") == first_content
     assert second.read_text(encoding="utf-8") == second_content
     assert not backups_dir.exists()
+
+
+def test_malformed_open_frontmatter_preserves_parser_error(tmp_path: Path) -> None:
+    content = "---\nstatus: TODO\n\n" + _legacy_task()
+    path = _write_task(tmp_path / "tasks", content)
+
+    with pytest.raises(Exception) as exc_info:
+        migrate_task_format.migrate_tasks(path.parent, apply=True, stdout=StringIO())
+
+    assert "missing closing frontmatter '---'" in str(exc_info.value)
+    assert path.read_text(encoding="utf-8") == content

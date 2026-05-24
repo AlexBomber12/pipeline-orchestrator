@@ -146,6 +146,10 @@ def make_task_zip(tmp_path):
         priority: int = 2,
     ) -> Path:
         body = (
+            "---\n"
+            "status: TODO\n"
+            "---\n"
+            "\n"
             f"# PR-{pr_id}: {title_slug}\n"
             "\n"
             f"Branch: pr-{pr_id}-{title_slug}\n"
@@ -215,6 +219,10 @@ def make_task_zip_multi(tmp_path):
                     task_priority = priority
                 depends_line = ", ".join(depends_on) if depends_on else "none"
                 body = (
+                    "---\n"
+                    "status: TODO\n"
+                    "---\n"
+                    "\n"
                     f"# PR-{pr_id}: {title_slug}\n"
                     "\n"
                     f"Branch: pr-{pr_id}-{title_slug}\n"

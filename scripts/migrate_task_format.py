@@ -65,6 +65,12 @@ def has_frontmatter(content: str) -> bool:
     return any(line.rstrip() == "---" for line in lines[first + 1 :])
 
 
+def has_frontmatter_opening(content: str) -> bool:
+    lines = content.splitlines()
+    first = next((index for index, line in enumerate(lines) if line.strip()), None)
+    return first is not None and lines[first].rstrip() == "---"
+
+
 def legacy_status(content: str) -> str:
     """Return the legacy header status, defaulting to TODO like the parser."""
     in_task = False
@@ -175,7 +181,7 @@ def _parse_or_legacy_issues(path: Path) -> TaskHeader | tuple[str, ...]:
     content = path.read_text(encoding="utf-8")
     parse_path = path
     temp_path: Path | None = None
-    if not has_frontmatter(content):
+    if not has_frontmatter_opening(content):
         fd, temp_name = tempfile.mkstemp(
             prefix=f".{path.name}.parse.", suffix=".tmp", dir=str(path.parent), text=True
         )
