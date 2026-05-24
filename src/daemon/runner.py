@@ -2187,8 +2187,9 @@ class PipelineRunner(
             return blocked_reason
         return SuppressionReason.CRASH
 
-    async def _cleanup_stale_legacy_key_markers(self) -> None:
+    async def _cleanup_stale_legacy_key_markers(self) -> bool:
         """Best-effort startup migration and sweep for legacy key families."""
+        completed = True
         keys = (
             (
                 "status_" f"write_failed_tasks:{self.name}",
@@ -2250,10 +2251,12 @@ class PipelineRunner(
                         )
                 await self.redis.delete(key)
             except Exception as exc:
+                completed = False
                 self.log_event(
                     "[INFRA] Warning: failed to migrate/clean stale legacy "
                     f"Redis key {key}: {exc}."
                 )
+        return completed
 
     def _track_current_coder_process(
         self, proc: asyncio.subprocess.Process
@@ -2902,8 +2905,11 @@ class PipelineRunner(
         if not self.state.user_paused:
             self._user_pause_logged = False
         if not self._recovered:
-            await self._cleanup_stale_legacy_key_markers()
+            legacy_cleanup_complete = await self._cleanup_stale_legacy_key_markers()
             recovery_complete = await self.recover_state()
+            if not legacy_cleanup_complete:
+                await self.publish_state()
+                return
             if not recovery_complete:
                 has_pending = False
                 try:

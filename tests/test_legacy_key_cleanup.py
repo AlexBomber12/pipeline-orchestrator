@@ -229,7 +229,9 @@ async def test_cleanup_ignores_invalid_legacy_entries() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cleanup_failure_does_not_block_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_cleanup_failure_retries_next_startup_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     runner = _make_runner()
 
     async def ensure_repo_cloned() -> None:
@@ -264,4 +266,49 @@ async def test_cleanup_failure_does_not_block_startup(monkeypatch: pytest.Monkey
 
     await runner._run_cycle_body()
 
-    assert runner._recovered is True
+    assert runner._recovered is False
+
+
+@pytest.mark.asyncio
+async def test_recovery_pending_upload_read_failure_is_best_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+
+    async def ensure_repo_cloned() -> None:
+        return None
+
+    async def check_github_api_budget() -> bool:
+        return True
+
+    async def refresh_user_paused_from_redis() -> None:
+        return None
+
+    async def recover_state() -> bool:
+        return False
+
+    async def publish_state() -> None:
+        return None
+
+    async def cleanup_legacy() -> bool:
+        return True
+
+    async def get(key: str) -> None:
+        del key
+        raise RuntimeError("redis unavailable")
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", ensure_repo_cloned)
+    monkeypatch.setattr(runner, "_check_github_api_budget", check_github_api_budget)
+    monkeypatch.setattr(
+        runner,
+        "_refresh_user_paused_from_redis",
+        refresh_user_paused_from_redis,
+    )
+    monkeypatch.setattr(runner, "recover_state", recover_state)
+    monkeypatch.setattr(runner, "publish_state", publish_state)
+    monkeypatch.setattr(runner, "_cleanup_stale_legacy_key_markers", cleanup_legacy)
+    runner.redis.get = get  # type: ignore[method-assign]
+
+    await runner._run_cycle_body()
+
+    assert runner._recovered is False
