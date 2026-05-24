@@ -2904,12 +2904,12 @@ class PipelineRunner(
         await self._refresh_user_paused_from_redis()
         if not self.state.user_paused:
             self._user_pause_logged = False
+        if not getattr(self, "_legacy_cleanup_complete", False):
+            self._legacy_cleanup_complete = (
+                await self._cleanup_stale_legacy_key_markers()
+            )
         if not self._recovered:
-            legacy_cleanup_complete = await self._cleanup_stale_legacy_key_markers()
             recovery_complete = await self.recover_state()
-            if not legacy_cleanup_complete:
-                await self.publish_state()
-                return
             if not recovery_complete:
                 has_pending = False
                 try:

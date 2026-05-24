@@ -229,10 +229,11 @@ async def test_cleanup_ignores_invalid_legacy_entries() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cleanup_failure_retries_next_startup_cycle(
+async def test_cleanup_failure_does_not_block_recovery_and_retries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = _make_runner()
+    cleanup_attempts = 0
 
     async def ensure_repo_cloned() -> None:
         return None
@@ -253,6 +254,9 @@ async def test_cleanup_failure_retries_next_startup_cycle(
     async def publish_state() -> None:
         return None
 
+    async def handle_idle() -> None:
+        return None
+
     monkeypatch.setattr(runner, "ensure_repo_cloned", ensure_repo_cloned)
     monkeypatch.setattr(runner, "_check_github_api_budget", check_github_api_budget)
     monkeypatch.setattr(
@@ -262,11 +266,25 @@ async def test_cleanup_failure_retries_next_startup_cycle(
     )
     monkeypatch.setattr(runner, "recover_state", recover_state)
     monkeypatch.setattr(runner, "publish_state", publish_state)
+    monkeypatch.setattr(runner, "handle_idle", handle_idle)
     runner.redis.delete = delete  # type: ignore[method-assign]
 
     await runner._run_cycle_body()
 
-    assert runner._recovered is False
+    assert runner._recovered is True
+    assert runner._legacy_cleanup_complete is False
+
+    async def cleanup() -> bool:
+        nonlocal cleanup_attempts
+        cleanup_attempts += 1
+        return True
+
+    monkeypatch.setattr(runner, "_cleanup_stale_legacy_key_markers", cleanup)
+
+    await runner._run_cycle_body()
+
+    assert runner._legacy_cleanup_complete is True
+    assert cleanup_attempts == 1
 
 
 @pytest.mark.asyncio
