@@ -962,6 +962,68 @@ def test_watch_review_timeout_status_write_failure_marks_task(
     assert getattr(marked[0], "pr_id", None) == "PR-012"
 
 
+def test_watch_review_timeout_marks_task_before_transition_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed status write must be parked before ERROR transition side
+    effects, so a later transition failure cannot requeue the same task."""
+    stale = datetime.now(timezone.utc) - timedelta(minutes=45)
+    pr = PRInfo(
+        number=14,
+        branch="pr-014",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.EYES,
+        last_activity=stale,
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+
+    async def fake_commit_fail(self, current_task, status, reason, **kwargs):
+        return False
+
+    monkeypatch.setattr(
+        PipelineRunner,
+        "_commit_task_status_change",
+        fake_commit_fail,
+    )
+
+    marked: list[Any] = []
+
+    async def fake_mark(self, current_task: Any, **kwargs: Any) -> None:
+        marked.append(current_task)
+
+    monkeypatch.setattr(
+        PipelineRunner,
+        "_mark_status_write_failed_task",
+        fake_mark,
+    )
+
+    async def fake_transition_to_error(self, message: str, **kwargs: Any) -> None:
+        raise RuntimeError("run record unavailable")
+
+    monkeypatch.setattr(
+        PipelineRunner,
+        "_transition_to_error",
+        fake_transition_to_error,
+    )
+
+    runner = h._make_runner(review_timeout_min=30)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=14, branch="pr-014")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-014",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-014",
+        task_file="tasks/PR-014.md",
+    )
+
+    with pytest.raises(RuntimeError, match="run record unavailable"):
+        asyncio.run(runner.handle_watch())
+
+    assert len(marked) == 1
+    assert getattr(marked[0], "pr_id", None) == "PR-014"
+
+
 def test_handle_watch_within_timeout_stays_watching(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

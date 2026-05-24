@@ -517,6 +517,12 @@ class WatchMixin:
                         "staying ERROR for retry."
                     )
                     status_write_failed = True
+            if current_task is not None and status_write_failed:
+                await self._mark_status_write_failed_task(
+                    current_task,
+                    blocked_reason=SuppressionReason.REVIEW_TIMEOUT,
+                    ensure_suppression=False,
+                )
             await self._transition_to_error(
                 message,
                 save_run_record_as="error",
@@ -538,12 +544,6 @@ class WatchMixin:
                 ),
                 commit_task_status=False,
             )
-            if current_task is not None and status_write_failed:
-                await self._mark_status_write_failed_task(
-                    current_task,
-                    blocked_reason=SuppressionReason.REVIEW_TIMEOUT,
-                    ensure_suppression=False,
-                )
             # PR-316 review feedback: park terminally for operator action.
             # ``run_cycle`` checks this flag in the ERROR branch and skips
             # the AI diagnose call so the model is not invoked on a
