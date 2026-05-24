@@ -138,6 +138,27 @@ async def test_cleanup_preserves_existing_suppression_record() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cleanup_replaces_nonblocking_existing_suppression() -> None:
+    runner = _make_runner()
+    key = f"status_write_failed_tasks:{runner.name}"
+    runner.redis.store[key] = '["PR-001"]'
+    await runner._suppress_task(
+        "PR-001",
+        SuppressionReason.INFRA_FAILURE,
+        {"source": "infra_failure"},
+    )
+
+    await runner._cleanup_stale_legacy_key_markers()
+
+    assert key not in runner.redis.store
+    record = await runner._suppression_record_for_task("PR-001")
+    assert record is not None
+    assert record.reason == SuppressionReason.CRASH
+    assert record.detail["source"] == "status_write_failed"
+    assert record.detail["legacy_key"] is True
+
+
+@pytest.mark.asyncio
 async def test_cleanup_failure_does_not_block_startup(monkeypatch: pytest.MonkeyPatch) -> None:
     runner = _make_runner()
 

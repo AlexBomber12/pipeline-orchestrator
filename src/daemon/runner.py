@@ -2212,7 +2212,9 @@ class PipelineRunner(
                 for pr_id in pr_ids:
                     if isinstance(pr_id, str) and pr_id:
                         record = await self._suppression_record_for_task(pr_id)
-                        if record is None:
+                        if record is None or not self._task_suppression_blocks_selection(
+                            record.reason
+                        ):
                             await self._suppress_task(
                                 pr_id,
                                 SuppressionReason.CRASH,
