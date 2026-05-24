@@ -2209,21 +2209,45 @@ class PipelineRunner(
                 pr_ids = json.loads(raw) if raw else []
                 if not isinstance(pr_ids, list):
                     pr_ids = []
-                for pr_id in pr_ids:
-                    if isinstance(pr_id, str) and pr_id:
-                        record = await self._suppression_record_for_task(pr_id)
-                        if record is None or not self._task_suppression_blocks_selection(
-                            record.reason
+                for item in pr_ids:
+                    expected_hash = None
+                    if isinstance(item, dict):
+                        pr_id = item.get("pr_id")
+                        expected_hash = item.get("task_spec_hash")
+                    else:
+                        pr_id = item
+                    if not isinstance(pr_id, str) or not pr_id:
+                        continue
+                    record = await self._suppression_record_for_task(pr_id)
+                    if record is not None and self._task_suppression_blocks_selection(
+                        record.reason
+                    ):
+                        continue
+                    should_migrate = record is not None
+                    task_path = Path(self.repo_path) / "tasks" / f"{pr_id}.md"
+                    if task_path.exists():
+                        task_text = task_path.read_text(encoding="utf-8")
+                        if (
+                            isinstance(expected_hash, str)
+                            and expected_hash == task_spec_content_hash(task_text)
                         ):
-                            await self._suppress_task(
-                                pr_id,
-                                SuppressionReason.CRASH,
-                                {
-                                    "source": "status_write_failed",
-                                    "legacy_key": True,
-                                    **detail,
-                                },
+                            should_migrate = True
+                        else:
+                            header = parse_task_header(task_path)
+                            should_migrate = header.frontmatter_status not in (
+                                None,
+                                "todo",
                             )
+                    if should_migrate:
+                        await self._suppress_task(
+                            pr_id,
+                            SuppressionReason.CRASH,
+                            {
+                                "source": "status_write_failed",
+                                "legacy_key": True,
+                                **detail,
+                            },
+                        )
                 await self.redis.delete(key)
             except Exception as exc:
                 self.log_event(

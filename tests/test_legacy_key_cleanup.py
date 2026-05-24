@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from src.cancellation import task_spec_content_hash
 from src.subsource_registry import SuppressionReason
 from tests.runner._helpers import _make_runner
 
@@ -14,6 +15,30 @@ def _production_python_files() -> list[Path]:
         for path in Path("src").rglob("*.py")
         if "test" not in path.parts
     ]
+
+
+def _write_task(runner, pr_id: str, status: str) -> None:
+    tasks_dir = Path(runner.repo_path) / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    (tasks_dir / f"{pr_id}.md").write_text(
+        "---\n"
+        f"status: {status}\n"
+        "---\n"
+        f"# {pr_id}: Legacy task\n\n"
+        f"Branch: {pr_id.lower()}\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+
+def _task_text(runner, pr_id: str) -> str:
+    return (Path(runner.repo_path) / "tasks" / f"{pr_id}.md").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_no_production_references() -> None:
@@ -36,6 +61,8 @@ def test_no_production_references() -> None:
 @pytest.mark.asyncio
 async def test_stale_key_cleanup_idempotent() -> None:
     runner = _make_runner()
+    for pr_id in ("PR-001", "PR-002", "PR-003"):
+        _write_task(runner, pr_id, "ERROR")
     runner.redis.store.update(
         {
             f"status_write_failed_tasks:{runner.name}": '["PR-001"]',
@@ -90,6 +117,7 @@ async def test_cleanup_preserves_key_when_migration_fails() -> None:
     runner = _make_runner()
     key = f"status_write_failed_tasks:{runner.name}"
     runner.redis.store[key] = '["PR-001"]'
+    _write_task(runner, "PR-001", "ERROR")
 
     async def suppress(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("redis unavailable")
@@ -156,6 +184,48 @@ async def test_cleanup_replaces_nonblocking_existing_suppression() -> None:
     assert record.reason == SuppressionReason.CRASH
     assert record.detail["source"] == "status_write_failed"
     assert record.detail["legacy_key"] is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_drops_stale_todo_legacy_marker() -> None:
+    runner = _make_runner()
+    key = f"status_write_failed_tasks:{runner.name}"
+    runner.redis.store[key] = '["PR-001"]'
+    _write_task(runner, "PR-001", "TODO")
+
+    await runner._cleanup_stale_legacy_key_markers()
+
+    assert key not in runner.redis.store
+    assert await runner._suppression_record_for_task("PR-001") is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_migrates_matching_hash_payload() -> None:
+    runner = _make_runner()
+    key = f"status_write_failed_tasks:{runner.name}"
+    _write_task(runner, "PR-001", "TODO")
+    task_hash = task_spec_content_hash(_task_text(runner, "PR-001"))
+    runner.redis.store[key] = (
+        f'[{{"pr_id": "PR-001", "task_spec_hash": "{task_hash}"}}]'
+    )
+
+    await runner._cleanup_stale_legacy_key_markers()
+
+    assert key not in runner.redis.store
+    record = await runner._suppression_record_for_task("PR-001")
+    assert record is not None
+    assert record.reason == SuppressionReason.CRASH
+
+
+@pytest.mark.asyncio
+async def test_cleanup_ignores_invalid_legacy_entries() -> None:
+    runner = _make_runner()
+    key = f"status_write_failed_tasks:{runner.name}"
+    runner.redis.store[key] = '[123, {"task_spec_hash": "abc"}]'
+
+    await runner._cleanup_stale_legacy_key_markers()
+
+    assert key not in runner.redis.store
 
 
 @pytest.mark.asyncio
