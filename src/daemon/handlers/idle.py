@@ -486,18 +486,39 @@ class IdleMixin:
                 "_recently_uploaded_task_pr_ids",
                 set(),
             )
+            status_write_failed_task_pr_ids = getattr(
+                self,
+                "_status_write_failed_task_pr_ids",
+                set(),
+            )
             pending_recently_uploaded_task_pr_ids: set[str] = set()
             for pr_id in list(statuses.keys()):
-                record = await self._suppression_record_for_task(pr_id)
-                if record is None:
-                    continue
-                is_status_write_failed = (
-                    record.detail.get("source") == "status_write_failed"
-                )
                 frontmatter_status = frontmatter_statuses.get(pr_id)
                 frontmatter_is_todo = frontmatter_status in (
                     None,
                     "todo",
+                )
+                record = await self._suppression_record_for_task(pr_id)
+                if record is None:
+                    if pr_id not in status_write_failed_task_pr_ids:
+                        continue
+                    if (
+                        frontmatter_is_todo
+                        and statuses[pr_id] == TaskStatus.DOING
+                        and pr_id in recently_uploaded_task_pr_ids
+                    ):
+                        pending_recently_uploaded_task_pr_ids.add(pr_id)
+                    elif (
+                        frontmatter_is_todo
+                        and pr_id in recently_uploaded_task_pr_ids
+                    ):
+                        status_write_failed_task_pr_ids.discard(pr_id)
+                        recently_uploaded_task_pr_ids.discard(pr_id)
+                        continue
+                    statuses[pr_id] = TaskStatus.ERROR
+                    continue
+                is_status_write_failed = (
+                    record.detail.get("source") == "status_write_failed"
                 )
                 if statuses[pr_id] == TaskStatus.DONE or (
                     statuses[pr_id] == TaskStatus.DOING

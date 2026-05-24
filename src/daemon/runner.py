@@ -2146,7 +2146,21 @@ class PipelineRunner(
                     suppression_reason,
                     suppression_detail,
                 )
+                fallback_task_pr_ids = getattr(
+                    self,
+                    "_status_write_failed_task_pr_ids",
+                    None,
+                )
+                if fallback_task_pr_ids is not None:
+                    fallback_task_pr_ids.discard(pr_id)
             except Exception as exc:
+                fallback_task_pr_ids = getattr(
+                    self,
+                    "_status_write_failed_task_pr_ids",
+                    set(),
+                )
+                fallback_task_pr_ids.add(pr_id)
+                self._status_write_failed_task_pr_ids = fallback_task_pr_ids
                 self.log_event(
                     f"[INFRA] Warning: failed to record status-write "
                     f"fallback suppression for {pr_id}: {exc}."

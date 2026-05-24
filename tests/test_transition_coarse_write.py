@@ -349,6 +349,7 @@ def test_status_write_failed_fallback_tolerates_suppression_store_failure(
     )
 
     assert runner.state.current_queue[0].status == TaskStatus.ERROR
+    assert runner._status_write_failed_task_pr_ids == {"PR-379"}
     assert published == [True]
     assert any(
         "failed to read suppression for status-write fallback PR-379"
