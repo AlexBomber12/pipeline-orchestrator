@@ -252,6 +252,46 @@ def test_verify_detects_mismatch(tmp_path: Path) -> None:
         )
 
 
+def test_verify_requires_current_file_frontmatter(tmp_path: Path) -> None:
+    original = _legacy_task(status="DONE")
+    path = _write_task(tmp_path / "tasks", original)
+    backups_dir = tmp_path / "backups"
+    migrate_task_format.migrate_tasks(
+        path.parent,
+        apply=True,
+        backups_dir=backups_dir,
+        stdout=StringIO(),
+    )
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="missing valid frontmatter status"):
+        migrate_task_format.verify_tasks(
+            path.parent,
+            backups_dir=backups_dir,
+            stdout=StringIO(),
+        )
+
+
+def test_verify_requires_current_frontmatter_status(tmp_path: Path) -> None:
+    path = _write_task(tmp_path / "tasks", _legacy_task(status="DONE"))
+    backups_dir = tmp_path / "backups"
+    migrate_task_format.migrate_tasks(
+        path.parent,
+        apply=True,
+        backups_dir=backups_dir,
+        stdout=StringIO(),
+    )
+    without_status = path.read_text(encoding="utf-8").replace("status: DONE\n", "")
+    path.write_text(without_status, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="missing valid frontmatter status"):
+        migrate_task_format.verify_tasks(
+            path.parent,
+            backups_dir=backups_dir,
+            stdout=StringIO(),
+        )
+
+
 def test_verify_fails_when_backup_missing(tmp_path: Path) -> None:
     path = _write_task(tmp_path / "tasks", _legacy_task(status="DONE"))
     backups_dir = tmp_path / "backups"

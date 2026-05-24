@@ -114,6 +114,27 @@ def current_status(content: str, fallback_status: str | None) -> str:
     return "TODO"
 
 
+def frontmatter_status(content: str) -> str | None:
+    if not has_frontmatter(content):
+        return None
+    in_frontmatter = False
+    for raw_line in content.splitlines():
+        line = raw_line.rstrip()
+        if not in_frontmatter:
+            if line == "---":
+                in_frontmatter = True
+            continue
+        if line == "---":
+            break
+        key, sep, value = line.partition(":")
+        if sep and key.strip().lower() == "status":
+            status = value.strip().split("#", 1)[0].strip().strip("'\"").upper()
+            if status in VALID_FRONTMATTER_STATUSES:
+                return status
+            return None
+    return None
+
+
 def converted_content(content: str) -> str:
     status = legacy_status(content)
     return f"---\nstatus: {status}\n---\n\n{content}"
@@ -275,6 +296,11 @@ def verify_tasks(
             mismatches.append(f"{relative}: missing task")
 
     for task_path in files:
+        after_content = task_path.read_text(encoding="utf-8")
+        if frontmatter_status(after_content) is None:
+            mismatches.append(f"{task_path.name}: missing valid frontmatter status")
+            continue
+
         backup_path = backup_path_for(selected_backups_dir, tasks_dir, task_path)
         if not backup_path.exists():
             mismatches.append(f"{task_path.name}: missing backup")
