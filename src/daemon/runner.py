@@ -2188,19 +2188,40 @@ class PipelineRunner(
         return SuppressionReason.CRASH
 
     async def _cleanup_stale_legacy_key_markers(self) -> None:
-        """Best-effort startup sweep for legacy Redis key families."""
+        """Best-effort startup migration and sweep for legacy key families."""
         keys = (
-            "status_" f"write_failed_tasks:{self.name}",
-            "recovered_" f"tasks:{self.name}",
-            "legacy_" f"recovered_" f"tasks:{self.name}",
+            (
+                "status_" f"write_failed_tasks:{self.name}",
+                {"source": "status_write_failed", "legacy_key": True},
+            ),
+            (
+                "recovered_" f"tasks:{self.name}",
+                {"source": "recovered_task", "legacy_key": True},
+            ),
+            (
+                "legacy_" f"recovered_" f"tasks:{self.name}",
+                {"source": "legacy_recovered_task", "legacy_key": True},
+            ),
         )
-        try:
-            for key in keys:
+        for key, detail in keys:
+            try:
+                raw = await self.redis.get(key)
+                pr_ids = json.loads(raw) if raw else []
+                if not isinstance(pr_ids, list):
+                    pr_ids = []
+                for pr_id in pr_ids:
+                    if isinstance(pr_id, str) and pr_id:
+                        await self._suppress_task(
+                            pr_id,
+                            SuppressionReason.CRASH,
+                            detail,
+                        )
                 await self.redis.delete(key)
-        except Exception as exc:
-            self.log_event(
-                f"[INFRA] Warning: failed to clean stale legacy Redis keys: {exc}."
-            )
+            except Exception as exc:
+                self.log_event(
+                    "[INFRA] Warning: failed to migrate/clean stale legacy "
+                    f"Redis key {key}: {exc}."
+                )
 
     def _track_current_coder_process(
         self, proc: asyncio.subprocess.Process

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from src.subsource_registry import SuppressionReason
 from tests.runner._helpers import _make_runner
 
 
@@ -50,12 +51,19 @@ async def test_stale_key_cleanup_idempotent() -> None:
     await runner._cleanup_stale_legacy_key_markers()
     await runner._cleanup_stale_legacy_key_markers()
 
-    assert runner.redis.store == {
-        "status_write_failed_tasks:other__repo": '["PR-101"]',
-        "recovered_tasks:other__repo": '["PR-102"]',
-        "legacy_recovered_tasks:other__repo": '["PR-103"]',
-        f"pipeline:{runner.name}": "{}",
-    }
+    assert "status_write_failed_tasks:other__repo" in runner.redis.store
+    assert "recovered_tasks:other__repo" in runner.redis.store
+    assert "legacy_recovered_tasks:other__repo" in runner.redis.store
+    assert f"pipeline:{runner.name}" in runner.redis.store
+    assert f"status_write_failed_tasks:{runner.name}" not in runner.redis.store
+    assert f"recovered_tasks:{runner.name}" not in runner.redis.store
+    assert f"legacy_recovered_tasks:{runner.name}" not in runner.redis.store
+
+    for pr_id in ("PR-001", "PR-002", "PR-003"):
+        record = await runner._suppression_record_for_task(pr_id)
+        assert record is not None
+        assert record.reason == SuppressionReason.CRASH
+        assert record.detail["legacy_key"] is True
 
 
 @pytest.mark.asyncio
@@ -71,9 +79,41 @@ async def test_cleanup_best_effort() -> None:
     await runner._cleanup_stale_legacy_key_markers()
 
     assert any(
-        "failed to clean stale legacy Redis keys" in entry["event"]
+        "failed to migrate/clean stale legacy Redis key" in entry["event"]
         for entry in runner.state.history
     )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_preserves_key_when_migration_fails() -> None:
+    runner = _make_runner()
+    key = f"status_write_failed_tasks:{runner.name}"
+    runner.redis.store[key] = '["PR-001"]'
+
+    async def suppress(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("redis unavailable")
+
+    runner._suppress_task = suppress  # type: ignore[method-assign]
+
+    await runner._cleanup_stale_legacy_key_markers()
+
+    assert runner.redis.store[key] == '["PR-001"]'
+    assert any(
+        "failed to migrate/clean stale legacy Redis key" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_drops_malformed_legacy_payload() -> None:
+    runner = _make_runner()
+    key = f"status_write_failed_tasks:{runner.name}"
+    runner.redis.store[key] = '{"PR-001": true}'
+
+    await runner._cleanup_stale_legacy_key_markers()
+
+    assert key not in runner.redis.store
+    assert await runner._suppression_record_for_task("PR-001") is None
 
 
 @pytest.mark.asyncio
