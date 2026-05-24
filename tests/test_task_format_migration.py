@@ -228,6 +228,40 @@ def test_verify_allows_unchanged_legacy_validation_gaps(tmp_path: Path) -> None:
     assert result.checked == 1
 
 
+def test_verify_uses_frontmatter_before_backup_fallback_status(
+    tmp_path: Path,
+) -> None:
+    tasks_dir = tmp_path / "tasks"
+    legacy_content = _legacy_task(status="DONE")
+    frontmatter_content = (
+        "---\nstatus: DONE\n---\n\n"
+        "# PR-998: Frontmatter validation gap\n\n"
+        "Branch: pr-998-frontmatter-validation-gap\n"
+        "- Type: refactor\n"
+        "- Complexity: medium\n\n"
+        "## Body\n\n"
+        "Still missing Depends on.\n"
+    )
+    _write_task(tasks_dir, legacy_content, "PR-999.md")
+    frontmatter_path = tasks_dir / "PR-998.md"
+    frontmatter_path.write_text(frontmatter_content, encoding="utf-8")
+    backups_dir = tmp_path / "backups"
+    migrate_task_format.migrate_tasks(
+        tasks_dir,
+        apply=True,
+        backups_dir=backups_dir,
+        stdout=StringIO(),
+    )
+
+    result = migrate_task_format.verify_tasks(
+        tasks_dir,
+        backups_dir=backups_dir,
+        stdout=StringIO(),
+    )
+
+    assert result.checked == 2
+
+
 def test_atomic_write_no_partial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = _write_task(tmp_path / "tasks", _legacy_task(status="DONE"))
     original = path.read_text(encoding="utf-8")

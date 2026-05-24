@@ -87,9 +87,9 @@ def legacy_status(content: str) -> str:
 
 
 def current_status(content: str, fallback_status: str | None) -> str:
-    if fallback_status is not None:
-        return fallback_status
     if not has_frontmatter(content):
+        if fallback_status is not None:
+            return fallback_status
         return legacy_status(content)
     in_frontmatter = False
     for raw_line in content.splitlines():
@@ -105,6 +105,8 @@ def current_status(content: str, fallback_status: str | None) -> str:
             status = value.strip().split("#", 1)[0].strip().strip("'\"").upper()
             if status in VALID_FRONTMATTER_STATUSES:
                 return status
+    if fallback_status is not None:
+        return fallback_status
     return "TODO"
 
 
