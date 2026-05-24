@@ -158,6 +158,22 @@ def test_apply_backs_up_unchanged_frontmatter_when_any_task_changes(
     assert (backups_dir / "PR-998.md").read_text(encoding="utf-8") == frontmatter_content
 
 
+def test_apply_creates_backup_for_noop_frontmatter_run(tmp_path: Path) -> None:
+    content = "---\nstatus: DONE\n---\n\n" + _legacy_task()
+    path = _write_task(tmp_path / "tasks", content)
+    backups_dir = tmp_path / "backups"
+
+    result = migrate_task_format.migrate_tasks(
+        path.parent,
+        apply=True,
+        backups_dir=backups_dir,
+        stdout=StringIO(),
+    )
+
+    assert result.changed == 0
+    assert (backups_dir / "PR-999.md").read_text(encoding="utf-8") == content
+
+
 def test_verify_detects_mismatch(tmp_path: Path) -> None:
     path = _write_task(tmp_path / "tasks", _legacy_task(status="DONE"))
     backups_dir = tmp_path / "backups"
@@ -193,6 +209,25 @@ def test_verify_fails_when_backup_missing(tmp_path: Path) -> None:
     (backups_dir / "PR-999.md").unlink()
 
     with pytest.raises(RuntimeError, match="missing backup"):
+        migrate_task_format.verify_tasks(
+            path.parent,
+            backups_dir=backups_dir,
+            stdout=StringIO(),
+        )
+
+
+def test_verify_fails_when_task_missing_from_backup(tmp_path: Path) -> None:
+    path = _write_task(tmp_path / "tasks", _legacy_task(status="DONE"))
+    backups_dir = tmp_path / "backups"
+    migrate_task_format.migrate_tasks(
+        path.parent,
+        apply=True,
+        backups_dir=backups_dir,
+        stdout=StringIO(),
+    )
+    path.unlink()
+
+    with pytest.raises(RuntimeError, match="missing task"):
         migrate_task_format.verify_tasks(
             path.parent,
             backups_dir=backups_dir,

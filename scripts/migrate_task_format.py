@@ -181,17 +181,15 @@ def migrate_tasks(
     tasks_dir = tasks_dir.resolve()
     files = task_files(tasks_dir)
     selected_backups_dir = backups_dir or (default_backups_dir(tasks_dir) if apply else None)
-    should_backup_all = apply and any(
-        not has_frontmatter(path.read_text(encoding="utf-8")) for path in files
-    )
     changed = 0
     print(
         f"{'apply' if apply else 'dry-run'}: scanning {len(files)} task files in {tasks_dir}",
         file=stdout,
     )
 
-    if should_backup_all:
+    if apply:
         assert selected_backups_dir is not None
+        selected_backups_dir.mkdir(parents=True, exist_ok=True)
         for task_path in files:
             create_backup(selected_backups_dir, tasks_dir, task_path)
 
@@ -211,7 +209,7 @@ def migrate_tasks(
         if apply:
             _atomic_write(task_path, after)
 
-    if apply and changed:
+    if apply:
         print(f"backups: {selected_backups_dir}", file=stdout)
     print(f"checked={len(files)} changed={changed}", file=stdout)
     return MigrationResult(len(files), changed, selected_backups_dir)
@@ -260,9 +258,15 @@ def verify_tasks(
         raise RuntimeError("no backup directory found; pass --backup-dir")
 
     files = task_files(tasks_dir)
+    backup_files = sorted(selected_backups_dir.rglob("PR-*.md"))
     mismatches: list[str] = []
     compared = 0
     print(f"verify: scanning {len(files)} task files in {tasks_dir}", file=stdout)
+
+    for backup_path in backup_files:
+        relative = backup_path.relative_to(selected_backups_dir)
+        if not (tasks_dir / relative).exists():
+            mismatches.append(f"{relative}: missing task")
 
     for task_path in files:
         backup_path = backup_path_for(selected_backups_dir, tasks_dir, task_path)
