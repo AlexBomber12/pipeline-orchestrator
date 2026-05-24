@@ -233,8 +233,13 @@ def test_legacy_file_actionable_error(tmp_path: Path) -> None:
     with pytest.raises(
         QueueValidationError,
         match=r"legacy header format; run scripts/migrate_task_format.py --apply",
-    ):
+    ) as exc_info:
         parse_task_header(task_path)
+
+    assert exc_info.value.issues == [
+        f"{task_path}: legacy header format; "
+        "run scripts/migrate_task_format.py --apply."
+    ]
 
 
 def test_legacy_constants_removed() -> None:

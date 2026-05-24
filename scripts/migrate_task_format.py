@@ -177,6 +177,22 @@ def _legacy_issue_kinds(path: Path, issues: list[str]) -> tuple[str, ...]:
     return tuple(kinds)
 
 
+def _with_real_issue_paths(
+    issues: list[str],
+    temp_path: Path | None,
+    real_path: Path,
+) -> list[str]:
+    if temp_path is None:
+        return issues
+    temp_prefix = f"{temp_path}: "
+    return [
+        f"{real_path}: {issue.removeprefix(temp_prefix)}"
+        if issue.startswith(temp_prefix)
+        else issue
+        for issue in issues
+    ]
+
+
 def _parse_or_legacy_issues(path: Path) -> TaskHeader | tuple[str, ...]:
     content = path.read_text(encoding="utf-8")
     parse_path = path
@@ -194,7 +210,9 @@ def _parse_or_legacy_issues(path: Path) -> TaskHeader | tuple[str, ...]:
     except QueueValidationError as exc:
         if _is_legacy_validation_error(exc):
             return _legacy_issue_kinds(path, exc.issues)
-        raise
+        raise QueueValidationError(
+            _with_real_issue_paths(exc.issues, temp_path, path)
+        ) from exc
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)

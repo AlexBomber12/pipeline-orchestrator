@@ -439,3 +439,15 @@ def test_malformed_open_frontmatter_preserves_parser_error(tmp_path: Path) -> No
 
     assert "missing closing frontmatter '---'" in str(exc_info.value)
     assert path.read_text(encoding="utf-8") == content
+
+
+def test_legacy_validation_error_reports_real_task_path(tmp_path: Path) -> None:
+    content = _legacy_task().replace("- Type: refactor\n", "- Type: not-real\n")
+    path = _write_task(tmp_path / "tasks", content)
+
+    with pytest.raises(Exception) as exc_info:
+        migrate_task_format.migrate_tasks(path.parent, apply=True, stdout=StringIO())
+
+    message = str(exc_info.value)
+    assert f"{path}: invalid Type 'not-real'" in message
+    assert ".parse." not in message

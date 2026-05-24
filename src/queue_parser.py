@@ -334,7 +334,7 @@ def parse_task_header(path: str | Path) -> TaskHeader:
             if _TASK_HEADER_RE.match(raw_line.rstrip()):
                 raise QueueValidationError(
                     [
-                        f"Task file {task_path} is in legacy header format; "
+                        f"{task_path}: legacy header format; "
                         "run scripts/migrate_task_format.py --apply."
                     ]
                 )
