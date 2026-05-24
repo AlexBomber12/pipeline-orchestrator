@@ -405,3 +405,25 @@ def test_atomic_write_no_partial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         migrate_task_format.migrate_tasks(path.parent, apply=True, stdout=StringIO())
 
     assert path.read_text(encoding="utf-8") == original
+
+
+def test_apply_validates_all_statuses_before_writing(tmp_path: Path) -> None:
+    tasks_dir = tmp_path / "tasks"
+    first = _write_task(tasks_dir, _legacy_task(status="DONE"), "PR-998.md")
+    second_content = _legacy_task(status="DOING")
+    second = tasks_dir / "PR-999.md"
+    second.write_text(second_content, encoding="utf-8")
+    first_content = first.read_text(encoding="utf-8")
+    backups_dir = tmp_path / "backups"
+
+    with pytest.raises(ValueError, match="cannot be represented in frontmatter"):
+        migrate_task_format.migrate_tasks(
+            tasks_dir,
+            apply=True,
+            backups_dir=backups_dir,
+            stdout=StringIO(),
+        )
+
+    assert first.read_text(encoding="utf-8") == first_content
+    assert second.read_text(encoding="utf-8") == second_content
+    assert not backups_dir.exists()

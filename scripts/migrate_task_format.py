@@ -35,6 +35,13 @@ class MigrationResult:
     backups_dir: Path | None = None
 
 
+@dataclass(frozen=True)
+class PlannedChange:
+    task_path: Path
+    status: str
+    content: str
+
+
 def resolve_tasks_dir(repo: Path) -> Path:
     """Return the task directory for either a repo root or a tasks path."""
     candidate = repo.expanduser().resolve()
@@ -214,27 +221,35 @@ def migrate_tasks(
         file=stdout,
     )
 
+    planned_changes: list[PlannedChange] = []
+    for task_path in files:
+        _parse_or_legacy_issues(task_path)
+        before = task_path.read_text(encoding="utf-8")
+        if has_frontmatter(before):
+            continue
+        status = legacy_status(before)
+        planned_changes.append(
+            PlannedChange(
+                task_path=task_path,
+                status=status,
+                content=converted_content(before),
+            )
+        )
+
     if apply:
         assert selected_backups_dir is not None
         selected_backups_dir.mkdir(parents=True, exist_ok=True)
         for task_path in files:
             create_backup(selected_backups_dir, tasks_dir, task_path)
 
-    for task_path in files:
-        _parse_or_legacy_issues(task_path)
-        before = task_path.read_text(encoding="utf-8")
-        if has_frontmatter(before):
-            continue
-
-        status = legacy_status(before)
-        after = converted_content(before)
+    for change in planned_changes:
         changed += 1
         print(
-            f"{task_path.name}: {status} -> {status}",
+            f"{change.task_path.name}: {change.status} -> {change.status}",
             file=stdout,
         )
         if apply:
-            _atomic_write(task_path, after)
+            _atomic_write(change.task_path, change.content)
 
     if apply:
         print(f"backups: {selected_backups_dir}", file=stdout)
