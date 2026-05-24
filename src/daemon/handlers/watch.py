@@ -496,6 +496,7 @@ class WatchMixin:
                 f"(review={review.value}, ci={ci.value})"
             )
             current_task = self.state.current_task
+            status_write_failed = False
             if current_task is not None:
                 try:
                     status_written = await self._commit_task_status_change(
@@ -515,11 +516,7 @@ class WatchMixin:
                         "[INFRA] Warning: status:ERROR write failed; "
                         "staying ERROR for retry."
                     )
-                    await self._mark_status_write_failed_task(
-                        current_task,
-                        blocked_reason=SuppressionReason.REVIEW_TIMEOUT,
-                        ensure_suppression=False,
-                    )
+                    status_write_failed = True
             await self._transition_to_error(
                 message,
                 save_run_record_as="error",
@@ -541,6 +538,12 @@ class WatchMixin:
                 ),
                 commit_task_status=False,
             )
+            if current_task is not None and status_write_failed:
+                await self._mark_status_write_failed_task(
+                    current_task,
+                    blocked_reason=SuppressionReason.REVIEW_TIMEOUT,
+                    ensure_suppression=False,
+                )
             # PR-316 review feedback: park terminally for operator action.
             # ``run_cycle`` checks this flag in the ERROR branch and skips
             # the AI diagnose call so the model is not invoked on a

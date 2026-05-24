@@ -2128,12 +2128,16 @@ class PipelineRunner(
                 f"status-write fallback {pr_id}: {exc}."
             )
             record = None
-        # Some callers immediately persist a richer cancellation cause after
-        # this marker. Respect their first-cause-wins path and only create the
-        # fallback suppression when explicitly asked to do so.
-        needs_suppression = ensure_suppression and (
+        # Some callers already persisted, or are about to persist, a richer
+        # cancellation cause. Respect that first-cause-wins path, but still
+        # create a fallback when no suppression exists to keep the failed
+        # status write parked.
+        needs_suppression = (
             record is None
-            or not self._task_suppression_blocks_selection(record.reason)
+            or (
+                ensure_suppression
+                and not self._task_suppression_blocks_selection(record.reason)
+            )
         )
         if needs_suppression:
             try:
