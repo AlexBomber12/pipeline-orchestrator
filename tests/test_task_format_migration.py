@@ -134,6 +134,13 @@ def test_resolve_tasks_dir_rejects_non_task_directory(tmp_path: Path) -> None:
         migrate_task_format.resolve_tasks_dir(empty_dir)
 
 
+def test_parser_rejects_apply_and_verify_together() -> None:
+    parser = migrate_task_format.build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--apply", "--verify"])
+
+
 def test_apply_creates_backup(tmp_path: Path) -> None:
     content = _legacy_task(status="DONE")
     path = _write_task(tmp_path / "tasks", content)

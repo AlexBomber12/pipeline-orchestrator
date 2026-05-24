@@ -309,12 +309,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path.cwd(),
         help="Repository root or tasks directory to scan.",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--apply",
         action="store_true",
         help="Write migrated files. Default is dry-run.",
     )
-    parser.add_argument(
+    mode.add_argument(
         "--verify",
         action="store_true",
         help="Compare migrated files against apply-created backups.",
