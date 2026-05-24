@@ -498,9 +498,20 @@ class IdleMixin:
                     None,
                     "todo",
                 )
-                record = await self._suppression_record_for_task(pr_id)
+                try:
+                    record = await self._suppression_record_for_task(pr_id)
+                except Exception as exc:
+                    self.log_event(
+                        "[INFRA] Warning: failed to read task suppression "
+                        f"for {pr_id}: {exc}."
+                    )
+                    record = None
                 if record is None:
                     if pr_id not in status_write_failed_task_pr_ids:
+                        continue
+                    if statuses[pr_id] == TaskStatus.DONE:
+                        status_write_failed_task_pr_ids.discard(pr_id)
+                        recently_uploaded_task_pr_ids.discard(pr_id)
                         continue
                     if (
                         frontmatter_is_todo

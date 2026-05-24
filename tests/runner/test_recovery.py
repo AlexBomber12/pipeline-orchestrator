@@ -732,6 +732,109 @@ def test_select_next_task_from_dag_retains_memory_fallback_without_reupload(
     assert runner._status_write_failed_task_pr_ids == {"PR-001"}
 
 
+def test_select_next_task_from_dag_preserves_done_memory_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A merged task wins over the memory-only status-write fallback."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "---\nstatus: TODO\n---\n"
+        "# PR-001: Status write failed but merged\n\n"
+        "Branch: pr-001-status-write-failed\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+    (tasks_dir / "PR-002.md").write_text(
+        "---\nstatus: TODO\n---\n"
+        "# PR-002: Depends on merged work\n\n"
+        "Branch: pr-002-dependent\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: PR-001\n"
+        "- Priority: 2\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "_resolve_merged_state",
+        lambda *args, **kwargs: _merged_state({"PR-001"}),
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._status_write_failed_task_pr_ids = {"PR-001"}
+
+    selected = asyncio.run(runner._select_next_task_from_dag())
+
+    assert selected is not None
+    assert selected.pr_id == "PR-002"
+    assert runner._idle_dag_statuses["PR-001"] == TaskStatus.DONE
+    assert runner._status_write_failed_task_pr_ids == set()
+
+
+def test_select_next_task_from_dag_survives_suppression_read_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A transient suppression read failure must not abort IDLE selection."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "---\nstatus: TODO\n---\n"
+        "# PR-001: Healthy task\n\n"
+        "Branch: pr-001-healthy\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        idle_module,
+        "_resolve_merged_state",
+        lambda *args, **kwargs: _merged_state(),
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+
+    async def fail_suppression_read(pr_id: str) -> None:
+        raise RuntimeError("redis unavailable")
+
+    runner._suppression_record_for_task = fail_suppression_read  # type: ignore[method-assign]
+
+    selected = asyncio.run(runner._select_next_task_from_dag())
+
+    assert selected is not None
+    assert selected.pr_id == "PR-001"
+    assert any(
+        "failed to read task suppression for PR-001" in event["event"]
+        for event in runner.state.history
+    )
+
+
 def test_select_next_task_from_dag_preserves_doing_for_crashed_task_with_visible_pr(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
