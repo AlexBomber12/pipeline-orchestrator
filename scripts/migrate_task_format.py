@@ -331,8 +331,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    tasks_dir = resolve_tasks_dir(args.repo)
     try:
+        tasks_dir = resolve_tasks_dir(args.repo)
         if args.verify:
             verify_tasks(tasks_dir, backups_dir=args.backup_dir)
         else:

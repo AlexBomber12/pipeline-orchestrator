@@ -141,6 +141,18 @@ def test_parser_rejects_apply_and_verify_together() -> None:
         parser.parse_args(["--apply", "--verify"])
 
 
+def test_main_reports_invalid_repo_without_traceback(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = migrate_task_format.main(["--repo", str(tmp_path / "missing")])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.err.startswith("ERROR: tasks directory not found")
+    assert "Traceback" not in captured.err
+
+
 def test_apply_creates_backup(tmp_path: Path) -> None:
     content = _legacy_task(status="DONE")
     path = _write_task(tmp_path / "tasks", content)
