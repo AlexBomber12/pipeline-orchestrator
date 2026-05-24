@@ -55,7 +55,8 @@ def test_legacy_no_status_becomes_todo(tmp_path: Path) -> None:
 
 def test_all_header_fields_preserved(tmp_path: Path) -> None:
     path = _write_task(tmp_path / "tasks", _legacy_task(status="ERROR"))
-    before = parse_task_header(path)
+    before = migrate_task_format._parse_or_legacy_issues(path)
+    assert not isinstance(before, tuple)
 
     migrate_task_format.migrate_tasks(path.parent, apply=True, stdout=StringIO())
 
@@ -427,3 +428,26 @@ def test_apply_validates_all_statuses_before_writing(tmp_path: Path) -> None:
     assert first.read_text(encoding="utf-8") == first_content
     assert second.read_text(encoding="utf-8") == second_content
     assert not backups_dir.exists()
+
+
+def test_malformed_open_frontmatter_preserves_parser_error(tmp_path: Path) -> None:
+    content = "---\nstatus: TODO\n\n" + _legacy_task()
+    path = _write_task(tmp_path / "tasks", content)
+
+    with pytest.raises(Exception) as exc_info:
+        migrate_task_format.migrate_tasks(path.parent, apply=True, stdout=StringIO())
+
+    assert "missing closing frontmatter '---'" in str(exc_info.value)
+    assert path.read_text(encoding="utf-8") == content
+
+
+def test_legacy_validation_error_reports_real_task_path(tmp_path: Path) -> None:
+    content = _legacy_task().replace("- Type: refactor\n", "- Type: not-real\n")
+    path = _write_task(tmp_path / "tasks", content)
+
+    with pytest.raises(Exception) as exc_info:
+        migrate_task_format.migrate_tasks(path.parent, apply=True, stdout=StringIO())
+
+    message = str(exc_info.value)
+    assert f"{path}: invalid Type 'not-real'" in message
+    assert ".parse." not in message

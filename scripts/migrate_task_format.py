@@ -65,6 +65,12 @@ def has_frontmatter(content: str) -> bool:
     return any(line.rstrip() == "---" for line in lines[first + 1 :])
 
 
+def has_frontmatter_opening(content: str) -> bool:
+    lines = content.splitlines()
+    first = next((index for index, line in enumerate(lines) if line.strip()), None)
+    return first is not None and lines[first].rstrip() == "---"
+
+
 def legacy_status(content: str) -> str:
     """Return the legacy header status, defaulting to TODO like the parser."""
     in_task = False
@@ -160,16 +166,56 @@ def _is_legacy_validation_error(exc: QueueValidationError) -> bool:
 
 def _legacy_issue_kinds(path: Path, issues: list[str]) -> tuple[str, ...]:
     prefix = f"{path}: "
-    return tuple(issue.removeprefix(prefix) for issue in issues)
+    kinds: list[str] = []
+    for issue in issues:
+        without_expected_prefix = issue.removeprefix(prefix)
+        if without_expected_prefix != issue:
+            kinds.append(without_expected_prefix)
+            continue
+        _path, separator, kind = issue.partition(": ")
+        kinds.append(kind if separator else issue)
+    return tuple(kinds)
+
+
+def _with_real_issue_paths(
+    issues: list[str],
+    temp_path: Path | None,
+    real_path: Path,
+) -> list[str]:
+    if temp_path is None:
+        return issues
+    temp_prefix = f"{temp_path}: "
+    return [
+        f"{real_path}: {issue.removeprefix(temp_prefix)}"
+        if issue.startswith(temp_prefix)
+        else issue
+        for issue in issues
+    ]
 
 
 def _parse_or_legacy_issues(path: Path) -> TaskHeader | tuple[str, ...]:
+    content = path.read_text(encoding="utf-8")
+    parse_path = path
+    temp_path: Path | None = None
+    if not has_frontmatter_opening(content):
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.parse.", suffix=".tmp", dir=str(path.parent), text=True
+        )
+        temp_path = Path(temp_name)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(f"---\n---\n{content}")
+        parse_path = temp_path
     try:
-        return parse_task_header(path)
+        return parse_task_header(parse_path)
     except QueueValidationError as exc:
         if _is_legacy_validation_error(exc):
             return _legacy_issue_kinds(path, exc.issues)
-        raise
+        raise QueueValidationError(
+            _with_real_issue_paths(exc.issues, temp_path, path)
+        ) from exc
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def _atomic_write(path: Path, content: str) -> None:

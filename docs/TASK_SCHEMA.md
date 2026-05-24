@@ -1,8 +1,9 @@
 # Task file schema (`tasks/PR-*.md`)
 
-Every PR has a corresponding task file under `tasks/`. The header at the
-top of the file is parsed by `src/queue_parser.py:parse_task_header` and
-must contain the following fields:
+Every PR has a corresponding task file under `tasks/`. The file must
+start with YAML frontmatter, followed by a task header parsed by
+`src/queue_parser.py:parse_task_header`. The header must contain the
+following fields:
 
 ```
 # PR-XXX: Short title
@@ -17,7 +18,7 @@ Branch: <branch-name>
 
 ## Frontmatter status field
 
-Task files may include YAML frontmatter before the task header:
+Task files include YAML frontmatter before the task header:
 
 ```yaml
 ---
@@ -27,8 +28,8 @@ status: TODO
 
 The canonical status values are uppercase by convention:
 
-- `TODO`: default work-queue state. Absence of the frontmatter field is
-  treated as TODO.
+- `TODO`: default work-queue state. Absence of the `status` field inside
+  the frontmatter block is treated as TODO.
 - `DONE`: terminal success state. The daemon writes this after a PR is
   merged.
 - `ERROR`: terminal failure state. The daemon writes this after a final

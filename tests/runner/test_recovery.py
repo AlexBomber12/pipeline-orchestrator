@@ -352,6 +352,7 @@ def test_select_next_task_from_dag_skips_crashed_task_marked_canceled(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
+        "---\n---\n"
         "# PR-001: Crashed task\n\n"
         "Branch: pr-001-crashed\n"
         "- Type: feature\n"
@@ -362,6 +363,7 @@ def test_select_next_task_from_dag_skips_crashed_task_marked_canceled(
         encoding="utf-8",
     )
     (tasks_dir / "PR-002.md").write_text(
+        "---\n---\n"
         "# PR-002: Healthy follow-up\n\n"
         "Branch: pr-002-healthy\n"
         "- Type: feature\n"
@@ -410,6 +412,7 @@ def test_select_next_task_from_dag_preserves_doing_for_crashed_task_with_visible
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
+        "---\n---\n"
         "# PR-001: Crashed task with visible PR\n\n"
         "Branch: pr-001-crashed\n"
         "- Type: feature\n"
@@ -465,6 +468,7 @@ def test_select_next_task_from_dag_uses_frontmatter_error_with_visible_pr(
         encoding="utf-8",
     )
     (tasks_dir / "PR-002.md").write_text(
+        "---\n---\n"
         "# PR-002: Healthy follow-up\n\n"
         "Branch: pr-002-healthy\n"
         "- Type: feature\n"
@@ -513,6 +517,7 @@ def test_select_next_task_from_dag_clears_crashed_flag_when_done(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
+        "---\n---\n"
         "# PR-001: Crashed but merged\n\n"
         "Branch: pr-001-merged\n"
         "- Type: feature\n"
@@ -914,14 +919,10 @@ def _write_pr_md_for_fixture(
         return
     depends = task.get("depends_on") or []
     depends_value = ", ".join(depends) if depends else "none"
-    frontmatter = []
+    frontmatter = ["---"]
     if task.get("frontmatter_status"):
-        frontmatter = [
-            "---",
-            f"status: {task['frontmatter_status']}",
-            "---",
-            "",
-        ]
+        frontmatter.append(f"status: {task['frontmatter_status']}")
+    frontmatter.extend(["---", ""])
     (task_dir / f"{task['pr_id']}.md").write_text(
         "\n".join(
             frontmatter

@@ -10,6 +10,8 @@ from src.queue_parser import QueueValidationError, parse_task_header
 
 def _write_task_file(tmp_path: Path, content: str) -> Path:
     task_path = tmp_path / "PR-999.md"
+    if not content.startswith("---\n"):
+        content = f"---\n---\n{content}"
     task_path.write_text(content, encoding="utf-8")
     return task_path
 

@@ -452,6 +452,7 @@ def test_get_coder_hard_pin_overrides_default_when_selector_returns_none(
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-201.md").write_text(
+        "---\n---\n"
         "# PR-201: Pinned to codex\n\n"
         "Branch: pr-201-pinned\n"
         "- Type: feature\n"

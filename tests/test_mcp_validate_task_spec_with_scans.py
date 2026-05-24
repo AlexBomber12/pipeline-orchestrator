@@ -8,7 +8,11 @@ return shape (PR-259). Schema validation behavior is covered by
 from __future__ import annotations
 
 
-_VALID_SPEC = """# PR-999: Example task
+_VALID_SPEC = """---
+status: TODO
+---
+
+# PR-999: Example task
 
 Branch: pr-999-example
 - Type: feature
