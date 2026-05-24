@@ -542,7 +542,7 @@ async def put_settings_daemon(
             updates["rate_limit_session_pause_percent"] = _coerce_int(
                 rate_limit_session_pause_percent,
                 "rate_limit_session_pause_percent",
-                min_value=50,
+                min_value=0,
                 max_value=100,
             )
         if (
@@ -552,7 +552,7 @@ async def put_settings_daemon(
             updates["rate_limit_weekly_pause_percent"] = _coerce_int(
                 rate_limit_weekly_pause_percent,
                 "rate_limit_weekly_pause_percent",
-                min_value=50,
+                min_value=0,
                 max_value=100,
             )
         if coder is not None and coder != "":
@@ -930,7 +930,7 @@ async def reset_spend_ceiling(request: Request) -> HTMLResponse:
 
     Deletes the keys from ``config.yml`` so Pydantic's defaults
     (``None`` for session/weekly, ``80`` for warning) take effect on the
-    next ``load_config``. Re-renders the Spending controls section as an
+    next ``load_config``. Re-renders the Usage limits section as an
     HTMX outerHTML swap target.
     """
     try:
