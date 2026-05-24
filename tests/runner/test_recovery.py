@@ -920,7 +920,7 @@ def test_select_next_task_from_dag_survives_suppression_read_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A transient suppression read failure must not abort IDLE selection."""
+    """A transient suppression read failure fails closed without aborting IDLE."""
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         idle_module.IdleMixin,
@@ -957,8 +957,8 @@ def test_select_next_task_from_dag_survives_suppression_read_failure(
 
     selected = asyncio.run(runner._select_next_task_from_dag())
 
-    assert selected is not None
-    assert selected.pr_id == "PR-001"
+    assert selected is None
+    assert runner._idle_dag_statuses["PR-001"] == TaskStatus.ERROR
     assert any(
         "failed to read task suppression for PR-001" in event["event"]
         for event in runner.state.history
