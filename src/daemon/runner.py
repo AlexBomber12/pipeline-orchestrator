@@ -2134,10 +2134,7 @@ class PipelineRunner(
         # status write parked.
         needs_suppression = (
             record is None
-            or (
-                ensure_suppression
-                and not self._task_suppression_blocks_selection(record.reason)
-            )
+            or not self._task_suppression_blocks_selection(record.reason)
         )
         if needs_suppression:
             try:

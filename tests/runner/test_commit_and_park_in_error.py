@@ -240,8 +240,8 @@ def test_commit_and_park_in_error_no_current_task_skips_status_write(
 def test_commit_and_park_in_error_marks_status_write_fallback_on_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When ``_commit_task_status_change`` returns False the runner keeps
-    the owning transition's richer suppression reason."""
+    """When ``_commit_task_status_change`` returns False the runner forces
+    a blocking fallback suppression for non-blocking transition reasons."""
     runner = h._make_runner()
     runner.state.current_task = QueueTask(
         pr_id="PR-903",
@@ -269,8 +269,9 @@ def test_commit_and_park_in_error_marks_status_write_fallback_on_failure(
 
     record = asyncio.run(runner._suppression_record_for_task("PR-903"))
     assert record is not None
-    assert record.reason == SuppressionReason.INFRA_FAILURE
-    assert runner._task_suppression_blocks_selection(record.reason) is False
+    assert record.reason == SuppressionReason.CRASH
+    assert record.detail["blocked_reason"] == SuppressionReason.INFRA_FAILURE.value
+    assert runner._task_suppression_blocks_selection(record.reason) is True
 
 
 def test_commit_and_park_in_error_saves_run_record_before_status_checkout(

@@ -320,6 +320,31 @@ def test_status_write_failed_fallback_preserves_existing_suppression() -> None:
     assert record.reason == SuppressionReason.REVIEW_TIMEOUT
 
 
+def test_status_write_failed_fallback_replaces_nonblocking_suppression() -> None:
+    runner = h._make_runner()
+    task = _task()
+    asyncio.run(
+        runner._suppress_task(
+            "PR-379",
+            SuppressionReason.INFRA_FAILURE,
+            {"subsource": "infra_failure"},
+        )
+    )
+
+    asyncio.run(
+        runner._mark_status_write_failed_task(
+            task,
+            blocked_reason=SuppressionReason.NO_PUSH_DEADLOCK,
+            ensure_suppression=False,
+        )
+    )
+
+    record = asyncio.run(runner._suppression_record_for_task("PR-379"))
+    assert record is not None
+    assert record.reason == SuppressionReason.NO_PUSH_DEADLOCK
+    assert runner._task_suppression_blocks_selection(record.reason) is True
+
+
 def test_status_write_failed_fallback_tolerates_suppression_store_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
