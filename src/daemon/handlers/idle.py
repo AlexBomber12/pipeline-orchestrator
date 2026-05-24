@@ -492,6 +492,9 @@ class IdleMixin:
                 "_status_write_failed_task_pr_ids",
                 set(),
             )
+            use_single_error_exit = (
+                self.repo_config.feature_flags.use_single_error_exit
+            )
             pending_recently_uploaded_task_pr_ids: set[str] = set()
             for pr_id in list(statuses.keys()):
                 frontmatter_status = frontmatter_statuses.get(pr_id)
@@ -514,6 +517,10 @@ class IdleMixin:
                         statuses[pr_id] = TaskStatus.ERROR
                         continue
                     if pr_id not in status_write_failed_task_pr_ids:
+                        continue
+                    if not use_single_error_exit:
+                        status_write_failed_task_pr_ids.discard(pr_id)
+                        recently_uploaded_task_pr_ids.discard(pr_id)
                         continue
                     if statuses[pr_id] == TaskStatus.DONE:
                         status_write_failed_task_pr_ids.discard(pr_id)
@@ -580,7 +587,13 @@ class IdleMixin:
                     await self._clear_task_suppression(pr_id)
                     recently_uploaded_task_pr_ids.discard(pr_id)
                     continue
-                if self._task_suppression_blocks_selection(record.reason):
+                suppresses_selection = self._task_suppression_blocks_selection(
+                    record.reason
+                )
+                if (
+                    suppresses_selection
+                    and (not is_status_write_failed or use_single_error_exit)
+                ):
                     statuses[pr_id] = TaskStatus.ERROR
             recently_uploaded_task_pr_ids.intersection_update(
                 pending_recently_uploaded_task_pr_ids

@@ -441,7 +441,9 @@ def test_select_next_task_from_dag_skips_status_write_failed_suppression(
         lambda *args, **kwargs: _merged_state(),
     )
 
-    runner = h._make_runner()
+    runner = h._make_runner(
+        feature_flags=h.FeatureFlags(use_single_error_exit=True)
+    )
     runner.repo_path = str(tmp_path)
     runner.state.current_task = QueueTask(
         pr_id="PR-001",
@@ -462,6 +464,116 @@ def test_select_next_task_from_dag_skips_status_write_failed_suppression(
     assert task is not None
     assert task.pr_id == "PR-002"
     assert runner._idle_dag_statuses["PR-001"] == TaskStatus.ERROR
+
+
+def test_select_next_task_from_dag_retries_status_write_failed_suppression_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Legacy ERROR handling keeps status-write fallbacks soft-retry eligible."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "---\nstatus: TODO\n---\n"
+        "# PR-001: Status write failed\n\n"
+        "Branch: pr-001-status-write-failed\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+    (tasks_dir / "PR-002.md").write_text(
+        "---\nstatus: TODO\n---\n"
+        "# PR-002: Healthy follow-up\n\n"
+        "Branch: pr-002-healthy\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 2\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        idle_module,
+        "_resolve_merged_state",
+        lambda *args, **kwargs: _merged_state(),
+    )
+
+    runner = h._make_runner(
+        feature_flags=h.FeatureFlags(use_single_error_exit=False)
+    )
+    runner.repo_path = str(tmp_path)
+    asyncio.run(
+        runner._suppress_task(
+            "PR-001",
+            SuppressionReason.CRASH,
+            {"source": "status_write_failed"},
+        )
+    )
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-001"
+    assert runner._idle_dag_statuses["PR-001"] == TaskStatus.TODO
+
+
+def test_select_next_task_from_dag_retries_status_write_memory_fallback_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Legacy ERROR handling also clears memory-only status-write fallback."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "PR-001.md").write_text(
+        "---\nstatus: TODO\n---\n"
+        "# PR-001: Status write failed\n\n"
+        "Branch: pr-001-status-write-failed\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        idle_module,
+        "_resolve_merged_state",
+        lambda *args, **kwargs: _merged_state(),
+    )
+
+    runner = h._make_runner(
+        feature_flags=h.FeatureFlags(use_single_error_exit=False)
+    )
+    runner.repo_path = str(tmp_path)
+    runner._status_write_failed_task_pr_ids = {"PR-001"}
+    runner._recently_uploaded_task_pr_ids = {"PR-001"}
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-001"
+    assert runner._idle_dag_statuses["PR-001"] == TaskStatus.TODO
+    assert runner._status_write_failed_task_pr_ids == set()
+    assert runner._recently_uploaded_task_pr_ids == set()
 
 
 def test_select_next_task_from_dag_clears_reuploaded_status_write_failed_task(
@@ -499,7 +611,9 @@ def test_select_next_task_from_dag_clears_reuploaded_status_write_failed_task(
         lambda *args, **kwargs: _merged_state(),
     )
 
-    runner = h._make_runner()
+    runner = h._make_runner(
+        feature_flags=h.FeatureFlags(use_single_error_exit=True)
+    )
     runner.repo_path = str(tmp_path)
     runner._recently_uploaded_task_pr_ids = {"PR-001"}
     task = QueueTask(
@@ -567,7 +681,9 @@ def test_select_next_task_from_dag_retains_reupload_marker_while_doing(
         lambda *args, **kwargs: _merged_state(),
     )
 
-    runner = h._make_runner()
+    runner = h._make_runner(
+        feature_flags=h.FeatureFlags(use_single_error_exit=True)
+    )
     runner.repo_path = str(tmp_path)
     runner._recently_uploaded_task_pr_ids = {"PR-001"}
     runner.state.current_task = QueueTask(
@@ -643,7 +759,9 @@ def test_select_next_task_from_dag_blocks_status_write_memory_fallback(
         lambda *args, **kwargs: _merged_state(),
     )
 
-    runner = h._make_runner()
+    runner = h._make_runner(
+        feature_flags=h.FeatureFlags(use_single_error_exit=True)
+    )
     runner.repo_path = str(tmp_path)
     runner._status_write_failed_task_pr_ids = {"PR-001"}
     runner._recently_uploaded_task_pr_ids = {"PR-001"}
@@ -728,7 +846,9 @@ def test_select_next_task_from_dag_backfills_memory_fallback_without_reupload(
         lambda *args, **kwargs: _merged_state(),
     )
 
-    runner = h._make_runner()
+    runner = h._make_runner(
+        feature_flags=h.FeatureFlags(use_single_error_exit=True)
+    )
     runner.repo_path = str(tmp_path)
     runner._status_write_failed_task_pr_ids = {"PR-001"}
     runner.state.current_task = None
@@ -786,7 +906,9 @@ def test_select_next_task_from_dag_retains_memory_fallback_on_backfill_failure(
         lambda *args, **kwargs: _merged_state(),
     )
 
-    runner = h._make_runner()
+    runner = h._make_runner(
+        feature_flags=h.FeatureFlags(use_single_error_exit=True)
+    )
     runner.repo_path = str(tmp_path)
     runner._status_write_failed_task_pr_ids = {"PR-001"}
     runner._recently_uploaded_task_pr_ids = {"PR-001"}
@@ -848,7 +970,9 @@ def test_select_next_task_from_dag_reupload_clears_memory_fallback(
         lambda *args, **kwargs: _merged_state(),
     )
 
-    runner = h._make_runner()
+    runner = h._make_runner(
+        feature_flags=h.FeatureFlags(use_single_error_exit=True)
+    )
     runner.repo_path = str(tmp_path)
     runner._status_write_failed_task_pr_ids = {"PR-001"}
     runner._recently_uploaded_task_pr_ids = {"PR-001"}
@@ -904,7 +1028,9 @@ def test_select_next_task_from_dag_preserves_done_memory_fallback(
         lambda *args, **kwargs: _merged_state({"PR-001"}),
     )
 
-    runner = h._make_runner()
+    runner = h._make_runner(
+        feature_flags=h.FeatureFlags(use_single_error_exit=True)
+    )
     runner.repo_path = str(tmp_path)
     runner._status_write_failed_task_pr_ids = {"PR-001"}
 
