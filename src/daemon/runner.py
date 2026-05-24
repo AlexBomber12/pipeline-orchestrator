@@ -2121,15 +2121,14 @@ class PipelineRunner(
 
     async def _cleanup_stale_legacy_key_markers(self) -> None:
         """Best-effort startup sweep for legacy Redis key families."""
-        patterns = (
-            "status_" "write_failed_tasks:*",
-            "recovered_" "tasks:*",
-            "legacy_" "recovered_" "tasks:*",
+        keys = (
+            "status_" f"write_failed_tasks:{self.name}",
+            "recovered_" f"tasks:{self.name}",
+            "legacy_" f"recovered_" f"tasks:{self.name}",
         )
         try:
-            for pattern in patterns:
-                async for key in self.redis.scan_iter(match=pattern):
-                    await self.redis.delete(key)
+            for key in keys:
+                await self.redis.delete(key)
         except Exception as exc:
             self.log_event(
                 f"[INFRA] Warning: failed to clean stale legacy Redis keys: {exc}."

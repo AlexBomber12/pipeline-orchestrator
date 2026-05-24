@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
@@ -38,37 +37,36 @@ async def test_stale_key_cleanup_idempotent() -> None:
     runner = _make_runner()
     runner.redis.store.update(
         {
-            "status_write_failed_tasks:demo": '["PR-001"]',
-            "recovered_tasks:demo": '["PR-002"]',
-            "legacy_recovered_tasks:demo": '["PR-003"]',
-            "pipeline:demo": "{}",
+            f"status_write_failed_tasks:{runner.name}": '["PR-001"]',
+            f"recovered_tasks:{runner.name}": '["PR-002"]',
+            f"legacy_recovered_tasks:{runner.name}": '["PR-003"]',
+            "status_write_failed_tasks:other__repo": '["PR-101"]',
+            "recovered_tasks:other__repo": '["PR-102"]',
+            "legacy_recovered_tasks:other__repo": '["PR-103"]',
+            f"pipeline:{runner.name}": "{}",
         }
     )
 
-    async def scan_iter(match: str | None = None) -> AsyncIterator[str]:
-        prefix = "" if match is None else match.removesuffix("*")
-        for key in list(runner.redis.store):
-            if key.startswith(prefix):
-                yield key
-
-    runner.redis.scan_iter = scan_iter  # type: ignore[attr-defined]
-
     await runner._cleanup_stale_legacy_key_markers()
     await runner._cleanup_stale_legacy_key_markers()
 
-    assert runner.redis.store == {"pipeline:demo": "{}"}
+    assert runner.redis.store == {
+        "status_write_failed_tasks:other__repo": '["PR-101"]',
+        "recovered_tasks:other__repo": '["PR-102"]',
+        "legacy_recovered_tasks:other__repo": '["PR-103"]',
+        f"pipeline:{runner.name}": "{}",
+    }
 
 
 @pytest.mark.asyncio
 async def test_cleanup_best_effort() -> None:
     runner = _make_runner()
 
-    async def scan_iter(match: str | None = None) -> AsyncIterator[str]:
-        del match
+    async def delete(key: str) -> int:
+        del key
         raise RuntimeError("redis unavailable")
-        yield ""
 
-    runner.redis.scan_iter = scan_iter  # type: ignore[attr-defined]
+    runner.redis.delete = delete  # type: ignore[method-assign]
 
     await runner._cleanup_stale_legacy_key_markers()
 
@@ -91,10 +89,9 @@ async def test_cleanup_failure_does_not_block_startup(monkeypatch: pytest.Monkey
     async def refresh_user_paused_from_redis() -> None:
         return None
 
-    async def scan_iter(match: str | None = None) -> AsyncIterator[str]:
-        del match
+    async def delete(key: str) -> int:
+        del key
         raise RuntimeError("redis unavailable")
-        yield ""
 
     async def recover_state() -> bool:
         return True
@@ -111,7 +108,7 @@ async def test_cleanup_failure_does_not_block_startup(monkeypatch: pytest.Monkey
     )
     monkeypatch.setattr(runner, "recover_state", recover_state)
     monkeypatch.setattr(runner, "publish_state", publish_state)
-    runner.redis.scan_iter = scan_iter  # type: ignore[attr-defined]
+    runner.redis.delete = delete  # type: ignore[method-assign]
 
     await runner._run_cycle_body()
 
