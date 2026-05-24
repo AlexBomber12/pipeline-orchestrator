@@ -121,6 +121,19 @@ def test_dry_run_writes_nothing(tmp_path: Path) -> None:
     assert path.read_text(encoding="utf-8") == content
 
 
+def test_resolve_tasks_dir_rejects_missing_repo_path(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="tasks directory not found"):
+        migrate_task_format.resolve_tasks_dir(tmp_path / "missing")
+
+
+def test_resolve_tasks_dir_rejects_non_task_directory(tmp_path: Path) -> None:
+    empty_dir = tmp_path / "not-tasks"
+    empty_dir.mkdir()
+
+    with pytest.raises(FileNotFoundError, match="tasks directory not found"):
+        migrate_task_format.resolve_tasks_dir(empty_dir)
+
+
 def test_apply_creates_backup(tmp_path: Path) -> None:
     content = _legacy_task(status="DONE")
     path = _write_task(tmp_path / "tasks", content)

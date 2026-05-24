@@ -39,11 +39,15 @@ def resolve_tasks_dir(repo: Path) -> Path:
     """Return the task directory for either a repo root or a tasks path."""
     candidate = repo.expanduser().resolve()
     if candidate.name == "tasks":
+        if not candidate.is_dir():
+            raise FileNotFoundError(f"tasks directory not found: {candidate}")
         return candidate
     tasks_dir = candidate / "tasks"
     if tasks_dir.is_dir():
         return tasks_dir
-    return candidate
+    if candidate.is_dir() and any(candidate.glob("PR-*.md")):
+        return candidate
+    raise FileNotFoundError(f"tasks directory not found for --repo {repo}")
 
 
 def has_frontmatter(content: str) -> bool:
