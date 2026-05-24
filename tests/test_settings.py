@@ -1511,8 +1511,9 @@ def test_settings_daemon_renders_with_group_headers(empty_config: Path) -> None:
 
     assert response.status_code == 200
     body = response.text
-    for header in ("Timeouts", "Rate Limits", "Self-Heal", "Coders"):
+    for header in ("Timeouts", "Self-Heal", "Coders"):
         assert header in body, f"Missing group header: {header}"
+    assert "Rate Limits" not in body
 
 
 def test_settings_daemon_renders_hints_for_all_fields(empty_config: Path) -> None:
@@ -1527,8 +1528,6 @@ def test_settings_daemon_renders_hints_for_all_fields(empty_config: Path) -> Non
         "planned_pr_timeout_sec",
         "fix_idle_timeout_sec",
         "review_timeout_min",
-        "rate_limit_session_pause_percent",
-        "rate_limit_weekly_pause_percent",
         "auto_fallback",
         "hung_fallback_codex_review",
         "error_handler_use_ai",
@@ -1542,8 +1541,6 @@ def test_settings_daemon_renders_hints_for_all_fields(empty_config: Path) -> Non
         "Seconds before the coder subprocess is killed if no activity.",
         "FIX time budget, reset on each successful push.",
         "Minutes to wait for review before the PR moves to HUNG.",
-        "Pause when 5-hour session usage reaches this percentage.",
-        "Set to 100 to keep running until the provider returns a rate-limit response.",
         "Switch to another eligible coder when the preferred one is unavailable.",
         "Re-post the review trigger when a PR times out waiting for Codex.",
         "Use the coder to diagnose ERROR before generic recovery kicks in.",
@@ -1625,6 +1622,137 @@ def test_update_daemon_rate_limit_weekly(
     assert response.status_code == 200
     cfg = load_config(str(empty_config))
     assert cfg.daemon.rate_limit_weekly_pause_percent == 90
+
+
+def _input_tag(body: str, field_name: str) -> str:
+    match = re.search(rf'<input\b[^>]*name="{field_name}"[^>]*>', body)
+    assert match is not None, f"Missing input: {field_name}"
+    return match.group(0)
+
+
+def test_single_usage_limits_section(empty_config: Path) -> None:
+    with TestClient(app) as client:
+        response = client.get("/settings")
+
+    assert response.status_code == 200
+    body = response.text
+    assert body.count(">Usage limits<") == 1
+    assert "Rate Limits" not in body
+    assert "Spending controls" not in body
+
+
+def test_all_controls_present(empty_config: Path) -> None:
+    with TestClient(app) as client:
+        response = client.get("/settings")
+
+    assert response.status_code == 200
+    body = response.text
+    for field_name in (
+        "rate_limit_session_pause_percent",
+        "rate_limit_weekly_pause_percent",
+        "spend_ceiling_session_percent",
+        "spend_ceiling_weekly_percent",
+        "spend_ceiling_warning_percent",
+    ):
+        assert f'name="{field_name}"' in body
+
+
+def test_explains_proactive_vs_reactive(
+    empty_config: Path,
+) -> None:
+    with TestClient(app) as client:
+        response = client.get("/settings")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "proactively before the provider returns a limit response" in body
+    assert "Reactive provider-limit detection is always on" in body
+
+
+def test_persists_to_same_fields(
+    empty_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(empty_config))
+
+    with TestClient(app) as client:
+        assert client.put(
+            "/settings/daemon",
+            data={"rate_limit_session_pause_percent": "76"},
+        ).status_code == 200
+        assert client.put(
+            "/settings/daemon",
+            data={"rate_limit_weekly_pause_percent": "91"},
+        ).status_code == 200
+        assert client.post(
+            "/settings/config/spend_ceiling_session_percent",
+            data={"spend_ceiling_session_percent": "72"},
+        ).status_code == 200
+        assert client.post(
+            "/settings/config/spend_ceiling_weekly_percent",
+            data={"spend_ceiling_weekly_percent": "88"},
+        ).status_code == 200
+        assert client.post(
+            "/settings/config/spend_ceiling_warning_percent",
+            data={"spend_ceiling_warning_percent": "66"},
+        ).status_code == 200
+
+    cfg = load_config(str(empty_config))
+    assert cfg.daemon.rate_limit_session_pause_percent == 76
+    assert cfg.daemon.rate_limit_weekly_pause_percent == 91
+    assert cfg.daemon.spend_ceiling_session_percent == 72
+    assert cfg.daemon.spend_ceiling_weekly_percent == 88
+    assert cfg.daemon.spend_ceiling_warning_percent == 66
+    assert cfg.daemon.usage_gate_rate_limit_session_pause_percent == 76
+    assert cfg.daemon.usage_gate_rate_limit_weekly_pause_percent == 91
+    assert cfg.daemon.usage_gate_spend_ceiling_session_percent == 72
+    assert cfg.daemon.usage_gate_spend_ceiling_weekly_percent == 88
+
+
+def test_reset_to_defaults_present(empty_config: Path) -> None:
+    with TestClient(app) as client:
+        response = client.get("/settings")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "Reset to defaults" in body
+    assert 'hx-post="/settings/config/reset/spend_ceiling"' in body
+    assert 'hx-target="#settings-usage-limits"' in body
+
+
+def test_htmx_persistence_preserved(empty_config: Path) -> None:
+    with TestClient(app) as client:
+        response = client.get("/settings")
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'hx-put="/settings/daemon"' in _input_tag(
+        body, "rate_limit_session_pause_percent"
+    )
+    assert 'hx-put="/settings/daemon"' in _input_tag(
+        body, "rate_limit_weekly_pause_percent"
+    )
+    for field_name in (
+        "spend_ceiling_session_percent",
+        "spend_ceiling_weekly_percent",
+        "spend_ceiling_warning_percent",
+    ):
+        assert f'hx-post="/settings/config/{field_name}"' in _input_tag(
+            body, field_name
+        )
+    for field_name in (
+        "rate_limit_session_pause_percent",
+        "rate_limit_weekly_pause_percent",
+        "spend_ceiling_session_percent",
+        "spend_ceiling_weekly_percent",
+        "spend_ceiling_warning_percent",
+    ):
+        assert 'hx-trigger="change"' in _input_tag(body, field_name)
+
+
+def test_no_orphaned_rate_limits_heading() -> None:
+    daemon_template = Path("src/web/templates/components/settings_daemon.html")
+    assert "Rate Limits" not in daemon_template.read_text(encoding="utf-8")
 
 
 # -----------------------------------------------------------------------

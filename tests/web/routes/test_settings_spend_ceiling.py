@@ -92,7 +92,8 @@ def test_settings_renders_spend_ceiling_fields(base_config: Path) -> None:
     assert 'name="spend_ceiling_session_percent"' in body
     assert 'name="spend_ceiling_weekly_percent"' in body
     assert 'name="spend_ceiling_warning_percent"' in body
-    assert "Spending controls" in body
+    assert "Usage limits" in body
+    assert "Spending controls" not in body
 
 
 def test_update_session_percent_persists_to_yaml(base_config: Path) -> None:
@@ -383,13 +384,13 @@ def test_update_blank_session_503_on_disk_error(
 
 
 def test_reset_rerenders_section_with_default_values(base_config: Path) -> None:
-    """The reset endpoint returns the spend-ceiling partial for HTMX swap."""
+    """The reset endpoint returns the usage-limits partial for HTMX swap."""
     with TestClient(app) as client:
         response = client.post("/settings/config/reset/spend_ceiling")
 
     assert response.status_code == 200
     body = response.text
-    assert 'id="settings-spend-ceiling"' in body
+    assert 'id="settings-usage-limits"' in body
     assert 'name="spend_ceiling_warning_percent"' in body
     # session/weekly defaults are None: rendered as empty value.
     assert 'name="spend_ceiling_session_percent"' in body

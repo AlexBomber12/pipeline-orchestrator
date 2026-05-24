@@ -1,47 +1,81 @@
-<section class="space-y-4" id="settings-spend-ceiling">
-    <h2 class="text-xl font-semibold tracking-tight mb-4">Spending controls</h2>
-    <div class="rounded-lg border border-white/5 bg-surface-2 p-5 space-y-4">
-        <p class="text-xs text-gray-400">
-            Percent of estimated session/weekly budget at which the daemon auto-pauses dispatch.
-            100% halts new dispatch until the budget cycle resets. Leave session/weekly blank to disable the ceiling.
-        </p>
+<section class="space-y-4" id="settings-usage-limits">
+    <h2 class="text-xl font-semibold tracking-tight mb-4">Usage limits</h2>
+    <div class="rounded-lg border border-white/5 bg-surface-2 p-5 space-y-5">
+        <div class="space-y-2">
+            <p class="text-sm text-gray-400">
+                Pause thresholds stop new dispatch proactively before the provider returns a limit response.
+                Reactive provider-limit detection is always on above this layer and still pauses dispatch when a 429 or provider limit message appears.
+            </p>
+            <p class="text-xs text-gray-500">
+                Provider pause thresholds write to the legacy rate-limit fields. Optional ceiling thresholds write to the legacy spend-ceiling fields read by the unified usage gate.
+            </p>
+        </div>
 
-        <label class="flex flex-col gap-1 text-sm">
-            <span class="text-gray-400">Session ceiling (%)</span>
-            <input type="number" min="1" max="100" step="1"
-                   name="spend_ceiling_session_percent"
-                   value="{{ daemon.spend_ceiling_session_percent if daemon.spend_ceiling_session_percent is not none else '' }}"
-                   hx-post="/settings/config/spend_ceiling_session_percent"
-                   hx-trigger="change"
-                   hx-swap="none"
-                   class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
-        </label>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <label class="flex flex-col gap-1 text-sm">
+                <span class="text-gray-400">Session provider pause threshold (%)</span>
+                <input type="number" min="0" max="100" step="5"
+                       name="rate_limit_session_pause_percent"
+                       value="{{ daemon.rate_limit_session_pause_percent }}"
+                       hx-put="/settings/daemon"
+                       hx-trigger="change"
+                       hx-swap="none"
+                       class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
+                <span class="text-xs text-gray-500">Pause when 5-hour provider usage reaches this percentage.</span>
+            </label>
 
-        <label class="flex flex-col gap-1 text-sm">
-            <span class="text-gray-400">Weekly ceiling (%)</span>
-            <input type="number" min="1" max="100" step="1"
-                   name="spend_ceiling_weekly_percent"
-                   value="{{ daemon.spend_ceiling_weekly_percent if daemon.spend_ceiling_weekly_percent is not none else '' }}"
-                   hx-post="/settings/config/spend_ceiling_weekly_percent"
-                   hx-trigger="change"
-                   hx-swap="none"
-                   class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
-        </label>
+            <label class="flex flex-col gap-1 text-sm">
+                <span class="text-gray-400">Weekly provider pause threshold (%)</span>
+                <input type="number" min="0" max="100" step="5"
+                       name="rate_limit_weekly_pause_percent"
+                       value="{{ daemon.rate_limit_weekly_pause_percent }}"
+                       hx-put="/settings/daemon"
+                       hx-trigger="change"
+                       hx-swap="none"
+                       class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
+                <span class="text-xs text-gray-500">Set to 100 to rely on the always-on reactive provider-limit detection.</span>
+            </label>
 
-        <label class="flex flex-col gap-1 text-sm">
-            <span class="text-gray-400">Warning threshold (%)</span>
-            <input type="number" min="1" max="100" step="1"
-                   name="spend_ceiling_warning_percent"
-                   value="{{ daemon.spend_ceiling_warning_percent }}"
-                   hx-post="/settings/config/spend_ceiling_warning_percent"
-                   hx-trigger="change"
-                   hx-swap="none"
-                   class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
-        </label>
+            <label class="flex flex-col gap-1 text-sm">
+                <span class="text-gray-400">Session ceiling pause threshold (%)</span>
+                <input type="number" min="1" max="100" step="1"
+                       name="spend_ceiling_session_percent"
+                       value="{{ daemon.spend_ceiling_session_percent if daemon.spend_ceiling_session_percent is not none else '' }}"
+                       hx-post="/settings/config/spend_ceiling_session_percent"
+                       hx-trigger="change"
+                       hx-swap="none"
+                       class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
+                <span class="text-xs text-gray-500">Optional session budget threshold; blank disables this ceiling.</span>
+            </label>
+
+            <label class="flex flex-col gap-1 text-sm">
+                <span class="text-gray-400">Weekly ceiling pause threshold (%)</span>
+                <input type="number" min="1" max="100" step="1"
+                       name="spend_ceiling_weekly_percent"
+                       value="{{ daemon.spend_ceiling_weekly_percent if daemon.spend_ceiling_weekly_percent is not none else '' }}"
+                       hx-post="/settings/config/spend_ceiling_weekly_percent"
+                       hx-trigger="change"
+                       hx-swap="none"
+                       class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
+                <span class="text-xs text-gray-500">Optional weekly budget threshold; blank disables this ceiling.</span>
+            </label>
+
+            <label class="flex flex-col gap-1 text-sm">
+                <span class="text-gray-400">Warning threshold (%)</span>
+                <input type="number" min="1" max="100" step="1"
+                       name="spend_ceiling_warning_percent"
+                       value="{{ daemon.spend_ceiling_warning_percent }}"
+                       hx-post="/settings/config/spend_ceiling_warning_percent"
+                       hx-trigger="change"
+                       hx-swap="none"
+                       class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
+                <span class="text-xs text-gray-500">Send the warning webhook when enabled ceilings reach this percentage of their threshold.</span>
+            </label>
+        </div>
 
         <button type="button"
                 hx-post="/settings/config/reset/spend_ceiling"
-                hx-target="#settings-spend-ceiling"
+                hx-target="#settings-usage-limits"
                 hx-swap="outerHTML"
                 class="text-xs text-gray-400 underline">
             Reset to defaults

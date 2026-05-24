@@ -66,45 +66,6 @@
 
     <section class="pt-4 border-t border-white/5">
         <div class="mb-3">
-            <h3 class="text-base font-semibold text-gray-200">Rate Limits</h3>
-            <p class="text-sm text-gray-500">Pause thresholds that keep the active coder below session and weekly usage caps.</p>
-        </div>
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <label class="flex flex-col gap-1 text-sm cursor-pointer">
-                <span class="text-gray-400">Session rate limit pause (%)</span>
-                <input type="number"
-                       name="rate_limit_session_pause_percent"
-                       value="{{ daemon.rate_limit_session_pause_percent }}"
-                       min="50"
-                       max="100"
-                       step="5"
-                       class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
-                       hx-put="/settings/daemon"
-                       hx-trigger="change"
-                       hx-target="#settings-daemon"
-                       hx-swap="innerHTML">
-                <span class="text-xs text-gray-500">Pause when 5-hour session usage reaches this percentage.</span>
-            </label>
-            <label class="flex flex-col gap-1 text-sm cursor-pointer">
-                <span class="text-gray-400">Weekly rate limit pause (%)</span>
-                <input type="number"
-                       name="rate_limit_weekly_pause_percent"
-                       value="{{ daemon.rate_limit_weekly_pause_percent }}"
-                       min="50"
-                       max="100"
-                       step="5"
-                       class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
-                       hx-put="/settings/daemon"
-                       hx-trigger="change"
-                       hx-target="#settings-daemon"
-                       hx-swap="innerHTML">
-                <span class="text-xs text-gray-500">Set to 100 to keep running until the provider returns a rate-limit response.</span>
-            </label>
-        </div>
-    </section>
-
-    <section class="pt-4 border-t border-white/5">
-        <div class="mb-3">
             <h3 class="text-base font-semibold text-gray-200">Self-Heal</h3>
             <p class="text-sm text-gray-500">Fallback and diagnosis controls for stuck reviews, unavailable coders, and failed runs.</p>
         </div>
