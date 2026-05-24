@@ -2102,7 +2102,8 @@ class PipelineRunner(
         suppression_reason = self._status_write_failed_suppression_reason(
             blocked_reason
         )
-        suppression_detail = dict(detail or {"source": "status_write_failed"})
+        suppression_detail = dict(detail or {})
+        suppression_detail.setdefault("source", "status_write_failed")
         if blocked_reason is not None and blocked_reason != suppression_reason:
             suppression_detail.setdefault("blocked_reason", blocked_reason.value)
         record = await self._suppression_record_for_task(pr_id)

@@ -481,20 +481,22 @@ class IdleMixin:
             frontmatter_statuses = {
                 header.pr_id: header.frontmatter_status for header in headers
             }
-            if self.repo_config.feature_flags.use_single_error_exit:
-                for pr_id in list(statuses.keys()):
-                    record = await self._suppression_record_for_task(pr_id)
-                    if record is None:
-                        continue
-                    if frontmatter_statuses.get(pr_id) == "todo":
-                        await self._clear_task_suppression(pr_id)
-                        continue
-                    if statuses[pr_id] in (TaskStatus.DONE, TaskStatus.DOING):
-                        await self._clear_task_suppression(pr_id)
-                        continue
-                    if self._task_suppression_blocks_selection(record.reason):
-                        statuses[pr_id] = TaskStatus.ERROR
-            else:
+            for pr_id in list(statuses.keys()):
+                record = await self._suppression_record_for_task(pr_id)
+                if record is None:
+                    continue
+                if statuses[pr_id] in (TaskStatus.DONE, TaskStatus.DOING):
+                    await self._clear_task_suppression(pr_id)
+                    continue
+                if (
+                    frontmatter_statuses.get(pr_id) == "todo"
+                    and record.detail.get("source") != "status_write_failed"
+                ):
+                    await self._clear_task_suppression(pr_id)
+                    continue
+                if self._task_suppression_blocks_selection(record.reason):
+                    statuses[pr_id] = TaskStatus.ERROR
+            if not self.repo_config.feature_flags.use_single_error_exit:
                 # PR-186: Recovery marks DOING-without-PR tasks crashed before
                 # transitioning to IDLE. Override their derived status to
                 # ERROR here so get_eligible_tasks excludes them and the
