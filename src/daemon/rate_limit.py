@@ -333,9 +333,15 @@ class RateLimitMixin:
     def _global_pause_verdict(self, now: datetime) -> GlobalPauseVerdict | None:
         if self.state.rate_limited_until is None:
             return None
-        pause_coder = resolve_pause_coder(
-            self._selection_context(task_coder_pin="")
-        ).name
+        if self.state.rate_limit_reactive_coder is None:
+            # Legacy pauses predate per-coder attribution and were always
+            # Claude pauses. Keep that mapping so Codex repos can cross-clear
+            # stale legacy metadata instead of treating it as their own pause.
+            pause_coder = "claude"
+        else:
+            pause_coder = resolve_pause_coder(
+                self._selection_context(task_coder_pin="")
+            ).name
         pause_until = (
             self._rate_limit_until_for(pause_coder)
             or self.state.rate_limited_until
