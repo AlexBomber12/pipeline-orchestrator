@@ -2118,7 +2118,6 @@ class PipelineRunner(
         decoded_sets: list[set[str]] = []
         for key in (
             self._status_write_failed_compat_key(),
-            "recovered_tasks:" + self.name,
         ):
             try:
                 raw = await self.redis.get(key)
