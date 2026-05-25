@@ -1605,6 +1605,26 @@ def test_handle_paused_preserves_legacy_pause_for_other_coder(
     assert runner.state.state == PipelineState.IDLE
 
 
+def test_handle_paused_maps_unattributed_legacy_pause_to_claude(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+
+    runner = h._make_runner(coder=CoderType.CODEX)
+    pause_until = datetime.now(timezone.utc) + timedelta(minutes=20)
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = pause_until
+    runner.state.rate_limit_reactive_coder = None
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive_coder is None
+    assert "claude" in runner.state.rate_limited_coders
+    assert runner.state.rate_limited_coder_until["claude"] == pause_until
+    assert runner.state.state == PipelineState.IDLE
+
+
 def test_handle_paused_stays_paused_when_no_alternate_coder_is_runnable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

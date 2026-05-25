@@ -375,6 +375,7 @@ def test_build_outcome_record_falls_back_to_config_when_run_record_missing(
 
     runner = _make_runner()
     runner.repo_config = runner.repo_config.model_copy(update={"coder": CoderType.CODEX})
+    runner.state.rate_limit_reactive_coder = "claude"
     # Leave _current_run_record as None.
 
     from datetime import datetime, timezone

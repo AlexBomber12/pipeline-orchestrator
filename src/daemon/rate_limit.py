@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from src.daemon.notifications import send_spend_ceiling_warning
+from src.daemon.selector import resolve_pause_coder
 from src.models import PipelineState
 from src.usage import UsageSnapshot
 
@@ -332,9 +333,15 @@ class RateLimitMixin:
     def _global_pause_verdict(self, now: datetime) -> GlobalPauseVerdict | None:
         if self.state.rate_limited_until is None:
             return None
-        # Legacy pauses (pre-PR-066) have no coder attribution; treat them
-        # as Claude since that was the only coder.
-        pause_coder = self.state.rate_limit_reactive_coder or "claude"
+        if self.state.rate_limit_reactive_coder is None:
+            # Legacy pauses predate per-coder attribution and were always
+            # Claude pauses. Keep that mapping so Codex repos can cross-clear
+            # stale legacy metadata instead of treating it as their own pause.
+            pause_coder = "claude"
+        else:
+            pause_coder = resolve_pause_coder(
+                self._selection_context(task_coder_pin="")
+            ).name
         pause_until = (
             self._rate_limit_until_for(pause_coder)
             or self.state.rate_limited_until
@@ -558,8 +565,7 @@ class RateLimitMixin:
         to the correct provider.
         """
         if coder_name is None:
-            coder = self.repo_config.coder or self.app_config.daemon.coder
-            coder_name = coder.value
+            coder_name = self._get_coder()[0]
         session_threshold = self.app_config.daemon.rate_limit_session_pause_percent
         weekly_threshold = self.app_config.daemon.rate_limit_weekly_pause_percent
         lower = stderr.lower()

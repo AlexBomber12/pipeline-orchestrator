@@ -228,6 +228,41 @@ def test_cross_coder_clearable_with_different_reset_windows(
     ) is True
 
 
+def test_check_rate_limit_cross_clears_legacy_global_pause_for_codex_repo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_provider = _FakeUsageProvider(
+        snapshot=UsageSnapshot(
+            session_percent=10,
+            session_resets_at=10,
+            weekly_percent=10,
+            weekly_resets_at=20,
+            fetched_at=0,
+        )
+    )
+    runner = _make_runner(
+        monkeypatch,
+        coder=CoderType.CODEX,
+        codex_provider=codex_provider,
+    )
+    pause_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    runner.state.rate_limited_until = pause_until
+    runner.state.rate_limit_reactive = True
+    runner.state.rate_limit_reactive_coder = None
+    runner.state.state = PipelineState.PAUSED
+
+    assert asyncio.run(runner._check_rate_limit()) is True
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive is False
+    assert runner.state.rate_limit_reactive_coder is None
+    assert runner.state.rate_limited_coder_until["claude"] == pause_until
+    assert any(
+        "Codex active while claude remains rate-limited" in event
+        for event in _events(runner)
+    )
+
+
 def test_state_apply_isolated(monkeypatch: pytest.MonkeyPatch) -> None:
     runner = _make_runner(monkeypatch)
     now = datetime.now(timezone.utc)

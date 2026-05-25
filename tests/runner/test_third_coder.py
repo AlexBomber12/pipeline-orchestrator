@@ -23,6 +23,7 @@ from src.coder_registry import CoderPlugin, CoderRegistry
 from src.config import DaemonConfig
 from src.daemon import runner as runner_module
 from src.daemon.runner import PipelineRunner
+from src.daemon.selector import CoderResolution
 from src.models import (
     CIStatus,
     PipelineState,
@@ -388,11 +389,11 @@ def test_get_coder_uses_selector(
     codex = runner._registry.get("codex")
     seen = []
 
-    def fake_select(ctx: object) -> tuple[str, object]:
+    def fake_resolve(ctx: object, *, purpose: object) -> CoderResolution:
         seen.append(ctx)
-        return ("codex", codex)
+        return CoderResolution("codex", codex, "ranked")
 
-    monkeypatch.setattr(runner_module, "select_coder", fake_select)
+    monkeypatch.setattr(runner_module, "resolve_active_coder", fake_resolve)
 
     name, plugin = runner._get_coder()
 
@@ -412,11 +413,11 @@ def test_get_coder_uses_cached_auth_statuses(
     }
     seen: list[object] = []
 
-    def fake_select(ctx: object) -> tuple[str, object]:
+    def fake_resolve(ctx: object, *, purpose: object) -> CoderResolution:
         seen.append(ctx)
-        return ("claude", runner._registry.get("claude"))
+        return CoderResolution("claude", runner._registry.get("claude"), "ranked")
 
-    monkeypatch.setattr(runner_module, "select_coder", fake_select)
+    monkeypatch.setattr(runner_module, "resolve_active_coder", fake_resolve)
 
     runner._get_coder()
 
@@ -424,12 +425,47 @@ def test_get_coder_uses_cached_auth_statuses(
     assert getattr(seen[0], "auth_statuses") == runner._auth_status_cache
 
 
+def test_select_auxiliary_coder_returns_none_when_resolver_has_no_plugin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    monkeypatch.setattr(
+        runner_module,
+        "resolve_active_coder",
+        lambda ctx, *, purpose: CoderResolution("ghost", None, "fallback"),
+    )
+
+    assert runner._select_auxiliary_coder() is None
+
+
 def test_get_coder_falls_through_to_default_when_selector_returns_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._allow_all_coder_auth(monkeypatch)
     runner = h._make_runner()
-    monkeypatch.setattr(runner_module, "select_coder", lambda ctx: None)
+    monkeypatch.setattr(
+        runner_module,
+        "resolve_active_coder",
+        lambda ctx, *, purpose: None,
+    )
+
+    name, plugin = runner._get_coder()
+
+    assert name == "claude"
+    assert plugin.name == "claude"
+
+
+def test_get_coder_ignores_stale_reactive_coder_when_selector_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._allow_all_coder_auth(monkeypatch)
+    runner = h._make_runner()
+    runner.state.rate_limit_reactive_coder = "ghost"
+    monkeypatch.setattr(
+        runner_module,
+        "resolve_active_coder",
+        lambda ctx, *, purpose: None,
+    )
 
     name, plugin = runner._get_coder()
 
@@ -469,7 +505,11 @@ def test_get_coder_hard_pin_overrides_default_when_selector_returns_none(
         task_file="tasks/PR-201.md",
         branch="pr-201-pinned",
     )
-    monkeypatch.setattr(runner_module, "select_coder", lambda ctx: None)
+    monkeypatch.setattr(
+        runner_module,
+        "resolve_active_coder",
+        lambda ctx, *, purpose: None,
+    )
 
     name, plugin = runner._get_coder()
 

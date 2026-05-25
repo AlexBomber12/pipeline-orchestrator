@@ -30,7 +30,10 @@ def test_stop_during_coding_then_resume_picks_next_task(
         status = upload_zip(zip_path)
         assert status in (200, 201), f"first upload failed with status {status}"
 
-        wait_for_state(["CODING"], timeout_sec=30)
+        # Shared testbed dispatch can exceed 30s because the daemon's IDLE
+        # poll interval is 60s; keep this aligned with the other upload e2e
+        # tests so this case exercises stop/resume behavior, not poll timing.
+        wait_for_state(["CODING"], timeout_sec=60)
 
         stop_resp = requests.post(
             f"{dashboard_url}/repos/{testbed_slug}/stop", timeout=10

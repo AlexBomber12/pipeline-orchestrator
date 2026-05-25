@@ -10,6 +10,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 
 from src.coder_registry import CoderPlugin, CoderRegistry
 from src.config import AppConfig, CoderType, RepoConfig
@@ -31,6 +32,19 @@ class SelectionContext:
     # ``None`` defer to repo / global defaults so unpinned tasks keep
     # the legacy auto_fallback behavior.
     task_coder_pin: str | None = None
+
+
+class CoderPurpose(str, Enum):
+    DISPATCH = "dispatch"
+    AUXILIARY = "auxiliary"
+    DISPLAY = "display"
+
+
+@dataclass(frozen=True)
+class CoderResolution:
+    name: str
+    plugin: CoderPlugin | None
+    reason: str
 
 
 def eligible_coders(ctx: SelectionContext) -> list[str]:
@@ -120,11 +134,10 @@ def rank_coders(eligible: list[str], ctx: SelectionContext) -> list[str]:
 
 def select_coder(ctx: SelectionContext) -> tuple[str, CoderPlugin] | None:
     """Return the top-ranked eligible coder and plugin, if any."""
-    eligible = eligible_coders(ctx)
-    if not eligible:
+    resolution = resolve_active_coder(ctx, purpose=CoderPurpose.DISPATCH)
+    if resolution is None or resolution.plugin is None:
         return None
-    name = rank_coders(eligible, ctx)[0]
-    return name, ctx.registry.get(name)
+    return resolution.name, resolution.plugin
 
 
 def rank_auxiliary_coders(
@@ -150,11 +163,114 @@ def select_auxiliary_coder(
     ctx: SelectionContext,
 ) -> tuple[str, CoderPlugin] | None:
     """Return the best eligible coder for diagnose/merge helper work."""
+    resolution = resolve_active_coder(ctx, purpose=CoderPurpose.AUXILIARY)
+    if resolution is None or resolution.plugin is None:
+        return None
+    return resolution.name, resolution.plugin
+
+
+def resolve_active_coder(
+    ctx: SelectionContext, *, purpose: CoderPurpose
+) -> CoderResolution | None:
+    """Resolve the active coder for the requested daemon purpose."""
+    if (
+        purpose is CoderPurpose.DISPLAY
+        and ctx.task_coder_pin not in ("claude", "codex")
+        and ctx.state.coder
+    ):
+        name = ctx.state.coder
+        return CoderResolution(
+            name=name,
+            plugin=_plugin_or_none(ctx.registry, name),
+            reason="pinned",
+        )
+
+    if purpose is CoderPurpose.AUXILIARY:
+        eligible = eligible_coders(ctx)
+        if not eligible:
+            return None
+        name = rank_auxiliary_coders(eligible, ctx)[0]
+        return CoderResolution(
+            name=name,
+            plugin=ctx.registry.get(name),
+            reason=_non_exploring_resolution_reason(name, ctx),
+        )
+
     eligible = eligible_coders(ctx)
     if not eligible:
         return None
-    name = rank_auxiliary_coders(eligible, ctx)[0]
-    return name, ctx.registry.get(name)
+
+    if purpose is CoderPurpose.DISPLAY:
+        state = ctx.rng.getstate()
+        try:
+            ranked = rank_coders(eligible, ctx)
+        finally:
+            ctx.rng.setstate(state)
+    else:
+        ranked = rank_coders(eligible, ctx)
+
+    name = ranked[0]
+    return CoderResolution(
+        name=name,
+        plugin=ctx.registry.get(name),
+        reason=_resolution_reason(name, eligible, ranked, ctx),
+    )
+
+
+def resolve_pause_coder(ctx: SelectionContext) -> CoderResolution:
+    """Resolve the coder used for legacy pause/fallback attribution."""
+    if ctx.state.rate_limit_reactive_coder:
+        name = ctx.state.rate_limit_reactive_coder
+        return CoderResolution(
+            name=name,
+            plugin=_plugin_or_none(ctx.registry, name),
+            reason="pinned",
+        )
+
+    name = _preferred_coder_name(ctx)
+    return CoderResolution(
+        name=name,
+        plugin=_plugin_or_none(ctx.registry, name),
+        reason="fallback",
+    )
+
+
+def _resolution_reason(
+    name: str,
+    eligible: list[str],
+    ranked: list[str],
+    ctx: SelectionContext,
+) -> str:
+    explicit_pin = ctx.task_coder_pin
+    if explicit_pin in ("claude", "codex"):
+        return "pinned" if name == explicit_pin else "fallback"
+
+    repo_pin = _pinned_coder_name(ctx)
+    if repo_pin is not None:
+        return "pinned" if name == repo_pin else "fallback"
+
+    greedy = _greedy_order(eligible, ctx)
+    if ranked and greedy and ranked[0] != greedy[0]:
+        return "exploration"
+    return "ranked"
+
+
+def _non_exploring_resolution_reason(name: str, ctx: SelectionContext) -> str:
+    explicit_pin = ctx.task_coder_pin
+    if explicit_pin in ("claude", "codex"):
+        return "pinned" if name == explicit_pin else "fallback"
+
+    repo_pin = _pinned_coder_name(ctx)
+    if repo_pin is not None:
+        return "pinned" if name == repo_pin else "fallback"
+    return "ranked"
+
+
+def _plugin_or_none(registry: CoderRegistry, name: str) -> CoderPlugin | None:
+    try:
+        return registry.get(name)
+    except KeyError:
+        return None
 
 
 def _sort_by_priority(eligible: list[str], ctx: SelectionContext) -> list[str]:
