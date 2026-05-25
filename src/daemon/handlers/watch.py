@@ -17,6 +17,7 @@ from pathlib import Path
 from src.cancellation import CancellationCause
 from src.daemon import guardrails
 from src.daemon.quarantine import apply_quarantine_label_for_violation
+from src.daemon.selector import CoderPurpose, resolve_active_coder, resolve_pause_coder
 from src.github import cache as gh_cache
 from src.github import checks as gh_checks
 from src.github import gh_runner
@@ -1073,6 +1074,7 @@ class WatchMixin:
         """Return the coder whose limit should gate WATCH retriggers."""
         current_pr = self.state.current_pr
         current_task = self.state.current_task
+        task_pin = None
         if (
             current_pr is not None
             and current_task is not None
@@ -1086,14 +1088,17 @@ class WatchMixin:
             except Exception:
                 header = None
             if header is not None and header.coder != "any":
-                return header.coder
+                task_pin = header.coder
 
-        candidate = (
-            self.state.coder
-            or getattr(self.repo_config.coder, "value", self.repo_config.coder)
-            or self.app_config.daemon.coder.value
+        ctx = self._selection_context(task_coder_pin=task_pin or "")
+        # WATCH retrigger gating follows the current PR's recorded coder
+        # when present, then falls back to dispatch-equivalent resolution.
+        resolution = resolve_active_coder(ctx, purpose=CoderPurpose.DISPLAY)
+        return (
+            resolution.name
+            if resolution is not None
+            else resolve_pause_coder(ctx).name
         )
-        return str(candidate)
 
     def _watch_retrigger_inhibited(self, coder: str) -> bool:
         """Return whether WATCH should skip a review retrigger for ``coder``."""

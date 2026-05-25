@@ -20,6 +20,7 @@ from src.branch_context import BranchContext
 from src.cancellation import delete_retry_count, delete_task_spec_hash
 from src.config import CoderType
 from src.daemon import git_ops
+from src.daemon.selector import resolve_pause_coder
 from src.github import cache as gh_cache
 from src.github import gh_runner
 from src.github import prs as gh_prs
@@ -445,10 +446,9 @@ class MergeMixin:
             parts = record.profile_id.split(":")
             if len(parts) >= 2 and parts[0] and parts[1]:
                 return parts[0], parts[1]
-        configured_coder = (
-            self.repo_config.coder or self.app_config.daemon.coder
-        )
-        coder_name = configured_coder.value
+        coder_name = resolve_pause_coder(
+            self._selection_context(task_coder_pin="")
+        ).name
         model = (
             self.app_config.daemon.codex_model
             if coder_name == CoderType.CODEX.value

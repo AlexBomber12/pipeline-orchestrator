@@ -97,9 +97,10 @@ from src.daemon.recovery import RecoveryMixin
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
 from src.daemon.repo_ops import RepoOpsMixin
 from src.daemon.selector import (
+    CoderPurpose,
     SelectionContext,
-    select_auxiliary_coder,
-    select_coder,
+    resolve_active_coder,
+    resolve_pause_coder,
 )
 from src.events import publish_repo_event
 from src.events.publisher import validate_event_tier
@@ -899,28 +900,39 @@ class PipelineRunner(
                 update={"exploration_epsilon": 0.0}
             )
             app_config = app_config.model_copy(update={"daemon": daemon_config})
-        ctx = SelectionContext(
+        ctx = self._selection_context(app_config=app_config)
+        resolution = resolve_active_coder(ctx, purpose=CoderPurpose.DISPATCH)
+        if resolution is None or resolution.plugin is None:
+            return None
+        return resolution.name, resolution.plugin
+
+    def _selection_context(
+        self,
+        *,
+        app_config: AppConfig | None = None,
+        task_coder_pin: str | None = None,
+    ) -> SelectionContext:
+        return SelectionContext(
             registry=self._registry,
             repo_config=self.repo_config,
-            app_config=app_config,
+            app_config=app_config or self.app_config,
             state=self.state,
             rng=self._selector_rng,
             auth_statuses=self._auth_status_cache or None,
-            task_coder_pin=self._active_task_coder_pin(),
+            task_coder_pin=(
+                self._active_task_coder_pin()
+                if task_coder_pin is None
+                else task_coder_pin
+            ),
         )
-        return select_coder(ctx)
 
     def _select_auxiliary_coder(self) -> tuple[str, CoderPlugin] | None:
         """Return the best eligible coder for daemon helper workflows."""
-        ctx = SelectionContext(
-            registry=self._registry,
-            repo_config=self.repo_config,
-            app_config=self.app_config,
-            state=self.state,
-            rng=self._selector_rng,
-            auth_statuses=self._auth_status_cache or None,
-        )
-        return select_auxiliary_coder(ctx)
+        ctx = self._selection_context(task_coder_pin="")
+        resolution = resolve_active_coder(ctx, purpose=CoderPurpose.AUXILIARY)
+        if resolution is None or resolution.plugin is None:
+            return None
+        return resolution.name, resolution.plugin
 
     def _get_coder(
         self, *, allow_exploration: bool = True
@@ -939,8 +951,8 @@ class PipelineRunner(
         if pin in ("claude", "codex"):
             self.state.coder = pin
             return pin, self._registry.get(pin)
-        coder = self.repo_config.coder or self.app_config.daemon.coder
-        coder_name = coder.value if isinstance(coder, CoderType) else str(coder)
+        ctx = self._selection_context(task_coder_pin="")
+        coder_name = resolve_pause_coder(ctx).name
         self.state.coder = coder_name
         return coder_name, self._registry.get(coder_name)
 
@@ -2268,8 +2280,8 @@ class PipelineRunner(
     async def publish_state(self) -> None:
         """Serialize ``self.state`` and write it to Redis."""
         self.state.active = self.repo_config.active
-        configured_coder = self.repo_config.coder or self.app_config.daemon.coder
-        active_coder = self.state.coder or configured_coder.value
+        ctx = self._selection_context(task_coder_pin="")
+        active_coder = self.state.coder or resolve_pause_coder(ctx).name
         self.state.coder = active_coder
         if self.repo_config.active:
             provider = (

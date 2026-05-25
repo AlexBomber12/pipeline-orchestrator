@@ -23,7 +23,7 @@ from src.daemon.main_commit_audit import (
     mark_shas_audited_in_redis,
     record_audit_findings_in_redis,
 )
-from src.daemon.selector import SelectionContext, candidate_coders
+from src.daemon.selector import SelectionContext, candidate_coders, resolve_pause_coder
 from src.dag import get_eligible_tasks
 from src.github import prs as gh_prs
 from src.inhibitor import InhibitorType, WorkInhibitor, is_work_inhibited
@@ -983,7 +983,9 @@ class IdleMixin:
             coder_name = (
                 selected[0]
                 if selected is not None
-                else self.state.rate_limit_reactive_coder or "claude"
+                else resolve_pause_coder(
+                    self._selection_context(task_coder_pin="")
+                ).name
             )
             _, blocking = is_work_inhibited(self.state, coder=coder_name)
             stop_key = control_stop(self.name)
@@ -1059,7 +1061,9 @@ class IdleMixin:
                 aware = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
                 return aware > now
 
-            pause_coder = self.state.rate_limit_reactive_coder or "claude"
+            pause_coder = resolve_pause_coder(
+                self._selection_context(task_coder_pin="")
+            ).name
             diagnosis_pause = (
                 self.state.error_message is not None
                 and pause_coder == "claude"
@@ -1182,7 +1186,9 @@ class IdleMixin:
             )
             self.state.state = PipelineState.IDLE
             return
-        pause_coder = self.state.rate_limit_reactive_coder or "claude"
+        pause_coder = resolve_pause_coder(
+            self._selection_context(task_coder_pin="")
+        ).name
         await self._refresh_auth_status_cache()
         selected = self._select_coder()
         coder_name = selected[0] if selected is not None else pause_coder
