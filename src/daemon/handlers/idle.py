@@ -1186,9 +1186,16 @@ class IdleMixin:
             )
             self.state.state = PipelineState.IDLE
             return
-        pause_coder = resolve_pause_coder(
-            self._selection_context(task_coder_pin="")
-        ).name
+        if self.state.rate_limit_reactive_coder is None:
+            # Legacy global pauses predate per-coder attribution and were
+            # Claude-only. Preserve that mapping so a Codex repo can resume
+            # through the alternate-coder path instead of waiting out the
+            # stale legacy window.
+            pause_coder = "claude"
+        else:
+            pause_coder = resolve_pause_coder(
+                self._selection_context(task_coder_pin="")
+            ).name
         await self._refresh_auth_status_cache()
         selected = self._select_coder()
         coder_name = selected[0] if selected is not None else pause_coder
