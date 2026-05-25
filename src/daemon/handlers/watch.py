@@ -1091,6 +1091,9 @@ class WatchMixin:
                 task_pin = header.coder
 
         ctx = self._selection_context(task_coder_pin=task_pin or "")
+        if task_pin is not None:
+            return task_pin
+
         # WATCH retrigger gating follows the current PR's recorded coder
         # when present, then falls back to dispatch-equivalent resolution.
         resolution = resolve_active_coder(ctx, purpose=CoderPurpose.DISPLAY)

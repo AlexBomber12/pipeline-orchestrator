@@ -552,6 +552,48 @@ def test_watch_retrigger_coder_prefers_active_task_header(
     assert runner._watch_retrigger_coder() == "codex"
 
 
+def test_watch_retrigger_coder_preserves_rate_limited_task_pin(
+    tmp_path: Path,
+) -> None:
+    runner = h._make_runner()
+    _set_flag(runner, False)
+    runner.repo_path = str(tmp_path)
+    task_file = tmp_path / "tasks" / "PR-392.md"
+    task_file.parent.mkdir()
+    task_file.write_text(
+        "---\n"
+        "status: todo\n"
+        "---\n\n"
+        "# PR-392: Resolve active coder\n\n"
+        "Branch: pr-392-resolve-active-coder\n"
+        "- Type: bugfix\n"
+        "- Complexity: medium\n"
+        "- Depends on: none\n"
+        "- Priority: 2\n"
+        "- Coder: codex\n",
+        encoding="utf-8",
+    )
+    runner.state.coder = "claude"
+    runner.state.rate_limited_coder_until["codex"] = _future()
+    runner.state.current_pr = PRInfo(
+        number=492,
+        branch="pr-392-resolve-active-coder",
+        pr_id="PR-392",
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-392",
+        title="Resolve active coder",
+        status=TaskStatus.DOING,
+        task_file="tasks/PR-392.md",
+        branch="pr-392-resolve-active-coder",
+    )
+
+    retrigger_coder = runner._watch_retrigger_coder()
+
+    assert retrigger_coder == "codex"
+    assert runner._watch_retrigger_inhibited(retrigger_coder) is True
+
+
 def test_watch_retrigger_coder_falls_back_when_task_header_missing(
     tmp_path: Path,
 ) -> None:
