@@ -952,7 +952,11 @@ class PipelineRunner(
             self.state.coder = pin
             return pin, self._registry.get(pin)
         ctx = self._selection_context(task_coder_pin="")
-        coder_name = resolve_pause_coder(ctx).name
+        fallback = resolve_pause_coder(ctx)
+        if fallback.plugin is not None:
+            self.state.coder = fallback.name
+            return fallback.name, fallback.plugin
+        coder_name = (self.repo_config.coder or self.app_config.daemon.coder).value
         self.state.coder = coder_name
         return coder_name, self._registry.get(coder_name)
 

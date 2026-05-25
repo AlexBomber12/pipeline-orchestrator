@@ -455,6 +455,24 @@ def test_get_coder_falls_through_to_default_when_selector_returns_none(
     assert plugin.name == "claude"
 
 
+def test_get_coder_ignores_stale_reactive_coder_when_selector_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._allow_all_coder_auth(monkeypatch)
+    runner = h._make_runner()
+    runner.state.rate_limit_reactive_coder = "ghost"
+    monkeypatch.setattr(
+        runner_module,
+        "resolve_active_coder",
+        lambda ctx, *, purpose: None,
+    )
+
+    name, plugin = runner._get_coder()
+
+    assert name == "claude"
+    assert plugin.name == "claude"
+
+
 def test_get_coder_hard_pin_overrides_default_when_selector_returns_none(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
