@@ -1061,9 +1061,16 @@ class IdleMixin:
                 aware = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
                 return aware > now
 
-            pause_coder = resolve_pause_coder(
-                self._selection_context(task_coder_pin="")
-            ).name
+            if self.state.rate_limit_reactive_coder is None:
+                # Legacy global pauses predate per-coder attribution and were
+                # Claude-only. Keep the unified recovery path aligned with
+                # the legacy PAUSED branch so Codex repos can cross-clear
+                # stale legacy windows.
+                pause_coder = "claude"
+            else:
+                pause_coder = resolve_pause_coder(
+                    self._selection_context(task_coder_pin="")
+                ).name
             diagnosis_pause = (
                 self.state.error_message is not None
                 and pause_coder == "claude"

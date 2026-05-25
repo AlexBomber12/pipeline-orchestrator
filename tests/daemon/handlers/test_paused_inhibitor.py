@@ -314,6 +314,35 @@ def test_handle_paused_flag_on_other_coder_rate_limit_resumes_and_preserves_mark
     assert runner.state.rate_limited_coder_until == {"claude": future}
 
 
+def test_handle_paused_flag_maps_unattributed_legacy_pause_to_claude() -> None:
+    """Unified PAUSED exit preserves legacy Claude attribution."""
+    runner = h._make_runner(coder=CoderType.CODEX)
+    _enable_flag(runner)
+    _seed_paused(runner)
+    future = datetime.now(timezone.utc) + timedelta(minutes=20)
+    runner.state.rate_limited_until = future
+    runner.state.rate_limit_reactive = True
+    runner.state.rate_limit_reactive_coder = None
+    runner.state.active_inhibitors = [
+        WorkInhibitor(
+            inhibitor_type=InhibitorType.RATE_LIMIT,
+            coder_affected="claude",
+            expires_at=future,
+            reason_text="legacy claude rate-limited",
+            source_key="state:octo__demo.rate_limited_until",
+        )
+    ]
+
+    asyncio.run(runner.handle_paused())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.rate_limited_until is None
+    assert runner.state.rate_limit_reactive is False
+    assert runner.state.rate_limit_reactive_coder is None
+    assert runner.state.rate_limited_coders == {"claude"}
+    assert runner.state.rate_limited_coder_until == {"claude": future}
+
+
 def test_handle_paused_flag_on_clears_stale_rate_limit_metadata() -> None:
     """Unified resume must clear ``rate_limited_*`` scalars.
 
