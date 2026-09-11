@@ -1092,3 +1092,58 @@ def test_parse_queue_non_strict_degrades_unknown_status_to_todo(
     tasks = parse_queue(str(queue_path), strict=False)
     assert len(tasks) == 1
     assert tasks[0].status == TaskStatus.TODO
+
+
+def _write_existing_raw(tmp_path: Path, content: str) -> Path:
+    path = tmp_path / "PR-100.md"
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize("status", ["TODO", "DONE", "ERROR", "DOING"])
+def test_existing_legacy_task_is_read_without_rewriting(tmp_path: Path, status: str) -> None:
+    from src.queue_parser import parse_existing_task_header
+
+    content = _frontmatter_task().removeprefix("---\n---\n")
+    content = content.replace("Branch:", f"- Status: {status}\nBranch:")
+    path = _write_existing_raw(tmp_path, content)
+    before = path.read_bytes()
+    header = parse_existing_task_header(path)
+
+    assert header.pr_id == "PR-100"
+    assert header.frontmatter_status == (status.lower() if status != "DOING" else None)
+    assert path.read_bytes() == before
+    with pytest.raises(QueueValidationError, match="legacy header format"):
+        parse_task_header(path)
+
+
+@pytest.mark.parametrize("prefix", ["", "---\n---\n"])
+def test_existing_unstructured_vs_malformed_new_task(tmp_path: Path, prefix: str) -> None:
+    from src.queue_parser import UnstructuredLegacyTaskError, parse_existing_task_header
+
+    path = _write_existing_raw(tmp_path, prefix + "# PR-123: History\n\nBranch: pr-123-history\n")
+    with pytest.raises(QueueValidationError) as caught:
+        parse_existing_task_header(path)
+    assert isinstance(caught.value, UnstructuredLegacyTaskError) == (not prefix)
+
+
+@pytest.mark.parametrize("content", [
+    "",
+    "A historical document with no task header\n",
+    "---\nstatus: TODO\n# PR-123: Missing closing frontmatter",
+])
+def test_existing_reader_does_not_hide_malformed_documents(tmp_path: Path, content: str) -> None:
+    from src.queue_parser import UnstructuredLegacyTaskError, parse_existing_task_header
+
+    with pytest.raises(QueueValidationError) as caught:
+        parse_existing_task_header(_write_existing_raw(tmp_path, content))
+    assert not isinstance(caught.value, UnstructuredLegacyTaskError)
+
+
+def test_existing_reader_rejects_invalid_legacy_metadata(tmp_path: Path) -> None:
+    from src.queue_parser import UnstructuredLegacyTaskError, parse_existing_task_header
+
+    content = "# PR-123: Bad history\nBranch: pr-123-history\n- Type: impossible\n"
+    with pytest.raises(QueueValidationError) as caught:
+        parse_existing_task_header(_write_existing_raw(tmp_path, content))
+    assert not isinstance(caught.value, UnstructuredLegacyTaskError)

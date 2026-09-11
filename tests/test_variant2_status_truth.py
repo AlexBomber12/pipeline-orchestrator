@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import pytest
 from src.models import PRInfo, TaskStatus
 from src.queue_parser import TaskHeader
 from src.task_status import (
     MergedState,
+    MergeStatusUnavailable,
     derive_task_status,
     merged_split_parent_aliases,
 )
@@ -89,14 +91,12 @@ def test_error_still_frontmatter_owned() -> None:
 
 
 def test_github_unreachable_safe() -> None:
-    status = derive_task_status(
-        _header(frontmatter_status="done"),
-        _state(api_available=False),
-        [],
-    )
-
-    assert status != TaskStatus.DONE
-    assert status == TaskStatus.TODO
+    with pytest.raises(MergeStatusUnavailable, match="preserving the previous queue"):
+        derive_task_status(
+            _header(frontmatter_status="done"),
+            _state(api_available=False),
+            [],
+        )
 
 
 def test_open_pr_is_doing() -> None:

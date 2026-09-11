@@ -15,7 +15,9 @@ from src.queue_parser import (
     _PR_ID_RE,
     QueueValidationError,
     TaskHeader,
-    parse_task_header,
+)
+from src.queue_parser import (
+    parse_existing_task_header as parse_task_header,
 )
 
 _PR_ID_PATTERN = _PR_ID_RE.pattern.removeprefix("^").removesuffix("$")
@@ -28,6 +30,10 @@ class MergedState:
     merged_pr_ids: set[str]
     merged_branches: set[str]
     api_available: bool
+
+
+class MergeStatusUnavailable(RuntimeError):
+    """A task cannot safely be classified as unfinished during an API outage."""
 
 
 def split_parent_of(pr_id: str) -> str | None:
@@ -120,6 +126,11 @@ def derive_task_status(
         open_prs,
     ) is not None:
         return TaskStatus.DOING
+    if not state.api_available:
+        raise MergeStatusUnavailable(
+            f"GitHub merge status unavailable for {task_header.pr_id}; "
+            "preserving the previous queue and deferring task selection"
+        )
     if current_task_pr_id == task_header.pr_id:
         return TaskStatus.DOING
     return TaskStatus.TODO

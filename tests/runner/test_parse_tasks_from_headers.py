@@ -133,7 +133,7 @@ def test_helper_skips_file_without_task_header(tmp_path: Path) -> None:
     assert runner._parse_tasks_from_headers() is None
 
 
-def test_helper_rejects_legacy_unstructured(
+def test_helper_skips_legacy_unstructured(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -167,8 +167,9 @@ def test_helper_rejects_legacy_unstructured(
     }
     runner, _repo = _runner_for_fixture(tmp_path, before, monkeypatch)
 
-    with pytest.raises(QueueValidationError, match="legacy header format"):
-        runner._parse_tasks_from_headers()
+    tasks = runner._parse_tasks_from_headers()
+    assert tasks is not None
+    assert [task.pr_id for task in tasks] == ["PR-001", "PR-003", "PR-004"]
 
 
 def test_helper_applies_merged_state_via_resolve(
@@ -354,3 +355,89 @@ def test_helper_against_each_golden_fixture(
         current_queue = [] if tasks is None else [_task_projection(task) for task in tasks]
 
         assert current_queue == expected["current_queue"], scenario_name
+
+
+@pytest.mark.parametrize("entry", ["idle", "recovery"])
+def test_legacy_history_does_not_reenter_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str,
+) -> None:
+    import asyncio
+    from src.daemon.handlers import idle as idle_module
+
+    before = {
+        "tasks": [
+            {"pr_id": "PR-001", "title": "Archive", "legacy_unstructured": True},
+            {"pr_id": "PR-002", "title": "Merged", "branch": "pr-002-merged"},
+        ],
+        "merged_branches_via_api": ["pr-002-merged"],
+    }
+    runner, repo = _runner_for_fixture(tmp_path, before, monkeypatch)
+    path = repo / "tasks" / "PR-002.md"
+    path.write_text(path.read_text().removeprefix("---\n---\n"))
+    contents = {p.name: p.read_bytes() for p in (repo / "tasks").glob("PR-*.md")}
+    monkeypatch.setattr(
+        idle_module, "_resolve_merged_state",
+        lambda *args, **kwargs: MergedState(set(), {"pr-002-merged"}, True),
+    )
+    if entry == "idle":
+        task = asyncio.run(h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG(runner))
+        assert task is None
+        tasks = runner._idle_dag_tasks
+    else:
+        tasks = runner._parse_tasks_from_headers()
+    assert [(t.pr_id, t.status) for t in tasks] == [("PR-002", TaskStatus.DONE)]
+    assert {p.name: p.read_bytes() for p in (repo / "tasks").glob("PR-*.md")} == contents
+
+
+@pytest.mark.parametrize("entry", ["idle", "recovery"])
+def test_api_outage_preserves_queue_without_dispatch_or_task_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str,
+) -> None:
+    import asyncio
+    from src.daemon.handlers import idle as idle_module
+
+    before = {
+        "tasks": [{"pr_id": "PR-002", "title": "Merged", "branch": "pr-002-merged"}],
+    }
+    runner, repo = _runner_for_fixture(tmp_path, before, monkeypatch)
+    previous = QueueTask(
+        pr_id="PR-002", title="Merged", status=TaskStatus.DONE,
+        task_file="tasks/PR-002.md", branch="pr-002-merged",
+    )
+    runner.state.current_queue = [previous]
+    runner.state.queue_done = 1
+    runner.state.queue_total = 1
+    path = repo / "tasks" / "PR-002.md"
+    original = path.read_bytes()
+    for module in (idle_module, recovery_module):
+        monkeypatch.setattr(
+            module, "_resolve_merged_state",
+            lambda *args, **kwargs: MergedState(set(), set(), False),
+        )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        idle_module.IdleMixin, "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+    async def unexpected_failure(*args, **kwargs):
+        pytest.fail("A missing merge probe must not fail the task")
+    monkeypatch.setattr(runner, "_transition_to_error", unexpected_failure)
+
+    if entry == "idle":
+        assert asyncio.run(runner._select_next_task_or_attach([], [])) is None
+    else:
+        assert asyncio.run(runner._recover_state_headers()) is False
+    assert runner.state.current_queue == [previous]
+    assert (runner.state.queue_done, runner.state.queue_total) == (1, 1)
+    assert runner.state.current_task is None
+    assert path.read_bytes() == original
+    assert any("merge status unavailable" in event["event"] for event in runner.state.history)
+
+    for module in (idle_module, recovery_module):
+        monkeypatch.setattr(
+            module, "_resolve_merged_state",
+            lambda *args, **kwargs: MergedState(set(), {"pr-002-merged"}, True),
+        )
+    assert asyncio.run(runner._recover_state_headers()) is True
+    assert runner.state.current_queue[0].status == TaskStatus.DONE
+    assert runner.state.current_task is None

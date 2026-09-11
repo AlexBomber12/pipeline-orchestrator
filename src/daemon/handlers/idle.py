@@ -34,9 +34,13 @@ from src.onboarding.reconciliation import reconcile_agents_md
 from src.queue_parser import (
     QueueValidationError,
     TaskHeader,
-    parse_task_header,
+    UnstructuredLegacyTaskError,
+)
+from src.queue_parser import (
+    parse_existing_task_header as parse_task_header,
 )
 from src.task_status import (
+    MergeStatusUnavailable,
     _resolve_merged_state,
     derive_task_status,
     find_matching_open_pr,
@@ -358,6 +362,9 @@ class IdleMixin:
         for task_file in sorted(task_dir.glob("PR-*.md")):
             try:
                 header = parse_task_header(task_file)
+            except UnstructuredLegacyTaskError:
+                skipped_unstructured_pr_ids.add(task_file.stem)
+                continue
             except QueueValidationError as exc:
                 if not self._is_missing_task_header_error(exc):
                     raise
@@ -388,8 +395,8 @@ class IdleMixin:
             self, "_idle_degraded_done_check_logged", False,
         ):
             self.log_event(
-                "[INFRA] Operating without gh API done-check; relying on "
-                "git log convention scan only"
+                "[INFRA] Operating without gh API done-check; tasks without "
+                "positive merge or open-PR evidence will defer task selection"
             )
             self._idle_degraded_done_check_logged = True
         merged_pr_ids = state.merged_pr_ids
@@ -619,6 +626,9 @@ class IdleMixin:
         self._idle_merged_prs = merged_prs
         try:
             task = await self._select_next_task_from_dag()
+        except MergeStatusUnavailable as exc:
+            self.log_event(f"[INFRA] {exc}")
+            return None
         except (
             OSError,
             RuntimeError,
