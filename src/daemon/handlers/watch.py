@@ -25,7 +25,7 @@ from src.github import prs as gh_prs
 from src.inhibitor import InhibitorType, is_work_inhibited
 from src.keyspace import ci_infra_retried
 from src.models import CIStatus, FeedbackCheckResult, PipelineState, ReviewStatus
-from src.queue_parser import parse_task_header
+from src.queue_parser import parse_existing_task_header as parse_task_header
 from src.subsource_registry import SuppressionReason
 
 logger = logging.getLogger(__name__)

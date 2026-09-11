@@ -357,9 +357,10 @@ def test_verify_allows_unchanged_legacy_validation_gaps(tmp_path: Path) -> None:
     )
 
     assert result.checked == 1
+    assert path.read_text(encoding="utf-8") == content
 
 
-def test_verify_uses_frontmatter_before_backup_fallback_status(
+def test_apply_rejects_frontmatter_validation_gap_before_writing(
     tmp_path: Path,
 ) -> None:
     tasks_dir = tmp_path / "tasks"
@@ -377,20 +378,16 @@ def test_verify_uses_frontmatter_before_backup_fallback_status(
     frontmatter_path = tasks_dir / "PR-998.md"
     frontmatter_path.write_text(frontmatter_content, encoding="utf-8")
     backups_dir = tmp_path / "backups"
-    migrate_task_format.migrate_tasks(
-        tasks_dir,
-        apply=True,
-        backups_dir=backups_dir,
-        stdout=StringIO(),
-    )
-
-    result = migrate_task_format.verify_tasks(
-        tasks_dir,
-        backups_dir=backups_dir,
-        stdout=StringIO(),
-    )
-
-    assert result.checked == 2
+    with pytest.raises(Exception, match="missing Depends on"):
+        migrate_task_format.migrate_tasks(
+            tasks_dir,
+            apply=True,
+            backups_dir=backups_dir,
+            stdout=StringIO(),
+        )
+    assert not backups_dir.exists()
+    assert frontmatter_path.read_text(encoding="utf-8") == frontmatter_content
+    assert (tasks_dir / "PR-999.md").read_text(encoding="utf-8") == legacy_content
 
 
 def test_atomic_write_no_partial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -451,3 +448,15 @@ def test_legacy_validation_error_reports_real_task_path(tmp_path: Path) -> None:
     message = str(exc_info.value)
     assert f"{path}: invalid Type 'not-real'" in message
     assert ".parse." not in message
+
+
+def test_verify_detects_rewrite_of_skipped_historical_task(tmp_path: Path) -> None:
+    content = "# PR-999: History\nBranch: pr-999-history\n"
+    path = _write_task(tmp_path / "tasks", content)
+    result = migrate_task_format.migrate_tasks(path.parent, apply=True, stdout=StringIO())
+    assert result.changed == 0
+    path.write_text("---\nstatus: TODO\n---\n" + content)
+    with pytest.raises(RuntimeError, match="historical task changed"):
+        migrate_task_format.verify_tasks(
+            path.parent, backups_dir=result.backups_dir, stdout=StringIO(),
+        )

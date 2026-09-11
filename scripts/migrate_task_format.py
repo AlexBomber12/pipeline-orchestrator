@@ -208,7 +208,7 @@ def _parse_or_legacy_issues(path: Path) -> TaskHeader | tuple[str, ...]:
     try:
         return parse_task_header(parse_path)
     except QueueValidationError as exc:
-        if _is_legacy_validation_error(exc):
+        if temp_path is not None and _is_legacy_validation_error(exc):
             return _legacy_issue_kinds(path, exc.issues)
         raise QueueValidationError(
             _with_real_issue_paths(exc.issues, temp_path, path)
@@ -269,7 +269,10 @@ def migrate_tasks(
 
     planned_changes: list[PlannedChange] = []
     for task_path in files:
-        _parse_or_legacy_issues(task_path)
+        parsed = _parse_or_legacy_issues(task_path)
+        if isinstance(parsed, tuple):
+            print(f"{task_path.name}: SKIP historical unstructured task", file=stdout)
+            continue
         before = task_path.read_text(encoding="utf-8")
         if has_frontmatter(before):
             continue
@@ -358,11 +361,17 @@ def verify_tasks(
 
     for task_path in files:
         after_content = task_path.read_text(encoding="utf-8")
+        backup_path = backup_path_for(selected_backups_dir, tasks_dir, task_path)
+        if backup_path.exists() and isinstance(_parse_or_legacy_issues(backup_path), tuple):
+            if task_path.read_bytes() != backup_path.read_bytes():
+                mismatches.append(f"{task_path.name}: historical task changed")
+            else:
+                compared += 1
+            continue
         if frontmatter_status(after_content) is None:
             mismatches.append(f"{task_path.name}: missing valid frontmatter status")
             continue
 
-        backup_path = backup_path_for(selected_backups_dir, tasks_dir, task_path)
         if not backup_path.exists():
             mismatches.append(f"{task_path.name}: missing backup")
             continue

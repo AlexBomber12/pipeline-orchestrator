@@ -28,9 +28,16 @@ from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.keyspace import pipeline_state, recovery_backup_branch
 from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
-from src.queue_parser import QueueValidationError, parse_task_header
+from src.queue_parser import (
+    QueueValidationError,
+    UnstructuredLegacyTaskError,
+)
+from src.queue_parser import (
+    parse_existing_task_header as parse_task_header,
+)
 from src.subsource_registry import SuppressionReason
 from src.task_status import (
+    MergeStatusUnavailable,
     _resolve_merged_state,
     derive_task_status,
     get_merged_pr_ids,
@@ -67,6 +74,8 @@ class RecoveryMixin:
         for task_file in sorted(task_dir.glob("PR-*.md")):
             try:
                 header = parse_task_header(task_file)
+            except UnstructuredLegacyTaskError:
+                continue
             except QueueValidationError as exc:
                 if not self._is_missing_task_header_error(exc):
                     raise
@@ -316,6 +325,9 @@ class RecoveryMixin:
         try:
             try:
                 tasks = self._parse_tasks_from_headers()
+            except MergeStatusUnavailable as exc:
+                self.log_event(f"[INFRA] recover_state deferred: {exc}")
+                return False
             except QueueValidationError as exc:
                 await self._transition_to_error(
                     f"recover_state: queue validation failed: {exc}",

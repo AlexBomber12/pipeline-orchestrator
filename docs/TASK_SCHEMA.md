@@ -1,6 +1,6 @@
 # Task file schema (`tasks/PR-*.md`)
 
-Every PR has a corresponding task file under `tasks/`. The file must
+Every new PR has a corresponding task file under `tasks/`. New files must
 start with YAML frontmatter, followed by a task header parsed by
 `src/queue_parser.py:parse_task_header`. The header must contain the
 following fields:
@@ -15,6 +15,34 @@ Branch: <branch-name>
 - Priority: 1-5
 - Coder: claude | codex | any
 ```
+
+## Reading existing repository history
+
+New uploads and MCP validation use `parse_task_header`, which requires
+frontmatter and every mandatory field. Existing repository files are read
+through `parse_existing_task_header`. This reader accepts structured
+pre-frontmatter headers in memory and preserves an explicit historical
+ERROR status without changing the file.
+
+Pre-frontmatter documents lacking Branch, Type, Complexity, or Depends on
+are historical, unstructured records. Recovery and IDLE exclude them from
+the runnable queue as before. They are not marked DONE merely because they
+were skipped; dependents still require merge evidence. A malformed file
+that already has frontmatter remains a validation error.
+
+Updating the daemon does not require rewriting all historical tasks.
+The optional migration script converts structured headers only, leaves
+unstructured historical records byte-for-byte unchanged, and verifies
+that those records were not changed. Invalid frontmatter files fail
+validation before any migration writes.
+
+DONE is derived from positive Git/GitHub merge evidence, not from the
+frontmatter word alone. If GitHub merge lookup fails and no positive
+evidence resolves a task, IDLE defers selection and recovery retries on
+a later cycle. This does not assign TODO or fail the task. An existing
+queue snapshot is preserved, and an INFRA event explains the delay.
+Without a previous snapshot, recovery remains incomplete until the
+lookup succeeds. No new persistent completion cache is introduced.
 
 ## Frontmatter status field
 

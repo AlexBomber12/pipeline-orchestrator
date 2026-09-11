@@ -126,8 +126,10 @@ from src.models import PipelineState, RepoState, TaskStatus
 from src.queue_parser import (
     TYPE_SYNONYMS,
     QueueValidationError,
-    parse_task_header,
     write_frontmatter_status,
+)
+from src.queue_parser import (
+    parse_existing_task_header as parse_task_header,
 )
 from src.subsource_registry import (
     SuppressionReason,

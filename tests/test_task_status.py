@@ -10,6 +10,7 @@ from src.github import GhPrMergedBranchesUnavailable
 from src.models import PRInfo, QueueTask, TaskStatus
 from src.queue_parser import QueueValidationError, TaskHeader
 from src.task_status import (
+    MergeStatusUnavailable,
     MergedState,
     _load_task_header,
     _resolve_merged_state,
@@ -503,9 +504,9 @@ def test_degraded_mode_logs_once(monkeypatch, tmp_path: Path) -> None:
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
-    task = asyncio.run(runner._select_next_task_from_dag())
-
-    assert task is not None
+    for _ in range(2):
+        with pytest.raises(MergeStatusUnavailable):
+            asyncio.run(runner._select_next_task_from_dag())
     assert seen_candidate_ids == {f"PR-{index:03}" for index in range(1, 11)}
     degraded_logs = [
         event["event"]
@@ -515,8 +516,8 @@ def test_degraded_mode_logs_once(monkeypatch, tmp_path: Path) -> None:
         )
     ]
     assert degraded_logs == [
-        "[INFRA] Operating without gh API done-check; relying on "
-        "git log convention scan only"
+        "[INFRA] Operating without gh API done-check; tasks without "
+        "positive merge or open-PR evidence will defer task selection"
     ]
 
 
@@ -1003,7 +1004,7 @@ def test_load_task_header_returns_frontmatter_even_when_queue_entry_differs(
     assert header.pr_id == "PR-999"
 
 
-def test_status_derivation_frontmatter_only(tmp_path: Path) -> None:
+def test_status_derivation_rejects_unstructured_legacy_entry(tmp_path: Path) -> None:
     task_file = tmp_path / "tasks" / "PR-001.md"
     task_file.parent.mkdir()
     task_file.write_text(
@@ -1020,7 +1021,7 @@ def test_status_derivation_frontmatter_only(tmp_path: Path) -> None:
         branch="pr-001-legacy-task",
     )
 
-    with pytest.raises(QueueValidationError, match="legacy header format"):
+    with pytest.raises(QueueValidationError, match="missing Type"):
         _load_task_header(task, str(tmp_path))
 
 
@@ -1278,3 +1279,31 @@ def test_get_merged_pr_ids_skips_blank_subject_lines_in_candidate_probe(
         "PR-085",
         "PR-099",
     }
+
+
+@pytest.mark.parametrize("current_task", [None, "PR-085"])
+def test_unknown_merge_evidence_never_becomes_todo_or_redispatch(current_task) -> None:
+    with pytest.raises(MergeStatusUnavailable, match="PR-085"):
+        derive_task_status(
+            _header("pr-085-already-done", frontmatter_status="done"),
+            _merged_state(api_available=False),
+            [],
+            current_task_pr_id=current_task,
+        )
+
+
+@pytest.mark.parametrize("evidence", ["git", "branch", "pr", "open", "error"])
+def test_positive_evidence_and_error_survive_api_outage(evidence: str) -> None:
+    header = _header("pr-085-existing", frontmatter_status="error" if evidence == "error" else None)
+    state = _merged_state(
+        {"PR-085"} if evidence == "git" else set(),
+        {header.branch} if evidence == "branch" else set(),
+        api_available=False,
+    )
+    pr = PRInfo(number=109, branch=header.branch, title="Existing implementation")
+    status = derive_task_status(
+        header, state, [pr] if evidence == "open" else [],
+        [pr] if evidence == "pr" else [],
+    )
+    expected = {"open": TaskStatus.DOING, "error": TaskStatus.ERROR}.get(evidence, TaskStatus.DONE)
+    assert status == expected

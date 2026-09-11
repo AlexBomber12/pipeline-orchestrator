@@ -28,6 +28,10 @@ class QueueValidationError(ValueError):
         )
 
 
+class UnstructuredLegacyTaskError(QueueValidationError):
+    """An existing pre-frontmatter task has no runnable structured header."""
+
+
 _HEADER_RE = re.compile(r"^##\s+(PR-[A-Za-z0-9_.-]+):\s*(.+?)\s*$")
 _TASK_HEADER_RE = re.compile(r"^#\s+(PR-[A-Za-z0-9_.-]+):\s*(.+?)\s*$")
 _PR_ID_RE = re.compile(r"^PR-[A-Za-z0-9_.-]+$")
@@ -310,9 +314,36 @@ def parse_queue_text(
 
 
 def parse_task_header(path: str | Path) -> TaskHeader:
-    """Parse structured metadata from a task file header."""
+    """Validate a new task; frontmatter and all required fields are mandatory."""
     task_path = Path(path)
     lines = task_path.read_text(encoding="utf-8").splitlines()
+    return _parse_task_header_lines(task_path, lines)
+
+
+def parse_existing_task_header(path: str | Path) -> TaskHeader:
+    """Read repository history without rewriting files or weakening admission."""
+    task_path = Path(path)
+    lines = task_path.read_text(encoding="utf-8").splitlines()
+    first = next((line.rstrip() for line in lines if line.strip()), None)
+    if first in (None, "---"):
+        return _parse_task_header_lines(task_path, lines)
+    try:
+        return _parse_task_header_lines(
+            task_path, ["---", "---", *lines], historical=True,
+        )
+    except QueueValidationError as exc:
+        missing_fields = (
+            ": missing Branch", ": missing Type",
+            ": missing Complexity", ": missing Depends on",
+        )
+        if exc.issues and all(issue.endswith(missing_fields) for issue in exc.issues):
+            raise UnstructuredLegacyTaskError(exc.issues) from exc
+        raise
+
+
+def _parse_task_header_lines(
+    task_path: Path, lines: list[str], *, historical: bool = False,
+) -> TaskHeader:
     issues: list[str] = []
     header_match: re.Match[str] | None = None
     fields: dict[str, str] = {}
@@ -478,6 +509,11 @@ def parse_task_header(path: str | Path) -> TaskHeader:
             f"{task_path}: invalid Coder {coder!r}; expected one of "
             f"{sorted(_CODER_VALUES)}"
         )
+
+    if historical and "status" in fields:
+        historical_status = fields["status"].strip().lower()
+        if historical_status in _FRONTMATTER_STATUS_VALUES:
+            frontmatter_status = historical_status
 
     if (
         frontmatter_status is not None
