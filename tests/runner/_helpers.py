@@ -337,6 +337,10 @@ class _FakePipeline:
         self.commands.append(("zadd", (key, mapping), {}))
         return self
 
+    def delete(self, key: str) -> "_FakePipeline":
+        self.commands.append(("delete", (key,), {}))
+        return self
+
     def expire(self, key: str, seconds: int) -> "_FakePipeline":
         self.commands.append(("expire", (key, seconds), {}))
         return self
@@ -351,6 +355,8 @@ class _FakePipeline:
             if command == "set":
                 await self.redis.set(args[0], args[1], **kwargs)
                 results.append(True)
+            elif command == "delete":
+                results.append(await self.redis.delete(args[0]))
             elif command == "zadd":
                 results.append(await self.redis.zadd(args[0], args[1]))
             elif command == "expire":

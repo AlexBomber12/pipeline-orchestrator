@@ -548,13 +548,14 @@ def _view(
         "recorded_at_text": recorded_at_text,
         "pr_url": pr_url,
         "is_active": is_active,
+        "approval_binding": "bound-decision",
     }
 
 
 def test_panel_renders_nothing_when_pending_empty() -> None:
     html = _render_panel(guardrail_pending=[])
     assert "guardrail-panel" not in html
-    assert "Pending guardrail decisions" not in html
+    assert "Guardrail decisions" not in html
 
 
 def test_panel_renders_section_and_count_for_two_entries() -> None:
@@ -562,7 +563,7 @@ def test_panel_renders_section_and_count_for_two_entries() -> None:
         guardrail_pending=[_view("PR-A"), _view("PR-B", rule="big_diff")]
     )
     assert "guardrail-panel" in html
-    assert "Pending guardrail decisions" in html
+    assert "Guardrail decisions" in html
     assert html.count('data-pr-id="PR-A"') == 1
     assert html.count('data-pr-id="PR-B"') == 1
     assert html.count("hx-post=\"/repos/example__alpha/guardrail/PR-A/decision\"") == 2
@@ -573,7 +574,7 @@ def test_panel_buttons_carry_confirm_target_and_swap_attributes() -> None:
     html = _render_panel(guardrail_pending=[_view("PR-296")])
     assert "Approve" in html and "Reject" in html
     assert "approve-btn" in html and "reject-btn" in html
-    assert 'hx-vals=\'{"decision": "approve"}\'' in html
+    assert 'hx-vals=\'{"decision": "approve", "binding": "bound-decision"}\'' in html
     assert 'hx-vals=\'{"decision": "reject"}\'' in html
     assert "hx-confirm=\"Approve guardrail violation for PR-296" in html
     assert "hx-confirm=\"Reject guardrail violation for PR-296" in html
@@ -581,21 +582,15 @@ def test_panel_buttons_carry_confirm_target_and_swap_attributes() -> None:
     assert 'hx-swap="outerHTML"' in html
 
 
-def test_panel_buttons_opt_in_to_204_swap() -> None:
-    """htmx 2.x skips 204 swaps by default; both buttons must opt in.
-
-    The decision endpoint returns 204 No Content on success and the
-    base.html global ``htmx:beforeSwap`` hook only flips ``shouldSwap``
-    for 400/404/409/422/503. Without a per-button override the row would
-    stay rendered after a successful click, inviting duplicate clicks
-    while the operator waits for the next poll to reconcile.
-    """
+def test_only_reject_opts_in_to_204_swap() -> None:
+    """Approve retains its row and renders a 202 acknowledgement; Reject is unchanged."""
     html = _render_panel(guardrail_pending=[_view("PR-296")])
     handler = (
         'hx-on::before-swap="if (event.detail.xhr.status === 204) { '
         'event.detail.shouldSwap = true; }"'
     )
-    assert html.count(handler) == 2
+    assert html.count(handler) == 1
+    assert 'hx-target="this"' in html
 
 
 def test_panel_renders_pr_url_when_present_and_plain_text_when_missing() -> None:
@@ -694,7 +689,7 @@ def test_repo_detail_route_omits_panel_when_no_pending(
 
     assert resp.status_code == 200
     assert "guardrail-panel" not in resp.text
-    assert "Pending guardrail decisions" not in resp.text
+    assert "Guardrail decisions" not in resp.text
 
 
 def test_repo_detail_route_swallows_redis_error_from_pending(

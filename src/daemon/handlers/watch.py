@@ -193,6 +193,7 @@ class WatchMixin:
         if pr_state in ("MERGED", "CLOSED"):
             await self._handle_external_pr_resolution(found, pr_state)
             return
+        found = self._approval_filtered_pr(found)
         await self._rehydrate_quarantine_from_pr_labels(found)
         await self._detect_external_quarantine_release(found)
 
@@ -613,6 +614,7 @@ class WatchMixin:
             daemon_config=self.app_config.daemon,
             repo_config=self.repo_config,
         )
+        violations = [v for v in violations if not self._approval_allows_violation(current_pr, v)]
         current_pr.diff_scanned_at_sha = current_pr.head_sha
         if violations:
             first = violations[0]
