@@ -288,6 +288,56 @@ def test_required_checks_fetch_outage_does_not_age_pending(
     assert key in redis.deleted
 
 
+def test_incomplete_successful_contexts_do_not_age_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Partial evidence with no failure is an outage, not stuck CI."""
+    redis = _FakeRedis()
+    base = 1_700_000_000.0
+    key = _pending_tracker_key("octo/repo", 7, "sha-aaa")
+    redis.store[key] = str(base)
+    monkeypatch.setattr(checks.time, "time", lambda: base + 60 * 60)
+
+    status, reason = asyncio.run(
+        classify_ci_status_with_age(
+            "octo/repo",
+            7,
+            "sha-aaa",
+            redis,
+            pending_max_seconds=1800,
+            runs_payload=[{"name": "unit", "conclusion": "success"}],
+            statuses_payload={},
+            fetch_ok=False,
+        )
+    )
+
+    assert status == CIStatus.PENDING
+    assert reason is None
+    assert key not in redis.store
+    assert key in redis.deleted
+
+
+def test_incomplete_observed_failure_remains_failure() -> None:
+    """Observed failures stay actionable even when evidence is incomplete."""
+    redis = _FakeRedis()
+
+    status, reason = asyncio.run(
+        classify_ci_status_with_age(
+            "octo/repo",
+            7,
+            "sha-aaa",
+            redis,
+            pending_max_seconds=1800,
+            runs_payload=[{"name": "unit", "conclusion": "failure"}],
+            statuses_payload={},
+            fetch_ok=False,
+        )
+    )
+
+    assert status == CIStatus.FAILURE
+    assert reason is None
+
+
 def test_head_sha_rotation_resets_tracker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

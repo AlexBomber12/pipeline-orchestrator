@@ -3397,7 +3397,6 @@ def test_fetch_ci_status_rest_combines_check_runs_and_status(
 
     assert [r["id"] for r in check_runs] == [1, 2, 3]
     assert status_payload == {"state": "pending", "statuses": [{"state": "pending"}]}
-    assert any("--paginate" in c for c in calls)
     assert any("per_page=100" in a for c in calls for a in c)
     assert any("--include" in c for c in calls)
     assert fetch_ok is True
@@ -3654,13 +3653,11 @@ def test_ci_evidence_required_status_context_can_be_on_later_page(
 ) -> None:
     """Required legacy status contexts are resolved across all status pages."""
 
-    def fake_paginated(path: str) -> list[dict]:
-        assert "check-runs" in path
-        return [{"check_runs": []}]
-
     status_calls: list[str] = []
 
     def fake_etag_get(path: str) -> dict:
+        if "check-runs" in path:
+            return {"check_runs": []}
         status_calls.append(path)
         if path.endswith("&page=1"):
             return {
@@ -3679,7 +3676,6 @@ def test_ci_evidence_required_status_context_can_be_on_later_page(
             }
         raise AssertionError(f"unexpected status page: {path}")
 
-    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
     monkeypatch.setattr("src.github.cache._etag_get", fake_etag_get)
 
     evidence = _fetch_ci_evidence_rest(
@@ -3708,11 +3704,9 @@ def test_ci_evidence_status_pagination_failure_preserves_observed_failure(
     toward failure handling instead of becoming an indefinite PENDING.
     """
 
-    def fake_paginated(path: str) -> list[dict]:
-        assert "check-runs" in path
-        return [{"check_runs": []}]
-
     def fake_etag_get(path: str) -> dict:
+        if "check-runs" in path:
+            return {"check_runs": []}
         if path.endswith("&page=1"):
             return {
                 "state": "failure",
@@ -3725,7 +3719,6 @@ def test_ci_evidence_status_pagination_failure_preserves_observed_failure(
             raise RuntimeError("HTTP 503")
         raise AssertionError(f"unexpected status page: {path}")
 
-    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
     monkeypatch.setattr("src.github.cache._etag_get", fake_etag_get)
     monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
 
@@ -3753,11 +3746,9 @@ def test_ci_evidence_later_bad_status_page_preserves_accumulated_payload(
 ) -> None:
     """Malformed later status pages are incomplete without dropping page 1."""
 
-    def fake_paginated(path: str) -> list[dict]:
-        assert "check-runs" in path
-        return [{"check_runs": []}]
-
     def fake_etag_get(path: str) -> object:
+        if "check-runs" in path:
+            return {"check_runs": []}
         if path.endswith("&page=1"):
             return {
                 "state": "success",
@@ -3770,7 +3761,6 @@ def test_ci_evidence_later_bad_status_page_preserves_accumulated_payload(
             return bad_page
         raise AssertionError(f"unexpected status page: {path}")
 
-    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
     monkeypatch.setattr("src.github.cache._etag_get", fake_etag_get)
 
     evidence = _fetch_ci_evidence_rest("owner/name", "abc123")
@@ -3781,6 +3771,63 @@ def test_ci_evidence_later_bad_status_page_preserves_accumulated_payload(
     assert evidence.statuses_source.reason == reason
     assert evidence.status_payload["state"] == "success"
     assert len(evidence.status_payload["statuses"]) == 100
+
+
+def test_ci_evidence_check_run_pagination_failure_preserves_observed_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Later check-run page failures keep already-fetched failures actionable."""
+
+    def fake_etag_get(path: str) -> dict:
+        if "check-runs" in path and path.endswith("&page=1"):
+            return {
+                "check_runs": [
+                    {"name": "unit", "conclusion": "failure", "id": 1}
+                ]
+                + [
+                    {"name": f"extra-{idx}", "conclusion": "success", "id": idx + 2}
+                    for idx in range(99)
+                ],
+            }
+        if "check-runs" in path and path.endswith("&page=2"):
+            raise RuntimeError("HTTP 503")
+        if "/status?" in path:
+            return {"state": "pending", "statuses": []}
+        raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr("src.github.cache._etag_get", fake_etag_get)
+    monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
+
+    evidence = _fetch_ci_evidence_rest("owner/name", "abc123")
+
+    assert evidence.ci_status == CIStatus.FAILURE
+    assert evidence.pending_reason is None
+    assert evidence.check_runs_source.complete is False
+    assert evidence.check_runs_source.reason == "check_runs_fetch_failed"
+    assert len(evidence.check_runs) == 100
+
+
+def test_ci_evidence_legacy_slurped_check_run_page_with_bad_runs_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed slurped check-run pages do not become complete empties."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in a for a in args):
+            return [{"check_runs": "bad"}]
+        return {"state": "pending", "statuses": []}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    evidence = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        allow_merge_without_checks=True,
+    )
+
+    assert evidence.ci_status == CIStatus.PENDING
+    assert evidence.pending_reason == "check_runs_unexpected_payload"
+    assert evidence.check_runs_source.complete is False
 
 
 def test_ci_evidence_collapses_check_run_reruns_by_identity(
@@ -3990,10 +4037,9 @@ def test_ci_evidence_unexpected_status_payload_is_incomplete(
     """A non-dict/non-json status payload cannot be treated as complete."""
 
     monkeypatch.setattr(
-        "src.github.cache._gh_api_paginated",
-        lambda path: [{"check_runs": []}],
+        "src.github.cache._etag_get",
+        lambda path: {"check_runs": []} if "check-runs" in path else 123,
     )
-    monkeypatch.setattr("src.github.cache._etag_get", lambda path: 123)
 
     evidence = _fetch_ci_evidence_rest(
         "owner/name",
@@ -4165,7 +4211,7 @@ def test_fetch_ci_status_rest_ignores_non_list_pages(
 def test_fetch_ci_status_rest_skips_non_dict_pages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Non-dict and non-list ``check_runs`` entries are tolerated."""
+    """Malformed check-run pages are treated as incomplete evidence."""
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
@@ -4179,7 +4225,7 @@ def test_fetch_ci_status_rest_skips_non_dict_pages(
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     check_runs, _, _ = _fetch_ci_status_rest("owner/name", "abc123")
-    assert check_runs == [{"conclusion": "success"}]
+    assert check_runs == []
 
 
 def test_fetch_ci_status_rest_hydrates_annotations_for_failing_run(

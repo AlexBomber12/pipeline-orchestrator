@@ -319,32 +319,7 @@ def _fetch_ci_evidence_rest(
             allow_merge_without_checks=allow_merge_without_checks,
         )
 
-    check_runs: list[dict] = []
-    status_payload: dict = {}
-
-    # check-runs is a paginated endpoint (per_page max 100). A commit can
-    # carry more than 100 runs, and ``_map_rest_ci_status_to_enum`` reads
-    # every entry — truncating to page 1 would let a failing or pending
-    # run beyond the cap masquerade as SUCCESS and misclassify the PR as
-    # mergeable, so we walk every page rather than relying on ETag-cached
-    # single-page reads.
-    check_runs_path = f"repos/{repo}/commits/{sha}/check-runs?per_page=100"
-    check_runs_source = _source_failed("check_runs_fetch_failed")
-    try:
-        cr_pages = cache._gh_api_paginated(check_runs_path)
-    except RuntimeError:
-        cr_pages = None
-    if isinstance(cr_pages, list):
-        check_runs_source = _source_ok()
-        for page in cr_pages:
-            if not isinstance(page, dict):
-                check_runs_source = _source_failed("check_runs_unexpected_payload")
-                continue
-            runs = page.get("check_runs")
-            if isinstance(runs, list):
-                check_runs.extend(r for r in runs if isinstance(r, dict))
-    elif cr_pages is not None:
-        check_runs_source = _source_failed("check_runs_unexpected_payload")
+    check_runs, check_runs_source = _fetch_check_runs_payload(repo, sha)
 
     # PR-251 (OBS-BC): GitHub's check-runs REST payload exposes only
     # ``annotations_count`` + ``annotations_url`` — not the annotation
@@ -388,6 +363,60 @@ def _parse_status_payload(raw_status: object) -> dict | None:
         if isinstance(parsed, dict):
             return parsed
     return None
+
+
+def _extract_check_runs_from_page(page: dict) -> list[dict] | None:
+    runs = page.get("check_runs")
+    if not isinstance(runs, list):
+        return None
+    return [run for run in runs if isinstance(run, dict)]
+
+
+def _fetch_check_runs_payload(
+    repo: str,
+    sha: str,
+) -> tuple[list[dict], CISourceCompleteness]:
+    check_runs_path = f"repos/{repo}/commits/{sha}/check-runs?per_page=100"
+    check_runs: list[dict] = []
+
+    for page_num in itertools.count(1):
+        page_path = f"{check_runs_path}&page={page_num}"
+        try:
+            raw_page = retry_transient(
+                lambda p=page_path: cache._etag_get(p),
+                operation_name=f"gh api {page_path}",
+            )
+        except RuntimeError:
+            if page_num == 1:
+                return [], _source_failed("check_runs_fetch_failed")
+            return check_runs, _source_failed("check_runs_fetch_failed")
+
+        if isinstance(raw_page, list):
+            source = _source_ok()
+            for page in raw_page:
+                if not isinstance(page, dict):
+                    return check_runs, _source_failed("check_runs_unexpected_payload")
+                runs = _extract_check_runs_from_page(page)
+                if runs is None:
+                    return check_runs, _source_failed("check_runs_unexpected_payload")
+                check_runs.extend(runs)
+            return check_runs, source
+
+        if not isinstance(raw_page, dict):
+            reason = (
+                "check_runs_fetch_failed"
+                if raw_page is None
+                else "check_runs_unexpected_payload"
+            )
+            return check_runs, _source_failed(reason)
+
+        page_runs = _extract_check_runs_from_page(raw_page)
+        if page_runs is None:
+            return check_runs, _source_failed("check_runs_unexpected_payload")
+        check_runs.extend(page_runs)
+        if len(page_runs) < 100:
+            break
+    return check_runs, _source_ok()
 
 
 def _fetch_combined_status_payload(
@@ -946,6 +975,20 @@ def _classify_raw_ci_status_for_age(
     fetch_ok: bool,
     required_checks: tuple[str, ...],
 ) -> CIStatus:
+    if not fetch_ok:
+        contexts = tuple(
+            _collapse_check_run_contexts(runs_payload)
+            + _collapse_status_contexts(statuses_payload)
+        )
+        visible_failure = _map_observed_contexts_to_enum(
+            runs_payload,
+            statuses_payload,
+            contexts,
+        )
+        if visible_failure in {CIStatus.FAILURE, CIStatus.INFRA_FAILURE}:
+            return visible_failure
+        return CIStatus.PENDING
+
     if not required_checks:
         return _map_rest_ci_status_to_enum(
             runs_payload,
@@ -965,8 +1008,6 @@ def _classify_raw_ci_status_for_age(
     )
     if visible_failure in {CIStatus.FAILURE, CIStatus.INFRA_FAILURE}:
         return visible_failure
-    if not fetch_ok:
-        return CIStatus.PENDING
     for required in required_checks:
         matches = [ctx for ctx in contexts if ctx.display_name == required]
         if not matches:

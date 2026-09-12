@@ -587,8 +587,12 @@ def test_handle_watch_reclassified_pending_routes_to_fix(
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
     monkeypatch.setattr(
-        "src.github.checks._fetch_ci_status_rest",
-        lambda repo, sha: ([{"status": "in_progress"}], {}, True),
+        "src.github.checks._fetch_ci_evidence_rest",
+        lambda repo, sha, **kw: types.SimpleNamespace(
+            check_runs=[{"status": "in_progress"}],
+            status_payload={},
+            complete=True,
+        ),
     )
 
     fix_calls: list[None] = []
@@ -639,8 +643,12 @@ def test_handle_watch_pending_within_threshold_does_not_reclassify(
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
     monkeypatch.setattr(
-        "src.github.checks._fetch_ci_status_rest",
-        lambda repo, sha: ([{"status": "in_progress"}], {}, True),
+        "src.github.checks._fetch_ci_evidence_rest",
+        lambda repo, sha, **kw: types.SimpleNamespace(
+            check_runs=[{"status": "in_progress"}],
+            status_payload={},
+            complete=True,
+        ),
     )
 
     runner = h._make_runner()
