@@ -8,6 +8,10 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.completion_evidence import (
+    CompletionEvidenceUnavailable,
+    get_recorded_completions,
+)
 from src.github import GhPrMergedBranchesUnavailable, gh_pr_get_merged_branches
 from src.github.prs import extract_queue_pr_id
 from src.models import PRInfo, QueueTask, TaskStatus
@@ -70,6 +74,7 @@ def _resolve_merged_state(
     *,
     log_event: Callable[[str], None],
 ) -> MergedState:
+    candidate_pr_ids = set(candidate_pr_ids)
     candidate_branches = {header.branch for header in headers if header.branch}
     try:
         merged_branches = gh_pr_get_merged_branches(owner_repo, candidate_branches)
@@ -85,8 +90,14 @@ def _resolve_merged_state(
         log_event(f"[INFRA] gh pr list merged-branches probe failed: {exc}")
 
     merged_pr_ids = get_merged_pr_ids(repo_path, base_branch, candidate_pr_ids)
+    try:
+        recorded = get_recorded_completions(
+            repo_path, base_branch, owner_repo, candidate_pr_ids,
+        )
+    except CompletionEvidenceUnavailable as exc:
+        raise MergeStatusUnavailable(str(exc)) from exc
     return MergedState(
-        merged_pr_ids=set(merged_pr_ids),
+        merged_pr_ids=set(merged_pr_ids) | recorded,
         merged_branches=set(merged_branches),
         api_available=api_available,
     )
@@ -189,6 +200,9 @@ def _branch_matches_task_pr(
 def _branch_name_matches_task_pr_id(pr_id: str, branch: str) -> bool:
     """Return True when a task branch name carries its queue PR id."""
     branch_name = branch.lower()
+    prefix, separator, remainder = branch_name.partition("/")
+    if separator and prefix in {"fix", "feat", "docs", "chore", "refactor", "test"}:
+        branch_name = remainder
     pr_id_name = pr_id.lower()
     candidates = {
         pr_id_name,

@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
+from src.completion_evidence import (
+    CompletionEvidenceUnavailable,
+    get_recorded_completions,
+)
 from src.daemon.handlers import idle as idle_module
 from src.github import GhPrMergedBranchesUnavailable
 from src.models import PRInfo, QueueTask, TaskStatus
 from src.queue_parser import QueueValidationError, TaskHeader
 from src.task_status import (
-    MergeStatusUnavailable,
     MergedState,
+    MergeStatusUnavailable,
     _load_task_header,
     _resolve_merged_state,
     derive_queue_task_statuses,
@@ -1307,3 +1313,214 @@ def test_positive_evidence_and_error_survive_api_outage(evidence: str) -> None:
     )
     expected = {"open": TaskStatus.DOING, "error": TaskStatus.ERROR}.get(evidence, TaskStatus.DONE)
     assert status == expected
+
+
+@pytest.mark.parametrize("prefix", ["fix", "feat", "docs", "chore", "refactor", "test"])
+def test_prefixed_branch_merge_is_done_without_pr_list(prefix: str) -> None:
+    branch = f"{prefix}/pr-085-existing"
+    assert derive_task_status(
+        _header(branch), _merged_state(branches={branch}), [],
+    ) == TaskStatus.DONE
+
+
+@pytest.mark.parametrize("branch", [
+    "fix/pr-0850-existing", "feat/pr-085a-existing", "docs/pr-999-existing",
+    "fix/pr-999/pr-085-existing", "unrelated/pr-085-existing",
+])
+def test_prefixed_branch_does_not_weaken_task_identity(branch: str) -> None:
+    assert derive_task_status(
+        _header(branch), _merged_state(branches={branch}), [],
+    ) == TaskStatus.TODO
+
+
+def _completion_git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=Fixture",
+         "-c", "user.email=fixture@example.invalid", *args],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+@pytest.fixture
+def completion_repo(tmp_path: Path):
+    _write_task_file(tmp_path, "PR-085", "Existing task", "pr-085-planned")
+    _completion_git(tmp_path, "init", "-b", "main")
+    _completion_git(tmp_path, "add", "tasks")
+    _completion_git(tmp_path, "commit", "-m", "MICRO: implement existing task")
+    record = {
+        "schema_version": 1,
+        "repository": "octo/demo",
+        "base_branch": "main",
+        "completions": {"PR-085": {
+            "task_sha256": hashlib.sha256(
+                (tmp_path / "tasks/PR-085.md").read_bytes()
+            ).hexdigest(),
+            "merge_commit": _completion_git(tmp_path, "rev-parse", "HEAD"),
+            "pull_request": 387,
+            "reason": "Implemented through a separately reviewed MICRO PR",
+        }},
+    }
+    _write_completion_record(tmp_path, record)
+    _completion_git(tmp_path, "add", "tasks/completions.json")
+    _completion_git(tmp_path, "commit", "-m", "Record verified completion")
+    _completion_git(tmp_path, "update-ref", "refs/remotes/origin/main", "HEAD")
+    return tmp_path, record
+
+
+def _write_completion_record(repo: Path, record: dict) -> None:
+    (repo / "tasks/completions.json").write_text(json.dumps(record), encoding="utf-8")
+
+
+def test_recorded_completion_checks_real_git_ancestry(completion_repo) -> None:
+    repo, _ = completion_repo
+    assert get_merged_pr_ids(str(repo), "main", {"PR-085"}) == set()
+    assert get_recorded_completions(str(repo), "main", "OCTO/DEMO", {"PR-085"}) == {"PR-085"}
+    assert get_recorded_completions(str(repo), "main", "octo/demo", {"PR-999"}) == set()
+    _completion_git(repo, "update-ref", "-d", "refs/remotes/origin/main")
+    assert get_recorded_completions(str(repo), "main", "octo/demo", {"PR-085"}) == {"PR-085"}
+
+
+def test_completion_receipt_is_not_inherited_by_changed_task(completion_repo) -> None:
+    repo, _ = completion_repo
+    path = repo / "tasks/PR-085.md"
+    path.write_text(path.read_text() + "\nChanged requirements.\n", encoding="utf-8")
+    assert get_recorded_completions(str(repo), "main", "octo/demo", {"PR-085"}) == set()
+
+
+@pytest.mark.parametrize("owner,base", [("other/repo", "main"), ("octo/demo", "release")])
+def test_completion_receipt_is_scoped_to_repository_and_base(completion_repo, owner, base) -> None:
+    repo, _ = completion_repo
+    with pytest.raises(CompletionEvidenceUnavailable, match="does not match"):
+        get_recorded_completions(str(repo), base, owner, {"PR-085"})
+
+
+@pytest.mark.parametrize("failure", ["missing_commit", "other_branch", "missing_base", "missing_task"])
+def test_unverifiable_completion_defers_instead_of_claiming_done(completion_repo, failure) -> None:
+    repo, record = completion_repo
+    if failure == "missing_commit":
+        record["completions"]["PR-085"]["merge_commit"] = "f" * 40
+    elif failure == "other_branch":
+        _completion_git(repo, "checkout", "-b", "other")
+        _completion_git(repo, "commit", "--allow-empty", "-m", "Unmerged work")
+        record["completions"]["PR-085"]["merge_commit"] = _completion_git(repo, "rev-parse", "HEAD")
+        _completion_git(repo, "checkout", "main")
+    elif failure == "missing_base":
+        _completion_git(repo, "update-ref", "-d", "refs/remotes/origin/main")
+        _completion_git(repo, "update-ref", "-d", "refs/heads/main")
+    else:
+        (repo / "tasks/PR-085.md").unlink()
+    _write_completion_record(repo, record)
+    with pytest.raises(CompletionEvidenceUnavailable):
+        get_recorded_completions(str(repo), "main", "octo/demo", {"PR-085"})
+
+
+@pytest.mark.parametrize("raw", ["{}", "not JSON", '{"schema_version": 2}'])
+def test_invalid_completion_manifest_fails_closed(completion_repo, raw) -> None:
+    repo, _ = completion_repo
+    (repo / "tasks/completions.json").write_text(raw, encoding="utf-8")
+    with pytest.raises(CompletionEvidenceUnavailable, match="Invalid"):
+        get_recorded_completions(str(repo), "main", "octo/demo", {"PR-085"})
+
+
+def test_duplicate_completion_fields_are_rejected(completion_repo) -> None:
+    repo, record = completion_repo
+    raw = json.dumps(record).replace('"schema_version": 1', '"schema_version": 1, "schema_version": 1')
+    (repo / "tasks/completions.json").write_text(raw, encoding="utf-8")
+    with pytest.raises(CompletionEvidenceUnavailable, match="Invalid"):
+        get_recorded_completions(str(repo), "main", "octo/demo", {"PR-085"})
+
+
+@pytest.mark.parametrize("field,value", [
+    ("task_sha256", "invalid"), ("merge_commit", "HEAD"),
+    ("pull_request", -1), ("pull_request", True), ("reason", ""), ("unexpected", "value"),
+])
+def test_invalid_completion_records_are_rejected(completion_repo, field, value) -> None:
+    repo, record = completion_repo
+    record["completions"]["PR-085"][field] = value
+    _write_completion_record(repo, record)
+    with pytest.raises(CompletionEvidenceUnavailable, match="Invalid"):
+        get_recorded_completions(str(repo), "main", "octo/demo", {"PR-085"})
+
+
+def test_completion_record_task_ids_cannot_escape_task_directory(completion_repo) -> None:
+    repo, record = completion_repo
+    record["completions"]["PR-../../outside"] = record["completions"].pop("PR-085")
+    _write_completion_record(repo, record)
+    with pytest.raises(CompletionEvidenceUnavailable, match="Invalid"):
+        get_recorded_completions(str(repo), "main", "octo/demo", {"PR-085"})
+
+
+@pytest.mark.parametrize("failure", [PermissionError("denied"), UnicodeError("invalid encoding")])
+def test_unreadable_completion_manifest_fails_closed(monkeypatch, failure) -> None:
+    def fail_read(*args, **kwargs):
+        raise failure
+    monkeypatch.setattr(Path, "read_text", fail_read)
+    with pytest.raises(CompletionEvidenceUnavailable, match="Cannot read"):
+        get_recorded_completions("/repo", "main", "octo/demo", {"PR-085"})
+
+
+@pytest.mark.parametrize("failure", [OSError("git unavailable"), subprocess.TimeoutExpired("git", 10)])
+def test_completion_git_failure_fails_closed(completion_repo, monkeypatch, failure) -> None:
+    repo, _ = completion_repo
+    def fail_git(*args):
+        raise failure
+    monkeypatch.setattr("src.completion_evidence._git", fail_git)
+    with pytest.raises(CompletionEvidenceUnavailable, match="Cannot verify"):
+        get_recorded_completions(str(repo), "main", "octo/demo", {"PR-085"})
+
+
+def test_missing_completion_manifest_preserves_existing_behavior(tmp_path) -> None:
+    assert get_recorded_completions(str(tmp_path), "main", "octo/demo", {"PR-085"}) == set()
+
+
+@pytest.mark.parametrize("available", [True, False])
+def test_resolver_uses_receipt_with_or_without_github(completion_repo, monkeypatch, available) -> None:
+    repo, record = completion_repo
+    def branches(*args):
+        if not available:
+            raise GhPrMergedBranchesUnavailable("offline")
+        return set()
+    monkeypatch.setattr("src.task_status.gh_pr_get_merged_branches", branches)
+    for _ in range(2):
+        state = _resolve_merged_state(
+            str(repo), "main", "octo/demo", iter(["PR-085"]),
+            [_header("pr-085-planned")], log_event=lambda _: None,
+        )
+        assert state.merged_pr_ids == {"PR-085"}
+        assert state.api_available is available
+        assert derive_task_status(_header("pr-085-planned"), state, []) == TaskStatus.DONE
+    record["completions"]["PR-085"]["merge_commit"] = "f" * 40
+    _write_completion_record(repo, record)
+    with pytest.raises(MergeStatusUnavailable, match="Completion commit"):
+        _resolve_merged_state(
+            str(repo), "main", "octo/demo", {"PR-085"},
+            [_header("pr-085-planned")], log_event=lambda _: None,
+        )
+
+
+@pytest.mark.parametrize("evidence", ["fix", "feat", "docs", "receipt_online", "receipt_offline"])
+def test_restart_and_idle_agree_without_dispatch(completion_repo, monkeypatch, evidence) -> None:
+    repo, _ = completion_repo
+    path = repo / "tasks/PR-085.md"
+    is_receipt = evidence.startswith("receipt")
+    if not is_receipt:
+        path.write_text(path.read_text().replace("pr-085-planned", f"{evidence}/pr-085-planned"))
+    before = path.read_bytes()
+
+    def branches(*args):
+        if evidence == "receipt_offline":
+            raise GhPrMergedBranchesUnavailable("offline")
+        return set() if is_receipt else {f"{evidence}/pr-085-planned"}
+
+    monkeypatch.setattr("src.task_status.gh_pr_get_merged_branches", branches)
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *args, **kwargs: [])
+    for _ in range(2):
+        runner = h._make_runner()
+        runner.repo_path = str(repo)
+        assert asyncio.run(runner._recover_state_headers()) is True
+        assert runner.state.queue_done == runner.state.queue_total == 1
+        assert runner.state.current_task is None
+        assert [t.status for t in runner.state.current_queue] == [TaskStatus.DONE]
+        assert asyncio.run(h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG(runner)) is None
+        assert [t.status for t in runner._idle_dag_tasks] == [TaskStatus.DONE]
+        assert path.read_bytes() == before

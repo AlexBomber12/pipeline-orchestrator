@@ -44,6 +44,46 @@ queue snapshot is preserved, and an INFRA event explains the delay.
 Without a previous snapshot, recovery remains incomplete until the
 lookup succeeds. No new persistent completion cache is introduced.
 
+### Work completed through a different PR
+
+Merged task branches may use `fix/`, `feat/`, `docs/`, `chore/`, `refactor/`,
+or `test/` before the task ID. Recovery and IDLE recognize the same branch
+evidence. Exact branch equality and the task-ID boundary are still required:
+`fix/pr-011-work` does not prove completion of `PR-01` or `PR-011a`.
+
+If a separate MICRO PR implemented an existing task, a repository owner can
+record that reviewed relationship in `tasks/completions.json`. This preserves
+the original specification and its planned Branch. It is an explicit
+completion record, not an automatically populated cache or a status override.
+
+The version 1 manifest contains `repository` (`owner/repo`), `base_branch`,
+and `completions`, a map from task IDs to records. Each record requires:
+
+- `task_sha256`: SHA-256 of the exact task file bytes.
+- `merge_commit`: full 40-character SHA of the implementing PR's merge commit.
+- `pull_request`: positive GitHub PR number in that repository.
+- `reason`: explanation of the relationship, including the PR URL.
+
+The owner reviews the task-to-PR relationship and confirms the PR was merged
+into the configured base before adding a record. Runtime does not infer that
+relationship from similar titles or from `status: DONE`. It verifies the
+repository/base scope, current task hash, and commit ancestry in
+`origin/<base_branch>` (or the local base branch if the remote ref is absent).
+ERROR suppression retains precedence. A changed task does not inherit the
+record. Invalid manifests, unreadable matching tasks, unavailable Git history,
+and commits outside the base defer selection/recovery instead of assigning
+TODO. Missing manifests preserve the existing behavior.
+
+Recovery, IDLE, and queue-status refresh share this verification. Verified
+records also work during a GitHub outage. The PR number/reason are reviewed
+provenance; runtime verifies the pinned commit locally and does not re-query
+that PR. No Redis state or historical task-file rewrite is required.
+
+When deploying a new record, update the daemon's managed repository clone
+under `/data/repos/<owner>__<repo>` before starting the daemon. Updating the
+application checkout alone does not update that separate task corpus.
+The record must be present there, with its referenced commit in local history.
+
 ## Frontmatter status field
 
 Task files include YAML frontmatter before the task header:
