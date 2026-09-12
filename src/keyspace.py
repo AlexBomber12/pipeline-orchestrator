@@ -40,6 +40,26 @@ def control_recover(repo_name: str) -> str:
     return f"control:{repo_name}:recover"
 
 
+def retry_command(repo_name: str, command_id: str) -> str:
+    """Durable payload for one operator Retry command."""
+    return f"control:{repo_name}:retry:command:{command_id}"
+
+
+def retry_command_pending(repo_name: str) -> str:
+    """Ordered set of Retry commands awaiting daemon reconciliation."""
+    return f"control:{repo_name}:retry:pending"
+
+
+def retry_command_dedupe(repo_name: str, request_binding: str) -> str:
+    """Idempotency pointer for a stable browser Retry request binding."""
+    return f"control:{repo_name}:retry:dedupe:{request_binding}"
+
+
+def retry_command_latest(repo_name: str, task_id: str) -> str:
+    """Pointer to the latest Retry command for a task, used by the UI."""
+    return f"control:{repo_name}:retry:latest:{task_id}"
+
+
 def upload_pending(repo_name: str) -> str:
     """Key for the pending-upload manifest consumed by the daemon."""
     return f"upload:{repo_name}:pending"

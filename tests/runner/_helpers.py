@@ -341,6 +341,10 @@ class _FakePipeline:
         self.commands.append(("expire", (key, seconds), {}))
         return self
 
+    def zrem(self, key: str, *members: str) -> "_FakePipeline":
+        self.commands.append(("zrem", (key, *members), {}))
+        return self
+
     async def execute(self) -> list[object]:
         results: list[object] = []
         for command, args, kwargs in self.commands:
@@ -351,6 +355,8 @@ class _FakePipeline:
                 results.append(await self.redis.zadd(args[0], args[1]))
             elif command == "expire":
                 results.append(await self.redis.expire(args[0], args[1]))
+            elif command == "zrem":
+                results.append(await self.redis.zrem(args[0], *args[1:]))
         return results
 
 

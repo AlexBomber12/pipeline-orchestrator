@@ -261,7 +261,7 @@ async def test_task_spec_hash_helpers_decode_bytes_and_delete() -> None:
 
 
 def test_task_spec_content_hash_ignores_frontmatter_status() -> None:
-    error_text = "---\nstatus: ERROR\n---\n\nBody\n"
+    error_text = "---\nstatus: ERROR\nblocked_reason: daemon\n---\n\nBody\n"
     todo_text = "---\nstatus: TODO\n---\n\nBody\n"
     changed_text = "---\nstatus: TODO\n---\n\nChanged\n"
     plain_text = "status: ERROR\n\nBody\n"

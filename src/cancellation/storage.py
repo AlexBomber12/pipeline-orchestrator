@@ -97,7 +97,7 @@ def current_run_started_at_key(repo_slug: str, task_id: str) -> str:
 
 
 def task_spec_content_hash(task_text: str) -> str:
-    """Hash task spec content excluding daemon-managed frontmatter status."""
+    """Hash task spec content excluding daemon-managed frontmatter fields."""
     lines = task_text.splitlines(keepends=True)
     first_content_index = next(
         (index for index, raw_line in enumerate(lines) if raw_line.strip()),
@@ -120,7 +120,9 @@ def task_spec_content_hash(task_text: str) -> str:
             frontmatter = [
                 raw_line
                 for raw_line in lines[first_content_index + 1 : closing_index]
-                if not re.match(r"^status:\s*", raw_line.rstrip())
+                if not re.match(
+                    r"^(?:status|blocked_reason):\s*", raw_line.rstrip()
+                )
             ]
             if any(raw_line.strip() for raw_line in frontmatter):
                 normalized = (

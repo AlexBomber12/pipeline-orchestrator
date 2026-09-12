@@ -1,67 +1,58 @@
-"""Tests for the per-task operator retry endpoint."""
+"""Contract tests for the durable per-task operator Retry endpoint."""
 
 from __future__ import annotations
 
-import subprocess
+import asyncio
+import re
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from src.cancellation.storage import cause_key, index_key
-from src.models import PipelineState, QueueTask, RepoState, TaskStatus
+from src.cancellation.storage import CancellationCause, cause_key
+from src.daemon import retry_commands as daemon_retry
+from src.keyspace import (
+    pipeline_state as pipeline_state_key,
+    retry_command,
+    retry_command_dedupe,
+    retry_command_pending,
+)
+from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
+from src.retry_commands import (
+    RetryCommandStatus,
+    RetryExecutionState,
+    load_latest_retry_command,
+    new_retry_command,
+)
 from src.web import app as web_app
 from src.web.app import app
 from src.web.routes import repo_control
 
+from tests.runner import _helpers as runner_helpers
+from tests.runner._helpers import _FakeRedis
 
-class _RetryRedis:
-    def __init__(self, store: dict[str, str] | None = None) -> None:
-        self.store = store or {}
-        self.deleted: list[str] = []
-        self.zremmed: list[tuple[str, tuple[str, ...]]] = []
-        self.expiries: dict[str, int] = {}
 
+class _WebRedis(_FakeRedis):
     async def ping(self) -> bool:
         return True
-
-    async def get(self, key: str) -> str | None:
-        return self.store.get(key)
-
-    def multi(self) -> None:
-        return None
-
-    def set(
-        self,
-        key: str,
-        value: str,
-        ex: int | None = None,
-        nx: bool = False,
-    ) -> bool:
-        if nx and key in self.store:
-            return False
-        self.store[key] = value
-        if ex is not None:
-            self.expiries[key] = ex
-        return True
-
-    async def delete(self, key: str) -> int:
-        self.deleted.append(key)
-        return 1 if self.store.pop(key, None) is not None else 0
-
-    async def zrem(self, key: str, *members: str) -> int:
-        self.zremmed.append((key, members))
-        return 1
-
-    async def transaction(self, callback: Any, *keys: str, value_from_callable: bool = False) -> Any:
-        result = await callback(self)
-        return result if value_from_callable else None
 
     async def aclose(self) -> None:
         return None
 
 
-def _aioredis(redis_client: _RetryRedis) -> object:
+class _GetFailureRedis(_WebRedis):
+    async def get(self, key: str) -> str | None:
+        if key.startswith("cancellation:"):
+            raise RuntimeError("redis read failed")
+        return await super().get(key)
+
+
+class _TransactionFailureRedis(_WebRedis):
+    async def transaction(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("redis write failed")
+
+
+def _aioredis(redis_client: _WebRedis) -> object:
     return type(
         "_Aioredis",
         (),
@@ -69,1686 +60,579 @@ def _aioredis(redis_client: _RetryRedis) -> object:
     )()
 
 
-def _write_config_and_task(
+def _task_text(*, status: str = "ERROR", body: str = "Retry body") -> str:
+    blocked_reason = "blocked_reason: daemon\n" if status == "ERROR" else ""
+    return (
+        "---\n"
+        f"status: {status}\n"
+        f"{blocked_reason}"
+        "---\n\n"
+        "# PR-283: Retry me\n\n"
+        "Branch: fix/pr-283\n"
+        "- Type: bugfix\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 2\n"
+        "- Coder: codex\n\n"
+        "## Problem\n"
+        f"{body}\n"
+    )
+
+
+def _setup_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
-    task_name: str = "PR-283",
-    status: str = "ERROR",
-    branch: str = "main",
-) -> Path:
-    cfg = tmp_path / "config.yml"
-    cfg.write_text(
+    redis_client: _WebRedis | None = None,
+    status: TaskStatus = TaskStatus.ERROR,
+    pipeline_state: PipelineState = PipelineState.ERROR,
+    retry_count: int = 0,
+    current_pr: PRInfo | None = None,
+) -> tuple[Path, _WebRedis]:
+    (tmp_path / "config.yml").write_text(
         "repositories:\n"
         "  - url: https://github.com/example/alpha.git\n"
-        f"    branch: {branch}\n"
+        "    branch: main\n"
         "daemon:\n"
         "  retry_button_cap: 3\n",
         encoding="utf-8",
     )
+    repo = tmp_path / "repos" / "example__alpha"
+    task_path = repo / "tasks" / "PR-283.md"
+    task_path.parent.mkdir(parents=True, exist_ok=True)
+    task_path.write_text(_task_text(status=status.value), encoding="utf-8")
+    task = QueueTask(
+        pr_id="PR-283",
+        title="Retry me",
+        status=status,
+        task_file="tasks/PR-283.md",
+        branch="fix/pr-283",
+        priority=2,
+    )
+    state = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=pipeline_state,
+        current_task=(task if pipeline_state == PipelineState.ERROR else None),
+        current_pr=current_pr,
+        current_queue=[task],
+        error_message="coder failed",
+    )
+    redis_client = redis_client or _WebRedis()
+    redis_client.store["pipeline:example__alpha"] = state.model_dump_json()
+    if retry_count:
+        redis_client.store["metrics:retry_count:example__alpha:PR-283"] = str(
+            retry_count
+        )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(web_app, "REPOS_DIR", str(tmp_path / "repos"))
-    repo_dir = tmp_path / "repos" / "example__alpha"
-    (repo_dir / "tasks").mkdir(parents=True)
-    (repo_dir / "tasks" / f"{task_name}.md").write_text(
-        f"---\nstatus: {status}\n---\n\n# {task_name}: Retry me\n\nBody\n",
-        encoding="utf-8",
-    )
-    return repo_dir
-
-
-def _snapshot(tasks: list[QueueTask]) -> str:
-    state = RepoState(
-        url="https://github.com/example/alpha.git",
-        name="example__alpha",
-        state=PipelineState.IDLE,
-        current_queue=tasks,
-    )
-    return state.model_dump_json()
-
-
-def _state_snapshot(
-    state: PipelineState,
-    tasks: list[QueueTask] | None = None,
-    *,
-    user_paused: bool = False,
-) -> str:
-    repo_state = RepoState(
-        url="https://github.com/example/alpha.git",
-        name="example__alpha",
-        state=state,
-        user_paused=user_paused,
-        current_queue=tasks or [],
-    )
-    return repo_state.model_dump_json()
-
-
-def test_retry_increments_counter_clears_cause_writes_queued(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repo_dir = _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis(
-        {
-            "pipeline:example__alpha": _snapshot(
-                [
-                    QueueTask(
-                        pr_id="PR-283",
-                        title="Retry me",
-                        status=TaskStatus.ERROR,
-                        task_file="tasks/PR-283.md",
-                    )
-                ]
-            ),
-            cause_key("example__alpha", "PR-283"): "{}",
-        }
-    )
     monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+    monkeypatch.setattr(repo_control, "write_audit_record", lambda *args: None)
+    return task_path, redis_client
 
-    git_calls: list[list[str]] = []
 
-    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        git_calls.append(args)
-        return subprocess.CompletedProcess(args, 0, "", "")
-
-    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
+def _rendered_binding(client: TestClient) -> str:
+    response = client.get("/repos/example__alpha/tasks")
     assert response.status_code == 200
-    assert redis_client.store["metrics:retry_count:example__alpha:PR-283"] == "1"
-    assert redis_client.expiries["metrics:retry_count:example__alpha:PR-283"] == 30 * 24 * 3600
-    assert cause_key("example__alpha", "PR-283") not in redis_client.store
-    assert cause_key("example__alpha", "PR-283") in redis_client.deleted
-    assert "control:retry_reservation:example__alpha" in redis_client.deleted
-    assert redis_client.zremmed == [(index_key("example__alpha"), ("PR-283",))]
-    assert "status: TODO" in (repo_dir / "tasks" / "PR-283.md").read_text(encoding="utf-8")
-    assert ["git", "-C", str(repo_dir), "add", "tasks/PR-283.md"] in git_calls
-    assert [
-        "git",
-        "-C",
-        str(repo_dir),
-        "commit",
-        "-m",
-        "[RETRY] PR-283 cleared by operator (attempt 1/3)",
-        "-m",
-        "[skip ci]",
-        "--",
-        "tasks/PR-283.md",
-    ] in git_calls
-    assert ["git", "-C", str(repo_dir), "push", "origin", "HEAD:main"] in git_calls
-    assert "TODO" in response.text
-    assert "PR-283" in response.text
+    match = re.search(r'"retry_binding":"([0-9a-f]{64})"', response.text)
+    assert match is not None, response.text
+    return match.group(1)
 
 
-def test_retry_git_timeout_returns_503_and_releases_repo_reservation(
+def test_retry_only_enqueues_and_duplicate_delivery_is_idempotent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis({"pipeline:example__alpha": _state_snapshot(PipelineState.IDLE)})
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+    task_path, redis_client = _setup_retry(tmp_path, monkeypatch)
+    original = task_path.read_text(encoding="utf-8")
+    wake_calls: list[str] = []
 
-    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        assert kwargs["timeout"] == repo_control._RETRY_GIT_TIMEOUT_SECONDS
-        raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+    async def publish_wake(redis: Any, repo: str, event: str) -> None:
+        assert redis is redis_client
+        assert repo == "example__alpha"
+        wake_calls.append(event)
 
-    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    monkeypatch.setattr(web_app, "publish_wake", publish_wake)
+    monkeypatch.setattr(
+        repo_control.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("Retry web handler must not run git"),
+    )
 
     with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+        binding = _rendered_binding(client)
+        first = client.post(
+            "/repos/example__alpha/tasks/PR-283/retry",
+            data={"retry_binding": binding},
+        )
+        second = client.post(
+            "/repos/example__alpha/tasks/PR-283/retry",
+            data={"retry_binding": binding},
+        )
 
-    assert response.status_code == 503
-    assert "Failed to commit retry change" in response.text
+    assert first.status_code == second.status_code == 202
+    assert task_path.read_text(encoding="utf-8") == original
     assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
-    assert "control:retry_reservation:example__alpha" in redis_client.deleted
-    stored_state = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
-    assert stored_state.user_paused is False
+    assert redis_client.zsets[retry_command_pending("example__alpha")]
+    assert len(redis_client.zsets[retry_command_pending("example__alpha")]) == 1
+    command = asyncio.run(
+        load_latest_retry_command(redis_client, "example__alpha", "PR-283")
+    )
+    assert command is not None
+    assert command.status == RetryCommandStatus.QUEUED
+    assert command.request_binding == binding
+    assert command.task_fingerprint == repo_control._task_retry_fingerprint(task_path)
+    assert wake_calls == ["retry_command"]
+    assert "Retry accepted" in first.text
 
 
-def test_retry_success_publishes_wake_event(
+def test_web_command_reaches_parked_daemon_and_dispatches_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis()
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-    monkeypatch.setattr(
-        repo_control.subprocess,
-        "run",
-        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
-    )
-
-    wake_calls: list[tuple[Any, str, str]] = []
-
-    async def fake_publish_wake(redis: Any, repo_name: str, event_type: str) -> None:
-        wake_calls.append((redis, repo_name, event_type))
-
-    monkeypatch.setattr(web_app, "publish_wake", fake_publish_wake)
-
+    task_path, redis_client = _setup_retry(tmp_path, monkeypatch)
     with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+        binding = _rendered_binding(client)
+        response = client.post(
+            "/repos/example__alpha/tasks/PR-283/retry",
+            data={"retry_binding": binding},
+        )
+    assert response.status_code == 202
 
-    assert response.status_code == 200
-    assert wake_calls == [(redis_client, "example__alpha", "retry")]
-
-
-def test_retry_allows_missing_frontmatter_status_when_snapshot_is_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repo_dir = _write_config_and_task(tmp_path, monkeypatch)
-    task_path = repo_dir / "tasks" / "PR-283.md"
-    task_path.write_text("# PR-283: Retry me\n\nBody\n", encoding="utf-8")
-    redis_client = _RetryRedis(
-        {
-            "pipeline:example__alpha": _snapshot(
-                [QueueTask(pr_id="PR-283", title="Retry me", status=TaskStatus.ERROR)]
-            )
-        }
+    runner = runner_helpers._make_runner()
+    runner.name = "example__alpha"
+    runner.owner_repo = "example/alpha"
+    runner.redis = redis_client
+    runner.repo_path = str(task_path.parents[1])
+    runner.state = RepoState.model_validate_json(
+        redis_client.store["pipeline:example__alpha"]
     )
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
+    runner._retry_command_owner = "integration-runner"
+    original = task_path.read_text(encoding="utf-8")
+    status_commits: list[str] = []
+    coder_calls: list[str] = []
+
+    monkeypatch.setattr(runner, "_retry_worktree_dirty", lambda: (False, ""))
     monkeypatch.setattr(
-        repo_control.subprocess,
-        "run",
-        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+        runner, "_origin_retry_task_text", lambda command: original
     )
 
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+    async def no_suppression(task_id: str) -> None:
+        return None
 
-    assert response.status_code == 200
+    async def no_inhibitors(*args: Any) -> list[Any]:
+        return []
+
+    async def coder_available(*args: Any) -> tuple[str, object]:
+        return "codex", object()
+
+    async def commit_status(task: QueueTask, status: str, reason: str) -> bool:
+        status_commits.append(status)
+        return True
+
+    monkeypatch.setattr(runner, "_suppression_record_for_task", no_suppression)
+    monkeypatch.setattr(daemon_retry, "derive_active_inhibitors", no_inhibitors)
+    monkeypatch.setattr(daemon_retry.gh_prs, "get_open_prs", lambda *args: [])
+    monkeypatch.setattr(
+        daemon_retry.gh_prs, "get_merged_prs", lambda *args, **kwargs: []
+    )
+    monkeypatch.setattr(runner, "_ensure_retry_coder_available", coder_available)
+    monkeypatch.setattr(runner, "_commit_task_status_change", commit_status)
+
+    async def ensure_repo_cloned() -> None:
+        return None
+
+    async def publish_state() -> None:
+        await redis_client.set(
+            pipeline_state_key(runner.name), runner.state.model_dump_json()
+        )
+
+    async def handle_coding() -> None:
+        coder_calls.append("PR-283")
+        runner.state.state = PipelineState.WATCH
+
+    runner._recovered = True
+    monkeypatch.setattr(runner, "ensure_repo_cloned", ensure_repo_cloned)
+    monkeypatch.setattr(runner, "publish_state", publish_state)
+    monkeypatch.setattr(runner, "handle_coding", handle_coding)
+    asyncio.run(runner._run_cycle_body())
+    command = asyncio.run(
+        load_latest_retry_command(redis_client, "example__alpha", "PR-283")
+    )
+    assert command is not None
+    assert command.status == RetryCommandStatus.APPLIED
+    assert command.execution_state == RetryExecutionState.WATCHING
+    assert command.selected_continuation == "coding"
+    assert status_commits == ["TODO"]
+    assert coder_calls == ["PR-283"]
     assert redis_client.store["metrics:retry_count:example__alpha:PR-283"] == "1"
-    assert task_path.read_text(encoding="utf-8").startswith("---\nstatus: TODO\n---")
+    assert task_path.read_text(encoding="utf-8") == original
+    published = RepoState.model_validate_json(
+        redis_client.store[pipeline_state_key("example__alpha")]
+    )
+    assert published.state == PipelineState.WATCH
+    assert published.current_task is not None
+    assert published.current_task.status == TaskStatus.DOING
 
 
-def test_retry_at_cap_returns_409(
+def test_retry_binds_failure_and_relevant_pr(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repo_dir = _write_config_and_task(tmp_path, monkeypatch)
-    fingerprint = repo_control._task_retry_fingerprint(repo_dir / "tasks" / "PR-283.md")
-    redis_client = _RetryRedis(
-        {
-            "pipeline:example__alpha": _snapshot(
-                [QueueTask(pr_id="PR-283", title="Retry me", status=TaskStatus.ERROR)]
-            ),
-            "metrics:retry_count:example__alpha:PR-283": "3",
-            "metrics:retry_fingerprint:example__alpha:PR-283": fingerprint,
-            cause_key("example__alpha", "PR-283"): "{}",
-        }
+    pr = PRInfo(
+        number=531,
+        branch="fix/pr-283",
+        head_sha="abc123",
+        pr_id="PR-283",
     )
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    git_called = False
-
-    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        nonlocal git_called
-        git_called = True
-        return subprocess.CompletedProcess(args, 0, "", "")
-
-    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
+    _, redis_client = _setup_retry(tmp_path, monkeypatch, current_pr=pr)
+    redis_client.store[cause_key("example__alpha", "PR-283")] = CancellationCause(
+        category="ERROR",
+        created_at="2026-01-01T00:00:00+00:00",
+        task_id="PR-283",
+        repo_slug="example__alpha",
+        payload={"subsource": "coder_crash"},
+    ).to_redis()
 
     with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
+        binding = _rendered_binding(client)
+        response = client.post(
+            "/repos/example__alpha/tasks/PR-283/retry",
+            data={"retry_binding": binding},
+        )
 
-    assert response.status_code == 409
-    assert "Edit task spec or delete to proceed" in response.text
-    assert redis_client.store["metrics:retry_count:example__alpha:PR-283"] == "3"
+    assert response.status_code == 202
+    command = asyncio.run(
+        load_latest_retry_command(redis_client, "example__alpha", "PR-283")
+    )
+    assert command is not None
+    assert command.bound_pr_number == 531
+    assert command.bound_pr_branch == "fix/pr-283"
+    assert command.bound_pr_head_sha == "abc123"
+    assert command.failure_subsource == "coder_crash"
+    assert command.failure_created_at == "2026-01-01T00:00:00+00:00"
     assert cause_key("example__alpha", "PR-283") in redis_client.store
-    assert "status: ERROR" in (repo_dir / "tasks" / "PR-283.md").read_text(encoding="utf-8")
-    assert git_called is True
 
 
-def test_retry_unknown_repo_returns_404(
+def test_retry_rejects_stale_or_invalid_binding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(_RetryRedis()))
-
+    task_path, _redis = _setup_retry(tmp_path, monkeypatch)
     with TestClient(app) as client:
-        response = client.post("/repos/example__missing/tasks/PR-283/retry")
-
-    assert response.status_code == 404
-    assert "Repository not found" in response.text
-
-
-def test_retry_unknown_task_returns_404(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(_RetryRedis()))
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-999/retry")
-
-    assert response.status_code == 404
-    assert "Task file not found" in response.text
-
-
-@pytest.mark.asyncio
-async def test_retry_count_helpers_handle_bad_values() -> None:
-    class _BoomRedis:
-        async def get(self, key: str) -> str:
-            raise RuntimeError("redis down")
-
-    assert repo_control._decode_retry_count(b"2") == 2
-    assert repo_control._decode_retry_count("bad") == 0
-    assert repo_control._decode_redis_text(b"fingerprint") == "fingerprint"
-    assert await repo_control._get_retry_count(_BoomRedis(), "repo", "PR-1") == 0
-
-
-@pytest.mark.asyncio
-async def test_get_retry_count_returns_zero_for_stale_fingerprint() -> None:
-    redis_client = _RetryRedis(
-        {
-            "metrics:retry_count:repo:PR-1": "3",
-            "metrics:retry_fingerprint:repo:PR-1": "old",
-        }
-    )
-
-    retry_count = await repo_control._get_retry_count(
-        redis_client,
-        "repo",
-        "PR-1",
-        fingerprint="new",
-    )
-
-    assert retry_count == 0
-
-
-@pytest.mark.asyncio
-async def test_increment_retry_count_rejects_cap() -> None:
-    redis_client = _RetryRedis({"metrics:retry_count:repo:PR-1": "2"})
-
-    with pytest.raises(repo_control._RetryCapExceeded):
-        await repo_control._increment_retry_count(redis_client, "repo", "PR-1", cap=2)
-
-
-@pytest.mark.asyncio
-async def test_increment_retry_count_resets_when_task_fingerprint_changes() -> None:
-    redis_client = _RetryRedis(
-        {
-            "metrics:retry_count:repo:PR-1": "3",
-            "metrics:retry_fingerprint:repo:PR-1": "old",
-        }
-    )
-
-    next_count = await repo_control._increment_retry_count(
-        redis_client,
-        "repo",
-        "PR-1",
-        cap=3,
-        fingerprint="new",
-    )
-
-    assert next_count == 1
-    assert redis_client.store["metrics:retry_count:repo:PR-1"] == "1"
-    assert redis_client.store["metrics:retry_fingerprint:repo:PR-1"] == "new"
-
-
-@pytest.mark.asyncio
-async def test_increment_retry_count_preserves_count_when_fingerprint_missing() -> None:
-    redis_client = _RetryRedis({"metrics:retry_count:repo:PR-1": "3"})
-
-    with pytest.raises(repo_control._RetryCapExceeded):
-        await repo_control._increment_retry_count(
-            redis_client,
-            "repo",
-            "PR-1",
-            cap=3,
-            fingerprint="new",
+        binding = _rendered_binding(client)
+        task_path.write_text(_task_text(body="changed"), encoding="utf-8")
+        stale = client.post(
+            "/repos/example__alpha/tasks/PR-283/retry",
+            data={"retry_binding": binding},
         )
-
-    assert redis_client.store["metrics:retry_count:repo:PR-1"] == "3"
-    assert "metrics:retry_fingerprint:repo:PR-1" not in redis_client.store
-
-
-@pytest.mark.asyncio
-async def test_decrement_retry_count_preserves_remaining_attempts() -> None:
-    class _TransactionRedis(_RetryRedis):
-        def __init__(self, store: dict[str, str]) -> None:
-            super().__init__(store)
-            self.transaction_keys: tuple[str, ...] | None = None
-
-        async def transaction(
-            self,
-            callback: Any,
-            *keys: str,
-            value_from_callable: bool = False,
-        ) -> Any:
-            self.transaction_keys = keys
-            return await super().transaction(
-                callback,
-                *keys,
-                value_from_callable=value_from_callable,
-            )
-
-    redis_client = _TransactionRedis({"metrics:retry_count:repo:PR-1": "2"})
-
-    await repo_control._decrement_retry_count(redis_client, "repo", "PR-1")
-
-    assert redis_client.store["metrics:retry_count:repo:PR-1"] == "1"
-    assert redis_client.expiries["metrics:retry_count:repo:PR-1"] == 30 * 24 * 3600
-    assert redis_client.transaction_keys == ("metrics:retry_count:repo:PR-1",)
-
-
-@pytest.mark.asyncio
-async def test_decrement_retry_count_awaits_async_set() -> None:
-    class _AsyncSetRedis(_RetryRedis):
-        async def set(  # type: ignore[override]
-            self,
-            key: str,
-            value: str,
-            ex: int | None = None,
-            nx: bool = False,
-        ) -> bool:
-            return super().set(key, value, ex=ex, nx=nx)
-
-    redis_client = _AsyncSetRedis({"metrics:retry_count:repo:PR-1": "2"})
-
-    await repo_control._decrement_retry_count(redis_client, "repo", "PR-1")
-
-    assert redis_client.store["metrics:retry_count:repo:PR-1"] == "1"
-
-
-@pytest.mark.asyncio
-async def test_release_retry_reservation_swallows_cleanup_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def fake_decrement(redis_client: _RetryRedis, repo_slug: str, task_id: str) -> None:
-        raise RuntimeError("redis down")
-
-    monkeypatch.setattr(repo_control, "_decrement_retry_count", fake_decrement)
-
-    await repo_control._release_retry_reservation(_RetryRedis(), "repo", "PR-1")
-
-
-@pytest.mark.asyncio
-async def test_repo_retry_reservation_handles_async_set_and_release_edges() -> None:
-    class _AsyncSetRedis(_RetryRedis):
-        async def set(  # type: ignore[override]
-            self,
-            key: str,
-            value: str,
-            ex: int | None = None,
-            nx: bool = False,
-        ) -> bool:
-            return super().set(key, value, ex=ex, nx=nx)
-
-    idle_state = _state_snapshot(PipelineState.IDLE)
-    redis_client = _AsyncSetRedis({"pipeline:repo": idle_state})
-
-    previous_user_paused = await repo_control._reserve_repo_for_retry(
-        redis_client,
-        "repo",
-        "https://github.com/example/repo.git",
-    )
-
-    reserved_state = RepoState.model_validate_json(redis_client.store["pipeline:repo"])
-    assert previous_user_paused is False
-    assert reserved_state.user_paused is True
-    assert redis_client.store["control:retry_reservation:repo"]
-
-    await repo_control._release_repo_retry_reservation(
-        redis_client,
-        "repo",
-        previous_user_paused=previous_user_paused,
-    )
-    assert "control:retry_reservation:repo" not in redis_client.store
-    assert (
-        RepoState.model_validate_json(redis_client.store["pipeline:repo"]).user_paused
-        is False
-    )
-
-    await repo_control._release_repo_retry_reservation(
-        _RetryRedis(),
-        "repo",
-        previous_user_paused=False,
-    )
-    await repo_control._release_repo_retry_reservation(
-        _RetryRedis({"pipeline:repo": "not-json"}),
-        "repo",
-        previous_user_paused=False,
-    )
-    active = _RetryRedis({"pipeline:repo": _state_snapshot(PipelineState.CODING)})
-    await repo_control._release_repo_retry_reservation(
-        active,
-        "repo",
-        previous_user_paused=False,
-    )
-    assert RepoState.model_validate_json(active.store["pipeline:repo"]).state == PipelineState.CODING
-
-    class _BoomTransactionRedis(_RetryRedis):
-        async def transaction(
-            self,
-            callback: Any,
-            *keys: str,
-            value_from_callable: bool = False,
-        ) -> Any:
-            raise RuntimeError("boom")
-
-    await repo_control._release_repo_retry_reservation(
-        _BoomTransactionRedis(),
-        "repo",
-        previous_user_paused=False,
-    )
-
-
-@pytest.mark.asyncio
-async def test_retry_release_preserves_newer_pause_control_intent() -> None:
-    state = RepoState(
-        url="https://github.com/example/repo.git",
-        name="repo",
-        state=PipelineState.IDLE,
-        user_paused=True,
-        history=[
-            {
-                "time": "2026-05-08T15:00:00+00:00",
-                "last_seen_at": "2026-05-08T15:00:00+00:00",
-                "state": "IDLE",
-                "event": "Pause requested. Finishing current PR cycle.",
-            }
-        ],
-    )
-    redis_client = _RetryRedis(
-        {
-            "pipeline:repo": state.model_dump_json(),
-            "control:retry_reservation:repo": "2026-05-08T14:59:00+00:00",
-        }
-    )
-
-    await repo_control._release_repo_retry_reservation(
-        redis_client,
-        "repo",
-        previous_user_paused=False,
-    )
-
-    stored_state = RepoState.model_validate_json(redis_client.store["pipeline:repo"])
-    assert stored_state.user_paused is True
-
-
-def test_has_pause_control_after_reservation_edges() -> None:
-    ignored_state = RepoState(
-        url="https://github.com/example/repo.git",
-        name="repo",
-        history=[
-            {"event": "Other event", "time": "2026-05-08T15:00:00+00:00"},
-            {"event": "Pause requested.", "state": "IDLE"},
-            {"event": "Resume requested.", "time": "not-a-time"},
-        ],
-    )
-    matched_state = RepoState(
-        url="https://github.com/example/repo.git",
-        name="repo",
-        history=[
-            {
-                "event": "Stop requested.",
-                "last_seen_at": "2026-05-08T15:01:00+00:00",
-            },
-        ],
-    )
-
-    assert repo_control._has_pause_control_after_reservation(ignored_state, None) is False
-    assert (
-        repo_control._has_pause_control_after_reservation(ignored_state, "bad")
-        is False
-    )
-    assert (
-        repo_control._has_pause_control_after_reservation(
-            ignored_state,
-            "2026-05-08T15:00:00+00:00",
+        invalid = client.post(
+            "/repos/example__alpha/tasks/PR-283/retry",
+            data={"retry_binding": "invalid"},
         )
-        is False
-    )
-    assert (
-        repo_control._has_pause_control_after_reservation(
-            matched_state,
-            "2026-05-08T15:00:00+00:00",
-        )
-        is True
-    )
+        missing = client.post("/repos/example__alpha/tasks/PR-283/retry")
 
-
-@pytest.mark.asyncio
-async def test_retry_release_tolerates_reservation_read_failure() -> None:
-    class _ReservationGetBoomRedis(_RetryRedis):
-        async def get(self, key: str) -> str | None:
-            raise RuntimeError("redis read failed")
-
-        async def transaction(
-            self,
-            callback: Any,
-            *keys: str,
-            value_from_callable: bool = False,
-        ) -> Any:
-            pipe = _RetryRedis(self.store)
-            result = await callback(pipe)
-            return result if value_from_callable else None
-
-    redis_client = _ReservationGetBoomRedis(
-        {"pipeline:repo": _state_snapshot(PipelineState.IDLE, user_paused=True)}
-    )
-
-    await repo_control._release_repo_retry_reservation(
-        redis_client,
-        "repo",
-        previous_user_paused=False,
-    )
-
-    stored_state = RepoState.model_validate_json(redis_client.store["pipeline:repo"])
-    assert stored_state.user_paused is False
-
-
-@pytest.mark.asyncio
-async def test_repo_retry_reservation_rejects_concurrent_retry() -> None:
-    redis_client = _RetryRedis(
-        {
-            "pipeline:repo": _state_snapshot(PipelineState.IDLE),
-            "control:retry_reservation:repo": "1",
-        }
-    )
-
-    with pytest.raises(repo_control._RepoStateMutationError) as exc:
-        await repo_control._reserve_repo_for_retry(
-            redis_client,
-            "repo",
-            "https://github.com/example/repo.git",
-        )
-
-    assert exc.value.status_code == 409
-    assert "already in progress" in exc.value.message
-    stored_state = RepoState.model_validate_json(redis_client.store["pipeline:repo"])
-    assert stored_state.user_paused is False
+    assert stale.status_code == 409
+    assert "stale" in stale.text
+    assert invalid.status_code == 400
+    assert missing.status_code == 422
 
 
 @pytest.mark.parametrize(
-    ("content", "expected"),
+    ("path", "expected"),
     [
-        ("# PR-1: No frontmatter\n", None),
-        ("---\n---\n# PR-1: Missing status\n", None),
-        ("---\ntitle: Test\nstatus: ERROR # retry\n---\n", TaskStatus.ERROR),
-        ("---\nstatus: maybe\n---\n", None),
-        ("---\ntitle: Test\n", None),
+        ("/repos/example__alpha/tasks/not-a-task/retry", 400),
+        ("/repos/missing/tasks/PR-283/retry", 404),
+        ("/repos/example__alpha/tasks/PR-999/retry", 404),
     ],
 )
-def test_read_task_frontmatter_status_variants(
+def test_retry_validates_target_before_enqueue(
     tmp_path: Path,
-    content: str,
-    expected: TaskStatus | None,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    expected: int,
 ) -> None:
-    task_path = tmp_path / "PR-1.md"
-    task_path.write_text(content, encoding="utf-8")
+    _setup_retry(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        response = client.post(path, data={"retry_binding": "a" * 64})
+    assert response.status_code == expected
 
-    assert repo_control._read_task_frontmatter_status(task_path) == expected
 
-
-def test_task_retry_fingerprint_ignores_status_but_tracks_spec(
+def test_retry_rejects_non_error_and_retry_cap(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    task_path = tmp_path / "PR-1.md"
-    task_path.write_text("---\nstatus: ERROR\n---\n\nBody\n", encoding="utf-8")
+    _setup_retry(
+        tmp_path,
+        monkeypatch,
+        status=TaskStatus.DONE,
+        pipeline_state=PipelineState.IDLE,
+    )
+    with TestClient(app) as client:
+        not_error = client.post(
+            "/repos/example__alpha/tasks/PR-283/retry",
+            data={"retry_binding": "a" * 64},
+        )
+    assert not_error.status_code == 409
+
+    _task_path, _redis = _setup_retry(tmp_path, monkeypatch, retry_count=3)
+    with TestClient(app) as client:
+        capped = client.post(
+            "/repos/example__alpha/tasks/PR-283/retry",
+            data={"retry_binding": "a" * 64},
+        )
+    assert capped.status_code == 409
+    assert "Retry cap reached" in capped.text
+
+
+def test_retry_reports_read_binding_and_command_store_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_retry(tmp_path, monkeypatch)
+    original_reader = repo_control._read_task_frontmatter_status
+    monkeypatch.setattr(
+        repo_control,
+        "_read_task_frontmatter_status",
+        lambda path: (_ for _ in ()).throw(OSError("read failed")),
+    )
+    with TestClient(app) as client:
+        read_failed = client.post(
+            "/repos/example__alpha/tasks/PR-283/retry",
+            data={"retry_binding": "a" * 64},
+        )
+    assert read_failed.status_code == 503
+
+    class _DedupeReadFails(_WebRedis):
+        async def get(self, key: str) -> str | None:
+            if ":retry:dedupe:" in key:
+                raise RuntimeError("command store down")
+            return await super().get(key)
+
+    monkeypatch.setattr(repo_control, "_read_task_frontmatter_status", original_reader)
+    _setup_retry(tmp_path, monkeypatch, redis_client=_DedupeReadFails())
+    with TestClient(app) as client:
+        command_store_failed = client.post(
+            "/repos/example__alpha/tasks/PR-283/retry",
+            data={"retry_binding": "a" * 64},
+        )
+    assert command_store_failed.status_code == 503
+
+
+def test_retry_rejects_cross_task_dedupe_and_unbindable_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_path, redis_client = _setup_retry(tmp_path, monkeypatch)
+    existing = new_retry_command(
+        repo_slug="example__alpha",
+        task_id="PR-999",
+        task_file="tasks/PR-999.md",
+        task_branch="fix/pr-999",
+        task_fingerprint="f" * 64,
+        request_binding="a" * 64,
+        failure_id="e" * 64,
+        retry_cap=3,
+    )
+    redis_client.store[
+        retry_command("example__alpha", existing.command_id)
+    ] = existing.model_dump_json()
+    redis_client.store[
+        retry_command_dedupe("example__alpha", existing.request_binding)
+    ] = existing.command_id
+    with TestClient(app) as client:
+        cross_task = client.post(
+            "/repos/example__alpha/tasks/PR-283/retry",
+            data={"retry_binding": "a" * 64},
+        )
+    assert cross_task.status_code == 409
+
+    redis_client.store.clear()
+    task = QueueTask(
+        pr_id="PR-283",
+        title="Retry me",
+        status=TaskStatus.ERROR,
+        task_file="tasks/PR-283.md",
+        branch="fix/pr-283",
+    )
+    redis_client.store["pipeline:example__alpha"] = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.ERROR,
+        current_task=task,
+        current_queue=[task],
+    ).model_dump_json()
+
+    async def no_binding(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(repo_control, "_retry_binding_context", no_binding)
+    with TestClient(app) as client:
+        unbindable = client.post(
+            "/repos/example__alpha/tasks/PR-283/retry",
+            data={"retry_binding": "a" * 64},
+        )
+    assert unbindable.status_code == 503
+    assert task_path.exists()
+
+
+def test_retry_store_failures_are_explicit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, failing_read = _setup_retry(
+        tmp_path,
+        monkeypatch,
+        redis_client=_GetFailureRedis(),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/repos/example__alpha/tasks/PR-283/retry",
+            data={"retry_binding": "a" * 64},
+        )
+    assert response.status_code == 503
+    assert not failing_read.zsets
+
+    _setup_retry(
+        tmp_path,
+        monkeypatch,
+        redis_client=_TransactionFailureRedis(),
+    )
+    with TestClient(app) as client:
+        binding = _rendered_binding(client)
+        response = client.post(
+            "/repos/example__alpha/tasks/PR-283/retry",
+            data={"retry_binding": binding},
+        )
+    assert response.status_code == 503
+    assert "persist" in response.text
+
+
+def test_retry_requires_redis_and_tolerates_wake_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, redis_client = _setup_retry(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        binding = _rendered_binding(client)
+        app.state.redis = None
+        unavailable = client.post(
+            "/repos/example__alpha/tasks/PR-283/retry",
+            data={"retry_binding": binding},
+        )
+    assert unavailable.status_code == 503
+
+    _setup_retry(tmp_path, monkeypatch, redis_client=redis_client)
+
+    async def fail_wake(*args: Any) -> None:
+        raise RuntimeError("pubsub unavailable")
+
+    monkeypatch.setattr(web_app, "publish_wake", fail_wake)
+    with TestClient(app) as client:
+        binding = _rendered_binding(client)
+        accepted = client.post(
+            "/repos/example__alpha/tasks/PR-283/retry",
+            data={"retry_binding": binding},
+        )
+    assert accepted.status_code == 202
+
+
+def test_task_panel_renders_command_lifecycle_and_polling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, redis_client = _setup_retry(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        binding = _rendered_binding(client)
+        client.post(
+            "/repos/example__alpha/tasks/PR-283/retry",
+            data={"retry_binding": binding},
+        )
+        queued = client.get("/repos/example__alpha/tasks")
+
+    assert "Retry accepted" in queued.text
+    assert 'hx-trigger="every 5s"' in queued.text
+    command = asyncio.run(
+        load_latest_retry_command(redis_client, "example__alpha", "PR-283")
+    )
+    assert command is not None
+    raw_key = f"control:example__alpha:retry:command:{command.command_id}"
+    for status, phrase, pending in [
+        (RetryCommandStatus.PROCESSING, "Daemon acknowledged", True),
+        (RetryCommandStatus.DEFERRED, "Retry deferred", True),
+        (RetryCommandStatus.APPLIED, "Retry applied", True),
+        (RetryCommandStatus.FAILED, "Retry failed", False),
+    ]:
+        command.status = status
+        command.outcome_reason = f"{status.value} reason"
+        if status == RetryCommandStatus.APPLIED:
+            command.execution_state = RetryExecutionState.UNCERTAIN
+        redis_client.store[raw_key] = command.model_dump_json()
+        if not pending:
+            redis_client.zsets[retry_command_pending("example__alpha")].clear()
+        with TestClient(app) as client:
+            rendered = client.get("/repos/example__alpha/tasks")
+        assert phrase in rendered.text
+
+
+def test_fingerprint_ignores_status_but_tracks_spec(tmp_path: Path) -> None:
+    task_path = tmp_path / "PR-283.md"
+    task_path.write_text(_task_text(), encoding="utf-8")
     error_fingerprint = repo_control._task_retry_fingerprint(task_path)
-
-    task_path.write_text("---\nstatus: TODO\n---\n\nBody\n", encoding="utf-8")
-    todo_fingerprint = repo_control._task_retry_fingerprint(task_path)
-
-    task_path.write_text("---\nstatus: TODO\n---\n\nChanged\n", encoding="utf-8")
-    changed_fingerprint = repo_control._task_retry_fingerprint(task_path)
-
-    no_frontmatter = tmp_path / "plain.md"
-    no_frontmatter.write_text("Body\n", encoding="utf-8")
-
-    assert todo_fingerprint == error_fingerprint
-    assert changed_fingerprint != error_fingerprint
-    assert repo_control._task_retry_fingerprint(no_frontmatter) != error_fingerprint
+    task_path.write_text(_task_text(status="TODO"), encoding="utf-8")
+    assert repo_control._task_retry_fingerprint(task_path) == error_fingerprint
+    task_path.write_text(_task_text(status="TODO", body="changed"), encoding="utf-8")
+    assert repo_control._task_retry_fingerprint(task_path) != error_fingerprint
 
 
-def test_retry_invalid_pr_id_returns_400(
+@pytest.mark.asyncio
+async def test_retry_count_decode_and_read_failures() -> None:
+    redis_client = _WebRedis()
+    assert repo_control._decode_retry_count(None) == 0
+    assert repo_control._decode_retry_count(b"2") == 2
+    assert repo_control._decode_retry_count("-1") == 0
+    assert repo_control._decode_retry_count("bad") == 0
+    assert await repo_control._get_retry_count(redis_client, "repo", "PR-1") == 0
+
+    class _Broken(_WebRedis):
+        async def get(self, key: str) -> str | None:
+            raise RuntimeError("down")
+
+    assert await repo_control._get_retry_count(_Broken(), "repo", "PR-1") == 0
+
+
+@pytest.mark.asyncio
+async def test_non_error_task_view_surfaces_active_retry_pipeline_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(_RetryRedis()))
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/not-a-pr/retry")
-
-    assert response.status_code == 400
-    assert "Invalid task identifier" in response.text
-
-
-def test_retry_without_redis_returns_503(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    monkeypatch.delattr(web_app.app.state, "redis", raising=False)
-
-    client = TestClient(app)
-    response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 503
-    assert "Redis unavailable" in response.text
-
-
-def test_retry_counter_failure_returns_503(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(_RetryRedis()))
-    monkeypatch.setattr(
-        repo_control.subprocess,
-        "run",
-        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+    _task_path, redis_client = _setup_retry(tmp_path, monkeypatch)
+    task = QueueTask(
+        pr_id="PR-283",
+        title="Retry me",
+        status=TaskStatus.TODO,
+        task_file="tasks/PR-283.md",
+        branch="fix/pr-283",
     )
-
-    async def fake_increment(
-        redis_client: Any,
-        repo_slug: str,
-        task_id: str,
-        cap: int,
-        fingerprint: str | None = None,
-    ) -> int:
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(repo_control, "_increment_retry_count", fake_increment)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 503
-    assert "Failed to update retry counter" in response.text
-
-
-def test_retry_cause_clear_failure_after_push_is_best_effort(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repo_dir = _write_config_and_task(tmp_path, monkeypatch)
-
-    class _BoomDeleteRedis(_RetryRedis):
-        async def delete(self, key: str) -> int:
-            raise RuntimeError("boom")
-
-    redis_client = _BoomDeleteRedis()
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-    monkeypatch.setattr(
-        repo_control.subprocess,
-        "run",
-        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+    command = new_retry_command(
+        repo_slug="example__alpha",
+        task_id=task.pr_id,
+        task_file=str(task.task_file),
+        task_branch=str(task.branch),
+        task_fingerprint="f" * 64,
+        request_binding="a" * 64,
+        failure_id="e" * 64,
+        retry_cap=3,
     )
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 200
-    assert redis_client.store["metrics:retry_count:example__alpha:PR-283"] == "1"
-    assert "status: TODO" in (repo_dir / "tasks" / "PR-283.md").read_text(
-        encoding="utf-8"
-    )
-
-
-def test_retry_frontmatter_write_failure_returns_503(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(_RetryRedis()))
-    monkeypatch.setattr(
-        repo_control,
-        "write_frontmatter_status",
-        lambda task_path, status: (_ for _ in ()).throw(OSError("boom")),
-    )
-    monkeypatch.setattr(
-        repo_control.subprocess,
-        "run",
-        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
-    )
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 503
-    assert "Failed to update task status" in response.text
-    assert "metrics:retry_count:example__alpha:PR-283" not in app.state.redis.store
-
-
-def test_retry_frontmatter_parse_failure_rolls_back_counter(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis()
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-    monkeypatch.setattr(
-        repo_control,
-        "write_frontmatter_status",
-        lambda task_path, status: (_ for _ in ()).throw(RuntimeError("bad yaml")),
-    )
-    monkeypatch.setattr(
-        repo_control.subprocess,
-        "run",
-        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
-    )
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 503
-    assert "Failed to update task status" in response.text
-    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
-
-
-def test_retry_rejects_resolved_task_outside_repo(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(_RetryRedis()))
-    outside = tmp_path / "outside.md"
-
-    async def fake_resolve(name: str, pr_id: str) -> tuple[Path, str]:
-        return outside, "outside.md"
-
-    monkeypatch.setattr(repo_control, "_resolve_repo_task_path", fake_resolve)
-    monkeypatch.setattr(repo_control, "write_frontmatter_status", lambda task_path, status: None)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 404
-    assert "Task file not found" in response.text
-    assert "metrics:retry_count:example__alpha:PR-283" not in app.state.redis.store
-
-
-def test_retry_returns_404_when_task_disappears_after_base_checkout(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repo_dir = _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis()
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    def fake_checkout(repo_root: Path, base_branch: str, relative_task: Path) -> None:
-        (repo_dir / "tasks" / "PR-283.md").unlink()
-
-    monkeypatch.setattr(repo_control, "_checkout_retry_base_task", fake_checkout)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 404
-    assert "Task file not found" in response.text
-    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
-
-
-def test_retry_returns_404_when_task_missing_on_base_branch(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis()
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        if args[3:] == [
-            "checkout",
-            "origin/main",
-            "--",
-            "tasks/PR-283.md",
-        ]:
-            raise subprocess.CalledProcessError(
-                1,
-                args,
-                stderr=(
-                    "error: pathspec 'tasks/PR-283.md' did not match any "
-                    "file(s) known to git"
-                ),
-            )
-        return subprocess.CompletedProcess(args, 0, "", "")
-
-    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 404
-    assert "Task file not found" in response.text
-    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
-
-
-def test_retry_rechecks_status_after_base_checkout(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repo_dir = _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis()
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    def fake_checkout(repo_root: Path, base_branch: str, relative_task: Path) -> None:
-        (repo_dir / "tasks" / "PR-283.md").write_text(
-            "---\nstatus: DONE\n---\n\n# PR-283: Retry me\n\nBody\n",
-            encoding="utf-8",
-        )
-
-    monkeypatch.setattr(repo_control, "_checkout_retry_base_task", fake_checkout)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 409
-    assert "Task is not in ERROR" in response.text
-    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
-
-
-def test_retry_counter_uses_post_checkout_task_fingerprint(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repo_dir = _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis()
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    captured_fingerprints: list[str | None] = []
-
-    def fake_checkout(repo_root: Path, base_branch: str, relative_task: Path) -> None:
-        (repo_dir / "tasks" / "PR-283.md").write_text(
-            "---\nstatus: ERROR\n---\n\n# PR-283: Retry me\n\nFresh base body\n",
-            encoding="utf-8",
-        )
-
-    async def fake_increment(
-        redis_client: Any,
-        repo_slug: str,
-        task_id: str,
-        cap: int,
-        fingerprint: str | None = None,
-    ) -> int:
-        captured_fingerprints.append(fingerprint)
-        return 1
-
-    monkeypatch.setattr(repo_control, "_checkout_retry_base_task", fake_checkout)
-    monkeypatch.setattr(repo_control, "_increment_retry_count", fake_increment)
-    monkeypatch.setattr(repo_control, "_commit_and_push_retry_reset", lambda *args: None)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 200
-    assert captured_fingerprints == [
-        repo_control._task_retry_fingerprint(repo_dir / "tasks" / "PR-283.md")
-    ]
-
-
-def test_retry_first_status_read_failure_returns_503_before_counter(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis()
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    def fake_read_task_frontmatter_status(task_path: Path) -> TaskStatus:
-        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")
-
-    monkeypatch.setattr(
-        repo_control,
-        "_read_task_frontmatter_status",
-        fake_read_task_frontmatter_status,
-    )
-    monkeypatch.setattr(
-        repo_control.subprocess,
-        "run",
-        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
-    )
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 503
-    assert "Failed to read task status" in response.text
-    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
-
-
-def test_retry_releases_counter_when_status_reread_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis()
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    status_reads = 0
-
-    def fake_read_task_frontmatter_status(task_path: Path) -> TaskStatus:
-        nonlocal status_reads
-        status_reads += 1
-        if status_reads == 2:
-            raise OSError("cannot reread")
-        return TaskStatus.ERROR
-
-    monkeypatch.setattr(
-        repo_control,
-        "_read_task_frontmatter_status",
-        fake_read_task_frontmatter_status,
-    )
-    monkeypatch.setattr(
-        repo_control.subprocess,
-        "run",
-        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
-    )
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 503
-    assert "Failed to read task status" in response.text
-    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
-
-
-def test_retry_git_failure_returns_503(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis({"metrics:retry_count:example__alpha:PR-283": "2"})
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        raise subprocess.CalledProcessError(1, args)
-
-    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 503
-    assert "Failed to commit retry change" in response.text
-    assert redis_client.store["metrics:retry_count:example__alpha:PR-283"] == "2"
-    assert "status: ERROR" in (
-        tmp_path / "repos" / "example__alpha" / "tasks" / "PR-283.md"
-    ).read_text(encoding="utf-8")
-
-
-def test_retry_commit_failure_returns_503_without_increment(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(_RetryRedis()))
-
-    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        if args[3] == "commit":
-            raise subprocess.CalledProcessError(1, args, stderr="fatal: bad revision")
-        return subprocess.CompletedProcess(args, 0, "", "")
-
-    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 503
-    assert "Failed to commit retry change" in response.text
-    assert "metrics:retry_count:example__alpha:PR-283" not in app.state.redis.store
-
-
-def test_retry_push_failure_can_retry_existing_local_commit(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repo_dir = _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis()
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    push_attempts = 0
-    commit_attempts = 0
-    git_calls: list[list[str]] = []
-
-    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        nonlocal commit_attempts, push_attempts
-        git_calls.append(args)
-        if args[3] == "log":
-            return subprocess.CompletedProcess(
-                args,
-                0,
-                "[RETRY] PR-283 cleared by operator (attempt 1/3)\n",
-                "",
-            )
-        if args[3] == "commit":
-            commit_attempts += 1
-        if args[3] == "push":
-            push_attempts += 1
-            if push_attempts == 1:
-                raise subprocess.CalledProcessError(1, args, stderr="rejected")
-        return subprocess.CompletedProcess(args, 0, "", "")
-
-    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
-
-    with TestClient(app) as client:
-        first = client.post("/repos/example__alpha/tasks/PR-283/retry")
-        second = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert first.status_code == 503
-    assert second.status_code == 200
-    assert redis_client.store["metrics:retry_count:example__alpha:PR-283"] == "1"
-    assert push_attempts == 2
-    assert commit_attempts == 2
-    assert ["git", "-C", str(repo_dir), "reset", "--hard", "origin/main"] in git_calls
-    assert ["git", "-C", str(repo_dir), "push", "origin", "HEAD:main"] in git_calls
-
-
-def test_retry_rejects_task_not_in_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch, status="DONE")
-    redis_client = _RetryRedis()
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    publish_called = False
-
-    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        nonlocal publish_called
-        if args[3] in {"add", "commit", "push"}:
-            publish_called = True
-        return subprocess.CompletedProcess(args, 0, "", "")
-
-    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 409
-    assert "Task is not in ERROR" in response.text
-    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
-    assert publish_called is False
-
-
-def test_retry_rejects_while_repo_active_before_git(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis({"pipeline:example__alpha": _state_snapshot(PipelineState.CODING)})
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    git_called = False
-
-    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        nonlocal git_called
-        git_called = True
-        return subprocess.CompletedProcess(args, 0, "", "")
-
-    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 409
-    assert "Repository is busy" in response.text
-    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
-    assert git_called is False
-
-
-def test_retry_rejects_while_repo_preflight_before_git(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis(
-        {"pipeline:example__alpha": _state_snapshot(PipelineState.PREFLIGHT)}
-    )
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    git_called = False
-
-    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        nonlocal git_called
-        git_called = True
-        return subprocess.CompletedProcess(args, 0, "", "")
-
-    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 409
-    assert "Repository is busy" in response.text
-    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
-    assert git_called is False
-
-
-def test_retry_rejects_while_repo_user_paused_before_git(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis(
-        {
-            "pipeline:example__alpha": _state_snapshot(
-                PipelineState.IDLE,
-                user_paused=True,
-            )
-        }
-    )
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    git_called = False
-
-    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        nonlocal git_called
-        git_called = True
-        return subprocess.CompletedProcess(args, 0, "", "")
-
-    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 409
-    assert "Repository is busy" in response.text
-    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
-    assert git_called is False
-
-
-def test_retry_rejects_while_repo_error_before_git(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis({"pipeline:example__alpha": _state_snapshot(PipelineState.ERROR)})
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    git_called = False
-
-    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        nonlocal git_called
-        git_called = True
-        return subprocess.CompletedProcess(args, 0, "", "")
-
-    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 409
-    assert "Repository is busy" in response.text
-    assert git_called is False
-
-
-def test_retry_rejects_operator_paused_repo_before_git(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis(
-        {
-            "pipeline:example__alpha": _state_snapshot(
-                PipelineState.PAUSED,
-                user_paused=True,
-            )
-        }
-    )
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-    git_called = False
-
-    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        nonlocal git_called
-        git_called = True
-        return subprocess.CompletedProcess(args, 0, "", "")
-
-    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 409
-    assert "Repository is busy" in response.text
-    stored_state = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
-    assert stored_state.state == PipelineState.PAUSED
-    assert stored_state.user_paused is True
-    assert git_called is False
-
-
-def test_retry_rejects_rate_limit_paused_repo_before_git(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis(
-        {
-            "pipeline:example__alpha": _state_snapshot(
-                PipelineState.PAUSED,
-                user_paused=False,
-            )
-        }
-    )
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    git_called = False
-
-    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        nonlocal git_called
-        git_called = True
-        return subprocess.CompletedProcess(args, 0, "", "")
-
-    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 409
-    assert "Repository is busy" in response.text
-    assert git_called is False
-
-
-def test_retry_reservation_restores_prior_pause_state(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis({"pipeline:example__alpha": _state_snapshot(PipelineState.IDLE)})
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-    monkeypatch.setattr(
-        repo_control.subprocess,
-        "run",
-        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
-    )
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 200
-    stored_state = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
-    assert stored_state.state == PipelineState.IDLE
-    assert stored_state.user_paused is False
-
-
-def test_retry_state_read_failure_returns_503_before_git(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis({"pipeline:example__alpha": "not-json"})
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    git_called = False
-
-    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        nonlocal git_called
-        git_called = True
-        return subprocess.CompletedProcess(args, 0, "", "")
-
-    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 503
-    assert "Failed to read repository state" in response.text
-    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
-    assert git_called is False
-
-
-def test_retry_reservation_failure_returns_503_before_counter(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-
-    class _BoomTransactionRedis(_RetryRedis):
-        async def transaction(
-            self,
-            callback: Any,
-            *keys: str,
-            value_from_callable: bool = False,
-        ) -> Any:
-            raise RuntimeError("boom")
-
-    redis_client = _BoomTransactionRedis()
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 503
-    assert "Failed to read repository state" in response.text
-    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
-
-
-def test_retry_not_retryable_after_status_rewrite_restores_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repo_dir = _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis()
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    def fake_commit_and_push(*args: Any, **kwargs: Any) -> None:
-        raise repo_control._TaskNotRetryable
-
-    monkeypatch.setattr(
-        repo_control,
-        "_commit_and_push_retry_reset",
-        fake_commit_and_push,
-    )
-    monkeypatch.setattr(
-        repo_control.subprocess,
-        "run",
-        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
-    )
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 409
-    assert "Task is not in ERROR" in response.text
-    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
-    assert "status: ERROR" in (repo_dir / "tasks" / "PR-283.md").read_text(
-        encoding="utf-8"
-    )
-
-
-def test_retry_releases_counter_when_error_status_restore_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis()
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    def fake_commit_and_push(*args: Any, **kwargs: Any) -> None:
-        raise subprocess.CalledProcessError(1, ["git", "push"], stderr="rejected")
-
-    original_write_frontmatter_status = repo_control.write_frontmatter_status
-
-    def fake_write_frontmatter_status(
-        task_path: Path,
-        status: str,
-        blocked_reason: object = None,
-    ) -> None:
-        if status == "ERROR":
-            raise OSError("cannot restore")
-        original_write_frontmatter_status(task_path, status, blocked_reason)
-
-    monkeypatch.setattr(
-        repo_control,
-        "_commit_and_push_retry_reset",
-        fake_commit_and_push,
-    )
-
-    def fail_reset(repo_root: Path, base_branch: str) -> None:
-        raise subprocess.CalledProcessError(1, ["git", "reset"])
-
-    monkeypatch.setattr(repo_control, "_reset_retry_worktree", fail_reset)
-    monkeypatch.setattr(
-        repo_control,
-        "write_frontmatter_status",
-        fake_write_frontmatter_status,
-    )
-    monkeypatch.setattr(
-        repo_control.subprocess,
-        "run",
-        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
-    )
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 503
-    assert "Failed to commit retry change" in response.text
-    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
-
-
-def test_retry_rejects_already_pushed_retry_commit(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch, status="TODO")
-    redis_client = _RetryRedis()
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        if args[3] == "commit":
-            raise subprocess.CalledProcessError(
-                1,
-                args,
-                output="On branch main\nnothing to commit, working tree clean\n",
-            )
-        if args[3] == "log":
-            return subprocess.CompletedProcess(
-                args,
-                0,
-                "[RETRY] PR-283 cleared by operator (attempt 1/3)\n",
-                "",
-            )
-        if args[3] == "push":
-            return subprocess.CompletedProcess(args, 0, "Everything up-to-date\n", "")
-        return subprocess.CompletedProcess(args, 0, "", "")
-
-    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 409
-    assert "Task is not in ERROR" in response.text
-    assert "metrics:retry_count:example__alpha:PR-283" not in redis_client.store
-
-
-def test_retry_noop_commit_without_replay_permission_is_not_retryable(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repo_dir = tmp_path / "repo"
-    repo_dir.mkdir()
-
-    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        if args[3] == "commit":
-            raise subprocess.CalledProcessError(
-                1,
-                args,
-                output="On branch main\nnothing to commit, working tree clean\n",
-            )
-        return subprocess.CompletedProcess(args, 0, "", "")
-
-    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
-
-    with pytest.raises(repo_control._TaskNotRetryable):
-        repo_control._commit_and_push_retry_reset(
-            repo_dir,
-            Path("tasks/PR-283.md"),
-            "[RETRY] PR-283 cleared by operator (attempt 1/3)",
-            "main",
-        )
-
-
-def test_retry_git_commands_run_in_thread(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repo_dir = _write_config_and_task(tmp_path, monkeypatch)
-    redis_client = _RetryRedis()
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(redis_client))
-
-    to_thread_calls: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
-
-    async def fake_to_thread(func: Any, *args: Any, **kwargs: Any) -> Any:
-        to_thread_calls.append((func, args, kwargs))
-        return func(*args, **kwargs)
-
-    monkeypatch.setattr(repo_control.asyncio, "to_thread", fake_to_thread)
-    monkeypatch.setattr(
-        repo_control.subprocess,
-        "run",
-        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
-    )
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 200
-    assert to_thread_calls == [
-        (
-            repo_control._checkout_retry_base_task,
-            (repo_dir, "main", Path("tasks/PR-283.md")),
-            {},
-        ),
-        (
-            repo_control._commit_and_push_retry_reset,
-            (
-                repo_dir,
-                Path("tasks/PR-283.md"),
-                "[RETRY] PR-283 cleared by operator (attempt 1/3)",
-                "main",
-            ),
-            {},
-        )
-    ]
-
-
-def test_retry_pushes_configured_base_branch_and_commits_only_task_path(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repo_dir = _write_config_and_task(tmp_path, monkeypatch, branch="develop")
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(_RetryRedis()))
-
-    git_calls: list[list[str]] = []
-    git_timeouts: list[int] = []
-
-    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        git_calls.append(args)
-        git_timeouts.append(kwargs["timeout"])
-        return subprocess.CompletedProcess(args, 0, "", "")
-
-    monkeypatch.setattr(repo_control.subprocess, "run", fake_run)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 200
-    assert [
-        "git",
-        "-C",
-        str(repo_dir),
-        "commit",
-        "-m",
-        "[RETRY] PR-283 cleared by operator (attempt 1/3)",
-        "-m",
-        "[skip ci]",
-        "--",
-        "tasks/PR-283.md",
-    ] in git_calls
-    assert ["git", "-C", str(repo_dir), "fetch", "origin", "develop"] in git_calls
-    assert ["git", "-C", str(repo_dir), "checkout", "-f", "develop"] in git_calls
-    assert [
-        "git",
-        "-C",
-        str(repo_dir),
-        "reset",
-        "--hard",
-        "origin/develop",
-    ] in git_calls
-    assert [
-        "git",
-        "-C",
-        str(repo_dir),
-        "checkout",
-        "origin/develop",
-        "--",
-        "tasks/PR-283.md",
-    ] in git_calls
-    assert ["git", "-C", str(repo_dir), "push", "origin", "HEAD:develop"] in git_calls
-    assert git_timeouts
-    assert all(
-        timeout == repo_control._RETRY_GIT_TIMEOUT_SECONDS
-        for timeout in git_timeouts
-    )
-
-
-def test_retry_counter_reservation_cap_returns_409_before_git(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(_RetryRedis()))
-    monkeypatch.setattr(
-        repo_control.subprocess,
-        "run",
-        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
-    )
-
-    async def fake_increment(
-        redis_client: Any,
-        repo_slug: str,
-        task_id: str,
-        cap: int,
-        fingerprint: str | None = None,
-    ) -> int:
-        raise repo_control._RetryCapExceeded(cap, cap)
-
-    monkeypatch.setattr(repo_control, "_increment_retry_count", fake_increment)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 409
-    assert "Edit task spec or delete to proceed" in response.text
-
-
-def test_retry_counter_reservation_failure_returns_503_before_git(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_config_and_task(tmp_path, monkeypatch)
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(_RetryRedis()))
-    monkeypatch.setattr(
-        repo_control.subprocess,
-        "run",
-        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
-    )
-
-    async def fake_increment(
-        redis_client: Any,
-        repo_slug: str,
-        task_id: str,
-        cap: int,
-        fingerprint: str | None = None,
-    ) -> int:
-        raise RuntimeError("redis down")
-
-    monkeypatch.setattr(repo_control, "_increment_retry_count", fake_increment)
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 503
-    assert "Failed to update retry counter" in response.text
-
-
-def test_retry_success_without_snapshot_returns_single_todo_fragment(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repo_dir = _write_config_and_task(tmp_path, monkeypatch)
-    monkeypatch.setattr(web_app, "aioredis", _aioredis(_RetryRedis()))
-    monkeypatch.setattr(
-        repo_control.subprocess,
-        "run",
-        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
-    )
-
-    with TestClient(app) as client:
-        response = client.post("/repos/example__alpha/tasks/PR-283/retry")
-
-    assert response.status_code == 200
-    assert "1 total" in response.text
-    assert "TODO" in response.text
-    assert "PR-283" in response.text
-    assert "status: TODO" in (repo_dir / "tasks" / "PR-283.md").read_text(encoding="utf-8")
+    redis_client.store[
+        retry_command("example__alpha", command.command_id)
+    ] = command.model_dump_json()
+    redis_client.store[
+        f"control:example__alpha:retry:latest:{task.pr_id}"
+    ] = command.command_id
+    state = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
+    state.state = PipelineState.CODING
+    state.current_task = task
+    redis_client.store["pipeline:example__alpha"] = state.model_dump_json()
+    view = await repo_control._task_view(task, "example__alpha", redis_client)
+    assert view["retry_pipeline_state"] == "CODING"

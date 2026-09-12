@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 from src.cancellation import CancellationCause
 from src.cancellation.storage import cause_key, index_key
 from src.daemon import runner as runner_module
@@ -131,6 +130,8 @@ def _render_error_group(task: QueueTask, reason: SuppressionReason) -> str:
                     "title": task.title,
                     "branch": task.branch,
                     "retry_count": 0,
+                    "retry_binding": "a" * 64,
+                    "retry_command": None,
                     "cancellation_subsource": reason.value,
                 }
             ],
@@ -229,6 +230,7 @@ def test_visible_exit_always(
     assert header.blocked_reason == reason.value
     assert ">Error<" in rendered
     assert f'hx-post="/repos/octo__demo/tasks/{task.pr_id}/retry"' in rendered
+    assert 'hx-vals=' in rendered
     assert "Retry" in rendered
 
 

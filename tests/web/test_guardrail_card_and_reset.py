@@ -341,7 +341,14 @@ def _setup_repo(
     (repo_dir / "tasks").mkdir(parents=True)
     (repo_dir / "tasks" / "PR-384.md").write_text(
         f"---\nstatus: {task_status}\nblocked_reason: guardrail\n---\n\n"
-        "# PR-384: Guardrail task\n\nBody\n",
+        "# PR-384: Guardrail task\n\n"
+        "Branch: fix/pr-384\n"
+        "- Type: bugfix\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 3\n"
+        "- Coder: codex\n\n"
+        "Body\n",
         encoding="utf-8",
     )
     state = RepoState(
@@ -353,6 +360,7 @@ def _setup_repo(
             title="Guardrail task",
             status=TaskStatus.ERROR,
             task_file="tasks/PR-384.md",
+            branch="fix/pr-384",
         ),
         current_queue=[
             QueueTask(
@@ -360,6 +368,7 @@ def _setup_repo(
                 title="Guardrail task",
                 status=TaskStatus.ERROR,
                 task_file="tasks/PR-384.md",
+                branch="fix/pr-384",
             )
         ],
         error_message="Guardrail park",
@@ -730,8 +739,8 @@ def test_reset_confirm_present() -> None:
     assert 'hx-confirm="Reset this repo to IDLE? The current task returns to TODO."' in rendered
 
 
-def test_reset_reuses_retry_clearing() -> None:
-    assert "_clear_operator_park_for_task" in inspect.getsource(
+def test_reset_owns_legacy_clearing_not_retry_enqueue() -> None:
+    assert "_clear_operator_park_for_task" not in inspect.getsource(
         repo_control.retry_repo_task
     )
     assert "_clear_operator_park_for_task" in inspect.getsource(

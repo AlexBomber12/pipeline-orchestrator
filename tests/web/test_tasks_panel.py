@@ -79,7 +79,18 @@ def _setup_panel(
     monkeypatch.setattr(web_app, "REPOS_DIR", str(tmp_path / "repos"))
     (tmp_path / "repos" / "example__alpha" / "tasks").mkdir(parents=True)
     (tmp_path / "repos" / "example__alpha" / "tasks" / "PR-283.md").write_text(
-        f"---\nstatus: ERROR\n---\n\n# PR-283: Retry me\n\n{task_body}\n",
+        "---\n"
+        "status: ERROR\n"
+        "blocked_reason: daemon\n"
+        "---\n\n"
+        "# PR-283: Retry me\n\n"
+        "Branch: pr-283\n"
+        "- Type: bugfix\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 3\n"
+        "- Coder: codex\n\n"
+        f"{task_body}\n",
         encoding="utf-8",
     )
     state = RepoState(
@@ -138,7 +149,7 @@ def test_renders_disabled_button_at_cap(
     assert "disabled" in body
 
 
-def test_renders_retry_button_when_stale_fingerprint_count_is_at_cap(
+def test_stale_legacy_fingerprint_does_not_reset_retry_cap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -155,9 +166,8 @@ def test_renders_retry_button_when_stale_fingerprint_count_is_at_cap(
 
     assert response.status_code == 200
     body = response.text
-    assert 'hx-post="/repos/example__alpha/tasks/PR-283/retry"' in body
-    assert 'hx-confirm="Retry PR-283? Counter will increment to 1/3."' in body
-    assert "Retry count 0/3" in body
+    assert 'hx-post="/repos/example__alpha/tasks/PR-283/retry"' not in body
+    assert "Retry count 3/3. Edit task spec or delete to proceed." in body
 
 
 def test_renders_raw_retry_count_when_fingerprint_read_fails(

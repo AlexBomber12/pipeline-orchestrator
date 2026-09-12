@@ -96,6 +96,7 @@ from src.daemon.rate_limit import RateLimitMixin
 from src.daemon.recovery import RecoveryMixin
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
 from src.daemon.repo_ops import RepoOpsMixin
+from src.daemon.retry_commands import RetryCommandMixin, RetryDispatch
 from src.daemon.selector import (
     CoderPurpose,
     SelectionContext,
@@ -297,6 +298,7 @@ _EXTENSION_LANGUAGE_MAP = {
 
 
 class PipelineRunner(
+    RetryCommandMixin,
     RecoveryMixin,
     PreflightMixin,
     RateLimitMixin,
@@ -413,6 +415,8 @@ class PipelineRunner(
         self._auth_status_cache: dict[str, dict[str, str]] = {}
         self._auth_status_cache_expires_at: datetime | None = None
         self._current_coder_process: asyncio.subprocess.Process | None = None
+        self._retry_command_owner = f"{os.getpid()}:{uuid.uuid4()}"
+        self._active_retry_command_id: str | None = None
         self._stop_requested = False
         self._user_stopped_task_pr_ids: set[str] = set()
         # Legacy flag-off storage for crash parks. The flag-on path records
@@ -2847,13 +2851,36 @@ class PipelineRunner(
             )
             return
 
+        await self._refresh_user_paused_from_redis()
+        if not self.state.user_paused:
+            self._user_pause_logged = False
+
+        # Durable Retry commands are consumed before the ordinary ERROR,
+        # pause, and GitHub-budget exits.  This lets a parked runner
+        # acknowledge the command and report the exact inhibitor instead of
+        # leaving the browser to infer success from an HTTP response.  Fresh
+        # runners recover task/PR state first, then consume on the next cycle.
+        if self._recovered:
+            retry_dispatch = await self._consume_retry_command()
+            if retry_dispatch != RetryDispatch.NONE:
+                await self.publish_state()
+                if retry_dispatch == RetryDispatch.CODING:
+                    if await self._start_retry_coding_execution():
+                        try:
+                            await self.handle_coding()
+                        except asyncio.CancelledError:
+                            raise
+                        else:
+                            await self._finish_retry_dispatch(retry_dispatch)
+                elif retry_dispatch == RetryDispatch.WATCH:
+                    await self._finish_retry_dispatch(retry_dispatch)
+                await self.publish_state()
+                return
+
         if not await self._check_github_api_budget():
             await self.publish_state()
             return
 
-        await self._refresh_user_paused_from_redis()
-        if not self.state.user_paused:
-            self._user_pause_logged = False
         if not self._recovered:
             recovery_complete = await self.recover_state()
             if not recovery_complete:

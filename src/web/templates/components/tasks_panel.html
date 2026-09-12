@@ -50,14 +50,46 @@
         </button>
     </div>
     <div id="{{ diagnostic_id }}" class="mt-1 empty:hidden"></div>
+    {% if task.retry_command %}
+    {% set command = task.retry_command %}
+    <div class="mt-2 rounded border border-accent/20 bg-accent/5 px-2 py-1.5 text-[11px] text-gray-300"
+         data-retry-command-id="{{ command.command_id }}"
+         data-retry-command-status="{{ command.status }}">
+        {% if command.status == 'queued' %}
+        <span class="font-medium text-accent">Retry accepted.</span>
+        Waiting for daemon acknowledgement{% if command.command_id %} ({{ command.command_id[:8] }}){% endif %}.
+        {% elif command.status == 'processing' %}
+        <span class="font-medium text-accent">Daemon acknowledged Retry.</span>
+        {{ command.outcome_reason }}
+        {% elif command.status == 'deferred' %}
+        <span class="font-medium text-warn">Retry deferred.</span>
+        {{ command.outcome_reason }}
+        {% elif command.status == 'applied' %}
+        <span class="font-medium text-ok">Retry applied.</span>
+        {{ command.outcome_reason }}
+        Execution: {{ command.execution_state }}{% if task.retry_pipeline_state %}; pipeline: {{ task.retry_pipeline_state }}{% endif %}.
+        {% else %}
+        <span class="font-medium text-fail">Retry failed.</span>
+        {{ command.outcome_reason }}
+        {% endif %}
+    </div>
+    {% endif %}
     {% if status_key == 'error' %}
     {% set next_retry = task.retry_count + 1 %}
     <div class="mt-2 flex items-center justify-end gap-2">
-        {% if task.retry_count < retry_cap %}
+        {% if task.retry_command and task.retry_command.status in ['queued', 'processing', 'deferred', 'applied'] %}
+        <button type="button"
+                class="cursor-not-allowed rounded border border-white/10 px-2 py-1 text-xs font-medium text-gray-500"
+                title="Retry command {{ task.retry_command.command_id }} is {{ task.retry_command.status }}."
+                disabled>
+            Retry {{ task.retry_command.status }}
+        </button>
+        {% elif task.retry_count < retry_cap and task.retry_binding %}
         <button type="button"
                 class="secondary-interactive rounded border border-fail/30 px-2 py-1 text-xs font-medium text-fail hover:border-fail/50 hover:bg-fail/10"
                 title="Retry count {{ task.retry_count }}/{{ retry_cap }}"
                 hx-post="/repos/{{ repo_name }}/tasks/{{ task.pr_id }}/retry"
+                hx-vals='{"retry_binding":"{{ task.retry_binding }}"}'
                 hx-target="#repo-tasks-panel-{{ repo_name }}"
                 hx-swap="outerHTML"
                 hx-confirm="Retry {{ task.pr_id }}? Counter will increment to {{ next_retry }}/{{ retry_cap }}.">
@@ -76,7 +108,13 @@
     <div id="{{ target_id }}" class="mt-2 empty:hidden"></div>
 </li>
 {%- endmacro %}
-<section id="repo-tasks-panel-{{ repo_name }}" class="mt-6 rounded-lg border border-white/5 bg-surface-2 p-5">
+<section id="repo-tasks-panel-{{ repo_name }}"
+         class="mt-6 rounded-lg border border-white/5 bg-surface-2 p-5"
+         {% if has_pending_retry %}
+         hx-get="/repos/{{ repo_name }}/tasks"
+         hx-trigger="every 5s"
+         hx-swap="outerHTML"
+         {% endif %}>
     <div class="mb-4 flex items-center justify-between gap-3">
         <div>
             <h3 class="text-sm font-semibold text-gray-300">Tasks queue</h3>

@@ -174,9 +174,11 @@ def test_retry_button_visible_after_transition(
                 {
                     "pr_id": task.pr_id,
                     "title": task.title,
-                    "branch": task.branch,
-                    "retry_count": 0,
-                    "cancellation_subsource": header.blocked_reason,
+                        "branch": task.branch,
+                        "retry_count": 0,
+                        "retry_binding": "a" * 64,
+                        "retry_command": None,
+                        "cancellation_subsource": header.blocked_reason,
                 }
             ],
         },
