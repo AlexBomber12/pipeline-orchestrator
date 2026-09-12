@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import subprocess
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
-
 from src.github import prs as gh_prs
-from src.models import ReviewStatus
+from src.models import CIStatus, ReviewStatus
 
 
 class _FakeCompletedProcess:
@@ -82,8 +82,8 @@ def test_get_open_prs_preserves_quarantine_labels(
     )
     monkeypatch.setattr(
         gh_prs.checks,
-        "_fetch_ci_status_rest",
-        lambda repo, sha: ([], [], True),
+        "_fetch_ci_evidence_rest",
+        lambda *args, **kwargs: SimpleNamespace(ci_status=CIStatus.PENDING),
     )
     monkeypatch.setattr(
         gh_prs.reviews,

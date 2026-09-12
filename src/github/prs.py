@@ -25,7 +25,7 @@ from src.github.gh_runner import (
     _parse_iso,
 )
 from src.github.reviews import _begin_review_cache_cycle
-from src.models import CIStatus, PRInfo
+from src.models import PRInfo
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,21 @@ def extract_queue_pr_id(subject: str) -> str | None:
     if match is None:
         return None
     return match.group(1)
+
+
+def _head_sha_from_pr_list_entry(entry: dict) -> str:
+    """Return the PR head SHA from a ``gh pr list`` entry."""
+    head_sha = entry.get("headRefOid")
+    if isinstance(head_sha, str) and head_sha:
+        return head_sha
+    commits = entry.get("commits")
+    if not isinstance(commits, list) or not commits:
+        return ""
+    latest = commits[-1]
+    if not isinstance(latest, dict):
+        return ""
+    oid = latest.get("oid")
+    return oid if isinstance(oid, str) else ""
 
 
 def clear_merged_prs_cache() -> None:
@@ -141,6 +156,7 @@ def _is_valid_branch_name(branch: str) -> bool:
 def get_open_prs(
     repo: str,
     allow_merge_without_checks: bool = False,
+    required_checks: list[str] | tuple[str, ...] | None = None,
 ) -> list[PRInfo]:
     """Return open PRs for ``repo`` (``owner/repo``) with CI and review status."""
 
@@ -166,6 +182,7 @@ def get_open_prs(
         return _get_open_prs_rest(
             repo,
             allow_merge_without_checks=allow_merge_without_checks,
+            required_checks=required_checks,
         )
     if not isinstance(raw, list):
         return []
@@ -176,10 +193,14 @@ def get_open_prs(
         if not number:
             continue
         commits = entry.get("commits") or []
-        head_sha = entry.get("headRefOid", "")
+        head_sha = _head_sha_from_pr_list_entry(entry)
         title = entry.get("title", "")
-        check_runs, status_payload, fetch_ok = checks._fetch_ci_status_rest(
-            repo, head_sha
+        ci_evidence = checks._fetch_ci_evidence_rest(
+            repo,
+            head_sha,
+            pr_number=number,
+            required_checks=required_checks,
+            allow_merge_without_checks=allow_merge_without_checks,
         )
         labels = entry.get("labels") or []
         quarantine_labels = {
@@ -194,12 +215,7 @@ def get_open_prs(
                 branch=entry.get("headRefName", ""),
                 title=title,
                 pr_id=extract_queue_pr_id(title),
-                ci_status=checks._map_rest_ci_status_to_enum(
-                    check_runs,
-                    status_payload,
-                    empty_is_success=allow_merge_without_checks,
-                    fetch_ok=fetch_ok,
-                ),
+                ci_status=ci_evidence.ci_status,
                 review_status=reviews.get_pr_review_status(
                     repo,
                     number,
@@ -228,6 +244,7 @@ def _get_open_prs_rest(
     repo: str,
     *,
     allow_merge_without_checks: bool,
+    required_checks: list[str] | tuple[str, ...] | None = None,
 ) -> list[PRInfo]:
     """Return open PRs via REST when GraphQL status rollup is unavailable."""
 
@@ -244,6 +261,13 @@ def _get_open_prs_rest(
         user = entry.get("user") or {}
         title = entry.get("title", "")
         head_sha = head.get("sha", "")
+        ci_evidence = checks._fetch_ci_evidence_rest(
+            repo,
+            head_sha,
+            pr_number=number,
+            required_checks=required_checks,
+            allow_merge_without_checks=allow_merge_without_checks,
+        )
         labels = entry.get("labels") or []
         quarantine_labels = {
             label.get("name", "")
@@ -257,11 +281,7 @@ def _get_open_prs_rest(
                 branch=head.get("ref", ""),
                 title=title,
                 pr_id=extract_queue_pr_id(title),
-                ci_status=(
-                    CIStatus.SUCCESS
-                    if allow_merge_without_checks
-                    else CIStatus.PENDING
-                ),
+                ci_status=ci_evidence.ci_status,
                 review_status=reviews.get_pr_review_status(
                     repo,
                     number,
