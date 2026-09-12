@@ -3649,6 +3649,54 @@ def test_ci_evidence_required_missing_and_pending_block_success(
     assert success.ci_status == CIStatus.SUCCESS
 
 
+def test_ci_evidence_required_status_context_can_be_on_later_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Required legacy status contexts are resolved across all status pages."""
+
+    def fake_paginated(path: str) -> list[dict]:
+        assert "check-runs" in path
+        return [{"check_runs": []}]
+
+    status_calls: list[str] = []
+
+    def fake_etag_get(path: str) -> dict:
+        status_calls.append(path)
+        if path.endswith("&page=1"):
+            return {
+                "state": "success",
+                "statuses": [
+                    {"context": f"legacy-{idx}", "state": "success"}
+                    for idx in range(100)
+                ],
+            }
+        if path.endswith("&page=2"):
+            return {
+                "state": "success",
+                "statuses": [
+                    {"context": "integration", "state": "success"},
+                ],
+            }
+        raise AssertionError(f"unexpected status page: {path}")
+
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
+    monkeypatch.setattr("src.github.cache._etag_get", fake_etag_get)
+
+    evidence = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        required_checks=["integration"],
+    )
+
+    assert evidence.ci_status == CIStatus.SUCCESS
+    assert evidence.statuses_source.complete is True
+    assert "required_check_missing:integration" != evidence.pending_reason
+    assert [ctx.display_name for ctx in evidence.contexts if ctx.display_name == "integration"] == [
+        "integration"
+    ]
+    assert len(status_calls) == 2
+
+
 def test_ci_evidence_collapses_check_run_reruns_by_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

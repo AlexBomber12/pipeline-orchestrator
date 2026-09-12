@@ -7,6 +7,7 @@ WATCH gate's CI status read. Reuses ``cache._etag_get`` and
 
 from __future__ import annotations
 
+import itertools
 import json
 import time
 from dataclasses import dataclass, field
@@ -94,6 +95,7 @@ _INFRA_ANNOTATION_KEYWORDS = (
 # captures any realistic infra annotation while keeping the worst case
 # at one extra REST call per failing non-infra-conclusion check-run.
 _ANNOTATION_HYDRATION_PER_PAGE = 50
+_COMBINED_STATUS_PER_PAGE = 100
 
 
 @dataclass(frozen=True)
@@ -356,30 +358,7 @@ def _fetch_ci_evidence_rest(
     for run in check_runs:
         _maybe_hydrate_annotations(repo, run)
 
-    status_path = f"repos/{repo}/commits/{sha}/status"
-    statuses_source = _source_failed("statuses_fetch_failed")
-    try:
-        raw_status = retry_transient(
-            lambda: cache._etag_get(status_path),
-            operation_name=f"gh api {status_path}",
-        )
-    except RuntimeError:
-        raw_status = None
-    if isinstance(raw_status, dict):
-        status_payload = raw_status
-        statuses_source = _source_ok()
-    elif isinstance(raw_status, str) and raw_status:
-        try:
-            parsed = json.loads(raw_status)
-        except json.JSONDecodeError:
-            parsed = None
-        if isinstance(parsed, dict):
-            status_payload = parsed
-            statuses_source = _source_ok()
-        else:
-            statuses_source = _source_failed("statuses_unexpected_payload")
-    elif raw_status is not None:
-        statuses_source = _source_failed("statuses_unexpected_payload")
+    status_payload, statuses_source = _fetch_combined_status_payload(repo, sha)
 
     evidence = _build_ci_evidence(
         repo=repo,
@@ -396,6 +375,62 @@ def _fetch_ci_evidence_rest(
     _evict_expired_ci_status_cache(now)
     _ci_status_cache[cache_key] = (now, evidence)
     return evidence
+
+
+def _parse_status_payload(raw_status: object) -> dict | None:
+    if isinstance(raw_status, dict):
+        return raw_status
+    if isinstance(raw_status, str) and raw_status:
+        try:
+            parsed = json.loads(raw_status)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _fetch_combined_status_payload(
+    repo: str,
+    sha: str,
+) -> tuple[dict, CISourceCompleteness]:
+    status_path = (
+        f"repos/{repo}/commits/{sha}/status?per_page={_COMBINED_STATUS_PER_PAGE}"
+    )
+    first_payload: dict | None = None
+    statuses: list[object] = []
+
+    for page_num in itertools.count(1):
+        page_path = f"{status_path}&page={page_num}"
+        try:
+            raw_status = retry_transient(
+                lambda p=page_path: cache._etag_get(p),
+                operation_name=f"gh api {page_path}",
+            )
+        except RuntimeError:
+            return {}, _source_failed("statuses_fetch_failed")
+
+        payload = _parse_status_payload(raw_status)
+        if payload is None:
+            reason = (
+                "statuses_fetch_failed"
+                if raw_status is None
+                else "statuses_unexpected_payload"
+            )
+            return {}, _source_failed(reason)
+
+        page_statuses = payload.get("statuses")
+        if not isinstance(page_statuses, list):
+            return {}, _source_failed("statuses_unexpected_payload")
+        if first_payload is None:
+            first_payload = payload
+        statuses.extend(page_statuses)
+        if len(page_statuses) < _COMBINED_STATUS_PER_PAGE:
+            break
+
+    status_payload = dict(first_payload or {})
+    status_payload["statuses"] = statuses
+    return status_payload, _source_ok()
 
 
 def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
