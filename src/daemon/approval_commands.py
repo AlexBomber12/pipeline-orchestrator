@@ -33,6 +33,7 @@ from src.github import prs as gh_prs
 from src.inhibitor import derive_active_inhibitors
 from src.keyspace import control_stop, pipeline_state, upload_pending
 from src.models import PipelineState, RepoState, TaskStatus
+from src.retry_commands import load_latest_retry_command
 
 
 def checkout_process_blocker(repo_path: str) -> str | None:
@@ -96,7 +97,8 @@ class ApprovalCommandMixin:
                         if raw:
                             snapshot = RepoState.model_validate_json(raw)
                     if command.status == "failed" and matches_state(command, snapshot):
-                        return True  # failed approval must not fall into dirty-tree reset
+                        if await self._failed_approval_holds(command):
+                            return True
                     continue
                 if command.status == "applied" and self._recovered and not self._approval_commit_uncertain:
                     if not matches_state(command, self.state) or self.state.state != PipelineState.WATCH:
@@ -130,6 +132,45 @@ class ApprovalCommandMixin:
         except Exception as exc:
             self.log_event(f"[RECOVERY] Approval store/application unavailable; deferring cycle: {exc}.")
             return True
+
+    async def _failed_approval_holds(self, command: ApprovalCommand) -> bool:
+        """Retain preservation until a later operator action safely supersedes it.
+
+        This only releases this approval's hold. Existing Retry/upload/rejection
+        consumers keep ownership of their own continuation policies.
+        """
+        if command.superseded:
+            return False
+        failure = failure_identity(await self.redis.get(cause_key(self.name, command.task.pr_id)))
+        upload = await self.redis.get(upload_pending(self.name))
+        retry = await load_latest_retry_command(self.redis, self.name, command.task.pr_id)
+        later_retry = retry is not None and retry.requested_at > command.requested_at
+        if failure == command.failure and not upload and not later_retry:
+            return True
+        reason = checkout_process_blocker(self.repo_path)
+        if not reason and self._current_coder_process is not None:
+            reason = "Coder execution is still active."
+        if not reason:
+            dirty = git_ops._git(self.repo_path, "--no-optional-locks", "status", "--porcelain")
+            local = git_ops._git(self.repo_path, "rev-list", "--branches", "HEAD", "--not", "--remotes")
+            if dirty.stdout.strip() or local.stdout.strip():
+                reason = "Checkout still contains uncommitted work or local-only commits."
+        if reason:
+            await self._approval_result(command, "failed", f"Later operator action is waiting: {reason}")
+            return True
+        key = approval_key(self.name, command.binding)
+
+        async def transaction(pipe: Any) -> None:
+            current = ApprovalCommand.model_validate_json(await pipe.get(key))
+            current.superseded = True
+            current.reason = (
+                "Failed approval superseded by a later operator action; normal reconciliation may continue."
+            )
+            pipe.multi()
+            pipe.set(key, current.model_dump_json())
+
+        await self.redis.transaction(transaction, key)
+        return False
 
     async def _approval_blocker(self, command: ApprovalCommand) -> str | None:
         if not self.repo_config.active:
@@ -265,6 +306,8 @@ class ApprovalCommandMixin:
             pipe.set(key, current.model_dump_json())
             pipe.set(state_key, state.model_dump_json())
             if failure:
+                # RedisSuppressionStore.is_suppressed reads this same key;
+                # clearing it atomically clears the bound MERGE suppression too.
                 pipe.delete(cancellation)
                 pipe.zrem(index_key(self.name), command.task.pr_id)
             return state

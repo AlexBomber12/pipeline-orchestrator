@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -25,6 +27,35 @@ from src.keyspace import control_stop, pipeline_state
 from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
 
 from tests.runner import _helpers as h
+
+
+@pytest.fixture(autouse=True)
+def isolated_daemon_process_view(monkeypatch):
+    """Model the daemon PID namespace, keeping real test child processes visible.
+
+    Hosted CI has unrelated non-dumpable processes under the same UID. They
+    correctly block a host-wide production probe but are not part of this
+    temporary daemon's execution ownership. Permission-denial behavior is
+    exercised separately; the real child/cwd regression remains unmocked.
+    """
+    original = Path.iterdir
+
+    def iterdir(path):
+        entries = original(path)
+        if path != Path("/proc"):
+            yield from entries
+            return
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+                if int(entry.name) == os.getpid() or int(fields[1]) == os.getpid():
+                    yield entry
+            except (OSError, IndexError):
+                continue
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
 
 
 def git(repo, *args):
@@ -868,3 +899,97 @@ async def test_changed_spec_after_application_has_visible_deferral(approval):
     saved = await load_approval(runner.redis, runner.name, command.binding)
     assert "continuation deferred:" in saved.reason and "Task specification changed" in saved.reason
     assert snapshot(repo) == before
+
+
+async def test_atomic_approval_clears_the_real_suppression_store_and_merge_gate(approval, monkeypatch):
+    from src.daemon.handlers.merge import MergeMixin
+    from src.subsource_registry import SuppressionReason
+
+    runner, command, repo, _ = approval
+    await runner._suppress_task(
+        "PR-42",
+        SuppressionReason.GUARDRAIL,
+        {
+            "pr_number": 42,
+            "category": "large_diff_threshold",
+            "excerpt": "+1800 LOC",
+        },
+    )
+    assert (await runner._suppression_record_for_task("PR-42")).reason == SuppressionReason.GUARDRAIL
+    raw = await runner.redis.get(cause_key(runner.name, "PR-42"))
+    command = build_approval(runner.name, runner.state, raw, repo)
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    assert await runner._suppression_record_for_task("PR-42") is None
+    assert "status: ERROR" in (repo / "tasks/PR-42.md").read_text()
+
+    # Exercise the real MERGE suppression gate, then stop before any Git write.
+    class ReachedMerge(BaseException):
+        pass
+
+    def stop_at_git(*args, **kwargs):
+        raise ReachedMerge
+
+    monkeypatch.setattr(daemon_approval.git_ops, "_git", stop_at_git)
+    with pytest.raises(ReachedMerge):
+        await MergeMixin.handle_merge(runner)
+
+
+@pytest.mark.parametrize("action", ["reject", "upload", "retry"])
+@pytest.mark.parametrize("restart", [False, True])
+async def test_later_operator_action_supersedes_failed_approval(approval, action, restart):
+    from datetime import timedelta
+
+    from src.keyspace import upload_pending
+    from src.retry_commands import enqueue_retry_command
+
+    from tests.test_retry_commands import _new
+
+    runner, command, _, _ = approval
+    command.status = "failed"
+    command.active = False
+    await enqueue_approval(runner.redis, command)
+    if action == "reject":
+        await runner.redis.set(
+            cause_key(runner.name, "PR-42"),
+            CancellationCause(
+                category="ERROR",
+                payload={"subsource": "operator_reject"},
+            ).to_redis(),
+        )
+    elif action == "upload":
+        await runner.redis.set(upload_pending(runner.name), "later upload")
+    else:
+        retry = _new()
+        retry.requested_at = command.requested_at + timedelta(seconds=1)
+        await enqueue_retry_command(runner.redis, retry)
+    if restart:
+        runner._recovered = False
+        runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+    assert not await runner._consume_approval_command()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "failed" and saved.superseded
+    assert not await runner._consume_approval_command()
+    assert await runner.redis.get(cause_key(runner.name, "PR-42"))
+
+
+@pytest.mark.parametrize("work", ["dirty", "coder", "unknown"])
+async def test_superseding_action_waits_for_preserved_work(approval, monkeypatch, work):
+    from src.keyspace import upload_pending
+
+    runner, command, repo, _ = approval
+    command.status = "failed"
+    command.active = False
+    await enqueue_approval(runner.redis, command)
+    await runner.redis.set(upload_pending(runner.name), "later upload")
+    if work == "dirty":
+        (repo / "notes").write_text("preserve this")
+    elif work == "coder":
+        runner._current_coder_process = object()
+    else:
+        monkeypatch.setattr(daemon_approval, "checkout_process_blocker", lambda _: "ownership uncertain")
+    before = snapshot(repo)
+    assert await runner._consume_approval_command()
+    assert snapshot(repo) == before
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert not saved.superseded and "Later operator action is waiting" in saved.reason

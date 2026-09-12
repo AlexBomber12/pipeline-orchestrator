@@ -36,6 +36,7 @@ class ApprovalCommand(BaseModel):
     reason: str = "Approval requested; waiting for the daemon to apply it."
     requested_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     active: bool = True
+    superseded: bool = False
 
 
 def approval_key(repo: str, binding: str) -> str:
