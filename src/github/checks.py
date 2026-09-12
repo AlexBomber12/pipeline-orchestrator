@@ -882,6 +882,7 @@ async def classify_ci_status_with_age(
     *,
     empty_is_success: bool = False,
     fetch_ok: bool = True,
+    required_checks: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[CIStatus, str | None]:
     """Augment :func:`_map_rest_ci_status_to_enum` with stuck-PENDING reclassification.
 
@@ -896,11 +897,12 @@ async def classify_ci_status_with_age(
 
     PR-250.
     """
-    raw_status = _map_rest_ci_status_to_enum(
+    raw_status = _classify_raw_ci_status_for_age(
         runs_payload,
         statuses_payload,
         empty_is_success=empty_is_success,
         fetch_ok=fetch_ok,
+        required_checks=tuple(required_checks or ()),
     )
     if raw_status != CIStatus.PENDING:
         await _clear_pending_tracker(redis_client, repo, pr_number, head_sha)
@@ -934,3 +936,41 @@ async def classify_ci_status_with_age(
     if age_seconds >= pending_max_seconds:
         return CIStatus.FAILURE, "stuck_pending"
     return raw_status, None
+
+
+def _classify_raw_ci_status_for_age(
+    runs_payload: list[dict],
+    statuses_payload: dict,
+    *,
+    empty_is_success: bool,
+    fetch_ok: bool,
+    required_checks: tuple[str, ...],
+) -> CIStatus:
+    if not required_checks:
+        return _map_rest_ci_status_to_enum(
+            runs_payload,
+            statuses_payload,
+            empty_is_success=empty_is_success,
+            fetch_ok=fetch_ok,
+        )
+
+    contexts = tuple(
+        _collapse_check_run_contexts(runs_payload)
+        + _collapse_status_contexts(statuses_payload)
+    )
+    visible_failure = _map_observed_contexts_to_enum(
+        runs_payload,
+        statuses_payload,
+        contexts,
+    )
+    if visible_failure in {CIStatus.FAILURE, CIStatus.INFRA_FAILURE}:
+        return visible_failure
+    if not fetch_ok:
+        return CIStatus.PENDING
+    for required in required_checks:
+        matches = [ctx for ctx in contexts if ctx.display_name == required]
+        if not matches:
+            return CIStatus.PENDING
+        if any(not ctx.success for ctx in matches):
+            return CIStatus.PENDING
+    return CIStatus.SUCCESS

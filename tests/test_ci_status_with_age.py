@@ -157,6 +157,137 @@ def test_status_transition_clears_tracker() -> None:
     assert key in redis.deleted
 
 
+def test_missing_required_check_ages_into_stuck_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing configured context stays PENDING long enough to reclassify."""
+    redis = _FakeRedis()
+    base = 1_700_000_000.0
+    key = _pending_tracker_key("octo/repo", 7, "sha-aaa")
+    redis.store[key] = str(base)
+    monkeypatch.setattr(checks.time, "time", lambda: base + 60 * 60)
+
+    status, reason = asyncio.run(
+        classify_ci_status_with_age(
+            "octo/repo",
+            7,
+            "sha-aaa",
+            redis,
+            pending_max_seconds=1800,
+            runs_payload=[{"name": "unit", "conclusion": "success"}],
+            statuses_payload={},
+            required_checks=["unit", "integration"],
+        )
+    )
+
+    assert status == CIStatus.FAILURE
+    assert reason == "stuck_pending"
+
+
+def test_required_checks_preserve_observed_failure() -> None:
+    """A visible failure still dominates required-check policy."""
+    redis = _FakeRedis()
+
+    status, reason = asyncio.run(
+        classify_ci_status_with_age(
+            "octo/repo",
+            7,
+            "sha-aaa",
+            redis,
+            pending_max_seconds=1800,
+            runs_payload=[{"name": "unit", "conclusion": "failure"}],
+            statuses_payload={},
+            required_checks=["unit"],
+        )
+    )
+
+    assert status == CIStatus.FAILURE
+    assert reason is None
+
+
+def test_present_required_check_pending_uses_pending_tracker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured context that exists but is non-terminal ages as PENDING."""
+    redis = _FakeRedis()
+    monkeypatch.setattr(checks.time, "time", lambda: 1_700_000_000.0)
+
+    status, reason = asyncio.run(
+        classify_ci_status_with_age(
+            "octo/repo",
+            7,
+            "sha-aaa",
+            redis,
+            pending_max_seconds=1800,
+            runs_payload=[{"name": "unit", "status": "in_progress"}],
+            statuses_payload={},
+            required_checks=["unit"],
+        )
+    )
+
+    assert status == CIStatus.PENDING
+    assert reason is None
+    assert _pending_tracker_key("octo/repo", 7, "sha-aaa") in redis.store
+
+
+def test_required_checks_success_clears_pending_tracker() -> None:
+    """Required policy success must not keep the pending-age anchor."""
+    redis = _FakeRedis()
+    key = _pending_tracker_key("octo/repo", 7, "sha-aaa")
+    redis.store[key] = "1700000000.0"
+
+    status, reason = asyncio.run(
+        classify_ci_status_with_age(
+            "octo/repo",
+            7,
+            "sha-aaa",
+            redis,
+            pending_max_seconds=1800,
+            runs_payload=[
+                {"name": "unit", "conclusion": "success"},
+                {"name": "integration", "conclusion": "success"},
+            ],
+            statuses_payload={},
+            required_checks=["unit", "integration"],
+        )
+    )
+
+    assert status == CIStatus.SUCCESS
+    assert reason is None
+    assert key not in redis.store
+    assert key in redis.deleted
+
+
+def test_required_checks_fetch_outage_does_not_age_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A required-check policy does not turn transport failure into stuck CI."""
+    redis = _FakeRedis()
+    base = 1_700_000_000.0
+    key = _pending_tracker_key("octo/repo", 7, "sha-aaa")
+    redis.store[key] = str(base)
+    monkeypatch.setattr(checks.time, "time", lambda: base + 60 * 60)
+
+    status, reason = asyncio.run(
+        classify_ci_status_with_age(
+            "octo/repo",
+            7,
+            "sha-aaa",
+            redis,
+            pending_max_seconds=1800,
+            runs_payload=[],
+            statuses_payload={},
+            fetch_ok=False,
+            required_checks=["unit"],
+        )
+    )
+
+    assert status == CIStatus.PENDING
+    assert reason is None
+    assert key not in redis.store
+    assert key in redis.deleted
+
+
 def test_head_sha_rotation_resets_tracker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
