@@ -408,7 +408,11 @@ def _fetch_combined_status_payload(
                 operation_name=f"gh api {page_path}",
             )
         except RuntimeError:
-            return {}, _source_failed("statuses_fetch_failed")
+            if first_payload is None:
+                return {}, _source_failed("statuses_fetch_failed")
+            status_payload = dict(first_payload)
+            status_payload["statuses"] = statuses
+            return status_payload, _source_failed("statuses_fetch_failed")
 
         payload = _parse_status_payload(raw_status)
         if payload is None:
@@ -417,11 +421,19 @@ def _fetch_combined_status_payload(
                 if raw_status is None
                 else "statuses_unexpected_payload"
             )
-            return {}, _source_failed(reason)
+            if first_payload is None:
+                return {}, _source_failed(reason)
+            status_payload = dict(first_payload)
+            status_payload["statuses"] = statuses
+            return status_payload, _source_failed(reason)
 
         page_statuses = payload.get("statuses")
         if not isinstance(page_statuses, list):
-            return {}, _source_failed("statuses_unexpected_payload")
+            if first_payload is None:
+                return {}, _source_failed("statuses_unexpected_payload")
+            status_payload = dict(first_payload)
+            status_payload["statuses"] = statuses
+            return status_payload, _source_failed("statuses_unexpected_payload")
         if first_payload is None:
             first_payload = payload
         statuses.extend(page_statuses)
