@@ -36,6 +36,7 @@ class RejectionCommand(BaseModel):
     file_sha256: str
     failure: str
     pr: PRInfo | None
+    initial_head_sha: str | None = None
     requested_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     status: Literal["accepted", "stopping", "closing", "deferred", "rejected", "merged"] = "accepted"
     reason: str = "Reject accepted; waiting for the daemon to stop this attempt and confirm PR closure."
@@ -103,6 +104,7 @@ def build_rejection(repo: str, state: RepoState, raw_cause: str | bytes, root: P
         file_sha256=hashlib.sha256(content.encode()).hexdigest(),
         failure=failure,
         pr=pr.model_copy(deep=True) if pr else None,
+        initial_head_sha=pr.head_sha if pr else None,
     )
 
 

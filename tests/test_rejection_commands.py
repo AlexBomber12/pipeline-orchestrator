@@ -1081,3 +1081,124 @@ async def test_pr_discovery_requires_attempt_repository_base_time_and_head(rejec
     else:
         with pytest.raises(AttemptChanged):
             discover_attempt_pr(str(repo), runner.owner_repo, "main", attempt)
+
+
+@pytest.mark.parametrize("push_timing", ["before_request", "after_request"])
+@pytest.mark.parametrize("lost_close_ack", [False, True])
+async def test_reject_rebinds_a_quiescent_same_attempt_push_and_preserves_replay(
+    rejected, monkeypatch, push_timing, lost_close_ack
+):
+    from tests.test_task_admission import stage, rewritten
+
+    runner, command, repo, remote, github, _ = rejected
+    original_head = command.pr.head_sha
+    if push_timing == "after_request":
+        assert (await post_reject(rejected)).status_code == 202
+    (repo / "late-attempt-work.txt").write_text("pushed after the decision was rendered")
+    git(repo, "add", "late-attempt-work.txt")
+    git(repo, "commit", "-m", "late attempt push")
+    git(repo, "push", "origin", "fix/pr-42")
+    updated_head = git(repo, "rev-parse", "HEAD")
+    github["attempt_prs"] = [raw_attempt_pr(command.pr.model_copy(update={"head_sha": updated_head}))]
+    if push_timing == "before_request":
+        assert (await post_reject(rejected)).status_code == 202
+    original_transport = daemon_reject.gh_runner.run_gh
+
+    def transport(args, *a, **kwargs):
+        result = original_transport(args, *a, **kwargs)
+        if lost_close_ack and args[:2] == ["pr", "close"]:
+            raise TimeoutError("close response lost after successful closure")
+        return result
+
+    monkeypatch.setattr(daemon_reject.gh_runner, "run_gh", transport)
+    await runner._consume_rejection_commands()
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    assert stored.initial_head_sha == original_head
+    assert stored.pr.head_sha == updated_head and stored.branch_head == updated_head
+    assert stored.pr.number == command.pr.number and stored.binding == command.binding
+    if lost_close_ack:
+        assert stored.status == "deferred" and not stored.released
+        fresh = h._make_runner()
+        fresh.repo_path, fresh.redis = runner.repo_path, runner.redis
+        await fresh._consume_rejection_commands()
+        runner.state = fresh.state
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    assert stored.status == "rejected" and stored.released
+    assert (await post_reject(rejected)).status_code == 202
+    assert sum(call[:2] == ["pr", "close"] for call in github["calls"]) == 1
+    assert (await stage(rejected, rewritten(repo))).status_code == 200
+    assert await runner.process_pending_uploads()
+    attempt = await load_attempt(runner.redis, runner.name, "PR-42")
+    runner.state.current_task = attempt.task
+    assert await runner._prepare_task_attempt((repo / "tasks/PR-42.md").read_text())
+    assert "refs/heads/fix/pr-42" not in git(remote, "show-ref")
+    assert not (repo / "late-attempt-work.txt").exists()
+
+
+@pytest.mark.parametrize("mismatch", ["remote_only", "local_missing", "api_only"])
+async def test_rejection_head_refresh_requires_local_and_remote_ownership(rejected, mismatch):
+    runner, command, repo, _, github, _ = rejected
+    original_head = command.pr.head_sha
+    assert (await post_reject(rejected)).status_code == 202
+    (repo / "external-update.txt").write_text("unattributed update")
+    git(repo, "add", "external-update.txt")
+    git(repo, "commit", "-m", "external update")
+    new_head = git(repo, "rev-parse", "HEAD")
+    if mismatch != "api_only":
+        git(repo, "push", "origin", "fix/pr-42")
+    git(repo, "checkout", "main")
+    if mismatch == "local_missing":
+        git(repo, "update-ref", "-d", "refs/heads/fix/pr-42")
+    else:
+        git(repo, "update-ref", "refs/heads/fix/pr-42", original_head)
+    github["attempt_prs"] = [raw_attempt_pr(command.pr.model_copy(update={"head_sha": new_head}))]
+    await runner._consume_rejection_commands()
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    assert stored.status == "deferred" and not stored.released
+    assert stored.pr.head_sha == original_head
+    assert not any(call[:2] == ["pr", "close"] for call in github["calls"])
+
+
+async def test_merged_pr_with_new_head_records_completion_without_rebinding_or_closing(rejected):
+    runner, command, _, _, github, _ = rejected
+    assert (await post_reject(rejected)).status_code == 202
+    github["attempt_prs"] = [
+        raw_attempt_pr(
+            command.pr.model_copy(update={"head_sha": "f" * 40}),
+            state="closed",
+            merged_at=datetime.now(timezone.utc).isoformat(),
+        )
+    ]
+    await runner._consume_rejection_commands()
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    assert stored.status == "merged" and stored.released
+    assert (await load_attempt(runner.redis, runner.name, "PR-42")).completed
+    assert not any(call[:2] == ["pr", "close"] for call in github["calls"])
+
+
+@pytest.mark.parametrize("changed", ["repository", "base", "number", "missing_head"])
+async def test_head_refresh_never_changes_the_bound_pr_identity(rejected, monkeypatch, changed):
+    runner, command, _, _, github, _ = rejected
+    assert (await post_reject(rejected)).status_code == 202
+    row = raw_attempt_pr(command.pr)
+    if changed == "repository":
+        row["head"]["repo"]["full_name"] = "outsider/demo"
+    elif changed == "base":
+        row["base"]["ref"] = "another-base"
+    elif changed == "number":
+        row["number"] = 99
+    else:
+        row["head"]["sha"] = ""
+    original_transport = daemon_reject.gh_runner.run_gh
+
+    def transport(args, *a, **kwargs):
+        if args == ["api", f"repos/{runner.owner_repo}/pulls/42"]:
+            return row
+        return original_transport(args, *a, **kwargs)
+
+    monkeypatch.setattr(daemon_reject.gh_runner, "run_gh", transport)
+    await runner._consume_rejection_commands()
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    assert stored.status == "deferred" and not stored.released
+    assert stored.pr == command.pr
+    assert not any(call[:2] == ["pr", "close"] for call in github["calls"])

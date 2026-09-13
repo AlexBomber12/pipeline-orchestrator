@@ -11,11 +11,13 @@ from src.models import PRInfo
 from src.task_attempts import AttemptChanged, TaskAttempt
 
 
-def attempt_branch_head(repo_path: str, branch: str) -> str | None:
+def attempt_branch_head(repo_path: str, branch: str, *, require_local: bool = False) -> str | None:
     remote = git_ops._git(repo_path, "ls-remote", "--heads", "origin", f"refs/heads/{branch}").stdout.strip()
     remote_sha = remote.split()[0] if remote else None
     local = git_ops._git(repo_path, "rev-parse", "--verify", f"refs/heads/{branch}", check=False)
     local_sha = local.stdout.strip() if local.returncode == 0 else None
+    if require_local and not local_sha:
+        raise AttemptChanged("Local attempt branch is missing; an updated PR HEAD cannot be attributed safely.")
     if remote_sha and local_sha and remote_sha != local_sha:
         raise AttemptChanged("Attempt branch refs disagree; PR ownership must be reconciled.")
     return remote_sha or local_sha

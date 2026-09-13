@@ -22,7 +22,13 @@ from src.rejection_commands import (
 from src.task_attempts import AttemptChanged, load_attempt, save_attempt
 
 
-def rejection_pr_details(owner_repo: str, command: RejectionCommand, base: str) -> dict:
+def rejection_pr_details(
+    owner_repo: str,
+    command: RejectionCommand,
+    base: str,
+    *,
+    require_head_match: bool = True,
+) -> dict:
     """Uncached exact-PR read, including repository and merge identity."""
     assert command.pr is not None
     data = gh_runner.run_gh(["api", f"repos/{owner_repo}/pulls/{command.pr.number}"])
@@ -35,7 +41,8 @@ def rejection_pr_details(owner_repo: str, command: RejectionCommand, base: str) 
         or head.get("repo", {}).get("full_name", "").casefold() != owner_repo.casefold()
         or target.get("repo", {}).get("full_name", "").casefold() != owner_repo.casefold()
         or target.get("ref") != base
-        or head.get("sha") != command.pr.head_sha
+        or not head.get("sha")
+        or (require_head_match and head.get("sha") != command.pr.head_sha)
         or data.get("state") not in {"open", "closed"}
         or "merged_at" not in data
     ):
@@ -129,10 +136,15 @@ class RejectionCommandMixin:
             if command.pr is None:
                 attempt = await load_attempt(self.redis, self.name, command.task.pr_id)
                 data = await asyncio.to_thread(
-                    discover_attempt_pr, self.repo_path, self.owner_repo, self.repo_config.branch, attempt,
+                    discover_attempt_pr,
+                    self.repo_path,
+                    self.owner_repo,
+                    self.repo_config.branch,
+                    attempt,
                 )
                 if data is not None:
                     command.pr = attempt_pr_info(data, self.owner_repo, attempt)
+                    command.initial_head_sha = command.pr.head_sha
                     command.branch_head = command.pr.head_sha
                     await self._save_rejection(command, "closing", "Attempt PR identified; verifying exact PR closure.")
                     updated = attempt.model_copy(update={"pr_number": command.pr.number, "pr_creation_pending": False})
@@ -146,7 +158,13 @@ class RejectionCommandMixin:
                     )
                     return
             if command.pr is not None:
-                data = await asyncio.to_thread(rejection_pr_details, self.owner_repo, command, self.repo_config.branch)
+                data = await asyncio.to_thread(
+                    rejection_pr_details,
+                    self.owner_repo,
+                    command,
+                    self.repo_config.branch,
+                    require_head_match=False,
+                )
                 if data["merged_at"]:
                     attempt = await load_attempt(self.redis, self.name, command.task.pr_id)
                     updated = attempt.model_copy(update={"completed": True})
@@ -156,6 +174,21 @@ class RejectionCommandMixin:
                     )
                     await self._release_rejected_attempt(command, merged=True)
                     return
+                if data["head"]["sha"] != command.pr.head_sha:
+                    # The same attempt may finish a push after its decision was
+                    # rendered. Execution is now quiescent; require local owner
+                    # evidence and matching remote refs before rebinding it.
+                    owned_head = attempt_branch_head(self.repo_path, command.task.branch, require_local=True)
+                    if owned_head != data["head"]["sha"]:
+                        raise AttemptChanged("Updated PR HEAD does not match the attempt-owned branch.")
+                    command.initial_head_sha = command.initial_head_sha or command.pr.head_sha
+                    command.pr = command.pr.model_copy(update={"head_sha": owned_head})
+                    command.branch_head = owned_head
+                    await self._save_rejection(
+                        command,
+                        "closing",
+                        "Verified updated HEAD of the same attempt; confirming exact PR closure.",
+                    )
                 if data["state"] == "open":
                     now = datetime.now(timezone.utc)
                     if command.close_requested_at and now - command.close_requested_at < timedelta(seconds=60):
