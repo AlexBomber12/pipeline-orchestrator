@@ -1,4 +1,4 @@
-"""Apply approval at the scheduler's between-cycle boundary, without Git writes.
+"""Apply approval at the scheduler's boundary without changing existing Git work.
 
 The main loop permits one in-flight cycle per repository. A command is handled
 before clone/scaffold, recovery, Retry or dirty-tree preflight. No coder is
@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -209,6 +210,15 @@ class ApprovalCommandMixin:
         reason = checkout_process_blocker(self.repo_path)
         if reason:
             return reason
+        if not Path(self.repo_path).exists():
+            # Restore an absent checkout without the ordinary clone helper's
+            # partial-clone deletion or scaffolding. Git refuses a destination
+            # that acquired files meanwhile; failures retain any partial work.
+            await asyncio.to_thread(
+                subprocess.run,
+                ["git", "clone", "--branch", command.pr.branch, "--", self.repo_config.url, self.repo_path],
+                capture_output=True, text=True, check=True, timeout=120,
+            )
         result = git_ops._git(self.repo_path, "--no-optional-locks", "status", "--porcelain")
         if result.stdout.strip():
             return "Checkout has staged, unstaged or untracked work; preserving it until the operator resolves it."

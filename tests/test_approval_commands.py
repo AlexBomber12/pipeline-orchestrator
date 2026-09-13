@@ -684,6 +684,18 @@ async def test_dashboard_retains_pending_deferred_applied_and_failed_results(app
     html = _render_panel(guardrail_pending=views)
     assert 'data-approval-status="applied"' in html and "CI and review" in html
     assert "reject-btn" not in html
+    # An unrelated applied receipt must not hide either action for a new cause.
+    await runner.redis.set(
+        cause_key(runner.name, "PR-42"),
+        CancellationCause(
+            category="ERROR", payload={"subsource": "guardrail", "category": "workflow_destruction"},
+        ).to_redis(),
+    )
+    monkeypatch.setattr(dashboard, "list_pending_guardrail_decisions", AsyncMock(return_value=[pending]))
+    views = await dashboard._build_guardrail_pending_view(runner.redis, runner.name, runner.state)
+    assert views[0]["approval_binding"] != command.binding
+    html = _render_panel(guardrail_pending=views)
+    assert "approve-btn" in html and "reject-btn" in html
 
 
 async def test_dashboard_unreadable_task_cannot_offer_unbound_approval(approval, monkeypatch):
@@ -1049,3 +1061,55 @@ async def test_rejection_supersedes_upload_blocked_approval(approval, single, re
     assert await runner.redis.get(cause_key(runner.name, "PR-42")) == rejection
     assert await runner.redis.get(upload_pending(runner.name))
     assert snapshot(repo) == before and git(remote, "show-ref") == remote_before
+
+
+@pytest.mark.parametrize("single", [False, True])
+async def test_restored_redis_approval_clones_absent_checkout_without_scaffolding(approval, single):
+    runner, _, repo, remote = approval
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    runner.repo_config.url = runner.state.url = str(remote)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    raw = await runner.redis.get(cause_key(runner.name, "PR-42"))
+    command = build_approval(runner.name, runner.state, raw, repo)
+    await enqueue_approval(runner.redis, command)
+    before, remote_before = snapshot(repo), git(remote, "show-ref")
+    backup = repo.with_name("preserved-original")
+    repo.rename(backup)
+    runner._recovered = False
+    runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
+    assert runner.state.current_pr.number == 42 and runner.state.state == PipelineState.WATCH
+    assert git(repo, "branch", "--show-current") == "fix/pr-42"
+    assert git(repo, "rev-parse", "HEAD") == command.pr.head_sha
+    assert not git(repo, "status", "--porcelain")
+    assert snapshot(backup) == before and git(remote, "show-ref") == remote_before
+    runner.ensure_repo_cloned.assert_not_awaited()
+
+
+@pytest.mark.parametrize("concurrent_work", [False, True])
+async def test_approval_clone_failure_defers_without_cleanup(approval, monkeypatch, concurrent_work):
+    runner, command, repo, remote = approval
+    await enqueue_approval(runner.redis, command)
+    backup = repo.with_name("preserved-original")
+    repo.rename(backup)
+    before, remote_before = snapshot(backup), git(remote, "show-ref")
+    original = subprocess.run
+
+    def clone(args, **kwargs):
+        assert args[:2] == ["git", "clone"]
+        if concurrent_work:
+            repo.mkdir()
+            (repo / "operator-notes").write_text("preserve concurrent work")
+            return original([*args[:-2], str(remote), args[-1]], **kwargs)
+        raise subprocess.CalledProcessError(1, args, stderr="clone unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(daemon_approval.subprocess, "run", clone)
+        await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "deferred" and "Application could not be verified" in saved.reason
+    assert await runner.redis.get(cause_key(runner.name, "PR-42"))
+    assert snapshot(backup) == before and git(remote, "show-ref") == remote_before
+    if concurrent_work:
+        assert (repo / "operator-notes").read_text() == "preserve concurrent work"
