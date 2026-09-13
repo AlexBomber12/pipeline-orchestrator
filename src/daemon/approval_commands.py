@@ -31,7 +31,7 @@ from src.cancellation.storage import CancellationCause, cause_key, index_key, ta
 from src.daemon import git_ops
 from src.daemon.quarantine import quarantine_label_for_category
 from src.github import prs as gh_prs
-from src.inhibitor import derive_active_inhibitors
+from src.inhibitor import InhibitorType, derive_active_inhibitors
 from src.keyspace import control_stop, pipeline_state, upload_pending
 from src.models import PipelineState, RepoState, TaskStatus
 from src.retry_commands import load_latest_retry_command
@@ -188,27 +188,31 @@ class ApprovalCommandMixin:
             return "Coder execution or Stop is still active."
         if self.state.pending_queue_sync_branch:
             return "Queue synchronization is pending."
-        if self.state.state not in (PipelineState.ERROR, PipelineState.IDLE, PipelineState.WATCH, PipelineState.PAUSED):
+        safe_states = {PipelineState.ERROR, PipelineState.IDLE, PipelineState.WATCH, PipelineState.PAUSED}
+        if command.status == "applied":
+            safe_states.add(PipelineState.MERGE)
+        if self.state.state not in safe_states:
             return "Work is active; waiting for the execution boundary."
         raw = await self.redis.get(pipeline_state(self.name))
         if raw:
             persisted = RepoState.model_validate_json(raw)
-            if persisted.state not in (
-                PipelineState.ERROR,
-                PipelineState.IDLE,
-                PipelineState.WATCH,
-                PipelineState.PAUSED,
-            ):
+            if persisted.state not in safe_states:
                 return "Prior execution ownership is uncertain; waiting for daemon reconciliation."
             self.state.user_paused = persisted.user_paused
         # Staged uploads do not change the current task yet. Once permission
         # is applied, WATCH must finish so the existing IDLE upload consumer
-        # can run. Initial application still defers competing task changes.
+        # can run. A competing upload retires an unapplied request; its hold
+        # yields to the existing upload consumer once work preservation is safe.
         if command.status != "applied" and await self.redis.get(upload_pending(self.name)):
-            return "Task upload is pending; approval cannot authorize revised requirements."
+            raise ApprovalChanged("Task upload superseded this approval; revised requirements need a new decision.")
         if await self.redis.get(control_stop(self.name)):
             return "Operator Stop is active."
         inhibitors = await derive_active_inhibitors(self.state, self.redis, self.app_config.daemon)
+        inhibitors = [
+            item for item in inhibitors if item.inhibitor_type not in (
+                InhibitorType.RATE_LIMIT, InhibitorType.SPEND_CEILING, InhibitorType.GITHUB_BUDGET_SLOWDOWN,
+            )
+        ]  # WATCH polling keeps its own GitHub budget and coder dispatch gates.
         if inhibitors:
             return "Active inhibitor(s): " + "; ".join(item.reason_text for item in inhibitors)
         reason = checkout_process_blocker(self.repo_path)
@@ -305,7 +309,7 @@ class ApprovalCommandMixin:
             failure = failure_identity(await pipe.get(cancellation))
             if failure != command.failure and not (current.status == "applied" and not failure):
                 raise ApprovalChanged("Pending failure changed; no unrelated failure was cleared.")
-            if current.status == "applied" and persisted.state != PipelineState.WATCH:
+            if current.status == "applied" and persisted.state not in (PipelineState.WATCH, PipelineState.MERGE):
                 raise ApprovalChanged("A later pipeline transition superseded this approval.")
             state = (self.state if self._recovered else persisted).model_copy(deep=True)
             state.current_task = command.task.model_copy(update={"status": TaskStatus.DOING})

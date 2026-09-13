@@ -531,14 +531,25 @@ async def test_restart_does_not_assume_prior_execution_finished(approval, prior)
     assert saved.status == "deferred" and "ownership is uncertain" in saved.reason
 
 
-async def test_upload_pending_defers_application(approval):
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("dirty", [False, True])
+async def test_upload_retires_unapplied_approval_without_discarding_work(approval, single, dirty):
     from src.keyspace import upload_pending
 
-    runner, command, _, _ = approval
+    runner, command, repo, remote = approval
+    runner.repo_config.feature_flags.use_single_error_exit = single
     await enqueue_approval(runner.redis, command)
+    if dirty:
+        (repo / "operator-notes").write_text("valuable work")
+    before, remote_before = snapshot(repo), git(remote, "show-ref")
     await runner.redis.set(upload_pending(runner.name), "pending revised spec")
     await runner._run_cycle_body()
-    assert "upload is pending" in (await load_approval(runner.redis, runner.name, command.binding)).reason
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "failed" and "upload superseded" in saved.reason
+    assert await runner._consume_approval_command() == dirty
+    assert await runner.redis.get(upload_pending(runner.name)) == "pending revised spec"
+    assert await runner.redis.get(cause_key(runner.name, "PR-42"))
+    assert snapshot(repo) == before and git(remote, "show-ref") == remote_before
 
 
 async def test_work_starting_during_github_read_defers(approval, monkeypatch):
@@ -1040,10 +1051,12 @@ async def test_rejection_supersedes_upload_blocked_approval(approval, single, re
     runner, command, repo, remote = approval
     runner.repo_config.feature_flags.use_single_error_exit = single
     await enqueue_approval(runner.redis, command)
-    await runner.redis.set(upload_pending(runner.name), "staged upload for the IDLE consumer")
     if deferred:
+        runner._current_coder_process = object()
         await runner._run_cycle_body()
+        runner._current_coder_process = None
         assert (await load_approval(runner.redis, runner.name, command.binding)).status == "deferred"
+    await runner.redis.set(upload_pending(runner.name), "staged upload for the IDLE consumer")
     rejection = CancellationCause(category="ERROR", payload={"subsource": "operator_reject"}).to_redis()
     await runner.redis.set(cause_key(runner.name, "PR-42"), rejection)
     if restart:
@@ -1197,3 +1210,61 @@ async def test_successive_approvals_retain_only_independently_approved_findings(
     changed.pr.head_sha = second.pr.head_sha
     changed.task_fingerprint = "revised-specification"
     assert runner._unapproved_labels(changed, {"quarantine:large_diff"}) == {"quarantine:large_diff"}
+
+
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("unified", [False, True])
+@pytest.mark.parametrize("limit", ["rate", "spend"])
+async def test_coder_limits_do_not_block_approved_watch(approval, monkeypatch, single, unified, limit):
+    from types import SimpleNamespace
+
+    from src.inhibitor import derive_active_inhibitors
+
+    runner, command, _, _ = approval
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    runner.repo_config.feature_flags.use_unified_inhibitor_check = unified
+    if limit == "rate":
+        runner.state.rate_limit_reactive_coder = "claude"
+    else:
+        runner.app_config.daemon.spend_ceiling_session_percent = 80
+        runner.state.usage_session_percent = 90
+        snapshot = SimpleNamespace(
+            session_percent=90, session_resets_at=None, weekly_percent=0, weekly_resets_at=None,
+        )
+        for provider in (runner._claude_usage_provider, runner._codex_usage_provider):
+            monkeypatch.setattr(provider, "fetch", lambda: snapshot)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
+    await runner._run_cycle_body()
+    runner.handle_watch.assert_awaited_once()
+    # Limits remain available to the existing coder/retrigger gates.
+    assert await derive_active_inhibitors(runner.state, runner.redis, runner.app_config.daemon)
+    if unified or limit == "rate":
+        assert runner._watch_retrigger_inhibited("claude")
+
+
+@pytest.mark.parametrize("single", [False, True])
+async def test_merge_restart_restores_approval_and_rechecks_watch_gates(approval, single):
+    runner, command, repo, remote = approval
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    runner.state.state = PipelineState.MERGE
+    await runner.publish_state()
+    before, remote_before = snapshot(repo), git(remote, "show-ref")
+    runner._recovered = False
+    runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+    runner._approval_receipt = None
+    runner._approval_history = []
+    await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "applied" and saved.active
+    assert runner.state.state == PipelineState.WATCH and runner.state.current_pr.number == 42
+    assert RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name))) == runner.state
+    assert runner._approval_filtered_pr(command.pr).quarantine_labels == set()
+    await runner._run_cycle_body()
+    runner.handle_watch.assert_awaited_once()
+    assert runner.redis.deleted.count(cause_key(runner.name, "PR-42")) == 1
+    assert snapshot(repo) == before and git(remote, "show-ref") == remote_before
