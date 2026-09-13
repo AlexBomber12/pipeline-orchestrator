@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from unittest.mock import AsyncMock
 
 import httpx
@@ -12,12 +13,20 @@ from src.approval_commands import build_approval, enqueue_approval
 from src.cancellation.storage import cause_key
 from src.daemon import git_ops
 from src.daemon import task_admission as daemon_admission
+from src.github.gh_runner import run_gh as cli_run_gh
 from src.keyspace import pipeline_state, upload_pending
 from src.models import PipelineState, QueueTask, TaskStatus
 from src.rejection_commands import load_rejection
 from src.retry_commands import enqueue_retry_command, new_retry_command
 from src.task_admission import admission_candidate
-from src.task_attempts import AttemptChanged, attempt_key, load_attempt, new_attempt, save_attempt
+from src.task_attempts import (
+    AttemptChanged,
+    attempt_key,
+    clear_failed_pr_creation,
+    load_attempt,
+    new_attempt,
+    save_attempt,
+)
 
 from tests.test_approval_commands import git, isolated_daemon_process_view  # noqa: F401
 from tests.test_rejection_commands import post_reject
@@ -826,6 +835,7 @@ async def test_pending_created_pr_recovers_in_later_cycle_without_restart_or_cod
     rejected, monkeypatch, single, visibility
 ):
     import asyncio
+
     from src.models import PRInfo
 
     await finish_reject(rejected)
@@ -900,3 +910,156 @@ async def test_pending_created_pr_recovers_in_later_cycle_without_restart_or_cod
     assert git(repo, "rev-parse", "fix/pr-42") == preserved_head
     assert git(repo, "show", "fix/pr-42:new-work.txt") == "preserve the new attempt"
     assert not await runner._reconcile_pending_pr_creation()
+
+
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("failure", ["authentication", "validation"])
+async def test_definitive_create_failure_allows_http_retry_without_losing_work(
+    rejected, monkeypatch, single, failure
+):
+    import asyncio
+
+    from src.web.routes import repo_control
+
+    from tests.runner import _helpers as h
+
+    await finish_reject(rejected)
+    runner, _, repo, _, github, app = rejected
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    assert (await stage(rejected, rewritten(repo))).status_code == 200
+    assert await runner.process_pending_uploads()
+    attempt = await load_attempt(runner.redis, runner.name, "PR-42")
+    runner.state.current_task = attempt.task
+    content = (repo / "tasks/PR-42.md").read_text()
+    assert await runner._prepare_task_attempt(content)
+    git(repo, "checkout", "-b", "fix/pr-42", "origin/main")
+    (repo / "retry-work.txt").write_text("keep this implementation")
+    git(repo, "add", "retry-work.txt")
+    git(repo, "commit", "-m", "new attempt work")
+    git(repo, "push", "-u", "origin", "fix/pr-42")
+    work_head = git(repo, "rev-parse", "HEAD")
+    runner.state.state = PipelineState.CODING
+    failed = True
+    create_calls = []
+    original_transport = daemon_admission.gh_runner.run_gh
+    original_subprocess = subprocess.run
+
+    def subprocess_boundary(cmd, *a, **kw):
+        if cmd[:3] == ["gh", "pr", "create"]:
+            code, stderr = (4, "Authentication required") if failure == "authentication" else (
+                1, "pull request create failed: GraphQL: No commits between main and fix/pr-42 (createPullRequest)"
+            )
+            return subprocess.CompletedProcess(cmd, code, stdout="", stderr=stderr)
+        return original_subprocess(cmd, *a, **kw)
+
+    def transport(args, *a, **kw):
+        if args[:2] == ["pr", "create"]:
+            create_calls.append(args)
+            if failed:
+                return cli_run_gh(args, *a, **kw)
+        return original_transport(args, *a, **kw)
+
+    original_sleep = asyncio.sleep
+
+    async def short_sleep(_delay):
+        await original_sleep(0)
+
+    monkeypatch.setattr(subprocess, "run", subprocess_boundary)
+    monkeypatch.setattr(daemon_admission.gh_runner, "run_gh", transport)
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *a, **kw: [github["new_pr"]] if github["new_pr"] else [])
+    monkeypatch.setattr("src.daemon.handlers.coding.asyncio.sleep", short_sleep)
+    await runner._diagnose_exit_zero_no_pr("fix/pr-42", "claude", AsyncMock(return_value=False))
+    assert runner.state.state == PipelineState.ERROR
+    receipt = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert not receipt.pr_creation_pending and receipt.attempt_id == attempt.attempt_id
+    assert not await runner._reconcile_pending_pr_creation()
+    assert github["new_pr"] is None
+    assert git(repo, "rev-parse", "fix/pr-42") == work_head
+
+    # Bind a real browser Retry to this failure, then let a restarted daemon
+    # consume it through the normal cycle and preserve the implementation.
+    await runner.publish_state()
+    context = await repo_control._retry_binding_context(
+        runner.redis, runner.name, runner.state.current_task, repo / "tasks/PR-42.md",
+        "tasks/PR-42.md", retry_count=0, state=runner.state,
+    )
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"/repos/{runner.name}/tasks/PR-42/retry", data={"retry_binding": context["binding"]},
+        )
+    assert response.status_code == 202, response.text
+    fresh = h._make_runner()
+    fresh.redis, fresh.repo_path, fresh.state = runner.redis, runner.repo_path, runner.state
+    fresh.repo_config.feature_flags.use_single_error_exit = single
+    fresh._recovered = True
+    received = []
+
+    async def coder(path, pr_id, task_file, task_body, **kwargs):
+        received.append(task_body)
+        assert git(repo, "rev-parse", "fix/pr-42") == work_head
+        assert git(repo, "show", "fix/pr-42:retry-work.txt") == "keep this implementation"
+        return 0, "ok", ""
+
+    monkeypatch.setattr(h.claude_cli, "run_auto_pr_async", coder)
+    monkeypatch.setattr(fresh, "_post_codex_review", lambda *a, **kw: True)
+    failed = False
+    await fresh._run_cycle_body()
+    assert len(received) == 1
+    assert fresh.state.state == PipelineState.WATCH
+    assert fresh.state.current_pr.number == 43
+    assert len(create_calls) == 2
+    assert (await load_attempt(fresh.redis, fresh.name, "PR-42")).attempt_id == attempt.attempt_id
+    assert github["state"] == "closed"
+
+
+@pytest.mark.parametrize("change", ["rejection", "replacement", "missing"])
+async def test_failed_creation_acknowledgement_preserves_concurrent_attempt_state(rejected, change):
+    from src.task_attempts import new_attempt, save_attempt
+
+    runner, _, repo, *_ = rejected
+    task = runner.state.current_task
+    attempt = new_attempt(runner.repo_config.url, task, (repo / task.task_file).read_text(), pr_creation_pending=True)
+    await save_attempt(runner.redis, runner.name, attempt, expected=None)
+    if change == "missing":
+        await runner.redis.delete(attempt_key(runner.name, task.pr_id))
+        with pytest.raises(AttemptChanged):
+            await clear_failed_pr_creation(runner.redis, runner.name, attempt)
+        assert await load_attempt(runner.redis, runner.name, task.pr_id) is None
+        return
+    current = attempt.model_copy(update={"rejection": "accepted-decision"}) if change == "rejection" else new_attempt(
+        runner.repo_config.url, task, "replacement spec", pr_creation_pending=True,
+    )
+    await save_attempt(runner.redis, runner.name, current, expected=attempt)
+    if change == "replacement":
+        with pytest.raises(AttemptChanged):
+            await clear_failed_pr_creation(runner.redis, runner.name, attempt)
+        assert await load_attempt(runner.redis, runner.name, task.pr_id) == current
+        return
+    await clear_failed_pr_creation(runner.redis, runner.name, attempt)
+    await clear_failed_pr_creation(runner.redis, runner.name, attempt)
+    stored = await load_attempt(runner.redis, runner.name, task.pr_id)
+    assert stored == current.model_copy(update={"pr_creation_pending": False})
+
+
+async def test_creation_failure_acknowledgement_races_reject_without_erasing_it(rejected):
+    import asyncio
+
+    from src.rejection_commands import build_rejection, enqueue_rejection
+
+    runner, _, repo, *_ = rejected
+    task = runner.state.current_task
+    attempt = new_attempt(runner.repo_config.url, task, (repo / task.task_file).read_text(), pr_creation_pending=True)
+    task.attempt_id = attempt.attempt_id
+    runner.state.current_pr = None
+    await save_attempt(runner.redis, runner.name, attempt, expected=None)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    cause = await runner.redis.get(cause_key(runner.name, task.pr_id))
+    command = build_rejection(runner.name, runner.state, cause, repo)
+    await asyncio.gather(
+        clear_failed_pr_creation(runner.redis, runner.name, attempt),
+        enqueue_rejection(runner.redis, command),
+    )
+    current = await load_attempt(runner.redis, runner.name, task.pr_id)
+    assert current.rejection == command.binding and not current.pr_creation_pending
+    assert (await load_rejection(runner.redis, runner.name, command.binding)).attempt_id == attempt.attempt_id
+    assert await runner._attempt_execution_blocked()

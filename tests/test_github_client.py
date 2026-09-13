@@ -21,7 +21,7 @@ from src.github.comments import (
     has_recent_codex_review_request,
     post_comment,
 )
-from src.github.gh_runner import _parse_iso, get_repo_full_name, run_gh
+from src.github.gh_runner import GhCommandError, _parse_iso, get_repo_full_name, pr_create_definitely_failed, run_gh
 from src.github.prs import (
     clear_last_known_sha,
     clear_merged_prs_cache,
@@ -108,6 +108,41 @@ def test_run_gh_raises_on_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(RuntimeError, match="boom"):
         run_gh(["pr", "list"])
+
+
+@pytest.mark.parametrize("code,stderr,stdout,definite", [
+    (4, "To get started with GitHub CLI, please run: gh auth login", "", True),
+    (1, "HTTP 401: Bad credentials (https://api.github.com/graphql)", "", True),
+    (1, "pull request create failed: HTTP 422: Validation Failed", "", True),
+    (1, "pull request create failed: GraphQL: No commits between main and fix/test (createPullRequest)", "", True),
+    (1, "pull request create failed: GraphQL: Resource not accessible by integration (createPullRequest)", "", True),
+    (1, "pull request create failed: GraphQL: Something went wrong (createPullRequest)", "", False),
+    (1, "pull request update failed: HTTP 403: Resource not accessible", "", False),
+    (1, "pull request create failed: HTTP 503: Service Unavailable", "", False),
+    (1, "connection reset by peer", "", False),
+    (2, "cancelled", "", False),
+    (1, "HTTP 401: Bad credentials", "https://github.com/octo/demo/pull/43", False),
+])
+def test_pr_creation_failure_uses_only_explicit_cli_evidence(monkeypatch, code, stderr, stdout, definite):
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **kw: _FakeCompletedProcess(stdout, stderr, code),
+    )
+    # Text in a user-supplied title/body must never be classified as an API reply.
+    with pytest.raises(GhCommandError) as error:
+        run_gh(["pr", "create", "--body", "HTTP 422: Validation Failed"])
+    assert error.value.returncode == code
+    assert pr_create_definitely_failed(error.value) is definite
+
+
+@pytest.mark.parametrize("error,definite", [
+    (FileNotFoundError("gh not installed"), True),
+    (PermissionError("gh is not executable"), True),
+    (TimeoutError("acknowledgement lost"), False),
+    (subprocess.TimeoutExpired("gh", 30), False),
+    (RuntimeError("HTTP 422: an unstructured error"), False),
+])
+def test_pr_creation_launch_failures_and_unknown_errors(error, definite):
+    assert pr_create_definitely_failed(error) is definite
 
 
 def test_run_gh_parses_json(monkeypatch: pytest.MonkeyPatch) -> None:

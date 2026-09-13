@@ -18,6 +18,34 @@ _REPO_URL_RE = re.compile(
 )
 
 
+class GhCommandError(RuntimeError):
+    """Keep CLI failure evidence separate from user-supplied command arguments."""
+
+    def __init__(self, args: list[str], result: subprocess.CompletedProcess[str]) -> None:
+        self.returncode = result.returncode
+        self.stderr = result.stderr.strip()
+        self.stdout = result.stdout.strip()
+        super().__init__(f"gh {' '.join(args)} failed (exit {result.returncode}): {self.stderr}")
+
+
+def pr_create_definitely_failed(exc: Exception) -> bool:
+    """Recognize launch/auth/validation rejection; unknown results remain ambiguous."""
+    if isinstance(exc, (FileNotFoundError, PermissionError)):
+        return True  # subprocess could not launch the CLI.
+    if not isinstance(exc, GhCommandError) or exc.stdout:
+        return False  # A returned PR URL or unstructured error is not non-creation proof.
+    if exc.returncode == 4:
+        return True  # gh's documented authentication-required exit code.
+    return bool(re.search(
+        r"(?im)^(?:pull request create failed:\s*)?HTTP (?:400|401|403|404|422):"
+        r"|^pull request create failed: GraphQL: "
+        r"(?=[^\n]*\(createPullRequest\))"
+        r"(?=[^\n]*(?:No commits between|(?:Head|Base) sha can't be blank|"
+        r"(?:Head|Base) ref must be a branch|Resource not accessible by))",
+        exc.stderr,
+    ))
+
+
 def run_gh(
     args: list[str],
     repo: str | None = None,
@@ -41,10 +69,7 @@ def run_gh(
         check=False,
     )
     if result.returncode != 0:
-        raise RuntimeError(
-            f"gh {' '.join(args)} failed (exit {result.returncode}): "
-            f"{result.stderr.strip()}"
-        )
+        raise GhCommandError(args, result)
 
     stdout = result.stdout.strip()
     if not stdout:

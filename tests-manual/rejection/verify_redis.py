@@ -28,6 +28,10 @@ from tests.test_rejection_commands import (
     test_connected_http_reject_rewrite_clean_base_and_new_pr,
     test_guardrail_before_pr_tracking_resolves_current_pr_and_ignores_history,
 )
+from tests.test_task_admission import (
+    test_creation_failure_acknowledgement_races_reject_without_erasing_it,
+    test_definitive_create_failure_allows_http_retry_without_losing_work,
+)
 
 
 async def exercise(socket: Path, root: Path):
@@ -68,6 +72,31 @@ async def exercise(socket: Path, root: Path):
                     True,
                     True,
                 )
+        for single in (False, True):
+            await redis.flushall()
+            directory = root / f"create-failure-{single}"
+            directory.mkdir()
+            with pytest.MonkeyPatch.context() as patch:
+                isolated_daemon_process_view.__wrapped__(patch)
+                fixture = await rejected.__wrapped__(directory, patch)
+                runner, _, _, _, _, app = fixture
+                for key, value in runner.redis.store.items():
+                    await redis.set(key, value)
+                runner.redis = app.state.redis = redis
+                await test_definitive_create_failure_allows_http_retry_without_losing_work(
+                    fixture, patch, single, "authentication",
+                )
+        await redis.flushall()
+        directory = root / "creation-reject-race"
+        directory.mkdir()
+        with pytest.MonkeyPatch.context() as patch:
+            isolated_daemon_process_view.__wrapped__(patch)
+            fixture = await rejected.__wrapped__(directory, patch)
+            runner, _, _, _, _, app = fixture
+            for key, value in runner.redis.store.items():
+                await redis.set(key, value)
+            runner.redis = app.state.redis = redis
+            await test_creation_failure_acknowledgement_races_reject_without_erasing_it(fixture)
         # Race actual approval application against Reject acceptance. A lost
         # decision either fails its CAS, or is superseded before execution.
         await redis.flushall()
@@ -97,6 +126,7 @@ async def exercise(socket: Path, root: Path):
         print(
             "Isolated Redis: connected scenario passed with both feature settings; "
             "untracked PR binding/restart, duplicate and Approve/Reject CAS races passed."
+            " Definitive creation failure Retry and creation-result/Reject arbitration passed."
         )
 
 

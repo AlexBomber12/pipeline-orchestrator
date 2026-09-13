@@ -33,7 +33,7 @@ from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.models import PipelineState
 from src.subsource_registry import SuppressionReason
-from src.task_attempts import load_attempt, save_attempt
+from src.task_attempts import clear_failed_pr_creation, load_attempt, save_attempt
 
 
 def _resolve_task_file_under_repo(repo_path: str, task_file: str) -> Path:
@@ -997,9 +997,9 @@ class CodingMixin:
         visibility); that case is treated as success so the caller's
         post-create visibility loop can pick up the existing PR rather than
         skipping the task. On any other failure the runner is
-        transitioned to IDLE with the gh error and the run record saved,
-        matching the ESCALATE-style handling the diagnostic uses for cases
-        A and B — a failed creation is not silently retried.
+        parked in ERROR with the gh error. Definitive creation rejections
+        permit ordinary Retry; ambiguous results retain the durable flag
+        so recovery discovers the existing PR before any further creation.
         """
         if await self._attempt_execution_blocked():
             return False
@@ -1044,7 +1044,8 @@ class CodingMixin:
                 repo=self.owner_repo,
             )
         except (RuntimeError, subprocess.SubprocessError, OSError) as exc:
-            if "already exists" in str(exc).lower():
+            error = exc.stderr if isinstance(exc, gh_runner.GhCommandError) else str(exc)
+            if "already exists" in error.lower():
                 self.log_event(
                     f"[CODING] [{coder_name}] gh pr create reports PR "
                     f"already exists for {target_branch!r}; reusing "
@@ -1059,6 +1060,8 @@ class CodingMixin:
                     f"repos/{self.owner_repo}/pulls"
                 )
                 return True
+            if attempt and gh_runner.pr_create_definitely_failed(exc):
+                await clear_failed_pr_creation(self.redis, self.name, attempt)
             message = (
                 f"[{coder_name}] Daemon PR creation failed for "
                 f"{target_branch!r}: {exc}"

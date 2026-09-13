@@ -49,6 +49,24 @@ async def load_attempt(redis: Any, repo: str, task_id: str) -> TaskAttempt | Non
     return TaskAttempt.model_validate_json(raw) if raw else None
 
 
+async def clear_failed_pr_creation(redis: Any, repo: str, attempt: TaskAttempt) -> None:
+    """Record definite non-creation without overwriting concurrent operator decisions."""
+    key = attempt_key(repo, attempt.task.pr_id)
+
+    async def transaction(pipe: Any) -> None:
+        raw = await pipe.get(key)
+        current = TaskAttempt.model_validate_json(raw) if raw else None
+        if current is None or current.attempt_id != attempt.attempt_id:
+            raise AttemptChanged("PR creation failure belongs to an obsolete attempt.")
+        if not current.pr_creation_pending:
+            return
+        current.pr_creation_pending = False
+        pipe.multi()
+        pipe.set(key, current.model_dump_json())
+
+    await redis.transaction(transaction, key)
+
+
 def new_attempt(repo_url: str, task: QueueTask, content: str, **kwargs: Any) -> TaskAttempt:
     return TaskAttempt(
         repo_url=repo_url,
