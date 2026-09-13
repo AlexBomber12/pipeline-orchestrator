@@ -89,7 +89,10 @@ class _Runner(repo_ops.RepoOpsMixin):
         # Real admission, reset and restart behavior lives in test_task_admission.
         return None
 
-    async def _reserve_admission(self, *args, **kwargs):
+    async def _validate_admission(self, *args, **kwargs):
+        return None, None
+
+    async def _reserve_validated_admission(self, *args, **kwargs):
         return None
 
     def log_event(self, message: str) -> None:

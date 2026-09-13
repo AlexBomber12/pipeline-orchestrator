@@ -31,6 +31,8 @@ from tests.test_rejection_commands import (
 from tests.test_task_admission import (
     test_creation_failure_acknowledgement_races_reject_without_erasing_it,
     test_definitive_create_failure_allows_http_retry_without_losing_work,
+    test_invalid_upload_discard_cannot_delete_a_newer_submission,
+    test_stale_batch_is_retired_before_reservation_and_next_upload_succeeds,
 )
 
 
@@ -97,6 +99,25 @@ async def exercise(socket: Path, root: Path):
                 await redis.set(key, value)
             runner.redis = app.state.redis = redis
             await test_creation_failure_acknowledgement_races_reject_without_erasing_it(fixture)
+        for scenario in ("stale-discard", "discard-race"):
+            await redis.flushall()
+            directory = root / scenario
+            directory.mkdir()
+            with pytest.MonkeyPatch.context() as patch:
+                isolated_daemon_process_view.__wrapped__(patch)
+                fixture = await rejected.__wrapped__(directory, patch)
+                runner, _, _, _, _, app = fixture
+                for key, value in runner.redis.store.items():
+                    await redis.set(key, value)
+                runner.redis = app.state.redis = redis
+                if scenario == "stale-discard":
+                    await test_stale_batch_is_retired_before_reservation_and_next_upload_succeeds(
+                        fixture, True, "delete", False,
+                    )
+                else:
+                    await test_invalid_upload_discard_cannot_delete_a_newer_submission(
+                        fixture, patch, after_read=True,
+                    )
         # Race actual approval application against Reject acceptance. A lost
         # decision either fails its CAS, or is superseded before execution.
         await redis.flushall()
@@ -127,6 +148,7 @@ async def exercise(socket: Path, root: Path):
             "Isolated Redis: connected scenario passed with both feature settings; "
             "untracked PR binding/restart, duplicate and Approve/Reject CAS races passed."
             " Definitive creation failure Retry and creation-result/Reject arbitration passed."
+            " Stale batch retirement and concurrent upload WATCH protection passed."
         )
 
 

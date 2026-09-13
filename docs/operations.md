@@ -60,6 +60,10 @@ Re-upload specs through the existing task upload control, or commit them to the
 configured base. An upload acknowledgement means the files are staged. The daemon
 applies the same admission checks to staged uploads and Git synchronization before
 making a task runnable; dashboard requests do not perform completion verification.
+If a staged task was changed or explicitly deleted before consumption, or the
+batch is permanently inadmissible, the daemon discards that batch and records the
+reason in repository history. Submit corrected files again. Temporary evidence
+outages and rejection closure still in progress retain the batch for reconciliation.
 Completion is established using Git/GitHub merge evidence and verified completion
 records, including implementation through another PR. Checks retain the previous
 accepted file identity before replacement; unavailable evidence defers admission.

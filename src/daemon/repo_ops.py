@@ -26,7 +26,7 @@ from src.daemon.git_ops import (
 from src.keyspace import upload_pending, upload_pending_count
 from src.models import TaskStatus
 from src.retry import retry_transient
-from src.task_attempts import AttemptChanged, load_attempt
+from src.task_attempts import AdmissionRejected, load_attempt
 
 logger = logging.getLogger(__name__)
 
@@ -250,13 +250,35 @@ return 0
         except Exception:
             logger.warning("%s: failed deleting upload pending count", self.name)
 
+    async def _discard_invalid_upload(
+        self, key: str, raw: bytes | str, staging_dir: Path, reason: str
+    ) -> bool | None:
+        """Retire only the rejected submission, never a concurrently staged batch."""
+        async def discard(pipe):
+            if await pipe.get(key) != raw:
+                return False
+            pipe.multi()
+            pipe.delete(key, upload_pending_count(self.name))
+            return True
+
+        try:
+            discarded = await self.redis.transaction(discard, key, value_from_callable=True)
+        except Exception as exc:
+            self.log_event(f"[INFRA] Invalid upload acknowledgement deferred ({type(exc).__name__}).")
+            return None
+        if not discarded:
+            return None
+        shutil.rmtree(str(staging_dir), ignore_errors=True)
+        self.log_event(f"[INFRA] Discarded invalid upload batch: {reason}. Submit corrected files again.")
+        return False
+
     async def process_pending_uploads(
         self, *, _safe: bool = False,
     ) -> bool | None:
         """Commit and push any files staged by the web upload endpoint.
 
         Returns ``True`` if an upload was pushed, ``False`` if there was
-        nothing pending, or ``None`` if a pending upload failed (caller
+        nothing pending or an invalid batch was discarded, or ``None`` if a pending upload failed (caller
         should skip task dispatch so it retries next cycle).
 
         When *_safe* is ``True`` the error handler skips the destructive
@@ -323,6 +345,7 @@ return 0
             tasks_dir.mkdir(exist_ok=True)
             await self._snapshot_accepted_specs()
             admissions = []
+            validated = []
             available_ids = {path.stem for path in tasks_dir.glob("PR-*.md")} | {
                 Path(name).stem for name in stageable_filenames if name.startswith("PR-")
             }
@@ -339,15 +362,19 @@ return 0
                             current and current.fingerprint == incoming_hash and current_hash == incoming_hash
                             and current.previous_rejection == manifest.get("rejection_tokens", {}).get(task_id)
                         ):
-                            raise AttemptChanged("Task changed or was deleted after upload; submit it again.")
+                            raise AdmissionRejected("Task changed or was deleted after upload; submit it again.")
                     elif current and not target.is_file():
-                        raise AttemptChanged("Task was deleted; an old pending upload cannot recreate it.")
-                    candidate = await self._reserve_admission(
+                        raise AdmissionRejected("Task was deleted; an old pending upload cannot recreate it.")
+                    validated.append(await self._validate_admission(
                         staging_dir / fname, token=manifest.get("rejection_tokens", {}).get(Path(fname).stem),
                         upload=True, available_ids=available_ids,
-                    )
-                    if candidate:
-                        admissions.append(candidate)
+                    ))
+            # Validate the whole batch before reserving any replacement. An
+            # invalid later file must not orphan an earlier pending receipt.
+            for previous, candidate in validated:
+                admission = await self._reserve_validated_admission(previous, candidate, upload=True)
+                if admission:
+                    admissions.append(admission)
             for fname in stageable_filenames:
                 src = staging_dir / fname
                 if src.is_file():
@@ -404,6 +431,8 @@ return 0
                 f"and pushed to {branch}."
             )
             self._clear_canceled_in_snapshot({attempt.task.pr_id for attempt in admissions})
+        except AdmissionRejected as exc:
+            return await self._discard_invalid_upload(key, raw, staging_dir, str(exc))
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError, ValueError) as exc:
             logger.error("%s: upload git operations failed: %s", self.name, exc)
             self.log_event(f"[INFRA] Upload push failed: {exc}.")

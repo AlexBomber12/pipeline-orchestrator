@@ -22,6 +22,10 @@ class AttemptChanged(ValueError):
     """An operator command or specification refers to obsolete work."""
 
 
+class AdmissionRejected(AttemptChanged):
+    """This staged input cannot be admitted by retrying the same submission."""
+
+
 class TaskAttempt(BaseModel):
     attempt_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     repo_url: str

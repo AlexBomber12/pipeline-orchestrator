@@ -18,9 +18,14 @@ from src.github import gh_pr_get_merged_branches, gh_runner
 from src.github import prs as gh_prs
 from src.keyspace import pipeline_state
 from src.models import PipelineState, QueueTask, RepoState, TaskStatus
-from src.queue_parser import UnstructuredLegacyTaskError, parse_existing_task_header, parse_task_header
+from src.queue_parser import (
+    QueueValidationError,
+    UnstructuredLegacyTaskError,
+    parse_existing_task_header,
+    parse_task_header,
+)
 from src.rejection_commands import load_rejection
-from src.task_attempts import AttemptChanged, TaskAttempt, load_attempt, new_attempt
+from src.task_attempts import AdmissionRejected, AttemptChanged, TaskAttempt, load_attempt, new_attempt
 from src.task_status import get_merged_pr_ids
 
 
@@ -28,7 +33,7 @@ def verify_unfinished(root: Path, base: str, repo_url: str, previous: TaskAttemp
     """Check the *prior* accepted bytes, including alternative-PR receipts."""
     task_id = previous.task.pr_id
     if previous.completed or previous.task.status == TaskStatus.DONE:
-        raise AttemptChanged(f"{task_id} is completed and cannot be reused.")
+        raise AdmissionRejected(f"{task_id} is completed and cannot be reused.")
     owner = gh_runner.get_repo_full_name(repo_url)
     branches = gh_pr_get_merged_branches(owner, {previous.task.branch})
     merged = get_merged_pr_ids(str(root), base, {task_id})
@@ -49,7 +54,7 @@ def verify_unfinished(root: Path, base: str, repo_url: str, previous: TaskAttemp
         or task_id in recorded
         or any(pr.pr_id == task_id or pr.branch == previous.task.branch for pr in merged_prs)
     ):
-        raise AttemptChanged(f"{task_id} has authoritative completion evidence and cannot be reused.")
+        raise AdmissionRejected(f"{task_id} has authoritative completion evidence and cannot be reused.")
 
 
 async def admission_candidate(
@@ -69,14 +74,17 @@ async def admission_candidate(
     Rejection tokens are checked even for identical inputs, so an upload
     originating before Reject cannot be interpreted as a later rewrite.
     """
-    header = parse_task_header(incoming)
+    try:
+        header = parse_task_header(incoming)
+    except QueueValidationError as exc:
+        raise AdmissionRejected(str(exc)) from exc
     if incoming.name != f"{header.pr_id}.md" or header.branch == base:
-        raise AttemptChanged("Task filename/identity must agree and branch must differ from the configured base.")
+        raise AdmissionRejected("Task filename/identity must agree and branch must differ from the configured base.")
     # Validate Git ref syntax without shell interpolation or repository writes.
     import subprocess
 
     if subprocess.run(["git", "check-ref-format", "--branch", header.branch], capture_output=True).returncode:
-        raise AttemptChanged("Task branch is not a valid Git branch.")
+        raise AdmissionRejected("Task branch is not a valid Git branch.")
     previous = await load_attempt(redis, repo, header.pr_id)
     existing = approval_task_path(root, f"tasks/{incoming.name}")
     content = incoming.read_text(encoding="utf-8")
@@ -103,19 +111,19 @@ async def admission_candidate(
             raise AttemptChanged("Legacy rejection lacks exact attempt/PR ownership; reconcile it before reuse.")
     if previous and previous.rejection:
         if upload and expected_rejection != previous.rejection:
-            raise AttemptChanged("Upload predates or belongs to another rejection; submit the rewritten task again.")
+            raise AdmissionRejected("Upload predates or belongs to another rejection; submit the rewritten task again.")
         rejection = await load_rejection(redis, repo, previous.rejection)
         if rejection is None or rejection.status != "rejected" or not rejection.released:
             raise AttemptChanged("Rejection is not final; wait for process quiescence and confirmed PR closure.")
         if fingerprint == previous.fingerprint:
-            raise AttemptChanged(
+            raise AdmissionRejected(
                 "File unchanged. Reject is final; rewrite or remove the unfinished task. Ordinary Retry is unavailable."
             )
     elif upload and expected_rejection:
         if not previous or previous.previous_rejection != expected_rejection or previous.fingerprint != fingerprint:
-            raise AttemptChanged("Upload belongs to an obsolete attempt.")
+            raise AdmissionRejected("Upload belongs to an obsolete attempt.")
     if previous and previous.repo_url != repo_url:
-        raise AttemptChanged("Task receipt belongs to a different repository.")
+        raise AdmissionRejected("Task receipt belongs to a different repository.")
     if previous and previous.fingerprint == fingerprint:
         return previous, None
     raw_state = await redis.get(pipeline_state(repo))
@@ -127,11 +135,13 @@ async def admission_candidate(
             or state.state
             in {PipelineState.CODING, PipelineState.WATCH, PipelineState.FIX, PipelineState.MERGE, PipelineState.ERROR}
         ):
-            raise AttemptChanged("An active attempt owns this task; Reject before accepting a rewritten specification.")
+            raise AdmissionRejected(
+                "An active attempt owns this task; Reject before accepting a rewritten specification."
+            )
     if previous:
         verify_unfinished(root, base, repo_url, previous)
         if previous.started and not previous.rejection:
-            raise AttemptChanged(
+            raise AdmissionRejected(
                 "An existing attempt owns this specification. Retry unchanged work or Reject before rewriting it."
             )
     available_ids = (

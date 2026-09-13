@@ -69,10 +69,10 @@ class TaskAdmissionMixin:
                 receipt.rejection = "legacy-missing-identity"
             await save_attempt(self.redis, self.name, receipt, expected=None)
 
-    async def _reserve_admission(
+    async def _validate_admission(
         self, path: Path, *, token: str | None = None, upload: bool = False, available_ids: set[str] | None = None
-    ) -> TaskAttempt | None:
-        previous, candidate = await admission_candidate(
+    ) -> tuple[TaskAttempt | None, TaskAttempt | None]:
+        return await admission_candidate(
             self.redis,
             self.name,
             self.repo_config.url,
@@ -83,6 +83,18 @@ class TaskAdmissionMixin:
             upload=upload,
             available_ids=available_ids,
         )
+
+    async def _reserve_admission(
+        self, path: Path, *, token: str | None = None, upload: bool = False, available_ids: set[str] | None = None
+    ) -> TaskAttempt | None:
+        previous, candidate = await self._validate_admission(
+            path, token=token, upload=upload, available_ids=available_ids,
+        )
+        return await self._reserve_validated_admission(previous, candidate, upload=upload)
+
+    async def _reserve_validated_admission(
+        self, previous: TaskAttempt | None, candidate: TaskAttempt | None, *, upload: bool
+    ) -> TaskAttempt | None:
         if candidate is None:
             return previous if previous and previous.admission_pending else None
         current = await load_attempt(self.redis, self.name, candidate.task.pr_id)

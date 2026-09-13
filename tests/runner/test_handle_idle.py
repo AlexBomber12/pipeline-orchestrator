@@ -3500,11 +3500,13 @@ def test_process_pending_uploads_preserves_upload_on_git_failure(
     tmp_path: Path,
 ) -> None:
     """On transient git failure, Redis key and staging dir must survive for retry."""
+    failed_adds = []
 
     def failing_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
         if cmd[:2] == ["git", "rev-list"]:
             return h._FakeCompletedProcess(args=cmd, stdout="0\n", returncode=0)
         if cmd[:2] == ["git", "add"]:
+            failed_adds.append(cmd)
             raise subprocess.CalledProcessError(1, cmd, stderr="git error")
         return h._FakeCompletedProcess(args=cmd, returncode=0)
 
@@ -3515,16 +3517,21 @@ def test_process_pending_uploads_preserves_upload_on_git_failure(
 
     staging = tmp_path.parent / "uploads" / runner.name / "abc123"
     staging.mkdir(parents=True)
-    (staging / "PR-001.md").write_text("- PR-001")
+    (staging / "PR-001.md").write_text(
+        "---\nstatus: TODO\n---\n\n"
+        "# PR-001: Upload task\nBranch: fix/pr-001\n"
+        "- Type: bugfix\n- Complexity: low\n- Depends on: none\n"
+    )
 
     manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
     key = f"upload:{runner.name}:pending"
     asyncio.run(runner.redis.set(key, manifest))
 
     result = asyncio.run(runner.process_pending_uploads())
-    assert result is None
+    assert result is None, runner.state.history
     assert asyncio.run(runner.redis.get(key)) == manifest
     assert staging.is_dir()
+    assert failed_adds == [["git", "add", "tasks/PR-001.md"]]
 
 
 def test_process_pending_uploads_cas_delete_skips_newer_manifest(
@@ -3532,18 +3539,19 @@ def test_process_pending_uploads_cas_delete_skips_newer_manifest(
     tmp_path: Path,
 ) -> None:
     """After a successful push, a newer manifest must not be deleted."""
-    h._patch_subprocess(monkeypatch)
+    calls = h._patch_subprocess(monkeypatch)
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
 
     staging = tmp_path.parent / "uploads" / runner.name / "old123"
     staging.mkdir(parents=True, exist_ok=True)
-    (staging / "PR-001.md").write_text("- PR-001")
+    # A helper-file upload isolates delivery/CAS from task admission policy.
+    (staging / "AGENTS.md").write_text("# Repository instructions\n")
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir(exist_ok=True)
 
-    old_manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
+    old_manifest = json.dumps({"files": ["AGENTS.md"], "staging_dir": str(staging)})
     new_manifest = json.dumps({"files": ["PR-099.md"]})
     key = f"upload:{runner.name}:pending"
     asyncio.run(runner.redis.set(key, old_manifest))
@@ -3561,6 +3569,7 @@ def test_process_pending_uploads_cas_delete_skips_newer_manifest(
     assert result is None, "newer upload pending must block dispatch"
     assert asyncio.run(runner.redis.get(key)) == new_manifest
     assert staging.is_dir(), "staging dir must survive when CAS delete skips newer manifest"
+    assert any(cmd[:3] == ["git", "push", "origin"] for cmd in calls)
 
 
 def test_process_pending_uploads_routes_root_instruction_files(

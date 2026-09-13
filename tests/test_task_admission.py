@@ -121,8 +121,9 @@ async def test_admission_refuses_unsafe_reuse(rejected, tmp_path, monkeypatch, m
     else:
         # Staging acknowledges the input; only the daemon verifies and admits it.
         assert response.status_code == 200, response.text
-        assert await runner.process_pending_uploads() is None
-        assert await runner.redis.get(upload_pending(runner.name)) is not None
+        temporary = mode in {"api_unavailable", "unknown_completion_identity"}
+        assert await runner.process_pending_uploads() is (None if temporary else False)
+        assert (await runner.redis.get(upload_pending(runner.name)) is not None) is temporary
     assert (repo / "tasks/PR-42.md").read_bytes() == before
     assert (await load_attempt(runner.redis, runner.name, "PR-42")).rejection == command.binding
 
@@ -161,7 +162,7 @@ async def test_pending_upload_from_before_reject_does_not_reactivate(rejected):
     path.write_text(original)
     await finish_reject(rejected)
     before = (repo / "tasks/PR-42.md").read_bytes()
-    assert await runner.process_pending_uploads() is None
+    assert await runner.process_pending_uploads() is False
     assert (repo / "tasks/PR-42.md").read_bytes() == before
     assert (await load_attempt(runner.redis, runner.name, "PR-42")).rejection == command.binding
 
@@ -173,7 +174,7 @@ async def test_git_deletion_is_not_undone_by_pending_upload(rejected):
     git(repo, "rm", "tasks/PR-42.md")
     git(repo, "commit", "-m", "explicit task deletion")
     git(repo, "push", "origin", "main")
-    assert await runner.process_pending_uploads() is None
+    assert await runner.process_pending_uploads() is False
     assert not (repo / "tasks/PR-42.md").exists()
     assert (
         await runner._fence_recovery_tasks([QueueTask(pr_id="PR-42", title="old snapshot", status=TaskStatus.TODO)])
@@ -684,7 +685,7 @@ async def test_legacy_upload_manifest_cannot_resurrect_deleted_task(rejected):
     git(repo, "rm", "tasks/PR-42.md")
     git(repo, "commit", "-m", "explicit deletion")
     git(repo, "push", "origin", "main")
-    assert await runner.process_pending_uploads() is None
+    assert await runner.process_pending_uploads() is False
     assert not (repo / "tasks/PR-42.md").exists()
 
 
@@ -727,9 +728,9 @@ async def test_legacy_todo_header_does_not_hide_a_live_pr_owner(rejected):
     )
     response = await stage(rejected, rewritten(repo))
     assert response.status_code == 200
-    assert await runner.process_pending_uploads() is None
+    assert await runner.process_pending_uploads() is False
     assert any("active attempt owns" in entry["event"] for entry in runner.state.history)
-    assert await runner.redis.get(upload_pending(runner.name)) is not None
+    assert await runner.redis.get(upload_pending(runner.name)) is None
     assert "New specification." not in path.read_text()
 
 
@@ -1128,8 +1129,143 @@ async def test_daemon_refuses_staged_replay_of_rejected_spec_even_after_http_acc
     if status_only:
         replay = "".join(line for line in replay.splitlines(keepends=True) if not line.startswith("blocked_reason:"))
     (Path(manifest["staging_dir"]) / "PR-42.md").write_text(replay)
-    assert await runner.process_pending_uploads() is None
+    assert await runner.process_pending_uploads() is False
     assert await load_attempt(runner.redis, runner.name, "PR-42") == previous
     assert (repo / "tasks/PR-42.md").read_text() == old_text
     assert any("File unchanged. Reject is final" in row["event"] for row in runner.state.history)
     assert (await load_rejection(runner.redis, runner.name, command.binding)).released
+
+
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("change", ["delete", "rewrite"])
+@pytest.mark.parametrize("invalid_first", [False, True])
+async def test_stale_batch_is_retired_before_reservation_and_next_upload_succeeds(
+    rejected, single, change, invalid_first
+):
+    from pathlib import Path
+
+    await finish_reject(rejected)
+    runner, _, repo, _, _, app = rejected
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    valid_text = rewritten(repo).replace("PR-42:", "PR-43:").replace("fix/pr-42", "fix/pr-43")
+    stale = ("files", ("PR-42.md", rewritten(repo), "text/markdown"))
+    valid = ("files", ("PR-43.md", valid_text, "text/markdown"))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"/repos/{runner.name}/upload-tasks", files=[stale, valid] if invalid_first else [valid, stale],
+        )
+        assert response.status_code == 200
+        manifest = json.loads(await runner.redis.get(upload_pending(runner.name)))
+        if change == "delete":
+            git(repo, "rm", "tasks/PR-42.md")
+        else:
+            path = repo / "tasks/PR-42.md"
+            path.write_text(path.read_text() + "\nChanged on configured base.\n")
+            git(repo, "add", "tasks/PR-42.md")
+        git(repo, "commit", "-m", "operator changes task after staging")
+        git(repo, "push", "origin", "main")
+        before = git(repo, "rev-parse", "HEAD")
+        counter = f"metrics:retry_count:{runner.name}:PR-42"
+        await runner.redis.set(counter, "2")
+        assert await runner.process_pending_uploads() is False
+        assert await runner.redis.get(upload_pending(runner.name)) is None
+        assert not Path(manifest["staging_dir"]).exists()
+        assert await load_attempt(runner.redis, runner.name, "PR-43") is None
+        assert await runner.redis.get(counter) == "2"
+        assert git(repo, "rev-parse", "HEAD") == before
+        assert not (repo / "tasks/PR-43.md").exists()
+        assert await runner.process_pending_uploads() is False
+        assert any("Discarded invalid upload batch" in row["event"] for row in runner.state.history)
+
+        response = await client.post(f"/repos/{runner.name}/upload-tasks", files=[valid])
+        assert response.status_code == 200
+        next_manifest = json.loads(await runner.redis.get(upload_pending(runner.name)))
+        assert next_manifest["files"] == ["PR-43.md"]
+        assert await runner.process_pending_uploads() is True
+    assert (repo / "tasks/PR-43.md").read_text() == valid_text
+    current = await load_attempt(runner.redis, runner.name, "PR-43")
+    assert not current.admission_pending
+    if change == "delete":
+        assert not (repo / "tasks/PR-42.md").exists()
+    else:
+        assert "Changed on configured base." in (repo / "tasks/PR-42.md").read_text()
+
+
+async def test_invalid_upload_discard_cannot_delete_a_newer_submission(rejected, monkeypatch, after_read=False):
+    from pathlib import Path
+
+    await finish_reject(rejected)
+    runner, _, repo, *_ = rejected
+    assert (await stage(rejected, rewritten(repo))).status_code == 200
+    stale_raw = await runner.redis.get(upload_pending(runner.name))
+    stale = json.loads(stale_raw)
+    path = repo / "tasks/PR-42.md"
+    path.write_text(path.read_text() + "\nChanged on base.\n")
+    git(repo, "commit", "-am", "base changed")
+    git(repo, "push", "origin", "main")
+    transaction = runner.redis.transaction
+    raced = False
+    corrected = rewritten(repo) + "\nFresh corrected upload.\n"
+
+    async def upload_new():
+        nonlocal raced
+        raced = True
+        assert (await stage(rejected, corrected)).status_code == 200
+
+    async def race(func, *keys, **kwargs):
+        if upload_pending(runner.name) in keys and not raced:
+            if after_read:
+                # Real Redis reruns the callback after this watched-key change.
+                async def changed_while_watched(pipe):
+                    result = await func(pipe)
+                    if not raced:
+                        await upload_new()
+                    return result
+                return await transaction(changed_while_watched, *keys, **kwargs)
+            await upload_new()
+        return await transaction(func, *keys, **kwargs)
+
+    monkeypatch.setattr(runner.redis, "transaction", race)
+    assert await runner.process_pending_uploads() is None
+    latest = json.loads(await runner.redis.get(upload_pending(runner.name)))
+    assert latest["staging_dir"] != stale["staging_dir"]
+    assert (Path(latest["staging_dir"]) / "PR-42.md").read_text() == corrected
+    assert await runner.process_pending_uploads() is True
+    assert path.read_text() == corrected
+
+
+async def test_invalid_upload_discard_waits_for_redis_and_preserves_unrelated_work(rejected, monkeypatch):
+    from pathlib import Path
+
+    await finish_reject(rejected)
+    runner, _, repo, *_ = rejected
+    assert (await stage(rejected, rewritten(repo))).status_code == 200
+    raw = await runner.redis.get(upload_pending(runner.name))
+    staging = Path(json.loads(raw)["staging_dir"])
+    # Permanently invalid input, with unrelated uncommitted checkout work.
+    incoming = staging / "PR-42.md"
+    incoming.write_text(incoming.read_text().replace("Type: bugfix", "Type: invalid"))
+    work = repo / "unrelated.txt"
+    work.write_text("preserve")
+    before = git(repo, "show-ref")
+    transaction = runner.redis.transaction
+    monkeypatch.setattr(runner.redis, "transaction", AsyncMock(side_effect=OSError("Redis unavailable")))
+    assert await runner.process_pending_uploads() is None
+    assert await runner.redis.get(upload_pending(runner.name)) == raw
+    assert staging.exists() and work.read_text() == "preserve"
+    monkeypatch.setattr(runner.redis, "transaction", transaction)
+    assert await runner.process_pending_uploads() is False
+    assert await runner.redis.get(upload_pending(runner.name)) is None
+    assert not staging.exists() and work.read_text() == "preserve"
+    assert git(repo, "show-ref") == before
+
+
+async def test_upload_waiting_for_final_reject_is_retained_then_admitted(rejected):
+    assert (await post_reject(rejected)).status_code == 202
+    runner, _, repo, *_ = rejected
+    assert (await stage(rejected, rewritten(repo))).status_code == 200
+    pending = await runner.redis.get(upload_pending(runner.name))
+    assert await runner.process_pending_uploads() is None
+    assert await runner.redis.get(upload_pending(runner.name)) == pending
+    await runner._consume_rejection_commands()
+    assert await runner.process_pending_uploads() is True
