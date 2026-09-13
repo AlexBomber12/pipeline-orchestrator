@@ -7,6 +7,7 @@ Mixin methods:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import subprocess
 from datetime import datetime, timezone
@@ -232,7 +233,7 @@ class CodingMixin:
                 log_prefix="[CODING]",
             )
             return
-        if not await self._prepare_task_attempt(task_body):
+        if not await self._prepare_task_attempt(task_body, file_sha256=hashlib.sha256(task_bytes).hexdigest()):
             return
         task_hash = task_spec_content_hash(task_body)
         try:

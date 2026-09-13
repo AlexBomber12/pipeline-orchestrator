@@ -16,7 +16,7 @@ from src.daemon import task_admission as daemon_admission
 from src.github.gh_runner import run_gh as cli_run_gh
 from src.keyspace import pipeline_state, upload_pending
 from src.models import PipelineState, QueueTask, TaskStatus
-from src.rejection_commands import load_rejection
+from src.rejection_commands import build_rejection, load_rejection, rejection_key
 from src.retry_commands import enqueue_retry_command, new_retry_command
 from src.task_admission import admission_candidate, validate_admission_graph
 from src.task_attempts import (
@@ -183,22 +183,31 @@ async def test_admission_refuses_unsafe_reuse(rejected, tmp_path, monkeypatch, m
 
 
 async def test_rejected_completion_matches_rejection_time_task_bytes(rejected):
-    runner, command, repo, _, _, _ = rejected
+    runner, _, repo, _, _, _ = rejected
     path = repo / "tasks/PR-42.md"
     error_text = path.read_text()
+    error_bytes = error_text.replace("\n", "\r\n").encode()
+    path.write_bytes(error_bytes)
+    command = build_rejection(runner.name, runner.state, await runner.redis.get(cause_key(runner.name, "PR-42")), repo)
     pre_error_text = error_text.replace("status: ERROR", "status: TODO").replace("blocked_reason: guardrail\n", "")
+    pre_error_bytes = pre_error_text.replace("\n", "\r\n").encode()
     prior = new_attempt(
         runner.repo_config.url,
         runner.state.current_task.model_copy(update={"status": TaskStatus.TODO}),
-        pre_error_text,
+        pre_error_bytes.decode(),
         attempt_id=command.attempt_id,
         started=True,
         coder_dispatched=True,
+        rejection=command.binding,
+        file_sha256=hashlib.sha256(pre_error_bytes).hexdigest(),
     )
     assert prior.fingerprint == command.fingerprint
     assert prior.file_sha256 != command.file_sha256
+    assert command.file_sha256 == hashlib.sha256(error_bytes).hexdigest()
     await save_attempt(runner.redis, runner.name, prior, expected=None)
-    await finish_reject(rejected)
+    command = command.model_copy(update={"status": "rejected", "released": True})
+    await runner.redis.set(rejection_key(runner.name, command.binding), command.model_dump_json())
+    assert (await load_rejection(runner.redis, runner.name, command.binding)).released
     (repo / "tasks/completions.json").write_text(
         json.dumps(
             {

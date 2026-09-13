@@ -56,6 +56,14 @@ def rejection_index(repo: str) -> str:
     return f"task_rejections:{repo}"
 
 
+def rejection_pending_index(repo: str) -> str:
+    return f"task_rejections_pending:{repo}"
+
+
+def rejection_pending_backfill_key(repo: str) -> str:
+    return f"task_rejections_pending_backfilled:{repo}"
+
+
 def build_rejection(repo: str, state: RepoState, raw_cause: str | bytes, root: Path) -> RejectionCommand:
     cause = CancellationCause.from_redis(raw_cause)
     task, pr = state.current_task, state.current_pr
@@ -74,7 +82,8 @@ def build_rejection(repo: str, state: RepoState, raw_cause: str | bytes, root: P
     attempt_id = task.attempt_id or (f"legacy-pr-{pr.number}" if pr else None)
     if not attempt_id:
         raise AttemptChanged("Legacy attempt identity is missing; daemon reconciliation is required.")
-    content = path.read_text(encoding="utf-8")
+    content_bytes = path.read_bytes()
+    content = content_bytes.decode("utf-8")
     fingerprint = task_spec_content_hash(content)
     failure = failure_identity(raw_cause)
     task = task.model_copy(update={"task_file": path.relative_to(root).as_posix(), "attempt_id": attempt_id})
@@ -101,7 +110,7 @@ def build_rejection(repo: str, state: RepoState, raw_cause: str | bytes, root: P
         task=task,
         attempt_id=attempt_id,
         fingerprint=fingerprint,
-        file_sha256=hashlib.sha256(content.encode()).hexdigest(),
+        file_sha256=hashlib.sha256(content_bytes).hexdigest(),
         failure=failure,
         pr=pr.model_copy(deep=True) if pr else None,
         initial_head_sha=pr.head_sha if pr else None,
@@ -121,6 +130,42 @@ async def list_rejections(redis: Any, repo: str) -> list[RejectionCommand]:
         command = await load_rejection(redis, repo, binding)
         if command is None:
             raise AttemptChanged("Rejection receipt missing; operator investigation required.")
+        result.append(command)
+    return result
+
+
+async def list_pending_rejections(redis: Any, repo: str) -> list[RejectionCommand]:
+    pending_key = rejection_pending_index(repo)
+    pending_bindings = await redis.zrangebyscore(pending_key, "-inf", "+inf")
+    result = []
+    seen = set()
+    for binding in pending_bindings:
+        binding = binding.decode() if isinstance(binding, bytes) else binding
+        seen.add(binding)
+        command = await load_rejection(redis, repo, binding)
+        if command is None:
+            raise AttemptChanged("Rejection receipt missing; operator investigation required.")
+        if command.released:
+            await redis.zrem(pending_key, binding)
+            continue
+        result.append(command)
+    backfill_key = rejection_pending_backfill_key(repo)
+    try:
+        claimed_backfill = await redis.set(backfill_key, "1", nx=True)
+    except TypeError:
+        claimed_backfill = True
+    if not claimed_backfill:
+        return result
+    for binding in await redis.zrangebyscore(rejection_index(repo), "-inf", "+inf"):
+        binding = binding.decode() if isinstance(binding, bytes) else binding
+        if binding in seen:
+            continue
+        command = await load_rejection(redis, repo, binding)
+        if command is None:
+            raise AttemptChanged("Rejection receipt missing; operator investigation required.")
+        if command.released:
+            continue
+        await redis.zadd(pending_key, {binding: command.requested_at.timestamp()})
         result.append(command)
     return result
 
@@ -198,6 +243,7 @@ async def enqueue_rejection(redis: Any, command: RejectionCommand) -> RejectionC
         pipe.multi()
         pipe.set(key, command.model_dump_json())
         pipe.zadd(rejection_index(command.repo_slug), {command.binding: command.requested_at.timestamp()})
+        pipe.zadd(rejection_pending_index(command.repo_slug), {command.binding: command.requested_at.timestamp()})
         pipe.set(task_key, attempt.model_dump_json())
         pipe.set(failure_key, cause.to_redis(), ex=TTL_SECONDS)
         pipe.zadd(index_key(command.repo_slug), {command.task.pr_id: command.requested_at.timestamp()})

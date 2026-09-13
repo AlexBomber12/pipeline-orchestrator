@@ -74,12 +74,19 @@ async def clear_failed_pr_creation(redis: Any, repo: str, attempt: TaskAttempt) 
     await redis.transaction(transaction, key)
 
 
-def new_attempt(repo_url: str, task: QueueTask, content: str, **kwargs: Any) -> TaskAttempt:
+def new_attempt(
+    repo_url: str,
+    task: QueueTask,
+    content: str,
+    *,
+    file_sha256: str | None = None,
+    **kwargs: Any,
+) -> TaskAttempt:
     return TaskAttempt(
         repo_url=repo_url,
         task=task.model_copy(deep=True),
         fingerprint=task_spec_content_hash(content),
-        file_sha256=hashlib.sha256(content.encode()).hexdigest(),
+        file_sha256=file_sha256 or hashlib.sha256(content.encode()).hexdigest(),
         **kwargs,
     )
 

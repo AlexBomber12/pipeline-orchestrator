@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import tempfile
 from pathlib import Path
 
@@ -43,7 +44,8 @@ class TaskAdmissionMixin:
             task_id = Path(filename).stem
             if await load_attempt(self.redis, self.name, task_id):
                 continue
-            content = git_ops._git(self.repo_path, "show", f"{base}:{filename}").stdout
+            content_bytes = git_ops._git_bytes(self.repo_path, "show", f"{base}:{filename}").stdout
+            content = content_bytes.decode("utf-8")
             with tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / Path(filename).name
                 path.write_text(content, encoding="utf-8")
@@ -65,6 +67,7 @@ class TaskAdmissionMixin:
                 task,
                 content,
                 started=header.frontmatter_status not in (None, "todo"),
+                file_sha256=hashlib.sha256(content_bytes).hexdigest(),
             )
             if header.blocked_reason == "operator_reject":
                 receipt.rejection = "legacy-missing-identity"
@@ -233,7 +236,7 @@ class TaskAdmissionMixin:
             result.append(task)
         return result
 
-    async def _prepare_task_attempt(self, content: str) -> bool:
+    async def _prepare_task_attempt(self, content: str, *, file_sha256: str | None = None) -> bool:
         """Bind a coder dispatch and remove only proven abandoned branch refs."""
         task = self.state.current_task
         if task is None:
@@ -241,7 +244,7 @@ class TaskAdmissionMixin:
         try:
             attempt = await load_attempt(self.redis, self.name, task.pr_id)
             if attempt is None:
-                attempt = new_attempt(self.repo_config.url, task, content)
+                attempt = new_attempt(self.repo_config.url, task, content, file_sha256=file_sha256)
                 attempt = await save_attempt(self.redis, self.name, attempt, expected=None)
             if (
                 attempt.rejection

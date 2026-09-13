@@ -135,7 +135,7 @@ from src.queue_parser import (
 from src.queue_parser import (
     parse_existing_task_header as parse_task_header,
 )
-from src.rejection_commands import list_rejections
+from src.rejection_commands import list_pending_rejections
 from src.subsource_registry import (
     SuppressionReason,
     error_category_to_reason,
@@ -2897,7 +2897,7 @@ class PipelineRunner(
         restored_checkout_for_rejection = False
         if checkout_missing:
             try:
-                has_rejection_work = bool(await list_rejections(self.redis, self.name))
+                has_rejection_work = bool(await list_pending_rejections(self.redis, self.name))
             except Exception:
                 has_rejection_work = False
             if has_rejection_work:

@@ -16,8 +16,9 @@ from src.keyspace import pipeline_state
 from src.models import PipelineState, RepoState, TaskStatus
 from src.rejection_commands import (
     RejectionCommand,
-    list_rejections,
+    list_pending_rejections,
     rejection_key,
+    rejection_pending_index,
 )
 from src.task_attempts import AttemptChanged, load_attempt, save_attempt
 
@@ -87,14 +88,12 @@ class RejectionCommandMixin:
         CODING/FIX call. Unknown orphan children hold the checkout visibly.
         """
         try:
-            commands = await list_rejections(self.redis, self.name)
+            commands = await list_pending_rejections(self.redis, self.name)
             for command in commands:
                 attempt = await load_attempt(self.redis, self.name, command.task.pr_id)
                 if attempt is None:
                     raise AttemptChanged("Rejected attempt receipt is missing.")
                 if attempt.attempt_id != command.attempt_id:
-                    continue
-                if command.released:
                     continue
                 if not self._recovered:
                     raw = await self.redis.get(pipeline_state(self.name))
@@ -290,3 +289,4 @@ class RejectionCommandMixin:
         await self.publish_state()
         command.released = True
         await self.redis.set(rejection_key(self.name, command.binding), command.model_dump_json())
+        await self.redis.zrem(rejection_pending_index(self.name), command.binding)

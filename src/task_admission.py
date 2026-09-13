@@ -8,6 +8,7 @@ actually followed.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterable
 from pathlib import Path
@@ -122,9 +123,12 @@ async def admission_candidate(
         raise AdmissionRejected("Task branch is not a valid Git branch.")
     previous = await load_attempt(redis, repo, header.pr_id)
     existing = approval_task_path(root, f"tasks/{incoming.name}")
-    content = incoming.read_text(encoding="utf-8")
+    incoming_bytes = incoming.read_bytes()
+    content = incoming_bytes.decode("utf-8")
     fingerprint = task_spec_content_hash(content)
     if previous is None and existing.is_file():
+        existing_bytes = existing.read_bytes()
+        existing_content = existing_bytes.decode("utf-8")
         old = parse_existing_task_header(existing)
         previous = new_attempt(
             repo_url,
@@ -135,8 +139,9 @@ async def admission_candidate(
                 branch=old.branch,
                 status=TaskStatus.DONE if old.frontmatter_status == "done" else TaskStatus.TODO,
             ),
-            existing.read_text(encoding="utf-8"),
+            existing_content,
             started=old.frontmatter_status not in (None, "todo"),
+            file_sha256=hashlib.sha256(existing_bytes).hexdigest(),
         )
     if previous and previous.admission_pending and fingerprint != previous.fingerprint:
         raise AttemptChanged("A different specification admission is pending; reconcile its Git/Redis result first.")
@@ -216,6 +221,7 @@ async def admission_candidate(
         previous_rejection=(previous.rejection or previous.previous_rejection) if previous else None,
         admission_pending=True,
         coder_dispatched=False,
+        file_sha256=hashlib.sha256(incoming_bytes).hexdigest(),
     )
     candidate.task.attempt_id = candidate.attempt_id
     return previous, candidate

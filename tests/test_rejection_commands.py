@@ -19,7 +19,16 @@ from src.daemon import git_ops
 from src.daemon import rejection_commands as daemon_reject
 from src.keyspace import pipeline_state
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
-from src.rejection_commands import build_rejection, enqueue_rejection, load_rejection, rejection_key
+from src.rejection_commands import (
+    build_rejection,
+    enqueue_rejection,
+    list_pending_rejections,
+    list_rejections,
+    load_rejection,
+    rejection_key,
+    rejection_pending_backfill_key,
+    rejection_pending_index,
+)
 from src.task_attempts import AttemptChanged, attempt_key, load_attempt
 from src.web import app as web_app
 from src.web.routes import repo_control, uploads
@@ -197,7 +206,7 @@ async def test_run_cycle_defers_checkout_restore_when_rejection_listing_fails(re
     runner, *_ = rejected
     shutil.rmtree(runner.repo_path)
     monkeypatch.setattr(
-        "src.daemon.runner.list_rejections",
+        "src.daemon.runner.list_pending_rejections",
         AsyncMock(side_effect=OSError("redis unavailable")),
     )
     ensure = AsyncMock(side_effect=AssertionError("checkout restore requires a confirmed pending rejection"))
@@ -225,6 +234,71 @@ async def test_run_cycle_clone_failure_before_rejection_transitions_error(reject
     consume_rejection.assert_not_awaited()
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message == "clone failed"
+
+
+async def test_pending_rejection_index_is_retired_after_release(rejected):
+    runner, command, *_ = rejected
+    assert (await post_reject(rejected)).status_code == 202
+    assert [item.binding for item in await list_pending_rejections(runner.redis, runner.name)] == [command.binding]
+
+    await runner._consume_rejection_commands()
+
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    assert stored.released
+    assert await list_pending_rejections(runner.redis, runner.name) == []
+    assert [item.binding for item in await list_rejections(runner.redis, runner.name)] == [command.binding]
+
+
+async def test_pending_rejection_index_backfills_legacy_unreleased_and_prunes_released(rejected):
+    runner, command, *_ = rejected
+    assert (await post_reject(rejected)).status_code == 202
+    await runner.redis.zrem(rejection_pending_index(runner.name), command.binding)
+    await runner.redis.delete(rejection_pending_backfill_key(runner.name))
+
+    pending = await list_pending_rejections(runner.redis, runner.name)
+
+    assert [item.binding for item in pending] == [command.binding]
+    indexed = await runner.redis.zrangebyscore(rejection_pending_index(runner.name), "-inf", "+inf")
+    assert [item.decode() if isinstance(item, bytes) else item for item in indexed] == [command.binding]
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    stored.released = True
+    await runner.redis.set(rejection_key(runner.name, command.binding), stored.model_dump_json())
+    await runner.redis.zadd(rejection_pending_index(runner.name), {command.binding: command.requested_at.timestamp()})
+
+    assert await list_pending_rejections(runner.redis, runner.name) == []
+    assert await runner.redis.zrangebyscore(rejection_pending_index(runner.name), "-inf", "+inf") == []
+
+
+async def test_pending_rejection_backfill_missing_receipt_fails_closed(rejected):
+    runner, command, *_ = rejected
+    assert (await post_reject(rejected)).status_code == 202
+    await runner.redis.zrem(rejection_pending_index(runner.name), command.binding)
+    await runner.redis.delete(rejection_pending_backfill_key(runner.name))
+    await runner.redis.delete(rejection_key(runner.name, command.binding))
+
+    with pytest.raises(AttemptChanged, match="missing"):
+        await list_pending_rejections(runner.redis, runner.name)
+
+
+async def test_pending_rejection_backfill_skips_released_history(rejected):
+    runner, command, *_ = rejected
+    assert (await post_reject(rejected)).status_code == 202
+    await runner.redis.zrem(rejection_pending_index(runner.name), command.binding)
+    await runner.redis.delete(rejection_pending_backfill_key(runner.name))
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    stored.released = True
+    await runner.redis.set(rejection_key(runner.name, command.binding), stored.model_dump_json())
+
+    assert await list_pending_rejections(runner.redis, runner.name) == []
+
+
+async def test_historical_rejection_index_missing_receipt_fails_closed(rejected):
+    runner, command, *_ = rejected
+    assert (await post_reject(rejected)).status_code == 202
+    await runner.redis.delete(rejection_key(runner.name, command.binding))
+
+    with pytest.raises(AttemptChanged, match="missing"):
+        await list_rejections(runner.redis, runner.name)
 
 
 @pytest.mark.parametrize("single", [False, True])
