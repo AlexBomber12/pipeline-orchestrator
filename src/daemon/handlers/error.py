@@ -20,9 +20,8 @@ from enum import Enum
 from src.branch_context import BranchContext
 from src.cancellation import get_cancellation_cause, safe_delete_cancellation_cause
 from src.daemon import git_ops
+from src.daemon.attempt_prs import attempt_pr_info, discover_attempt_pr
 from src.diagnosis import parse_diagnosis
-from src.github import cache as gh_cache
-from src.github import prs as gh_prs
 from src.models import PipelineState
 from src.retry import retry_transient
 from src.subsource_registry import SuppressionReason
@@ -154,19 +153,10 @@ class ErrorMixin:
                 return True
             if not await self._check_github_api_budget():
                 return True
-            gh_cache._invalidate_etag_cache(f"repos/{self.owner_repo}/pulls")
-            prs = await asyncio.to_thread(
-                gh_prs.get_open_prs,
-                self.owner_repo,
-                allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+            data = await asyncio.to_thread(
+                discover_attempt_pr, self.repo_path, self.owner_repo, self.repo_config.branch, attempt,
             )
-            matches = [
-                pr for pr in prs
-                if pr.branch == task.branch and pr.pr_id in (None, task.pr_id)
-                and (attempt.pr_number is None or pr.number == attempt.pr_number)
-                and pr.head_sha
-            ]
-            if len(matches) != 1:
+            if data is None:
                 self.log_event("[RECOVERY] PR creation acknowledgement unresolved; waiting for one matching PR.")
                 return True
             if await self._attempt_execution_blocked():
@@ -175,13 +165,19 @@ class ErrorMixin:
             if self.state.user_paused or await self._pop_stop_request():
                 self.state.user_paused = True
                 return True
-            candidate = matches[0]
+            candidate = attempt_pr_info(data, self.owner_repo, attempt)
             # WATCH may race an operator decision while GitHub is queried.
             # Commit the exact attempt receipt before publishing the handoff.
-            updated = attempt.model_copy(update={"pr_creation_pending": False, "pr_number": candidate.number})
+            updated = attempt.model_copy(update={
+                "pr_creation_pending": False, "pr_number": candidate.number,
+                "completed": attempt.completed or bool(data["merged_at"]),
+            })
             await save_attempt(self.redis, self.name, updated, expected=attempt)
             task.attempt_id = attempt.attempt_id
             self.state.current_pr = candidate
+            if data["merged_at"] or data["state"] == "closed":
+                await self._handle_external_pr_resolution(candidate, "MERGED" if data["merged_at"] else "CLOSED")
+                return True
             self.state.state = PipelineState.WATCH
             self._rehydrate_last_push_at(candidate)
             await self._save_current_run_record("coding_complete")

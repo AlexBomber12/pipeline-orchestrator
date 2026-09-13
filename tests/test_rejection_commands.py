@@ -28,6 +28,17 @@ from tests.runner import _helpers as h
 from tests.test_approval_commands import git, isolated_daemon_process_view  # noqa: F401
 
 
+def raw_attempt_pr(pr, *, created_at=None, state="open", merged_at=None):
+    return {
+        "number": pr.number,
+        "state": state,
+        "merged_at": merged_at,
+        "created_at": created_at or datetime.now(timezone.utc).isoformat(),
+        "head": {"ref": pr.branch, "sha": pr.head_sha, "repo": {"full_name": "octo/demo"}},
+        "base": {"ref": "main", "repo": {"full_name": "octo/demo"}},
+    }
+
+
 @pytest.fixture
 async def rejected(tmp_path, monkeypatch):
     repo = tmp_path / "octo__demo"
@@ -82,7 +93,12 @@ async def rejected(tmp_path, monkeypatch):
 
     def transport(args, repo=None, **kwargs):
         github["calls"].append(args)
+        if args[:3] == ["api", "--paginate", "--slurp"]:
+            return [github.get("attempt_prs", [])] if "/pulls?" in args[-1] else [[]]
         if args[:1] == ["api"]:
+            for row in github.get("attempt_prs", []):
+                if args[1].endswith(f"/{row['number']}"):
+                    return row
             return {
                 "number": 42,
                 "state": github["state"],
@@ -93,6 +109,9 @@ async def rejected(tmp_path, monkeypatch):
         if args[:2] == ["pr", "close"]:
             assert args == ["pr", "close", "42"]
             github["state"] = "closed"
+            for row in github.get("attempt_prs", []):
+                if row["number"] == 42:
+                    row["state"] = "closed"
             return ""
         if args[:2] == ["pr", "list"]:
             return []
@@ -101,6 +120,7 @@ async def rejected(tmp_path, monkeypatch):
             github["new_pr"] = PRInfo(
                 number=43, pr_id="PR-42", branch="fix/pr-42", head_sha=git(repo_path, "rev-parse", "HEAD")
             )
+            github["attempt_prs"] = [raw_attempt_pr(github["new_pr"])]
             return "https://github.com/octo/demo/pull/43"
         pytest.fail(f"Unexpected GitHub call: {args}")
 
@@ -335,7 +355,7 @@ async def test_pre_pr_reject_confirms_absence_before_releasing_branch(rejected, 
         monkeypatch.setattr(
             daemon_reject.gh_runner,
             "run_gh",
-            lambda args, *a, **kw: [{"number": 99}] if args[:2] == ["pr", "list"] else original(args, *a, **kw),
+            lambda args, *a, **kw: [{"number": 99}] if "--slurp" in args else original(args, *a, **kw),
         )
     await runner._consume_rejection_commands()
     first = await load_rejection(runner.redis, runner.name, command.binding)
@@ -767,10 +787,22 @@ async def test_legacy_approve_url_uses_bound_durable_command_and_preserves_work(
     assert github["state"] == "closed"
 
 
-@pytest.mark.parametrize("case", [
-    "pause", "stop", "budget", "rejected", "ambiguous", "changed_while_polling",
-    "pause_while_polling", "stop_while_polling", "cas_conflict", "skip_trigger",
-])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "pause",
+        "stop",
+        "budget",
+        "rejected",
+        "ambiguous",
+        "fork_while_hidden",
+        "changed_while_polling",
+        "pause_while_polling",
+        "stop_while_polling",
+        "cas_conflict",
+        "skip_trigger",
+    ],
+)
 async def test_pending_pr_reconciliation_respects_controls_and_attempt_changes(rejected, monkeypatch, case):
     from src.keyspace import control_stop
     from src.task_attempts import new_attempt, save_attempt
@@ -780,8 +812,11 @@ async def test_pending_pr_reconciliation_respects_controls_and_attempt_changes(r
     candidate = runner.state.current_pr.model_copy(deep=True)
     runner.state.current_pr = None
     attempt = new_attempt(
-        runner.repo_config.url, runner.state.current_task,
-        (repo / "tasks/PR-42.md").read_text(), started=True, pr_creation_pending=True,
+        runner.repo_config.url,
+        runner.state.current_task,
+        (repo / "tasks/PR-42.md").read_text(),
+        started=True,
+        pr_creation_pending=True,
     )
     runner.state.current_task.attempt_id = attempt.attempt_id
     await save_attempt(runner.redis, runner.name, attempt, expected=None)
@@ -801,19 +836,28 @@ async def test_pending_pr_reconciliation_respects_controls_and_attempt_changes(r
     elif case == "budget":
         monkeypatch.setattr(runner, "_check_github_api_budget", AsyncMock(return_value=False))
     elif case == "rejected":
-        command = build_rejection(runner.name, runner.state,
-                                  await runner.redis.get(cause_key(runner.name, "PR-42")), repo)
+        command = build_rejection(
+            runner.name, runner.state, await runner.redis.get(cause_key(runner.name, "PR-42")), repo
+        )
         await enqueue_rejection(runner.redis, command)
     elif case == "cas_conflict":
+
         async def conflict(redis, name, updated, *, expected):
             concurrent = expected.model_copy(update={"rejection": "concurrent-reject"})
             await save_attempt(redis, name, concurrent, expected=expected)
             return await save_attempt(redis, name, updated, expected=expected)
+
         monkeypatch.setattr(error, "save_attempt", conflict)
     elif case == "skip_trigger":
         monkeypatch.setattr(runner, "_should_skip_codex_review_post", lambda number: True)
 
-    def get_open_prs(*args, **kwargs):
+    row = raw_attempt_pr(candidate)
+    if case == "fork_while_hidden":
+        row["head"]["repo"]["full_name"] = "outsider/demo"
+
+    def get_attempt_prs(args, *a, **kwargs):
+        if args[:3] != ["api", "--paginate", "--slurp"]:
+            return row
         calls.append("lookup")
         if case == "changed_while_polling":
             concurrent = attempt.model_copy(update={"rejection": "concurrent-reject"})
@@ -823,10 +867,10 @@ async def test_pending_pr_reconciliation_respects_controls_and_attempt_changes(r
         elif case == "stop_while_polling":
             runner.redis.store[control_stop(runner.name)] = "1"
         if case == "ambiguous":
-            return [candidate, candidate.model_copy(update={"number": 43})]
-        return [candidate]
+            return [[row, {**row, "number": 43}]]
+        return [[row]]
 
-    monkeypatch.setattr(error.gh_prs, "get_open_prs", get_open_prs)
+    monkeypatch.setattr(daemon_reject.gh_runner, "run_gh", get_attempt_prs)
     monkeypatch.setattr(runner, "_post_codex_review", lambda number: reviews.append(number))
     assert await runner._reconcile_pending_pr_creation()
     current = await load_attempt(runner.redis, runner.name, "PR-42")
@@ -841,3 +885,199 @@ async def test_pending_pr_reconciliation_respects_controls_and_attempt_changes(r
     assert len(calls) == (0 if case in {"pause", "stop", "budget", "rejected"} else 1)
     if "pause" in case or "stop" in case:
         assert runner.state.user_paused
+
+
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("lost_close_ack", [False, True])
+@pytest.mark.parametrize("pending_creation", [False, True])
+async def test_guardrail_before_pr_tracking_resolves_current_pr_and_ignores_history(
+    rejected, monkeypatch, single, lost_close_ack, pending_creation
+):
+    from datetime import timedelta
+    from src.task_attempts import new_attempt, save_attempt
+
+    runner, _, repo, _, github, _ = rejected
+    current_pr = runner.state.current_pr.model_copy(deep=True)
+    runner.state.current_pr = None
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    attempt = new_attempt(
+        runner.repo_config.url,
+        runner.state.current_task,
+        (repo / "tasks/PR-42.md").read_text(),
+        started=True,
+        pr_creation_pending=pending_creation,
+    )
+    runner.state.current_task.attempt_id = attempt.attempt_id
+    await save_attempt(runner.redis, runner.name, attempt, expected=None)
+    old = raw_attempt_pr(
+        current_pr.model_copy(update={"number": 41}),
+        state="closed",
+        created_at=(attempt.accepted_at - timedelta(days=1)).isoformat(),
+    )
+    fork = raw_attempt_pr(current_pr.model_copy(update={"number": 88}))
+    fork["head"]["repo"]["full_name"] = "outsider/demo"
+    github["attempt_prs"] = [old, fork, raw_attempt_pr(current_pr)]
+    # This is coder output, not an executed command. The real scanner parks
+    # before the normal PR lookup, recreating the reported tracking gap.
+    await runner._post_coder_resolution(
+        "claude",
+        0,
+        "gh repo create octo/demo\n",
+        "",
+        target_branch="fix/pr-42",
+        current_pr_id="PR-42",
+    )
+    assert runner.state.state == PipelineState.ERROR and runner.state.current_pr is None
+    await runner.publish_state()
+    command = build_rejection(runner.name, runner.state, await runner.redis.get(cause_key(runner.name, "PR-42")), repo)
+    assert command.pr is None
+    assert (await post_reject(rejected, binding=command.binding)).status_code == 202
+    original_transport = daemon_reject.gh_runner.run_gh
+
+    def transport(args, *a, **kwargs):
+        result = original_transport(args, *a, **kwargs)
+        if lost_close_ack and args[:2] == ["pr", "close"]:
+            raise TimeoutError("close reply lost")
+        return result
+
+    monkeypatch.setattr(daemon_reject.gh_runner, "run_gh", transport)
+    await runner._consume_rejection_commands()
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    assert stored.pr.number == 42
+    if lost_close_ack:
+        assert stored.status == "deferred" and not stored.released
+        fresh = h._make_runner()
+        fresh.repo_path, fresh.redis = runner.repo_path, runner.redis
+        await fresh._consume_rejection_commands()
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    assert stored.status == "rejected" and stored.released
+    assert sum(call[:2] == ["pr", "close"] for call in github["calls"]) == 1
+    assert old["state"] == "closed" and fork["state"] == "open"
+
+
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("terminal", ["closed", "merged"])
+async def test_pending_creation_reconciles_terminal_pr_and_releases_ownership(rejected, monkeypatch, single, terminal):
+    from src.task_attempts import new_attempt, save_attempt
+
+    runner, _, repo, _, github, _ = rejected
+    pr = runner.state.current_pr.model_copy(deep=True)
+    runner.state.current_pr = None
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    attempt = new_attempt(
+        runner.repo_config.url,
+        runner.state.current_task,
+        (repo / "tasks/PR-42.md").read_text(),
+        started=True,
+        pr_creation_pending=True,
+    )
+    runner.state.current_task.attempt_id = attempt.attempt_id
+    await save_attempt(runner.redis, runner.name, attempt, expected=None)
+    await runner.redis.delete(cause_key(runner.name, "PR-42"))
+    await runner.publish_state()
+    github["attempt_prs"] = [
+        raw_attempt_pr(
+            pr,
+            state="closed",
+            merged_at=datetime.now(timezone.utc).isoformat() if terminal == "merged" else None,
+        )
+    ]
+    reviews = []
+    monkeypatch.setattr(runner, "_post_codex_review", lambda number: reviews.append(number))
+    await runner._run_cycle_body()
+    receipt = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert not receipt.pr_creation_pending
+    assert receipt.pr_number == 42 and receipt.completed is (terminal == "merged")
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None and runner.state.current_pr is None
+    assert not reviews
+    assert not any(call[:2] in (["pr", "create"], ["pr", "close"]) for call in github["calls"])
+    if terminal == "merged":
+        assert runner.state.current_queue[0].status == TaskStatus.DONE
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "fork_only",
+        "old_only",
+        "other_branch",
+        "wrong_base",
+        "wrong_target_repo",
+        "wrong_receipt_repo",
+        "unexpected_head",
+        "multiple",
+        "bad_pages",
+        "changed_exact",
+        "invalid_state",
+        "known_other_number",
+        "known_number",
+        "fork_and_owned",
+        "missing_branch",
+    ],
+)
+async def test_pr_discovery_requires_attempt_repository_base_time_and_head(rejected, monkeypatch, case):
+    from datetime import timedelta
+    from copy import deepcopy
+    from src.daemon.attempt_prs import discover_attempt_pr
+    from src.task_attempts import new_attempt
+
+    runner, _, repo, remote, github, _ = rejected
+    pr = runner.state.current_pr
+    attempt = new_attempt(
+        runner.repo_config.url,
+        runner.state.current_task,
+        (repo / "tasks/PR-42.md").read_text(),
+        started=True,
+        pr_creation_pending=True,
+    )
+    row = raw_attempt_pr(pr)
+    rows = [row]
+    if case == "fork_only":
+        row["head"]["repo"]["full_name"] = "outsider/demo"
+    elif case == "old_only":
+        row["created_at"] = (attempt.accepted_at - timedelta(days=1)).isoformat()
+        row["state"] = "closed"
+    elif case == "other_branch":
+        row["head"]["ref"] = "other"
+    elif case == "wrong_base":
+        row["base"]["ref"] = "other"
+    elif case == "wrong_target_repo":
+        row["base"]["repo"]["full_name"] = "another/repo"
+    elif case == "wrong_receipt_repo":
+        attempt.repo_url = "https://github.com/another/repo.git"
+    elif case == "unexpected_head":
+        row["head"]["sha"] = "f" * 40
+    elif case == "multiple":
+        rows.append({**deepcopy(row), "number": 43})
+    elif case == "invalid_state":
+        row["state"] = "unknown"
+    elif case in {"known_other_number", "known_number"}:
+        attempt.pr_number = 99 if case == "known_other_number" else pr.number
+    elif case == "fork_and_owned":
+        fork = deepcopy(row)
+        fork["number"] = 88
+        fork["head"]["repo"]["full_name"] = "outsider/demo"
+        rows.insert(0, fork)
+    elif case == "missing_branch":
+        git(repo, "checkout", "main")
+        git(repo, "update-ref", "-d", "refs/heads/fix/pr-42")
+        git(remote, "update-ref", "-d", "refs/heads/fix/pr-42")
+
+    def transport(args, *a, **kwargs):
+        if "--slurp" in args:
+            return {} if case == "bad_pages" else [rows]
+        if case == "changed_exact":
+            changed = deepcopy(row)
+            changed["head"]["repo"]["full_name"] = "outsider/demo"
+            return changed
+        return row
+
+    monkeypatch.setattr(daemon_reject.gh_runner, "run_gh", transport)
+    if case in {"fork_only", "old_only", "other_branch", "known_other_number"}:
+        assert discover_attempt_pr(str(repo), runner.owner_repo, "main", attempt) is None
+    elif case in {"known_number", "fork_and_owned"}:
+        assert discover_attempt_pr(str(repo), runner.owner_repo, "main", attempt)["number"] == 42
+    else:
+        with pytest.raises(AttemptChanged):
+            discover_attempt_pr(str(repo), runner.owner_repo, "main", attempt)

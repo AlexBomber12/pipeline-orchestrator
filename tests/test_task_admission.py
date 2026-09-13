@@ -859,6 +859,19 @@ async def test_pending_created_pr_recovers_in_later_cycle_without_restart_or_cod
     async def short_sleep(_delay):
         await original_sleep(0)
 
+    original_transport = daemon_admission.gh_runner.run_gh
+    discovery_lookups = []
+
+    def transport(args, *a, **kwargs):
+        if args[:3] == ["api", "--paginate", "--slurp"] and "/pulls?" in args[-1]:
+            discovery_lookups.append(visible)
+            if not visible:
+                if visibility == "outage":
+                    raise OSError("GitHub list unavailable")
+                return [[]]
+        return original_transport(args, *a, **kwargs)
+
+    monkeypatch.setattr(daemon_admission.gh_runner, "run_gh", transport)
     monkeypatch.setattr("src.github.prs.get_open_prs", get_open_prs)
     monkeypatch.setattr("src.daemon.handlers.coding.asyncio.sleep", short_sleep)
     monkeypatch.setattr(runner, "_post_codex_review", lambda number: reviews.append(number))
@@ -871,11 +884,11 @@ async def test_pending_created_pr_recovers_in_later_cycle_without_restart_or_cod
     # Another failed cycle keeps polling read-only, then the same running
     # daemon adopts the PR once GitHub's list becomes visible.
     await runner._run_cycle_body()
-    assert len(lookups) == 4
+    assert discovery_lookups == [False]
     assert runner.state.state == PipelineState.ERROR
     visible = True
     await runner._run_cycle_body()
-    assert len(lookups) == 5
+    assert discovery_lookups == [False, True]
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr.number == 43
     current = await load_attempt(runner.redis, runner.name, "PR-42")

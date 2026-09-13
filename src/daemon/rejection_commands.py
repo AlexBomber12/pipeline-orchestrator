@@ -10,6 +10,7 @@ from src.cancellation.storage import CancellationCause, cause_key
 from src.daemon import git_ops
 from src.daemon.approval_commands import checkout_process_blocker
 from src.daemon.attempt_processes import stop_attempt_children
+from src.daemon.attempt_prs import attempt_branch_head, attempt_pr_info, discover_attempt_pr
 from src.github import gh_runner
 from src.keyspace import pipeline_state
 from src.models import PipelineState, RepoState, TaskStatus
@@ -127,33 +128,24 @@ class RejectionCommandMixin:
                 ).stdout.strip()
             if command.pr is None:
                 attempt = await load_attempt(self.redis, self.name, command.task.pr_id)
-                if attempt.pr_creation_pending:
-                    raise AttemptChanged("PR creation acknowledgement is unresolved; exact PR identity is required.")
                 data = await asyncio.to_thread(
-                    gh_runner.run_gh,
-                    [
-                        "pr",
-                        "list",
-                        "--state",
-                        "all",
-                        "--head",
-                        command.task.branch,
-                        "--json",
-                        "number,state,headRefName",
-                        "--limit",
-                        "100",
-                    ],
-                    self.owner_repo,
+                    discover_attempt_pr, self.repo_path, self.owner_repo, self.repo_config.branch, attempt,
                 )
-                if not isinstance(data, list) or data:
-                    raise AttemptChanged("An unbound or ambiguous PR exists; exact PR identity must be reconciled.")
-                if not command.absence_confirmed:
+                if data is not None:
+                    command.pr = attempt_pr_info(data, self.owner_repo, attempt)
+                    command.branch_head = command.pr.head_sha
+                    await self._save_rejection(command, "closing", "Attempt PR identified; verifying exact PR closure.")
+                    updated = attempt.model_copy(update={"pr_number": command.pr.number, "pr_creation_pending": False})
+                    await save_attempt(self.redis, self.name, updated, expected=attempt)
+                elif attempt.pr_creation_pending:
+                    raise AttemptChanged("PR creation acknowledgement is unresolved; exact PR identity is required.")
+                elif not command.absence_confirmed:
                     command.absence_confirmed = True
                     await self._save_rejection(
                         command, "closing", "Confirming that no PR was created; rechecking next cycle."
                     )
                     return
-            else:
+            if command.pr is not None:
                 data = await asyncio.to_thread(rejection_pr_details, self.owner_repo, command, self.repo_config.branch)
                 if data["merged_at"]:
                     attempt = await load_attempt(self.redis, self.name, command.task.pr_id)
@@ -192,17 +184,7 @@ class RejectionCommandMixin:
                 # A pre-PR attempt has an explicit UUID and two negative PR
                 # observations. Freeze its now-quiescent branch refs for the
                 # same exact-SHA cleanup used for closed-PR attempts.
-                remote = git_ops._git(
-                    self.repo_path, "ls-remote", "--heads", "origin", f"refs/heads/{command.task.branch}"
-                ).stdout.strip()
-                remote_sha = remote.split()[0] if remote else None
-                local = git_ops._git(
-                    self.repo_path, "rev-parse", "--verify", f"refs/heads/{command.task.branch}", check=False
-                )
-                local_sha = local.stdout.strip() if local.returncode == 0 else None
-                if remote_sha and local_sha and remote_sha != local_sha:
-                    raise AttemptChanged("Pre-PR branch refs disagree; ownership must be reconciled.")
-                command.branch_head = remote_sha or local_sha
+                command.branch_head = attempt_branch_head(self.repo_path, command.task.branch)
             blocker = checkout_process_blocker(self.repo_path)
             if blocker or self._current_coder_process is not None:
                 raise AttemptChanged(blocker or "Coder process remains active.")

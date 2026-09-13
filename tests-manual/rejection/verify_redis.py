@@ -23,7 +23,11 @@ from src.approval_commands import build_approval, enqueue_approval
 from src.rejection_commands import enqueue_rejection, load_rejection
 from src.task_attempts import AttemptChanged
 from tests.test_approval_commands import isolated_daemon_process_view
-from tests.test_rejection_commands import rejected, test_connected_http_reject_rewrite_clean_base_and_new_pr
+from tests.test_rejection_commands import (
+    rejected,
+    test_connected_http_reject_rewrite_clean_base_and_new_pr,
+    test_guardrail_before_pr_tracking_resolves_current_pr_and_ignores_history,
+)
 
 
 async def exercise(socket: Path, root: Path):
@@ -46,6 +50,24 @@ async def exercise(socket: Path, root: Path):
                 )
                 assert first.binding == replay.binding
                 await test_connected_http_reject_rewrite_clean_base_and_new_pr(fixture, patch, single)
+        for single in (False, True):
+            await redis.flushall()
+            directory = root / f"untracked-{single}"
+            directory.mkdir()
+            with pytest.MonkeyPatch.context() as patch:
+                isolated_daemon_process_view.__wrapped__(patch)
+                fixture = await rejected.__wrapped__(directory, patch)
+                runner, _, _, _, _, app = fixture
+                for key, value in runner.redis.store.items():
+                    await redis.set(key, value)
+                runner.redis = app.state.redis = redis
+                await test_guardrail_before_pr_tracking_resolves_current_pr_and_ignores_history(
+                    fixture,
+                    patch,
+                    single,
+                    True,
+                    True,
+                )
         # Race actual approval application against Reject acceptance. A lost
         # decision either fails its CAS, or is superseded before execution.
         await redis.flushall()
@@ -74,7 +96,7 @@ async def exercise(socket: Path, root: Path):
                 assert outcomes[0] is None
         print(
             "Isolated Redis: connected scenario passed with both feature settings; "
-            "duplicate and Approve/Reject CAS races passed."
+            "untracked PR binding/restart, duplicate and Approve/Reject CAS races passed."
         )
 
 
