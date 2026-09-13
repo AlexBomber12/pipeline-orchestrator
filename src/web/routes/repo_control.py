@@ -720,7 +720,11 @@ async def _retry_binding_context(
     pr_number = relevant_pr.number if relevant_pr is not None else None
     pr_branch = relevant_pr.branch if relevant_pr is not None else None
     pr_head_sha = relevant_pr.head_sha if relevant_pr is not None else None
-    attempt = await load_attempt(redis_client, repo_slug, task.pr_id)
+    try:
+        attempt = await load_attempt(redis_client, repo_slug, task.pr_id)
+    except Exception:
+        # Unknown ownership must disable Retry without breaking the panel.
+        return None
     binding = retry_request_binding(
         attempt_id=attempt.attempt_id if attempt else None,
         repo_slug=repo_slug,

@@ -818,3 +818,72 @@ async def test_new_guardrail_panel_does_not_associate_an_old_pr_approval(rejecte
     active = next(view for view in views if view["is_active"])
     assert "approval" not in active
     assert active["approval_binding"] != approval.binding
+
+
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("visibility", ["empty", "outage"])
+async def test_pending_created_pr_recovers_in_later_cycle_without_restart_or_coder(
+    rejected, monkeypatch, single, visibility
+):
+    import asyncio
+    from src.models import PRInfo
+
+    await finish_reject(rejected)
+    runner, _, repo, _, github, _ = rejected
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    assert (await stage(rejected, rewritten(repo))).status_code == 200
+    assert await runner.process_pending_uploads()
+    attempt = await load_attempt(runner.redis, runner.name, "PR-42")
+    runner.state.current_task = attempt.task
+    assert await runner._prepare_task_attempt((repo / "tasks/PR-42.md").read_text())
+    git(repo, "checkout", "-b", "fix/pr-42", "origin/main")
+    (repo / "new-work.txt").write_text("preserve the new attempt")
+    git(repo, "add", "new-work.txt")
+    git(repo, "commit", "-m", "new implementation")
+    git(repo, "push", "-u", "origin", "fix/pr-42")
+    runner.state.state = PipelineState.CODING
+    visible = False
+    lookups = []
+    reviews = []
+
+    def get_open_prs(*args, **kwargs):
+        lookups.append(visible)
+        if not visible:
+            if visibility == "outage":
+                raise OSError("GitHub list unavailable")
+            return []
+        return [PRInfo(number=99, branch="unrelated"), github["new_pr"]]
+
+    original_sleep = asyncio.sleep
+
+    async def short_sleep(_delay):
+        await original_sleep(0)
+
+    monkeypatch.setattr("src.github.prs.get_open_prs", get_open_prs)
+    monkeypatch.setattr("src.daemon.handlers.coding.asyncio.sleep", short_sleep)
+    monkeypatch.setattr(runner, "_post_codex_review", lambda number: reviews.append(number))
+    await runner._diagnose_exit_zero_no_pr("fix/pr-42", "claude", AsyncMock(return_value=False))
+    assert len(lookups) == 3
+    assert runner.state.state == PipelineState.ERROR
+    assert (await load_attempt(runner.redis, runner.name, "PR-42")).pr_creation_pending
+    preserved_head = git(repo, "rev-parse", "fix/pr-42")
+
+    # Another failed cycle keeps polling read-only, then the same running
+    # daemon adopts the PR once GitHub's list becomes visible.
+    await runner._run_cycle_body()
+    assert len(lookups) == 4
+    assert runner.state.state == PipelineState.ERROR
+    visible = True
+    await runner._run_cycle_body()
+    assert len(lookups) == 5
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr.number == 43
+    current = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert current.attempt_id == attempt.attempt_id
+    assert not current.pr_creation_pending and current.pr_number == 43
+    assert sum(call[:2] == ["pr", "create"] for call in github["calls"]) == 1
+    assert reviews == [43]
+    assert github["state"] == "closed"
+    assert git(repo, "rev-parse", "fix/pr-42") == preserved_head
+    assert git(repo, "show", "fix/pr-42:new-work.txt") == "preserve the new attempt"
+    assert not await runner._reconcile_pending_pr_creation()

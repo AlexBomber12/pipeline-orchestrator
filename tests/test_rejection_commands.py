@@ -765,3 +765,79 @@ async def test_legacy_approve_url_uses_bound_durable_command_and_preserves_work(
     await runner._consume_rejection_commands()
     assert not await runner._consume_approval_command()
     assert github["state"] == "closed"
+
+
+@pytest.mark.parametrize("case", [
+    "pause", "stop", "budget", "rejected", "ambiguous", "changed_while_polling",
+    "pause_while_polling", "stop_while_polling", "cas_conflict", "skip_trigger",
+])
+async def test_pending_pr_reconciliation_respects_controls_and_attempt_changes(rejected, monkeypatch, case):
+    from src.keyspace import control_stop
+    from src.task_attempts import new_attempt, save_attempt
+    from src.daemon.handlers import error
+
+    runner, _, repo, _, _, _ = rejected
+    candidate = runner.state.current_pr.model_copy(deep=True)
+    runner.state.current_pr = None
+    attempt = new_attempt(
+        runner.repo_config.url, runner.state.current_task,
+        (repo / "tasks/PR-42.md").read_text(), started=True, pr_creation_pending=True,
+    )
+    runner.state.current_task.attempt_id = attempt.attempt_id
+    await save_attempt(runner.redis, runner.name, attempt, expected=None)
+    await runner.publish_state()
+    calls = []
+    reviews = []
+
+    def pause():
+        paused = runner.state.model_copy(deep=True)
+        paused.user_paused = True
+        runner.redis.store[pipeline_state(runner.name)] = paused.model_dump_json()
+
+    if case == "pause":
+        pause()
+    elif case == "stop":
+        await runner.redis.set(control_stop(runner.name), "1")
+    elif case == "budget":
+        monkeypatch.setattr(runner, "_check_github_api_budget", AsyncMock(return_value=False))
+    elif case == "rejected":
+        command = build_rejection(runner.name, runner.state,
+                                  await runner.redis.get(cause_key(runner.name, "PR-42")), repo)
+        await enqueue_rejection(runner.redis, command)
+    elif case == "cas_conflict":
+        async def conflict(redis, name, updated, *, expected):
+            concurrent = expected.model_copy(update={"rejection": "concurrent-reject"})
+            await save_attempt(redis, name, concurrent, expected=expected)
+            return await save_attempt(redis, name, updated, expected=expected)
+        monkeypatch.setattr(error, "save_attempt", conflict)
+    elif case == "skip_trigger":
+        monkeypatch.setattr(runner, "_should_skip_codex_review_post", lambda number: True)
+
+    def get_open_prs(*args, **kwargs):
+        calls.append("lookup")
+        if case == "changed_while_polling":
+            concurrent = attempt.model_copy(update={"rejection": "concurrent-reject"})
+            runner.redis.store[attempt_key(runner.name, "PR-42")] = concurrent.model_dump_json()
+        elif case == "pause_while_polling":
+            pause()
+        elif case == "stop_while_polling":
+            runner.redis.store[control_stop(runner.name)] = "1"
+        if case == "ambiguous":
+            return [candidate, candidate.model_copy(update={"number": 43})]
+        return [candidate]
+
+    monkeypatch.setattr(error.gh_prs, "get_open_prs", get_open_prs)
+    monkeypatch.setattr(runner, "_post_codex_review", lambda number: reviews.append(number))
+    assert await runner._reconcile_pending_pr_creation()
+    current = await load_attempt(runner.redis, runner.name, "PR-42")
+    if case == "skip_trigger":
+        assert runner.state.state == PipelineState.WATCH
+        assert not current.pr_creation_pending
+    else:
+        assert runner.state.state == PipelineState.ERROR
+        assert runner.state.current_pr is None
+        assert current.pr_creation_pending
+    assert reviews == []
+    assert len(calls) == (0 if case in {"pause", "stop", "budget", "rejected"} else 1)
+    if "pause" in case or "stop" in case:
+        assert runner.state.user_paused

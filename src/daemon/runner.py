@@ -2913,6 +2913,13 @@ class PipelineRunner(
         if not self.state.user_paused:
             self._user_pause_logged = False
 
+        if (
+            self._recovered and self.state.state == PipelineState.ERROR
+            and await self._reconcile_pending_pr_creation()
+        ):
+            await self.publish_state()
+            return
+
         # Durable Retry commands are consumed before the ordinary ERROR,
         # pause, and GitHub-budget exits.  This lets a parked runner
         # acknowledge the command and report the exact inhibitor instead of
