@@ -1026,7 +1026,26 @@ class CodingMixin:
                 self.log_event("[CODING] PR creation has an unresolved acknowledgement; reconciling visibility only.")
                 return True
             updated = attempt.model_copy(update={"pr_creation_pending": True})
-            await save_attempt(self.redis, self.name, updated, expected=attempt)
+            try:
+                await save_attempt(self.redis, self.name, updated, expected=attempt)
+            except Exception:
+                # EXEC may have committed before its reply was lost. Replay
+                # the exact CAS before issuing any GitHub creation request;
+                # an already-written receipt succeeds without another write.
+                try:
+                    await save_attempt(self.redis, self.name, updated, expected=attempt)
+                except Exception as exc:
+                    await self._transition_to_error(
+                        f"[{coder_name}] Cannot confirm PR creation intent for "
+                        f"{target_branch!r}: {type(exc).__name__}",
+                        save_run_record_as=None,
+                        cancellation_cause=CancellationCause(
+                            category="ERROR",
+                            payload={"subsource": "infra_failure", "subsystem": "pr_creation_intent"},
+                        ),
+                    )
+                    return False
+                self.log_event("[CODING] Confirmed PR creation intent after replaying its acknowledgement.")
         try:
             gh_runner.run_gh(
                 [

@@ -922,6 +922,87 @@ async def test_pending_created_pr_recovers_in_later_cycle_without_restart_or_cod
 
 
 @pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("failure", ["before_exec", "after_exec", "repeated_loss", "rejection", "replacement", "missing"])
+async def test_creation_intent_acknowledgement_replays_before_github_request(
+    rejected, monkeypatch, single, failure
+):
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    await finish_reject(rejected)
+    runner, _, repo, _, github, _ = rejected
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    assert (await stage(rejected, rewritten(repo))).status_code == 200
+    assert await runner.process_pending_uploads()
+    attempt = await load_attempt(runner.redis, runner.name, "PR-42")
+    runner.state.current_task = attempt.task
+    assert await runner._prepare_task_attempt((repo / "tasks/PR-42.md").read_text())
+    git(repo, "checkout", "-b", "fix/pr-42", "origin/main")
+    (repo / "intent-work.txt").write_text("preserve implementation across lost EXEC reply")
+    git(repo, "add", "intent-work.txt")
+    git(repo, "commit", "-m", "new implementation")
+    git(repo, "push", "-u", "origin", "fix/pr-42")
+    work_head = git(repo, "rev-parse", "HEAD")
+    accepted_base = git(repo, "rev-parse", "origin/main")
+    runner.state.state = PipelineState.CODING
+    original_transaction = runner.redis.transaction
+    key = attempt_key(runner.name, "PR-42")
+    calls = 0
+    concurrent = None
+
+    async def transaction(callback, *keys, **kwargs):
+        nonlocal calls, concurrent
+        if key not in keys or github["new_pr"] is not None:
+            return await original_transaction(callback, *keys, **kwargs)
+        calls += 1
+        assert github["new_pr"] is None, "GitHub must wait until receipt acknowledgement is confirmed"
+        if calls == 1 and failure == "before_exec":
+            raise RedisConnectionError("connection lost before EXEC")
+        result = await original_transaction(callback, *keys, **kwargs)
+        if calls == 1 and failure in {"rejection", "replacement", "missing"}:
+            current = await load_attempt(runner.redis, runner.name, "PR-42")
+            if failure == "missing":
+                await runner.redis.delete(key)
+            else:
+                concurrent = current.model_copy(update={"rejection": "concurrent-reject"}) if failure == "rejection" else (
+                    new_attempt(runner.repo_config.url, current.task, "replacement specification")
+                )
+                await runner.redis.set(key, concurrent.model_dump_json())
+        if calls == 1 or failure == "repeated_loss":
+            raise RedisConnectionError("EXEC reply lost")
+        return result
+
+    monkeypatch.setattr(runner.redis, "transaction", transaction)
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *a, **kw: [github["new_pr"]] if github["new_pr"] else [])
+    reviews = []
+    monkeypatch.setattr(runner, "_post_codex_review", lambda number: reviews.append(number))
+    await runner._diagnose_exit_zero_no_pr("fix/pr-42", "claude", AsyncMock(return_value=False))
+    assert calls == 2
+    creations = sum(call[:2] == ["pr", "create"] for call in github["calls"])
+    if failure in {"before_exec", "after_exec"}:
+        assert runner.state.state == PipelineState.WATCH
+        assert runner.state.current_pr.number == 43
+        assert creations == 1 and reviews == [43]
+        current = await load_attempt(runner.redis, runner.name, "PR-42")
+        assert current.pr_number == 43 and not current.pr_creation_pending
+        assert current.attempt_id == attempt.attempt_id
+    else:
+        assert runner.state.state == PipelineState.ERROR
+        assert "Cannot confirm PR creation intent" in runner.state.error_message
+        assert creations == 0 and reviews == []
+        assert json.loads(await runner.redis.get(pipeline_state(runner.name)))["state"] == "ERROR"
+        current = await load_attempt(runner.redis, runner.name, "PR-42")
+        if failure == "repeated_loss":
+            assert current.pr_creation_pending and current.attempt_id == attempt.attempt_id
+        else:
+            assert current == concurrent
+    assert git(repo, "rev-parse", "fix/pr-42") == work_head
+    assert git(repo, "show", "fix/pr-42:intent-work.txt") == "preserve implementation across lost EXEC reply"
+    assert git(repo, "rev-parse", "origin/main") == accepted_base
+    assert git(repo, "rev-parse", "HEAD") == work_head
+    assert github["state"] == "closed"
+
+
+@pytest.mark.parametrize("single", [False, True])
 @pytest.mark.parametrize("failure", ["authentication", "validation"])
 async def test_definitive_create_failure_allows_http_retry_without_losing_work(
     rejected, monkeypatch, single, failure
