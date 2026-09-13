@@ -1017,3 +1017,35 @@ async def test_upload_after_applied_approval_does_not_deadlock_watch(approval, s
     runner.state.current_task = None
     runner.state.current_pr = None
     assert not await runner._consume_approval_command()
+
+
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("deferred", [False, True])
+async def test_rejection_supersedes_upload_blocked_approval(approval, single, restart, deferred):
+    from src.keyspace import upload_pending
+
+    runner, command, repo, remote = approval
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    await enqueue_approval(runner.redis, command)
+    await runner.redis.set(upload_pending(runner.name), "staged upload for the IDLE consumer")
+    if deferred:
+        await runner._run_cycle_body()
+        assert (await load_approval(runner.redis, runner.name, command.binding)).status == "deferred"
+    rejection = CancellationCause(category="ERROR", payload={"subsource": "operator_reject"}).to_redis()
+    await runner.redis.set(cause_key(runner.name, "PR-42"), rejection)
+    if restart:
+        runner._recovered = False
+        runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+    before, remote_before = snapshot(repo), git(remote, "show-ref")
+    await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "failed" and not saved.active
+    assert "Pending failure changed" in saved.reason
+    # The existing control consumers can now run; approval does not consume
+    # the newer rejection or upload and does not change the checkout.
+    assert not await runner._consume_approval_command()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).superseded
+    assert await runner.redis.get(cause_key(runner.name, "PR-42")) == rejection
+    assert await runner.redis.get(upload_pending(runner.name))
+    assert snapshot(repo) == before and git(remote, "show-ref") == remote_before

@@ -228,6 +228,12 @@ class ApprovalCommandMixin:
                 raise ApprovalChanged("Approval repository binding changed.")
             if self._recovered and not matches_state(command, self.state):
                 raise ApprovalChanged("Active task or PR binding changed.")
+            # A later decision invalidates this request even while uploads or
+            # other inhibitors block application. The transaction checks again
+            # before clearing anything; a stale request must not hold forever.
+            failure = failure_identity(await self.redis.get(cause_key(self.name, command.task.pr_id)))
+            if failure != command.failure and not (command.status == "applied" and not failure):
+                raise ApprovalChanged("Pending failure changed; no unrelated failure was cleared.")
             reason = await self._approval_blocker(command)
             if reason:
                 await self._approval_result(command, "deferred", reason)
