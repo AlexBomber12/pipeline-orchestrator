@@ -143,6 +143,7 @@ class WatchMixin:
             prs = gh_prs.get_open_prs(
                 self.owner_repo,
                 allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+                required_checks=self.repo_config.required_checks,
             )
         except Exception as exc:
             await self._transition_to_error(
@@ -774,8 +775,12 @@ class WatchMixin:
         if not head_sha:
             return
         pending_max_seconds = self.app_config.daemon.ci_pending_max_min * 60
-        runs_payload, statuses_payload, fetch_ok = (
-            gh_checks._fetch_ci_status_rest(self.owner_repo, head_sha)
+        ci_evidence = gh_checks._fetch_ci_evidence_rest(
+            self.owner_repo,
+            head_sha,
+            pr_number=found.number,
+            required_checks=self.repo_config.required_checks,
+            allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
         )
         reclassified, reason = await gh_checks.classify_ci_status_with_age(
             self.owner_repo,
@@ -783,10 +788,11 @@ class WatchMixin:
             head_sha,
             self.redis,
             pending_max_seconds,
-            runs_payload,
-            statuses_payload,
+            ci_evidence.check_runs,
+            ci_evidence.status_payload,
             empty_is_success=self.repo_config.allow_merge_without_checks,
-            fetch_ok=fetch_ok,
+            fetch_ok=ci_evidence.complete,
+            required_checks=self.repo_config.required_checks,
         )
         if reason != "stuck_pending":
             return

@@ -67,3 +67,21 @@ runtime config loader does not read that file. Reload the daemon config
 through the normal inotify path, or restart the daemon container. Verify
 the rollback by checking the dashboard event log for legacy throttle
 decisions on the affected repository.
+
+## Merge Prerequisites
+
+Each repository can declare exact CI context names in
+`repositories[].required_checks`. When the list is non-empty, every named
+check must be present and terminal-success on the current PR head SHA
+before the daemon can treat CI as green. Names are matched exactly
+against GitHub check-run/status context display names; deployments that
+preserve an existing server config must explicitly add the intended
+`required_checks` entries during rollout.
+
+Repositories without `required_checks` keep the compatible weaker policy:
+the daemon evaluates every observed CI context and requires complete
+retrieval plus at least one real context when
+`allow_merge_without_checks` is false. Setting
+`allow_merge_without_checks: true` permits a known complete empty CI set;
+it does not waive configured required checks and does not convert a
+GitHub transport or pagination failure into success.

@@ -5,6 +5,9 @@ repositories:
   active: true
   poll_interval_sec: 60
   allow_merge_without_checks: false
+  required_checks:
+  - unit
+  - integration
   allow_merge_without_review: false
   coder: codex
   # Routes dispatcher decisions through the unified WorkInhibitor helper;

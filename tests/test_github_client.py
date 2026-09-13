@@ -6,6 +6,7 @@ import logging
 import subprocess
 from datetime import datetime, timedelta
 from datetime import timezone as _tz
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -13,7 +14,11 @@ from src.github import cache, checks, comments, prs, rate_limit, reactions, revi
 from src.github import comments as gh_comments
 from src.github.cache import clear_etag_cache  # noqa: F401 — used in tests
 from src.github.checks import (
+    CIContext,
+    _collapse_check_run_contexts,
+    _fetch_ci_evidence_rest,
     _fetch_ci_status_rest,
+    _map_observed_contexts_to_enum,
     _map_rest_ci_status_to_enum,
     clear_ci_status_cache,
 )
@@ -23,6 +28,7 @@ from src.github.comments import (
 )
 from src.github.gh_runner import _parse_iso, get_repo_full_name, run_gh
 from src.github.prs import (
+    _head_sha_from_pr_list_entry,
     clear_last_known_sha,
     clear_merged_prs_cache,
     get_branch_last_push_time,
@@ -2276,15 +2282,8 @@ def test_map_rest_ci_status_handles_non_dict_status_payload() -> None:
 
 
 def test_map_rest_ci_status_failed_fetch_follows_empty_is_success() -> None:
-    """``fetch_ok=False`` with empty payloads must follow ``empty_is_success``.
-
-    Aligns with ``_get_open_prs_rest``, which already returns SUCCESS for
-    ``allow_merge_without_checks=True`` whenever the GraphQL primary
-    fetch is unavailable. A transient REST-budget squeeze in the e2e
-    suite (``poll_interval_sec=2``, per-token quota shared across runs)
-    must not strand WATCH on a testbed PR that has no checks at all.
-    """
-    assert _map_rest_ci_status_to_enum([], {}, empty_is_success=True, fetch_ok=False) == CIStatus.SUCCESS
+    """``fetch_ok=False`` with empty payloads must stay pending."""
+    assert _map_rest_ci_status_to_enum([], {}, empty_is_success=True, fetch_ok=False) == CIStatus.PENDING
     assert _map_rest_ci_status_to_enum([], {}, empty_is_success=False, fetch_ok=False) == CIStatus.PENDING
 
 
@@ -2372,8 +2371,8 @@ def test_get_open_prs_returns_prinfo_objects(
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     monkeypatch.setattr(
-        "src.github.checks._fetch_ci_status_rest",
-        lambda repo, sha: ([], {}, True),
+        "src.github.checks._fetch_ci_evidence_rest",
+        lambda *args, **kwargs: SimpleNamespace(ci_status=CIStatus.SUCCESS),
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
@@ -2417,18 +2416,25 @@ def test_get_open_prs_invokes_rest_helper_with_head_sha(
             "isCrossRepository": False,
         }
     ]
-    captured: list[tuple[str, str]] = []
+    captured: list[tuple[str, str, int | None, tuple[str, ...]]] = []
 
-    def fake_fetch(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
-        captured.append((repo, sha))
-        return (
-            [{"conclusion": "failure"}],
-            {"state": "failure", "statuses": []},
-            True,
+    def fake_fetch(
+        repo: str,
+        sha: str,
+        **kwargs: Any,
+    ) -> SimpleNamespace:
+        captured.append(
+            (
+                repo,
+                sha,
+                kwargs.get("pr_number"),
+                tuple(kwargs.get("required_checks") or ()),
+            )
         )
+        return SimpleNamespace(ci_status=CIStatus.FAILURE)
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: raw)
-    monkeypatch.setattr("src.github.checks._fetch_ci_status_rest", fake_fetch)
+    monkeypatch.setattr("src.github.checks._fetch_ci_evidence_rest", fake_fetch)
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
         lambda repo, number, pr_author, head_sha: ReviewStatus.PENDING,
@@ -2436,22 +2442,58 @@ def test_get_open_prs_invokes_rest_helper_with_head_sha(
 
     prs = get_open_prs("owner/name")
 
-    assert captured == [("owner/name", "deadbeef")]
+    assert captured == [("owner/name", "deadbeef", 7, ())]
     assert prs[0].ci_status == CIStatus.FAILURE
 
 
-def test_get_open_prs_rest_fetch_failure_follows_allow_merge_without_checks(
+def test_get_open_prs_falls_back_to_latest_commit_oid_for_head_sha(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """REST CI fetch failure must follow ``allow_merge_without_checks``.
+    """If ``headRefOid`` is omitted, use the latest commit identity."""
+    raw = [
+        {
+            "number": 7,
+            "title": "PR-7: foo",
+            "headRefName": "bar",
+            "headRefOid": "",
+            "url": "u",
+            "updatedAt": "2026-04-18T00:00:00Z",
+            "commits": [{"oid": "old"}, {"oid": "latest"}],
+            "author": {"login": "a"},
+            "labels": [],
+            "isCrossRepository": False,
+        }
+    ]
+    captured: list[str] = []
 
-    When ``_fetch_ci_status_rest`` reports both endpoints failed and the
-    repo opts into ``allow_merge_without_checks``, ``get_open_prs`` must
-    surface ``CIStatus.SUCCESS`` to match the GraphQL-rate-limit fallback
-    in ``_get_open_prs_rest``. Without this alignment the daemon stalls
-    in WATCH on every transient REST-budget squeeze (the e2e suite hit
-    this with ``poll_interval_sec=2`` and a quota shared across runs).
-    """
+    def fake_fetch(repo: str, sha: str, **kwargs: Any) -> SimpleNamespace:
+        captured.append(sha)
+        return SimpleNamespace(ci_status=CIStatus.SUCCESS)
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: raw)
+    monkeypatch.setattr("src.github.checks._fetch_ci_evidence_rest", fake_fetch)
+    monkeypatch.setattr(
+        "src.github.reviews.get_pr_review_status",
+        lambda repo, number, pr_author, head_sha: ReviewStatus.PENDING,
+    )
+
+    [pr] = get_open_prs("owner/name", allow_merge_without_checks=True)
+
+    assert captured == ["latest"]
+    assert pr.head_sha == "latest"
+    assert pr.observed_head_shas == {"latest"}
+
+
+def test_head_sha_from_pr_list_entry_rejects_malformed_commits() -> None:
+    assert _head_sha_from_pr_list_entry({"headRefOid": "", "commits": []}) == ""
+    assert _head_sha_from_pr_list_entry({"commits": ["bad"]}) == ""
+    assert _head_sha_from_pr_list_entry({"commits": [{"oid": None}]}) == ""
+
+
+def test_get_open_prs_fetch_failure_does_not_follow_allow_merge_without_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transport failure is pending even when empty checks are allowed."""
     raw = [
         {
             "number": 7,
@@ -2469,8 +2511,8 @@ def test_get_open_prs_rest_fetch_failure_follows_allow_merge_without_checks(
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: raw)
     monkeypatch.setattr(
-        "src.github.checks._fetch_ci_status_rest",
-        lambda repo, sha: ([], {}, False),
+        "src.github.checks._fetch_ci_evidence_rest",
+        lambda *args, **kwargs: SimpleNamespace(ci_status=CIStatus.PENDING),
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
@@ -2479,7 +2521,7 @@ def test_get_open_prs_rest_fetch_failure_follows_allow_merge_without_checks(
 
     prs = get_open_prs("owner/name", allow_merge_without_checks=True)
 
-    assert prs[0].ci_status == CIStatus.SUCCESS
+    assert prs[0].ci_status == CIStatus.PENDING
 
 
 def test_get_open_prs_falls_back_to_rest_on_graphql_rate_limit(
@@ -2511,6 +2553,10 @@ def test_get_open_prs_falls_back_to_rest_on_graphql_rate_limit(
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
         lambda repo, number, pr_author, head_sha: ReviewStatus.PENDING,
+    )
+    monkeypatch.setattr(
+        "src.github.checks._fetch_ci_evidence_rest",
+        lambda *args, **kwargs: SimpleNamespace(ci_status=CIStatus.SUCCESS),
     )
 
     prs = get_open_prs("owner/name", allow_merge_without_checks=True)
@@ -3351,7 +3397,6 @@ def test_fetch_ci_status_rest_combines_check_runs_and_status(
 
     assert [r["id"] for r in check_runs] == [1, 2, 3]
     assert status_payload == {"state": "pending", "statuses": [{"state": "pending"}]}
-    assert any("--paginate" in c for c in calls)
     assert any("per_page=100" in a for c in calls for a in c)
     assert any("--include" in c for c in calls)
     assert fetch_ok is True
@@ -3359,7 +3404,7 @@ def test_fetch_ci_status_rest_combines_check_runs_and_status(
 
 def test_fetch_ci_status_rest_returns_empty_for_blank_sha() -> None:
     """A missing SHA short-circuits both REST calls."""
-    assert _fetch_ci_status_rest("owner/name", "") == ([], {}, True)
+    assert _fetch_ci_status_rest("owner/name", "") == ([], {}, False)
 
 
 def test_fetch_ci_status_rest_degrades_on_check_runs_failure(
@@ -3422,21 +3467,10 @@ def test_fetch_ci_status_rest_marks_fetch_failure_when_both_endpoints_fail(
     assert fetch_ok is False
 
 
-def test_fetch_ci_status_rest_partial_failure_trusts_empty_survivor(
+def test_fetch_ci_status_rest_partial_failure_marks_legacy_fetch_ok(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One endpoint raising while the survivor returns an empty signal must
-    still surface ``fetch_ok=True``.
-
-    The testbed's GitHub App grants ``Commit statuses`` but not ``Checks``, so
-    ``check-runs`` raises 403 while ``status`` legitimately reports zero
-    contexts. Treating that as a fetch failure permanently blocked the
-    auto-merge gate even when the operator opted into
-    ``allow_merge_without_checks``. Trusting the surviving endpoint's empty
-    report restores the previous "no checks = green when explicitly allowed"
-    semantics; the both-endpoints-failed case below remains the fetch-failure
-    safety net.
-    """
+    """The legacy fetch tuple records partial visibility as fetch_ok=True."""
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
@@ -3452,10 +3486,10 @@ def test_fetch_ci_status_rest_partial_failure_trusts_empty_survivor(
     assert fetch_ok is True
 
 
-def test_fetch_ci_status_rest_partial_failure_status_side_with_empty_check_runs(
+def test_fetch_ci_status_rest_partial_failure_status_side_marks_legacy_fetch_ok(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Mirror: ``status`` fails, ``check-runs`` returns empty — fetch still ok."""
+    """Mirror: legacy fetch_ok remains true when one source responds."""
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
@@ -3469,6 +3503,661 @@ def test_fetch_ci_status_rest_partial_failure_status_side_with_empty_check_runs(
     assert check_runs == []
     assert status_payload == {}
     assert fetch_ok is True
+
+
+def test_ci_evidence_partial_check_runs_failure_cannot_authorize_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Successful statuses plus failed check-run retrieval stays pending."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in a for a in args):
+            raise RuntimeError("HTTP 503")
+        return {"state": "success", "statuses": [{"context": "unit", "state": "success"}]}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
+
+    evidence = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        required_checks=["unit"],
+        allow_merge_without_checks=True,
+    )
+
+    assert evidence.ci_status == CIStatus.PENDING
+    assert evidence.pending_reason == "check_runs_fetch_failed"
+    assert evidence.statuses_source.complete is True
+    assert evidence.check_runs_source.complete is False
+
+
+def test_ci_evidence_partial_status_failure_cannot_authorize_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Successful check-runs plus failed statuses retrieval stays pending."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in a for a in args):
+            return [{"check_runs": [{"name": "unit", "conclusion": "success"}]}]
+        raise RuntimeError("HTTP 503")
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
+
+    evidence = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        required_checks=["unit"],
+        allow_merge_without_checks=True,
+    )
+
+    assert evidence.ci_status == CIStatus.PENDING
+    assert evidence.pending_reason == "statuses_fetch_failed"
+    assert evidence.check_runs_source.complete is True
+    assert evidence.statuses_source.complete is False
+
+
+def test_ci_evidence_complete_empty_respects_no_checks_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A known empty context set only passes with explicit no-checks allowance."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in a for a in args):
+            return [{"check_runs": []}]
+        return {"state": "pending", "statuses": []}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    denied = _fetch_ci_evidence_rest("owner/name", "abc123")
+    clear_ci_status_cache()
+    allowed = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        allow_merge_without_checks=True,
+    )
+
+    assert denied.ci_status == CIStatus.PENDING
+    assert denied.pending_reason == "no_ci_contexts"
+    assert allowed.ci_status == CIStatus.SUCCESS
+    assert allowed.pending_reason is None
+
+
+def test_ci_evidence_required_missing_and_pending_block_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Configured unit+integration requires both current contexts green."""
+
+    def fake_run_gh_missing(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in a for a in args):
+            return [{"check_runs": [{"name": "unit", "conclusion": "success"}]}]
+        return {"state": "pending", "statuses": []}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh_missing)
+    missing = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        required_checks=["unit", "integration"],
+    )
+    assert missing.ci_status == CIStatus.PENDING
+    assert missing.pending_reason == "required_check_missing:integration"
+
+    clear_ci_status_cache()
+
+    def fake_run_gh_pending(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in a for a in args):
+            return [
+                {
+                    "check_runs": [
+                        {"name": "unit", "conclusion": "success"},
+                        {"name": "integration", "status": "in_progress"},
+                    ]
+                }
+            ]
+        return {"state": "pending", "statuses": []}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh_pending)
+    pending = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        required_checks=["unit", "integration"],
+    )
+    assert pending.ci_status == CIStatus.PENDING
+    assert pending.pending_reason == "required_check_pending:integration"
+
+    clear_ci_status_cache()
+
+    def fake_run_gh_success(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in a for a in args):
+            return [
+                {
+                    "check_runs": [
+                        {"name": "unit", "conclusion": "success"},
+                        {"name": "integration", "conclusion": "success"},
+                    ]
+                }
+            ]
+        return {"state": "pending", "statuses": []}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh_success)
+    success = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        required_checks=["unit", "integration"],
+    )
+    assert success.ci_status == CIStatus.SUCCESS
+
+
+def test_ci_evidence_required_status_context_can_be_on_later_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Required legacy status contexts are resolved across all status pages."""
+
+    status_calls: list[str] = []
+
+    def fake_etag_get(path: str) -> dict:
+        if "check-runs" in path:
+            return {"check_runs": []}
+        status_calls.append(path)
+        if path.endswith("&page=1"):
+            return {
+                "state": "success",
+                "statuses": [
+                    {"context": f"legacy-{idx}", "state": "success"}
+                    for idx in range(100)
+                ],
+            }
+        if path.endswith("&page=2"):
+            return {
+                "state": "success",
+                "statuses": [
+                    {"context": "integration", "state": "success"},
+                ],
+            }
+        raise AssertionError(f"unexpected status page: {path}")
+
+    monkeypatch.setattr("src.github.cache._etag_get", fake_etag_get)
+
+    evidence = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        required_checks=["integration"],
+    )
+
+    assert evidence.ci_status == CIStatus.SUCCESS
+    assert evidence.statuses_source.complete is True
+    assert "required_check_missing:integration" != evidence.pending_reason
+    assert [ctx.display_name for ctx in evidence.contexts if ctx.display_name == "integration"] == [
+        "integration"
+    ]
+    assert len(status_calls) == 2
+
+
+def test_ci_evidence_status_pagination_failure_preserves_observed_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Later status-page failures keep page-1 evidence actionable.
+
+    Page 1's aggregate ``state`` covers statuses beyond the embedded first
+    page. If page 2 then fails, the source is incomplete and cannot produce
+    success, but an already-observed aggregate failure must still route WATCH
+    toward failure handling instead of becoming an indefinite PENDING.
+    """
+
+    def fake_etag_get(path: str) -> dict:
+        if "check-runs" in path:
+            return {"check_runs": []}
+        if path.endswith("&page=1"):
+            return {
+                "state": "failure",
+                "statuses": [
+                    {"context": f"legacy-{idx}", "state": "success"}
+                    for idx in range(100)
+                ],
+            }
+        if path.endswith("&page=2"):
+            raise RuntimeError("HTTP 503")
+        raise AssertionError(f"unexpected status page: {path}")
+
+    monkeypatch.setattr("src.github.cache._etag_get", fake_etag_get)
+    monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
+
+    evidence = _fetch_ci_evidence_rest("owner/name", "abc123")
+
+    assert evidence.ci_status == CIStatus.FAILURE
+    assert evidence.pending_reason is None
+    assert evidence.statuses_source.complete is False
+    assert evidence.statuses_source.reason == "statuses_fetch_failed"
+    assert evidence.status_payload["state"] == "failure"
+    assert len(evidence.status_payload["statuses"]) == 100
+
+
+@pytest.mark.parametrize(
+    ("bad_page", "reason"),
+    [
+        (None, "statuses_fetch_failed"),
+        ({"state": "success", "statuses": "bad"}, "statuses_unexpected_payload"),
+    ],
+)
+def test_ci_evidence_later_bad_status_page_preserves_accumulated_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_page: object,
+    reason: str,
+) -> None:
+    """Malformed later status pages are incomplete without dropping page 1."""
+
+    def fake_etag_get(path: str) -> object:
+        if "check-runs" in path:
+            return {"check_runs": []}
+        if path.endswith("&page=1"):
+            return {
+                "state": "success",
+                "statuses": [
+                    {"context": f"legacy-{idx}", "state": "success"}
+                    for idx in range(100)
+                ],
+            }
+        if path.endswith("&page=2"):
+            return bad_page
+        raise AssertionError(f"unexpected status page: {path}")
+
+    monkeypatch.setattr("src.github.cache._etag_get", fake_etag_get)
+
+    evidence = _fetch_ci_evidence_rest("owner/name", "abc123")
+
+    assert evidence.ci_status == CIStatus.PENDING
+    assert evidence.pending_reason == reason
+    assert evidence.statuses_source.complete is False
+    assert evidence.statuses_source.reason == reason
+    assert evidence.status_payload["state"] == "success"
+    assert len(evidence.status_payload["statuses"]) == 100
+
+
+def test_ci_evidence_check_run_pagination_failure_preserves_observed_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Later check-run page failures keep already-fetched failures actionable."""
+
+    def fake_etag_get(path: str) -> dict:
+        if "check-runs" in path and path.endswith("&page=1"):
+            return {
+                "check_runs": [
+                    {"name": "unit", "conclusion": "failure", "id": 1}
+                ]
+                + [
+                    {"name": f"extra-{idx}", "conclusion": "success", "id": idx + 2}
+                    for idx in range(99)
+                ],
+            }
+        if "check-runs" in path and path.endswith("&page=2"):
+            raise RuntimeError("HTTP 503")
+        if "/status?" in path:
+            return {"state": "pending", "statuses": []}
+        raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr("src.github.cache._etag_get", fake_etag_get)
+    monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
+
+    evidence = _fetch_ci_evidence_rest("owner/name", "abc123")
+
+    assert evidence.ci_status == CIStatus.FAILURE
+    assert evidence.pending_reason is None
+    assert evidence.check_runs_source.complete is False
+    assert evidence.check_runs_source.reason == "check_runs_fetch_failed"
+    assert len(evidence.check_runs) == 100
+
+
+def test_ci_evidence_legacy_slurped_check_run_page_with_bad_runs_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed slurped check-run pages do not become complete empties."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in a for a in args):
+            return [{"check_runs": "bad"}]
+        return {"state": "pending", "statuses": []}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    evidence = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        allow_merge_without_checks=True,
+    )
+
+    assert evidence.ci_status == CIStatus.PENDING
+    assert evidence.pending_reason == "check_runs_unexpected_payload"
+    assert evidence.check_runs_source.complete is False
+
+
+def test_ci_evidence_collapses_check_run_reruns_by_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Newer attempts override older history for the same app/name identity."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in a for a in args):
+            return [
+                {
+                    "check_runs": [
+                        {
+                            "id": 1,
+                            "name": "unit",
+                            "conclusion": "failure",
+                            "completed_at": "2026-01-01T00:00:00Z",
+                            "app": {"slug": "github-actions"},
+                        },
+                        {
+                            "id": 2,
+                            "name": "unit",
+                            "conclusion": "success",
+                            "completed_at": "2026-01-01T00:05:00Z",
+                            "app": {"slug": "github-actions"},
+                        },
+                    ]
+                }
+            ]
+        return {"state": "pending", "statuses": []}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    evidence = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        required_checks=["unit"],
+    )
+
+    assert evidence.ci_status == CIStatus.SUCCESS
+    assert [ctx.attempt_id for ctx in evidence.contexts if ctx.display_name == "unit"] == ["2"]
+
+
+def test_ci_evidence_duplicate_display_names_do_not_merge_apps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same display name from another app remains a separate required context."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in a for a in args):
+            return [
+                {
+                    "check_runs": [
+                        {
+                            "id": 1,
+                            "name": "unit",
+                            "conclusion": "success",
+                            "completed_at": "2026-01-01T00:05:00Z",
+                            "app": {"slug": "github-actions"},
+                        },
+                        {
+                            "id": 2,
+                            "name": "unit",
+                            "status": "queued",
+                            "started_at": "2026-01-01T00:06:00Z",
+                            "app": {"slug": "third-party-ci"},
+                        },
+                    ]
+                }
+            ]
+        return {"state": "pending", "statuses": []}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    evidence = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        required_checks=["unit"],
+    )
+
+    assert evidence.ci_status == CIStatus.PENDING
+    assert evidence.pending_reason == "required_check_pending:unit"
+    assert len([ctx for ctx in evidence.contexts if ctx.display_name == "unit"]) == 2
+
+
+def test_ci_evidence_cache_re_evaluates_policy_without_losing_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cached payload retains source completeness while policy can vary."""
+
+    calls = {"count": 0}
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in a for a in args):
+            calls["count"] += 1
+            return [{"check_runs": []}]
+        return {"state": "pending", "statuses": []}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    allowed = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        allow_merge_without_checks=True,
+    )
+    required = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        required_checks=["unit"],
+        allow_merge_without_checks=True,
+    )
+
+    assert calls["count"] == 1
+    assert allowed.ci_status == CIStatus.SUCCESS
+    assert required.ci_status == CIStatus.PENDING
+    assert required.pending_reason == "required_check_missing:unit"
+    assert required.complete is True
+
+
+def test_ci_evidence_malformed_check_run_pages_are_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed paginated page is not a successful empty check-run read."""
+
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", lambda path: ["bad-page"])
+    monkeypatch.setattr(
+        "src.github.cache._etag_get",
+        lambda path: {"state": "pending", "statuses": []},
+    )
+
+    evidence = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        allow_merge_without_checks=True,
+    )
+
+    assert evidence.ci_status == CIStatus.PENDING
+    assert evidence.pending_reason == "check_runs_unexpected_payload"
+
+
+def test_ci_evidence_unexpected_check_runs_payload_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-list check-runs payload cannot be treated as complete."""
+
+    monkeypatch.setattr("src.github.cache._gh_api_paginated", lambda path: {"bad": True})
+    monkeypatch.setattr(
+        "src.github.cache._etag_get",
+        lambda path: {"state": "pending", "statuses": []},
+    )
+
+    evidence = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        allow_merge_without_checks=True,
+    )
+
+    assert evidence.ci_status == CIStatus.PENDING
+    assert evidence.pending_reason == "check_runs_unexpected_payload"
+
+
+def test_ci_evidence_ignores_malformed_context_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed individual check/status entries are skipped, not merged."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in a for a in args):
+            return [
+                {
+                    "check_runs": [
+                        None,
+                        {"name": "missing-state", "app": {}},
+                        {"name": "unit", "conclusion": "success", "app": {}},
+                    ]
+                }
+            ]
+        return {
+            "state": "pending",
+            "statuses": [
+                None,
+                {"context": "missing-state"},
+                {"context": "legacy", "state": "success"},
+            ],
+        }
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    evidence = _fetch_ci_evidence_rest("owner/name", "abc123")
+
+    assert evidence.ci_status == CIStatus.SUCCESS
+    assert {ctx.display_name for ctx in evidence.contexts} == {"unit", "legacy"}
+    assert any(ctx.app == "app:unknown" for ctx in evidence.contexts)
+
+
+def test_collapse_check_run_contexts_skips_non_dict_entries() -> None:
+    contexts = _collapse_check_run_contexts(
+        [None, {"name": "unit", "conclusion": "success"}]  # type: ignore[list-item]
+    )
+
+    assert [ctx.display_name for ctx in contexts] == ["unit"]
+
+
+def test_ci_evidence_unexpected_status_payload_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-dict/non-json status payload cannot be treated as complete."""
+
+    monkeypatch.setattr(
+        "src.github.cache._etag_get",
+        lambda path: {"check_runs": []} if "check-runs" in path else 123,
+    )
+
+    evidence = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        allow_merge_without_checks=True,
+    )
+
+    assert evidence.ci_status == CIStatus.PENDING
+    assert evidence.pending_reason == "statuses_unexpected_payload"
+
+
+def test_ci_evidence_observed_pending_context_stays_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without required checks, observed non-terminal contexts stay pending."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in a for a in args):
+            return [{"check_runs": [{"name": "unit", "status": "queued"}]}]
+        return {"state": "pending", "statuses": []}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    evidence = _fetch_ci_evidence_rest("owner/name", "abc123")
+
+    assert evidence.ci_status == CIStatus.PENDING
+    assert evidence.pending_reason == "ci_pending"
+
+
+def test_ci_evidence_visible_status_failure_dominates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legacy status failure is preserved as FAILURE."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in a for a in args):
+            return [{"check_runs": [{"name": "unit", "conclusion": "success"}]}]
+        return {"state": "failure", "statuses": [{"context": "legacy", "state": "failure"}]}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    evidence = _fetch_ci_evidence_rest("owner/name", "abc123")
+
+    assert evidence.ci_status == CIStatus.FAILURE
+    assert evidence.pending_reason is None
+
+
+def test_ci_evidence_visible_check_run_failure_dominates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A current logic-class check-run failure is preserved as FAILURE."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in a for a in args):
+            return [{"check_runs": [{"name": "unit", "conclusion": "failure"}]}]
+        return {"state": "pending", "statuses": []}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    evidence = _fetch_ci_evidence_rest("owner/name", "abc123")
+
+    assert evidence.ci_status == CIStatus.FAILURE
+
+
+def test_ci_evidence_visible_infra_check_run_failure_dominates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A current infra-class check-run failure is preserved."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in a for a in args):
+            return [{"check_runs": [{"name": "unit", "conclusion": "cancelled"}]}]
+        return {"state": "pending", "statuses": []}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    evidence = _fetch_ci_evidence_rest("owner/name", "abc123")
+
+    assert evidence.ci_status == CIStatus.INFRA_FAILURE
+
+
+def test_ci_evidence_combined_failure_without_context_dominates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Combined status aggregate failure is preserved even without contexts."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in a for a in args):
+            return [{"check_runs": []}]
+        return {"state": "failure", "statuses": []}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    evidence = _fetch_ci_evidence_rest("owner/name", "abc123")
+
+    assert evidence.ci_status == CIStatus.FAILURE
+
+
+def test_map_observed_contexts_ignores_orphan_failure_context() -> None:
+    """A fabricated check-run context without raw run metadata is ignored."""
+
+    status = _map_observed_contexts_to_enum(
+        [None],  # type: ignore[list-item]
+        {"state": "pending", "statuses": []},
+        (
+            CIContext(
+                display_name="unit",
+                identity="check-run:unit:app:missing",
+                source="check_runs",
+                state="FAILURE",
+                success=False,
+                failure=True,
+                pending=False,
+            ),
+        ),
+    )
+
+    assert status == CIStatus.PENDING
 
 
 def test_fetch_ci_status_rest_parses_string_status_payload(
@@ -3522,7 +4211,7 @@ def test_fetch_ci_status_rest_ignores_non_list_pages(
 def test_fetch_ci_status_rest_skips_non_dict_pages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Non-dict and non-list ``check_runs`` entries are tolerated."""
+    """Malformed check-run pages are treated as incomplete evidence."""
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
@@ -3536,7 +4225,7 @@ def test_fetch_ci_status_rest_skips_non_dict_pages(
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     check_runs, _, _ = _fetch_ci_status_rest("owner/name", "abc123")
-    assert check_runs == [{"conclusion": "success"}]
+    assert check_runs == []
 
 
 def test_fetch_ci_status_rest_hydrates_annotations_for_failing_run(

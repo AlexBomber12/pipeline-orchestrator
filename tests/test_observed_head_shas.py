@@ -12,6 +12,7 @@ Covers the four scenarios called out in tasks/PR-195.md:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -259,8 +260,8 @@ def test_get_open_prs_populates_observed_head_shas_with_current_head(
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     monkeypatch.setattr(
-        "src.github.checks._fetch_ci_status_rest",
-        lambda repo, sha: ([], {}, True),
+        "src.github.checks._fetch_ci_evidence_rest",
+        lambda *args, **kwargs: SimpleNamespace(ci_status=CIStatus.SUCCESS),
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",

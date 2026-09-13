@@ -7,8 +7,11 @@ WATCH gate's CI status read. Reuses ``cache._etag_get`` and
 
 from __future__ import annotations
 
+import itertools
 import json
 import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from src.github import cache, gh_runner
@@ -38,9 +41,7 @@ _CI_STATUS_CACHE_TTL_SECONDS = 15.0
 #: watched repo — long-running daemons would retain full check-run
 #: payloads for SHAs that will never be queried again. Sweeping on write
 #: keeps the resident set ~O(unique SHAs queried within one TTL window).
-_ci_status_cache: dict[
-    tuple[str, str], tuple[float, list[dict], dict, bool]
-] = {}
+_ci_status_cache: dict[tuple[str, str], tuple[float, "CIEvidence"]] = {}
 
 
 _REST_CI_FAILURE_STATES = {
@@ -94,6 +95,63 @@ _INFRA_ANNOTATION_KEYWORDS = (
 # captures any realistic infra annotation while keeping the worst case
 # at one extra REST call per failing non-infra-conclusion check-run.
 _ANNOTATION_HYDRATION_PER_PAGE = 50
+_COMBINED_STATUS_PER_PAGE = 100
+
+
+@dataclass(frozen=True)
+class CISourceCompleteness:
+    """Retrieval state for one authoritative CI source."""
+
+    ok: bool
+    complete: bool
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class CIContext:
+    """Latest observed state for a normalized CI context identity."""
+
+    display_name: str
+    identity: str
+    source: str
+    state: str
+    success: bool
+    failure: bool
+    pending: bool
+    app: str | None = None
+    attempt_id: str | None = None
+
+
+@dataclass(frozen=True)
+class CIEvidence:
+    """Complete CI evidence for a single commit SHA."""
+
+    repo: str
+    head_sha: str
+    pr_number: int | None
+    fetched_at: datetime
+    check_runs: list[dict] = field(default_factory=list)
+    status_payload: dict = field(default_factory=dict)
+    check_runs_source: CISourceCompleteness = field(
+        default_factory=lambda: CISourceCompleteness(False, False, "not_fetched")
+    )
+    statuses_source: CISourceCompleteness = field(
+        default_factory=lambda: CISourceCompleteness(False, False, "not_fetched")
+    )
+    contexts: tuple[CIContext, ...] = ()
+    ci_status: CIStatus = CIStatus.PENDING
+    pending_reason: str | None = None
+    required_checks: tuple[str, ...] = ()
+
+    @property
+    def fetch_ok(self) -> bool:
+        """Legacy adapter: at least one source was fetched successfully."""
+        return self.check_runs_source.ok or self.statuses_source.ok
+
+    @property
+    def complete(self) -> bool:
+        """Both authoritative sources were retrieved completely for this SHA."""
+        return self.check_runs_source.complete and self.statuses_source.complete
 
 
 def _is_infra_failure(check_run: dict) -> bool:
@@ -205,49 +263,63 @@ def _evict_expired_ci_status_cache(now: float) -> None:
         _ci_status_cache.pop(key, None)
 
 
-def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
-    """Fetch combined CI signals for ``sha`` via the REST API.
+def _source_ok() -> CISourceCompleteness:
+    return CISourceCompleteness(ok=True, complete=True)
 
-    Returns ``(check_runs, status_payload, fetch_ok)`` where ``check_runs`` is
-    a flat list of all check_run dicts across pages from
-    ``GET /repos/{repo}/commits/{sha}/check-runs`` and ``status_payload`` is
-    the ``{"state": ..., "statuses": [...]}`` shape of
-    ``GET /repos/{repo}/commits/{sha}/status``. ``fetch_ok`` is ``False`` only
-    when *both* REST calls raised ``RuntimeError``; the caller currently
-    folds that case back into ``empty_is_success`` so the WATCH gate does
-    not stall on a transient REST-budget squeeze, matching the existing
-    GraphQL-rate-limit fallback in ``_get_open_prs_rest``.
+
+def _source_failed(reason: str) -> CISourceCompleteness:
+    return CISourceCompleteness(ok=False, complete=False, reason=reason)
+
+
+def _fetch_ci_evidence_rest(
+    repo: str,
+    sha: str,
+    *,
+    pr_number: int | None = None,
+    required_checks: list[str] | tuple[str, ...] | None = None,
+    allow_merge_without_checks: bool = False,
+) -> CIEvidence:
+    """Fetch and evaluate complete REST CI evidence for ``sha``.
+
+    Both check-runs and combined commit statuses must be fetched
+    successfully before evidence can authorize a merge. Partial data can
+    still surface observed failures, but never success.
     """
-    check_runs: list[dict] = []
-    status_payload: dict = {}
+    required = tuple(required_checks or ())
+    fetched_at = datetime.now(timezone.utc)
     if not sha:
-        return check_runs, status_payload, True
+        return _build_ci_evidence(
+            repo=repo,
+            sha=sha,
+            pr_number=pr_number,
+            fetched_at=fetched_at,
+            check_runs=[],
+            status_payload={},
+            check_runs_source=_source_failed("missing_head_sha"),
+            statuses_source=_source_failed("missing_head_sha"),
+            required_checks=required,
+            allow_merge_without_checks=allow_merge_without_checks,
+        )
 
     cache_key = (repo, sha)
     cached = _ci_status_cache.get(cache_key)
     now = time.monotonic()
     if cached is not None and (now - cached[0]) < _CI_STATUS_CACHE_TTL_SECONDS:
-        return list(cached[1]), dict(cached[2]), cached[3]
+        cached_evidence = cached[1]
+        return _build_ci_evidence(
+            repo=cached_evidence.repo,
+            sha=cached_evidence.head_sha,
+            pr_number=pr_number if pr_number is not None else cached_evidence.pr_number,
+            fetched_at=cached_evidence.fetched_at,
+            check_runs=list(cached_evidence.check_runs),
+            status_payload=dict(cached_evidence.status_payload),
+            check_runs_source=cached_evidence.check_runs_source,
+            statuses_source=cached_evidence.statuses_source,
+            required_checks=required,
+            allow_merge_without_checks=allow_merge_without_checks,
+        )
 
-    # check-runs is a paginated endpoint (per_page max 100). A commit can
-    # carry more than 100 runs, and ``_map_rest_ci_status_to_enum`` reads
-    # every entry — truncating to page 1 would let a failing or pending
-    # run beyond the cap masquerade as SUCCESS and misclassify the PR as
-    # mergeable, so we walk every page rather than relying on ETag-cached
-    # single-page reads.
-    check_runs_path = f"repos/{repo}/commits/{sha}/check-runs?per_page=100"
-    check_runs_ok = False
-    try:
-        cr_pages = cache._gh_api_paginated(check_runs_path)
-    except RuntimeError:
-        cr_pages = None
-    else:
-        check_runs_ok = True
-    if isinstance(cr_pages, list):
-        for page in cr_pages:
-            runs = page.get("check_runs")
-            if isinstance(runs, list):
-                check_runs.extend(r for r in runs if isinstance(r, dict))
+    check_runs, check_runs_source = _fetch_check_runs_payload(repo, sha)
 
     # PR-251 (OBS-BC): GitHub's check-runs REST payload exposes only
     # ``annotations_count`` + ``annotations_url`` — not the annotation
@@ -261,31 +333,371 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
     for run in check_runs:
         _maybe_hydrate_annotations(repo, run)
 
-    status_path = f"repos/{repo}/commits/{sha}/status"
-    status_ok = False
-    try:
-        raw_status = retry_transient(
-            lambda: cache._etag_get(status_path),
-            operation_name=f"gh api {status_path}",
-        )
-    except RuntimeError:
-        raw_status = None
-    else:
-        status_ok = True
+    status_payload, statuses_source = _fetch_combined_status_payload(repo, sha)
+
+    evidence = _build_ci_evidence(
+        repo=repo,
+        sha=sha,
+        pr_number=pr_number,
+        fetched_at=fetched_at,
+        check_runs=check_runs,
+        status_payload=status_payload,
+        check_runs_source=check_runs_source,
+        statuses_source=statuses_source,
+        required_checks=required,
+        allow_merge_without_checks=allow_merge_without_checks,
+    )
+    _evict_expired_ci_status_cache(now)
+    _ci_status_cache[cache_key] = (now, evidence)
+    return evidence
+
+
+def _parse_status_payload(raw_status: object) -> dict | None:
     if isinstance(raw_status, dict):
-        status_payload = raw_status
-    elif isinstance(raw_status, str) and raw_status:
+        return raw_status
+    if isinstance(raw_status, str) and raw_status:
         try:
             parsed = json.loads(raw_status)
         except json.JSONDecodeError:
-            parsed = None
+            return None
         if isinstance(parsed, dict):
-            status_payload = parsed
+            return parsed
+    return None
 
-    fetch_ok = check_runs_ok or status_ok
-    _evict_expired_ci_status_cache(now)
-    _ci_status_cache[cache_key] = (now, list(check_runs), dict(status_payload), fetch_ok)
-    return check_runs, status_payload, fetch_ok
+
+def _extract_check_runs_from_page(page: dict) -> list[dict] | None:
+    runs = page.get("check_runs")
+    if not isinstance(runs, list):
+        return None
+    return [run for run in runs if isinstance(run, dict)]
+
+
+def _fetch_check_runs_payload(
+    repo: str,
+    sha: str,
+) -> tuple[list[dict], CISourceCompleteness]:
+    check_runs_path = f"repos/{repo}/commits/{sha}/check-runs?per_page=100"
+    check_runs: list[dict] = []
+
+    for page_num in itertools.count(1):
+        page_path = f"{check_runs_path}&page={page_num}"
+        try:
+            raw_page = retry_transient(
+                lambda p=page_path: cache._etag_get(p),
+                operation_name=f"gh api {page_path}",
+            )
+        except RuntimeError:
+            if page_num == 1:
+                return [], _source_failed("check_runs_fetch_failed")
+            return check_runs, _source_failed("check_runs_fetch_failed")
+
+        if isinstance(raw_page, list):
+            source = _source_ok()
+            for page in raw_page:
+                if not isinstance(page, dict):
+                    return check_runs, _source_failed("check_runs_unexpected_payload")
+                runs = _extract_check_runs_from_page(page)
+                if runs is None:
+                    return check_runs, _source_failed("check_runs_unexpected_payload")
+                check_runs.extend(runs)
+            return check_runs, source
+
+        if not isinstance(raw_page, dict):
+            reason = (
+                "check_runs_fetch_failed"
+                if raw_page is None
+                else "check_runs_unexpected_payload"
+            )
+            return check_runs, _source_failed(reason)
+
+        page_runs = _extract_check_runs_from_page(raw_page)
+        if page_runs is None:
+            return check_runs, _source_failed("check_runs_unexpected_payload")
+        check_runs.extend(page_runs)
+        if len(page_runs) < 100:
+            break
+    return check_runs, _source_ok()
+
+
+def _fetch_combined_status_payload(
+    repo: str,
+    sha: str,
+) -> tuple[dict, CISourceCompleteness]:
+    status_path = (
+        f"repos/{repo}/commits/{sha}/status?per_page={_COMBINED_STATUS_PER_PAGE}"
+    )
+    first_payload: dict | None = None
+    statuses: list[object] = []
+
+    for page_num in itertools.count(1):
+        page_path = f"{status_path}&page={page_num}"
+        try:
+            raw_status = retry_transient(
+                lambda p=page_path: cache._etag_get(p),
+                operation_name=f"gh api {page_path}",
+            )
+        except RuntimeError:
+            if first_payload is None:
+                return {}, _source_failed("statuses_fetch_failed")
+            status_payload = dict(first_payload)
+            status_payload["statuses"] = statuses
+            return status_payload, _source_failed("statuses_fetch_failed")
+
+        payload = _parse_status_payload(raw_status)
+        if payload is None:
+            reason = (
+                "statuses_fetch_failed"
+                if raw_status is None
+                else "statuses_unexpected_payload"
+            )
+            if first_payload is None:
+                return {}, _source_failed(reason)
+            status_payload = dict(first_payload)
+            status_payload["statuses"] = statuses
+            return status_payload, _source_failed(reason)
+
+        page_statuses = payload.get("statuses")
+        if not isinstance(page_statuses, list):
+            if first_payload is None:
+                return {}, _source_failed("statuses_unexpected_payload")
+            status_payload = dict(first_payload)
+            status_payload["statuses"] = statuses
+            return status_payload, _source_failed("statuses_unexpected_payload")
+        if first_payload is None:
+            first_payload = payload
+        statuses.extend(page_statuses)
+        if len(page_statuses) < _COMBINED_STATUS_PER_PAGE:
+            break
+
+    status_payload = dict(first_payload or {})
+    status_payload["statuses"] = statuses
+    return status_payload, _source_ok()
+
+
+def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
+    """Compatibility wrapper returning legacy REST CI payloads."""
+    evidence = _fetch_ci_evidence_rest(repo, sha)
+    return list(evidence.check_runs), dict(evidence.status_payload), evidence.fetch_ok
+
+
+def _check_run_app_identity(run: dict) -> str:
+    app = run.get("app")
+    if not isinstance(app, dict):
+        return "app:unknown"
+    for key in ("slug", "id", "name"):
+        value = app.get(key)
+        if value not in (None, ""):
+            return f"app:{key}:{value}"
+    return "app:unknown"
+
+
+def _attempt_sort_key(item: dict) -> tuple[str, int]:
+    timestamp = ""
+    for key in ("started_at", "completed_at", "updated_at", "created_at"):
+        value = item.get(key)
+        if isinstance(value, str) and value:
+            timestamp = value
+            break
+    item_id = item.get("id")
+    return timestamp, item_id if isinstance(item_id, int) else 0
+
+
+def _collapse_check_run_contexts(check_runs: list[dict]) -> list[CIContext]:
+    latest: dict[str, dict] = {}
+    for run in check_runs:
+        if not isinstance(run, dict):
+            continue
+        name = run.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        app_identity = _check_run_app_identity(run)
+        identity = f"check-run:{name.strip()}:{app_identity}"
+        current = latest.get(identity)
+        if current is None or _attempt_sort_key(run) >= _attempt_sort_key(current):
+            latest[identity] = run
+
+    contexts: list[CIContext] = []
+    for identity, run in latest.items():
+        value = run.get("conclusion") or run.get("status")
+        if not value:
+            continue
+        state = str(value).upper()
+        contexts.append(
+            CIContext(
+                display_name=str(run.get("name", "")).strip(),
+                identity=identity,
+                source="check_runs",
+                state=state,
+                success=state in _REST_CI_SUCCESS_STATES,
+                failure=state in _REST_CI_FAILURE_STATES,
+                pending=state not in _REST_CI_SUCCESS_STATES
+                and state not in _REST_CI_FAILURE_STATES,
+                app=app_identity,
+                attempt_id=str(run.get("id")) if run.get("id") is not None else None,
+            )
+        )
+    return contexts
+
+
+def _collapse_status_contexts(status_payload: dict) -> list[CIContext]:
+    statuses_raw = (
+        status_payload.get("statuses") if isinstance(status_payload, dict) else None
+    )
+    if not isinstance(statuses_raw, list):
+        return []
+    latest: dict[str, dict] = {}
+    for status in statuses_raw:
+        if not isinstance(status, dict):
+            continue
+        context = status.get("context")
+        if not isinstance(context, str) or not context.strip():
+            continue
+        identity = f"status:{context.strip()}"
+        # The combined-status endpoint returns newest statuses first.
+        latest.setdefault(identity, status)
+
+    contexts: list[CIContext] = []
+    for identity, status in latest.items():
+        value = status.get("state")
+        if not isinstance(value, str) or not value:
+            continue
+        state = value.upper()
+        contexts.append(
+            CIContext(
+                display_name=str(status.get("context", "")).strip(),
+                identity=identity,
+                source="statuses",
+                state=state,
+                success=state in _REST_CI_SUCCESS_STATES,
+                failure=state in _REST_CI_FAILURE_STATES,
+                pending=state not in _REST_CI_SUCCESS_STATES
+                and state not in _REST_CI_FAILURE_STATES,
+            )
+        )
+    return contexts
+
+
+def _build_ci_evidence(
+    *,
+    repo: str,
+    sha: str,
+    pr_number: int | None,
+    fetched_at: datetime,
+    check_runs: list[dict],
+    status_payload: dict,
+    check_runs_source: CISourceCompleteness,
+    statuses_source: CISourceCompleteness,
+    required_checks: tuple[str, ...],
+    allow_merge_without_checks: bool,
+) -> CIEvidence:
+    contexts = tuple(
+        _collapse_check_run_contexts(check_runs) + _collapse_status_contexts(status_payload)
+    )
+    ci_status, pending_reason = _evaluate_ci_evidence(
+        check_runs=check_runs,
+        status_payload=status_payload,
+        contexts=contexts,
+        check_runs_source=check_runs_source,
+        statuses_source=statuses_source,
+        required_checks=required_checks,
+        allow_merge_without_checks=allow_merge_without_checks,
+    )
+    return CIEvidence(
+        repo=repo,
+        head_sha=sha,
+        pr_number=pr_number,
+        fetched_at=fetched_at,
+        check_runs=list(check_runs),
+        status_payload=dict(status_payload),
+        check_runs_source=check_runs_source,
+        statuses_source=statuses_source,
+        contexts=contexts,
+        ci_status=ci_status,
+        pending_reason=pending_reason,
+        required_checks=required_checks,
+    )
+
+
+def _evaluate_ci_evidence(
+    *,
+    check_runs: list[dict],
+    status_payload: dict,
+    contexts: tuple[CIContext, ...],
+    check_runs_source: CISourceCompleteness,
+    statuses_source: CISourceCompleteness,
+    required_checks: tuple[str, ...],
+    allow_merge_without_checks: bool,
+) -> tuple[CIStatus, str | None]:
+    complete = check_runs_source.complete and statuses_source.complete
+    visible_failure = _map_observed_contexts_to_enum(check_runs, status_payload, contexts)
+    if visible_failure in {CIStatus.FAILURE, CIStatus.INFRA_FAILURE}:
+        return visible_failure, None
+
+    if not complete:
+        reasons = [
+            source.reason
+            for source in (check_runs_source, statuses_source)
+            if not source.complete and source.reason
+        ]
+        return CIStatus.PENDING, "+".join(reasons) or "ci_evidence_incomplete"
+
+    if required_checks:
+        for required in required_checks:
+            matches = [ctx for ctx in contexts if ctx.display_name == required]
+            if not matches:
+                return CIStatus.PENDING, f"required_check_missing:{required}"
+            if any(not ctx.success for ctx in matches):
+                return CIStatus.PENDING, f"required_check_pending:{required}"
+        return CIStatus.SUCCESS, None
+
+    if not contexts:
+        if allow_merge_without_checks:
+            return CIStatus.SUCCESS, None
+        return CIStatus.PENDING, "no_ci_contexts"
+    if all(ctx.success for ctx in contexts):
+        return CIStatus.SUCCESS, None
+    return CIStatus.PENDING, "ci_pending"
+
+
+def _map_observed_contexts_to_enum(
+    check_runs: list[dict],
+    status_payload: dict,
+    contexts: tuple[CIContext, ...],
+) -> CIStatus:
+    if any(ctx.failure and ctx.source == "statuses" for ctx in contexts):
+        return CIStatus.FAILURE
+    latest_runs: dict[str, dict] = {}
+    for run in check_runs:
+        if not isinstance(run, dict):
+            continue
+        name = run.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        identity = f"check-run:{name.strip()}:{_check_run_app_identity(run)}"
+        current = latest_runs.get(identity)
+        if current is None or _attempt_sort_key(run) >= _attempt_sort_key(current):
+            latest_runs[identity] = run
+    failing_runs = []
+    for ctx in contexts:
+        if not ctx.failure or ctx.source != "check_runs":
+            continue
+        run = latest_runs.get(ctx.identity)
+        if run is not None:
+            failing_runs.append(run)
+    if failing_runs:
+        if all(_is_infra_failure(run) for run in failing_runs):
+            return CIStatus.INFRA_FAILURE
+        return CIStatus.FAILURE
+
+    combined_state = (
+        status_payload.get("state") if isinstance(status_payload, dict) else None
+    )
+    combined_state_upper = (
+        combined_state.upper() if isinstance(combined_state, str) and combined_state else ""
+    )
+    if combined_state_upper in _REST_CI_FAILURE_STATES:
+        return CIStatus.FAILURE
+    return CIStatus.PENDING
 
 
 def _map_rest_ci_status_to_enum(
@@ -327,7 +739,6 @@ def _map_rest_ci_status_to_enum(
     a stale ``failure`` from an earlier retry would force ``FAILURE``
     even after the latest status for that context turned green.
     """
-    del fetch_ok  # retained for caller signature compatibility
     statuses_raw = (
         status_payload.get("statuses") if isinstance(status_payload, dict) else None
     )
@@ -335,6 +746,9 @@ def _map_rest_ci_status_to_enum(
     combined_state = (
         status_payload.get("state") if isinstance(status_payload, dict) else None
     )
+
+    if not fetch_ok and not check_runs and not statuses:
+        return CIStatus.PENDING
 
     if not check_runs and not statuses:
         return CIStatus.SUCCESS if empty_is_success else CIStatus.PENDING
@@ -497,6 +911,7 @@ async def classify_ci_status_with_age(
     *,
     empty_is_success: bool = False,
     fetch_ok: bool = True,
+    required_checks: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[CIStatus, str | None]:
     """Augment :func:`_map_rest_ci_status_to_enum` with stuck-PENDING reclassification.
 
@@ -511,11 +926,12 @@ async def classify_ci_status_with_age(
 
     PR-250.
     """
-    raw_status = _map_rest_ci_status_to_enum(
+    raw_status = _classify_raw_ci_status_for_age(
         runs_payload,
         statuses_payload,
         empty_is_success=empty_is_success,
         fetch_ok=fetch_ok,
+        required_checks=tuple(required_checks or ()),
     )
     if raw_status != CIStatus.PENDING:
         await _clear_pending_tracker(redis_client, repo, pr_number, head_sha)
@@ -549,3 +965,53 @@ async def classify_ci_status_with_age(
     if age_seconds >= pending_max_seconds:
         return CIStatus.FAILURE, "stuck_pending"
     return raw_status, None
+
+
+def _classify_raw_ci_status_for_age(
+    runs_payload: list[dict],
+    statuses_payload: dict,
+    *,
+    empty_is_success: bool,
+    fetch_ok: bool,
+    required_checks: tuple[str, ...],
+) -> CIStatus:
+    if not fetch_ok:
+        contexts = tuple(
+            _collapse_check_run_contexts(runs_payload)
+            + _collapse_status_contexts(statuses_payload)
+        )
+        visible_failure = _map_observed_contexts_to_enum(
+            runs_payload,
+            statuses_payload,
+            contexts,
+        )
+        if visible_failure in {CIStatus.FAILURE, CIStatus.INFRA_FAILURE}:
+            return visible_failure
+        return CIStatus.PENDING
+
+    if not required_checks:
+        return _map_rest_ci_status_to_enum(
+            runs_payload,
+            statuses_payload,
+            empty_is_success=empty_is_success,
+            fetch_ok=fetch_ok,
+        )
+
+    contexts = tuple(
+        _collapse_check_run_contexts(runs_payload)
+        + _collapse_status_contexts(statuses_payload)
+    )
+    visible_failure = _map_observed_contexts_to_enum(
+        runs_payload,
+        statuses_payload,
+        contexts,
+    )
+    if visible_failure in {CIStatus.FAILURE, CIStatus.INFRA_FAILURE}:
+        return visible_failure
+    for required in required_checks:
+        matches = [ctx for ctx in contexts if ctx.display_name == required]
+        if not matches:
+            return CIStatus.PENDING
+        if any(not ctx.success for ctx in matches):
+            return CIStatus.PENDING
+    return CIStatus.SUCCESS

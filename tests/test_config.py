@@ -801,6 +801,7 @@ def test_repo_poll_interval_rejects_float() -> None:
 def test_repo_allow_merge_without_checks_default() -> None:
     repo = RepoConfig(url="https://github.com/example/repo")
     assert repo.allow_merge_without_checks is False
+    assert repo.required_checks == []
     assert repo.allow_merge_without_review is False
 
 
@@ -814,6 +815,38 @@ def test_repo_allow_merge_without_checks_loads_from_yaml(tmp_path: Path) -> None
     )
     cfg = load_config(str(cfg_path))
     assert cfg.repositories[0].allow_merge_without_checks is True
+    assert cfg.repositories[0].required_checks == []
+
+
+def test_repo_required_checks_load_save_round_trip(tmp_path: Path) -> None:
+    path = tmp_path / "config.yml"
+    cfg = AppConfig(
+        repositories=[
+            RepoConfig(
+                url="https://github.com/example/repo",
+                required_checks=["unit", "integration"],
+            )
+        ]
+    )
+    save_config(cfg, str(path))
+
+    reloaded = load_config(str(path))
+
+    assert reloaded.repositories[0].required_checks == ["unit", "integration"]
+
+
+def test_repo_required_checks_rejects_invalid_entries() -> None:
+    assert RepoConfig(
+        url="https://github.com/example/repo", required_checks=None
+    ).required_checks == []
+    with pytest.raises(ValueError, match="must be a list"):
+        RepoConfig(url="https://github.com/example/repo", required_checks="unit")
+    with pytest.raises(ValueError, match="entries must be strings"):
+        RepoConfig(url="https://github.com/example/repo", required_checks=[123])
+    with pytest.raises(ValueError, match="non-empty"):
+        RepoConfig(url="https://github.com/example/repo", required_checks=[" "])
+    with pytest.raises(ValueError, match="unique"):
+        RepoConfig(url="https://github.com/example/repo", required_checks=["unit", "unit"])
 
 
 def test_repo_governance_scan_enabled_loads_from_yaml(tmp_path: Path) -> None:
@@ -866,6 +899,22 @@ def test_update_repository_allow_merge_without_checks(tmp_path: Path) -> None:
 
     reloaded = load_config(str(path))
     assert reloaded.repositories[0].allow_merge_without_checks is True
+
+
+def test_update_repository_required_checks(tmp_path: Path) -> None:
+    path = tmp_path / "config.yml"
+    save_config(AppConfig(), str(path))
+    add_repository("https://github.com/octo/alpha.git", str(path))
+
+    cfg = update_repository(
+        "https://github.com/octo/alpha.git",
+        str(path),
+        required_checks=["unit", "integration"],
+    )
+    assert cfg.repositories[0].required_checks == ["unit", "integration"]
+
+    reloaded = load_config(str(path))
+    assert reloaded.repositories[0].required_checks == ["unit", "integration"]
 
 
 def test_update_daemon_config_accepts_strict_queue_validation(
