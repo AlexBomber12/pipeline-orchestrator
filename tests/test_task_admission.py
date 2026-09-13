@@ -182,6 +182,52 @@ async def test_admission_refuses_unsafe_reuse(rejected, tmp_path, monkeypatch, m
     assert (await load_attempt(runner.redis, runner.name, "PR-42")).rejection == command.binding
 
 
+async def test_rejected_completion_matches_rejection_time_task_bytes(rejected):
+    runner, command, repo, _, _, _ = rejected
+    path = repo / "tasks/PR-42.md"
+    error_text = path.read_text()
+    pre_error_text = error_text.replace("status: ERROR", "status: TODO").replace("blocked_reason: guardrail\n", "")
+    prior = new_attempt(
+        runner.repo_config.url,
+        runner.state.current_task.model_copy(update={"status": TaskStatus.TODO}),
+        pre_error_text,
+        attempt_id=command.attempt_id,
+        started=True,
+        coder_dispatched=True,
+    )
+    assert prior.fingerprint == command.fingerprint
+    assert prior.file_sha256 != command.file_sha256
+    await save_attempt(runner.redis, runner.name, prior, expected=None)
+    await finish_reject(rejected)
+    (repo / "tasks/completions.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "repository": "octo/demo",
+                "base_branch": "main",
+                "completions": {
+                    "PR-42": {
+                        "task_sha256": command.file_sha256,
+                        "merge_commit": git(repo, "rev-parse", "main"),
+                        "pull_request": 17,
+                        "reason": "Implemented by alternative PR after ERROR status was recorded",
+                    }
+                },
+            }
+        )
+    )
+    before = path.read_bytes()
+    assert (await stage(rejected, rewritten(repo))).status_code == 200
+
+    assert await runner.process_pending_uploads() is False
+
+    assert await runner.redis.get(upload_pending(runner.name)) is None
+    assert path.read_bytes() == before
+    current = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert current.rejection == command.binding
+    assert current.file_sha256 == prior.file_sha256
+
+
 async def test_configured_base_git_rewrite_admits_once(rejected):
     await finish_reject(rejected)
     runner, command, repo, _, _, _ = rejected
@@ -1692,9 +1738,9 @@ async def test_sprint_zip_replays_completed_tasks_without_reusing_them(
     completed_check_calls = []
     original_verify = task_admission.verify_unfinished
 
-    def verify(*args):
+    def verify(*args, **kwargs):
         completed_check_calls.append(args[-1].task.pr_id)
-        return original_verify(*args)
+        return original_verify(*args, **kwargs)
 
     monkeypatch.setattr(task_admission, "verify_unfinished", verify)
     replay = completed.replace("status: DONE", "status: TODO")

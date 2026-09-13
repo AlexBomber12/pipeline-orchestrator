@@ -57,7 +57,14 @@ def validate_admission_graph(root: Path, incoming: Iterable[Path] = ()) -> None:
         raise AdmissionRejected("Dependency cycle: " + " -> ".join(cycle))
 
 
-def verify_unfinished(root: Path, base: str, repo_url: str, previous: TaskAttempt) -> None:
+def verify_unfinished(
+    root: Path,
+    base: str,
+    repo_url: str,
+    previous: TaskAttempt,
+    *,
+    accepted_file_sha256: str | None = None,
+) -> None:
     """Check the *prior* accepted bytes, including alternative-PR receipts."""
     task_id = previous.task.pr_id
     if previous.completed or previous.task.status == TaskStatus.DONE:
@@ -70,7 +77,7 @@ def verify_unfinished(root: Path, base: str, repo_url: str, previous: TaskAttemp
         base,
         owner,
         {task_id},
-        accepted_digests={task_id: previous.file_sha256},
+        accepted_digests={task_id: accepted_file_sha256 or previous.file_sha256},
     )
     manifest = root / "tasks/completions.json"
     if manifest.is_file() and task_id in json.loads(manifest.read_text())["completions"] and task_id not in recorded:
@@ -137,12 +144,14 @@ async def admission_candidate(
     if raw_cause and CancellationCause.from_redis(raw_cause).payload.get("subsource") == "operator_reject":
         if previous is None or not previous.rejection:
             raise AttemptChanged("Legacy rejection lacks exact attempt/PR ownership; reconcile it before reuse.")
+    rejection_file_sha256 = None
     if previous and previous.rejection:
         if upload and expected_rejection != previous.rejection:
             raise AdmissionRejected("Upload predates or belongs to another rejection; submit the rewritten task again.")
         rejection = await load_rejection(redis, repo, previous.rejection)
         if rejection is None or rejection.status != "rejected" or not rejection.released:
             raise AttemptChanged("Rejection is not final; wait for process quiescence and confirmed PR closure.")
+        rejection_file_sha256 = rejection.file_sha256
         if fingerprint == previous.fingerprint:
             raise AdmissionRejected(
                 "File unchanged. Reject is final; rewrite or remove the unfinished task. Ordinary Retry is unavailable."
@@ -169,7 +178,7 @@ async def admission_candidate(
                 "An active attempt owns this task; Reject before accepting a rewritten specification."
             )
     if previous:
-        verify_unfinished(root, base, repo_url, previous)
+        verify_unfinished(root, base, repo_url, previous, accepted_file_sha256=rejection_file_sha256)
         if previous.started and not previous.rejection:
             raise AdmissionRejected(
                 "An existing attempt owns this specification. Retry unchanged work or Reject before rewriting it."
