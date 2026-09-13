@@ -11,7 +11,7 @@ from src.daemon.approval_commands import checkout_process_blocker
 from src.daemon.rejection_commands import rejection_pr_details
 from src.github import gh_runner
 from src.models import QueueTask, TaskStatus
-from src.queue_parser import UnstructuredLegacyTaskError, parse_existing_task_header
+from src.queue_parser import QueueValidationError, UnstructuredLegacyTaskError, parse_existing_task_header
 from src.rejection_commands import load_rejection
 from src.task_admission import admission_candidate, verify_unfinished
 from src.task_attempts import (
@@ -50,6 +50,8 @@ class TaskAdmissionMixin:
                     header = parse_existing_task_header(path)
                 except UnstructuredLegacyTaskError:
                     continue
+                except QueueValidationError as exc:
+                    raise QueueValidationError([issue.replace(str(path), filename) for issue in exc.issues]) from exc
             task = QueueTask(
                 pr_id=header.pr_id,
                 title=header.title,

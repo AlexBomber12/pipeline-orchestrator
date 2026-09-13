@@ -4436,3 +4436,48 @@ def test_agents_scan_method_re_emits_when_drift_changes(
         "PR-088.md" in event and "no_verify_commit" in event
         for event in scan_events
     ), scan_events
+
+
+@pytest.mark.parametrize("single", [False, True])
+async def test_invalid_initial_snapshot_header_reaches_controlled_queue_error(tmp_path, monkeypatch, single):
+    from src.keyspace import pipeline_state
+    from src.models import RepoState
+    from src.task_attempts import load_attempt
+
+    from tests.test_approval_commands import git
+
+    repo = tmp_path / "repo"
+    git(tmp_path, "init", "-b", "main", str(repo))
+    git(repo, "config", "user.name", "Snapshot Test")
+    git(repo, "config", "user.email", "snapshot@example.test")
+    (repo / "tasks").mkdir()
+    path = repo / "tasks/PR-001.md"
+    invalid = (
+        "# PR-001: Invalid structured task\nBranch: fix/pr-001\n"
+        "- Type: invalid-type\n- Complexity: low\n- Depends on: none\n"
+    )
+    path.write_text(invalid)
+    git(repo, "add", "tasks")
+    git(repo, "commit", "-m", "invalid task header")
+    remote = tmp_path / "remote.git"
+    git(tmp_path, "init", "--bare", str(remote))
+    git(repo, "remote", "add", "origin", str(remote))
+    git(repo, "push", "-u", "origin", "main")
+    runner = h._make_runner()
+    runner.repo_path = str(repo)
+    runner._recovered = True
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    runner.state.state = PipelineState.IDLE
+    monkeypatch.setattr(runner, "sync_to_main", lambda: pytest.fail("invalid snapshot must stop before sync"))
+    monkeypatch.setattr(runner, "_get_coder", lambda: pytest.fail("invalid queue must not dispatch a coder"))
+
+    await runner.run_cycle()
+    assert runner.state.state == PipelineState.ERROR
+    assert "Task snapshot failed" in runner.state.error_message
+    assert "tasks/PR-001.md" in runner.state.error_message
+    assert "invalid-type" in runner.state.error_message
+    assert "/tmp/" not in runner.state.error_message
+    assert await load_attempt(runner.redis, runner.name, "PR-001") is None
+    assert path.read_text() == invalid
+    state = RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name)))
+    assert state.state == PipelineState.ERROR and state.error_message == runner.state.error_message

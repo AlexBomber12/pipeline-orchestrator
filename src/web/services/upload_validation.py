@@ -236,12 +236,12 @@ def _build_upload_success_message(
         )
     if repo_state == PipelineState.IDLE:
         lines.append(
-            "Daemon will commit on the next poll cycle (up to 60 seconds)."
+            "Daemon will validate and commit eligible files on the next poll cycle (up to 60 seconds)."
         )
     else:
         lines.append(
             "Daemon is currently "
-            f"{repo_state.value}. Files will be committed when it returns to IDLE."
+            f"{repo_state.value}. Files await validation and will be committed if eligible when it returns to IDLE."
         )
     lines.append("Auto-dismissing in 30 seconds.")
     return "\n".join(lines)

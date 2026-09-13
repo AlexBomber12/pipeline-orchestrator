@@ -39,7 +39,6 @@ from src.queue_parser import (
     parse_task_header,
 )
 from src.rejection_commands import load_rejection
-from src.task_admission import admission_candidate
 from src.task_attempts import AttemptChanged, load_attempt
 from src.task_status import get_merged_pr_ids, merged_split_parent_aliases
 from src.utils import repo_slug_from_url
@@ -707,23 +706,19 @@ async def upload_tasks(
                 rejection = await load_rejection(redis_client, name, token)
                 if rejection and rejection.requested_at > upload_started_at:
                     raise AttemptChanged("Upload began before Reject; submit the rewritten task again.")
+                if uploaded_hash == attempt.fingerprint:
+                    raise AttemptChanged(
+                        "File unchanged. Reject is final; rewrite or remove the unfinished task. "
+                        "Ordinary Retry is unavailable."
+                    )
             rejection_tokens[task_id] = token
             prior_path = Path(repo_path) / "tasks" / fname
             prior_spec_files[task_id] = (
                 task_spec_content_hash(prior_path.read_text(encoding="utf-8")) if prior_path.is_file() else None
             )
-            with tempfile.TemporaryDirectory() as directory:
-                incoming = Path(directory) / fname
-                incoming.write_text(parsed_task_texts[fname], encoding="utf-8")
-                await admission_candidate(
-                    redis_client, name, repo.url, repo_branch, Path(repo_path), incoming,
-                    expected_rejection=token, upload=True,
-                    available_ids=(existing_task_ids | batch_task_ids | pending_task_ids | merged_pr_ids
-                                   | merged_split_parent_aliases(
-                                       structured_pr_ids=existing_task_ids | batch_task_ids,
-                                       merged_pr_ids=merged_pr_ids,
-                                   )),
-                )
+            # HTTP acceptance stages input bound to the observed decision.
+            # The daemon alone verifies completion/ownership and reserves
+            # admission before it changes any task files or dispatches work.
         except Exception as exc:
             message = (str(exc) if isinstance(exc, (AttemptChanged, QueueValidationError))
                        else "Admission evidence unavailable; try again when it can be verified.")

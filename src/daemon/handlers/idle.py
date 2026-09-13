@@ -814,7 +814,16 @@ class IdleMixin:
             if not await self._resolve_pending_queue_sync():
                 return
 
-        await self._snapshot_accepted_specs()
+        try:
+            await self._snapshot_accepted_specs()
+        except (OSError, RuntimeError, QueueValidationError, subprocess.TimeoutExpired) as exc:
+            await self._transition_to_error(
+                f"Task snapshot failed: {exc}",
+                save_run_record_as=None,
+                publish=False,
+                log_prefix="[INFRA]",
+            )
+            return
         try:
             self.sync_to_main()
         except (

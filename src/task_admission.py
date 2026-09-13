@@ -1,7 +1,7 @@
-"""Shared admission policy for HTTP staging and configured-base Git edits.
+"""Daemon admission policy for staged uploads and configured-base Git edits.
 
 Validation never removes a dependency or rewrites an old completion record.
-The daemon repeats it before changing any files; HTTP acceptance only stages
+The daemon verifies it before changing any files; HTTP acceptance only stages
 input. A per-task rejection token records which operator decision an upload
 actually followed.
 """

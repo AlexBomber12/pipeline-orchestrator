@@ -115,8 +115,14 @@ async def test_admission_refuses_unsafe_reuse(rejected, tmp_path, monkeypatch, m
         )
     before = (repo / "tasks/PR-42.md").read_bytes()
     response = await stage(rejected, content)
-    assert response.status_code in {400, 409}, response.text
-    assert await runner.redis.get(upload_pending(runner.name)) is None
+    if mode in {"same", "status_only", "missing_dependency"}:
+        assert response.status_code in {400, 409}, response.text
+        assert await runner.redis.get(upload_pending(runner.name)) is None
+    else:
+        # Staging acknowledges the input; only the daemon verifies and admits it.
+        assert response.status_code == 200, response.text
+        assert await runner.process_pending_uploads() is None
+        assert await runner.redis.get(upload_pending(runner.name)) is not None
     assert (repo / "tasks/PR-42.md").read_bytes() == before
     assert (await load_attempt(runner.redis, runner.name, "PR-42")).rejection == command.binding
 
@@ -720,9 +726,11 @@ async def test_legacy_todo_header_does_not_hide_a_live_pr_owner(rejected):
         path.read_text().replace("status: ERROR", "status: TODO").replace("blocked_reason: guardrail\n", "")
     )
     response = await stage(rejected, rewritten(repo))
-    assert response.status_code == 400
-    assert "active attempt owns" in response.text
-    assert await runner.redis.get(upload_pending(runner.name)) is None
+    assert response.status_code == 200
+    assert await runner.process_pending_uploads() is None
+    assert any("active attempt owns" in entry["event"] for entry in runner.state.history)
+    assert await runner.redis.get(upload_pending(runner.name)) is not None
+    assert "New specification." not in path.read_text()
 
 
 async def test_reject_accepted_during_http_upload_prevents_staging(rejected, monkeypatch):
@@ -1063,3 +1071,65 @@ async def test_creation_failure_acknowledgement_races_reject_without_erasing_it(
     assert current.rejection == command.binding and not current.pr_creation_pending
     assert (await load_rejection(runner.redis, runner.name, command.binding)).attempt_id == attempt.attempt_id
     assert await runner._attempt_execution_blocked()
+
+
+@pytest.mark.parametrize("single", [False, True])
+async def test_upload_stages_without_completion_queries_then_daemon_verifies(rejected, monkeypatch, single):
+    from src import task_admission
+
+    await finish_reject(rejected)
+    runner, command, repo, *_ = rejected
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    prior = await load_attempt(runner.redis, runner.name, "PR-42")
+    content = rewritten(repo)
+    original = (repo / "tasks/PR-42.md").read_bytes()
+    calls = []
+    available = False
+
+    def completion_transport(owner, branches):
+        calls.append((owner, branches))
+        if not available:
+            raise OSError("GitHub completion evidence unavailable")
+        return set()
+
+    monkeypatch.setattr(task_admission, "gh_pr_get_merged_branches", completion_transport)
+    assert (await stage(rejected, content)).status_code == 200
+    assert calls == []  # No GitHub verification ran inside the HTTP request.
+    manifest = json.loads(await runner.redis.get(upload_pending(runner.name)))
+    assert manifest["rejection_tokens"]["PR-42"] == command.binding
+    assert manifest["prior_spec_files"]["PR-42"] == prior.fingerprint
+    assert (await load_attempt(runner.redis, runner.name, "PR-42")) == prior
+    assert (repo / "tasks/PR-42.md").read_bytes() == original
+
+    assert await runner.process_pending_uploads() is None
+    assert len(calls) == 1
+    assert (await load_attempt(runner.redis, runner.name, "PR-42")) == prior
+    assert (repo / "tasks/PR-42.md").read_bytes() == original
+    available = True
+    assert await runner.process_pending_uploads()
+    current = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert current.attempt_id != prior.attempt_id and not current.admission_pending
+    assert (repo / "tasks/PR-42.md").read_text() == content
+
+
+@pytest.mark.parametrize("status_only", [False, True])
+async def test_daemon_refuses_staged_replay_of_rejected_spec_even_after_http_acceptance(rejected, status_only):
+    from pathlib import Path
+
+    await finish_reject(rejected)
+    runner, command, repo, *_ = rejected
+    previous = await load_attempt(runner.redis, runner.name, "PR-42")
+    old_text = (repo / "tasks/PR-42.md").read_text()
+    assert (await stage(rejected, rewritten(repo))).status_code == 200
+    manifest = json.loads(await runner.redis.get(upload_pending(runner.name)))
+    # An obsolete staging writer changes the accepted upload before consumption.
+    # The daemon must enforce final rejection independently of the HTTP check.
+    replay = old_text.replace("status: ERROR", "status: TODO") if status_only else old_text
+    if status_only:
+        replay = "".join(line for line in replay.splitlines(keepends=True) if not line.startswith("blocked_reason:"))
+    (Path(manifest["staging_dir"]) / "PR-42.md").write_text(replay)
+    assert await runner.process_pending_uploads() is None
+    assert await load_attempt(runner.redis, runner.name, "PR-42") == previous
+    assert (repo / "tasks/PR-42.md").read_text() == old_text
+    assert any("File unchanged. Reject is final" in row["event"] for row in runner.state.history)
+    assert (await load_rejection(runner.redis, runner.name, command.binding)).released

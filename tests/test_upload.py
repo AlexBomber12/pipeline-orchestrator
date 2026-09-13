@@ -328,7 +328,7 @@ def test_upload_handles_corrupt_state_and_accepts_busy_repos(
 
     assert busy.status_code == 200
     assert (
-        "Daemon is currently CODING. Files will be committed when it returns to IDLE."
+        "Daemon is currently CODING. Files await validation and will be committed if eligible when it returns to IDLE."
         in busy.text
     )
 
@@ -356,7 +356,7 @@ def test_upload_without_queue_md(
         )
     assert resp.status_code == 200
     assert "Accepted 1 task file (PR-001)." in resp.text
-    assert "Daemon will commit on the next poll cycle (up to 60 seconds)." in resp.text
+    assert "Daemon will validate and commit eligible files on the next poll cycle (up to 60 seconds)." in resp.text
     assert "Auto-dismissing in 30 seconds." in resp.text
 
     repo_upload_dir = uploads_dir / "example__alpha"
@@ -441,7 +441,7 @@ def test_upload_stages_files_and_sets_redis_key(
     assert resp.headers["HX-Retarget"] == "#upload-feedback-example__alpha"
     assert "Dismiss upload feedback" in resp.text
     assert "::load" in resp.text
-    assert "Daemon will commit on the next poll cycle (up to 60 seconds)." in resp.text
+    assert "Daemon will validate and commit eligible files on the next poll cycle (up to 60 seconds)." in resp.text
 
     repo_upload_dir = uploads_dir / "example__alpha"
     subdirs = list(repo_upload_dir.iterdir())
@@ -511,7 +511,7 @@ def test_reupload_status_only_change_returns_409(
     assert not (uploads_dir / "example__alpha").exists()
 
 
-def test_reupload_active_task_requires_final_reject(
+def test_reupload_active_task_stages_without_resetting_attempt_state(
     one_repo_config: Path,
     repo_dir: Path,
     uploads_dir: Path,
@@ -537,9 +537,8 @@ def test_reupload_active_task_requires_final_reject(
         )
         assert redis._store[retry_count_key("example__alpha", "PR-001")] == "3"
 
-    assert resp.status_code == 400
-    assert "active attempt owns" in resp.text
-    assert not (uploads_dir / "example__alpha").exists()
+    assert resp.status_code == 200
+    assert list((uploads_dir / "example__alpha").rglob("PR-001.md"))
 
 
 def test_upload_new_task_no_existing_hash_proceeds(
@@ -1447,7 +1446,7 @@ def test_upload_accepts_tasks_during_coding_state(
     assert resp.status_code == 200
     assert "Accepted 1 task file (PR-001)." in resp.text
     assert (
-        "Daemon is currently CODING. Files will be committed when it returns to IDLE."
+        "Daemon is currently CODING. Files await validation and will be committed if eligible when it returns to IDLE."
         in resp.text
     )
     assert "Cannot upload while repo is" not in resp.text
