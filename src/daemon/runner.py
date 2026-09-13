@@ -60,6 +60,7 @@ from src.daemon import (
     git_ops,
     scaffolder,  # noqa: F401 — tests reference runner_module.scaffolder
 )
+from src.daemon.approval_commands import ApprovalCommandMixin
 from src.daemon.git_ops import _repo_looks_scaffolded, repo_owner_from_url
 from src.daemon.github_rate_limit import (
     BUDGET_REDIS_KEY,
@@ -298,6 +299,7 @@ _EXTENSION_LANGUAGE_MAP = {
 
 
 class PipelineRunner(
+    ApprovalCommandMixin,
     RetryCommandMixin,
     RecoveryMixin,
     PreflightMixin,
@@ -417,6 +419,11 @@ class PipelineRunner(
         self._current_coder_process: asyncio.subprocess.Process | None = None
         self._retry_command_owner = f"{os.getpid()}:{uuid.uuid4()}"
         self._active_retry_command_id: str | None = None
+        self._approval_receipt = None
+        self._approval_history = []
+        self._approval_commit_uncertain = False
+        self._approval_head_refresh_uncertain = False
+        self._cycle_lock = asyncio.Lock()
         self._stop_requested = False
         self._user_stopped_task_pr_ids: set[str] = set()
         # Legacy flag-off storage for crash parks. The flag-on path records
@@ -2807,7 +2814,8 @@ class PipelineRunner(
         """Advance the state machine by one step."""
         before_remaining = await self._capture_budget_remaining_for_burn()
         try:
-            await self._run_cycle_body()
+            async with self._cycle_lock:
+                await self._run_cycle_body()
         finally:
             await self._record_cycle_burn(before_remaining)
 
@@ -2839,6 +2847,9 @@ class PipelineRunner(
 
     async def _run_cycle_body(self) -> None:
         """Inner state-machine step; ``run_cycle`` wraps it for burn tracking."""
+        if await self._consume_approval_command():
+            return
+
         try:
             await self.ensure_repo_cloned()
         except RuntimeError as exc:

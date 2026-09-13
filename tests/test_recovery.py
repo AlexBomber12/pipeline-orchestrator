@@ -39,6 +39,10 @@ class _FakeRedis:
         self.writes.append((key, value))
         self.store[key] = value
 
+    async def zrangebyscore(self, key: str, minimum: str, maximum: str) -> list[str]:
+        """No durable commands are queued in these recovery-only fixtures."""
+        return []
+
     async def get(self, key: str) -> str | None:
         return self.store.get(key)
 

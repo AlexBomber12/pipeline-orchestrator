@@ -1,29 +1,10 @@
-{# Operator override surface for guardrail-flagged PRs.
-
-   ``guardrail_pending`` is a list of serialized GuardrailPending entries
-   (see ``_serialize_guardrail_pending`` in ``src.web.routes.dashboard``):
-   ``pr_id``, ``rule``, ``excerpt`` (already truncated to <=200 chars),
-   ``recorded_at`` (unix), ``recorded_at_text`` (server-side relative
-   label), ``pr_url`` (GitHub PR URL when known, ``None`` otherwise),
-   ``is_active`` (true only when the entry matches the daemon's current
-   task/PR — mirrors the approve endpoint's accept gate so Approve does
-   not render on historical rows that would 409).
-
-   The amber palette signals "needs attention but not destructive". The
-   row is replaced with empty content on 204 from the backend so the
-   operator gets immediate visceral feedback; the next poll of
-   ``/partials/repo/{name}`` reconciles state with the backend. htmx
-   2.x does not swap 204 responses by default and base.html's global
-   ``htmx:beforeSwap`` hook only opts in 400/404/409/422/503, so each
-   button installs a per-element ``before-swap`` handler that flips
-   ``shouldSwap`` for 204 — keeping the global behavior unchanged while
-   letting Approve/Reject clear the row immediately on success. #}
+{# Durable approval results remain visible after the cancellation is cleared. #}
 {% if guardrail_pending %}
 <section class="guardrail-panel mb-6 rounded-lg border border-warn/30 bg-warn/10 p-4"
          data-guardrail-panel
          id="guardrail-panel-{{ repo.name }}">
     <header class="mb-3 flex items-center gap-2">
-        <h3 class="text-sm font-semibold text-warn">Pending guardrail decisions</h3>
+        <h3 class="text-sm font-semibold text-warn">Guardrail decisions</h3>
         <span class="rounded border border-warn/30 bg-warn/10 px-2 py-0.5 font-mono text-[11px] text-warn">{{ guardrail_pending | length }}</span>
     </header>
     <ul class="space-y-2">
@@ -44,20 +25,27 @@
                           data-ts-unix="{{ entry.recorded_at }}">{{ entry.recorded_at_text }}</time>
                 </div>
                 <p class="break-words text-xs text-gray-300">{{ entry.excerpt }}</p>
+                {% if entry.approval %}
+                <p class="text-xs text-gray-200" data-approval-status="{{ entry.approval.status }}">
+                    Approval {{ entry.approval.status }}: {{ entry.approval.reason }}
+                </p>
+                {% elif entry.approval_unavailable %}
+                <p class="text-xs text-fail">Approval status unavailable; refresh when Redis recovers.</p>
+                {% endif %}
             </div>
             <div class="flex items-center justify-end gap-2">
-                {% if entry.is_active %}
+                {% if entry.is_active and entry.approval_binding and (not entry.approval or entry.approval.binding != entry.approval_binding) %}
                 <button type="button"
                         class="approve-btn rounded border border-ok/40 bg-ok/15 px-3 py-1 text-xs font-semibold text-ok hover:bg-ok/25"
                         hx-post="/repos/{{ repo.name }}/guardrail/{{ entry.pr_id }}/decision"
-                        hx-vals='{"decision": "approve"}'
-                        hx-confirm="Approve guardrail violation for {{ entry.pr_id }}? PR will proceed to MERGE."
-                        hx-target="closest .guardrail-row"
-                        hx-swap="outerHTML"
-                        hx-on::before-swap="if (event.detail.xhr.status === 204) { event.detail.shouldSwap = true; }">
+                        hx-vals='{"decision": "approve", "binding": "{{ entry.approval_binding }}"}'
+                        hx-confirm="Approve guardrail violation for {{ entry.pr_id }}? The daemon will apply it when safe. CI and review remain required."
+                        hx-target="this"
+                        hx-swap="outerHTML">
                     Approve
                 </button>
                 {% endif %}
+                {% if not entry.approval or entry.approval.status != "applied" or (entry.approval_binding and entry.approval.binding != entry.approval_binding) %}
                 <button type="button"
                         class="reject-btn rounded border border-fail/40 bg-fail/15 px-3 py-1 text-xs font-semibold text-fail hover:bg-fail/25"
                         hx-post="/repos/{{ repo.name }}/guardrail/{{ entry.pr_id }}/decision"
@@ -68,6 +56,7 @@
                         hx-on::before-swap="if (event.detail.xhr.status === 204) { event.detail.shouldSwap = true; }">
                     Reject
                 </button>
+                {% endif %}
             </div>
         </li>
         {% endfor %}

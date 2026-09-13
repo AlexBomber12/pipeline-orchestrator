@@ -106,6 +106,8 @@ def test_handle_fix_posts_codex_review_after_push(
 def test_fix_post_coder_guardrail_violation_transitions_to_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from src.daemon import approval_commands
+
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
@@ -129,6 +131,11 @@ def test_fix_post_coder_guardrail_violation_transitions_to_error(
     runner.state.current_pr = PRInfo(number=77, branch="pr-019")
     monkeypatch.setattr(runner, "_transition_to_error", fake_transition_to_error)
     monkeypatch.setattr("src.github.comments.post_comment", fake_post)
+    def refreshed_pr(*args):
+        assert transition_calls, "Refresh must follow guardrail metadata bookkeeping"
+        return [PRInfo(number=77, branch="pr-019", head_sha="pushed-fix-head")]
+
+    monkeypatch.setattr(approval_commands.gh_prs, "get_open_prs", refreshed_pr)
 
     asyncio.run(runner.handle_fix())
 
@@ -136,6 +143,7 @@ def test_fix_post_coder_guardrail_violation_transitions_to_error(
     assert transition_calls[0][0].startswith("GUARDRAIL: repo_create:")
     assert transition_calls[0][1] == "[FIX]"
     assert posted == []
+    assert runner.state.current_pr.head_sha == "pushed-fix-head"
 
 
 def test_fix_guardrail_suppression_keeps_pr_number_detail(

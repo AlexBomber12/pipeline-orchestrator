@@ -175,7 +175,7 @@ class _FakeRedis:
         )
 
     async def zrangebyscore(
-        self, key: str, min_score: object, max_score: object
+        self, key: str, min_score: object, max_score: object, start: int = 0, num: int | None = None
     ) -> list[str]:
         def _bound(value: object) -> tuple[float, bool]:
             if value == "-inf":
@@ -196,7 +196,7 @@ class _FakeRedis:
             and (score < upper if upper_exclusive else score <= upper)
         ]
         members.sort(key=lambda member: bucket[member])
-        return members
+        return members[start:None if num is None else start + num]
 
     async def zremrangebyscore(
         self, key: str, min_score: object, max_score: object
@@ -337,6 +337,10 @@ class _FakePipeline:
         self.commands.append(("zadd", (key, mapping), {}))
         return self
 
+    def delete(self, key: str) -> "_FakePipeline":
+        self.commands.append(("delete", (key,), {}))
+        return self
+
     def expire(self, key: str, seconds: int) -> "_FakePipeline":
         self.commands.append(("expire", (key, seconds), {}))
         return self
@@ -351,6 +355,8 @@ class _FakePipeline:
             if command == "set":
                 await self.redis.set(args[0], args[1], **kwargs)
                 results.append(True)
+            elif command == "delete":
+                results.append(await self.redis.delete(args[0]))
             elif command == "zadd":
                 results.append(await self.redis.zadd(args[0], args[1]))
             elif command == "expire":

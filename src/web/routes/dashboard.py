@@ -15,12 +15,14 @@ import json
 import re
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
+from src.approval_commands import build_approval, list_approvals
 from src.cancellation import (
     classify_cancellation_subsource,
     list_recent_cancellations,
@@ -33,6 +35,7 @@ from src.cancellation.availability import (
 )
 from src.cancellation.storage import (
     GuardrailPending,
+    cause_key,
     get_cancellation_cause,
     get_current_run_started_at,
     list_pending_guardrail_decisions,
@@ -426,7 +429,7 @@ async def _build_guardrail_pending_view(
         if state.current_pr.url:
             current_pr_url = state.current_pr.url
             current_task_pr_id = state.current_task.pr_id
-    return [
+    views = [
         _serialize_guardrail_pending(
             entry,
             current_pr_url=(
@@ -437,6 +440,36 @@ async def _build_guardrail_pending_view(
         )
         for entry in pending
     ]
+    try:
+        commands = await list_approvals(redis_client, repo_name, recent=True)
+        commands += await list_approvals(redis_client, repo_name)
+        commands = sorted({c.binding: c for c in commands}.values(), key=lambda c: c.requested_at)
+        for view in views:
+            if view["is_active"]:
+                raw = await redis_client.get(cause_key(repo_name, view["pr_id"]))
+                try:
+                    command = build_approval(repo_name, state, raw, Path(_app.REPOS_DIR) / repo_name)
+                    view["approval_binding"] = command.binding
+                except (ValueError, OSError):
+                    view["approval_binding"] = None
+            matching = [c for c in commands if c.task.pr_id == view["pr_id"]]
+            if matching:
+                view["approval"] = matching[-1].model_dump(mode="json")
+        visible = {v["pr_id"] for v in views}
+        for command in commands[-20:]:
+            if command.task.pr_id not in visible:
+                views.append({
+                    "pr_id": command.task.pr_id, "rule": "Approval result", "excerpt": "",
+                    "recorded_at": int(command.requested_at.timestamp()),
+                    "recorded_at_text": command.requested_at.isoformat(),
+                    "pr_url": command.pr.url, "is_active": False,
+                    "approval": command.model_dump(mode="json"),
+                })
+    except Exception:
+        for view in views:
+            view["approval_unavailable"] = True
+    return views
+
 
 
 async def _build_recent_graphql_burns_view(
