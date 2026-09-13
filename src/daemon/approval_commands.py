@@ -27,7 +27,7 @@ from src.approval_commands import (
     list_approvals,
     matches_state,
 )
-from src.cancellation.storage import cause_key, index_key, task_spec_content_hash
+from src.cancellation.storage import CancellationCause, cause_key, index_key, task_spec_content_hash
 from src.daemon import git_ops
 from src.daemon.quarantine import quarantine_label_for_category
 from src.github import prs as gh_prs
@@ -90,15 +90,16 @@ class ApprovalCommandMixin:
         """Return True when ordinary cycle work must wait or WATCH was restored."""
         try:
             commands = await list_approvals(self.redis, self.name)
+            self._approval_history = [c for c in commands if c.status == "applied" and c.active]
             for command in reversed(commands):
                 if not command.active:
                     snapshot = self.state
-                    if command.status == "failed" and not self._recovered:
+                    if not self._recovered:
                         raw = await self.redis.get(pipeline_state(self.name))
                         if raw:
                             snapshot = RepoState.model_validate_json(raw)
-                    if command.status == "failed" and matches_state(command, snapshot):
-                        if await self._failed_approval_holds(command):
+                    if matches_state(command, snapshot):
+                        if await self._inactive_approval_holds(command):
                             return True
                     continue
                 if command.status == "applied" and self._recovered and not self._approval_commit_uncertain:
@@ -106,8 +107,11 @@ class ApprovalCommandMixin:
                         continue
                     # Protect preserved work from the legacy dirty-tree reset on
                     # subsequent WATCH cycles too, not just the acceptance cycle.
-                    if await self.redis.get(cause_key(self.name, command.task.pr_id)):
+                    cause = await self.redis.get(cause_key(self.name, command.task.pr_id))
+                    if cause:
                         self._approval_receipt = None
+                        if CancellationCause.from_redis(cause).payload.get("subsource") == "operator_reject":
+                            await self._approval_result(command, "failed", "A later operator rejection ended approval.")
                         return True  # a newer failure must never inherit this permission
                     self._approval_receipt = command
                     try:
@@ -134,7 +138,7 @@ class ApprovalCommandMixin:
             self.log_event(f"[RECOVERY] Approval store/application unavailable; deferring cycle: {exc}.")
             return True
 
-    async def _failed_approval_holds(self, command: ApprovalCommand) -> bool:
+    async def _inactive_approval_holds(self, command: ApprovalCommand) -> bool:
         """Retain preservation until a later operator action safely supersedes it.
 
         This only releases this approval's hold. Existing Retry/upload/rejection
@@ -151,7 +155,7 @@ class ApprovalCommandMixin:
         reason = checkout_process_blocker(self.repo_path)
         if not reason and self._current_coder_process is not None:
             reason = "Coder execution is still active."
-        if not reason:
+        if not reason and Path(self.repo_path).exists():
             dirty = git_ops._git(self.repo_path, "--no-optional-locks", "status", "--porcelain")
             local = git_ops._git(self.repo_path, "rev-list", "--branches", "HEAD", "--not", "--remotes")
             if dirty.stdout.strip() or local.stdout.strip():
@@ -165,7 +169,7 @@ class ApprovalCommandMixin:
             current = ApprovalCommand.model_validate_json(await pipe.get(key))
             current.superseded = True
             current.reason = (
-                "Failed approval superseded by a later operator action; normal reconciliation may continue."
+                "Approval superseded by a later operator action; normal reconciliation may continue."
             )
             pipe.multi()
             pipe.set(key, current.model_dump_json())
@@ -360,10 +364,24 @@ class ApprovalCommandMixin:
                 excerpt = excerpt or parts[2].strip()
         return category, excerpt
 
-    @classmethod
-    def _unapproved_labels(cls, command: ApprovalCommand, labels: set[str]) -> set[str]:
-        category, _excerpt = cls._approved_finding(command)
-        return labels - {quarantine_label_for_category(category)} if category else labels
+    @staticmethod
+    def _approval_scope(command: ApprovalCommand) -> tuple[Any, ...]:
+        return (
+            command.repo_slug, command.repo_url, command.task.pr_id, command.task.task_file,
+            command.pr.number, command.pr.branch, command.pr.head_sha, command.task_fingerprint,
+        )
+
+    def _matching_approvals(self, command: ApprovalCommand) -> list[ApprovalCommand]:
+        # Keep independently approved findings at the same task/spec/PR/HEAD.
+        # This grants no lifetime across pushes or revised requirements.
+        return [command] + [
+            previous for previous in self._approval_history
+            if previous.binding != command.binding and self._approval_scope(previous) == self._approval_scope(command)
+        ]
+
+    def _unapproved_labels(self, command: ApprovalCommand, labels: set[str]) -> set[str]:
+        approved = {self._approved_finding(c)[0] for c in self._matching_approvals(command)}
+        return labels - {quarantine_label_for_category(category) for category in approved if category}
 
     def _current_approval(self, pr: Any) -> ApprovalCommand | None:
         command = self._approval_receipt
@@ -389,4 +407,7 @@ class ApprovalCommandMixin:
         command = self._current_approval(pr)
         if command is None:
             return False
-        return self._approved_finding(command) == (violation.category, violation.excerpt)
+        return any(
+            self._approved_finding(c) == (violation.category, violation.excerpt)
+            for c in self._matching_approvals(command)
+        )

@@ -1113,3 +1113,87 @@ async def test_approval_clone_failure_defers_without_cleanup(approval, monkeypat
     assert snapshot(backup) == before and git(remote, "show-ref") == remote_before
     if concurrent_work:
         assert (repo / "operator-notes").read_text() == "preserve concurrent work"
+
+
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("dirty", [False, True])
+async def test_rejection_retires_applied_approval_while_preserving_work(approval, single, restart, dirty):
+    runner, command, repo, remote = approval
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    rejection = CancellationCause(category="ERROR", payload={"subsource": "operator_reject"}).to_redis()
+    await runner.redis.set(cause_key(runner.name, "PR-42"), rejection)
+    if dirty:
+        (repo / "operator-notes").write_text("preserve work after rejection")
+    before, remote_before = snapshot(repo), git(remote, "show-ref")
+    if restart:
+        runner._recovered = False
+        runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+    await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "applied" and not saved.active
+    assert await runner._consume_approval_command() == dirty
+    assert (await load_approval(runner.redis, runner.name, command.binding)).superseded == (not dirty)
+    assert await runner.redis.get(cause_key(runner.name, "PR-42")) == rejection
+    assert snapshot(repo) == before and git(remote, "show-ref") == remote_before
+    runner.handle_watch.assert_not_awaited()
+
+
+async def test_retired_approval_allows_normal_clone_when_checkout_is_absent(approval):
+    runner, command, repo, _ = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    await runner.redis.set(
+        cause_key(runner.name, "PR-42"),
+        CancellationCause(category="ERROR", payload={"subsource": "operator_reject"}).to_redis(),
+    )
+    repo.rename(repo.with_name("preserved-original"))
+    await runner._run_cycle_body()
+    assert not await runner._consume_approval_command()
+    assert not repo.exists()
+
+
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("restart", [False, True])
+async def test_successive_approvals_retain_only_independently_approved_findings(approval, monkeypatch, single, restart):
+    runner, first, repo, remote = approval
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    await enqueue_approval(runner.redis, first)
+    await runner._run_cycle_body()
+    raw = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "guardrail", "category": "workflow_destruction", "excerpt": "workflow change"},
+    ).to_redis()
+    runner.state.state = PipelineState.ERROR
+    runner.state.current_pr.quarantine_labels.add("quarantine:workflow")
+    await runner.redis.set(cause_key(runner.name, "PR-42"), raw)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    second = build_approval(runner.name, runner.state, raw, repo)
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [second.pr])
+    await enqueue_approval(runner.redis, second)
+    before, remote_before = snapshot(repo), git(remote, "show-ref")
+    if restart:
+        runner._recovered = False
+        runner._approval_history = []
+        runner._approval_receipt = None
+        runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, second.binding)).status == "applied"
+    assert runner._approval_filtered_pr(second.pr).quarantine_labels == set()
+    for category, excerpt in [("large_diff_threshold", "+1800 LOC"), ("workflow_destruction", "workflow change")]:
+        assert runner._approval_allows_violation(second.pr, GuardrailViolation(1, category, excerpt, "rule"))
+    assert not runner._approval_allows_violation(
+        second.pr, GuardrailViolation(1, "large_diff_threshold", "different finding", "rule")
+    )
+    assert runner._unapproved_labels(second, {"quarantine:other"}) == {"quarantine:other"}
+    assert second.pr.quarantine_labels == {"quarantine:large_diff", "quarantine:workflow"}
+    assert snapshot(repo) == before and git(remote, "show-ref") == remote_before
+    # Earlier permission cannot bleed into a different HEAD or specification.
+    changed = second.model_copy(deep=True)
+    changed.pr.head_sha = "other-head"
+    assert runner._unapproved_labels(changed, {"quarantine:large_diff"}) == {"quarantine:large_diff"}
+    changed.pr.head_sha = second.pr.head_sha
+    changed.task_fingerprint = "revised-specification"
+    assert runner._unapproved_labels(changed, {"quarantine:large_diff"}) == {"quarantine:large_diff"}

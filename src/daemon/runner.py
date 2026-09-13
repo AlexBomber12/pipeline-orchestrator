@@ -420,6 +420,7 @@ class PipelineRunner(
         self._retry_command_owner = f"{os.getpid()}:{uuid.uuid4()}"
         self._active_retry_command_id: str | None = None
         self._approval_receipt = None
+        self._approval_history = []
         self._approval_commit_uncertain = False
         self._cycle_lock = asyncio.Lock()
         self._stop_requested = False
