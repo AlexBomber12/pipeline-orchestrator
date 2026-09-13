@@ -18,8 +18,9 @@ from src.keyspace import pipeline_state, upload_pending
 from src.models import PipelineState, QueueTask, TaskStatus
 from src.rejection_commands import load_rejection
 from src.retry_commands import enqueue_retry_command, new_retry_command
-from src.task_admission import admission_candidate
+from src.task_admission import admission_candidate, validate_admission_graph
 from src.task_attempts import (
+    AdmissionRejected,
     AttemptChanged,
     attempt_key,
     clear_failed_pr_creation,
@@ -53,11 +54,64 @@ def rewritten(repo):
 
 
 async def stage(fixture, text):
+    return await stage_files(fixture, [("PR-42.md", text)])
+
+
+async def stage_files(fixture, files):
     runner, _, _, _, _, app = fixture
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         return await client.post(
-            f"/repos/{runner.name}/upload-tasks", files={"files": ("PR-42.md", text, "text/markdown")}
+            f"/repos/{runner.name}/upload-tasks",
+            files=[("files", (name, text, "text/markdown")) for name, text in files],
         )
+
+
+def task_43_from(repo, *, depends_on="none"):
+    text = (
+        rewritten(repo)
+        .replace("PR-42:", "PR-43:")
+        .replace("fix/pr-42", "fix/pr-43")
+    )
+    return task_with_dependency(text, depends_on)
+
+
+def task_42_from(repo, *, depends_on="none"):
+    return task_with_dependency(rewritten(repo), depends_on)
+
+
+def task_with_dependency(text, depends_on):
+    lines = [
+        f"- Depends on: {depends_on}" if line.startswith("- Depends on: ") else line
+        for line in text.splitlines()
+    ]
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+
+def test_admission_graph_tolerates_legacy_noise_but_rejects_structured_errors(tmp_path):
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    (tasks / "PR-90.md").write_text("# PR-90: Legacy note\n\nUnstructured body.\n")
+    (tasks / "PR-91.md").write_text("Loose operator notes without a task header.\n")
+    validate_admission_graph(tmp_path)
+
+    (tasks / "PR-92.md").write_text(
+        "---\nstatus: TODO\n---\n\n"
+        "# PR-92: Broken structured task\n"
+        "Branch: task/92\n"
+        "- Type: invalid\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+    )
+    with pytest.raises(AdmissionRejected, match="invalid Type"):
+        validate_admission_graph(tmp_path)
+
+
+async def test_direct_admission_rejects_malformed_incoming_task(rejected, tmp_path):
+    runner, _, *_ = rejected
+    incoming = tmp_path / "PR-42.md"
+    incoming.write_text("not a structured task\n")
+    with pytest.raises(AdmissionRejected, match="missing task header"):
+        await runner._validate_admission(incoming, upload=True)
 
 
 @pytest.mark.parametrize(
@@ -564,6 +618,68 @@ async def test_git_input_already_present_at_rejection_does_not_become_new_attemp
     assert (await load_attempt(runner.redis, runner.name, "PR-42")).rejection == command.binding
 
 
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("fetch_failure", [False, True])
+async def test_reject_fetches_base_before_anchoring_later_git_rewrites(
+    rejected, monkeypatch, tmp_path, single, fetch_failure
+):
+    from tests.runner import _helpers as h
+
+    runner, command, repo, remote, github, _ = rejected
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    stale_base = git(repo, "rev-parse", "origin/main")
+    writer = tmp_path / "operator"
+    git(tmp_path, "clone", "--branch", "main", str(remote), str(writer))
+    git(writer, "config", "user.name", "Operator")
+    git(writer, "config", "user.email", "operator@example.test")
+    (writer / "tasks/PR-42.md").write_text(rewritten(repo))
+    git(writer, "commit", "-am", "task edit before Reject")
+    git(writer, "push", "origin", "main")
+    before_reject = git(writer, "rev-parse", "HEAD")
+    assert before_reject != stale_base
+    assert git(repo, "rev-parse", "origin/main") == stale_base
+    assert (await post_reject(rejected)).status_code == 202
+    original_git = git_ops._git
+
+    def transport(path, *args, **kwargs):
+        if fetch_failure and args[:2] == ("fetch", "origin"):
+            raise OSError("remote temporarily unavailable")
+        return original_git(path, *args, **kwargs)
+
+    monkeypatch.setattr(git_ops, "_git", transport)
+    await runner._run_cycle_body()
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    if fetch_failure:
+        assert stored.status == "deferred" and not stored.released and not stored.base_commit
+        assert github["state"] == "open" and github["calls"] == []
+        assert git(repo, "rev-parse", "origin/main") == stale_base
+        fresh = h._make_runner()
+        fresh.redis, fresh.repo_path = runner.redis, runner.repo_path
+        fresh.repo_config.feature_flags.use_single_error_exit = single
+        runner = fresh
+        fetch_failure = False
+        await runner._run_cycle_body()
+        stored = await load_rejection(runner.redis, runner.name, command.binding)
+    assert stored.released and stored.base_commit == before_reject
+    assert github["state"] == "closed"
+    runner.sync_to_main()
+    assert await runner._reconcile_git_admissions() == {"PR-42"}
+    prior = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert prior.rejection == command.binding and not prior.admission_pending
+
+    # A later, genuinely changed specification follows the same Git path
+    # and can now be admitted without inheriting the rejected attempt.
+    (writer / "tasks/PR-42.md").write_text(rewritten(repo) + "\nRewrite after final rejection.\n")
+    git(writer, "commit", "-am", "later specification rewrite")
+    git(writer, "push", "origin", "main")
+    runner.sync_to_main()
+    assert await runner._reconcile_git_admissions() == set()
+    current = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert current.attempt_id != prior.attempt_id and current.previous_rejection == command.binding
+    assert not current.admission_pending and current.rejection is None
+    assert github["new_pr"] is None
+
+
 async def test_completed_dependency_and_unstructured_sibling_are_preserved(rejected, tmp_path, monkeypatch):
     await finish_reject(rejected)
     runner, command, repo, *_ = rejected
@@ -922,7 +1038,9 @@ async def test_pending_created_pr_recovers_in_later_cycle_without_restart_or_cod
 
 
 @pytest.mark.parametrize("single", [False, True])
-@pytest.mark.parametrize("failure", ["before_exec", "after_exec", "repeated_loss", "rejection", "replacement", "missing"])
+@pytest.mark.parametrize(
+    "failure", ["before_exec", "after_exec", "repeated_loss", "rejection", "replacement", "missing"]
+)
 async def test_creation_intent_acknowledgement_replays_before_github_request(
     rejected, monkeypatch, single, failure
 ):
@@ -963,8 +1081,10 @@ async def test_creation_intent_acknowledgement_replays_before_github_request(
             if failure == "missing":
                 await runner.redis.delete(key)
             else:
-                concurrent = current.model_copy(update={"rejection": "concurrent-reject"}) if failure == "rejection" else (
-                    new_attempt(runner.repo_config.url, current.task, "replacement specification")
+                concurrent = (
+                    current.model_copy(update={"rejection": "concurrent-reject"})
+                    if failure == "rejection"
+                    else new_attempt(runner.repo_config.url, current.task, "replacement specification")
                 )
                 await runner.redis.set(key, concurrent.model_dump_json())
         if calls == 1 or failure == "repeated_loss":
@@ -1270,6 +1390,111 @@ async def test_stale_batch_is_retired_before_reservation_and_next_upload_succeed
         assert not (repo / "tasks/PR-42.md").exists()
     else:
         assert "Changed on configured base." in (repo / "tasks/PR-42.md").read_text()
+
+
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("retained_existing", [False, True])
+async def test_upload_dependency_cycle_is_discarded_before_reservation_or_push(
+    rejected, single, retained_existing
+):
+    from pathlib import Path
+
+    await finish_reject(rejected)
+    runner, command, repo, *_ = rejected
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    prior42 = await load_attempt(runner.redis, runner.name, "PR-42")
+    original42 = (repo / "tasks/PR-42.md").read_text()
+    valid43 = task_43_from(repo, depends_on="PR-42")
+    if retained_existing:
+        git(repo, "checkout", "main")
+        (repo / "tasks/PR-43.md").write_text(valid43)
+        git(repo, "add", "tasks/PR-43.md")
+        git(repo, "commit", "-m", "add retained dependent task")
+        git(repo, "push", "origin", "main")
+
+    valid42 = task_42_from(repo)
+    cycle42 = task_42_from(repo, depends_on="PR-43")
+    cycle43 = task_43_from(repo, depends_on="PR-42")
+    files = [("PR-42.md", cycle42)]
+    if not retained_existing:
+        files.append(("PR-43.md", cycle43))
+    response = await stage_files(rejected, files)
+    assert response.status_code == 200, response.text
+    manifest = json.loads(await runner.redis.get(upload_pending(runner.name)))
+    before_head = git(repo, "rev-parse", "HEAD")
+    before_origin = git(repo, "rev-parse", "origin/main")
+    await runner.redis.set(f"metrics:retry_count:{runner.name}:PR-42", "4")
+
+    assert await runner.process_pending_uploads() is False
+    assert await runner.redis.get(upload_pending(runner.name)) is None
+    assert not Path(manifest["staging_dir"]).exists()
+    assert git(repo, "rev-parse", "HEAD") == before_head
+    assert git(repo, "rev-parse", "origin/main") == before_origin
+    assert (repo / "tasks/PR-42.md").read_text() == original42
+    assert await load_attempt(runner.redis, runner.name, "PR-42") == prior42
+    assert await load_attempt(runner.redis, runner.name, "PR-43") is None
+    assert await runner.redis.get(f"metrics:retry_count:{runner.name}:PR-42") == "4"
+    assert any("Dependency cycle" in row["event"] for row in runner.state.history)
+
+    valid_files = [("PR-42.md", valid42)]
+    if not retained_existing:
+        valid_files.append(("PR-43.md", valid43))
+    response = await stage_files(rejected, valid_files)
+    assert response.status_code == 200, response.text
+    assert await runner.process_pending_uploads() is True
+    current42 = await load_attempt(runner.redis, runner.name, "PR-42")
+    current43 = await load_attempt(runner.redis, runner.name, "PR-43")
+    assert current42.attempt_id != prior42.attempt_id
+    assert current42.previous_rejection == command.binding and current42.rejection is None
+    assert not current42.admission_pending
+    assert current43 is not None and not current43.admission_pending
+    assert (repo / "tasks/PR-43.md").read_text() == valid43
+
+
+@pytest.mark.parametrize("single", [False, True])
+async def test_git_dependency_cycle_is_held_before_reserving_rewrites(
+    rejected, single
+):
+    await finish_reject(rejected)
+    runner, command, repo, *_ = rejected
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    prior42 = await load_attempt(runner.redis, runner.name, "PR-42")
+    valid42 = task_42_from(repo)
+
+    git(repo, "checkout", "main")
+    valid43 = task_43_from(repo, depends_on="none")
+    (repo / "tasks/PR-43.md").write_text(valid43)
+    git(repo, "add", "tasks/PR-43.md")
+    git(repo, "commit", "-m", "add queued dependent task")
+    git(repo, "push", "origin", "main")
+    await runner._snapshot_accepted_specs()
+    prior43 = await load_attempt(runner.redis, runner.name, "PR-43")
+    await runner.redis.set(f"metrics:retry_count:{runner.name}:PR-42", "5")
+    await runner.redis.set(f"metrics:retry_count:{runner.name}:PR-43", "6")
+
+    (repo / "tasks/PR-42.md").write_text(task_42_from(repo, depends_on="PR-43"))
+    (repo / "tasks/PR-43.md").write_text(task_43_from(repo, depends_on="PR-42"))
+    git(repo, "commit", "-am", "introduce dependency cycle")
+    git(repo, "push", "origin", "main")
+    assert await runner._reconcile_git_admissions() == {"PR-42", "PR-43"}
+    assert await load_attempt(runner.redis, runner.name, "PR-42") == prior42
+    assert await load_attempt(runner.redis, runner.name, "PR-43") == prior43
+    assert await runner.redis.get(f"metrics:retry_count:{runner.name}:PR-42") == "5"
+    assert await runner.redis.get(f"metrics:retry_count:{runner.name}:PR-43") == "6"
+
+    (repo / "tasks/PR-42.md").write_text(valid42)
+    (repo / "tasks/PR-43.md").write_text(task_43_from(repo, depends_on="PR-42"))
+    git(repo, "commit", "-am", "correct dependency graph")
+    git(repo, "push", "origin", "main")
+    assert await runner._reconcile_git_admissions() == set()
+    current42 = await load_attempt(runner.redis, runner.name, "PR-42")
+    current43 = await load_attempt(runner.redis, runner.name, "PR-43")
+    assert current42.attempt_id != prior42.attempt_id
+    assert current42.previous_rejection == command.binding and current42.rejection is None
+    assert not current42.admission_pending
+    assert current43.attempt_id != prior43.attempt_id
+    assert current43.task.depends_on == ["PR-42"]
+    assert not current43.admission_pending
 
 
 async def test_invalid_upload_discard_cannot_delete_a_newer_submission(rejected, monkeypatch, after_read=False):

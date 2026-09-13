@@ -13,8 +13,9 @@ from src.github import gh_runner
 from src.models import QueueTask, TaskStatus
 from src.queue_parser import QueueValidationError, UnstructuredLegacyTaskError, parse_existing_task_header
 from src.rejection_commands import load_rejection
-from src.task_admission import admission_candidate, verify_unfinished
+from src.task_admission import admission_candidate, validate_admission_graph, verify_unfinished
 from src.task_attempts import (
+    AdmissionRejected,
     AttemptChanged,
     TaskAttempt,
     attempt_key,
@@ -169,6 +170,13 @@ class TaskAdmissionMixin:
     async def _reconcile_git_admissions(self) -> set[str]:
         """Hold invalid/partial inputs individually, leaving independent tasks eligible."""
         held = set()
+        try:
+            validate_admission_graph(Path(self.repo_path))
+        except AdmissionRejected as exc:
+            held = {path.stem for path in (Path(self.repo_path) / "tasks").glob("PR-*.md")}
+            self._admission_held_task_ids = held
+            self.log_event(f"[RECOVERY] Task set cannot be admitted: {exc}")
+            return held
         for path in sorted((Path(self.repo_path) / "tasks").glob("PR-*.md")):
             prior = await load_attempt(self.redis, self.name, path.stem)
             if prior is None:

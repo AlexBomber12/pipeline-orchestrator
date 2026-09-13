@@ -32,8 +32,11 @@ from tests.test_task_admission import (
     test_creation_failure_acknowledgement_races_reject_without_erasing_it,
     test_creation_intent_acknowledgement_replays_before_github_request,
     test_definitive_create_failure_allows_http_retry_without_losing_work,
+    test_git_dependency_cycle_is_held_before_reserving_rewrites,
     test_invalid_upload_discard_cannot_delete_a_newer_submission,
+    test_reject_fetches_base_before_anchoring_later_git_rewrites,
     test_stale_batch_is_retired_before_reservation_and_next_upload_succeeds,
+    test_upload_dependency_cycle_is_discarded_before_reservation_or_push,
 )
 
 
@@ -135,6 +138,47 @@ async def exercise(socket: Path, root: Path):
                     await test_invalid_upload_discard_cannot_delete_a_newer_submission(
                         fixture, patch, after_read=True,
                     )
+        for single in (False, True):
+            await redis.flushall()
+            directory = root / f"stale-anchor-{single}"
+            directory.mkdir()
+            with pytest.MonkeyPatch.context() as patch:
+                isolated_daemon_process_view.__wrapped__(patch)
+                fixture = await rejected.__wrapped__(directory, patch)
+                runner, _, _, _, _, app = fixture
+                for key, value in runner.redis.store.items():
+                    await redis.set(key, value)
+                runner.redis = app.state.redis = redis
+                await test_reject_fetches_base_before_anchoring_later_git_rewrites(
+                    fixture, patch, directory, single, True,
+                )
+        for single in (False, True):
+            for retained_existing in (False, True):
+                await redis.flushall()
+                directory = root / f"upload-cycle-{single}-{retained_existing}"
+                directory.mkdir()
+                with pytest.MonkeyPatch.context() as patch:
+                    isolated_daemon_process_view.__wrapped__(patch)
+                    fixture = await rejected.__wrapped__(directory, patch)
+                    runner, _, _, _, _, app = fixture
+                    for key, value in runner.redis.store.items():
+                        await redis.set(key, value)
+                    runner.redis = app.state.redis = redis
+                    await test_upload_dependency_cycle_is_discarded_before_reservation_or_push(
+                        fixture, single, retained_existing,
+                    )
+        for single in (False, True):
+            await redis.flushall()
+            directory = root / f"git-cycle-{single}"
+            directory.mkdir()
+            with pytest.MonkeyPatch.context() as patch:
+                isolated_daemon_process_view.__wrapped__(patch)
+                fixture = await rejected.__wrapped__(directory, patch)
+                runner, _, _, _, _, app = fixture
+                for key, value in runner.redis.store.items():
+                    await redis.set(key, value)
+                runner.redis = app.state.redis = redis
+                await test_git_dependency_cycle_is_held_before_reserving_rewrites(fixture, single)
         # Race actual approval application against Reject acceptance. A lost
         # decision either fails its CAS, or is superseded before execution.
         await redis.flushall()
@@ -166,7 +210,8 @@ async def exercise(socket: Path, root: Path):
             "untracked PR binding/restart, duplicate and Approve/Reject CAS races passed."
             " Definitive creation failure Retry and creation-result/Reject arbitration passed."
             " PR creation intent replay before/after EXEC and concurrent Reject protection passed."
-            " Stale batch retirement and concurrent upload WATCH protection passed."
+            " Stale batch retirement, stale Reject base anchoring, dependency-cycle admission,"
+            " and concurrent upload WATCH protection passed."
         )
 
 

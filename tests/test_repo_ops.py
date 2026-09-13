@@ -11,7 +11,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from src.cancellation import retry_count_key, task_spec_hash_key
 from src.daemon import repo_ops
 
 
@@ -121,6 +120,20 @@ class _Runner(repo_ops.RepoOpsMixin):
 
 def _run(coro: Any) -> Any:
     return asyncio.run(coro)
+
+
+def _valid_task_text(pr_id: str, *, depends_on: str = "none", body: str = "Uploaded task") -> str:
+    number = pr_id.removeprefix("PR-").lower()
+    return (
+        "---\nstatus: TODO\n---\n\n"
+        f"# {pr_id}: Uploaded task\n"
+        f"Branch: task/{number}\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        f"- Depends on: {depends_on}\n\n"
+        "## Requirements\n"
+        f"{body}\n"
+    )
 
 
 def _patch_retry_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -556,8 +569,8 @@ def test_process_pending_uploads_uses_manifest_commit_subject_and_body(
     repo_dir.mkdir(parents=True)
     staging = tmp_path / "uploads" / "demo"
     staging.mkdir(parents=True)
-    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
-    (staging / "PR-002.md").write_text("# PR-002\n", encoding="utf-8")
+    (staging / "PR-001.md").write_text(_valid_task_text("PR-001"), encoding="utf-8")
+    (staging / "PR-002.md").write_text(_valid_task_text("PR-002"), encoding="utf-8")
     runner.redis.store[f"upload:{runner.name}:pending"] = json.dumps(
         {
             "files": ["PR-002.md", "PR-001.md"],
@@ -600,7 +613,7 @@ def test_process_pending_uploads_returns_none_when_newer_manifest_exists(
     Path(runner.repo_path).mkdir(parents=True)
     staging = tmp_path / "uploads" / "demo"
     staging.mkdir(parents=True)
-    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
+    (staging / "PR-001.md").write_text(_valid_task_text("PR-001"), encoding="utf-8")
     key = f"upload:{runner.name}:pending"
     old_manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
     runner.redis.store[key] = old_manifest
@@ -652,8 +665,8 @@ def test_process_pending_uploads_counts_unique_task_filenames_in_log_event(
     staging = tmp_path / "uploads" / "demo"
     staging.mkdir(parents=True)
     (staging / "QUEUE.md").write_text("# Queue\n", encoding="utf-8")
-    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
-    (staging / "PR-002.md").write_text("# PR-002\n", encoding="utf-8")
+    (staging / "PR-001.md").write_text(_valid_task_text("PR-001"), encoding="utf-8")
+    (staging / "PR-002.md").write_text(_valid_task_text("PR-002"), encoding="utf-8")
     key = f"upload:{runner.name}:pending"
     manifest = json.dumps(
         {
@@ -750,12 +763,12 @@ def test_process_pending_uploads_logs_overwrite_collision_hashes(
     tasks_dir = repo_dir / "tasks"
     tasks_dir.mkdir(parents=True)
     existing = tasks_dir / "PR-001.md"
-    existing.write_text("# old\n", encoding="utf-8")
+    existing.write_text(_valid_task_text("PR-001", body="old"), encoding="utf-8")
 
     staging = tmp_path / "uploads" / "demo"
     staging.mkdir(parents=True)
     incoming = staging / "PR-001.md"
-    incoming.write_text("# new\n", encoding="utf-8")
+    incoming.write_text(_valid_task_text("PR-001", body="new"), encoding="utf-8")
     key = f"upload:{runner.name}:pending"
     runner.redis.store[key] = json.dumps(
         {"files": ["PR-001.md"], "staging_dir": str(staging)}
@@ -771,8 +784,8 @@ def test_process_pending_uploads_logs_overwrite_collision_hashes(
 
     assert _run(runner.process_pending_uploads()) is True
 
-    old_hash = hashlib.sha256(b"# old\n").hexdigest()
-    new_hash = hashlib.sha256(b"# new\n").hexdigest()
+    old_hash = hashlib.sha256(_valid_task_text("PR-001", body="old").encode()).hexdigest()
+    new_hash = hashlib.sha256(_valid_task_text("PR-001", body="new").encode()).hexdigest()
     assert any(
         "Upload overwrite warning: tasks/PR-001.md "
         f"existing_sha256={old_hash} new_sha256={new_hash}" in event
@@ -828,7 +841,7 @@ def test_process_pending_uploads_handles_failures_and_safe_mode(
     Path(runner.repo_path).mkdir(parents=True)
     staging = tmp_path / "uploads" / "demo"
     staging.mkdir(parents=True)
-    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
+    (staging / "PR-001.md").write_text(_valid_task_text("PR-001"), encoding="utf-8")
     manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
     key = f"upload:{runner.name}:pending"
     runner.redis.store[key] = manifest

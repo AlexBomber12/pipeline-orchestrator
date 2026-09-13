@@ -9,11 +9,13 @@ actually followed.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from pathlib import Path
 
 from src.approval_commands import approval_task_path
 from src.cancellation.storage import CancellationCause, cause_key, task_spec_content_hash
 from src.completion_evidence import get_recorded_completions
+from src.dag import detect_cycle
 from src.github import gh_pr_get_merged_branches, gh_runner
 from src.github import prs as gh_prs
 from src.keyspace import pipeline_state
@@ -27,6 +29,32 @@ from src.queue_parser import (
 from src.rejection_commands import load_rejection
 from src.task_attempts import AdmissionRejected, AttemptChanged, TaskAttempt, load_attempt, new_attempt
 from src.task_status import get_merged_pr_ids
+
+
+def validate_admission_graph(root: Path, incoming: Iterable[Path] = ()) -> None:
+    """Check the proposed task graph before reserving any new attempts.
+
+    Uploaded files replace their filenames in the existing graph; files
+    omitted from a batch stay present. Missing/merged dependencies retain
+    their separate admission checks and historical parsing stays tolerant.
+    """
+    paths = {path.name: path for path in (root / "tasks").glob("PR-*.md")}
+    replacements = {path.name: path for path in incoming}
+    paths.update(replacements)
+    graph = {}
+    for name, path in sorted(paths.items()):
+        try:
+            header = parse_task_header(path) if name in replacements else parse_existing_task_header(path)
+        except UnstructuredLegacyTaskError:
+            continue
+        except QueueValidationError as exc:
+            if name not in replacements and all("missing task header like" in issue for issue in exc.issues):
+                continue
+            raise AdmissionRejected(str(exc)) from exc
+        graph[header.pr_id] = header.depends_on
+    cycle = detect_cycle(graph)
+    if cycle:
+        raise AdmissionRejected("Dependency cycle: " + " -> ".join(cycle))
 
 
 def verify_unfinished(root: Path, base: str, repo_url: str, previous: TaskAttempt) -> None:

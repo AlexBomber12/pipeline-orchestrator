@@ -26,6 +26,7 @@ from src.daemon.git_ops import (
 from src.keyspace import upload_pending, upload_pending_count
 from src.models import TaskStatus
 from src.retry import retry_transient
+from src.task_admission import validate_admission_graph
 from src.task_attempts import AdmissionRejected, load_attempt
 
 logger = logging.getLogger(__name__)
@@ -343,6 +344,10 @@ return 0
         try:
             tasks_dir = Path(self.repo_path) / "tasks"
             tasks_dir.mkdir(exist_ok=True)
+            validate_admission_graph(Path(self.repo_path), [
+                staging_dir / name for name in stageable_filenames
+                if name.startswith("PR-") and name.endswith(".md")
+            ])
             await self._snapshot_accepted_specs()
             admissions = []
             validated = []

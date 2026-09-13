@@ -128,6 +128,15 @@ class RejectionCommandMixin:
             # Capture the base before any sync/admission. A Git edit already
             # visible when Reject was accepted cannot count as a later rewrite.
             if not command.base_commit:
+                base = self.repo_config.branch
+                await asyncio.to_thread(
+                    git_ops._git,
+                    self.repo_path,
+                    "fetch",
+                    "origin",
+                    f"refs/heads/{base}:refs/remotes/origin/{base}",
+                    timeout=60,
+                )
                 command.base_commit = git_ops._git(
                     self.repo_path,
                     "rev-parse",

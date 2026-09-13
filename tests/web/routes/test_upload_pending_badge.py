@@ -18,7 +18,7 @@ from src.web.app import app, templates
 from src.web.routes import dashboard as dashboard_routes
 from src.web.routes import uploads as upload_routes
 
-from tests.test_repo_ops import _FakeCompletedProcess, _Runner
+from tests.test_repo_ops import _FakeCompletedProcess, _Runner, _valid_task_text
 from tests.test_upload import _StubAioredis, _task_file
 
 pytestmark = pytest.mark.usefixtures("one_repo_config", "repo_dir", "uploads_dir")
@@ -110,7 +110,7 @@ def test_idle_upload_extending_pending_manifest_keeps_pending_count(
 ) -> None:
     old_staging = uploads_dir / "example__alpha" / "existing"
     old_staging.mkdir(parents=True)
-    (old_staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
+    (old_staging / "PR-001.md").write_text(_valid_task_text("PR-001"), encoding="utf-8")
 
     with TestClient(app) as client:
         client.app.state.redis._store[upload_pending("example__alpha")] = (
@@ -395,7 +395,7 @@ def test_pending_count_cleared_after_deferred_commit(
     repo_dir.mkdir(parents=True)
     staging = tmp_path / "uploads" / "demo"
     staging.mkdir(parents=True)
-    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
+    (staging / "PR-001.md").write_text(_valid_task_text("PR-001"), encoding="utf-8")
     manifest = json.dumps(
         {"files": ["PR-001.md"], "staging_dir": str(staging)}
     )
@@ -426,7 +426,7 @@ def test_pending_count_cleared_on_commit_failure(
     repo_dir.mkdir(parents=True)
     staging = tmp_path / "uploads" / "demo"
     staging.mkdir(parents=True)
-    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
+    (staging / "PR-001.md").write_text(_valid_task_text("PR-001"), encoding="utf-8")
     manifest = json.dumps(
         {"files": ["PR-001.md"], "staging_dir": str(staging)}
     )
