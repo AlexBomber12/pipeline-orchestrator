@@ -993,3 +993,27 @@ async def test_superseding_action_waits_for_preserved_work(approval, monkeypatch
     assert snapshot(repo) == before
     saved = await load_approval(runner.redis, runner.name, command.binding)
     assert not saved.superseded and "Later operator action is waiting" in saved.reason
+
+
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("restart", [False, True])
+async def test_upload_after_applied_approval_does_not_deadlock_watch(approval, single, restart):
+    from src.keyspace import upload_pending
+    runner, command, _, _ = approval
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    await runner.redis.set(upload_pending(runner.name), "staged upload for the IDLE consumer")
+    if restart:
+        runner._recovered = False
+        runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+        await runner._run_cycle_body()
+        assert runner.state.state == PipelineState.WATCH
+    await runner._run_cycle_body()
+    runner.handle_watch.assert_awaited_once()
+    assert await runner.redis.get(upload_pending(runner.name))
+    # Completion of WATCH leaves the normal IDLE/upload path reachable.
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_task = None
+    runner.state.current_pr = None
+    assert not await runner._consume_approval_command()

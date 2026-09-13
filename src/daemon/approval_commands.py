@@ -196,7 +196,10 @@ class ApprovalCommandMixin:
             ):
                 return "Prior execution ownership is uncertain; waiting for daemon reconciliation."
             self.state.user_paused = persisted.user_paused
-        if await self.redis.get(upload_pending(self.name)):
+        # Staged uploads do not change the current task yet. Once permission
+        # is applied, WATCH must finish so the existing IDLE upload consumer
+        # can run. Initial application still defers competing task changes.
+        if command.status != "applied" and await self.redis.get(upload_pending(self.name)):
             return "Task upload is pending; approval cannot authorize revised requirements."
         if await self.redis.get(control_stop(self.name)):
             return "Operator Stop is active."
@@ -272,7 +275,7 @@ class ApprovalCommandMixin:
             persisted = RepoState.model_validate_json(raw) if raw else self.state
             if not matches_state(command, persisted):
                 raise ApprovalChanged("Published task or PR changed while applying approval.")
-            if await pipe.get(upload_key):
+            if current.status != "applied" and await pipe.get(upload_key):
                 raise RuntimeError("Task upload arrived during approval application.")
             path = approval_task_path(Path(self.repo_path), command.task.task_file)
             if task_spec_content_hash(path.read_text(encoding="utf-8")) != command.task_fingerprint:
