@@ -294,6 +294,26 @@ async def test_pending_upload_from_before_reject_does_not_reactivate(rejected):
     assert (await load_attempt(runner.redis, runner.name, "PR-42")).rejection == command.binding
 
 
+async def test_upload_stages_unchanged_completed_rejected_attempt_with_new_task(rejected):
+    await finish_reject(rejected)
+    runner, _, repo, _, _, _ = rejected
+    prior = await load_attempt(runner.redis, runner.name, "PR-42")
+    await save_attempt(runner.redis, runner.name, prior.model_copy(update={"completed": True}), expected=prior)
+    unchanged_completed = (
+        (repo / "tasks/PR-42.md")
+        .read_text()
+        .replace("status: ERROR", "status: TODO")
+        .replace("blocked_reason: guardrail\n", "")
+    )
+    new_task = task_43_from(repo)
+
+    response = await stage_files(rejected, [("PR-42.md", unchanged_completed), ("PR-43.md", new_task)])
+
+    assert response.status_code == 200, response.text
+    manifest = json.loads(await runner.redis.get(upload_pending(runner.name)))
+    assert sorted(manifest["files"]) == ["PR-42.md", "PR-43.md"]
+
+
 async def test_stale_pending_upload_member_preserves_newer_valid_submission(rejected, tmp_path):
     runner, _, repo, _, _, _ = rejected
     path = repo / "tasks/PR-42.md"
@@ -329,6 +349,79 @@ async def test_stale_pending_upload_member_preserves_newer_valid_submission(reje
     assert not (staging / "PR-42.md").exists()
     assert (staging / "PR-43.md").read_text() == newer
     assert await runner.redis.get(upload_pending_count(runner.name)) == "1"
+
+
+async def test_stale_pending_upload_member_is_pruned_before_graph_validation(rejected, tmp_path):
+    runner, _, repo, _, _, _ = rejected
+    path = repo / "tasks/PR-42.md"
+    prior_hash = task_spec_content_hash(path.read_text())
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    stale_duplicate_branch = rewritten(repo).replace("fix/pr-42", "fix/pr-43")
+    newer = task_43_from(repo)
+    (staging / "PR-42.md").write_text(stale_duplicate_branch)
+    (staging / "PR-43.md").write_text(newer)
+    manifest = {
+        "repo": runner.name,
+        "files": ["PR-42.md", "PR-43.md"],
+        "staging_dir": str(staging),
+        "task_hashes": {
+            "PR-42": task_spec_content_hash(stale_duplicate_branch),
+            "PR-43": task_spec_content_hash(newer),
+        },
+        "rejection_tokens": {},
+        "prior_spec_files": {"PR-42": prior_hash},
+        "commit_subject": "tasks: upload batch (2 files)",
+    }
+    await runner.redis.set(upload_pending(runner.name), json.dumps(manifest))
+    await runner.redis.set(upload_pending_count(runner.name), "2")
+    path.write_text(path.read_text() + "\nEdited after stale upload.\n")
+
+    assert await runner.process_pending_uploads() is None
+
+    retained = json.loads(await runner.redis.get(upload_pending(runner.name)))
+    assert retained["files"] == ["PR-43.md"]
+    assert (staging / "PR-43.md").read_text() == newer
+
+
+async def test_stale_pending_upload_member_raced_after_graph_validation_is_pruned(rejected, tmp_path, monkeypatch):
+    runner, _, repo, _, _, _ = rejected
+    path = repo / "tasks/PR-42.md"
+    prior_hash = task_spec_content_hash(path.read_text())
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    stale = rewritten(repo)
+    newer = task_43_from(repo)
+    (staging / "PR-42.md").write_text(stale)
+    (staging / "PR-43.md").write_text(newer)
+    manifest = {
+        "repo": runner.name,
+        "files": ["PR-42.md", "PR-43.md"],
+        "staging_dir": str(staging),
+        "task_hashes": {
+            "PR-42": task_spec_content_hash(stale),
+            "PR-43": task_spec_content_hash(newer),
+        },
+        "rejection_tokens": {},
+        "prior_spec_files": {"PR-42": prior_hash},
+        "commit_subject": "tasks: upload batch (2 files)",
+    }
+    await runner.redis.set(upload_pending(runner.name), json.dumps(manifest))
+    await runner.redis.set(upload_pending_count(runner.name), "2")
+
+    def edit_after_graph(repo_path, incoming_paths=None):
+        validate_admission_graph(repo_path, incoming_paths)
+        path.write_text(path.read_text() + "\nEdited after graph validation.\n")
+
+    monkeypatch.setattr("src.daemon.repo_ops.validate_admission_graph", edit_after_graph)
+
+    assert await runner.process_pending_uploads() is None
+
+    retained = json.loads(await runner.redis.get(upload_pending(runner.name)))
+    assert retained["files"] == ["PR-43.md"]
+    assert retained["task_hashes"] == {"PR-43": task_spec_content_hash(newer)}
+    assert not (staging / "PR-42.md").exists()
+    assert (staging / "PR-43.md").read_text() == newer
 
 
 async def test_invalid_upload_discard_defers_when_manifest_changed(rejected, tmp_path):

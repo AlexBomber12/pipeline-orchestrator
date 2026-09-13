@@ -398,6 +398,26 @@ return 0
         try:
             tasks_dir = Path(self.repo_path) / "tasks"
             tasks_dir.mkdir(exist_ok=True)
+            prior_files = manifest.get("prior_spec_files", {})
+            for fname in stageable_filenames:
+                if fname.startswith("PR-") and fname.endswith(".md") and Path(fname).stem in prior_files:
+                    task_id = Path(fname).stem
+                    target = tasks_dir / fname
+                    current = await load_attempt(self.redis, self.name, task_id)
+                    current_hash = task_spec_content_hash(target.read_text()) if target.is_file() else None
+                    incoming_hash = task_spec_content_hash((staging_dir / fname).read_text())
+                    if current_hash != prior_files[task_id] and not (
+                        current and current.fingerprint == incoming_hash and current_hash == incoming_hash
+                        and current.previous_rejection == manifest.get("rejection_tokens", {}).get(task_id)
+                    ):
+                        return await self._discard_invalid_upload_member(
+                            key,
+                            raw,
+                            staging_dir,
+                            manifest,
+                            fname,
+                            "Task changed or was deleted after upload; submit it again.",
+                        )
             validate_admission_graph(Path(self.repo_path), [
                 staging_dir / name for name in stageable_filenames
                 if name.startswith("PR-") and name.endswith(".md")
@@ -413,7 +433,6 @@ return 0
                     task_id = Path(fname).stem
                     target = tasks_dir / fname
                     current = await load_attempt(self.redis, self.name, task_id)
-                    prior_files = manifest.get("prior_spec_files", {})
                     current_hash = task_spec_content_hash(target.read_text()) if target.is_file() else None
                     incoming_hash = task_spec_content_hash((staging_dir / fname).read_text())
                     if task_id in prior_files:

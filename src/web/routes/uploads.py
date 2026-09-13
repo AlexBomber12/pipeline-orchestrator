@@ -706,7 +706,7 @@ async def upload_tasks(
                 rejection = await load_rejection(redis_client, name, token)
                 if rejection and rejection.requested_at > upload_started_at:
                     raise AttemptChanged("Upload began before Reject; submit the rewritten task again.")
-                if uploaded_hash == attempt.fingerprint:
+                if uploaded_hash == attempt.fingerprint and not attempt.completed:
                     raise AttemptChanged(
                         "File unchanged. Reject is final; rewrite or remove the unfinished task. "
                         "Ordinary Retry is unavailable."
