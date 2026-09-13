@@ -257,8 +257,8 @@ class TaskAdmissionMixin:
                 await self._prepare_reused_branch(attempt)
                 updated = attempt.model_copy(update={"branch_prepared": True})
                 attempt = await save_attempt(self.redis, self.name, updated, expected=attempt)
-            if not attempt.started:
-                updated = attempt.model_copy(update={"started": True})
+            if not attempt.started or attempt.coder_dispatched is not True:
+                updated = attempt.model_copy(update={"started": True, "coder_dispatched": True})
                 attempt = await save_attempt(self.redis, self.name, updated, expected=attempt)
             await self.publish_state()
             return True

@@ -170,7 +170,8 @@ async def enqueue_rejection(redis: Any, command: RejectionCommand) -> RejectionC
             attempt.fingerprint = command.fingerprint
             attempt.file_sha256 = command.file_sha256
         attempt.rejection = command.binding
-        attempt.pr_number = pr.number if pr else None
+        # A temporarily untracked in-memory PR must not erase durable creation evidence.
+        attempt.pr_number = pr.number if pr else attempt.pr_number
         original = CancellationCause.from_redis(command.failure).payload
         original_rule = original.get("rule") or original.get("category") or ""
         original_excerpt = original.get("excerpt") or original.get("reason_text") or ""

@@ -200,11 +200,13 @@ async def test_connected_http_reject_rewrite_clean_base_and_new_pr(rejected, mon
     attempt = await load_attempt(runner.redis, runner.name, "PR-42")
     assert attempt.attempt_id != old_attempt.attempt_id and not attempt.admission_pending
     assert attempt.previous_rejection == command.binding and attempt.rejection is None
+    assert attempt.coder_dispatched is False
     assert await runner._reconcile_git_admissions() == set()
     received = []
 
     async def coder(path, pr_id, task_file, task_body, **kwargs):
         received.append(task_body)
+        assert (await load_attempt(runner.redis, runner.name, pr_id)).coder_dispatched is True
         git(repo, "checkout", "-b", "fix/pr-42", "origin/main")
         assert not (repo / "abandoned-marker.txt").exists()
         (repo / "new-implementation.txt").write_text("fresh")
@@ -343,7 +345,8 @@ async def test_pre_pr_reject_confirms_absence_before_releasing_branch(rejected, 
     runner, _, repo, _, github, _ = rejected
     runner.state.current_pr = None
     attempt = new_attempt(
-        runner.repo_config.url, runner.state.current_task, (repo / "tasks/PR-42.md").read_text(), started=True
+        runner.repo_config.url, runner.state.current_task, (repo / "tasks/PR-42.md").read_text(),
+        started=False, coder_dispatched=False,
     )
     runner.state.current_task.attempt_id = attempt.attempt_id
     await save_attempt(runner.redis, runner.name, attempt, expected=None)
@@ -359,8 +362,8 @@ async def test_pre_pr_reject_confirms_absence_before_releasing_branch(rejected, 
         )
     await runner._consume_rejection_commands()
     first = await load_rejection(runner.redis, runner.name, command.binding)
-    assert not first.released
-    assert first.status == ("deferred" if ambiguous else "closing")
+    assert first.released is (not ambiguous)
+    assert first.status == ("deferred" if ambiguous else "rejected")
     await runner._consume_rejection_commands()
     result = await load_rejection(runner.redis, runner.name, command.binding)
     assert result.released is (not ambiguous)
@@ -662,7 +665,7 @@ async def test_dashboard_and_http_use_receipt_identity_and_final_operation_histo
     assert response.status_code == 409
 
 
-@pytest.mark.parametrize("case", ["ambiguous_creation", "divergent_refs", "late_process"])
+@pytest.mark.parametrize("case", ["ambiguous_creation", "known_pr", "divergent_refs", "late_process"])
 async def test_pre_pr_closure_waits_for_ambiguous_effects_and_checkout_ownership(rejected, monkeypatch, case):
     from src.task_attempts import new_attempt, save_attempt
 
@@ -672,14 +675,18 @@ async def test_pre_pr_closure_waits_for_ambiguous_effects_and_checkout_ownership
         runner.repo_config.url,
         runner.state.current_task,
         (repo / "tasks/PR-42.md").read_text(),
-        started=True,
+        started=False,
         pr_creation_pending=case == "ambiguous_creation",
+        pr_number=42 if case == "known_pr" else None,
+        coder_dispatched=False,
     )
     runner.state.current_task.attempt_id = attempt.attempt_id
     await save_attempt(runner.redis, runner.name, attempt, expected=None)
     await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
     command = build_rejection(runner.name, runner.state, await runner.redis.get(cause_key(runner.name, "PR-42")), repo)
     await enqueue_rejection(runner.redis, command)
+    if case == "known_pr":
+        assert (await load_attempt(runner.redis, runner.name, "PR-42")).pr_number == 42
     if case == "divergent_refs":
         git(repo, "commit", "--allow-empty", "-m", "local unpublished commit")
     elif case == "late_process":
@@ -688,7 +695,7 @@ async def test_pre_pr_closure_waits_for_ambiguous_effects_and_checkout_ownership
         def blocker(path):
             nonlocal calls
             calls += 1
-            return "A process appeared before checkout release" if calls == 3 else None
+            return "A process appeared before checkout release" if calls >= 2 else None
 
         monkeypatch.setattr(daemon_reject, "checkout_process_blocker", blocker)
     await runner._consume_rejection_commands()
@@ -890,8 +897,9 @@ async def test_pending_pr_reconciliation_respects_controls_and_attempt_changes(r
 @pytest.mark.parametrize("single", [False, True])
 @pytest.mark.parametrize("lost_close_ack", [False, True])
 @pytest.mark.parametrize("pending_creation", [False, True])
+@pytest.mark.parametrize("dispatch_marker", [None, True])
 async def test_guardrail_before_pr_tracking_resolves_current_pr_and_ignores_history(
-    rejected, monkeypatch, single, lost_close_ack, pending_creation
+    rejected, monkeypatch, single, lost_close_ack, pending_creation, dispatch_marker
 ):
     from datetime import timedelta
     from src.task_attempts import new_attempt, save_attempt
@@ -906,6 +914,7 @@ async def test_guardrail_before_pr_tracking_resolves_current_pr_and_ignores_hist
         (repo / "tasks/PR-42.md").read_text(),
         started=True,
         pr_creation_pending=pending_creation,
+        coder_dispatched=dispatch_marker,
     )
     runner.state.current_task.attempt_id = attempt.attempt_id
     await save_attempt(runner.redis, runner.name, attempt, expected=None)
@@ -933,14 +942,33 @@ async def test_guardrail_before_pr_tracking_resolves_current_pr_and_ignores_hist
     assert command.pr is None
     assert (await post_reject(rejected, binding=command.binding)).status_code == 202
     original_transport = daemon_reject.gh_runner.run_gh
+    visible = False
 
     def transport(args, *a, **kwargs):
+        if not visible and args[:3] == ["api", "--paginate", "--slurp"] and "/pulls?" in args[-1]:
+            return [[]]
         result = original_transport(args, *a, **kwargs)
         if lost_close_ack and args[:2] == ["pr", "close"]:
             raise TimeoutError("close reply lost")
         return result
 
     monkeypatch.setattr(daemon_reject.gh_runner, "run_gh", transport)
+    # Visibility may lag for arbitrarily many queries, including after restart.
+    # A prior daemon's negative observation is not durable non-creation proof.
+    pending = await load_rejection(runner.redis, runner.name, command.binding)
+    pending.absence_confirmed = True
+    await runner.redis.set(rejection_key(runner.name, command.binding), pending.model_dump_json())
+    for cycle in range(4):
+        if cycle == 2:
+            fresh = h._make_runner()
+            fresh.repo_path, fresh.redis = runner.repo_path, runner.redis
+            fresh.repo_config.feature_flags.use_single_error_exit = single
+            runner = fresh
+        await runner._consume_rejection_commands()
+        stored = await load_rejection(runner.redis, runner.name, command.binding)
+        assert stored.status == "deferred" and not stored.released and stored.pr is None
+        assert github["state"] == "open"
+    visible = True
     await runner._consume_rejection_commands()
     stored = await load_rejection(runner.redis, runner.name, command.binding)
     assert stored.pr.number == 42
@@ -948,6 +976,7 @@ async def test_guardrail_before_pr_tracking_resolves_current_pr_and_ignores_hist
         assert stored.status == "deferred" and not stored.released
         fresh = h._make_runner()
         fresh.repo_path, fresh.redis = runner.repo_path, runner.redis
+        fresh.repo_config.feature_flags.use_single_error_exit = single
         await fresh._consume_rejection_commands()
     stored = await load_rejection(runner.redis, runner.name, command.binding)
     assert stored.status == "rejected" and stored.released

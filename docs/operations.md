@@ -48,6 +48,10 @@ stopping, closure awaiting confirmation, deferred verification, and final
 rejection separately. A timeout is not closure confirmation. The same durable
 operation is reconciled after restart; retrying closure does not retry coding.
 If the PR already merged, its task is completed and cannot be reused.
+If its PR is not yet tracked, empty lookups after coder execution remain pending;
+they do not prove that no PR was created. Final rejection without a PR requires a
+durable never-dispatched receipt and no recorded or unresolved PR creation.
+Legacy attempts without that evidence remain deferred for exact PR reconciliation.
 
 After final rejection, manually rewrite or remove unfinished task specifications
 and update their dependencies. An unfinished task may retain its filename, task

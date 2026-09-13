@@ -178,6 +178,7 @@ async def admission_candidate(
         content,
         previous_rejection=(previous.rejection or previous.previous_rejection) if previous else None,
         admission_pending=True,
+        coder_dispatched=False,
     )
     candidate.task.attempt_id = candidate.attempt_id
     return previous, candidate

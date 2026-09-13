@@ -73,6 +73,7 @@ async def exercise(socket: Path, root: Path):
                     single,
                     True,
                     True,
+                    True,
                 )
         for single in (False, True):
             await redis.flushall()

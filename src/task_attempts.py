@@ -35,6 +35,9 @@ class TaskAttempt(BaseModel):
     accepted_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     base_commit: str = ""
     started: bool = False
+    # False is explicit new-admission evidence. Mark True before dispatch;
+    # missing legacy evidence stays unknown rather than proving non-creation.
+    coder_dispatched: bool | None = None
     pr_number: int | None = None
     pr_creation_pending: bool = False
     rejection: str | None = None

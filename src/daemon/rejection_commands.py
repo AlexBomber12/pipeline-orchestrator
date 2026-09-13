@@ -149,14 +149,20 @@ class RejectionCommandMixin:
                     await self._save_rejection(command, "closing", "Attempt PR identified; verifying exact PR closure.")
                     updated = attempt.model_copy(update={"pr_number": command.pr.number, "pr_creation_pending": False})
                     await save_attempt(self.redis, self.name, updated, expected=attempt)
-                elif attempt.pr_creation_pending:
-                    raise AttemptChanged("PR creation acknowledgement is unresolved; exact PR identity is required.")
-                elif not command.absence_confirmed:
-                    command.absence_confirmed = True
-                    await self._save_rejection(
-                        command, "closing", "Confirming that no PR was created; rechecking next cycle."
+                elif (
+                    attempt.pr_creation_pending or attempt.pr_number is not None
+                    or attempt.started or attempt.coder_dispatched is not False
+                ):
+                    raise AttemptChanged(
+                        "PR creation may have occurred; exact PR identity is required. "
+                        "Empty lookup results cannot prove non-creation after coder dispatch "
+                        "or unknown legacy execution."
                     )
-                    return
+                else:
+                    # Only an explicit never-dispatched receipt plus no pending
+                    # creation can establish absence. Old negative-list hints
+                    # are insufficient after any potentially effectful run.
+                    command.absence_confirmed = True
             if command.pr is not None:
                 data = await asyncio.to_thread(
                     rejection_pr_details,
@@ -214,8 +220,8 @@ class RejectionCommandMixin:
                         raise AttemptChanged("PR closure remains unconfirmed; reconciliation will continue.")
                 command.branch_head = data["head"]["sha"]
             if command.pr is None:
-                # A pre-PR attempt has an explicit UUID and two negative PR
-                # observations. Freeze its now-quiescent branch refs for the
+                # A never-dispatched attempt has no pending PR creation and a
+                # verified empty lookup. Freeze its quiescent branch refs for the
                 # same exact-SHA cleanup used for closed-PR attempts.
                 command.branch_head = attempt_branch_head(self.repo_path, command.task.branch)
             blocker = checkout_process_blocker(self.repo_path)
