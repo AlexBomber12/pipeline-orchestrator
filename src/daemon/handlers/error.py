@@ -25,7 +25,7 @@ from src.diagnosis import parse_diagnosis
 from src.models import PipelineState
 from src.retry import retry_transient
 from src.subsource_registry import SuppressionReason
-from src.task_attempts import load_attempt, save_attempt
+from src.task_attempts import clear_failed_pr_creation, load_attempt, save_attempt
 
 logger = logging.getLogger(__name__)
 _CLAUDE_CLI_COAUTHOR = "Co-authored-by: Claude CLI <noreply@anthropic.com>"
@@ -157,6 +157,12 @@ class ErrorMixin:
                 discover_attempt_pr, self.repo_path, self.owner_repo, self.repo_config.branch, attempt,
             )
             if data is None:
+                cause = await get_cancellation_cause(self.redis, self.name, task.pr_id, refresh_ttl=False)
+                payload = cause.payload if cause and isinstance(cause.payload, dict) else {}
+                if payload.get("subsystem") == "pr_creation_clear":
+                    await clear_failed_pr_creation(self.redis, self.name, attempt)
+                    self.log_event("[RECOVERY] Confirmed failed PR creation cleanup after Redis recovered.")
+                    return False
                 self.log_event("[RECOVERY] PR creation acknowledgement unresolved; waiting for one matching PR.")
                 return True
             if await self._attempt_execution_blocked():

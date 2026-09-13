@@ -135,6 +135,7 @@ from src.queue_parser import (
 from src.queue_parser import (
     parse_existing_task_header as parse_task_header,
 )
+from src.rejection_commands import list_rejections
 from src.subsource_registry import (
     SuppressionReason,
     error_category_to_reason,
@@ -2892,22 +2893,43 @@ class PipelineRunner(
 
     async def _run_cycle_body(self) -> None:
         """Inner state-machine step; ``run_cycle`` wraps it for burn tracking."""
+        checkout_missing = not (Path(self.repo_path) / ".git").exists()
+        restored_checkout_for_rejection = False
+        if checkout_missing:
+            try:
+                has_rejection_work = bool(await list_rejections(self.redis, self.name))
+            except Exception:
+                has_rejection_work = False
+            if has_rejection_work:
+                try:
+                    await self.ensure_repo_cloned()
+                except RuntimeError as exc:
+                    await self._transition_to_error(
+                        str(exc),
+                        log_prefix="[INFRA]",
+                        log_message=f"ensure_repo_cloned failed: {exc}",
+                        save_run_record_as=None,
+                        publish=True,
+                    )
+                    return
+                restored_checkout_for_rejection = True
         if await self._consume_rejection_commands():
             return
         if await self._consume_approval_command():
             return
 
-        try:
-            await self.ensure_repo_cloned()
-        except RuntimeError as exc:
-            await self._transition_to_error(
-                str(exc),
-                log_prefix="[INFRA]",
-                log_message=f"ensure_repo_cloned failed: {exc}",
-                save_run_record_as=None,
-                publish=True,
-            )
-            return
+        if not restored_checkout_for_rejection:
+            try:
+                await self.ensure_repo_cloned()
+            except RuntimeError as exc:
+                await self._transition_to_error(
+                    str(exc),
+                    log_prefix="[INFRA]",
+                    log_message=f"ensure_repo_cloned failed: {exc}",
+                    save_run_record_as=None,
+                    publish=True,
+                )
+                return
 
         await self._refresh_user_paused_from_redis()
         if not self.state.user_paused:

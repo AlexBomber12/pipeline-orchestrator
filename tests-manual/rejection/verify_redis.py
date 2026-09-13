@@ -95,19 +95,20 @@ async def exercise(socket: Path, root: Path):
                     fixture, patch, single, "authentication",
                 )
         for single in (False, True):
-            await redis.flushall()
-            directory = root / f"create-clear-ack-{single}"
-            directory.mkdir()
-            with pytest.MonkeyPatch.context() as patch:
-                isolated_daemon_process_view.__wrapped__(patch)
-                fixture = await rejected.__wrapped__(directory, patch)
-                runner, _, _, _, _, app = fixture
-                for key, value in runner.redis.store.items():
-                    await redis.set(key, value)
-                runner.redis = app.state.redis = redis
-                await test_definitive_create_failure_replays_lost_clear_ack(
-                    fixture, patch, single, "after_exec_twice",
-                )
+            for clear_ack in ("after_exec_twice", "before_exec_and_load_outage"):
+                await redis.flushall()
+                directory = root / f"create-clear-ack-{single}-{clear_ack}"
+                directory.mkdir()
+                with pytest.MonkeyPatch.context() as patch:
+                    isolated_daemon_process_view.__wrapped__(patch)
+                    fixture = await rejected.__wrapped__(directory, patch)
+                    runner, _, _, _, _, app = fixture
+                    for key, value in runner.redis.store.items():
+                        await redis.set(key, value)
+                    runner.redis = app.state.redis = redis
+                    await test_definitive_create_failure_replays_lost_clear_ack(
+                        fixture, patch, single, clear_ack,
+                    )
         for single in (False, True):
             for failure in ("before_exec", "after_exec", "rejection"):
                 await redis.flushall()

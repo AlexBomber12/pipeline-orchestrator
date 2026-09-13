@@ -1228,6 +1228,9 @@ async def test_definitive_create_failure_allows_http_retry_without_losing_work(
         assert "Cannot confirm failed PR creation cleanup" in runner.state.error_message
         assert github["new_pr"] is None
         assert git(repo, "rev-parse", "fix/pr-42") == work_head
+        assert not await runner._reconcile_pending_pr_creation()
+        receipt = await load_attempt(runner.redis, runner.name, "PR-42")
+        assert not receipt.pr_creation_pending and receipt.attempt_id == attempt.attempt_id
         return
     assert not receipt.pr_creation_pending and receipt.attempt_id == attempt.attempt_id
     assert not await runner._reconcile_pending_pr_creation()

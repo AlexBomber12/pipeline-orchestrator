@@ -165,6 +165,68 @@ async def post_reject(fixture, *, alternate=False, binding=None):
         return await client.post(route, data={"decision": "reject", "binding": binding or command.binding})
 
 
+async def test_run_cycle_restores_missing_checkout_before_rejection(rejected, monkeypatch):
+    import shutil
+    from pathlib import Path
+
+    runner, *_ = rejected
+    assert (await post_reject(rejected)).status_code == 202
+    shutil.rmtree(runner.repo_path)
+    calls = []
+
+    async def ensure_checkout():
+        calls.append("ensure")
+        Path(runner.repo_path, ".git").mkdir(parents=True)
+
+    async def consume_rejection():
+        calls.append("reject")
+        assert Path(runner.repo_path, ".git").is_dir()
+        return True
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", ensure_checkout)
+    monkeypatch.setattr(runner, "_consume_rejection_commands", consume_rejection)
+
+    await runner._run_cycle_body()
+
+    assert calls == ["ensure", "reject"]
+
+
+async def test_run_cycle_defers_checkout_restore_when_rejection_listing_fails(rejected, monkeypatch):
+    import shutil
+
+    runner, *_ = rejected
+    shutil.rmtree(runner.repo_path)
+    monkeypatch.setattr(
+        "src.daemon.runner.list_rejections",
+        AsyncMock(side_effect=OSError("redis unavailable")),
+    )
+    ensure = AsyncMock(side_effect=AssertionError("checkout restore requires a confirmed pending rejection"))
+    monkeypatch.setattr(runner, "ensure_repo_cloned", ensure)
+    monkeypatch.setattr(runner, "_consume_rejection_commands", AsyncMock(return_value=True))
+
+    await runner._run_cycle_body()
+
+    ensure.assert_not_awaited()
+
+
+async def test_run_cycle_clone_failure_before_rejection_transitions_error(rejected, monkeypatch):
+    import shutil
+
+    runner, *_ = rejected
+    assert (await post_reject(rejected)).status_code == 202
+    shutil.rmtree(runner.repo_path)
+    monkeypatch.setattr(runner, "ensure_repo_cloned", AsyncMock(side_effect=RuntimeError("clone failed")))
+    consume_rejection = AsyncMock(side_effect=AssertionError("rejection must wait for checkout restore"))
+    monkeypatch.setattr(runner, "_consume_rejection_commands", consume_rejection)
+
+    await runner._run_cycle_body()
+
+    runner.ensure_repo_cloned.assert_awaited_once()
+    consume_rejection.assert_not_awaited()
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "clone failed"
+
+
 @pytest.mark.parametrize("single", [False, True])
 async def test_connected_http_reject_rewrite_clean_base_and_new_pr(rejected, monkeypatch, single):
     runner, command, repo, remote, github, app = rejected
@@ -811,9 +873,9 @@ async def test_legacy_approve_url_uses_bound_durable_command_and_preserves_work(
     ],
 )
 async def test_pending_pr_reconciliation_respects_controls_and_attempt_changes(rejected, monkeypatch, case):
+    from src.daemon.handlers import error
     from src.keyspace import control_stop
     from src.task_attempts import new_attempt, save_attempt
-    from src.daemon.handlers import error
 
     runner, _, repo, _, _, _ = rejected
     candidate = runner.state.current_pr.model_copy(deep=True)
@@ -902,6 +964,7 @@ async def test_guardrail_before_pr_tracking_resolves_current_pr_and_ignores_hist
     rejected, monkeypatch, single, lost_close_ack, pending_creation, dispatch_marker
 ):
     from datetime import timedelta
+
     from src.task_attempts import new_attempt, save_attempt
 
     runner, _, repo, _, github, _ = rejected
@@ -1046,8 +1109,9 @@ async def test_pending_creation_reconciles_terminal_pr_and_releases_ownership(re
     ],
 )
 async def test_pr_discovery_requires_attempt_repository_base_time_and_head(rejected, monkeypatch, case):
-    from datetime import timedelta
     from copy import deepcopy
+    from datetime import timedelta
+
     from src.daemon.attempt_prs import discover_attempt_pr
     from src.task_attempts import new_attempt
 
@@ -1117,7 +1181,7 @@ async def test_pr_discovery_requires_attempt_repository_base_time_and_head(rejec
 async def test_reject_rebinds_a_quiescent_same_attempt_push_and_preserves_replay(
     rejected, monkeypatch, push_timing, lost_close_ack
 ):
-    from tests.test_task_admission import stage, rewritten
+    from tests.test_task_admission import rewritten, stage
 
     runner, command, repo, remote, github, _ = rejected
     original_head = command.pr.head_sha
