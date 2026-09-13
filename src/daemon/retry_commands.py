@@ -267,6 +267,7 @@ class RetryCommandMixin:
             depends_on=list(header.depends_on),
             branch=header.branch,
             priority=header.priority,
+            attempt_id=attempt.attempt_id if attempt is not None else command.attempt_id,
         )
         return header, task
 
