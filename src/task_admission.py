@@ -125,6 +125,8 @@ async def admission_candidate(
     if previous and previous.repo_url != repo_url:
         raise AdmissionRejected("Task receipt belongs to a different repository.")
     if previous and previous.fingerprint == fingerprint:
+        # Replays keep their existing attempt, including completed tasks in a
+        # sprint ZIP. Only changed specifications reach verify_unfinished below.
         return previous, None
     raw_state = await redis.get(pipeline_state(repo))
     state = RepoState.model_validate_json(raw_state) if raw_state else None

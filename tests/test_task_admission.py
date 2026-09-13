@@ -1269,3 +1269,90 @@ async def test_upload_waiting_for_final_reject_is_retained_then_admitted(rejecte
     assert await runner.redis.get(upload_pending(runner.name)) == pending
     await runner._consume_rejection_commands()
     assert await runner.process_pending_uploads() is True
+
+
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("existing_receipt", [False, True])
+@pytest.mark.parametrize("changed", [False, True])
+async def test_sprint_zip_replays_completed_tasks_without_reusing_them(
+    rejected, monkeypatch, single, existing_receipt, changed
+):
+    import io
+    import zipfile
+
+    from src import task_admission
+    from src.cancellation.storage import index_key
+
+    runner, _, repo, _, _, app = rejected
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    git(repo, "checkout", "main")
+    path = repo / "tasks/PR-42.md"
+    completed = path.read_text().replace("status: ERROR", "status: DONE").replace("blocked_reason: guardrail\n", "")
+    path.write_text(completed)
+    git(repo, "commit", "-am", "task completed")
+    record = {
+        "schema_version": 1, "repository": "octo/demo", "base_branch": "main",
+        "completions": {"PR-42": {
+            "task_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "merge_commit": git(repo, "rev-parse", "main"), "pull_request": 42,
+            "reason": "Completed implementation",
+        }},
+    }
+    manifest_path = repo / "tasks/completions.json"
+    manifest_path.write_text(json.dumps(record))
+    git(repo, "add", "tasks/completions.json")
+    git(repo, "commit", "-m", "record completed implementation")
+    git(repo, "push", "origin", "main")
+    runner.state.current_task = runner.state.current_pr = None
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_queue[0].status = TaskStatus.DONE
+    await runner.redis.delete(cause_key(runner.name, "PR-42"))
+    await runner.redis.delete(index_key(runner.name))
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    prior = None
+    if existing_receipt:
+        await runner._snapshot_accepted_specs()
+        prior = await load_attempt(runner.redis, runner.name, "PR-42")
+        prior = await save_attempt(
+            runner.redis, runner.name, prior.model_copy(update={"completed": True}), expected=prior,
+        )
+    counter = f"metrics:retry_count:{runner.name}:PR-42"
+    await runner.redis.set(counter, "3")
+    completed_check_calls = []
+    original_verify = task_admission.verify_unfinished
+
+    def verify(*args):
+        completed_check_calls.append(args[-1].task.pr_id)
+        return original_verify(*args)
+
+    monkeypatch.setattr(task_admission, "verify_unfinished", verify)
+    replay = completed.replace("status: DONE", "status: TODO")
+    new_task = replay.replace("PR-42:", "PR-43:").replace("fix/pr-42", "fix/pr-43")
+    if changed:
+        replay += "\nChanged implementation scope for completed task.\n"
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("PR-42.md", replay)
+        archive.writestr("PR-43.md", new_task)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"/repos/{runner.name}/upload-tasks", files={"files": ("sprint.zip", buffer.getvalue(), "application/zip")},
+        )
+    assert response.status_code == 200, response.text
+    assert await runner.process_pending_uploads() is (not changed)
+    current = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert current.task.status == TaskStatus.DONE
+    assert current.file_sha256 == record["completions"]["PR-42"]["task_sha256"]
+    assert not current.admission_pending and current.previous_rejection is None
+    if prior:
+        assert current == prior
+    assert await runner.redis.get(counter) == "3"
+    assert path.read_text() == completed
+    assert json.loads(manifest_path.read_text()) == record
+    assert completed_check_calls == (["PR-42"] if changed else [])
+    new_attempt = await load_attempt(runner.redis, runner.name, "PR-43")
+    if changed:
+        assert new_attempt is None and not (repo / "tasks/PR-43.md").exists()
+    else:
+        assert not new_attempt.started and not new_attempt.admission_pending
+        assert (repo / "tasks/PR-43.md").read_text() == new_task
