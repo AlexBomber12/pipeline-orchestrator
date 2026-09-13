@@ -16,11 +16,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from src.cancellation import (
-    record_task_spec_hash,
-    reset_retry_count,
-    safe_delete_cancellation_cause,
-)
+from src.cancellation.storage import task_spec_content_hash
 from src.daemon import git_ops, scaffolder
 from src.daemon.git_ops import (
     _FETCH_MISSING_REF_NEEDLE,
@@ -30,6 +26,7 @@ from src.daemon.git_ops import (
 from src.keyspace import upload_pending, upload_pending_count
 from src.models import TaskStatus
 from src.retry import retry_transient
+from src.task_attempts import AttemptChanged, load_attempt
 
 logger = logging.getLogger(__name__)
 
@@ -286,7 +283,6 @@ return 0
 
         staging_dir = Path(manifest["staging_dir"]) if "staging_dir" in manifest else Path("/data/uploads") / self.name
         filenames: list[str] = manifest.get("files", [])
-        task_hashes = manifest.get("task_hashes", {})
         commit_subject = manifest.get("commit_subject")
         include_commit_body = isinstance(commit_subject, str) and bool(
             commit_subject.strip()
@@ -295,8 +291,6 @@ return 0
             commit_subject = "chore: upload sprint tasks via dashboard"
         else:
             commit_subject = commit_subject.strip()
-        if not isinstance(task_hashes, dict):
-            task_hashes = {}
         if not filenames or not staging_dir.is_dir():
             logger.warning("%s: upload manifest has no files or staging dir missing", self.name)
             await self.redis.delete(key)
@@ -327,6 +321,33 @@ return 0
         try:
             tasks_dir = Path(self.repo_path) / "tasks"
             tasks_dir.mkdir(exist_ok=True)
+            await self._snapshot_accepted_specs()
+            admissions = []
+            available_ids = {path.stem for path in tasks_dir.glob("PR-*.md")} | {
+                Path(name).stem for name in stageable_filenames if name.startswith("PR-")
+            }
+            for fname in stageable_filenames:
+                if fname.startswith("PR-") and fname.endswith(".md"):
+                    task_id = Path(fname).stem
+                    target = tasks_dir / fname
+                    current = await load_attempt(self.redis, self.name, task_id)
+                    prior_files = manifest.get("prior_spec_files", {})
+                    current_hash = task_spec_content_hash(target.read_text()) if target.is_file() else None
+                    incoming_hash = task_spec_content_hash((staging_dir / fname).read_text())
+                    if task_id in prior_files:
+                        if current_hash != prior_files[task_id] and not (
+                            current and current.fingerprint == incoming_hash and current_hash == incoming_hash
+                            and current.previous_rejection == manifest.get("rejection_tokens", {}).get(task_id)
+                        ):
+                            raise AttemptChanged("Task changed or was deleted after upload; submit it again.")
+                    elif current and not target.is_file():
+                        raise AttemptChanged("Task was deleted; an old pending upload cannot recreate it.")
+                    candidate = await self._reserve_admission(
+                        staging_dir / fname, token=manifest.get("rejection_tokens", {}).get(Path(fname).stem),
+                        upload=True, available_ids=available_ids,
+                    )
+                    if candidate:
+                        admissions.append(candidate)
             for fname in stageable_filenames:
                 src = staging_dir / fname
                 if src.is_file():
@@ -369,20 +390,8 @@ return 0
                 lambda: git_ops._git(self.repo_path, "push", "origin", branch, timeout=60),
                 operation_name=f"git push origin {branch}",
             )
-            try:
-                for task_id, task_hash in task_hashes.items():
-                    await record_task_spec_hash(
-                        self.redis,
-                        self.name,
-                        str(task_id),
-                        str(task_hash),
-                    )
-                    await reset_retry_count(self.redis, self.name, str(task_id))
-            except Exception as exc:
-                logger.error("%s: upload metadata update failed: %s", self.name, exc)
-                self.log_event(f"[INFRA] Upload metadata update failed: {exc}.")
-                await self._clear_upload_pending_count_if_manifest_matches(key, raw)
-                return None
+            for attempt in admissions:
+                await self._finish_admission(attempt)
             task_count = len(
                 {
                     name
@@ -394,43 +403,8 @@ return 0
                 f"[INFRA] Uploaded {task_count} task files to tasks/ "
                 f"and pushed to {branch}."
             )
-            # Re-uploading a task file is the user's signal to retry a
-            # previously parked task. Flag-on repos clear the suppression via
-            # the cancellation record below; flag-off repos still clear the
-            # legacy in-memory crash marker here.
-            uploaded_pr_ids = {
-                Path(name).stem
-                for name in stageable_filenames
-                if name.startswith("PR-") and name.endswith(".md")
-            }
-            crashed_pr_ids = getattr(self, "_crashed_task_pr_ids", None)
-            use_single_error_exit = getattr(
-                getattr(self.repo_config, "feature_flags", None),
-                "use_single_error_exit",
-                False,
-            )
-            if (
-                crashed_pr_ids
-                and not use_single_error_exit
-            ):
-                crashed_pr_ids.difference_update(uploaded_pr_ids)
-            clear_status_write_failed = getattr(
-                self,
-                "_clear_status_write_failed_task_ids",
-                None,
-            )
-            if uploaded_pr_ids and clear_status_write_failed is not None:
-                await clear_status_write_failed(uploaded_pr_ids)
-            if uploaded_pr_ids:
-                for pr_id in uploaded_pr_ids:
-                    await safe_delete_cancellation_cause(
-                        self.redis,
-                        self.name,
-                        pr_id,
-                        log=self.log_event,
-                    )
-                self._clear_canceled_in_snapshot(uploaded_pr_ids)
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
+            self._clear_canceled_in_snapshot({attempt.task.pr_id for attempt in admissions})
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError, ValueError) as exc:
             logger.error("%s: upload git operations failed: %s", self.name, exc)
             self.log_event(f"[INFRA] Upload push failed: {exc}.")
             if not _safe:

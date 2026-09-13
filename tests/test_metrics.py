@@ -237,6 +237,7 @@ async def test_record_serialization() -> None:
         "languages_touched": [],
         "operator_intervention": False,
         "outcome": "merged",
+        "attempt_id": "",
         "attempt_index": 1,
         "head_sha": "",
         "run_phase": "coding",

@@ -96,6 +96,7 @@ from src.daemon.preflight import PreflightMixin
 from src.daemon.rate_limit import RateLimitMixin
 from src.daemon.recovery import RecoveryMixin
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
+from src.daemon.rejection_commands import RejectionCommandMixin
 from src.daemon.repo_ops import RepoOpsMixin
 from src.daemon.retry_commands import RetryCommandMixin, RetryDispatch
 from src.daemon.selector import (
@@ -104,6 +105,7 @@ from src.daemon.selector import (
     resolve_active_coder,
     resolve_pause_coder,
 )
+from src.daemon.task_admission import TaskAdmissionMixin
 from src.events import publish_repo_event
 from src.events.publisher import validate_event_tier
 from src.github import gh_runner
@@ -139,6 +141,7 @@ from src.subsource_registry import (
     is_operator_clearable,
 )
 from src.suppression.redis_store import RedisSuppressionStore
+from src.task_attempts import load_attempt, save_attempt
 from src.usage import UsageProvider
 from src.utils import repo_slug_from_url
 
@@ -299,6 +302,8 @@ _EXTENSION_LANGUAGE_MAP = {
 
 
 class PipelineRunner(
+    TaskAdmissionMixin,
+    RejectionCommandMixin,
     ApprovalCommandMixin,
     RetryCommandMixin,
     RecoveryMixin,
@@ -1043,6 +1048,7 @@ class PipelineRunner(
         self._current_run_record = RunRecord(
             run_id=str(uuid.uuid4()),
             task_id=task.pr_id,
+            attempt_id=task.attempt_id or "",
             profile_id=f"{coder_name}:{model}:container",
             task_type=task_type,
             complexity=complexity,
@@ -1421,6 +1427,7 @@ class PipelineRunner(
             self._current_run_record = None
             return
         try:
+            attempt = await load_attempt(self.redis, self.name, task.pr_id)
             recent = await self._metrics_store.recent(
                 task_id=task.pr_id,
                 limit=20,
@@ -1434,7 +1441,11 @@ class PipelineRunner(
             )
             return
         self._current_run_record = next(
-            (record for record in recent if record.task_id == task.pr_id),
+            (record for record in recent if record.task_id == task.pr_id and (
+                attempt is None
+                or record.attempt_id == attempt.attempt_id
+                or (not attempt.previous_rejection and not record.attempt_id)
+            )),
             None,
         )
 
@@ -1449,6 +1460,30 @@ class PipelineRunner(
         cause_subsource: str | None = None,
     ) -> None:
         """Finalize and persist the active run record."""
+        if exit_reason in {"success_merged", "coding_complete"} and self.state.current_task:
+            try:
+                attempt = await load_attempt(self.redis, self.name, self.state.current_task.pr_id)
+                task_id_matches = attempt and (
+                    self.state.current_task.attempt_id == attempt.attempt_id
+                    or (not attempt.previous_rejection and self.state.current_task.attempt_id is None)
+                )
+                record_matches = (
+                    self._current_run_record is None
+                    or (not attempt.previous_rejection and not self._current_run_record.attempt_id)
+                    or self._current_run_record.attempt_id == attempt.attempt_id
+                ) if attempt else False
+                if attempt and not (task_id_matches and record_matches):
+                    self.log_event("[RECOVERY] Ignoring a completion callback from an obsolete attempt.")
+                    return
+                if task_id_matches and record_matches:
+                    updated = attempt.model_copy(update={
+                        "completed": attempt.completed or exit_reason == "success_merged",
+                        "pr_number": self.state.current_pr.number if self.state.current_pr else attempt.pr_number,
+                        "pr_creation_pending": False,
+                    })
+                    await save_attempt(self.redis, self.name, updated, expected=attempt)
+            except Exception:
+                self.log_event("[RECOVERY] Completion receipt deferred; Git/GitHub merge evidence remains available.")
         record = self._current_run_record
         if record is None:
             return
@@ -2012,6 +2047,12 @@ class PipelineRunner(
         blocked_reason: SuppressionReason | str | None = None,
     ) -> bool:
         """Best-effort commit of daemon-written task frontmatter status."""
+        try:
+            attempt = await load_attempt(self.redis, self.name, current_task.pr_id)
+            if attempt and attempt.rejection and status != "ERROR":
+                return False
+        except Exception:
+            return False
         task_file = getattr(current_task, "task_file", None)
         pr_id = getattr(current_task, "pr_id", "")
         if not task_file:
@@ -2282,6 +2323,10 @@ class PipelineRunner(
     ) -> None:
         """Watch Redis for user stop commands while CODING is active."""
         while not cli_task.done():
+            if await self._attempt_execution_blocked():
+                await self._terminate_current_coder()
+                cli_task.cancel()
+                return
             if await self._pop_stop_request():
                 self._stop_requested = True
                 self.state.user_paused = True
@@ -2847,6 +2892,8 @@ class PipelineRunner(
 
     async def _run_cycle_body(self) -> None:
         """Inner state-machine step; ``run_cycle`` wraps it for burn tracking."""
+        if await self._consume_rejection_commands():
+            return
         if await self._consume_approval_command():
             return
 

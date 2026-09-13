@@ -177,33 +177,17 @@ def test_dispatch_legacy_escalate_category_record_logs_warning(
     ), events
 
 
-def test_dispatch_redis_failure_falls_back_to_crash_branch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A Redis read failure preserves the pre-PR-318 crash log line.
-
-    Recovery cannot prove the previous run was a deliberate park if it
-    cannot read Redis; defaulting to ``crash`` keeps the back-compatible
-    log line that dashboards have grepped on since PR-186 and that
-    legacy tests assert against.
-    """
+def test_dispatch_redis_failure_defers_ownership_recovery(monkeypatch) -> None:
     runner = _crashed_doing_runner(monkeypatch)
 
-    async def boom(key: str) -> Any:
+    async def boom(key):
         raise RuntimeError("redis down")
 
-    runner.redis.get = boom  # type: ignore[method-assign]
-
-    asyncio.run(runner.recover_state())
-
+    runner.redis.get = boom
+    assert asyncio.run(runner.recover_state()) is False
     events = [e["event"] for e in runner.state.history]
-    assert any(
-        "failed to read cancellation cause for PR-318" in ev for ev in events
-    ), events
-    assert any(
-        ev.startswith("[INFRA] Task PR-318 crashed, marking ERROR.")
-        for ev in events
-    ), events
+    assert any("Attempt ownership unavailable; recovery is deferred" in ev for ev in events)
+    assert not any("crashed, marking ERROR" in ev for ev in events)
 
 
 def test_dispatch_empty_subsource_routes_to_crash_branch(

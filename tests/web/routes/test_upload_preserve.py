@@ -3,7 +3,7 @@
 The dashboard upload route rewrites incoming task-file content so that a
 re-uploaded ``status: TODO`` spec cannot regress an on-disk
 ``status: DONE`` task. ``status: ERROR`` is intentionally left replaceable
-because re-upload is the documented retry signal — see
+for legacy queued input; active attempt ownership is checked by
 ``src/daemon/repo_ops.py``. The transform happens before files are staged
 under ``/data/uploads/``, so the daemon's later ``shutil.copy2`` into
 ``tasks/`` carries the preserved DONE status.
@@ -73,6 +73,12 @@ def one_repo_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    from src import task_admission
+    from src.github import prs
+    monkeypatch.setattr(task_admission, "gh_pr_get_merged_branches", lambda *a, **kw: set())
+    monkeypatch.setattr(task_admission, "get_merged_pr_ids", lambda *a, **kw: set())
+    monkeypatch.setattr(task_admission, "get_recorded_completions", lambda *a, **kw: set())
+    monkeypatch.setattr(prs, "get_merged_prs", lambda *a, **kw: [])
     return cfg
 
 
@@ -117,7 +123,8 @@ def _task_text(
     body = _task_body(pr_id, title)
     if status is None:
         return body
-    return f"---\nstatus: {status}\n---\n\n{body}"
+    reason = "blocked_reason: crash\n" if status == "ERROR" else ""
+    return f"---\nstatus: {status}\n{reason}---\n\n{body}"
 
 
 def _task_upload(
@@ -175,14 +182,12 @@ def test_upload_preserves_done_status_on_collision(
 
     resp = _post([_task_upload("PR-322", status="TODO", title="Regenerated spec")])
 
-    assert resp.status_code == 200
-    staged = _staged_text(uploads_dir, "PR-322.md")
-    assert "status: DONE" in staged.splitlines()[1]
-    assert "status: TODO" not in staged
-    assert "Regenerated spec" in staged
+    assert resp.status_code == 400, resp.text
+    assert not list(uploads_dir.rglob("*.md"))
+    assert not list(uploads_dir.rglob("manifest.json"))
 
 
-def test_upload_replaces_error_status_on_collision(
+def test_legacy_error_requires_reconciliation_before_rewrite(
     one_repo_config: Path,
     repo_dir: Path,
     uploads_dir: Path,
@@ -197,9 +202,8 @@ def test_upload_replaces_error_status_on_collision(
 
     resp = _post([_task_upload("PR-322", status="TODO", title="Regenerated body")])
 
-    assert resp.status_code == 200
-    staged = _staged_text(uploads_dir, "PR-322.md")
-    assert staged == _task_text("PR-322", status="TODO", title="Regenerated body")
+    assert resp.status_code == 400
+    assert not list(uploads_dir.rglob("*.md"))
 
 
 def test_upload_replaces_todo_status_on_collision(
@@ -269,9 +273,9 @@ def test_upload_replaces_malformed_existing_file_with_unclosed_frontmatter(
 
     resp = _post([_task_upload("PR-322", status="TODO", title="Repair upload")])
 
-    assert resp.status_code == 200
-    staged = _staged_text(uploads_dir, "PR-322.md")
-    assert staged == _task_text("PR-322", status="TODO", title="Repair upload")
+    assert resp.status_code == 400, resp.text
+    assert not list(uploads_dir.rglob("*.md"))
+    assert not list(uploads_dir.rglob("manifest.json"))
 
 
 def test_upload_zip_partial_preserve(
@@ -295,14 +299,9 @@ def test_upload_zip_partial_preserve(
     ]
     resp = _post([_zip_upload(entries)])
 
-    assert resp.status_code == 200
-    staged_100 = _staged_text(uploads_dir, "PR-100.md")
-    staged_101 = _staged_text(uploads_dir, "PR-101.md")
-    staged_102 = _staged_text(uploads_dir, "PR-102.md")
-    assert "status: DONE" in staged_100.splitlines()[1]
-    assert "Regenerated 100" in staged_100
-    assert staged_101 == _task_text("PR-101", status="TODO", title="Regenerated 101")
-    assert staged_102 == _task_text("PR-102", status="TODO", title="Brand new 102")
+    assert resp.status_code == 400, resp.text
+    assert not list(uploads_dir.rglob("*.md"))
+    assert not list(uploads_dir.rglob("manifest.json"))
 
 
 def test_upload_audit_event_records_preserved_collisions(
@@ -344,10 +343,9 @@ def test_upload_preserves_done_status_with_quoted_value(
 
     resp = _post([_task_upload("PR-322", status="TODO", title="Regenerated")])
 
-    assert resp.status_code == 200
-    staged = _staged_text(uploads_dir, "PR-322.md")
-    assert "status: DONE" in staged.splitlines()[1]
-    assert "Regenerated" in staged
+    assert resp.status_code == 400, resp.text
+    assert not list(uploads_dir.rglob("*.md"))
+    assert not list(uploads_dir.rglob("manifest.json"))
 
 
 def test_upload_preserves_done_status_with_trailing_comment(
@@ -367,10 +365,9 @@ def test_upload_preserves_done_status_with_trailing_comment(
 
     resp = _post([_task_upload("PR-322", status="TODO", title="Regenerated")])
 
-    assert resp.status_code == 200
-    staged = _staged_text(uploads_dir, "PR-322.md")
-    assert "status: DONE" in staged.splitlines()[1]
-    assert "Regenerated" in staged
+    assert resp.status_code == 400, resp.text
+    assert not list(uploads_dir.rglob("*.md"))
+    assert not list(uploads_dir.rglob("manifest.json"))
 
 
 def test_read_frontmatter_status_strips_inline_comment() -> None:
@@ -461,11 +458,9 @@ def test_upload_preserves_done_with_leading_blank_lines_on_existing(
 
     resp = _post([_task_upload("PR-322", status="TODO", title="Regenerated")])
 
-    assert resp.status_code == 200
-    staged = _staged_text(uploads_dir, "PR-322.md")
-    assert "status: DONE" in staged
-    assert "status: TODO" not in staged
-    assert "Regenerated" in staged
+    assert resp.status_code == 400, resp.text
+    assert not list(uploads_dir.rglob("*.md"))
+    assert not list(uploads_dir.rglob("manifest.json"))
 
 
 def test_upload_preserves_done_when_upload_has_leading_blank_lines(
@@ -498,12 +493,9 @@ def test_upload_preserves_done_when_upload_has_leading_blank_lines(
 
     resp = _post(files)
 
-    assert resp.status_code == 200
-    staged = _staged_text(uploads_dir, "PR-322.md")
-    assert staged.count("---\nstatus:") == 1
-    assert "status: DONE" in staged
-    assert "status: TODO" not in staged
-    assert "Regenerated spec" in staged
+    assert resp.status_code == 400, resp.text
+    assert not list(uploads_dir.rglob("*.md"))
+    assert not list(uploads_dir.rglob("manifest.json"))
 
 
 def test_replace_frontmatter_status_skips_leading_blank_lines() -> None:
@@ -525,10 +517,9 @@ def test_upload_preserves_done_when_existing_has_duplicate_status_keys(
 
     resp = _post([_task_upload("PR-322", status="TODO", title="Regenerated")])
 
-    assert resp.status_code == 200
-    staged = _staged_text(uploads_dir, "PR-322.md")
-    assert "status: DONE" in staged
-    assert "Regenerated" in staged
+    assert resp.status_code == 400, resp.text
+    assert not list(uploads_dir.rglob("*.md"))
+    assert not list(uploads_dir.rglob("manifest.json"))
 
 
 def test_preserve_terminal_status_missing_existing_file(tmp_path: Path) -> None:
@@ -578,7 +569,6 @@ def test_upload_zip_with_duplicate_entry_earlier_non_utf8(
 
     resp = _post([zip_field])
 
-    assert resp.status_code == 200, resp.text
-    staged = _staged_text(uploads_dir, "PR-322.md")
-    assert "status: DONE" in staged.splitlines()[1]
-    assert "Regenerated body" in staged
+    assert resp.status_code == 400, resp.text
+    assert not list(uploads_dir.rglob("*.md"))
+    assert not list(uploads_dir.rglob("manifest.json"))

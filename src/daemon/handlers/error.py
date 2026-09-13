@@ -24,6 +24,7 @@ from src.diagnosis import parse_diagnosis
 from src.models import PipelineState
 from src.retry import retry_transient
 from src.subsource_registry import SuppressionReason
+from src.task_attempts import load_attempt
 
 logger = logging.getLogger(__name__)
 _CLAUDE_CLI_COAUTHOR = "Co-authored-by: Claude CLI <noreply@anthropic.com>"
@@ -141,6 +142,16 @@ class ErrorMixin:
             "[BRANCH] handle_error: %s",
             BranchContext.from_runner(self).log_summary(),
         )
+        if await self._attempt_execution_blocked():
+            return
+        if self.state.current_task and self.state.current_pr is None:
+            attempt = await load_attempt(self.redis, self.name, self.state.current_task.pr_id)
+            if attempt and attempt.pr_creation_pending:
+                self.log_event(
+                    "[RECOVERY] PR creation acknowledgement unresolved; "
+                    "reconcile GitHub before retrying implementation."
+                )
+                return
         # The cancellation cause was written by the prior _transition_to_error
         # call. Any IDLE-for-retry path below means the task continues, so
         # the previously recorded cause must be cleared — otherwise a later

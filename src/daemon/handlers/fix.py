@@ -220,6 +220,8 @@ class FixMixin(BreachMixin):
 
     async def handle_fix(self) -> None:
         """Run ``FIX FEEDBACK`` via the active coder CLI and return to WATCH."""
+        if await self._attempt_execution_blocked():
+            return
         self._stop_requested = False
         # PR-358: a FIX entry begins a new review iteration; clear the
         # single-shot review_timeout repost flag so the next WATCH
@@ -357,6 +359,7 @@ class FixMixin(BreachMixin):
         fix_kwargs: dict[str, object] = {
             **plugin_run_kwargs,
             "on_process_start": self._track_current_coder_process,
+            "attempt_id": self.state.current_task.attempt_id if self.state.current_task else None,
         }
         if self.state.current_task is not None:
             fix_kwargs["pr_id"] = self.state.current_task.pr_id
@@ -391,6 +394,8 @@ class FixMixin(BreachMixin):
         try:
             code, stdout, stderr = await claude_task
         except asyncio.CancelledError:
+            if await self._attempt_execution_blocked():
+                return
             if self._stop_requested:
                 stop_cancelled = True
                 code, stdout, stderr = 1, "", ""

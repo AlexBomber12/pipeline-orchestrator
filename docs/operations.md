@@ -30,23 +30,54 @@ passes on every repository.
 
 ## Recovery from ERROR
 
-When a task ships its terminal failure state to ERROR (frontmatter
-status:ERROR), the operator has two recovery affordances:
+Use the **Retry button** for an unchanged specification after a retryable failure. The
+request is durable; the daemon applies it when existing Pause, Stop, budget,
+provider and dependency controls permit. Retry preserves the existing PR and
+implementation. Its per-task allowance is controlled by
+`daemon.retry_button_cap` (default 3).
 
-1. **Retry button** — clears the cancellation_cause record + frontmatter
-   status, daemon re-dispatches the spec from the top on the next IDLE
-   cycle. Retry counter capped by `DaemonConfig.retry_button_cap`
-   (default 3, configurable via `daemon.retry_button_cap` in `config.yml`)
-   in Redis (resets on file content change). Deployments that override
-   the cap will enforce that configured value, not the default.
+**Approve** permits the selected guardrail deviation and continues the existing
+PR with its work intact. CI and review gates still apply. Approval remains bound
+to the current finding and HEAD; extending it to the entire PR is a separate
+follow-up.
 
-2. **Re-upload spec with changed content** — file content hash differs
-   from stored hash → daemon treats as fresh task, cancellation_cause
-   cleared, retry counter reset.
+**Reject** is final for the current attempt. The confirmation explains that the
+daemon will stop attempt-owned execution and close that exact PR without merging.
+An HTTP acknowledgement means the request was accepted. The guardrail panel shows
+stopping, closure awaiting confirmation, deferred verification, and final
+rejection separately. A timeout is not closure confirmation. The same durable
+operation is reconciled after restart; retrying closure does not retry coding.
+If the PR already merged, its task is completed and cannot be reused.
 
-Both affordances are mutually exclusive: Retry is for unchanged content
-("try again, environment may have transient issue"); re-upload is for
-changed content ("operator iterated on the spec itself").
+After final rejection, manually rewrite or remove unfinished task specifications
+and update their dependencies. An unfinished task may retain its filename, task
+ID and branch. Its specification must actually change: changing only `status`
+or `blocked_reason`, or re-uploading identical content, cannot bypass rejection.
+An identical rejected specification has no ordinary Retry action. Tasks that
+were queued but never started can also be rewritten with the same IDs.
+
+Re-upload specs through the existing task upload control, or commit them to the
+configured base. Uploads and Git synchronization use the same admission checks.
+Completion is established using Git/GitHub merge evidence and verified completion
+records, including implementation through another PR. Checks retain the previous
+accepted file identity before replacement; unavailable evidence defers admission.
+A ZIP does not delete omitted tasks. Deletion is an explicit Git change, and
+missing dependencies remain blockers until the operator fixes them.
+
+Before manually replacing an unfinished task set, **pause repository processing
+and confirm process quiescence**. Resolve pending rejection/admission operations
+first. A legacy record without exact ownership, an unknown process, uncommitted
+checkout files, or an unexpected branch update requires operator reconciliation.
+The daemon reports the missing evidence and holds the attempt.
+
+Once admission succeeds, scheduling is automatic, subject to existing Pause,
+Stop, dependencies and inhibitors; no additional task Retry click is required.
+A reused branch is removed only when its exact old HEAD belongs to the confirmed
+closed, unmerged attempt. The new coder creates its branch from the current
+configured base and creates a **new PR number**, with its own CI, review and
+approval evidence. The rejected PR stays closed. Closing it does not erase its
+historical commits. There is no same-PR specification revision or automatic
+salvage, dependency rewriting, or sprint replanning.
 
 ## WorkInhibitor rollback
 

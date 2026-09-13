@@ -134,6 +134,8 @@ class WatchMixin:
 
     async def handle_watch(self) -> None:
         """Poll PR status and decide whether to merge, fix, hang, or wait."""
+        if await self._attempt_execution_blocked():
+            return
         if self.state.current_pr is None:
             self.state.state = PipelineState.IDLE
             self.log_event("[WATCH] WATCH without current_pr -> IDLE.")

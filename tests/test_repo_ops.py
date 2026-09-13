@@ -84,6 +84,14 @@ class _Runner(repo_ops.RepoOpsMixin):
         self.cleared_status_write_failed_calls = 0
         self.state = SimpleNamespace(current_queue=None)
 
+    async def _snapshot_accepted_specs(self) -> None:
+        # This mixin fixture isolates manifest/Git delivery of admitted replays.
+        # Real admission, reset and restart behavior lives in test_task_admission.
+        return None
+
+    async def _reserve_admission(self, *args, **kwargs):
+        return None
+
     def log_event(self, message: str) -> None:
         self.events.append(message)
 
@@ -534,40 +542,6 @@ def test_process_pending_uploads_success_and_nothing_to_commit(
     )
 
 
-def test_process_pending_uploads_persists_task_hash_after_push(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runner = _Runner(tmp_path)
-    repo_dir = Path(runner.repo_path)
-    repo_dir.mkdir(parents=True)
-    staging = tmp_path / "uploads" / "demo"
-    staging.mkdir(parents=True)
-    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
-    key = f"upload:{runner.name}:pending"
-    manifest = json.dumps(
-        {
-            "files": ["PR-001.md"],
-            "staging_dir": str(staging),
-            "task_hashes": {"PR-001": "new-hash"},
-        }
-    )
-    runner.redis.store[key] = manifest
-    runner.redis.store[task_spec_hash_key("demo", "PR-001")] = "old-hash"
-    runner.redis.store[retry_count_key("demo", "PR-001")] = "3"
-
-    monkeypatch.setattr(
-        repo_ops.git_ops,
-        "_git",
-        lambda *args, **kwargs: _FakeCompletedProcess(),
-    )
-    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
-    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
-
-    assert _run(runner.process_pending_uploads()) is True
-    assert runner.redis.store[task_spec_hash_key("demo", "PR-001")] == "new-hash"
-    assert runner.redis.store[retry_count_key("demo", "PR-001")] == "0"
-    assert key not in runner.redis.store
 
 
 def test_process_pending_uploads_uses_manifest_commit_subject_and_body(
@@ -609,105 +583,10 @@ def test_process_pending_uploads_uses_manifest_commit_subject_and_body(
     ) in git_calls
 
 
-def test_process_pending_uploads_ignores_malformed_task_hashes(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runner = _Runner(tmp_path)
-    Path(runner.repo_path).mkdir(parents=True)
-    staging = tmp_path / "uploads" / "demo"
-    staging.mkdir(parents=True)
-    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
-    key = f"upload:{runner.name}:pending"
-    runner.redis.store[key] = json.dumps(
-        {
-            "files": ["PR-001.md"],
-            "staging_dir": str(staging),
-            "task_hashes": ["not", "a", "mapping"],
-        }
-    )
-
-    monkeypatch.setattr(
-        repo_ops.git_ops,
-        "_git",
-        lambda *args, **kwargs: _FakeCompletedProcess(),
-    )
-    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
-    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
-
-    assert _run(runner.process_pending_uploads()) is True
-    assert task_spec_hash_key("demo", "PR-001") not in runner.redis.store
 
 
-def test_process_pending_uploads_keeps_manifest_when_metadata_update_fails(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runner = _Runner(tmp_path)
-    Path(runner.repo_path).mkdir(parents=True)
-    staging = tmp_path / "uploads" / "demo"
-    staging.mkdir(parents=True)
-    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
-    key = f"upload:{runner.name}:pending"
-    manifest = json.dumps(
-        {
-            "files": ["PR-001.md"],
-            "staging_dir": str(staging),
-            "task_hashes": {"PR-001": "new-hash"},
-        }
-    )
-    runner.redis.store[key] = manifest
-
-    async def fail_set(key: str, value: str, **kwargs: object) -> None:
-        raise RuntimeError("redis down")
-
-    runner.redis.set = fail_set  # type: ignore[method-assign]
-    monkeypatch.setattr(
-        repo_ops.git_ops,
-        "_git",
-        lambda *args, **kwargs: _FakeCompletedProcess(),
-    )
-    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
-
-    assert _run(runner.process_pending_uploads()) is None
-    assert runner.redis.store[key] == manifest
-    assert any("Upload metadata update failed" in event for event in runner.events)
 
 
-def test_process_pending_uploads_leaves_task_hash_on_git_failure(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runner = _Runner(tmp_path)
-    repo_dir = Path(runner.repo_path)
-    repo_dir.mkdir(parents=True)
-    staging = tmp_path / "uploads" / "demo"
-    staging.mkdir(parents=True)
-    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
-    key = f"upload:{runner.name}:pending"
-    manifest = json.dumps(
-        {
-            "files": ["PR-001.md"],
-            "staging_dir": str(staging),
-            "task_hashes": {"PR-001": "new-hash"},
-        }
-    )
-    runner.redis.store[key] = manifest
-    runner.redis.store[task_spec_hash_key("demo", "PR-001")] = "old-hash"
-    runner.redis.store[retry_count_key("demo", "PR-001")] = "3"
-
-    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> _FakeCompletedProcess:
-        if args[:1] == ("push",):
-            raise subprocess.CalledProcessError(1, ["git", "push"], stderr="nope")
-        return _FakeCompletedProcess()
-
-    monkeypatch.setattr(repo_ops.git_ops, "_git", fake_git)
-    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
-
-    assert _run(runner.process_pending_uploads()) is None
-    assert runner.redis.store[task_spec_hash_key("demo", "PR-001")] == "old-hash"
-    assert runner.redis.store[retry_count_key("demo", "PR-001")] == "3"
-    assert runner.redis.store[key] == manifest
 
 
 def test_process_pending_uploads_returns_none_when_newer_manifest_exists(
@@ -792,184 +671,18 @@ def test_process_pending_uploads_counts_unique_task_filenames_in_log_event(
     )
 
 
-def test_process_pending_uploads_clears_crashed_pr_ids_on_reupload_with_sibling(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """PR-186: Re-uploading a previously-crashed task file is the user's
-    signal to retry. The crashed-pr-ids set on the runner must be
-    cleared for any uploaded PR-id so the next IDLE cycle picks the
-    task again instead of treating it as still ERROR. Other
-    crashed entries that were not re-uploaded must remain intact."""
-    runner = _Runner(tmp_path)
-    runner._crashed_task_pr_ids.update({"PR-001", "PR-999"})
-    Path(runner.repo_path).mkdir(parents=True)
-    staging = tmp_path / "uploads" / "demo"
-    staging.mkdir(parents=True)
-    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
-    key = f"upload:{runner.name}:pending"
-    manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
-    runner.redis.store[key] = manifest
-
-    monkeypatch.setattr(repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess())
-    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
-    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
-
-    assert _run(runner.process_pending_uploads()) is True
-    assert runner._crashed_task_pr_ids == {"PR-999"}
 
 
-def test_process_pending_uploads_clears_status_write_fallback_on_reupload(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Re-uploading a task clears the in-memory status-write fallback."""
-    runner = _Runner(tmp_path)
-    runner._status_write_failed_task_pr_ids.update({"PR-001", "PR-999"})
-    runner.redis.store["recovered_tasks:demo"] = '["PR-001"]'
-    Path(runner.repo_path).mkdir(parents=True)
-    staging = tmp_path / "uploads" / "demo"
-    staging.mkdir(parents=True)
-    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
-    key = f"upload:{runner.name}:pending"
-    manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
-    runner.redis.store[key] = manifest
-
-    monkeypatch.setattr(repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess())
-    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
-    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
-
-    assert _run(runner.process_pending_uploads()) is True
-    assert runner._status_write_failed_task_pr_ids == {"PR-999"}
-    assert runner.cleared_status_write_failed_calls == 1
-    assert "recovered_tasks:demo" not in runner.redis.store
 
 
-def test_process_pending_uploads_ignores_legacy_recovered_delete_failure(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Legacy marker cleanup is best-effort during re-upload."""
-    runner = _Runner(tmp_path)
-    runner._status_write_failed_task_pr_ids.add("PR-001")
-    runner.redis.store["recovered_tasks:demo"] = '["PR-001"]'
-    runner.redis.delete_error = RuntimeError("redis down")
-    Path(runner.repo_path).mkdir(parents=True)
-    staging = tmp_path / "uploads" / "demo"
-    staging.mkdir(parents=True)
-    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
-    key = f"upload:{runner.name}:pending"
-    manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
-    runner.redis.store[key] = manifest
-
-    monkeypatch.setattr(repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess())
-    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
-    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
-
-    assert _run(runner.process_pending_uploads()) is True
-    assert runner._status_write_failed_task_pr_ids == set()
-    assert runner.cleared_status_write_failed_calls == 1
 
 
-def test_process_pending_uploads_clears_persisted_status_fallback_before_hydrate(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Re-upload clears persisted fallback state even before recovery hydrates it."""
-    runner = _Runner(tmp_path)
-    runner.redis.store["status_write_failed_tasks:demo"] = '["PR-001", "PR-999"]'
-    Path(runner.repo_path).mkdir(parents=True)
-    staging = tmp_path / "uploads" / "demo"
-    staging.mkdir(parents=True)
-    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
-    key = f"upload:{runner.name}:pending"
-    manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
-    runner.redis.store[key] = manifest
-
-    monkeypatch.setattr(repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess())
-    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
-    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
-
-    assert _run(runner.process_pending_uploads()) is True
-    assert runner._status_write_failed_task_pr_ids == {"PR-999"}
-    assert json.loads(runner.redis.store["status_write_failed_tasks:demo"]) == [
-        "PR-999"
-    ]
 
 
-def test_process_pending_uploads_clears_cancellation_cause_on_reupload(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Re-uploading a task clears stale cancellation cause attribution."""
-    runner = _Runner(tmp_path)
-    runner.redis.store["cancellation:demo:PR-001"] = "{}"
-    Path(runner.repo_path).mkdir(parents=True)
-    staging = tmp_path / "uploads" / "demo"
-    staging.mkdir(parents=True)
-    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
-    key = f"upload:{runner.name}:pending"
-    manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
-    runner.redis.store[key] = manifest
-
-    monkeypatch.setattr(repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess())
-    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
-    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
-
-    assert _run(runner.process_pending_uploads()) is True
-    assert "cancellation:demo:PR-001" not in runner.redis.store
 
 
-def test_process_pending_uploads_clears_crashed_pr_ids_on_reupload(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Re-uploading an errored task file is the user's retry signal."""
-    runner = _Runner(tmp_path)
-    runner._crashed_task_pr_ids.update({"PR-001", "PR-999"})
-    Path(runner.repo_path).mkdir(parents=True)
-    staging = tmp_path / "uploads" / "demo"
-    staging.mkdir(parents=True)
-    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
-    key = f"upload:{runner.name}:pending"
-    manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
-    runner.redis.store[key] = manifest
-
-    monkeypatch.setattr(repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess())
-    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
-    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
-
-    assert _run(runner.process_pending_uploads()) is True
-    assert runner._crashed_task_pr_ids == {"PR-999"}
 
 
-def test_process_pending_uploads_flips_canceled_to_todo_in_snapshot(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """PR-267: Uploading a ERROR task flips its snapshot status to TODO."""
-    from src.models import QueueTask, TaskStatus
-
-    runner = _Runner(tmp_path)
-    runner.state.current_queue = [
-        QueueTask(pr_id="PR-001", title="Crashed", status=TaskStatus.ERROR),
-        QueueTask(pr_id="PR-002", title="Other", status=TaskStatus.TODO),
-    ]
-    Path(runner.repo_path).mkdir(parents=True)
-    staging = tmp_path / "uploads" / "demo"
-    staging.mkdir(parents=True)
-    (staging / "PR-001.md").write_text("# PR-001\n", encoding="utf-8")
-    key = f"upload:{runner.name}:pending"
-    manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
-    runner.redis.store[key] = manifest
-
-    monkeypatch.setattr(repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess())
-    monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
-    monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
-
-    assert _run(runner.process_pending_uploads()) is True
-    statuses = {q.pr_id: q.status for q in runner.state.current_queue}
-    assert statuses == {"PR-001": TaskStatus.TODO, "PR-002": TaskStatus.TODO}
 
 
 def test_clear_canceled_in_snapshot_refreshes_snapshot_timestamp(

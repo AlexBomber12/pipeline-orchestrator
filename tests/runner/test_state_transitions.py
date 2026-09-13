@@ -2537,3 +2537,21 @@ def test_handle_coding_honors_stop_requested_after_pr_poll_exhaustion(
     assert runner.state.current_pr is None
     assert attempts["count"] == 3
     assert any(entry["event"] == "[CODING] CODING aborted: user stop requested." for entry in runner.state.history)
+
+
+@pytest.mark.parametrize("boundary", [2, 3])
+def test_merge_rechecks_attempt_ownership_after_async_preparation(monkeypatch, boundary):
+    """A superseding operator decision prevents the irreversible merge call."""
+    h._patch_subprocess(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
+    observations = 0
+    async def ownership():
+        nonlocal observations
+        observations += 1
+        return observations >= boundary
+    monkeypatch.setattr(runner, "_attempt_execution_blocked", ownership)
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda *a: pytest.fail("rejected attempt cannot merge"))
+    asyncio.run(runner.handle_merge())
+    assert observations == boundary

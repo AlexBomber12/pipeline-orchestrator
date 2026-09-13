@@ -25,6 +25,16 @@
                           data-ts-unix="{{ entry.recorded_at }}">{{ entry.recorded_at_text }}</time>
                 </div>
                 <p class="break-words text-xs text-gray-300">{{ entry.excerpt }}</p>
+                {% if entry.rejection %}
+                <p class="text-xs text-gray-200" data-rejection-status="{{ entry.rejection.status }}">
+                    Reject {{ entry.rejection.status }}: {{ entry.rejection.reason }}
+                </p>
+                {% endif %}
+                {% if entry.replacement_accepted %}
+                <p class="text-xs text-ok">Rewritten task accepted. Its new attempt is scheduled subject to Pause, Stop, dependencies, and limits.</p>
+                {% elif entry.rejection_unavailable %}
+                <p class="text-xs text-warn">Exact rejection identity is unavailable. Refresh after daemon reconciliation; no PR will be selected by branch alone.</p>
+                {% endif %}
                 {% if entry.approval %}
                 <p class="text-xs text-gray-200" data-approval-status="{{ entry.approval.status }}">
                     Approval {{ entry.approval.status }}: {{ entry.approval.reason }}
@@ -45,15 +55,14 @@
                     Approve
                 </button>
                 {% endif %}
-                {% if not entry.approval or entry.approval.status != "applied" or (entry.approval_binding and entry.approval.binding != entry.approval_binding) %}
+                {% if entry.rejection_binding and not entry.rejection %}
                 <button type="button"
                         class="reject-btn rounded border border-fail/40 bg-fail/15 px-3 py-1 text-xs font-semibold text-fail hover:bg-fail/25"
                         hx-post="/repos/{{ repo.name }}/guardrail/{{ entry.pr_id }}/decision"
-                        hx-vals='{"decision": "reject"}'
-                        hx-confirm="Reject guardrail violation for {{ entry.pr_id }}? PR will be closed and task marked ERROR."
-                        hx-target="closest .guardrail-row"
-                        hx-swap="outerHTML"
-                        hx-on::before-swap="if (event.detail.xhr.status === 204) { event.detail.shouldSwap = true; }">
+                        hx-vals='{"decision": "reject", "binding": "{{ entry.rejection_binding }}"}'
+                        hx-confirm="Abandon {{ entry.pr_id }} and close its PR? Reject is final. Manually rewrite or remove unfinished tasks before a new attempt."
+                        hx-target="this"
+                        hx-swap="outerHTML">
                     Reject
                 </button>
                 {% endif %}

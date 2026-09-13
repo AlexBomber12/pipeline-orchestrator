@@ -312,7 +312,7 @@ def test_upload_handles_corrupt_state_and_accepts_busy_repos(
 
         class _BusyRedis:
             async def get(self, key: str) -> str | None:
-                return '{"url":"","name":"example__alpha","state":"CODING"}'
+                return '{"url":"","name":"example__alpha","state":"CODING"}' if key.startswith("pipeline:") else None
 
             async def set(self, key: str, value: str, **kwargs: object) -> None:
                 return None
@@ -456,6 +456,8 @@ def test_reupload_identical_content_returns_409(
     uploads_dir: Path,
 ) -> None:
     content = _task_bytes()
+    (repo_dir / "tasks").mkdir(exist_ok=True)
+    (repo_dir / "tasks" / "PR-001.md").write_bytes(content)
     expected_hash = _task_hash(content)
     with TestClient(app) as client:
         redis = client.app.state.redis
@@ -490,6 +492,8 @@ def test_reupload_status_only_change_returns_409(
         "- Coder: any\n"
     )
     uploaded = stored.replace("status: ERROR", "status: TODO")
+    (repo_dir / "tasks").mkdir(exist_ok=True)
+    (repo_dir / "tasks" / "PR-001.md").write_text(uploaded)
     with TestClient(app) as client:
         redis = client.app.state.redis
         redis._store["pipeline:example__alpha"] = _error_state_payload()
@@ -507,7 +511,7 @@ def test_reupload_status_only_change_returns_409(
     assert not (uploads_dir / "example__alpha").exists()
 
 
-def test_reupload_changed_content_proceeds(
+def test_reupload_active_task_requires_final_reject(
     one_repo_config: Path,
     repo_dir: Path,
     uploads_dir: Path,
@@ -533,16 +537,9 @@ def test_reupload_changed_content_proceeds(
         )
         assert redis._store[retry_count_key("example__alpha", "PR-001")] == "3"
 
-    assert resp.status_code == 200
-    assert "Accepted 1 task file (PR-001)." in resp.text
-    staging = next((uploads_dir / "example__alpha").iterdir())
-    assert (staging / "PR-001.md").read_bytes() == changed
-    manifest = json.loads(
-        client.app.state.redis._store["upload:example__alpha:pending"]
-    )
-    assert manifest["task_hashes"] == {
-        "PR-001": _task_hash(changed)
-    }
+    assert resp.status_code == 400
+    assert "active attempt owns" in resp.text
+    assert not (uploads_dir / "example__alpha").exists()
 
 
 def test_upload_new_task_no_existing_hash_proceeds(
@@ -670,7 +667,6 @@ def test_upload_blocks_when_pending_manifest_write_fails(
     original_hash = _task_hash(original)
     with TestClient(app) as client:
         client.app.state.redis = _PendingSetFails()
-        client.app.state.redis._store["pipeline:example__alpha"] = _error_state_payload()
         client.app.state.redis._store[
             task_spec_hash_key("example__alpha", "PR-001")
         ] = original_hash
@@ -1406,7 +1402,7 @@ def test_upload_writes_redis_manifest(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_task_file(name="PR-002.md")],
+            files=[_task_file(name="PR-002.md", pr_id="PR-002")],
         )
 
     assert resp.status_code == 200

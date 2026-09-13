@@ -174,6 +174,10 @@ class _FakeRedis:
             and (score < upper if upper_exclusive else score <= upper)
         )
 
+    async def zrange(self, key: str, start: int, stop: int, withscores: bool = False):
+        ordered = sorted(self.zsets.get(key, {}).items(), key=lambda item: item[1])
+        return [member for member, _ in ordered][start:stop + 1 if stop != -1 else None]
+
     async def zrangebyscore(
         self, key: str, min_score: object, max_score: object, start: int = 0, num: int | None = None
     ) -> list[str]:
@@ -234,6 +238,14 @@ class _FakeRedis:
         return 1
 
     async def eval(self, script: str, numkeys: int, *args: Any) -> int:
+        if script.lstrip().startswith('redis.call("set", KEYS[1], ARGV[1])'):
+            self.store[args[0]] = args[numkeys]
+            if args[numkeys + 1]:
+                self.store[args[1]] = args[numkeys + 1]
+            else:
+                self.store.pop(args[1], None)
+            return 1
+
         key = args[0]
         if numkeys >= 2:
             delete_key = args[1]
@@ -337,8 +349,12 @@ class _FakePipeline:
         self.commands.append(("zadd", (key, mapping), {}))
         return self
 
-    def delete(self, key: str) -> "_FakePipeline":
-        self.commands.append(("delete", (key,), {}))
+    def delete(self, *keys: str) -> "_FakePipeline":
+        self.commands.append(("delete", keys, {}))
+        return self
+
+    def sadd(self, key: str, member: str) -> "_FakePipeline":
+        self.commands.append(("sadd", (key, member), {}))
         return self
 
     def expire(self, key: str, seconds: int) -> "_FakePipeline":
@@ -356,11 +372,15 @@ class _FakePipeline:
                 await self.redis.set(args[0], args[1], **kwargs)
                 results.append(True)
             elif command == "delete":
-                results.append(await self.redis.delete(args[0]))
+                for key in args:
+                    await self.redis.delete(key)
+                results.append(len(args))
             elif command == "zadd":
                 results.append(await self.redis.zadd(args[0], args[1]))
             elif command == "expire":
                 results.append(await self.redis.expire(args[0], args[1]))
+            elif command == "sadd":
+                results.append(await self.redis.sadd(args[0], args[1]))
             elif command == "zrem":
                 results.append(await self.redis.zrem(args[0], *args[1:]))
         return results

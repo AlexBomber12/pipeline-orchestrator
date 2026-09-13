@@ -697,10 +697,12 @@ async def test_dashboard_retains_pending_deferred_applied_and_failed_results(app
     assert 'data-approval-status="applied"' in html and "CI and review" in html
     assert "reject-btn" not in html
     # An unrelated applied receipt must not hide either action for a new cause.
+    runner.state.state = PipelineState.ERROR
     await runner.redis.set(
         cause_key(runner.name, "PR-42"),
         CancellationCause(
-            category="ERROR", payload={"subsource": "guardrail", "category": "workflow_destruction"},
+            category="ERROR", task_id="PR-42", repo_slug=runner.name,
+            payload={"subsource": "guardrail", "category": "workflow_destruction"},
         ).to_redis(),
     )
     monkeypatch.setattr(dashboard, "list_pending_guardrail_decisions", AsyncMock(return_value=[pending]))
@@ -756,13 +758,6 @@ async def test_http_stale_binding_and_redis_failure_are_explicit(approval, monke
         runner.name, "PR-42", runner.repo_config, runner.redis, command.binding
     )
     assert response.status_code == 503
-
-
-async def test_reject_best_effort_label_failure_is_still_tolerated(monkeypatch):
-    from src.web.routes import repo_control
-
-    monkeypatch.setattr(repo_control, "_gh_subprocess", lambda *args: (1, "network error"))
-    await repo_control._gh_best_effort("test", 42, "label", [])
 
 
 async def test_watch_rescans_and_keeps_unrelated_findings(approval, monkeypatch):

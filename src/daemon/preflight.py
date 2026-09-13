@@ -14,6 +14,7 @@ from src.branch_context import BranchContext
 from src.daemon import git_ops
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
 from src.models import PipelineState
+from src.task_attempts import load_attempt
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,17 @@ class PreflightMixin:
         dirty = result.stdout.strip()
         policy = self._build_dirty_tree_policy()
         if dirty:
+            candidates = (
+                [self.state.current_task] if self.state.current_task else (self.state.current_queue or [])
+            )
+            for task in candidates:
+                attempt = await load_attempt(self.redis, self.name, task.pr_id)
+                if attempt and attempt.previous_rejection and not attempt.started:
+                    self.log_event(
+                        "[RECOVERY] New attempt checkout conflict; "
+                        "unrelated files are preserved pending reconciliation."
+                    )
+                    return False
             count = policy.increment(self)
             if count >= _DIRTY_CYCLES_BEFORE_AUTO_RESET:
                 self.log_event(

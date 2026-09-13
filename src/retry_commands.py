@@ -25,6 +25,7 @@ from src.keyspace import (
     retry_command_latest,
     retry_command_pending,
 )
+from src.task_attempts import AttemptChanged, TaskAttempt, attempt_key
 
 COMMAND_TTL_SECONDS = 90 * 24 * 3600
 RETRY_COUNT_TTL_SECONDS = 30 * 24 * 3600
@@ -65,6 +66,7 @@ class RetryCommandTransition(BaseModel):
 
 
 class RetryCommand(BaseModel):
+    attempt_id: str | None = None
     command_id: str
     repo_slug: str
     task_id: str
@@ -118,10 +120,12 @@ def retry_request_binding(
     pr_number: int | None,
     pr_branch: str | None,
     pr_head_sha: str | None,
+    attempt_id: str | None = None,
 ) -> str:
     """Return the stable idempotency/staleness token rendered by the UI."""
     payload = json.dumps(
         {
+            "attempt_id": attempt_id,
             "failure_id": failure_id,
             "pr_branch": pr_branch,
             "pr_head_sha": pr_head_sha,
@@ -155,9 +159,11 @@ def new_retry_command(
     bound_pr_branch: str | None = None,
     bound_pr_head_sha: str | None = None,
     now: datetime | None = None,
+    attempt_id: str | None = None,
 ) -> RetryCommand:
     moment = now or utc_now()
     command = RetryCommand(
+        attempt_id=attempt_id,
         command_id=str(uuid.uuid4()),
         repo_slug=repo_slug,
         task_id=task_id,
@@ -283,6 +289,14 @@ async def enqueue_retry_command(
             )
             if existing is not None:
                 return existing, False
+        raw_attempt = await pipe.get(attempt_key(command.repo_slug, command.task_id))
+        attempt = TaskAttempt.model_validate_json(raw_attempt) if raw_attempt else None
+        if attempt and (
+            attempt.rejection or attempt.admission_pending or attempt.completed
+            or (command.attempt_id and command.attempt_id != attempt.attempt_id)
+            or (attempt.previous_rejection and command.attempt_id != attempt.attempt_id)
+        ):
+            raise AttemptChanged("Retry belongs to a rejected or replaced attempt.")
         pipe.multi()
         pipe.set(command_key, _serialize(command), ex=COMMAND_TTL_SECONDS)
         pipe.set(dedupe_key, command.command_id, ex=COMMAND_TTL_SECONDS)
@@ -294,6 +308,7 @@ async def enqueue_retry_command(
     return await redis_client.transaction(
         _transaction,
         dedupe_key,
+        attempt_key(command.repo_slug, command.task_id),
         value_from_callable=True,
     )
 

@@ -202,6 +202,7 @@ async def run_claude_async(
     model: str | None = None,
     system_prompt_file: str | None = "CLAUDE.md",
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    attempt_id: str | None = None,
     breach_dir: str | None = None,
     breach_run_id: str | None = None,
     session_threshold: int | None = None,
@@ -231,6 +232,8 @@ async def run_claude_async(
         if weekly_threshold is not None:
             env["PIPELINE_WEEKLY_THRESHOLD"] = str(weekly_threshold)
 
+    if attempt_id is not None:
+        env["PIPELINE_ATTEMPT_ID"] = attempt_id
     cmd = _maybe_wrap_sandbox(cmd, cwd)
     proc: asyncio.subprocess.Process | None = None
     try:
@@ -288,6 +291,7 @@ async def run_planned_pr_async(
     model: str | None = None,
     timeout: int = 900,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    attempt_id: str | None = None,
     breach_dir: str | None = None,
     breach_run_id: str | None = None,
     session_threshold: int | None = None,
@@ -303,6 +307,8 @@ async def run_planned_pr_async(
     }
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
+    if attempt_id is not None:
+        kwargs["attempt_id"] = attempt_id
     return await run_claude_async("PLANNED PR", repo_path, **kwargs)
 
 
@@ -315,6 +321,7 @@ async def run_auto_pr_async(
     model: str | None = None,
     timeout: int = 900,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    attempt_id: str | None = None,
     breach_dir: str | None = None,
     breach_run_id: str | None = None,
     session_threshold: int | None = None,
@@ -331,6 +338,8 @@ async def run_auto_pr_async(
     }
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
+    if attempt_id is not None:
+        kwargs["attempt_id"] = attempt_id
     return await run_claude_async(
         _build_auto_pr_prompt(pr_id, task_file, task_body), repo_path, **kwargs
     )
@@ -341,6 +350,7 @@ async def fix_review_async(
     model: str | None = None,
     timeout: int | None = None,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    attempt_id: str | None = None,
     breach_dir: str | None = None,
     breach_run_id: str | None = None,
     session_threshold: int | None = None,
@@ -359,6 +369,8 @@ async def fix_review_async(
     }
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
+    if attempt_id is not None:
+        kwargs["attempt_id"] = attempt_id
     return await run_claude_async(
         _build_fix_feedback_prompt(
             extra_context,

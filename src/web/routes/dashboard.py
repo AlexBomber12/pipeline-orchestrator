@@ -59,12 +59,14 @@ from src.keyspace import (
 )
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState
+from src.rejection_commands import build_rejection, list_rejections
 from src.sandbox.runtime_state import (
     REDIS_SANDBOX_STATE_KEY,
     SandboxState,
 )
 from src.subsource_registry import all_subsources, group_for
 from src.subsource_registry import lookup as _subsource_lookup
+from src.task_attempts import load_attempt
 from src.utils import repo_slug_from_url
 from src.web.services.coder import _effective_coder_name
 from src.web.services.repo_state import (
@@ -242,7 +244,6 @@ def _coder_rate_limit_supported(coder: str | None) -> bool:
 
 _GUARDRAIL_EXCERPT_MAX_CHARS = 200
 _GUARDRAIL_PENDING_LIMIT = 100
-# Mirrors ``_extract_guardrail_metadata`` in ``src.web.routes.repo_control``:
 # coding.py and fix.py emit guardrail causes carrying only
 # ``payload.reason_text = "GUARDRAIL: {category}: {excerpt}"`` (watch.py
 # emits structured ``rule``/``excerpt`` directly), so without this parse the
@@ -255,8 +256,7 @@ def _resolve_guardrail_metadata(payload: dict[str, Any]) -> tuple[str, str]:
 
     Falls back through ``rule`` -> ``category`` -> parsed ``reason_text``
     so CODING/FIX-emitted causes (which carry only ``reason_text``) still
-    produce non-empty panel rows. Kept in lockstep with
-    ``_extract_guardrail_metadata`` in ``src.web.routes.repo_control``.
+    produce non-empty panel rows.
     """
     rule = payload.get("rule") or payload.get("category") or ""
     excerpt = payload.get("excerpt", "") or ""
@@ -424,9 +424,9 @@ async def _build_guardrail_pending_view(
     # separately from ``current_pr_url`` so an entry can be approve-eligible
     # even when ``current_pr.url`` is empty.
     active_pr_id: str | None = None
-    if state.current_task is not None and state.current_pr is not None:
+    if state.current_task is not None:
         active_pr_id = state.current_task.pr_id
-        if state.current_pr.url:
+        if state.current_pr is not None and state.current_pr.url:
             current_pr_url = state.current_pr.url
             current_task_pr_id = state.current_task.pr_id
     views = [
@@ -448,11 +448,23 @@ async def _build_guardrail_pending_view(
             if view["is_active"]:
                 raw = await redis_client.get(cause_key(repo_name, view["pr_id"]))
                 try:
+                    attempt = await load_attempt(redis_client, repo_name, view["pr_id"])
+                    if attempt and state.current_task:
+                        state.current_task.attempt_id = attempt.attempt_id
+                    try:
+                        rejection = build_rejection(repo_name, state, raw, Path(_app.REPOS_DIR) / repo_name)
+                        view["rejection_binding"] = rejection.binding
+                    except (ValueError, OSError):
+                        view["rejection_binding"] = None
+                        view["rejection_unavailable"] = True
                     command = build_approval(repo_name, state, raw, Path(_app.REPOS_DIR) / repo_name)
                     view["approval_binding"] = command.binding
                 except (ValueError, OSError):
                     view["approval_binding"] = None
-            matching = [c for c in commands if c.task.pr_id == view["pr_id"]]
+            matching = [
+                c for c in commands if c.task.pr_id == view["pr_id"]
+                and (not view["is_active"] or (state.current_pr and c.pr.number == state.current_pr.number))
+            ]
             if matching:
                 view["approval"] = matching[-1].model_dump(mode="json")
         visible = {v["pr_id"] for v in views}
@@ -468,6 +480,23 @@ async def _build_guardrail_pending_view(
     except Exception:
         for view in views:
             view["approval_unavailable"] = True
+    try:
+        rejections = await list_rejections(redis_client, repo_name)
+        for command in rejections[-20:]:
+            current = await load_attempt(redis_client, repo_name, command.task.pr_id)
+            views.append({
+                "pr_id": command.task.pr_id, "rule": "Operator rejection", "excerpt": command.reason,
+                "recorded_at": int(command.requested_at.timestamp()),
+                "recorded_at_text": command.requested_at.isoformat(),
+                "pr_url": command.pr.url if command.pr else None, "is_active": False,
+                "rejection": command.model_dump(mode="json"),
+                "replacement_accepted": bool(
+                    current and current.previous_rejection == command.binding and not current.admission_pending
+                ),
+            })
+    except Exception:
+        for view in views:
+            view["rejection_unavailable"] = True
     return views
 
 

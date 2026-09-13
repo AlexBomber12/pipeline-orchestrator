@@ -33,6 +33,7 @@ from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.models import PipelineState
 from src.subsource_registry import SuppressionReason
+from src.task_attempts import load_attempt, save_attempt
 
 
 def _resolve_task_file_under_repo(repo_path: str, task_file: str) -> Path:
@@ -149,6 +150,8 @@ class CodingMixin:
         3. ``_post_coder_resolution`` — CLI log save, exit classification,
            PR lookup or daemon-side PR creation, run record save.
         """
+        if await self._attempt_execution_blocked():
+            return
         self._stop_requested = False
         current_pr_id = (
             self.state.current_task.pr_id
@@ -229,6 +232,8 @@ class CodingMixin:
                 log_prefix="[CODING]",
             )
             return
+        if not await self._prepare_task_attempt(task_body):
+            return
         task_hash = task_spec_content_hash(task_body)
         try:
             previous_task_hash = await get_task_spec_hash(
@@ -288,6 +293,8 @@ class CodingMixin:
         except CoderUnavailable:
             return
 
+        if await self._attempt_execution_blocked():
+            return
         self._write_active_pr_runtime_file(pr_id)
         self._write_expected_branch(target_branch)
         # Expected-branch cleanup belongs in a finally so the pre-push
@@ -353,6 +360,7 @@ class CodingMixin:
             **plugin_run_kwargs,
             "timeout": self.app_config.daemon.planned_pr_timeout_sec,
             "on_process_start": self._track_current_coder_process,
+            "attempt_id": self.state.current_task.attempt_id if self.state.current_task else None,
         }
 
     async def _run_coder_with_supervision(
@@ -375,6 +383,8 @@ class CodingMixin:
         breach detected during or shortly after the subprocess (state
         moved to PAUSED, run record saved as ``"rate_limit"``).
         """
+        if await self._attempt_execution_blocked():
+            return None
         breach_dir = self._current_breach_dir
         breach_run_id = self._current_breach_run_id
         breach_flag: dict[str, bool] = {"breached": False}
@@ -400,6 +410,8 @@ class CodingMixin:
         try:
             code, stdout, stderr = await cli_task
         except asyncio.CancelledError:
+            if await self._attempt_execution_blocked():
+                return None
             if self._stop_requested:
                 if current_pr_id is not None:
                     self._user_stopped_task_pr_ids.add(current_pr_id)
@@ -989,6 +1001,8 @@ class CodingMixin:
         matching the ESCALATE-style handling the diagnostic uses for cases
         A and B — a failed creation is not silently retried.
         """
+        if await self._attempt_execution_blocked():
+            return False
         task = self.state.current_task
         # The diagnostic only runs after handle_coding's target_branch guard,
         # so current_task is always populated when we reach this method.
@@ -1006,6 +1020,13 @@ class CodingMixin:
             )
 
         base_branch = self.repo_config.branch
+        attempt = await load_attempt(self.redis, self.name, task.pr_id)
+        if attempt:
+            if attempt.pr_creation_pending:
+                self.log_event("[CODING] PR creation has an unresolved acknowledgement; reconciling visibility only.")
+                return True
+            updated = attempt.model_copy(update={"pr_creation_pending": True})
+            await save_attempt(self.redis, self.name, updated, expected=attempt)
         try:
             gh_runner.run_gh(
                 [

@@ -538,6 +538,9 @@ class IdleMixin:
                         crashed_task_pr_ids.discard(pr_id)
                         continue
                     statuses[pr_id] = TaskStatus.ERROR
+            for pr_id in getattr(self, "_admission_held_task_ids", set()):
+                if pr_id in statuses:
+                    statuses[pr_id] = TaskStatus.ERROR
             eligible = [
                 header
                 for header in get_eligible_tasks(eligibility_headers, statuses)
@@ -811,6 +814,7 @@ class IdleMixin:
             if not await self._resolve_pending_queue_sync():
                 return
 
+        await self._snapshot_accepted_specs()
         try:
             self.sync_to_main()
         except (
@@ -850,6 +854,7 @@ class IdleMixin:
                 )
                 return
 
+        await self._reconcile_git_admissions()
         try:
             prs = gh_prs.get_open_prs(
                 self.owner_repo,

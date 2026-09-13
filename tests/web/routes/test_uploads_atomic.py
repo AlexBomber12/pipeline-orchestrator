@@ -492,7 +492,7 @@ def test_dependency_closure_continues_when_pending_lookup_fails(
         async def get(self, key: str) -> str | None:
             if key == upload_pending("example__alpha"):
                 raise RuntimeError("boom")
-            return '{"url":"","name":"example__alpha","state":"IDLE"}'
+            return '{"url":"","name":"example__alpha","state":"IDLE"}' if key.startswith("pipeline:") else None
 
         async def set(self, key: str, value: str, **kwargs: object) -> None:
             return None

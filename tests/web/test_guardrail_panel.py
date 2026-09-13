@@ -549,6 +549,7 @@ def _view(
         "pr_url": pr_url,
         "is_active": is_active,
         "approval_binding": "bound-decision",
+        "rejection_binding": "bound-rejection" if is_active else None,
     }
 
 
@@ -575,21 +576,21 @@ def test_panel_buttons_carry_confirm_target_and_swap_attributes() -> None:
     assert "Approve" in html and "Reject" in html
     assert "approve-btn" in html and "reject-btn" in html
     assert 'hx-vals=\'{"decision": "approve", "binding": "bound-decision"}\'' in html
-    assert 'hx-vals=\'{"decision": "reject"}\'' in html
+    assert 'hx-vals=\'{"decision": "reject", "binding": "bound-rejection"}\'' in html
     assert "hx-confirm=\"Approve guardrail violation for PR-296" in html
-    assert "hx-confirm=\"Reject guardrail violation for PR-296" in html
-    assert 'hx-target="closest .guardrail-row"' in html
+    assert "hx-confirm=\"Abandon PR-296" in html
+    assert 'hx-target="this"' in html
     assert 'hx-swap="outerHTML"' in html
 
 
-def test_only_reject_opts_in_to_204_swap() -> None:
-    """Approve retains its row and renders a 202 acknowledgement; Reject is unchanged."""
+def test_both_decisions_render_acknowledgement_in_button() -> None:
+    """Both decisions retain history and render a durable 202 acknowledgement."""
     html = _render_panel(guardrail_pending=[_view("PR-296")])
     handler = (
         'hx-on::before-swap="if (event.detail.xhr.status === 204) { '
         'event.detail.shouldSwap = true; }"'
     )
-    assert html.count(handler) == 1
+    assert html.count(handler) == 0
     assert 'hx-target="this"' in html
 
 
@@ -671,7 +672,7 @@ def test_repo_detail_route_passes_guardrail_pending_to_template(
     assert "PR-296" in resp.text
     assert "PR-LATER" in resp.text
     assert (
-        "/repos/example__alpha/guardrail/PR-296/decision" in resp.text
+        "/repos/example__alpha/guardrail/PR-296/decision" not in resp.text
     )
 
 
@@ -755,7 +756,7 @@ def test_repo_detail_route_route_response_template_pr_url_uses_current_pr(
 
 @pytest.mark.parametrize(
     "decision_text",
-    ["Approve guardrail violation", "Reject guardrail violation"],
+    ["Approve guardrail violation", "Abandon"],
 )
 def test_panel_confirm_dialogs_mention_consequence(decision_text: str) -> None:
     html = _render_panel(guardrail_pending=[_view("PR-296")])
@@ -773,14 +774,13 @@ def test_panel_hides_approve_button_for_inactive_entry() -> None:
     html = _render_panel(guardrail_pending=[_view("PR-OTHER", is_active=False)])
     assert "approve-btn" not in html
     assert "Approve guardrail violation" not in html
-    # Reject remains because the reject endpoint accepts non-current PRs.
-    assert "reject-btn" in html
-    assert "Reject guardrail violation for PR-OTHER" in html
+    assert "reject-btn" not in html
+    assert "Abandon PR-OTHER" not in html
 
 
 def test_panel_shows_approve_only_on_active_row_in_mixed_list() -> None:
     """When the panel lists both active and historical entries, only the
-    active row gets an Approve button — Reject still renders for both."""
+    active row gets an exact decision binding."""
     html = _render_panel(
         guardrail_pending=[
             _view("PR-CURRENT", is_active=True),
@@ -790,6 +790,6 @@ def test_panel_shows_approve_only_on_active_row_in_mixed_list() -> None:
     assert html.count("approve-btn") == 1
     assert "Approve guardrail violation for PR-CURRENT" in html
     assert "Approve guardrail violation for PR-OTHER" not in html
-    assert html.count("reject-btn") == 2
-    assert "Reject guardrail violation for PR-CURRENT" in html
-    assert "Reject guardrail violation for PR-OTHER" in html
+    assert html.count("reject-btn") == 1
+    assert "Abandon PR-CURRENT" in html
+    assert "Abandon PR-OTHER" not in html

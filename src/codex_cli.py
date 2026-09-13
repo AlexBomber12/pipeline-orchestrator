@@ -50,6 +50,7 @@ async def run_codex_async(
     timeout: int | None = 600,
     model: str | None = None,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    attempt_id: str | None = None,
 ) -> tuple[int, str, str]:
     """Invoke ``codex exec`` with ``prompt`` inside ``cwd``.
 
@@ -69,6 +70,9 @@ async def run_codex_async(
     cmd.append(prompt)
     logger.info("[codex] running codex exec with prompt: %s", prompt[:80])
 
+    env = dict(os.environ)
+    if attempt_id is not None:
+        env["PIPELINE_ATTEMPT_ID"] = attempt_id
     cmd = _maybe_wrap_sandbox(cmd, cwd)
     proc: asyncio.subprocess.Process | None = None
     try:
@@ -78,6 +82,7 @@ async def run_codex_async(
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
             stdin=asyncio.subprocess.DEVNULL,
+            env=env,
         )
         if on_process_start is not None:
             on_process_start(proc)
@@ -125,12 +130,15 @@ async def run_planned_pr_async(
     model: str | None = None,
     timeout: int = 900,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    attempt_id: str | None = None,
     **_kwargs: object,
 ) -> tuple[int, str, str]:
     """Trigger a ``PLANNED PR`` run in ``repo_path`` via Codex CLI."""
     kwargs: dict[str, object] = {"timeout": timeout, "model": model}
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
+    if attempt_id is not None:
+        kwargs["attempt_id"] = attempt_id
     return await run_codex_async("PLANNED PR", repo_path, **kwargs)
 
 
@@ -147,12 +155,15 @@ async def run_auto_pr_async(
     model: str | None = None,
     timeout: int = 900,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    attempt_id: str | None = None,
     **_kwargs: object,
 ) -> tuple[int, str, str]:
     """Trigger an ``AUTO PR`` run in ``repo_path`` via Codex CLI."""
     kwargs: dict[str, object] = {"timeout": timeout, "model": model}
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
+    if attempt_id is not None:
+        kwargs["attempt_id"] = attempt_id
     return await run_codex_async(
         _build_auto_pr_prompt(pr_id, task_file, task_body), repo_path, **kwargs
     )
@@ -184,6 +195,7 @@ async def fix_review_async(
     model: str | None = None,
     timeout: int | None = None,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    attempt_id: str | None = None,
     extra_context: str | None = None,
     pr_id: str | None = None,
     task_file: str | None = None,
@@ -193,6 +205,8 @@ async def fix_review_async(
     kwargs: dict[str, object] = {"timeout": timeout, "model": model}
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
+    if attempt_id is not None:
+        kwargs["attempt_id"] = attempt_id
     return await run_codex_async(
         _build_fix_feedback_prompt(
             extra_context,
