@@ -1337,3 +1337,103 @@ async def test_completed_approvals_leave_active_index_but_keep_bounded_recent_hi
     await runner._run_cycle_body()
     assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
     assert [c.binding for c in await list_approvals(runner.redis, runner.name)] == [command.binding]
+
+
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("lost_reply", [False, True])
+async def test_stale_fix_head_refreshes_binding_without_approving_new_head(
+    approval, monkeypatch, single, restart, lost_reply,
+):
+    runner, command, repo, remote = approval
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    (repo / "implementation.py").write_text("pushed FIX work\n")
+    git(repo, "commit", "-am", "FIX pushed before guardrail")
+    git(repo, "push", "origin", "fix/pr-42")
+    fresh = command.pr.model_copy(update={"head_sha": git(repo, "rev-parse", "HEAD")})
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [fresh])
+    await enqueue_approval(runner.redis, command)
+    if lost_reply:
+        original = runner.redis.transaction
+        lost = False
+
+        async def transaction(fn, *keys, **kwargs):
+            nonlocal lost
+            result = await original(fn, *keys, **kwargs)
+            if len(keys) == 2 and not lost:
+                lost = True
+                raise ConnectionError("head refresh EXEC reply lost")
+            return result
+
+        monkeypatch.setattr(runner.redis, "transaction", transaction)
+    if restart:
+        runner._recovered = False
+        runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+    before, remote_before = snapshot(repo), git(remote, "show-ref")
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).status == (
+        "deferred" if lost_reply else "failed"
+    )
+    published = RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name)))
+    assert published.current_pr.head_sha == fresh.head_sha
+    assert published.state == PipelineState.ERROR
+    if not lost_reply:
+        assert runner.state == published
+    raw = await runner.redis.get(cause_key(runner.name, "PR-42"))
+    assert failure_identity(raw) == command.failure
+    # The failed old binding still protects useful work while the UI offers
+    # a distinct request for the actual pushed head.
+    if not lost_reply:
+        assert await runner._consume_approval_command()
+    assert snapshot(repo) == before and git(remote, "show-ref") == remote_before
+    replacement = build_approval(runner.name, published, raw, repo)
+    assert replacement.binding != command.binding and replacement.pr.head_sha == fresh.head_sha
+    await enqueue_approval(runner.redis, replacement)
+    if lost_reply and restart:
+        runner._recovered = False
+        runner._approval_head_refresh_uncertain = False
+        runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, replacement.binding)).status == "applied"
+    assert runner.state.current_pr.number == 42
+    assert snapshot(repo) == before and git(remote, "show-ref") == remote_before
+
+
+@pytest.mark.parametrize("change", ["cause", "pr", "head"])
+async def test_head_refresh_cannot_overwrite_a_new_decision(approval, change):
+    runner, command, _, _ = approval
+    if change == "cause":
+        await runner.redis.set(cause_key(runner.name, "PR-42"), '{"payload":{"subsource":"operator_reject"}}')
+    else:
+        changed = runner.state.model_copy(deep=True)
+        if change == "pr":
+            changed.current_pr.number = 99
+        else:
+            changed.current_pr.head_sha = "another-newer-head"
+        await runner.redis.set(pipeline_state(runner.name), changed.model_dump_json())
+    before = await runner.redis.get(pipeline_state(runner.name))
+    with pytest.raises(ApprovalChanged, match="decision changed"):
+        await runner._publish_refreshed_guardrail_head(command, "new-head")
+    assert await runner.redis.get(pipeline_state(runner.name)) == before
+
+
+async def test_fix_head_refresh_failure_preserves_current_snapshot(approval, monkeypatch):
+    runner, command, _, _ = approval
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: (_ for _ in ()).throw(OSError("offline")))
+    await runner._refresh_guardrail_head_after_fix()
+    assert runner.state.current_pr.head_sha == command.pr.head_sha
+    runner.state.current_pr = None
+    await runner._refresh_guardrail_head_after_fix()
+
+
+async def test_unavailable_pr_head_stays_retryable(approval, monkeypatch):
+    runner, command, _, _ = approval
+    await enqueue_approval(runner.redis, command)
+    monkeypatch.setattr(
+        daemon_approval.gh_prs, "get_open_prs", lambda *a: [command.pr.model_copy(update={"head_sha": ""})],
+    )
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "deferred"
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [command.pr])
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"

@@ -645,6 +645,7 @@ class FixMixin(BreachMixin):
                 ),
                 commit_task_status=True,
             )
+            await self._refresh_guardrail_head_after_fix()
             return
         await capture_stop_requested_after_exit()
         escalate_reason = fix_escalation.parse_escalate_marker(stdout)

@@ -161,7 +161,7 @@ async def enqueue_approval(redis: Any, command: ApprovalCommand) -> ApprovalComm
     return await redis.transaction(transaction, key, cancellation, state_key, value_from_callable=True)
 
 
-def matches_state(command: ApprovalCommand, state: RepoState) -> bool:
+def matches_state(command: ApprovalCommand, state: RepoState, *, check_head: bool = True) -> bool:
     task, pr = state.current_task, state.current_pr
     return bool(
         state.url == command.repo_url
@@ -171,5 +171,5 @@ def matches_state(command: ApprovalCommand, state: RepoState) -> bool:
         and (task.task_file or f"tasks/{task.pr_id}.md") == command.task.task_file
         and pr.number == command.pr.number
         and pr.branch == command.pr.branch
-        and pr.head_sha == command.pr.head_sha
+        and (not check_head or pr.head_sha == command.pr.head_sha)
     )

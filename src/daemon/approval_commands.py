@@ -90,6 +90,10 @@ class ApprovalCommandMixin:
     async def _consume_approval_command(self) -> bool:
         """Return True when ordinary cycle work must wait or WATCH was restored."""
         try:
+            if self._approval_head_refresh_uncertain:
+                raw = await self.redis.get(pipeline_state(self.name))
+                self.state = RepoState.model_validate_json(raw)
+                self._approval_head_refresh_uncertain = False
             commands = await list_approvals(self.redis, self.name)
             self._approval_history = [c for c in commands if c.status == "applied" and c.active]
             for command in reversed(commands):
@@ -99,7 +103,7 @@ class ApprovalCommandMixin:
                         raw = await self.redis.get(pipeline_state(self.name))
                         if raw:
                             snapshot = RepoState.model_validate_json(raw)
-                    if matches_state(command, snapshot):
+                    if matches_state(command, snapshot, check_head=False):
                         if await self._inactive_approval_holds(command):
                             return True
                     elif self._recovered:
@@ -285,10 +289,17 @@ class ApprovalCommandMixin:
                 self.repo_config.allow_merge_without_checks,
             )
             pr = next((pr for pr in prs if pr.number == command.pr.number), None)
-            if pr is None or pr.branch != command.pr.branch or pr.head_sha != command.pr.head_sha:
+            if pr is None or pr.branch != command.pr.branch:
                 raise ApprovalChanged("The bound PR is closed, missing, or its branch/HEAD changed.")
+            if not pr.head_sha:
+                raise RuntimeError("The current PR HEAD is unavailable; waiting for a verified GitHub snapshot.")
             if pr.pr_id not in (None, command.task.pr_id):
                 raise ApprovalChanged("The bound PR now identifies a different task.")
+            if pr.head_sha != command.pr.head_sha:
+                await self._publish_refreshed_guardrail_head(command, pr.head_sha)
+                raise ApprovalChanged(
+                    "PR HEAD changed; daemon state was refreshed. Review the current PR and approve again."
+                )
             if self._unapproved_labels(command, pr.quarantine_labels):
                 await self._approval_result(
                     command, "deferred", "The PR has another quarantine finding awaiting resolution."
@@ -308,6 +319,45 @@ class ApprovalCommandMixin:
         except Exception as exc:
             await self._approval_result(command, "deferred", f"Application could not be verified: {exc}")
             return True
+
+    async def _refresh_guardrail_head_after_fix(self) -> None:
+        """Publish the pushed implementation/metadata head, not the pre-FIX head."""
+        current = self.state.current_pr
+        if current is None:
+            return
+        try:
+            prs = await asyncio.to_thread(
+                gh_prs.get_open_prs, self.owner_repo, self.repo_config.allow_merge_without_checks,
+            )
+            fresh = next((p for p in prs if p.number == current.number and p.branch == current.branch), None)
+            if fresh is not None and fresh.head_sha:
+                current.head_sha = fresh.head_sha
+        except Exception as exc:
+            self.log_event(f"[RECOVERY] Guardrail PR head refresh deferred: {exc}")
+
+    async def _publish_refreshed_guardrail_head(self, command: ApprovalCommand, head_sha: str) -> None:
+        """Refresh a stale error snapshot without rebinding the accepted request."""
+        state_key = pipeline_state(self.name)
+        cancellation = cause_key(self.name, command.task.pr_id)
+
+        async def transaction(pipe: Any) -> RepoState:
+            persisted = RepoState.model_validate_json(await pipe.get(state_key))
+            if (
+                not matches_state(command, persisted, check_head=False)
+                or persisted.current_pr.head_sha not in (command.pr.head_sha, head_sha)
+                or failure_identity(await pipe.get(cancellation)) != command.failure
+            ):
+                raise ApprovalChanged("Pending decision changed while refreshing its PR head.")
+            state = (self.state if self._recovered else persisted).model_copy(deep=True)
+            state.user_paused = persisted.user_paused
+            state.current_pr.head_sha = head_sha
+            pipe.multi()
+            pipe.set(state_key, state.model_dump_json())
+            return state
+
+        self._approval_head_refresh_uncertain = True
+        self.state = await self.redis.transaction(transaction, state_key, cancellation, value_from_callable=True)
+        self._approval_head_refresh_uncertain = False
 
     async def _commit_approval_state(self, command: ApprovalCommand) -> None:
         key = approval_key(self.name, command.binding)
