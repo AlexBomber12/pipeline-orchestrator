@@ -984,6 +984,41 @@ class CodingMixin:
         else:
             self._post_codex_review(candidate.number)
 
+    async def _clear_failed_pr_creation_for_definitive_failure(
+        self,
+        attempt,
+        *,
+        target_branch: str,
+        coder_name: str,
+    ) -> bool:
+        last_exc: Exception | None = None
+        for replay in range(2):
+            try:
+                await clear_failed_pr_creation(self.redis, self.name, attempt)
+            except Exception as exc:
+                last_exc = exc
+                continue
+            if replay:
+                self.log_event("[CODING] Confirmed failed PR creation cleanup after replaying its acknowledgement.")
+            return True
+        try:
+            current = await load_attempt(self.redis, self.name, attempt.task.pr_id)
+            if current and current.attempt_id == attempt.attempt_id and not current.pr_creation_pending:
+                self.log_event("[CODING] Confirmed failed PR creation cleanup after Redis acknowledgement loss.")
+                return True
+        except Exception as exc:
+            last_exc = exc
+        name = type(last_exc).__name__ if last_exc else "UnknownError"
+        await self._transition_to_error(
+            f"[{coder_name}] Cannot confirm failed PR creation cleanup for {target_branch!r}: {name}",
+            save_run_record_as=None,
+            cancellation_cause=CancellationCause(
+                category="ERROR",
+                payload={"subsource": "infra_failure", "subsystem": "pr_creation_clear"},
+            ),
+        )
+        return False
+
     async def _daemon_create_pr_for_branch(
         self,
         target_branch: str,
@@ -1080,7 +1115,12 @@ class CodingMixin:
                 )
                 return True
             if attempt and gh_runner.pr_create_definitely_failed(exc):
-                await clear_failed_pr_creation(self.redis, self.name, attempt)
+                if not await self._clear_failed_pr_creation_for_definitive_failure(
+                    attempt,
+                    target_branch=target_branch,
+                    coder_name=coder_name,
+                ):
+                    return False
             message = (
                 f"[{coder_name}] Daemon PR creation failed for "
                 f"{target_branch!r}: {exc}"

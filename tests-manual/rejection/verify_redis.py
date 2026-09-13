@@ -32,6 +32,7 @@ from tests.test_task_admission import (
     test_creation_failure_acknowledgement_races_reject_without_erasing_it,
     test_creation_intent_acknowledgement_replays_before_github_request,
     test_definitive_create_failure_allows_http_retry_without_losing_work,
+    test_definitive_create_failure_replays_lost_clear_ack,
     test_git_dependency_cycle_is_held_before_reserving_rewrites,
     test_invalid_upload_discard_cannot_delete_a_newer_submission,
     test_reject_fetches_base_before_anchoring_later_git_rewrites,
@@ -92,6 +93,20 @@ async def exercise(socket: Path, root: Path):
                 runner.redis = app.state.redis = redis
                 await test_definitive_create_failure_allows_http_retry_without_losing_work(
                     fixture, patch, single, "authentication",
+                )
+        for single in (False, True):
+            await redis.flushall()
+            directory = root / f"create-clear-ack-{single}"
+            directory.mkdir()
+            with pytest.MonkeyPatch.context() as patch:
+                isolated_daemon_process_view.__wrapped__(patch)
+                fixture = await rejected.__wrapped__(directory, patch)
+                runner, _, _, _, _, app = fixture
+                for key, value in runner.redis.store.items():
+                    await redis.set(key, value)
+                runner.redis = app.state.redis = redis
+                await test_definitive_create_failure_replays_lost_clear_ack(
+                    fixture, patch, single, "after_exec_twice",
                 )
         for single in (False, True):
             for failure in ("before_exec", "after_exec", "rejection"):
@@ -208,7 +223,8 @@ async def exercise(socket: Path, root: Path):
         print(
             "Isolated Redis: connected scenario passed with both feature settings; "
             "untracked PR binding/restart, duplicate and Approve/Reject CAS races passed."
-            " Definitive creation failure Retry and creation-result/Reject arbitration passed."
+            " Definitive creation failure Retry, PR creation clear replay,"
+            " and creation-result/Reject arbitration passed."
             " PR creation intent replay before/after EXEC and concurrent Reject protection passed."
             " Stale batch retirement, stale Reject base anchoring, dependency-cycle admission,"
             " and concurrent upload WATCH protection passed."

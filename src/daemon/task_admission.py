@@ -185,6 +185,8 @@ class TaskAdmissionMixin:
                     held.add(path.stem)
                 continue  # normal first admission is recorded at dispatch
             if task_spec_content_hash(path.read_text(encoding="utf-8")) == prior.fingerprint:
+                if prior.completed:
+                    continue
                 if prior.rejection:
                     held.add(path.stem)
                 elif prior.admission_pending:

@@ -541,6 +541,24 @@ async def test_recovery_fences_attempts_even_with_todo_frontmatter(rejected, cas
     assert result[0].status == (TaskStatus.DONE if case == "completed" else TaskStatus.ERROR)
 
 
+async def test_completed_rejected_attempt_is_not_held_as_failed_admission(rejected):
+    await finish_reject(rejected)
+    runner, command, *_ = rejected
+    prior = await load_attempt(runner.redis, runner.name, "PR-42")
+    completed = await save_attempt(
+        runner.redis,
+        runner.name,
+        prior.model_copy(update={"completed": True}),
+        expected=prior,
+    )
+
+    assert completed.rejection == command.binding
+    assert await runner._reconcile_git_admissions() == set()
+    assert runner._admission_held_task_ids == set()
+    fenced = await runner._fence_recovery_tasks([completed.task.model_copy(update={"status": TaskStatus.TODO})])
+    assert fenced[0].status == TaskStatus.DONE
+
+
 @pytest.mark.parametrize("case", ["success", "origin_pending", "changed_again"])
 async def test_git_admission_restart_resumes_partial_receipt(rejected, tmp_path, case):
     await finish_reject(rejected)
@@ -1125,10 +1143,12 @@ async def test_creation_intent_acknowledgement_replays_before_github_request(
 @pytest.mark.parametrize("single", [False, True])
 @pytest.mark.parametrize("failure", ["authentication", "validation"])
 async def test_definitive_create_failure_allows_http_retry_without_losing_work(
-    rejected, monkeypatch, single, failure
+    rejected, monkeypatch, single, failure, clear_ack="ok"
 ):
     import asyncio
 
+    from redis.exceptions import ConnectionError as RedisConnectionError
+    from src.daemon.handlers import coding as coding_handler
     from src.web.routes import repo_control
 
     from tests.runner import _helpers as h
@@ -1170,17 +1190,45 @@ async def test_definitive_create_failure_allows_http_retry_without_losing_work(
         return original_transport(args, *a, **kw)
 
     original_sleep = asyncio.sleep
+    original_clear = coding_handler.clear_failed_pr_creation
+    original_load = coding_handler.load_attempt
+    clear_calls = 0
 
     async def short_sleep(_delay):
         await original_sleep(0)
 
+    async def clear_transport(redis, name, attempt_to_clear):
+        nonlocal clear_calls
+        clear_calls += 1
+        if clear_ack in {"before_exec_twice", "before_exec_and_load_outage"}:
+            raise RedisConnectionError("connection lost before clearing creation intent")
+        await original_clear(redis, name, attempt_to_clear)
+        if clear_ack == "after_exec" and clear_calls == 1:
+            raise RedisConnectionError("EXEC reply lost while clearing creation intent")
+        if clear_ack == "after_exec_twice":
+            raise RedisConnectionError("repeated EXEC reply loss while clearing creation intent")
+
+    async def load_transport(redis, name, task_id):
+        if clear_ack == "before_exec_and_load_outage" and clear_calls >= 2:
+            raise RedisConnectionError("connection lost while confirming creation intent clear")
+        return await original_load(redis, name, task_id)
+
     monkeypatch.setattr(subprocess, "run", subprocess_boundary)
     monkeypatch.setattr(daemon_admission.gh_runner, "run_gh", transport)
+    monkeypatch.setattr(coding_handler, "clear_failed_pr_creation", clear_transport)
+    monkeypatch.setattr(coding_handler, "load_attempt", load_transport)
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda *a, **kw: [github["new_pr"]] if github["new_pr"] else [])
     monkeypatch.setattr("src.daemon.handlers.coding.asyncio.sleep", short_sleep)
     await runner._diagnose_exit_zero_no_pr("fix/pr-42", "claude", AsyncMock(return_value=False))
     assert runner.state.state == PipelineState.ERROR
+    assert clear_calls == (1 if clear_ack == "ok" else 2)
     receipt = await load_attempt(runner.redis, runner.name, "PR-42")
+    if clear_ack in {"before_exec_twice", "before_exec_and_load_outage"}:
+        assert receipt.pr_creation_pending and receipt.attempt_id == attempt.attempt_id
+        assert "Cannot confirm failed PR creation cleanup" in runner.state.error_message
+        assert github["new_pr"] is None
+        assert git(repo, "rev-parse", "fix/pr-42") == work_head
+        return
     assert not receipt.pr_creation_pending and receipt.attempt_id == attempt.attempt_id
     assert not await runner._reconcile_pending_pr_creation()
     assert github["new_pr"] is None
@@ -1220,6 +1268,20 @@ async def test_definitive_create_failure_allows_http_retry_without_losing_work(
     assert len(create_calls) == 2
     assert (await load_attempt(fresh.redis, fresh.name, "PR-42")).attempt_id == attempt.attempt_id
     assert github["state"] == "closed"
+
+
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize(
+    "clear_ack", ["after_exec", "after_exec_twice", "before_exec_twice", "before_exec_and_load_outage"]
+)
+async def test_definitive_create_failure_replays_lost_clear_ack(rejected, monkeypatch, single, clear_ack):
+    await test_definitive_create_failure_allows_http_retry_without_losing_work(
+        rejected,
+        monkeypatch,
+        single,
+        "authentication",
+        clear_ack=clear_ack,
+    )
 
 
 @pytest.mark.parametrize("change", ["rejection", "replacement", "missing"])
