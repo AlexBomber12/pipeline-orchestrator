@@ -13,6 +13,7 @@ from src.approval_commands import (
     ApprovalChanged,
     approval_index,
     approval_key,
+    approval_recent_index,
     approval_task_path,
     build_approval,
     enqueue_approval,
@@ -992,6 +993,7 @@ async def test_later_operator_action_supersedes_failed_approval(approval, action
     assert not await runner._consume_approval_command()
     saved = await load_approval(runner.redis, runner.name, command.binding)
     assert saved.status == "failed" and saved.superseded
+    assert not await runner._inactive_approval_holds(saved)
     assert not await runner._consume_approval_command()
     assert await runner.redis.get(cause_key(runner.name, "PR-42"))
 
@@ -1169,7 +1171,7 @@ async def test_retired_approval_allows_normal_clone_when_checkout_is_absent(appr
 
 
 @pytest.mark.parametrize("single", [False, True])
-@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("restart", ["none", "before_acceptance", "after_acceptance"])
 async def test_successive_approvals_retain_only_independently_approved_findings(approval, monkeypatch, single, restart):
     runner, first, repo, remote = approval
     runner.repo_config.feature_flags.use_single_error_exit = single
@@ -1183,11 +1185,18 @@ async def test_successive_approvals_retain_only_independently_approved_findings(
     runner.state.current_pr.quarantine_labels.add("quarantine:workflow")
     await runner.redis.set(cause_key(runner.name, "PR-42"), raw)
     await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
-    second = build_approval(runner.name, runner.state, raw, repo)
+    decision_state = runner.state.model_copy(deep=True)
+    if restart == "before_acceptance":
+        runner._recovered = False
+        runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+        await runner._run_cycle_body()
+        assert (await load_approval(runner.redis, runner.name, first.binding)).active
+        assert await runner.redis.get(cause_key(runner.name, "PR-42")) == raw
+    second = build_approval(runner.name, decision_state, raw, repo)
     monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [second.pr])
     await enqueue_approval(runner.redis, second)
     before, remote_before = snapshot(repo), git(remote, "show-ref")
-    if restart:
+    if restart != "none":
         runner._recovered = False
         runner._approval_history = []
         runner._approval_receipt = None
@@ -1252,6 +1261,7 @@ async def test_merge_restart_restores_approval_and_rechecks_watch_gates(approval
     await enqueue_approval(runner.redis, command)
     await runner._run_cycle_body()
     runner.state.state = PipelineState.MERGE
+    assert not await runner._consume_approval_command()
     await runner.publish_state()
     before, remote_before = snapshot(repo), git(remote, "show-ref")
     runner._recovered = False
@@ -1268,3 +1278,62 @@ async def test_merge_restart_restores_approval_and_rechecks_watch_gates(approval
     runner.handle_watch.assert_awaited_once()
     assert runner.redis.deleted.count(cause_key(runner.name, "PR-42")) == 1
     assert snapshot(repo) == before and git(remote, "show-ref") == remote_before
+
+
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("blocker", ["none", "pause", "stop", "process", "unknown", "missing_state"])
+async def test_resume_reconciles_stop_latch_only_when_execution_is_quiescent(approval, monkeypatch, single, blocker):
+    runner, command, repo, _ = approval
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    runner._stop_requested = True
+    if blocker == "pause":
+        runner.state.user_paused = True
+        await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    elif blocker == "stop":
+        await runner.redis.set(control_stop(runner.name), "1")
+    elif blocker == "process":
+        runner._current_coder_process = object()
+    elif blocker == "unknown":
+        monkeypatch.setattr(daemon_approval, "checkout_process_blocker", lambda _: "ownership uncertain")
+    elif blocker == "missing_state":
+        await runner.redis.delete(pipeline_state(runner.name))
+    before = snapshot(repo)
+    await runner._run_cycle_body()
+    assert runner._stop_requested == (blocker != "none")
+    assert runner.handle_watch.await_count == (1 if blocker == "none" else 0)
+    assert snapshot(repo) == before
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "applied"
+
+
+async def test_completed_approvals_leave_active_index_but_keep_bounded_recent_history(approval, monkeypatch):
+    from datetime import timedelta
+
+    runner, command, _, _ = approval
+    for i in range(40):
+        old = command.model_copy(deep=True)
+        old.binding = f"past-{i}"
+        old.task.pr_id = f"PR-old-{i}"
+        old.status = "applied" if i % 2 else "failed"
+        old.active = old.status == "applied"
+        old.requested_at += timedelta(seconds=i + 1)
+        await runner.redis.set(approval_key(runner.name, old.binding), old.model_dump_json())
+        await runner.redis.zadd(approval_index(runner.name), {old.binding: old.requested_at.timestamp()})
+        await runner.redis.zadd(approval_recent_index(runner.name), {old.binding: -old.requested_at.timestamp()})
+    assert not await runner._consume_approval_command()
+    assert not await list_approvals(runner.redis, runner.name)
+    get = AsyncMock(wraps=runner.redis.get)
+    monkeypatch.setattr(runner.redis, "get", get)
+    assert not await runner._consume_approval_command()
+    get.assert_not_awaited()
+    recent = await list_approvals(runner.redis, runner.name, recent=True)
+    assert [c.binding for c in recent] == [f"past-{i}" for i in range(20, 40)]
+    assert get.await_count == 20
+    assert await load_approval(runner.redis, runner.name, "past-0") is not None
+    # A live request stays recoverable independently of the recent display limit.
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
+    assert [c.binding for c in await list_approvals(runner.redis, runner.name)] == [command.binding]

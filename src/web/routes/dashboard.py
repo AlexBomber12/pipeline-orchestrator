@@ -441,7 +441,9 @@ async def _build_guardrail_pending_view(
         for entry in pending
     ]
     try:
-        commands = await list_approvals(redis_client, repo_name)
+        commands = await list_approvals(redis_client, repo_name, recent=True)
+        commands += await list_approvals(redis_client, repo_name)
+        commands = sorted({c.binding: c for c in commands}.values(), key=lambda c: c.requested_at)
         for view in views:
             if view["is_active"]:
                 raw = await redis_client.get(cause_key(repo_name, view["pr_id"]))

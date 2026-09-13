@@ -21,6 +21,7 @@ from typing import Any
 from src.approval_commands import (
     ApprovalChanged,
     ApprovalCommand,
+    approval_index,
     approval_key,
     approval_task_path,
     failure_identity,
@@ -101,9 +102,14 @@ class ApprovalCommandMixin:
                     if matches_state(command, snapshot):
                         if await self._inactive_approval_holds(command):
                             return True
+                    elif self._recovered:
+                        await self.redis.zrem(approval_index(self.name), command.binding)
                     continue
                 if command.status == "applied" and self._recovered and not self._approval_commit_uncertain:
-                    if not matches_state(command, self.state) or self.state.state != PipelineState.WATCH:
+                    if not matches_state(command, self.state):
+                        await self.redis.zrem(approval_index(self.name), command.binding)
+                        continue
+                    if self.state.state != PipelineState.WATCH:
                         continue
                     # Protect preserved work from the legacy dirty-tree reset on
                     # subsequent WATCH cycles too, not just the acceptance cycle.
@@ -173,6 +179,7 @@ class ApprovalCommandMixin:
             )
             pipe.multi()
             pipe.set(key, current.model_dump_json())
+            pipe.zrem(approval_index(self.name), command.binding)
 
         await self.redis.transaction(transaction, key)
         return False
@@ -182,7 +189,6 @@ class ApprovalCommandMixin:
             return "Repository is disabled."
         if (
             self._current_coder_process is not None
-            or self._stop_requested
             or command.task.pr_id in self._user_stopped_task_pr_ids
         ):
             return "Coder execution or Stop is still active."
@@ -218,6 +224,12 @@ class ApprovalCommandMixin:
         reason = checkout_process_blocker(self.repo_path)
         if reason:
             return reason
+        if self._stop_requested:
+            if not raw:
+                return "Prior Stop state is unavailable; waiting for operator reconciliation."
+            # Resume clears persisted Pause/Stop, but FIX's local latch survives.
+            # Only reconcile it after controls and process quiescence agree.
+            self._stop_requested = False
         if not Path(self.repo_path).exists():
             # Restore an absent checkout without the ordinary clone helper's
             # partial-clone deletion or scaffolding. Git refuses a destination
@@ -251,6 +263,17 @@ class ApprovalCommandMixin:
             # before clearing anything; a stale request must not hold forever.
             failure = failure_identity(await self.redis.get(cause_key(self.name, command.task.pr_id)))
             if failure != command.failure and not (command.status == "applied" and not failure):
+                if (
+                    command.status == "applied" and failure
+                    and json.loads(failure)["payload"].get("subsource") == "guardrail"
+                ):
+                    raw = await self.redis.get(pipeline_state(self.name))
+                    if raw and matches_state(command, RepoState.model_validate_json(raw)):
+                        self._approval_receipt = None
+                        await self._approval_result(
+                            command, "deferred", "A newer guardrail decision is awaiting action."
+                        )
+                        return True
                 raise ApprovalChanged("Pending failure changed; no unrelated failure was cleared.")
             reason = await self._approval_blocker(command)
             if reason:

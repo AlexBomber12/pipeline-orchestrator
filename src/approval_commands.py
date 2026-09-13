@@ -47,6 +47,10 @@ def approval_index(repo: str) -> str:
     return f"guardrail_approvals:{repo}"
 
 
+def approval_recent_index(repo: str) -> str:
+    return f"guardrail_approvals_recent:{repo}"
+
+
 def failure_identity(raw: str | bytes | None) -> str:
     if raw is None:
         return ""
@@ -116,8 +120,13 @@ async def load_approval(redis: Any, repo: str, binding: str) -> ApprovalCommand 
     return ApprovalCommand.model_validate_json(raw) if raw else None
 
 
-async def list_approvals(redis: Any, repo: str) -> list[ApprovalCommand]:
-    bindings = await redis.zrangebyscore(approval_index(repo), "-inf", "+inf")
+async def list_approvals(redis: Any, repo: str, *, recent: bool = False) -> list[ApprovalCommand]:
+    if recent:
+        # Negative timestamps put newest first without reading permanent history.
+        bindings = await redis.zrangebyscore(approval_recent_index(repo), "-inf", "+inf", start=0, num=20)
+        bindings = list(reversed(bindings))
+    else:
+        bindings = await redis.zrangebyscore(approval_index(repo), "-inf", "+inf")
     commands = []
     for binding in bindings:
         if isinstance(binding, bytes):
@@ -146,6 +155,7 @@ async def enqueue_approval(redis: Any, command: ApprovalCommand) -> ApprovalComm
         pipe.multi()
         pipe.set(key, command.model_dump_json())
         pipe.zadd(approval_index(command.repo_slug), {command.binding: command.requested_at.timestamp()})
+        pipe.zadd(approval_recent_index(command.repo_slug), {command.binding: -command.requested_at.timestamp()})
         return command
 
     return await redis.transaction(transaction, key, cancellation, state_key, value_from_callable=True)
