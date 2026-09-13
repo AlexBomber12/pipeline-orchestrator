@@ -29,10 +29,12 @@ def _belongs_to_attempt(data: dict, owner_repo: str, base: str, attempt: TaskAtt
         return False  # A fork is never the daemon's implementation branch.
     if head.get("ref") != attempt.task.branch:
         return False
+    if attempt.pr_number is not None and data.get("number") != attempt.pr_number:
+        return False
     if target.get("repo", {}).get("full_name", "").casefold() != owner_repo.casefold() or target.get("ref") != base:
         raise AttemptChanged("Attempt PR targets an unexpected repository or base.")
     if attempt.pr_number is not None:
-        return data.get("number") == attempt.pr_number
+        return True
     # GitHub timestamps have second precision. Previous closed PRs on a reused
     # branch predate this accepted attempt and are historical, not ambiguity.
     created = datetime.fromisoformat(data["created_at"])

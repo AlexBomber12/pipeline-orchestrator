@@ -249,6 +249,21 @@ async def test_pending_rejection_index_is_retired_after_release(rejected):
     assert [item.binding for item in await list_rejections(runner.redis, runner.name)] == [command.binding]
 
 
+async def test_rejection_release_resets_task_local_counters(rejected):
+    runner, *_ = rejected
+    runner._error_diagnose_count = 3
+    runner._error_skip_active = True
+    runner._idle_dispatch_deferred = True
+    assert (await post_reject(rejected)).status_code == 202
+
+    await runner._consume_rejection_commands()
+
+    assert runner.state.current_task is None
+    assert runner._error_diagnose_count == 0
+    assert runner._error_skip_active is False
+    assert runner._idle_dispatch_deferred is False
+
+
 async def test_pending_rejection_index_backfills_legacy_unreleased_and_prunes_released(rejected):
     runner, command, *_ = rejected
     assert (await post_reject(rejected)).status_code == 202
@@ -1178,6 +1193,7 @@ async def test_pending_creation_reconciles_terminal_pr_and_releases_ownership(re
         "invalid_state",
         "known_other_number",
         "known_number",
+        "known_number_ignores_wrong_base_history",
         "fork_and_owned",
         "missing_branch",
     ],
@@ -1221,6 +1237,13 @@ async def test_pr_discovery_requires_attempt_repository_base_time_and_head(rejec
         row["state"] = "unknown"
     elif case in {"known_other_number", "known_number"}:
         attempt.pr_number = 99 if case == "known_other_number" else pr.number
+    elif case == "known_number_ignores_wrong_base_history":
+        attempt.pr_number = pr.number
+        historical = deepcopy(row)
+        historical["number"] = 41
+        historical["base"]["ref"] = "release"
+        historical["state"] = "closed"
+        rows = [historical, row]
     elif case == "fork_and_owned":
         fork = deepcopy(row)
         fork["number"] = 88
@@ -1243,7 +1266,7 @@ async def test_pr_discovery_requires_attempt_repository_base_time_and_head(rejec
     monkeypatch.setattr(daemon_reject.gh_runner, "run_gh", transport)
     if case in {"fork_only", "old_only", "other_branch", "known_other_number"}:
         assert discover_attempt_pr(str(repo), runner.owner_repo, "main", attempt) is None
-    elif case in {"known_number", "fork_and_owned"}:
+    elif case in {"known_number", "known_number_ignores_wrong_base_history", "fork_and_owned"}:
         assert discover_attempt_pr(str(repo), runner.owner_repo, "main", attempt)["number"] == 42
     else:
         with pytest.raises(AttemptChanged):

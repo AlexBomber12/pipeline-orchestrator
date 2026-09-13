@@ -281,6 +281,7 @@ class RejectionCommandMixin:
             for task in (self.state.current_queue or [])
         ]
         self.state.current_task = None
+        self._reset_runner_local_task_counters()
         self.state.current_pr = None
         self.state.error_message = None
         self.state.skip_ai_error_diagnose = False
