@@ -10,11 +10,11 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 from src.approval_commands import build_approval, enqueue_approval
-from src.cancellation.storage import cause_key
+from src.cancellation.storage import cause_key, task_spec_content_hash
 from src.daemon import git_ops
 from src.daemon import task_admission as daemon_admission
 from src.github.gh_runner import run_gh as cli_run_gh
-from src.keyspace import pipeline_state, upload_pending
+from src.keyspace import pipeline_state, upload_pending, upload_pending_count
 from src.models import PipelineState, QueueTask, TaskStatus
 from src.rejection_commands import build_rejection, load_rejection, rejection_key
 from src.retry_commands import enqueue_retry_command, new_retry_command
@@ -104,6 +104,24 @@ def test_admission_graph_tolerates_legacy_noise_but_rejects_structured_errors(tm
     )
     with pytest.raises(AdmissionRejected, match="invalid Type"):
         validate_admission_graph(tmp_path)
+
+
+def test_admission_graph_rejects_duplicate_branch_across_incoming_batch(tmp_path):
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    (incoming / "PR-42.md").write_text(
+        "---\nstatus: TODO\n---\n\n"
+        "# PR-42: First\nBranch: fix/shared\n- Type: bugfix\n- Complexity: low\n- Depends on: none\n"
+    )
+    (incoming / "PR-43.md").write_text(
+        "---\nstatus: TODO\n---\n\n"
+        "# PR-43: Second\nBranch: fix/shared\n- Type: bugfix\n- Complexity: low\n- Depends on: none\n"
+    )
+
+    with pytest.raises(AdmissionRejected, match="Branch fix/shared is also assigned to PR-42"):
+        validate_admission_graph(tmp_path, [incoming / "PR-42.md", incoming / "PR-43.md"])
 
 
 async def test_direct_admission_rejects_malformed_incoming_task(rejected, tmp_path):
@@ -274,6 +292,101 @@ async def test_pending_upload_from_before_reject_does_not_reactivate(rejected):
     assert await runner.process_pending_uploads() is False
     assert (repo / "tasks/PR-42.md").read_bytes() == before
     assert (await load_attempt(runner.redis, runner.name, "PR-42")).rejection == command.binding
+
+
+async def test_stale_pending_upload_member_preserves_newer_valid_submission(rejected, tmp_path):
+    runner, _, repo, _, _, _ = rejected
+    path = repo / "tasks/PR-42.md"
+    prior_hash = task_spec_content_hash(path.read_text())
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    stale = rewritten(repo)
+    newer = task_43_from(repo)
+    (staging / "PR-42.md").write_text(stale)
+    (staging / "PR-43.md").write_text(newer)
+    manifest = {
+        "repo": runner.name,
+        "files": ["PR-42.md", "PR-43.md"],
+        "staging_dir": str(staging),
+        "task_hashes": {
+            "PR-42": task_spec_content_hash(stale),
+            "PR-43": task_spec_content_hash(newer),
+        },
+        "rejection_tokens": {},
+        "prior_spec_files": {"PR-42": prior_hash},
+        "commit_subject": "tasks: upload batch (2 files)",
+    }
+    await runner.redis.set(upload_pending(runner.name), json.dumps(manifest))
+    await runner.redis.set(upload_pending_count(runner.name), "2")
+    path.write_text(path.read_text() + "\nEdited after stale upload.\n")
+
+    assert await runner.process_pending_uploads() is None
+
+    retained = json.loads(await runner.redis.get(upload_pending(runner.name)))
+    assert retained["files"] == ["PR-43.md"]
+    assert retained["task_hashes"] == {"PR-43": task_spec_content_hash(newer)}
+    assert retained["prior_spec_files"] == {}
+    assert not (staging / "PR-42.md").exists()
+    assert (staging / "PR-43.md").read_text() == newer
+    assert await runner.redis.get(upload_pending_count(runner.name)) == "1"
+
+
+async def test_invalid_upload_discard_defers_when_manifest_changed(rejected, tmp_path):
+    runner, *_ = rejected
+    key = upload_pending(runner.name)
+    await runner.redis.set(key, "newer")
+
+    assert await runner._discard_invalid_upload(key, "older", tmp_path, "invalid") is None
+
+    assert await runner.redis.get(key) == "newer"
+
+
+async def test_invalid_upload_member_discard_defers_on_redis_error(rejected, tmp_path, monkeypatch):
+    runner, *_ = rejected
+    monkeypatch.setattr(runner.redis, "transaction", AsyncMock(side_effect=OSError("offline")))
+
+    result = await runner._discard_invalid_upload_member(
+        upload_pending(runner.name),
+        "raw",
+        tmp_path,
+        {"files": ["PR-42.md"]},
+        "PR-42.md",
+        "invalid",
+    )
+
+    assert result is None
+    assert any("Invalid upload acknowledgement deferred" in row["event"] for row in runner.state.history)
+
+
+async def test_invalid_upload_member_discard_logs_unlink_failure(rejected, tmp_path, monkeypatch):
+    runner, *_ = rejected
+    key = upload_pending(runner.name)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "PR-42.md").write_text("invalid")
+    (staging / "PR-43.md").write_text("keep")
+    manifest = {
+        "files": ["PR-42.md", "PR-43.md"],
+        "staging_dir": str(staging),
+        "task_hashes": {"PR-42": "old", "PR-43": "new"},
+    }
+    raw = json.dumps(manifest)
+    await runner.redis.set(key, raw)
+
+    original_unlink = type(staging).__mro__[0].unlink
+
+    def fail_unlink(path, *args, **kwargs):
+        if path.name == "PR-42.md":
+            raise OSError("permission denied")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(staging), "unlink", fail_unlink)
+
+    assert await runner._discard_invalid_upload_member(key, raw, staging, manifest, "PR-42.md", "invalid") is None
+
+    retained = json.loads(await runner.redis.get(key))
+    assert retained["files"] == ["PR-43.md"]
+    assert retained["task_hashes"] == {"PR-43": "new"}
 
 
 async def test_git_deletion_is_not_undone_by_pending_upload(rejected):
@@ -1488,20 +1601,18 @@ async def test_stale_batch_is_retired_before_reservation_and_next_upload_succeed
         before = git(repo, "rev-parse", "HEAD")
         counter = f"metrics:retry_count:{runner.name}:PR-42"
         await runner.redis.set(counter, "2")
-        assert await runner.process_pending_uploads() is False
-        assert await runner.redis.get(upload_pending(runner.name)) is None
-        assert not Path(manifest["staging_dir"]).exists()
+        assert await runner.process_pending_uploads() is None
+        retained = json.loads(await runner.redis.get(upload_pending(runner.name)))
+        assert retained["files"] == ["PR-43.md"]
+        assert Path(retained["staging_dir"]) == Path(manifest["staging_dir"])
+        assert (Path(manifest["staging_dir"]) / "PR-43.md").is_file()
+        assert not (Path(manifest["staging_dir"]) / "PR-42.md").exists()
         assert await load_attempt(runner.redis, runner.name, "PR-43") is None
         assert await runner.redis.get(counter) == "2"
         assert git(repo, "rev-parse", "HEAD") == before
         assert not (repo / "tasks/PR-43.md").exists()
-        assert await runner.process_pending_uploads() is False
-        assert any("Discarded invalid upload batch" in row["event"] for row in runner.state.history)
+        assert any("Discarded invalid upload member PR-42.md" in row["event"] for row in runner.state.history)
 
-        response = await client.post(f"/repos/{runner.name}/upload-tasks", files=[valid])
-        assert response.status_code == 200
-        next_manifest = json.loads(await runner.redis.get(upload_pending(runner.name)))
-        assert next_manifest["files"] == ["PR-43.md"]
         assert await runner.process_pending_uploads() is True
     assert (repo / "tasks/PR-43.md").read_text() == valid_text
     current = await load_attempt(runner.redis, runner.name, "PR-43")

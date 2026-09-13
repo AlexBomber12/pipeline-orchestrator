@@ -273,6 +273,60 @@ return 0
         self.log_event(f"[INFRA] Discarded invalid upload batch: {reason}. Submit corrected files again.")
         return False
 
+    async def _discard_invalid_upload_member(
+        self,
+        key: str,
+        raw: bytes | str,
+        staging_dir: Path,
+        manifest: dict,
+        filename: str,
+        reason: str,
+    ) -> bool | None:
+        """Remove one invalid staged file while preserving unrelated pending uploads."""
+        files = [name for name in manifest.get("files", []) if name != filename]
+        task_id = Path(filename).stem
+        updated = dict(manifest)
+        updated["files"] = files
+        for field in ("task_hashes", "rejection_tokens", "prior_spec_files"):
+            values = updated.get(field)
+            if isinstance(values, dict):
+                values = dict(values)
+                values.pop(task_id, None)
+                updated[field] = values
+        updated_raw = json.dumps(updated)
+
+        async def discard(pipe):
+            if await pipe.get(key) != raw:
+                return "changed"
+            pipe.multi()
+            if files:
+                pipe.set(key, updated_raw)
+                pipe.set(upload_pending_count(self.name), str(len(files)))
+                return "retained"
+            pipe.delete(key, upload_pending_count(self.name))
+            return "discarded"
+
+        try:
+            result = await self.redis.transaction(discard, key, value_from_callable=True)
+        except Exception as exc:
+            self.log_event(f"[INFRA] Invalid upload acknowledgement deferred ({type(exc).__name__}).")
+            return None
+        if result == "changed":
+            return None
+        try:
+            (staging_dir / filename).unlink(missing_ok=True)
+        except Exception:
+            logger.warning("%s: failed removing invalid upload member %s", self.name, filename)
+        if result == "discarded":
+            shutil.rmtree(str(staging_dir), ignore_errors=True)
+            self.log_event(f"[INFRA] Discarded invalid upload batch: {reason}. Submit corrected files again.")
+            return False
+        self.log_event(
+            f"[INFRA] Discarded invalid upload member {filename}: {reason}. "
+            "Remaining staged files stay pending."
+        )
+        return None
+
     async def process_pending_uploads(
         self, *, _safe: bool = False,
     ) -> bool | None:
@@ -367,7 +421,14 @@ return 0
                             current and current.fingerprint == incoming_hash and current_hash == incoming_hash
                             and current.previous_rejection == manifest.get("rejection_tokens", {}).get(task_id)
                         ):
-                            raise AdmissionRejected("Task changed or was deleted after upload; submit it again.")
+                            return await self._discard_invalid_upload_member(
+                                key,
+                                raw,
+                                staging_dir,
+                                manifest,
+                                fname,
+                                "Task changed or was deleted after upload; submit it again.",
+                            )
                     elif current and not target.is_file():
                         raise AdmissionRejected("Task was deleted; an old pending upload cannot recreate it.")
                     validated.append(await self._validate_admission(

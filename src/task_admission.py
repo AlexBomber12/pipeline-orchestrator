@@ -43,6 +43,7 @@ def validate_admission_graph(root: Path, incoming: Iterable[Path] = ()) -> None:
     replacements = {path.name: path for path in incoming}
     paths.update(replacements)
     graph = {}
+    branch_owner = {}
     for name, path in sorted(paths.items()):
         try:
             header = parse_task_header(path) if name in replacements else parse_existing_task_header(path)
@@ -52,6 +53,10 @@ def validate_admission_graph(root: Path, incoming: Iterable[Path] = ()) -> None:
             if name not in replacements and all("missing task header like" in issue for issue in exc.issues):
                 continue
             raise AdmissionRejected(str(exc)) from exc
+        owner = branch_owner.get(header.branch)
+        if owner is not None and owner != header.pr_id:
+            raise AdmissionRejected(f"Branch {header.branch} is also assigned to {owner}.")
+        branch_owner[header.branch] = header.pr_id
         graph[header.pr_id] = header.depends_on
     cycle = detect_cycle(graph)
     if cycle:
