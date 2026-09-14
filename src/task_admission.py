@@ -165,15 +165,16 @@ def verify_unfinished(
     previous: TaskAttempt,
     *,
     accepted_file_sha256: str | None = None,
-) -> None:
+) -> dict | None:
     """Check the *prior* accepted bytes, including alternative-PR receipts."""
     task_id = previous.task.pr_id
     if previous.completed or previous.task.status == TaskStatus.DONE:
         raise AdmissionRejected(f"{task_id} is completed and cannot be reused.")
     owner = gh_runner.get_repo_full_name(repo_url)
+    prior_pr = None
     if previous.started and not previous.rejection:
-        data = discover_attempt_pr(str(root), owner, base, previous)
-        if data is not None and data.get("state") == "open":
+        prior_pr = discover_attempt_pr(str(root), owner, base, previous)
+        if prior_pr is not None and prior_pr.get("state") == "open":
             raise AttemptChanged(
                 "Prior attempt still has an open PR; close it before accepting a changed specification."
             )
@@ -197,6 +198,7 @@ def verify_unfinished(
         or any(pr.pr_id == task_id or pr.branch == previous.task.branch for pr in merged_prs)
     ):
         raise AdmissionRejected(f"{task_id} has authoritative completion evidence and cannot be reused.")
+    return prior_pr
 
 
 async def admission_candidate(
@@ -268,6 +270,9 @@ async def admission_candidate(
             raise AttemptChanged("Legacy rejection lacks exact attempt/PR ownership; reconcile it before reuse.")
     rejection_file_sha256 = None
     prior_rejection_binding = previous.previous_rejection if previous else None
+    branch_cleanup_branch = None
+    branch_cleanup_head = None
+    branch_cleanup_pr_number = None
     if previous and previous.rejection:
         if previous.completed:
             if fingerprint == previous.fingerprint:
@@ -364,7 +369,11 @@ async def admission_candidate(
                 "An active attempt owns this task; Reject before accepting a rewritten specification."
             )
     if previous:
-        verify_unfinished(root, base, repo_url, previous, accepted_file_sha256=rejection_file_sha256)
+        prior_pr = verify_unfinished(root, base, repo_url, previous, accepted_file_sha256=rejection_file_sha256)
+        if prior_pr is not None and prior_pr.get("state") == "closed" and not prior_pr.get("merged_at"):
+            branch_cleanup_branch = previous.task.branch
+            branch_cleanup_head = str(prior_pr.get("head", {}).get("sha") or "")
+            branch_cleanup_pr_number = int(prior_pr["number"])
     available_ids = (
         available_ids if available_ids is not None else existing_task_header_ids(root)
     )
@@ -398,6 +407,9 @@ async def admission_candidate(
         admission_pending=True,
         coder_dispatched=False,
         file_sha256=hashlib.sha256(incoming_bytes).hexdigest(),
+        branch_cleanup_branch=branch_cleanup_branch,
+        branch_cleanup_head=branch_cleanup_head or None,
+        branch_cleanup_pr_number=branch_cleanup_pr_number,
     )
     candidate.task.attempt_id = candidate.attempt_id
     return previous, candidate

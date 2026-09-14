@@ -199,6 +199,90 @@ async def test_changed_upload_after_reset_defers_while_prior_pr_remains_open(rej
     assert await runner.redis.get(upload_pending(runner.name)) is not None
 
 
+async def admit_closed_automatic_error_rewrite(fixture):
+    runner, _, repo, _, github, _ = fixture
+    git(repo, "checkout", "main")
+    path = repo / "tasks/PR-42.md"
+    reset_text = without_blocked_reason(
+        path.read_text().replace("status: ERROR", "status: TODO")
+    )
+    path.write_text(reset_text)
+    git(repo, "commit", "-am", "reset automatic error task")
+    git(repo, "push", "origin", "main")
+    task = QueueTask(
+        pr_id="PR-42",
+        title="Reusable task",
+        task_file="tasks/PR-42.md",
+        branch="fix/pr-42",
+        status=TaskStatus.TODO,
+    )
+    previous = new_attempt(
+        runner.repo_config.url,
+        task,
+        reset_text,
+        started=True,
+        coder_dispatched=True,
+        pr_number=42,
+    )
+    await save_attempt(runner.redis, runner.name, previous, expected=None)
+    prior_head = git(repo, "rev-parse", "fix/pr-42")
+    github["attempt_prs"] = [
+        raw_attempt_pr(
+            PRInfo(
+                number=42,
+                pr_id="PR-42",
+                branch="fix/pr-42",
+                head_sha=prior_head,
+            ),
+            state="closed",
+        )
+    ]
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_task = None
+    await runner.redis.delete(cause_key(runner.name, "PR-42"))
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    changed = reset_text.replace("Original specification.", "Replacement after reset.")
+    assert (await stage(fixture, changed)).status_code == 200
+    assert await runner.process_pending_uploads() is True
+    return await load_attempt(runner.redis, runner.name, "PR-42"), changed, prior_head
+
+
+async def test_closed_automatic_error_pr_branch_is_cleaned_before_reuse(rejected):
+    runner, _, _, remote, _, _ = rejected
+    current, changed, prior_head = await admit_closed_automatic_error_rewrite(rejected)
+
+    assert current.branch_cleanup_branch == "fix/pr-42"
+    assert current.branch_cleanup_head == prior_head
+    assert current.branch_cleanup_pr_number == 42
+    runner.state.current_task = current.task
+    assert await runner._prepare_task_attempt(changed)
+    prepared = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert prepared.branch_prepared is True
+    assert "refs/heads/fix/pr-42" not in git(remote, "show-ref")
+
+
+@pytest.mark.parametrize("change", ["repo", "incomplete", "reopened"])
+async def test_closed_attempt_branch_cleanup_refuses_ambiguous_ownership(rejected, change):
+    runner, _, _, remote, github, _ = rejected
+    current, changed, _ = await admit_closed_automatic_error_rewrite(rejected)
+    update = {}
+    if change == "repo":
+        update["repo_url"] = "https://github.com/other/repo.git"
+    elif change == "incomplete":
+        update["branch_cleanup_branch"] = None
+    else:
+        github["attempt_prs"][0]["state"] = "open"
+    updated = current.model_copy(update=update)
+    await save_attempt(runner.redis, runner.name, updated, expected=current)
+    runner.state.current_task = updated.task
+    remote_before = git(remote, "show-ref")
+
+    assert not await runner._prepare_task_attempt(changed)
+
+    assert git(remote, "show-ref") == remote_before
+    assert not (await load_attempt(runner.redis, runner.name, "PR-42")).started
+
+
 async def test_git_rewrite_of_legacy_filename_admits_by_header_identity(rejected):
     runner, _, repo, *_ = rejected
     git(repo, "checkout", "main")
@@ -1050,13 +1134,20 @@ async def test_old_approval_and_retry_cannot_cross_replacement(rejected):
     assert runner.state.current_pr is None
 
 
-@pytest.mark.parametrize("change", ["local", "remote", "dirty", "process", "reopened"])
+@pytest.mark.parametrize("change", ["local", "remote", "dirty", "process", "reopened", "repo"])
 async def test_reused_branch_cleanup_refuses_ambiguous_ownership(rejected, monkeypatch, change):
     await finish_reject(rejected)
     runner, _, repo, remote, github, _ = rejected
     assert (await stage(rejected, rewritten(repo))).status_code == 200
     assert await runner.process_pending_uploads() is True
     attempt = await load_attempt(runner.redis, runner.name, "PR-42")
+    if change == "repo":
+        attempt = await save_attempt(
+            runner.redis,
+            runner.name,
+            attempt.model_copy(update={"repo_url": "https://github.com/other/repo.git"}),
+            expected=attempt,
+        )
     runner.state.current_task = attempt.task.model_copy(deep=True)
     if change in {"local", "remote"}:
         git(repo, "checkout", "fix/pr-42")
@@ -1070,7 +1161,7 @@ async def test_reused_branch_cleanup_refuses_ambiguous_ownership(rejected, monke
         (repo / "unrelated.txt").write_text("preserve")
     elif change == "process":
         monkeypatch.setattr(daemon_admission, "checkout_process_blocker", lambda path: "orphan still running")
-    else:
+    elif change == "reopened":
         github["state"] = "open"
     remote_before = git(remote, "show-ref")
     assert not await runner._prepare_task_attempt((repo / "tasks/PR-42.md").read_text())

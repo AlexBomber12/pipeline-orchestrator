@@ -626,6 +626,19 @@ async def test_rejection_identity_manifest_redacts_guardrail_failure(rejected):
     }
 
 
+async def test_rejection_identity_manifest_sanitizes_authenticated_repo_url(rejected):
+    runner, command, repo, *_ = rejected
+    command.repo_url = "https://token123@github.com/octo/demo.git"
+
+    assert await runner._commit_rejection_identity(command)
+
+    manifest_text = git(repo, "show", "origin/main:tasks/rejections.json")
+    assert "token123" not in manifest_text
+    entry = json.loads(manifest_text)["rejections"]["PR-42"][0]
+    assert entry["repo_url"] == "https://github.com/octo/demo"
+    assert daemon_reject._manifest_repo_url("not a github url", "octo/demo") == "https://github.com/octo/demo"
+
+
 @pytest.mark.parametrize(
     ("manifest", "message"),
     [

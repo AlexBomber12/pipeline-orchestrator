@@ -45,6 +45,9 @@ class TaskAttempt(BaseModel):
     previous_rejection: str | None = None
     admission_pending: bool = False
     branch_prepared: bool = False
+    branch_cleanup_branch: str | None = None
+    branch_cleanup_head: str | None = None
+    branch_cleanup_pr_number: int | None = None
 
 
 def attempt_key(repo: str, task_id: str) -> str:

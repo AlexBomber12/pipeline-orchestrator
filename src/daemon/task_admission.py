@@ -11,6 +11,7 @@ from src.cancellation.storage import CancellationCause, cause_key, index_key, ta
 from src.config import normalize_repo_url
 from src.daemon import git_ops
 from src.daemon.approval_commands import checkout_process_blocker
+from src.daemon.attempt_prs import discover_attempt_pr
 from src.daemon.rejection_commands import rejection_pr_details
 from src.github import gh_runner
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
@@ -508,7 +509,11 @@ class TaskAdmissionMixin:
             self.state.current_task.attempt_id = attempt.attempt_id
             if self._current_run_record is not None:
                 self._current_run_record.attempt_id = attempt.attempt_id
-            if attempt.previous_rejection and not attempt.branch_prepared:
+            if not attempt.branch_prepared and attempt.branch_cleanup_head:
+                await self._prepare_closed_attempt_branch(attempt)
+                updated = attempt.model_copy(update={"branch_prepared": True})
+                attempt = await save_attempt(self.redis, self.name, updated, expected=attempt)
+            if not attempt.branch_prepared and attempt.previous_rejection:
                 await self._prepare_reused_branch(attempt)
                 updated = attempt.model_copy(update={"branch_prepared": True})
                 attempt = await save_attempt(self.redis, self.name, updated, expected=attempt)
@@ -555,25 +560,19 @@ class TaskAdmissionMixin:
         self.log_event(f"[RECOVERY] {task_id}: {reason}")
         await self.publish_state()
 
-
-    async def _prepare_reused_branch(self, attempt: TaskAttempt) -> None:
-        command = await self._load_final_rejection(attempt.previous_rejection, attempt.task.pr_id)
-        if command is None or command.status != "rejected" or not command.released:
-            raise AttemptChanged("Prior rejection is not confirmed.")
-        branch, base = attempt.task.branch, self.repo_config.branch
-        if branch == base or normalize_repo_url(attempt.repo_url) != normalize_repo_url(
-            command.repo_url
-        ):
-            raise AttemptChanged("Branch or repository ownership differs from the abandoned attempt.")
+    def _prepare_owned_branch_cleanup(
+        self,
+        branch: str,
+        base: str,
+        expected: str | None,
+    ) -> None:
+        if branch == base:
+            raise AttemptChanged("Branch cleanup target is the configured base.")
         if self._current_coder_process is not None or checkout_process_blocker(self.repo_path):
             raise AttemptChanged("Checkout process quiescence is not established.")
         origin = git_ops._git(self.repo_path, "remote", "get-url", "origin").stdout.strip()
         if gh_runner.get_repo_full_name(origin).casefold() != self.owner_repo.casefold():
             raise AttemptChanged("Origin does not belong to the configured repository.")
-        if command.pr:
-            details = rejection_pr_details(self.owner_repo, command, base)
-            if details["state"] != "closed" or details["merged_at"]:
-                raise AttemptChanged("Rejected PR is no longer closed without merge.")
         prs = gh_runner.run_gh(
             ["pr", "list", "--state", "open", "--head", branch, "--json", "number"],
             self.owner_repo,
@@ -586,7 +585,6 @@ class TaskAdmissionMixin:
         remote_sha = remote.split()[0] if remote else None
         local = git_ops._git(self.repo_path, "rev-parse", "--verify", f"refs/heads/{branch}", check=False)
         local_sha = local.stdout.strip() if local.returncode == 0 else None
-        expected = command.branch_head if branch == command.task.branch else None
         if (remote_sha and remote_sha != expected) or (local_sha and local_sha != expected):
             raise AttemptChanged("Abandoned branch has an unexpected update; reconcile ownership before cleanup.")
         git_ops._git(self.repo_path, "fetch", "origin", base)
@@ -611,3 +609,51 @@ class TaskAdmissionMixin:
             git_ops._git(self.repo_path, "update-ref", "-d", f"refs/heads/{branch}", local_sha)
         # Coder's normal AUTO PR creates the now-absent branch from origin/base.
         # Retry/Approve never call this abandoned-attempt cleanup.
+
+    async def _prepare_reused_branch(self, attempt: TaskAttempt) -> None:
+        command = await self._load_final_rejection(attempt.previous_rejection, attempt.task.pr_id)
+        if command is None or command.status != "rejected" or not command.released:
+            raise AttemptChanged("Prior rejection is not confirmed.")
+        branch, base = attempt.task.branch, self.repo_config.branch
+        if normalize_repo_url(attempt.repo_url) != normalize_repo_url(command.repo_url):
+            raise AttemptChanged("Branch or repository ownership differs from the abandoned attempt.")
+        if command.pr:
+            details = rejection_pr_details(self.owner_repo, command, base)
+            if details["state"] != "closed" or details["merged_at"]:
+                raise AttemptChanged("Rejected PR is no longer closed without merge.")
+        expected = command.branch_head if branch == command.task.branch else None
+        self._prepare_owned_branch_cleanup(branch, base, expected)
+
+    async def _prepare_closed_attempt_branch(self, attempt: TaskAttempt) -> None:
+        if normalize_repo_url(attempt.repo_url) != normalize_repo_url(self.repo_config.url):
+            raise AttemptChanged("Branch cleanup belongs to a different repository.")
+        if (
+            attempt.branch_cleanup_branch is None
+            or attempt.branch_cleanup_head is None
+            or attempt.branch_cleanup_pr_number is None
+        ):
+            raise AttemptChanged("Prior branch cleanup ownership is incomplete.")
+        probe = attempt.model_copy(
+            update={
+                "pr_number": attempt.branch_cleanup_pr_number,
+                "task": attempt.task.model_copy(update={"branch": attempt.branch_cleanup_branch}),
+            }
+        )
+        data = discover_attempt_pr(
+            self.repo_path,
+            self.owner_repo,
+            self.repo_config.branch,
+            probe,
+        )
+        if (
+            data is None
+            or data.get("state") != "closed"
+            or data.get("merged_at")
+            or data.get("head", {}).get("sha") != attempt.branch_cleanup_head
+        ):
+            raise AttemptChanged("Prior attempt PR is not closed without merge.")
+        self._prepare_owned_branch_cleanup(
+            attempt.branch_cleanup_branch,
+            self.repo_config.branch,
+            attempt.branch_cleanup_head,
+        )

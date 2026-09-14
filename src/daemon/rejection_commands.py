@@ -31,6 +31,14 @@ from src.task_attempts import AttemptChanged, load_attempt, save_attempt
 _NO_PR_ABSENCE_REASON = "No PR found after stopping execution; confirming absence before final rejection."
 
 
+def _manifest_repo_url(repo_url: str, owner_repo: str) -> str:
+    try:
+        owner = gh_runner.get_repo_full_name(repo_url)
+    except ValueError:
+        owner = owner_repo
+    return f"https://github.com/{owner}"
+
+
 def rejection_pr_details(
     owner_repo: str,
     command: RejectionCommand,
@@ -338,7 +346,7 @@ class RejectionCommandMixin:
                 "file_sha256": command.file_sha256,
                 "attempt_id": command.attempt_id,
                 "rejection_binding": command.binding,
-                "repo_url": command.repo_url,
+                "repo_url": _manifest_repo_url(command.repo_url, self.owner_repo),
                 "base_commit": command.base_commit,
                 "task_file": command.task.task_file,
                 "task_title": command.task.title,
