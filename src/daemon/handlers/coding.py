@@ -614,7 +614,7 @@ class CodingMixin:
                 f"until the marker is removed."
             )
 
-    async def _record_visible_guardrail_pr(self, target_branch: str) -> None:
+    async def _record_visible_pr_before_error(self, target_branch: str, source: str) -> None:
         gh_cache._invalidate_etag_cache(f"repos/{self.owner_repo}/pulls")
         candidate = None
         last_exc: Exception | None = None
@@ -645,12 +645,12 @@ class CodingMixin:
         if candidate is None:
             if ambiguous:
                 self.log_event(
-                    f"[CODING] Guardrail PR lookup found multiple matches for {target_branch!r}; "
+                    f"[CODING] {source} PR lookup found multiple matches for {target_branch!r}; "
                     "ownership record deferred."
                 )
             if last_exc is not None:
                 self.log_event(
-                    f"[CODING] Guardrail PR lookup deferred for {target_branch!r}: {last_exc}."
+                    f"[CODING] {source} PR lookup deferred for {target_branch!r}: {last_exc}."
                 )
             return
         task = self.state.current_task
@@ -686,13 +686,13 @@ class CodingMixin:
             task.attempt_id = attempt.attempt_id
         except Exception as exc:
             self.log_event(
-                f"[CODING] Guardrail PR ownership record deferred for {target_branch!r}: {exc}."
+                f"[CODING] {source} PR ownership record deferred for {target_branch!r}: {exc}."
             )
             return
         self.state.current_pr = candidate
         self._rehydrate_last_push_at(candidate)
         self.log_event(
-            f"[CODING] Recorded PR #{candidate.number} for {target_branch!r} before guardrail ERROR."
+            f"[CODING] Recorded PR #{candidate.number} for {target_branch!r} before {source} ERROR."
         )
 
     async def _post_coder_resolution(
@@ -762,7 +762,7 @@ class CodingMixin:
             if await pause_for_stop_if_requested():
                 return
             if self.state.current_pr is None:
-                await self._record_visible_guardrail_pr(target_branch)
+                await self._record_visible_pr_before_error(target_branch, "guardrail")
             if self.state.current_pr is not None:
                 pr_number = self.state.current_pr.number
                 self.state.quarantined_prs.add(pr_number)
@@ -810,6 +810,11 @@ class CodingMixin:
                     f"{self.state.rate_limited_until.isoformat()}."
                 )
                 return
+            if self.state.current_pr is None:
+                await self._record_visible_pr_before_error(
+                    target_branch,
+                    f"{coder_name} failure",
+                )
             await self._transition_to_error(
                 stderr.strip() or f"{coder_name} exit {code}",
                 publish=False,

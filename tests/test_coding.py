@@ -534,9 +534,74 @@ def test_record_visible_guardrail_pr_requires_task_attempt_receipt(
     if case == "task_none":
         runner.state.current_task = None
 
-    asyncio.run(runner._record_visible_guardrail_pr("pr-001"))
+    asyncio.run(runner._record_visible_pr_before_error("pr-001", "guardrail"))
 
     assert runner.state.current_pr is None
+
+def test_nonzero_coder_exit_records_visible_pr_number_before_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner(monkeypatch)
+    attempt = new_attempt(
+        runner.repo_config.url,
+        runner.state.current_task,
+        "# PR-001\n\nBranch: pr-001\n",
+        started=True,
+        coder_dispatched=True,
+    )
+    runner.state.current_task.attempt_id = attempt.attempt_id
+    asyncio.run(save_attempt(runner.redis, runner.name, attempt, expected=None))
+    found = PRInfo(number=42, branch="pr-001", pr_id="PR-001", head_sha="abcdef")
+    invalidations: list[str] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **_kw: Any):
+        if args == ["api", f"repos/{runner.owner_repo}/pulls/42"]:
+            return {
+                "number": 42,
+                "state": "open",
+                "head": {
+                    "ref": "pr-001",
+                    "sha": "abcdef",
+                    "repo": {"full_name": runner.owner_repo},
+                },
+                "base": {
+                    "ref": runner.repo_config.branch,
+                    "repo": {"full_name": runner.owner_repo},
+                },
+            }
+        return ""
+
+    _patch_branch_state(monkeypatch, local_exists=False, remote_exists=True)
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *a, **kw: [found])
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+    monkeypatch.setattr(
+        coding_module.gh_cache,
+        "_invalidate_etag_cache",
+        lambda key: invalidations.append(key),
+    )
+
+    asyncio.run(
+        runner._post_coder_resolution(
+            "claude",
+            1,
+            "",
+            "coder failed after opening PR",
+            target_branch="pr-001",
+            current_pr_id="PR-001",
+        )
+    )
+
+    current = asyncio.run(load_attempt(runner.redis, runner.name, "PR-001"))
+    assert invalidations == [f"repos/{runner.owner_repo}/pulls"]
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_pr == found
+    assert current.pr_number == 42
+    assert any(
+        "Recorded PR #42 for 'pr-001' before claude failure ERROR"
+        in entry["event"]
+        for entry in runner.state.history
+    )
+
 
 def test_case_c_already_exists_error_recovers_to_watch(
     monkeypatch: pytest.MonkeyPatch,
