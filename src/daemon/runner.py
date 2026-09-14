@@ -2304,15 +2304,60 @@ class PipelineRunner(
 
     async def _pop_stop_request(self) -> bool:
         """Return True when a pending stop control signal exists."""
-        key = control_stop(self.name)
+        stop_key = control_stop(self.name)
+        state_key = pipeline_state(self.name)
+
+        async def _claim_with_transaction() -> bool:
+            async def _transaction(pipe: Any) -> bool:
+                raw_stop = await pipe.get(stop_key)
+                if not raw_stop:
+                    return False
+                raw_state = await pipe.get(state_key)
+                if raw_state:
+                    try:
+                        persisted = RepoState.model_validate_json(raw_state)
+                    except Exception:
+                        persisted = self.state.model_copy(deep=True)
+                else:
+                    persisted = self.state.model_copy(deep=True)
+                persisted.user_paused = True
+                pipe.multi()
+                pipe.set(state_key, persisted.model_dump_json())
+                pipe.delete(stop_key)
+                return True
+
+            return bool(
+                await self.redis.transaction(
+                    _transaction,
+                    stop_key,
+                    state_key,
+                    value_from_callable=True,
+                )
+            )
+
+        if hasattr(self.redis, "transaction"):
+            try:
+                claimed = await _claim_with_transaction()
+            except Exception:
+                pass
+            else:
+                if claimed:
+                    self.state.user_paused = True
+                return claimed
+
         try:
-            raw = await self.redis.get(key)
+            raw = await self.redis.get(stop_key)
         except Exception:
             return False
         if not raw:
             return False
+        self.state.user_paused = True
         try:
-            await self.redis.delete(key)
+            await self.redis.set(state_key, self.state.model_dump_json())
+        except Exception:
+            pass
+        try:
+            await self.redis.delete(stop_key)
         except Exception:
             pass
         return True
