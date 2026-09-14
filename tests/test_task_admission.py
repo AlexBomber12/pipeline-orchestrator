@@ -334,6 +334,35 @@ async def test_changed_upload_after_reset_replaces_started_automatic_error_attem
     assert (repo / "tasks/PR-42.md").read_text() == changed
 
 
+async def test_changed_upload_while_idle_current_task_owns_started_attempt_is_rejected(rejected):
+    await finish_reject(rejected)
+    runner, _, repo, *_ = rejected
+    first_rewrite = rewritten(repo)
+    assert (await stage(rejected, first_rewrite)).status_code == 200
+    assert await runner.process_pending_uploads() is True
+    admitted = await load_attempt(runner.redis, runner.name, "PR-42")
+    runner.state.current_task = admitted.task
+    assert await runner._prepare_task_attempt(first_rewrite)
+    previous = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert previous.started and previous.coder_dispatched is True
+    assert previous.rejection is None and previous.previous_rejection is not None
+
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_task = previous.task
+    runner.state.current_pr = None
+    await runner.redis.delete(cause_key(runner.name, "PR-42"))
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    changed = first_rewrite.replace("New specification.", "Replacement while still owned.")
+
+    assert (await stage(rejected, changed)).status_code == 200
+    assert await runner.process_pending_uploads() is False
+
+    current = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert current == previous
+    assert (repo / "tasks/PR-42.md").read_text() == first_rewrite
+    assert await runner.redis.get(upload_pending(runner.name)) is None
+
+
 async def test_changed_upload_after_reset_defers_while_prior_pr_remains_open(rejected):
     runner, _, repo, _, github, _ = rejected
     git(repo, "checkout", "main")

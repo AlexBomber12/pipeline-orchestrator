@@ -395,10 +395,24 @@ async def admission_candidate(
     state = RepoState.model_validate_json(raw_state) if raw_state else None
     if (previous is None or not previous.rejection) and state and state.current_task:
         active = state.current_task
+        active_states = {
+            PipelineState.CODING,
+            PipelineState.WATCH,
+            PipelineState.FIX,
+            PipelineState.MERGE,
+            PipelineState.ERROR,
+        }
+        idle_started_owner = (
+            state.state == PipelineState.IDLE
+            and previous is not None
+            and previous.started
+            and not previous.rejection
+            and not previous.completed
+        )
         if active.pr_id == header.pr_id and (
             state.current_pr is not None
-            or state.state
-            in {PipelineState.CODING, PipelineState.WATCH, PipelineState.FIX, PipelineState.MERGE, PipelineState.ERROR}
+            or state.state in active_states
+            or idle_started_owner
         ):
             raise AdmissionRejected(
                 "An active attempt owns this task; Reject before accepting a rewritten specification."
