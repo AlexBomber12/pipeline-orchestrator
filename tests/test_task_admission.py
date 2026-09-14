@@ -15,7 +15,7 @@ from src.daemon import git_ops
 from src.daemon import task_admission as daemon_admission
 from src.github.gh_runner import run_gh as cli_run_gh
 from src.keyspace import pipeline_state, upload_pending, upload_pending_count
-from src.models import PipelineState, QueueTask, TaskStatus
+from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 from src.rejection_commands import build_rejection, load_rejection, rejection_key
 from src.retry_commands import enqueue_retry_command, new_retry_command
 from src.task_admission import admission_candidate, validate_admission_graph
@@ -28,6 +28,7 @@ from src.task_attempts import (
     new_attempt,
     save_attempt,
 )
+from src.task_status import MergeStatusUnavailable
 
 from tests.test_approval_commands import git, isolated_daemon_process_view  # noqa: F401
 from tests.test_rejection_commands import post_reject
@@ -43,13 +44,16 @@ async def finish_reject(fixture):
     assert (await load_rejection(runner.redis, runner.name, command.binding)).released
 
 
+def without_blocked_reason(text):
+    return text.replace("blocked_reason: guardrail\n", "").replace("blocked_reason: operator_reject\n", "")
+
+
 def rewritten(repo):
-    return (
+    return without_blocked_reason(
         (repo / "tasks/PR-42.md")
         .read_text()
         .replace("Original specification.", "New specification.")
         .replace("status: ERROR", "status: TODO")
-        .replace("blocked_reason: guardrail\n", "")
     )
 
 
@@ -207,7 +211,7 @@ async def test_rejected_completion_matches_rejection_time_task_bytes(rejected):
     error_bytes = error_text.replace("\n", "\r\n").encode()
     path.write_bytes(error_bytes)
     command = build_rejection(runner.name, runner.state, await runner.redis.get(cause_key(runner.name, "PR-42")), repo)
-    pre_error_text = error_text.replace("status: ERROR", "status: TODO").replace("blocked_reason: guardrail\n", "")
+    pre_error_text = without_blocked_reason(error_text.replace("status: ERROR", "status: TODO"))
     pre_error_bytes = pre_error_text.replace("\n", "\r\n").encode()
     prior = new_attempt(
         runner.repo_config.url,
@@ -278,7 +282,7 @@ async def test_pending_upload_from_before_reject_does_not_reactivate(rejected):
     # the guardrail decision happen after HTTP staging but before consumption.
     path = repo / "tasks/PR-42.md"
     original = path.read_text()
-    path.write_text(original.replace("status: ERROR", "status: TODO").replace("blocked_reason: guardrail\n", ""))
+    path.write_text(without_blocked_reason(original.replace("status: ERROR", "status: TODO")))
     persisted = runner.state.model_dump_json()
     queued = runner.state.model_copy(deep=True)
     queued.current_task = None
@@ -299,11 +303,8 @@ async def test_upload_stages_unchanged_completed_rejected_attempt_with_new_task(
     runner, _, repo, _, _, _ = rejected
     prior = await load_attempt(runner.redis, runner.name, "PR-42")
     await save_attempt(runner.redis, runner.name, prior.model_copy(update={"completed": True}), expected=prior)
-    unchanged_completed = (
-        (repo / "tasks/PR-42.md")
-        .read_text()
-        .replace("status: ERROR", "status: TODO")
-        .replace("blocked_reason: guardrail\n", "")
+    unchanged_completed = without_blocked_reason(
+        (repo / "tasks/PR-42.md").read_text().replace("status: ERROR", "status: TODO")
     )
     new_task = task_43_from(repo)
 
@@ -324,11 +325,8 @@ async def test_upload_replays_unchanged_completed_merged_rejection_with_new_task
         rejection_key(runner.name, command.binding),
         stored.model_copy(update={"status": "merged", "released": True}).model_dump_json(),
     )
-    unchanged_completed = (
-        (repo / "tasks/PR-42.md")
-        .read_text()
-        .replace("status: ERROR", "status: TODO")
-        .replace("blocked_reason: guardrail\n", "")
+    unchanged_completed = without_blocked_reason(
+        (repo / "tasks/PR-42.md").read_text().replace("status: ERROR", "status: TODO")
     )
     new_task = task_43_from(repo)
 
@@ -768,6 +766,74 @@ async def test_prior_base_snapshot_preserves_legacy_rejection_and_ignores_unstru
     assert (await load_attempt(runner.redis, runner.name, "PR-42")).attempt_id == receipt.attempt_id
 
 
+async def test_prior_base_snapshot_waits_for_local_base_before_sync(rejected):
+    runner, _, repo, *_ = rejected
+    git(repo, "checkout", "main")
+    git(repo, "checkout", "-b", "release")
+    git(repo, "push", "-u", "origin", "release")
+    git(repo, "checkout", "main")
+    git(repo, "branch", "-D", "release")
+    runner.repo_config = runner.repo_config.model_copy(update={"branch": "release"})
+
+    await runner._snapshot_accepted_specs()
+    assert await load_attempt(runner.redis, runner.name, "PR-42") is None
+
+    runner.sync_to_main()
+    assert git(repo, "branch", "--show-current") == "release"
+    await runner._snapshot_accepted_specs()
+    assert (await load_attempt(runner.redis, runner.name, "PR-42")).task.pr_id == "PR-42"
+
+
+@pytest.mark.parametrize("case", ["log_failure", "missing_blob", "non_utf8", "changed_spec", "invalid_header"])
+async def test_historical_operator_reject_marker_ignores_unusable_history(rejected, monkeypatch, case):
+    runner, _, repo, *_ = rejected
+    marker = (repo / "tasks/PR-42.md").read_text().replace(
+        "blocked_reason: guardrail",
+        "blocked_reason: operator_reject",
+    )
+    content = marker
+    fingerprint = task_spec_content_hash(marker)
+    if case == "changed_spec":
+        content = marker + "\nChanged requirements.\n"
+    elif case == "invalid_header":
+        content = marker.replace("- Type: bugfix", "- Type: invalid")
+        fingerprint = task_spec_content_hash(content)
+
+    def fake_git(path, *args, **kwargs):
+        if args[:2] == ("log", "--format=%H"):
+            return subprocess.CompletedProcess(args, 1 if case == "log_failure" else 0, stdout="abc123\n", stderr="")
+        raise AssertionError(args)
+
+    def fake_git_bytes(path, *args, **kwargs):
+        if args[:1] == ("show",):
+            if case == "missing_blob":
+                return subprocess.CompletedProcess(args, 1, stdout=b"", stderr=b"missing")
+            if case == "non_utf8":
+                return subprocess.CompletedProcess(args, 0, stdout=b"\xff", stderr=b"")
+            return subprocess.CompletedProcess(args, 0, stdout=content.encode(), stderr=b"")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(daemon_admission.git_ops, "_git", fake_git)
+    monkeypatch.setattr(daemon_admission.git_ops, "_git_bytes", fake_git_bytes)
+
+    assert not runner._has_historical_operator_reject_marker("main", "tasks/PR-42.md", fingerprint)
+
+
+async def test_prior_base_snapshot_git_failure_defers_as_merge_unavailable(rejected, monkeypatch):
+    runner, *_ = rejected
+    original_git = daemon_admission.git_ops._git
+
+    def failing_git(path, *args, **kwargs):
+        if args[:3] == ("ls-tree", "-r", "--name-only"):
+            raise subprocess.CalledProcessError(128, args, stderr="bad ref")
+        return original_git(path, *args, **kwargs)
+
+    monkeypatch.setattr(daemon_admission.git_ops, "_git", failing_git)
+
+    with pytest.raises(MergeStatusUnavailable, match="Accepted-spec snapshot unavailable"):
+        await runner._snapshot_accepted_specs()
+
+
 @pytest.mark.parametrize(
     "case", ["checkout", "origin", "superseded", "status_failure", "status_success", "lost_finish"]
 )
@@ -1191,10 +1257,44 @@ async def test_admission_checks_completion_history_without_attempt_receipt(rejec
     await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
     incoming = tmp_path / "PR-42.md"
     incoming.write_text(
-        historical.decode()
-        .replace("status: ERROR", "status: TODO")
-        .replace("blocked_reason: guardrail\n", "")
+        without_blocked_reason(historical.decode().replace("status: ERROR", "status: TODO"))
         .replace("Original specification.", "Duplicate replacement.")
+    )
+
+    with pytest.raises(AdmissionRejected, match="completion evidence"):
+        await admission_candidate(
+            runner.redis,
+            runner.name,
+            runner.repo_config.url,
+            "main",
+            repo,
+            incoming,
+            upload=True,
+        )
+
+
+async def test_admission_checks_github_completion_metadata_without_attempt_receipt(rejected, tmp_path, monkeypatch):
+    runner, _, repo, *_ = rejected
+    git(repo, "checkout", "main")
+    path = repo / "tasks/PR-42.md"
+    historical = path.read_text()
+    git(repo, "rm", "tasks/PR-42.md")
+    git(repo, "commit", "-m", "archive completed task")
+    git(repo, "push", "origin", "main")
+    await runner.redis.delete(attempt_key(runner.name, "PR-42"))
+    runner.state.current_task = None
+    runner.state.current_pr = None
+    runner.state.state = PipelineState.IDLE
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    monkeypatch.setattr(
+        "src.task_admission.gh_prs.get_merged_prs",
+        lambda owner, base, refresh=False: [PRInfo(number=17, branch="fix/pr-42", pr_id=None)],
+    )
+    incoming = tmp_path / "PR-42.md"
+    incoming.write_text(
+        without_blocked_reason(historical.replace("status: ERROR", "status: TODO")).replace(
+            "Original specification.", "Duplicate replacement."
+        )
     )
 
     with pytest.raises(AdmissionRejected, match="completion evidence"):
@@ -1218,9 +1318,7 @@ async def test_empty_active_task_cannot_prepare_an_attempt(rejected):
 async def test_legacy_todo_header_does_not_hide_a_live_pr_owner(rejected):
     runner, _, repo, *_ = rejected
     path = repo / "tasks/PR-42.md"
-    path.write_text(
-        path.read_text().replace("status: ERROR", "status: TODO").replace("blocked_reason: guardrail\n", "")
-    )
+    path.write_text(without_blocked_reason(path.read_text().replace("status: ERROR", "status: TODO")))
     response = await stage(rejected, rewritten(repo))
     assert response.status_code == 200
     assert await runner.process_pending_uploads() is False
@@ -2017,7 +2115,7 @@ async def test_sprint_zip_replays_completed_tasks_without_reusing_them(
     runner.repo_config.feature_flags.use_single_error_exit = single
     git(repo, "checkout", "main")
     path = repo / "tasks/PR-42.md"
-    completed = path.read_text().replace("status: ERROR", "status: DONE").replace("blocked_reason: guardrail\n", "")
+    completed = without_blocked_reason(path.read_text().replace("status: ERROR", "status: DONE"))
     path.write_text(completed)
     git(repo, "commit", "-am", "task completed")
     record = {

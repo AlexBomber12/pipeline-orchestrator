@@ -43,6 +43,7 @@ from src.cancellation import (
     get_cancellation_cause,
     safe_delete_cancellation_cause,
     safe_record_cancellation_cause,
+    task_spec_content_hash,
     truncate_for_payload,
 )
 from src.cancellation.availability import (
@@ -2046,6 +2047,9 @@ class PipelineRunner(
         status: str,
         reason: str,
         blocked_reason: SuppressionReason | str | None = None,
+        *,
+        expected_spec_hash: str | None = None,
+        allow_spec_hash_mismatch: bool = False,
     ) -> bool:
         """Best-effort commit of daemon-written task frontmatter status."""
         try:
@@ -2100,6 +2104,16 @@ class PipelineRunner(
                 f"origin/{base}",
                 timeout=60,
             )
+            if expected_spec_hash is not None:
+                current_hash = task_spec_content_hash(
+                    (Path(self.repo_path) / task_file).read_text(encoding="utf-8")
+                )
+                if current_hash != expected_spec_hash:
+                    self.log_event(
+                        f"[INFRA] Warning: skipping {status} status commit for "
+                        f"{task_file}: task specification changed."
+                    )
+                    return allow_spec_hash_mismatch
             write_frontmatter_status(
                 Path(self.repo_path) / task_file,
                 status,

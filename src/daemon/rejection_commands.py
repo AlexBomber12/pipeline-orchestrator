@@ -20,6 +20,7 @@ from src.rejection_commands import (
     rejection_key,
     rejection_pending_index,
 )
+from src.subsource_registry import SuppressionReason
 from src.task_attempts import AttemptChanged, load_attempt, save_attempt
 
 _NO_PR_ABSENCE_REASON = "No PR found after stopping execution; confirming absence before final rejection."
@@ -262,7 +263,15 @@ class RejectionCommandMixin:
                 raise AttemptChanged(
                     "PR is closed; checkout has uncommitted files. Confirm ownership and clear them before release."
                 )
-            git_ops._git(self.repo_path, "checkout", self.repo_config.branch)
+            if not await self._commit_task_status_change(
+                command.task,
+                "ERROR",
+                "operator reject finalized",
+                SuppressionReason.OPERATOR_REJECT,
+                expected_spec_hash=command.fingerprint,
+                allow_spec_hash_mismatch=True,
+            ):
+                raise AttemptChanged("Operator rejection marker could not be committed; rejection remains pending.")
             await self._save_rejection(
                 command,
                 "rejected",

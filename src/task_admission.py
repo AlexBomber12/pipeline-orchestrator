@@ -187,7 +187,12 @@ async def admission_candidate(
             {header.pr_id},
             trust_recorded_digest_if_task_missing=True,
         )
-        if header.pr_id in merged or header.pr_id in recorded:
+        merged_prs = gh_prs.get_merged_prs(owner, base, refresh=True)
+        if (
+            header.pr_id in merged
+            or header.pr_id in recorded
+            or any(pr.pr_id == header.pr_id or pr.branch == header.branch for pr in merged_prs)
+        ):
             raise AdmissionRejected(f"{header.pr_id} has authoritative completion evidence and cannot be reused.")
     raw_state = await redis.get(pipeline_state(repo))
     state = RepoState.model_validate_json(raw_state) if raw_state else None

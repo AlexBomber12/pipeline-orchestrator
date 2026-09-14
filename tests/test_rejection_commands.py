@@ -373,6 +373,7 @@ async def test_connected_http_reject_rewrite_clean_base_and_new_pr(rejected, mon
         .replace("Original specification.", "Rewritten specification.")
         .replace("status: ERROR", "status: TODO")
         .replace("blocked_reason: guardrail\n", "")
+        .replace("blocked_reason: operator_reject\n", "")
     )
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post(
@@ -416,6 +417,52 @@ async def test_connected_http_reject_rewrite_clean_base_and_new_pr(rejected, mon
     assert git(remote, "show", "refs/heads/fix/pr-42:new-implementation.txt") == "fresh"
     assert (await post_reject(rejected)).status_code == 202
     assert github["state"] == "closed" and runner.state.current_pr.number == 43
+
+
+async def test_final_rejection_commits_operator_reject_marker_for_redis_loss(rejected):
+    runner, command, repo, *_ = rejected
+
+    assert (await post_reject(rejected)).status_code == 202
+    await runner._run_cycle_body()
+
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    assert stored.status == "rejected" and stored.released
+    assert "blocked_reason: operator_reject" in git(repo, "show", "origin/main:tasks/PR-42.md")
+    git(repo, "checkout", "main")
+    task_path = repo / "tasks/PR-42.md"
+    task_path.write_text(
+        task_path.read_text()
+        .replace("status: ERROR", "status: TODO")
+        .replace("blocked_reason: operator_reject\n", "")
+    )
+    git(repo, "commit", "-am", "operator clears reject status only")
+    git(repo, "push", "origin", "main")
+
+    await runner.redis.delete(attempt_key(runner.name, "PR-42"))
+    await runner.redis.delete(rejection_key(runner.name, command.binding))
+    await runner.redis.delete(cause_key(runner.name, "PR-42"))
+    await runner.redis.delete(index_key(runner.name))
+
+    await runner._snapshot_accepted_specs()
+    recovered = await load_attempt(runner.redis, runner.name, "PR-42")
+
+    assert recovered.rejection == "legacy-missing-identity"
+    assert recovered.fingerprint == command.fingerprint
+    assert await runner._reconcile_git_admissions() == {"PR-42"}
+
+
+async def test_rejection_defers_when_operator_marker_commit_fails(rejected, monkeypatch):
+    runner, command, _, _, github, _ = rejected
+
+    assert (await post_reject(rejected)).status_code == 202
+    monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=False))
+
+    await runner._consume_rejection_commands()
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+
+    assert stored.status == "deferred" and not stored.released
+    assert "Operator rejection marker could not be committed" in stored.reason
+    assert github["state"] == "closed"
 
 
 async def test_stale_decision_and_repeated_submission(rejected):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -27,7 +28,41 @@ from src.task_attempts import (
 from src.task_status import MergeStatusUnavailable
 
 
+def _parse_snapshot_header(filename: str, content: str):
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / Path(filename).name
+        path.write_text(content, encoding="utf-8")
+        try:
+            return parse_existing_task_header(path)
+        except UnstructuredLegacyTaskError:
+            return None
+        except QueueValidationError as exc:
+            raise QueueValidationError([issue.replace(str(path), filename) for issue in exc.issues]) from exc
+
+
 class TaskAdmissionMixin:
+    def _has_historical_operator_reject_marker(self, base: str, filename: str, fingerprint: str) -> bool:
+        result = git_ops._git(self.repo_path, "log", "--format=%H", base, "--", filename, check=False)
+        if result.returncode != 0:
+            return False
+        for commit in result.stdout.splitlines():
+            blob = git_ops._git_bytes(self.repo_path, "show", f"{commit}:{filename}", check=False)
+            if blob.returncode != 0:
+                continue
+            try:
+                content = blob.stdout.decode("utf-8")
+            except UnicodeError:
+                continue
+            if task_spec_content_hash(content) != fingerprint:
+                continue
+            try:
+                header = _parse_snapshot_header(filename, content)
+            except QueueValidationError:
+                continue
+            if header and header.blocked_reason == "operator_reject":
+                return True
+        return False
+
     async def _snapshot_accepted_specs(self) -> None:
         """Capture prior local-base bytes before synchronization overwrites them.
 
@@ -37,7 +72,21 @@ class TaskAdmissionMixin:
         if not (Path(self.repo_path) / ".git").exists():
             return  # No local-base snapshot exists before the first clone.
         base = self.repo_config.branch
-        result = git_ops._git(self.repo_path, "ls-tree", "-r", "--name-only", base, "tasks")
+        local_base = git_ops._git(
+            self.repo_path,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{base}^{{commit}}",
+            check=False,
+        )
+        if local_base.returncode != 0:
+            self.log_event(f"[RECOVERY] Accepted-spec snapshot deferred until local base {base!r} is synchronized.")
+            return
+        try:
+            result = git_ops._git(self.repo_path, "ls-tree", "-r", "--name-only", base, "tasks")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            raise MergeStatusUnavailable(f"Accepted-spec snapshot unavailable for {base}: {exc}") from exc
         for filename in result.stdout.splitlines():
             if not Path(filename).match("tasks/PR-*.md"):
                 continue
@@ -46,15 +95,10 @@ class TaskAdmissionMixin:
                 continue
             content_bytes = git_ops._git_bytes(self.repo_path, "show", f"{base}:{filename}").stdout
             content = content_bytes.decode("utf-8")
-            with tempfile.TemporaryDirectory() as directory:
-                path = Path(directory) / Path(filename).name
-                path.write_text(content, encoding="utf-8")
-                try:
-                    header = parse_existing_task_header(path)
-                except UnstructuredLegacyTaskError:
-                    continue
-                except QueueValidationError as exc:
-                    raise QueueValidationError([issue.replace(str(path), filename) for issue in exc.issues]) from exc
+            header = _parse_snapshot_header(filename, content)
+            if header is None:
+                continue
+            fingerprint = task_spec_content_hash(content)
             task = QueueTask(
                 pr_id=header.pr_id,
                 title=header.title,
@@ -69,7 +113,11 @@ class TaskAdmissionMixin:
                 started=header.frontmatter_status not in (None, "todo"),
                 file_sha256=hashlib.sha256(content_bytes).hexdigest(),
             )
-            if header.blocked_reason == "operator_reject":
+            if header.blocked_reason == "operator_reject" or self._has_historical_operator_reject_marker(
+                base,
+                filename,
+                fingerprint,
+            ):
                 receipt.rejection = "legacy-missing-identity"
             await save_attempt(self.redis, self.name, receipt, expected=None)
 

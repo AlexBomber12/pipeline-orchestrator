@@ -3511,6 +3511,7 @@ def test_process_pending_uploads_preserves_upload_on_git_failure(
         return h._FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", failing_run)
+    monkeypatch.setattr("src.task_admission.gh_prs.get_merged_prs", lambda *args, **kwargs: [])
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
