@@ -1123,6 +1123,44 @@ async def test_prior_base_snapshot_uses_header_pr_id_for_receipt_lookup(rejected
     ).attempt_id == receipt.attempt_id
 
 
+async def test_git_reconciliation_uses_header_pr_id_for_mismatched_legacy_file(rejected, monkeypatch):
+    runner, _, repo, *_ = rejected
+    git(repo, "checkout", "main")
+    await runner.redis.delete(attempt_key(runner.name, "PR-42"))
+    original = (repo / "tasks/PR-42.md").read_text()
+    mismatched = original.replace("PR-42:", "PR-999:").replace(
+        "fix/pr-42",
+        "fix/pr-999",
+    )
+    path = repo / "tasks/PR-001.md"
+    (repo / "tasks/PR-42.md").unlink()
+    path.write_text(mismatched)
+    git(repo, "add", "tasks")
+    git(repo, "commit", "-m", "add mismatched legacy task")
+
+    await runner._snapshot_accepted_specs()
+    prior = await load_attempt(runner.redis, runner.name, "PR-999")
+    changed = mismatched.replace("Original specification.", "Changed specification.")
+    path.write_text(changed)
+    git(repo, "commit", "-am", "rewrite mismatched legacy task")
+
+    calls = []
+
+    async def reserve(admission_path):
+        calls.append(
+            (
+                admission_path.relative_to(repo).as_posix(),
+                (await load_attempt(runner.redis, runner.name, "PR-999")).attempt_id,
+            )
+        )
+        return None
+
+    monkeypatch.setattr(runner, "_reserve_admission", reserve)
+
+    assert await runner._reconcile_git_admissions() == set()
+    assert calls == [("tasks/PR-001.md", prior.attempt_id)]
+
+
 async def test_legacy_rejection_sentinel_admits_changed_spec_without_receipt(rejected, tmp_path):
     from src.cancellation.storage import index_key
 
@@ -1244,6 +1282,46 @@ async def test_snapshot_preserves_rejection_cleanup_for_post_final_rewrite_after
     assert recovered.rejection is None
     assert recovered.previous_rejection == command.binding
     assert recovered.fingerprint == task_spec_content_hash(content)
+
+
+async def test_snapshot_preserves_cleanup_for_rewritten_error_after_redis_loss(rejected):
+    from src.cancellation.storage import index_key, task_spec_hash_key
+
+    await finish_reject(rejected)
+    runner, command, repo, remote, *_ = rejected
+    await runner.redis.delete(attempt_key(runner.name, "PR-42"))
+    await runner.redis.delete(rejection_key(runner.name, command.binding))
+    await runner.redis.delete(cause_key(runner.name, "PR-42"))
+    await runner.redis.delete(index_key(runner.name))
+    await runner.redis.delete(task_spec_hash_key(runner.name, "PR-42"))
+
+    git(repo, "checkout", "main")
+    path = repo / "tasks/PR-42.md"
+    content = without_blocked_reason(
+        path.read_text().replace("Original specification.", "Post-final replacement.")
+    )
+    path.write_text(content)
+    git(repo, "commit", "-am", "post-final error rewrite after redis loss")
+    git(repo, "push", "origin", "main")
+
+    await runner._snapshot_accepted_specs()
+
+    recovered = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert recovered.rejection is None
+    assert recovered.previous_rejection == command.binding
+    assert recovered.fingerprint == task_spec_content_hash(content)
+
+    todo = content.replace("status: ERROR", "status: TODO")
+    assert task_spec_content_hash(todo) == recovered.fingerprint
+    path.write_text(todo)
+    git(repo, "commit", "-am", "mark rewritten task todo")
+    git(repo, "push", "origin", "main")
+
+    assert await runner._reconcile_git_admissions() == set()
+    current = await load_attempt(runner.redis, runner.name, "PR-42")
+    runner.state.current_task = current.task
+    assert await runner._prepare_task_attempt(todo)
+    assert "refs/heads/fix/pr-42" not in git(remote, "show-ref")
 
 
 async def test_snapshot_recovers_rejection_relationship_for_pre_final_base_rewrite(rejected):

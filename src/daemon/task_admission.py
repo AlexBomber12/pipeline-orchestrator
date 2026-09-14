@@ -265,7 +265,7 @@ class TaskAdmissionMixin:
             elif (
                 task_rejection
                 and task_rejection.get("rejection_binding")
-                and header.frontmatter_status in (None, "todo")
+                and header.frontmatter_status != "done"
             ):
                 receipt.previous_rejection = str(task_rejection["rejection_binding"])
             await save_attempt(self.redis, self.name, receipt, expected=None)
@@ -388,36 +388,42 @@ class TaskAdmissionMixin:
             self.log_event(f"[RECOVERY] Task set cannot be admitted: {exc}")
             return held
         for path in sorted((Path(self.repo_path) / "tasks").glob("PR-*.md")):
-            prior = await load_attempt(self.redis, self.name, path.stem)
+            content = path.read_text(encoding="utf-8")
+            try:
+                header = parse_existing_task_header(path)
+                task_id = header.pr_id
+            except (QueueValidationError, UnstructuredLegacyTaskError):
+                task_id = path.stem
+            prior = await load_attempt(self.redis, self.name, task_id)
+            fingerprint = task_spec_content_hash(content)
             if prior is None:
-                fingerprint = task_spec_content_hash(path.read_text(encoding="utf-8"))
-                if self._has_recorded_rejection_identity(path.stem, fingerprint):
-                    held.add(path.stem)
+                if self._has_recorded_rejection_identity(task_id, fingerprint):
+                    held.add(task_id)
                     continue
-                raw = await self.redis.get(cause_key(self.name, path.stem))
+                raw = await self.redis.get(cause_key(self.name, task_id))
                 if raw and CancellationCause.from_redis(raw).payload.get("subsource") == "operator_reject":
-                    held.add(path.stem)
+                    held.add(task_id)
                 continue  # normal first admission is recorded at dispatch
-            if task_spec_content_hash(path.read_text(encoding="utf-8")) == prior.fingerprint:
+            if fingerprint == prior.fingerprint:
                 if prior.completed:
                     continue
                 if prior.rejection:
-                    held.add(path.stem)
+                    held.add(task_id)
                 elif prior.admission_pending:
                     try:
                         await self._finish_admission(prior)
                     except Exception as exc:
-                        held.add(path.stem)
-                        self.log_event(f"[RECOVERY] {path.stem}: admission pending ({type(exc).__name__}).")
+                        held.add(task_id)
+                        self.log_event(f"[RECOVERY] {task_id}: admission pending ({type(exc).__name__}).")
                 continue
             try:
                 candidate = await self._reserve_admission(path)
                 if candidate:
                     await self._finish_admission(candidate)
             except Exception as exc:
-                held.add(path.stem)
+                held.add(task_id)
                 message = str(exc) if isinstance(exc, AttemptChanged) else type(exc).__name__
-                self.log_event(f"[RECOVERY] {path.stem}: {message}")
+                self.log_event(f"[RECOVERY] {task_id}: {message}")
         self._admission_held_task_ids = held
         return held
 
