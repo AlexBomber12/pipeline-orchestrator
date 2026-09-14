@@ -31,6 +31,7 @@ from src.models import (
     TaskStatus,
 )
 from src.queue_parser import QueueValidationError, TaskHeader
+from src.task_attempts import new_attempt, save_attempt
 from src.task_status import MergedState
 
 from tests.runner import _helpers as h
@@ -725,7 +726,11 @@ def test_handle_idle_dag_skips_files_without_headers(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
+    monkeypatch.setattr(
+        idle_module,
+        "_resolve_merged_state",
+        lambda *args, **kwargs: _merged_state(),
+    )
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
@@ -2138,6 +2143,57 @@ def test_select_next_task_from_dag_rejects_header_filename_mismatch(
     assert excinfo.value.issues == [
         f"{tasks_dir / 'PR-001.md'}: header PR ID 'PR-999' does not match task file 'PR-001'"
     ]
+
+
+def test_select_next_task_from_dag_selects_admitted_legacy_filename(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    content = (
+        "---\n---\n"
+        "# PR-999: Accepted legacy task\n\n"
+        "Branch: pr-999-accepted-legacy\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+    )
+    (tasks_dir / "PR-001.md").write_text(content, encoding="utf-8")
+
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+    attempt = new_attempt(
+        runner.repo_config.url,
+        QueueTask(
+            pr_id="PR-999",
+            title="Accepted legacy task",
+            task_file="tasks/PR-001.md",
+            branch="pr-999-accepted-legacy",
+            status=TaskStatus.TODO,
+        ),
+        content,
+    )
+    asyncio.run(save_attempt(runner.redis, runner.name, attempt, expected=None))
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-999"
+    assert task.task_file == "tasks/PR-001.md"
+    assert task.branch == "pr-999-accepted-legacy"
+    assert runner._idle_dag_tasks == [task]
 
 
 def test_init_migrates_legacy_clone_when_origin_matches(
