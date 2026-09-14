@@ -26,7 +26,7 @@ from src.daemon.git_ops import (
 from src.keyspace import upload_pending, upload_pending_count
 from src.models import TaskStatus
 from src.retry import retry_transient
-from src.task_admission import validate_admission_graph
+from src.task_admission import invalid_upload_graph_members, validate_admission_graph
 from src.task_attempts import AdmissionRejected, load_attempt
 
 logger = logging.getLogger(__name__)
@@ -327,6 +327,62 @@ return 0
         )
         return None
 
+    async def _discard_invalid_upload_members(
+        self,
+        key: str,
+        raw: bytes | str,
+        staging_dir: Path,
+        manifest: dict,
+        filenames: set[str],
+        reason: str,
+    ) -> bool | None:
+        """Remove invalid staged task files while preserving unrelated uploads."""
+        files = [name for name in manifest.get("files", []) if name not in filenames]
+        task_ids = {Path(filename).stem for filename in filenames}
+        updated = dict(manifest)
+        updated["files"] = files
+        for field in ("task_hashes", "rejection_tokens", "prior_spec_files"):
+            values = updated.get(field)
+            if isinstance(values, dict):
+                values = dict(values)
+                for task_id in task_ids:
+                    values.pop(task_id, None)
+                updated[field] = values
+        updated_raw = json.dumps(updated)
+
+        async def discard(pipe):
+            if await pipe.get(key) != raw:
+                return "changed"
+            pipe.multi()
+            if files:
+                pipe.set(key, updated_raw)
+                pipe.set(upload_pending_count(self.name), str(len(files)))
+                return "retained"
+            pipe.delete(key, upload_pending_count(self.name))
+            return "discarded"
+
+        try:
+            result = await self.redis.transaction(discard, key, value_from_callable=True)
+        except Exception as exc:
+            self.log_event(f"[INFRA] Invalid upload acknowledgement deferred ({type(exc).__name__}).")
+            return None
+        if result == "changed":
+            return None
+        for filename in filenames:
+            try:
+                (staging_dir / filename).unlink(missing_ok=True)
+            except Exception:
+                logger.warning("%s: failed removing invalid upload member %s", self.name, filename)
+        if result == "discarded":
+            shutil.rmtree(str(staging_dir), ignore_errors=True)
+            self.log_event(f"[INFRA] Discarded invalid upload batch: {reason}. Submit corrected files again.")
+            return False
+        self.log_event(
+            f"[INFRA] Discarded invalid upload members {', '.join(sorted(filenames))}: {reason}. "
+            "Remaining staged files stay pending."
+        )
+        return None
+
     async def process_pending_uploads(
         self, *, _safe: bool = False,
     ) -> bool | None:
@@ -418,10 +474,24 @@ return 0
                             fname,
                             "Task changed or was deleted after upload; submit it again.",
                         )
-            validate_admission_graph(Path(self.repo_path), [
+            task_uploads = [
                 staging_dir / name for name in stageable_filenames
                 if name.startswith("PR-") and name.endswith(".md")
-            ])
+            ]
+            try:
+                validate_admission_graph(Path(self.repo_path), task_uploads)
+            except AdmissionRejected as exc:
+                invalid_graph_members = invalid_upload_graph_members(Path(self.repo_path), task_uploads)
+                if invalid_graph_members:
+                    return await self._discard_invalid_upload_members(
+                        key,
+                        raw,
+                        staging_dir,
+                        manifest,
+                        invalid_graph_members,
+                        str(exc),
+                    )
+                raise
             await self._snapshot_accepted_specs()
             admissions = []
             validated = []

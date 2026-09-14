@@ -18,7 +18,7 @@ from src.keyspace import pipeline_state, upload_pending, upload_pending_count
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 from src.rejection_commands import LEGACY_REJECTION_SENTINEL, build_rejection, load_rejection, rejection_key
 from src.retry_commands import enqueue_retry_command, new_retry_command
-from src.task_admission import admission_candidate, validate_admission_graph
+from src.task_admission import admission_candidate, invalid_upload_graph_members, validate_admission_graph
 from src.task_attempts import (
     AdmissionRejected,
     AttemptChanged,
@@ -126,6 +126,108 @@ def test_admission_graph_rejects_duplicate_branch_across_incoming_batch(tmp_path
 
     with pytest.raises(AdmissionRejected, match="Branch fix/shared is also assigned to PR-42"):
         validate_admission_graph(tmp_path, [incoming / "PR-42.md", incoming / "PR-43.md"])
+
+
+def test_invalid_upload_graph_members_identifies_duplicate_branches(tmp_path):
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    (incoming / "PR-42.md").write_text(
+        "---\nstatus: TODO\n---\n\n"
+        "# PR-42: First\nBranch: fix/shared\n- Type: bugfix\n- Complexity: low\n- Depends on: none\n"
+    )
+    (incoming / "PR-43.md").write_text(
+        "---\nstatus: TODO\n---\n\n"
+        "# PR-43: Second\nBranch: fix/shared\n- Type: bugfix\n- Complexity: low\n- Depends on: none\n"
+    )
+
+    assert invalid_upload_graph_members(tmp_path, [incoming / "PR-42.md", incoming / "PR-43.md"]) == {
+        "PR-42.md",
+        "PR-43.md",
+    }
+
+
+def test_invalid_upload_graph_members_identifies_cycles_and_dependents(tmp_path):
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    tasks.joinpath("PR-90.md").write_text("# PR-90: Legacy note\n\nUnstructured body.\n")
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    incoming.joinpath("PR-42.md").write_text(
+        "---\nstatus: TODO\n---\n\n"
+        "# PR-42: First\nBranch: fix/pr-42\n- Type: bugfix\n- Complexity: low\n- Depends on: PR-43\n"
+    )
+    incoming.joinpath("PR-43.md").write_text(
+        "---\nstatus: TODO\n---\n\n"
+        "# PR-43: Second\nBranch: fix/pr-43\n- Type: bugfix\n- Complexity: low\n- Depends on: PR-42\n"
+    )
+    incoming.joinpath("PR-44.md").write_text(
+        "---\nstatus: TODO\n---\n\n"
+        "# PR-44: Dependent\nBranch: fix/pr-44\n- Type: bugfix\n- Complexity: low\n- Depends on: PR-42\n"
+    )
+    incoming.joinpath("PR-45.md").write_text(
+        "---\nstatus: TODO\n---\n\n"
+        "# PR-45: Independent\nBranch: fix/pr-45\n- Type: bugfix\n- Complexity: low\n- Depends on: none\n"
+    )
+
+    assert invalid_upload_graph_members(
+        tmp_path,
+        [
+            incoming / "PR-42.md",
+            incoming / "PR-43.md",
+            incoming / "PR-44.md",
+            incoming / "PR-45.md",
+        ],
+    ) == {"PR-42.md", "PR-43.md", "PR-44.md"}
+
+
+def test_invalid_upload_graph_members_isolates_malformed_incoming(tmp_path):
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    tasks.joinpath("PR-90.md").write_text(
+        "---\nstatus: TODO\n---\n\n"
+        "# PR-90: Broken existing\nBranch: fix/pr-90\n- Type: invalid\n- Complexity: low\n- Depends on: none\n"
+    )
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    incoming.joinpath("PR-42.md").write_text(
+        "---\nstatus: TODO\n---\n\n"
+        "# PR-42: Broken incoming\nBranch: fix/pr-42\n- Type: invalid\n- Complexity: low\n- Depends on: none\n"
+    )
+
+    assert invalid_upload_graph_members(tmp_path, [incoming / "PR-42.md"]) == {"PR-42.md"}
+    with pytest.raises(AdmissionRejected, match="invalid Type"):
+        invalid_upload_graph_members(tmp_path, [])
+
+
+def test_invalid_upload_graph_members_tolerates_existing_missing_task_header(tmp_path):
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    tasks.joinpath("PR-90.md").write_text("---\nstatus: TODO\n---\n\nLoose structured note.\n")
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    incoming.joinpath("PR-42.md").write_text(
+        "---\nstatus: TODO\n---\n\n"
+        "# PR-42: Valid incoming\nBranch: fix/pr-42\n- Type: bugfix\n- Complexity: low\n- Depends on: none\n"
+    )
+
+    assert invalid_upload_graph_members(tmp_path, [incoming / "PR-42.md"]) == set()
+
+
+@pytest.mark.parametrize("failure", ["local", "remote"])
+def test_legacy_rejection_branch_ref_probe_defers_on_git_failures(tmp_path, monkeypatch, failure):
+    from src import task_admission
+
+    def run(args, **kwargs):
+        if args[3] == "show-ref":
+            return subprocess.CompletedProcess(args, 2 if failure == "local" else 1, stdout="", stderr="")
+        return subprocess.CompletedProcess(args, 2, stdout="", stderr="")
+
+    monkeypatch.setattr(task_admission.subprocess, "run", run)
+
+    with pytest.raises(AttemptChanged, match="Legacy rejection branch ownership is unavailable"):
+        task_admission._legacy_rejection_branch_ref_exists(tmp_path, "fix/pr-42")
 
 
 async def test_direct_admission_rejects_malformed_incoming_task(rejected, tmp_path):
@@ -538,6 +640,16 @@ async def test_invalid_upload_discard_defers_when_manifest_changed(rejected, tmp
     assert await runner.redis.get(key) == "newer"
 
 
+async def test_invalid_upload_discard_defers_on_redis_error(rejected, tmp_path, monkeypatch):
+    runner, *_ = rejected
+    monkeypatch.setattr(runner.redis, "transaction", AsyncMock(side_effect=OSError("offline")))
+
+    result = await runner._discard_invalid_upload(upload_pending(runner.name), "raw", tmp_path, "invalid")
+
+    assert result is None
+    assert any("Invalid upload acknowledgement deferred" in row["event"] for row in runner.state.history)
+
+
 async def test_invalid_upload_member_discard_defers_on_redis_error(rejected, tmp_path, monkeypatch):
     runner, *_ = rejected
     monkeypatch.setattr(runner.redis, "transaction", AsyncMock(side_effect=OSError("offline")))
@@ -581,6 +693,67 @@ async def test_invalid_upload_member_discard_logs_unlink_failure(rejected, tmp_p
 
     assert await runner._discard_invalid_upload_member(key, raw, staging, manifest, "PR-42.md", "invalid") is None
 
+    retained = json.loads(await runner.redis.get(key))
+    assert retained["files"] == ["PR-43.md"]
+    assert retained["task_hashes"] == {"PR-43": "new"}
+
+
+async def test_invalid_upload_members_discard_defers_when_manifest_changed(rejected, tmp_path):
+    runner, *_ = rejected
+    key = upload_pending(runner.name)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    await runner.redis.set(key, "newer")
+
+    assert (
+        await runner._discard_invalid_upload_members(
+            key,
+            "older",
+            staging,
+            {"files": ["PR-42.md", "PR-43.md"]},
+            {"PR-42.md"},
+            "invalid",
+        )
+        is None
+    )
+    assert await runner.redis.get(key) == "newer"
+
+
+async def test_invalid_upload_members_discard_logs_unlink_failure(rejected, tmp_path, monkeypatch):
+    runner, *_ = rejected
+    key = upload_pending(runner.name)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "PR-42.md").write_text("invalid")
+    (staging / "PR-43.md").write_text("keep")
+    manifest = {
+        "files": ["PR-42.md", "PR-43.md"],
+        "staging_dir": str(staging),
+        "task_hashes": {"PR-42": "old", "PR-43": "new"},
+    }
+    raw = json.dumps(manifest)
+    await runner.redis.set(key, raw)
+
+    original_unlink = type(staging).__mro__[0].unlink
+
+    def fail_unlink(path, *args, **kwargs):
+        if path.name == "PR-42.md":
+            raise OSError("permission denied")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(staging), "unlink", fail_unlink)
+
+    assert (
+        await runner._discard_invalid_upload_members(
+            key,
+            raw,
+            staging,
+            manifest,
+            {"PR-42.md"},
+            "invalid",
+        )
+        is None
+    )
     retained = json.loads(await runner.redis.get(key))
     assert retained["files"] == ["PR-43.md"]
     assert retained["task_hashes"] == {"PR-43": "new"}
@@ -860,6 +1033,8 @@ async def test_legacy_rejection_sentinel_admits_changed_spec_without_receipt(rej
     await runner._snapshot_accepted_specs()
     recovered = await load_attempt(runner.redis, runner.name, "PR-42")
     assert recovered.rejection == LEGACY_REJECTION_SENTINEL
+    git(repo, "branch", "-D", "fix/pr-42")
+    git(repo, "push", "origin", ":refs/heads/fix/pr-42")
     incoming = tmp_path / "PR-42.md"
     incoming.write_text(rewritten(repo))
 
@@ -876,6 +1051,37 @@ async def test_legacy_rejection_sentinel_admits_changed_spec_without_receipt(rej
 
     assert previous == recovered
     assert candidate is not None and candidate.previous_rejection is None
+
+
+async def test_legacy_rejection_sentinel_defers_changed_spec_while_branch_exists(rejected, tmp_path):
+    from src.cancellation.storage import index_key
+
+    runner, _, repo, *_ = rejected
+    git(repo, "checkout", "main")
+    path = repo / "tasks/PR-42.md"
+    path.write_text(path.read_text().replace("blocked_reason: guardrail", "blocked_reason: operator_reject"))
+    git(repo, "commit", "-am", "legacy operator reject marker")
+    await runner.redis.delete(attempt_key(runner.name, "PR-42"))
+    await runner.redis.delete(cause_key(runner.name, "PR-42"))
+    await runner.redis.delete(index_key(runner.name))
+
+    await runner._snapshot_accepted_specs()
+    recovered = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert recovered.rejection == LEGACY_REJECTION_SENTINEL
+    incoming = tmp_path / "PR-42.md"
+    incoming.write_text(rewritten(repo))
+
+    with pytest.raises(AttemptChanged, match="Legacy rejection branch still exists"):
+        await admission_candidate(
+            runner.redis,
+            runner.name,
+            runner.repo_config.url,
+            "main",
+            repo,
+            incoming,
+            expected_rejection=LEGACY_REJECTION_SENTINEL,
+            upload=True,
+        )
 
 
 async def test_recovered_rejection_identity_admits_changed_git_rewrite_after_redis_loss(rejected):
@@ -2382,6 +2588,87 @@ async def test_upload_dependency_cycle_is_discarded_before_reservation_or_push(
     assert not current42.admission_pending
     assert current43 is not None and not current43.admission_pending
     assert (repo / "tasks/PR-43.md").read_text() == valid43
+
+
+@pytest.mark.parametrize("failure", ["cycle", "duplicate_branch"])
+async def test_upload_graph_failure_prunes_participants_and_preserves_independent_members(rejected, failure):
+    from pathlib import Path
+
+    await finish_reject(rejected)
+    runner, _, repo, *_ = rejected
+
+    def make_task(pr_id: str, *, branch: str | None = None, depends_on: str = "none") -> str:
+        return task_with_dependency(
+            rewritten(repo)
+            .replace("PR-42:", f"{pr_id}:")
+            .replace("fix/pr-42", branch or f"fix/{pr_id.lower()}"),
+            depends_on,
+        )
+
+    if failure == "cycle":
+        retained_name = "PR-44.md"
+        retained_text = make_task("PR-44")
+        files = [
+            ("PR-42.md", make_task("PR-42", depends_on="PR-43")),
+            ("PR-43.md", make_task("PR-43", depends_on="PR-42")),
+            (retained_name, retained_text),
+        ]
+        pruned = {"PR-42.md", "PR-43.md"}
+    else:
+        retained_name = "PR-45.md"
+        retained_text = make_task("PR-45")
+        files = [
+            ("PR-43.md", make_task("PR-43", branch="fix/shared")),
+            ("PR-44.md", make_task("PR-44", branch="fix/shared")),
+            (retained_name, retained_text),
+        ]
+        pruned = {"PR-43.md", "PR-44.md"}
+    response = await stage_files(rejected, files)
+    assert response.status_code == 200, response.text
+    manifest = json.loads(await runner.redis.get(upload_pending(runner.name)))
+    staging_dir = Path(manifest["staging_dir"])
+
+    assert await runner.process_pending_uploads() is None
+
+    retained = json.loads(await runner.redis.get(upload_pending(runner.name)))
+    assert retained["files"] == [retained_name]
+    for filename in pruned:
+        assert not (staging_dir / filename).exists()
+    assert (staging_dir / retained_name).read_text() == retained_text
+    assert await load_attempt(runner.redis, runner.name, Path(retained_name).stem) is None
+
+    assert await runner.process_pending_uploads() is True
+    current = await load_attempt(runner.redis, runner.name, Path(retained_name).stem)
+    assert current is not None and not current.admission_pending
+    assert (repo / "tasks" / retained_name).read_text() == retained_text
+
+
+async def test_upload_graph_failure_from_existing_tasks_discards_unrelated_batch(rejected):
+    from pathlib import Path
+
+    await finish_reject(rejected)
+    runner, _, repo, *_ = rejected
+    broken_existing = task_43_from(repo).replace("fix/pr-43", "fix/pr-42")
+    valid44 = (
+        rewritten(repo)
+        .replace("PR-42:", "PR-44:")
+        .replace("fix/pr-42", "fix/pr-44")
+    )
+    git(repo, "checkout", "main")
+    (repo / "tasks/PR-43.md").write_text(broken_existing)
+    git(repo, "add", "tasks/PR-43.md")
+    git(repo, "commit", "-m", "break existing task graph")
+    git(repo, "push", "origin", "main")
+
+    response = await stage_files(rejected, [("PR-44.md", valid44)])
+    assert response.status_code == 200, response.text
+    manifest = json.loads(await runner.redis.get(upload_pending(runner.name)))
+
+    assert await runner.process_pending_uploads() is False
+    assert await runner.redis.get(upload_pending(runner.name)) is None
+    assert not Path(manifest["staging_dir"]).exists()
+    assert not (repo / "tasks/PR-44.md").exists()
+    assert any("Branch fix/pr-42 is also assigned to PR-42" in row["event"] for row in runner.state.history)
 
 
 @pytest.mark.parametrize("single", [False, True])

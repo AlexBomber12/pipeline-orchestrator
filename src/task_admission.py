@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -66,6 +67,66 @@ def validate_admission_graph(root: Path, incoming: Iterable[Path] = ()) -> None:
     cycle = detect_cycle(graph)
     if cycle:
         raise AdmissionRejected("Dependency cycle: " + " -> ".join(cycle))
+
+
+def invalid_upload_graph_members(root: Path, incoming: Iterable[Path]) -> set[str]:
+    """Return uploaded task filenames that participate in graph conflicts."""
+    replacements = {path.name: path for path in incoming}
+    paths = {path.name: path for path in (root / "tasks").glob("PR-*.md")}
+    paths.update(replacements)
+    graph: dict[str, tuple[str, ...]] = {}
+    branch_owners: dict[str, set[str]] = {}
+    task_names: dict[str, str] = {}
+    incoming_ids: set[str] = set()
+    invalid_ids: set[str] = set()
+    for name, path in sorted(paths.items()):
+        try:
+            header = parse_task_header(path) if name in replacements else parse_existing_task_header(path)
+        except UnstructuredLegacyTaskError:
+            continue
+        except QueueValidationError as exc:
+            if name not in replacements and all("missing task header like" in issue for issue in exc.issues):
+                continue
+            if name in replacements:
+                return {name}
+            raise AdmissionRejected(str(exc)) from exc
+        branch_owners.setdefault(header.branch, set()).add(header.pr_id)
+        graph[header.pr_id] = tuple(header.depends_on)
+        task_names[header.pr_id] = name
+        if name in replacements:
+            incoming_ids.add(header.pr_id)
+    for owners in branch_owners.values():
+        if len(owners) > 1:
+            invalid_ids.update(owners)
+    if cycle := detect_cycle(graph):
+        invalid_ids.update(cycle)
+    changed = True
+    while changed:
+        changed = False
+        for task_id, dependencies in graph.items():
+            if task_id in incoming_ids and task_id not in invalid_ids and invalid_ids.intersection(dependencies):
+                invalid_ids.add(task_id)
+                changed = True
+    return {task_names[task_id] for task_id in invalid_ids.intersection(incoming_ids)}
+
+
+def _legacy_rejection_branch_ref_exists(root: Path, branch: str) -> bool:
+    local = subprocess.run(
+        ["git", "-C", str(root), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        capture_output=True,
+    )
+    if local.returncode == 0:
+        return True
+    if local.returncode != 1:
+        raise AttemptChanged("Legacy rejection branch ownership is unavailable; reuse is deferred.")
+    remote = subprocess.run(
+        ["git", "-C", str(root), "ls-remote", "--heads", "origin", f"refs/heads/{branch}"],
+        capture_output=True,
+        text=True,
+    )
+    if remote.returncode != 0:
+        raise AttemptChanged("Legacy rejection branch ownership is unavailable; reuse is deferred.")
+    return bool(remote.stdout.strip())
 
 
 def verify_unfinished(
@@ -127,8 +188,6 @@ async def admission_candidate(
     if incoming.name != f"{header.pr_id}.md" or header.branch == base:
         raise AdmissionRejected("Task filename/identity must agree and branch must differ from the configured base.")
     # Validate Git ref syntax without shell interpolation or repository writes.
-    import subprocess
-
     if subprocess.run(["git", "check-ref-format", "--branch", header.branch], capture_output=True).returncode:
         raise AdmissionRejected("Task branch is not a valid Git branch.")
     previous = await load_attempt(redis, repo, header.pr_id)
@@ -181,6 +240,8 @@ async def admission_candidate(
             raise AdmissionRejected("Upload predates or belongs to another rejection; submit the rewritten task again.")
         if previous.rejection == LEGACY_REJECTION_SENTINEL:
             rejection_file_sha256 = previous.file_sha256
+            if fingerprint != previous.fingerprint and _legacy_rejection_branch_ref_exists(root, previous.task.branch):
+                raise AttemptChanged("Legacy rejection branch still exists; remove the abandoned branch before reuse.")
         else:
             rejection = await load_rejection(redis, repo, previous.rejection)
             if rejection is None:
