@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -35,6 +36,24 @@ from src.task_attempts import (
     save_attempt,
 )
 from src.task_status import MergeStatusUnavailable
+
+_TASK_HEADER_ID_RE = re.compile(r"^#\s+(PR-[A-Za-z0-9_.-]+):")
+
+
+def _declared_task_id_from_text(path: Path) -> str | None:
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        if match := _TASK_HEADER_ID_RE.match(raw_line.rstrip()):
+            return match.group(1)
+    return None
+
+
+def _task_id_for_graph_hold(path: Path) -> str:
+    try:
+        return parse_existing_task_header(path).pr_id
+    except UnstructuredLegacyTaskError:
+        return path.stem
+    except QueueValidationError:
+        return _declared_task_id_from_text(path) or path.stem
 
 
 def _parse_snapshot_header(filename: str, content: str):
@@ -513,7 +532,10 @@ class TaskAdmissionMixin:
         try:
             validate_admission_graph(Path(self.repo_path))
         except AdmissionRejected as exc:
-            held = {path.stem for path in (Path(self.repo_path) / "tasks").glob("PR-*.md")}
+            held = {
+                _task_id_for_graph_hold(path)
+                for path in (Path(self.repo_path) / "tasks").glob("PR-*.md")
+            }
             self._admission_held_task_ids = held
             self.log_event(f"[RECOVERY] Task set cannot be admitted: {exc}")
             return held

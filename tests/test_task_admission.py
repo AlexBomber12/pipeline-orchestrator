@@ -636,6 +636,49 @@ async def test_git_rewrite_of_legacy_filename_admits_by_header_identity(rejected
     assert current.fingerprint == task_spec_content_hash(changed)
 
 
+async def test_git_graph_hold_uses_legacy_header_id_for_idle_selection(rejected):
+    runner, _, repo, *_ = rejected
+    git(repo, "checkout", "main")
+    legacy = rewritten(repo).replace("PR-42:", "PR-999:").replace(
+        "fix/pr-42",
+        "fix/shared",
+    )
+    peer = task_43_from(repo).replace("fix/pr-43", "fix/shared")
+    legacy_path = repo / "tasks/PR-001.md"
+    legacy_path.write_text(legacy)
+    (repo / "tasks/PR-43.md").write_text(peer)
+    git(repo, "add", "tasks/PR-001.md", "tasks/PR-43.md")
+    git(repo, "commit", "-m", "add invalid legacy task graph")
+    git(repo, "push", "origin", "main")
+    legacy_task = QueueTask(
+        pr_id="PR-999",
+        title="Reusable task",
+        task_file="tasks/PR-001.md",
+        branch="fix/shared",
+        status=TaskStatus.TODO,
+    )
+    await save_attempt(
+        runner.redis,
+        runner.name,
+        new_attempt(runner.repo_config.url, legacy_task, legacy),
+        expected=None,
+    )
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_task = None
+    runner.state.current_pr = None
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+
+    held = await runner._reconcile_git_admissions()
+    selected = await runner._select_next_task_from_dag()
+
+    assert "PR-999" in held
+    assert "PR-001" not in held
+    assert "PR-43" in held
+    assert selected is None
+    assert runner._idle_dag_statuses["PR-999"] == TaskStatus.ERROR
+    assert runner._idle_dag_statuses["PR-43"] == TaskStatus.ERROR
+
+
 def test_admission_graph_tolerates_legacy_noise_but_rejects_structured_errors(tmp_path):
     tasks = tmp_path / "tasks"
     tasks.mkdir()
@@ -653,6 +696,20 @@ def test_admission_graph_tolerates_legacy_noise_but_rejects_structured_errors(tm
     )
     with pytest.raises(AdmissionRejected, match="invalid Type"):
         validate_admission_graph(tmp_path)
+
+
+def test_graph_hold_task_id_falls_back_for_unstructured_legacy_and_missing_header(
+    tmp_path,
+):
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    unstructured = tasks / "PR-90.md"
+    unstructured.write_text("# PR-90: Legacy note\n\nUnstructured body.\n")
+    missing_header = tasks / "PR-91.md"
+    missing_header.write_text("---\nstatus: TODO\n---\n\nMissing task header.\n")
+
+    assert daemon_admission._task_id_for_graph_hold(unstructured) == "PR-90"
+    assert daemon_admission._task_id_for_graph_hold(missing_header) == "PR-91"
 
 
 def test_admission_graph_rejects_duplicate_branch_across_incoming_batch(tmp_path):
