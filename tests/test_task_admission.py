@@ -199,7 +199,7 @@ async def test_changed_upload_after_reset_defers_while_prior_pr_remains_open(rej
     assert await runner.redis.get(upload_pending(runner.name)) is not None
 
 
-async def admit_closed_automatic_error_rewrite(fixture):
+async def admit_automatic_error_rewrite(fixture, *, pr_number=42, attempt_pr_state="closed"):
     runner, _, repo, _, github, _ = fixture
     git(repo, "checkout", "main")
     path = repo / "tasks/PR-42.md"
@@ -222,21 +222,25 @@ async def admit_closed_automatic_error_rewrite(fixture):
         reset_text,
         started=True,
         coder_dispatched=True,
-        pr_number=42,
+        pr_number=pr_number,
     )
     await save_attempt(runner.redis, runner.name, previous, expected=None)
     prior_head = git(repo, "rev-parse", "fix/pr-42")
-    github["attempt_prs"] = [
-        raw_attempt_pr(
-            PRInfo(
-                number=42,
-                pr_id="PR-42",
-                branch="fix/pr-42",
-                head_sha=prior_head,
-            ),
-            state="closed",
-        )
-    ]
+    github["attempt_prs"] = (
+        []
+        if attempt_pr_state is None
+        else [
+            raw_attempt_pr(
+                PRInfo(
+                    number=42,
+                    pr_id="PR-42",
+                    branch="fix/pr-42",
+                    head_sha=prior_head,
+                ),
+                state=attempt_pr_state,
+            )
+        ]
+    )
     runner.state.state = PipelineState.IDLE
     runner.state.current_task = None
     await runner.redis.delete(cause_key(runner.name, "PR-42"))
@@ -249,7 +253,7 @@ async def admit_closed_automatic_error_rewrite(fixture):
 
 async def test_closed_automatic_error_pr_branch_is_cleaned_before_reuse(rejected):
     runner, _, _, remote, _, _ = rejected
-    current, changed, prior_head = await admit_closed_automatic_error_rewrite(rejected)
+    current, changed, prior_head = await admit_automatic_error_rewrite(rejected)
 
     assert current.branch_cleanup_branch == "fix/pr-42"
     assert current.branch_cleanup_head == prior_head
@@ -261,10 +265,26 @@ async def test_closed_automatic_error_pr_branch_is_cleaned_before_reuse(rejected
     assert "refs/heads/fix/pr-42" not in git(remote, "show-ref")
 
 
+async def test_no_pr_automatic_error_branch_is_cleaned_before_reuse(rejected):
+    runner, _, _, remote, _, _ = rejected
+    current, changed, prior_head = await admit_automatic_error_rewrite(
+        rejected,
+        pr_number=None,
+        attempt_pr_state=None,
+    )
+
+    assert current.branch_cleanup_branch == "fix/pr-42"
+    assert current.branch_cleanup_head == prior_head
+    assert current.branch_cleanup_pr_number is None
+    runner.state.current_task = current.task
+    assert await runner._prepare_task_attempt(changed)
+    assert "refs/heads/fix/pr-42" not in git(remote, "show-ref")
+
+
 @pytest.mark.parametrize("change", ["repo", "incomplete", "reopened"])
 async def test_closed_attempt_branch_cleanup_refuses_ambiguous_ownership(rejected, change):
     runner, _, _, remote, github, _ = rejected
-    current, changed, _ = await admit_closed_automatic_error_rewrite(rejected)
+    current, changed, _ = await admit_automatic_error_rewrite(rejected)
     update = {}
     if change == "repo":
         update["repo_url"] = "https://github.com/other/repo.git"
@@ -2201,6 +2221,85 @@ async def test_git_admission_restart_resumes_partial_receipt(rejected, tmp_path,
     assert (await load_attempt(runner.redis, runner.name, "PR-42")).admission_pending is (case != "success")
     if case == "success":
         assert (await load_attempt(runner.redis, runner.name, "PR-42")).attempt_id == pending.attempt_id
+
+
+async def test_git_admission_supersedes_stale_pending_receipt_after_base_race(rejected):
+    await finish_reject(rejected)
+    runner, command, repo, *_ = rejected
+    git(repo, "checkout", "main")
+    path = repo / "tasks/PR-42.md"
+    first = rewritten(repo)
+    path.write_text(first)
+    git(repo, "commit", "-am", "first git rewrite")
+    git(repo, "push", "origin", "main")
+    pending = await runner._reserve_admission(path)
+    assert pending.admission_source == "git"
+
+    second = first + "\nSecond git rewrite.\n"
+    path.write_text(second)
+    git(repo, "commit", "-am", "second git rewrite")
+    git(repo, "push", "origin", "main")
+
+    assert await runner._reconcile_git_admissions() == set()
+
+    current = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert current.attempt_id != pending.attempt_id
+    assert current.previous_rejection == command.binding
+    assert current.fingerprint == task_spec_content_hash(second)
+    assert not current.admission_pending
+    assert current.admission_source is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["upload_source", "same_fingerprint", "rev_parse_failure", "base_unchanged", "missing_blob", "invalid_utf8"],
+)
+async def test_git_admission_lost_base_race_false_guards(rejected, monkeypatch, case):
+    runner, _, repo, *_ = rejected
+    path = repo / "tasks/PR-42.md"
+    attempt = new_attempt(
+        runner.repo_config.url,
+        runner.state.current_task.model_copy(update={"status": TaskStatus.TODO}),
+        "reserved",
+        admission_pending=True,
+        admission_source="git",
+        base_commit="reserved-base",
+    )
+    fingerprint = task_spec_content_hash("new")
+    if case == "upload_source":
+        attempt.admission_source = "upload"
+    elif case == "same_fingerprint":
+        fingerprint = attempt.fingerprint
+    elif case == "rev_parse_failure":
+        def fail_rev_parse(*args, **kwargs):
+            raise subprocess.CalledProcessError(128, ["git", "rev-parse"])
+
+        monkeypatch.setattr(daemon_admission.git_ops, "_git", fail_rev_parse)
+    elif case == "base_unchanged":
+        def unchanged_base(*args, **kwargs):
+            return subprocess.CompletedProcess(args, 0, stdout="reserved-base\n", stderr="")
+
+        monkeypatch.setattr(daemon_admission.git_ops, "_git", unchanged_base)
+    elif case == "missing_blob":
+        def changed_base(*args, **kwargs):
+            return subprocess.CompletedProcess(args, 0, stdout="new-base\n", stderr="")
+
+        def missing_blob(*args, **kwargs):
+            return subprocess.CompletedProcess(args, 128, stdout=b"", stderr=b"missing")
+
+        monkeypatch.setattr(daemon_admission.git_ops, "_git", changed_base)
+        monkeypatch.setattr(daemon_admission.git_ops, "_git_bytes", missing_blob)
+    else:
+        def changed_base(*args, **kwargs):
+            return subprocess.CompletedProcess(args, 0, stdout="new-base\n", stderr="")
+
+        def invalid_utf8(*args, **kwargs):
+            return subprocess.CompletedProcess(args, 0, stdout=b"\xff", stderr=b"")
+
+        monkeypatch.setattr(daemon_admission.git_ops, "_git", changed_base)
+        monkeypatch.setattr(daemon_admission.git_ops, "_git_bytes", invalid_utf8)
+
+    assert not runner._git_admission_lost_base_race(attempt, path, fingerprint)
 
 
 @pytest.mark.parametrize("case", ["missing_receipt", "foreign_branch", "foreign_origin", "another_pr", "base_advanced"])

@@ -275,7 +275,13 @@ class TaskAdmissionMixin:
             await save_attempt(self.redis, self.name, receipt, expected=None)
 
     async def _validate_admission(
-        self, path: Path, *, token: str | None = None, upload: bool = False, available_ids: set[str] | None = None
+        self,
+        path: Path,
+        *,
+        token: str | None = None,
+        upload: bool = False,
+        available_ids: set[str] | None = None,
+        supersede_pending_attempt_id: str | None = None,
     ) -> tuple[TaskAttempt | None, TaskAttempt | None]:
         return await admission_candidate(
             self.redis,
@@ -287,13 +293,24 @@ class TaskAdmissionMixin:
             expected_rejection=token,
             upload=upload,
             available_ids=available_ids,
+            supersede_pending_attempt_id=supersede_pending_attempt_id,
         )
 
     async def _reserve_admission(
-        self, path: Path, *, token: str | None = None, upload: bool = False, available_ids: set[str] | None = None
+        self,
+        path: Path,
+        *,
+        token: str | None = None,
+        upload: bool = False,
+        available_ids: set[str] | None = None,
+        supersede_pending_attempt_id: str | None = None,
     ) -> TaskAttempt | None:
         previous, candidate = await self._validate_admission(
-            path, token=token, upload=upload, available_ids=available_ids,
+            path,
+            token=token,
+            upload=upload,
+            available_ids=available_ids,
+            supersede_pending_attempt_id=supersede_pending_attempt_id,
         )
         return await self._reserve_validated_admission(previous, candidate, upload=upload)
 
@@ -326,6 +343,7 @@ class TaskAdmissionMixin:
             "rev-parse",
             f"origin/{self.repo_config.branch}",
         ).stdout.strip()
+        candidate.admission_source = "upload" if upload else "git"
         return await save_attempt(self.redis, self.name, candidate, expected=current)
 
     async def _finish_admission(self, attempt: TaskAttempt) -> None:
@@ -353,6 +371,7 @@ class TaskAdmissionMixin:
             if not current.admission_pending:
                 return
             current.admission_pending = False
+            current.admission_source = None
             pipe.multi()
             pipe.set(key, current.model_dump_json())
             pipe.delete(
@@ -380,6 +399,37 @@ class TaskAdmissionMixin:
             f"[RECOVERY] {task_id}: rewritten task accepted as attempt {attempt.attempt_id}; "
             "scheduling subject to controls and dependencies."
         )
+
+    def _git_admission_lost_base_race(self, attempt: TaskAttempt, path: Path, fingerprint: str) -> bool:
+        if attempt.admission_source != "git" or not attempt.base_commit or attempt.fingerprint == fingerprint:
+            return False
+        base_ref = f"origin/{self.repo_config.branch}"
+        try:
+            base_head = git_ops._git(self.repo_path, "rev-parse", base_ref).stdout.strip()
+        except subprocess.CalledProcessError:
+            return False
+        if base_head == attempt.base_commit:
+            return False
+        old = git_ops._git_bytes(
+            self.repo_path,
+            "show",
+            f"{attempt.base_commit}:{attempt.task.task_file}",
+            check=False,
+        )
+        current = git_ops._git_bytes(
+            self.repo_path,
+            "show",
+            f"{base_ref}:{path.relative_to(self.repo_path).as_posix()}",
+            check=False,
+        )
+        if old.returncode != 0 or current.returncode != 0:
+            return False
+        try:
+            old_fingerprint = task_spec_content_hash(old.stdout.decode("utf-8"))
+            current_fingerprint = task_spec_content_hash(current.stdout.decode("utf-8"))
+        except UnicodeDecodeError:
+            return False
+        return old_fingerprint == attempt.fingerprint and current_fingerprint == fingerprint
 
     async def _reconcile_git_admissions(self) -> set[str]:
         """Hold invalid/partial inputs individually, leaving independent tasks eligible."""
@@ -420,8 +470,19 @@ class TaskAdmissionMixin:
                         held.add(task_id)
                         self.log_event(f"[RECOVERY] {task_id}: admission pending ({type(exc).__name__}).")
                 continue
+            supersede_pending_attempt_id = (
+                prior.attempt_id
+                if prior.admission_pending and self._git_admission_lost_base_race(prior, path, fingerprint)
+                else None
+            )
             try:
-                candidate = await self._reserve_admission(path)
+                if supersede_pending_attempt_id is None:
+                    candidate = await self._reserve_admission(path)
+                else:
+                    candidate = await self._reserve_admission(
+                        path,
+                        supersede_pending_attempt_id=supersede_pending_attempt_id,
+                    )
                 if candidate:
                     await self._finish_admission(candidate)
             except Exception as exc:
@@ -627,31 +688,28 @@ class TaskAdmissionMixin:
     async def _prepare_closed_attempt_branch(self, attempt: TaskAttempt) -> None:
         if normalize_repo_url(attempt.repo_url) != normalize_repo_url(self.repo_config.url):
             raise AttemptChanged("Branch cleanup belongs to a different repository.")
-        if (
-            attempt.branch_cleanup_branch is None
-            or attempt.branch_cleanup_head is None
-            or attempt.branch_cleanup_pr_number is None
-        ):
+        if attempt.branch_cleanup_branch is None or attempt.branch_cleanup_head is None:
             raise AttemptChanged("Prior branch cleanup ownership is incomplete.")
-        probe = attempt.model_copy(
-            update={
-                "pr_number": attempt.branch_cleanup_pr_number,
-                "task": attempt.task.model_copy(update={"branch": attempt.branch_cleanup_branch}),
-            }
-        )
-        data = discover_attempt_pr(
-            self.repo_path,
-            self.owner_repo,
-            self.repo_config.branch,
-            probe,
-        )
-        if (
-            data is None
-            or data.get("state") != "closed"
-            or data.get("merged_at")
-            or data.get("head", {}).get("sha") != attempt.branch_cleanup_head
-        ):
-            raise AttemptChanged("Prior attempt PR is not closed without merge.")
+        if attempt.branch_cleanup_pr_number is not None:
+            probe = attempt.model_copy(
+                update={
+                    "pr_number": attempt.branch_cleanup_pr_number,
+                    "task": attempt.task.model_copy(update={"branch": attempt.branch_cleanup_branch}),
+                }
+            )
+            data = discover_attempt_pr(
+                self.repo_path,
+                self.owner_repo,
+                self.repo_config.branch,
+                probe,
+            )
+            if (
+                data is None
+                or data.get("state") != "closed"
+                or data.get("merged_at")
+                or data.get("head", {}).get("sha") != attempt.branch_cleanup_head
+            ):
+                raise AttemptChanged("Prior attempt PR is not closed without merge.")
         self._prepare_owned_branch_cleanup(
             attempt.branch_cleanup_branch,
             self.repo_config.branch,

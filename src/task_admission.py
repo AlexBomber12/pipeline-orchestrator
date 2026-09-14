@@ -18,7 +18,7 @@ from src.approval_commands import approval_task_path
 from src.cancellation.storage import CancellationCause, cause_key, task_spec_content_hash
 from src.completion_evidence import get_recorded_completions
 from src.config import normalize_repo_url
-from src.daemon.attempt_prs import discover_attempt_pr
+from src.daemon.attempt_prs import attempt_branch_head, discover_attempt_pr
 from src.dag import detect_cycle
 from src.github import gh_pr_get_merged_branches, gh_runner
 from src.github import prs as gh_prs
@@ -212,6 +212,7 @@ async def admission_candidate(
     expected_rejection: str | None = None,
     upload: bool = False,
     available_ids: set[str] | None = None,
+    supersede_pending_attempt_id: str | None = None,
 ) -> tuple[TaskAttempt | None, TaskAttempt | None]:
     """Return prior receipt and proposed replacement, or None for a replay.
 
@@ -262,17 +263,23 @@ async def admission_candidate(
             started=old.frontmatter_status not in (None, "todo"),
             file_sha256=hashlib.sha256(existing_bytes).hexdigest(),
         )
+    superseding_pending = False
     if previous and previous.admission_pending and fingerprint != previous.fingerprint:
-        raise AttemptChanged("A different specification admission is pending; reconcile its Git/Redis result first.")
+        if supersede_pending_attempt_id == previous.attempt_id:
+            superseding_pending = True
+        else:
+            raise AttemptChanged(
+                "A different specification admission is pending; reconcile its Git/Redis result first."
+            )
     raw_cause = await redis.get(cause_key(repo, header.pr_id))
     if raw_cause and CancellationCause.from_redis(raw_cause).payload.get("subsource") == "operator_reject":
-        if previous is None or not previous.rejection:
+        if previous is None or (not previous.rejection and not previous.previous_rejection):
             raise AttemptChanged("Legacy rejection lacks exact attempt/PR ownership; reconcile it before reuse.")
     rejection_file_sha256 = None
     prior_rejection_binding = previous.previous_rejection if previous else None
-    branch_cleanup_branch = None
-    branch_cleanup_head = None
-    branch_cleanup_pr_number = None
+    branch_cleanup_branch = previous.branch_cleanup_branch if previous and superseding_pending else None
+    branch_cleanup_head = previous.branch_cleanup_head if previous and superseding_pending else None
+    branch_cleanup_pr_number = previous.branch_cleanup_pr_number if previous and superseding_pending else None
     if previous and previous.rejection:
         if previous.completed:
             if fingerprint == previous.fingerprint:
@@ -374,6 +381,11 @@ async def admission_candidate(
             branch_cleanup_branch = previous.task.branch
             branch_cleanup_head = str(prior_pr.get("head", {}).get("sha") or "")
             branch_cleanup_pr_number = int(prior_pr["number"])
+        elif previous.started and not previous.rejection:
+            if prior_branch_head := attempt_branch_head(str(root), previous.task.branch):
+                branch_cleanup_branch = previous.task.branch
+                branch_cleanup_head = prior_branch_head
+                branch_cleanup_pr_number = None
     available_ids = (
         available_ids if available_ids is not None else existing_task_header_ids(root)
     )

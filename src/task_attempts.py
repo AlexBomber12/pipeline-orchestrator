@@ -44,6 +44,7 @@ class TaskAttempt(BaseModel):
     completed: bool = False
     previous_rejection: str | None = None
     admission_pending: bool = False
+    admission_source: str | None = None
     branch_prepared: bool = False
     branch_cleanup_branch: str | None = None
     branch_cleanup_head: str | None = None
