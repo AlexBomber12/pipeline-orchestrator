@@ -160,10 +160,10 @@ async def list_pending_rejections(redis: Any, repo: str) -> list[RejectionComman
         result.append(command)
     backfill_key = rejection_pending_backfill_key(repo)
     try:
-        claimed_backfill = await redis.set(backfill_key, "1", nx=True)
-    except TypeError:
-        claimed_backfill = True
-    if not claimed_backfill:
+        backfill_done = await redis.get(backfill_key)
+    except Exception:
+        return result
+    if backfill_done:
         return result
     for binding in await redis.zrangebyscore(rejection_index(repo), "-inf", "+inf"):
         binding = binding.decode() if isinstance(binding, bytes) else binding
@@ -176,6 +176,7 @@ async def list_pending_rejections(redis: Any, repo: str) -> list[RejectionComman
             continue
         await redis.zadd(pending_key, {binding: command.requested_at.timestamp()})
         result.append(command)
+    await redis.set(backfill_key, "1")
     return result
 
 

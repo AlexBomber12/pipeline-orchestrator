@@ -819,6 +819,31 @@ async def test_historical_operator_reject_marker_ignores_unusable_history(reject
     assert not runner._has_historical_operator_reject_marker("main", "tasks/PR-42.md", fingerprint)
 
 
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {"schema_version": 1, "repository": "other/repo", "base_branch": "main", "rejections": {}},
+        {"schema_version": 1, "repository": "octo/demo", "base_branch": "main", "rejections": []},
+        {"schema_version": 1, "repository": "octo/demo", "base_branch": "main", "rejections": {"PR-42": {}}},
+    ],
+)
+async def test_recorded_rejection_identity_ignores_mismatched_manifest_shapes(rejected, manifest):
+    runner, _, repo, *_ = rejected
+    path = repo / "tasks/rejections.json"
+    path.write_text(json.dumps(manifest))
+
+    assert not runner._has_recorded_rejection_identity("PR-42", "f" * 64)
+
+
+async def test_recorded_rejection_identity_invalid_manifest_defers(rejected):
+    runner, _, repo, *_ = rejected
+    path = repo / "tasks/rejections.json"
+    path.write_text("{")
+
+    with pytest.raises(MergeStatusUnavailable, match="Rejection identity manifest is unavailable"):
+        runner._has_recorded_rejection_identity("PR-42", "f" * 64)
+
+
 async def test_prior_base_snapshot_git_failure_defers_as_merge_unavailable(rejected, monkeypatch):
     runner, *_ = rejected
     original_git = daemon_admission.git_ops._git
@@ -1062,6 +1087,7 @@ async def test_reject_fetches_base_before_anchoring_later_git_rewrites(
 
     # A later, genuinely changed specification follows the same Git path
     # and can now be admitted without inheriting the rejected attempt.
+    git(writer, "pull", "--rebase", "origin", "main")
     (writer / "tasks/PR-42.md").write_text(rewritten(repo) + "\nRewrite after final rejection.\n")
     git(writer, "commit", "-am", "later specification rewrite")
     git(writer, "push", "origin", "main")

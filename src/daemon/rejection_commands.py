@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from src.approval_commands import approval_index, approval_key, list_approvals
 from src.cancellation.storage import CancellationCause, cause_key
@@ -24,6 +26,7 @@ from src.subsource_registry import SuppressionReason
 from src.task_attempts import AttemptChanged, load_attempt, save_attempt
 
 _NO_PR_ABSENCE_REASON = "No PR found after stopping execution; confirming absence before final rejection."
+_REJECTION_IDENTITY_MANIFEST = "tasks/rejections.json"
 
 
 def rejection_pr_details(
@@ -272,6 +275,8 @@ class RejectionCommandMixin:
                 allow_spec_hash_mismatch=True,
             ):
                 raise AttemptChanged("Operator rejection marker could not be committed; rejection remains pending.")
+            if not await self._commit_rejection_identity(command):
+                raise AttemptChanged("Operator rejection identity could not be committed; rejection remains pending.")
             await self._save_rejection(
                 command,
                 "rejected",
@@ -290,6 +295,71 @@ class RejectionCommandMixin:
                 else f"Closure or checkout verification unavailable ({type(exc).__name__})."
             )
             await self._save_rejection(command, "deferred", reason)
+
+    async def _commit_rejection_identity(self, command: RejectionCommand) -> bool:
+        """Persist rejected fingerprint evidence in Git-recoverable state."""
+        base = self.repo_config.branch
+        task_id = command.task.pr_id
+        subject = f"[STATUS] {task_id} recorded rejected fingerprint: operator reject finalized"
+        try:
+            git_ops._git(self.repo_path, "fetch", "origin", base, timeout=60)
+            git_ops._git(self.repo_path, "checkout", "-f", base, timeout=60)
+            git_ops._git(self.repo_path, "reset", "--hard", f"origin/{base}", timeout=60)
+            manifest_path = Path(self.repo_path) / _REJECTION_IDENTITY_MANIFEST
+            if manifest_path.exists():
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if not isinstance(manifest, dict):
+                    raise AttemptChanged("Rejection identity manifest is invalid.")
+            else:
+                manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                manifest = {
+                    "schema_version": 1,
+                    "repository": self.owner_repo,
+                    "base_branch": base,
+                    "rejections": {},
+                }
+            if (
+                manifest.get("schema_version") != 1
+                or str(manifest.get("repository", "")).casefold() != self.owner_repo.casefold()
+                or manifest.get("base_branch") != base
+                or not isinstance(manifest.get("rejections"), dict)
+            ):
+                raise AttemptChanged("Rejection identity manifest does not match this runner.")
+            rejections = manifest["rejections"]
+            entries = rejections.setdefault(task_id, [])
+            if not isinstance(entries, list):
+                raise AttemptChanged("Rejection identity manifest task record is invalid.")
+            entry = {
+                "fingerprint": command.fingerprint,
+                "file_sha256": command.file_sha256,
+                "attempt_id": command.attempt_id,
+                "rejection_binding": command.binding,
+                "task_file": command.task.task_file,
+                "branch": command.task.branch,
+            }
+            if entry not in entries:
+                entries.append(entry)
+            manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            git_ops._git(self.repo_path, "add", "--", _REJECTION_IDENTITY_MANIFEST, timeout=30)
+            diff = git_ops._git(
+                self.repo_path,
+                "diff",
+                "--cached",
+                "--quiet",
+                "--",
+                _REJECTION_IDENTITY_MANIFEST,
+                check=False,
+            )
+            if diff.returncode == 0:
+                return True
+            git_ops._git(self.repo_path, "commit", "-m", f"{subject}\n\n[skip ci]", timeout=60)
+            git_ops._git(self.repo_path, "push", "origin", base, timeout=60)
+            return True
+        except AttemptChanged:
+            raise
+        except Exception as exc:
+            self.log_event(f"[INFRA] Warning: failed to commit rejection identity for {task_id}: {exc}.")
+            return False
 
     async def _release_rejected_attempt(self, command: RejectionCommand, *, merged: bool = False) -> None:
         for approval in await list_approvals(self.redis, self.name):

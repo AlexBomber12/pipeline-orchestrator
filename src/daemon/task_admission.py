@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 import tempfile
 from pathlib import Path
@@ -27,6 +28,8 @@ from src.task_attempts import (
 )
 from src.task_status import MergeStatusUnavailable
 
+_REJECTION_IDENTITY_MANIFEST = "tasks/rejections.json"
+
 
 def _parse_snapshot_header(filename: str, content: str):
     with tempfile.TemporaryDirectory() as directory:
@@ -41,6 +44,29 @@ def _parse_snapshot_header(filename: str, content: str):
 
 
 class TaskAdmissionMixin:
+    def _has_recorded_rejection_identity(self, task_id: str, fingerprint: str) -> bool:
+        path = Path(self.repo_path) / _REJECTION_IDENTITY_MANIFEST
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return False
+        except (OSError, ValueError, TypeError) as exc:
+            raise MergeStatusUnavailable("Rejection identity manifest is unavailable.") from exc
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("schema_version") != 1
+            or str(manifest.get("repository", "")).casefold() != self.owner_repo.casefold()
+            or manifest.get("base_branch") != self.repo_config.branch
+        ):
+            return False
+        records = manifest.get("rejections")
+        if not isinstance(records, dict):
+            return False
+        entries = records.get(task_id, [])
+        if not isinstance(entries, list):
+            return False
+        return any(isinstance(entry, dict) and entry.get("fingerprint") == fingerprint for entry in entries)
+
     def _has_historical_operator_reject_marker(self, base: str, filename: str, fingerprint: str) -> bool:
         result = git_ops._git(self.repo_path, "log", "--format=%H", base, "--", filename, check=False)
         if result.returncode != 0:
@@ -117,7 +143,7 @@ class TaskAdmissionMixin:
                 base,
                 filename,
                 fingerprint,
-            ):
+            ) or self._has_recorded_rejection_identity(task_id, fingerprint):
                 receipt.rejection = "legacy-missing-identity"
             await save_attempt(self.redis, self.name, receipt, expected=None)
 

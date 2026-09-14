@@ -8,6 +8,7 @@ Redis by tests-manual/rejection/verify_redis.py.
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
@@ -451,6 +452,100 @@ async def test_final_rejection_commits_operator_reject_marker_for_redis_loss(rej
     assert await runner._reconcile_git_admissions() == {"PR-42"}
 
 
+async def test_concurrent_rewrite_rejection_manifest_fences_restored_rejected_bytes(rejected):
+    runner, command, repo, *_ = rejected
+    original = (repo / "tasks/PR-42.md").read_text()
+    git(repo, "checkout", "main")
+    (repo / "tasks/PR-42.md").write_text(
+        original.replace("Original specification.", "Concurrent replacement.")
+        .replace("status: ERROR", "status: TODO")
+        .replace("blocked_reason: guardrail\n", "")
+    )
+    git(repo, "commit", "-am", "operator rewrites before reject releases")
+    git(repo, "push", "origin", "main")
+    git(repo, "checkout", "fix/pr-42")
+
+    assert (await post_reject(rejected)).status_code == 202
+    await runner._run_cycle_body()
+
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    manifest = json.loads(git(repo, "show", "origin/main:tasks/rejections.json"))
+    assert stored.status == "rejected" and stored.released
+    assert manifest["rejections"]["PR-42"][0]["fingerprint"] == command.fingerprint
+    assert "operator_reject" not in git(repo, "show", "origin/main:tasks/PR-42.md")
+
+    git(repo, "checkout", "main")
+    (repo / "tasks/PR-42.md").write_text(
+        original.replace("status: ERROR", "status: TODO").replace("blocked_reason: guardrail\n", "")
+    )
+    git(repo, "commit", "-am", "restore rejected bytes without redis")
+    git(repo, "push", "origin", "main")
+    await runner.redis.delete(attempt_key(runner.name, "PR-42"))
+    await runner.redis.delete(rejection_key(runner.name, command.binding))
+    await runner.redis.delete(cause_key(runner.name, "PR-42"))
+    await runner.redis.delete(index_key(runner.name))
+
+    await runner._snapshot_accepted_specs()
+    recovered = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert recovered.rejection == "legacy-missing-identity"
+
+
+@pytest.mark.parametrize(
+    ("manifest", "message"),
+    [
+        ([], "manifest is invalid"),
+        (
+            {"schema_version": 1, "repository": "other/repo", "base_branch": "main", "rejections": {}},
+            "does not match this runner",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "repository": "octo/demo",
+                "base_branch": "main",
+                "rejections": {"PR-42": {}},
+            },
+            "task record is invalid",
+        ),
+    ],
+)
+async def test_rejection_identity_manifest_invalid_shapes_defer(rejected, manifest, message):
+    runner, command, repo, *_ = rejected
+    git(repo, "checkout", "main")
+    path = repo / "tasks/rejections.json"
+    path.write_text(json.dumps(manifest))
+    git(repo, "add", "tasks/rejections.json")
+    git(repo, "commit", "-m", "invalid rejection manifest")
+    git(repo, "push", "origin", "main")
+
+    with pytest.raises(AttemptChanged, match=message):
+        await runner._commit_rejection_identity(command)
+
+
+async def test_rejection_identity_commit_is_idempotent(rejected):
+    runner, command, *_ = rejected
+
+    assert (await post_reject(rejected)).status_code == 202
+    await runner._run_cycle_body()
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+
+    assert await runner._commit_rejection_identity(stored)
+
+
+async def test_rejection_identity_commit_returns_false_on_git_failure(rejected, monkeypatch):
+    runner, command, *_ = rejected
+    original_git = daemon_reject.git_ops._git
+
+    def failing_git(path, *args, **kwargs):
+        if args[:2] == ("fetch", "origin"):
+            raise OSError("git unavailable")
+        return original_git(path, *args, **kwargs)
+
+    monkeypatch.setattr(daemon_reject.git_ops, "_git", failing_git)
+
+    assert not await runner._commit_rejection_identity(command)
+
+
 async def test_rejection_defers_when_operator_marker_commit_fails(rejected, monkeypatch):
     runner, command, _, _, github, _ = rejected
 
@@ -463,6 +558,62 @@ async def test_rejection_defers_when_operator_marker_commit_fails(rejected, monk
     assert stored.status == "deferred" and not stored.released
     assert "Operator rejection marker could not be committed" in stored.reason
     assert github["state"] == "closed"
+
+
+async def test_rejection_defers_when_rejection_identity_commit_fails(rejected, monkeypatch):
+    runner, command, _, _, github, _ = rejected
+
+    assert (await post_reject(rejected)).status_code == 202
+    monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
+    monkeypatch.setattr(runner, "_commit_rejection_identity", AsyncMock(return_value=False))
+
+    await runner._consume_rejection_commands()
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+
+    assert stored.status == "deferred" and not stored.released
+    assert "Operator rejection identity could not be committed" in stored.reason
+    assert github["state"] == "closed"
+
+
+async def test_pending_rejection_backfill_marker_written_after_success(rejected):
+    runner, command, *_ = rejected
+    assert (await post_reject(rejected)).status_code == 202
+    await runner.redis.zrem(rejection_pending_index(runner.name), command.binding)
+    original_zrangebyscore = runner.redis.zrangebyscore
+    calls = 0
+
+    async def flaky_zrangebyscore(key, *args, **kwargs):
+        nonlocal calls
+        if key == rejection_index(runner.name):
+            calls += 1
+            if calls == 1:
+                raise OSError("redis unavailable")
+        return await original_zrangebyscore(key, *args, **kwargs)
+
+    runner.redis.zrangebyscore = flaky_zrangebyscore
+    with pytest.raises(OSError):
+        await list_pending_rejections(runner.redis, runner.name)
+    assert await runner.redis.get(rejection_pending_backfill_key(runner.name)) is None
+
+    pending = await list_pending_rejections(runner.redis, runner.name)
+    assert [item.binding for item in pending] == [command.binding]
+    assert await runner.redis.get(rejection_pending_backfill_key(runner.name)) == "1"
+
+
+async def test_pending_rejection_backfill_marker_read_failure_returns_pending_only(rejected):
+    runner, command, *_ = rejected
+    assert (await post_reject(rejected)).status_code == 202
+    await runner.redis.zrem(rejection_pending_index(runner.name), command.binding)
+    original_get = runner.redis.get
+
+    async def failing_get(key):
+        if key == rejection_pending_backfill_key(runner.name):
+            raise OSError("redis unavailable")
+        return await original_get(key)
+
+    runner.redis.get = failing_get
+
+    assert await list_pending_rejections(runner.redis, runner.name) == []
 
 
 async def test_stale_decision_and_repeated_submission(rejected):
