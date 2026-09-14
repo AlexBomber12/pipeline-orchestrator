@@ -619,6 +619,7 @@ class CodingMixin:
         candidate = None
         last_exc: Exception | None = None
         ambiguous = False
+        saw_any_pr = False
         for attempt_number in range(3):
             try:
                 prs = gh_prs.get_open_prs(
@@ -629,6 +630,8 @@ class CodingMixin:
                 last_exc = exc
             else:
                 last_exc = None
+                if prs:
+                    saw_any_pr = True
                 matches = [
                     pr
                     for pr in prs
@@ -660,7 +663,10 @@ class CodingMixin:
             if attempt is None or task.attempt_id not in (None, attempt.attempt_id):
                 return
             if candidate is None:
-                if last_exc is not None:
+                if (last_exc is not None or not saw_any_pr) and attempt_branch_head(
+                    self.repo_path,
+                    target_branch,
+                ):
                     updated = attempt.model_copy(update={"pr_discovery_pending": True})
                     await save_attempt(self.redis, self.name, updated, expected=attempt)
                     task.attempt_id = attempt.attempt_id

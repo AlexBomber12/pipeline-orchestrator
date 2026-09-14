@@ -410,6 +410,7 @@ def test_daemon_create_pr_without_attempt_keeps_legacy_body(
         "found",
         "retry_found",
         "none",
+        "empty",
         "fork_only",
         "ambiguous",
         "head_mismatch",
@@ -447,6 +448,8 @@ def test_guardrail_records_visible_pr_number_before_error(
             return []
         if case == "none":
             return [PRInfo(number=44, branch="other")]
+        if case == "empty":
+            return []
         if case == "fork_only":
             return [fork]
         if case == "ambiguous":
@@ -525,7 +528,9 @@ def test_guardrail_records_visible_pr_number_before_error(
     else:
         assert runner.state.current_pr is None
         assert current.pr_number is None
-        assert current.pr_discovery_pending is (case in {"lookup_error", "save_error"})
+        assert current.pr_discovery_pending is (
+            case in {"lookup_error", "save_error", "empty"}
+        )
         assert labels == []
 
 

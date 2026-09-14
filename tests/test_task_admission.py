@@ -2464,6 +2464,9 @@ async def test_recorded_rejection_identity_ignores_mismatched_manifest_shapes(re
 @pytest.mark.parametrize(
     "manifest",
     [
+        [],
+        {"repository": "octo/demo", "base_branch": "main", "rejections": {}},
+        {"schema_version": 2, "repository": "octo/demo", "base_branch": "main", "rejections": {}},
         {"schema_version": 1, "repository": "octo/demo", "base_branch": "main", "rejections": []},
         {"schema_version": 1, "repository": "octo/demo", "base_branch": "main", "rejections": {"PR-42": {}}},
     ],

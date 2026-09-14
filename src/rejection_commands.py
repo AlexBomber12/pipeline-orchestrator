@@ -115,13 +115,15 @@ def _load_rejection_identity_records(
     except (OSError, ValueError, TypeError) as exc:
         raise RejectionIdentityManifestUnavailable("Rejection identity manifest is unavailable.") from exc
 
+    if not isinstance(manifest, dict):
+        raise RejectionIdentityManifestUnavailable("Rejection identity manifest is unavailable.")
     if (
-        not isinstance(manifest, dict)
-        or manifest.get("schema_version") != 1
-        or str(manifest.get("repository", "")).casefold() != owner_repo.casefold()
+        str(manifest.get("repository", "")).casefold() != owner_repo.casefold()
         or manifest.get("base_branch") != base_branch
     ):
         return None
+    if manifest.get("schema_version") != 1:
+        raise RejectionIdentityManifestUnavailable("Rejection identity manifest is unavailable.")
     records = manifest.get("rejections")
     if not isinstance(records, dict):
         raise RejectionIdentityManifestUnavailable("Rejection identity manifest is unavailable.")
