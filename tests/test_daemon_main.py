@@ -2082,6 +2082,7 @@ async def test_wait_or_wake_rechecks_paused_runner_until_resume_state(
     assert healthy is True
     assert last_run["alpha-key"] == 0.0
     assert runner.idle_streak_resets == 1
+    assert runner.state.user_paused is False
     assert fingerprints == {}
     assert delays == []
     assert redis.keys == [
@@ -2168,6 +2169,26 @@ async def test_pending_upload_reconcile_skips_when_state_read_fails() -> None:
 async def test_pending_upload_reconcile_clears_reset_stale_pause() -> None:
     redis = _ScriptedRedisGet([None, None])
     runner = _FakeIdleRunner(state=PipelineState.PAUSED, user_paused=True)
+
+    assert (
+        await main_module._runner_should_reconcile_pending_upload(
+            redis, "alpha", "alpha-key", {"alpha-key": runner}
+        )
+        is True
+    )
+    assert runner.state.user_paused is False
+    assert redis.keys == [
+        main_module.pipeline_state("alpha"),
+        main_module.control_stop("alpha"),
+    ]
+
+
+@pytest.mark.parametrize("runner_state", [PipelineState.IDLE, PipelineState.PAUSED])
+async def test_pending_upload_reconcile_clears_persisted_resume_stale_pause(
+    runner_state: PipelineState,
+) -> None:
+    redis = _ScriptedRedisGet(['{"state": "IDLE", "user_paused": false}', None])
+    runner = _FakeIdleRunner(state=runner_state, user_paused=True)
 
     assert (
         await main_module._runner_should_reconcile_pending_upload(

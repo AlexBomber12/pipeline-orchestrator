@@ -699,8 +699,7 @@ async def _runner_should_reconcile_pending_upload(
         return False
     if stop_request:
         return False
-    if state_was_cleared:
-        repo_state.user_paused = False
+    repo_state.user_paused = False
     return True
 
 
