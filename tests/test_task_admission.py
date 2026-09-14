@@ -341,6 +341,42 @@ async def test_upload_replays_unchanged_completed_merged_rejection_with_new_task
     assert accepted is not None and not accepted.admission_pending
 
 
+async def test_changed_completed_merged_rejection_upload_member_is_pruned(rejected):
+    from pathlib import Path
+
+    await finish_reject(rejected)
+    runner, command, repo, _, _, _ = rejected
+    prior = await load_attempt(runner.redis, runner.name, "PR-42")
+    await save_attempt(runner.redis, runner.name, prior.model_copy(update={"completed": True}), expected=prior)
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    await runner.redis.set(
+        rejection_key(runner.name, command.binding),
+        stored.model_copy(update={"status": "merged", "released": True}).model_dump_json(),
+    )
+    changed_completed = rewritten(repo) + "\nChanged completed task scope.\n"
+    new_task = task_43_from(repo)
+
+    response = await stage_files(rejected, [("PR-42.md", changed_completed), ("PR-43.md", new_task)])
+    assert response.status_code == 200, response.text
+    manifest = json.loads(await runner.redis.get(upload_pending(runner.name)))
+    staging_dir = Path(manifest["staging_dir"])
+
+    assert await runner.process_pending_uploads() is None
+
+    retained = json.loads(await runner.redis.get(upload_pending(runner.name)))
+    assert retained["files"] == ["PR-43.md"]
+    assert "PR-42" not in retained["task_hashes"]
+    assert not (staging_dir / "PR-42.md").exists()
+    assert (staging_dir / "PR-43.md").read_text() == new_task
+    assert await load_attempt(runner.redis, runner.name, "PR-43") is None
+
+    assert await runner.process_pending_uploads() is True
+    current42 = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert current42.completed and current42.rejection == command.binding
+    current43 = await load_attempt(runner.redis, runner.name, "PR-43")
+    assert current43 is not None and not current43.admission_pending
+
+
 async def test_completed_upload_member_is_pruned_without_losing_new_task(rejected):
     from pathlib import Path
 
@@ -874,6 +910,55 @@ async def test_recovered_rejection_identity_admits_changed_git_rewrite_after_red
     assert "refs/heads/fix/pr-42" not in git(remote, "show-ref")
 
 
+async def test_snapshot_recovers_rejection_relationship_for_pre_final_base_rewrite(rejected):
+    from src.cancellation.storage import index_key, task_spec_hash_key
+
+    runner, command, repo, *_ = rejected
+    assert (await post_reject(rejected)).status_code == 202
+    git(repo, "checkout", "main")
+    path = repo / "tasks/PR-42.md"
+    pre_final = without_blocked_reason(
+        path.read_text()
+        .replace("status: ERROR", "status: TODO")
+        .replace("Original specification.", "Pre-final replacement.")
+    )
+    path.write_text(pre_final)
+    git(repo, "commit", "-am", "operator rewrites before reject finalizes")
+    git(repo, "push", "origin", "main")
+    pre_final_base = git(repo, "rev-parse", "main")
+    git(repo, "checkout", "fix/pr-42")
+
+    await runner._run_cycle_body()
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    assert stored.status == "rejected" and stored.released
+    assert stored.base_commit == pre_final_base
+    assert "operator_reject" not in git(repo, "show", "origin/main:tasks/PR-42.md")
+    await runner.redis.delete(attempt_key(runner.name, "PR-42"))
+    await runner.redis.delete(rejection_key(runner.name, command.binding))
+    await runner.redis.delete(cause_key(runner.name, "PR-42"))
+    await runner.redis.delete(index_key(runner.name))
+    await runner.redis.delete(task_spec_hash_key(runner.name, "PR-42"))
+    await runner.redis.delete(pipeline_state(runner.name))
+
+    await runner._snapshot_accepted_specs()
+    recovered = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert recovered.rejection == command.binding
+    assert recovered.fingerprint == task_spec_content_hash(pre_final)
+    assert await runner._reconcile_git_admissions() == {"PR-42"}
+
+    post_final = pre_final + "\nPost-final rewrite.\n"
+    path.write_text(post_final)
+    git(repo, "commit", "-am", "operator rewrites after reject finalizes")
+    git(repo, "push", "origin", "main")
+
+    result = await runner._reconcile_git_admissions()
+    assert result == set(), [row["event"] for row in runner.state.history[-5:]]
+    current = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert current.attempt_id != recovered.attempt_id
+    assert current.previous_rejection == command.binding
+    assert not current.admission_pending
+
+
 async def test_prior_base_snapshot_waits_for_local_base_before_sync(rejected):
     runner, _, repo, *_ = rejected
     git(repo, "checkout", "main")
@@ -986,6 +1071,22 @@ async def test_rejection_identity_helpers_handle_invalid_entries_and_legacy_sent
         runner._recorded_rejection_identity("PR-42", "f" * 64)
     with pytest.raises(MergeStatusUnavailable, match="Rejection identity manifest is unavailable"):
         await runner._load_final_rejection("binding", "PR-42")
+
+
+@pytest.mark.parametrize("case", ["missing_entry", "missing_base", "missing_blob", "non_utf8"])
+async def test_rejection_identity_base_match_ignores_unusable_entries(rejected, monkeypatch, case):
+    runner, *_ = rejected
+    entry = None if case == "missing_entry" else {"base_commit": ""}
+    if case in {"missing_blob", "non_utf8"}:
+        entry = {"base_commit": "abc123"}
+
+        def fake_git_bytes(path, *args, **kwargs):
+            stdout = b"\xff" if case == "non_utf8" else b""
+            return subprocess.CompletedProcess(args, 0 if case == "non_utf8" else 1, stdout=stdout, stderr=b"")
+
+        monkeypatch.setattr(daemon_admission.git_ops, "_git_bytes", fake_git_bytes)
+
+    assert not runner._rejection_identity_matches_base(entry, "tasks/PR-42.md", "f" * 64)
 
 
 async def test_admission_defers_when_rejection_identity_manifest_is_unreadable(rejected, tmp_path):

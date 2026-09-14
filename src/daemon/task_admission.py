@@ -62,7 +62,7 @@ class TaskAdmissionMixin:
         except RejectionIdentityManifestUnavailable as exc:
             raise MergeStatusUnavailable("Rejection identity manifest is unavailable.") from exc
 
-    def _recorded_rejection_identity(self, task_id: str, fingerprint: str) -> dict | None:
+    def _recorded_rejection_identity(self, task_id: str, fingerprint: str | None = None) -> dict | None:
         try:
             return recorded_rejection_identity(
                 Path(self.repo_path),
@@ -73,6 +73,27 @@ class TaskAdmissionMixin:
             )
         except RejectionIdentityManifestUnavailable as exc:
             raise MergeStatusUnavailable("Rejection identity manifest is unavailable.") from exc
+
+    def _rejection_identity_matches_base(
+        self,
+        entry: dict | None,
+        filename: str,
+        fingerprint: str,
+    ) -> bool:
+        if not entry or not isinstance(entry.get("base_commit"), str) or not entry["base_commit"]:
+            return False
+        blob = git_ops._git_bytes(
+            self.repo_path,
+            "show",
+            f"{entry['base_commit']}:{filename}",
+            check=False,
+        )
+        if blob.returncode != 0:
+            return False
+        try:
+            return task_spec_content_hash(blob.stdout.decode("utf-8")) == fingerprint
+        except UnicodeError:
+            return False
 
     def _rejection_command_from_identity(self, task_id: str, entry: dict | None) -> RejectionCommand | None:
         if not entry:
@@ -222,6 +243,10 @@ class TaskAdmissionMixin:
                 file_sha256=hashlib.sha256(content_bytes).hexdigest(),
             )
             recorded_rejection = self._recorded_rejection_identity(task_id, fingerprint)
+            if not recorded_rejection:
+                task_rejection = self._recorded_rejection_identity(task_id)
+                if self._rejection_identity_matches_base(task_rejection, filename, fingerprint):
+                    recorded_rejection = task_rejection
             if (
                 header.blocked_reason == "operator_reject"
                 or self._has_historical_operator_reject_marker(
@@ -273,7 +298,6 @@ class TaskAdmissionMixin:
             rejection = await self._load_final_rejection(
                 previous.rejection,
                 previous.task.pr_id,
-                fingerprint=previous.fingerprint,
             )
             if rejection is None or rejection.status != "rejected" or not rejection.released:
                 raise AttemptChanged("Prior rejection is not confirmed.")

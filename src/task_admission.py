@@ -173,8 +173,10 @@ async def admission_candidate(
     rejection_file_sha256 = None
     prior_rejection_binding = previous.previous_rejection if previous else None
     if previous and previous.rejection:
-        if previous.completed and fingerprint == previous.fingerprint:
-            return previous, None
+        if previous.completed:
+            if fingerprint == previous.fingerprint:
+                return previous, None
+            raise AdmissionRejected(f"{previous.task.pr_id} is completed and cannot be reused.")
         if upload and expected_rejection != previous.rejection:
             raise AdmissionRejected("Upload predates or belongs to another rejection; submit the rewritten task again.")
         if previous.rejection == LEGACY_REJECTION_SENTINEL:
@@ -188,7 +190,6 @@ async def admission_candidate(
                         owner,
                         base,
                         previous.task.pr_id,
-                        fingerprint=previous.fingerprint,
                         binding=previous.rejection,
                     )
                 except RejectionIdentityManifestUnavailable as exc:
