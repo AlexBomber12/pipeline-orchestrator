@@ -356,10 +356,6 @@ async def admission_candidate(
             )
     if previous:
         verify_unfinished(root, base, repo_url, previous, accepted_file_sha256=rejection_file_sha256)
-        if previous.started and not previous.rejection:
-            raise AdmissionRejected(
-                "An existing attempt owns this specification. Retry unchanged work or Reject before rewriting it."
-            )
     available_ids = (
         available_ids if available_ids is not None else existing_task_header_ids(root)
     )

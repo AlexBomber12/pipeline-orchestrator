@@ -120,6 +120,35 @@ async def test_upload_dependency_availability_uses_existing_task_header_ids(reje
     assert (repo / "tasks/PR-100.md").read_text() == uploaded
 
 
+async def test_changed_upload_after_reset_replaces_started_automatic_error_attempt(rejected):
+    await finish_reject(rejected)
+    runner, _, repo, *_ = rejected
+    first_rewrite = rewritten(repo)
+    assert (await stage(rejected, first_rewrite)).status_code == 200
+    assert await runner.process_pending_uploads() is True
+    admitted = await load_attempt(runner.redis, runner.name, "PR-42")
+    runner.state.current_task = admitted.task
+    assert await runner._prepare_task_attempt(first_rewrite)
+    previous = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert previous.started and previous.coder_dispatched is True
+    assert previous.rejection is None and previous.previous_rejection is not None
+
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_task = None
+    await runner.redis.delete(cause_key(runner.name, "PR-42"))
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    changed = first_rewrite.replace("New specification.", "Replacement after reset.")
+
+    assert (await stage(rejected, changed)).status_code == 200
+    assert await runner.process_pending_uploads() is True
+
+    current = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert current.attempt_id != previous.attempt_id
+    assert current.previous_rejection == previous.previous_rejection
+    assert not current.started and not current.admission_pending
+    assert (repo / "tasks/PR-42.md").read_text() == changed
+
+
 def test_admission_graph_tolerates_legacy_noise_but_rejects_structured_errors(tmp_path):
     tasks = tmp_path / "tasks"
     tasks.mkdir()
@@ -1302,6 +1331,10 @@ async def test_shared_admission_refuses_invalid_or_obsolete_ownership(rejected, 
             token = None
         elif case == "active_attempt":
             receipt.started = True
+            runner.state.state = PipelineState.CODING
+            runner.state.current_task = receipt.task.model_copy(update={"status": TaskStatus.DOING})
+            runner.state.current_pr = None
+            await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
             token = None
         await runner.redis.set(attempt_key(runner.name, "PR-42"), receipt.model_dump_json())
     elif case == "missing_dependency":
