@@ -44,6 +44,8 @@ def _parse_snapshot_header(filename: str, content: str):
         except UnstructuredLegacyTaskError:
             return None
         except QueueValidationError as exc:
+            if exc.issues and all("missing task header like" in issue for issue in exc.issues):
+                return None
             raise QueueValidationError([issue.replace(str(path), filename) for issue in exc.issues]) from exc
 
 

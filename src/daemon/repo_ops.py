@@ -25,8 +25,9 @@ from src.daemon.git_ops import (
 )
 from src.keyspace import upload_pending, upload_pending_count
 from src.models import TaskStatus
+from src.queue_parser import parse_task_header
 from src.retry import retry_transient
-from src.task_admission import invalid_upload_graph_members, validate_admission_graph
+from src.task_admission import existing_task_header_ids, invalid_upload_graph_members, validate_admission_graph
 from src.task_attempts import AdmissionRejected, TaskAttempt, attempt_key, load_attempt
 
 logger = logging.getLogger(__name__)
@@ -565,8 +566,11 @@ return 0
             await self._snapshot_accepted_specs()
             admissions = []
             validated = []
-            available_ids = {path.stem for path in tasks_dir.glob("PR-*.md")} | {
-                Path(name).stem for name in stageable_filenames if name.startswith("PR-")
+            available_ids = existing_task_header_ids(Path(self.repo_path)) | {
+                task_id
+                for name in stageable_filenames
+                if name.startswith("PR-") and name.endswith(".md")
+                for task_id in [parse_task_header(staging_dir / name).pr_id]
             }
             for fname in stageable_filenames:
                 if fname.startswith("PR-") and fname.endswith(".md"):

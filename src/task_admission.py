@@ -39,6 +39,31 @@ from src.task_attempts import AdmissionRejected, AttemptChanged, TaskAttempt, lo
 from src.task_status import get_merged_pr_ids
 
 
+def _is_missing_existing_task_header_error(exc: QueueValidationError) -> bool:
+    return bool(exc.issues) and all(
+        "missing task header like" in issue for issue in exc.issues
+    )
+
+
+def _parse_existing_task_header_or_none(path: Path):
+    try:
+        return parse_existing_task_header(path)
+    except UnstructuredLegacyTaskError:
+        return None
+    except QueueValidationError as exc:
+        if _is_missing_existing_task_header_error(exc):
+            return None
+        raise
+
+
+def existing_task_header_ids(root: Path) -> set[str]:
+    return {
+        header.pr_id
+        for path in (root / "tasks").glob("PR-*.md")
+        if (header := _parse_existing_task_header_or_none(path))
+    }
+
+
 def validate_admission_graph(root: Path, incoming: Iterable[Path] = ()) -> None:
     """Check the proposed task graph before reserving any new attempts.
 
@@ -53,12 +78,13 @@ def validate_admission_graph(root: Path, incoming: Iterable[Path] = ()) -> None:
     branch_owner = {}
     for name, path in sorted(paths.items()):
         try:
-            header = parse_task_header(path) if name in replacements else parse_existing_task_header(path)
-        except UnstructuredLegacyTaskError:
-            continue
+            if name in replacements:
+                header = parse_task_header(path)
+            else:
+                header = _parse_existing_task_header_or_none(path)
+                if header is None:
+                    continue
         except QueueValidationError as exc:
-            if name not in replacements and all("missing task header like" in issue for issue in exc.issues):
-                continue
             raise AdmissionRejected(str(exc)) from exc
         owner = branch_owner.get(header.branch)
         if owner is not None and owner != header.pr_id:
@@ -82,12 +108,13 @@ def invalid_upload_graph_members(root: Path, incoming: Iterable[Path]) -> set[st
     invalid_ids: set[str] = set()
     for name, path in sorted(paths.items()):
         try:
-            header = parse_task_header(path) if name in replacements else parse_existing_task_header(path)
-        except UnstructuredLegacyTaskError:
-            continue
+            if name in replacements:
+                header = parse_task_header(path)
+            else:
+                header = _parse_existing_task_header_or_none(path)
+                if header is None:
+                    continue
         except QueueValidationError as exc:
-            if name not in replacements and all("missing task header like" in issue for issue in exc.issues):
-                continue
             if name in replacements:
                 return {name}
             raise AdmissionRejected(str(exc)) from exc
@@ -334,7 +361,7 @@ async def admission_candidate(
                 "An existing attempt owns this specification. Retry unchanged work or Reject before rewriting it."
             )
     available_ids = (
-        available_ids if available_ids is not None else {path.stem for path in (root / "tasks").glob("PR-*.md")}
+        available_ids if available_ids is not None else existing_task_header_ids(root)
     )
     missing = set(header.depends_on) - available_ids
     if missing:
@@ -344,9 +371,8 @@ async def admission_candidate(
     for path in (root / "tasks").glob("PR-*.md"):
         if path.name == incoming.name:
             continue
-        try:
-            other = parse_existing_task_header(path)
-        except UnstructuredLegacyTaskError:
+        other = _parse_existing_task_header_or_none(path)
+        if other is None:
             continue
         if other.branch == header.branch:
             raise AttemptChanged(f"Branch is also assigned to {other.pr_id}.")

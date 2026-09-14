@@ -91,6 +91,35 @@ def task_with_dependency(text, depends_on):
     return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
 
+async def test_upload_dependency_availability_uses_existing_task_header_ids(rejected):
+    runner, _, repo, *_ = rejected
+    git(repo, "checkout", "main")
+    legacy = rewritten(repo).replace("PR-42:", "PR-999:").replace(
+        "fix/pr-42",
+        "fix/pr-999",
+    )
+    (repo / "tasks/PR-001.md").write_text(legacy)
+    (repo / "tasks/PR-050.md").write_text("Loose historical notes.\n")
+    git(repo, "add", "tasks")
+    git(repo, "commit", "-m", "add historical task ids")
+    git(repo, "push", "origin", "main")
+    uploaded = task_with_dependency(
+        rewritten(repo).replace("PR-42:", "PR-100:").replace(
+            "fix/pr-42",
+            "fix/pr-100",
+        ),
+        "PR-999",
+    )
+
+    response = await stage_files(rejected, [("PR-100.md", uploaded)])
+
+    assert response.status_code == 200, response.text
+    assert await runner.process_pending_uploads() is True
+    current = await load_attempt(runner.redis, runner.name, "PR-100")
+    assert current is not None and not current.admission_pending
+    assert (repo / "tasks/PR-100.md").read_text() == uploaded
+
+
 def test_admission_graph_tolerates_legacy_noise_but_rejects_structured_errors(tmp_path):
     tasks = tmp_path / "tasks"
     tasks.mkdir()

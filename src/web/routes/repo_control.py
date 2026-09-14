@@ -41,7 +41,7 @@ from src.cancellation.storage import (
     list_pending_guardrail_decisions,
     task_spec_content_hash,
 )
-from src.config import load_config
+from src.config import load_config, normalize_repo_url
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.inhibitor import derive_active_inhibitors
@@ -2712,7 +2712,9 @@ async def _reject_guardrail_decision(
             raise AttemptChanged("Reject binding is missing; refresh the guardrail decision.")
         existing = await load_rejection(redis_client, name, binding)
         if existing:
-            if existing.task.pr_id != pr_id or existing.repo_url != repo_config.url:
+            if existing.task.pr_id != pr_id or normalize_repo_url(
+                existing.repo_url
+            ) != normalize_repo_url(repo_config.url):
                 raise AttemptChanged("Rejection binding belongs to different work.")
             return HTMLResponse(escape(existing.reason), status_code=202)
         raw_cause = await redis_client.get(cause_key(name, pr_id))
@@ -2724,7 +2726,11 @@ async def _reject_guardrail_decision(
         if attempt and state.current_task:
             state.current_task.attempt_id = attempt.attempt_id
         command = build_rejection(name, state, raw_cause, Path(_app.REPOS_DIR) / name)
-        if command.task.pr_id != pr_id or command.repo_url != repo_config.url or command.binding != binding:
+        if (
+            command.task.pr_id != pr_id
+            or normalize_repo_url(command.repo_url) != normalize_repo_url(repo_config.url)
+            or command.binding != binding
+        ):
             raise AttemptChanged("Reject decision changed; refresh before rejecting.")
         command = await enqueue_rejection(redis_client, command)
     except RedisError:

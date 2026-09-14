@@ -805,6 +805,19 @@ async def test_unknown_process_defers_rejection(rejected, monkeypatch):
     assert (await load_rejection(runner.redis, runner.name, command.binding)).status == "deferred"
 
 
+async def test_http_reject_accepts_equivalent_repo_url_after_config_reload(rejected):
+    runner, command, *_ = rejected
+    web_app.CONFIG_PATH.write_text(
+        "repositories:\n  - url: https://github.com/octo/demo\n    branch: main\n"
+    )
+
+    response = await post_reject(rejected)
+
+    assert response.status_code == 202, response.text
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    assert stored.repo_url == runner.repo_config.url
+
+
 async def test_rejection_reconciliation_allows_equivalent_repo_url(rejected):
     runner, command, *_ = rejected
     assert (await post_reject(rejected)).status_code == 202
