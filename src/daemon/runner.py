@@ -2105,8 +2105,15 @@ class PipelineRunner(
                 timeout=60,
             )
             if expected_spec_hash is not None:
+                current_task_path = Path(self.repo_path) / task_file
+                if not current_task_path.is_file():
+                    self.log_event(
+                        f"[INFRA] Warning: skipping {status} status commit for "
+                        f"{task_file}: task specification changed or was removed."
+                    )
+                    return allow_spec_hash_mismatch
                 current_hash = task_spec_content_hash(
-                    (Path(self.repo_path) / task_file).read_text(encoding="utf-8")
+                    current_task_path.read_text(encoding="utf-8")
                 )
                 if current_hash != expected_spec_hash:
                     self.log_event(

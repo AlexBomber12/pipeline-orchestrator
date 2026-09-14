@@ -529,6 +529,29 @@ async def test_final_rejection_commits_operator_reject_marker_for_redis_loss(rej
     assert await runner._reconcile_git_admissions() == {"PR-42"}
 
 
+async def test_final_rejection_releases_when_task_removed_before_marker_commit(rejected):
+    runner, command, repo, *_ = rejected
+
+    assert (await post_reject(rejected)).status_code == 202
+    git(repo, "checkout", "main")
+    git(repo, "rm", "tasks/PR-42.md")
+    git(repo, "commit", "-m", "operator removes rejected task before finalization")
+    git(repo, "push", "origin", "main")
+    git(repo, "checkout", "fix/pr-42")
+
+    await runner._run_cycle_body()
+
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    assert stored.status == "rejected" and stored.released
+    assert stored.base_commit == git(repo, "rev-parse", "origin/main~1")
+    assert git_ops._git(repo, "show", "origin/main:tasks/PR-42.md", check=False).returncode != 0
+    manifest = json.loads(git(repo, "show", "origin/main:tasks/rejections.json"))
+    entry = manifest["rejections"]["PR-42"][0]
+    assert entry["fingerprint"] == command.fingerprint
+    assert entry["rejection_binding"] == command.binding
+    assert entry["base_commit"] == stored.base_commit
+
+
 async def test_concurrent_rewrite_rejection_manifest_fences_restored_rejected_bytes(rejected):
     runner, command, repo, *_ = rejected
     original = (repo / "tasks/PR-42.md").read_text()
