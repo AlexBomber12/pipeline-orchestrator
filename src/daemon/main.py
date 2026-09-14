@@ -683,7 +683,10 @@ async def _runner_should_reconcile_pending_upload(
             exc_info=True,
         )
         return False
-    if not _persisted_state_allows_pending_upload_reconcile(raw_state):
+    state_was_cleared = raw_state is None
+    if not state_was_cleared and not _persisted_state_allows_pending_upload_reconcile(
+        raw_state
+    ):
         return False
     try:
         stop_request = await redis_client.get(control_stop(slug))
@@ -694,7 +697,11 @@ async def _runner_should_reconcile_pending_upload(
             exc_info=True,
         )
         return False
-    return not bool(stop_request)
+    if stop_request:
+        return False
+    if state_was_cleared:
+        repo_state.user_paused = False
+    return True
 
 
 async def _drain_wake_messages(

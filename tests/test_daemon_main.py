@@ -2096,7 +2096,6 @@ async def test_wait_or_wake_rechecks_paused_runner_until_resume_state(
 @pytest.mark.parametrize(
     "raw_state",
     [
-        None,
         42,
         "{broken",
         "[]",
@@ -2113,6 +2112,10 @@ def test_persisted_state_blocks_pending_upload_reconcile(raw_state: Any) -> None
         main_module._persisted_state_allows_pending_upload_reconcile(raw_state)
         is False
     )
+
+
+def test_persisted_state_blocks_missing_pending_upload_reconcile_state() -> None:
+    assert main_module._persisted_state_allows_pending_upload_reconcile(None) is False
 
 
 def test_persisted_state_allows_cleared_pause_with_stale_pause_inhibitor() -> None:
@@ -2160,6 +2163,40 @@ async def test_pending_upload_reconcile_skips_when_state_read_fails() -> None:
         is False
     )
     assert redis.keys == [main_module.pipeline_state("alpha")]
+
+
+async def test_pending_upload_reconcile_clears_reset_stale_pause() -> None:
+    redis = _ScriptedRedisGet([None, None])
+    runner = _FakeIdleRunner(state=PipelineState.PAUSED, user_paused=True)
+
+    assert (
+        await main_module._runner_should_reconcile_pending_upload(
+            redis, "alpha", "alpha-key", {"alpha-key": runner}
+        )
+        is True
+    )
+    assert runner.state.user_paused is False
+    assert redis.keys == [
+        main_module.pipeline_state("alpha"),
+        main_module.control_stop("alpha"),
+    ]
+
+
+async def test_pending_upload_reconcile_keeps_reset_pause_when_stop_key_live() -> None:
+    redis = _ScriptedRedisGet([None, "1"])
+    runner = _FakeIdleRunner(state=PipelineState.PAUSED, user_paused=True)
+
+    assert (
+        await main_module._runner_should_reconcile_pending_upload(
+            redis, "alpha", "alpha-key", {"alpha-key": runner}
+        )
+        is False
+    )
+    assert runner.state.user_paused is True
+    assert redis.keys == [
+        main_module.pipeline_state("alpha"),
+        main_module.control_stop("alpha"),
+    ]
 
 
 async def test_pending_upload_reconcile_skips_when_stop_key_live() -> None:
