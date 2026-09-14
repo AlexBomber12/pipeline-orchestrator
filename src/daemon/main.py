@@ -54,7 +54,7 @@ from src.daemon.migrations.run_record_backfill import (
 )
 from src.daemon.runner import PipelineRunner
 from src.events.wake import repo_from_channel, subscribe_wake
-from src.keyspace import pipeline_state, upload_pending
+from src.keyspace import control_stop, pipeline_state, upload_pending
 from src.models import PipelineState
 from src.sandbox.runtime_state import refresh_sandbox_state
 from src.usage import UsageProvider
@@ -683,7 +683,18 @@ async def _runner_should_reconcile_pending_upload(
             exc_info=True,
         )
         return False
-    return _persisted_state_allows_pending_upload_reconcile(raw_state)
+    if not _persisted_state_allows_pending_upload_reconcile(raw_state):
+        return False
+    try:
+        stop_request = await redis_client.get(control_stop(slug))
+    except Exception:
+        logger.debug(
+            "pending-upload stop state check failed for %s",
+            slug,
+            exc_info=True,
+        )
+        return False
+    return not bool(stop_request)
 
 
 async def _drain_wake_messages(

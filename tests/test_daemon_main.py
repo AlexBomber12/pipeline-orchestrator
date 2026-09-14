@@ -2055,6 +2055,7 @@ async def test_wait_or_wake_rechecks_paused_runner_until_resume_state(
             '{"state": "PAUSED", "user_paused": true}',
             manifest,
             '{"state": "PAUSED", "user_paused": false}',
+            None,
         ]
     )
     last_run = {"alpha-key": 100.0}
@@ -2088,6 +2089,7 @@ async def test_wait_or_wake_rechecks_paused_runner_until_resume_state(
         main_module.pipeline_state("alpha"),
         main_module.upload_pending("alpha"),
         main_module.pipeline_state("alpha"),
+        main_module.control_stop("alpha"),
     ]
 
 
@@ -2158,6 +2160,49 @@ async def test_pending_upload_reconcile_skips_when_state_read_fails() -> None:
         is False
     )
     assert redis.keys == [main_module.pipeline_state("alpha")]
+
+
+async def test_pending_upload_reconcile_skips_when_stop_key_live() -> None:
+    redis = _ScriptedRedisGet(
+        [
+            '{"state": "PAUSED", "user_paused": false, '
+            '"active_inhibitors": [{"inhibitor_type": "user_stop"}]}',
+            "1",
+        ]
+    )
+    runner = _FakeIdleRunner(state=PipelineState.PAUSED)
+
+    assert (
+        await main_module._runner_should_reconcile_pending_upload(
+            redis, "alpha", "alpha-key", {"alpha-key": runner}
+        )
+        is False
+    )
+    assert redis.keys == [
+        main_module.pipeline_state("alpha"),
+        main_module.control_stop("alpha"),
+    ]
+
+
+async def test_pending_upload_reconcile_skips_when_stop_key_read_fails() -> None:
+    redis = _ScriptedRedisGet(
+        [
+            '{"state": "PAUSED", "user_paused": false}',
+            RuntimeError("redis down"),
+        ]
+    )
+    runner = _FakeIdleRunner(state=PipelineState.PAUSED)
+
+    assert (
+        await main_module._runner_should_reconcile_pending_upload(
+            redis, "alpha", "alpha-key", {"alpha-key": runner}
+        )
+        is False
+    )
+    assert redis.keys == [
+        main_module.pipeline_state("alpha"),
+        main_module.control_stop("alpha"),
+    ]
 
 
 async def test_wait_or_wake_pending_upload_errors_keep_sleep_path() -> None:
