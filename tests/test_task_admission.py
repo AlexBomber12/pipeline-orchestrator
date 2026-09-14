@@ -341,6 +341,47 @@ async def test_upload_replays_unchanged_completed_merged_rejection_with_new_task
     assert accepted is not None and not accepted.admission_pending
 
 
+async def test_completed_upload_member_is_pruned_without_losing_new_task(rejected):
+    from pathlib import Path
+
+    await finish_reject(rejected)
+    runner, command, repo, _, _, _ = rejected
+    prior = await load_attempt(runner.redis, runner.name, "PR-42")
+    rewritten42 = rewritten(repo)
+    new_task = task_43_from(repo)
+
+    response = await stage_files(rejected, [("PR-42.md", rewritten42), ("PR-43.md", new_task)])
+    assert response.status_code == 200, response.text
+    raw = await runner.redis.get(upload_pending(runner.name))
+    manifest = json.loads(raw)
+    staging_dir = Path(manifest["staging_dir"])
+    await save_attempt(runner.redis, runner.name, prior.model_copy(update={"completed": True}), expected=prior)
+    before = git(repo, "rev-parse", "HEAD")
+
+    assert await runner.process_pending_uploads() is None
+
+    retained = json.loads(await runner.redis.get(upload_pending(runner.name)))
+    assert retained["files"] == ["PR-43.md"]
+    assert "PR-42" not in retained["task_hashes"]
+    assert "PR-42" not in retained["rejection_tokens"]
+    assert "PR-42" not in retained["prior_spec_files"]
+    assert not (staging_dir / "PR-42.md").exists()
+    assert (staging_dir / "PR-43.md").read_text() == new_task
+    assert await runner.redis.get(upload_pending_count(runner.name)) == "1"
+    assert await load_attempt(runner.redis, runner.name, "PR-43") is None
+    assert not (repo / "tasks/PR-43.md").exists()
+    assert git(repo, "rev-parse", "HEAD") == before
+    assert any("PR-42 is completed and cannot be reused" in row["event"] for row in runner.state.history)
+
+    assert await runner.process_pending_uploads() is True
+    assert await runner.redis.get(upload_pending(runner.name)) is None
+    assert (repo / "tasks/PR-43.md").read_text() == new_task
+    current42 = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert current42.completed and current42.rejection == command.binding
+    current43 = await load_attempt(runner.redis, runner.name, "PR-43")
+    assert current43 is not None and not current43.admission_pending
+
+
 async def test_stale_pending_upload_member_preserves_newer_valid_submission(rejected, tmp_path):
     runner, _, repo, _, _, _ = rejected
     path = repo / "tasks/PR-42.md"
@@ -2133,6 +2174,7 @@ async def test_sprint_zip_replays_completed_tasks_without_reusing_them(
 ):
     import io
     import zipfile
+    from pathlib import Path
 
     from src import task_admission
     from src.cancellation.storage import index_key
@@ -2168,7 +2210,10 @@ async def test_sprint_zip_replays_completed_tasks_without_reusing_them(
         await runner._snapshot_accepted_specs()
         prior = await load_attempt(runner.redis, runner.name, "PR-42")
         prior = await save_attempt(
-            runner.redis, runner.name, prior.model_copy(update={"completed": True}), expected=prior,
+            runner.redis,
+            runner.name,
+            prior.model_copy(update={"completed": True}),
+            expected=prior,
         )
     counter = f"metrics:retry_count:{runner.name}:PR-42"
     await runner.redis.set(counter, "3")
@@ -2190,10 +2235,11 @@ async def test_sprint_zip_replays_completed_tasks_without_reusing_them(
         archive.writestr("PR-43.md", new_task)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post(
-            f"/repos/{runner.name}/upload-tasks", files={"files": ("sprint.zip", buffer.getvalue(), "application/zip")},
+            f"/repos/{runner.name}/upload-tasks",
+            files={"files": ("sprint.zip", buffer.getvalue(), "application/zip")},
         )
-    assert response.status_code == 200, response.text
-    assert await runner.process_pending_uploads() is (not changed)
+        assert response.status_code == 200, response.text
+    assert await runner.process_pending_uploads() is (None if changed else True)
     current = await load_attempt(runner.redis, runner.name, "PR-42")
     assert current.task.status == TaskStatus.DONE
     assert current.file_sha256 == record["completions"]["PR-42"]["task_sha256"]
@@ -2206,7 +2252,15 @@ async def test_sprint_zip_replays_completed_tasks_without_reusing_them(
     assert completed_check_calls == (["PR-42"] if changed else [])
     new_attempt = await load_attempt(runner.redis, runner.name, "PR-43")
     if changed:
+        retained = json.loads(await runner.redis.get(upload_pending(runner.name)))
+        assert retained["files"] == ["PR-43.md"]
+        assert "PR-42" not in retained["task_hashes"]
+        assert (Path(retained["staging_dir"]) / "PR-43.md").read_text() == new_task
         assert new_attempt is None and not (repo / "tasks/PR-43.md").exists()
+        assert await runner.process_pending_uploads() is True
+        new_attempt = await load_attempt(runner.redis, runner.name, "PR-43")
+        assert await runner.redis.get(upload_pending(runner.name)) is None
     else:
-        assert not new_attempt.started and not new_attempt.admission_pending
-        assert (repo / "tasks/PR-43.md").read_text() == new_task
+        assert await runner.redis.get(upload_pending(runner.name)) is None
+    assert not new_attempt.started and not new_attempt.admission_pending
+    assert (repo / "tasks/PR-43.md").read_text() == new_task

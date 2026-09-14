@@ -450,10 +450,24 @@ return 0
                             )
                     elif current and not target.is_file():
                         raise AdmissionRejected("Task was deleted; an old pending upload cannot recreate it.")
-                    validated.append(await self._validate_admission(
-                        staging_dir / fname, token=manifest.get("rejection_tokens", {}).get(Path(fname).stem),
-                        upload=True, available_ids=available_ids,
-                    ))
+                    try:
+                        validated.append(
+                            await self._validate_admission(
+                                staging_dir / fname,
+                                token=manifest.get("rejection_tokens", {}).get(Path(fname).stem),
+                                upload=True,
+                                available_ids=available_ids,
+                            )
+                        )
+                    except AdmissionRejected as exc:
+                        return await self._discard_invalid_upload_member(
+                            key,
+                            raw,
+                            staging_dir,
+                            manifest,
+                            fname,
+                            str(exc),
+                        )
             # Validate the whole batch before reserving any replacement. An
             # invalid later file must not orphan an earlier pending receipt.
             for previous, candidate in validated:
