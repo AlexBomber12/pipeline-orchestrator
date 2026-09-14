@@ -62,10 +62,10 @@ def recorded_rejection_identity(
         return None
     records = manifest.get("rejections")
     if not isinstance(records, dict):
-        return None
+        raise RejectionIdentityManifestUnavailable("Rejection identity manifest is unavailable.")
     entries = records.get(task_id, [])
     if not isinstance(entries, list):
-        return None
+        raise RejectionIdentityManifestUnavailable("Rejection identity manifest is unavailable.")
     for entry in reversed(entries):
         if not isinstance(entry, dict):
             continue

@@ -381,11 +381,10 @@ async def admission_candidate(
             branch_cleanup_branch = previous.task.branch
             branch_cleanup_head = str(prior_pr.get("head", {}).get("sha") or "")
             branch_cleanup_pr_number = int(prior_pr["number"])
-        elif previous.started and not previous.rejection:
-            if prior_branch_head := attempt_branch_head(str(root), previous.task.branch):
-                branch_cleanup_branch = previous.task.branch
-                branch_cleanup_head = prior_branch_head
-                branch_cleanup_pr_number = None
+        elif previous.started and not previous.rejection and attempt_branch_head(str(root), previous.task.branch):
+            raise AttemptChanged(
+                "Prior attempt branch exists without PR ownership; remove it before accepting a changed specification."
+            )
     available_ids = (
         available_ids if available_ids is not None else existing_task_header_ids(root)
     )

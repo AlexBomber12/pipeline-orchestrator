@@ -688,28 +688,31 @@ class TaskAdmissionMixin:
     async def _prepare_closed_attempt_branch(self, attempt: TaskAttempt) -> None:
         if normalize_repo_url(attempt.repo_url) != normalize_repo_url(self.repo_config.url):
             raise AttemptChanged("Branch cleanup belongs to a different repository.")
-        if attempt.branch_cleanup_branch is None or attempt.branch_cleanup_head is None:
+        if (
+            attempt.branch_cleanup_branch is None
+            or attempt.branch_cleanup_head is None
+            or attempt.branch_cleanup_pr_number is None
+        ):
             raise AttemptChanged("Prior branch cleanup ownership is incomplete.")
-        if attempt.branch_cleanup_pr_number is not None:
-            probe = attempt.model_copy(
-                update={
-                    "pr_number": attempt.branch_cleanup_pr_number,
-                    "task": attempt.task.model_copy(update={"branch": attempt.branch_cleanup_branch}),
-                }
-            )
-            data = discover_attempt_pr(
-                self.repo_path,
-                self.owner_repo,
-                self.repo_config.branch,
-                probe,
-            )
-            if (
-                data is None
-                or data.get("state") != "closed"
-                or data.get("merged_at")
-                or data.get("head", {}).get("sha") != attempt.branch_cleanup_head
-            ):
-                raise AttemptChanged("Prior attempt PR is not closed without merge.")
+        probe = attempt.model_copy(
+            update={
+                "pr_number": attempt.branch_cleanup_pr_number,
+                "task": attempt.task.model_copy(update={"branch": attempt.branch_cleanup_branch}),
+            }
+        )
+        data = discover_attempt_pr(
+            self.repo_path,
+            self.owner_repo,
+            self.repo_config.branch,
+            probe,
+        )
+        if (
+            data is None
+            or data.get("state") != "closed"
+            or data.get("merged_at")
+            or data.get("head", {}).get("sha") != attempt.branch_cleanup_head
+        ):
+            raise AttemptChanged("Prior attempt PR is not closed without merge.")
         self._prepare_owned_branch_cleanup(
             attempt.branch_cleanup_branch,
             self.repo_config.branch,

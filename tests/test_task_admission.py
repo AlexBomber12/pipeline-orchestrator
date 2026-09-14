@@ -199,7 +199,7 @@ async def test_changed_upload_after_reset_defers_while_prior_pr_remains_open(rej
     assert await runner.redis.get(upload_pending(runner.name)) is not None
 
 
-async def admit_automatic_error_rewrite(fixture, *, pr_number=42, attempt_pr_state="closed"):
+async def admit_automatic_error_rewrite(fixture, *, pr_number=42, attempt_pr_state="closed", expected_result=True):
     runner, _, repo, _, github, _ = fixture
     git(repo, "checkout", "main")
     path = repo / "tasks/PR-42.md"
@@ -247,7 +247,7 @@ async def admit_automatic_error_rewrite(fixture, *, pr_number=42, attempt_pr_sta
     await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
     changed = reset_text.replace("Original specification.", "Replacement after reset.")
     assert (await stage(fixture, changed)).status_code == 200
-    assert await runner.process_pending_uploads() is True
+    assert await runner.process_pending_uploads() is expected_result
     return await load_attempt(runner.redis, runner.name, "PR-42"), changed, prior_head
 
 
@@ -265,20 +265,29 @@ async def test_closed_automatic_error_pr_branch_is_cleaned_before_reuse(rejected
     assert "refs/heads/fix/pr-42" not in git(remote, "show-ref")
 
 
-async def test_no_pr_automatic_error_branch_is_cleaned_before_reuse(rejected):
-    runner, _, _, remote, _, _ = rejected
+async def test_no_pr_automatic_error_branch_defers_until_branch_removed(rejected):
+    runner, _, repo, remote, _, _ = rejected
     current, changed, prior_head = await admit_automatic_error_rewrite(
         rejected,
         pr_number=None,
         attempt_pr_state=None,
+        expected_result=None,
     )
 
-    assert current.branch_cleanup_branch == "fix/pr-42"
-    assert current.branch_cleanup_head == prior_head
+    assert current.started
+    assert current.branch_cleanup_branch is None
+    assert current.branch_cleanup_head is None
     assert current.branch_cleanup_pr_number is None
-    runner.state.current_task = current.task
-    assert await runner._prepare_task_attempt(changed)
-    assert "refs/heads/fix/pr-42" not in git(remote, "show-ref")
+    assert prior_head in git(remote, "show-ref")
+    assert await runner.redis.get(upload_pending(runner.name)) is not None
+    assert "Prior attempt branch exists without PR ownership" in runner.state.history[-1]["event"]
+
+    git(remote, "update-ref", "-d", "refs/heads/fix/pr-42", prior_head)
+    git(repo, "branch", "-D", "fix/pr-42")
+    assert await runner.process_pending_uploads() is True
+    admitted = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert admitted.attempt_id != current.attempt_id
+    assert admitted.fingerprint == task_spec_content_hash(changed)
 
 
 @pytest.mark.parametrize("change", ["repo", "incomplete", "reopened"])
@@ -1913,8 +1922,6 @@ async def test_historical_operator_reject_marker_ignores_unusable_history(reject
     "manifest",
     [
         {"schema_version": 1, "repository": "other/repo", "base_branch": "main", "rejections": {}},
-        {"schema_version": 1, "repository": "octo/demo", "base_branch": "main", "rejections": []},
-        {"schema_version": 1, "repository": "octo/demo", "base_branch": "main", "rejections": {"PR-42": {}}},
     ],
 )
 async def test_recorded_rejection_identity_ignores_mismatched_manifest_shapes(rejected, manifest):
@@ -1923,6 +1930,22 @@ async def test_recorded_rejection_identity_ignores_mismatched_manifest_shapes(re
     path.write_text(json.dumps(manifest))
 
     assert not runner._has_recorded_rejection_identity("PR-42", "f" * 64)
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {"schema_version": 1, "repository": "octo/demo", "base_branch": "main", "rejections": []},
+        {"schema_version": 1, "repository": "octo/demo", "base_branch": "main", "rejections": {"PR-42": {}}},
+    ],
+)
+async def test_recorded_rejection_identity_malformed_records_defer(rejected, manifest):
+    runner, _, repo, *_ = rejected
+    path = repo / "tasks/rejections.json"
+    path.write_text(json.dumps(manifest))
+
+    with pytest.raises(MergeStatusUnavailable, match="Rejection identity manifest is unavailable"):
+        runner._has_recorded_rejection_identity("PR-42", "f" * 64)
 
 
 async def test_recorded_rejection_identity_invalid_manifest_defers(rejected):
