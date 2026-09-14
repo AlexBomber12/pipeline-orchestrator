@@ -54,7 +54,7 @@ from src.daemon.migrations.run_record_backfill import (
 )
 from src.daemon.runner import PipelineRunner
 from src.events.wake import repo_from_channel, subscribe_wake
-from src.keyspace import upload_pending
+from src.keyspace import pipeline_state, upload_pending
 from src.models import PipelineState
 from src.sandbox.runtime_state import refresh_sandbox_state
 from src.usage import UsageProvider
@@ -609,6 +609,83 @@ def _runner_can_process_pending_upload(
     return state in (None, PipelineState.IDLE) and not user_paused
 
 
+def _runner_can_watch_pending_upload(
+    key: str,
+    runners: dict[str, PipelineRunner] | None = None,
+) -> bool:
+    """Return whether durable upload polling should watch this runner."""
+    if runners is None:
+        return True
+    repo_state = getattr(runners.get(key), "state", None)
+    state = getattr(repo_state, "state", None)
+    return state in (None, PipelineState.IDLE, PipelineState.PAUSED)
+
+
+def _persisted_state_allows_pending_upload_reconcile(raw_state: Any) -> bool:
+    """Return whether persisted state says a PAUSED runner may reconcile."""
+    if raw_state is None:
+        return False
+    if isinstance(raw_state, bytes):
+        raw_state = raw_state.decode("utf-8", "replace")
+    if not isinstance(raw_state, str):
+        return False
+    try:
+        payload = json.loads(raw_state)
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if bool(payload.get("user_paused", False)):
+        return False
+    state = payload.get("state")
+    if state not in (None, PipelineState.IDLE.value, PipelineState.PAUSED.value):
+        return False
+    if (
+        payload.get("rate_limited_until")
+        or payload.get("rate_limit_reactive")
+        or payload.get("rate_limited_coders")
+    ):
+        return False
+    coder_until = payload.get("rate_limited_coder_until")
+    if isinstance(coder_until, dict) and any(coder_until.values()):
+        return False
+    inhibitors = payload.get("active_inhibitors")
+    if isinstance(inhibitors, list):
+        allowed_stale = {"github_budget_slowdown", "user_pause", "user_stop"}
+        for inhibitor in inhibitors:
+            if not isinstance(inhibitor, dict):
+                return False
+            inhibitor_type = inhibitor.get("inhibitor_type")
+            if inhibitor_type not in allowed_stale:
+                return False
+    return True
+
+
+async def _runner_should_reconcile_pending_upload(
+    redis_client: Any,
+    slug: str,
+    key: str,
+    runners: dict[str, PipelineRunner] | None = None,
+) -> bool:
+    """Return whether pending upload should wake a runner to refresh state."""
+    if runners is None:
+        return False
+    repo_state = getattr(runners.get(key), "state", None)
+    state = getattr(repo_state, "state", None)
+    if state not in (PipelineState.IDLE, PipelineState.PAUSED):
+        return False
+    try:
+        raw_state = await redis_client.get(pipeline_state(slug))
+    except Exception:
+        logger.debug(
+            "pending-upload persisted state check failed for %s",
+            slug,
+            exc_info=True,
+        )
+        return False
+    return _persisted_state_allows_pending_upload_reconcile(raw_state)
+
+
 async def _drain_wake_messages(
     pubsub: Any,
     last_run: dict[str, float],
@@ -669,6 +746,13 @@ async def _apply_pending_upload_wake(
                 pending_upload_wake_fingerprints.pop(slug, None)
             continue
         fingerprint = _pending_upload_fingerprint(pending_upload)
+        if not _runner_can_process_pending_upload(key, runners):
+            if await _runner_should_reconcile_pending_upload(
+                redis_client, slug, key, runners
+            ):
+                _mark_runner_due(key, last_run, runners)
+                found = True
+            continue
         if (
             pending_upload_wake_fingerprints is not None
             and pending_upload_wake_fingerprints.get(slug) == fingerprint
@@ -749,7 +833,7 @@ async def _wait_or_wake(
     pending_upload_slug_to_key = {
         slug: key
         for slug, key in slug_to_key.items()
-        if _runner_can_process_pending_upload(key, runners)
+        if _runner_can_watch_pending_upload(key, runners)
     }
     poll_pending_uploads = (
         redis_client is not None and bool(pending_upload_slug_to_key)
