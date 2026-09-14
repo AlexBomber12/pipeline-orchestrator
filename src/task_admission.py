@@ -156,6 +156,8 @@ async def admission_candidate(
             raise AttemptChanged("Legacy rejection lacks exact attempt/PR ownership; reconcile it before reuse.")
     rejection_file_sha256 = None
     if previous and previous.rejection:
+        if previous.completed and fingerprint == previous.fingerprint:
+            return previous, None
         if upload and expected_rejection != previous.rejection:
             raise AdmissionRejected("Upload predates or belongs to another rejection; submit the rewritten task again.")
         rejection = await load_rejection(redis, repo, previous.rejection)

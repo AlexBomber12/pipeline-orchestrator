@@ -314,6 +314,35 @@ async def test_upload_stages_unchanged_completed_rejected_attempt_with_new_task(
     assert sorted(manifest["files"]) == ["PR-42.md", "PR-43.md"]
 
 
+async def test_upload_replays_unchanged_completed_merged_rejection_with_new_task(rejected):
+    await finish_reject(rejected)
+    runner, command, repo, _, _, _ = rejected
+    prior = await load_attempt(runner.redis, runner.name, "PR-42")
+    await save_attempt(runner.redis, runner.name, prior.model_copy(update={"completed": True}), expected=prior)
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    await runner.redis.set(
+        rejection_key(runner.name, command.binding),
+        stored.model_copy(update={"status": "merged", "released": True}).model_dump_json(),
+    )
+    unchanged_completed = (
+        (repo / "tasks/PR-42.md")
+        .read_text()
+        .replace("status: ERROR", "status: TODO")
+        .replace("blocked_reason: guardrail\n", "")
+    )
+    new_task = task_43_from(repo)
+
+    response = await stage_files(rejected, [("PR-42.md", unchanged_completed), ("PR-43.md", new_task)])
+    assert response.status_code == 200, response.text
+    assert await runner.process_pending_uploads() is True
+
+    assert await runner.redis.get(upload_pending(runner.name)) is None
+    current = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert current.completed and current.rejection == command.binding
+    accepted = await load_attempt(runner.redis, runner.name, "PR-43")
+    assert accepted is not None and not accepted.admission_pending
+
+
 async def test_stale_pending_upload_member_preserves_newer_valid_submission(rejected, tmp_path):
     runner, _, repo, _, _, _ = rejected
     path = repo / "tasks/PR-42.md"
