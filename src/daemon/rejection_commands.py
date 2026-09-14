@@ -148,6 +148,7 @@ class RejectionCommandMixin:
                     "rev-parse",
                     f"refs/remotes/origin/{self.repo_config.branch}",
                 ).stdout.strip()
+                await self.redis.set(rejection_key(self.name, command.binding), command.model_dump_json())
             if command.pr is None:
                 attempt = await load_attempt(self.redis, self.name, command.task.pr_id)
                 data = await asyncio.to_thread(

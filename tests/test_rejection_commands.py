@@ -597,6 +597,36 @@ async def test_dispatched_pre_pr_reject_confirms_absence_then_releases(rejected,
     assert all(call[:2] != ["pr", "close"] for call in github["calls"])
 
 
+async def test_reject_persists_base_anchor_before_no_pr_discovery_failure(rejected, monkeypatch):
+    from src.task_attempts import new_attempt, save_attempt
+
+    runner, _, repo, *_ = rejected
+    runner.state.current_pr = None
+    attempt = new_attempt(
+        runner.repo_config.url,
+        runner.state.current_task,
+        (repo / "tasks/PR-42.md").read_text(),
+        started=True,
+        coder_dispatched=True,
+    )
+    runner.state.current_task.attempt_id = attempt.attempt_id
+    await save_attempt(runner.redis, runner.name, attempt, expected=None)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_rejection(runner.name, runner.state, await runner.redis.get(cause_key(runner.name, "PR-42")), repo)
+    await enqueue_rejection(runner.redis, command)
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("discovery unavailable")
+
+    monkeypatch.setattr(daemon_reject, "discover_attempt_pr", unavailable)
+
+    await runner._consume_rejection_commands()
+
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    assert stored.status == "deferred"
+    assert stored.base_commit == git(repo, "rev-parse", "origin/main")
+
+
 @pytest.mark.parametrize(
     "change",
     [
