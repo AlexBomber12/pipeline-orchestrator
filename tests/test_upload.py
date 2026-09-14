@@ -65,6 +65,33 @@ class _StubAioredis:
         return self.client
 
 
+async def test_load_upload_attempt_ignores_unowned_legacy_predecessor(
+    tmp_path: Path,
+) -> None:
+    redis = _StubAioredisClient()
+    repo = tmp_path / "repo"
+    tasks = repo / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "PR-001.md").write_text(
+        "# PR-999: Legacy predecessor\n"
+        "Branch: fix/pr-999\n"
+        "\n"
+        "No receipt owns this historical file.\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        await upload_routes._load_upload_attempt(
+            redis,
+            "example__alpha",
+            str(repo),
+            "PR-001.md",
+            "PR-001",
+        )
+        is None
+    )
+
+
 @pytest.fixture
 def one_repo_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     cfg = tmp_path / "config.yml"
@@ -312,7 +339,7 @@ def test_upload_handles_corrupt_state_and_accepts_busy_repos(
 
         class _BusyRedis:
             async def get(self, key: str) -> str | None:
-                return '{"url":"","name":"example__alpha","state":"CODING"}'
+                return '{"url":"","name":"example__alpha","state":"CODING"}' if key.startswith("pipeline:") else None
 
             async def set(self, key: str, value: str, **kwargs: object) -> None:
                 return None
@@ -328,7 +355,7 @@ def test_upload_handles_corrupt_state_and_accepts_busy_repos(
 
     assert busy.status_code == 200
     assert (
-        "Daemon is currently CODING. Files will be committed when it returns to IDLE."
+        "Daemon is currently CODING. Files await validation and will be committed if eligible when it returns to IDLE."
         in busy.text
     )
 
@@ -356,7 +383,7 @@ def test_upload_without_queue_md(
         )
     assert resp.status_code == 200
     assert "Accepted 1 task file (PR-001)." in resp.text
-    assert "Daemon will commit on the next poll cycle (up to 60 seconds)." in resp.text
+    assert "Daemon will validate and commit eligible files on the next poll cycle (up to 60 seconds)." in resp.text
     assert "Auto-dismissing in 30 seconds." in resp.text
 
     repo_upload_dir = uploads_dir / "example__alpha"
@@ -441,7 +468,7 @@ def test_upload_stages_files_and_sets_redis_key(
     assert resp.headers["HX-Retarget"] == "#upload-feedback-example__alpha"
     assert "Dismiss upload feedback" in resp.text
     assert "::load" in resp.text
-    assert "Daemon will commit on the next poll cycle (up to 60 seconds)." in resp.text
+    assert "Daemon will validate and commit eligible files on the next poll cycle (up to 60 seconds)." in resp.text
 
     repo_upload_dir = uploads_dir / "example__alpha"
     subdirs = list(repo_upload_dir.iterdir())
@@ -456,6 +483,8 @@ def test_reupload_identical_content_returns_409(
     uploads_dir: Path,
 ) -> None:
     content = _task_bytes()
+    (repo_dir / "tasks").mkdir(exist_ok=True)
+    (repo_dir / "tasks" / "PR-001.md").write_bytes(content)
     expected_hash = _task_hash(content)
     with TestClient(app) as client:
         redis = client.app.state.redis
@@ -490,6 +519,8 @@ def test_reupload_status_only_change_returns_409(
         "- Coder: any\n"
     )
     uploaded = stored.replace("status: ERROR", "status: TODO")
+    (repo_dir / "tasks").mkdir(exist_ok=True)
+    (repo_dir / "tasks" / "PR-001.md").write_text(uploaded)
     with TestClient(app) as client:
         redis = client.app.state.redis
         redis._store["pipeline:example__alpha"] = _error_state_payload()
@@ -507,7 +538,7 @@ def test_reupload_status_only_change_returns_409(
     assert not (uploads_dir / "example__alpha").exists()
 
 
-def test_reupload_changed_content_proceeds(
+def test_reupload_active_task_stages_without_resetting_attempt_state(
     one_repo_config: Path,
     repo_dir: Path,
     uploads_dir: Path,
@@ -534,15 +565,7 @@ def test_reupload_changed_content_proceeds(
         assert redis._store[retry_count_key("example__alpha", "PR-001")] == "3"
 
     assert resp.status_code == 200
-    assert "Accepted 1 task file (PR-001)." in resp.text
-    staging = next((uploads_dir / "example__alpha").iterdir())
-    assert (staging / "PR-001.md").read_bytes() == changed
-    manifest = json.loads(
-        client.app.state.redis._store["upload:example__alpha:pending"]
-    )
-    assert manifest["task_hashes"] == {
-        "PR-001": _task_hash(changed)
-    }
+    assert list((uploads_dir / "example__alpha").rglob("PR-001.md"))
 
 
 def test_upload_new_task_no_existing_hash_proceeds(
@@ -670,7 +693,6 @@ def test_upload_blocks_when_pending_manifest_write_fails(
     original_hash = _task_hash(original)
     with TestClient(app) as client:
         client.app.state.redis = _PendingSetFails()
-        client.app.state.redis._store["pipeline:example__alpha"] = _error_state_payload()
         client.app.state.redis._store[
             task_spec_hash_key("example__alpha", "PR-001")
         ] = original_hash
@@ -1406,7 +1428,7 @@ def test_upload_writes_redis_manifest(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_task_file(name="PR-002.md")],
+            files=[_task_file(name="PR-002.md", pr_id="PR-002")],
         )
 
     assert resp.status_code == 200
@@ -1451,7 +1473,7 @@ def test_upload_accepts_tasks_during_coding_state(
     assert resp.status_code == 200
     assert "Accepted 1 task file (PR-001)." in resp.text
     assert (
-        "Daemon is currently CODING. Files will be committed when it returns to IDLE."
+        "Daemon is currently CODING. Files await validation and will be committed if eligible when it returns to IDLE."
         in resp.text
     )
     assert "Cannot upload while repo is" not in resp.text

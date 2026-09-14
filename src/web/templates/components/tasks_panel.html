@@ -74,7 +74,9 @@
         {% endif %}
     </div>
     {% endif %}
-    {% if status_key == 'error' %}
+    {% if status_key == 'error' and task.cancellation_subsource == 'operator_reject' %}
+    <p class="mt-2 text-xs text-gray-400">Reject is final. After confirmed closure, manually rewrite or remove unfinished tasks and update dependencies.</p>
+    {% elif status_key == 'error' %}
     {% set next_retry = task.retry_count + 1 %}
     <div class="mt-2 flex items-center justify-end gap-2">
         {% if task.retry_command and task.retry_command.status in ['queued', 'processing', 'deferred', 'applied'] %}

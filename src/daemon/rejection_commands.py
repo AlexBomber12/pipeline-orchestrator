@@ -1,0 +1,422 @@
+"""Reconcile final operator rejection before any ordinary scheduler work."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from src.approval_commands import approval_index, approval_key, list_approvals
+from src.cancellation.storage import CancellationCause, cause_key
+from src.config import normalize_repo_url
+from src.daemon import git_ops
+from src.daemon.approval_commands import checkout_process_blocker
+from src.daemon.attempt_processes import stop_attempt_children
+from src.daemon.attempt_prs import attempt_branch_head, attempt_pr_info, discover_attempt_pr
+from src.github import gh_runner
+from src.keyspace import pipeline_state
+from src.models import PipelineState, RepoState, TaskStatus
+from src.rejection_commands import (
+    REJECTION_IDENTITY_MANIFEST,
+    RejectionCommand,
+    list_pending_rejections,
+    redacted_rejection_failure_identity,
+    rejection_key,
+    rejection_pending_index,
+)
+from src.subsource_registry import SuppressionReason
+from src.task_attempts import AttemptChanged, load_attempt, save_attempt
+
+_NO_PR_ABSENCE_REASON = "No PR found after stopping execution; confirming absence before final rejection."
+
+
+def _manifest_repo_url(repo_url: str, owner_repo: str) -> str:
+    try:
+        owner = gh_runner.get_repo_full_name(repo_url)
+    except ValueError:
+        owner = owner_repo
+    return f"https://github.com/{owner}"
+
+
+def rejection_pr_details(
+    owner_repo: str,
+    command: RejectionCommand,
+    base: str,
+    *,
+    require_head_match: bool = True,
+) -> dict:
+    """Uncached exact-PR read, including repository and merge identity."""
+    assert command.pr is not None
+    data = gh_runner.run_gh(["api", f"repos/{owner_repo}/pulls/{command.pr.number}"])
+    if not isinstance(data, dict):
+        raise AttemptChanged("PR lookup returned no verifiable identity.")
+    head, target = data.get("head", {}), data.get("base", {})
+    if (
+        data.get("number") != command.pr.number
+        or head.get("ref") != command.task.branch
+        or head.get("repo", {}).get("full_name", "").casefold() != owner_repo.casefold()
+        or target.get("repo", {}).get("full_name", "").casefold() != owner_repo.casefold()
+        or target.get("ref") != base
+        or not head.get("sha")
+        or (require_head_match and head.get("sha") != command.pr.head_sha)
+        or data.get("state") not in {"open", "closed"}
+        or "merged_at" not in data
+    ):
+        raise AttemptChanged("Bound PR repository, branch, base, or HEAD changed; closure is deferred.")
+    return data
+
+
+class RejectionCommandMixin:
+    async def _save_rejection(self, command: RejectionCommand, status: str, reason: str) -> None:
+        command.status = status
+        command.reason = reason
+        await self.redis.set(rejection_key(self.name, command.binding), command.model_dump_json())
+        self.log_event(f"[RECOVERY] {command.task.pr_id}: {reason}")
+
+    async def _attempt_execution_blocked(self) -> bool:
+        task = self.state.current_task
+        if task is None:
+            return False
+        try:
+            raw_cause = await self.redis.get(cause_key(self.name, task.pr_id))
+            if raw_cause and CancellationCause.from_redis(raw_cause).payload.get("subsource") == "operator_reject":
+                return True
+            attempt = await load_attempt(self.redis, self.name, task.pr_id)
+            if attempt and (
+                attempt.rejection
+                or attempt.admission_pending
+                or attempt.completed
+                or (task.attempt_id and task.attempt_id != attempt.attempt_id)
+            ):
+                self.log_event(f"[RECOVERY] Execution fenced for {task.pr_id}; waiting for reconciliation.")
+                return True
+        except Exception:
+            self.log_event("[RECOVERY] Attempt ownership unavailable; execution deferred.")
+            return True
+        return False
+
+    async def _consume_rejection_commands(self) -> bool:
+        """Return True while this checkout is still owned by rejection work.
+
+        Scheduler serialization prevents a second cycle in the same checkout.
+        The process monitor sees the permanent attempt fence during a long
+        CODING/FIX call. Unknown orphan children hold the checkout visibly.
+        """
+        try:
+            commands = await list_pending_rejections(self.redis, self.name)
+            for command in commands:
+                attempt = await load_attempt(self.redis, self.name, command.task.pr_id)
+                if attempt is None:
+                    raise AttemptChanged("Rejected attempt receipt is missing.")
+                if attempt.attempt_id != command.attempt_id:
+                    continue
+                if not self._recovered:
+                    raw = await self.redis.get(pipeline_state(self.name))
+                    if raw:
+                        self.state = RepoState.model_validate_json(raw)
+                await self._reconcile_rejection(command)
+                return True
+            return False
+        except Exception as exc:
+            self.log_event(f"[RECOVERY] Reconciliation deferred ({type(exc).__name__}); receipt remains pending.")
+            return True
+
+    async def _reconcile_rejection(self, command: RejectionCommand) -> None:
+        try:
+            confirmed_no_pr_absence = (
+                command.absence_confirmed
+                and command.status == "deferred"
+                and command.reason == _NO_PR_ABSENCE_REASON
+            )
+            if normalize_repo_url(command.repo_url) != normalize_repo_url(
+                self.repo_config.url
+            ):
+                raise AttemptChanged("Repository configuration changed; rejection is deferred.")
+            task = self.state.current_task
+            if task and (task.pr_id != command.task.pr_id or task.attempt_id not in (None, command.attempt_id)):
+                raise AttemptChanged("Checkout is owned by another attempt.")
+            command.stopping_started_at = command.stopping_started_at or datetime.now(timezone.utc)
+            await self._save_rejection(command, "stopping", "Stopping attempt-owned execution.")
+            await self._terminate_current_coder()
+            elapsed = (datetime.now(timezone.utc) - command.stopping_started_at).total_seconds()
+            blocker = stop_attempt_children(
+                command.attempt_id,
+                force=elapsed >= self.app_config.daemon.coder_terminate_grace_sec,
+            ) or checkout_process_blocker(self.repo_path)
+            if blocker:
+                await self._save_rejection(command, "deferred", blocker)
+                return
+            # Capture the base before any sync/admission. A Git edit already
+            # visible when Reject was accepted cannot count as a later rewrite.
+            if not command.base_commit:
+                base = self.repo_config.branch
+                await asyncio.to_thread(
+                    git_ops._git,
+                    self.repo_path,
+                    "fetch",
+                    "origin",
+                    f"refs/heads/{base}:refs/remotes/origin/{base}",
+                    timeout=60,
+                )
+                command.base_commit = git_ops._git(
+                    self.repo_path,
+                    "rev-parse",
+                    f"refs/remotes/origin/{self.repo_config.branch}",
+                ).stdout.strip()
+                await self.redis.set(rejection_key(self.name, command.binding), command.model_dump_json())
+            if command.pr is None:
+                attempt = await load_attempt(self.redis, self.name, command.task.pr_id)
+                data = await asyncio.to_thread(
+                    discover_attempt_pr,
+                    self.repo_path,
+                    self.owner_repo,
+                    self.repo_config.branch,
+                    attempt,
+                )
+                if data is not None:
+                    command.pr = attempt_pr_info(data, self.owner_repo, attempt)
+                    command.initial_head_sha = command.pr.head_sha
+                    command.branch_head = command.pr.head_sha
+                    await self._save_rejection(command, "closing", "Attempt PR identified; verifying exact PR closure.")
+                    updated = attempt.model_copy(update={"pr_number": command.pr.number, "pr_creation_pending": False})
+                    await save_attempt(self.redis, self.name, updated, expected=attempt)
+                elif attempt.pr_creation_pending or attempt.pr_number is not None or attempt.coder_dispatched is None:
+                    raise AttemptChanged(
+                        "PR creation may have occurred; exact PR identity is required. "
+                        "Empty lookup results cannot prove non-creation after coder dispatch "
+                        "or unknown legacy execution."
+                    )
+                elif attempt.started or attempt.coder_dispatched:
+                    if not confirmed_no_pr_absence:
+                        command.absence_confirmed = True
+                        command.absence_confirmed_at = datetime.now(timezone.utc)
+                        await self._save_rejection(
+                            command,
+                            "deferred",
+                            _NO_PR_ABSENCE_REASON,
+                        )
+                        return
+                    if (
+                        command.absence_confirmed_at is None
+                        or datetime.now(timezone.utc) - command.absence_confirmed_at < timedelta(seconds=60)
+                    ):
+                        await self._save_rejection(command, "deferred", _NO_PR_ABSENCE_REASON)
+                        return
+                else:
+                    # Only an explicit never-dispatched receipt plus no pending
+                    # creation can establish absence. Old negative-list hints
+                    # are insufficient after any potentially effectful run.
+                    command.absence_confirmed = True
+            if command.pr is not None:
+                data = await asyncio.to_thread(
+                    rejection_pr_details,
+                    self.owner_repo,
+                    command,
+                    self.repo_config.branch,
+                    require_head_match=False,
+                )
+                if data["merged_at"]:
+                    attempt = await load_attempt(self.redis, self.name, command.task.pr_id)
+                    updated = attempt.model_copy(update={"completed": True})
+                    await save_attempt(self.redis, self.name, updated, expected=attempt)
+                    await self._save_rejection(
+                        command, "merged", "PR already merged; rejection cannot succeed and task ID cannot be reused."
+                    )
+                    await self._release_rejected_attempt(command, merged=True)
+                    return
+                if data["head"]["sha"] != command.pr.head_sha:
+                    # The same attempt may finish a push after its decision was
+                    # rendered. Execution is now quiescent; require local owner
+                    # evidence and matching remote refs before rebinding it.
+                    owned_head = attempt_branch_head(self.repo_path, command.task.branch, require_local=True)
+                    if owned_head != data["head"]["sha"]:
+                        raise AttemptChanged("Updated PR HEAD does not match the attempt-owned branch.")
+                    command.initial_head_sha = command.initial_head_sha or command.pr.head_sha
+                    command.pr = command.pr.model_copy(update={"head_sha": owned_head})
+                    command.branch_head = owned_head
+                    await self._save_rejection(
+                        command,
+                        "closing",
+                        "Verified updated HEAD of the same attempt; confirming exact PR closure.",
+                    )
+                if data["state"] == "open":
+                    now = datetime.now(timezone.utc)
+                    if command.close_requested_at and now - command.close_requested_at < timedelta(seconds=60):
+                        await self._save_rejection(
+                            command, "closing", "PR closure awaiting confirmation; next close attempt is deferred."
+                        )
+                        return
+                    command.close_requested_at = now
+                    await self._save_rejection(
+                        command, "closing", "PR closure requested; awaiting an independent confirmation."
+                    )
+                    # No comment: an ambiguous response can be reconciled and
+                    # retried without duplicating operator comments.
+                    await asyncio.to_thread(
+                        gh_runner.run_gh,
+                        ["pr", "close", str(command.pr.number)],
+                        self.owner_repo,
+                    )
+                    data = await asyncio.to_thread(
+                        rejection_pr_details, self.owner_repo, command, self.repo_config.branch
+                    )
+                    if data["merged_at"] or data["state"] != "closed":
+                        raise AttemptChanged("PR closure remains unconfirmed; reconciliation will continue.")
+                command.branch_head = data["head"]["sha"]
+            if command.pr is None:
+                # A never-dispatched attempt has no pending PR creation and a
+                # verified empty lookup. Freeze its quiescent branch refs for the
+                # same exact-SHA cleanup used for closed-PR attempts.
+                command.branch_head = attempt_branch_head(self.repo_path, command.task.branch)
+            blocker = checkout_process_blocker(self.repo_path)
+            if blocker or self._current_coder_process is not None:
+                raise AttemptChanged(blocker or "Coder process remains active.")
+            # Release only a clean, proven checkout. Dirty/untracked unrelated
+            # work is never swept by the legacy preflight recovery path.
+            if git_ops._git(self.repo_path, "status", "--porcelain").stdout.strip():
+                raise AttemptChanged(
+                    "PR is closed; checkout has uncommitted files. Confirm ownership and clear them before release."
+                )
+            if not await self._commit_task_status_change(
+                command.task,
+                "ERROR",
+                "operator reject finalized",
+                SuppressionReason.OPERATOR_REJECT,
+                expected_spec_hash=command.fingerprint,
+                allow_spec_hash_mismatch=True,
+            ):
+                raise AttemptChanged("Operator rejection marker could not be committed; rejection remains pending.")
+            if not await self._commit_rejection_identity(command):
+                raise AttemptChanged("Operator rejection identity could not be committed; rejection remains pending.")
+            await self._save_rejection(
+                command,
+                "rejected",
+                (
+                    "Attempt rejected; PR closed without merge. "
+                    if command.pr
+                    else "Attempt rejected; no PR was created. "
+                )
+                + "Manually rewrite or remove unfinished tasks and maintain dependencies.",
+            )
+            await self._release_rejected_attempt(command)
+        except Exception as exc:
+            reason = (
+                str(exc)
+                if isinstance(exc, AttemptChanged)
+                else f"Closure or checkout verification unavailable ({type(exc).__name__})."
+            )
+            await self._save_rejection(command, "deferred", reason)
+
+    async def _commit_rejection_identity(self, command: RejectionCommand) -> bool:
+        """Persist rejected fingerprint evidence in Git-recoverable state."""
+        base = self.repo_config.branch
+        task_id = command.task.pr_id
+        subject = f"[STATUS] {task_id} recorded rejected fingerprint: operator reject finalized"
+        try:
+            git_ops._git(self.repo_path, "fetch", "origin", base, timeout=60)
+            git_ops._git(self.repo_path, "checkout", "-f", base, timeout=60)
+            git_ops._git(self.repo_path, "reset", "--hard", f"origin/{base}", timeout=60)
+            manifest_path = Path(self.repo_path) / REJECTION_IDENTITY_MANIFEST
+            if manifest_path.exists():
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if not isinstance(manifest, dict):
+                    raise AttemptChanged("Rejection identity manifest is invalid.")
+            else:
+                manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                manifest = {
+                    "schema_version": 1,
+                    "repository": self.owner_repo,
+                    "base_branch": base,
+                    "rejections": {},
+                }
+            if (
+                manifest.get("schema_version") != 1
+                or str(manifest.get("repository", "")).casefold() != self.owner_repo.casefold()
+                or manifest.get("base_branch") != base
+                or not isinstance(manifest.get("rejections"), dict)
+            ):
+                raise AttemptChanged("Rejection identity manifest does not match this runner.")
+            rejections = manifest["rejections"]
+            entries = rejections.setdefault(task_id, [])
+            if not isinstance(entries, list):
+                raise AttemptChanged("Rejection identity manifest task record is invalid.")
+            entry = {
+                "fingerprint": command.fingerprint,
+                "file_sha256": command.file_sha256,
+                "attempt_id": command.attempt_id,
+                "rejection_binding": command.binding,
+                "requested_at": command.requested_at.isoformat(),
+                "repo_url": _manifest_repo_url(command.repo_url, self.owner_repo),
+                "base_commit": command.base_commit,
+                "task_file": command.task.task_file,
+                "task_title": command.task.title,
+                "branch": command.task.branch,
+                "branch_head": command.branch_head,
+                "pr_number": command.pr.number if command.pr else None,
+                "pr_head_sha": command.pr.head_sha if command.pr else None,
+                "initial_head_sha": command.initial_head_sha,
+                "failure": redacted_rejection_failure_identity(command.failure),
+            }
+            for existing in entries:
+                if (
+                    isinstance(existing, dict)
+                    and existing.get("fingerprint") == command.fingerprint
+                    and existing.get("rejection_binding") == command.binding
+                ):
+                    existing.update(entry)
+                    break
+            else:
+                entries.append(entry)
+            manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            git_ops._git(self.repo_path, "add", "--", REJECTION_IDENTITY_MANIFEST, timeout=30)
+            diff = git_ops._git(
+                self.repo_path,
+                "diff",
+                "--cached",
+                "--quiet",
+                "--",
+                REJECTION_IDENTITY_MANIFEST,
+                check=False,
+            )
+            if diff.returncode == 0:
+                return True
+            git_ops._git(self.repo_path, "commit", "-m", f"{subject}\n\n[skip ci]", timeout=60)
+            git_ops._git(self.repo_path, "push", "origin", base, timeout=60)
+            return True
+        except AttemptChanged:
+            raise
+        except Exception as exc:
+            self.log_event(f"[INFRA] Warning: failed to commit rejection identity for {task_id}: {exc}.")
+            return False
+
+    async def _release_rejected_attempt(self, command: RejectionCommand, *, merged: bool = False) -> None:
+        for approval in await list_approvals(self.redis, self.name):
+            if approval.task.pr_id == command.task.pr_id:
+                approval.active = False
+                approval.superseded = True
+                await self.redis.set(approval_key(self.name, approval.binding), approval.model_dump_json())
+                await self.redis.zrem(approval_index(self.name), approval.binding)
+        self._approval_receipt = None
+        self._approval_history = []
+        self._current_run_record = None
+        self._active_retry_command_id = None
+        if command.pr:
+            self.state.quarantined_prs.discard(command.pr.number)
+        self.state.current_queue = [
+            task.model_copy(update={"status": TaskStatus.DONE if merged else TaskStatus.ERROR})
+            if task.pr_id == command.task.pr_id
+            else task
+            for task in (self.state.current_queue or [])
+        ]
+        self.state.current_task = None
+        self._reset_runner_local_task_counters()
+        self.state.current_pr = None
+        self.state.error_message = None
+        self.state.skip_ai_error_diagnose = False
+        self.state.state = PipelineState.IDLE
+        self._recovered = True
+        await self.publish_state()
+        command.released = True
+        await self.redis.set(rejection_key(self.name, command.binding), command.model_dump_json())
+        await self.redis.zrem(rejection_pending_index(self.name), command.binding)

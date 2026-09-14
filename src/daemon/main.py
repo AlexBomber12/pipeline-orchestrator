@@ -21,6 +21,7 @@ are propagated onto existing runners without restarting the process.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -53,6 +54,7 @@ from src.daemon.migrations.run_record_backfill import (
 )
 from src.daemon.runner import PipelineRunner
 from src.events.wake import repo_from_channel, subscribe_wake
+from src.keyspace import control_stop, pipeline_state, upload_pending
 from src.models import PipelineState
 from src.sandbox.runtime_state import refresh_sandbox_state
 from src.usage import UsageProvider
@@ -72,6 +74,7 @@ DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 #: ``CONFIG_RELOAD_CYCLES * daemon.poll_interval_sec`` seconds, so it
 #: adapts to both fast and slow deployments.
 CONFIG_RELOAD_CYCLES = 5
+PENDING_UPLOAD_WAKE_POLL_SEC = 1.0
 _DEFERRED_RUNNER_CONFIG_STATES = {
     PipelineState.CODING,
     PipelineState.WATCH,
@@ -576,11 +579,128 @@ def _apply_wake_message(
         return
     key = slug_to_key.get(slug)
     if key is not None:
-        last_run[key] = 0.0
-        if runners is not None:
-            runner = runners.get(key)
-            if runner is not None and hasattr(runner, "reset_idle_streak"):
-                runner.reset_idle_streak()
+        _mark_runner_due(key, last_run, runners)
+
+
+def _mark_runner_due(
+    key: str,
+    last_run: dict[str, float],
+    runners: dict[str, PipelineRunner] | None = None,
+) -> None:
+    """Force ``key`` to run on the next daemon cycle."""
+    last_run[key] = 0.0
+    if runners is None:
+        return
+    runner = runners.get(key)
+    if runner is not None and hasattr(runner, "reset_idle_streak"):
+        runner.reset_idle_streak()
+
+
+def _runner_can_process_pending_upload(
+    key: str,
+    runners: dict[str, PipelineRunner] | None = None,
+) -> bool:
+    """Return whether the runner is in the state that consumes uploads."""
+    if runners is None:
+        return True
+    repo_state = getattr(runners.get(key), "state", None)
+    state = getattr(repo_state, "state", None)
+    user_paused = bool(getattr(repo_state, "user_paused", False))
+    return state in (None, PipelineState.IDLE) and not user_paused
+
+
+def _runner_can_watch_pending_upload(
+    key: str,
+    runners: dict[str, PipelineRunner] | None = None,
+) -> bool:
+    """Return whether durable upload polling should watch this runner."""
+    if runners is None:
+        return True
+    repo_state = getattr(runners.get(key), "state", None)
+    state = getattr(repo_state, "state", None)
+    return state in (None, PipelineState.IDLE, PipelineState.PAUSED)
+
+
+def _persisted_state_allows_pending_upload_reconcile(raw_state: Any) -> bool:
+    """Return whether persisted state says a PAUSED runner may reconcile."""
+    if raw_state is None:
+        return False
+    if isinstance(raw_state, bytes):
+        raw_state = raw_state.decode("utf-8", "replace")
+    if not isinstance(raw_state, str):
+        return False
+    try:
+        payload = json.loads(raw_state)
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if bool(payload.get("user_paused", False)):
+        return False
+    state = payload.get("state")
+    if state not in (None, PipelineState.IDLE.value, PipelineState.PAUSED.value):
+        return False
+    if (
+        payload.get("rate_limited_until")
+        or payload.get("rate_limit_reactive")
+        or payload.get("rate_limited_coders")
+    ):
+        return False
+    coder_until = payload.get("rate_limited_coder_until")
+    if isinstance(coder_until, dict) and any(coder_until.values()):
+        return False
+    inhibitors = payload.get("active_inhibitors")
+    if isinstance(inhibitors, list):
+        allowed_stale = {"github_budget_slowdown", "user_pause", "user_stop"}
+        for inhibitor in inhibitors:
+            if not isinstance(inhibitor, dict):
+                return False
+            inhibitor_type = inhibitor.get("inhibitor_type")
+            if inhibitor_type not in allowed_stale:
+                return False
+    return True
+
+
+async def _runner_should_reconcile_pending_upload(
+    redis_client: Any,
+    slug: str,
+    key: str,
+    runners: dict[str, PipelineRunner] | None = None,
+) -> bool:
+    """Return whether pending upload should wake a runner to refresh state."""
+    if runners is None:
+        return False
+    repo_state = getattr(runners.get(key), "state", None)
+    state = getattr(repo_state, "state", None)
+    if state not in (PipelineState.IDLE, PipelineState.PAUSED):
+        return False
+    try:
+        raw_state = await redis_client.get(pipeline_state(slug))
+    except Exception:
+        logger.debug(
+            "pending-upload persisted state check failed for %s",
+            slug,
+            exc_info=True,
+        )
+        return False
+    state_was_cleared = raw_state is None
+    if not state_was_cleared and not _persisted_state_allows_pending_upload_reconcile(
+        raw_state
+    ):
+        return False
+    try:
+        stop_request = await redis_client.get(control_stop(slug))
+    except Exception:
+        logger.debug(
+            "pending-upload stop state check failed for %s",
+            slug,
+            exc_info=True,
+        )
+        return False
+    if stop_request:
+        return False
+    repo_state.user_paused = False
+    return True
 
 
 async def _drain_wake_messages(
@@ -602,6 +722,94 @@ async def _drain_wake_messages(
         _apply_wake_message(extra, last_run, slug_to_key, runners)
 
 
+async def _timer_delay(seconds: float) -> None:
+    """Wait using the event-loop timer instead of ``asyncio.sleep``.
+
+    The daemon tests monkeypatch ``asyncio.sleep`` to drive the main loop
+    deterministically. Pending-upload polling is an internal wake source,
+    so it uses a direct loop timer and leaves the main sleep accounting
+    unchanged.
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[None] = loop.create_future()
+    handle = loop.call_later(seconds, future.set_result, None)
+    try:
+        await future
+    finally:
+        handle.cancel()
+
+
+async def _apply_pending_upload_wake(
+    redis_client: Any,
+    last_run: dict[str, float],
+    slug_to_key: dict[str, str],
+    runners: dict[str, PipelineRunner] | None = None,
+    pending_upload_wake_fingerprints: dict[str, str] | None = None,
+) -> bool:
+    """Mark repos with a durable pending-upload manifest as due."""
+    found = False
+    for slug, key in slug_to_key.items():
+        try:
+            pending_upload = await redis_client.get(upload_pending(slug))
+        except Exception:
+            logger.debug(
+                "pending-upload wake check failed for %s",
+                slug,
+                exc_info=True,
+            )
+            continue
+        if pending_upload is None:
+            if pending_upload_wake_fingerprints is not None:
+                pending_upload_wake_fingerprints.pop(slug, None)
+            continue
+        fingerprint = _pending_upload_fingerprint(pending_upload)
+        if not _runner_can_process_pending_upload(key, runners):
+            if await _runner_should_reconcile_pending_upload(
+                redis_client, slug, key, runners
+            ):
+                _mark_runner_due(key, last_run, runners)
+                found = True
+            continue
+        if (
+            pending_upload_wake_fingerprints is not None
+            and pending_upload_wake_fingerprints.get(slug) == fingerprint
+        ):
+            continue
+        if pending_upload_wake_fingerprints is not None:
+            pending_upload_wake_fingerprints[slug] = fingerprint
+        _mark_runner_due(key, last_run, runners)
+        found = True
+    return found
+
+
+def _pending_upload_fingerprint(pending_upload: Any) -> str:
+    """Return a stable fingerprint for one pending-upload manifest value."""
+    payload = str(pending_upload).encode("utf-8", "surrogatepass")
+    return hashlib.sha256(payload).hexdigest()
+
+
+async def _wait_for_pending_upload(
+    redis_client: Any,
+    last_run: dict[str, float],
+    slug_to_key: dict[str, str],
+    runners: dict[str, PipelineRunner] | None = None,
+    *,
+    pending_upload_wake_fingerprints: dict[str, str] | None = None,
+    poll_interval: float = PENDING_UPLOAD_WAKE_POLL_SEC,
+) -> bool:
+    """Wake when any active repo has a durable pending-upload manifest."""
+    while True:
+        if await _apply_pending_upload_wake(
+            redis_client,
+            last_run,
+            slug_to_key,
+            runners,
+            pending_upload_wake_fingerprints,
+        ):
+            return True
+        await _timer_delay(poll_interval)
+
+
 async def _wait_or_wake(
     pubsub: Any,
     tick: float,
@@ -610,6 +818,8 @@ async def _wait_or_wake(
     runners: dict[str, PipelineRunner] | None = None,
     *,
     wake_event: asyncio.Event | None = None,
+    redis_client: Any | None = None,
+    pending_upload_wake_fingerprints: dict[str, str] | None = None,
 ) -> bool:
     """Sleep ``tick`` seconds or wake early on a wake-channel message.
 
@@ -619,10 +829,10 @@ async def _wait_or_wake(
     before returning so the caller cannot rebuild the subscriber faster
     than the configured cadence — otherwise a Redis disconnect would
     drive a tight reconnect loop. Falls back to a pure sleep when
-    ``pubsub`` is None and no ``wake_event`` was supplied so the daemon
-    never blocks on a missing subscriber.
+    ``pubsub`` is None and no alternate wake source was supplied so the
+    daemon never blocks on a missing subscriber.
 
-    ``wake_event``, when provided, is a third wake source alongside the
+    ``wake_event``, when provided, is a wake source alongside the
     pubsub message and the tick deadline. The main loop passes the
     inotify reload event here so a ``config.yml`` edit interrupts the
     sleep immediately — without this, the inotify-driven reload would
@@ -630,8 +840,39 @@ async def _wait_or_wake(
     before the next iteration observed the event, defeating the
     "near-immediate hot reload" the inotify path is meant to provide.
     The caller is responsible for clearing the event between waits.
+
+    ``redis_client`` enables a durable pending-upload fallback. Uploaded
+    task manifests are already stored in Redis until the IDLE handler
+    commits and admits them, so polling that key lets the daemon recover
+    quickly from a missed Pub/Sub wake after restart or transient Redis
+    subscriber failure without changing upload consumption semantics.
     """
-    if pubsub is None and wake_event is None:
+    pending_upload_slug_to_key = {
+        slug: key
+        for slug, key in slug_to_key.items()
+        if _runner_can_watch_pending_upload(key, runners)
+    }
+    poll_pending_uploads = (
+        redis_client is not None and bool(pending_upload_slug_to_key)
+    )
+    if poll_pending_uploads:
+        if await _apply_pending_upload_wake(
+            redis_client,
+            last_run,
+            pending_upload_slug_to_key,
+            runners,
+            pending_upload_wake_fingerprints,
+        ):
+            return True
+        if pending_upload_wake_fingerprints is not None:
+            pending_upload_slug_to_key = {
+                slug: key
+                for slug, key in pending_upload_slug_to_key.items()
+                if slug not in pending_upload_wake_fingerprints
+            }
+            poll_pending_uploads = bool(pending_upload_slug_to_key)
+
+    if pubsub is None and wake_event is None and not poll_pending_uploads:
         await asyncio.sleep(tick)
         return True
 
@@ -647,12 +888,28 @@ async def _wait_or_wake(
     if wake_event is not None:
         event_task = asyncio.create_task(wake_event.wait())
         waiters.add(event_task)
+    pending_upload_task: asyncio.Task[bool] | None = None
+    if poll_pending_uploads:
+        pending_upload_task = asyncio.create_task(
+            _wait_for_pending_upload(
+                redis_client,
+                last_run,
+                pending_upload_slug_to_key,
+                runners,
+                pending_upload_wake_fingerprints=pending_upload_wake_fingerprints,
+            )
+        )
+        waiters.add(pending_upload_task)
     done, pending = await asyncio.wait(
         waiters,
         return_when=asyncio.FIRST_COMPLETED,
     )
 
     healthy = True
+    durable_wake = False
+    if pending_upload_task is not None and pending_upload_task in done:
+        durable_wake = pending_upload_task.result()
+
     if wake_task is not None and wake_task in done:
         wake_exc = wake_task.exception()
         if wake_exc is not None:
@@ -665,7 +922,7 @@ async def _wait_or_wake(
                     pubsub, last_run, slug_to_key, runners
                 )
 
-    if not healthy and not sleep_task.done():
+    if not healthy and not durable_wake and not sleep_task.done():
         # Subscriber errored early; finish the tick so the caller observes
         # the same backoff as a healthy cycle and cannot drive a tight
         # reconnect loop while Redis is unreachable.
@@ -791,6 +1048,7 @@ async def main() -> None:
     inotify_task.add_done_callback(_background_tasks.discard)
 
     last_run: dict[str, float] = {}
+    pending_upload_wake_fingerprints: dict[str, str] = {}
     last_config_check = time.monotonic()
     pubsub: Any | None = None
     subscribed_slugs: tuple[str, ...] = ()
@@ -943,6 +1201,8 @@ async def main() -> None:
                 slug_to_key,
                 runners,
                 wake_event=inotify_reload_event,
+                redis_client=redis_client,
+                pending_upload_wake_fingerprints=pending_upload_wake_fingerprints,
             )
         finally:
             # Wait_or_wake yields to the event loop, giving any newly

@@ -51,6 +51,9 @@ def get_recorded_completions(
     base_branch: str,
     owner_repo: str,
     candidate_pr_ids: set[str],
+    *,
+    accepted_digests: dict[str, str] | None = None,
+    trust_recorded_digest_if_task_missing: bool = False,
 ) -> set[str]:
     """Verify matching task bytes and commit ancestry, without network or writes.
 
@@ -88,13 +91,19 @@ def get_recorded_completions(
         if pr_id not in candidate_pr_ids:
             continue
         task_path = Path(repo_path) / "tasks" / f"{pr_id}.md"
-        try:
-            task_bytes = task_path.read_bytes()
-        except OSError as exc:
-            raise CompletionEvidenceUnavailable(
-                f"Cannot read task for completion record {pr_id}"
-            ) from exc
-        if hashlib.sha256(task_bytes).hexdigest() != record.task_sha256:
+        if accepted_digests is not None and pr_id in accepted_digests:
+            digest = accepted_digests[pr_id]
+        else:
+            try:
+                digest = hashlib.sha256(task_path.read_bytes()).hexdigest()
+            except OSError as exc:
+                if trust_recorded_digest_if_task_missing:
+                    digest = record.task_sha256
+                else:
+                    raise CompletionEvidenceUnavailable(
+                        f"Cannot read task for completion record {pr_id}"
+                    ) from exc
+        if digest != record.task_sha256:
             continue
         try:
             base = _base_commit(repo_path, base_branch)

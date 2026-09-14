@@ -459,3 +459,35 @@ def test_tasks_panel_subsource_read_does_not_refresh_ttl(
     assert response.status_code == 200
     assert captured, "expected get_cancellation_cause to be invoked"
     assert all(value is False for value in captured)
+
+
+@pytest.mark.parametrize("failure", ["all_reads", "binding_read", "invalid_receipt"])
+def test_attempt_read_failure_disables_retry_without_breaking_panel(tmp_path, monkeypatch, failure):
+    from redis.exceptions import RedisError
+
+    _setup_panel(tmp_path, monkeypatch, retry_count=0)
+    original_get = _PanelRedis.get
+    attempts = 0
+    healthy = False
+
+    async def get(redis, key):
+        nonlocal attempts
+        if key == "task_attempt:example__alpha:PR-283":
+            attempts += 1
+            if not healthy and (failure != "binding_read" or attempts == 2):
+                if failure == "invalid_receipt":
+                    return "invalid receipt"
+                raise RedisError("temporary receipt outage")
+        return await original_get(redis, key)
+
+    monkeypatch.setattr(_PanelRedis, "get", get)
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks")
+        assert response.status_code == 200
+        assert "PR-283" in response.text
+        assert 'hx-post="/repos/example__alpha/tasks/PR-283/retry"' not in response.text
+        assert attempts == 2
+        healthy = True
+        response = client.get("/repos/example__alpha/tasks")
+        assert response.status_code == 200
+        assert 'hx-post="/repos/example__alpha/tasks/PR-283/retry"' in response.text

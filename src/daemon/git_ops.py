@@ -59,6 +59,22 @@ def _git(
     )
 
 
+def _git_bytes(
+    repo_path: str,
+    *args: str,
+    timeout: int = 30,
+    check: bool = True,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run ``git <args>`` and preserve stdout/stderr bytes exactly."""
+    return subprocess.run(
+        ["git", *args],
+        capture_output=True,
+        timeout=timeout,
+        check=check,
+        cwd=repo_path,
+    )
+
+
 def _base_branch_ahead_of_origin(repo_path: str, branch: str) -> bool:
     """Return ``True`` if ``refs/heads/{branch}`` has commits not yet
     on ``refs/remotes/origin/{branch}``.

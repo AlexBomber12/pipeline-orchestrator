@@ -729,6 +729,9 @@ def test_handle_error_cleanup_swallows_redis_failure(
     """A Redis outage during cleanup must not block the IDLE retry transition."""
 
     class _BoomRedis:
+        async def get(self, key: str):
+            return None
+
         async def delete(self, key: str) -> int:
             raise RuntimeError("redis down")
 

@@ -774,7 +774,7 @@ def test_reset_returns_503_on_has_state_redis_error(
         response = client.post("/api/reset-task/example__alpha/PR-322")
 
     assert response.status_code == 503
-    assert response.json() == {"error": "redis unavailable"}
+    assert response.json() == {"error": "Attempt state unavailable"}
 
 
 def test_reset_returns_503_on_zscore_redis_error(

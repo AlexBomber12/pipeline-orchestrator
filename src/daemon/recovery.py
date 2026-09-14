@@ -325,6 +325,8 @@ class RecoveryMixin:
         try:
             try:
                 tasks = self._parse_tasks_from_headers()
+                if tasks is not None:
+                    tasks = await self._fence_recovery_tasks(tasks)
             except MergeStatusUnavailable as exc:
                 self.log_event(f"[INFRA] recover_state deferred: {exc}")
                 return False

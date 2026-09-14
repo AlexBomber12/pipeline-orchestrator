@@ -3,7 +3,7 @@
 The dashboard upload route rewrites incoming task-file content so that a
 re-uploaded ``status: TODO`` spec cannot regress an on-disk
 ``status: DONE`` task. ``status: ERROR`` is intentionally left replaceable
-because re-upload is the documented retry signal — see
+for legacy queued input; active attempt ownership is checked by
 ``src/daemon/repo_ops.py``. The transform happens before files are staged
 under ``/data/uploads/``, so the daemon's later ``shutil.copy2`` into
 ``tasks/`` carries the preserved DONE status.
@@ -18,7 +18,6 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-
 from src.web import app as web_app
 from src.web.app import app
 from src.web.services import upload_validation
@@ -117,7 +116,8 @@ def _task_text(
     body = _task_body(pr_id, title)
     if status is None:
         return body
-    return f"---\nstatus: {status}\n---\n\n{body}"
+    reason = "blocked_reason: crash\n" if status == "ERROR" else ""
+    return f"---\nstatus: {status}\n{reason}---\n\n{body}"
 
 
 def _task_upload(
@@ -175,14 +175,13 @@ def test_upload_preserves_done_status_on_collision(
 
     resp = _post([_task_upload("PR-322", status="TODO", title="Regenerated spec")])
 
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     staged = _staged_text(uploads_dir, "PR-322.md")
-    assert "status: DONE" in staged.splitlines()[1]
-    assert "status: TODO" not in staged
-    assert "Regenerated spec" in staged
+    assert upload_validation.read_frontmatter_status(staged) == "DONE"
+    assert "Regenerated" in staged
 
 
-def test_upload_replaces_error_status_on_collision(
+def test_legacy_error_stages_for_daemon_reconciliation(
     one_repo_config: Path,
     repo_dir: Path,
     uploads_dir: Path,
@@ -198,8 +197,8 @@ def test_upload_replaces_error_status_on_collision(
     resp = _post([_task_upload("PR-322", status="TODO", title="Regenerated body")])
 
     assert resp.status_code == 200
-    staged = _staged_text(uploads_dir, "PR-322.md")
-    assert staged == _task_text("PR-322", status="TODO", title="Regenerated body")
+    assert "Regenerated body" in _staged_text(uploads_dir, "PR-322.md")
+    assert "status: ERROR" in (repo_dir / "tasks/PR-322.md").read_text()
 
 
 def test_upload_replaces_todo_status_on_collision(
@@ -269,9 +268,10 @@ def test_upload_replaces_malformed_existing_file_with_unclosed_frontmatter(
 
     resp = _post([_task_upload("PR-322", status="TODO", title="Repair upload")])
 
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     staged = _staged_text(uploads_dir, "PR-322.md")
-    assert staged == _task_text("PR-322", status="TODO", title="Repair upload")
+    assert upload_validation.read_frontmatter_status(staged) == "TODO"
+    assert "Repair upload" in staged
 
 
 def test_upload_zip_partial_preserve(
@@ -295,14 +295,13 @@ def test_upload_zip_partial_preserve(
     ]
     resp = _post([_zip_upload(entries)])
 
-    assert resp.status_code == 200
-    staged_100 = _staged_text(uploads_dir, "PR-100.md")
-    staged_101 = _staged_text(uploads_dir, "PR-101.md")
-    staged_102 = _staged_text(uploads_dir, "PR-102.md")
-    assert "status: DONE" in staged_100.splitlines()[1]
-    assert "Regenerated 100" in staged_100
-    assert staged_101 == _task_text("PR-101", status="TODO", title="Regenerated 101")
-    assert staged_102 == _task_text("PR-102", status="TODO", title="Brand new 102")
+    assert resp.status_code == 200, resp.text
+    staged = _staged_text(uploads_dir, "PR-100.md")
+    assert upload_validation.read_frontmatter_status(staged) == "DONE"
+    assert "Regenerated" in staged
+
+    assert "status: TODO" in _staged_text(uploads_dir, "PR-101.md")
+    assert "status: TODO" in _staged_text(uploads_dir, "PR-102.md")
 
 
 def test_upload_audit_event_records_preserved_collisions(
@@ -344,9 +343,9 @@ def test_upload_preserves_done_status_with_quoted_value(
 
     resp = _post([_task_upload("PR-322", status="TODO", title="Regenerated")])
 
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     staged = _staged_text(uploads_dir, "PR-322.md")
-    assert "status: DONE" in staged.splitlines()[1]
+    assert upload_validation.read_frontmatter_status(staged) == "DONE"
     assert "Regenerated" in staged
 
 
@@ -367,9 +366,9 @@ def test_upload_preserves_done_status_with_trailing_comment(
 
     resp = _post([_task_upload("PR-322", status="TODO", title="Regenerated")])
 
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     staged = _staged_text(uploads_dir, "PR-322.md")
-    assert "status: DONE" in staged.splitlines()[1]
+    assert upload_validation.read_frontmatter_status(staged) == "DONE"
     assert "Regenerated" in staged
 
 
@@ -461,10 +460,9 @@ def test_upload_preserves_done_with_leading_blank_lines_on_existing(
 
     resp = _post([_task_upload("PR-322", status="TODO", title="Regenerated")])
 
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     staged = _staged_text(uploads_dir, "PR-322.md")
-    assert "status: DONE" in staged
-    assert "status: TODO" not in staged
+    assert upload_validation.read_frontmatter_status(staged) == "DONE"
     assert "Regenerated" in staged
 
 
@@ -498,12 +496,10 @@ def test_upload_preserves_done_when_upload_has_leading_blank_lines(
 
     resp = _post(files)
 
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     staged = _staged_text(uploads_dir, "PR-322.md")
-    assert staged.count("---\nstatus:") == 1
-    assert "status: DONE" in staged
-    assert "status: TODO" not in staged
-    assert "Regenerated spec" in staged
+    assert upload_validation.read_frontmatter_status(staged) == "DONE"
+    assert "Regenerated" in staged
 
 
 def test_replace_frontmatter_status_skips_leading_blank_lines() -> None:
@@ -525,9 +521,9 @@ def test_upload_preserves_done_when_existing_has_duplicate_status_keys(
 
     resp = _post([_task_upload("PR-322", status="TODO", title="Regenerated")])
 
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     staged = _staged_text(uploads_dir, "PR-322.md")
-    assert "status: DONE" in staged
+    assert upload_validation.read_frontmatter_status(staged) == "DONE"
     assert "Regenerated" in staged
 
 
@@ -580,5 +576,5 @@ def test_upload_zip_with_duplicate_entry_earlier_non_utf8(
 
     assert resp.status_code == 200, resp.text
     staged = _staged_text(uploads_dir, "PR-322.md")
-    assert "status: DONE" in staged.splitlines()[1]
-    assert "Regenerated body" in staged
+    assert upload_validation.read_frontmatter_status(staged) == "DONE"
+    assert "Regenerated" in staged

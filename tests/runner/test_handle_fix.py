@@ -5191,3 +5191,21 @@ def test_no_push_branch_uses_committer_date_when_available(
     assert runner.state.current_pr.no_push_fix_count == 1
     assert runner._last_push_at is not None
     assert runner._last_push_at.isoformat() == "2026-05-10T02:30:00+00:00"
+
+
+def test_fix_cancelled_by_rejection_does_not_enter_error_or_pause(monkeypatch):
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    rejected = False
+    async def ownership():
+        return rejected
+    async def coder(*args, **kwargs):
+        nonlocal rejected
+        rejected = True
+        raise asyncio.CancelledError
+    monkeypatch.setattr(runner, "_attempt_execution_blocked", ownership)
+    monkeypatch.setattr(git_ops_module, "_git", lambda *a, **kw: h._FakeCompletedProcess(stdout="aaa111\n"))
+    monkeypatch.setattr(claude_cli, "fix_review_async", coder)
+    asyncio.run(runner.handle_fix())
+    assert rejected and runner.state.state == PipelineState.FIX
+    assert not runner.state.user_paused

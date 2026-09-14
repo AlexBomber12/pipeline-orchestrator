@@ -16,11 +16,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from src.cancellation import (
-    record_task_spec_hash,
-    reset_retry_count,
-    safe_delete_cancellation_cause,
-)
+from src.cancellation.storage import task_spec_content_hash
 from src.daemon import git_ops, scaffolder
 from src.daemon.git_ops import (
     _FETCH_MISSING_REF_NEEDLE,
@@ -29,7 +25,10 @@ from src.daemon.git_ops import (
 )
 from src.keyspace import upload_pending, upload_pending_count
 from src.models import TaskStatus
+from src.queue_parser import parse_task_header
 from src.retry import retry_transient
+from src.task_admission import existing_task_header_ids, invalid_upload_graph_members, validate_admission_graph
+from src.task_attempts import AdmissionRejected, TaskAttempt, attempt_key, load_attempt
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +38,29 @@ def _uploaded_repo_path(filename: str) -> Path:
     if filename in {"AGENTS.md", "CLAUDE.md"}:
         return Path(filename)
     return Path("tasks") / filename
+
+
+def _matches_pruned_upload_receipt(
+    raw_attempt: str | bytes | None,
+    task_id: str,
+    filename: str,
+    fingerprint: str | None,
+) -> bool:
+    """Return whether a pending receipt belongs to a pruned upload member."""
+    if not raw_attempt or not isinstance(fingerprint, str):
+        return False
+    attempt = TaskAttempt.model_validate_json(raw_attempt)
+    return (
+        attempt.task.pr_id == task_id
+        and Path(attempt.task.task_file).name == filename
+        and attempt.fingerprint == fingerprint
+        and attempt.admission_pending
+        and not attempt.started
+        and not attempt.completed
+        and attempt.pr_number is None
+        and not attempt.pr_creation_pending
+        and not attempt.rejection
+    )
 
 
 class RepoOpsMixin:
@@ -253,13 +275,192 @@ return 0
         except Exception:
             logger.warning("%s: failed deleting upload pending count", self.name)
 
+    async def _discard_invalid_upload(
+        self, key: str, raw: bytes | str, staging_dir: Path, reason: str
+    ) -> bool | None:
+        """Retire only the rejected submission, never a concurrently staged batch."""
+        async def discard(pipe):
+            if await pipe.get(key) != raw:
+                return False
+            pipe.multi()
+            pipe.delete(key, upload_pending_count(self.name))
+            return True
+
+        try:
+            discarded = await self.redis.transaction(discard, key, value_from_callable=True)
+        except Exception as exc:
+            self.log_event(f"[INFRA] Invalid upload acknowledgement deferred ({type(exc).__name__}).")
+            return None
+        if not discarded:
+            return None
+        shutil.rmtree(str(staging_dir), ignore_errors=True)
+        self.log_event(f"[INFRA] Discarded invalid upload batch: {reason}. Submit corrected files again.")
+        return False
+
+    async def _discard_invalid_upload_member(
+        self,
+        key: str,
+        raw: bytes | str,
+        staging_dir: Path,
+        manifest: dict,
+        filename: str,
+        reason: str,
+    ) -> bool | None:
+        """Remove one invalid staged file while preserving unrelated pending uploads."""
+        files = [name for name in manifest.get("files", []) if name != filename]
+        task_id = Path(filename).stem
+        updated = dict(manifest)
+        updated["files"] = files
+        for field in ("task_hashes", "rejection_tokens", "prior_spec_files"):
+            values = updated.get(field)
+            if isinstance(values, dict):
+                values = dict(values)
+                values.pop(task_id, None)
+                updated[field] = values
+        updated_raw = json.dumps(updated)
+        task_hashes = manifest.get("task_hashes", {})
+        upload_fingerprint = (
+            task_hashes.get(task_id) if isinstance(task_hashes, dict) else None
+        )
+        receipt_key = attempt_key(self.name, task_id)
+
+        async def discard(pipe):
+            if await pipe.get(key) != raw:
+                return "changed"
+            receipt_raw = await pipe.get(receipt_key)
+            delete_receipt = _matches_pruned_upload_receipt(
+                receipt_raw,
+                task_id,
+                filename,
+                upload_fingerprint,
+            )
+            pipe.multi()
+            if files:
+                pipe.set(key, updated_raw)
+                pipe.set(upload_pending_count(self.name), str(len(files)))
+            if delete_receipt:
+                pipe.delete(receipt_key)
+            if files:
+                return "retained"
+            pipe.delete(key, upload_pending_count(self.name))
+            return "discarded"
+
+        try:
+            result = await self.redis.transaction(
+                discard,
+                key,
+                receipt_key,
+                value_from_callable=True,
+            )
+        except Exception as exc:
+            self.log_event(f"[INFRA] Invalid upload acknowledgement deferred ({type(exc).__name__}).")
+            return None
+        if result == "changed":
+            return None
+        try:
+            (staging_dir / filename).unlink(missing_ok=True)
+        except Exception:
+            logger.warning("%s: failed removing invalid upload member %s", self.name, filename)
+        if result == "discarded":
+            shutil.rmtree(str(staging_dir), ignore_errors=True)
+            self.log_event(f"[INFRA] Discarded invalid upload batch: {reason}. Submit corrected files again.")
+            return False
+        self.log_event(
+            f"[INFRA] Discarded invalid upload member {filename}: {reason}. "
+            "Remaining staged files stay pending."
+        )
+        return None
+
+    async def _discard_invalid_upload_members(
+        self,
+        key: str,
+        raw: bytes | str,
+        staging_dir: Path,
+        manifest: dict,
+        filenames: set[str],
+        reason: str,
+    ) -> bool | None:
+        """Remove invalid staged task files while preserving unrelated uploads."""
+        files = [name for name in manifest.get("files", []) if name not in filenames]
+        task_ids = {Path(filename).stem for filename in filenames}
+        updated = dict(manifest)
+        updated["files"] = files
+        for field in ("task_hashes", "rejection_tokens", "prior_spec_files"):
+            values = updated.get(field)
+            if isinstance(values, dict):
+                values = dict(values)
+                for task_id in task_ids:
+                    values.pop(task_id, None)
+                updated[field] = values
+        updated_raw = json.dumps(updated)
+        task_hashes = manifest.get("task_hashes", {})
+        receipt_keys = {
+            task_id: attempt_key(self.name, task_id) for task_id in task_ids
+        }
+
+        async def discard(pipe):
+            if await pipe.get(key) != raw:
+                return "changed"
+            delete_receipt_keys = []
+            for task_id, receipt_key in sorted(receipt_keys.items()):
+                upload_fingerprint = (
+                    task_hashes.get(task_id)
+                    if isinstance(task_hashes, dict)
+                    else None
+                )
+                receipt_raw = await pipe.get(receipt_key)
+                if _matches_pruned_upload_receipt(
+                    receipt_raw,
+                    task_id,
+                    f"{task_id}.md",
+                    upload_fingerprint,
+                ):
+                    delete_receipt_keys.append(receipt_key)
+            pipe.multi()
+            if files:
+                pipe.set(key, updated_raw)
+                pipe.set(upload_pending_count(self.name), str(len(files)))
+            if delete_receipt_keys:
+                pipe.delete(*delete_receipt_keys)
+            if files:
+                return "retained"
+            pipe.delete(key, upload_pending_count(self.name))
+            return "discarded"
+
+        try:
+            result = await self.redis.transaction(
+                discard,
+                key,
+                *receipt_keys.values(),
+                value_from_callable=True,
+            )
+        except Exception as exc:
+            self.log_event(f"[INFRA] Invalid upload acknowledgement deferred ({type(exc).__name__}).")
+            return None
+        if result == "changed":
+            return None
+        for filename in filenames:
+            try:
+                (staging_dir / filename).unlink(missing_ok=True)
+            except Exception:
+                logger.warning("%s: failed removing invalid upload member %s", self.name, filename)
+        if result == "discarded":
+            shutil.rmtree(str(staging_dir), ignore_errors=True)
+            self.log_event(f"[INFRA] Discarded invalid upload batch: {reason}. Submit corrected files again.")
+            return False
+        self.log_event(
+            f"[INFRA] Discarded invalid upload members {', '.join(sorted(filenames))}: {reason}. "
+            "Remaining staged files stay pending."
+        )
+        return None
+
     async def process_pending_uploads(
         self, *, _safe: bool = False,
     ) -> bool | None:
         """Commit and push any files staged by the web upload endpoint.
 
         Returns ``True`` if an upload was pushed, ``False`` if there was
-        nothing pending, or ``None`` if a pending upload failed (caller
+        nothing pending or an invalid batch was discarded, or ``None`` if a pending upload failed (caller
         should skip task dispatch so it retries next cycle).
 
         When *_safe* is ``True`` the error handler skips the destructive
@@ -286,7 +487,6 @@ return 0
 
         staging_dir = Path(manifest["staging_dir"]) if "staging_dir" in manifest else Path("/data/uploads") / self.name
         filenames: list[str] = manifest.get("files", [])
-        task_hashes = manifest.get("task_hashes", {})
         commit_subject = manifest.get("commit_subject")
         include_commit_body = isinstance(commit_subject, str) and bool(
             commit_subject.strip()
@@ -295,8 +495,6 @@ return 0
             commit_subject = "chore: upload sprint tasks via dashboard"
         else:
             commit_subject = commit_subject.strip()
-        if not isinstance(task_hashes, dict):
-            task_hashes = {}
         if not filenames or not staging_dir.is_dir():
             logger.warning("%s: upload manifest has no files or staging dir missing", self.name)
             await self.redis.delete(key)
@@ -327,6 +525,99 @@ return 0
         try:
             tasks_dir = Path(self.repo_path) / "tasks"
             tasks_dir.mkdir(exist_ok=True)
+            prior_files = manifest.get("prior_spec_files", {})
+            for fname in stageable_filenames:
+                if fname.startswith("PR-") and fname.endswith(".md") and Path(fname).stem in prior_files:
+                    task_id = Path(fname).stem
+                    target = tasks_dir / fname
+                    current = await load_attempt(self.redis, self.name, task_id)
+                    current_hash = task_spec_content_hash(target.read_text()) if target.is_file() else None
+                    incoming_hash = task_spec_content_hash((staging_dir / fname).read_text())
+                    if current_hash != prior_files[task_id] and not (
+                        current and current.fingerprint == incoming_hash and current_hash == incoming_hash
+                        and current.previous_rejection == manifest.get("rejection_tokens", {}).get(task_id)
+                    ):
+                        return await self._discard_invalid_upload_member(
+                            key,
+                            raw,
+                            staging_dir,
+                            manifest,
+                            fname,
+                            "Task changed or was deleted after upload; submit it again.",
+                        )
+            task_uploads = [
+                staging_dir / name for name in stageable_filenames
+                if name.startswith("PR-") and name.endswith(".md")
+            ]
+            try:
+                validate_admission_graph(Path(self.repo_path), task_uploads)
+            except AdmissionRejected as exc:
+                invalid_graph_members = invalid_upload_graph_members(Path(self.repo_path), task_uploads)
+                if invalid_graph_members:
+                    return await self._discard_invalid_upload_members(
+                        key,
+                        raw,
+                        staging_dir,
+                        manifest,
+                        invalid_graph_members,
+                        str(exc),
+                    )
+                raise
+            await self._snapshot_accepted_specs()
+            admissions = []
+            validated = []
+            available_ids = existing_task_header_ids(Path(self.repo_path)) | {
+                task_id
+                for name in stageable_filenames
+                if name.startswith("PR-") and name.endswith(".md")
+                for task_id in [parse_task_header(staging_dir / name).pr_id]
+            }
+            for fname in stageable_filenames:
+                if fname.startswith("PR-") and fname.endswith(".md"):
+                    task_id = Path(fname).stem
+                    target = tasks_dir / fname
+                    current = await load_attempt(self.redis, self.name, task_id)
+                    current_hash = task_spec_content_hash(target.read_text()) if target.is_file() else None
+                    incoming_hash = task_spec_content_hash((staging_dir / fname).read_text())
+                    if task_id in prior_files:
+                        if current_hash != prior_files[task_id] and not (
+                            current and current.fingerprint == incoming_hash and current_hash == incoming_hash
+                            and current.previous_rejection == manifest.get("rejection_tokens", {}).get(task_id)
+                        ):
+                            return await self._discard_invalid_upload_member(
+                                key,
+                                raw,
+                                staging_dir,
+                                manifest,
+                                fname,
+                                "Task changed or was deleted after upload; submit it again.",
+                            )
+                    elif current and not target.is_file():
+                        raise AdmissionRejected("Task was deleted; an old pending upload cannot recreate it.")
+                    try:
+                        validated.append(
+                            await self._validate_admission(
+                                staging_dir / fname,
+                                token=manifest.get("rejection_tokens", {}).get(Path(fname).stem),
+                                upload=True,
+                                available_ids=available_ids,
+                            )
+                        )
+                    except AdmissionRejected as exc:
+                        return await self._discard_invalid_upload_member(
+                            key,
+                            raw,
+                            staging_dir,
+                            manifest,
+                            fname,
+                            str(exc),
+                        )
+            # Validate the whole batch before reserving any replacement. An
+            # invalid later file must not orphan an earlier pending receipt.
+            for previous, candidate in validated:
+                admission = await self._reserve_validated_admission(previous, candidate, upload=True)
+                if admission:
+                    admissions.append(admission)
             for fname in stageable_filenames:
                 src = staging_dir / fname
                 if src.is_file():
@@ -369,20 +660,8 @@ return 0
                 lambda: git_ops._git(self.repo_path, "push", "origin", branch, timeout=60),
                 operation_name=f"git push origin {branch}",
             )
-            try:
-                for task_id, task_hash in task_hashes.items():
-                    await record_task_spec_hash(
-                        self.redis,
-                        self.name,
-                        str(task_id),
-                        str(task_hash),
-                    )
-                    await reset_retry_count(self.redis, self.name, str(task_id))
-            except Exception as exc:
-                logger.error("%s: upload metadata update failed: %s", self.name, exc)
-                self.log_event(f"[INFRA] Upload metadata update failed: {exc}.")
-                await self._clear_upload_pending_count_if_manifest_matches(key, raw)
-                return None
+            for attempt in admissions:
+                await self._finish_admission(attempt)
             task_count = len(
                 {
                     name
@@ -394,43 +673,10 @@ return 0
                 f"[INFRA] Uploaded {task_count} task files to tasks/ "
                 f"and pushed to {branch}."
             )
-            # Re-uploading a task file is the user's signal to retry a
-            # previously parked task. Flag-on repos clear the suppression via
-            # the cancellation record below; flag-off repos still clear the
-            # legacy in-memory crash marker here.
-            uploaded_pr_ids = {
-                Path(name).stem
-                for name in stageable_filenames
-                if name.startswith("PR-") and name.endswith(".md")
-            }
-            crashed_pr_ids = getattr(self, "_crashed_task_pr_ids", None)
-            use_single_error_exit = getattr(
-                getattr(self.repo_config, "feature_flags", None),
-                "use_single_error_exit",
-                False,
-            )
-            if (
-                crashed_pr_ids
-                and not use_single_error_exit
-            ):
-                crashed_pr_ids.difference_update(uploaded_pr_ids)
-            clear_status_write_failed = getattr(
-                self,
-                "_clear_status_write_failed_task_ids",
-                None,
-            )
-            if uploaded_pr_ids and clear_status_write_failed is not None:
-                await clear_status_write_failed(uploaded_pr_ids)
-            if uploaded_pr_ids:
-                for pr_id in uploaded_pr_ids:
-                    await safe_delete_cancellation_cause(
-                        self.redis,
-                        self.name,
-                        pr_id,
-                        log=self.log_event,
-                    )
-                self._clear_canceled_in_snapshot(uploaded_pr_ids)
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
+            self._clear_canceled_in_snapshot({attempt.task.pr_id for attempt in admissions})
+        except AdmissionRejected as exc:
+            return await self._discard_invalid_upload(key, raw, staging_dir, str(exc))
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError, ValueError) as exc:
             logger.error("%s: upload git operations failed: %s", self.name, exc)
             self.log_event(f"[INFRA] Upload push failed: {exc}.")
             if not _safe:
@@ -456,11 +702,14 @@ return 0
             shutil.rmtree(str(staging_dir), ignore_errors=True)
             return True
 
+        # The upload has already been committed, pushed, and admitted. A newer
+        # manifest only means the cleanup CAS lost a race; leaving it queued
+        # must not make IDLE skip dispatch from the committed base branch.
         self.log_event(
-            "[INFRA] Newer upload pending; blocking dispatch to process "
-            "it next cycle."
+            "[INFRA] Newer upload pending; completed current upload "
+            "and leaving newer upload queued."
         )
-        return None
+        return True
 
     def _clear_canceled_in_snapshot(self, uploaded_pr_ids: set[str]) -> None:
         """Flip ERROR → TODO in ``state.current_queue`` for re-uploads.

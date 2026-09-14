@@ -1,0 +1,842 @@
+"""Daemon admission receipts reconcile Git writes and Redis independently."""
+
+from __future__ import annotations
+
+import hashlib
+import re
+import subprocess
+import tempfile
+from pathlib import Path
+
+from src.cancellation.storage import CancellationCause, cause_key, index_key, task_spec_content_hash, task_spec_hash_key
+from src.config import normalize_repo_url
+from src.daemon import git_ops
+from src.daemon.approval_commands import checkout_process_blocker
+from src.daemon.attempt_prs import discover_attempt_pr
+from src.daemon.rejection_commands import rejection_pr_details
+from src.github import gh_runner
+from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
+from src.queue_parser import QueueValidationError, UnstructuredLegacyTaskError, parse_existing_task_header
+from src.rejection_commands import (
+    LEGACY_REJECTION_SENTINEL,
+    RejectionCommand,
+    RejectionIdentityManifestUnavailable,
+    load_rejection,
+    recorded_rejection_identity,
+    recorded_rejection_identity_by_task_file,
+)
+from src.task_admission import admission_candidate, validate_admission_graph, verify_unfinished
+from src.task_attempts import (
+    AdmissionRejected,
+    AttemptChanged,
+    TaskAttempt,
+    attempt_key,
+    load_attempt,
+    new_attempt,
+    save_attempt,
+)
+from src.task_status import MergeStatusUnavailable
+
+_TASK_HEADER_ID_RE = re.compile(r"^#\s+(PR-[A-Za-z0-9_.-]+):")
+
+
+def _declared_task_id_from_text(path: Path) -> str | None:
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        if match := _TASK_HEADER_ID_RE.match(raw_line.rstrip()):
+            return match.group(1)
+    return None
+
+
+def _task_id_for_graph_hold(path: Path) -> str:
+    try:
+        return parse_existing_task_header(path).pr_id
+    except UnstructuredLegacyTaskError:
+        return path.stem
+    except QueueValidationError:
+        return _declared_task_id_from_text(path) or path.stem
+
+
+def _parse_snapshot_header(filename: str, content: str):
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / Path(filename).name
+        path.write_text(content, encoding="utf-8")
+        try:
+            return parse_existing_task_header(path)
+        except UnstructuredLegacyTaskError:
+            return None
+        except QueueValidationError as exc:
+            if exc.issues and all("missing task header like" in issue for issue in exc.issues):
+                return None
+            raise QueueValidationError([issue.replace(str(path), filename) for issue in exc.issues]) from exc
+
+
+class TaskAdmissionMixin:
+    def _has_recorded_rejection_identity(self, task_id: str, fingerprint: str) -> bool:
+        try:
+            return (
+                recorded_rejection_identity(
+                    Path(self.repo_path),
+                    self.owner_repo,
+                    self.repo_config.branch,
+                    task_id,
+                    fingerprint=fingerprint,
+                )
+                is not None
+            )
+        except RejectionIdentityManifestUnavailable as exc:
+            raise MergeStatusUnavailable("Rejection identity manifest is unavailable.") from exc
+
+    def _recorded_rejection_identity(self, task_id: str, fingerprint: str | None = None) -> dict | None:
+        try:
+            return recorded_rejection_identity(
+                Path(self.repo_path),
+                self.owner_repo,
+                self.repo_config.branch,
+                task_id,
+                fingerprint=fingerprint,
+            )
+        except RejectionIdentityManifestUnavailable as exc:
+            raise MergeStatusUnavailable("Rejection identity manifest is unavailable.") from exc
+
+    def _recorded_rejection_identity_by_task_file(
+        self,
+        task_file: str,
+        *,
+        fingerprint: str | None = None,
+        binding: str | None = None,
+    ) -> tuple[str, dict] | None:
+        try:
+            return recorded_rejection_identity_by_task_file(
+                Path(self.repo_path),
+                self.owner_repo,
+                self.repo_config.branch,
+                task_file,
+                fingerprint=fingerprint,
+                binding=binding,
+            )
+        except RejectionIdentityManifestUnavailable as exc:
+            raise MergeStatusUnavailable("Rejection identity manifest is unavailable.") from exc
+
+    def _rejection_identity_matches_base(
+        self,
+        entry: dict | None,
+        filename: str,
+        fingerprint: str,
+    ) -> bool:
+        if not entry or not isinstance(entry.get("base_commit"), str) or not entry["base_commit"]:
+            return False
+        blob = git_ops._git_bytes(
+            self.repo_path,
+            "show",
+            f"{entry['base_commit']}:{filename}",
+            check=False,
+        )
+        if blob.returncode != 0:
+            return False
+        try:
+            return task_spec_content_hash(blob.stdout.decode("utf-8")) == fingerprint
+        except UnicodeError:
+            return False
+
+    def _rejection_command_from_identity(self, task_id: str, entry: dict | None) -> RejectionCommand | None:
+        if not entry:
+            return None
+        binding = entry.get("rejection_binding")
+        attempt_id = entry.get("attempt_id")
+        fingerprint = entry.get("fingerprint")
+        file_sha256 = entry.get("file_sha256")
+        branch = entry.get("branch")
+        task_file = entry.get("task_file") or f"tasks/{task_id}.md"
+        if not all(
+            isinstance(value, str) and value
+            for value in (binding, attempt_id, fingerprint, file_sha256, branch)
+        ):
+            return None
+        pr = None
+        pr_number = entry.get("pr_number")
+        pr_head_sha = entry.get("pr_head_sha")
+        if pr_number is not None and pr_head_sha:
+            try:
+                pr = PRInfo(
+                    number=int(pr_number),
+                    branch=branch,
+                    pr_id=task_id,
+                    head_sha=str(pr_head_sha),
+                )
+            except (TypeError, ValueError):
+                pr = None
+        return RejectionCommand(
+            binding=binding,
+            repo_slug=self.name,
+            repo_url=str(entry.get("repo_url") or self.repo_config.url),
+            task=QueueTask(
+                pr_id=task_id,
+                title=str(entry.get("task_title") or task_id),
+                task_file=str(task_file),
+                branch=branch,
+                status=TaskStatus.ERROR,
+            ),
+            attempt_id=attempt_id,
+            fingerprint=fingerprint,
+            file_sha256=file_sha256,
+            failure=str(entry.get("failure") or ""),
+            pr=pr,
+            initial_head_sha=entry.get("initial_head_sha"),
+            status="rejected",
+            branch_head=entry.get("branch_head"),
+            base_commit=str(entry.get("base_commit") or ""),
+            released=True,
+        )
+
+    async def _load_final_rejection(
+        self,
+        binding: str,
+        task_id: str,
+        *,
+        fingerprint: str | None = None,
+        task_file: str | None = None,
+    ) -> RejectionCommand | None:
+        if binding == LEGACY_REJECTION_SENTINEL:
+            return None
+        command = await load_rejection(self.redis, self.name, binding)
+        if command is not None:
+            return command
+        try:
+            entry = recorded_rejection_identity(
+                Path(self.repo_path),
+                self.owner_repo,
+                self.repo_config.branch,
+                task_id,
+                fingerprint=fingerprint,
+                binding=binding,
+            )
+        except RejectionIdentityManifestUnavailable as exc:
+            raise MergeStatusUnavailable("Rejection identity manifest is unavailable.") from exc
+        if entry is not None:
+            return self._rejection_command_from_identity(task_id, entry)
+        if task_file is not None:
+            matched = self._recorded_rejection_identity_by_task_file(
+                task_file,
+                fingerprint=fingerprint,
+                binding=binding,
+            )
+            if matched is not None:
+                owner_task_id, owner_entry = matched
+                return self._rejection_command_from_identity(owner_task_id, owner_entry)
+        return None
+
+    def _has_historical_operator_reject_marker(self, base: str, filename: str, fingerprint: str) -> bool:
+        result = git_ops._git(self.repo_path, "log", "--format=%H", base, "--", filename, check=False)
+        if result.returncode != 0:
+            return False
+        for commit in result.stdout.splitlines():
+            blob = git_ops._git_bytes(self.repo_path, "show", f"{commit}:{filename}", check=False)
+            if blob.returncode != 0:
+                continue
+            try:
+                content = blob.stdout.decode("utf-8")
+            except UnicodeError:
+                continue
+            if task_spec_content_hash(content) != fingerprint:
+                continue
+            try:
+                header = _parse_snapshot_header(filename, content)
+            except QueueValidationError:
+                continue
+            if header and header.blocked_reason == "operator_reject":
+                return True
+        return False
+
+    async def _load_historical_task_file_owner(
+        self,
+        task_file: str,
+        current_task_id: str,
+    ) -> TaskAttempt | None:
+        result = git_ops._git(
+            self.repo_path,
+            "log",
+            "--format=%H",
+            "--",
+            task_file,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        for commit in result.stdout.splitlines():
+            blob = git_ops._git_bytes(
+                self.repo_path,
+                "show",
+                f"{commit}:{task_file}",
+                check=False,
+            )
+            if blob.returncode != 0:
+                continue
+            try:
+                header = _parse_snapshot_header(
+                    task_file,
+                    blob.stdout.decode("utf-8"),
+                )
+            except (QueueValidationError, UnicodeError):
+                continue
+            if header is None or header.pr_id == current_task_id:
+                continue
+            attempt = await load_attempt(self.redis, self.name, header.pr_id)
+            if attempt and attempt.task.task_file == task_file:
+                return attempt
+        return None
+
+    async def _snapshot_accepted_specs(self) -> None:
+        """Capture prior local-base bytes before synchronization overwrites them.
+
+        These receipts preserve the identity needed to verify an alternative
+        completion record even when a later Git edit changes the task hash.
+        """
+        if not (Path(self.repo_path) / ".git").exists():
+            return  # No local-base snapshot exists before the first clone.
+        base = self.repo_config.branch
+        local_base = git_ops._git(
+            self.repo_path,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{base}^{{commit}}",
+            check=False,
+        )
+        if local_base.returncode != 0:
+            self.log_event(f"[RECOVERY] Accepted-spec snapshot deferred until local base {base!r} is synchronized.")
+            return
+        try:
+            result = git_ops._git(self.repo_path, "ls-tree", "-r", "--name-only", base, "tasks")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            raise MergeStatusUnavailable(f"Accepted-spec snapshot unavailable for {base}: {exc}") from exc
+        for filename in result.stdout.splitlines():
+            if not Path(filename).match("tasks/PR-*.md"):
+                continue
+            content_bytes = git_ops._git_bytes(self.repo_path, "show", f"{base}:{filename}").stdout
+            content = content_bytes.decode("utf-8")
+            header = _parse_snapshot_header(filename, content)
+            if header is None:
+                continue
+            task_id = header.pr_id
+            if await load_attempt(self.redis, self.name, task_id):
+                continue
+            fingerprint = task_spec_content_hash(content)
+            task = QueueTask(
+                pr_id=header.pr_id,
+                title=header.title,
+                task_file=filename,
+                branch=header.branch,
+                status=TaskStatus.DONE if header.frontmatter_status == "done" else TaskStatus.TODO,
+            )
+            receipt = new_attempt(
+                self.repo_config.url,
+                task,
+                content,
+                started=header.frontmatter_status not in (None, "todo"),
+                file_sha256=hashlib.sha256(content_bytes).hexdigest(),
+            )
+            recorded_rejection = self._recorded_rejection_identity(task_id, fingerprint)
+            task_rejection = None
+            if not recorded_rejection:
+                task_rejection = self._recorded_rejection_identity(task_id)
+                if self._rejection_identity_matches_base(task_rejection, filename, fingerprint):
+                    recorded_rejection = task_rejection
+            if task_rejection is None:
+                task_file_rejection = self._recorded_rejection_identity_by_task_file(
+                    filename
+                )
+                if task_file_rejection is not None:
+                    _, task_rejection = task_file_rejection
+            if (
+                header.blocked_reason == "operator_reject"
+                or self._has_historical_operator_reject_marker(
+                    base,
+                    filename,
+                    fingerprint,
+                )
+                or recorded_rejection
+            ):
+                receipt.rejection = (
+                    str(recorded_rejection["rejection_binding"])
+                    if recorded_rejection and recorded_rejection.get("rejection_binding")
+                    else LEGACY_REJECTION_SENTINEL
+                )
+            elif (
+                task_rejection
+                and task_rejection.get("rejection_binding")
+                and header.frontmatter_status != "done"
+            ):
+                receipt.previous_rejection = str(task_rejection["rejection_binding"])
+            await save_attempt(self.redis, self.name, receipt, expected=None)
+
+    async def _validate_admission(
+        self,
+        path: Path,
+        *,
+        token: str | None = None,
+        upload: bool = False,
+        available_ids: set[str] | None = None,
+        supersede_pending_attempt_id: str | None = None,
+    ) -> tuple[TaskAttempt | None, TaskAttempt | None]:
+        return await admission_candidate(
+            self.redis,
+            self.name,
+            self.repo_config.url,
+            self.repo_config.branch,
+            Path(self.repo_path),
+            path,
+            expected_rejection=token,
+            upload=upload,
+            available_ids=available_ids,
+            supersede_pending_attempt_id=supersede_pending_attempt_id,
+        )
+
+    async def _reserve_admission(
+        self,
+        path: Path,
+        *,
+        token: str | None = None,
+        upload: bool = False,
+        available_ids: set[str] | None = None,
+        supersede_pending_attempt_id: str | None = None,
+    ) -> TaskAttempt | None:
+        previous, candidate = await self._validate_admission(
+            path,
+            token=token,
+            upload=upload,
+            available_ids=available_ids,
+            supersede_pending_attempt_id=supersede_pending_attempt_id,
+        )
+        return await self._reserve_validated_admission(previous, candidate, upload=upload)
+
+    async def _reserve_validated_admission(
+        self, previous: TaskAttempt | None, candidate: TaskAttempt | None, *, upload: bool
+    ) -> TaskAttempt | None:
+        if candidate is None:
+            return previous if previous and previous.admission_pending else None
+        current = await load_attempt(self.redis, self.name, candidate.task.pr_id)
+        if current and current != previous:
+            raise AttemptChanged("Accepted task changed during admission.")
+        if previous and previous.rejection and previous.rejection != LEGACY_REJECTION_SENTINEL and not upload:
+            rejection = await self._load_final_rejection(
+                previous.rejection,
+                previous.task.pr_id,
+            )
+            if rejection is None or rejection.status != "rejected" or not rejection.released:
+                raise AttemptChanged("Prior rejection is not confirmed.")
+            if rejection.base_commit:
+                old = git_ops._git(
+                    self.repo_path,
+                    "show",
+                    f"{rejection.base_commit}:{candidate.task.task_file}",
+                    check=False,
+                )
+                if old.returncode == 0 and task_spec_content_hash(old.stdout) == candidate.fingerprint:
+                    raise AttemptChanged("This Git input predates rejection; commit a later specification rewrite.")
+        candidate.base_commit = git_ops._git(
+            self.repo_path,
+            "rev-parse",
+            f"origin/{self.repo_config.branch}",
+        ).stdout.strip()
+        candidate.admission_source = "upload" if upload else "git"
+        return await save_attempt(self.redis, self.name, candidate, expected=current)
+
+    async def _finish_admission(self, attempt: TaskAttempt) -> None:
+        key = attempt_key(self.name, attempt.task.pr_id)
+        task_id = attempt.task.pr_id
+        path = Path(self.repo_path) / attempt.task.task_file
+        if task_spec_content_hash(path.read_bytes().decode("utf-8")) != attempt.fingerprint:
+            raise AttemptChanged("Accepted specification is not present in the checkout.")
+        header = parse_existing_task_header(path)
+        if header.frontmatter_status == "error":
+            if not await self._commit_task_status_change(attempt.task, "TODO", "accept rewritten unfinished task"):
+                raise AttemptChanged("Rewritten specification is pending its TODO status commit.")
+        origin = git_ops._git_bytes(
+            self.repo_path,
+            "show",
+            f"origin/{self.repo_config.branch}:{attempt.task.task_file}",
+        )
+        if task_spec_content_hash(origin.stdout.decode("utf-8")) != attempt.fingerprint:
+            raise AttemptChanged("Accepted specification is not confirmed on the configured base.")
+
+        async def transaction(pipe):
+            current = TaskAttempt.model_validate_json(await pipe.get(key))
+            if current.attempt_id != attempt.attempt_id or current.rejection:
+                raise AttemptChanged("Admission was superseded by another decision.")
+            if not current.admission_pending:
+                return
+            current.admission_pending = False
+            current.admission_source = None
+            pipe.multi()
+            pipe.set(key, current.model_dump_json())
+            pipe.delete(
+                cause_key(self.name, task_id),
+                f"diagnose_exhausted:{self.name}:{task_id}",
+                f"metrics:retry_count:{self.name}:{task_id}",
+                f"metrics:retry_fingerprint:{self.name}:{task_id}",
+                f"metrics:attempt_count:{self.name}:{task_id}",
+                f"current_run_started_at:{self.name}:{task_id}",
+            )
+            pipe.zrem(index_key(self.name), task_id)
+            pipe.set(task_spec_hash_key(self.name, task_id), current.fingerprint)
+
+        await self.redis.transaction(transaction, key)
+        self._crashed_task_pr_ids.discard(task_id)
+        self._user_stopped_task_pr_ids.discard(task_id)
+        self._status_write_failed_task_pr_ids.discard(task_id)
+        await self._persist_status_write_failed_task_pr_ids()
+        if self.state.current_task and self.state.current_task.pr_id == task_id:
+            self.state.current_task = None
+            self.state.current_pr = None
+            self._reset_runner_local_task_counters()
+            self._current_run_record = None
+        self.log_event(
+            f"[RECOVERY] {task_id}: rewritten task accepted as attempt {attempt.attempt_id}; "
+            "scheduling subject to controls and dependencies."
+        )
+
+    def _git_admission_lost_base_race(self, attempt: TaskAttempt, path: Path, fingerprint: str) -> bool:
+        if attempt.admission_source != "git" or not attempt.base_commit or attempt.fingerprint == fingerprint:
+            return False
+        base_ref = f"origin/{self.repo_config.branch}"
+        try:
+            base_head = git_ops._git(self.repo_path, "rev-parse", base_ref).stdout.strip()
+        except subprocess.CalledProcessError:
+            return False
+        if base_head == attempt.base_commit:
+            return False
+        old = git_ops._git_bytes(
+            self.repo_path,
+            "show",
+            f"{attempt.base_commit}:{attempt.task.task_file}",
+            check=False,
+        )
+        current = git_ops._git_bytes(
+            self.repo_path,
+            "show",
+            f"{base_ref}:{path.relative_to(self.repo_path).as_posix()}",
+            check=False,
+        )
+        if old.returncode != 0 or current.returncode != 0:
+            return False
+        try:
+            old_fingerprint = task_spec_content_hash(old.stdout.decode("utf-8"))
+            current_fingerprint = task_spec_content_hash(current.stdout.decode("utf-8"))
+        except UnicodeDecodeError:
+            return False
+        return old_fingerprint == attempt.fingerprint and current_fingerprint == fingerprint
+
+    async def _reconcile_git_admissions(self) -> set[str]:
+        """Hold invalid/partial inputs individually, leaving independent tasks eligible."""
+        held = set()
+        try:
+            validate_admission_graph(Path(self.repo_path))
+        except AdmissionRejected as exc:
+            held = {
+                _task_id_for_graph_hold(path)
+                for path in (Path(self.repo_path) / "tasks").glob("PR-*.md")
+            }
+            self._admission_held_task_ids = held
+            self.log_event(f"[RECOVERY] Task set cannot be admitted: {exc}")
+            return held
+        for path in sorted((Path(self.repo_path) / "tasks").glob("PR-*.md")):
+            content = path.read_text(encoding="utf-8")
+            try:
+                header = parse_existing_task_header(path)
+                task_id = header.pr_id
+            except (QueueValidationError, UnstructuredLegacyTaskError):
+                task_id = path.stem
+            prior = await load_attempt(self.redis, self.name, task_id)
+            fingerprint = task_spec_content_hash(content)
+            if prior is None:
+                task_file = path.relative_to(self.repo_path).as_posix()
+                historical_owner = await self._load_historical_task_file_owner(
+                    task_file,
+                    task_id,
+                )
+                if historical_owner is not None:
+                    held.add(task_id)
+                    self.log_event(
+                        f"[RECOVERY] {task_id}: task file already belongs to "
+                        f"{historical_owner.task.pr_id}; reconcile prior "
+                        "attempt before changing task identity."
+                    )
+                    continue
+                if self._has_recorded_rejection_identity(task_id, fingerprint):
+                    held.add(task_id)
+                    continue
+                raw = await self.redis.get(cause_key(self.name, task_id))
+                if raw and CancellationCause.from_redis(raw).payload.get("subsource") == "operator_reject":
+                    held.add(task_id)
+                continue  # normal first admission is recorded at dispatch
+            if fingerprint == prior.fingerprint:
+                if prior.completed:
+                    continue
+                if prior.rejection:
+                    held.add(task_id)
+                elif prior.admission_pending:
+                    try:
+                        await self._finish_admission(prior)
+                    except Exception as exc:
+                        held.add(task_id)
+                        self.log_event(f"[RECOVERY] {task_id}: admission pending ({type(exc).__name__}).")
+                continue
+            supersede_pending_attempt_id = (
+                prior.attempt_id
+                if prior.admission_pending and self._git_admission_lost_base_race(prior, path, fingerprint)
+                else None
+            )
+            try:
+                if supersede_pending_attempt_id is None:
+                    candidate = await self._reserve_admission(path)
+                else:
+                    candidate = await self._reserve_admission(
+                        path,
+                        supersede_pending_attempt_id=supersede_pending_attempt_id,
+                    )
+                if candidate:
+                    await self._finish_admission(candidate)
+            except Exception as exc:
+                held.add(task_id)
+                message = str(exc) if isinstance(exc, AttemptChanged) else type(exc).__name__
+                self.log_event(f"[RECOVERY] {task_id}: {message}")
+        self._admission_held_task_ids = held
+        return held
+
+    async def _fence_recovery_tasks(self, tasks: list[QueueTask]) -> list[QueueTask]:
+        result = []
+        for task in tasks:
+            path = Path(self.repo_path) / (task.task_file or f"tasks/{task.pr_id}.md")
+            try:
+                attempt = await load_attempt(self.redis, self.name, task.pr_id)
+            except Exception as exc:
+                raise MergeStatusUnavailable("Attempt ownership unavailable; recovery is deferred.") from exc
+            if attempt and not path.is_file():
+                continue
+            raw = await self.redis.get(cause_key(self.name, task.pr_id))
+            if raw and CancellationCause.from_redis(raw).payload.get("subsource") == "operator_reject":
+                task.status = TaskStatus.ERROR
+            if attempt:
+                task.attempt_id = attempt.attempt_id
+                if attempt.completed:
+                    task.status = TaskStatus.DONE
+                elif (
+                    attempt.rejection
+                    or attempt.admission_pending
+                    or attempt.fingerprint != task_spec_content_hash(path.read_text())
+                ):
+                    task.status = TaskStatus.ERROR
+            result.append(task)
+        return result
+
+    async def _prepare_task_attempt(self, content: str, *, file_sha256: str | None = None) -> bool:
+        """Bind a coder dispatch and remove only proven abandoned branch refs."""
+        task = self.state.current_task
+        if task is None:
+            return False
+        try:
+            attempt = await load_attempt(self.redis, self.name, task.pr_id)
+            if attempt is None:
+                fingerprint = task_spec_content_hash(content)
+                recorded_rejection = self._recorded_rejection_identity(task.pr_id, fingerprint)
+                if recorded_rejection:
+                    raise AttemptChanged(
+                        "File unchanged. Reject is final; rewrite or remove the unfinished task."
+                    )
+                recorded_previous = self._recorded_rejection_identity(task.pr_id)
+                if recorded_previous is None:
+                    task_file = task.task_file or f"tasks/{task.pr_id}.md"
+                    matched_previous = self._recorded_rejection_identity_by_task_file(
+                        task_file
+                    )
+                    if matched_previous is not None:
+                        _, recorded_previous = matched_previous
+                previous_rejection = (
+                    str(recorded_previous["rejection_binding"])
+                    if recorded_previous and recorded_previous.get("rejection_binding")
+                    else None
+                )
+                attempt = new_attempt(
+                    self.repo_config.url,
+                    task,
+                    content,
+                    file_sha256=file_sha256,
+                    previous_rejection=previous_rejection,
+                )
+                attempt = await save_attempt(self.redis, self.name, attempt, expected=None)
+            if (
+                attempt.rejection
+                or attempt.admission_pending
+                or attempt.completed
+                or attempt.pr_creation_pending
+                or attempt.fingerprint != task_spec_content_hash(content)
+            ):
+                raise AttemptChanged("Specification/attempt is not admitted for coding.")
+            if self._recovered and not attempt.started:
+                # Startup recovery may have no older Redis receipt. An unresolved
+                # historical digest must not turn an edited completion into TODO.
+                try:
+                    verify_unfinished(
+                        Path(self.repo_path),
+                        self.repo_config.branch,
+                        self.repo_config.url,
+                        attempt,
+                    )
+                except AdmissionRejected as exc:
+                    await self._mark_recovered_attempt_completed(attempt, str(exc))
+                    return False
+            self.state.current_task.attempt_id = attempt.attempt_id
+            if self._current_run_record is not None:
+                self._current_run_record.attempt_id = attempt.attempt_id
+            if not attempt.branch_prepared and attempt.branch_cleanup_head:
+                await self._prepare_closed_attempt_branch(attempt)
+                updated = attempt.model_copy(update={"branch_prepared": True})
+                attempt = await save_attempt(self.redis, self.name, updated, expected=attempt)
+            if not attempt.branch_prepared and attempt.previous_rejection:
+                await self._prepare_reused_branch(attempt)
+                updated = attempt.model_copy(update={"branch_prepared": True})
+                attempt = await save_attempt(self.redis, self.name, updated, expected=attempt)
+            if not attempt.started or attempt.coder_dispatched is not True:
+                updated = attempt.model_copy(update={"started": True, "coder_dispatched": True})
+                attempt = await save_attempt(self.redis, self.name, updated, expected=attempt)
+            await self.publish_state()
+            return True
+        except Exception as exc:
+            message = str(exc) if isinstance(exc, AttemptChanged) else type(exc).__name__
+            self.log_event(f"[RECOVERY] {task.pr_id}: coder dispatch deferred: {message}")
+            return False
+
+    async def _mark_recovered_attempt_completed(self, attempt: TaskAttempt, reason: str) -> None:
+        task_id = attempt.task.pr_id
+        done_task = attempt.task.model_copy(
+            update={"status": TaskStatus.DONE, "attempt_id": attempt.attempt_id}
+        )
+        updated = await save_attempt(
+            self.redis,
+            self.name,
+            attempt.model_copy(
+                update={
+                    "completed": True,
+                    "pr_creation_pending": False,
+                    "task": done_task,
+                }
+            ),
+            expected=attempt,
+        )
+        if self.state.current_queue:
+            self.state.current_queue = [
+                queued.model_copy(
+                    update={"status": TaskStatus.DONE, "attempt_id": updated.attempt_id}
+                )
+                if queued.pr_id == task_id
+                else queued
+                for queued in self.state.current_queue
+            ]
+        if self.state.current_task and self.state.current_task.pr_id == task_id:
+            self.state.current_task = None
+            self._reset_runner_local_task_counters()
+        self.state.state = PipelineState.IDLE
+        self.log_event(f"[RECOVERY] {task_id}: {reason}")
+        await self.publish_state()
+
+    def _prepare_owned_branch_cleanup(
+        self,
+        branch: str,
+        base: str,
+        expected: str | None,
+    ) -> None:
+        if branch == base:
+            raise AttemptChanged("Branch cleanup target is the configured base.")
+        if self._current_coder_process is not None or checkout_process_blocker(self.repo_path):
+            raise AttemptChanged("Checkout process quiescence is not established.")
+        origin = git_ops._git(self.repo_path, "remote", "get-url", "origin").stdout.strip()
+        if gh_runner.get_repo_full_name(origin).casefold() != self.owner_repo.casefold():
+            raise AttemptChanged("Origin does not belong to the configured repository.")
+        prs = gh_runner.run_gh(
+            ["pr", "list", "--state", "open", "--head", branch, "--json", "number"],
+            self.owner_repo,
+        )
+        if prs != []:
+            raise AttemptChanged("Another PR may own the reused branch.")
+        if git_ops._git(self.repo_path, "status", "--porcelain").stdout.strip():
+            raise AttemptChanged("Checkout has unrelated uncommitted files.")
+        remote = git_ops._git(self.repo_path, "ls-remote", "--heads", "origin", f"refs/heads/{branch}").stdout.strip()
+        remote_sha = remote.split()[0] if remote else None
+        local = git_ops._git(self.repo_path, "rev-parse", "--verify", f"refs/heads/{branch}", check=False)
+        local_sha = local.stdout.strip() if local.returncode == 0 else None
+        if (remote_sha and remote_sha != expected) or (local_sha and local_sha != expected):
+            raise AttemptChanged("Abandoned branch has an unexpected update; reconcile ownership before cleanup.")
+        git_ops._git(self.repo_path, "fetch", "origin", base)
+        git_ops._git(self.repo_path, "checkout", base)
+        # The normal IDLE sync has already established a clean current base.
+        # A new base update is consumed by the next IDLE cycle, not hard-reset
+        # over a potentially unrelated local base commit here.
+        if (
+            git_ops._git(self.repo_path, "rev-parse", "HEAD").stdout
+            != git_ops._git(self.repo_path, "rev-parse", f"origin/{base}").stdout
+        ):
+            raise AttemptChanged("Configured base advanced; synchronize before preparing the new attempt.")
+        if remote_sha:
+            git_ops._git(
+                self.repo_path,
+                "push",
+                f"--force-with-lease=refs/heads/{branch}:{remote_sha}",
+                "origin",
+                f":refs/heads/{branch}",
+            )
+        if local_sha:
+            git_ops._git(self.repo_path, "update-ref", "-d", f"refs/heads/{branch}", local_sha)
+        # Coder's normal AUTO PR creates the now-absent branch from origin/base.
+        # Retry/Approve never call this abandoned-attempt cleanup.
+
+    async def _prepare_reused_branch(self, attempt: TaskAttempt) -> None:
+        command = await self._load_final_rejection(
+            attempt.previous_rejection,
+            attempt.task.pr_id,
+            task_file=attempt.task.task_file,
+        )
+        if command is None or command.status != "rejected" or not command.released:
+            raise AttemptChanged("Prior rejection is not confirmed.")
+        branch, base = attempt.task.branch, self.repo_config.branch
+        if normalize_repo_url(attempt.repo_url) != normalize_repo_url(command.repo_url):
+            raise AttemptChanged("Branch or repository ownership differs from the abandoned attempt.")
+        if command.pr:
+            details = rejection_pr_details(self.owner_repo, command, base)
+            if details["state"] != "closed" or details["merged_at"]:
+                raise AttemptChanged("Rejected PR is no longer closed without merge.")
+        expected = command.branch_head if branch == command.task.branch else None
+        self._prepare_owned_branch_cleanup(branch, base, expected)
+
+    async def _prepare_closed_attempt_branch(self, attempt: TaskAttempt) -> None:
+        if normalize_repo_url(attempt.repo_url) != normalize_repo_url(self.repo_config.url):
+            raise AttemptChanged("Branch cleanup belongs to a different repository.")
+        if (
+            attempt.branch_cleanup_branch is None
+            or attempt.branch_cleanup_head is None
+            or attempt.branch_cleanup_pr_number is None
+        ):
+            raise AttemptChanged("Prior branch cleanup ownership is incomplete.")
+        probe = attempt.model_copy(
+            update={
+                "pr_number": attempt.branch_cleanup_pr_number,
+                "task": attempt.task.model_copy(update={"branch": attempt.branch_cleanup_branch}),
+            }
+        )
+        data = discover_attempt_pr(
+            self.repo_path,
+            self.owner_repo,
+            self.repo_config.branch,
+            probe,
+        )
+        if (
+            data is None
+            or data.get("state") != "closed"
+            or data.get("merged_at")
+            or data.get("head", {}).get("sha") != attempt.branch_cleanup_head
+        ):
+            raise AttemptChanged("Prior attempt PR is not closed without merge.")
+        self._prepare_owned_branch_cleanup(
+            attempt.branch_cleanup_branch,
+            self.repo_config.branch,
+            attempt.branch_cleanup_head,
+        )

@@ -13,6 +13,7 @@ from src.cancellation import (
     get_current_run_started_at,
     task_spec_content_hash,
 )
+from src.cancellation.storage import CancellationCause, cause_key, index_key
 from src.daemon import git_ops
 from src.daemon.selector import CoderPurpose, resolve_active_coder
 from src.github import prs as gh_prs
@@ -32,7 +33,7 @@ from src.retry_commands import (
     update_retry_command,
 )
 from src.subsource_registry import SuppressionReason
-from src.suppression.redis_store import RedisSuppressionStore
+from src.task_attempts import AttemptChanged, TaskAttempt, attempt_key, load_attempt
 
 
 class RetryDispatch(StrEnum):
@@ -184,6 +185,13 @@ class RetryCommandMixin:
     async def _validate_retry_command(
         self, command: RetryCommand
     ) -> tuple[Any, QueueTask] | RetryDispatch:
+        attempt = await load_attempt(self.redis, self.name, command.task_id)
+        if attempt and (
+            attempt.rejection or attempt.admission_pending or attempt.completed
+            or (command.attempt_id and command.attempt_id != attempt.attempt_id)
+            or (attempt.previous_rejection and command.attempt_id != attempt.attempt_id)
+        ):
+            return await self._fail_retry_command(command, "Retry belongs to a rejected or replaced attempt.")
         if command.repo_slug != self.name:
             return await self._fail_retry_command(
                 command, "Command repository binding does not match this runner."
@@ -259,6 +267,7 @@ class RetryCommandMixin:
             depends_on=list(header.depends_on),
             branch=header.branch,
             priority=header.priority,
+            attempt_id=attempt.attempt_id if attempt is not None else command.attempt_id,
         )
         return header, task
 
@@ -446,8 +455,25 @@ class RetryCommandMixin:
         return updated
 
     async def _clear_retry_failure_evidence(self, command: RetryCommand) -> None:
-        await RedisSuppressionStore(self.redis).clear(self.name, command.task_id)
-        await self.redis.delete(f"diagnose_exhausted:{self.name}:{command.task_id}")
+        receipt_key = attempt_key(self.name, command.task_id)
+        failure_key = cause_key(self.name, command.task_id)
+
+        async def transaction(pipe):
+            raw = await pipe.get(receipt_key)
+            attempt = TaskAttempt.model_validate_json(raw) if raw else None
+            failure = await pipe.get(failure_key)
+            if (attempt and (
+                attempt.rejection or attempt.admission_pending or attempt.completed
+                or (command.attempt_id and command.attempt_id != attempt.attempt_id)
+                or (attempt.previous_rejection and command.attempt_id != attempt.attempt_id)
+            )) or (failure and CancellationCause.from_redis(failure).payload.get("subsource") == "operator_reject"):
+                raise AttemptChanged("Retry was superseded by Reject or new task admission.")
+            pipe.multi()
+            pipe.delete(failure_key)
+            pipe.zrem(index_key(self.name), command.task_id)
+            pipe.delete(f"diagnose_exhausted:{self.name}:{command.task_id}")
+
+        await self.redis.transaction(transaction, receipt_key, failure_key)
         self._crashed_task_pr_ids.discard(command.task_id)
         self._user_stopped_task_pr_ids.discard(command.task_id)
         self._status_write_failed_task_pr_ids.discard(command.task_id)
@@ -677,6 +703,8 @@ class RetryCommandMixin:
         return RetryDispatch.CODING
 
     async def _start_retry_coding_execution(self) -> bool:
+        if await self._attempt_execution_blocked():
+            return False
         command_id = getattr(self, "_active_retry_command_id", None)
         if command_id is None:
             return False

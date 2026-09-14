@@ -40,6 +40,8 @@ class MergeMixin:
 
     async def handle_merge(self) -> None:
         """Merge the current PR and return to IDLE."""
+        if await self._attempt_execution_blocked():
+            return
         if self.state.current_pr is None:
             self.state.state = PipelineState.IDLE
             return
@@ -276,6 +278,8 @@ class MergeMixin:
                 )
                 return
 
+        if await self._attempt_execution_blocked():
+            return
         merged_diff_stats = self._compute_diff_stats(base)
         self.log_event(
             f"Merging PR #{number}.",
@@ -298,6 +302,8 @@ class MergeMixin:
             )
         self.state.merge_phase = "merging"
         await self.publish_state()
+        if await self._attempt_execution_blocked():
+            return
         try:
             gh_prs.merge_pr(self.owner_repo, number)
         except Exception as exc:

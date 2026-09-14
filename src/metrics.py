@@ -56,6 +56,7 @@ class RunRecord:
     # subsources); other causes leave this ``None``.
     cause_subsource: str | None = None
     run_phase: RunPhase = "coding"
+    attempt_id: str = ""
     attempt_index: int = 1
     coder_session_id: str = ""
     base_sha: str = ""

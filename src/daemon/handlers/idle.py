@@ -39,6 +39,7 @@ from src.queue_parser import (
 from src.queue_parser import (
     parse_existing_task_header as parse_task_header,
 )
+from src.task_attempts import load_attempt
 from src.task_status import (
     MergeStatusUnavailable,
     _resolve_merged_state,
@@ -287,16 +288,24 @@ class IdleMixin:
         if removed > 0:
             self.log_event(f"[BACKUP] pruned {removed} old bundles")
 
-    @staticmethod
-    def _validate_task_file_header_match(task_file: Path, header_pr_id: str) -> None:
+    async def _validate_task_file_header_match(self, task_file: Path, header_pr_id: str) -> None:
         expected_pr_id = task_file.stem
-        if header_pr_id != expected_pr_id:
-            raise QueueValidationError(
-                [
-                    f"{task_file}: header PR ID {header_pr_id!r} "
-                    f"does not match task file {expected_pr_id!r}"
-                ]
-            )
+        if header_pr_id == expected_pr_id:
+            return
+        task_ref = task_file.relative_to(self.repo_path).as_posix()
+        attempt = await load_attempt(self.redis, self.name, header_pr_id)
+        if (
+            attempt is not None
+            and attempt.task.pr_id == header_pr_id
+            and attempt.task.task_file == task_ref
+        ):
+            return
+        raise QueueValidationError(
+            [
+                f"{task_file}: header PR ID {header_pr_id!r} "
+                f"does not match task file {expected_pr_id!r}"
+            ]
+        )
 
     @staticmethod
     def _is_missing_task_header_error(exc: QueueValidationError) -> bool:
@@ -370,7 +379,7 @@ class IdleMixin:
                     raise
                 skipped_unstructured_pr_ids.add(task_file.stem)
                 continue
-            self._validate_task_file_header_match(task_file, header.pr_id)
+            await self._validate_task_file_header_match(task_file, header.pr_id)
             headers.append(header)
             task_files[header.pr_id] = task_file.relative_to(repo_root).as_posix()
 
@@ -537,6 +546,9 @@ class IdleMixin:
                     if statuses[pr_id] in (TaskStatus.DONE, TaskStatus.DOING):
                         crashed_task_pr_ids.discard(pr_id)
                         continue
+                    statuses[pr_id] = TaskStatus.ERROR
+            for pr_id in getattr(self, "_admission_held_task_ids", set()):
+                if pr_id in statuses:
                     statuses[pr_id] = TaskStatus.ERROR
             eligible = [
                 header
@@ -812,6 +824,16 @@ class IdleMixin:
                 return
 
         try:
+            await self._snapshot_accepted_specs()
+        except (OSError, RuntimeError, QueueValidationError, subprocess.TimeoutExpired) as exc:
+            await self._transition_to_error(
+                f"Task snapshot failed: {exc}",
+                save_run_record_as=None,
+                publish=False,
+                log_prefix="[INFRA]",
+            )
+            return
+        try:
             self.sync_to_main()
         except (
             subprocess.CalledProcessError,
@@ -850,6 +872,7 @@ class IdleMixin:
                 )
                 return
 
+        await self._reconcile_git_admissions()
         try:
             prs = gh_prs.get_open_prs(
                 self.owner_repo,

@@ -43,6 +43,7 @@ from src.cancellation import (
     get_cancellation_cause,
     safe_delete_cancellation_cause,
     safe_record_cancellation_cause,
+    task_spec_content_hash,
     truncate_for_payload,
 )
 from src.cancellation.availability import (
@@ -96,6 +97,7 @@ from src.daemon.preflight import PreflightMixin
 from src.daemon.rate_limit import RateLimitMixin
 from src.daemon.recovery import RecoveryMixin
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
+from src.daemon.rejection_commands import RejectionCommandMixin
 from src.daemon.repo_ops import RepoOpsMixin
 from src.daemon.retry_commands import RetryCommandMixin, RetryDispatch
 from src.daemon.selector import (
@@ -104,6 +106,7 @@ from src.daemon.selector import (
     resolve_active_coder,
     resolve_pause_coder,
 )
+from src.daemon.task_admission import TaskAdmissionMixin
 from src.events import publish_repo_event
 from src.events.publisher import validate_event_tier
 from src.github import gh_runner
@@ -133,12 +136,14 @@ from src.queue_parser import (
 from src.queue_parser import (
     parse_existing_task_header as parse_task_header,
 )
+from src.rejection_commands import list_pending_rejections
 from src.subsource_registry import (
     SuppressionReason,
     error_category_to_reason,
     is_operator_clearable,
 )
 from src.suppression.redis_store import RedisSuppressionStore
+from src.task_attempts import load_attempt, save_attempt
 from src.usage import UsageProvider
 from src.utils import repo_slug_from_url
 
@@ -299,6 +304,8 @@ _EXTENSION_LANGUAGE_MAP = {
 
 
 class PipelineRunner(
+    TaskAdmissionMixin,
+    RejectionCommandMixin,
     ApprovalCommandMixin,
     RetryCommandMixin,
     RecoveryMixin,
@@ -1043,6 +1050,7 @@ class PipelineRunner(
         self._current_run_record = RunRecord(
             run_id=str(uuid.uuid4()),
             task_id=task.pr_id,
+            attempt_id=task.attempt_id or "",
             profile_id=f"{coder_name}:{model}:container",
             task_type=task_type,
             complexity=complexity,
@@ -1421,6 +1429,7 @@ class PipelineRunner(
             self._current_run_record = None
             return
         try:
+            attempt = await load_attempt(self.redis, self.name, task.pr_id)
             recent = await self._metrics_store.recent(
                 task_id=task.pr_id,
                 limit=20,
@@ -1434,7 +1443,11 @@ class PipelineRunner(
             )
             return
         self._current_run_record = next(
-            (record for record in recent if record.task_id == task.pr_id),
+            (record for record in recent if record.task_id == task.pr_id and (
+                attempt is None
+                or record.attempt_id == attempt.attempt_id
+                or (not attempt.previous_rejection and not record.attempt_id)
+            )),
             None,
         )
 
@@ -1449,6 +1462,30 @@ class PipelineRunner(
         cause_subsource: str | None = None,
     ) -> None:
         """Finalize and persist the active run record."""
+        if exit_reason in {"success_merged", "coding_complete"} and self.state.current_task:
+            try:
+                attempt = await load_attempt(self.redis, self.name, self.state.current_task.pr_id)
+                task_id_matches = attempt and (
+                    self.state.current_task.attempt_id == attempt.attempt_id
+                    or (not attempt.previous_rejection and self.state.current_task.attempt_id is None)
+                )
+                record_matches = (
+                    self._current_run_record is None
+                    or (not attempt.previous_rejection and not self._current_run_record.attempt_id)
+                    or self._current_run_record.attempt_id == attempt.attempt_id
+                ) if attempt else False
+                if attempt and not (task_id_matches and record_matches):
+                    self.log_event("[RECOVERY] Ignoring a completion callback from an obsolete attempt.")
+                    return
+                if task_id_matches and record_matches:
+                    updated = attempt.model_copy(update={
+                        "completed": attempt.completed or exit_reason == "success_merged",
+                        "pr_number": self.state.current_pr.number if self.state.current_pr else attempt.pr_number,
+                        "pr_creation_pending": False,
+                    })
+                    await save_attempt(self.redis, self.name, updated, expected=attempt)
+            except Exception:
+                self.log_event("[RECOVERY] Completion receipt deferred; Git/GitHub merge evidence remains available.")
         record = self._current_run_record
         if record is None:
             return
@@ -2010,8 +2047,17 @@ class PipelineRunner(
         status: str,
         reason: str,
         blocked_reason: SuppressionReason | str | None = None,
+        *,
+        expected_spec_hash: str | None = None,
+        allow_spec_hash_mismatch: bool = False,
     ) -> bool:
         """Best-effort commit of daemon-written task frontmatter status."""
+        try:
+            attempt = await load_attempt(self.redis, self.name, current_task.pr_id)
+            if attempt and attempt.rejection and status != "ERROR":
+                return False
+        except Exception:
+            return False
         task_file = getattr(current_task, "task_file", None)
         pr_id = getattr(current_task, "pr_id", "")
         if not task_file:
@@ -2058,6 +2104,23 @@ class PipelineRunner(
                 f"origin/{base}",
                 timeout=60,
             )
+            if expected_spec_hash is not None:
+                current_task_path = Path(self.repo_path) / task_file
+                if not current_task_path.is_file():
+                    self.log_event(
+                        f"[INFRA] Warning: skipping {status} status commit for "
+                        f"{task_file}: task specification changed or was removed."
+                    )
+                    return allow_spec_hash_mismatch
+                current_hash = task_spec_content_hash(
+                    current_task_path.read_text(encoding="utf-8")
+                )
+                if current_hash != expected_spec_hash:
+                    self.log_event(
+                        f"[INFRA] Warning: skipping {status} status commit for "
+                        f"{task_file}: task specification changed."
+                    )
+                    return allow_spec_hash_mismatch
             write_frontmatter_status(
                 Path(self.repo_path) / task_file,
                 status,
@@ -2241,15 +2304,60 @@ class PipelineRunner(
 
     async def _pop_stop_request(self) -> bool:
         """Return True when a pending stop control signal exists."""
-        key = control_stop(self.name)
+        stop_key = control_stop(self.name)
+        state_key = pipeline_state(self.name)
+
+        async def _claim_with_transaction() -> bool:
+            async def _transaction(pipe: Any) -> bool:
+                raw_stop = await pipe.get(stop_key)
+                if not raw_stop:
+                    return False
+                raw_state = await pipe.get(state_key)
+                if raw_state:
+                    try:
+                        persisted = RepoState.model_validate_json(raw_state)
+                    except Exception:
+                        persisted = self.state.model_copy(deep=True)
+                else:
+                    persisted = self.state.model_copy(deep=True)
+                persisted.user_paused = True
+                pipe.multi()
+                pipe.set(state_key, persisted.model_dump_json())
+                pipe.delete(stop_key)
+                return True
+
+            return bool(
+                await self.redis.transaction(
+                    _transaction,
+                    stop_key,
+                    state_key,
+                    value_from_callable=True,
+                )
+            )
+
+        if hasattr(self.redis, "transaction"):
+            try:
+                claimed = await _claim_with_transaction()
+            except Exception:
+                pass
+            else:
+                if claimed:
+                    self.state.user_paused = True
+                return claimed
+
         try:
-            raw = await self.redis.get(key)
+            raw = await self.redis.get(stop_key)
         except Exception:
             return False
         if not raw:
             return False
+        self.state.user_paused = True
         try:
-            await self.redis.delete(key)
+            await self.redis.set(state_key, self.state.model_dump_json())
+        except Exception:
+            pass
+        try:
+            await self.redis.delete(stop_key)
         except Exception:
             pass
         return True
@@ -2282,6 +2390,10 @@ class PipelineRunner(
     ) -> None:
         """Watch Redis for user stop commands while CODING is active."""
         while not cli_task.done():
+            if await self._attempt_execution_blocked():
+                await self._terminate_current_coder()
+                cli_task.cancel()
+                return
             if await self._pop_stop_request():
                 self._stop_requested = True
                 self.state.user_paused = True
@@ -2847,24 +2959,54 @@ class PipelineRunner(
 
     async def _run_cycle_body(self) -> None:
         """Inner state-machine step; ``run_cycle`` wraps it for burn tracking."""
+        checkout_missing = not (Path(self.repo_path) / ".git").exists()
+        restored_checkout_for_rejection = False
+        if checkout_missing:
+            try:
+                has_rejection_work = bool(await list_pending_rejections(self.redis, self.name))
+            except Exception:
+                has_rejection_work = False
+            if has_rejection_work:
+                try:
+                    await self.ensure_repo_cloned()
+                except RuntimeError as exc:
+                    await self._transition_to_error(
+                        str(exc),
+                        log_prefix="[INFRA]",
+                        log_message=f"ensure_repo_cloned failed: {exc}",
+                        save_run_record_as=None,
+                        publish=True,
+                    )
+                    return
+                restored_checkout_for_rejection = True
+        if await self._consume_rejection_commands():
+            return
         if await self._consume_approval_command():
             return
 
-        try:
-            await self.ensure_repo_cloned()
-        except RuntimeError as exc:
-            await self._transition_to_error(
-                str(exc),
-                log_prefix="[INFRA]",
-                log_message=f"ensure_repo_cloned failed: {exc}",
-                save_run_record_as=None,
-                publish=True,
-            )
-            return
+        if not restored_checkout_for_rejection:
+            try:
+                await self.ensure_repo_cloned()
+            except RuntimeError as exc:
+                await self._transition_to_error(
+                    str(exc),
+                    log_prefix="[INFRA]",
+                    log_message=f"ensure_repo_cloned failed: {exc}",
+                    save_run_record_as=None,
+                    publish=True,
+                )
+                return
 
         await self._refresh_user_paused_from_redis()
         if not self.state.user_paused:
             self._user_pause_logged = False
+
+        if (
+            self._recovered and self.state.state == PipelineState.ERROR
+            and await self._reconcile_pending_pr_creation()
+        ):
+            await self.publish_state()
+            return
 
         # Durable Retry commands are consumed before the ordinary ERROR,
         # pause, and GitHub-budget exits.  This lets a parked runner

@@ -20,10 +20,12 @@ from src.daemon import git_ops as git_ops_module
 from src.daemon import recovery_policy as recovery_policy_module
 from src.daemon import runner as runner_module
 from src.daemon.runner import PipelineRunner
+from src.keyspace import control_stop, pipeline_state
 from src.models import (
     PipelineState,
     PRInfo,
     QueueTask,
+    RepoState,
     TaskStatus,
 )
 
@@ -865,3 +867,88 @@ def test_pop_stop_request_returns_true_when_delete_fails(
     monkeypatch.setattr(runner.redis, "delete", boom_delete)
 
     assert asyncio.run(runner._pop_stop_request()) is True
+
+
+def test_pop_stop_request_persists_pause_before_deleting_stop() -> None:
+    runner = h._make_runner()
+    assert isinstance(runner.redis, h._FakeRedis)
+    state_key = pipeline_state(runner.name)
+    stop_key = control_stop(runner.name)
+    persisted = runner.state.model_copy(deep=True)
+    persisted.state = PipelineState.CODING
+    persisted.user_paused = False
+    runner.redis.store[state_key] = persisted.model_dump_json()
+    runner.redis.store[stop_key] = "1"
+
+    assert asyncio.run(runner._pop_stop_request()) is True
+
+    assert stop_key not in runner.redis.store
+    written = RepoState.model_validate_json(runner.redis.store[state_key])
+    assert written.user_paused is True
+    assert written.state is PipelineState.CODING
+    assert runner.state.user_paused is True
+
+
+def test_pop_stop_request_transaction_falls_back_from_malformed_state() -> None:
+    runner = h._make_runner()
+    assert isinstance(runner.redis, h._FakeRedis)
+    state_key = pipeline_state(runner.name)
+    stop_key = control_stop(runner.name)
+    runner.state.state = PipelineState.CODING
+    runner.redis.store[state_key] = "not-json"
+    runner.redis.store[stop_key] = "1"
+
+    assert asyncio.run(runner._pop_stop_request()) is True
+
+    written = RepoState.model_validate_json(runner.redis.store[state_key])
+    assert written.user_paused is True
+    assert written.state is PipelineState.CODING
+
+
+def test_pop_stop_request_returns_false_when_transaction_and_get_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+
+    async def boom_transaction(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("transaction down")
+
+    async def boom_get(key: str) -> str | None:
+        raise RuntimeError("redis down")
+
+    monkeypatch.setattr(runner.redis, "transaction", boom_transaction)
+    monkeypatch.setattr(runner.redis, "get", boom_get)
+
+    assert asyncio.run(runner._pop_stop_request()) is False
+
+
+def test_pop_stop_request_returns_false_when_fallback_sees_no_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+
+    async def boom_transaction(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("transaction down")
+
+    monkeypatch.setattr(runner.redis, "transaction", boom_transaction)
+
+    assert asyncio.run(runner._pop_stop_request()) is False
+
+
+def test_pop_stop_request_ignores_fallback_pause_persist_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    runner.redis.store[control_stop(runner.name)] = "1"
+
+    async def boom_transaction(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("transaction down")
+
+    async def boom_set(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("set failed")
+
+    monkeypatch.setattr(runner.redis, "transaction", boom_transaction)
+    monkeypatch.setattr(runner.redis, "set", boom_set)
+
+    assert asyncio.run(runner._pop_stop_request()) is True
+    assert runner.state.user_paused is True

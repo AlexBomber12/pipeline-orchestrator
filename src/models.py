@@ -64,6 +64,7 @@ class QueueTask(BaseModel):
     unresolved_deps: list[str] = Field(default_factory=list)
     branch: str | None = None
     priority: int = 3
+    attempt_id: str | None = None
 
 
 class PRInfo(BaseModel):

@@ -18,7 +18,9 @@ import tempfile
 import uuid
 import zipfile
 import zlib
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse
@@ -37,6 +39,8 @@ from src.queue_parser import (
     TaskHeader,
     parse_task_header,
 )
+from src.rejection_commands import load_rejection
+from src.task_attempts import AttemptChanged, load_attempt
 from src.task_status import get_merged_pr_ids, merged_split_parent_aliases
 from src.utils import repo_slug_from_url
 from src.web.services.upload_validation import (
@@ -193,6 +197,26 @@ def _parse_legacy_existing_task_header(path: Path) -> TaskHeader | None:
         priority=3,
         coder="any",
     )
+
+
+async def _load_upload_attempt(
+    redis_client: Any,
+    repo_name: str,
+    repo_path: str,
+    fname: str,
+    task_id: str,
+) -> Any:
+    attempt = await load_attempt(redis_client, repo_name, task_id)
+    if attempt is not None:
+        return attempt
+    prior_path = Path(repo_path) / "tasks" / fname
+    prior_header = _parse_existing_task_header(prior_path)
+    if prior_header is None or prior_header.pr_id == task_id:
+        return None
+    prior_attempt = await load_attempt(redis_client, repo_name, prior_header.pr_id)
+    if prior_attempt is not None and prior_attempt.task.task_file == f"tasks/{fname}":
+        return prior_attempt
+    return None
 
 
 def _pending_upload_task_ids(raw_manifest: str | bytes | None) -> set[str]:
@@ -402,6 +426,7 @@ async def upload_tasks(
     files: list[UploadFile] = [],
     subject: str = Form(""),
 ) -> HTMLResponse:
+    upload_started_at = datetime.now(timezone.utc)
     cfg = _app.load_config(_app.CONFIG_PATH)
     found = False
     repo_branch = "main"
@@ -687,12 +712,45 @@ async def upload_tasks(
 
     accepted_file_contents: list[tuple[str, bytes]] = []
     accepted_task_hashes: dict[str, str] = {}
+    rejection_tokens: dict[str, str | None] = {}
+    prior_spec_files: dict[str, str | None] = {}
     for fname, content in file_contents:
         if fname not in task_uploads:
             accepted_file_contents.append((fname, content))
             continue
         task_id = parsed_task_ids.get(fname, _task_id_from_filename(fname))
         uploaded_hash = task_spec_content_hash(parsed_task_texts[fname])
+        try:
+            attempt = await _load_upload_attempt(
+                redis_client,
+                name,
+                repo_path,
+                fname,
+                task_id,
+            )
+            token = attempt.rejection if attempt else None
+            if token:
+                rejection = await load_rejection(redis_client, name, token)
+                if rejection and rejection.requested_at > upload_started_at:
+                    raise AttemptChanged("Upload began before Reject; submit the rewritten task again.")
+                if uploaded_hash == attempt.fingerprint and not attempt.completed:
+                    raise AttemptChanged(
+                        "File unchanged. Reject is final; rewrite or remove the unfinished task. "
+                        "Ordinary Retry is unavailable."
+                    )
+            rejection_tokens[task_id] = token
+            prior_path = Path(repo_path) / "tasks" / fname
+            prior_spec_files[task_id] = (
+                task_spec_content_hash(prior_path.read_text(encoding="utf-8")) if prior_path.is_file() else None
+            )
+            # HTTP acceptance stages input bound to the observed decision.
+            # The daemon alone verifies completion/ownership and reserves
+            # admission before it changes any task files or dispatches work.
+        except Exception as exc:
+            message = (str(exc) if isinstance(exc, (AttemptChanged, QueueValidationError))
+                       else "Admission evidence unavailable; try again when it can be verified.")
+            _add_validation_error(errors_by_file, fname, message)
+            continue
         try:
             existing_hash = await get_task_spec_hash(redis_client, name, task_id)
         except Exception:
@@ -818,6 +876,8 @@ async def upload_tasks(
             uploaded_filenames = [fn for fn, _ in file_contents]
             manifest_filenames = list(uploaded_filenames)
             manifest_task_hashes: dict[str, str] = {}
+            manifest_rejection_tokens: dict[str, str | None] = {}
+            manifest_prior_files: dict[str, str | None] = {}
             pending_key = upload_pending(name)
             try:
                 existing_raw = await redis_client.get(pending_key)
@@ -870,6 +930,8 @@ async def upload_tasks(
                                 for task_id, task_hash in existing_task_hashes.items()
                             }
                         )
+                    manifest_rejection_tokens.update(existing.get("rejection_tokens", {}))
+                    manifest_prior_files.update(existing.get("prior_spec_files", {}))
                     old_staging = Path(existing["staging_dir"])
                     for old_fn in existing.get("files", []):
                         if old_fn not in manifest_filenames and (old_staging / old_fn).is_file():
@@ -883,11 +945,16 @@ async def upload_tasks(
                     pass
 
             manifest_task_hashes.update(accepted_task_hashes)
+            manifest_rejection_tokens.update(rejection_tokens)
+            manifest_prior_files.update(prior_spec_files)
             manifest = {
                 "repo": name,
                 "files": manifest_filenames,
                 "staging_dir": str(staging_dir),
                 "task_hashes": manifest_task_hashes,
+                "rejection_tokens": manifest_rejection_tokens,
+                "prior_spec_files": manifest_prior_files,
+                "requested_at": upload_started_at.isoformat(),
                 "commit_subject": _upload_commit_subject(
                     subject,
                     len(uploaded_filenames),

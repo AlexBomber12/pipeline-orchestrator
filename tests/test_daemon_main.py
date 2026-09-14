@@ -1658,6 +1658,23 @@ class _ScriptedPubSub:
         self.closed = True
 
 
+class _ScriptedRedisGet:
+    """Redis ``get`` stub that returns scripted values and errors."""
+
+    def __init__(self, results: list[Any]) -> None:
+        self._results = list(results)
+        self.keys: list[str] = []
+
+    async def get(self, key: str) -> Any:
+        self.keys.append(key)
+        if not self._results:
+            return None
+        item = self._results.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
 async def test_wait_or_wake_falls_back_to_sleep_when_pubsub_none() -> None:
     last_run: dict[str, float] = {"k": 5.0}
     slept = []
@@ -1863,6 +1880,424 @@ async def test_wait_or_wake_no_event_keeps_legacy_sleep_path() -> None:
     assert slept == [3.0]
 
 
+async def test_wait_or_wake_wakes_from_existing_pending_upload() -> None:
+    """A durable pending-upload manifest wakes even without Pub/Sub."""
+    manifest = '{"files": ["PR-001.md"]}'
+    redis = _ScriptedRedisGet([manifest])
+    last_run = {"alpha-key": 100.0}
+    runner = _FakeIdleRunner()
+    fingerprints: dict[str, str] = {}
+
+    healthy = await main_module._wait_or_wake(
+        None,
+        60.0,
+        last_run,
+        {"alpha": "alpha-key"},
+        {"alpha-key": runner},
+        redis_client=redis,
+        pending_upload_wake_fingerprints=fingerprints,
+    )
+
+    assert healthy is True
+    assert last_run["alpha-key"] == 0.0
+    assert runner.idle_streak_resets == 1
+    assert fingerprints == {
+        "alpha": main_module._pending_upload_fingerprint(manifest)
+    }
+    assert redis.keys == [main_module.upload_pending("alpha")]
+
+
+async def test_wait_or_wake_polls_for_pending_upload_during_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A manifest arriving after the wait starts still wakes promptly."""
+    redis = _ScriptedRedisGet(
+        [
+            None,
+            None,
+            '{"files": ["PR-001.md"]}',
+        ]
+    )
+    delays: list[float] = []
+    last_run = {"alpha-key": 100.0}
+    fingerprints: dict[str, str] = {}
+
+    async def fake_timer_delay(seconds: float) -> None:
+        delays.append(seconds)
+        await _REAL_ASYNCIO_SLEEP(0)
+
+    monkeypatch.setattr(main_module, "_timer_delay", fake_timer_delay)
+
+    healthy = await main_module._wait_or_wake(
+        None,
+        60.0,
+        last_run,
+        {"alpha": "alpha-key"},
+        redis_client=redis,
+        pending_upload_wake_fingerprints=fingerprints,
+    )
+
+    assert healthy is True
+    assert last_run["alpha-key"] == 0.0
+    assert "alpha" in fingerprints
+    assert delays == [main_module.PENDING_UPLOAD_WAKE_POLL_SEC]
+    assert redis.keys == [
+        main_module.upload_pending("alpha"),
+        main_module.upload_pending("alpha"),
+        main_module.upload_pending("alpha"),
+    ]
+
+
+async def test_wait_or_wake_seen_pending_upload_keeps_backoff() -> None:
+    """The same manifest value does not wake every daemon wait."""
+    manifest = '{"files": ["PR-001.md"]}'
+    redis = _ScriptedRedisGet([manifest])
+    last_run = {"alpha-key": 100.0}
+    fingerprints = {
+        "alpha": main_module._pending_upload_fingerprint(manifest)
+    }
+    slept: list[float] = []
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        await real_sleep(0)
+
+    with patch.object(main_module.asyncio, "sleep", fake_sleep):
+        healthy = await main_module._wait_or_wake(
+            None,
+            3.0,
+            last_run,
+            {"alpha": "alpha-key"},
+            redis_client=redis,
+            pending_upload_wake_fingerprints=fingerprints,
+        )
+
+    assert healthy is True
+    assert last_run["alpha-key"] == 100.0
+    assert slept == [3.0]
+    assert redis.keys == [main_module.upload_pending("alpha")]
+
+
+async def test_wait_or_wake_skips_pending_upload_wake_when_runner_not_idle() -> None:
+    """Active states retain their normal cadence until IDLE can consume uploads."""
+    redis = _ScriptedRedisGet(['{"files": ["PR-001.md"]}'])
+    last_run = {"alpha-key": 100.0}
+    runner = _FakeIdleRunner(state=PipelineState.WATCH)
+    fingerprints: dict[str, str] = {}
+    slept: list[float] = []
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        await real_sleep(0)
+
+    with patch.object(main_module.asyncio, "sleep", fake_sleep):
+        healthy = await main_module._wait_or_wake(
+            None,
+            3.0,
+            last_run,
+            {"alpha": "alpha-key"},
+            {"alpha-key": runner},
+            redis_client=redis,
+            pending_upload_wake_fingerprints=fingerprints,
+        )
+
+    assert healthy is True
+    assert last_run["alpha-key"] == 100.0
+    assert runner.idle_streak_resets == 0
+    assert fingerprints == {}
+    assert slept == [3.0]
+    assert redis.keys == []
+
+
+async def test_apply_pending_upload_wake_skips_runner_still_paused_in_redis() -> None:
+    """Paused IDLE runners do not consume the one-shot manifest fingerprint."""
+    manifest = '{"files": ["PR-001.md"]}'
+    redis = _ScriptedRedisGet(
+        [
+            manifest,
+            '{"state": "IDLE", "user_paused": true}',
+        ]
+    )
+    last_run = {"alpha-key": 100.0}
+    runner = _FakeIdleRunner(user_paused=True)
+    fingerprints: dict[str, str] = {}
+
+    found = await main_module._apply_pending_upload_wake(
+        redis,
+        last_run,
+        {"alpha": "alpha-key"},
+        {"alpha-key": runner},
+        fingerprints,
+    )
+
+    assert found is False
+    assert last_run["alpha-key"] == 100.0
+    assert runner.idle_streak_resets == 0
+    assert fingerprints == {}
+    assert redis.keys == [
+        main_module.upload_pending("alpha"),
+        main_module.pipeline_state("alpha"),
+    ]
+
+
+async def test_wait_or_wake_rechecks_paused_runner_until_resume_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pending upload wakes once Redis shows a paused runner was resumed."""
+    manifest = '{"files": ["PR-001.md"]}'
+    redis = _ScriptedRedisGet(
+        [
+            manifest,
+            '{"state": "PAUSED", "user_paused": true}',
+            manifest,
+            '{"state": "PAUSED", "user_paused": false}',
+            None,
+        ]
+    )
+    last_run = {"alpha-key": 100.0}
+    runner = _FakeIdleRunner(state=PipelineState.PAUSED, user_paused=True)
+    fingerprints: dict[str, str] = {}
+    delays: list[float] = []
+
+    async def fake_timer_delay(seconds: float) -> None:
+        delays.append(seconds)
+        await _REAL_ASYNCIO_SLEEP(0)
+
+    monkeypatch.setattr(main_module, "_timer_delay", fake_timer_delay)
+
+    healthy = await main_module._wait_or_wake(
+        None,
+        60.0,
+        last_run,
+        {"alpha": "alpha-key"},
+        {"alpha-key": runner},
+        redis_client=redis,
+        pending_upload_wake_fingerprints=fingerprints,
+    )
+
+    assert healthy is True
+    assert last_run["alpha-key"] == 0.0
+    assert runner.idle_streak_resets == 1
+    assert runner.state.user_paused is False
+    assert fingerprints == {}
+    assert delays == []
+    assert redis.keys == [
+        main_module.upload_pending("alpha"),
+        main_module.pipeline_state("alpha"),
+        main_module.upload_pending("alpha"),
+        main_module.pipeline_state("alpha"),
+        main_module.control_stop("alpha"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "raw_state",
+    [
+        42,
+        "{broken",
+        "[]",
+        '{"state": "IDLE", "user_paused": true}',
+        '{"state": "CODING", "user_paused": false}',
+        '{"state": "PAUSED", "user_paused": false, "rate_limited_until": "2026-09-14T13:00:00Z"}',
+        '{"state": "PAUSED", "user_paused": false, "rate_limited_coder_until": {"claude": "2026-09-14T13:00:00Z"}}',
+        '{"state": "PAUSED", "user_paused": false, "active_inhibitors": [null]}',
+        '{"state": "PAUSED", "user_paused": false, "active_inhibitors": [{"inhibitor_type": "auth_unavailable"}]}',
+    ],
+)
+def test_persisted_state_blocks_pending_upload_reconcile(raw_state: Any) -> None:
+    assert (
+        main_module._persisted_state_allows_pending_upload_reconcile(raw_state)
+        is False
+    )
+
+
+def test_persisted_state_blocks_missing_pending_upload_reconcile_state() -> None:
+    assert main_module._persisted_state_allows_pending_upload_reconcile(None) is False
+
+
+def test_persisted_state_allows_cleared_pause_with_stale_pause_inhibitor() -> None:
+    raw_state = (
+        b'{"state": "PAUSED", "user_paused": false, '
+        b'"active_inhibitors": [{"inhibitor_type": "user_pause"}]}'
+    )
+
+    assert main_module._persisted_state_allows_pending_upload_reconcile(raw_state)
+
+
+async def test_pending_upload_reconcile_skips_without_runner_context() -> None:
+    redis = _ScriptedRedisGet([])
+
+    assert (
+        await main_module._runner_should_reconcile_pending_upload(
+            redis, "alpha", "alpha-key", None
+        )
+        is False
+    )
+    assert redis.keys == []
+
+
+async def test_pending_upload_reconcile_skips_active_runner_state() -> None:
+    redis = _ScriptedRedisGet([])
+    runner = _FakeIdleRunner(state=PipelineState.WATCH)
+
+    assert (
+        await main_module._runner_should_reconcile_pending_upload(
+            redis, "alpha", "alpha-key", {"alpha-key": runner}
+        )
+        is False
+    )
+    assert redis.keys == []
+
+
+async def test_pending_upload_reconcile_skips_when_state_read_fails() -> None:
+    redis = _ScriptedRedisGet([RuntimeError("redis down")])
+    runner = _FakeIdleRunner(state=PipelineState.PAUSED)
+
+    assert (
+        await main_module._runner_should_reconcile_pending_upload(
+            redis, "alpha", "alpha-key", {"alpha-key": runner}
+        )
+        is False
+    )
+    assert redis.keys == [main_module.pipeline_state("alpha")]
+
+
+async def test_pending_upload_reconcile_clears_reset_stale_pause() -> None:
+    redis = _ScriptedRedisGet([None, None])
+    runner = _FakeIdleRunner(state=PipelineState.PAUSED, user_paused=True)
+
+    assert (
+        await main_module._runner_should_reconcile_pending_upload(
+            redis, "alpha", "alpha-key", {"alpha-key": runner}
+        )
+        is True
+    )
+    assert runner.state.user_paused is False
+    assert redis.keys == [
+        main_module.pipeline_state("alpha"),
+        main_module.control_stop("alpha"),
+    ]
+
+
+@pytest.mark.parametrize("runner_state", [PipelineState.IDLE, PipelineState.PAUSED])
+async def test_pending_upload_reconcile_clears_persisted_resume_stale_pause(
+    runner_state: PipelineState,
+) -> None:
+    redis = _ScriptedRedisGet(['{"state": "IDLE", "user_paused": false}', None])
+    runner = _FakeIdleRunner(state=runner_state, user_paused=True)
+
+    assert (
+        await main_module._runner_should_reconcile_pending_upload(
+            redis, "alpha", "alpha-key", {"alpha-key": runner}
+        )
+        is True
+    )
+    assert runner.state.user_paused is False
+    assert redis.keys == [
+        main_module.pipeline_state("alpha"),
+        main_module.control_stop("alpha"),
+    ]
+
+
+async def test_pending_upload_reconcile_keeps_reset_pause_when_stop_key_live() -> None:
+    redis = _ScriptedRedisGet([None, "1"])
+    runner = _FakeIdleRunner(state=PipelineState.PAUSED, user_paused=True)
+
+    assert (
+        await main_module._runner_should_reconcile_pending_upload(
+            redis, "alpha", "alpha-key", {"alpha-key": runner}
+        )
+        is False
+    )
+    assert runner.state.user_paused is True
+    assert redis.keys == [
+        main_module.pipeline_state("alpha"),
+        main_module.control_stop("alpha"),
+    ]
+
+
+async def test_pending_upload_reconcile_skips_when_stop_key_live() -> None:
+    redis = _ScriptedRedisGet(
+        [
+            '{"state": "PAUSED", "user_paused": false, '
+            '"active_inhibitors": [{"inhibitor_type": "user_stop"}]}',
+            "1",
+        ]
+    )
+    runner = _FakeIdleRunner(state=PipelineState.PAUSED)
+
+    assert (
+        await main_module._runner_should_reconcile_pending_upload(
+            redis, "alpha", "alpha-key", {"alpha-key": runner}
+        )
+        is False
+    )
+    assert redis.keys == [
+        main_module.pipeline_state("alpha"),
+        main_module.control_stop("alpha"),
+    ]
+
+
+async def test_pending_upload_reconcile_skips_when_stop_key_read_fails() -> None:
+    redis = _ScriptedRedisGet(
+        [
+            '{"state": "PAUSED", "user_paused": false}',
+            RuntimeError("redis down"),
+        ]
+    )
+    runner = _FakeIdleRunner(state=PipelineState.PAUSED)
+
+    assert (
+        await main_module._runner_should_reconcile_pending_upload(
+            redis, "alpha", "alpha-key", {"alpha-key": runner}
+        )
+        is False
+    )
+    assert redis.keys == [
+        main_module.pipeline_state("alpha"),
+        main_module.control_stop("alpha"),
+    ]
+
+
+async def test_wait_or_wake_pending_upload_errors_keep_sleep_path() -> None:
+    """Redis read errors in the durable wake check keep normal backoff."""
+    redis = _ScriptedRedisGet(
+        [
+            RuntimeError("redis down"),
+            RuntimeError("redis down"),
+        ]
+    )
+    last_run = {"alpha-key": 100.0}
+    slept: list[float] = []
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        await real_sleep(0)
+
+    with patch.object(main_module.asyncio, "sleep", fake_sleep):
+        healthy = await main_module._wait_or_wake(
+            None,
+            3.0,
+            last_run,
+            {"alpha": "alpha-key"},
+            redis_client=redis,
+        )
+
+    assert healthy is True
+    assert last_run["alpha-key"] == 100.0
+    assert slept == [3.0]
+    assert redis.keys == [
+        main_module.upload_pending("alpha"),
+        main_module.upload_pending("alpha"),
+    ]
+
+
 async def test_close_pubsub_handles_none_and_errors() -> None:
     await main_module._close_pubsub(None)
 
@@ -1977,11 +2412,12 @@ class _FakeIdleRunner:
         self,
         *,
         state: PipelineState = PipelineState.IDLE,
+        user_paused: bool = False,
         base: int = 60,
         effective: int = 60,
     ) -> None:
         self.repo_config = types.SimpleNamespace(poll_interval_sec=base)
-        self.state = types.SimpleNamespace(state=state)
+        self.state = types.SimpleNamespace(state=state, user_paused=user_paused)
         self.effective_idle_poll_interval = effective
         self.idle_streak_resets = 0
 

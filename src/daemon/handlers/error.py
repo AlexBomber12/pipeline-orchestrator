@@ -20,10 +20,12 @@ from enum import Enum
 from src.branch_context import BranchContext
 from src.cancellation import get_cancellation_cause, safe_delete_cancellation_cause
 from src.daemon import git_ops
+from src.daemon.attempt_prs import attempt_pr_info, discover_attempt_pr
 from src.diagnosis import parse_diagnosis
 from src.models import PipelineState
 from src.retry import retry_transient
 from src.subsource_registry import SuppressionReason
+from src.task_attempts import clear_failed_pr_creation, load_attempt, save_attempt
 
 logger = logging.getLogger(__name__)
 _CLAUDE_CLI_COAUTHOR = "Co-authored-by: Claude CLI <noreply@anthropic.com>"
@@ -134,6 +136,80 @@ def _classify_error(context: str) -> ErrorCategory:
 class ErrorMixin:
     """Ask the selected coder whether to FIX, SKIP, or ESCALATE the error."""
 
+    async def _reconcile_pending_pr_creation(self) -> bool:
+        """Poll an ambiguous creation once per cycle, without another create/coder call."""
+        task = self.state.current_task
+        if task is None or self.state.current_pr is not None:
+            return False
+        try:
+            attempt = await load_attempt(self.redis, self.name, task.pr_id)
+            if attempt is None or not (
+                attempt.pr_creation_pending or attempt.pr_discovery_pending
+            ):
+                return False
+            if await self._attempt_execution_blocked():
+                return True
+            await self._refresh_user_paused_from_redis()
+            if self.state.user_paused or await self._pop_stop_request():
+                self.state.user_paused = True
+                return True
+            if not await self._check_github_api_budget():
+                return True
+            data = await asyncio.to_thread(
+                discover_attempt_pr, self.repo_path, self.owner_repo, self.repo_config.branch, attempt,
+            )
+            if data is None:
+                cause = await get_cancellation_cause(self.redis, self.name, task.pr_id, refresh_ttl=False)
+                payload = cause.payload if cause and isinstance(cause.payload, dict) else {}
+                if (
+                    attempt.pr_creation_pending
+                    and payload.get("subsystem") == "pr_creation_clear"
+                ):
+                    await clear_failed_pr_creation(self.redis, self.name, attempt)
+                    self.log_event("[RECOVERY] Confirmed failed PR creation cleanup after Redis recovered.")
+                    return False
+                if attempt.pr_discovery_pending and not attempt.pr_creation_pending:
+                    self.log_event("[RECOVERY] PR discovery unresolved; waiting for one matching PR.")
+                else:
+                    self.log_event("[RECOVERY] PR creation acknowledgement unresolved; waiting for one matching PR.")
+                return True
+            if await self._attempt_execution_blocked():
+                return True
+            await self._refresh_user_paused_from_redis()
+            if self.state.user_paused or await self._pop_stop_request():
+                self.state.user_paused = True
+                return True
+            candidate = attempt_pr_info(data, self.owner_repo, attempt)
+            # WATCH may race an operator decision while GitHub is queried.
+            # Commit the exact attempt receipt before publishing the handoff.
+            updated = attempt.model_copy(update={
+                "pr_creation_pending": False,
+                "pr_discovery_pending": False,
+                "pr_number": candidate.number,
+                "completed": attempt.completed or bool(data["merged_at"]),
+            })
+            await save_attempt(self.redis, self.name, updated, expected=attempt)
+            task.attempt_id = attempt.attempt_id
+            self.state.current_pr = candidate
+            if data["merged_at"] or data["state"] == "closed":
+                await self._handle_external_pr_resolution(candidate, "MERGED" if data["merged_at"] else "CLOSED")
+                return True
+            self.state.state = PipelineState.WATCH
+            self._rehydrate_last_push_at(candidate)
+            await self._save_current_run_record("coding_complete")
+            self.state.error_message = None
+            if attempt.pr_discovery_pending and not attempt.pr_creation_pending:
+                self.log_event(f"[RECOVERY] Reconciled pending PR discovery #{candidate.number} -> WATCH.")
+            else:
+                self.log_event(f"[RECOVERY] Reconciled daemon-created PR #{candidate.number} -> WATCH.")
+            if not self._should_skip_codex_review_post(candidate.number):
+                self._post_codex_review(candidate.number)
+        except Exception as exc:
+            self.log_event(
+                f"[RECOVERY] PR creation reconciliation deferred ({type(exc).__name__}); retrying next cycle."
+            )
+        return True
+
     async def handle_error(self, error_context: str | None = None) -> None:
         """Ask the selected coder whether to FIX, SKIP, or ESCALATE the error."""
         context = error_context or self.state.error_message or "Unknown error"
@@ -141,6 +217,10 @@ class ErrorMixin:
             "[BRANCH] handle_error: %s",
             BranchContext.from_runner(self).log_summary(),
         )
+        if await self._attempt_execution_blocked():
+            return
+        if await self._reconcile_pending_pr_creation():
+            return
         # The cancellation cause was written by the prior _transition_to_error
         # call. Any IDLE-for-retry path below means the task continues, so
         # the previously recorded cause must be cleared — otherwise a later

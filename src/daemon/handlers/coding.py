@@ -7,6 +7,7 @@ Mixin methods:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import subprocess
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ from src.cancellation import (
 )
 from src.coder_registry import CoderPlugin
 from src.daemon import git_ops
+from src.daemon.attempt_prs import attempt_branch_head, daemon_created_pr_body
 from src.daemon.guardrails import scan_stdout
 from src.daemon.handlers import CoderUnavailable
 from src.daemon.quarantine import apply_quarantine_label_for_violation
@@ -33,6 +35,7 @@ from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.models import PipelineState
 from src.subsource_registry import SuppressionReason
+from src.task_attempts import AttemptChanged, clear_failed_pr_creation, load_attempt, save_attempt
 
 
 def _resolve_task_file_under_repo(repo_path: str, task_file: str) -> Path:
@@ -149,6 +152,8 @@ class CodingMixin:
         3. ``_post_coder_resolution`` — CLI log save, exit classification,
            PR lookup or daemon-side PR creation, run record save.
         """
+        if await self._attempt_execution_blocked():
+            return
         self._stop_requested = False
         current_pr_id = (
             self.state.current_task.pr_id
@@ -229,6 +234,8 @@ class CodingMixin:
                 log_prefix="[CODING]",
             )
             return
+        if not await self._prepare_task_attempt(task_body, file_sha256=hashlib.sha256(task_bytes).hexdigest()):
+            return
         task_hash = task_spec_content_hash(task_body)
         try:
             previous_task_hash = await get_task_spec_hash(
@@ -288,6 +295,8 @@ class CodingMixin:
         except CoderUnavailable:
             return
 
+        if await self._attempt_execution_blocked():
+            return
         self._write_active_pr_runtime_file(pr_id)
         self._write_expected_branch(target_branch)
         # Expected-branch cleanup belongs in a finally so the pre-push
@@ -353,6 +362,7 @@ class CodingMixin:
             **plugin_run_kwargs,
             "timeout": self.app_config.daemon.planned_pr_timeout_sec,
             "on_process_start": self._track_current_coder_process,
+            "attempt_id": self.state.current_task.attempt_id if self.state.current_task else None,
         }
 
     async def _run_coder_with_supervision(
@@ -375,6 +385,8 @@ class CodingMixin:
         breach detected during or shortly after the subprocess (state
         moved to PAUSED, run record saved as ``"rate_limit"``).
         """
+        if await self._attempt_execution_blocked():
+            return None
         breach_dir = self._current_breach_dir
         breach_run_id = self._current_breach_run_id
         breach_flag: dict[str, bool] = {"breached": False}
@@ -400,6 +412,8 @@ class CodingMixin:
         try:
             code, stdout, stderr = await cli_task
         except asyncio.CancelledError:
+            if await self._attempt_execution_blocked():
+                return None
             if self._stop_requested:
                 if current_pr_id is not None:
                     self._user_stopped_task_pr_ids.add(current_pr_id)
@@ -600,6 +614,127 @@ class CodingMixin:
                 f"until the marker is removed."
             )
 
+    async def _record_visible_pr_before_error(self, target_branch: str, source: str) -> None:
+        gh_cache._invalidate_etag_cache(f"repos/{self.owner_repo}/pulls")
+        candidate = None
+        last_exc: Exception | None = None
+        ambiguous = False
+        for attempt_number in range(3):
+            try:
+                prs = gh_prs.get_open_prs(
+                    self.owner_repo,
+                    allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+                )
+            except Exception as exc:
+                last_exc = exc
+            else:
+                last_exc = None
+                matches = [
+                    pr
+                    for pr in prs
+                    if pr.branch == target_branch and not pr.is_cross_repository
+                ]
+                if len(matches) > 1:
+                    ambiguous = True
+                    break
+                if matches:
+                    candidate = matches[0]
+                    break
+            if attempt_number < 2:
+                await asyncio.sleep(5)
+        if candidate is None:
+            if ambiguous:
+                self.log_event(
+                    f"[CODING] {source} PR lookup found multiple matches for {target_branch!r}; "
+                    "ownership record deferred."
+                )
+            if last_exc is not None:
+                self.log_event(
+                    f"[CODING] {source} PR lookup deferred for {target_branch!r}: {last_exc}."
+                )
+        task = self.state.current_task
+        try:
+            if task is None:
+                return
+            attempt = await load_attempt(self.redis, self.name, task.pr_id)
+            if attempt is None or task.attempt_id not in (None, attempt.attempt_id):
+                return
+            async def mark_discovery_pending(reason: str) -> None:
+                if not attempt_branch_head(self.repo_path, target_branch):
+                    return
+                pending = attempt.model_copy(update={"pr_discovery_pending": True})
+                await save_attempt(self.redis, self.name, pending, expected=attempt)
+                task.attempt_id = attempt.attempt_id
+                self.log_event(
+                    f"[CODING] {source} PR discovery unresolved for "
+                    f"{target_branch!r}: {reason}; will retry from ERROR "
+                    "before releasing ownership."
+                )
+
+            if candidate is None:
+                await mark_discovery_pending("no verified matching PR was visible")
+                return
+            expected_head = attempt_branch_head(self.repo_path, target_branch)
+            if not expected_head:
+                return
+            try:
+                data = gh_runner.run_gh(["api", f"repos/{self.owner_repo}/pulls/{candidate.number}"])
+            except Exception as exc:
+                await mark_discovery_pending(f"detail lookup failed: {exc}")
+                return
+            head = data.get("head", {})
+            base = data.get("base", {})
+            if (
+                data.get("number") != candidate.number
+                or data.get("state") != "open"
+                or head.get("ref") != target_branch
+                or head.get("sha") != expected_head
+                or head.get("repo", {}).get("full_name", "").casefold()
+                != self.owner_repo.casefold()
+                or base.get("ref") != self.repo_config.branch
+                or base.get("repo", {}).get("full_name", "").casefold()
+                != self.owner_repo.casefold()
+            ):
+                await mark_discovery_pending("detail verification was inconclusive")
+                return
+            candidate.head_sha = expected_head
+            updated = attempt.model_copy(
+                update={
+                    "pr_number": candidate.number,
+                    "pr_creation_pending": False,
+                    "pr_discovery_pending": False,
+                }
+            )
+            last_save_exc: Exception | None = None
+            for _ in range(2):
+                try:
+                    await save_attempt(self.redis, self.name, updated, expected=attempt)
+                    task.attempt_id = attempt.attempt_id
+                    break
+                except AttemptChanged:
+                    raise
+                except Exception as exc:
+                    last_save_exc = exc
+            else:
+                pending = attempt.model_copy(update={"pr_discovery_pending": True})
+                await save_attempt(self.redis, self.name, pending, expected=attempt)
+                task.attempt_id = attempt.attempt_id
+                self.log_event(
+                    f"[CODING] {source} PR ownership save deferred for "
+                    f"{target_branch!r}: {last_save_exc}; discovery will retry from ERROR."
+                )
+                return
+        except Exception as exc:
+            self.log_event(
+                f"[CODING] {source} PR ownership record deferred for {target_branch!r}: {exc}."
+            )
+            return
+        self.state.current_pr = candidate
+        self._rehydrate_last_push_at(candidate)
+        self.log_event(
+            f"[CODING] Recorded PR #{candidate.number} for {target_branch!r} before {source} ERROR."
+        )
+
     async def _post_coder_resolution(
         self,
         coder_name: str,
@@ -666,6 +801,8 @@ class CodingMixin:
                 )
             if await pause_for_stop_if_requested():
                 return
+            if self.state.current_pr is None:
+                await self._record_visible_pr_before_error(target_branch, "guardrail")
             if self.state.current_pr is not None:
                 pr_number = self.state.current_pr.number
                 self.state.quarantined_prs.add(pr_number)
@@ -713,6 +850,11 @@ class CodingMixin:
                     f"{self.state.rate_limited_until.isoformat()}."
                 )
                 return
+            if self.state.current_pr is None:
+                await self._record_visible_pr_before_error(
+                    target_branch,
+                    f"{coder_name} failure",
+                )
             await self._transition_to_error(
                 stderr.strip() or f"{coder_name} exit {code}",
                 publish=False,
@@ -972,6 +1114,41 @@ class CodingMixin:
         else:
             self._post_codex_review(candidate.number)
 
+    async def _clear_failed_pr_creation_for_definitive_failure(
+        self,
+        attempt,
+        *,
+        target_branch: str,
+        coder_name: str,
+    ) -> bool:
+        last_exc: Exception | None = None
+        for replay in range(2):
+            try:
+                await clear_failed_pr_creation(self.redis, self.name, attempt)
+            except Exception as exc:
+                last_exc = exc
+                continue
+            if replay:
+                self.log_event("[CODING] Confirmed failed PR creation cleanup after replaying its acknowledgement.")
+            return True
+        try:
+            current = await load_attempt(self.redis, self.name, attempt.task.pr_id)
+            if current and current.attempt_id == attempt.attempt_id and not current.pr_creation_pending:
+                self.log_event("[CODING] Confirmed failed PR creation cleanup after Redis acknowledgement loss.")
+                return True
+        except Exception as exc:
+            last_exc = exc
+        name = type(last_exc).__name__ if last_exc else "UnknownError"
+        await self._transition_to_error(
+            f"[{coder_name}] Cannot confirm failed PR creation cleanup for {target_branch!r}: {name}",
+            save_run_record_as=None,
+            cancellation_cause=CancellationCause(
+                category="ERROR",
+                payload={"subsource": "infra_failure", "subsystem": "pr_creation_clear"},
+            ),
+        )
+        return False
+
     async def _daemon_create_pr_for_branch(
         self,
         target_branch: str,
@@ -985,18 +1162,49 @@ class CodingMixin:
         visibility); that case is treated as success so the caller's
         post-create visibility loop can pick up the existing PR rather than
         skipping the task. On any other failure the runner is
-        transitioned to IDLE with the gh error and the run record saved,
-        matching the ESCALATE-style handling the diagnostic uses for cases
-        A and B — a failed creation is not silently retried.
+        parked in ERROR with the gh error. Definitive creation rejections
+        permit ordinary Retry; ambiguous results retain the durable flag
+        so recovery discovers the existing PR before any further creation.
         """
+        if await self._attempt_execution_blocked():
+            return False
         task = self.state.current_task
         # The diagnostic only runs after handle_coding's target_branch guard,
         # so current_task is always populated when we reach this method.
         assert task is not None
         pr_title = f"{task.pr_id}: {task.title}" if task.title else task.pr_id
-        if task.task_file:
+        base_branch = self.repo_config.branch
+        attempt = await load_attempt(self.redis, self.name, task.pr_id)
+        if attempt:
+            if attempt.pr_creation_pending:
+                self.log_event("[CODING] PR creation has an unresolved acknowledgement; reconciling visibility only.")
+                return True
+            updated = attempt.model_copy(update={"pr_creation_pending": True})
+            try:
+                await save_attempt(self.redis, self.name, updated, expected=attempt)
+            except Exception:
+                # EXEC may have committed before its reply was lost. Replay
+                # the exact CAS before issuing any GitHub creation request;
+                # an already-written receipt succeeds without another write.
+                try:
+                    attempt = await save_attempt(self.redis, self.name, updated, expected=attempt)
+                except Exception as exc:
+                    await self._transition_to_error(
+                        f"[{coder_name}] Cannot confirm PR creation intent for "
+                        f"{target_branch!r}: {type(exc).__name__}",
+                        save_run_record_as=None,
+                        cancellation_cause=CancellationCause(
+                            category="ERROR",
+                            payload={"subsource": "infra_failure", "subsystem": "pr_creation_intent"},
+                        ),
+                    )
+                    return False
+                self.log_event("[CODING] Confirmed PR creation intent after replaying its acknowledgement.")
+        if attempt:
+            body = daemon_created_pr_body(attempt)
+        elif task.task_file:
             body = (
-                f"Auto-created by pipeline-orchestrator after coder exit=0 "
+                "Auto-created by pipeline-orchestrator after coder exit=0 "
                 f"with no PR. See `{task.task_file}` for the planned scope."
             )
         else:
@@ -1005,7 +1213,6 @@ class CodingMixin:
                 "with no PR."
             )
 
-        base_branch = self.repo_config.branch
         try:
             gh_runner.run_gh(
                 [
@@ -1023,7 +1230,8 @@ class CodingMixin:
                 repo=self.owner_repo,
             )
         except (RuntimeError, subprocess.SubprocessError, OSError) as exc:
-            if "already exists" in str(exc).lower():
+            error = exc.stderr if isinstance(exc, gh_runner.GhCommandError) else str(exc)
+            if "already exists" in error.lower():
                 self.log_event(
                     f"[CODING] [{coder_name}] gh pr create reports PR "
                     f"already exists for {target_branch!r}; reusing "
@@ -1038,6 +1246,13 @@ class CodingMixin:
                     f"repos/{self.owner_repo}/pulls"
                 )
                 return True
+            if attempt and gh_runner.pr_create_definitely_failed(exc):
+                if not await self._clear_failed_pr_creation_for_definitive_failure(
+                    attempt,
+                    target_branch=target_branch,
+                    coder_name=coder_name,
+                ):
+                    return False
             message = (
                 f"[{coder_name}] Daemon PR creation failed for "
                 f"{target_branch!r}: {exc}"

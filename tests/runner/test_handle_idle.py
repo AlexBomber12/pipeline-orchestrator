@@ -31,6 +31,7 @@ from src.models import (
     TaskStatus,
 )
 from src.queue_parser import QueueValidationError, TaskHeader
+from src.task_attempts import new_attempt, save_attempt
 from src.task_status import MergedState
 
 from tests.runner import _helpers as h
@@ -725,7 +726,11 @@ def test_handle_idle_dag_skips_files_without_headers(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
+    monkeypatch.setattr(
+        idle_module,
+        "_resolve_merged_state",
+        lambda *args, **kwargs: _merged_state(),
+    )
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [],
@@ -2140,6 +2145,57 @@ def test_select_next_task_from_dag_rejects_header_filename_mismatch(
     ]
 
 
+def test_select_next_task_from_dag_selects_admitted_legacy_filename(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        idle_module.IdleMixin,
+        "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    content = (
+        "---\n---\n"
+        "# PR-999: Accepted legacy task\n\n"
+        "Branch: pr-999-accepted-legacy\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+    )
+    (tasks_dir / "PR-001.md").write_text(content, encoding="utf-8")
+
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *args, **kwargs: _merged_state())
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+    attempt = new_attempt(
+        runner.repo_config.url,
+        QueueTask(
+            pr_id="PR-999",
+            title="Accepted legacy task",
+            task_file="tasks/PR-001.md",
+            branch="pr-999-accepted-legacy",
+            status=TaskStatus.TODO,
+        ),
+        content,
+    )
+    asyncio.run(save_attempt(runner.redis, runner.name, attempt, expected=None))
+
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-999"
+    assert task.task_file == "tasks/PR-001.md"
+    assert task.branch == "pr-999-accepted-legacy"
+    assert runner._idle_dag_tasks == [task]
+
+
 def test_init_migrates_legacy_clone_when_origin_matches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3500,50 +3556,59 @@ def test_process_pending_uploads_preserves_upload_on_git_failure(
     tmp_path: Path,
 ) -> None:
     """On transient git failure, Redis key and staging dir must survive for retry."""
+    failed_adds = []
 
     def failing_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
         if cmd[:2] == ["git", "rev-list"]:
             return h._FakeCompletedProcess(args=cmd, stdout="0\n", returncode=0)
         if cmd[:2] == ["git", "add"]:
+            failed_adds.append(cmd)
             raise subprocess.CalledProcessError(1, cmd, stderr="git error")
         return h._FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", failing_run)
+    monkeypatch.setattr("src.task_admission.gh_prs.get_merged_prs", lambda *args, **kwargs: [])
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
 
     staging = tmp_path.parent / "uploads" / runner.name / "abc123"
     staging.mkdir(parents=True)
-    (staging / "PR-001.md").write_text("- PR-001")
+    (staging / "PR-001.md").write_text(
+        "---\nstatus: TODO\n---\n\n"
+        "# PR-001: Upload task\nBranch: fix/pr-001\n"
+        "- Type: bugfix\n- Complexity: low\n- Depends on: none\n"
+    )
 
     manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
     key = f"upload:{runner.name}:pending"
     asyncio.run(runner.redis.set(key, manifest))
 
     result = asyncio.run(runner.process_pending_uploads())
-    assert result is None
+    assert result is None, runner.state.history
     assert asyncio.run(runner.redis.get(key)) == manifest
     assert staging.is_dir()
+    assert failed_adds == [["git", "add", "tasks/PR-001.md"]]
 
 
-def test_process_pending_uploads_cas_delete_skips_newer_manifest(
+def test_process_pending_uploads_cas_delete_keeps_dispatch_after_success(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """After a successful push, a newer manifest must not be deleted."""
-    h._patch_subprocess(monkeypatch)
+    """After a successful push, a newer manifest must not block dispatch."""
+    calls = h._patch_subprocess(monkeypatch)
 
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
 
     staging = tmp_path.parent / "uploads" / runner.name / "old123"
     staging.mkdir(parents=True, exist_ok=True)
-    (staging / "PR-001.md").write_text("- PR-001")
+    # A helper-file upload isolates delivery/CAS from task admission policy.
+    (staging / "AGENTS.md").write_text("# Repository instructions\n")
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir(exist_ok=True)
 
-    old_manifest = json.dumps({"files": ["PR-001.md"], "staging_dir": str(staging)})
+    old_manifest = json.dumps({"files": ["AGENTS.md"], "staging_dir": str(staging)})
     new_manifest = json.dumps({"files": ["PR-099.md"]})
     key = f"upload:{runner.name}:pending"
     asyncio.run(runner.redis.set(key, old_manifest))
@@ -3558,9 +3623,14 @@ def test_process_pending_uploads_cas_delete_skips_newer_manifest(
     runner.redis.eval = inject_new_manifest  # type: ignore[assignment]
 
     result = asyncio.run(runner.process_pending_uploads())
-    assert result is None, "newer upload pending must block dispatch"
+    assert result is True, "completed upload must not defer IDLE dispatch"
     assert asyncio.run(runner.redis.get(key)) == new_manifest
     assert staging.is_dir(), "staging dir must survive when CAS delete skips newer manifest"
+    assert any(cmd[:3] == ["git", "push", "origin"] for cmd in calls)
+    assert any(
+        "completed current upload" in entry["event"]
+        for entry in runner.state.history
+    )
 
 
 def test_process_pending_uploads_routes_root_instruction_files(
@@ -4436,3 +4506,48 @@ def test_agents_scan_method_re_emits_when_drift_changes(
         "PR-088.md" in event and "no_verify_commit" in event
         for event in scan_events
     ), scan_events
+
+
+@pytest.mark.parametrize("single", [False, True])
+async def test_invalid_initial_snapshot_header_reaches_controlled_queue_error(tmp_path, monkeypatch, single):
+    from src.keyspace import pipeline_state
+    from src.models import RepoState
+    from src.task_attempts import load_attempt
+
+    from tests.test_approval_commands import git
+
+    repo = tmp_path / "repo"
+    git(tmp_path, "init", "-b", "main", str(repo))
+    git(repo, "config", "user.name", "Snapshot Test")
+    git(repo, "config", "user.email", "snapshot@example.test")
+    (repo / "tasks").mkdir()
+    path = repo / "tasks/PR-001.md"
+    invalid = (
+        "# PR-001: Invalid structured task\nBranch: fix/pr-001\n"
+        "- Type: invalid-type\n- Complexity: low\n- Depends on: none\n"
+    )
+    path.write_text(invalid)
+    git(repo, "add", "tasks")
+    git(repo, "commit", "-m", "invalid task header")
+    remote = tmp_path / "remote.git"
+    git(tmp_path, "init", "--bare", str(remote))
+    git(repo, "remote", "add", "origin", str(remote))
+    git(repo, "push", "-u", "origin", "main")
+    runner = h._make_runner()
+    runner.repo_path = str(repo)
+    runner._recovered = True
+    runner.repo_config.feature_flags.use_single_error_exit = single
+    runner.state.state = PipelineState.IDLE
+    monkeypatch.setattr(runner, "sync_to_main", lambda: pytest.fail("invalid snapshot must stop before sync"))
+    monkeypatch.setattr(runner, "_get_coder", lambda: pytest.fail("invalid queue must not dispatch a coder"))
+
+    await runner.run_cycle()
+    assert runner.state.state == PipelineState.ERROR
+    assert "Task snapshot failed" in runner.state.error_message
+    assert "tasks/PR-001.md" in runner.state.error_message
+    assert "invalid-type" in runner.state.error_message
+    assert "/tmp/" not in runner.state.error_message
+    assert await load_attempt(runner.redis, runner.name, "PR-001") is None
+    assert path.read_text() == invalid
+    state = RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name)))
+    assert state.state == PipelineState.ERROR and state.error_message == runner.state.error_message

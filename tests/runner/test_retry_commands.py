@@ -31,6 +31,7 @@ from src.retry_commands import (
 )
 from src.subsource_registry import SuppressionReason
 from src.suppression import SuppressionRecord
+from src.task_attempts import load_attempt, new_attempt, save_attempt
 
 from tests.runner import _helpers as h
 
@@ -61,6 +62,7 @@ def _command(
     task_id: str = "PR-42",
     branch: str = "fix/pr-42",
     bound_pr: PRInfo | None = None,
+    attempt_id: str | None = None,
 ):
     return new_retry_command(
         repo_slug="octo__demo",
@@ -76,6 +78,7 @@ def _command(
         bound_pr_number=bound_pr.number if bound_pr else None,
         bound_pr_branch=bound_pr.branch if bound_pr else None,
         bound_pr_head_sha=bound_pr.head_sha if bound_pr else None,
+        attempt_id=attempt_id,
         now=NOW,
     )
 
@@ -724,6 +727,7 @@ async def test_watch_retry_preserves_pr_and_resets_pr_local_counters(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     text = _task_text()
+    attempt_id = "replacement-attempt"
     pr = PRInfo(
         number=42,
         branch="fix/pr-42",
@@ -736,8 +740,16 @@ async def test_watch_retry_preserves_pr_and_resets_pr_local_counters(
     runner, command, _task, _repo = await _prepared_runner(
         tmp_path,
         text=text,
-        command=_command(text, bound_pr=pr),
+        command=_command(text, bound_pr=pr, attempt_id=attempt_id),
     )
+    attempt = new_attempt(
+        runner.repo_config.url,
+        runner.state.current_task,
+        text,
+        attempt_id=attempt_id,
+        previous_rejection="reject-binding",
+    )
+    await save_attempt(runner.redis, runner.name, attempt, expected=None)
     _allow_validation(monkeypatch, runner, text)
     monkeypatch.setattr(runner, "_suppression_record_for_task", _none_record)
     monkeypatch.setattr(retry_module, "derive_active_inhibitors", _async_value([]))
@@ -754,6 +766,14 @@ async def test_watch_retry_preserves_pr_and_resets_pr_local_counters(
     assert runner.state.current_pr.fix_iteration_count == 0
     assert runner.state.current_pr.no_push_fix_count == 0
     assert runner.state.current_pr.watch_retrigger_count == 0
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.attempt_id == attempt_id
+    await runner._save_current_run_record("success_merged")
+    completed = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert completed is not None
+    assert completed.completed
+    assert completed.attempt_id == attempt_id
+    assert completed.pr_number == 42
     stored = await load_retry_command(runner.redis, runner.name, command.command_id)
     assert stored is not None
     assert stored.selected_continuation == "watch"

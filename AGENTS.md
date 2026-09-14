@@ -111,8 +111,11 @@ Fix loop (used in `FIX FEEDBACK` mode)
 <!-- pipeline-orchestrator: managed BEGIN escalate_protocol -->
 When a daemon-detected failure occurs (review timeout, FIX iteration
 cap exceeded, no-push deadlock, etc.), the task transitions to terminal
-ERROR state. The operator addresses the failure via the dashboard
-Retry button or by re-uploading a modified spec. Coders should not
+ERROR state. The operator uses the Retry button for unchanged retryable failures.
+Operator Reject is final: it closes the attempt’s PR; only a changed,
+validated unfinished specification submitted by re-upload or Git edit may
+start a new attempt and new PR.
+Coders should not
 attempt to "recover" from their own escalation — if the task is
 genuinely impossible, emit an `ESCALATE:` marker as the LAST non-empty
 line of stdout. The parser (`parse_escalate_marker` in

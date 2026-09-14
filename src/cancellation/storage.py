@@ -135,17 +135,24 @@ def task_spec_content_hash(task_text: str) -> str:
                 if body_start < len(lines) and not lines[body_start].strip():
                     body_start += 1
                 normalized = lines[:first_content_index] + lines[body_start:]
-    return hashlib.sha256("".join(normalized).encode("utf-8")).hexdigest()
+    normalized_text = "".join(normalized).replace("\r\n", "\n").replace("\r", "\n")
+    return hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
 
 
-def _sort_created_at(cause: CancellationCause) -> datetime:
+def _parse_created_at_utc(value: str) -> datetime | None:
     try:
-        parsed = datetime.fromisoformat(cause.created_at)
+        parsed = datetime.fromisoformat(value)
     except (TypeError, ValueError):
-        return datetime.min.replace(tzinfo=timezone.utc)
+        return None
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def _sort_created_at(cause: CancellationCause) -> datetime:
+    return _parse_created_at_utc(cause.created_at) or datetime.min.replace(
+        tzinfo=timezone.utc
+    )
 
 
 async def record_cancellation_cause(
@@ -160,7 +167,10 @@ async def record_cancellation_cause(
     cause.task_id = task_id
     cause.repo_slug = repo_slug
     serialized = cause.to_redis()
-    score = datetime.fromisoformat(cause.created_at).timestamp()
+    score_at = _parse_created_at_utc(cause.created_at)
+    if score_at is None:
+        raise ValueError(f"Invalid cancellation created_at: {cause.created_at!r}")
+    score = score_at.timestamp()
     pipe = redis_client.pipeline()
     pipe.set(cause_key(repo_slug, task_id), serialized, ex=TTL_SECONDS)
     pipe.zadd(index_key(repo_slug), {task_id: score})
@@ -238,10 +248,10 @@ async def _refresh_forensic_ttl(
     key: str,
 ) -> None:
     await redis_client.expire(key, READ_REFRESH_TTL_SECONDS)
-    try:
-        score = datetime.fromisoformat(cause.created_at).timestamp()
-    except (TypeError, ValueError):
+    score_at = _parse_created_at_utc(cause.created_at)
+    if score_at is None:
         return
+    score = score_at.timestamp()
     idx = index_key(repo_slug)
     await redis_client.zadd(idx, {task_id: score})
     await redis_client.expire(idx, READ_REFRESH_TTL_SECONDS)
