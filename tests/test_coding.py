@@ -415,6 +415,7 @@ def test_daemon_create_pr_without_attempt_keeps_legacy_body(
         "ambiguous",
         "head_mismatch",
         "wrong_base",
+        "detail_error",
         "missing_branch",
         "lookup_error",
         "save_error",
@@ -458,6 +459,8 @@ def test_guardrail_records_visible_pr_number_before_error(
 
     def fake_run_gh(args: list[str], repo: str | None = None, **_kw: Any):
         if args == ["api", f"repos/{runner.owner_repo}/pulls/42"]:
+            if case == "detail_error":
+                raise RuntimeError("detail failed")
             return {
                 "number": 42,
                 "state": "open",
@@ -529,7 +532,18 @@ def test_guardrail_records_visible_pr_number_before_error(
         assert runner.state.current_pr is None
         assert current.pr_number is None
         assert current.pr_discovery_pending is (
-            case in {"lookup_error", "save_error", "empty"}
+            case
+            in {
+                "ambiguous",
+                "detail_error",
+                "empty",
+                "fork_only",
+                "head_mismatch",
+                "lookup_error",
+                "none",
+                "save_error",
+                "wrong_base",
+            }
         )
         assert labels == []
 

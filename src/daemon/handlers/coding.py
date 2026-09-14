@@ -619,7 +619,6 @@ class CodingMixin:
         candidate = None
         last_exc: Exception | None = None
         ambiguous = False
-        saw_any_pr = False
         for attempt_number in range(3):
             try:
                 prs = gh_prs.get_open_prs(
@@ -630,8 +629,6 @@ class CodingMixin:
                 last_exc = exc
             else:
                 last_exc = None
-                if prs:
-                    saw_any_pr = True
                 matches = [
                     pr
                     for pr in prs
@@ -662,23 +659,29 @@ class CodingMixin:
             attempt = await load_attempt(self.redis, self.name, task.pr_id)
             if attempt is None or task.attempt_id not in (None, attempt.attempt_id):
                 return
+            async def mark_discovery_pending(reason: str) -> None:
+                if not attempt_branch_head(self.repo_path, target_branch):
+                    return
+                pending = attempt.model_copy(update={"pr_discovery_pending": True})
+                await save_attempt(self.redis, self.name, pending, expected=attempt)
+                task.attempt_id = attempt.attempt_id
+                self.log_event(
+                    f"[CODING] {source} PR discovery unresolved for "
+                    f"{target_branch!r}: {reason}; will retry from ERROR "
+                    "before releasing ownership."
+                )
+
             if candidate is None:
-                if (last_exc is not None or not saw_any_pr) and attempt_branch_head(
-                    self.repo_path,
-                    target_branch,
-                ):
-                    updated = attempt.model_copy(update={"pr_discovery_pending": True})
-                    await save_attempt(self.redis, self.name, updated, expected=attempt)
-                    task.attempt_id = attempt.attempt_id
-                    self.log_event(
-                        f"[CODING] {source} PR discovery unresolved for {target_branch!r}; "
-                        "will retry from ERROR before releasing ownership."
-                    )
+                await mark_discovery_pending("no verified matching PR was visible")
                 return
             expected_head = attempt_branch_head(self.repo_path, target_branch)
             if not expected_head:
                 return
-            data = gh_runner.run_gh(["api", f"repos/{self.owner_repo}/pulls/{candidate.number}"])
+            try:
+                data = gh_runner.run_gh(["api", f"repos/{self.owner_repo}/pulls/{candidate.number}"])
+            except Exception as exc:
+                await mark_discovery_pending(f"detail lookup failed: {exc}")
+                return
             head = data.get("head", {})
             base = data.get("base", {})
             if (
@@ -692,6 +695,7 @@ class CodingMixin:
                 or base.get("repo", {}).get("full_name", "").casefold()
                 != self.owner_repo.casefold()
             ):
+                await mark_discovery_pending("detail verification was inconclusive")
                 return
             candidate.head_sha = expected_head
             updated = attempt.model_copy(
