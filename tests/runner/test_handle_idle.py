@@ -3535,11 +3535,11 @@ def test_process_pending_uploads_preserves_upload_on_git_failure(
     assert failed_adds == [["git", "add", "tasks/PR-001.md"]]
 
 
-def test_process_pending_uploads_cas_delete_skips_newer_manifest(
+def test_process_pending_uploads_cas_delete_keeps_dispatch_after_success(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """After a successful push, a newer manifest must not be deleted."""
+    """After a successful push, a newer manifest must not block dispatch."""
     calls = h._patch_subprocess(monkeypatch)
 
     runner = h._make_runner()
@@ -3567,10 +3567,14 @@ def test_process_pending_uploads_cas_delete_skips_newer_manifest(
     runner.redis.eval = inject_new_manifest  # type: ignore[assignment]
 
     result = asyncio.run(runner.process_pending_uploads())
-    assert result is None, "newer upload pending must block dispatch"
+    assert result is True, "completed upload must not defer IDLE dispatch"
     assert asyncio.run(runner.redis.get(key)) == new_manifest
     assert staging.is_dir(), "staging dir must survive when CAS delete skips newer manifest"
     assert any(cmd[:3] == ["git", "push", "origin"] for cmd in calls)
+    assert any(
+        "completed current upload" in entry["event"]
+        for entry in runner.state.history
+    )
 
 
 def test_process_pending_uploads_routes_root_instruction_files(

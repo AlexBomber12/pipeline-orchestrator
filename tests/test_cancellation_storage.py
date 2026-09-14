@@ -220,6 +220,17 @@ async def test_record_fills_missing_metadata() -> None:
     datetime.fromisoformat(stored.created_at)
 
 
+async def test_record_rejects_unparseable_created_at() -> None:
+    redis = _FakeRedis()
+    cause = CancellationCause(category="ERROR", created_at="not-a-timestamp")
+
+    with pytest.raises(ValueError, match="Invalid cancellation created_at"):
+        await record_cancellation_cause(redis, "beta", "PR-BAD", cause)
+
+    assert cause_key("beta", "PR-BAD") not in redis.values
+    assert index_key("beta") not in redis.zsets
+
+
 async def test_record_overrides_stale_identifiers_in_payload() -> None:
     redis = _FakeRedis()
     cause = CancellationCause(

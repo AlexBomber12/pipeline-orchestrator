@@ -605,7 +605,7 @@ def test_process_pending_uploads_uses_manifest_commit_subject_and_body(
 
 
 
-def test_process_pending_uploads_returns_none_when_newer_manifest_exists(
+def test_process_pending_uploads_returns_true_when_newer_manifest_exists_after_success(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -620,15 +620,22 @@ def test_process_pending_uploads_returns_none_when_newer_manifest_exists(
 
     monkeypatch.setattr(repo_ops.git_ops, "_git", lambda *args, **kwargs: _FakeCompletedProcess())
     monkeypatch.setattr(repo_ops, "retry_transient", lambda func, operation_name=None: func())
+    newer_manifest = json.dumps({"files": ["PR-002.md"], "staging_dir": str(staging)})
+
+    async def lose_manifest_delete(upload_key, expected, **kwargs):
+        runner.redis.store[upload_key] = newer_manifest
+        return False
+
     monkeypatch.setattr(
         runner,
         "_delete_upload_if_unchanged",
-        lambda upload_key, expected, **kwargs: asyncio.sleep(0, result=False),
+        lose_manifest_delete,
     )
 
-    assert _run(runner.process_pending_uploads()) is None
+    assert _run(runner.process_pending_uploads()) is True
+    assert runner.redis.store[key] == newer_manifest
     assert staging.is_dir()
-    assert any("Newer upload pending" in event for event in runner.events)
+    assert any("leaving newer upload queued" in event for event in runner.events)
 
 
 def test_process_pending_uploads_reports_configured_push_branch(

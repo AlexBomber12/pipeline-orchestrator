@@ -628,11 +628,14 @@ return 0
             shutil.rmtree(str(staging_dir), ignore_errors=True)
             return True
 
+        # The upload has already been committed, pushed, and admitted. A newer
+        # manifest only means the cleanup CAS lost a race; leaving it queued
+        # must not make IDLE skip dispatch from the committed base branch.
         self.log_event(
-            "[INFRA] Newer upload pending; blocking dispatch to process "
-            "it next cycle."
+            "[INFRA] Newer upload pending; completed current upload "
+            "and leaving newer upload queued."
         )
-        return None
+        return True
 
     def _clear_canceled_in_snapshot(self, uploaded_pr_ids: set[str]) -> None:
         """Flip ERROR → TODO in ``state.current_queue`` for re-uploads.

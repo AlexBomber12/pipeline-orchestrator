@@ -151,21 +151,41 @@ async def watch_config_changes(
         )
         return
 
-    target_paths = {_normalize_path(p) for p in existing_paths}
+    path_by_target = {_normalize_path(p): p for p in existing_paths}
+    target_paths = set(path_by_target)
     parent_dirs = sorted({_normalize_path(p.parent) for p in existing_paths})
+    signatures = {target: _safe_signature(path) for target, path in path_by_target.items()}
 
-    async for changes in awatch(*parent_dirs, recursive=False):
-        for change_type, changed_path in changes:
-            if change_type not in (Change.modified, Change.added):
-                continue
-            if _normalize_path(changed_path) not in target_paths:
-                continue
-            logger.info("Inotify config change detected: %s", changed_path)
-            try:
-                on_change_callback()
-            except Exception:
-                logger.exception("Config reload callback raised")
-            break
+    def _signatures_changed() -> bool:
+        changed = False
+        for target, path in path_by_target.items():
+            current = _safe_signature(path)
+            if current is not None and signatures.get(target) != current:
+                changed = True
+            signatures[target] = current
+        return changed
+
+    async for changes in awatch(
+        *parent_dirs,
+        recursive=False,
+        yield_on_timeout=True,
+        rust_timeout=500,
+    ):
+        relevant_paths = [
+            changed_path
+            for change_type, changed_path in changes
+            if change_type in (Change.modified, Change.added)
+            and _normalize_path(changed_path) in target_paths
+        ]
+        content_changed = _signatures_changed()
+        if not relevant_paths and not content_changed:
+            continue
+        changed_path = relevant_paths[0] if relevant_paths else ", ".join(target_paths)
+        logger.info("Inotify config change detected: %s", changed_path)
+        try:
+            on_change_callback()
+        except Exception:
+            logger.exception("Config reload callback raised")
 
 
 async def watch_config_file_changes(
