@@ -219,13 +219,13 @@ class TaskAdmissionMixin:
         for filename in result.stdout.splitlines():
             if not Path(filename).match("tasks/PR-*.md"):
                 continue
-            task_id = Path(filename).stem
-            if await load_attempt(self.redis, self.name, task_id):
-                continue
             content_bytes = git_ops._git_bytes(self.repo_path, "show", f"{base}:{filename}").stdout
             content = content_bytes.decode("utf-8")
             header = _parse_snapshot_header(filename, content)
             if header is None:
+                continue
+            task_id = header.pr_id
+            if await load_attempt(self.redis, self.name, task_id):
                 continue
             fingerprint = task_spec_content_hash(content)
             task = QueueTask(

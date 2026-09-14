@@ -1018,6 +1018,34 @@ async def test_prior_base_snapshot_preserves_legacy_rejection_and_ignores_unstru
     assert (await load_attempt(runner.redis, runner.name, "PR-42")).attempt_id == receipt.attempt_id
 
 
+async def test_prior_base_snapshot_uses_header_pr_id_for_receipt_lookup(rejected):
+    runner, _, repo, *_ = rejected
+    git(repo, "checkout", "main")
+    await runner.redis.delete(attempt_key(runner.name, "PR-42"))
+    original = (repo / "tasks/PR-42.md").read_text()
+    mismatched = original.replace("PR-42:", "PR-999:").replace(
+        "fix/pr-42",
+        "fix/pr-999",
+    )
+    path = repo / "tasks/PR-001.md"
+    (repo / "tasks/PR-42.md").unlink()
+    path.write_text(mismatched)
+    git(repo, "add", "tasks")
+    git(repo, "commit", "-m", "add historical mismatched task filename")
+
+    await runner._snapshot_accepted_specs()
+    receipt = await load_attempt(runner.redis, runner.name, "PR-999")
+
+    assert receipt is not None
+    assert receipt.task.pr_id == "PR-999"
+    assert receipt.task.task_file == "tasks/PR-001.md"
+    assert await load_attempt(runner.redis, runner.name, "PR-001") is None
+    await runner._snapshot_accepted_specs()
+    assert (
+        await load_attempt(runner.redis, runner.name, "PR-999")
+    ).attempt_id == receipt.attempt_id
+
+
 async def test_legacy_rejection_sentinel_admits_changed_spec_without_receipt(rejected, tmp_path):
     from src.cancellation.storage import index_key
 
