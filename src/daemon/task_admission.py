@@ -196,6 +196,44 @@ class TaskAdmissionMixin:
                 return True
         return False
 
+    async def _load_historical_task_file_owner(
+        self,
+        task_file: str,
+        current_task_id: str,
+    ) -> TaskAttempt | None:
+        result = git_ops._git(
+            self.repo_path,
+            "log",
+            "--format=%H",
+            "--",
+            task_file,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        for commit in result.stdout.splitlines():
+            blob = git_ops._git_bytes(
+                self.repo_path,
+                "show",
+                f"{commit}:{task_file}",
+                check=False,
+            )
+            if blob.returncode != 0:
+                continue
+            try:
+                header = _parse_snapshot_header(
+                    task_file,
+                    blob.stdout.decode("utf-8"),
+                )
+            except (QueueValidationError, UnicodeError):
+                continue
+            if header is None or header.pr_id == current_task_id:
+                continue
+            attempt = await load_attempt(self.redis, self.name, header.pr_id)
+            if attempt and attempt.task.task_file == task_file:
+                return attempt
+        return None
+
     async def _snapshot_accepted_specs(self) -> None:
         """Capture prior local-base bytes before synchronization overwrites them.
 
@@ -451,6 +489,19 @@ class TaskAdmissionMixin:
             prior = await load_attempt(self.redis, self.name, task_id)
             fingerprint = task_spec_content_hash(content)
             if prior is None:
+                task_file = path.relative_to(self.repo_path).as_posix()
+                historical_owner = await self._load_historical_task_file_owner(
+                    task_file,
+                    task_id,
+                )
+                if historical_owner is not None:
+                    held.add(task_id)
+                    self.log_event(
+                        f"[RECOVERY] {task_id}: task file already belongs to "
+                        f"{historical_owner.task.pr_id}; reconcile prior "
+                        "attempt before changing task identity."
+                    )
+                    continue
                 if self._has_recorded_rejection_identity(task_id, fingerprint):
                     held.add(task_id)
                     continue

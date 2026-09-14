@@ -1721,6 +1721,122 @@ async def test_git_reconciliation_uses_header_pr_id_for_mismatched_legacy_file(r
     assert calls == [("tasks/PR-001.md", prior.attempt_id)]
 
 
+async def test_git_reconciliation_holds_task_id_change_for_owned_legacy_file(
+    rejected,
+    monkeypatch,
+):
+    runner, _, repo, *_ = rejected
+    git(repo, "checkout", "main")
+    legacy = rewritten(repo).replace("PR-42:", "PR-999:").replace(
+        "fix/pr-42",
+        "fix/pr-999",
+    )
+    path = repo / "tasks/PR-001.md"
+    path.write_text(legacy)
+    git(repo, "add", "tasks/PR-001.md")
+    git(repo, "commit", "-m", "add mismatched legacy task")
+    task = QueueTask(
+        pr_id="PR-999",
+        title="Reusable task",
+        task_file="tasks/PR-001.md",
+        branch="fix/pr-999",
+        status=TaskStatus.TODO,
+    )
+    previous = new_attempt(
+        runner.repo_config.url,
+        task,
+        legacy,
+        rejection="accepted-rejection",
+    )
+    await save_attempt(runner.redis, runner.name, previous, expected=None)
+    changed = legacy.replace("PR-999:", "PR-001:")
+    path.write_text(changed)
+    git(repo, "commit", "-am", "change legacy task identity")
+
+    async def reserve(*_args, **_kwargs):
+        raise AssertionError("identity-changing file must be held")
+
+    monkeypatch.setattr(runner, "_reserve_admission", reserve)
+
+    assert await runner._reconcile_git_admissions() == {"PR-001"}
+    assert await load_attempt(runner.redis, runner.name, "PR-999") == previous
+    assert await load_attempt(runner.redis, runner.name, "PR-001") is None
+    assert any(
+        "task file already belongs to PR-999" in item["event"]
+        for item in runner.state.history
+    )
+
+
+async def test_historical_task_file_owner_ignores_git_log_failure(
+    rejected,
+    monkeypatch,
+):
+    runner, *_ = rejected
+    monkeypatch.setattr(
+        daemon_admission.git_ops,
+        "_git",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 1, "", ""),
+    )
+
+    assert (
+        await runner._load_historical_task_file_owner(
+            "tasks/PR-001.md",
+            "PR-001",
+        )
+        is None
+    )
+
+
+async def test_historical_task_file_owner_ignores_missing_blob(
+    rejected,
+    monkeypatch,
+):
+    runner, *_ = rejected
+    monkeypatch.setattr(
+        daemon_admission.git_ops,
+        "_git",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, "abc123\n", ""),
+    )
+    monkeypatch.setattr(
+        daemon_admission.git_ops,
+        "_git_bytes",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 1, b"", b""),
+    )
+
+    assert (
+        await runner._load_historical_task_file_owner(
+            "tasks/PR-001.md",
+            "PR-001",
+        )
+        is None
+    )
+
+
+async def test_historical_task_file_owner_ignores_undecodable_blob(
+    rejected,
+    monkeypatch,
+):
+    runner, *_ = rejected
+    monkeypatch.setattr(
+        daemon_admission.git_ops,
+        "_git",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, "abc123\n", ""),
+    )
+    monkeypatch.setattr(
+        daemon_admission.git_ops,
+        "_git_bytes",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, b"\xff", b""),
+    )
+
+    assert (
+        await runner._load_historical_task_file_owner(
+            "tasks/PR-001.md",
+            "PR-001",
+        )
+        is None
+    )
+
+
 async def test_legacy_rejection_sentinel_admits_changed_spec_without_receipt(rejected, tmp_path):
     from src.cancellation.storage import index_key
 
