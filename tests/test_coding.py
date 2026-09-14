@@ -405,7 +405,19 @@ def test_daemon_create_pr_without_attempt_keeps_legacy_body(
 
 
 @pytest.mark.parametrize(
-    "case", ["found", "retry_found", "none", "fork_only", "lookup_error", "save_error"]
+    "case",
+    [
+        "found",
+        "retry_found",
+        "none",
+        "fork_only",
+        "ambiguous",
+        "head_mismatch",
+        "wrong_base",
+        "missing_branch",
+        "lookup_error",
+        "save_error",
+    ],
 )
 def test_guardrail_records_visible_pr_number_before_error(
     monkeypatch: pytest.MonkeyPatch, case: str
@@ -420,7 +432,7 @@ def test_guardrail_records_visible_pr_number_before_error(
     )
     runner.state.current_task.attempt_id = attempt.attempt_id
     asyncio.run(save_attempt(runner.redis, runner.name, attempt, expected=None))
-    found = PRInfo(number=42, branch="pr-001", pr_id="PR-001", head_sha="abc")
+    found = PRInfo(number=42, branch="pr-001", pr_id="PR-001", head_sha="abcdef")
     fork = found.model_copy(update={"number": 43, "is_cross_repository": True})
     labels: list[int] = []
     invalidations: list[str] = []
@@ -436,7 +448,26 @@ def test_guardrail_records_visible_pr_number_before_error(
             return [PRInfo(number=44, branch="other")]
         if case == "fork_only":
             return [fork]
+        if case == "ambiguous":
+            return [found, found.model_copy(update={"number": 45})]
         return [fork, found]
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **_kw: Any):
+        if args == ["api", f"repos/{runner.owner_repo}/pulls/42"]:
+            return {
+                "number": 42,
+                "state": "open",
+                "head": {
+                    "ref": "pr-001",
+                    "sha": "bad" if case == "head_mismatch" else "abcdef",
+                    "repo": {"full_name": runner.owner_repo},
+                },
+                "base": {
+                    "ref": "release" if case == "wrong_base" else runner.repo_config.branch,
+                    "repo": {"full_name": runner.owner_repo},
+                },
+            }
+        return ""
 
     async def fail_save(*_args: Any, **_kwargs: Any):
         raise RuntimeError("save failed")
@@ -444,7 +475,13 @@ def test_guardrail_records_visible_pr_number_before_error(
     async def short_sleep(_seconds: float) -> None:
         return None
 
+    _patch_branch_state(
+        monkeypatch,
+        local_exists=False,
+        remote_exists=case != "missing_branch",
+    )
     monkeypatch.setattr("src.github.prs.get_open_prs", fake_open_prs)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     monkeypatch.setattr(coding_module.asyncio, "sleep", short_sleep)
     monkeypatch.setattr(
         coding_module.gh_cache,

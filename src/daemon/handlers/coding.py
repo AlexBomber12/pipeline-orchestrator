@@ -26,7 +26,7 @@ from src.cancellation import (
 )
 from src.coder_registry import CoderPlugin
 from src.daemon import git_ops
-from src.daemon.attempt_prs import daemon_created_pr_body
+from src.daemon.attempt_prs import attempt_branch_head, daemon_created_pr_body
 from src.daemon.guardrails import scan_stdout
 from src.daemon.handlers import CoderUnavailable
 from src.daemon.quarantine import apply_quarantine_label_for_violation
@@ -618,6 +618,7 @@ class CodingMixin:
         gh_cache._invalidate_etag_cache(f"repos/{self.owner_repo}/pulls")
         candidate = None
         last_exc: Exception | None = None
+        ambiguous = False
         for attempt_number in range(3):
             try:
                 prs = gh_prs.get_open_prs(
@@ -628,19 +629,25 @@ class CodingMixin:
                 last_exc = exc
             else:
                 last_exc = None
-                candidate = next(
-                    (
-                        pr
-                        for pr in prs
-                        if pr.branch == target_branch and not pr.is_cross_repository
-                    ),
-                    None,
-                )
-                if candidate is not None:
+                matches = [
+                    pr
+                    for pr in prs
+                    if pr.branch == target_branch and not pr.is_cross_repository
+                ]
+                if len(matches) > 1:
+                    ambiguous = True
+                    break
+                if matches:
+                    candidate = matches[0]
                     break
             if attempt_number < 2:
                 await asyncio.sleep(5)
         if candidate is None:
+            if ambiguous:
+                self.log_event(
+                    f"[CODING] Guardrail PR lookup found multiple matches for {target_branch!r}; "
+                    "ownership record deferred."
+                )
             if last_exc is not None:
                 self.log_event(
                     f"[CODING] Guardrail PR lookup deferred for {target_branch!r}: {last_exc}."
@@ -653,6 +660,25 @@ class CodingMixin:
             attempt = await load_attempt(self.redis, self.name, task.pr_id)
             if attempt is None or task.attempt_id not in (None, attempt.attempt_id):
                 return
+            expected_head = attempt_branch_head(self.repo_path, target_branch)
+            if not expected_head:
+                return
+            data = gh_runner.run_gh(["api", f"repos/{self.owner_repo}/pulls/{candidate.number}"])
+            head = data.get("head", {})
+            base = data.get("base", {})
+            if (
+                data.get("number") != candidate.number
+                or data.get("state") != "open"
+                or head.get("ref") != target_branch
+                or head.get("sha") != expected_head
+                or head.get("repo", {}).get("full_name", "").casefold()
+                != self.owner_repo.casefold()
+                or base.get("ref") != self.repo_config.branch
+                or base.get("repo", {}).get("full_name", "").casefold()
+                != self.owner_repo.casefold()
+            ):
+                return
+            candidate.head_sha = expected_head
             updated = attempt.model_copy(
                 update={"pr_number": candidate.number, "pr_creation_pending": False}
             )
