@@ -1643,6 +1643,11 @@ async def test_guardrail_before_pr_tracking_resolves_current_pr_and_ignores_hist
     fork = raw_attempt_pr(current_pr.model_copy(update={"number": 88}))
     fork["head"]["repo"]["full_name"] = "outsider/demo"
     github["attempt_prs"] = [old, fork, raw_attempt_pr(current_pr, body=daemon_created_pr_body(attempt))]
+
+    async def short_sleep(_delay):
+        return None
+
+    monkeypatch.setattr("src.daemon.handlers.coding.asyncio.sleep", short_sleep)
     # This is coder output, not an executed command. The real scanner parks
     # before the normal PR lookup, recreating the reported tracking gap.
     await runner._post_coder_resolution(

@@ -615,16 +615,36 @@ class CodingMixin:
             )
 
     async def _record_visible_guardrail_pr(self, target_branch: str) -> None:
-        try:
-            prs = gh_prs.get_open_prs(
-                self.owner_repo,
-                allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
-            )
-        except Exception as exc:
-            self.log_event(f"[CODING] Guardrail PR lookup deferred for {target_branch!r}: {exc}.")
-            return
-        candidate = next((pr for pr in prs if pr.branch == target_branch), None)
+        gh_cache._invalidate_etag_cache(f"repos/{self.owner_repo}/pulls")
+        candidate = None
+        last_exc: Exception | None = None
+        for attempt_number in range(3):
+            try:
+                prs = gh_prs.get_open_prs(
+                    self.owner_repo,
+                    allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+                )
+            except Exception as exc:
+                last_exc = exc
+            else:
+                last_exc = None
+                candidate = next(
+                    (
+                        pr
+                        for pr in prs
+                        if pr.branch == target_branch and not pr.is_cross_repository
+                    ),
+                    None,
+                )
+                if candidate is not None:
+                    break
+            if attempt_number < 2:
+                await asyncio.sleep(5)
         if candidate is None:
+            if last_exc is not None:
+                self.log_event(
+                    f"[CODING] Guardrail PR lookup deferred for {target_branch!r}: {last_exc}."
+                )
             return
         task = self.state.current_task
         try:

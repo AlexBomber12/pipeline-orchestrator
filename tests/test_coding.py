@@ -404,7 +404,9 @@ def test_daemon_create_pr_without_attempt_keeps_legacy_body(
     assert "Pipeline-Attempt-ID" not in body
 
 
-@pytest.mark.parametrize("case", ["found", "none", "lookup_error", "save_error"])
+@pytest.mark.parametrize(
+    "case", ["found", "retry_found", "none", "fork_only", "lookup_error", "save_error"]
+)
 def test_guardrail_records_visible_pr_number_before_error(
     monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
@@ -419,19 +421,36 @@ def test_guardrail_records_visible_pr_number_before_error(
     runner.state.current_task.attempt_id = attempt.attempt_id
     asyncio.run(save_attempt(runner.redis, runner.name, attempt, expected=None))
     found = PRInfo(number=42, branch="pr-001", pr_id="PR-001", head_sha="abc")
+    fork = found.model_copy(update={"number": 43, "is_cross_repository": True})
     labels: list[int] = []
+    invalidations: list[str] = []
+    calls = {"count": 0}
 
     def fake_open_prs(repo: str, **kw: Any) -> list[PRInfo]:
+        calls["count"] += 1
         if case == "lookup_error":
             raise RuntimeError("list failed")
+        if case == "retry_found" and calls["count"] == 1:
+            return []
         if case == "none":
-            return [PRInfo(number=43, branch="other")]
-        return [found]
+            return [PRInfo(number=44, branch="other")]
+        if case == "fork_only":
+            return [fork]
+        return [fork, found]
 
     async def fail_save(*_args: Any, **_kwargs: Any):
         raise RuntimeError("save failed")
 
+    async def short_sleep(_seconds: float) -> None:
+        return None
+
     monkeypatch.setattr("src.github.prs.get_open_prs", fake_open_prs)
+    monkeypatch.setattr(coding_module.asyncio, "sleep", short_sleep)
+    monkeypatch.setattr(
+        coding_module.gh_cache,
+        "_invalidate_etag_cache",
+        lambda key: invalidations.append(key),
+    )
     if case == "save_error":
         monkeypatch.setattr(coding_module, "save_attempt", fail_save)
     monkeypatch.setattr(
@@ -452,8 +471,9 @@ def test_guardrail_records_visible_pr_number_before_error(
     )
 
     current = asyncio.run(load_attempt(runner.redis, runner.name, "PR-001"))
+    assert invalidations == [f"repos/{runner.owner_repo}/pulls"]
     assert runner.state.state == PipelineState.ERROR
-    if case == "found":
+    if case in {"found", "retry_found"}:
         assert runner.state.current_pr == found
         assert current.pr_number == 42
         assert labels == [42]
