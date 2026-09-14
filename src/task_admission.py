@@ -402,10 +402,16 @@ async def admission_candidate(
             PipelineState.MERGE,
             PipelineState.ERROR,
         }
+        active_matches_task = active.pr_id == header.pr_id
+        if previous is not None:
+            active_matches_task = active_matches_task or (
+                active.pr_id == previous.task.pr_id
+                or (active.attempt_id is not None and active.attempt_id == previous.attempt_id)
+            )
         idle_current_task_owner = state.state == PipelineState.IDLE and (
             previous is None or not previous.completed
         )
-        if active.pr_id == header.pr_id and (
+        if active_matches_task and (
             state.current_pr is not None
             or state.state in active_states
             or idle_current_task_owner

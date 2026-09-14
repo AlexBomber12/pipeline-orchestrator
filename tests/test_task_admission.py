@@ -230,6 +230,49 @@ async def test_upload_renamed_legacy_file_loads_old_rejection_receipt(rejected):
     assert legacy_path.read_text() == uploaded
 
 
+async def test_upload_renamed_legacy_file_respects_idle_active_old_owner(rejected):
+    runner, _, repo, *_ = rejected
+    git(repo, "checkout", "main")
+    old_text = rewritten(repo).replace("PR-42:", "PR-999:").replace(
+        "fix/pr-42",
+        "fix/pr-999",
+    )
+    legacy_path = repo / "tasks/PR-001.md"
+    legacy_path.write_text(old_text)
+    git(repo, "add", "tasks/PR-001.md")
+    git(repo, "commit", "-m", "add active legacy renamed task")
+    git(repo, "push", "origin", "main")
+    task = QueueTask(
+        pr_id="PR-999",
+        title="Reusable task",
+        task_file="tasks/PR-001.md",
+        branch="fix/pr-999",
+        status=TaskStatus.TODO,
+    )
+    previous = new_attempt(
+        runner.repo_config.url,
+        task,
+        old_text,
+        started=True,
+        coder_dispatched=True,
+    )
+    await save_attempt(runner.redis, runner.name, previous, expected=None)
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_task = previous.task.model_copy(update={"attempt_id": previous.attempt_id})
+    runner.state.current_pr = None
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    uploaded = old_text.replace("PR-999:", "PR-001:") + "\nCanonical rewrite.\n"
+
+    response = await stage_files(rejected, [("PR-001.md", uploaded)])
+
+    assert response.status_code == 200, response.text
+    assert await runner.process_pending_uploads() is False
+    assert await load_attempt(runner.redis, runner.name, "PR-999") == previous
+    assert await load_attempt(runner.redis, runner.name, "PR-001") is None
+    assert legacy_path.read_text() == old_text
+    assert await runner.redis.get(upload_pending(runner.name)) is None
+
+
 async def test_snapshot_recovery_preserves_upload_renamed_rejection_by_task_file(rejected):
     runner, _, repo, remote, *_ = rejected
     git(repo, "checkout", "main")
