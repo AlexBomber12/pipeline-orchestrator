@@ -125,14 +125,18 @@ class TaskAdmissionMixin:
         key = attempt_key(self.name, attempt.task.pr_id)
         task_id = attempt.task.pr_id
         path = Path(self.repo_path) / attempt.task.task_file
-        if task_spec_content_hash(path.read_text(encoding="utf-8")) != attempt.fingerprint:
+        if task_spec_content_hash(path.read_bytes().decode("utf-8")) != attempt.fingerprint:
             raise AttemptChanged("Accepted specification is not present in the checkout.")
         header = parse_existing_task_header(path)
         if header.frontmatter_status == "error":
             if not await self._commit_task_status_change(attempt.task, "TODO", "accept rewritten unfinished task"):
                 raise AttemptChanged("Rewritten specification is pending its TODO status commit.")
-        origin = git_ops._git(self.repo_path, "show", f"origin/{self.repo_config.branch}:{attempt.task.task_file}")
-        if task_spec_content_hash(origin.stdout) != attempt.fingerprint:
+        origin = git_ops._git_bytes(
+            self.repo_path,
+            "show",
+            f"origin/{self.repo_config.branch}:{attempt.task.task_file}",
+        )
+        if task_spec_content_hash(origin.stdout.decode("utf-8")) != attempt.fingerprint:
             raise AttemptChanged("Accepted specification is not confirmed on the configured base.")
 
         async def transaction(pipe):

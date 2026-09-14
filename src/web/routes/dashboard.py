@@ -481,8 +481,8 @@ async def _build_guardrail_pending_view(
         for view in views:
             view["approval_unavailable"] = True
     try:
-        rejections = await list_rejections(redis_client, repo_name)
-        for command in rejections[-20:]:
+        rejections = await list_rejections(redis_client, repo_name, limit=20)
+        for command in rejections:
             current = await load_attempt(redis_client, repo_name, command.task.pr_id)
             views.append({
                 "pr_id": command.task.pr_id, "rule": "Operator rejection", "excerpt": command.reason,

@@ -135,7 +135,8 @@ def task_spec_content_hash(task_text: str) -> str:
                 if body_start < len(lines) and not lines[body_start].strip():
                     body_start += 1
                 normalized = lines[:first_content_index] + lines[body_start:]
-    return hashlib.sha256("".join(normalized).encode("utf-8")).hexdigest()
+    normalized_text = "".join(normalized).replace("\r\n", "\n").replace("\r", "\n")
+    return hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
 
 
 def _sort_created_at(cause: CancellationCause) -> datetime:

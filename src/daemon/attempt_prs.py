@@ -31,14 +31,18 @@ def _belongs_to_attempt(data: dict, owner_repo: str, base: str, attempt: TaskAtt
         return False
     if attempt.pr_number is not None and data.get("number") != attempt.pr_number:
         return False
+    if attempt.pr_number is None:
+        # GitHub branch names can be reused. Historical PRs from an earlier
+        # accepted attempt may target a different base and must be discarded
+        # before current-attempt safety checks validate the PR target.
+        created = datetime.fromisoformat(data["created_at"])
+        if created < attempt.accepted_at.replace(microsecond=0):
+            return False
     if target.get("repo", {}).get("full_name", "").casefold() != owner_repo.casefold() or target.get("ref") != base:
         raise AttemptChanged("Attempt PR targets an unexpected repository or base.")
     if attempt.pr_number is not None:
         return True
-    # GitHub timestamps have second precision. Previous closed PRs on a reused
-    # branch predate this accepted attempt and are historical, not ambiguity.
-    created = datetime.fromisoformat(data["created_at"])
-    return created >= attempt.accepted_at.replace(microsecond=0)
+    return True
 
 
 def discover_attempt_pr(

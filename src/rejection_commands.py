@@ -122,8 +122,16 @@ async def load_rejection(redis: Any, repo: str, binding: str) -> RejectionComman
     return RejectionCommand.model_validate_json(raw) if raw else None
 
 
-async def list_rejections(redis: Any, repo: str) -> list[RejectionCommand]:
-    bindings = await redis.zrangebyscore(rejection_index(repo), "-inf", "+inf")
+async def list_rejections(redis: Any, repo: str, *, limit: int | None = None) -> list[RejectionCommand]:
+    index = rejection_index(repo)
+    if limit is not None and limit <= 0:
+        return []
+    if limit is None:
+        bindings = await redis.zrangebyscore(index, "-inf", "+inf")
+    elif zrevrange := getattr(redis, "zrevrange", None):
+        bindings = list(reversed(await zrevrange(index, 0, limit - 1)))
+    else:
+        bindings = (await redis.zrangebyscore(index, "-inf", "+inf"))[-limit:]
     result = []
     for binding in bindings:
         binding = binding.decode() if isinstance(binding, bytes) else binding

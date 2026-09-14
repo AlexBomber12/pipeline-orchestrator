@@ -778,6 +778,25 @@ async def test_partial_admission_is_not_runnable_until_git_and_receipt_agree(rej
         assert (await load_attempt(runner.redis, runner.name, "PR-42")).admission_pending
 
 
+async def test_crlf_admission_finishes_with_matching_git_bytes(rejected, tmp_path):
+    await finish_reject(rejected)
+    runner, command, repo, *_ = rejected
+    incoming = tmp_path / "PR-42.md"
+    content = rewritten(repo).replace("\n", "\r\n").encode()
+    incoming.write_bytes(content)
+    pending = await runner._reserve_admission(incoming, token=command.binding, upload=True)
+    assert pending is not None
+    (repo / "tasks/PR-42.md").write_bytes(content)
+    git(repo, "commit", "-am", "accept crlf spec")
+    git(repo, "push", "origin", "main")
+
+    await runner._finish_admission(pending)
+
+    current = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert current.attempt_id == pending.attempt_id
+    assert not current.admission_pending
+
+
 @pytest.mark.parametrize("case", ["pending", "rejected", "completed", "legacy_reject"])
 async def test_recovery_fences_attempts_even_with_todo_frontmatter(rejected, case):
     runner, _, repo, *_ = rejected

@@ -8,7 +8,7 @@ Redis by tests-manual/rejection/verify_redis.py.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import httpx
@@ -25,6 +25,7 @@ from src.rejection_commands import (
     list_pending_rejections,
     list_rejections,
     load_rejection,
+    rejection_index,
     rejection_key,
     rejection_pending_backfill_key,
     rejection_pending_index,
@@ -314,6 +315,37 @@ async def test_historical_rejection_index_missing_receipt_fails_closed(rejected)
 
     with pytest.raises(AttemptChanged, match="missing"):
         await list_rejections(runner.redis, runner.name)
+
+
+async def test_recent_rejection_history_reads_only_bounded_index_window(rejected):
+    runner, command, *_ = rejected
+    bindings = []
+    for index in range(25):
+        binding = f"{index:064x}"
+        stored = command.model_copy(
+            update={
+                "binding": binding,
+                "requested_at": command.requested_at + timedelta(seconds=index),
+            }
+        )
+        bindings.append(binding)
+        await runner.redis.set(rejection_key(runner.name, binding), stored.model_dump_json())
+        await runner.redis.zadd(rejection_index(runner.name), {binding: stored.requested_at.timestamp()})
+
+    calls = []
+
+    async def zrevrange(key, start, stop):
+        calls.append((key, start, stop))
+        ordered = sorted(runner.redis.zsets[key].items(), key=lambda item: item[1], reverse=True)
+        return [member for member, _ in ordered][start : stop + 1]
+
+    runner.redis.zrevrange = zrevrange
+
+    assert await list_rejections(runner.redis, runner.name, limit=0) == []
+    recent = await list_rejections(runner.redis, runner.name, limit=20)
+
+    assert calls == [(rejection_index(runner.name), 0, 19)]
+    assert [command.binding for command in recent] == bindings[-20:]
 
 
 @pytest.mark.parametrize("single", [False, True])
@@ -1194,13 +1226,13 @@ async def test_pending_creation_reconciles_terminal_pr_and_releases_ownership(re
         "known_other_number",
         "known_number",
         "known_number_ignores_wrong_base_history",
+        "old_wrong_base_with_new_match",
         "fork_and_owned",
         "missing_branch",
     ],
 )
 async def test_pr_discovery_requires_attempt_repository_base_time_and_head(rejected, monkeypatch, case):
     from copy import deepcopy
-    from datetime import timedelta
 
     from src.daemon.attempt_prs import discover_attempt_pr
     from src.task_attempts import new_attempt
@@ -1244,6 +1276,13 @@ async def test_pr_discovery_requires_attempt_repository_base_time_and_head(rejec
         historical["base"]["ref"] = "release"
         historical["state"] = "closed"
         rows = [historical, row]
+    elif case == "old_wrong_base_with_new_match":
+        historical = deepcopy(row)
+        historical["number"] = 41
+        historical["created_at"] = (attempt.accepted_at - timedelta(days=1)).isoformat()
+        historical["base"]["ref"] = "release"
+        historical["state"] = "closed"
+        rows = [historical, row]
     elif case == "fork_and_owned":
         fork = deepcopy(row)
         fork["number"] = 88
@@ -1266,7 +1305,12 @@ async def test_pr_discovery_requires_attempt_repository_base_time_and_head(rejec
     monkeypatch.setattr(daemon_reject.gh_runner, "run_gh", transport)
     if case in {"fork_only", "old_only", "other_branch", "known_other_number"}:
         assert discover_attempt_pr(str(repo), runner.owner_repo, "main", attempt) is None
-    elif case in {"known_number", "known_number_ignores_wrong_base_history", "fork_and_owned"}:
+    elif case in {
+        "known_number",
+        "known_number_ignores_wrong_base_history",
+        "old_wrong_base_with_new_match",
+        "fork_and_owned",
+    }:
         assert discover_attempt_pr(str(repo), runner.owner_repo, "main", attempt)["number"] == 42
     else:
         with pytest.raises(AttemptChanged):
