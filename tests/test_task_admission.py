@@ -1629,6 +1629,23 @@ async def test_git_input_already_present_at_rejection_does_not_become_new_attemp
     assert (await load_attempt(runner.redis, runner.name, "PR-42")).rejection == command.binding
 
 
+async def test_git_input_without_receipt_checks_rejection_history(rejected):
+    await finish_reject(rejected)
+    runner, command, repo, *_ = rejected
+    path = repo / "tasks/PR-42.md"
+    rejected_text = without_blocked_reason(
+        path.read_text().replace("status: ERROR", "status: TODO")
+    )
+    path.write_text(rejected_text)
+    git(repo, "commit", "-am", "reintroduce rejected task bytes")
+    await runner.redis.delete(attempt_key(runner.name, "PR-42"))
+    await runner.redis.delete(cause_key(runner.name, "PR-42"))
+    await runner.redis.delete(rejection_key(runner.name, command.binding))
+
+    assert await runner._reconcile_git_admissions() == {"PR-42"}
+    assert await load_attempt(runner.redis, runner.name, "PR-42") is None
+
+
 @pytest.mark.parametrize("single", [False, True])
 @pytest.mark.parametrize("fetch_failure", [False, True])
 async def test_reject_fetches_base_before_anchoring_later_git_rewrites(

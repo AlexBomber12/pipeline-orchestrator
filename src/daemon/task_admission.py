@@ -383,6 +383,10 @@ class TaskAdmissionMixin:
         for path in sorted((Path(self.repo_path) / "tasks").glob("PR-*.md")):
             prior = await load_attempt(self.redis, self.name, path.stem)
             if prior is None:
+                fingerprint = task_spec_content_hash(path.read_text(encoding="utf-8"))
+                if self._has_recorded_rejection_identity(path.stem, fingerprint):
+                    held.add(path.stem)
+                    continue
                 raw = await self.redis.get(cause_key(self.name, path.stem))
                 if raw and CancellationCause.from_redis(raw).payload.get("subsource") == "operator_reject":
                     held.add(path.stem)
