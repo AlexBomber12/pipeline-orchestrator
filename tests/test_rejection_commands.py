@@ -8,6 +8,7 @@ Redis by tests-manual/rejection/verify_redis.py.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
@@ -26,6 +27,7 @@ from src.rejection_commands import (
     list_pending_rejections,
     list_rejections,
     load_rejection,
+    redacted_rejection_failure_identity,
     rejection_index,
     rejection_key,
     rejection_pending_backfill_key,
@@ -37,6 +39,43 @@ from src.web.routes import repo_control, uploads
 
 from tests.runner import _helpers as h
 from tests.test_approval_commands import git, isolated_daemon_process_view  # noqa: F401
+
+
+def test_redacted_rejection_failure_identity_omits_guardrail_excerpt() -> None:
+    raw = CancellationCause(
+        category="ERROR",
+        payload={
+            "subsource": "guardrail",
+            "rule": "forbidden_action",
+            "excerpt": "gh repo create https://ghp_secret@example.test/octo/demo",
+        },
+    ).to_redis()
+
+    redacted = redacted_rejection_failure_identity(raw)
+    summary = json.loads(redacted)
+
+    assert summary == {
+        "category": "ERROR",
+        "failure_sha256": hashlib.sha256(raw.encode()).hexdigest(),
+        "subsource": "guardrail",
+    }
+    assert "ghp_secret" not in redacted
+    assert "gh repo create" not in redacted
+
+
+def test_redacted_rejection_failure_identity_handles_absent_and_malformed_inputs() -> None:
+    invalid = b"not json ghp_secret"
+    non_object = "[\"ghp_secret\"]"
+
+    assert redacted_rejection_failure_identity(None) == ""
+    assert json.loads(redacted_rejection_failure_identity(invalid)) == {
+        "failure_sha256": hashlib.sha256(invalid).hexdigest()
+    }
+    assert json.loads(redacted_rejection_failure_identity(non_object)) == {
+        "failure_sha256": hashlib.sha256(non_object.encode()).hexdigest()
+    }
+    assert "ghp_secret" not in redacted_rejection_failure_identity(invalid)
+    assert "ghp_secret" not in redacted_rejection_failure_identity(non_object)
 
 
 def test_recorded_rejection_identity_skips_bad_entries_and_binding_mismatches(tmp_path):
@@ -205,6 +244,13 @@ async def post_reject(fixture, *, alternate=False, binding=None):
     )
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         return await client.post(route, data={"decision": "reject", "binding": binding or command.binding})
+
+
+async def test_attempt_execution_blocked_returns_false_without_current_task():
+    runner = h._make_runner()
+    runner.state.current_task = None
+
+    assert await runner._attempt_execution_blocked() is False
 
 
 async def test_run_cycle_restores_missing_checkout_before_rejection(rejected, monkeypatch):
@@ -523,6 +569,38 @@ async def test_concurrent_rewrite_rejection_manifest_fences_restored_rejected_by
     await runner._snapshot_accepted_specs()
     recovered = await load_attempt(runner.redis, runner.name, "PR-42")
     assert recovered.rejection == command.binding
+
+
+async def test_rejection_identity_manifest_redacts_guardrail_failure(rejected):
+    runner, _, repo, remote, github, app = rejected
+    secret = "ghp_secret123456789"
+    raw_cause = CancellationCause(
+        category="ERROR",
+        task_id="PR-42",
+        repo_slug=runner.name,
+        payload={
+            "subsource": "guardrail",
+            "reason_text": f"GUARDRAIL: repo_creation: gh repo create https://{secret}@example.test/octo/demo",
+        },
+        created_at=datetime.now(timezone.utc).isoformat(),
+    ).to_redis()
+    await runner.redis.set(cause_key(runner.name, "PR-42"), raw_cause)
+    command = build_rejection(runner.name, runner.state, raw_cause, repo)
+
+    assert (await post_reject((runner, command, repo, remote, github, app))).status_code == 202
+    await runner._run_cycle_body()
+
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    assert secret in stored.failure
+    manifest_text = git(repo, "show", "origin/main:tasks/rejections.json")
+    assert secret not in manifest_text
+    assert "gh repo create" not in manifest_text
+    entry = json.loads(manifest_text)["rejections"]["PR-42"][0]
+    assert json.loads(entry["failure"]) == {
+        "category": "ERROR",
+        "failure_sha256": hashlib.sha256(command.failure.encode()).hexdigest(),
+        "subsource": "guardrail",
+    }
 
 
 @pytest.mark.parametrize(

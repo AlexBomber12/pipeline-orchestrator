@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from src.approval_commands import approval_task_path, failure_identity
 from src.cancellation.storage import (
+    CATEGORIES,
     READ_REFRESH_TTL_SECONDS,
     TTL_SECONDS,
     CancellationCause,
@@ -27,6 +28,7 @@ from src.task_attempts import AttemptChanged, TaskAttempt, attempt_key, new_atte
 
 REJECTION_IDENTITY_MANIFEST = "tasks/rejections.json"
 LEGACY_REJECTION_SENTINEL = "legacy-missing-identity"
+_SAFE_FAILURE_LABEL = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 
 
 class RejectionIdentityManifestUnavailable(AttemptChanged):
@@ -73,6 +75,38 @@ def recorded_rejection_identity(
             continue
         return entry
     return None
+
+
+def _safe_failure_label(value: Any) -> str:
+    return value if isinstance(value, str) and _SAFE_FAILURE_LABEL.fullmatch(value) else ""
+
+
+def redacted_rejection_failure_identity(raw: str | bytes | None) -> str:
+    """Return a Git-safe failure identity without guardrail stdout excerpts."""
+    if raw is None:
+        return ""
+    if isinstance(raw, bytes):
+        raw_bytes = raw
+        raw_text = raw.decode("utf-8", errors="replace")
+    else:
+        raw_text = str(raw)
+        raw_bytes = raw_text.encode("utf-8", errors="surrogatepass")
+    summary = {"failure_sha256": hashlib.sha256(raw_bytes).hexdigest()}
+    try:
+        parsed = json.loads(raw_text)
+    except (TypeError, ValueError):
+        return json.dumps(summary, sort_keys=True, separators=(",", ":"))
+    if not isinstance(parsed, dict):
+        return json.dumps(summary, sort_keys=True, separators=(",", ":"))
+    category = _safe_failure_label(parsed.get("category"))
+    if category in CATEGORIES:
+        summary["category"] = category
+    payload = parsed.get("payload")
+    if isinstance(payload, dict):
+        subsource = _safe_failure_label(payload.get("subsource"))
+        if subsource:
+            summary["subsource"] = subsource
+    return json.dumps(summary, sort_keys=True, separators=(",", ":"))
 
 
 class RejectionCommand(BaseModel):

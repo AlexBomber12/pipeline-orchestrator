@@ -20,6 +20,7 @@ from src.rejection_commands import (
     REJECTION_IDENTITY_MANIFEST,
     RejectionCommand,
     list_pending_rejections,
+    redacted_rejection_failure_identity,
     rejection_key,
     rejection_pending_index,
 )
@@ -343,7 +344,7 @@ class RejectionCommandMixin:
                 "pr_number": command.pr.number if command.pr else None,
                 "pr_head_sha": command.pr.head_sha if command.pr else None,
                 "initial_head_sha": command.initial_head_sha,
-                "failure": command.failure,
+                "failure": redacted_rejection_failure_identity(command.failure),
             }
             for existing in entries:
                 if (
