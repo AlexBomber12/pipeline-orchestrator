@@ -43,6 +43,7 @@ class RejectionCommand(BaseModel):
     stopping_started_at: datetime | None = None
     close_requested_at: datetime | None = None
     absence_confirmed: bool = False
+    absence_confirmed_at: datetime | None = None
     branch_head: str | None = None
     base_commit: str = ""
     released: bool = False

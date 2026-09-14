@@ -556,6 +556,47 @@ async def test_pre_pr_reject_confirms_absence_before_releasing_branch(rejected, 
     assert all(call[:2] != ["pr", "close"] for call in github["calls"])
 
 
+async def test_dispatched_pre_pr_reject_confirms_absence_then_releases(rejected, monkeypatch):
+    from src.task_attempts import new_attempt, save_attempt
+
+    runner, _, repo, _, github, _ = rejected
+    runner.state.current_pr = None
+    attempt = new_attempt(
+        runner.repo_config.url,
+        runner.state.current_task,
+        (repo / "tasks/PR-42.md").read_text(),
+        started=True,
+        coder_dispatched=True,
+    )
+    runner.state.current_task.attempt_id = attempt.attempt_id
+    await save_attempt(runner.redis, runner.name, attempt, expected=None)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_rejection(runner.name, runner.state, await runner.redis.get(cause_key(runner.name, "PR-42")), repo)
+    await enqueue_rejection(runner.redis, command)
+
+    original = daemon_reject.gh_runner.run_gh
+    monkeypatch.setattr(
+        daemon_reject.gh_runner,
+        "run_gh",
+        lambda args, *a, **kw: [[]] if "--slurp" in args else original(args, *a, **kw),
+    )
+
+    await runner._consume_rejection_commands()
+    first = await load_rejection(runner.redis, runner.name, command.binding)
+    assert first.status == "deferred"
+    assert first.absence_confirmed and not first.released
+    first.absence_confirmed_at = datetime.now(timezone.utc) - timedelta(seconds=61)
+    await runner.redis.set(rejection_key(runner.name, command.binding), first.model_dump_json())
+
+    await runner._consume_rejection_commands()
+    result = await load_rejection(runner.redis, runner.name, command.binding)
+    assert result.status == "rejected"
+    assert result.released
+    assert result.branch_head == git(repo, "rev-parse", "fix/pr-42")
+    assert "no PR was created" in result.reason
+    assert all(call[:2] != ["pr", "close"] for call in github["calls"])
+
+
 @pytest.mark.parametrize(
     "change",
     [

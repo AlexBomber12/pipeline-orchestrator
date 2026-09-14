@@ -22,6 +22,8 @@ from src.rejection_commands import (
 )
 from src.task_attempts import AttemptChanged, load_attempt, save_attempt
 
+_NO_PR_ABSENCE_REASON = "No PR found after stopping execution; confirming absence before final rejection."
+
 
 def rejection_pr_details(
     owner_repo: str,
@@ -108,6 +110,11 @@ class RejectionCommandMixin:
 
     async def _reconcile_rejection(self, command: RejectionCommand) -> None:
         try:
+            confirmed_no_pr_absence = (
+                command.absence_confirmed
+                and command.status == "deferred"
+                and command.reason == _NO_PR_ABSENCE_REASON
+            )
             if command.repo_url != self.repo_config.url:
                 raise AttemptChanged("Repository configuration changed; rejection is deferred.")
             task = self.state.current_task
@@ -157,15 +164,28 @@ class RejectionCommandMixin:
                     await self._save_rejection(command, "closing", "Attempt PR identified; verifying exact PR closure.")
                     updated = attempt.model_copy(update={"pr_number": command.pr.number, "pr_creation_pending": False})
                     await save_attempt(self.redis, self.name, updated, expected=attempt)
-                elif (
-                    attempt.pr_creation_pending or attempt.pr_number is not None
-                    or attempt.started or attempt.coder_dispatched is not False
-                ):
+                elif attempt.pr_creation_pending or attempt.pr_number is not None or attempt.coder_dispatched is None:
                     raise AttemptChanged(
                         "PR creation may have occurred; exact PR identity is required. "
                         "Empty lookup results cannot prove non-creation after coder dispatch "
                         "or unknown legacy execution."
                     )
+                elif attempt.started or attempt.coder_dispatched:
+                    if not confirmed_no_pr_absence:
+                        command.absence_confirmed = True
+                        command.absence_confirmed_at = datetime.now(timezone.utc)
+                        await self._save_rejection(
+                            command,
+                            "deferred",
+                            _NO_PR_ABSENCE_REASON,
+                        )
+                        return
+                    if (
+                        command.absence_confirmed_at is None
+                        or datetime.now(timezone.utc) - command.absence_confirmed_at < timedelta(seconds=60)
+                    ):
+                        await self._save_rejection(command, "deferred", _NO_PR_ABSENCE_REASON)
+                        return
                 else:
                     # Only an explicit never-dispatched receipt plus no pending
                     # creation can establish absence. Old negative-list hints
