@@ -117,6 +117,13 @@ def test_recorded_rejection_identity_by_task_file_returns_owner(tmp_path):
         "task_file": "tasks/PR-001.md",
         "fingerprint": "new",
         "rejection_binding": "wanted",
+        "requested_at": "2026-01-02T00:00:00+00:00",
+    }
+    older_entry = {
+        "task_file": "tasks/PR-001.md",
+        "fingerprint": "new",
+        "rejection_binding": "wanted",
+        "requested_at": "2026-01-01T00:00:00+00:00",
     }
     (tmp_path / "tasks").mkdir()
     (tmp_path / "tasks/rejections.json").write_text(
@@ -126,15 +133,26 @@ def test_recorded_rejection_identity_by_task_file_returns_owner(tmp_path):
                 "repository": "octo/demo",
                 "base_branch": "main",
                 "rejections": {
+                    "PR-001": [
+                        owner_entry,
+                    ],
+                    "PR-997": [
+                        {
+                            "task_file": "tasks/PR-001.md",
+                            "fingerprint": "new",
+                            "rejection_binding": "wanted",
+                        },
+                    ],
                     "PR-998": [
                         {
                             "task_file": "tasks/PR-001.md",
                             "fingerprint": "new",
-                            "rejection_binding": "older",
+                            "rejection_binding": "wanted",
+                            "requested_at": "not-a-date",
                         },
                     ],
                     "PR-999": [
-                        owner_entry,
+                        older_entry,
                         "bad",
                         {
                             "task_file": "tasks/PR-999.md",
@@ -164,7 +182,7 @@ def test_recorded_rejection_identity_by_task_file_returns_owner(tmp_path):
         "tasks/PR-001.md",
         fingerprint="new",
         binding="wanted",
-    ) == ("PR-999", owner_entry)
+    ) == ("PR-001", owner_entry)
     assert (
         recorded_rejection_identity_by_task_file(
             tmp_path,
@@ -621,6 +639,7 @@ async def test_final_rejection_releases_when_task_removed_before_marker_commit(r
     entry = manifest["rejections"]["PR-42"][0]
     assert entry["fingerprint"] == command.fingerprint
     assert entry["rejection_binding"] == command.binding
+    assert entry["requested_at"] == stored.requested_at.isoformat()
     assert entry["base_commit"] == stored.base_commit
 
 

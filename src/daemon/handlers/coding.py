@@ -614,6 +614,41 @@ class CodingMixin:
                 f"until the marker is removed."
             )
 
+    async def _record_visible_guardrail_pr(self, target_branch: str) -> None:
+        try:
+            prs = gh_prs.get_open_prs(
+                self.owner_repo,
+                allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+            )
+        except Exception as exc:
+            self.log_event(f"[CODING] Guardrail PR lookup deferred for {target_branch!r}: {exc}.")
+            return
+        candidate = next((pr for pr in prs if pr.branch == target_branch), None)
+        if candidate is None:
+            return
+        task = self.state.current_task
+        try:
+            if task is None:
+                return
+            attempt = await load_attempt(self.redis, self.name, task.pr_id)
+            if attempt is None or task.attempt_id not in (None, attempt.attempt_id):
+                return
+            updated = attempt.model_copy(
+                update={"pr_number": candidate.number, "pr_creation_pending": False}
+            )
+            await save_attempt(self.redis, self.name, updated, expected=attempt)
+            task.attempt_id = attempt.attempt_id
+        except Exception as exc:
+            self.log_event(
+                f"[CODING] Guardrail PR ownership record deferred for {target_branch!r}: {exc}."
+            )
+            return
+        self.state.current_pr = candidate
+        self._rehydrate_last_push_at(candidate)
+        self.log_event(
+            f"[CODING] Recorded PR #{candidate.number} for {target_branch!r} before guardrail ERROR."
+        )
+
     async def _post_coder_resolution(
         self,
         coder_name: str,
@@ -680,6 +715,8 @@ class CodingMixin:
                 )
             if await pause_for_stop_if_requested():
                 return
+            if self.state.current_pr is None:
+                await self._record_visible_guardrail_pr(target_branch)
             if self.state.current_pr is not None:
                 pr_number = self.state.current_pr.number
                 self.state.quarantined_prs.add(pr_number)

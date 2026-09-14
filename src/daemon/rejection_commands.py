@@ -346,6 +346,7 @@ class RejectionCommandMixin:
                 "file_sha256": command.file_sha256,
                 "attempt_id": command.attempt_id,
                 "rejection_binding": command.binding,
+                "requested_at": command.requested_at.isoformat(),
                 "repo_url": _manifest_repo_url(command.repo_url, self.owner_repo),
                 "base_commit": command.base_commit,
                 "task_file": command.task.task_file,

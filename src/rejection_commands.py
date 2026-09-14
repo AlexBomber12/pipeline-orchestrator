@@ -69,8 +69,9 @@ def recorded_rejection_identity_by_task_file(
     records = _load_rejection_identity_records(root, owner_repo, base_branch)
     if records is None:
         return None
-    for task_id in reversed(list(records)):
-        for entry in reversed(_rejection_identity_entries(records, str(task_id))):
+    matches: list[tuple[tuple[float, int, int], str, dict]] = []
+    for task_order, task_id in enumerate(records):
+        for entry_order, entry in enumerate(_rejection_identity_entries(records, str(task_id))):
             if not isinstance(entry, dict):
                 continue
             if entry.get("task_file") != task_file:
@@ -79,8 +80,26 @@ def recorded_rejection_identity_by_task_file(
                 continue
             if binding is not None and entry.get("rejection_binding") != binding:
                 continue
-            return str(task_id), entry
-    return None
+            matches.append(
+                (
+                    (_rejection_identity_requested_timestamp(entry), task_order, entry_order),
+                    str(task_id),
+                    entry,
+                )
+            )
+    if not matches:
+        return None
+    return max(matches, key=lambda match: match[0])[1:]
+
+
+def _rejection_identity_requested_timestamp(entry: dict) -> float:
+    raw = entry.get("requested_at")
+    if not isinstance(raw, str):
+        return float("-inf")
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return float("-inf")
 
 
 def _load_rejection_identity_records(
