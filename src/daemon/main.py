@@ -53,6 +53,7 @@ from src.daemon.migrations.run_record_backfill import (
 )
 from src.daemon.runner import PipelineRunner
 from src.events.wake import repo_from_channel, subscribe_wake
+from src.keyspace import upload_pending
 from src.models import PipelineState
 from src.sandbox.runtime_state import refresh_sandbox_state
 from src.usage import UsageProvider
@@ -72,6 +73,7 @@ DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 #: ``CONFIG_RELOAD_CYCLES * daemon.poll_interval_sec`` seconds, so it
 #: adapts to both fast and slow deployments.
 CONFIG_RELOAD_CYCLES = 5
+PENDING_UPLOAD_WAKE_POLL_SEC = 1.0
 _DEFERRED_RUNNER_CONFIG_STATES = {
     PipelineState.CODING,
     PipelineState.WATCH,
@@ -576,11 +578,21 @@ def _apply_wake_message(
         return
     key = slug_to_key.get(slug)
     if key is not None:
-        last_run[key] = 0.0
-        if runners is not None:
-            runner = runners.get(key)
-            if runner is not None and hasattr(runner, "reset_idle_streak"):
-                runner.reset_idle_streak()
+        _mark_runner_due(key, last_run, runners)
+
+
+def _mark_runner_due(
+    key: str,
+    last_run: dict[str, float],
+    runners: dict[str, PipelineRunner] | None = None,
+) -> None:
+    """Force ``key`` to run on the next daemon cycle."""
+    last_run[key] = 0.0
+    if runners is None:
+        return
+    runner = runners.get(key)
+    if runner is not None and hasattr(runner, "reset_idle_streak"):
+        runner.reset_idle_streak()
 
 
 async def _drain_wake_messages(
@@ -602,6 +614,67 @@ async def _drain_wake_messages(
         _apply_wake_message(extra, last_run, slug_to_key, runners)
 
 
+async def _timer_delay(seconds: float) -> None:
+    """Wait using the event-loop timer instead of ``asyncio.sleep``.
+
+    The daemon tests monkeypatch ``asyncio.sleep`` to drive the main loop
+    deterministically. Pending-upload polling is an internal wake source,
+    so it uses a direct loop timer and leaves the main sleep accounting
+    unchanged.
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[None] = loop.create_future()
+    handle = loop.call_later(seconds, future.set_result, None)
+    try:
+        await future
+    finally:
+        handle.cancel()
+
+
+async def _apply_pending_upload_wake(
+    redis_client: Any,
+    last_run: dict[str, float],
+    slug_to_key: dict[str, str],
+    runners: dict[str, PipelineRunner] | None = None,
+) -> bool:
+    """Mark repos with a durable pending-upload manifest as due."""
+    found = False
+    for slug, key in slug_to_key.items():
+        try:
+            pending_upload = await redis_client.get(upload_pending(slug))
+        except Exception:
+            logger.debug(
+                "pending-upload wake check failed for %s",
+                slug,
+                exc_info=True,
+            )
+            continue
+        if pending_upload is not None:
+            _mark_runner_due(key, last_run, runners)
+            found = True
+    return found
+
+
+async def _wait_for_pending_upload(
+    redis_client: Any,
+    last_run: dict[str, float],
+    slug_to_key: dict[str, str],
+    runners: dict[str, PipelineRunner] | None = None,
+    *,
+    poll_interval: float = PENDING_UPLOAD_WAKE_POLL_SEC,
+) -> bool:
+    """Wake when any active repo has a durable pending-upload manifest."""
+    while True:
+        if await _apply_pending_upload_wake(
+            redis_client,
+            last_run,
+            slug_to_key,
+            runners,
+        ):
+            return True
+        await _timer_delay(poll_interval)
+
+
 async def _wait_or_wake(
     pubsub: Any,
     tick: float,
@@ -610,6 +683,7 @@ async def _wait_or_wake(
     runners: dict[str, PipelineRunner] | None = None,
     *,
     wake_event: asyncio.Event | None = None,
+    redis_client: Any | None = None,
 ) -> bool:
     """Sleep ``tick`` seconds or wake early on a wake-channel message.
 
@@ -619,10 +693,10 @@ async def _wait_or_wake(
     before returning so the caller cannot rebuild the subscriber faster
     than the configured cadence — otherwise a Redis disconnect would
     drive a tight reconnect loop. Falls back to a pure sleep when
-    ``pubsub`` is None and no ``wake_event`` was supplied so the daemon
-    never blocks on a missing subscriber.
+    ``pubsub`` is None and no alternate wake source was supplied so the
+    daemon never blocks on a missing subscriber.
 
-    ``wake_event``, when provided, is a third wake source alongside the
+    ``wake_event``, when provided, is a wake source alongside the
     pubsub message and the tick deadline. The main loop passes the
     inotify reload event here so a ``config.yml`` edit interrupts the
     sleep immediately — without this, the inotify-driven reload would
@@ -630,8 +704,23 @@ async def _wait_or_wake(
     before the next iteration observed the event, defeating the
     "near-immediate hot reload" the inotify path is meant to provide.
     The caller is responsible for clearing the event between waits.
+
+    ``redis_client`` enables a durable pending-upload fallback. Uploaded
+    task manifests are already stored in Redis until the IDLE handler
+    commits and admits them, so polling that key lets the daemon recover
+    quickly from a missed Pub/Sub wake after restart or transient Redis
+    subscriber failure without changing upload consumption semantics.
     """
-    if pubsub is None and wake_event is None:
+    poll_pending_uploads = redis_client is not None and bool(slug_to_key)
+    if poll_pending_uploads and await _apply_pending_upload_wake(
+        redis_client,
+        last_run,
+        slug_to_key,
+        runners,
+    ):
+        return True
+
+    if pubsub is None and wake_event is None and not poll_pending_uploads:
         await asyncio.sleep(tick)
         return True
 
@@ -647,12 +736,27 @@ async def _wait_or_wake(
     if wake_event is not None:
         event_task = asyncio.create_task(wake_event.wait())
         waiters.add(event_task)
+    pending_upload_task: asyncio.Task[bool] | None = None
+    if poll_pending_uploads:
+        pending_upload_task = asyncio.create_task(
+            _wait_for_pending_upload(
+                redis_client,
+                last_run,
+                slug_to_key,
+                runners,
+            )
+        )
+        waiters.add(pending_upload_task)
     done, pending = await asyncio.wait(
         waiters,
         return_when=asyncio.FIRST_COMPLETED,
     )
 
     healthy = True
+    durable_wake = False
+    if pending_upload_task is not None and pending_upload_task in done:
+        durable_wake = pending_upload_task.result()
+
     if wake_task is not None and wake_task in done:
         wake_exc = wake_task.exception()
         if wake_exc is not None:
@@ -665,7 +769,7 @@ async def _wait_or_wake(
                     pubsub, last_run, slug_to_key, runners
                 )
 
-    if not healthy and not sleep_task.done():
+    if not healthy and not durable_wake and not sleep_task.done():
         # Subscriber errored early; finish the tick so the caller observes
         # the same backoff as a healthy cycle and cannot drive a tight
         # reconnect loop while Redis is unreachable.
@@ -943,6 +1047,7 @@ async def main() -> None:
                 slug_to_key,
                 runners,
                 wake_event=inotify_reload_event,
+                redis_client=redis_client,
             )
         finally:
             # Wait_or_wake yields to the event loop, giving any newly

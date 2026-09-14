@@ -1658,6 +1658,23 @@ class _ScriptedPubSub:
         self.closed = True
 
 
+class _ScriptedRedisGet:
+    """Redis ``get`` stub that returns scripted values and errors."""
+
+    def __init__(self, results: list[Any]) -> None:
+        self._results = list(results)
+        self.keys: list[str] = []
+
+    async def get(self, key: str) -> Any:
+        self.keys.append(key)
+        if not self._results:
+            return None
+        item = self._results.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
 async def test_wait_or_wake_falls_back_to_sleep_when_pubsub_none() -> None:
     last_run: dict[str, float] = {"k": 5.0}
     slept = []
@@ -1861,6 +1878,100 @@ async def test_wait_or_wake_no_event_keeps_legacy_sleep_path() -> None:
 
     assert healthy is True
     assert slept == [3.0]
+
+
+async def test_wait_or_wake_wakes_from_existing_pending_upload() -> None:
+    """A durable pending-upload manifest wakes even without Pub/Sub."""
+    redis = _ScriptedRedisGet(['{"files": ["PR-001.md"]}'])
+    last_run = {"alpha-key": 100.0}
+    runner = _FakeIdleRunner()
+
+    healthy = await main_module._wait_or_wake(
+        None,
+        60.0,
+        last_run,
+        {"alpha": "alpha-key"},
+        {"alpha-key": runner},
+        redis_client=redis,
+    )
+
+    assert healthy is True
+    assert last_run["alpha-key"] == 0.0
+    assert runner.idle_streak_resets == 1
+    assert redis.keys == [main_module.upload_pending("alpha")]
+
+
+async def test_wait_or_wake_polls_for_pending_upload_during_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A manifest arriving after the wait starts still wakes promptly."""
+    redis = _ScriptedRedisGet(
+        [
+            None,
+            None,
+            '{"files": ["PR-001.md"]}',
+        ]
+    )
+    delays: list[float] = []
+    last_run = {"alpha-key": 100.0}
+
+    async def fake_timer_delay(seconds: float) -> None:
+        delays.append(seconds)
+        await _REAL_ASYNCIO_SLEEP(0)
+
+    monkeypatch.setattr(main_module, "_timer_delay", fake_timer_delay)
+
+    healthy = await main_module._wait_or_wake(
+        None,
+        60.0,
+        last_run,
+        {"alpha": "alpha-key"},
+        redis_client=redis,
+    )
+
+    assert healthy is True
+    assert last_run["alpha-key"] == 0.0
+    assert delays == [main_module.PENDING_UPLOAD_WAKE_POLL_SEC]
+    assert redis.keys == [
+        main_module.upload_pending("alpha"),
+        main_module.upload_pending("alpha"),
+        main_module.upload_pending("alpha"),
+    ]
+
+
+async def test_wait_or_wake_pending_upload_errors_keep_sleep_path() -> None:
+    """Redis read errors in the durable wake check keep normal backoff."""
+    redis = _ScriptedRedisGet(
+        [
+            RuntimeError("redis down"),
+            RuntimeError("redis down"),
+        ]
+    )
+    last_run = {"alpha-key": 100.0}
+    slept: list[float] = []
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        await real_sleep(0)
+
+    with patch.object(main_module.asyncio, "sleep", fake_sleep):
+        healthy = await main_module._wait_or_wake(
+            None,
+            3.0,
+            last_run,
+            {"alpha": "alpha-key"},
+            redis_client=redis,
+        )
+
+    assert healthy is True
+    assert last_run["alpha-key"] == 100.0
+    assert slept == [3.0]
+    assert redis.keys == [
+        main_module.upload_pending("alpha"),
+        main_module.upload_pending("alpha"),
+    ]
 
 
 async def test_close_pubsub_handles_none_and_errors() -> None:
