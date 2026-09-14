@@ -1015,6 +1015,58 @@ async def test_ambiguous_pr_creation_is_not_repeated_after_restart(rejected, mon
     assert not await fresh._prepare_task_attempt((repo / "tasks/PR-42.md").read_text())
 
 
+async def test_admission_allows_equivalent_receipt_repo_url(rejected, tmp_path):
+    await finish_reject(rejected)
+    runner, command, repo, *_ = rejected
+    incoming = tmp_path / "PR-42.md"
+    incoming.write_text(rewritten(repo))
+
+    previous, candidate = await admission_candidate(
+        runner.redis,
+        runner.name,
+        runner.repo_config.url.removesuffix(".git"),
+        "main",
+        repo,
+        incoming,
+        expected_rejection=command.binding,
+        upload=True,
+    )
+
+    assert previous.repo_url == runner.repo_config.url
+    assert candidate is not None
+    assert candidate.previous_rejection == command.binding
+    assert candidate.repo_url == runner.repo_config.url.removesuffix(".git")
+
+
+async def test_prepare_reused_branch_allows_equivalent_repo_url(rejected):
+    await finish_reject(rejected)
+    runner, command, repo, remote, *_ = rejected
+    runner.repo_config.url = runner.repo_config.url.removesuffix(".git")
+    git(repo, "checkout", "main")
+    path = repo / "tasks/PR-42.md"
+    content = rewritten(repo)
+    path.write_text(content)
+    git(repo, "commit", "-am", "rewrite after url spelling change")
+    git(repo, "push", "origin", "main")
+    task = QueueTask(
+        pr_id="PR-42",
+        title="Reusable task",
+        task_file="tasks/PR-42.md",
+        branch="fix/pr-42",
+        status=TaskStatus.TODO,
+    )
+    attempt = new_attempt(
+        runner.repo_config.url,
+        task,
+        content,
+        previous_rejection=command.binding,
+    )
+
+    await runner._prepare_reused_branch(attempt)
+
+    assert "refs/heads/fix/pr-42" not in git(remote, "show-ref")
+
+
 @pytest.mark.parametrize(
     "case",
     [
@@ -2039,20 +2091,23 @@ async def test_first_startup_cannot_hide_completion_by_rewriting_its_file_hash(r
     assert any("unresolved prior task identity" in item["event"] for item in runner.state.history)
 
 
-async def test_prepare_task_attempt_checks_completion_without_manifest(rejected, monkeypatch):
+async def test_prepare_task_attempt_marks_completion_evidence_done_without_manifest(rejected, monkeypatch):
     runner, _, repo, *_ = rejected
     path = repo / "tasks/PR-42.md"
     content = without_blocked_reason(path.read_text().replace("status: ERROR", "status: TODO"))
     path.write_text(content)
     assert not (repo / "tasks/completions.json").exists()
     await runner.redis.delete(attempt_key(runner.name, "PR-42"))
-    runner.state.current_task = QueueTask(
+    task = QueueTask(
         pr_id="PR-42",
         title="Reusable task",
         task_file="tasks/PR-42.md",
         branch="fix/pr-42",
         status=TaskStatus.TODO,
     )
+    runner.state.current_task = task
+    runner.state.current_queue = [task]
+    runner.state.state = PipelineState.CODING
     calls = []
 
     def verify(*args, **kwargs):
@@ -2065,7 +2120,11 @@ async def test_prepare_task_attempt_checks_completion_without_manifest(rejected,
 
     attempt = await load_attempt(runner.redis, runner.name, "PR-42")
     assert calls == [("PR-42", {})]
-    assert not attempt.started
+    assert attempt.completed
+    assert attempt.task.status == TaskStatus.DONE
+    assert runner.state.current_task is None
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_queue[0].status == TaskStatus.DONE
     assert any("authoritative completion evidence" in item["event"] for item in runner.state.history)
 
 

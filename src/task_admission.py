@@ -17,6 +17,7 @@ from pathlib import Path
 from src.approval_commands import approval_task_path
 from src.cancellation.storage import CancellationCause, cause_key, task_spec_content_hash
 from src.completion_evidence import get_recorded_completions
+from src.config import normalize_repo_url
 from src.dag import detect_cycle
 from src.github import gh_pr_get_merged_branches, gh_runner
 from src.github import prs as gh_prs
@@ -272,7 +273,9 @@ async def admission_candidate(
     elif upload and expected_rejection:
         if not previous or previous.previous_rejection != expected_rejection or previous.fingerprint != fingerprint:
             raise AdmissionRejected("Upload belongs to an obsolete attempt.")
-    if previous and previous.repo_url != repo_url:
+    if previous and normalize_repo_url(previous.repo_url) != normalize_repo_url(
+        repo_url
+    ):
         raise AdmissionRejected("Task receipt belongs to a different repository.")
     if previous and previous.fingerprint == fingerprint:
         # Replays keep their existing attempt, including completed tasks in a

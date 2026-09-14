@@ -8,11 +8,12 @@ import tempfile
 from pathlib import Path
 
 from src.cancellation.storage import CancellationCause, cause_key, index_key, task_spec_content_hash, task_spec_hash_key
+from src.config import normalize_repo_url
 from src.daemon import git_ops
 from src.daemon.approval_commands import checkout_process_blocker
 from src.daemon.rejection_commands import rejection_pr_details
 from src.github import gh_runner
-from src.models import PRInfo, QueueTask, TaskStatus
+from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 from src.queue_parser import QueueValidationError, UnstructuredLegacyTaskError, parse_existing_task_header
 from src.rejection_commands import (
     LEGACY_REJECTION_SENTINEL,
@@ -474,12 +475,16 @@ class TaskAdmissionMixin:
             if self._recovered and not attempt.started:
                 # Startup recovery may have no older Redis receipt. An unresolved
                 # historical digest must not turn an edited completion into TODO.
-                verify_unfinished(
-                    Path(self.repo_path),
-                    self.repo_config.branch,
-                    self.repo_config.url,
-                    attempt,
-                )
+                try:
+                    verify_unfinished(
+                        Path(self.repo_path),
+                        self.repo_config.branch,
+                        self.repo_config.url,
+                        attempt,
+                    )
+                except AdmissionRejected as exc:
+                    await self._mark_recovered_attempt_completed(attempt, str(exc))
+                    return False
             self.state.current_task.attempt_id = attempt.attempt_id
             if self._current_run_record is not None:
                 self._current_run_record.attempt_id = attempt.attempt_id
@@ -497,12 +502,48 @@ class TaskAdmissionMixin:
             self.log_event(f"[RECOVERY] {task.pr_id}: coder dispatch deferred: {message}")
             return False
 
+    async def _mark_recovered_attempt_completed(self, attempt: TaskAttempt, reason: str) -> None:
+        task_id = attempt.task.pr_id
+        done_task = attempt.task.model_copy(
+            update={"status": TaskStatus.DONE, "attempt_id": attempt.attempt_id}
+        )
+        updated = await save_attempt(
+            self.redis,
+            self.name,
+            attempt.model_copy(
+                update={
+                    "completed": True,
+                    "pr_creation_pending": False,
+                    "task": done_task,
+                }
+            ),
+            expected=attempt,
+        )
+        if self.state.current_queue:
+            self.state.current_queue = [
+                queued.model_copy(
+                    update={"status": TaskStatus.DONE, "attempt_id": updated.attempt_id}
+                )
+                if queued.pr_id == task_id
+                else queued
+                for queued in self.state.current_queue
+            ]
+        if self.state.current_task and self.state.current_task.pr_id == task_id:
+            self.state.current_task = None
+            self._reset_runner_local_task_counters()
+        self.state.state = PipelineState.IDLE
+        self.log_event(f"[RECOVERY] {task_id}: {reason}")
+        await self.publish_state()
+
+
     async def _prepare_reused_branch(self, attempt: TaskAttempt) -> None:
         command = await self._load_final_rejection(attempt.previous_rejection, attempt.task.pr_id)
         if command is None or command.status != "rejected" or not command.released:
             raise AttemptChanged("Prior rejection is not confirmed.")
         branch, base = attempt.task.branch, self.repo_config.branch
-        if branch == base or attempt.repo_url != command.repo_url:
+        if branch == base or normalize_repo_url(attempt.repo_url) != normalize_repo_url(
+            command.repo_url
+        ):
             raise AttemptChanged("Branch or repository ownership differs from the abandoned attempt.")
         if self._current_coder_process is not None or checkout_process_blocker(self.repo_path):
             raise AttemptChanged("Checkout process quiescence is not established.")
