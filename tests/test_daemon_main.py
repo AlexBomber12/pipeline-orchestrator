@@ -1882,9 +1882,11 @@ async def test_wait_or_wake_no_event_keeps_legacy_sleep_path() -> None:
 
 async def test_wait_or_wake_wakes_from_existing_pending_upload() -> None:
     """A durable pending-upload manifest wakes even without Pub/Sub."""
-    redis = _ScriptedRedisGet(['{"files": ["PR-001.md"]}'])
+    manifest = '{"files": ["PR-001.md"]}'
+    redis = _ScriptedRedisGet([manifest])
     last_run = {"alpha-key": 100.0}
     runner = _FakeIdleRunner()
+    fingerprints: dict[str, str] = {}
 
     healthy = await main_module._wait_or_wake(
         None,
@@ -1893,11 +1895,15 @@ async def test_wait_or_wake_wakes_from_existing_pending_upload() -> None:
         {"alpha": "alpha-key"},
         {"alpha-key": runner},
         redis_client=redis,
+        pending_upload_wake_fingerprints=fingerprints,
     )
 
     assert healthy is True
     assert last_run["alpha-key"] == 0.0
     assert runner.idle_streak_resets == 1
+    assert fingerprints == {
+        "alpha": main_module._pending_upload_fingerprint(manifest)
+    }
     assert redis.keys == [main_module.upload_pending("alpha")]
 
 
@@ -1914,6 +1920,7 @@ async def test_wait_or_wake_polls_for_pending_upload_during_sleep(
     )
     delays: list[float] = []
     last_run = {"alpha-key": 100.0}
+    fingerprints: dict[str, str] = {}
 
     async def fake_timer_delay(seconds: float) -> None:
         delays.append(seconds)
@@ -1927,16 +1934,83 @@ async def test_wait_or_wake_polls_for_pending_upload_during_sleep(
         last_run,
         {"alpha": "alpha-key"},
         redis_client=redis,
+        pending_upload_wake_fingerprints=fingerprints,
     )
 
     assert healthy is True
     assert last_run["alpha-key"] == 0.0
+    assert "alpha" in fingerprints
     assert delays == [main_module.PENDING_UPLOAD_WAKE_POLL_SEC]
     assert redis.keys == [
         main_module.upload_pending("alpha"),
         main_module.upload_pending("alpha"),
         main_module.upload_pending("alpha"),
     ]
+
+
+async def test_wait_or_wake_seen_pending_upload_keeps_backoff() -> None:
+    """The same manifest value does not wake every daemon wait."""
+    manifest = '{"files": ["PR-001.md"]}'
+    redis = _ScriptedRedisGet([manifest])
+    last_run = {"alpha-key": 100.0}
+    fingerprints = {
+        "alpha": main_module._pending_upload_fingerprint(manifest)
+    }
+    slept: list[float] = []
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        await real_sleep(0)
+
+    with patch.object(main_module.asyncio, "sleep", fake_sleep):
+        healthy = await main_module._wait_or_wake(
+            None,
+            3.0,
+            last_run,
+            {"alpha": "alpha-key"},
+            redis_client=redis,
+            pending_upload_wake_fingerprints=fingerprints,
+        )
+
+    assert healthy is True
+    assert last_run["alpha-key"] == 100.0
+    assert slept == [3.0]
+    assert redis.keys == [main_module.upload_pending("alpha")]
+
+
+async def test_wait_or_wake_skips_pending_upload_wake_when_runner_not_idle() -> None:
+    """Active states retain their normal cadence until IDLE can consume uploads."""
+    redis = _ScriptedRedisGet(['{"files": ["PR-001.md"]}'])
+    last_run = {"alpha-key": 100.0}
+    runner = _FakeIdleRunner(state=PipelineState.WATCH)
+    fingerprints: dict[str, str] = {}
+    slept: list[float] = []
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        await real_sleep(0)
+
+    with patch.object(main_module.asyncio, "sleep", fake_sleep):
+        healthy = await main_module._wait_or_wake(
+            None,
+            3.0,
+            last_run,
+            {"alpha": "alpha-key"},
+            {"alpha-key": runner},
+            redis_client=redis,
+            pending_upload_wake_fingerprints=fingerprints,
+        )
+
+    assert healthy is True
+    assert last_run["alpha-key"] == 100.0
+    assert runner.idle_streak_resets == 0
+    assert fingerprints == {}
+    assert slept == [3.0]
+    assert redis.keys == []
 
 
 async def test_wait_or_wake_pending_upload_errors_keep_sleep_path() -> None:
