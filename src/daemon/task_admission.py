@@ -462,7 +462,25 @@ class TaskAdmissionMixin:
         try:
             attempt = await load_attempt(self.redis, self.name, task.pr_id)
             if attempt is None:
-                attempt = new_attempt(self.repo_config.url, task, content, file_sha256=file_sha256)
+                fingerprint = task_spec_content_hash(content)
+                recorded_rejection = self._recorded_rejection_identity(task.pr_id, fingerprint)
+                if recorded_rejection:
+                    raise AttemptChanged(
+                        "File unchanged. Reject is final; rewrite or remove the unfinished task."
+                    )
+                recorded_previous = self._recorded_rejection_identity(task.pr_id)
+                previous_rejection = (
+                    str(recorded_previous["rejection_binding"])
+                    if recorded_previous and recorded_previous.get("rejection_binding")
+                    else None
+                )
+                attempt = new_attempt(
+                    self.repo_config.url,
+                    task,
+                    content,
+                    file_sha256=file_sha256,
+                    previous_rejection=previous_rejection,
+                )
                 attempt = await save_attempt(self.redis, self.name, attempt, expected=None)
             if (
                 attempt.rejection

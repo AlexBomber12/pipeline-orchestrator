@@ -1015,6 +1015,170 @@ async def test_ambiguous_pr_creation_is_not_repeated_after_restart(rejected, mon
     assert not await fresh._prepare_task_attempt((repo / "tasks/PR-42.md").read_text())
 
 
+async def test_prepare_task_attempt_blocks_exact_rejected_replay_without_receipt(rejected):
+    await finish_reject(rejected)
+    runner, _, repo, *_ = rejected
+    path = repo / "tasks/PR-42.md"
+    content = path.read_text()
+    await runner.redis.delete(attempt_key(runner.name, "PR-42"))
+    await runner.redis.delete(cause_key(runner.name, "PR-42"))
+    runner.state.current_task = QueueTask(
+        pr_id="PR-42",
+        title="Reusable task",
+        task_file="tasks/PR-42.md",
+        branch="fix/pr-42",
+        status=TaskStatus.TODO,
+    )
+
+    assert not await runner._prepare_task_attempt(content)
+
+    assert await load_attempt(runner.redis, runner.name, "PR-42") is None
+    assert any("File unchanged. Reject is final" in item["event"] for item in runner.state.history)
+
+
+async def test_admission_reintroduced_deleted_task_carries_rejection_cleanup(rejected, tmp_path):
+    await finish_reject(rejected)
+    runner, command, repo, *_ = rejected
+    git(repo, "checkout", "main")
+    original = (repo / "tasks/PR-42.md").read_text()
+    git(repo, "rm", "tasks/PR-42.md")
+    git(repo, "commit", "-m", "remove rejected task")
+    git(repo, "push", "origin", "main")
+    await runner.redis.delete(attempt_key(runner.name, "PR-42"))
+    await runner.redis.delete(cause_key(runner.name, "PR-42"))
+    await runner.redis.delete(pipeline_state(runner.name))
+    incoming = tmp_path / "PR-42.md"
+    incoming.write_text(
+        without_blocked_reason(
+            original.replace("Original specification.", "Replacement after deletion.").replace(
+                "status: ERROR",
+                "status: TODO",
+            )
+        )
+    )
+
+    previous, candidate = await admission_candidate(
+        runner.redis,
+        runner.name,
+        runner.repo_config.url,
+        "main",
+        repo,
+        incoming,
+        expected_rejection=command.binding,
+        upload=True,
+    )
+
+    assert previous is None
+    assert candidate is not None
+    assert candidate.previous_rejection == command.binding
+
+
+async def test_prepare_task_attempt_reintroduced_deleted_task_cleans_rejected_branch(rejected):
+    await finish_reject(rejected)
+    runner, command, repo, remote, *_ = rejected
+    git(repo, "checkout", "main")
+    original = (repo / "tasks/PR-42.md").read_text()
+    git(repo, "rm", "tasks/PR-42.md")
+    git(repo, "commit", "-m", "remove rejected task")
+    git(repo, "push", "origin", "main")
+    await runner.redis.delete(attempt_key(runner.name, "PR-42"))
+    await runner.redis.delete(rejection_key(runner.name, command.binding))
+    await runner.redis.delete(cause_key(runner.name, "PR-42"))
+    content = without_blocked_reason(
+        original.replace("Original specification.", "Replacement after deletion.").replace(
+            "status: ERROR",
+            "status: TODO",
+        )
+    )
+    path = repo / "tasks/PR-42.md"
+    path.write_text(content)
+    git(repo, "add", "tasks/PR-42.md")
+    git(repo, "commit", "-m", "reintroduce rejected task")
+    git(repo, "push", "origin", "main")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-42",
+        title="Reusable task",
+        task_file="tasks/PR-42.md",
+        branch="fix/pr-42",
+        status=TaskStatus.TODO,
+    )
+
+    assert await runner._prepare_task_attempt(content)
+
+    attempt = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert attempt.previous_rejection == command.binding
+    assert "refs/heads/fix/pr-42" not in git(remote, "show-ref")
+
+
+async def test_admission_reintroduced_deleted_task_rejects_stale_cleanup_token(rejected, tmp_path):
+    await finish_reject(rejected)
+    runner, _, repo, *_ = rejected
+    git(repo, "checkout", "main")
+    original = (repo / "tasks/PR-42.md").read_text()
+    git(repo, "rm", "tasks/PR-42.md")
+    git(repo, "commit", "-m", "remove rejected task")
+    git(repo, "push", "origin", "main")
+    await runner.redis.delete(attempt_key(runner.name, "PR-42"))
+    await runner.redis.delete(cause_key(runner.name, "PR-42"))
+    incoming = tmp_path / "PR-42.md"
+    incoming.write_text(
+        without_blocked_reason(
+            original.replace("Original specification.", "Replacement after deletion.").replace(
+                "status: ERROR",
+                "status: TODO",
+            )
+        )
+    )
+
+    with pytest.raises(AdmissionRejected, match="obsolete attempt"):
+        await admission_candidate(
+            runner.redis,
+            runner.name,
+            runner.repo_config.url,
+            "main",
+            repo,
+            incoming,
+            expected_rejection="stale-rejection-binding",
+            upload=True,
+        )
+
+
+async def test_admission_defers_when_cleanup_rejection_manifest_unavailable(
+    rejected,
+    tmp_path,
+    monkeypatch,
+):
+    from src import task_admission
+    from src.rejection_commands import RejectionIdentityManifestUnavailable
+
+    runner, _, repo, *_ = rejected
+    await runner.redis.delete(attempt_key(runner.name, "PR-42"))
+    await runner.redis.delete(cause_key(runner.name, "PR-42"))
+    await runner.redis.delete(pipeline_state(runner.name))
+    content = rewritten(repo)
+    (repo / "tasks/PR-42.md").unlink()
+    incoming = tmp_path / "PR-42.md"
+    incoming.write_text(content)
+
+    def unavailable(*args, fingerprint=None, binding=None):
+        if fingerprint is not None:
+            return None
+        raise RejectionIdentityManifestUnavailable("offline")
+
+    monkeypatch.setattr(task_admission, "recorded_rejection_identity", unavailable)
+
+    with pytest.raises(AttemptChanged, match="Rejection identity manifest is unavailable"):
+        await admission_candidate(
+            runner.redis,
+            runner.name,
+            runner.repo_config.url,
+            "main",
+            repo,
+            incoming,
+            upload=True,
+        )
+
+
 async def test_admission_allows_equivalent_receipt_repo_url(rejected, tmp_path):
     await finish_reject(rejected)
     runner, command, repo, *_ = rejected

@@ -270,6 +270,20 @@ async def admission_candidate(
             raise AdmissionRejected(
                 "File unchanged. Reject is final; rewrite or remove the unfinished task. Ordinary Retry is unavailable."
             )
+    elif previous is None and recorded_incoming_rejection is None:
+        try:
+            recorded_previous_rejection = recorded_rejection_identity(
+                root,
+                owner,
+                base,
+                header.pr_id,
+            )
+        except RejectionIdentityManifestUnavailable as exc:
+            raise AttemptChanged("Rejection identity manifest is unavailable; reuse is deferred.") from exc
+        if recorded_previous_rejection and recorded_previous_rejection.get("rejection_binding"):
+            prior_rejection_binding = str(recorded_previous_rejection["rejection_binding"])
+        if upload and expected_rejection and expected_rejection != prior_rejection_binding:
+            raise AdmissionRejected("Upload belongs to an obsolete attempt.")
     elif upload and expected_rejection:
         if not previous or previous.previous_rejection != expected_rejection or previous.fingerprint != fingerprint:
             raise AdmissionRejected("Upload belongs to an obsolete attempt.")
