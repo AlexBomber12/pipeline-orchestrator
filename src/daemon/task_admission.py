@@ -243,6 +243,7 @@ class TaskAdmissionMixin:
                 file_sha256=hashlib.sha256(content_bytes).hexdigest(),
             )
             recorded_rejection = self._recorded_rejection_identity(task_id, fingerprint)
+            task_rejection = None
             if not recorded_rejection:
                 task_rejection = self._recorded_rejection_identity(task_id)
                 if self._rejection_identity_matches_base(task_rejection, filename, fingerprint):
@@ -261,6 +262,12 @@ class TaskAdmissionMixin:
                     if recorded_rejection and recorded_rejection.get("rejection_binding")
                     else LEGACY_REJECTION_SENTINEL
                 )
+            elif (
+                task_rejection
+                and task_rejection.get("rejection_binding")
+                and header.frontmatter_status in (None, "todo")
+            ):
+                receipt.previous_rejection = str(task_rejection["rejection_binding"])
             await save_attempt(self.redis, self.name, receipt, expected=None)
 
     async def _validate_admission(
@@ -458,8 +465,8 @@ class TaskAdmissionMixin:
                 or attempt.fingerprint != task_spec_content_hash(content)
             ):
                 raise AttemptChanged("Specification/attempt is not admitted for coding.")
-            if not attempt.started and (Path(self.repo_path) / "tasks/completions.json").is_file():
-                # First startup may have no older Redis receipt. An unresolved
+            if self._recovered and not attempt.started:
+                # Startup recovery may have no older Redis receipt. An unresolved
                 # historical digest must not turn an edited completion into TODO.
                 verify_unfinished(
                     Path(self.repo_path),

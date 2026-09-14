@@ -805,6 +805,17 @@ async def test_unknown_process_defers_rejection(rejected, monkeypatch):
     assert (await load_rejection(runner.redis, runner.name, command.binding)).status == "deferred"
 
 
+async def test_rejection_reconciliation_allows_equivalent_repo_url(rejected):
+    runner, command, *_ = rejected
+    assert (await post_reject(rejected)).status_code == 202
+    runner.repo_config.url = runner.repo_config.url.removesuffix(".git")
+
+    await runner._consume_rejection_commands()
+
+    stored = await load_rejection(runner.redis, runner.name, command.binding)
+    assert stored.status == "rejected" and stored.released
+
+
 @pytest.mark.parametrize(
     "change",
     [

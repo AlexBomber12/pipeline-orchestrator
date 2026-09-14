@@ -9,6 +9,7 @@ from pathlib import Path
 
 from src.approval_commands import approval_index, approval_key, list_approvals
 from src.cancellation.storage import CancellationCause, cause_key
+from src.config import normalize_repo_url
 from src.daemon import git_ops
 from src.daemon.approval_commands import checkout_process_blocker
 from src.daemon.attempt_processes import stop_attempt_children
@@ -120,7 +121,9 @@ class RejectionCommandMixin:
                 and command.status == "deferred"
                 and command.reason == _NO_PR_ABSENCE_REASON
             )
-            if command.repo_url != self.repo_config.url:
+            if normalize_repo_url(command.repo_url) != normalize_repo_url(
+                self.repo_config.url
+            ):
                 raise AttemptChanged("Repository configuration changed; rejection is deferred.")
             task = self.state.current_task
             if task and (task.pr_id != command.task.pr_id or task.attempt_id not in (None, command.attempt_id)):

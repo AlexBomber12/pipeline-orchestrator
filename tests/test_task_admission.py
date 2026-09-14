@@ -1221,6 +1221,31 @@ async def test_recovered_rejection_identity_admits_changed_git_rewrite_after_red
     assert "refs/heads/fix/pr-42" not in git(remote, "show-ref")
 
 
+async def test_snapshot_preserves_rejection_cleanup_for_post_final_rewrite_after_redis_loss(rejected):
+    from src.cancellation.storage import index_key, task_spec_hash_key
+
+    await finish_reject(rejected)
+    runner, command, repo, *_ = rejected
+    await runner.redis.delete(attempt_key(runner.name, "PR-42"))
+    await runner.redis.delete(rejection_key(runner.name, command.binding))
+    await runner.redis.delete(cause_key(runner.name, "PR-42"))
+    await runner.redis.delete(index_key(runner.name))
+    await runner.redis.delete(task_spec_hash_key(runner.name, "PR-42"))
+
+    git(repo, "checkout", "main")
+    content = rewritten(repo) + "\nPost-final rewrite after Redis loss.\n"
+    (repo / "tasks/PR-42.md").write_text(content)
+    git(repo, "commit", "-am", "post-final rewrite after redis loss")
+    git(repo, "push", "origin", "main")
+
+    await runner._snapshot_accepted_specs()
+
+    recovered = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert recovered.rejection is None
+    assert recovered.previous_rejection == command.binding
+    assert recovered.fingerprint == task_spec_content_hash(content)
+
+
 async def test_snapshot_recovers_rejection_relationship_for_pre_final_base_rewrite(rejected):
     from src.cancellation.storage import index_key, task_spec_hash_key
 
@@ -1934,6 +1959,36 @@ async def test_first_startup_cannot_hide_completion_by_rewriting_its_file_hash(r
     attempt = await load_attempt(runner.redis, runner.name, "PR-42")
     assert not attempt.started
     assert any("unresolved prior task identity" in item["event"] for item in runner.state.history)
+
+
+async def test_prepare_task_attempt_checks_completion_without_manifest(rejected, monkeypatch):
+    runner, _, repo, *_ = rejected
+    path = repo / "tasks/PR-42.md"
+    content = without_blocked_reason(path.read_text().replace("status: ERROR", "status: TODO"))
+    path.write_text(content)
+    assert not (repo / "tasks/completions.json").exists()
+    await runner.redis.delete(attempt_key(runner.name, "PR-42"))
+    runner.state.current_task = QueueTask(
+        pr_id="PR-42",
+        title="Reusable task",
+        task_file="tasks/PR-42.md",
+        branch="fix/pr-42",
+        status=TaskStatus.TODO,
+    )
+    calls = []
+
+    def verify(*args, **kwargs):
+        calls.append((args[-1].task.pr_id, kwargs))
+        raise AdmissionRejected("PR-42 has authoritative completion evidence and cannot be reused.")
+
+    monkeypatch.setattr(daemon_admission, "verify_unfinished", verify)
+
+    assert not await runner._prepare_task_attempt(content)
+
+    attempt = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert calls == [("PR-42", {})]
+    assert not attempt.started
+    assert any("authoritative completion evidence" in item["event"] for item in runner.state.history)
 
 
 async def test_admission_checks_completion_history_without_attempt_receipt(rejected, tmp_path):
