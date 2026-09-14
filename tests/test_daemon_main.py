@@ -2013,6 +2013,39 @@ async def test_wait_or_wake_skips_pending_upload_wake_when_runner_not_idle() -> 
     assert redis.keys == []
 
 
+async def test_wait_or_wake_skips_pending_upload_wake_when_runner_paused_idle() -> None:
+    """Paused IDLE runners do not consume the one-shot manifest fingerprint."""
+    redis = _ScriptedRedisGet(['{"files": ["PR-001.md"]}'])
+    last_run = {"alpha-key": 100.0}
+    runner = _FakeIdleRunner(user_paused=True)
+    fingerprints: dict[str, str] = {}
+    slept: list[float] = []
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        await real_sleep(0)
+
+    with patch.object(main_module.asyncio, "sleep", fake_sleep):
+        healthy = await main_module._wait_or_wake(
+            None,
+            3.0,
+            last_run,
+            {"alpha": "alpha-key"},
+            {"alpha-key": runner},
+            redis_client=redis,
+            pending_upload_wake_fingerprints=fingerprints,
+        )
+
+    assert healthy is True
+    assert last_run["alpha-key"] == 100.0
+    assert runner.idle_streak_resets == 0
+    assert fingerprints == {}
+    assert slept == [3.0]
+    assert redis.keys == []
+
+
 async def test_wait_or_wake_pending_upload_errors_keep_sleep_path() -> None:
     """Redis read errors in the durable wake check keep normal backoff."""
     redis = _ScriptedRedisGet(
@@ -2162,11 +2195,12 @@ class _FakeIdleRunner:
         self,
         *,
         state: PipelineState = PipelineState.IDLE,
+        user_paused: bool = False,
         base: int = 60,
         effective: int = 60,
     ) -> None:
         self.repo_config = types.SimpleNamespace(poll_interval_sec=base)
-        self.state = types.SimpleNamespace(state=state)
+        self.state = types.SimpleNamespace(state=state, user_paused=user_paused)
         self.effective_idle_poll_interval = effective
         self.idle_streak_resets = 0
 

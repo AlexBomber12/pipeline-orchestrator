@@ -603,8 +603,10 @@ def _runner_can_process_pending_upload(
     """Return whether the runner is in the state that consumes uploads."""
     if runners is None:
         return True
-    state = getattr(getattr(runners.get(key), "state", None), "state", None)
-    return state in (None, PipelineState.IDLE)
+    repo_state = getattr(runners.get(key), "state", None)
+    state = getattr(repo_state, "state", None)
+    user_paused = bool(getattr(repo_state, "user_paused", False))
+    return state in (None, PipelineState.IDLE) and not user_paused
 
 
 async def _drain_wake_messages(
