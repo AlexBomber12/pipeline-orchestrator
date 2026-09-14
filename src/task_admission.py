@@ -27,7 +27,12 @@ from src.queue_parser import (
     parse_existing_task_header,
     parse_task_header,
 )
-from src.rejection_commands import load_rejection
+from src.rejection_commands import (
+    LEGACY_REJECTION_SENTINEL,
+    RejectionIdentityManifestUnavailable,
+    load_rejection,
+    recorded_rejection_identity,
+)
 from src.task_attempts import AdmissionRejected, AttemptChanged, TaskAttempt, load_attempt, new_attempt
 from src.task_status import get_merged_pr_ids
 
@@ -131,6 +136,17 @@ async def admission_candidate(
     incoming_bytes = incoming.read_bytes()
     content = incoming_bytes.decode("utf-8")
     fingerprint = task_spec_content_hash(content)
+    owner = gh_runner.get_repo_full_name(repo_url)
+    try:
+        recorded_incoming_rejection = recorded_rejection_identity(
+            root,
+            owner,
+            base,
+            header.pr_id,
+            fingerprint=fingerprint,
+        )
+    except RejectionIdentityManifestUnavailable as exc:
+        raise AttemptChanged("Rejection identity manifest is unavailable; reuse is deferred.") from exc
     if previous is None and existing.is_file():
         existing_bytes = existing.read_bytes()
         existing_content = existing_bytes.decode("utf-8")
@@ -155,15 +171,38 @@ async def admission_candidate(
         if previous is None or not previous.rejection:
             raise AttemptChanged("Legacy rejection lacks exact attempt/PR ownership; reconcile it before reuse.")
     rejection_file_sha256 = None
+    prior_rejection_binding = previous.previous_rejection if previous else None
     if previous and previous.rejection:
         if previous.completed and fingerprint == previous.fingerprint:
             return previous, None
         if upload and expected_rejection != previous.rejection:
             raise AdmissionRejected("Upload predates or belongs to another rejection; submit the rewritten task again.")
-        rejection = await load_rejection(redis, repo, previous.rejection)
-        if rejection is None or rejection.status != "rejected" or not rejection.released:
-            raise AttemptChanged("Rejection is not final; wait for process quiescence and confirmed PR closure.")
-        rejection_file_sha256 = rejection.file_sha256
+        if previous.rejection == LEGACY_REJECTION_SENTINEL:
+            rejection_file_sha256 = previous.file_sha256
+        else:
+            rejection = await load_rejection(redis, repo, previous.rejection)
+            if rejection is None:
+                try:
+                    recorded_previous_rejection = recorded_rejection_identity(
+                        root,
+                        owner,
+                        base,
+                        previous.task.pr_id,
+                        fingerprint=previous.fingerprint,
+                        binding=previous.rejection,
+                    )
+                except RejectionIdentityManifestUnavailable as exc:
+                    raise AttemptChanged("Rejection identity manifest is unavailable; reuse is deferred.") from exc
+                if recorded_previous_rejection is None:
+                    raise AttemptChanged(
+                        "Rejection is not final; wait for process quiescence and confirmed PR closure."
+                    )
+                rejection_file_sha256 = str(recorded_previous_rejection.get("file_sha256") or previous.file_sha256)
+            elif rejection.status != "rejected" or not rejection.released:
+                raise AttemptChanged("Rejection is not final; wait for process quiescence and confirmed PR closure.")
+            else:
+                rejection_file_sha256 = rejection.file_sha256
+            prior_rejection_binding = previous.rejection
         if fingerprint == previous.fingerprint:
             raise AdmissionRejected(
                 "File unchanged. Reject is final; rewrite or remove the unfinished task. Ordinary Retry is unavailable."
@@ -178,7 +217,10 @@ async def admission_candidate(
         # sprint ZIP. Only changed specifications reach verify_unfinished below.
         return previous, None
     if previous is None:
-        owner = gh_runner.get_repo_full_name(repo_url)
+        if recorded_incoming_rejection is not None:
+            raise AdmissionRejected(
+                "File unchanged. Reject is final; rewrite or remove the unfinished task. Ordinary Retry is unavailable."
+            )
         merged = get_merged_pr_ids(str(root), base, {header.pr_id})
         recorded = get_recorded_completions(
             str(root),
@@ -242,7 +284,7 @@ async def admission_candidate(
         repo_url,
         task,
         content,
-        previous_rejection=(previous.rejection or previous.previous_rejection) if previous else None,
+        previous_rejection=prior_rejection_binding,
         admission_pending=True,
         coder_dispatched=False,
         file_sha256=hashlib.sha256(incoming_bytes).hexdigest(),

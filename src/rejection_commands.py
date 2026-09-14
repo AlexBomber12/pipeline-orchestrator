@@ -25,6 +25,55 @@ from src.models import PipelineState, PRInfo, QueueTask, RepoState
 from src.queue_parser import parse_existing_task_header
 from src.task_attempts import AttemptChanged, TaskAttempt, attempt_key, new_attempt
 
+REJECTION_IDENTITY_MANIFEST = "tasks/rejections.json"
+LEGACY_REJECTION_SENTINEL = "legacy-missing-identity"
+
+
+class RejectionIdentityManifestUnavailable(AttemptChanged):
+    """Durable rejection identity evidence exists but cannot be read safely."""
+
+
+def recorded_rejection_identity(
+    root: Path,
+    owner_repo: str,
+    base_branch: str,
+    task_id: str,
+    *,
+    fingerprint: str | None = None,
+    binding: str | None = None,
+) -> dict | None:
+    """Return a matching durable rejection identity entry from ``tasks/rejections.json``."""
+    manifest_path = root / REJECTION_IDENTITY_MANIFEST
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, TypeError) as exc:
+        raise RejectionIdentityManifestUnavailable("Rejection identity manifest is unavailable.") from exc
+
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema_version") != 1
+        or str(manifest.get("repository", "")).casefold() != owner_repo.casefold()
+        or manifest.get("base_branch") != base_branch
+    ):
+        return None
+    records = manifest.get("rejections")
+    if not isinstance(records, dict):
+        return None
+    entries = records.get(task_id, [])
+    if not isinstance(entries, list):
+        return None
+    for entry in reversed(entries):
+        if not isinstance(entry, dict):
+            continue
+        if fingerprint is not None and entry.get("fingerprint") != fingerprint:
+            continue
+        if binding is not None and entry.get("rejection_binding") != binding:
+            continue
+        return entry
+    return None
+
 
 class RejectionCommand(BaseModel):
     binding: str

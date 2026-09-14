@@ -17,6 +17,7 @@ from src.github import gh_runner
 from src.keyspace import pipeline_state
 from src.models import PipelineState, RepoState, TaskStatus
 from src.rejection_commands import (
+    REJECTION_IDENTITY_MANIFEST,
     RejectionCommand,
     list_pending_rejections,
     rejection_key,
@@ -26,7 +27,6 @@ from src.subsource_registry import SuppressionReason
 from src.task_attempts import AttemptChanged, load_attempt, save_attempt
 
 _NO_PR_ABSENCE_REASON = "No PR found after stopping execution; confirming absence before final rejection."
-_REJECTION_IDENTITY_MANIFEST = "tasks/rejections.json"
 
 
 def rejection_pr_details(
@@ -305,7 +305,7 @@ class RejectionCommandMixin:
             git_ops._git(self.repo_path, "fetch", "origin", base, timeout=60)
             git_ops._git(self.repo_path, "checkout", "-f", base, timeout=60)
             git_ops._git(self.repo_path, "reset", "--hard", f"origin/{base}", timeout=60)
-            manifest_path = Path(self.repo_path) / _REJECTION_IDENTITY_MANIFEST
+            manifest_path = Path(self.repo_path) / REJECTION_IDENTITY_MANIFEST
             if manifest_path.exists():
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                 if not isinstance(manifest, dict):
@@ -334,20 +334,36 @@ class RejectionCommandMixin:
                 "file_sha256": command.file_sha256,
                 "attempt_id": command.attempt_id,
                 "rejection_binding": command.binding,
+                "repo_url": command.repo_url,
+                "base_commit": command.base_commit,
                 "task_file": command.task.task_file,
+                "task_title": command.task.title,
                 "branch": command.task.branch,
+                "branch_head": command.branch_head,
+                "pr_number": command.pr.number if command.pr else None,
+                "pr_head_sha": command.pr.head_sha if command.pr else None,
+                "initial_head_sha": command.initial_head_sha,
+                "failure": command.failure,
             }
-            if entry not in entries:
+            for existing in entries:
+                if (
+                    isinstance(existing, dict)
+                    and existing.get("fingerprint") == command.fingerprint
+                    and existing.get("rejection_binding") == command.binding
+                ):
+                    existing.update(entry)
+                    break
+            else:
                 entries.append(entry)
             manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-            git_ops._git(self.repo_path, "add", "--", _REJECTION_IDENTITY_MANIFEST, timeout=30)
+            git_ops._git(self.repo_path, "add", "--", REJECTION_IDENTITY_MANIFEST, timeout=30)
             diff = git_ops._git(
                 self.repo_path,
                 "diff",
                 "--cached",
                 "--quiet",
                 "--",
-                _REJECTION_IDENTITY_MANIFEST,
+                REJECTION_IDENTITY_MANIFEST,
                 check=False,
             )
             if diff.returncode == 0:

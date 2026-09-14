@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import subprocess
 import tempfile
 from pathlib import Path
@@ -13,9 +12,15 @@ from src.daemon import git_ops
 from src.daemon.approval_commands import checkout_process_blocker
 from src.daemon.rejection_commands import rejection_pr_details
 from src.github import gh_runner
-from src.models import QueueTask, TaskStatus
+from src.models import PRInfo, QueueTask, TaskStatus
 from src.queue_parser import QueueValidationError, UnstructuredLegacyTaskError, parse_existing_task_header
-from src.rejection_commands import load_rejection
+from src.rejection_commands import (
+    LEGACY_REJECTION_SENTINEL,
+    RejectionCommand,
+    RejectionIdentityManifestUnavailable,
+    load_rejection,
+    recorded_rejection_identity,
+)
 from src.task_admission import admission_candidate, validate_admission_graph, verify_unfinished
 from src.task_attempts import (
     AdmissionRejected,
@@ -27,8 +32,6 @@ from src.task_attempts import (
     save_attempt,
 )
 from src.task_status import MergeStatusUnavailable
-
-_REJECTION_IDENTITY_MANIFEST = "tasks/rejections.json"
 
 
 def _parse_snapshot_header(filename: str, content: str):
@@ -45,27 +48,106 @@ def _parse_snapshot_header(filename: str, content: str):
 
 class TaskAdmissionMixin:
     def _has_recorded_rejection_identity(self, task_id: str, fingerprint: str) -> bool:
-        path = Path(self.repo_path) / _REJECTION_IDENTITY_MANIFEST
         try:
-            manifest = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return False
-        except (OSError, ValueError, TypeError) as exc:
+            return (
+                recorded_rejection_identity(
+                    Path(self.repo_path),
+                    self.owner_repo,
+                    self.repo_config.branch,
+                    task_id,
+                    fingerprint=fingerprint,
+                )
+                is not None
+            )
+        except RejectionIdentityManifestUnavailable as exc:
             raise MergeStatusUnavailable("Rejection identity manifest is unavailable.") from exc
-        if (
-            not isinstance(manifest, dict)
-            or manifest.get("schema_version") != 1
-            or str(manifest.get("repository", "")).casefold() != self.owner_repo.casefold()
-            or manifest.get("base_branch") != self.repo_config.branch
+
+    def _recorded_rejection_identity(self, task_id: str, fingerprint: str) -> dict | None:
+        try:
+            return recorded_rejection_identity(
+                Path(self.repo_path),
+                self.owner_repo,
+                self.repo_config.branch,
+                task_id,
+                fingerprint=fingerprint,
+            )
+        except RejectionIdentityManifestUnavailable as exc:
+            raise MergeStatusUnavailable("Rejection identity manifest is unavailable.") from exc
+
+    def _rejection_command_from_identity(self, task_id: str, entry: dict | None) -> RejectionCommand | None:
+        if not entry:
+            return None
+        binding = entry.get("rejection_binding")
+        attempt_id = entry.get("attempt_id")
+        fingerprint = entry.get("fingerprint")
+        file_sha256 = entry.get("file_sha256")
+        branch = entry.get("branch")
+        task_file = entry.get("task_file") or f"tasks/{task_id}.md"
+        if not all(
+            isinstance(value, str) and value
+            for value in (binding, attempt_id, fingerprint, file_sha256, branch)
         ):
-            return False
-        records = manifest.get("rejections")
-        if not isinstance(records, dict):
-            return False
-        entries = records.get(task_id, [])
-        if not isinstance(entries, list):
-            return False
-        return any(isinstance(entry, dict) and entry.get("fingerprint") == fingerprint for entry in entries)
+            return None
+        pr = None
+        pr_number = entry.get("pr_number")
+        pr_head_sha = entry.get("pr_head_sha")
+        if pr_number is not None and pr_head_sha:
+            try:
+                pr = PRInfo(
+                    number=int(pr_number),
+                    branch=branch,
+                    pr_id=task_id,
+                    head_sha=str(pr_head_sha),
+                )
+            except (TypeError, ValueError):
+                pr = None
+        return RejectionCommand(
+            binding=binding,
+            repo_slug=self.name,
+            repo_url=str(entry.get("repo_url") or self.repo_config.url),
+            task=QueueTask(
+                pr_id=task_id,
+                title=str(entry.get("task_title") or task_id),
+                task_file=str(task_file),
+                branch=branch,
+                status=TaskStatus.ERROR,
+            ),
+            attempt_id=attempt_id,
+            fingerprint=fingerprint,
+            file_sha256=file_sha256,
+            failure=str(entry.get("failure") or ""),
+            pr=pr,
+            initial_head_sha=entry.get("initial_head_sha"),
+            status="rejected",
+            branch_head=entry.get("branch_head"),
+            base_commit=str(entry.get("base_commit") or ""),
+            released=True,
+        )
+
+    async def _load_final_rejection(
+        self,
+        binding: str,
+        task_id: str,
+        *,
+        fingerprint: str | None = None,
+    ) -> RejectionCommand | None:
+        if binding == LEGACY_REJECTION_SENTINEL:
+            return None
+        command = await load_rejection(self.redis, self.name, binding)
+        if command is not None:
+            return command
+        try:
+            entry = recorded_rejection_identity(
+                Path(self.repo_path),
+                self.owner_repo,
+                self.repo_config.branch,
+                task_id,
+                fingerprint=fingerprint,
+                binding=binding,
+            )
+        except RejectionIdentityManifestUnavailable as exc:
+            raise MergeStatusUnavailable("Rejection identity manifest is unavailable.") from exc
+        return self._rejection_command_from_identity(task_id, entry)
 
     def _has_historical_operator_reject_marker(self, base: str, filename: str, fingerprint: str) -> bool:
         result = git_ops._git(self.repo_path, "log", "--format=%H", base, "--", filename, check=False)
@@ -139,12 +221,21 @@ class TaskAdmissionMixin:
                 started=header.frontmatter_status not in (None, "todo"),
                 file_sha256=hashlib.sha256(content_bytes).hexdigest(),
             )
-            if header.blocked_reason == "operator_reject" or self._has_historical_operator_reject_marker(
-                base,
-                filename,
-                fingerprint,
-            ) or self._has_recorded_rejection_identity(task_id, fingerprint):
-                receipt.rejection = "legacy-missing-identity"
+            recorded_rejection = self._recorded_rejection_identity(task_id, fingerprint)
+            if (
+                header.blocked_reason == "operator_reject"
+                or self._has_historical_operator_reject_marker(
+                    base,
+                    filename,
+                    fingerprint,
+                )
+                or recorded_rejection
+            ):
+                receipt.rejection = (
+                    str(recorded_rejection["rejection_binding"])
+                    if recorded_rejection and recorded_rejection.get("rejection_binding")
+                    else LEGACY_REJECTION_SENTINEL
+                )
             await save_attempt(self.redis, self.name, receipt, expected=None)
 
     async def _validate_admission(
@@ -178,16 +269,23 @@ class TaskAdmissionMixin:
         current = await load_attempt(self.redis, self.name, candidate.task.pr_id)
         if current and current != previous:
             raise AttemptChanged("Accepted task changed during admission.")
-        if previous and previous.rejection and not upload:
-            rejection = await load_rejection(self.redis, self.name, previous.rejection)
-            old = git_ops._git(
-                self.repo_path,
-                "show",
-                f"{rejection.base_commit}:{candidate.task.task_file}",
-                check=False,
+        if previous and previous.rejection and previous.rejection != LEGACY_REJECTION_SENTINEL and not upload:
+            rejection = await self._load_final_rejection(
+                previous.rejection,
+                previous.task.pr_id,
+                fingerprint=previous.fingerprint,
             )
-            if old.returncode == 0 and task_spec_content_hash(old.stdout) == candidate.fingerprint:
-                raise AttemptChanged("This Git input predates rejection; commit a later specification rewrite.")
+            if rejection is None or rejection.status != "rejected" or not rejection.released:
+                raise AttemptChanged("Prior rejection is not confirmed.")
+            if rejection.base_commit:
+                old = git_ops._git(
+                    self.repo_path,
+                    "show",
+                    f"{rejection.base_commit}:{candidate.task.task_file}",
+                    check=False,
+                )
+                if old.returncode == 0 and task_spec_content_hash(old.stdout) == candidate.fingerprint:
+                    raise AttemptChanged("This Git input predates rejection; commit a later specification rewrite.")
         candidate.base_commit = git_ops._git(
             self.repo_path,
             "rev-parse",
@@ -359,7 +457,7 @@ class TaskAdmissionMixin:
             return False
 
     async def _prepare_reused_branch(self, attempt: TaskAttempt) -> None:
-        command = await load_rejection(self.redis, self.name, attempt.previous_rejection)
+        command = await self._load_final_rejection(attempt.previous_rejection, attempt.task.pr_id)
         if command is None or command.status != "rejected" or not command.released:
             raise AttemptChanged("Prior rejection is not confirmed.")
         branch, base = attempt.task.branch, self.repo_config.branch

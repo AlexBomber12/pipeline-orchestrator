@@ -39,6 +39,37 @@ from tests.runner import _helpers as h
 from tests.test_approval_commands import git, isolated_daemon_process_view  # noqa: F401
 
 
+def test_recorded_rejection_identity_skips_bad_entries_and_binding_mismatches(tmp_path):
+    from src.rejection_commands import recorded_rejection_identity
+
+    (tmp_path / "tasks").mkdir()
+    (tmp_path / "tasks/rejections.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "repository": "octo/demo",
+                "base_branch": "main",
+                "rejections": {
+                    "PR-42": [
+                        {"fingerprint": "match", "rejection_binding": "wanted"},
+                        {"fingerprint": "match", "rejection_binding": "other"},
+                        "bad",
+                    ]
+                },
+            }
+        )
+    )
+
+    assert recorded_rejection_identity(
+        tmp_path,
+        "octo/demo",
+        "main",
+        "PR-42",
+        fingerprint="match",
+        binding="wanted",
+    ) == {"fingerprint": "match", "rejection_binding": "wanted"}
+
+
 def raw_attempt_pr(pr, *, created_at=None, state="open", merged_at=None):
     return {
         "number": pr.number,
@@ -447,7 +478,7 @@ async def test_final_rejection_commits_operator_reject_marker_for_redis_loss(rej
     await runner._snapshot_accepted_specs()
     recovered = await load_attempt(runner.redis, runner.name, "PR-42")
 
-    assert recovered.rejection == "legacy-missing-identity"
+    assert recovered.rejection == command.binding
     assert recovered.fingerprint == command.fingerprint
     assert await runner._reconcile_git_admissions() == {"PR-42"}
 
@@ -471,7 +502,11 @@ async def test_concurrent_rewrite_rejection_manifest_fences_restored_rejected_by
     stored = await load_rejection(runner.redis, runner.name, command.binding)
     manifest = json.loads(git(repo, "show", "origin/main:tasks/rejections.json"))
     assert stored.status == "rejected" and stored.released
-    assert manifest["rejections"]["PR-42"][0]["fingerprint"] == command.fingerprint
+    entry = manifest["rejections"]["PR-42"][0]
+    assert entry["fingerprint"] == command.fingerprint
+    assert entry["rejection_binding"] == command.binding
+    assert entry["base_commit"] == stored.base_commit
+    assert entry["branch_head"] == stored.branch_head
     assert "operator_reject" not in git(repo, "show", "origin/main:tasks/PR-42.md")
 
     git(repo, "checkout", "main")
@@ -487,7 +522,7 @@ async def test_concurrent_rewrite_rejection_manifest_fences_restored_rejected_by
 
     await runner._snapshot_accepted_specs()
     recovered = await load_attempt(runner.redis, runner.name, "PR-42")
-    assert recovered.rejection == "legacy-missing-identity"
+    assert recovered.rejection == command.binding
 
 
 @pytest.mark.parametrize(
