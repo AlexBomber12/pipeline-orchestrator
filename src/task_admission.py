@@ -18,6 +18,7 @@ from src.approval_commands import approval_task_path
 from src.cancellation.storage import CancellationCause, cause_key, task_spec_content_hash
 from src.completion_evidence import get_recorded_completions
 from src.config import normalize_repo_url
+from src.daemon.attempt_prs import discover_attempt_pr
 from src.dag import detect_cycle
 from src.github import gh_pr_get_merged_branches, gh_runner
 from src.github import prs as gh_prs
@@ -170,6 +171,12 @@ def verify_unfinished(
     if previous.completed or previous.task.status == TaskStatus.DONE:
         raise AdmissionRejected(f"{task_id} is completed and cannot be reused.")
     owner = gh_runner.get_repo_full_name(repo_url)
+    if previous.started and not previous.rejection:
+        data = discover_attempt_pr(str(root), owner, base, previous)
+        if data is not None and data.get("state") == "open":
+            raise AttemptChanged(
+                "Prior attempt still has an open PR; close it before accepting a changed specification."
+            )
     branches = gh_pr_get_merged_branches(owner, {previous.task.branch})
     merged = get_merged_pr_ids(str(root), base, {task_id})
     recorded = get_recorded_completions(
@@ -213,8 +220,10 @@ async def admission_candidate(
         header = parse_task_header(incoming)
     except QueueValidationError as exc:
         raise AdmissionRejected(str(exc)) from exc
-    if incoming.name != f"{header.pr_id}.md" or header.branch == base:
-        raise AdmissionRejected("Task filename/identity must agree and branch must differ from the configured base.")
+    if upload and incoming.name != f"{header.pr_id}.md":
+        raise AdmissionRejected("Uploaded task filename must match its task identity.")
+    if header.branch == base:
+        raise AdmissionRejected("Task branch must differ from the configured base.")
     # Validate Git ref syntax without shell interpolation or repository writes.
     if subprocess.run(["git", "check-ref-format", "--branch", header.branch], capture_output=True).returncode:
         raise AdmissionRejected("Task branch is not a valid Git branch.")

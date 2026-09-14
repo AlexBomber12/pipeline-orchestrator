@@ -31,7 +31,7 @@ from src.task_attempts import (
 from src.task_status import MergeStatusUnavailable
 
 from tests.test_approval_commands import git, isolated_daemon_process_view  # noqa: F401
-from tests.test_rejection_commands import post_reject
+from tests.test_rejection_commands import post_reject, raw_attempt_pr
 from tests.test_rejection_commands import rejected as rejection_fixture
 
 rejected = rejection_fixture
@@ -147,6 +147,91 @@ async def test_changed_upload_after_reset_replaces_started_automatic_error_attem
     assert current.previous_rejection == previous.previous_rejection
     assert not current.started and not current.admission_pending
     assert (repo / "tasks/PR-42.md").read_text() == changed
+
+
+async def test_changed_upload_after_reset_defers_while_prior_pr_remains_open(rejected):
+    runner, _, repo, _, github, _ = rejected
+    git(repo, "checkout", "main")
+    path = repo / "tasks/PR-42.md"
+    reset_text = without_blocked_reason(
+        path.read_text().replace("status: ERROR", "status: TODO")
+    )
+    path.write_text(reset_text)
+    git(repo, "commit", "-am", "reset automatic error task")
+    git(repo, "push", "origin", "main")
+    task = QueueTask(
+        pr_id="PR-42",
+        title="Reusable task",
+        task_file="tasks/PR-42.md",
+        branch="fix/pr-42",
+        status=TaskStatus.TODO,
+    )
+    previous = new_attempt(
+        runner.repo_config.url,
+        task,
+        reset_text,
+        started=True,
+        coder_dispatched=True,
+        pr_number=42,
+    )
+    await save_attempt(runner.redis, runner.name, previous, expected=None)
+    github["attempt_prs"] = [
+        raw_attempt_pr(
+            PRInfo(
+                number=42,
+                pr_id="PR-42",
+                branch="fix/pr-42",
+                head_sha=git(repo, "rev-parse", "fix/pr-42"),
+            )
+        )
+    ]
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_task = None
+    await runner.redis.delete(cause_key(runner.name, "PR-42"))
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    changed = reset_text.replace("Original specification.", "Replacement after reset.")
+
+    assert (await stage(rejected, changed)).status_code == 200
+    assert await runner.process_pending_uploads() is None
+
+    assert await load_attempt(runner.redis, runner.name, "PR-42") == previous
+    assert (repo / "tasks/PR-42.md").read_text() == reset_text
+    assert await runner.redis.get(upload_pending(runner.name)) is not None
+
+
+async def test_git_rewrite_of_legacy_filename_admits_by_header_identity(rejected):
+    runner, _, repo, *_ = rejected
+    git(repo, "checkout", "main")
+    legacy = rewritten(repo).replace("PR-42:", "PR-999:").replace(
+        "fix/pr-42",
+        "fix/pr-999",
+    )
+    path = repo / "tasks/PR-001.md"
+    path.write_text(legacy)
+    git(repo, "add", "tasks/PR-001.md")
+    git(repo, "commit", "-m", "add legacy filename task")
+    git(repo, "push", "origin", "main")
+    task = QueueTask(
+        pr_id="PR-999",
+        title="Reusable task",
+        task_file="tasks/PR-001.md",
+        branch="fix/pr-999",
+        status=TaskStatus.TODO,
+    )
+    previous = new_attempt(runner.repo_config.url, task, legacy)
+    await save_attempt(runner.redis, runner.name, previous, expected=None)
+    changed = legacy.replace("New specification.", "Legacy filename rewrite.")
+    path.write_text(changed)
+    git(repo, "commit", "-am", "rewrite legacy filename task")
+    git(repo, "push", "origin", "main")
+
+    assert await runner._reconcile_git_admissions() == set()
+
+    current = await load_attempt(runner.redis, runner.name, "PR-999")
+    assert current.attempt_id != previous.attempt_id
+    assert current.task.task_file == "tasks/PR-001.md"
+    assert not current.admission_pending
+    assert current.fingerprint == task_spec_content_hash(changed)
 
 
 def test_admission_graph_tolerates_legacy_noise_but_rejects_structured_errors(tmp_path):
