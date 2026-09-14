@@ -544,6 +544,22 @@ async def test_stale_pending_upload_member_preserves_newer_valid_submission(reje
     }
     await runner.redis.set(upload_pending(runner.name), json.dumps(manifest))
     await runner.redis.set(upload_pending_count(runner.name), "2")
+    orphan = new_attempt(
+        runner.repo_config.url,
+        QueueTask(
+            pr_id="PR-42",
+            title="Reusable task",
+            task_file="tasks/PR-42.md",
+            branch="fix/pr-42",
+            status=TaskStatus.TODO,
+        ),
+        stale,
+        admission_pending=True,
+    )
+    await runner.redis.set(
+        attempt_key(runner.name, "PR-42"),
+        orphan.model_dump_json(),
+    )
     path.write_text(path.read_text() + "\nEdited after stale upload.\n")
 
     assert await runner.process_pending_uploads() is None
@@ -555,6 +571,7 @@ async def test_stale_pending_upload_member_preserves_newer_valid_submission(reje
     assert not (staging / "PR-42.md").exists()
     assert (staging / "PR-43.md").read_text() == newer
     assert await runner.redis.get(upload_pending_count(runner.name)) == "1"
+    assert await load_attempt(runner.redis, runner.name, "PR-42") is None
 
 
 async def test_stale_pending_upload_member_is_pruned_before_graph_validation(rejected, tmp_path):
@@ -757,6 +774,66 @@ async def test_invalid_upload_members_discard_logs_unlink_failure(rejected, tmp_
     retained = json.loads(await runner.redis.get(key))
     assert retained["files"] == ["PR-43.md"]
     assert retained["task_hashes"] == {"PR-43": "new"}
+
+
+async def test_invalid_upload_members_discard_clears_matching_pending_receipts(
+    rejected,
+    tmp_path,
+):
+    runner, _, repo, *_ = rejected
+    key = upload_pending(runner.name)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    texts = {
+        "PR-42": task_42_from(repo),
+        "PR-43": task_43_from(repo),
+    }
+    for task_id, text in texts.items():
+        filename = f"{task_id}.md"
+        (staging / filename).write_text(text)
+        attempt = new_attempt(
+            runner.repo_config.url,
+            QueueTask(
+                pr_id=task_id,
+                title=f"Task {task_id}",
+                task_file=f"tasks/{filename}",
+                branch=f"fix/{task_id.lower()}",
+                status=TaskStatus.TODO,
+            ),
+            text,
+            admission_pending=True,
+        )
+        await runner.redis.set(
+            attempt_key(runner.name, task_id),
+            attempt.model_dump_json(),
+        )
+    manifest = {
+        "files": ["PR-42.md", "PR-43.md"],
+        "staging_dir": str(staging),
+        "task_hashes": {
+            task_id: task_spec_content_hash(text)
+            for task_id, text in texts.items()
+        },
+    }
+    raw = json.dumps(manifest)
+    await runner.redis.set(key, raw)
+    await runner.redis.set(upload_pending_count(runner.name), "2")
+
+    result = await runner._discard_invalid_upload_members(
+        key,
+        raw,
+        staging,
+        manifest,
+        {"PR-42.md", "PR-43.md"},
+        "invalid",
+    )
+
+    assert result is False
+    assert await runner.redis.get(key) is None
+    assert await runner.redis.get(upload_pending_count(runner.name)) is None
+    assert not staging.exists()
+    assert await load_attempt(runner.redis, runner.name, "PR-42") is None
+    assert await load_attempt(runner.redis, runner.name, "PR-43") is None
 
 
 async def test_git_deletion_is_not_undone_by_pending_upload(rejected):

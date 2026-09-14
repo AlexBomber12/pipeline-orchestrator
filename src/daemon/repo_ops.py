@@ -27,7 +27,7 @@ from src.keyspace import upload_pending, upload_pending_count
 from src.models import TaskStatus
 from src.retry import retry_transient
 from src.task_admission import invalid_upload_graph_members, validate_admission_graph
-from src.task_attempts import AdmissionRejected, load_attempt
+from src.task_attempts import AdmissionRejected, TaskAttempt, attempt_key, load_attempt
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,29 @@ def _uploaded_repo_path(filename: str) -> Path:
     if filename in {"AGENTS.md", "CLAUDE.md"}:
         return Path(filename)
     return Path("tasks") / filename
+
+
+def _matches_pruned_upload_receipt(
+    raw_attempt: str | bytes | None,
+    task_id: str,
+    filename: str,
+    fingerprint: str | None,
+) -> bool:
+    """Return whether a pending receipt belongs to a pruned upload member."""
+    if not raw_attempt or not isinstance(fingerprint, str):
+        return False
+    attempt = TaskAttempt.model_validate_json(raw_attempt)
+    return (
+        attempt.task.pr_id == task_id
+        and Path(attempt.task.task_file).name == filename
+        and attempt.fingerprint == fingerprint
+        and attempt.admission_pending
+        and not attempt.started
+        and not attempt.completed
+        and attempt.pr_number is None
+        and not attempt.pr_creation_pending
+        and not attempt.rejection
+    )
 
 
 class RepoOpsMixin:
@@ -294,20 +317,40 @@ return 0
                 values.pop(task_id, None)
                 updated[field] = values
         updated_raw = json.dumps(updated)
+        task_hashes = manifest.get("task_hashes", {})
+        upload_fingerprint = (
+            task_hashes.get(task_id) if isinstance(task_hashes, dict) else None
+        )
+        receipt_key = attempt_key(self.name, task_id)
 
         async def discard(pipe):
             if await pipe.get(key) != raw:
                 return "changed"
+            receipt_raw = await pipe.get(receipt_key)
+            delete_receipt = _matches_pruned_upload_receipt(
+                receipt_raw,
+                task_id,
+                filename,
+                upload_fingerprint,
+            )
             pipe.multi()
             if files:
                 pipe.set(key, updated_raw)
                 pipe.set(upload_pending_count(self.name), str(len(files)))
+            if delete_receipt:
+                pipe.delete(receipt_key)
+            if files:
                 return "retained"
             pipe.delete(key, upload_pending_count(self.name))
             return "discarded"
 
         try:
-            result = await self.redis.transaction(discard, key, value_from_callable=True)
+            result = await self.redis.transaction(
+                discard,
+                key,
+                receipt_key,
+                value_from_callable=True,
+            )
         except Exception as exc:
             self.log_event(f"[INFRA] Invalid upload acknowledgement deferred ({type(exc).__name__}).")
             return None
@@ -349,20 +392,47 @@ return 0
                     values.pop(task_id, None)
                 updated[field] = values
         updated_raw = json.dumps(updated)
+        task_hashes = manifest.get("task_hashes", {})
+        receipt_keys = {
+            task_id: attempt_key(self.name, task_id) for task_id in task_ids
+        }
 
         async def discard(pipe):
             if await pipe.get(key) != raw:
                 return "changed"
+            delete_receipt_keys = []
+            for task_id, receipt_key in sorted(receipt_keys.items()):
+                upload_fingerprint = (
+                    task_hashes.get(task_id)
+                    if isinstance(task_hashes, dict)
+                    else None
+                )
+                receipt_raw = await pipe.get(receipt_key)
+                if _matches_pruned_upload_receipt(
+                    receipt_raw,
+                    task_id,
+                    f"{task_id}.md",
+                    upload_fingerprint,
+                ):
+                    delete_receipt_keys.append(receipt_key)
             pipe.multi()
             if files:
                 pipe.set(key, updated_raw)
                 pipe.set(upload_pending_count(self.name), str(len(files)))
+            if delete_receipt_keys:
+                pipe.delete(*delete_receipt_keys)
+            if files:
                 return "retained"
             pipe.delete(key, upload_pending_count(self.name))
             return "discarded"
 
         try:
-            result = await self.redis.transaction(discard, key, value_from_callable=True)
+            result = await self.redis.transaction(
+                discard,
+                key,
+                *receipt_keys.values(),
+                value_from_callable=True,
+            )
         except Exception as exc:
             self.log_event(f"[INFRA] Invalid upload acknowledgement deferred ({type(exc).__name__}).")
             return None
