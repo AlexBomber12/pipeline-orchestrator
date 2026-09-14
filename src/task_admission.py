@@ -77,6 +77,7 @@ def validate_admission_graph(root: Path, incoming: Iterable[Path] = ()) -> None:
     paths.update(replacements)
     graph = {}
     branch_owner = {}
+    task_owner = {}
     for name, path in sorted(paths.items()):
         try:
             if name in replacements:
@@ -91,6 +92,10 @@ def validate_admission_graph(root: Path, incoming: Iterable[Path] = ()) -> None:
         if owner is not None and owner != header.pr_id:
             raise AdmissionRejected(f"Branch {header.branch} is also assigned to {owner}.")
         branch_owner[header.branch] = header.pr_id
+        existing_owner = task_owner.get(header.pr_id)
+        if existing_owner is not None and existing_owner != name:
+            raise AdmissionRejected(f"Task {header.pr_id} is also declared by {existing_owner}.")
+        task_owner[header.pr_id] = name
         graph[header.pr_id] = header.depends_on
     cycle = detect_cycle(graph)
     if cycle:
@@ -104,7 +109,9 @@ def invalid_upload_graph_members(root: Path, incoming: Iterable[Path]) -> set[st
     paths.update(replacements)
     graph: dict[str, tuple[str, ...]] = {}
     branch_owners: dict[str, set[str]] = {}
+    task_files: dict[str, set[str]] = {}
     task_names: dict[str, str] = {}
+    incoming_names: dict[str, set[str]] = {}
     incoming_ids: set[str] = set()
     invalid_ids: set[str] = set()
     for name, path in sorted(paths.items()):
@@ -120,10 +127,15 @@ def invalid_upload_graph_members(root: Path, incoming: Iterable[Path]) -> set[st
                 return {name}
             raise AdmissionRejected(str(exc)) from exc
         branch_owners.setdefault(header.branch, set()).add(header.pr_id)
+        task_files.setdefault(header.pr_id, set()).add(name)
         graph[header.pr_id] = tuple(header.depends_on)
-        task_names[header.pr_id] = name
+        task_names.setdefault(header.pr_id, name)
         if name in replacements:
             incoming_ids.add(header.pr_id)
+            incoming_names.setdefault(header.pr_id, set()).add(name)
+    for task_id, names in task_files.items():
+        if len(names) > 1:
+            invalid_ids.add(task_id)
     for owners in branch_owners.values():
         if len(owners) > 1:
             invalid_ids.update(owners)
@@ -136,7 +148,10 @@ def invalid_upload_graph_members(root: Path, incoming: Iterable[Path]) -> set[st
             if task_id in incoming_ids and task_id not in invalid_ids and invalid_ids.intersection(dependencies):
                 invalid_ids.add(task_id)
                 changed = True
-    return {task_names[task_id] for task_id in invalid_ids.intersection(incoming_ids)}
+    invalid_names = set()
+    for task_id in invalid_ids.intersection(incoming_ids):
+        invalid_names.update(incoming_names.get(task_id, {task_names[task_id]}))
+    return invalid_names
 
 
 def _legacy_rejection_branch_ref_exists(root: Path, branch: str) -> bool:

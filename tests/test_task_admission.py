@@ -384,6 +384,26 @@ def test_admission_graph_rejects_duplicate_branch_across_incoming_batch(tmp_path
         validate_admission_graph(tmp_path, [incoming / "PR-42.md", incoming / "PR-43.md"])
 
 
+def test_admission_graph_rejects_duplicate_parsed_task_ids(tmp_path):
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    tasks.joinpath("PR-001.md").write_text(
+        "---\nstatus: TODO\n---\n\n"
+        "# PR-999: Existing legacy filename\n"
+        "Branch: fix/legacy\n- Type: bugfix\n- Complexity: low\n- Depends on: none\n"
+    )
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    incoming.joinpath("PR-999.md").write_text(
+        "---\nstatus: TODO\n---\n\n"
+        "# PR-999: Incoming canonical filename\n"
+        "Branch: fix/new\n- Type: bugfix\n- Complexity: low\n- Depends on: none\n"
+    )
+
+    with pytest.raises(AdmissionRejected, match="Task PR-999 is also declared by PR-001.md"):
+        validate_admission_graph(tmp_path, [incoming / "PR-999.md"])
+
+
 def test_invalid_upload_graph_members_identifies_duplicate_branches(tmp_path):
     tasks = tmp_path / "tasks"
     tasks.mkdir()
@@ -402,6 +422,25 @@ def test_invalid_upload_graph_members_identifies_duplicate_branches(tmp_path):
         "PR-42.md",
         "PR-43.md",
     }
+
+
+def test_invalid_upload_graph_members_identifies_duplicate_parsed_task_ids(tmp_path):
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    tasks.joinpath("PR-001.md").write_text(
+        "---\nstatus: TODO\n---\n\n"
+        "# PR-999: Existing legacy filename\n"
+        "Branch: fix/legacy\n- Type: bugfix\n- Complexity: low\n- Depends on: none\n"
+    )
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    incoming.joinpath("PR-999.md").write_text(
+        "---\nstatus: TODO\n---\n\n"
+        "# PR-999: Incoming canonical filename\n"
+        "Branch: fix/new\n- Type: bugfix\n- Complexity: low\n- Depends on: none\n"
+    )
+
+    assert invalid_upload_graph_members(tmp_path, [incoming / "PR-999.md"]) == {"PR-999.md"}
 
 
 def test_invalid_upload_graph_members_identifies_cycles_and_dependents(tmp_path):
