@@ -16,7 +16,13 @@ from src.daemon import task_admission as daemon_admission
 from src.github.gh_runner import run_gh as cli_run_gh
 from src.keyspace import pipeline_state, upload_pending, upload_pending_count
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
-from src.rejection_commands import LEGACY_REJECTION_SENTINEL, build_rejection, load_rejection, rejection_key
+from src.rejection_commands import (
+    LEGACY_REJECTION_SENTINEL,
+    RejectionCommand,
+    build_rejection,
+    load_rejection,
+    rejection_key,
+)
 from src.retry_commands import enqueue_retry_command, new_retry_command
 from src.task_admission import admission_candidate, invalid_upload_graph_members, validate_admission_graph
 from src.task_attempts import (
@@ -156,6 +162,71 @@ async def test_upload_replacement_over_unstructured_legacy_file_admits(rejected)
     assert current.task.pr_id == "PR-100"
     assert legacy_path.read_text() == uploaded
     assert await runner.redis.get(upload_pending(runner.name)) is None
+
+
+async def test_upload_renamed_legacy_file_loads_old_rejection_receipt(rejected):
+    runner, _, repo, *_ = rejected
+    git(repo, "checkout", "main")
+    old_text = rewritten(repo).replace("PR-42:", "PR-999:").replace(
+        "fix/pr-42",
+        "fix/pr-999",
+    )
+    legacy_path = repo / "tasks/PR-001.md"
+    legacy_path.write_text(old_text)
+    git(repo, "add", "tasks/PR-001.md")
+    git(repo, "commit", "-m", "add legacy renamed task")
+    git(repo, "push", "origin", "main")
+    task = QueueTask(
+        pr_id="PR-999",
+        title="Reusable task",
+        task_file="tasks/PR-001.md",
+        branch="fix/pr-999",
+        status=TaskStatus.ERROR,
+    )
+    previous = new_attempt(
+        runner.repo_config.url,
+        task,
+        old_text,
+        started=True,
+        rejection="rename-rejection",
+    )
+    await save_attempt(runner.redis, runner.name, previous, expected=None)
+    rejection = RejectionCommand(
+        binding="rename-rejection",
+        repo_slug=runner.name,
+        repo_url=runner.repo_config.url,
+        task=task,
+        attempt_id=previous.attempt_id,
+        fingerprint=previous.fingerprint,
+        file_sha256=previous.file_sha256,
+        failure="{}",
+        pr=None,
+        status="rejected",
+        released=True,
+    )
+    await runner.redis.set(
+        rejection_key(runner.name, rejection.binding),
+        rejection.model_dump_json(),
+    )
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_task = None
+    runner.state.current_pr = None
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    uploaded = old_text.replace("PR-999:", "PR-001:") + "\nCanonical rewrite.\n"
+
+    response = await stage_files(rejected, [("PR-001.md", uploaded)])
+
+    assert response.status_code == 200, response.text
+    manifest = json.loads(await runner.redis.get(upload_pending(runner.name)))
+    assert manifest["rejection_tokens"]["PR-001"] == rejection.binding
+    assert manifest["prior_spec_files"]["PR-001"] == task_spec_content_hash(old_text)
+    assert await runner.process_pending_uploads() is True
+    current = await load_attempt(runner.redis, runner.name, "PR-001")
+    assert current is not None and not current.admission_pending
+    assert current.previous_rejection == rejection.binding
+    assert current.task.branch == "fix/pr-999"
+    assert await load_attempt(runner.redis, runner.name, "PR-999") == previous
+    assert legacy_path.read_text() == uploaded
 
 
 async def test_changed_upload_after_reset_replaces_started_automatic_error_attempt(rejected):

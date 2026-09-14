@@ -65,6 +65,33 @@ class _StubAioredis:
         return self.client
 
 
+async def test_load_upload_attempt_ignores_unowned_legacy_predecessor(
+    tmp_path: Path,
+) -> None:
+    redis = _StubAioredisClient()
+    repo = tmp_path / "repo"
+    tasks = repo / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "PR-001.md").write_text(
+        "# PR-999: Legacy predecessor\n"
+        "Branch: fix/pr-999\n"
+        "\n"
+        "No receipt owns this historical file.\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        await upload_routes._load_upload_attempt(
+            redis,
+            "example__alpha",
+            str(repo),
+            "PR-001.md",
+            "PR-001",
+        )
+        is None
+    )
+
+
 @pytest.fixture
 def one_repo_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     cfg = tmp_path / "config.yml"

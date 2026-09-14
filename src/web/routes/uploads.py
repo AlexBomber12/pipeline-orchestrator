@@ -20,6 +20,7 @@ import zipfile
 import zlib
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse
@@ -196,6 +197,26 @@ def _parse_legacy_existing_task_header(path: Path) -> TaskHeader | None:
         priority=3,
         coder="any",
     )
+
+
+async def _load_upload_attempt(
+    redis_client: Any,
+    repo_name: str,
+    repo_path: str,
+    fname: str,
+    task_id: str,
+) -> Any:
+    attempt = await load_attempt(redis_client, repo_name, task_id)
+    if attempt is not None:
+        return attempt
+    prior_path = Path(repo_path) / "tasks" / fname
+    prior_header = _parse_existing_task_header(prior_path)
+    if prior_header is None or prior_header.pr_id == task_id:
+        return None
+    prior_attempt = await load_attempt(redis_client, repo_name, prior_header.pr_id)
+    if prior_attempt is not None and prior_attempt.task.task_file == f"tasks/{fname}":
+        return prior_attempt
+    return None
 
 
 def _pending_upload_task_ids(raw_manifest: str | bytes | None) -> set[str]:
@@ -700,7 +721,13 @@ async def upload_tasks(
         task_id = parsed_task_ids.get(fname, _task_id_from_filename(fname))
         uploaded_hash = task_spec_content_hash(parsed_task_texts[fname])
         try:
-            attempt = await load_attempt(redis_client, name, task_id)
+            attempt = await _load_upload_attempt(
+                redis_client,
+                name,
+                repo_path,
+                fname,
+                task_id,
+            )
             token = attempt.rejection if attempt else None
             if token:
                 rejection = await load_rejection(redis_client, name, token)
