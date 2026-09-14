@@ -1128,6 +1128,58 @@ async def test_first_startup_cannot_hide_completion_by_rewriting_its_file_hash(r
     assert any("unresolved prior task identity" in item["event"] for item in runner.state.history)
 
 
+async def test_admission_checks_completion_history_without_attempt_receipt(rejected, tmp_path):
+    runner, _, repo, *_ = rejected
+    git(repo, "checkout", "main")
+    path = repo / "tasks/PR-42.md"
+    historical = path.read_bytes()
+    (repo / "tasks/completions.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "repository": "octo/demo",
+                "base_branch": "main",
+                "completions": {
+                    "PR-42": {
+                        "task_sha256": hashlib.sha256(historical).hexdigest(),
+                        "merge_commit": git(repo, "rev-parse", "main"),
+                        "pull_request": 17,
+                        "reason": "Historical completed implementation",
+                    }
+                },
+            }
+        )
+    )
+    git(repo, "add", "tasks/completions.json")
+    git(repo, "commit", "-m", "record historical completion")
+    git(repo, "rm", "tasks/PR-42.md")
+    git(repo, "commit", "-m", "archive completed task")
+    git(repo, "push", "origin", "main")
+    await runner.redis.delete(attempt_key(runner.name, "PR-42"))
+    runner.state.current_task = None
+    runner.state.current_pr = None
+    runner.state.state = PipelineState.IDLE
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    incoming = tmp_path / "PR-42.md"
+    incoming.write_text(
+        historical.decode()
+        .replace("status: ERROR", "status: TODO")
+        .replace("blocked_reason: guardrail\n", "")
+        .replace("Original specification.", "Duplicate replacement.")
+    )
+
+    with pytest.raises(AdmissionRejected, match="completion evidence"):
+        await admission_candidate(
+            runner.redis,
+            runner.name,
+            runner.repo_config.url,
+            "main",
+            repo,
+            incoming,
+            upload=True,
+        )
+
+
 async def test_empty_active_task_cannot_prepare_an_attempt(rejected):
     runner, *_ = rejected
     runner.state.current_task = None

@@ -78,7 +78,9 @@ def discover_attempt_pr(
     ):
         raise AttemptChanged("Discovered PR identity or state changed; reconciliation is deferred.")
     expected = attempt_branch_head(repo_path, attempt.task.branch)
-    if not expected or data.get("head", {}).get("sha") != expected:
+    if expected and data.get("head", {}).get("sha") != expected:
+        raise AttemptChanged("Discovered PR HEAD differs from the attempt-owned branch.")
+    if not expected and data.get("state") != "closed":
         raise AttemptChanged("Discovered PR HEAD differs from the attempt-owned branch.")
     return data
 

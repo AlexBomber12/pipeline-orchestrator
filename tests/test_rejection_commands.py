@@ -1229,6 +1229,7 @@ async def test_pending_creation_reconciles_terminal_pr_and_releases_ownership(re
         "old_wrong_base_with_new_match",
         "fork_and_owned",
         "missing_branch",
+        "terminal_missing_branch",
     ],
 )
 async def test_pr_discovery_requires_attempt_repository_base_time_and_head(rejected, monkeypatch, case):
@@ -1288,7 +1289,10 @@ async def test_pr_discovery_requires_attempt_repository_base_time_and_head(rejec
         fork["number"] = 88
         fork["head"]["repo"]["full_name"] = "outsider/demo"
         rows.insert(0, fork)
-    elif case == "missing_branch":
+    elif case in {"missing_branch", "terminal_missing_branch"}:
+        if case == "terminal_missing_branch":
+            row["state"] = "closed"
+            row["merged_at"] = datetime.now(timezone.utc).isoformat()
         git(repo, "checkout", "main")
         git(repo, "update-ref", "-d", "refs/heads/fix/pr-42")
         git(remote, "update-ref", "-d", "refs/heads/fix/pr-42")
@@ -1310,6 +1314,7 @@ async def test_pr_discovery_requires_attempt_repository_base_time_and_head(rejec
         "known_number_ignores_wrong_base_history",
         "old_wrong_base_with_new_match",
         "fork_and_owned",
+        "terminal_missing_branch",
     }:
         assert discover_attempt_pr(str(repo), runner.owner_repo, "main", attempt)["number"] == 42
     else:

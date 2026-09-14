@@ -53,6 +53,7 @@ def get_recorded_completions(
     candidate_pr_ids: set[str],
     *,
     accepted_digests: dict[str, str] | None = None,
+    trust_recorded_digest_if_task_missing: bool = False,
 ) -> set[str]:
     """Verify matching task bytes and commit ancestry, without network or writes.
 
@@ -96,9 +97,12 @@ def get_recorded_completions(
             try:
                 digest = hashlib.sha256(task_path.read_bytes()).hexdigest()
             except OSError as exc:
-                raise CompletionEvidenceUnavailable(
-                    f"Cannot read task for completion record {pr_id}"
-                ) from exc
+                if trust_recorded_digest_if_task_missing:
+                    digest = record.task_sha256
+                else:
+                    raise CompletionEvidenceUnavailable(
+                        f"Cannot read task for completion record {pr_id}"
+                    ) from exc
         if digest != record.task_sha256:
             continue
         try:

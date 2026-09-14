@@ -175,6 +175,18 @@ async def admission_candidate(
         # Replays keep their existing attempt, including completed tasks in a
         # sprint ZIP. Only changed specifications reach verify_unfinished below.
         return previous, None
+    if previous is None:
+        owner = gh_runner.get_repo_full_name(repo_url)
+        merged = get_merged_pr_ids(str(root), base, {header.pr_id})
+        recorded = get_recorded_completions(
+            str(root),
+            base,
+            owner,
+            {header.pr_id},
+            trust_recorded_digest_if_task_missing=True,
+        )
+        if header.pr_id in merged or header.pr_id in recorded:
+            raise AdmissionRejected(f"{header.pr_id} has authoritative completion evidence and cannot be reused.")
     raw_state = await redis.get(pipeline_state(repo))
     state = RepoState.model_validate_json(raw_state) if raw_state else None
     if (previous is None or not previous.rejection) and state and state.current_task:
