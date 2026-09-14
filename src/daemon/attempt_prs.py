@@ -10,6 +10,26 @@ from src.github import gh_runner
 from src.models import PRInfo
 from src.task_attempts import AttemptChanged, TaskAttempt
 
+_DAEMON_CREATED_PR_PREFIX = (
+    "Auto-created by pipeline-orchestrator after coder exit=0 with no PR."
+)
+_ATTEMPT_MARKER_LABEL = "Pipeline-Attempt-ID"
+
+
+def daemon_created_pr_body(attempt: TaskAttempt) -> str:
+    body = _DAEMON_CREATED_PR_PREFIX
+    if attempt.task.task_file:
+        body = f"{body} See `{attempt.task.task_file}` for the planned scope."
+    return f"{body}\n\n{_ATTEMPT_MARKER_LABEL}: `{attempt.attempt_id}`"
+
+
+def _has_durable_unnumbered_pr_ownership(data: dict, attempt: TaskAttempt) -> bool:
+    body = data.get("body")
+    if not isinstance(body, str):
+        return False
+    marker = f"{_ATTEMPT_MARKER_LABEL}: `{attempt.attempt_id}`"
+    return marker in {line.strip() for line in body.splitlines()}
+
 
 def attempt_branch_head(repo_path: str, branch: str, *, require_local: bool = False) -> str | None:
     remote = git_ops._git(repo_path, "ls-remote", "--heads", "origin", f"refs/heads/{branch}").stdout.strip()
@@ -77,6 +97,8 @@ def discover_attempt_pr(
         or "merged_at" not in data
     ):
         raise AttemptChanged("Discovered PR identity or state changed; reconciliation is deferred.")
+    if attempt.pr_number is None and not _has_durable_unnumbered_pr_ownership(data, attempt):
+        raise AttemptChanged("Unnumbered attempt PR lacks durable ownership evidence.")
     expected = attempt_branch_head(repo_path, attempt.task.branch)
     if expected and data.get("head", {}).get("sha") != expected:
         raise AttemptChanged("Discovered PR HEAD differs from the attempt-owned branch.")

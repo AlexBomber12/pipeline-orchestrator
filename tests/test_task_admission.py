@@ -13,6 +13,7 @@ from src.approval_commands import build_approval, enqueue_approval
 from src.cancellation.storage import cause_key, task_spec_content_hash
 from src.daemon import git_ops
 from src.daemon import task_admission as daemon_admission
+from src.daemon.attempt_prs import daemon_created_pr_body
 from src.github.gh_runner import run_gh as cli_run_gh
 from src.keyspace import pipeline_state, upload_pending, upload_pending_count
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
@@ -359,6 +360,37 @@ async def test_changed_upload_while_idle_current_task_owns_started_attempt_is_re
 
     current = await load_attempt(runner.redis, runner.name, "PR-42")
     assert current == previous
+    assert (repo / "tasks/PR-42.md").read_text() == first_rewrite
+    assert await runner.redis.get(upload_pending(runner.name)) is None
+
+
+async def test_changed_upload_while_idle_current_task_owns_missing_receipt_is_rejected(rejected):
+    await finish_reject(rejected)
+    runner, _, repo, *_ = rejected
+    first_rewrite = rewritten(repo)
+    assert (await stage(rejected, first_rewrite)).status_code == 200
+    assert await runner.process_pending_uploads() is True
+    admitted = await load_attempt(runner.redis, runner.name, "PR-42")
+    runner.state.current_task = admitted.task
+    assert await runner._prepare_task_attempt(first_rewrite)
+    previous = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert previous.started and previous.coder_dispatched is True
+
+    await runner.redis.delete(attempt_key(runner.name, "PR-42"))
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_task = previous.task
+    runner.state.current_pr = None
+    await runner.redis.delete(cause_key(runner.name, "PR-42"))
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    changed = first_rewrite.replace("New specification.", "Replacement without receipt.")
+
+    assert (await stage(rejected, changed)).status_code == 200
+    assert await runner.process_pending_uploads() is False
+
+    current = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert current is not None
+    assert current.fingerprint == task_spec_content_hash(first_rewrite)
+    assert not current.started
     assert (repo / "tasks/PR-42.md").read_text() == first_rewrite
     assert await runner.redis.get(upload_pending(runner.name)) is None
 
@@ -3317,7 +3349,11 @@ async def test_pending_created_pr_recovers_in_later_cycle_without_restart_or_cod
     await runner._diagnose_exit_zero_no_pr("fix/pr-42", "claude", AsyncMock(return_value=False))
     assert len(lookups) == 3
     assert runner.state.state == PipelineState.ERROR
-    assert (await load_attempt(runner.redis, runner.name, "PR-42")).pr_creation_pending
+    created_attempt = await load_attempt(runner.redis, runner.name, "PR-42")
+    assert created_attempt.pr_creation_pending
+    for row in github["attempt_prs"]:
+        if row["number"] == 43:
+            row["body"] = daemon_created_pr_body(created_attempt)
     preserved_head = git(repo, "rev-parse", "fix/pr-42")
 
     # Another failed cycle keeps polling read-only, then the same running

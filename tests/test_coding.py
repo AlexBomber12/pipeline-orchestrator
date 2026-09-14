@@ -11,6 +11,7 @@ from src.daemon import git_ops
 from src.daemon.handlers import coding as coding_module
 from src.github import gh_runner
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
+from src.task_attempts import new_attempt, save_attempt
 
 from tests.runner import _helpers as h
 
@@ -351,6 +352,9 @@ def test_daemon_create_pr_uses_pr_id_when_title_missing(
         status=TaskStatus.DOING,
         branch="pr-001",
     )
+    attempt = new_attempt(runner.repo_config.url, runner.state.current_task, "# PR-001\n\nBranch: pr-001\n")
+    runner.state.current_task.attempt_id = attempt.attempt_id
+    asyncio.run(save_attempt(runner.redis, runner.name, attempt, expected=None))
     _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
 
     captured: list[list[str]] = []
@@ -368,7 +372,36 @@ def test_daemon_create_pr_uses_pr_id_when_title_missing(
     assert create_args[title_idx] == "PR-001"
     body_idx = create_args.index("--body") + 1
     assert "with no PR" in create_args[body_idx]
+    assert f"Pipeline-Attempt-ID: `{attempt.attempt_id}`" in create_args[body_idx]
 
+
+
+@pytest.mark.parametrize(
+    ("task_file", "expected"),
+    [
+        ("tasks/PR-001.md", "See `tasks/PR-001.md` for the planned scope."),
+        (None, "Auto-created by pipeline-orchestrator after coder exit=0 with no PR."),
+    ],
+)
+def test_daemon_create_pr_without_attempt_keeps_legacy_body(
+    monkeypatch: pytest.MonkeyPatch, task_file: str | None, expected: str
+) -> None:
+    runner = _runner(monkeypatch)
+    runner.state.current_task.task_file = task_file
+    captured: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], repo: str | None = None, **_kw: Any):
+        captured.append(args)
+        return ""
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    assert asyncio.run(runner._daemon_create_pr_for_branch("pr-001", "claude"))
+
+    create_args = next(args for args in captured if args[:2] == ["pr", "create"])
+    body = create_args[create_args.index("--body") + 1]
+    assert expected in body
+    assert "Pipeline-Attempt-ID" not in body
 
 def test_case_c_already_exists_error_recovers_to_watch(
     monkeypatch: pytest.MonkeyPatch,

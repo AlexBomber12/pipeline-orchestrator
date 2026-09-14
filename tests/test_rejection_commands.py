@@ -19,6 +19,7 @@ from fastapi import FastAPI
 from src.cancellation.storage import CancellationCause, cause_key, index_key
 from src.daemon import git_ops
 from src.daemon import rejection_commands as daemon_reject
+from src.daemon.attempt_prs import daemon_created_pr_body
 from src.keyspace import pipeline_state
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 from src.rejection_commands import (
@@ -175,8 +176,8 @@ def test_recorded_rejection_identity_by_task_file_returns_owner(tmp_path):
     )
 
 
-def raw_attempt_pr(pr, *, created_at=None, state="open", merged_at=None):
-    return {
+def raw_attempt_pr(pr, *, created_at=None, state="open", merged_at=None, body=None, title=None):
+    data = {
         "number": pr.number,
         "state": state,
         "merged_at": merged_at,
@@ -184,6 +185,11 @@ def raw_attempt_pr(pr, *, created_at=None, state="open", merged_at=None):
         "head": {"ref": pr.branch, "sha": pr.head_sha, "repo": {"full_name": "octo/demo"}},
         "base": {"ref": "main", "repo": {"full_name": "octo/demo"}},
     }
+    if body is not None:
+        data["body"] = body
+    if title is not None:
+        data["title"] = title
+    return data
 
 
 @pytest.fixture
@@ -1549,7 +1555,7 @@ async def test_pending_pr_reconciliation_respects_controls_and_attempt_changes(r
     elif case == "skip_trigger":
         monkeypatch.setattr(runner, "_should_skip_codex_review_post", lambda number: True)
 
-    row = raw_attempt_pr(candidate)
+    row = raw_attempt_pr(candidate, body=daemon_created_pr_body(attempt))
     if case == "fork_while_hidden":
         row["head"]["repo"]["full_name"] = "outsider/demo"
 
@@ -1617,7 +1623,7 @@ async def test_guardrail_before_pr_tracking_resolves_current_pr_and_ignores_hist
     )
     fork = raw_attempt_pr(current_pr.model_copy(update={"number": 88}))
     fork["head"]["repo"]["full_name"] = "outsider/demo"
-    github["attempt_prs"] = [old, fork, raw_attempt_pr(current_pr)]
+    github["attempt_prs"] = [old, fork, raw_attempt_pr(current_pr, body=daemon_created_pr_body(attempt))]
     # This is coder output, not an executed command. The real scanner parks
     # before the normal PR lookup, recreating the reported tracking gap.
     await runner._post_coder_resolution(
@@ -1701,6 +1707,7 @@ async def test_pending_creation_reconciles_terminal_pr_and_releases_ownership(re
             pr,
             state="closed",
             merged_at=datetime.now(timezone.utc).isoformat() if terminal == "merged" else None,
+            body=daemon_created_pr_body(attempt),
         )
     ]
     reviews = []
@@ -1738,6 +1745,7 @@ async def test_pending_creation_reconciles_terminal_pr_and_releases_ownership(re
         "fork_and_owned",
         "missing_branch",
         "terminal_missing_branch",
+        "missing_marker",
     ],
 )
 async def test_pr_discovery_requires_attempt_repository_base_time_and_head(rejected, monkeypatch, case):
@@ -1755,7 +1763,7 @@ async def test_pr_discovery_requires_attempt_repository_base_time_and_head(rejec
         started=True,
         pr_creation_pending=True,
     )
-    row = raw_attempt_pr(pr)
+    row = raw_attempt_pr(pr, body=daemon_created_pr_body(attempt))
     rows = [row]
     if case == "fork_only":
         row["head"]["repo"]["full_name"] = "outsider/demo"
@@ -1797,6 +1805,8 @@ async def test_pr_discovery_requires_attempt_repository_base_time_and_head(rejec
         fork["number"] = 88
         fork["head"]["repo"]["full_name"] = "outsider/demo"
         rows.insert(0, fork)
+    elif case == "missing_marker":
+        row.pop("body", None)
     elif case in {"missing_branch", "terminal_missing_branch"}:
         if case == "terminal_missing_branch":
             row["state"] = "closed"

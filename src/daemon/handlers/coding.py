@@ -26,6 +26,7 @@ from src.cancellation import (
 )
 from src.coder_registry import CoderPlugin
 from src.daemon import git_ops
+from src.daemon.attempt_prs import daemon_created_pr_body
 from src.daemon.guardrails import scan_stdout
 from src.daemon.handlers import CoderUnavailable
 from src.daemon.quarantine import apply_quarantine_label_for_violation
@@ -1044,17 +1045,6 @@ class CodingMixin:
         # so current_task is always populated when we reach this method.
         assert task is not None
         pr_title = f"{task.pr_id}: {task.title}" if task.title else task.pr_id
-        if task.task_file:
-            body = (
-                f"Auto-created by pipeline-orchestrator after coder exit=0 "
-                f"with no PR. See `{task.task_file}` for the planned scope."
-            )
-        else:
-            body = (
-                "Auto-created by pipeline-orchestrator after coder exit=0 "
-                "with no PR."
-            )
-
         base_branch = self.repo_config.branch
         attempt = await load_attempt(self.redis, self.name, task.pr_id)
         if attempt:
@@ -1069,7 +1059,7 @@ class CodingMixin:
                 # the exact CAS before issuing any GitHub creation request;
                 # an already-written receipt succeeds without another write.
                 try:
-                    await save_attempt(self.redis, self.name, updated, expected=attempt)
+                    attempt = await save_attempt(self.redis, self.name, updated, expected=attempt)
                 except Exception as exc:
                     await self._transition_to_error(
                         f"[{coder_name}] Cannot confirm PR creation intent for "
@@ -1082,6 +1072,19 @@ class CodingMixin:
                     )
                     return False
                 self.log_event("[CODING] Confirmed PR creation intent after replaying its acknowledgement.")
+        if attempt:
+            body = daemon_created_pr_body(attempt)
+        elif task.task_file:
+            body = (
+                "Auto-created by pipeline-orchestrator after coder exit=0 "
+                f"with no PR. See `{task.task_file}` for the planned scope."
+            )
+        else:
+            body = (
+                "Auto-created by pipeline-orchestrator after coder exit=0 "
+                "with no PR."
+            )
+
         try:
             gh_runner.run_gh(
                 [
