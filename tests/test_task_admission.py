@@ -488,7 +488,14 @@ async def test_changed_upload_after_reset_defers_while_prior_pr_remains_open(rej
     assert await runner.redis.get(upload_pending(runner.name)) is not None
 
 
-async def admit_automatic_error_rewrite(fixture, *, pr_number=42, attempt_pr_state="closed", expected_result=True):
+async def admit_automatic_error_rewrite(
+    fixture,
+    *,
+    pr_number=42,
+    attempt_pr_state="closed",
+    expected_result=True,
+    pr_discovery_pending=False,
+):
     runner, _, repo, _, github, _ = fixture
     git(repo, "checkout", "main")
     path = repo / "tasks/PR-42.md"
@@ -512,6 +519,7 @@ async def admit_automatic_error_rewrite(fixture, *, pr_number=42, attempt_pr_sta
         started=True,
         coder_dispatched=True,
         pr_number=pr_number,
+        pr_discovery_pending=pr_discovery_pending,
     )
     await save_attempt(runner.redis, runner.name, previous, expected=None)
     prior_head = git(repo, "rev-parse", "fix/pr-42")
@@ -552,6 +560,26 @@ async def test_closed_automatic_error_pr_branch_is_cleaned_before_reuse(rejected
     prepared = await load_attempt(runner.redis, runner.name, "PR-42")
     assert prepared.branch_prepared is True
     assert "refs/heads/fix/pr-42" not in git(remote, "show-ref")
+
+
+async def test_closed_pr_discovery_pending_attempt_branch_is_cleaned_before_reuse(
+    rejected,
+):
+    runner, *_ = rejected
+    current, changed, prior_head = await admit_automatic_error_rewrite(
+        rejected,
+        pr_number=None,
+        pr_discovery_pending=True,
+    )
+
+    assert current.branch_cleanup_branch == "fix/pr-42"
+    assert current.branch_cleanup_head == prior_head
+    assert current.branch_cleanup_pr_number == 42
+    assert current.pr_discovery_pending is False
+    runner.state.current_task = current.task
+    assert await runner._prepare_task_attempt(changed)
+
+
 
 
 async def test_no_pr_automatic_error_branch_defers_until_branch_removed(rejected):

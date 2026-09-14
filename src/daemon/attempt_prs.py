@@ -97,7 +97,11 @@ def discover_attempt_pr(
         or "merged_at" not in data
     ):
         raise AttemptChanged("Discovered PR identity or state changed; reconciliation is deferred.")
-    if attempt.pr_number is None and not _has_durable_unnumbered_pr_ownership(data, attempt):
+    if (
+        attempt.pr_number is None
+        and not attempt.pr_discovery_pending
+        and not _has_durable_unnumbered_pr_ownership(data, attempt)
+    ):
         raise AttemptChanged("Unnumbered attempt PR lacks durable ownership evidence.")
     expected = attempt_branch_head(repo_path, attempt.task.branch)
     if expected and data.get("head", {}).get("sha") != expected:

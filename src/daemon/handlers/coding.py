@@ -35,7 +35,7 @@ from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.models import PipelineState
 from src.subsource_registry import SuppressionReason
-from src.task_attempts import clear_failed_pr_creation, load_attempt, save_attempt
+from src.task_attempts import AttemptChanged, clear_failed_pr_creation, load_attempt, save_attempt
 
 
 def _resolve_task_file_under_repo(repo_path: str, task_file: str) -> Path:
@@ -652,13 +652,22 @@ class CodingMixin:
                 self.log_event(
                     f"[CODING] {source} PR lookup deferred for {target_branch!r}: {last_exc}."
                 )
-            return
         task = self.state.current_task
         try:
             if task is None:
                 return
             attempt = await load_attempt(self.redis, self.name, task.pr_id)
             if attempt is None or task.attempt_id not in (None, attempt.attempt_id):
+                return
+            if candidate is None:
+                if last_exc is not None:
+                    updated = attempt.model_copy(update={"pr_discovery_pending": True})
+                    await save_attempt(self.redis, self.name, updated, expected=attempt)
+                    task.attempt_id = attempt.attempt_id
+                    self.log_event(
+                        f"[CODING] {source} PR discovery unresolved for {target_branch!r}; "
+                        "will retry from ERROR before releasing ownership."
+                    )
                 return
             expected_head = attempt_branch_head(self.repo_path, target_branch)
             if not expected_head:
@@ -680,10 +689,31 @@ class CodingMixin:
                 return
             candidate.head_sha = expected_head
             updated = attempt.model_copy(
-                update={"pr_number": candidate.number, "pr_creation_pending": False}
+                update={
+                    "pr_number": candidate.number,
+                    "pr_creation_pending": False,
+                    "pr_discovery_pending": False,
+                }
             )
-            await save_attempt(self.redis, self.name, updated, expected=attempt)
-            task.attempt_id = attempt.attempt_id
+            last_save_exc: Exception | None = None
+            for _ in range(2):
+                try:
+                    await save_attempt(self.redis, self.name, updated, expected=attempt)
+                    task.attempt_id = attempt.attempt_id
+                    break
+                except AttemptChanged:
+                    raise
+                except Exception as exc:
+                    last_save_exc = exc
+            else:
+                pending = attempt.model_copy(update={"pr_discovery_pending": True})
+                await save_attempt(self.redis, self.name, pending, expected=attempt)
+                task.attempt_id = attempt.attempt_id
+                self.log_event(
+                    f"[CODING] {source} PR ownership save deferred for "
+                    f"{target_branch!r}: {last_save_exc}; discovery will retry from ERROR."
+                )
+                return
         except Exception as exc:
             self.log_event(
                 f"[CODING] {source} PR ownership record deferred for {target_branch!r}: {exc}."

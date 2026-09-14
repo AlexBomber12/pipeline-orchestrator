@@ -143,7 +143,9 @@ class ErrorMixin:
             return False
         try:
             attempt = await load_attempt(self.redis, self.name, task.pr_id)
-            if attempt is None or not attempt.pr_creation_pending:
+            if attempt is None or not (
+                attempt.pr_creation_pending or attempt.pr_discovery_pending
+            ):
                 return False
             if await self._attempt_execution_blocked():
                 return True
@@ -159,11 +161,17 @@ class ErrorMixin:
             if data is None:
                 cause = await get_cancellation_cause(self.redis, self.name, task.pr_id, refresh_ttl=False)
                 payload = cause.payload if cause and isinstance(cause.payload, dict) else {}
-                if payload.get("subsystem") == "pr_creation_clear":
+                if (
+                    attempt.pr_creation_pending
+                    and payload.get("subsystem") == "pr_creation_clear"
+                ):
                     await clear_failed_pr_creation(self.redis, self.name, attempt)
                     self.log_event("[RECOVERY] Confirmed failed PR creation cleanup after Redis recovered.")
                     return False
-                self.log_event("[RECOVERY] PR creation acknowledgement unresolved; waiting for one matching PR.")
+                if attempt.pr_discovery_pending and not attempt.pr_creation_pending:
+                    self.log_event("[RECOVERY] PR discovery unresolved; waiting for one matching PR.")
+                else:
+                    self.log_event("[RECOVERY] PR creation acknowledgement unresolved; waiting for one matching PR.")
                 return True
             if await self._attempt_execution_blocked():
                 return True
@@ -175,7 +183,9 @@ class ErrorMixin:
             # WATCH may race an operator decision while GitHub is queried.
             # Commit the exact attempt receipt before publishing the handoff.
             updated = attempt.model_copy(update={
-                "pr_creation_pending": False, "pr_number": candidate.number,
+                "pr_creation_pending": False,
+                "pr_discovery_pending": False,
+                "pr_number": candidate.number,
                 "completed": attempt.completed or bool(data["merged_at"]),
             })
             await save_attempt(self.redis, self.name, updated, expected=attempt)
@@ -188,7 +198,10 @@ class ErrorMixin:
             self._rehydrate_last_push_at(candidate)
             await self._save_current_run_record("coding_complete")
             self.state.error_message = None
-            self.log_event(f"[RECOVERY] Reconciled daemon-created PR #{candidate.number} -> WATCH.")
+            if attempt.pr_discovery_pending and not attempt.pr_creation_pending:
+                self.log_event(f"[RECOVERY] Reconciled pending PR discovery #{candidate.number} -> WATCH.")
+            else:
+                self.log_event(f"[RECOVERY] Reconciled daemon-created PR #{candidate.number} -> WATCH.")
             if not self._should_skip_codex_review_post(candidate.number):
                 self._post_codex_review(candidate.number)
         except Exception as exc:

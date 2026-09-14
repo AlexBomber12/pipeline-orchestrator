@@ -11,7 +11,7 @@ from src.daemon import git_ops
 from src.daemon.handlers import coding as coding_module
 from src.github import gh_runner
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
-from src.task_attempts import load_attempt, new_attempt, save_attempt
+from src.task_attempts import AttemptChanged, load_attempt, new_attempt, save_attempt
 
 from tests.runner import _helpers as h
 
@@ -417,6 +417,7 @@ def test_daemon_create_pr_without_attempt_keeps_legacy_body(
         "missing_branch",
         "lookup_error",
         "save_error",
+        "attempt_changed",
     ],
 )
 def test_guardrail_records_visible_pr_number_before_error(
@@ -469,8 +470,14 @@ def test_guardrail_records_visible_pr_number_before_error(
             }
         return ""
 
-    async def fail_save(*_args: Any, **_kwargs: Any):
-        raise RuntimeError("save failed")
+    original_save_attempt = coding_module.save_attempt
+
+    async def fail_save(redis: Any, repo: str, updated, *, expected):
+        if updated.pr_number == 42:
+            if case == "attempt_changed":
+                raise AttemptChanged("attempt changed")
+            raise RuntimeError("save failed")
+        return await original_save_attempt(redis, repo, updated, expected=expected)
 
     async def short_sleep(_seconds: float) -> None:
         return None
@@ -488,7 +495,7 @@ def test_guardrail_records_visible_pr_number_before_error(
         "_invalidate_etag_cache",
         lambda key: invalidations.append(key),
     )
-    if case == "save_error":
+    if case in {"save_error", "attempt_changed"}:
         monkeypatch.setattr(coding_module, "save_attempt", fail_save)
     monkeypatch.setattr(
         coding_module,
@@ -513,10 +520,12 @@ def test_guardrail_records_visible_pr_number_before_error(
     if case in {"found", "retry_found"}:
         assert runner.state.current_pr == found
         assert current.pr_number == 42
+        assert current.pr_discovery_pending is False
         assert labels == [42]
     else:
         assert runner.state.current_pr is None
         assert current.pr_number is None
+        assert current.pr_discovery_pending is (case in {"lookup_error", "save_error"})
         assert labels == []
 
 
@@ -599,6 +608,103 @@ def test_nonzero_coder_exit_records_visible_pr_number_before_error(
     assert any(
         "Recorded PR #42 for 'pr-001' before claude failure ERROR"
         in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_error_reconciles_pending_coder_pr_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner(monkeypatch)
+    attempt = new_attempt(
+        runner.repo_config.url,
+        runner.state.current_task,
+        "# PR-001\n\nBranch: pr-001\n",
+        started=True,
+        coder_dispatched=True,
+        pr_discovery_pending=True,
+    )
+    runner.state.current_task.attempt_id = attempt.attempt_id
+    runner.state.current_pr = None
+    runner.state.state = PipelineState.ERROR
+    asyncio.run(save_attempt(runner.redis, runner.name, attempt, expected=None))
+    data = {
+        "number": 42,
+        "state": "open",
+        "merged_at": None,
+        "head": {"ref": "pr-001", "sha": "abcdef"},
+    }
+    reviews: list[int] = []
+
+    async def check_budget() -> bool:
+        return True
+
+    async def refresh_pause() -> None:
+        runner.state.user_paused = False
+
+    monkeypatch.setattr(runner, "_check_github_api_budget", check_budget)
+    monkeypatch.setattr(runner, "_refresh_user_paused_from_redis", refresh_pause)
+    monkeypatch.setattr("src.daemon.handlers.error.discover_attempt_pr", lambda *a: data)
+    monkeypatch.setattr(runner, "_should_skip_codex_review_post", lambda number: False)
+    monkeypatch.setattr(runner, "_post_codex_review", lambda number: reviews.append(number))
+
+    assert asyncio.run(runner._reconcile_pending_pr_creation()) is True
+
+    current = asyncio.run(load_attempt(runner.redis, runner.name, "PR-001"))
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr == PRInfo(
+        number=42,
+        branch="pr-001",
+        pr_id="PR-001",
+        head_sha="abcdef",
+        url=f"https://github.com/{runner.owner_repo}/pull/42",
+        is_cross_repository=False,
+    )
+    assert current.pr_number == 42
+    assert current.pr_discovery_pending is False
+    assert current.pr_creation_pending is False
+    assert reviews == [42]
+    assert any(
+        "Reconciled pending PR discovery #42 -> WATCH" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_error_keeps_pending_coder_pr_discovery_when_pr_still_invisible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner(monkeypatch)
+    attempt = new_attempt(
+        runner.repo_config.url,
+        runner.state.current_task,
+        "# PR-001\n\nBranch: pr-001\n",
+        started=True,
+        coder_dispatched=True,
+        pr_discovery_pending=True,
+    )
+    runner.state.current_task.attempt_id = attempt.attempt_id
+    runner.state.current_pr = None
+    runner.state.state = PipelineState.ERROR
+    asyncio.run(save_attempt(runner.redis, runner.name, attempt, expected=None))
+
+    async def check_budget() -> bool:
+        return True
+
+    async def refresh_pause() -> None:
+        runner.state.user_paused = False
+
+    monkeypatch.setattr(runner, "_check_github_api_budget", check_budget)
+    monkeypatch.setattr(runner, "_refresh_user_paused_from_redis", refresh_pause)
+    monkeypatch.setattr("src.daemon.handlers.error.discover_attempt_pr", lambda *a: None)
+
+    assert asyncio.run(runner._reconcile_pending_pr_creation()) is True
+
+    current = asyncio.run(load_attempt(runner.redis, runner.name, "PR-001"))
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_pr is None
+    assert current.pr_discovery_pending is True
+    assert any(
+        "PR discovery unresolved; waiting for one matching PR" in entry["event"]
         for entry in runner.state.history
     )
 

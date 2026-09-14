@@ -40,6 +40,7 @@ class TaskAttempt(BaseModel):
     coder_dispatched: bool | None = None
     pr_number: int | None = None
     pr_creation_pending: bool = False
+    pr_discovery_pending: bool = False
     rejection: str | None = None
     completed: bool = False
     previous_rejection: str | None = None
