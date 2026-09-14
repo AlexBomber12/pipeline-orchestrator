@@ -264,20 +264,21 @@ async def admission_candidate(
     if previous is None and existing.is_file():
         existing_bytes = existing.read_bytes()
         existing_content = existing_bytes.decode("utf-8")
-        old = parse_existing_task_header(existing)
-        previous = new_attempt(
-            repo_url,
-            QueueTask(
-                pr_id=old.pr_id,
-                title=old.title,
-                task_file=f"tasks/{incoming.name}",
-                branch=old.branch,
-                status=TaskStatus.DONE if old.frontmatter_status == "done" else TaskStatus.TODO,
-            ),
-            existing_content,
-            started=old.frontmatter_status not in (None, "todo"),
-            file_sha256=hashlib.sha256(existing_bytes).hexdigest(),
-        )
+        old = _parse_existing_task_header_or_none(existing)
+        if old is not None:
+            previous = new_attempt(
+                repo_url,
+                QueueTask(
+                    pr_id=old.pr_id,
+                    title=old.title,
+                    task_file=f"tasks/{incoming.name}",
+                    branch=old.branch,
+                    status=TaskStatus.DONE if old.frontmatter_status == "done" else TaskStatus.TODO,
+                ),
+                existing_content,
+                started=old.frontmatter_status not in (None, "todo"),
+                file_sha256=hashlib.sha256(existing_bytes).hexdigest(),
+            )
     superseding_pending = False
     if previous and previous.admission_pending and fingerprint != previous.fingerprint:
         if supersede_pending_attempt_id == previous.attempt_id:

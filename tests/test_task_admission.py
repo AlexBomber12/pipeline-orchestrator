@@ -120,6 +120,44 @@ async def test_upload_dependency_availability_uses_existing_task_header_ids(reje
     assert (repo / "tasks/PR-100.md").read_text() == uploaded
 
 
+async def test_upload_replacement_over_unstructured_legacy_file_admits(rejected):
+    runner, _, repo, *_ = rejected
+    git(repo, "checkout", "main")
+    legacy_path = repo / "tasks/PR-100.md"
+    legacy_path.write_text(
+        "# PR-100: Legacy predecessor\n"
+        "Branch: fix/pr-100\n"
+        "\n"
+        "Historical note without structured task metadata.\n"
+    )
+    git(repo, "add", "tasks/PR-100.md")
+    git(repo, "commit", "-m", "add legacy predecessor")
+    git(repo, "push", "origin", "main")
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_task = None
+    runner.state.current_pr = None
+    await runner.redis.delete(attempt_key(runner.name, "PR-100"))
+    await runner.redis.delete(cause_key(runner.name, "PR-100"))
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    uploaded = task_with_dependency(
+        rewritten(repo).replace("PR-42:", "PR-100:").replace(
+            "fix/pr-42",
+            "fix/pr-100",
+        ),
+        "none",
+    )
+
+    response = await stage_files(rejected, [("PR-100.md", uploaded)])
+
+    assert response.status_code == 200, response.text
+    assert await runner.process_pending_uploads() is True
+    current = await load_attempt(runner.redis, runner.name, "PR-100")
+    assert current is not None and not current.admission_pending
+    assert current.task.pr_id == "PR-100"
+    assert legacy_path.read_text() == uploaded
+    assert await runner.redis.get(upload_pending(runner.name)) is None
+
+
 async def test_changed_upload_after_reset_replaces_started_automatic_error_attempt(rejected):
     await finish_reject(rejected)
     runner, _, repo, *_ = rejected
