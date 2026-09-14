@@ -109,6 +109,72 @@ def test_recorded_rejection_identity_skips_bad_entries_and_binding_mismatches(tm
     ) == {"fingerprint": "match", "rejection_binding": "wanted"}
 
 
+def test_recorded_rejection_identity_by_task_file_returns_owner(tmp_path):
+    from src.rejection_commands import recorded_rejection_identity_by_task_file
+
+    owner_entry = {
+        "task_file": "tasks/PR-001.md",
+        "fingerprint": "new",
+        "rejection_binding": "wanted",
+    }
+    (tmp_path / "tasks").mkdir()
+    (tmp_path / "tasks/rejections.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "repository": "octo/demo",
+                "base_branch": "main",
+                "rejections": {
+                    "PR-998": [
+                        {
+                            "task_file": "tasks/PR-001.md",
+                            "fingerprint": "new",
+                            "rejection_binding": "older",
+                        },
+                    ],
+                    "PR-999": [
+                        owner_entry,
+                        "bad",
+                        {
+                            "task_file": "tasks/PR-999.md",
+                            "fingerprint": "new",
+                            "rejection_binding": "wanted",
+                        },
+                        {
+                            "task_file": "tasks/PR-001.md",
+                            "fingerprint": "old",
+                            "rejection_binding": "wanted",
+                        },
+                        {
+                            "task_file": "tasks/PR-001.md",
+                            "fingerprint": "new",
+                            "rejection_binding": "other",
+                        },
+                    ],
+                },
+            }
+        )
+    )
+
+    assert recorded_rejection_identity_by_task_file(
+        tmp_path,
+        "octo/demo",
+        "main",
+        "tasks/PR-001.md",
+        fingerprint="new",
+        binding="wanted",
+    ) == ("PR-999", owner_entry)
+    assert (
+        recorded_rejection_identity_by_task_file(
+            tmp_path,
+            "octo/demo",
+            "main",
+            "tasks/PR-404.md",
+        )
+        is None
+    )
+
+
 def raw_attempt_pr(pr, *, created_at=None, state="open", merged_at=None):
     return {
         "number": pr.number,

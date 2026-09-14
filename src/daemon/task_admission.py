@@ -22,6 +22,7 @@ from src.rejection_commands import (
     RejectionIdentityManifestUnavailable,
     load_rejection,
     recorded_rejection_identity,
+    recorded_rejection_identity_by_task_file,
 )
 from src.task_admission import admission_candidate, validate_admission_graph, verify_unfinished
 from src.task_attempts import (
@@ -74,6 +75,25 @@ class TaskAdmissionMixin:
                 self.repo_config.branch,
                 task_id,
                 fingerprint=fingerprint,
+            )
+        except RejectionIdentityManifestUnavailable as exc:
+            raise MergeStatusUnavailable("Rejection identity manifest is unavailable.") from exc
+
+    def _recorded_rejection_identity_by_task_file(
+        self,
+        task_file: str,
+        *,
+        fingerprint: str | None = None,
+        binding: str | None = None,
+    ) -> tuple[str, dict] | None:
+        try:
+            return recorded_rejection_identity_by_task_file(
+                Path(self.repo_path),
+                self.owner_repo,
+                self.repo_config.branch,
+                task_file,
+                fingerprint=fingerprint,
+                binding=binding,
             )
         except RejectionIdentityManifestUnavailable as exc:
             raise MergeStatusUnavailable("Rejection identity manifest is unavailable.") from exc
@@ -155,6 +175,7 @@ class TaskAdmissionMixin:
         task_id: str,
         *,
         fingerprint: str | None = None,
+        task_file: str | None = None,
     ) -> RejectionCommand | None:
         if binding == LEGACY_REJECTION_SENTINEL:
             return None
@@ -172,7 +193,18 @@ class TaskAdmissionMixin:
             )
         except RejectionIdentityManifestUnavailable as exc:
             raise MergeStatusUnavailable("Rejection identity manifest is unavailable.") from exc
-        return self._rejection_command_from_identity(task_id, entry)
+        if entry is not None:
+            return self._rejection_command_from_identity(task_id, entry)
+        if task_file is not None:
+            matched = self._recorded_rejection_identity_by_task_file(
+                task_file,
+                fingerprint=fingerprint,
+                binding=binding,
+            )
+            if matched is not None:
+                owner_task_id, owner_entry = matched
+                return self._rejection_command_from_identity(owner_task_id, owner_entry)
+        return None
 
     def _has_historical_operator_reject_marker(self, base: str, filename: str, fingerprint: str) -> bool:
         result = git_ops._git(self.repo_path, "log", "--format=%H", base, "--", filename, check=False)
@@ -290,6 +322,12 @@ class TaskAdmissionMixin:
                 task_rejection = self._recorded_rejection_identity(task_id)
                 if self._rejection_identity_matches_base(task_rejection, filename, fingerprint):
                     recorded_rejection = task_rejection
+            if task_rejection is None:
+                task_file_rejection = self._recorded_rejection_identity_by_task_file(
+                    filename
+                )
+                if task_file_rejection is not None:
+                    _, task_rejection = task_file_rejection
             if (
                 header.blocked_reason == "operator_reject"
                 or self._has_historical_operator_reject_marker(
@@ -584,6 +622,13 @@ class TaskAdmissionMixin:
                         "File unchanged. Reject is final; rewrite or remove the unfinished task."
                     )
                 recorded_previous = self._recorded_rejection_identity(task.pr_id)
+                if recorded_previous is None:
+                    task_file = task.task_file or f"tasks/{task.pr_id}.md"
+                    matched_previous = self._recorded_rejection_identity_by_task_file(
+                        task_file
+                    )
+                    if matched_previous is not None:
+                        _, recorded_previous = matched_previous
                 previous_rejection = (
                     str(recorded_previous["rejection_binding"])
                     if recorded_previous and recorded_previous.get("rejection_binding")
@@ -723,7 +768,11 @@ class TaskAdmissionMixin:
         # Retry/Approve never call this abandoned-attempt cleanup.
 
     async def _prepare_reused_branch(self, attempt: TaskAttempt) -> None:
-        command = await self._load_final_rejection(attempt.previous_rejection, attempt.task.pr_id)
+        command = await self._load_final_rejection(
+            attempt.previous_rejection,
+            attempt.task.pr_id,
+            task_file=attempt.task.task_file,
+        )
         if command is None or command.status != "rejected" or not command.released:
             raise AttemptChanged("Prior rejection is not confirmed.")
         branch, base = attempt.task.branch, self.repo_config.branch

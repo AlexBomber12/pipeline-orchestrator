@@ -229,6 +229,82 @@ async def test_upload_renamed_legacy_file_loads_old_rejection_receipt(rejected):
     assert legacy_path.read_text() == uploaded
 
 
+async def test_snapshot_recovery_preserves_upload_renamed_rejection_by_task_file(rejected):
+    runner, _, repo, remote, *_ = rejected
+    git(repo, "checkout", "main")
+    old_text = rewritten(repo).replace("PR-42:", "PR-999:").replace(
+        "fix/pr-42",
+        "fix/pr-999",
+    )
+    legacy_path = repo / "tasks/PR-001.md"
+    legacy_path.write_text(old_text)
+    git(repo, "add", "tasks/PR-001.md")
+    git(repo, "commit", "-m", "add legacy renamed task")
+    git(repo, "push", "origin", "main")
+    base_commit = git(repo, "rev-parse", "origin/main")
+    git(repo, "checkout", "-B", "fix/pr-999", "origin/main")
+    (repo / "legacy-branch.txt").write_text("abandoned")
+    git(repo, "add", "legacy-branch.txt")
+    git(repo, "commit", "-m", "abandoned renamed branch")
+    git(repo, "push", "-u", "origin", "fix/pr-999")
+    branch_head = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "main")
+    task = QueueTask(
+        pr_id="PR-999",
+        title="Reusable task",
+        task_file="tasks/PR-001.md",
+        branch="fix/pr-999",
+        status=TaskStatus.ERROR,
+    )
+    command = RejectionCommand(
+        binding="rename-rejection",
+        repo_slug=runner.name,
+        repo_url=runner.repo_config.url,
+        task=task,
+        attempt_id="attempt-pr-999",
+        fingerprint=task_spec_content_hash(old_text),
+        file_sha256=hashlib.sha256(old_text.encode()).hexdigest(),
+        failure="{}",
+        pr=None,
+        status="rejected",
+        branch_head=branch_head,
+        base_commit=base_commit,
+        released=True,
+    )
+    assert await runner._commit_rejection_identity(command)
+    uploaded = old_text.replace("PR-999:", "PR-001:") + "\nCanonical rewrite.\n"
+    legacy_path.write_text(uploaded)
+    git(repo, "add", "tasks/PR-001.md")
+    git(repo, "commit", "-m", "upload renamed task")
+    git(repo, "push", "origin", "main")
+
+    await runner._snapshot_accepted_specs()
+
+    recovered = await load_attempt(runner.redis, runner.name, "PR-001")
+    assert recovered is not None
+    assert recovered.previous_rejection == command.binding
+    assert recovered.task.task_file == "tasks/PR-001.md"
+    assert recovered.task.branch == "fix/pr-999"
+    await runner.redis.delete(attempt_key(runner.name, "PR-001"))
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="Reusable task",
+        task_file="tasks/PR-001.md",
+        branch="fix/pr-999",
+        status=TaskStatus.TODO,
+    )
+    runner.state.current_pr = None
+    runner.state.state = PipelineState.IDLE
+
+    assert await runner._prepare_task_attempt(uploaded)
+
+    prepared = await load_attempt(runner.redis, runner.name, "PR-001")
+    assert prepared is not None and prepared.branch_prepared
+    assert prepared.started and prepared.coder_dispatched
+    assert prepared.previous_rejection == command.binding
+    assert "refs/heads/fix/pr-999" not in git(remote, "show-ref")
+
+
 async def test_changed_upload_after_reset_replaces_started_automatic_error_attempt(rejected):
     await finish_reject(rejected)
     runner, _, repo, *_ = rejected
@@ -2224,6 +2300,7 @@ async def test_recorded_rejection_identity_invalid_manifest_defers(rejected):
 async def test_rejection_identity_helpers_handle_invalid_entries_and_legacy_sentinel(rejected):
     runner, _, repo, *_ = rejected
     assert await runner._load_final_rejection(LEGACY_REJECTION_SENTINEL, "PR-42") is None
+    assert runner._rejection_command_from_identity("PR-42", None) is None
     assert runner._rejection_command_from_identity("PR-42", {"rejection_binding": ""}) is None
     command = runner._rejection_command_from_identity(
         "PR-42",
@@ -2244,6 +2321,8 @@ async def test_rejection_identity_helpers_handle_invalid_entries_and_legacy_sent
     path.write_text("{")
     with pytest.raises(MergeStatusUnavailable, match="Rejection identity manifest is unavailable"):
         runner._recorded_rejection_identity("PR-42", "f" * 64)
+    with pytest.raises(MergeStatusUnavailable, match="Rejection identity manifest is unavailable"):
+        runner._recorded_rejection_identity_by_task_file("tasks/PR-42.md")
     with pytest.raises(MergeStatusUnavailable, match="Rejection identity manifest is unavailable"):
         await runner._load_final_rejection("binding", "PR-42")
 

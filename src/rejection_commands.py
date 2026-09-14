@@ -45,6 +45,49 @@ def recorded_rejection_identity(
     binding: str | None = None,
 ) -> dict | None:
     """Return a matching durable rejection identity entry from ``tasks/rejections.json``."""
+    records = _load_rejection_identity_records(root, owner_repo, base_branch)
+    if records is None:
+        return None
+    entries = _rejection_identity_entries(records, task_id)
+    return _matching_rejection_identity_entry(
+        entries,
+        fingerprint=fingerprint,
+        binding=binding,
+    )
+
+
+def recorded_rejection_identity_by_task_file(
+    root: Path,
+    owner_repo: str,
+    base_branch: str,
+    task_file: str,
+    *,
+    fingerprint: str | None = None,
+    binding: str | None = None,
+) -> tuple[str, dict] | None:
+    """Return a durable rejection identity entry that owns ``task_file``."""
+    records = _load_rejection_identity_records(root, owner_repo, base_branch)
+    if records is None:
+        return None
+    for task_id in reversed(list(records)):
+        for entry in reversed(_rejection_identity_entries(records, str(task_id))):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("task_file") != task_file:
+                continue
+            if fingerprint is not None and entry.get("fingerprint") != fingerprint:
+                continue
+            if binding is not None and entry.get("rejection_binding") != binding:
+                continue
+            return str(task_id), entry
+    return None
+
+
+def _load_rejection_identity_records(
+    root: Path,
+    owner_repo: str,
+    base_branch: str,
+) -> dict | None:
     manifest_path = root / REJECTION_IDENTITY_MANIFEST
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -63,9 +106,22 @@ def recorded_rejection_identity(
     records = manifest.get("rejections")
     if not isinstance(records, dict):
         raise RejectionIdentityManifestUnavailable("Rejection identity manifest is unavailable.")
+    return records
+
+
+def _rejection_identity_entries(records: dict, task_id: str) -> list:
     entries = records.get(task_id, [])
     if not isinstance(entries, list):
         raise RejectionIdentityManifestUnavailable("Rejection identity manifest is unavailable.")
+    return entries
+
+
+def _matching_rejection_identity_entry(
+    entries: list,
+    *,
+    fingerprint: str | None = None,
+    binding: str | None = None,
+) -> dict | None:
     for entry in reversed(entries):
         if not isinstance(entry, dict):
             continue
