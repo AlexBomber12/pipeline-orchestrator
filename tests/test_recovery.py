@@ -21,7 +21,7 @@ from src.models import (
     ReviewStatus,
     TaskStatus,
 )
-from src.queue_parser import QueueValidationError
+from src.queue_parser import QueueValidationError, write_frontmatter_status
 from src.subsource_registry import SuppressionReason
 from src.suppression import SuppressionRecord
 from src.task_status import MergedState
@@ -128,6 +128,9 @@ def _write_task_file(
     pr_id: str,
     status: str,
     branch: str,
+    *,
+    depends_on: str = "none",
+    priority: int = 2,
 ) -> None:
     tasks_dir = repo_root / "tasks"
     tasks_dir.mkdir(exist_ok=True)
@@ -137,8 +140,8 @@ def _write_task_file(
         f"Branch: {branch}\n"
         "- Type: feature\n"
         "- Complexity: medium\n"
-        "- Depends on: none\n"
-        "- Priority: 2\n"
+        f"- Depends on: {depends_on}\n"
+        f"- Priority: {priority}\n"
         "- Coder: codex\n",
         encoding="utf-8",
     )
@@ -609,6 +612,69 @@ def test_recovery_after_redis_flush_excludes_error_tasks(
     assert runner._crashed_task_pr_ids == {"PR-100"}
     statuses = {task.pr_id: task.status for task in runner.state.current_queue or []}
     assert statuses == {"PR-100": TaskStatus.ERROR, "PR-101": TaskStatus.TODO}
+
+
+@pytest.mark.parametrize("use_single_error_exit", [False, True])
+@pytest.mark.parametrize("status_write_succeeds", [False, True])
+def test_crash_recovery_blocks_todo_task_and_selects_independent_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_single_error_exit: bool,
+    status_write_succeeds: bool,
+) -> None:
+    _write_task_file(tmp_path, "PR-100", "TODO", "pr-100-crashed", priority=2)
+    _write_task_file(tmp_path, "PR-101", "TODO", "pr-101-independent", priority=3)
+    _write_task_file(
+        tmp_path, "PR-102", "TODO", "pr-102-dependent",
+        depends_on="PR-100", priority=1,
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
+    monkeypatch.setattr(
+        recovery_module, "_resolve_merged_state",
+        lambda *args, **kwargs: MergedState(set(), set(), True),
+    )
+    monkeypatch.setattr(
+        "src.daemon.handlers.idle._resolve_merged_state",
+        lambda *args, **kwargs: MergedState(set(), set(), True),
+    )
+
+    runner = _make_runner()
+    runner.repo_config.feature_flags.use_single_error_exit = use_single_error_exit
+    runner.repo_path = str(tmp_path)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-100", title="Crashed", status=TaskStatus.DOING,
+        task_file="tasks/PR-100.md", branch="pr-100-crashed",
+    )
+    runner._preserve_crashed_run_commits = lambda branch: True  # type: ignore[method-assign]
+
+    async def persist_status(task, status, reason, blocked_reason=None) -> bool:
+        if status_write_succeeds:
+            write_frontmatter_status(
+                tmp_path / task.task_file, status, blocked_reason,
+            )
+        return status_write_succeeds
+
+    runner._commit_task_status_change = persist_status  # type: ignore[method-assign]
+    asyncio.run(runner.recover_state())
+    crashed_text = (tmp_path / "tasks/PR-100.md").read_text(encoding="utf-8")
+    if status_write_succeeds:
+        assert "status: ERROR" in crashed_text
+    else:
+        assert "status: TODO" in crashed_text
+        assert any(
+            "fallback marker keeps task blocked" in entry["event"]
+            for entry in runner.state.history
+        )
+
+    for active_runner in (runner, _make_runner()):
+        active_runner.repo_config.feature_flags.use_single_error_exit = use_single_error_exit
+        active_runner.repo_path = str(tmp_path)
+        active_runner.redis = runner.redis
+        if active_runner is not runner:
+            asyncio.run(active_runner.recover_state())
+        selected = asyncio.run(active_runner._select_next_task_from_dag())
+        assert selected is not None and selected.pr_id == "PR-101"
+        assert active_runner._idle_dag_statuses["PR-100"] == TaskStatus.ERROR
 
 
 def test_recover_paused_doing_task_without_pr_defers_coding(

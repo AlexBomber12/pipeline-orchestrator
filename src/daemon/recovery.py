@@ -580,6 +580,20 @@ class RecoveryMixin:
                     )
             else:
                 self._crashed_task_pr_ids.add(doing.pr_id)
+            if branch_kind == "crash":
+                status_written = await self._commit_task_status_change(
+                    doing,
+                    "ERROR",
+                    "crash recovery",
+                    blocked_reason=SuppressionReason.CRASH,
+                )
+                if not status_written:
+                    self._status_write_failed_task_pr_ids.add(doing.pr_id)
+                    await self._persist_status_write_failed_task_pr_ids()
+                    self.log_event(
+                        f"[INFRA] Warning: failed to persist status:ERROR for "
+                        f"{doing.pr_id}; fallback marker keeps task blocked."
+                    )
             # PR-266b crash-no-PR fix: reflect the cancellation in the
             # in-memory tasks list so the headers-mode current_queue
             # snapshot does not display ``DOING`` for a task the runner
