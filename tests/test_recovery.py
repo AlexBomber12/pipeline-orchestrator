@@ -616,11 +616,13 @@ def test_recovery_after_redis_flush_excludes_error_tasks(
 
 @pytest.mark.parametrize("use_single_error_exit", [False, True])
 @pytest.mark.parametrize("status_write_succeeds", [False, True])
+@pytest.mark.parametrize("worktree_dirty", [False, True])
 def test_crash_recovery_blocks_todo_task_and_selects_independent_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     use_single_error_exit: bool,
     status_write_succeeds: bool,
+    worktree_dirty: bool,
 ) -> None:
     _write_task_file(tmp_path, "PR-100", "TODO", "pr-100-crashed", priority=2)
     _write_task_file(tmp_path, "PR-101", "TODO", "pr-101-independent", priority=3)
@@ -637,6 +639,7 @@ def test_crash_recovery_blocks_todo_task_and_selects_independent_work(
         "src.daemon.handlers.idle._resolve_merged_state",
         lambda *args, **kwargs: MergedState(set(), set(), True),
     )
+    monkeypatch.setattr(recovery_module.git_ops, "_working_tree_dirty", lambda path: worktree_dirty)
 
     runner = _make_runner()
     runner.repo_config.feature_flags.use_single_error_exit = use_single_error_exit
@@ -648,6 +651,7 @@ def test_crash_recovery_blocks_todo_task_and_selects_independent_work(
     runner._preserve_crashed_run_commits = lambda branch: True  # type: ignore[method-assign]
 
     async def persist_status(task, status, reason, blocked_reason=None) -> bool:
+        assert not worktree_dirty
         if status_write_succeeds:
             write_frontmatter_status(
                 tmp_path / task.task_file, status, blocked_reason,
@@ -657,7 +661,7 @@ def test_crash_recovery_blocks_todo_task_and_selects_independent_work(
     runner._commit_task_status_change = persist_status  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
     crashed_text = (tmp_path / "tasks/PR-100.md").read_text(encoding="utf-8")
-    if status_write_succeeds:
+    if status_write_succeeds and not worktree_dirty:
         assert "status: ERROR" in crashed_text
     else:
         assert "status: TODO" in crashed_text
