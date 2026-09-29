@@ -432,6 +432,7 @@ class PipelineRunner(
         self._approval_head_refresh_uncertain = False
         self._cycle_lock = asyncio.Lock()
         self._stop_requested = False
+        self._stop_pause_publish_pending = False
         self._user_stopped_task_pr_ids: set[str] = set()
         # Legacy flag-off storage for crash parks. The flag-on path records
         # crash suppressions in RedisSuppressionStore instead.
@@ -2295,6 +2296,13 @@ class PipelineRunner(
         except Exception:
             return
         if not raw:
+            try:
+                stop_requested = bool(await self.redis.get(control_stop(self.name)))
+            except Exception:
+                return
+            if not stop_requested:
+                self.state.user_paused = False
+                self._stop_pause_publish_pending = False
             return
         try:
             persisted = RepoState.model_validate_json(raw)
@@ -2343,6 +2351,7 @@ class PipelineRunner(
             else:
                 if claimed:
                     self.state.user_paused = True
+                    self._stop_pause_publish_pending = True
                 return claimed
 
         try:
@@ -2352,6 +2361,7 @@ class PipelineRunner(
         if not raw:
             return False
         self.state.user_paused = True
+        self._stop_pause_publish_pending = True
         try:
             await self.redis.set(state_key, self.state.model_dump_json())
         except Exception:
@@ -2433,8 +2443,13 @@ class PipelineRunner(
         self.state.last_updated = datetime.now(timezone.utc)
         state_key = pipeline_state(self.name)
 
+        preserve_stop_pause = (
+            self._stop_pause_publish_pending and self.state.user_paused
+        )
+
         async def _serialize_latest_state() -> str:
-            await self._refresh_user_paused_from_redis()
+            if not preserve_stop_pause:
+                await self._refresh_user_paused_from_redis()
             # PR-328: derive the typed inhibitor list AFTER refreshing
             # ``user_paused`` (and after the transaction branch has merged
             # the persisted pause flag) so the published list cannot lag
@@ -2461,7 +2476,7 @@ class PipelineRunner(
         if hasattr(self.redis, "transaction"):
             async def _transaction(pipe: Any) -> None:
                 raw = await pipe.get(state_key)
-                if raw:
+                if raw and not preserve_stop_pause:
                     try:
                         persisted = RepoState.model_validate_json(raw)
                     except Exception:
@@ -2476,6 +2491,8 @@ class PipelineRunner(
         else:
             payload = await _serialize_latest_state()
             await self.redis.set(state_key, payload)
+        if preserve_stop_pause:
+            self._stop_pause_publish_pending = False
         if self._old_basename != self.name:
             try:
                 old_key = pipeline_state(self._old_basename)

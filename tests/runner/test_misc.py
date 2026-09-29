@@ -855,6 +855,31 @@ def test_pop_stop_request_returns_false_when_redis_get_fails(
     assert asyncio.run(runner._pop_stop_request()) is False
 
 
+def test_refresh_user_paused_clears_reset_stale_local_pause() -> None:
+    """A reset that removes pipeline state and the stop key should not leave
+    a prior in-memory pause blocking the next upload or dispatch cycle."""
+    runner = h._make_runner()
+    runner.state.user_paused = True
+    runner._stop_pause_publish_pending = True
+
+    asyncio.run(runner._refresh_user_paused_from_redis())
+
+    assert runner.state.user_paused is False
+    assert runner._stop_pause_publish_pending is False
+
+
+def test_refresh_user_paused_keeps_reset_pause_when_stop_key_live() -> None:
+    runner = h._make_runner()
+    runner.state.user_paused = True
+    runner._stop_pause_publish_pending = True
+    runner.redis.store[control_stop(runner.name)] = "1"
+
+    asyncio.run(runner._refresh_user_paused_from_redis())
+
+    assert runner.state.user_paused is True
+    assert runner._stop_pause_publish_pending is True
+
+
 def test_pop_stop_request_returns_true_when_delete_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -887,6 +912,7 @@ def test_pop_stop_request_persists_pause_before_deleting_stop() -> None:
     assert written.user_paused is True
     assert written.state is PipelineState.CODING
     assert runner.state.user_paused is True
+    assert runner._stop_pause_publish_pending is True
 
 
 def test_pop_stop_request_transaction_falls_back_from_malformed_state() -> None:
@@ -952,3 +978,4 @@ def test_pop_stop_request_ignores_fallback_pause_persist_failure(
 
     assert asyncio.run(runner._pop_stop_request()) is True
     assert runner.state.user_paused is True
+    assert runner._stop_pause_publish_pending is True

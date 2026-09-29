@@ -846,6 +846,31 @@ def test_publish_state_derives_inhibitors_after_redis_refresh() -> None:
     assert written.active_inhibitors[0].inhibitor_type is InhibitorType.USER_PAUSE
 
 
+def test_publish_state_preserves_pending_stop_pause_over_stale_persisted_state() -> None:
+    """A consumed stop must publish one durable PAUSED snapshot before
+    Redis refresh can merge a stale unpaused value over the local stop."""
+    from src.inhibitor import InhibitorType
+
+    runner = _make_runner()
+    assert isinstance(runner.redis, _FakeRedis)
+    state_key = f"pipeline:{runner.name}"
+    stale = runner.state.model_copy(deep=True)
+    stale.state = PipelineState.CODING
+    stale.user_paused = False
+    runner.redis.store[state_key] = stale.model_dump_json()
+    runner.state.state = PipelineState.PAUSED
+    runner.state.user_paused = True
+    runner._stop_pause_publish_pending = True
+
+    asyncio.run(runner.publish_state())
+
+    written = RepoState.model_validate_json(runner.redis.store[state_key])
+    assert written.state is PipelineState.PAUSED
+    assert written.user_paused is True
+    assert written.active_inhibitors[0].inhibitor_type is InhibitorType.USER_PAUSE
+    assert runner._stop_pause_publish_pending is False
+
+
 def test_publish_state_handles_derive_exception_gracefully(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
