@@ -148,6 +148,13 @@ def _sort_created_at(cause: CancellationCause) -> datetime:
     return parsed
 
 
+def _created_at_timestamp(created_at: str) -> float:
+    parsed = datetime.fromisoformat(created_at)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
 async def record_cancellation_cause(
     redis_client: Any,
     repo_slug: str,
@@ -160,7 +167,7 @@ async def record_cancellation_cause(
     cause.task_id = task_id
     cause.repo_slug = repo_slug
     serialized = cause.to_redis()
-    score = datetime.fromisoformat(cause.created_at).timestamp()
+    score = _created_at_timestamp(cause.created_at)
     pipe = redis_client.pipeline()
     pipe.set(cause_key(repo_slug, task_id), serialized, ex=TTL_SECONDS)
     pipe.zadd(index_key(repo_slug), {task_id: score})
@@ -239,7 +246,7 @@ async def _refresh_forensic_ttl(
 ) -> None:
     await redis_client.expire(key, READ_REFRESH_TTL_SECONDS)
     try:
-        score = datetime.fromisoformat(cause.created_at).timestamp()
+        score = _created_at_timestamp(cause.created_at)
     except (TypeError, ValueError):
         return
     idx = index_key(repo_slug)

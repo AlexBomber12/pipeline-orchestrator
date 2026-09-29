@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import time
+from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -159,6 +162,21 @@ class _FakeRedis:
         if isinstance(value, str) and value.startswith("("):
             return float(value[1:]), True
         return float(value), False
+
+
+@pytest.fixture
+def europe_rome_timezone() -> Iterator[None]:
+    previous_tz = os.environ.get("TZ")
+    os.environ["TZ"] = "Europe/Rome"
+    time.tzset()
+    try:
+        yield
+    finally:
+        if previous_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous_tz
+        time.tzset()
 
 
 def test_categories_tuple_does_not_include_operator_recovery() -> None:
@@ -519,10 +537,15 @@ async def test_list_recent_orders_by_parsed_timestamp_across_offsets() -> None:
 
     since = datetime(2026, 5, 4, tzinfo=timezone.utc)
     recent = await list_recent_cancellations(redis, "alpha", since)
+    assert await redis.zscore(index_key("alpha"), "PR-LATER") == datetime(
+        2026, 5, 4, 13, 30, tzinfo=timezone.utc
+    ).timestamp()
     assert [c.task_id for c in recent] == ["PR-LATER", "PR-EARLY"]
 
 
-async def test_list_recent_orders_naive_timestamps_as_utc() -> None:
+async def test_list_recent_orders_naive_timestamps_as_utc(
+    europe_rome_timezone: None,
+) -> None:
     redis = _FakeRedis()
     base = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
     await record_cancellation_cause(
@@ -541,6 +564,9 @@ async def test_list_recent_orders_naive_timestamps_as_utc() -> None:
         ),
     )
 
+    assert await redis.zscore(index_key("alpha"), "PR-NAIVE") == datetime(
+        2026, 5, 4, 12, 30, tzinfo=timezone.utc
+    ).timestamp()
     recent = await list_recent_cancellations(redis, "alpha", base)
     assert [c.task_id for c in recent] == ["PR-AWARE", "PR-NAIVE"]
 
@@ -691,18 +717,37 @@ async def test_read_refresh_extends_index_zset_ttl() -> None:
 
 async def test_read_refresh_does_not_change_canceled_at_score() -> None:
     redis = _FakeRedis()
-    cause = _seed_cause_with_ttl(
+    _seed_cause_with_ttl(
         redis,
         "alpha",
         "PR-303",
-        created_at="2026-05-04T10:00:00+00:00",
+        created_at="2026-05-04T05:00:00-05:00",
         ttl=TTL_SECONDS,
     )
-    original_score = datetime.fromisoformat(cause.created_at).timestamp()
+    original_score = datetime(2026, 5, 4, 10, 0, tzinfo=timezone.utc).timestamp()
 
     await get_cancellation_cause(redis, "alpha", "PR-303")
 
     assert await redis.zscore(index_key("alpha"), "PR-303") == original_score
+
+
+async def test_read_refresh_scores_naive_timestamp_as_utc(
+    europe_rome_timezone: None,
+) -> None:
+    redis = _FakeRedis()
+    _seed_cause_with_ttl(
+        redis,
+        "alpha",
+        "PR-NAIVE",
+        created_at="2026-05-04T10:00:00",
+        ttl=TTL_SECONDS,
+    )
+    expected_score = datetime(2026, 5, 4, 10, 0, tzinfo=timezone.utc).timestamp()
+    assert await redis.zscore(index_key("alpha"), "PR-NAIVE") != expected_score
+
+    await get_cancellation_cause(redis, "alpha", "PR-NAIVE")
+
+    assert await redis.zscore(index_key("alpha"), "PR-NAIVE") == expected_score
 
 
 async def test_read_returns_none_for_missing_key_without_issuing_expire() -> None:
