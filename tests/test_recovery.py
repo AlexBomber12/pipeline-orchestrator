@@ -637,8 +637,7 @@ def test_crash_recovery_blocks_todo_task_and_selects_independent_work(
     asyncio.run(runner.recover_state())
     for active_runner in (runner, _make_runner()):
         active_runner.repo_config.feature_flags.use_single_error_exit = use_single_error_exit
-        active_runner.repo_path = str(tmp_path)
-        active_runner.redis = runner.redis
+        active_runner.repo_path, active_runner.redis = str(tmp_path), runner.redis
         if active_runner is not runner:
             asyncio.run(active_runner.recover_state())
         assert asyncio.run(active_runner._select_next_task_from_dag()).pr_id == "PR-101"
@@ -715,8 +714,7 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
     not lost when the user re-uploads to retry."""
     task = _doing_task()
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
-    nonsecret = type("V", (), {"category": "large_diff_threshold"})()
-    monkeypatch.setattr(recovery_module, "scan_pr_diff", lambda diff: [nonsecret])
+    monkeypatch.setattr(recovery_module, "scan_pr_diff", lambda diff: [type("V", (), {"category": "large_diff_threshold"})()])
 
     events: list[str] = []
 
@@ -726,10 +724,11 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
     def fake_run(cmd: list[str], **kwargs: Any) -> Any:
         if cmd[1:3] == ["status", "--porcelain"]:
             return subprocess.CompletedProcess(cmd, 0, " M src/work.py\n?? notes.txt\n", "")
-        if cmd[1:3] == ["stash", "push"]:
-            events.append("stash")
         if cmd[1:] == ["rev-parse", "stash@{0}"]:
             return subprocess.CompletedProcess(cmd, 0, f"{'a' * 40}\n", "")
+        if cmd[1] == "grep":
+            events.append("grep:" + " ".join(cmd[2:]))
+            return subprocess.CompletedProcess(cmd, 1, "", "")
         if cmd[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
             events.append("probe")
 
@@ -767,26 +766,26 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
     # Preserve push must happen before recovery transitions to IDLE so
     # the work is durable on origin even when the task is ERROR.
     assert "coding" not in events
+    assert f"grep:-a -q PRIVATE KEY----- {'a' * 40} {'a' * 40}^3" in events
     assert any(f"{'a' * 40}:refs/heads/crash-backup/PR-042/" in event for event in events)
     assert any("Preserved crashed-run commits on pr-042-inflight" in e["event"] for e in runner.state.history)
     assert runner.state.state == PipelineState.IDLE
     assert "PR-042" in runner._crashed_task_pr_ids
 
 
-@pytest.mark.parametrize("failure_at", ["status", "stash", "", "secret"])
+@pytest.mark.parametrize("failure_at", ["status", "stash", "", "private-key"])
 def test_preserve_dirty_work_failure_blocks_recovery(monkeypatch, failure_at) -> None:
-    runner = _make_runner()
     def fake_git(repo_path, *args, **kwargs):
         if args[0] == failure_at:
             raise OSError(f"{failure_at} failed")
         stdout = " M work.py" if args[0] == "status" else ""
-        if failure_at == "secret" and args[0] == "rev-parse":
+        if failure_at == "private-key" and args[0] == "rev-parse":
             stdout = "a" * 40
+        if args[0] == "grep":
+            return subprocess.CompletedProcess(args, int(failure_at != "private-key"), "", "")
         return subprocess.CompletedProcess(args, 0, stdout, "")
-    violation = type("V", (), {"category": "github_pat_classic"})()
-    monkeypatch.setattr(recovery_module, "scan_pr_diff", lambda diff: [violation] if failure_at == "secret" else [])
     monkeypatch.setattr(recovery_module.git_ops, "_git", fake_git)
-    assert runner._preserve_crashed_run_commits("pr-042-inflight") is False
+    assert _make_runner()._preserve_crashed_run_commits("pr-042-inflight") is False
 
 
 def test_recover_preserve_tolerates_missing_local_branch(

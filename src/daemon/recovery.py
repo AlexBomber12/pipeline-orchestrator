@@ -859,14 +859,15 @@ class RecoveryMixin:
                     self.repo_path, "stash", "push", "--include-untracked",
                     "-m", "pipeline crash recovery", timeout=60,
                 )
-                stash_ref = git_ops._git(self.repo_path, "rev-parse", "stash@{0}", timeout=10).stdout.strip()
-                stash_diff = git_ops._git(self.repo_path, "stash", "show", "-u", "-p", timeout=60).stdout
+                ref = git_ops._git(self.repo_path, "rev-parse", "stash@{0}", timeout=10).stdout.strip()
+                diff = git_ops._git(self.repo_path, "stash", "show", "-u", "-p", timeout=60).stdout
+                key = git_ops._git(self.repo_path, "grep", "-a", "-q", "PRIVATE KEY-----", ref, f"{ref}^3", check=False)
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
                 self.log_event(f"[INFRA] Failed to stash crashed-run work: {exc}.")
                 return False
-            secret_categories = {c for c, _ in SECRET_PATTERNS_A + SECRET_PATTERNS_B} | {"generic_high_entropy"}
-            unsafe = any(v.category in secret_categories for v in scan_pr_diff(stash_diff)) or not stash_ref
-            if unsafe or self._attempt_backup_branch_push(stash_ref, "dirty worktree") is None:
+            secrets = {c for c, _ in SECRET_PATTERNS_A + SECRET_PATTERNS_B} | {"generic_high_entropy"}
+            unsafe = key.returncode != 1 or any(v.category in secrets for v in scan_pr_diff(diff)) or not ref
+            if unsafe or self._attempt_backup_branch_push(ref, "dirty worktree") is None:
                 return False
             self.log_event(f"[INFRA] Preserved crashed-run commits on {branch}.")
             return True
