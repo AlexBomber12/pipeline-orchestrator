@@ -24,6 +24,7 @@ from src.cancellation import (
     safe_record_cancellation_cause,
 )
 from src.daemon import git_ops
+from src.daemon.guardrails import scan_pr_diff
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.keyspace import pipeline_state, recovery_backup_branch
@@ -797,7 +798,7 @@ class RecoveryMixin:
         return True
 
     def _preserve_crashed_run_commits(self, branch: str) -> bool:
-        """Preserve dirty work and push unpushed commits on ``branch``.
+        """Push any unpushed commits on ``branch`` to origin.
 
         Called from ``recover_state`` before re-running ``handle_coding``
         after a crash. Claude's PLANNED PR flow creates the branch from
@@ -859,10 +860,13 @@ class RecoveryMixin:
                     "-m", "pipeline crash recovery", timeout=60,
                 )
                 stash_ref = git_ops._git(self.repo_path, "rev-parse", "stash@{0}", timeout=10).stdout.strip()
+                stash_diff = git_ops._git(
+                    self.repo_path, "stash", "show", "--include-untracked", "-p", timeout=60).stdout
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
                 self.log_event(f"[INFRA] Failed to stash crashed-run work: {exc}.")
                 return False
-            if not stash_ref or self._attempt_backup_branch_push(stash_ref, "dirty worktree") is None:
+            unsafe = scan_pr_diff(stash_diff) or not stash_ref
+            if unsafe or self._attempt_backup_branch_push(stash_ref, "dirty worktree") is None:
                 return False
             self.log_event(f"[INFRA] Preserved crashed-run commits on {branch}.")
             return True

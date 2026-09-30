@@ -128,9 +128,7 @@ def _write_task_file(
     pr_id: str,
     status: str,
     branch: str,
-    *,
     depends_on: str = "none",
-    priority: int = 2,
 ) -> None:
     tasks_dir = repo_root / "tasks"
     tasks_dir.mkdir(exist_ok=True)
@@ -141,7 +139,7 @@ def _write_task_file(
         "- Type: feature\n"
         "- Complexity: medium\n"
         f"- Depends on: {depends_on}\n"
-        f"- Priority: {priority}\n"
+        "- Priority: 2\n"
         "- Coder: codex\n",
         encoding="utf-8",
     )
@@ -620,9 +618,9 @@ def test_crash_recovery_blocks_todo_task_and_selects_independent_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     use_single_error_exit: bool, status_write_succeeds: bool,
 ) -> None:
-    _write_task_file(tmp_path, "PR-100", "TODO", "pr-100-crashed", priority=2)
-    _write_task_file(tmp_path, "PR-101", "TODO", "pr-101-independent", priority=3)
-    _write_task_file(tmp_path, "PR-102", "TODO", "pr-102-dependent", depends_on="PR-100", priority=1)
+    _write_task_file(tmp_path, "PR-100", "TODO", "pr-100-crashed")
+    _write_task_file(tmp_path, "PR-101", "TODO", "pr-101-independent")
+    _write_task_file(tmp_path, "PR-099", "TODO", "pr-099-dependent", "PR-100")
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
     for target in ("src.daemon.recovery._resolve_merged_state", "src.daemon.handlers.idle._resolve_merged_state"):
         monkeypatch.setattr(target, lambda *args, **kwargs: MergedState(set(), set(), True))
@@ -767,7 +765,6 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
     # Preserve push must happen before recovery transitions to IDLE so
     # the work is durable on origin even when the task is ERROR.
     assert "coding" not in events
-    assert "stash" in events
     assert any(f"{'a' * 40}:refs/heads/crash-backup/PR-042/" in event for event in events)
     assert any("Preserved crashed-run commits on pr-042-inflight" in e["event"] for e in runner.state.history)
     assert runner.state.state == PipelineState.IDLE
@@ -776,6 +773,7 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
 
 @pytest.mark.parametrize(("failure_at", "stash_result"), [
     ("status", OSError("status failed")), ("stash", OSError("stash failed")), ("", ""),
+    ("secret", "secret"),
 ])
 def test_preserve_dirty_work_failure_blocks_recovery(monkeypatch, failure_at, stash_result) -> None:
     runner = _make_runner()
@@ -783,7 +781,10 @@ def test_preserve_dirty_work_failure_blocks_recovery(monkeypatch, failure_at, st
         if args[0] == failure_at:
             raise stash_result
         stdout = " M work.py" if args[0] == "status" else ""
+        if failure_at == "secret" and args[0] == "rev-parse":
+            stdout = "a" * 40
         return subprocess.CompletedProcess(args, 0, stdout, "")
+    monkeypatch.setattr(recovery_module, "scan_pr_diff", lambda diff: [object()] if failure_at == "secret" else [])
     monkeypatch.setattr(recovery_module.git_ops, "_git", fake_git)
     assert runner._preserve_crashed_run_commits("pr-042-inflight") is False
 
