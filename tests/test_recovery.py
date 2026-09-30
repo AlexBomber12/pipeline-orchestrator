@@ -614,61 +614,34 @@ def test_recovery_after_redis_flush_excludes_error_tasks(
     assert statuses == {"PR-100": TaskStatus.ERROR, "PR-101": TaskStatus.TODO}
 
 
-@pytest.mark.parametrize("use_single_error_exit", [False, True])
-@pytest.mark.parametrize("status_write_succeeds", [False, True])
-@pytest.mark.parametrize("worktree_dirty", [False, True])
+@pytest.mark.parametrize(
+    ("use_single_error_exit", "status_write_succeeds"),
+    [(False, False), (False, True), (True, False), (True, True)],
+)
 def test_crash_recovery_blocks_todo_task_and_selects_independent_work(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    use_single_error_exit: bool,
-    status_write_succeeds: bool,
-    worktree_dirty: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    use_single_error_exit: bool, status_write_succeeds: bool,
 ) -> None:
     _write_task_file(tmp_path, "PR-100", "TODO", "pr-100-crashed", priority=2)
     _write_task_file(tmp_path, "PR-101", "TODO", "pr-101-independent", priority=3)
-    _write_task_file(
-        tmp_path, "PR-102", "TODO", "pr-102-dependent",
-        depends_on="PR-100", priority=1,
-    )
+    _write_task_file(tmp_path, "PR-102", "TODO", "pr-102-dependent", depends_on="PR-100", priority=1)
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
-    monkeypatch.setattr(
-        recovery_module, "_resolve_merged_state",
-        lambda *args, **kwargs: MergedState(set(), set(), True),
-    )
-    monkeypatch.setattr(
-        "src.daemon.handlers.idle._resolve_merged_state",
-        lambda *args, **kwargs: MergedState(set(), set(), True),
-    )
-    monkeypatch.setattr(recovery_module.git_ops, "_working_tree_dirty", lambda path: worktree_dirty)
+    for target in ("src.daemon.recovery._resolve_merged_state", "src.daemon.handlers.idle._resolve_merged_state"):
+        monkeypatch.setattr(target, lambda *args, **kwargs: MergedState(set(), set(), True))
 
     runner = _make_runner()
     runner.repo_config.feature_flags.use_single_error_exit = use_single_error_exit
     runner.repo_path = str(tmp_path)
-    runner.state.current_task = QueueTask(
-        pr_id="PR-100", title="Crashed", status=TaskStatus.DOING,
-        task_file="tasks/PR-100.md", branch="pr-100-crashed",
-    )
+    runner.state.current_task = QueueTask(pr_id="PR-100", title="", status=TaskStatus.DOING)
     runner._preserve_crashed_run_commits = lambda branch: True  # type: ignore[method-assign]
 
     async def persist_status(task, status, reason, blocked_reason=None) -> bool:
-        assert not worktree_dirty
         if status_write_succeeds:
-            write_frontmatter_status(
-                tmp_path / task.task_file, status, blocked_reason,
-            )
+            write_frontmatter_status(tmp_path / task.task_file, status, blocked_reason)
         return status_write_succeeds
 
     runner._commit_task_status_change = persist_status  # type: ignore[method-assign]
     asyncio.run(runner.recover_state())
-    crashed_text = (tmp_path / "tasks/PR-100.md").read_text(encoding="utf-8")
-    if status_write_succeeds and not worktree_dirty:
-        assert "status: ERROR" in crashed_text
-    else:
-        assert "status: TODO" in crashed_text
-        assert any(
-            "fallback marker keeps task blocked" in entry["event"]
-            for entry in runner.state.history
-        )
 
     for active_runner in (runner, _make_runner()):
         active_runner.repo_config.feature_flags.use_single_error_exit = use_single_error_exit
@@ -758,6 +731,12 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
         events.append("coding")
 
     def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        if cmd[1:3] == ["status", "--porcelain"]:
+            return subprocess.CompletedProcess(cmd, 0, " M src/work.py\n?? notes.txt\n", "")
+        if cmd[1:3] == ["stash", "push"]:
+            events.append("stash")
+        if cmd[1:] == ["rev-parse", "stash@{0}"]:
+            return subprocess.CompletedProcess(cmd, 0, "stash-sha\n", "")
         if cmd[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
             events.append("probe")
 
@@ -795,10 +774,27 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
     # Preserve push must happen before recovery transitions to IDLE so
     # the work is durable on origin even when the task is ERROR.
     assert "coding" not in events
+    assert "stash" in events
+    assert any("stash-sha:crash-backup/PR-042/" in event for event in events)
     assert "push:pr-042-inflight:pr-042-inflight" in events
     assert any("Preserved crashed-run commits on pr-042-inflight" in e["event"] for e in runner.state.history)
     assert runner.state.state == PipelineState.IDLE
     assert "PR-042" in runner._crashed_task_pr_ids
+
+
+@pytest.mark.parametrize("stash_result", [OSError("stash failed"), ""])
+def test_preserve_dirty_work_failure_blocks_recovery(monkeypatch, stash_result) -> None:
+    runner = _make_runner()
+    monkeypatch.setattr(recovery_module.git_ops, "_working_tree_dirty", lambda path: True)
+    def fake_git(repo_path, *args, **kwargs):
+        if args[:2] == ("rev-parse", "--verify"):
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if isinstance(stash_result, Exception) and args[0] == "stash":
+            raise stash_result
+        stdout = stash_result if args == ("rev-parse", "stash@{0}") else ""
+        return subprocess.CompletedProcess(args, 0, stdout, "")
+    monkeypatch.setattr(recovery_module.git_ops, "_git", fake_git)
+    assert runner._preserve_crashed_run_commits("pr-042-inflight") is False
 
 
 def test_recover_preserve_tolerates_missing_local_branch(

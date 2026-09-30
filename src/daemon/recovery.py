@@ -581,20 +581,10 @@ class RecoveryMixin:
             else:
                 self._crashed_task_pr_ids.add(doing.pr_id)
             if branch_kind == "crash":
-                status_written = False
-                if (
-                    Path(self.repo_path).exists()
-                    and git_ops._working_tree_dirty(self.repo_path)
-                ):
-                    self.log_event(
-                        "[INFRA] Preserving uncommitted crashed-run work; "
-                        "skipping destructive status write."
-                    )
-                else:
-                    status_written = await self._commit_task_status_change(
-                        doing, "ERROR", "crash recovery",
-                        blocked_reason=SuppressionReason.CRASH,
-                    )
+                status_written = await self._commit_task_status_change(
+                    doing, "ERROR", "crash recovery",
+                    blocked_reason=SuppressionReason.CRASH,
+                )
                 if not status_written:
                     self._status_write_failed_task_pr_ids.add(doing.pr_id)
                     await self._persist_status_write_failed_task_pr_ids()
@@ -808,7 +798,7 @@ class RecoveryMixin:
         return True
 
     def _preserve_crashed_run_commits(self, branch: str) -> bool:
-        """Push any unpushed commits on ``branch`` to origin.
+        """Preserve dirty work and push unpushed commits on ``branch``.
 
         Called from ``recover_state`` before re-running ``handle_coding``
         after a crash. Claude's PLANNED PR flow creates the branch from
@@ -859,6 +849,20 @@ class RecoveryMixin:
                 f"[INFRA] Could not probe local branch {branch}: {exc}."
             )
             return False
+        if git_ops._working_tree_dirty(self.repo_path):
+            try:
+                git_ops._git(
+                    self.repo_path, "stash", "push", "--include-untracked",
+                    "-m", "pipeline crash recovery", timeout=60,
+                )
+                stash_ref = git_ops._git(
+                    self.repo_path, "rev-parse", "stash@{0}", timeout=10,
+                ).stdout.strip()
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+                self.log_event(f"[INFRA] Failed to stash crashed-run work: {exc}.")
+                return False
+            if not stash_ref or self._attempt_backup_branch_push(stash_ref, "dirty worktree") is None:
+                return False
         if probe.returncode != 0:
             return True
 
