@@ -24,7 +24,7 @@ from src.cancellation import (
     safe_record_cancellation_cause,
 )
 from src.daemon import git_ops
-from src.daemon.guardrails import scan_pr_diff
+from src.daemon.guardrails import SECRET_PATTERNS_A, SECRET_PATTERNS_B, scan_pr_diff
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.keyspace import pipeline_state, recovery_backup_branch
@@ -860,12 +860,12 @@ class RecoveryMixin:
                     "-m", "pipeline crash recovery", timeout=60,
                 )
                 stash_ref = git_ops._git(self.repo_path, "rev-parse", "stash@{0}", timeout=10).stdout.strip()
-                stash_diff = git_ops._git(
-                    self.repo_path, "stash", "show", "--include-untracked", "-p", timeout=60).stdout
+                stash_diff = git_ops._git(self.repo_path, "stash", "show", "-u", "-p", timeout=60).stdout
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
                 self.log_event(f"[INFRA] Failed to stash crashed-run work: {exc}.")
                 return False
-            unsafe = scan_pr_diff(stash_diff) or not stash_ref
+            secret_categories = {c for c, _ in SECRET_PATTERNS_A + SECRET_PATTERNS_B} | {"generic_high_entropy"}
+            unsafe = any(v.category in secret_categories for v in scan_pr_diff(stash_diff)) or not stash_ref
             if unsafe or self._attempt_backup_branch_push(stash_ref, "dirty worktree") is None:
                 return False
             self.log_event(f"[INFRA] Preserved crashed-run commits on {branch}.")

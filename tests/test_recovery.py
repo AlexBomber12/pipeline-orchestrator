@@ -715,6 +715,8 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
     not lost when the user re-uploads to retry."""
     task = _doing_task()
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
+    nonsecret = type("V", (), {"category": "large_diff_threshold"})()
+    monkeypatch.setattr(recovery_module, "scan_pr_diff", lambda diff: [nonsecret])
 
     events: list[str] = []
 
@@ -771,20 +773,18 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
     assert "PR-042" in runner._crashed_task_pr_ids
 
 
-@pytest.mark.parametrize(("failure_at", "stash_result"), [
-    ("status", OSError("status failed")), ("stash", OSError("stash failed")), ("", ""),
-    ("secret", "secret"),
-])
-def test_preserve_dirty_work_failure_blocks_recovery(monkeypatch, failure_at, stash_result) -> None:
+@pytest.mark.parametrize("failure_at", ["status", "stash", "", "secret"])
+def test_preserve_dirty_work_failure_blocks_recovery(monkeypatch, failure_at) -> None:
     runner = _make_runner()
     def fake_git(repo_path, *args, **kwargs):
         if args[0] == failure_at:
-            raise stash_result
+            raise OSError(f"{failure_at} failed")
         stdout = " M work.py" if args[0] == "status" else ""
         if failure_at == "secret" and args[0] == "rev-parse":
             stdout = "a" * 40
         return subprocess.CompletedProcess(args, 0, stdout, "")
-    monkeypatch.setattr(recovery_module, "scan_pr_diff", lambda diff: [object()] if failure_at == "secret" else [])
+    violation = type("V", (), {"category": "github_pat_classic"})()
+    monkeypatch.setattr(recovery_module, "scan_pr_diff", lambda diff: [violation] if failure_at == "secret" else [])
     monkeypatch.setattr(recovery_module.git_ops, "_git", fake_git)
     assert runner._preserve_crashed_run_commits("pr-042-inflight") is False
 
