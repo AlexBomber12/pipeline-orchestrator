@@ -108,6 +108,37 @@ must write the canonical uppercase values. Operator-uploaded specs should
 include `status: TODO` for explicit intent. The daemon owns terminal
 status writes; operators never edit the status field directly.
 
+## Small-task authoring policy
+
+Apply this policy to every new or deliberately rewritten task; do not rewrite
+historical task files or completion records to adopt it.
+
+- Deliver one independently testable behavior or internal contract per task.
+- Target at most 150 changed production-code lines; 200 is the maximum.
+- Limit the complete PR to 500 added plus deleted lines, including tests,
+  fixtures, documentation, and review fixes.
+- Change at most 3 production-code files and 6 files overall. Existing stricter
+  work-mode limits still apply.
+- Decompose high-complexity work before execution. For medium complexity,
+  briefly justify that the change is local and the implementation approach is
+  known. Investigate unknown causes or architecture in a separate bounded task
+  before implementation.
+- State the outcome, scope, exclusions, expected files, separate production and
+  test estimates, total diff estimate, acceptance criteria, dependencies,
+  verification, and stop condition.
+- Include tests for changed behavior in the same PR. If the behavior and
+  meaningful tests exceed a budget, split the behavior again before execution.
+- Keep intermediate PRs independently verifiable and safe before connecting
+  their consumers. Name every required predecessor explicitly as a dependency.
+- Count the whole PR against its base, not the latest commit or net growth. Do
+  not evade limits through minification, missing tests, or automatic budget
+  increases.
+- Every task author must obtain the current canonical schema, inspect the
+  relevant implementation, and validate the complete task body.
+
+Automated size enforcement and review-cycle limits are separate follow-up
+tasks. Existing schema validation does not yet enforce this policy.
+
 ## Frontmatter blocked_reason field
 
 `blocked_reason` is a daemon-owned companion field for `status: ERROR`:
