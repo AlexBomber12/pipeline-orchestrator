@@ -139,6 +139,35 @@ historical task files or completion records to adopt it.
 Automated size enforcement and review-cycle limits are separate follow-up
 tasks. Existing schema validation does not yet enforce this policy.
 
+### Declared task budget
+
+Authors can express the estimate used by the small-task policy as a
+`task_budget` mapping:
+
+```yaml
+task_budget:
+  version: 1
+  production_lines: 120
+  test_lines: 180
+  other_lines: 40
+  production_files: 2
+  total_files: 4
+  rationale: Local change with a known implementation approach.
+```
+
+`production_lines`, `test_lines`, and `other_lines` estimate production-code,
+test/fixture, and remaining changes respectively. They count additions plus
+deletions across the complete PR, including review fixes. The 150-line
+production target is advisory; estimates from 151 through the 200-line maximum
+remain valid when the other limits are met. `production_files` counts files
+containing production code, while `total_files` counts every changed file.
+`version` is currently `1`. `rationale` is optional for low-complexity tasks
+and required for medium-complexity tasks.
+
+`validate_task_budget` validates declared estimates only. MCP and upload
+integration, as well as enforcement against the actual PR size, remain
+separate follow-ups.
+
 ## Frontmatter blocked_reason field
 
 `blocked_reason` is a daemon-owned companion field for `status: ERROR`:
