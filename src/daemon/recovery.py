@@ -24,6 +24,7 @@ from src.cancellation import (
     safe_record_cancellation_cause,
 )
 from src.daemon import git_ops
+from src.daemon.guardrails import SECRET_PATTERNS_A, SECRET_PATTERNS_B, scan_pr_diff
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.keyspace import pipeline_state, recovery_backup_branch
@@ -580,6 +581,17 @@ class RecoveryMixin:
                     )
             else:
                 self._crashed_task_pr_ids.add(doing.pr_id)
+            if branch_kind == "crash":
+                status_written = await self._commit_task_status_change(
+                    doing, "ERROR", "crash recovery", blocked_reason=SuppressionReason.CRASH,
+                )
+                if not status_written:
+                    self._status_write_failed_task_pr_ids.add(doing.pr_id)
+                    await self._persist_status_write_failed_task_pr_ids()
+                    self.log_event(
+                        f"[INFRA] Warning: failed to persist status:ERROR for "
+                        f"{doing.pr_id}; fallback marker keeps task blocked."
+                    )
             # PR-266b crash-no-PR fix: reflect the cancellation in the
             # in-memory tasks list so the headers-mode current_queue
             # snapshot does not display ``DOING`` for a task the runner
@@ -837,6 +849,28 @@ class RecoveryMixin:
                 f"[INFRA] Could not probe local branch {branch}: {exc}."
             )
             return False
+        try:
+            dirty = git_ops._git(self.repo_path, "status", "--porcelain").stdout.strip()
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            return False
+        if dirty:
+            try:
+                git_ops._git(
+                    self.repo_path, "stash", "push", "--include-untracked",
+                    "-m", "pipeline crash recovery", timeout=60,
+                )
+                ref = git_ops._git(self.repo_path, "rev-parse", "stash@{0}", timeout=10).stdout.strip()
+                diff = git_ops._git(self.repo_path, "stash", "show", "-u", "-p", "--text", timeout=60).stdout
+                key = any(line.startswith("+") and "PRIVATE KEY-----" in line for line in diff.splitlines())
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+                self.log_event(f"[INFRA] Failed to stash crashed-run work: {exc}.")
+                return False
+            secrets = {c for c, _ in SECRET_PATTERNS_A + SECRET_PATTERNS_B} | {"generic_high_entropy"}
+            unsafe = key or any(v.category in secrets for v in scan_pr_diff(diff)) or not ref
+            if unsafe or self._attempt_backup_branch_push(ref, "dirty worktree") is None:
+                return False
+            self.log_event(f"[INFRA] Preserved crashed-run commits on {branch}.")
+            return True
         if probe.returncode != 0:
             return True
 
@@ -919,12 +953,13 @@ class RecoveryMixin:
         task_id = current_task.pr_id
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         backup_branch = f"crash-backup/{task_id}/{timestamp}"
+        backup_ref = f"refs/heads/{backup_branch}" if len(branch) == 40 else backup_branch
         try:
             git_ops._git(
                 self.repo_path,
                 "push",
                 "origin",
-                f"{branch}:{backup_branch}",
+                f"{branch}:{backup_ref}",
                 timeout=120,
             )
         except (

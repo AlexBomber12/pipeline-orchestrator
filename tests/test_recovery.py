@@ -21,7 +21,7 @@ from src.models import (
     ReviewStatus,
     TaskStatus,
 )
-from src.queue_parser import QueueValidationError
+from src.queue_parser import QueueValidationError, write_frontmatter_status
 from src.subsource_registry import SuppressionReason
 from src.suppression import SuppressionRecord
 from src.task_status import MergedState
@@ -128,6 +128,7 @@ def _write_task_file(
     pr_id: str,
     status: str,
     branch: str,
+    depends_on: str = "none",
 ) -> None:
     tasks_dir = repo_root / "tasks"
     tasks_dir.mkdir(exist_ok=True)
@@ -137,7 +138,7 @@ def _write_task_file(
         f"Branch: {branch}\n"
         "- Type: feature\n"
         "- Complexity: medium\n"
-        "- Depends on: none\n"
+        f"- Depends on: {depends_on}\n"
         "- Priority: 2\n"
         "- Coder: codex\n",
         encoding="utf-8",
@@ -611,6 +612,38 @@ def test_recovery_after_redis_flush_excludes_error_tasks(
     assert statuses == {"PR-100": TaskStatus.ERROR, "PR-101": TaskStatus.TODO}
 
 
+@pytest.mark.parametrize("use_single_error_exit", [False, True])
+@pytest.mark.parametrize("status_write_succeeds", [False, True])
+def test_crash_recovery_blocks_todo_task_and_selects_independent_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    use_single_error_exit: bool, status_write_succeeds: bool,
+) -> None:
+    _write_task_file(tmp_path, "PR-100", "TODO", "pr-100-crashed")
+    _write_task_file(tmp_path, "PR-101", "TODO", "pr-101-independent")
+    _write_task_file(tmp_path, "PR-099", "TODO", "pr-099-dependent", "PR-100")
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
+    for target in ("src.daemon.recovery._resolve_merged_state", "src.daemon.handlers.idle._resolve_merged_state"):
+        monkeypatch.setattr(target, lambda *args, **kwargs: MergedState(set(), set(), True))
+    runner = _make_runner()
+    runner.repo_config.feature_flags.use_single_error_exit = use_single_error_exit
+    runner.repo_path = str(tmp_path)
+    runner.state.current_task = QueueTask(pr_id="PR-100", title="", status=TaskStatus.DOING)
+    runner._preserve_crashed_run_commits = lambda branch: True  # type: ignore[method-assign]
+    async def persist_status(task, status, reason, blocked_reason=None) -> bool:
+        if status_write_succeeds:
+            write_frontmatter_status(tmp_path / task.task_file, status, blocked_reason)
+        return status_write_succeeds
+    runner._commit_task_status_change = persist_status  # type: ignore[method-assign]
+    asyncio.run(runner.recover_state())
+    for active_runner in (runner, _make_runner()):
+        active_runner.repo_config.feature_flags.use_single_error_exit = use_single_error_exit
+        active_runner.repo_path, active_runner.redis = str(tmp_path), runner.redis
+        if active_runner is not runner:
+            asyncio.run(active_runner.recover_state())
+        assert asyncio.run(active_runner._select_next_task_from_dag()).pr_id == "PR-101"
+        assert active_runner._idle_dag_statuses["PR-100"] == TaskStatus.ERROR
+
+
 def test_recover_paused_doing_task_without_pr_defers_coding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -681,6 +714,7 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
     not lost when the user re-uploads to retry."""
     task = _doing_task()
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
+    monkeypatch.setattr(recovery_module, "scan_pr_diff", lambda diff: [type("V", (), {"category": "large_diff_threshold"})()])
 
     events: list[str] = []
 
@@ -688,6 +722,12 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
         events.append("coding")
 
     def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        if cmd[1:3] == ["status", "--porcelain"]:
+            return subprocess.CompletedProcess(cmd, 0, " M src/work.py\n?? notes.txt\n", "")
+        if cmd[1:] == ["rev-parse", "stash@{0}"]:
+            return subprocess.CompletedProcess(cmd, 0, f"{'a' * 40}\n", "")
+        if cmd[1:3] == ["stash", "show"]:
+            return subprocess.CompletedProcess(cmd, 0, " -----BEGIN PRIVATE KEY-----\n+harmless\n", "")
         if cmd[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
             events.append("probe")
 
@@ -725,10 +765,27 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
     # Preserve push must happen before recovery transitions to IDLE so
     # the work is durable on origin even when the task is ERROR.
     assert "coding" not in events
-    assert "push:pr-042-inflight:pr-042-inflight" in events
+    assert any(f"{'a' * 40}:refs/heads/crash-backup/PR-042/" in event for event in events)
     assert any("Preserved crashed-run commits on pr-042-inflight" in e["event"] for e in runner.state.history)
     assert runner.state.state == PipelineState.IDLE
     assert "PR-042" in runner._crashed_task_pr_ids
+
+
+@pytest.mark.parametrize("failure_at", ["status", "stash", "", "private-key"])
+def test_preserve_dirty_work_failure_blocks_recovery(monkeypatch, failure_at) -> None:
+    runner = _make_runner()
+    runner.state.current_task = _doing_task()
+    def fake_git(repo_path, *args, **kwargs):
+        if args[0] == failure_at:
+            raise OSError(f"{failure_at} failed")
+        stdout = " M work.py" if args[0] == "status" else ""
+        if failure_at == "private-key" and args[0] == "rev-parse":
+            stdout = "a" * 40
+        if failure_at == "private-key" and args[:2] == ("stash", "show") and "--text" in args:
+            stdout = "+\0-----BEGIN PRIVATE KEY-----\n"
+        return subprocess.CompletedProcess(args, 0, stdout, "")
+    monkeypatch.setattr(recovery_module.git_ops, "_git", fake_git)
+    assert runner._preserve_crashed_run_commits("pr-042-inflight") is False
 
 
 def test_recover_preserve_tolerates_missing_local_branch(
