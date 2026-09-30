@@ -726,9 +726,8 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
             return subprocess.CompletedProcess(cmd, 0, " M src/work.py\n?? notes.txt\n", "")
         if cmd[1:] == ["rev-parse", "stash@{0}"]:
             return subprocess.CompletedProcess(cmd, 0, f"{'a' * 40}\n", "")
-        if cmd[1] == "grep":
-            events.append("grep:" + " ".join(cmd[2:]))
-            return subprocess.CompletedProcess(cmd, 1, "", "")
+        if cmd[1:3] == ["stash", "show"]:
+            return subprocess.CompletedProcess(cmd, 0, " -----BEGIN PRIVATE KEY-----\n+harmless\n", "")
         if cmd[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
             events.append("probe")
 
@@ -766,7 +765,6 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
     # Preserve push must happen before recovery transitions to IDLE so
     # the work is durable on origin even when the task is ERROR.
     assert "coding" not in events
-    assert f"grep:-a -q PRIVATE KEY----- {'a' * 40} {'a' * 40}^3" in events
     assert any(f"{'a' * 40}:refs/heads/crash-backup/PR-042/" in event for event in events)
     assert any("Preserved crashed-run commits on pr-042-inflight" in e["event"] for e in runner.state.history)
     assert runner.state.state == PipelineState.IDLE
@@ -775,17 +773,19 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
 
 @pytest.mark.parametrize("failure_at", ["status", "stash", "", "private-key"])
 def test_preserve_dirty_work_failure_blocks_recovery(monkeypatch, failure_at) -> None:
+    runner = _make_runner()
+    runner.state.current_task = _doing_task()
     def fake_git(repo_path, *args, **kwargs):
         if args[0] == failure_at:
             raise OSError(f"{failure_at} failed")
         stdout = " M work.py" if args[0] == "status" else ""
         if failure_at == "private-key" and args[0] == "rev-parse":
             stdout = "a" * 40
-        if args[0] == "grep":
-            return subprocess.CompletedProcess(args, int(failure_at != "private-key"), "", "")
+        if failure_at == "private-key" and args[:2] == ("stash", "show") and "--text" in args:
+            stdout = "+\0-----BEGIN PRIVATE KEY-----\n"
         return subprocess.CompletedProcess(args, 0, stdout, "")
     monkeypatch.setattr(recovery_module.git_ops, "_git", fake_git)
-    assert _make_runner()._preserve_crashed_run_commits("pr-042-inflight") is False
+    assert runner._preserve_crashed_run_commits("pr-042-inflight") is False
 
 
 def test_recover_preserve_tolerates_missing_local_branch(
