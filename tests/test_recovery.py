@@ -769,7 +769,6 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
     assert "coding" not in events
     assert "stash" in events
     assert any(f"{'a' * 40}:refs/heads/crash-backup/PR-042/" in event for event in events)
-    assert "push:pr-042-inflight:pr-042-inflight" in events
     assert any("Preserved crashed-run commits on pr-042-inflight" in e["event"] for e in runner.state.history)
     assert runner.state.state == PipelineState.IDLE
     assert "PR-042" in runner._crashed_task_pr_ids

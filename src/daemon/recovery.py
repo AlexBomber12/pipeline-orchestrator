@@ -582,8 +582,7 @@ class RecoveryMixin:
                 self._crashed_task_pr_ids.add(doing.pr_id)
             if branch_kind == "crash":
                 status_written = await self._commit_task_status_change(
-                    doing, "ERROR", "crash recovery",
-                    blocked_reason=SuppressionReason.CRASH,
+                    doing, "ERROR", "crash recovery", blocked_reason=SuppressionReason.CRASH,
                 )
                 if not status_written:
                     self._status_write_failed_task_pr_ids.add(doing.pr_id)
@@ -859,14 +858,14 @@ class RecoveryMixin:
                     self.repo_path, "stash", "push", "--include-untracked",
                     "-m", "pipeline crash recovery", timeout=60,
                 )
-                stash_ref = git_ops._git(
-                    self.repo_path, "rev-parse", "stash@{0}", timeout=10,
-                ).stdout.strip()
+                stash_ref = git_ops._git(self.repo_path, "rev-parse", "stash@{0}", timeout=10).stdout.strip()
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
                 self.log_event(f"[INFRA] Failed to stash crashed-run work: {exc}.")
                 return False
             if not stash_ref or self._attempt_backup_branch_push(stash_ref, "dirty worktree") is None:
                 return False
+            self.log_event(f"[INFRA] Preserved crashed-run commits on {branch}.")
+            return True
         if probe.returncode != 0:
             return True
 
