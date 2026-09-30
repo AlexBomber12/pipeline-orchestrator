@@ -849,7 +849,11 @@ class RecoveryMixin:
                 f"[INFRA] Could not probe local branch {branch}: {exc}."
             )
             return False
-        if git_ops._working_tree_dirty(self.repo_path):
+        try:
+            dirty = git_ops._git(self.repo_path, "status", "--porcelain").stdout.strip()
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            return False
+        if dirty:
             try:
                 git_ops._git(
                     self.repo_path, "stash", "push", "--include-untracked",
@@ -945,12 +949,13 @@ class RecoveryMixin:
         task_id = current_task.pr_id
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         backup_branch = f"crash-backup/{task_id}/{timestamp}"
+        backup_ref = f"refs/heads/{backup_branch}" if len(branch) == 40 else backup_branch
         try:
             git_ops._git(
                 self.repo_path,
                 "push",
                 "origin",
-                f"{branch}:{backup_branch}",
+                f"{branch}:{backup_ref}",
                 timeout=120,
             )
         except (
