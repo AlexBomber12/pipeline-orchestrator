@@ -37,6 +37,7 @@ from src.queue_parser import (
     TaskHeader,
     parse_task_header,
 )
+from src.task_budget import validate_task_frontmatter_budget
 from src.task_status import get_merged_pr_ids, merged_split_parent_aliases
 from src.utils import repo_slug_from_url
 from src.web.services.upload_validation import (
@@ -606,6 +607,10 @@ async def upload_tasks(
             task_path.write_text(task_text, encoding="utf-8")
             try:
                 header = parse_task_header(task_path)
+                for issue in validate_task_frontmatter_budget(
+                    task_text, complexity=header.complexity
+                ):
+                    _add_validation_error(errors_by_file, fname, issue)
                 parsed_task_ids[fname] = header.pr_id
                 parsed_task_texts[fname] = task_text
                 parsed_headers[fname] = header

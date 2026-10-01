@@ -136,14 +136,11 @@ historical task files or completion records to adopt it.
 - Every task author must obtain the current canonical schema, inspect the
   relevant implementation, and validate the complete task body.
 
-Upload admission, automated validation against the actual PR size, and
-review-cycle limits remain separate follow-up tasks.
-
 ### Declared task budget
 
-Every specification submitted to the MCP `validate_task_spec` tool must
-express the estimate used by the small-task policy as a `task_budget` mapping
-in its opening YAML frontmatter:
+Every specification submitted to the MCP `validate_task_spec` tool or uploaded
+through the dashboard must express the estimate used by the small-task policy
+as a `task_budget` mapping in its opening YAML frontmatter:
 
 ```yaml
 task_budget:
@@ -165,11 +162,12 @@ containing production code, while `total_files` counts every changed file.
 `version` is currently `1`. `rationale` is optional for low-complexity tasks
 and required for medium-complexity tasks.
 
-MCP validation parses this opening frontmatter as safe YAML, rejects malformed
-or ambiguous mappings, and passes the declared values to
-`validate_task_budget`. A budget in the Markdown body does not count. Upload
-admission and enforcement against the actual PR size remain separate
-follow-ups.
+MCP validation and dashboard uploads safely parse this opening frontmatter,
+reject malformed or ambiguous mappings, and pass it to the shared validator.
+A budget in the Markdown body does not count. New uploads and reuploads require
+a valid budget. Existing stored tasks and pending-upload references remain
+readable without one and are not migrated or retroactively rejected; actual
+PR-size and review-cycle enforcement remains separate follow-up work.
 
 ## Frontmatter blocked_reason field
 
