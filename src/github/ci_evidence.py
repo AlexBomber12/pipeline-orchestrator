@@ -131,19 +131,19 @@ def _run_producer(run: dict[str, Any]) -> str | None:
     app = run.get("app")
     if isinstance(app, dict):
         app_id = app.get("id")
-        if (type(app_id) is int and app_id > 0) or (isinstance(app_id, str) and app_id.isdigit()):
-            return f"app:{app_id}"
-        if app.get("slug"):
-            return f"app:{app['slug']}"
+        if str(app_id).isdecimal() and int(app_id) > 0:
+            return f"app:{int(app_id)}"
+        if slug := _text(app.get("slug")):
+            return f"app:{slug}"
     return _status_producer(run)
 
 
 def _status_producer(status: dict[str, Any]) -> str | None:
-    if status.get("app_id"):
-        return f"app:{status['app_id']}"
+    if str(status.get("app_id", "")).isdecimal() and int(status["app_id"]) > 0:
+        return f"app:{int(status['app_id'])}"
     creator = status.get("creator")
-    if isinstance(creator, dict) and creator.get("login"):
-        return f"user:{creator['login']}"
+    if isinstance(creator, dict) and (login := _text(creator.get("login"))):
+        return f"user:{login}"
     return None
 
 
