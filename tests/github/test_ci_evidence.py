@@ -44,7 +44,7 @@ def test_required_contexts_must_be_successful_on_the_current_sha() -> None:
     missing = evaluate(check_runs=[run("unit")], required_contexts=["unit", "integration"])
     success = evaluate(
         check_runs=[run("unit"), run("integration", app_id=2)],
-        required_contexts=["unit", "integration"],
+        required_contexts=["unit", "integration"], sha=SHA.upper(),
     )
     foreign = evaluate(check_runs=[run("unit", sha=OTHER)], required_contexts=["unit"], empty_is_success=True)
     foreign_empty = evaluate(statuses=[status("legacy", sha="")], empty_is_success=True)
