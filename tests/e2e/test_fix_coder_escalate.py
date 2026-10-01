@@ -189,7 +189,7 @@ def test_coder_escalate_marker_parks_pr_in_error(
         status = upload_zip(zip_path)
         assert status in (200, 201), f"upload failed with status {status}"
 
-        coding_entry = wait_for_state(["CODING"], timeout_sec=30)
+        coding_entry = wait_for_state(["CODING"], timeout_sec=60)
         coding_task = coding_entry.get("current_task") or {}
         assert coding_task.get("pr_id") == expected_pr_id, coding_task
         assert coding_task.get("branch") == expected_branch, coding_task

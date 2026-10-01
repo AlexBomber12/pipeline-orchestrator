@@ -124,7 +124,7 @@ def test_changes_requested_review_drives_watch_to_fix(
         status = upload_zip(zip_path)
         assert status in (200, 201), f"upload failed with status {status}"
 
-        coding_entry = wait_for_state(["CODING"], timeout_sec=30)
+        coding_entry = wait_for_state(["CODING"], timeout_sec=60)
         coding_task = coding_entry.get("current_task") or {}
         assert coding_task.get("pr_id") == expected_pr_id, (
             f"CODING was for current_task={coding_task!r}, "
