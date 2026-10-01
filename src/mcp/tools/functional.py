@@ -11,12 +11,8 @@ from __future__ import annotations
 import logging
 import re
 import tempfile
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated
-
-from ruamel.yaml import YAML
-from ruamel.yaml.error import YAMLError
 
 from src.mcp.scans import scan_for_conflicts
 from src.mcp.server import mcp
@@ -24,7 +20,7 @@ from src.queue_parser import (
     QueueValidationError,
     parse_task_header,
 )
-from src.task_budget import validate_task_budget
+from src.task_budget import validate_task_frontmatter_budget
 
 logger = logging.getLogger(__name__)
 
@@ -54,35 +50,6 @@ _CANONICAL_STATUSES = {"TODO", "DONE", "ERROR"}
 _REPO_SLUG_PATTERN = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9_.-]*__[A-Za-z0-9][A-Za-z0-9_.-]*$"
 )
-
-
-def _validate_frontmatter_budget(content: str, *, complexity: str) -> list[str]:
-    """Validate the budget from the opening frontmatter block only."""
-    lines = content.splitlines()
-    first_content_index = next(
-        index for index, raw_line in enumerate(lines) if raw_line.strip()
-    )
-    frontmatter_end_index = next(
-        index
-        for index in range(first_content_index + 1, len(lines))
-        if lines[index].rstrip() == _FRONTMATTER_DELIMITER
-    )
-    frontmatter_text = "\n".join(
-        lines[first_content_index + 1 : frontmatter_end_index]
-    )
-
-    yaml = YAML(typ="safe")
-    yaml.allow_duplicate_keys = False
-    try:
-        frontmatter = yaml.load(frontmatter_text)
-    except YAMLError as exc:
-        return [f"invalid YAML frontmatter: {exc}"]
-
-    if not isinstance(frontmatter, Mapping):
-        return ["frontmatter must be a mapping"]
-    if "task_budget" not in frontmatter:
-        return ["frontmatter is missing required task_budget mapping"]
-    return validate_task_budget(frontmatter["task_budget"], complexity=complexity)
 
 
 @mcp.tool()
@@ -130,7 +97,9 @@ def validate_task_spec(content: str) -> dict:
         schema_errors = list(exc.issues)
     else:
         schema_errors.extend(
-            _validate_frontmatter_budget(content, complexity=header.complexity)
+            validate_task_frontmatter_budget(
+                content, complexity=header.complexity
+            )
         )
     finally:
         tmp_path.unlink(missing_ok=True)
