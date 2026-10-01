@@ -5,7 +5,10 @@ from __future__ import annotations
 from copy import deepcopy
 
 import pytest
-from src.task_budget import validate_task_budget
+from src.task_budget import (
+    validate_task_budget,
+    validate_task_frontmatter_budget,
+)
 
 
 def _budget(**overrides: object) -> dict[str, object]:
@@ -19,6 +22,82 @@ def _budget(**overrides: object) -> dict[str, object]:
     }
     budget.update(overrides)
     return budget
+
+
+_VALID_FRONTMATTER = """---
+status: TODO
+task_budget:
+  version: 1
+  production_lines: 120
+  test_lines: 180
+  other_lines: 40
+  production_files: 2
+  total_files: 4
+---
+"""
+
+
+def test_frontmatter_budget_accepts_valid_opening_block() -> None:
+    content = "\n \n" + _VALID_FRONTMATTER.replace("---\n", "---  \n")
+
+    assert validate_task_frontmatter_budget(content, complexity="low") == []
+
+
+def test_frontmatter_budget_uses_only_the_opening_block() -> None:
+    content = _VALID_FRONTMATTER + """
+# PR-999: Example
+
+```yaml
+task_budget:
+  production_lines: 999
+```
+"""
+
+    assert validate_task_frontmatter_budget(content, complexity="low") == []
+
+
+@pytest.mark.parametrize(
+    "content", ["", " \n\t\n", "# PR-999: No frontmatter\n", " ---\n"]
+)
+def test_frontmatter_budget_reports_missing_opening_block(content: str) -> None:
+    assert validate_task_frontmatter_budget(content, complexity="low") == [
+        "missing opening frontmatter '---'"
+    ]
+
+
+def test_frontmatter_budget_reports_unclosed_block() -> None:
+    assert validate_task_frontmatter_budget(
+        "---\nstatus: TODO\ntask_budget: {}\n", complexity="low"
+    ) == ["missing closing frontmatter '---'"]
+
+
+@pytest.mark.parametrize(
+    ("frontmatter", "expected"),
+    [
+        ("metadata: [broken", "invalid YAML frontmatter:"),
+        ("- not-a-mapping", "frontmatter must be a mapping"),
+        ("status: TODO", "frontmatter is missing required task_budget mapping"),
+    ],
+)
+def test_frontmatter_budget_reports_malformed_or_missing_data(
+    frontmatter: str, expected: str
+) -> None:
+    errors = validate_task_frontmatter_budget(
+        f"---\n{frontmatter}\n---\n", complexity="low"
+    )
+
+    assert len(errors) == 1
+    assert errors[0].startswith(expected)
+
+
+def test_frontmatter_budget_delegates_to_budget_validator() -> None:
+    content = _VALID_FRONTMATTER.replace(
+        "production_lines: 120", "production_lines: 201"
+    )
+
+    assert validate_task_frontmatter_budget(content, complexity="low") == [
+        "production_lines must be <= 200; got 201"
+    ]
 
 
 @pytest.mark.parametrize(

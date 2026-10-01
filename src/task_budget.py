@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from ruamel.yaml import YAML
+from ruamel.yaml.error import YAMLError
+
+_FRONTMATTER_DELIMITER = "---"
 _REQUIRED_FIELDS = (
     "version",
     "production_lines",
@@ -20,6 +24,49 @@ _MISSING = object()
 
 def _is_nonnegative_integer(value: object) -> bool:
     return type(value) is int and value >= 0
+
+
+def validate_task_frontmatter_budget(
+    content: str, *, complexity: str
+) -> list[str]:
+    """Validate the budget declared in the opening frontmatter block."""
+    lines = content.splitlines()
+    first_content_index = next(
+        (index for index, raw_line in enumerate(lines) if raw_line.strip()),
+        None,
+    )
+    if (
+        first_content_index is None
+        or lines[first_content_index].rstrip() != _FRONTMATTER_DELIMITER
+    ):
+        return ["missing opening frontmatter '---'"]
+
+    frontmatter_end_index = next(
+        (
+            index
+            for index in range(first_content_index + 1, len(lines))
+            if lines[index].rstrip() == _FRONTMATTER_DELIMITER
+        ),
+        None,
+    )
+    if frontmatter_end_index is None:
+        return ["missing closing frontmatter '---'"]
+
+    frontmatter_text = "\n".join(
+        lines[first_content_index + 1 : frontmatter_end_index]
+    )
+    yaml = YAML(typ="safe")
+    yaml.allow_duplicate_keys = False
+    try:
+        frontmatter = yaml.load(frontmatter_text)
+    except YAMLError as exc:
+        return [f"invalid YAML frontmatter: {exc}"]
+
+    if not isinstance(frontmatter, Mapping):
+        return ["frontmatter must be a mapping"]
+    if "task_budget" not in frontmatter:
+        return ["frontmatter is missing required task_budget mapping"]
+    return validate_task_budget(frontmatter["task_budget"], complexity=complexity)
 
 
 def validate_task_budget(budget: object, *, complexity: str) -> list[str]:
