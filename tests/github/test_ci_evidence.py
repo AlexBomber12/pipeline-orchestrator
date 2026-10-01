@@ -48,7 +48,7 @@ def test_required_contexts_must_be_successful_on_the_current_sha() -> None:
     )
     foreign = evaluate(check_runs=[run("unit", sha=OTHER)], required_contexts=["unit"], empty_is_success=True)
     foreign_empty = evaluate(statuses=[status("legacy", sha="")], empty_is_success=True)
-    unbound = evaluate(check_runs=[{"name": "unit", "conclusion": "success"}], empty_is_success=True)
+    unbound = evaluate(check_runs=[{"name": "unit", "head_sha": "", "sha": SHA}], empty_is_success=True)
     nameless_run = evaluate(check_runs=[{"head_sha": SHA, "conclusion": "failure"}], empty_is_success=True)
     nameless_status = evaluate(statuses=[{"sha": SHA, "state": "failure"}], empty_is_success=True)
 

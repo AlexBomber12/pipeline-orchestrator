@@ -45,7 +45,7 @@ def _contexts(sha: str, check_runs: Iterable[dict[str, Any]], statuses: Iterable
     out: list[CIContextEvidence] = []
     for run in check_runs:
         name = _text(run.get("name"))
-        run_sha = _text(run.get("head_sha") or run.get("sha") or run.get("commit_sha")).lower()
+        run_sha = _text(run.get("head_sha", run.get("sha", run.get("commit_sha", "")))).lower()
         if name and run_sha == sha:
             out.append(CIContextEvidence(name, _state(run.get("conclusion") or run.get("status")), run_sha,
                                          _run_producer(run), _attempt(run), _time(run) or observed_at, run.get("id")))
