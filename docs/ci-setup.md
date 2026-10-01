@@ -19,6 +19,7 @@ Navigate to <https://github.com/settings/apps/new>. Fill in the form:
 - Webhook: uncheck "Active". The integration job does not consume webhooks.
 - Repository permissions:
   - Contents: Read and write
+  - Checks: Read-only
   - Issues: Read and write
   - Pull requests: Read and write
   - Commit statuses: Read and write
@@ -51,7 +52,7 @@ After adding the secret, you can delete the `.pem` file from your local machine;
 
 ### Step E2: Create the independent review simulator App
 
-GitHub rejects requested changes from the PR author, so create a second, test-only App named `pipeline-orchestrator-testbed-codex-reviewer`. The `codex` segment is required by the current testbed review classifier; do not broaden the production trust policy for this test.
+GitHub rejects requested changes from the PR author, so create a second, test-only App named `po-testbed-codex-reviewer`. The `codex` segment is required by the current testbed review classifier; do not broaden the production trust policy for this test.
 
 Give this reviewer App only these repository permissions:
 
@@ -69,6 +70,25 @@ The workflow exposes the separate installation token as `TESTBED_REVIEWER_TOKEN`
 ### Step F: Verify
 
 Re-run the most recent failed integration job (Actions tab → click the workflow run → "Re-run failed jobs"). The integration job's "Verify gh auth" step should now succeed. If it fails with "App not installed on repository", repeat Step D and ensure the testbed repo is selected.
+
+The integration test `tests/e2e/test_ci_evidence_access.py` is the readiness
+probe for CI evidence rollout. It runs with the same GitHub App installation
+token as the test daemon, reads the testbed default-branch HEAD, and requires
+successful retrieval of both:
+
+- `GET /repos/AlexBomber12/pipeline-orchestrator-testbed/commits/<sha>/check-runs?per_page=100`
+- `GET /repos/AlexBomber12/pipeline-orchestrator-testbed/commits/<sha>/status`
+
+Empty check-run or status lists are acceptable; HTTP 403 or "Resource not
+accessible by integration" is an external App permission/install prerequisite,
+not a WATCH timeout symptom. To run just this probe in the supported integration
+environment, re-run the GitHub Actions `integration` job or run:
+
+```bash
+GH_TOKEN=<testbed GitHub App installation token> \
+GITHUB_ACTIONS=true \
+pytest tests/e2e/test_ci_evidence_access.py -v
+```
 
 ## Required check enforcement
 
@@ -97,5 +117,7 @@ Common issues and fixes:
 - **"Bad credentials" from `gh` CLI in workflow**: the App private key in the secret is malformed. Re-do Step E, ensuring you paste the entire `.pem` contents including the BEGIN/END lines.
 - **Integration job hangs at `docker compose up -d --wait`**: the Dockerfile build is failing or a service healthcheck is failing. Check the prior step's output for image build errors, then check the redis-test healthcheck (uses `redis-cli ping`, which is in the `redis:7-alpine` image by default).
 - **"Permission denied" pushing to testbed**: the App is installed but the Contents permission is read-only. Re-do Step A, ensuring Contents is "Read and write".
-- **`tests/e2e/test_fix_external_merge.py` skipped with "Commit statuses: Write" message**: the App was provisioned before that permission was added to the documented set. In the App's "Permissions & events" page, change "Commit statuses" from no access to Read and write, then re-grant access on the install (the App owner will get an "approve permission update" prompt at the install URL).
+- **`tests/e2e/test_fix_external_merge.py` fails while posting or reading commit statuses**: the App is missing required Commit statuses access. In the App's "Permissions & events" page, change "Commit statuses" from no access to Read and write, then re-grant access on the install (the App owner will get an "approve permission update" prompt at the install URL).
+- **`tests/e2e/test_ci_evidence_access.py` fails on check-runs**: the App lacks Checks read access or the install has not been re-approved after adding that permission. In the App's "Permissions & events" page, set "Checks" to Read-only, then approve the updated installation for `pipeline-orchestrator-testbed`.
+- **`tests/e2e/test_ci_evidence_access.py` fails on combined status**: the App lacks Commit statuses read access or cannot see the testbed repository. Confirm "Commit statuses" is Read and write and repeat Step D for `pipeline-orchestrator-testbed`.
 - **Missing `TESTBED_REVIEWER_APP_ID` or `TESTBED_REVIEWER_APP_PRIVATE_KEY`**: complete Step E2. The workflow intentionally fails before e2e setup instead of letting the review test create a PR with the author identity.
