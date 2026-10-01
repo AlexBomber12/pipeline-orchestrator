@@ -143,6 +143,10 @@ def test_changes_requested_review_drives_watch_to_fix(
             f"expected {expected_branch!r}"
         )
 
+        # Arm cleanup first: WATCH may consume feedback while the fixture verifies its API response.
+        history_floor = len(watch_entry.get("history") or [])
+        SHIM_SCENARIO_PATH.write_text("escalate\n")
+
         # The fixture uses a separate Codex-named reviewer App, binds the
         # REQUEST_CHANGES review to the current head, and comments on the
         # marker line after both the push and author review anchor.
@@ -152,12 +156,8 @@ def test_changes_requested_review_drives_watch_to_fix(
         assert review["state"] == "CHANGES_REQUESTED"
         assert review["commit_id"] == review["head_sha"]
 
-        # Ensure the next coder invocation takes the terminal cleanup path.
         # FIX can be shorter than the polling interval, so history below is
         # also accepted as proof that this PR entered the real FIX handler.
-        history_floor = len(watch_entry.get("history") or [])
-        SHIM_SCENARIO_PATH.write_text("escalate\n")
-
         # Poll for FIX with the same PR number. The 90s deadline covers
         # two WATCH polls (5–10s each) plus the freshness round-trip
         # plus the FIX entry transition.
