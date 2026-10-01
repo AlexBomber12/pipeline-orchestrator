@@ -11,8 +11,12 @@ from __future__ import annotations
 import logging
 import re
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated
+
+from ruamel.yaml import YAML
+from ruamel.yaml.error import YAMLError
 
 from src.mcp.scans import scan_for_conflicts
 from src.mcp.server import mcp
@@ -20,6 +24,7 @@ from src.queue_parser import (
     QueueValidationError,
     parse_task_header,
 )
+from src.task_budget import validate_task_budget
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +56,35 @@ _REPO_SLUG_PATTERN = re.compile(
 )
 
 
+def _validate_frontmatter_budget(content: str, *, complexity: str) -> list[str]:
+    """Validate the budget from the opening frontmatter block only."""
+    lines = content.splitlines()
+    first_content_index = next(
+        index for index, raw_line in enumerate(lines) if raw_line.strip()
+    )
+    frontmatter_end_index = next(
+        index
+        for index in range(first_content_index + 1, len(lines))
+        if lines[index].rstrip() == _FRONTMATTER_DELIMITER
+    )
+    frontmatter_text = "\n".join(
+        lines[first_content_index + 1 : frontmatter_end_index]
+    )
+
+    yaml = YAML(typ="safe")
+    yaml.allow_duplicate_keys = False
+    try:
+        frontmatter = yaml.load(frontmatter_text)
+    except YAMLError as exc:
+        return [f"invalid YAML frontmatter: {exc}"]
+
+    if not isinstance(frontmatter, Mapping):
+        return ["frontmatter must be a mapping"]
+    if "task_budget" not in frontmatter:
+        return ["frontmatter is missing required task_budget mapping"]
+    return validate_task_budget(frontmatter["task_budget"], complexity=complexity)
+
+
 @mcp.tool()
 def validate_task_spec(content: str) -> dict:
     """Validate a candidate task file body against the canonical schema.
@@ -68,8 +102,8 @@ def validate_task_spec(content: str) -> dict:
     Returns:
         A dict with four keys:
 
-        - ``valid``: ``True`` when the spec parses cleanly AND no
-          AGENTS.md anti-pattern violations were detected.
+        - ``valid``: ``True`` when the header and declared budget validate
+          cleanly AND no AGENTS.md anti-pattern violations were detected.
         - ``errors``: legacy alias of ``schema_errors`` retained for
           MCP clients written against the PR-246 shape, which read
           ``result["errors"]`` directly. Always present (empty list
@@ -91,9 +125,13 @@ def validate_task_spec(content: str) -> dict:
         tmp_path = Path(tmp.name)
     schema_errors: list[str] = []
     try:
-        parse_task_header(tmp_path)
+        header = parse_task_header(tmp_path)
     except QueueValidationError as exc:
         schema_errors = list(exc.issues)
+    else:
+        schema_errors.extend(
+            _validate_frontmatter_budget(content, complexity=header.complexity)
+        )
     finally:
         tmp_path.unlink(missing_ok=True)
 

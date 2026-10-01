@@ -6,12 +6,20 @@ from unittest.mock import patch
 
 import pytest
 
-
 # ---- validate_task_spec ----
 
-_VALID_SPEC = """---
+_VALID_BUDGET = """task_budget:
+  version: 1
+  production_lines: 60
+  test_lines: 90
+  other_lines: 10
+  production_files: 1
+  total_files: 2
+"""
+
+_VALID_SPEC = f"""---
 status: TODO
----
+{_VALID_BUDGET}---
 
 # PR-999: Example task
 
@@ -38,6 +46,91 @@ def test_validate_task_spec_accepts_valid_content():
         "schema_errors": [],
         "agents_violations": [],
     }
+
+
+def test_validate_task_spec_accepts_valid_medium_budget():
+    from src.mcp.tools.functional import validate_task_spec
+
+    spec = _VALID_SPEC.replace("- Complexity: low", "- Complexity: medium")
+    spec = spec.replace(
+        "  total_files: 2\n",
+        "  total_files: 2\n"
+        "  rationale: Local change with a known implementation approach.\n",
+    )
+
+    assert validate_task_spec(spec)["valid"] is True
+
+
+def test_validate_task_spec_requires_budget_in_opening_frontmatter():
+    from src.mcp.tools.functional import validate_task_spec
+
+    missing = _VALID_SPEC.replace(_VALID_BUDGET, "")
+    body_only = missing + f"\n```yaml\n{_VALID_BUDGET}```\n"
+
+    for spec in (missing, body_only):
+        result = validate_task_spec(spec)
+        assert result["valid"] is False
+        assert result["errors"] == result["schema_errors"]
+        assert result["schema_errors"] == [
+            "frontmatter is missing required task_budget mapping"
+        ]
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        (
+            "  production_lines: 60",
+            "  production_lines: 201",
+            "production_lines must be <= 200; got 201",
+        ),
+        (
+            "  test_lines: 90",
+            "  test_lines: true",
+            "test_lines must be a nonnegative integer",
+        ),
+        (
+            "- Complexity: low",
+            "- Complexity: high",
+            "high complexity is not allowed; split the task",
+        ),
+    ],
+)
+def test_validate_task_spec_rejects_invalid_budgets(old, new, expected):
+    from src.mcp.tools.functional import validate_task_spec
+
+    result = validate_task_spec(_VALID_SPEC.replace(old, new))
+
+    assert result["valid"] is False
+    assert result["errors"] == result["schema_errors"]
+    assert expected in result["schema_errors"]
+
+
+@pytest.mark.parametrize(
+    ("frontmatter", "expected"),
+    [
+        ("status: TODO\nmetadata: [broken\n", "invalid YAML frontmatter"),
+        ("status: TODO\nstatus: DONE\n", "duplicate key"),
+        ("- not-a-mapping\n", "frontmatter must be a mapping"),
+        ("status: TODO\nmetadata: !unsupported value\n", "could not determine"),
+    ],
+)
+def test_validate_task_spec_rejects_unsafe_or_malformed_frontmatter(
+    frontmatter, expected
+):
+    from src.mcp.tools.functional import validate_task_spec
+
+    spec = _VALID_SPEC.replace(f"status: TODO\n{_VALID_BUDGET}", frontmatter)
+    result = validate_task_spec(spec)
+
+    assert result["valid"] is False
+    assert any(expected in error for error in result["schema_errors"])
+
+
+def test_validate_task_spec_accepts_leading_blank_lines():
+    from src.mcp.tools.functional import validate_task_spec
+
+    assert validate_task_spec("\n \n" + _VALID_SPEC)["valid"] is True
 
 
 def test_validate_task_spec_rejects_missing_branch_field():

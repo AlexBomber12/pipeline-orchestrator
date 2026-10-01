@@ -131,6 +131,13 @@ def test_validate_task_spec_accepts_synonyms() -> None:
     result = validate_task_spec(
         """---
 status: TODO
+task_budget:
+  version: 1
+  production_lines: 40
+  test_lines: 60
+  other_lines: 10
+  production_files: 1
+  total_files: 2
 ---
 
 # PR-999: Synonym validation

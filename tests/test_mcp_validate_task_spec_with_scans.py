@@ -7,9 +7,15 @@ return shape (PR-259). Schema validation behavior is covered by
 
 from __future__ import annotations
 
-
 _VALID_SPEC = """---
 status: TODO
+task_budget:
+  version: 1
+  production_lines: 50
+  test_lines: 80
+  other_lines: 10
+  production_files: 1
+  total_files: 2
 ---
 
 # PR-999: Example task
@@ -61,16 +67,17 @@ def test_valid_field_false_when_violations_present():
     assert result["agents_violations"]
 
 
-def test_schema_and_violations_both_reported():
-    """Schema errors and agents violations stack independently."""
+def test_budget_and_violations_both_reported():
+    """Budget errors and AGENTS violations stack independently."""
     from src.mcp.tools.functional import validate_task_spec
 
-    bad = _VALID_SPEC.replace("- Type: feature", "- Type: nonsense")
+    bad = _VALID_SPEC.replace("production_lines: 50", "production_lines: 201")
     bad += "\ngh pr create --draft --title wip\n"
     result = validate_task_spec(bad)
 
     assert result["valid"] is False
-    assert result["schema_errors"]
+    assert result["errors"] == result["schema_errors"]
+    assert "production_lines must be <= 200; got 201" in result["schema_errors"]
     assert any(
         v["type"] == "draft_pr_flag" for v in result["agents_violations"]
     )
