@@ -208,6 +208,7 @@ def test_slug_node_id_datetime_now_and_helper_tie_breaks() -> None:
     left = CIContextEvidence("unit", "success", SHA)
     right = CIContextEvidence("unit", "pending", SHA)
     attempted = CIContextEvidence("unit", "success", SHA, attempt=1)
+    identified = CIContextEvidence("unit", "success", SHA, run_id=1)
     newer_time = CIContextEvidence("unit", "success", SHA, observed_at=NOW)
     older_time = CIContextEvidence("unit", "pending", SHA, observed_at=datetime(2026, 10, 1, 11, tzinfo=timezone.utc))
     same_time = CIContextEvidence("unit", "success", SHA, observed_at=NOW)
@@ -221,3 +222,5 @@ def test_slug_node_id_datetime_now_and_helper_tie_breaks() -> None:
     assert _newer(newer_time, same_time) is True
     assert _newer(attempted, right) is True
     assert _newer(right, attempted) is False
+    assert _newer(identified, left) is True
+    assert _newer(left, identified) is False
