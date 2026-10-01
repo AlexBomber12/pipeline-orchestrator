@@ -69,7 +69,7 @@ def _policy(contexts: tuple[CIContextEvidence, ...], complete: bool, required: t
         return CIStatus.PENDING, "conflicting_sha"
     if not complete:
         return CIStatus.PENDING, "sources_incomplete"
-    if required is None:
+    if not required:
         if not latest:
             return (CIStatus.SUCCESS, None) if empty_is_success else (CIStatus.PENDING, "no_contexts")
         for name, producers in latest.items():
@@ -158,7 +158,7 @@ def _attempt(payload: dict[str, Any]) -> int | None:
 
 
 def _time(payload: dict[str, Any]) -> datetime | None:
-    for key in ("completed_at", "updated_at", "started_at", "created_at"):
+    for key in ("started_at", "created_at", "completed_at", "updated_at"):
         if parsed := _dt(payload.get(key)):
             return parsed
     return None

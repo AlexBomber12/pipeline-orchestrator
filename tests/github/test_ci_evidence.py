@@ -88,20 +88,23 @@ def test_reruns_use_authoritative_attempt_ordering() -> None:
         ],
         required_contexts=["unit"],
     )
-    newer_execution = evaluate(
-        check_runs=[
-            run("unit", "success", attempt=2, completed_at="2026-10-01T11:00:00Z"),
-            run("unit", None, status="in_progress", attempt=1, completed_at="2026-10-01T12:00:00Z"),
-        ],
-        required_contexts=["unit"],
-    )
+    older = run("unit", "success", attempt=2, started_at="2026-10-01T10:00:00Z",
+                completed_at="2026-10-01T13:00:00Z")
+    for newer, expected in [
+        (run("unit", None, status="in_progress", attempt=1, started_at="2026-10-01T12:00:00Z",
+             completed_at=None), CIStatus.PENDING),
+        (run("unit", "failure", attempt=1, started_at="2026-10-01T12:00:00Z",
+             completed_at=None), CIStatus.FAILURE),
+    ]:
+        for records in ([older, newer], [newer, older]):
+            overlapping = evaluate(check_runs=records, required_contexts=["unit"])
+            assert overlapping.policy_result == expected
 
     assert pending.policy_result == CIStatus.PENDING
     assert pending.pending_reason == "required_not_success:unit"
     assert pending.contexts[-1].state == "pending"
     assert recovered.policy_result == CIStatus.SUCCESS
     assert equal_attempt.policy_result == CIStatus.FAILURE
-    assert newer_execution.pending_reason == "required_not_success:unit"
 
 
 def test_ambiguous_or_missing_identity_does_not_authorize_success() -> None:
@@ -120,6 +123,8 @@ def test_ambiguous_or_missing_identity_does_not_authorize_success() -> None:
 def test_no_required_list_requires_complete_nonempty_success_unless_exempt() -> None:
     no_contexts = evaluate()
     empty_ok = evaluate(empty_is_success=True)
+    empty_required = evaluate(required_contexts=["", " "])
+    empty_required_ok = evaluate(required_contexts=[], empty_is_success=True)
     all_success = evaluate(check_runs=[run("unit", "neutral")], statuses=[status("legacy")])
     context_pending = evaluate(check_runs=[run("unit", None, status="queued")])
     ambiguous = evaluate(check_runs=[run("unit", app_id=1), run("unit", app_id=2)])
@@ -127,6 +132,8 @@ def test_no_required_list_requires_complete_nonempty_success_unless_exempt() -> 
 
     assert no_contexts.pending_reason == "no_contexts"
     assert empty_ok.policy_result == CIStatus.SUCCESS
+    assert empty_required.pending_reason == "no_contexts"
+    assert empty_required_ok.policy_result == CIStatus.SUCCESS
     assert all_success.policy_result == CIStatus.SUCCESS
     assert context_pending.policy_result == CIStatus.PENDING
     assert context_pending.pending_reason == "context_pending"
