@@ -30,10 +30,7 @@ def evaluate_ci_evidence(
     statuses = tuple(statuses)
     contexts = tuple(_contexts(sha, check_runs, statuses, observed))
     complete = check_runs_complete and statuses_complete
-    conflict = any(
-        _text(item.get("head_sha") or item.get("sha") or item.get("commit_sha")) != sha
-        for item in [*check_runs, *statuses]
-    )
+    conflict = len(contexts) != len(check_runs) + len(statuses)
     result, reason = _policy(contexts, complete, required, empty_is_success, conflict)
     return CIEvidence(
         repo=repo, pr_number=pr_number, sha=sha, observed_at=observed, contexts=contexts,
