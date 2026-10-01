@@ -49,6 +49,24 @@ jobs:
           owner: AlexBomber12
           repositories: pipeline-orchestrator-testbed
 
+      - name: Require independent reviewer App credentials
+        env:
+          HAS_REVIEWER_APP_ID: ${{ secrets.TESTBED_REVIEWER_APP_ID != '' }}
+          HAS_REVIEWER_APP_PRIVATE_KEY: ${{ secrets.TESTBED_REVIEWER_APP_PRIVATE_KEY != '' }}
+        run: |
+          if [[ "$HAS_REVIEWER_APP_ID" != "true" || "$HAS_REVIEWER_APP_PRIVATE_KEY" != "true" ]]; then
+            echo "::error::Missing TESTBED_REVIEWER_APP_ID or TESTBED_REVIEWER_APP_PRIVATE_KEY; see docs/ci-setup.md"
+            exit 1
+          fi
+
+      - id: testbed-reviewer-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.TESTBED_REVIEWER_APP_ID }}
+          private-key: ${{ secrets.TESTBED_REVIEWER_APP_PRIVATE_KEY }}
+          owner: AlexBomber12
+          repositories: pipeline-orchestrator-testbed
+
       - name: Verify gh auth
         env:
           GH_TOKEN: ${{ steps.testbed-token.outputs.token }}
@@ -105,6 +123,7 @@ jobs:
       - name: Run e2e tests
         env:
           GH_TOKEN: ${{ steps.testbed-token.outputs.token }}
+          TESTBED_REVIEWER_TOKEN: ${{ steps.testbed-reviewer-token.outputs.token }}
         run: pytest tests/e2e/ -v
 
       - name: Capture stack logs on failure
