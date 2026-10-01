@@ -37,7 +37,7 @@ def status(name: str, state: str = "success", **kw: object) -> dict:
 
 def evaluate(**kw: object):
     observed_at = kw.pop("observed_at", NOW)
-    return evaluate_ci_evidence(repo="octo/demo", pr_number=7, sha=SHA, observed_at=observed_at, **kw)
+    return evaluate_ci_evidence(repo="octo/demo", pr_number=7, sha=kw.pop("sha", SHA), observed_at=observed_at, **kw)
 
 
 def test_required_contexts_must_be_successful_on_the_current_sha() -> None:
@@ -66,6 +66,9 @@ def test_required_contexts_must_be_successful_on_the_current_sha() -> None:
     assert nameless_status.pending_reason == "conflicting_sha"
     assert missing.repo == "octo/demo"
     assert missing.pr_number == 7
+    for invalid_sha in ("", SHA[:7]):
+        invalid = evaluate(sha=invalid_sha, check_runs=[run("unit", sha=invalid_sha)], required_contexts=["unit"])
+        assert invalid.pending_reason == "conflicting_sha"
 
 
 def test_partial_sources_cannot_pass_but_known_failure_remains_visible() -> None:
