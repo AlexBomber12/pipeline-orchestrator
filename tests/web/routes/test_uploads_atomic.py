@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from src.keyspace import upload_pending
+from src.cancellation import task_spec_hash_key
+from src.keyspace import upload_pending, upload_pending_count
 from src.web import app as web_app
 from src.web.app import app
 from src.web.routes import uploads as upload_routes
@@ -62,6 +63,188 @@ def _staging_dir(uploads_dir: Path) -> Path:
 
 def _upload_temp_dirs() -> list[Path]:
     return list(Path("/tmp").glob("upload-*"))
+
+
+_DEFAULT_BUDGET_BLOCK = (
+    "task_budget:\n"
+    "  version: 1\n"
+    "  production_lines: 20\n"
+    "  test_lines: 20\n"
+    "  other_lines: 0\n"
+    "  production_files: 1\n"
+    "  total_files: 2\n"
+)
+
+
+def _budget_task_file(
+    name: str = "PR-001.md",
+    *,
+    pr_id: str = "PR-001",
+    include_budget: bool = True,
+    production_lines: int = 20,
+    complexity: str = "low",
+    rationale: str | None = None,
+    depends_on: str = "none",
+) -> tuple[str, tuple[str, bytes, str]]:
+    upload = _task_file(name=name, pr_id=pr_id, depends_on=depends_on)
+    text = upload[1][1].decode("utf-8")
+    budget_block = _DEFAULT_BUDGET_BLOCK.replace(
+        "production_lines: 20", f"production_lines: {production_lines}"
+    )
+    if rationale is not None:
+        budget_block = budget_block.replace(
+            "  total_files: 2\n", f"  total_files: 2\n  rationale: {rationale}\n"
+        )
+    text = text.replace(
+        _DEFAULT_BUDGET_BLOCK,
+        budget_block if include_budget else "",
+    ).replace("- Complexity: low", f"- Complexity: {complexity}")
+    return ("files", (name, text.encode("utf-8"), "text/markdown"))
+
+
+@pytest.mark.parametrize(
+    ("include_budget", "production_lines", "diagnostic"),
+    [
+        (False, 20, "frontmatter is missing required task_budget mapping"),
+        (True, 201, "production_lines must be &lt;= 200; got 201"),
+    ],
+)
+def test_budget_validation_rejects_missing_and_over_limit_declarations(
+    uploads_dir: Path,
+    include_budget: bool,
+    production_lines: int,
+    diagnostic: str,
+) -> None:
+    resp = _post_upload(
+        [
+            _budget_task_file(
+                include_budget=include_budget,
+                production_lines=production_lines,
+            )
+        ]
+    )
+
+    assert resp.status_code == 400
+    assert "PR-001.md" in resp.text
+    assert diagnostic in resp.text
+    assert not (uploads_dir / "example__alpha").exists()
+
+
+@pytest.mark.parametrize(
+    ("complexity", "rationale", "status_code", "diagnostic"),
+    [
+        ("medium", "Local and understood.", 200, None),
+        (
+            "medium",
+            None,
+            400,
+            "rationale must be a nonempty string for medium complexity",
+        ),
+        ("high", None, 400, "high complexity is not allowed; split the task"),
+    ],
+)
+def test_budget_validation_uses_normalized_header_complexity(
+    uploads_dir: Path,
+    complexity: str,
+    rationale: str | None,
+    status_code: int,
+    diagnostic: str | None,
+) -> None:
+    resp = _post_upload([_budget_task_file(complexity=complexity, rationale=rationale)])
+
+    assert resp.status_code == status_code
+    if diagnostic is None:
+        assert (_staging_dir(uploads_dir) / "PR-001.md").is_file()
+    else:
+        assert diagnostic in resp.text
+        assert not (uploads_dir / "example__alpha").exists()
+
+
+@pytest.mark.parametrize("archive_upload", [False, True])
+def test_mixed_budget_batch_rejection_is_atomic(
+    uploads_dir: Path, archive_upload: bool
+) -> None:
+    valid = _budget_task_file(name="PR-001.md", pr_id="PR-001")
+    invalid = _budget_task_file(
+        name="PR-002.md", pr_id="PR-002", include_budget=False
+    )
+    uploads = [valid, invalid]
+    if archive_upload:
+        uploads = [
+            _zip_file({upload[1][0]: upload[1][1] for upload in uploads})
+        ]
+
+    resp = _post_upload(uploads)
+
+    assert resp.status_code == 400
+    assert "PR-002.md" in resp.text
+    assert not (uploads_dir / "example__alpha").exists()
+
+
+def test_budget_rejection_preserves_pending_state_and_has_no_side_effects(
+    uploads_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pending_dir = uploads_dir / "example__alpha" / "pending"
+    pending_dir.mkdir(parents=True)
+    pending_task = pending_dir / "PR-900.md"
+    pending_task.write_bytes(_historical_task_bytes("PR-900"))
+    pending_manifest = json.dumps(
+        {
+            "repo": "example__alpha",
+            "files": ["PR-900.md"],
+            "staging_dir": str(pending_dir),
+            "task_hashes": {"PR-900": "existing-hash"},
+        }
+    )
+    wake_calls: list[tuple[str, str]] = []
+
+    async def _record_wake(
+        redis_client: object, repo_name: str, event_type: str
+    ) -> None:
+        wake_calls.append((repo_name, event_type))
+
+    monkeypatch.setattr(upload_routes, "publish_wake", _record_wake)
+    with TestClient(app) as client:
+        redis_client = client.app.state.redis
+        redis_client._store[upload_pending("example__alpha")] = pending_manifest
+        redis_client._store[upload_pending_count("example__alpha")] = "1"
+        hash_key = task_spec_hash_key("example__alpha", "PR-900")
+        redis_client._store[hash_key] = "existing-hash"
+        original_store = dict(redis_client._store)
+
+        invalid_reupload = _budget_task_file(
+            name="PR-900.md", pr_id="PR-900", include_budget=False
+        )
+        resp = client.post(
+            "/repos/example__alpha/upload-tasks", files=[invalid_reupload]
+        )
+
+        assert redis_client._store == original_store
+
+    assert resp.status_code == 400
+    assert pending_task.read_bytes() == _historical_task_bytes("PR-900")
+    assert set(pending_dir.parent.iterdir()) == {pending_dir}
+    assert wake_calls == []
+
+
+def test_budget_conflict_and_dependency_errors_are_aggregated(
+    uploads_dir: Path,
+) -> None:
+    upload = _budget_task_file(
+        name="PR-002.md",
+        pr_id="PR-002",
+        include_budget=False,
+        depends_on="PR-999",
+    )
+    bad_text = upload[1][1] + b"\ngh pr create --draft\n"
+
+    resp = _post_upload([("files", ("PR-002.md", bad_text, "text/markdown"))])
+
+    assert resp.status_code == 400
+    assert "frontmatter is missing required task_budget mapping" in resp.text
+    assert "AGENTS.md anti-pattern" in resp.text
+    assert "Depends on PR-999 which is not in this upload" in resp.text
+    assert not (uploads_dir / "example__alpha").exists()
 
 
 def test_all_valid_commits_all(uploads_dir: Path) -> None:
