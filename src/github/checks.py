@@ -372,6 +372,15 @@ def _extract_check_runs_from_page(page: dict) -> list[dict] | None:
     return [run for run in runs if isinstance(run, dict)]
 
 
+def _check_run_page_matches_sha(page_runs: list[dict], sha: str) -> bool:
+    """Return False when check-run metadata contradicts the requested SHA."""
+    for run in page_runs:
+        head_sha = run.get("head_sha")
+        if isinstance(head_sha, str) and head_sha and head_sha != sha:
+            return False
+    return True
+
+
 def _fetch_check_runs_payload(
     repo: str,
     sha: str,
@@ -399,6 +408,8 @@ def _fetch_check_runs_payload(
                 runs = _extract_check_runs_from_page(page)
                 if runs is None:
                     return check_runs, _source_failed("check_runs_unexpected_payload")
+                if not _check_run_page_matches_sha(runs, sha):
+                    return check_runs, _source_failed("check_runs_sha_mismatch")
                 check_runs.extend(runs)
             return check_runs, source
 
@@ -413,6 +424,8 @@ def _fetch_check_runs_payload(
         page_runs = _extract_check_runs_from_page(raw_page)
         if page_runs is None:
             return check_runs, _source_failed("check_runs_unexpected_payload")
+        if not _check_run_page_matches_sha(page_runs, sha):
+            return check_runs, _source_failed("check_runs_sha_mismatch")
         check_runs.extend(page_runs)
         if len(page_runs) < 100:
             break
@@ -455,6 +468,14 @@ def _fetch_combined_status_payload(
             status_payload = dict(first_payload)
             status_payload["statuses"] = statuses
             return status_payload, _source_failed(reason)
+
+        payload_sha = payload.get("sha")
+        if isinstance(payload_sha, str) and payload_sha and payload_sha != sha:
+            if first_payload is None:
+                return {}, _source_failed("statuses_sha_mismatch")
+            status_payload = dict(first_payload)
+            status_payload["statuses"] = statuses
+            return status_payload, _source_failed("statuses_sha_mismatch")
 
         page_statuses = payload.get("statuses")
         if not isinstance(page_statuses, list):

@@ -3773,6 +3773,72 @@ def test_ci_evidence_later_bad_status_page_preserves_accumulated_payload(
     assert len(evidence.status_payload["statuses"]) == 100
 
 
+def test_ci_evidence_status_sha_mismatch_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A status payload for another SHA cannot produce successful evidence."""
+
+    def fake_etag_get(path: str) -> dict:
+        if "check-runs" in path:
+            return {"check_runs": [{"name": "unit", "conclusion": "success"}]}
+        return {
+            "sha": "wrong-sha",
+            "state": "success",
+            "statuses": [{"context": "legacy", "state": "success"}],
+        }
+
+    monkeypatch.setattr("src.github.cache._etag_get", fake_etag_get)
+
+    evidence = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        allow_merge_without_checks=True,
+    )
+
+    assert evidence.ci_status == CIStatus.PENDING
+    assert evidence.pending_reason == "statuses_sha_mismatch"
+    assert evidence.statuses_source.complete is False
+
+
+def test_ci_evidence_later_status_sha_mismatch_preserves_accumulated_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later status page for another SHA is incomplete but keeps page 1."""
+
+    def fake_etag_get(path: str) -> dict:
+        if "check-runs" in path:
+            return {"check_runs": []}
+        if path.endswith("&page=1"):
+            return {
+                "sha": "abc123",
+                "state": "success",
+                "statuses": [
+                    {"context": f"legacy-{idx}", "state": "success"}
+                    for idx in range(100)
+                ],
+            }
+        if path.endswith("&page=2"):
+            return {
+                "sha": "wrong-sha",
+                "state": "success",
+                "statuses": [{"context": "integration", "state": "success"}],
+            }
+        raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr("src.github.cache._etag_get", fake_etag_get)
+
+    evidence = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        allow_merge_without_checks=True,
+    )
+
+    assert evidence.ci_status == CIStatus.PENDING
+    assert evidence.pending_reason == "statuses_sha_mismatch"
+    assert evidence.statuses_source.complete is False
+    assert len(evidence.status_payload["statuses"]) == 100
+
+
 def test_ci_evidence_check_run_pagination_failure_preserves_observed_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3805,6 +3871,78 @@ def test_ci_evidence_check_run_pagination_failure_preserves_observed_failure(
     assert evidence.check_runs_source.complete is False
     assert evidence.check_runs_source.reason == "check_runs_fetch_failed"
     assert len(evidence.check_runs) == 100
+
+
+def test_ci_evidence_check_run_sha_mismatch_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A check-run payload for another SHA cannot produce successful evidence."""
+
+    def fake_etag_get(path: str) -> dict:
+        if "check-runs" in path:
+            return {
+                "check_runs": [
+                    {
+                        "name": "unit",
+                        "head_sha": "wrong-sha",
+                        "conclusion": "success",
+                    }
+                ]
+            }
+        return {
+            "sha": "abc123",
+            "state": "success",
+            "statuses": [{"context": "legacy", "state": "success"}],
+        }
+
+    monkeypatch.setattr("src.github.cache._etag_get", fake_etag_get)
+
+    evidence = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        allow_merge_without_checks=True,
+    )
+
+    assert evidence.ci_status == CIStatus.PENDING
+    assert evidence.pending_reason == "check_runs_sha_mismatch"
+    assert evidence.check_runs_source.complete is False
+
+
+def test_ci_evidence_slurped_check_run_sha_mismatch_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy slurped check-run pages also reject mismatched SHA metadata."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in a for a in args):
+            return [
+                {
+                    "check_runs": [
+                        {
+                            "name": "unit",
+                            "head_sha": "wrong-sha",
+                            "conclusion": "success",
+                        }
+                    ]
+                }
+            ]
+        return {
+            "sha": "abc123",
+            "state": "success",
+            "statuses": [{"context": "legacy", "state": "success"}],
+        }
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    evidence = _fetch_ci_evidence_rest(
+        "owner/name",
+        "abc123",
+        allow_merge_without_checks=True,
+    )
+
+    assert evidence.ci_status == CIStatus.PENDING
+    assert evidence.pending_reason == "check_runs_sha_mismatch"
+    assert evidence.check_runs_source.complete is False
 
 
 def test_ci_evidence_legacy_slurped_check_run_page_with_bad_runs_is_incomplete(
