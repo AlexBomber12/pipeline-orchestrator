@@ -41,9 +41,9 @@ TESTBED_REPO = "AlexBomber12/pipeline-orchestrator-testbed"
 # freshness round-trip plus the FIX entry transition with comfortable
 # slack before declaring failure.
 FIX_TRANSITION_DEADLINE_SEC = 90
-# After flipping the shim to ``escalate``, the FIX-cycle parser routes
-# the runner back to IDLE without further coder work.
-ESCALATE_TO_IDLE_DEADLINE_SEC = 60
+# After flipping the shim to ``escalate``, the FIX-cycle parser parks the
+# failed task in ERROR without further coder work.
+ESCALATE_TO_ERROR_DEADLINE_SEC = 60
 
 _PERMISSION_GAP_MESSAGE = (
     "Testbed GitHub App is missing the 'Commit statuses: Write' "
@@ -143,15 +143,21 @@ def test_changes_requested_review_drives_watch_to_fix(
             f"expected {expected_branch!r}"
         )
 
-        # Post a CHANGES_REQUESTED review via REST. The freshness gate
-        # anchors on the head commit timestamp; the review is submitted
-        # AFTER the shim's push, so the gate sees it as fresh feedback.
-        post_review(
-            watch_pr_number,
-            event="REQUEST_CHANGES",
-            body="e2e: please address review feedback",
-        )
+        # Arm cleanup first: WATCH may consume feedback while the fixture verifies its API response.
+        history_floor = len(watch_entry.get("history") or [])
+        SHIM_SCENARIO_PATH.write_text("escalate\n")
 
+        # The fixture uses a separate Codex-named reviewer App, binds the
+        # REQUEST_CHANGES review to the current head, and comments on the
+        # marker line after both the push and author review anchor.
+        review = post_review(watch_pr_number)
+        assert review["reviewer"] != review["author"]
+        assert "codex" in (review["reviewer"] or "").lower()
+        assert review["state"] == "CHANGES_REQUESTED"
+        assert review["commit_id"] == review["head_sha"]
+
+        # FIX can be shorter than the polling interval, so history below is
+        # also accepted as proof that this PR entered the real FIX handler.
         # Poll for FIX with the same PR number. The 90s deadline covers
         # two WATCH polls (5–10s each) plus the freshness round-trip
         # plus the FIX entry transition.
@@ -165,7 +171,16 @@ def test_changes_requested_review_drives_watch_to_fix(
                 last_state = entry.get("state")
                 current_pr = entry.get("current_pr") or {}
                 last_pr_number = current_pr.get("number")
-                if last_state == "FIX" and last_pr_number == watch_pr_number:
+                recent_history = (entry.get("history") or [])[history_floor:]
+                saw_fix_history = any(
+                    item.get("state") == "FIX"
+                    and "entering FIX" in item.get("event", "")
+                    for item in recent_history
+                    if isinstance(item, dict)
+                )
+                if last_pr_number == watch_pr_number and (
+                    last_state == "FIX" or saw_fix_history
+                ):
                     fix_entry = entry
                     break
             time.sleep(1)
@@ -191,18 +206,13 @@ def test_changes_requested_review_drives_watch_to_fix(
             f"appears in history; recent events={events[-10:]!r}"
         )
 
-        # Switch the shim mid-flight: the next FIX-cycle invocation
-        # emits the ESCALATE marker, parking the runner in IDLE without
-        # a second push or merge so the testbed is left in a clean
-        # state for the next test.
-        SHIM_SCENARIO_PATH.write_text("escalate\n")
-
         wait_for_state(
-            ["IDLE"], timeout_sec=ESCALATE_TO_IDLE_DEADLINE_SEC,
+            ["ERROR"], timeout_sec=ESCALATE_TO_ERROR_DEADLINE_SEC,
         )
 
     final_state = get_state()
     assert final_state is not None, "no state entry returned for testbed"
-    assert final_state["state"] == "IDLE", (
-        f"final state was {final_state['state']!r}, expected IDLE"
+    assert final_state["state"] == "ERROR", (
+        f"final state was {final_state['state']!r}, expected ERROR"
     )
+    assert "FIX coder ESCALATE" in (final_state.get("error_message") or "")

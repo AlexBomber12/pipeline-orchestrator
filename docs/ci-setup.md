@@ -49,6 +49,23 @@ Navigate to <https://github.com/AlexBomber12/pipeline-orchestrator/settings/secr
 
 After adding the secret, you can delete the `.pem` file from your local machine; the secret is stored encrypted in GitHub.
 
+### Step E2: Create the independent review simulator App
+
+GitHub rejects requested changes from the PR author, so create a second, test-only App named `pipeline-orchestrator-testbed-codex-reviewer`. The `codex` segment is required by the current testbed review classifier; do not broaden the production trust policy for this test.
+
+Give this reviewer App only these repository permissions:
+
+- Pull requests: Read and write (submit and read the review and inline comment)
+- Contents: Read-only (locate a real changed line and bind the review to HEAD)
+- Metadata: Read-only (GitHub's required default)
+
+Install it only on `AlexBomber12/pipeline-orchestrator-testbed`, generate its private key, and add these Actions secrets to `pipeline-orchestrator`:
+
+- `TESTBED_REVIEWER_APP_ID`
+- `TESTBED_REVIEWER_APP_PRIVATE_KEY`
+
+The workflow exposes the separate installation token as `TESTBED_REVIEWER_TOKEN`; the fixture overrides `GH_TOKEN` only in reviewer subprocesses and never falls back to other credentials. Check only the names with `gh secret list --repo AlexBomber12/pipeline-orchestrator`.
+
 ### Step F: Verify
 
 Re-run the most recent failed integration job (Actions tab → click the workflow run → "Re-run failed jobs"). The integration job's "Verify gh auth" step should now succeed. If it fails with "App not installed on repository", repeat Step D and ensure the testbed repo is selected.
@@ -81,3 +98,4 @@ Common issues and fixes:
 - **Integration job hangs at `docker compose up -d --wait`**: the Dockerfile build is failing or a service healthcheck is failing. Check the prior step's output for image build errors, then check the redis-test healthcheck (uses `redis-cli ping`, which is in the `redis:7-alpine` image by default).
 - **"Permission denied" pushing to testbed**: the App is installed but the Contents permission is read-only. Re-do Step A, ensuring Contents is "Read and write".
 - **`tests/e2e/test_fix_external_merge.py` skipped with "Commit statuses: Write" message**: the App was provisioned before that permission was added to the documented set. In the App's "Permissions & events" page, change "Commit statuses" from no access to Read and write, then re-grant access on the install (the App owner will get an "approve permission update" prompt at the install URL).
+- **Missing `TESTBED_REVIEWER_APP_ID` or `TESTBED_REVIEWER_APP_PRIVATE_KEY`**: complete Step E2. The workflow intentionally fails before e2e setup instead of letting the review test create a PR with the author identity.
