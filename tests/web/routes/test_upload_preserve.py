@@ -18,7 +18,6 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-
 from src.web import app as web_app
 from src.web.app import app
 from src.web.services import upload_validation
@@ -117,6 +116,28 @@ def _task_text(
     body = _task_body(pr_id, title)
     if status is None:
         return body
+    return (
+        f"---\nstatus: {status}\n"
+        "task_budget:\n"
+        "  version: 1\n"
+        "  production_lines: 20\n"
+        "  test_lines: 20\n"
+        "  other_lines: 0\n"
+        "  production_files: 1\n"
+        "  total_files: 2\n"
+        f"---\n\n{body}"
+    )
+
+
+def _historical_task_text(
+    pr_id: str = "PR-322",
+    *,
+    status: str | None = "TODO",
+    title: str = "Example task",
+) -> str:
+    body = _task_body(pr_id, title)
+    if status is None:
+        return body
     return f"---\nstatus: {status}\n---\n\n{body}"
 
 
@@ -169,7 +190,7 @@ def test_upload_preserves_done_status_on_collision(
     uploads_dir: Path,
 ) -> None:
     (repo_dir / "tasks" / "PR-322.md").write_text(
-        _task_text("PR-322", status="DONE", title="Already merged"),
+        _historical_task_text("PR-322", status="DONE", title="Already merged"),
         encoding="utf-8",
     )
 
@@ -191,7 +212,7 @@ def test_upload_replaces_error_status_on_collision(
     # task must accept the incoming ``status: TODO`` so the next IDLE cycle
     # picks the task up again. Preserving ERROR here would deadlock retry.
     (repo_dir / "tasks" / "PR-322.md").write_text(
-        _task_text("PR-322", status="ERROR"),
+        _historical_task_text("PR-322", status="ERROR"),
         encoding="utf-8",
     )
 
@@ -208,7 +229,7 @@ def test_upload_replaces_todo_status_on_collision(
     uploads_dir: Path,
 ) -> None:
     (repo_dir / "tasks" / "PR-322.md").write_text(
-        _task_text("PR-322", status="TODO", title="Old body"),
+        _historical_task_text("PR-322", status="TODO", title="Old body"),
         encoding="utf-8",
     )
 
@@ -241,7 +262,7 @@ def test_upload_preserves_when_existing_has_no_frontmatter(
     # Existing without frontmatter is treated as TODO — operator intent is
     # full replace.
     (repo_dir / "tasks" / "PR-322.md").write_text(
-        _task_text("PR-322", status=None),
+        _historical_task_text("PR-322", status=None),
         encoding="utf-8",
     )
 
@@ -249,8 +270,7 @@ def test_upload_preserves_when_existing_has_no_frontmatter(
 
     assert resp.status_code == 200
     staged = _staged_text(uploads_dir, "PR-322.md")
-    assert "Replacement" in staged
-    assert staged.startswith("---\nstatus: TODO\n---")
+    assert staged == _task_text("PR-322", status="TODO", title="Replacement")
 
 
 def test_upload_replaces_malformed_existing_file_with_unclosed_frontmatter(
@@ -280,11 +300,11 @@ def test_upload_zip_partial_preserve(
     uploads_dir: Path,
 ) -> None:
     (repo_dir / "tasks" / "PR-100.md").write_text(
-        _task_text("PR-100", status="DONE", title="Done already"),
+        _historical_task_text("PR-100", status="DONE", title="Done already"),
         encoding="utf-8",
     )
     (repo_dir / "tasks" / "PR-101.md").write_text(
-        _task_text("PR-101", status="TODO", title="In progress"),
+        _historical_task_text("PR-101", status="TODO", title="In progress"),
         encoding="utf-8",
     )
 
@@ -312,7 +332,7 @@ def test_upload_audit_event_records_preserved_collisions(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     (repo_dir / "tasks" / "PR-322.md").write_text(
-        _task_text("PR-322", status="DONE"),
+        _historical_task_text("PR-322", status="DONE"),
         encoding="utf-8",
     )
 
@@ -479,7 +499,7 @@ def test_upload_preserves_done_when_upload_has_leading_blank_lines(
     # that block in place instead of prepending a second frontmatter section
     # that would leave the uploaded ``status: TODO`` in the body.
     (repo_dir / "tasks" / "PR-322.md").write_text(
-        _task_text("PR-322", status="DONE", title="Already merged"),
+        _historical_task_text("PR-322", status="DONE", title="Already merged"),
         encoding="utf-8",
     )
     upload_payload = "\n\n" + _task_text(
@@ -563,7 +583,7 @@ def test_upload_zip_with_duplicate_entry_earlier_non_utf8(
     # the staged file matches the later (valid) entry with the on-disk DONE
     # status preserved.
     (repo_dir / "tasks" / "PR-322.md").write_text(
-        _task_text("PR-322", status="DONE", title="Already merged"),
+        _historical_task_text("PR-322", status="DONE", title="Already merged"),
         encoding="utf-8",
     )
 

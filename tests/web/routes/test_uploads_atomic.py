@@ -13,13 +13,14 @@ from src.web.app import app
 from src.web.routes import uploads as upload_routes
 
 from tests.test_upload import (
+    _historical_task_bytes,
     _post_upload,
     _StubAioredis,
     _task_bytes,
     _task_file,
     _zip_file,
 )
-from tests.web.routes.test_upload_preserve import _task_text
+from tests.web.routes.test_upload_preserve import _historical_task_text, _task_text
 
 pytestmark = pytest.mark.usefixtures("one_repo_config", "repo_dir", "uploads_dir")
 
@@ -145,7 +146,7 @@ def test_dependency_closure_satisfied_by_existing_tasks_dir(
 ) -> None:
     tasks_dir = repo_dir / "tasks"
     tasks_dir.mkdir()
-    (tasks_dir / "PR-001.md").write_bytes(_task_bytes("PR-001.md", pr_id="PR-001"))
+    (tasks_dir / "PR-001.md").write_bytes(_historical_task_bytes("PR-001"))
 
     resp = _post_upload(
         [_task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-001")]
@@ -162,7 +163,7 @@ def test_dependency_closure_uses_existing_task_header_pr_id(
     tasks_dir = repo_dir / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_bytes(
-        _task_bytes("PR-001.md", pr_id="PR-999")
+        _historical_task_bytes("PR-999")
     )
 
     accepted = _post_upload(
@@ -180,7 +181,7 @@ def test_dependency_closure_ignores_existing_filename_when_header_differs(
     tasks_dir = repo_dir / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_bytes(
-        _task_bytes("PR-001.md", pr_id="PR-999")
+        _historical_task_bytes("PR-999")
     )
 
     rejected = _post_upload(
@@ -434,7 +435,7 @@ def test_dependency_closure_locked_recheck_refreshes_tasks_dir(
                 tasks_dir = repo_dir / "tasks"
                 tasks_dir.mkdir(exist_ok=True)
                 (tasks_dir / "PR-001.md").write_bytes(
-                    _task_bytes("PR-001.md", pr_id="PR-001")
+                    _historical_task_bytes("PR-001")
                 )
                 return None
             return None
@@ -553,7 +554,7 @@ def test_preserve_terminal_status_on_collision_applied(
     tasks_dir = repo_dir / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
-        _task_text("PR-001", status="DONE"),
+        _historical_task_text("PR-001", status="DONE"),
         encoding="utf-8",
     )
 

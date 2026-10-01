@@ -121,6 +121,13 @@ def _task_file(
     header = [
         "---",
         "status: TODO",
+        "task_budget:",
+        "  version: 1",
+        "  production_lines: 20",
+        "  test_lines: 20",
+        "  other_lines: 0",
+        "  production_files: 1",
+        "  total_files: 2",
         "---",
         "",
         f"# {pr_id}: Example task",
@@ -161,6 +168,21 @@ def _zip_file_entries(
 
 def _task_bytes(name: str = "PR-001.md", *, pr_id: str = "PR-001") -> bytes:
     return _task_file(name, pr_id=pr_id)[1][1]
+
+
+def _historical_task_bytes(pr_id: str = "PR-001") -> bytes:
+    return (
+        "---\n"
+        "status: TODO\n"
+        "---\n\n"
+        f"# {pr_id}: Example task\n\n"
+        f"Branch: {pr_id.lower()}-example-task\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: any\n"
+    ).encode("utf-8")
 
 
 def _task_hash(content: bytes) -> str:
@@ -480,6 +502,13 @@ def test_reupload_status_only_change_returns_409(
     stored = (
         "---\n"
         "status: ERROR\n"
+        "task_budget:\n"
+        "  version: 1\n"
+        "  production_lines: 20\n"
+        "  test_lines: 20\n"
+        "  other_lines: 0\n"
+        "  production_files: 1\n"
+        "  total_files: 2\n"
         "---\n\n"
         "# PR-001: Example task\n\n"
         "Branch: pr-001-example-task\n"
@@ -1323,11 +1352,11 @@ def test_upload_accepts_task_with_dependencies(
     tasks_dir = repo_dir / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "PR-001.md").write_text(
-        _task_bytes("PR-001.md", pr_id="PR-001").decode("utf-8"),
+        _historical_task_bytes("PR-001").decode("utf-8"),
         encoding="utf-8",
     )
     (tasks_dir / "PR-002.md").write_text(
-        _task_bytes("PR-002.md", pr_id="PR-002").decode("utf-8"),
+        _historical_task_bytes("PR-002").decode("utf-8"),
         encoding="utf-8",
     )
     with TestClient(app) as client:
