@@ -124,7 +124,7 @@ def test_ambiguous_or_missing_identity_does_not_authorize_success() -> None:
         check_runs=[run("unit", "success", app_id=1), run("unit", "success", app_id=2)],
         required_contexts=["unit"],
     )
-    missing_identity = evaluate(check_runs=[run("unit", app_id=None, node_id="record")], required_contexts=["unit"])
+    missing_identity = evaluate(check_runs=[run("unit", app_id=None, app={"id": ""})], required_contexts=["unit"])
 
     assert ambiguous.policy_result == CIStatus.PENDING
     assert ambiguous.pending_reason == "ambiguous_required:unit"

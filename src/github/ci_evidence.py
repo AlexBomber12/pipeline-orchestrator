@@ -129,8 +129,9 @@ def _state(value: object) -> str:
 def _run_producer(run: dict[str, Any]) -> str | None:
     app = run.get("app")
     if isinstance(app, dict):
-        if app.get("id") is not None:
-            return f"app:{app['id']}"
+        app_id = app.get("id")
+        if (type(app_id) is int and app_id > 0) or (isinstance(app_id, str) and app_id.isdigit()):
+            return f"app:{app_id}"
         if app.get("slug"):
             return f"app:{app['slug']}"
     return _status_producer(run)
