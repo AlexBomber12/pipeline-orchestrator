@@ -4,12 +4,12 @@ from typing import Any, Iterable
 
 from src.models import CIStatus
 
-_SUCCESS = {"SUCCESS", "COMPLETED", "NEUTRAL", "SKIPPED"}
+_SUCCESS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 _PENDING = {"PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING", "EXPECTED"}
 _FAILURE = {"FAILURE", "FAILED", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE"}
 
 CIContextEvidence = namedtuple(
-    "CIContextEvidence", "name state sha producer attempt observed_at", defaults=[None, None, None]
+    "CIContextEvidence", "name state sha producer attempt observed_at run_id", defaults=[None, None, None, None]
 )
 CIEvidence = namedtuple(
     "CIEvidence", "sha observed_at contexts sources_complete policy_result pending_reason repo pr_number",
@@ -46,14 +46,14 @@ def _contexts(sha: str, check_runs: Iterable[dict[str, Any]], statuses: Iterable
         run_sha = _text(run.get("head_sha") or run.get("sha") or run.get("commit_sha"))
         if name and run_sha == sha:
             out.append(CIContextEvidence(name, _state(run.get("conclusion") or run.get("status")), run_sha,
-                                         _run_producer(run), _attempt(run), _time(run) or observed_at))
+                                         _run_producer(run), _attempt(run), _time(run) or observed_at, run.get("id")))
     for status in statuses:
         name = _text(status.get("context") or status.get("name"))
-        status_sha = _text(status.get("sha") or status.get("commit_sha"))
+        status_sha = _text(status.get("sha") or status.get("commit_sha") or sha)
         if name and status_sha == sha:
             out.append(CIContextEvidence(name, _state(status.get("state") or status.get("status")), status_sha,
                                          _status_producer(status), _attempt(status),
-                                         _time(status) or observed_at))
+                                         _time(status) or observed_at, status.get("id")))
     return out
 
 
@@ -103,12 +103,14 @@ def _latest(contexts: Iterable[CIContextEvidence]) -> dict[str, dict[str | None,
 def _newer(left: CIContextEvidence, right: CIContextEvidence) -> bool:
     if left.observed_at is not None and right.observed_at is not None and left.observed_at != right.observed_at:
         return left.observed_at > right.observed_at
+    if left.run_id != right.run_id:
+        if left.run_id is not None and right.run_id is not None:
+            return left.run_id > right.run_id
+        return left.run_id is not None
     if left.attempt != right.attempt:
         if left.attempt is not None and right.attempt is not None:
             return left.attempt > right.attempt
         return left.attempt is not None
-    if left.observed_at is not None and right.observed_at is not None:
-        return left.observed_at >= right.observed_at
     return True
 
 

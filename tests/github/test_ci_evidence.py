@@ -95,12 +95,14 @@ def test_reruns_use_authoritative_attempt_ordering() -> None:
         ],
         required_contexts=["unit"],
     )
-    older = run("unit", "success", attempt=2, started_at="2026-10-01T10:00:00Z",
+    older = run("unit", "success", attempt=2, id=1, started_at="2026-10-01T10:00:00Z",
                 completed_at="2026-10-01T13:00:00Z")
     for newer, expected in [
         (run("unit", None, status="in_progress", attempt=1, started_at="2026-10-01T12:00:00Z",
              completed_at=None), CIStatus.PENDING),
         (run("unit", "failure", attempt=1, started_at="2026-10-01T12:00:00Z",
+             completed_at=None), CIStatus.FAILURE),
+        (run("unit", "failure", attempt=2, id=2, started_at="2026-10-01T10:00:00Z",
              completed_at=None), CIStatus.FAILURE),
     ]:
         for records in ([older, newer], [newer, older]):
@@ -133,7 +135,7 @@ def test_no_required_list_requires_complete_nonempty_success_unless_exempt() -> 
     empty_required = evaluate(required_contexts=["", " "])
     empty_required_ok = evaluate(required_contexts=[], empty_is_success=True)
     all_success = evaluate(check_runs=[run("unit", "neutral")], statuses=[status("legacy")])
-    context_pending = evaluate(check_runs=[run("unit", None, status="queued")])
+    context_pending = evaluate(check_runs=[run("unit", None, status="completed")])
     ambiguous = evaluate(check_runs=[run("unit", app_id=1), run("unit", app_id=2)])
     missing_identity = evaluate(check_runs=[run("unit", app_id=None)])
 
@@ -160,7 +162,7 @@ def test_status_contexts_and_normalization_fallbacks() -> None:
         ],
         statuses=[
             status("foreign", sha=OTHER),
-            {"context": "legacy", "state": "success", "commit_sha": SHA, "app_id": 99},
+            {"context": "legacy", "state": "success", "app_id": 99},
         ],
         required_contexts=["legacy"],
         observed_at=naive,
