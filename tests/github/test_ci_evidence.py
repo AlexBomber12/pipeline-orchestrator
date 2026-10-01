@@ -88,12 +88,20 @@ def test_reruns_use_authoritative_attempt_ordering() -> None:
         ],
         required_contexts=["unit"],
     )
+    newer_execution = evaluate(
+        check_runs=[
+            run("unit", "success", attempt=2, completed_at="2026-10-01T11:00:00Z"),
+            run("unit", None, status="in_progress", attempt=1, completed_at="2026-10-01T12:00:00Z"),
+        ],
+        required_contexts=["unit"],
+    )
 
     assert pending.policy_result == CIStatus.PENDING
     assert pending.pending_reason == "required_not_success:unit"
     assert pending.contexts[-1].state == "pending"
     assert recovered.policy_result == CIStatus.SUCCESS
     assert equal_attempt.policy_result == CIStatus.FAILURE
+    assert newer_execution.pending_reason == "required_not_success:unit"
 
 
 def test_ambiguous_or_missing_identity_does_not_authorize_success() -> None:
@@ -115,6 +123,7 @@ def test_no_required_list_requires_complete_nonempty_success_unless_exempt() -> 
     all_success = evaluate(check_runs=[run("unit", "neutral")], statuses=[status("legacy")])
     context_pending = evaluate(check_runs=[run("unit", None, status="queued")])
     ambiguous = evaluate(check_runs=[run("unit", app_id=1), run("unit", app_id=2)])
+    missing_identity = evaluate(check_runs=[run("unit", app_id=None)])
 
     assert no_contexts.pending_reason == "no_contexts"
     assert empty_ok.policy_result == CIStatus.SUCCESS
@@ -122,6 +131,7 @@ def test_no_required_list_requires_complete_nonempty_success_unless_exempt() -> 
     assert context_pending.policy_result == CIStatus.PENDING
     assert context_pending.pending_reason == "context_pending"
     assert ambiguous.pending_reason == "ambiguous_context:unit"
+    assert missing_identity.pending_reason == "missing_identity:unit"
 
 
 def test_status_contexts_and_normalization_fallbacks() -> None:
@@ -159,7 +169,15 @@ def test_status_contexts_and_normalization_fallbacks() -> None:
         ],
         required_contexts=["legacy"],
     )
+    node_recovered = evaluate(
+        statuses=[
+            status("legacy", "failure", node_id="old", updated_at="2026-10-01T11:00:00Z"),
+            status("legacy", "success", node_id="new", updated_at="2026-10-01T12:00:00Z"),
+        ],
+        required_contexts=["legacy"],
+    )
     assert legacy_recovered.policy_result == CIStatus.SUCCESS
+    assert node_recovered.policy_result == CIStatus.SUCCESS
 
 
 def test_slug_node_id_datetime_now_and_helper_tie_breaks() -> None:
@@ -176,6 +194,7 @@ def test_slug_node_id_datetime_now_and_helper_tie_breaks() -> None:
     attempted = CIContextEvidence("unit", "success", SHA, attempt=1)
     newer_time = CIContextEvidence("unit", "success", SHA, observed_at=NOW)
     older_time = CIContextEvidence("unit", "pending", SHA, observed_at=datetime(2026, 10, 1, 11, tzinfo=timezone.utc))
+    same_time = CIContextEvidence("unit", "success", SHA, observed_at=NOW)
 
     assert observed.policy_result == CIStatus.SUCCESS
     assert observed.observed_at.tzinfo is not None
@@ -183,5 +202,6 @@ def test_slug_node_id_datetime_now_and_helper_tie_breaks() -> None:
     assert observed.contexts[1].producer == "node_id:node-1"
     assert _newer(left, right) is True
     assert _newer(newer_time, older_time) is True
+    assert _newer(newer_time, same_time) is True
     assert _newer(attempted, right) is True
     assert _newer(right, attempted) is False

@@ -8,7 +8,6 @@ _SUCCESS = {"SUCCESS", "COMPLETED", "NEUTRAL", "SKIPPED"}
 _PENDING = {"PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING", "EXPECTED"}
 _FAILURE = {"FAILURE", "FAILED", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE"}
 
-
 CIContextEvidence = namedtuple(
     "CIContextEvidence", "name state sha producer attempt observed_at", defaults=[None, None, None]
 )
@@ -74,6 +73,8 @@ def _policy(contexts: tuple[CIContextEvidence, ...], complete: bool, required: t
         if not latest:
             return (CIStatus.SUCCESS, None) if empty_is_success else (CIStatus.PENDING, "no_contexts")
         for name, producers in latest.items():
+            if None in producers:
+                return CIStatus.PENDING, f"missing_identity:{name}"
             if len(producers) != 1:
                 return CIStatus.PENDING, f"ambiguous_context:{name}"
         if any(ctx.state != "success" for producers in latest.values() for ctx in producers.values()):
@@ -103,6 +104,8 @@ def _latest(contexts: Iterable[CIContextEvidence]) -> dict[str, dict[str | None,
 
 
 def _newer(left: CIContextEvidence, right: CIContextEvidence) -> bool:
+    if left.observed_at is not None and right.observed_at is not None and left.observed_at != right.observed_at:
+        return left.observed_at > right.observed_at
     if left.attempt != right.attempt:
         if left.attempt is not None and right.attempt is not None:
             return left.attempt > right.attempt
@@ -134,12 +137,13 @@ def _run_producer(run: dict[str, Any]) -> str | None:
 
 
 def _status_producer(status: dict[str, Any]) -> str | None:
-    for key in ("app_id", "node_id"):
-        if status.get(key):
-            return f"{key}:{status[key]}"
+    if status.get("app_id"):
+        return f"app_id:{status['app_id']}"
     creator = status.get("creator")
     if isinstance(creator, dict) and creator.get("login"):
         return f"user:{creator['login']}"
+    if status.get("node_id"):
+        return f"node_id:{status['node_id']}"
     return f"target_url:{status['target_url']}" if status.get("target_url") else None
 
 
