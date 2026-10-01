@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from src.github.ci_evidence import PENDING, SUCCESS, UNKNOWN, CIContextEvidence, _newer, evaluate_ci_evidence
+from src.github.ci_evidence import CIContextEvidence, _newer, evaluate_ci_evidence
 from src.models import CIStatus
 
 SHA = "a" * 40
@@ -47,13 +47,16 @@ def test_required_contexts_must_be_successful_on_the_current_sha() -> None:
         required_contexts=["unit", "integration"],
     )
     foreign = evaluate(check_runs=[run("unit", sha=OTHER)], required_contexts=["unit"], empty_is_success=True)
+    foreign_empty = evaluate(statuses=[status("legacy", sha=OTHER)], empty_is_success=True)
 
     assert missing.policy_result == CIStatus.PENDING
     assert missing.pending_reason == "missing_required:integration"
     assert success.policy_result == CIStatus.SUCCESS
     assert success.pending_reason is None
     assert foreign.contexts == ()
-    assert foreign.pending_reason == "missing_required:unit"
+    assert foreign.pending_reason == "conflicting_sha"
+    assert foreign_empty.policy_result == CIStatus.PENDING
+    assert foreign_empty.pending_reason == "conflicting_sha"
     assert missing.repo == "octo/demo"
     assert missing.pr_number == 7
 
@@ -78,11 +81,19 @@ def test_reruns_use_authoritative_attempt_ordering() -> None:
         check_runs=[run("unit", "failure", attempt=1), run("unit", "success", attempt=2)],
         required_contexts=["unit"],
     )
+    equal_attempt = evaluate(
+        check_runs=[
+            run("unit", "success", completed_at="2026-10-01T11:00:00Z"),
+            run("unit", "failure", completed_at="2026-10-01T12:00:00Z"),
+        ],
+        required_contexts=["unit"],
+    )
 
     assert pending.policy_result == CIStatus.PENDING
     assert pending.pending_reason == "required_not_success:unit"
-    assert pending.contexts[-1].state == PENDING
+    assert pending.contexts[-1].state == "pending"
     assert recovered.policy_result == CIStatus.SUCCESS
+    assert equal_attempt.policy_result == CIStatus.FAILURE
 
 
 def test_ambiguous_or_missing_identity_does_not_authorize_success() -> None:
@@ -103,12 +114,14 @@ def test_no_required_list_requires_complete_nonempty_success_unless_exempt() -> 
     empty_ok = evaluate(empty_is_success=True)
     all_success = evaluate(check_runs=[run("unit", "neutral")], statuses=[status("legacy")])
     context_pending = evaluate(check_runs=[run("unit", None, status="queued")])
+    ambiguous = evaluate(check_runs=[run("unit", app_id=1), run("unit", app_id=2)])
 
     assert no_contexts.pending_reason == "no_contexts"
     assert empty_ok.policy_result == CIStatus.SUCCESS
     assert all_success.policy_result == CIStatus.SUCCESS
     assert context_pending.policy_result == CIStatus.PENDING
     assert context_pending.pending_reason == "context_pending"
+    assert ambiguous.pending_reason == "ambiguous_context:unit"
 
 
 def test_status_contexts_and_normalization_fallbacks() -> None:
@@ -134,10 +147,19 @@ def test_status_contexts_and_normalization_fallbacks() -> None:
     assert by_name["slugged"].producer == "app:actions"
     assert by_name["slugged"].attempt == 2
     assert by_name["slugged"].observed_at == naive.replace(tzinfo=timezone.utc)
-    assert by_name["slugged"].state == UNKNOWN
+    assert by_name["slugged"].state == "unknown"
     assert by_name["fallback"].producer == "target_url:https://ci.example/runs/1"
     assert by_name["legacy"].producer == "app_id:99"
     assert evidence.observed_at == naive.replace(tzinfo=timezone.utc)
+
+    legacy_recovered = evaluate(
+        statuses=[
+            status("legacy", "failure", target_url="https://ci.example/old", updated_at="2026-10-01T11:00:00Z"),
+            status("legacy", "success", target_url="https://ci.example/new", updated_at="2026-10-01T12:00:00Z"),
+        ],
+        required_contexts=["legacy"],
+    )
+    assert legacy_recovered.policy_result == CIStatus.SUCCESS
 
 
 def test_slug_node_id_datetime_now_and_helper_tie_breaks() -> None:
@@ -149,11 +171,11 @@ def test_slug_node_id_datetime_now_and_helper_tie_breaks() -> None:
         statuses=[{"name": "legacy", "status": "success", "sha": SHA, "node_id": "node-1"}],
         required_contexts=["slug"],
     )
-    left = CIContextEvidence("unit", SUCCESS, SHA)
-    right = CIContextEvidence("unit", PENDING, SHA)
-    attempted = CIContextEvidence("unit", SUCCESS, SHA, attempt=1)
-    newer_time = CIContextEvidence("unit", SUCCESS, SHA, observed_at=NOW)
-    older_time = CIContextEvidence("unit", PENDING, SHA, observed_at=datetime(2026, 10, 1, 11, tzinfo=timezone.utc))
+    left = CIContextEvidence("unit", "success", SHA)
+    right = CIContextEvidence("unit", "pending", SHA)
+    attempted = CIContextEvidence("unit", "success", SHA, attempt=1)
+    newer_time = CIContextEvidence("unit", "success", SHA, observed_at=NOW)
+    older_time = CIContextEvidence("unit", "pending", SHA, observed_at=datetime(2026, 10, 1, 11, tzinfo=timezone.utc))
 
     assert observed.policy_result == CIStatus.SUCCESS
     assert observed.observed_at.tzinfo is not None

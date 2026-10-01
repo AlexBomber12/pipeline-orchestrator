@@ -1,36 +1,21 @@
-from dataclasses import dataclass
+from collections import namedtuple
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from src.models import CIStatus
 
-SUCCESS, PENDING, FAILURE, UNKNOWN = "success", "pending", "failure", "unknown"
-_SUCCESS, _PENDING = {"SUCCESS", "COMPLETED", "NEUTRAL", "SKIPPED"}, {
-    "PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING", "EXPECTED"
-}
+_SUCCESS = {"SUCCESS", "COMPLETED", "NEUTRAL", "SKIPPED"}
+_PENDING = {"PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING", "EXPECTED"}
 _FAILURE = {"FAILURE", "FAILED", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE"}
 
 
-@dataclass(frozen=True)
-class CIContextEvidence:
-    name: str
-    state: str
-    sha: str
-    producer: str | None = None
-    attempt: int | None = None
-    observed_at: datetime | None = None
-
-
-@dataclass(frozen=True)
-class CIEvidence:
-    sha: str
-    observed_at: datetime
-    contexts: tuple[CIContextEvidence, ...]
-    sources_complete: bool
-    policy_result: CIStatus
-    pending_reason: str | None = None
-    repo: str | None = None
-    pr_number: int | None = None
+CIContextEvidence = namedtuple(
+    "CIContextEvidence", "name state sha producer attempt observed_at", defaults=[None, None, None]
+)
+CIEvidence = namedtuple(
+    "CIEvidence", "sha observed_at contexts sources_complete policy_result pending_reason repo pr_number",
+    defaults=[None, None, None],
+)
 
 
 def evaluate_ci_evidence(
@@ -42,9 +27,15 @@ def evaluate_ci_evidence(
 ) -> CIEvidence:
     observed = _dt(observed_at) or datetime.now(timezone.utc)
     required = None if required_contexts is None else tuple(n for raw in required_contexts if (n := _text(raw)))
+    check_runs = tuple(check_runs)
+    statuses = tuple(statuses)
     contexts = tuple(_contexts(sha, check_runs, statuses, observed))
     complete = check_runs_complete and statuses_complete
-    result, reason = _policy(contexts, complete, required, empty_is_success)
+    conflict = any(
+        (item_sha := _text(item.get("head_sha") or item.get("sha") or item.get("commit_sha"))) and item_sha != sha
+        for item in [*check_runs, *statuses]
+    )
+    result, reason = _policy(contexts, complete, required, empty_is_success, conflict)
     return CIEvidence(
         repo=repo, pr_number=pr_number, sha=sha, observed_at=observed, contexts=contexts,
         sources_complete=complete, policy_result=result, pending_reason=reason
@@ -71,16 +62,21 @@ def _contexts(sha: str, check_runs: Iterable[dict[str, Any]], statuses: Iterable
 
 
 def _policy(contexts: tuple[CIContextEvidence, ...], complete: bool, required: tuple[str, ...] | None,
-            empty_is_success: bool) -> tuple[CIStatus, str | None]:
+            empty_is_success: bool, conflict: bool) -> tuple[CIStatus, str | None]:
     latest = _latest(contexts)
-    if any(ctx.state == FAILURE for producers in latest.values() for ctx in producers.values()):
+    if any(ctx.state == "failure" for producers in latest.values() for ctx in producers.values()):
         return CIStatus.FAILURE, None
+    if conflict:
+        return CIStatus.PENDING, "conflicting_sha"
     if not complete:
         return CIStatus.PENDING, "sources_incomplete"
     if required is None:
         if not latest:
             return (CIStatus.SUCCESS, None) if empty_is_success else (CIStatus.PENDING, "no_contexts")
-        if any(ctx.state != SUCCESS for producers in latest.values() for ctx in producers.values()):
+        for name, producers in latest.items():
+            if len(producers) != 1:
+                return CIStatus.PENDING, f"ambiguous_context:{name}"
+        if any(ctx.state != "success" for producers in latest.values() for ctx in producers.values()):
             return CIStatus.PENDING, "context_pending"
         return CIStatus.SUCCESS, None
     for name in required:
@@ -92,7 +88,7 @@ def _policy(contexts: tuple[CIContextEvidence, ...], complete: bool, required: t
         [ctx] = producers.values()
         if ctx.producer is None:
             return CIStatus.PENDING, f"missing_identity:{name}"
-        if ctx.state != SUCCESS:
+        if ctx.state != "success":
             return CIStatus.PENDING, f"required_not_success:{name}"
     return CIStatus.SUCCESS, None
 
@@ -107,12 +103,10 @@ def _latest(contexts: Iterable[CIContextEvidence]) -> dict[str, dict[str | None,
 
 
 def _newer(left: CIContextEvidence, right: CIContextEvidence) -> bool:
-    if left.attempt is not None and right.attempt is not None:
-        return left.attempt >= right.attempt
-    if left.attempt is not None:
-        return True
-    if right.attempt is not None:
-        return False
+    if left.attempt != right.attempt:
+        if left.attempt is not None and right.attempt is not None:
+            return left.attempt > right.attempt
+        return left.attempt is not None
     if left.observed_at is not None and right.observed_at is not None:
         return left.observed_at >= right.observed_at
     return True
@@ -121,12 +115,12 @@ def _newer(left: CIContextEvidence, right: CIContextEvidence) -> bool:
 def _state(value: object) -> str:
     upper = str(value or "").upper()
     if upper in _SUCCESS:
-        return SUCCESS
+        return "success"
     if upper in _FAILURE:
-        return FAILURE
+        return "failure"
     if upper in _PENDING:
-        return PENDING
-    return UNKNOWN
+        return "pending"
+    return "unknown"
 
 
 def _run_producer(run: dict[str, Any]) -> str | None:
@@ -140,11 +134,13 @@ def _run_producer(run: dict[str, Any]) -> str | None:
 
 
 def _status_producer(status: dict[str, Any]) -> str | None:
-    for key in ("app_id", "node_id", "target_url"):
+    for key in ("app_id", "node_id"):
         if status.get(key):
             return f"{key}:{status[key]}"
     creator = status.get("creator")
-    return f"user:{creator['login']}" if isinstance(creator, dict) and creator.get("login") else None
+    if isinstance(creator, dict) and creator.get("login"):
+        return f"user:{creator['login']}"
+    return f"target_url:{status['target_url']}" if status.get("target_url") else None
 
 
 def _attempt(payload: dict[str, Any]) -> int | None:
