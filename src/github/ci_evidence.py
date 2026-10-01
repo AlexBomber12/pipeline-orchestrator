@@ -41,21 +41,21 @@ def evaluate_ci_evidence(
 
 
 def _contexts(sha: str, check_runs: Iterable[dict[str, Any]], statuses: Iterable[dict[str, Any]],
-              observed_at: datetime) -> list[CIContextEvidence]:
+              at: datetime) -> list[CIContextEvidence]:
     out: list[CIContextEvidence] = []
     for run in check_runs:
         name = _text(run.get("name"))
         run_sha = _text(run.get("head_sha", run.get("sha", run.get("commit_sha", "")))).lower()
         if name and run_sha == sha:
             out.append(CIContextEvidence(name, _state(run.get("conclusion") or run.get("status")), run_sha,
-                                         _run_producer(run), _attempt(run), _time(run) or observed_at, run.get("id")))
+                                         _run_producer(run), _attempt(run), _time(run) or at, ("check", run.get("id"))))
     for status in statuses:
         name = _text(status.get("context") or status.get("name"))
         status_sha = _text(status.get("sha", status.get("commit_sha", sha))).lower()
         if name and status_sha == sha:
             out.append(CIContextEvidence(name, _state(status.get("state") or status.get("status")), status_sha,
                                          _status_producer(status), _attempt(status),
-                                         _time(status) or observed_at, status.get("id")))
+                                         _time(status) or at, ("status", status.get("id"))))
     return out
 
 
@@ -106,9 +106,9 @@ def _newer(left: CIContextEvidence, right: CIContextEvidence) -> bool:
     if left.observed_at is not None and right.observed_at is not None and left.observed_at != right.observed_at:
         return left.observed_at > right.observed_at
     if left.run_id != right.run_id:
-        if left.run_id is not None and right.run_id is not None:
-            return left.run_id > right.run_id
-        return left.run_id is not None
+        if left.run_id and right.run_id and left.run_id[0] == right.run_id[0]:
+            return (left.run_id[1] is not None, left.run_id[1]) > (right.run_id[1] is not None, right.run_id[1])
+        return left.state == "failure" or (left.state != "success" and right.state == "success")
     if left.attempt != right.attempt:
         if left.attempt is not None and right.attempt is not None:
             return left.attempt > right.attempt

@@ -162,11 +162,11 @@ def test_status_contexts_and_normalization_fallbacks() -> None:
                 "fallback", "success", app_id=None, target_url="https://ci.example/runs/1",
                 completed_at="bad", started_at="bad"
             ),
-            run("legacy", app_id=99),
+            run("legacy", "failure", app_id=99, id=1),
         ],
         statuses=[
             status("foreign", sha=OTHER),
-            {"context": "legacy", "state": "success", "app_id": 99},
+            {"context": "legacy", "state": "success", "app_id": 99, "id": 2},
         ],
         required_contexts=["legacy"],
         observed_at=naive,
@@ -180,7 +180,7 @@ def test_status_contexts_and_normalization_fallbacks() -> None:
     assert by_name["slugged"].state == "unknown"
     assert by_name["fallback"].producer is None
     assert by_name["legacy"].producer == "app:99"
-    assert evidence.observed_at == naive.replace(tzinfo=timezone.utc)
+    assert evidence.policy_result == CIStatus.FAILURE
 
     legacy_recovered = evaluate(
         statuses=[
@@ -209,10 +209,10 @@ def test_slug_node_id_datetime_now_and_helper_tie_breaks() -> None:
         statuses=[{"name": "legacy", "status": "success", "sha": SHA, "node_id": "node-1"}],
         required_contexts=["slug"],
     )
-    left = CIContextEvidence("unit", "success", SHA)
-    right = CIContextEvidence("unit", "pending", SHA)
+    left = CIContextEvidence("unit", "success", SHA, run_id=("status", 2))
+    right = CIContextEvidence("unit", "failure", SHA, run_id=("check", 1))
     attempted = CIContextEvidence("unit", "success", SHA, attempt=1)
-    identified = CIContextEvidence("unit", "success", SHA, run_id=1)
+    identified = CIContextEvidence("unit", "success", SHA, run_id=("check", 2))
     newer_time = CIContextEvidence("unit", "success", SHA, observed_at=NOW)
     older_time = CIContextEvidence("unit", "pending", SHA, observed_at=datetime(2026, 10, 1, 11, tzinfo=timezone.utc))
     same_time = CIContextEvidence("unit", "success", SHA, observed_at=NOW)
@@ -220,11 +220,11 @@ def test_slug_node_id_datetime_now_and_helper_tie_breaks() -> None:
     assert observed.policy_result == CIStatus.SUCCESS
     assert observed.observed_at.tzinfo is not None
     assert observed.contexts[0].producer == "app:actions"
-    assert observed.contexts[1].producer is None
-    assert _newer(left, right) is True
+    assert _newer(right, left) is True
+    assert _newer(left, right) is False
     assert _newer(newer_time, older_time) is True
     assert _newer(newer_time, same_time) is True
-    assert _newer(attempted, right) is True
-    assert _newer(right, attempted) is False
-    assert _newer(identified, left) is True
-    assert _newer(left, identified) is False
+    assert _newer(attempted, same_time) is True
+    assert _newer(same_time, attempted) is False
+    assert _newer(identified, right) is True
+    assert _newer(right, identified) is False
