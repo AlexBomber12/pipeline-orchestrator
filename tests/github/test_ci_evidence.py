@@ -47,7 +47,7 @@ def test_required_contexts_must_be_successful_on_the_current_sha() -> None:
         required_contexts=["unit", "integration"],
     )
     foreign = evaluate(check_runs=[run("unit", sha=OTHER)], required_contexts=["unit"], empty_is_success=True)
-    foreign_empty = evaluate(statuses=[status("legacy", sha=OTHER)], empty_is_success=True)
+    foreign_empty = evaluate(statuses=[status("legacy", sha="")], empty_is_success=True)
     unbound = evaluate(check_runs=[{"name": "unit", "conclusion": "success"}], empty_is_success=True)
     nameless_run = evaluate(check_runs=[{"head_sha": SHA, "conclusion": "failure"}], empty_is_success=True)
     nameless_status = evaluate(statuses=[{"sha": SHA, "state": "failure"}], empty_is_success=True)
@@ -124,7 +124,7 @@ def test_ambiguous_or_missing_identity_does_not_authorize_success() -> None:
         check_runs=[run("unit", "success", app_id=1), run("unit", "success", app_id=2)],
         required_contexts=["unit"],
     )
-    missing_identity = evaluate(check_runs=[run("unit", "success", app_id=None)], required_contexts=["unit"])
+    missing_identity = evaluate(check_runs=[run("unit", app_id=None, node_id="record")], required_contexts=["unit"])
 
     assert ambiguous.policy_result == CIStatus.PENDING
     assert ambiguous.pending_reason == "ambiguous_required:unit"
@@ -162,6 +162,7 @@ def test_status_contexts_and_normalization_fallbacks() -> None:
                 "fallback", "success", app_id=None, target_url="https://ci.example/runs/1",
                 completed_at="bad", started_at="bad"
             ),
+            run("legacy", app_id=99),
         ],
         statuses=[
             status("foreign", sha=OTHER),
@@ -177,8 +178,8 @@ def test_status_contexts_and_normalization_fallbacks() -> None:
     assert by_name["slugged"].attempt == 2
     assert by_name["slugged"].observed_at == naive.replace(tzinfo=timezone.utc)
     assert by_name["slugged"].state == "unknown"
-    assert by_name["fallback"].producer == "target_url:https://ci.example/runs/1"
-    assert by_name["legacy"].producer == "app_id:99"
+    assert by_name["fallback"].producer is None
+    assert by_name["legacy"].producer == "app:99"
     assert evidence.observed_at == naive.replace(tzinfo=timezone.utc)
 
     legacy_recovered = evaluate(
@@ -219,7 +220,7 @@ def test_slug_node_id_datetime_now_and_helper_tie_breaks() -> None:
     assert observed.policy_result == CIStatus.SUCCESS
     assert observed.observed_at.tzinfo is not None
     assert observed.contexts[0].producer == "app:actions"
-    assert observed.contexts[1].producer == "node_id:node-1"
+    assert observed.contexts[1].producer is None
     assert _newer(left, right) is True
     assert _newer(newer_time, older_time) is True
     assert _newer(newer_time, same_time) is True

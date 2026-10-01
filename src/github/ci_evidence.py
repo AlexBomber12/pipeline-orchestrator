@@ -50,7 +50,7 @@ def _contexts(sha: str, check_runs: Iterable[dict[str, Any]], statuses: Iterable
                                          _run_producer(run), _attempt(run), _time(run) or observed_at, run.get("id")))
     for status in statuses:
         name = _text(status.get("context") or status.get("name"))
-        status_sha = _text(status.get("sha") or status.get("commit_sha") or sha)
+        status_sha = _text(status.get("sha", status.get("commit_sha", sha)))
         if name and status_sha == sha:
             out.append(CIContextEvidence(name, _state(status.get("state") or status.get("status")), status_sha,
                                          _status_producer(status), _attempt(status),
@@ -138,13 +138,11 @@ def _run_producer(run: dict[str, Any]) -> str | None:
 
 def _status_producer(status: dict[str, Any]) -> str | None:
     if status.get("app_id"):
-        return f"app_id:{status['app_id']}"
+        return f"app:{status['app_id']}"
     creator = status.get("creator")
     if isinstance(creator, dict) and creator.get("login"):
         return f"user:{creator['login']}"
-    if status.get("node_id"):
-        return f"node_id:{status['node_id']}"
-    return f"target_url:{status['target_url']}" if status.get("target_url") else None
+    return None
 
 
 def _attempt(payload: dict[str, Any]) -> int | None:
