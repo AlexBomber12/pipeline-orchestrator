@@ -31,7 +31,7 @@ def evaluate_ci_evidence(
     contexts = tuple(_contexts(sha, check_runs, statuses, observed))
     complete = check_runs_complete and statuses_complete
     conflict = any(
-        (item_sha := _text(item.get("head_sha") or item.get("sha") or item.get("commit_sha"))) and item_sha != sha
+        _text(item.get("head_sha") or item.get("sha") or item.get("commit_sha")) != sha
         for item in [*check_runs, *statuses]
     )
     result, reason = _policy(contexts, complete, required, empty_is_success, conflict)

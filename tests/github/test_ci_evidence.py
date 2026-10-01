@@ -48,6 +48,7 @@ def test_required_contexts_must_be_successful_on_the_current_sha() -> None:
     )
     foreign = evaluate(check_runs=[run("unit", sha=OTHER)], required_contexts=["unit"], empty_is_success=True)
     foreign_empty = evaluate(statuses=[status("legacy", sha=OTHER)], empty_is_success=True)
+    unbound = evaluate(check_runs=[{"name": "unit", "conclusion": "success"}], empty_is_success=True)
 
     assert missing.policy_result == CIStatus.PENDING
     assert missing.pending_reason == "missing_required:integration"
@@ -57,6 +58,8 @@ def test_required_contexts_must_be_successful_on_the_current_sha() -> None:
     assert foreign.pending_reason == "conflicting_sha"
     assert foreign_empty.policy_result == CIStatus.PENDING
     assert foreign_empty.pending_reason == "conflicting_sha"
+    assert unbound.policy_result == CIStatus.PENDING
+    assert unbound.pending_reason == "conflicting_sha"
     assert missing.repo == "octo/demo"
     assert missing.pr_number == 7
 
