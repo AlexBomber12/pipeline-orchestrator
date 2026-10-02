@@ -174,4 +174,4 @@ async def _close_process(process: asyncio.subprocess.Process) -> None:
         process.stdin.close()
     with suppress(ProcessLookupError):
         process.kill()
-    await process.wait()
+    await process.communicate()

@@ -58,9 +58,9 @@ class _FakeProcess:
         self.reaped = False
     def kill(self) -> None:
         self.killed = True
-    async def wait(self) -> int:
+    async def communicate(self) -> tuple[bytes, bytes]:
         self.reaped = True
-        return -9 if self.killed else 0
+        return b"", b""
 
 
 def _install_process(
