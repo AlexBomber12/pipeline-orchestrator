@@ -27,7 +27,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 # Override at build time, e.g.:
 #   docker build --build-arg CLAUDE_CODE_VERSION=2.2.0 .
 ARG CLAUDE_CODE_VERSION=2.1.119
-ARG CODEX_VERSION=0.125.0
+ARG CODEX_VERSION=0.160.0
 
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
