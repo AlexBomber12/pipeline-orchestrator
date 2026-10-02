@@ -9,6 +9,7 @@ separate containment (for example, a cgroup or container supervisor).
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import signal
 from dataclasses import dataclass
@@ -106,8 +107,13 @@ class SupervisedProcess:
         the shielded, bounded cleanup task finishes.
         """
         if self._cleanup_task is None:
-            if term_grace < 0 or kill_grace < 0:
-                raise ValueError("cleanup grace periods must be non-negative")
+            if (
+                not math.isfinite(term_grace)
+                or not math.isfinite(kill_grace)
+                or term_grace < 0
+                or kill_grace < 0
+            ):
+                raise ValueError("cleanup grace periods must be finite and non-negative")
             self._cleanup_task = asyncio.create_task(
                 self._cleanup_impl(term_grace, kill_grace)
             )

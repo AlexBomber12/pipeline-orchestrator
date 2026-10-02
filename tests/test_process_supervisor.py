@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import signal
 import sys
@@ -548,8 +549,14 @@ def test_parse_proc_stat_and_invalid_grace_validation() -> None:
         _parse_proc_stat("invalid")
 
 
+@pytest.mark.parametrize(
+    ("term_grace", "kill_grace"),
+    ((-1, 0), (math.inf, 0), (0, math.nan)),
+)
 @pytest.mark.asyncio
-async def test_negative_grace_is_rejected(process_pool: ProcessPool) -> None:
+async def test_invalid_grace_is_rejected(
+    process_pool: ProcessPool, term_grace: float, kill_grace: float
+) -> None:
     managed = await process_pool.launch("pass")
-    with pytest.raises(ValueError, match="non-negative"):
-        await managed.cleanup(term_grace=-1)
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        await managed.cleanup(term_grace=term_grace, kill_grace=kill_grace)
