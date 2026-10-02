@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections import namedtuple
 from typing import Any
 
 from src.github import cache, gh_runner
@@ -38,9 +39,13 @@ _CI_STATUS_CACHE_TTL_SECONDS = 15.0
 #: watched repo — long-running daemons would retain full check-run
 #: payloads for SHAs that will never be queried again. Sweeping on write
 #: keeps the resident set ~O(unique SHAs queried within one TTL window).
-_ci_status_cache: dict[
-    tuple[str, str], tuple[float, list[dict], dict, bool]
-] = {}
+_CiSourceEvidence = namedtuple("_CiSourceEvidence", "complete empty error", defaults=[None])
+_CiStatusEvidence = namedtuple(
+    "_CiStatusEvidence",
+    "repo sha fetched_at check_runs status_payload check_runs_source status_source",
+)
+
+_ci_status_cache: dict[tuple[str, str], _CiStatusEvidence] = {}
 
 
 _REST_CI_FAILURE_STATES = {
@@ -199,35 +204,59 @@ def _evict_expired_ci_status_cache(now: float) -> None:
     expired = [
         key
         for key, entry in _ci_status_cache.items()
-        if (now - entry[0]) >= _CI_STATUS_CACHE_TTL_SECONDS
+        if (now - entry.fetched_at) >= _CI_STATUS_CACHE_TTL_SECONDS
     ]
     for key in expired:
         _ci_status_cache.pop(key, None)
 
 
-def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
-    """Fetch combined CI signals for ``sha`` via the REST API.
+def _source_error(exc: RuntimeError) -> str:
+    msg = str(exc)
+    lower = msg.lower()
+    if "timeout" in lower or "timed out" in lower:
+        return "timeout"
+    if "403" in msg or "forbidden" in lower:
+        return "forbidden"
+    return msg
 
-    Returns ``(check_runs, status_payload, fetch_ok)`` where ``check_runs`` is
-    a flat list of all check_run dicts across pages from
-    ``GET /repos/{repo}/commits/{sha}/check-runs`` and ``status_payload`` is
-    the ``{"state": ..., "statuses": [...]}`` shape of
-    ``GET /repos/{repo}/commits/{sha}/status``. ``fetch_ok`` is ``False`` only
-    when *both* REST calls raised ``RuntimeError``; the caller currently
-    folds that case back into ``empty_is_success`` so the WATCH gate does
-    not stall on a transient REST-budget squeeze, matching the existing
-    GraphQL-rate-limit fallback in ``_get_open_prs_rest``.
-    """
-    check_runs: list[dict] = []
-    status_payload: dict = {}
+
+def _parse_status_payload(raw_status: object) -> tuple[dict, _CiSourceEvidence]:
+    parsed: object = raw_status
+    if isinstance(raw_status, str) and raw_status:
+        try:
+            parsed = json.loads(raw_status)
+        except json.JSONDecodeError:
+            return {}, _CiSourceEvidence(False, False, "malformed")
+    if not isinstance(parsed, dict):
+        return {}, _CiSourceEvidence(False, False, "malformed")
+    if not isinstance(parsed.get("state"), str):
+        return {}, _CiSourceEvidence(False, False, "malformed")
+    statuses_raw = parsed.get("statuses")
+    if not isinstance(statuses_raw, list):
+        return {}, _CiSourceEvidence(False, False, "malformed")
+    return parsed, _CiSourceEvidence(True, len(statuses_raw) == 0)
+
+
+def _retrieve_ci_status_evidence(repo: str, sha: str) -> _CiStatusEvidence:
+    now = time.monotonic()
     if not sha:
-        return check_runs, status_payload, True
+        empty = _CiSourceEvidence(True, True)
+        return _CiStatusEvidence(
+            repo, sha, now, [], {}, empty, empty
+        )
 
     cache_key = (repo, sha)
     cached = _ci_status_cache.get(cache_key)
-    now = time.monotonic()
-    if cached is not None and (now - cached[0]) < _CI_STATUS_CACHE_TTL_SECONDS:
-        return list(cached[1]), dict(cached[2]), cached[3]
+    if (
+        cached is not None
+        and cached.repo == repo
+        and cached.sha == sha
+        and (now - cached.fetched_at) < _CI_STATUS_CACHE_TTL_SECONDS
+    ):
+        return cached
+
+    check_runs: list[dict] = []
+    status_payload: dict = {}
 
     # check-runs is a paginated endpoint (per_page max 100). A commit can
     # carry more than 100 runs, and ``_map_rest_ci_status_to_enum`` reads
@@ -236,18 +265,27 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
     # mergeable, so we walk every page rather than relying on ETag-cached
     # single-page reads.
     check_runs_path = f"repos/{repo}/commits/{sha}/check-runs?per_page=100"
-    check_runs_ok = False
-    try:
-        cr_pages = cache._gh_api_paginated(check_runs_path)
-    except RuntimeError:
-        cr_pages = None
-    else:
-        check_runs_ok = True
-    if isinstance(cr_pages, list):
-        for page in cr_pages:
-            runs = page.get("check_runs")
-            if isinstance(runs, list):
-                check_runs.extend(r for r in runs if isinstance(r, dict))
+    cr_evidence = cache._gh_api_paginated_evidence(check_runs_path)
+    check_runs_malformed = False
+    for page in cr_evidence.items:
+        runs = page.get("check_runs")
+        if not isinstance(runs, list):
+            check_runs_malformed = True
+            continue
+        for run in runs:
+            if isinstance(run, dict) and (run.get("conclusion") or run.get("status")):
+                check_runs.append(run)
+            else:
+                check_runs_malformed = True
+    check_runs_source = _CiSourceEvidence(
+        cr_evidence.complete and not check_runs_malformed,
+        cr_evidence.empty or (cr_evidence.complete and not check_runs),
+        "malformed"
+        if check_runs_malformed
+        else _source_error(RuntimeError(cr_evidence.error))
+        if cr_evidence.error
+        else None,
+    )
 
     # PR-251 (OBS-BC): GitHub's check-runs REST payload exposes only
     # ``annotations_count`` + ``annotations_url`` — not the annotation
@@ -262,30 +300,34 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
         _maybe_hydrate_annotations(repo, run)
 
     status_path = f"repos/{repo}/commits/{sha}/status"
-    status_ok = False
     try:
         raw_status = retry_transient(
             lambda: cache._etag_get(status_path),
             operation_name=f"gh api {status_path}",
         )
-    except RuntimeError:
-        raw_status = None
+    except RuntimeError as exc:
+        status_source = _CiSourceEvidence(False, False, _source_error(exc))
     else:
-        status_ok = True
-    if isinstance(raw_status, dict):
-        status_payload = raw_status
-    elif isinstance(raw_status, str) and raw_status:
-        try:
-            parsed = json.loads(raw_status)
-        except json.JSONDecodeError:
-            parsed = None
-        if isinstance(parsed, dict):
-            status_payload = parsed
+        status_payload, status_source = _parse_status_payload(raw_status)
 
-    fetch_ok = check_runs_ok or status_ok
+    evidence = _CiStatusEvidence(
+        repo,
+        sha,
+        now,
+        list(check_runs),
+        dict(status_payload),
+        check_runs_source,
+        status_source,
+    )
     _evict_expired_ci_status_cache(now)
-    _ci_status_cache[cache_key] = (now, list(check_runs), dict(status_payload), fetch_ok)
-    return check_runs, status_payload, fetch_ok
+    _ci_status_cache[cache_key] = evidence
+    return evidence
+
+
+def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
+    evidence = _retrieve_ci_status_evidence(repo, sha)
+    fetch_ok = evidence.check_runs_source.complete and evidence.status_source.complete
+    return list(evidence.check_runs), dict(evidence.status_payload), fetch_ok
 
 
 def _map_rest_ci_status_to_enum(
@@ -327,7 +369,6 @@ def _map_rest_ci_status_to_enum(
     a stale ``failure`` from an earlier retry would force ``FAILURE``
     even after the latest status for that context turned green.
     """
-    del fetch_ok  # retained for caller signature compatibility
     statuses_raw = (
         status_payload.get("statuses") if isinstance(status_payload, dict) else None
     )
@@ -337,7 +378,7 @@ def _map_rest_ci_status_to_enum(
     )
 
     if not check_runs and not statuses:
-        return CIStatus.SUCCESS if empty_is_success else CIStatus.PENDING
+        return CIStatus.SUCCESS if empty_is_success and fetch_ok else CIStatus.PENDING
 
     states: list[str] = []
     failing_runs: list[dict] = []
@@ -375,7 +416,7 @@ def _map_rest_ci_status_to_enum(
         ):
             return CIStatus.INFRA_FAILURE
         return CIStatus.FAILURE
-    if all(s in _REST_CI_SUCCESS_STATES for s in states):
+    if all(s in _REST_CI_SUCCESS_STATES for s in states) and fetch_ok:
         return CIStatus.SUCCESS
     return CIStatus.PENDING
 

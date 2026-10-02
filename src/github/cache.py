@@ -14,6 +14,7 @@ import collections
 import itertools
 import json
 import re
+from typing import NamedTuple
 
 from src.github import gh_runner
 from src.retry import retry_transient
@@ -45,6 +46,13 @@ _ETAG_PAGINATED_DEFAULT_PER_PAGE = 30
 
 _HTTP_STATUS_RE = re.compile(r"^HTTP/\S+\s+(\d{3})", re.MULTILINE)
 _HTTP_304_PATTERN = re.compile(r"\bHTTP\s+304\b")
+
+
+class PaginatedEvidence(NamedTuple):
+    items: list[dict]
+    complete: bool
+    empty: bool
+    error: str | None = None
 
 
 def clear_etag_cache() -> None:
@@ -239,6 +247,29 @@ def _gh_api_paginated(path: str) -> list[dict] | None:
         elif isinstance(page, dict):
             items.append(page)
     return items
+
+
+def _gh_api_paginated_evidence(path: str) -> PaginatedEvidence:
+    items: list[dict] = []
+    sep = "&" if "?" in path else "?"
+    per_page_match = re.search(r"(?:^|[?&])per_page=(\d+)", path)
+    per_page = int(per_page_match.group(1)) if per_page_match else _ETAG_PAGINATED_DEFAULT_PER_PAGE
+    for page_num in itertools.count(1):
+        url = f"{path}{sep}page={page_num}"
+        try:
+            raw = retry_transient(lambda u=url: gh_runner.run_gh(["api", u]), operation_name=f"gh api {url}")
+        except RuntimeError as exc:
+            return PaginatedEvidence(items, False, len(items) == 0, str(exc))
+        pages = raw if page_num == 1 and isinstance(raw, list) else [raw]
+        for page in pages:
+            if not isinstance(page, dict):
+                return PaginatedEvidence(items, False, len(items) == 0, "malformed")
+            items.append(page)
+        runs = items[-1].get("check_runs")
+        if not isinstance(runs, list):
+            return PaginatedEvidence(items, False, len(items) == 0, "malformed")
+        if isinstance(raw, list) or len(runs) < per_page:
+            return PaginatedEvidence(items, True, len(items) == 0)
 
 
 def _etag_get_paginated(path: str) -> list[dict] | None:
