@@ -241,14 +241,14 @@ async def test_cancellation_waits_for_shielded_cleanup(
     managed = await process_pool.launch(TERM_IGNORING_PROCESS)
     await _read_pids(managed.process)
     term_sent = asyncio.Event()
-    real_killpg = os.killpg
+    real_pidfd_send_signal = signal.pidfd_send_signal
 
-    def tracked_killpg(pgid: int, sig: int) -> None:
-        real_killpg(pgid, sig)
-        if pgid == managed.identity.process_group_id and sig == signal.SIGTERM:
+    def tracked_pidfd_signal(pidfd: int, sig: int) -> None:
+        real_pidfd_send_signal(pidfd, sig)
+        if sig == signal.SIGTERM:
             term_sent.set()
 
-    monkeypatch.setattr(os, "killpg", tracked_killpg)
+    monkeypatch.setattr(signal, "pidfd_send_signal", tracked_pidfd_signal)
     cleanup = asyncio.create_task(
         managed.cleanup(term_grace=0.05, kill_grace=0.5)
     )
@@ -420,11 +420,15 @@ async def test_wait_and_signal_refuse_unconfirmed_states(
     unknown = _GroupObservation(_GroupState.UNKNOWN, "unknown")
     quiet = _GroupObservation(_GroupState.QUIESCENT, "quiet")
 
-    monkeypatch.setattr(managed, "_observe_group", lambda: unknown)
+    monkeypatch.setattr(
+        managed, "_snapshot_group", lambda **_kwargs: (unknown, [])
+    )
     assert await managed._wait_for_quiescence(0) is unknown
     assert managed._signal_group(signal.SIGTERM) == (False, "unknown")
 
-    monkeypatch.setattr(managed, "_observe_group", lambda: quiet)
+    monkeypatch.setattr(
+        managed, "_snapshot_group", lambda **_kwargs: (quiet, [])
+    )
     timed_out = await managed._wait_for_quiescence(0)
     assert timed_out.state is _GroupState.LIVE
     assert timed_out.detail == "process group is quiet but leader was not reaped"
@@ -453,22 +457,143 @@ async def test_signal_races_do_not_turn_disappearance_into_failure(
 ) -> None:
     managed = await process_pool.launch(SLEEPING_PROCESS)
     await _read_pids(managed.process)
-    real_killpg = os.killpg
+    real_pidfd_send_signal = signal.pidfd_send_signal
 
-    def disappeared(_pgid: int, _sig: int) -> None:
+    def disappeared(_pidfd: int, _sig: int) -> None:
         raise ProcessLookupError
 
-    monkeypatch.setattr(os, "killpg", disappeared)
+    monkeypatch.setattr(signal, "pidfd_send_signal", disappeared)
     assert managed._signal_group(signal.SIGTERM) == (False, None)
 
-    def denied(_pgid: int, _sig: int) -> None:
+    def denied(_pidfd: int, _sig: int) -> None:
         raise PermissionError("denied")
 
-    monkeypatch.setattr(os, "killpg", denied)
+    monkeypatch.setattr(signal, "pidfd_send_signal", denied)
     sent, detail = managed._signal_group(signal.SIGTERM)
     assert not sent
-    assert detail == "could not signal owned process group: denied"
-    monkeypatch.setattr(os, "killpg", real_killpg)
+    assert detail == "could not signal owned process-group member: denied"
+    monkeypatch.setattr(signal, "pidfd_send_signal", real_pidfd_send_signal)
+
+
+@pytest.mark.asyncio
+async def test_pidfd_delivery_fails_closed_when_host_support_is_missing(
+    process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed = await process_pool.launch(SLEEPING_PROCESS)
+    await _read_pids(managed.process)
+    real_sender = signal.pidfd_send_signal
+    real_opener = os.pidfd_open
+
+    monkeypatch.delattr(signal, "pidfd_send_signal")
+    sent, detail = managed._signal_group(signal.SIGTERM)
+    assert not sent
+    assert detail == "pidfd signaling is unavailable on this Linux host"
+    monkeypatch.setattr(signal, "pidfd_send_signal", real_sender, raising=False)
+
+    monkeypatch.delattr(os, "pidfd_open")
+    pidfd, error = managed._open_owned_pidfd(
+        managed.process.pid, managed.identity.leader_start_time or 0
+    )
+    assert pidfd is None
+    assert error is not None
+    assert error.detail == "pidfd_open is unavailable on this Linux host"
+    monkeypatch.setattr(os, "pidfd_open", real_opener, raising=False)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_refuses_identity_changes_and_handle_races(
+    process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed = await process_pool.launch(SLEEPING_PROCESS)
+    await _read_pids(managed.process)
+    assert managed.identity.leader_start_time is not None
+    monkeypatch.setattr(managed, "_check_leader_identity", lambda: None)
+    managed._identity = replace(
+        managed.identity, leader_start_time=managed.identity.leader_start_time + 1
+    )
+
+    observation, pidfds = managed._snapshot_group(acquire_pidfds=True)
+    assert observation.state is _GroupState.UNPROVEN
+    assert pidfds == []
+
+    managed._identity = replace(
+        managed.identity, leader_start_time=managed.identity.leader_start_time - 1
+    )
+    unknown = _GroupObservation(_GroupState.UNKNOWN, "handle error")
+    monkeypatch.setattr(
+        managed, "_open_owned_pidfd", lambda _pid, _start: (None, unknown)
+    )
+    observation, pidfds = managed._snapshot_group(acquire_pidfds=True)
+    assert observation is unknown
+    assert pidfds == []
+
+    monkeypatch.setattr(
+        managed, "_open_owned_pidfd", lambda _pid, _start: (None, None)
+    )
+    observation, pidfds = managed._snapshot_group(acquire_pidfds=True)
+    assert observation.state is _GroupState.UNKNOWN
+    assert "stable handles" in observation.detail
+    assert pidfds == []
+
+
+@pytest.mark.asyncio
+async def test_pidfd_acquisition_revalidates_process_identity(
+    process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed = await process_pool.launch(SLEEPING_PROCESS)
+    await _read_pids(managed.process)
+    pid = managed.process.pid
+    assert managed.identity.leader_start_time is not None
+    start_time = managed.identity.leader_start_time
+    real_opener = os.pidfd_open
+
+    monkeypatch.setattr(
+        os, "pidfd_open", lambda _pid: (_ for _ in ()).throw(ProcessLookupError())
+    )
+    assert managed._open_owned_pidfd(pid, start_time) == (None, None)
+
+    monkeypatch.setattr(
+        os,
+        "pidfd_open",
+        lambda _pid: (_ for _ in ()).throw(PermissionError("denied")),
+    )
+    pidfd, error = managed._open_owned_pidfd(pid, start_time)
+    assert pidfd is None
+    assert error is not None
+    assert error.detail == "could not open stable process handle: denied"
+    monkeypatch.setattr(os, "pidfd_open", real_opener)
+
+    def unreadable(*_args: Any, **_kwargs: Any) -> Any:
+        raise PermissionError("unreadable")
+
+    monkeypatch.setattr(process_supervisor, "open", unreadable, raising=False)
+    leader_error = managed._check_leader_identity()
+    assert leader_error is not None
+    assert leader_error.detail == "could not confirm leader identity: unreadable"
+    pidfd, error = managed._open_owned_pidfd(pid, start_time)
+    assert pidfd is None
+    assert error is not None
+    assert error.detail == "could not revalidate stable process handle: unreadable"
+    monkeypatch.delattr(process_supervisor, "open")
+
+    def disappeared(*_args: Any, **_kwargs: Any) -> Any:
+        raise FileNotFoundError
+
+    monkeypatch.setattr(process_supervisor, "open", disappeared, raising=False)
+    assert managed._open_owned_pidfd(pid, start_time) == (None, None)
+    monkeypatch.delattr(process_supervisor, "open")
+
+    pidfd, error = managed._open_owned_pidfd(pid, start_time + 1)
+    assert pidfd is None
+    assert error is not None
+    assert error.detail == "process identity changed while acquiring stable handle"
+
+    original_identity = managed.identity
+    managed._identity = replace(
+        original_identity, process_group_id=original_identity.process_group_id + 1
+    )
+    assert managed._open_owned_pidfd(pid, start_time) == (None, None)
+    managed._identity = original_identity
 
 
 @pytest.mark.asyncio

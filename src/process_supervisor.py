@@ -4,6 +4,8 @@ The supervisor contains ordinary descendants that remain in the dedicated
 session/process group created at launch.  A descendant that creates another
 session, moves to another process group, or crosses a container boundary needs
 separate containment (for example, a cgroup or container supervisor).
+TERM and KILL are delivered only through revalidated per-member Linux pidfds;
+the recyclable numeric process-group ID is never a signal-delivery target.
 """
 
 from __future__ import annotations
@@ -200,29 +202,53 @@ class SupervisedProcess:
             await asyncio.sleep(min(_POLL_INTERVAL_SECONDS, remaining))
 
     def _signal_group(self, sig: signal.Signals) -> tuple[bool, str | None]:
-        observation = self._observe_group()
+        observation, pidfds = self._snapshot_group(acquire_pidfds=True)
         if observation.state is _GroupState.QUIESCENT:
             return False, None
         if observation.state is not _GroupState.LIVE:
             return False, observation.detail
+        sender = getattr(signal, "pidfd_send_signal", None)
+        if sender is None:
+            self._close_pidfds(pidfds)
+            return False, "pidfd signaling is unavailable on this Linux host"
+        sent = False
         try:
-            os.killpg(self.identity.process_group_id, sig)
-        except ProcessLookupError:
-            return False, None
-        except OSError as exc:
-            return False, f"could not signal owned process group: {exc}"
-        return True, None
+            for pidfd in pidfds:
+                try:
+                    sender(pidfd, sig)
+                except ProcessLookupError:
+                    continue
+                except OSError as exc:
+                    return sent, f"could not signal owned process-group member: {exc}"
+                sent = True
+        finally:
+            self._close_pidfds(pidfds)
+        return sent, None
 
     def _observe_group(self) -> _GroupObservation:
+        observation, pidfds = self._snapshot_group(acquire_pidfds=False)
+        self._close_pidfds(pidfds)
+        return observation
+
+    def _snapshot_group(
+        self, *, acquire_pidfds: bool
+    ) -> tuple[_GroupObservation, list[int]]:
         pgid = self.identity.process_group_id
         if pgid <= 1 or pgid == os.getpgrp():
-            return _GroupObservation(
-                _GroupState.UNPROVEN,
-                "refusing to inspect or signal the daemon process group",
+            return (
+                _GroupObservation(
+                    _GroupState.UNPROVEN,
+                    "refusing to inspect or signal the daemon process group",
+                ),
+                [],
             )
 
+        leader_error = self._check_leader_identity()
+        if leader_error is not None:
+            return leader_error, []
         matched = False
         live = False
+        pidfds: list[int] = []
         try:
             with os.scandir("/proc") as entries:
                 for entry in entries:
@@ -242,42 +268,160 @@ class SupervisedProcess:
                         continue
                     matched = True
                     if member_sid != self.identity.session_id:
-                        return _GroupObservation(
-                            _GroupState.UNPROVEN,
-                            "process-group identity no longer belongs to the owned session",
+                        self._close_pidfds(pidfds)
+                        return (
+                            _GroupObservation(
+                                _GroupState.UNPROVEN,
+                                "process-group identity no longer belongs to the owned session",
+                            ),
+                            [],
                         )
                     if (
                         int(entry.name) == self.identity.leader_pid
                         and start_time != self.identity.leader_start_time
                     ):
-                        return _GroupObservation(
-                            _GroupState.UNPROVEN,
-                            "process-group leader identity is unproven",
+                        self._close_pidfds(pidfds)
+                        return (
+                            _GroupObservation(
+                                _GroupState.UNPROVEN,
+                                "process-group leader identity is unproven",
+                            ),
+                            [],
                         )
-                    live = live or state != "Z"
+                    if state == "Z":
+                        continue
+                    live = True
+                    if acquire_pidfds:
+                        pidfd, error = self._open_owned_pidfd(
+                            int(entry.name), start_time
+                        )
+                        if error is not None:
+                            self._close_pidfds(pidfds)
+                            return error, []
+                        if pidfd is not None:
+                            pidfds.append(pidfd)
         except OSError as exc:
-            return _GroupObservation(
-                _GroupState.UNKNOWN, f"could not inspect /proc: {exc}"
+            self._close_pidfds(pidfds)
+            return (
+                _GroupObservation(
+                    _GroupState.UNKNOWN, f"could not inspect /proc: {exc}"
+                ),
+                [],
             )
 
         if live:
-            return _GroupObservation(_GroupState.LIVE, "owned process group is live")
+            if acquire_pidfds and not pidfds:
+                return (
+                    _GroupObservation(
+                        _GroupState.UNKNOWN,
+                        "owned members disappeared before stable handles were acquired",
+                    ),
+                    [],
+                )
+            return (
+                _GroupObservation(_GroupState.LIVE, "owned process group is live"),
+                pidfds,
+            )
         if matched:
-            return _GroupObservation(
-                _GroupState.QUIESCENT, "owned process group contains only zombies"
+            return (
+                _GroupObservation(
+                    _GroupState.QUIESCENT,
+                    "owned process group contains only zombies",
+                ),
+                [],
             )
         try:
             os.killpg(pgid, 0)
         except ProcessLookupError:
-            return _GroupObservation(_GroupState.QUIESCENT, "process group disappeared")
-        except OSError as exc:
-            return _GroupObservation(
-                _GroupState.UNKNOWN, f"could not confirm process-group state: {exc}"
+            return (
+                _GroupObservation(
+                    _GroupState.QUIESCENT, "process group disappeared"
+                ),
+                [],
             )
-        return _GroupObservation(
-            _GroupState.UNKNOWN,
-            "process group exists but no member could be proven owned",
+        except OSError as exc:
+            return (
+                _GroupObservation(
+                    _GroupState.UNKNOWN,
+                    f"could not confirm process-group state: {exc}",
+                ),
+                [],
+            )
+        return (
+            _GroupObservation(
+                _GroupState.UNKNOWN,
+                "process group exists but no member could be proven owned",
+            ),
+            [],
         )
+
+    def _check_leader_identity(self) -> _GroupObservation | None:
+        try:
+            with open(
+                f"/proc/{self.identity.leader_pid}/stat", encoding="utf-8"
+            ) as stat_file:
+                start_time = _parse_proc_stat(stat_file.read())[3]
+        except FileNotFoundError:
+            return None
+        except (OSError, IndexError, ValueError) as exc:
+            return _GroupObservation(
+                _GroupState.UNKNOWN, f"could not confirm leader identity: {exc}"
+            )
+        if start_time != self.identity.leader_start_time:
+            return _GroupObservation(
+                _GroupState.UNPROVEN, "process-group leader identity is unproven"
+            )
+        return None
+
+    def _open_owned_pidfd(
+        self, pid: int, expected_start_time: int
+    ) -> tuple[int | None, _GroupObservation | None]:
+        opener = getattr(os, "pidfd_open", None)
+        if opener is None:
+            return None, _GroupObservation(
+                _GroupState.UNKNOWN, "pidfd_open is unavailable on this Linux host"
+            )
+        try:
+            pidfd = opener(pid)
+        except ProcessLookupError:
+            return None, None
+        except OSError as exc:
+            return None, _GroupObservation(
+                _GroupState.UNKNOWN, f"could not open stable process handle: {exc}"
+            )
+        keep_open = False
+        try:
+            try:
+                with open(f"/proc/{pid}/stat", encoding="utf-8") as stat_file:
+                    state, pgid, sid, start_time = _parse_proc_stat(stat_file.read())
+            except FileNotFoundError:
+                return None, None
+            except (OSError, IndexError, ValueError) as exc:
+                return None, _GroupObservation(
+                    _GroupState.UNKNOWN,
+                    f"could not revalidate stable process handle: {exc}",
+                )
+            if start_time != expected_start_time:
+                return None, _GroupObservation(
+                    _GroupState.UNPROVEN,
+                    "process identity changed while acquiring stable handle",
+                )
+            if (
+                state == "Z"
+                or pgid != self.identity.process_group_id
+                or sid != self.identity.session_id
+            ):
+                return None, None
+            keep_open = True
+            return pidfd, None
+        finally:
+            if not keep_open:
+                os.close(pidfd)
+
+    @staticmethod
+    def _close_pidfds(pidfds: list[int]) -> None:
+        for pidfd in pidfds:
+            os.close(pidfd)
 
 
 def _parse_proc_stat(stat: str) -> tuple[str, int, int, int]:
