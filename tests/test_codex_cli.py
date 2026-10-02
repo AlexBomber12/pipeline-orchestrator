@@ -182,6 +182,7 @@ async def test_run_planned_pr_async_calls_exec_with_docker_sandbox(
     assert "--model" in cmd
     assert cmd[cmd.index("--model") + 1] == "o3"
     assert cmd[-1] == "PLANNED PR"
+    assert "DAEMON INVOCATION" not in cmd[-1]
 
 
 @pytest.mark.asyncio
@@ -217,7 +218,12 @@ async def test_fix_review_async_passes_prompt(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
-    await fix_review_async("/data/repos/demo")
+    await fix_review_async(
+        "/data/repos/demo",
+        extra_context="Latest review feedback:\nP1: fix this",
+        pr_id="PR-270",
+        task_file="tasks/PR-270.md",
+    )
 
     cmd = captured["cmd"]
     assert cmd[:6] == [
@@ -228,7 +234,16 @@ async def test_fix_review_async_passes_prompt(
         "--sandbox",
         "danger-full-access",
     ]
-    assert cmd[-1] == "FIX FEEDBACK"
+    prompt = cmd[-1]
+    assert prompt.startswith("Task: PR-270\n\nFile: tasks/PR-270.md\n\n")
+    assert "\n\nFIX FEEDBACK\n\nDAEMON INVOCATION" in prompt
+    assert "This FIX FEEDBACK run was dispatched" in prompt
+    assert "one iteration" in prompt
+    assert "scripts/make-review-artifacts.sh" in prompt
+    assert "remote PR HEAD is the pushed local HEAD" in prompt
+    assert "daemon owns review triggering" in prompt
+    assert "Do not wait for a new review" in prompt
+    assert prompt.endswith("Latest review feedback:\nP1: fix this")
 
 
 @pytest.mark.asyncio
@@ -287,21 +302,29 @@ def test_build_fix_feedback_prompt_with_task_anchor() -> None:
         "Stay in the scope of this task. Do not address any "
         "other PR or task in this run."
     ) in prompt
-    assert "\n\nFIX FEEDBACK\n\nsome logs" in prompt
+    assert "\n\nFIX FEEDBACK\n\nDAEMON INVOCATION" in prompt
+    assert prompt.endswith("some logs")
 
 
 def test_build_fix_feedback_prompt_legacy_fallbacks() -> None:
-    assert _build_fix_feedback_prompt(
+    prompt = _build_fix_feedback_prompt(
         "ci logs",
         pr_id=None,
         task_file=None,
-    ) == "FIX FEEDBACK\n\nci logs"
-    assert _build_fix_feedback_prompt(
+    )
+    assert prompt.startswith("FIX FEEDBACK\n\nDAEMON INVOCATION")
+    assert prompt.endswith("\n\nci logs")
+    partial_prompt = _build_fix_feedback_prompt(
         "ci logs",
         pr_id="PR-100",
         task_file=None,
-    ) == "FIX FEEDBACK\n\nci logs"
-    assert _build_fix_feedback_prompt(None) == "FIX FEEDBACK"
+    )
+    assert partial_prompt.startswith("FIX FEEDBACK\n\nDAEMON INVOCATION")
+    assert "Task: PR-100" not in partial_prompt
+    assert partial_prompt.endswith("\n\nci logs")
+    assert _build_fix_feedback_prompt(None).startswith(
+        "FIX FEEDBACK\n\nDAEMON INVOCATION"
+    )
 
 
 @pytest.mark.asyncio
@@ -333,6 +356,7 @@ async def test_diagnose_error_async_uses_expected_prompt_and_timeout(
     assert cmd[cmd.index("--model") + 1] == "gpt-5.4"
     assert "Error context: broken CI" in cmd[-1]
     assert "FIX, SKIP, or ESCALATE" in cmd[-1]
+    assert "DAEMON INVOCATION" not in cmd[-1]
 
 
 @pytest.mark.asyncio
@@ -439,9 +463,17 @@ async def test_run_auto_pr_async_formats_prompt_with_headers(
     ]
     assert "--model" in cmd
     assert cmd[cmd.index("--model") + 1] == "gpt-5.4"
-    assert cmd[-1] == (
-        "AUTO PR\nTask: PR-270\nFile: tasks/PR-270.md\n\n<body>"
+    assert cmd[-1].startswith(
+        "AUTO PR\nTask: PR-270\nFile: tasks/PR-270.md\n\n<body>\n\n"
     )
+    assert "This AUTO PR run was dispatched" in cmd[-1]
+    assert "ready (not draft) PR" in cmd[-1]
+    assert "scripts/make-review-artifacts.sh" in cmd[-1]
+    assert "artifacts/pr.patch must be nonempty" in cmd[-1]
+    assert "repository, base branch, head branch, and HEAD SHA" in cmd[-1]
+    assert "daemon owns review triggering" in cmd[-1]
+    assert "Do not trigger or poll review" in cmd[-1]
+    assert "Never fabricate a PR, push, gate, or approval" in cmd[-1]
 
 
 @pytest.mark.asyncio
