@@ -261,6 +261,8 @@ def _gh_api_paginated_evidence(path: str) -> PaginatedEvidence:
         except RuntimeError as exc:
             return PaginatedEvidence(items, False, len(items) == 0, str(exc))
         pages = raw if page_num == 1 and isinstance(raw, list) else [raw]
+        if not pages:
+            return PaginatedEvidence(items, False, len(items) == 0, "malformed")
         for page in pages:
             if not isinstance(page, dict):
                 return PaginatedEvidence(items, False, len(items) == 0, "malformed")

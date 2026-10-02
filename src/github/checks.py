@@ -64,6 +64,25 @@ _REST_CI_FAILURE_STATES = {
     "STALE",
 }
 _REST_CI_SUCCESS_STATES = {"SUCCESS", "COMPLETED", "NEUTRAL", "SKIPPED"}
+_REST_COMMIT_STATUS_STATES = {"ERROR", "FAILURE", "PENDING", "SUCCESS"}
+_REST_CHECK_RUN_STATUSES = {
+    "COMPLETED",
+    "IN_PROGRESS",
+    "PENDING",
+    "QUEUED",
+    "REQUESTED",
+    "WAITING",
+}
+_REST_CHECK_RUN_CONCLUSIONS = {
+    "ACTION_REQUIRED",
+    "CANCELLED",
+    "FAILURE",
+    "NEUTRAL",
+    "SKIPPED",
+    "STALE",
+    "SUCCESS",
+    "TIMED_OUT",
+}
 
 # PR-251 (OBS-BC): conclusions that indicate an infrastructure-class
 # failure rather than a logic failure. ``cancelled`` is unusual without
@@ -220,6 +239,29 @@ def _source_error(exc: RuntimeError) -> str:
     return msg
 
 
+def _commit_status_state(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    upper = value.upper()
+    return upper if upper in _REST_COMMIT_STATUS_STATES else None
+
+
+def _check_run_state(run: dict) -> str | None:
+    conclusion = run.get("conclusion")
+    if conclusion:
+        if not isinstance(conclusion, str):
+            return None
+        upper = conclusion.upper()
+        return upper if upper in _REST_CHECK_RUN_CONCLUSIONS else None
+    status = run.get("status")
+    if status:
+        if not isinstance(status, str):
+            return None
+        upper = status.upper()
+        return upper if upper in _REST_CHECK_RUN_STATUSES else None
+    return None
+
+
 def _parse_status_payload(raw_status: object) -> tuple[dict, _CiSourceEvidence]:
     parsed: object = raw_status
     if isinstance(raw_status, str) and raw_status:
@@ -229,10 +271,23 @@ def _parse_status_payload(raw_status: object) -> tuple[dict, _CiSourceEvidence]:
             return {}, _CiSourceEvidence(False, False, "malformed")
     if not isinstance(parsed, dict):
         return {}, _CiSourceEvidence(False, False, "malformed")
-    if not isinstance(parsed.get("state"), str):
+    combined_state = parsed.get("state")
+    combined_state_upper = _commit_status_state(combined_state)
+    if combined_state_upper is None:
         return {}, _CiSourceEvidence(False, False, "malformed")
     statuses_raw = parsed.get("statuses")
     if not isinstance(statuses_raw, list):
+        return {}, _CiSourceEvidence(False, False, "malformed")
+    statuses_malformed = False
+    for status in statuses_raw:
+        if not isinstance(status, dict):
+            statuses_malformed = True
+            continue
+        if _commit_status_state(status.get("state")) is None:
+            statuses_malformed = True
+    if statuses_malformed:
+        if combined_state_upper in _REST_CI_FAILURE_STATES:
+            return parsed, _CiSourceEvidence(False, False, "malformed")
         return {}, _CiSourceEvidence(False, False, "malformed")
     return parsed, _CiSourceEvidence(True, len(statuses_raw) == 0)
 
@@ -273,7 +328,7 @@ def _retrieve_ci_status_evidence(repo: str, sha: str) -> _CiStatusEvidence:
             check_runs_malformed = True
             continue
         for run in runs:
-            if isinstance(run, dict) and (run.get("conclusion") or run.get("status")):
+            if isinstance(run, dict) and _check_run_state(run):
                 check_runs.append(run)
             else:
                 check_runs_malformed = True
@@ -376,28 +431,39 @@ def _map_rest_ci_status_to_enum(
     combined_state = (
         status_payload.get("state") if isinstance(status_payload, dict) else None
     )
+    malformed_statuses = any(
+        not isinstance(status, dict)
+        or _commit_status_state(status.get("state")) is None
+        for status in statuses
+    )
 
     if not check_runs and not statuses:
         return CIStatus.SUCCESS if empty_is_success and fetch_ok else CIStatus.PENDING
 
     states: list[str] = []
     failing_runs: list[dict] = []
+    malformed_check_runs = False
     for run in check_runs:
         if not isinstance(run, dict):
+            malformed_check_runs = True
             continue
-        value = run.get("conclusion") or run.get("status")
-        if not value:
+        upper = _check_run_state(run)
+        if not upper:
+            malformed_check_runs = True
             continue
-        upper = str(value).upper()
         states.append(upper)
         if upper in _REST_CI_FAILURE_STATES:
             failing_runs.append(run)
 
-    combined_state_upper = (
-        combined_state.upper() if isinstance(combined_state, str) and combined_state else ""
-    )
-    if statuses and combined_state_upper:
+    combined_state_upper = _commit_status_state(combined_state) or ""
+    if statuses and malformed_statuses:
+        fetch_ok = False
+        if combined_state_upper in _REST_CI_FAILURE_STATES:
+            states.append(combined_state_upper)
+    elif statuses and combined_state_upper:
         states.append(combined_state_upper)
+    if malformed_check_runs:
+        fetch_ok = False
 
     if not states:
         return CIStatus.PENDING

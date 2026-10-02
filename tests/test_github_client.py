@@ -3196,6 +3196,9 @@ def test_map_rest_ci_status_success_requires_all_states_success_like() -> None:
 def test_map_rest_ci_status_pending_when_states_missing_or_mixed() -> None:
     assert _map_rest_ci_status_to_enum([{}, {"conclusion": ""}], {}) == CIStatus.PENDING
     assert _map_rest_ci_status_to_enum([{"conclusion": "success"}, {"status": "in_progress"}], {}) == CIStatus.PENDING
+    assert _map_rest_ci_status_to_enum([{"status": "success"}], {}) == CIStatus.PENDING
+    assert _map_rest_ci_status_to_enum([{"conclusion": 1}], {}) == CIStatus.PENDING
+    assert _map_rest_ci_status_to_enum([{"status": 1}], {}) == CIStatus.PENDING
 
 
 def test_map_rest_ci_status_pending_from_status_in_progress() -> None:
@@ -3209,14 +3212,61 @@ def test_map_rest_ci_status_pending_from_status_in_progress() -> None:
     )
 
 
-def test_map_rest_ci_status_skips_non_dict_entries() -> None:
-    """Garbage entries in either list are tolerated and ignored."""
+def test_map_rest_ci_status_rejects_non_dict_check_run_entries() -> None:
+    """Malformed check-run entries cannot satisfy the merge gate."""
     assert (
         _map_rest_ci_status_to_enum(
             [{"conclusion": "success"}, "garbage"],
-            {"state": "success", "statuses": [{"state": "success"}, 7]},
+            {"state": "success", "statuses": [{"state": "success"}]},
         )
-        == CIStatus.SUCCESS
+        == CIStatus.PENDING
+    )
+
+
+def test_map_rest_ci_status_rejects_malformed_status_entries() -> None:
+    """Malformed commit-status evidence cannot satisfy the merge gate."""
+    assert (
+        _map_rest_ci_status_to_enum(
+            [{"conclusion": "success"}],
+            {"state": "success", "statuses": [{}]},
+        )
+        == CIStatus.PENDING
+    )
+    assert (
+        _map_rest_ci_status_to_enum(
+            [{"conclusion": "success"}],
+            {"state": "success", "statuses": [{"state": ""}]},
+        )
+        == CIStatus.PENDING
+    )
+    assert (
+        _map_rest_ci_status_to_enum(
+            [{"conclusion": "failure"}],
+            {"state": "success", "statuses": [{}]},
+        )
+        == CIStatus.FAILURE
+    )
+
+
+def test_map_rest_ci_status_rejects_unsupported_status_entries() -> None:
+    """Unsupported commit-status states cannot satisfy the merge gate."""
+    assert (
+        _map_rest_ci_status_to_enum(
+            [{"conclusion": "success"}],
+            {"state": "success", "statuses": [{"state": "nonsense"}]},
+        )
+        == CIStatus.PENDING
+    )
+
+
+def test_map_rest_ci_status_preserves_failure_with_malformed_status_entries() -> None:
+    """Known aggregate commit-status failures still route to failure handling."""
+    assert (
+        _map_rest_ci_status_to_enum(
+            [{"conclusion": "success"}],
+            {"state": "failure", "statuses": [{}]},
+        )
+        == CIStatus.FAILURE
     )
 
 
@@ -3514,6 +3564,44 @@ def test_fetch_ci_status_rest_skips_non_dict_pages(
     assert fetch_ok is False
 
 
+def test_fetch_ci_status_rest_empty_page_array_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zero-page check-runs array is malformed, not an ``IndexError``."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in a for a in args):
+            return []
+        return {"state": "success", "statuses": [{"state": "success"}]}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
+
+    assert check_runs == []
+    assert status_payload == {"state": "success", "statuses": [{"state": "success"}]}
+    assert fetch_ok is False
+
+
+def test_fetch_ci_status_rest_rejects_invalid_check_run_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check-run status and conclusion values are validated by field."""
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in a for a in args):
+            return {"check_runs": [{"status": "success"}]}
+        return {"state": "success", "statuses": [{"state": "success"}]}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
+
+    assert check_runs == []
+    assert status_payload == {"state": "success", "statuses": [{"state": "success"}]}
+    assert fetch_ok is False
+
+
 def test_fetch_ci_status_rest_hydrates_annotations_for_failing_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3743,6 +3831,70 @@ def test_retrieve_ci_status_evidence_rejects_invalid_statuses_field(
     assert evidence.status_source.error == "malformed"
 
 
+def test_retrieve_ci_status_evidence_rejects_malformed_status_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cache, "_gh_api_paginated_evidence", lambda path: cache.PaginatedEvidence([], True, True))
+    monkeypatch.setattr(cache, "_etag_get", lambda path: {"state": "success", "statuses": [{}]})
+
+    evidence = _retrieve_ci_status_evidence("owner/name", "abc123")
+
+    assert evidence.status_source.complete is False
+    assert evidence.status_source.error == "malformed"
+    assert evidence.status_payload == {}
+
+
+def test_retrieve_ci_status_evidence_rejects_empty_aggregate_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cache, "_gh_api_paginated_evidence", lambda path: cache.PaginatedEvidence([], True, True))
+    monkeypatch.setattr(cache, "_etag_get", lambda path: {"state": "", "statuses": [{"state": "success"}]})
+
+    evidence = _retrieve_ci_status_evidence("owner/name", "abc123")
+
+    assert evidence.status_source.complete is False
+    assert evidence.status_source.error == "malformed"
+    assert evidence.status_payload == {}
+
+
+def test_retrieve_ci_status_evidence_rejects_unsupported_status_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cache, "_gh_api_paginated_evidence", lambda path: cache.PaginatedEvidence([], True, True))
+    monkeypatch.setattr(cache, "_etag_get", lambda path: {"state": "success", "statuses": [{"state": "nonsense"}]})
+
+    evidence = _retrieve_ci_status_evidence("owner/name", "abc123")
+
+    assert evidence.status_source.complete is False
+    assert evidence.status_source.error == "malformed"
+    assert evidence.status_payload == {}
+
+
+def test_retrieve_ci_status_evidence_preserves_failure_with_malformed_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cache, "_gh_api_paginated_evidence", lambda path: cache.PaginatedEvidence([], True, True))
+    monkeypatch.setattr(cache, "_etag_get", lambda path: {"state": "failure", "statuses": [{}]})
+
+    evidence = _retrieve_ci_status_evidence("owner/name", "abc123")
+
+    assert evidence.status_source.complete is False
+    assert evidence.status_source.error == "malformed"
+    assert evidence.status_payload == {"state": "failure", "statuses": [{}]}
+
+
+def test_retrieve_ci_status_evidence_rejects_non_object_status_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cache, "_gh_api_paginated_evidence", lambda path: cache.PaginatedEvidence([], True, True))
+    monkeypatch.setattr(cache, "_etag_get", lambda path: {"state": "success", "statuses": [7]})
+
+    evidence = _retrieve_ci_status_evidence("owner/name", "abc123")
+
+    assert evidence.status_source.error == "malformed"
+    assert evidence.status_payload == {}
+
+
 def test_fetch_ci_status_rest_second_page_failure_is_incomplete(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3926,7 +4078,7 @@ def test_fetch_ci_status_rest_cache_expires_after_ttl(
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
             state["calls"] += 1
-            return [{"check_runs": [{"conclusion": f"call_{state['calls']}"}]}]
+            return [{"check_runs": [{"conclusion": "success", "name": f"call_{state['calls']}"}]}]
         return {"state": "pending", "statuses": []}
 
     fake_now = {"value": 1000.0}
