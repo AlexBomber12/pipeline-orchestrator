@@ -41,9 +41,9 @@ TESTBED_REPO = "AlexBomber12/pipeline-orchestrator-testbed"
 # freshness round-trip plus the FIX entry transition with comfortable
 # slack before declaring failure.
 FIX_TRANSITION_DEADLINE_SEC = 90
-# The first WATCH handler cycle should arrive well inside this bound;
-# keeping a separate deadline makes the pre-review synchronization finite.
-WATCH_WAIT_LOG_DEADLINE_SEC = 30
+# A WATCH cycle can include several serial GitHub calls; align the finite
+# pre-review synchronization bound with the downstream transition deadline.
+WATCH_WAIT_LOG_DEADLINE_SEC = FIX_TRANSITION_DEADLINE_SEC
 # After flipping the shim to ``escalate``, the FIX-cycle parser parks the
 # failed task in ERROR without further coder work.
 ESCALATE_TO_ERROR_DEADLINE_SEC = 60
