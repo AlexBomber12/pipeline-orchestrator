@@ -20,6 +20,40 @@ from src.diagnosis import build_diagnosis_prompt
 logger = logging.getLogger(__name__)
 
 
+_DAEMON_AUTO_PR_HANDOFF = """DAEMON INVOCATION -- PUBLICATION HANDOFF
+This AUTO PR run was dispatched by the pipeline-orchestrator daemon.
+Completion boundary for this invocation:
+- Implement only the supplied task scope and run its required focused checks.
+- Create the intended commit, then run scripts/make-review-artifacts.sh as the
+  single final local full-gate and artifact entrypoint. It must exit 0 and
+  artifacts/pr.patch must be nonempty. Do not repeat an unchanged full gate.
+- Push the task branch, publish a ready (not draft) PR, and verify the PR's
+  repository, base branch, head branch, and HEAD SHA against the intended
+  repository and local HEAD. Report that evidence, then exit.
+- Green GitHub CI and current-change Codex approval remain merge requirements,
+  but the daemon owns review triggering, CI/review waiting, later FIX dispatch,
+  and merge decisions. Do not trigger or poll review, start a FIX round, or merge.
+- If implementation or publication cannot complete, report the blocker and use
+  the repository's ESCALATE protocol. Never fabricate a PR, push, gate, or approval."""
+
+_DAEMON_FIX_HANDOFF = """DAEMON INVOCATION -- ONE-ITERATION PUBLICATION HANDOFF
+This FIX FEEDBACK run was dispatched by the pipeline-orchestrator daemon.
+Completion boundary for this invocation:
+- Address only the supplied current feedback, in one iteration, and run the
+  required focused checks.
+- Create the changed commit, then run scripts/make-review-artifacts.sh as the
+  single final local full-gate and artifact entrypoint. It must exit 0 and
+  artifacts/pr.patch must be nonempty. Do not repeat an unchanged full gate.
+- Push to the same PR branch, verify the remote PR HEAD is the pushed local HEAD,
+  report the PR and HEAD evidence, then exit.
+- Green GitHub CI and current-change Codex approval remain merge requirements,
+  but the daemon owns review triggering, CI/review waiting, later FIX dispatch,
+  and merge decisions. Do not wait for a new review or act on newly arriving
+  findings in this invocation, and do not merge.
+- If implementation or publication cannot complete, report the blocker and use
+  the repository's ESCALATE protocol. Never fabricate a push, gate, or approval."""
+
+
 def _maybe_wrap_sandbox(cmd: list[str], cwd: str) -> list[str]:
     """Wrap ``cmd`` with bwrap when ``coder_filesystem_isolation`` is on."""
     cfg = load_config()
@@ -116,7 +150,10 @@ def run_planned_pr(
 
 
 def _build_auto_pr_prompt(pr_id: str, task_file: str, task_body: str) -> str:
-    return f"AUTO PR\nTask: {pr_id}\nFile: {task_file}\n\n{task_body}"
+    return (
+        f"AUTO PR\nTask: {pr_id}\nFile: {task_file}\n\n{task_body}"
+        f"\n\n{_DAEMON_AUTO_PR_HANDOFF}"
+    )
 
 
 def run_auto_pr(
@@ -153,6 +190,7 @@ def _build_fix_feedback_prompt(
             "other PR or task in this run."
         )
     parts.append("FIX FEEDBACK")
+    parts.append(_DAEMON_FIX_HANDOFF)
     if extra_context:
         parts.append(extra_context)
     return "\n\n".join(parts)
