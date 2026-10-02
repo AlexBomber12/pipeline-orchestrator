@@ -41,6 +41,9 @@ TESTBED_REPO = "AlexBomber12/pipeline-orchestrator-testbed"
 # freshness round-trip plus the FIX entry transition with comfortable
 # slack before declaring failure.
 FIX_TRANSITION_DEADLINE_SEC = 90
+# The first WATCH handler cycle should arrive well inside this bound;
+# keeping a separate deadline makes the pre-review synchronization finite.
+WATCH_WAIT_LOG_DEADLINE_SEC = 30
 # After flipping the shim to ``escalate``, the FIX-cycle parser parks the
 # failed task in ERROR without further coder work.
 ESCALATE_TO_ERROR_DEADLINE_SEC = 60
@@ -146,6 +149,46 @@ def test_changes_requested_review_drives_watch_to_fix(
         # Arm cleanup first: WATCH may consume feedback while the fixture verifies its API response.
         history_floor = len(watch_entry.get("history") or [])
         SHIM_SCENARIO_PATH.write_text("escalate\n")
+
+        # The initial WATCH snapshot can precede the handler's first waiting
+        # cycle. Wait for that cycle before posting feedback so a fast
+        # CHANGES_REQUESTED transition cannot bypass its history marker.
+        watch_waiting_marker = f"[WATCH] PR #{watch_pr_number} waiting "
+        deadline = time.monotonic() + WATCH_WAIT_LOG_DEADLINE_SEC
+        waiting_entry: dict | None = None
+        last_wait_state = None
+        last_wait_pr_number = None
+        last_wait_events: list[str] = []
+        while time.monotonic() < deadline:
+            entry = get_state(testbed_slug)
+            if entry is not None:
+                last_wait_state = entry.get("state")
+                current_pr = entry.get("current_pr") or {}
+                last_wait_pr_number = current_pr.get("number")
+                last_wait_events = [
+                    item.get("event", "")
+                    for item in entry.get("history") or []
+                    if isinstance(item, dict)
+                ]
+                if (
+                    last_wait_state == "WATCH"
+                    and last_wait_pr_number == watch_pr_number
+                    and any(
+                        watch_waiting_marker in event
+                        for event in last_wait_events
+                    )
+                ):
+                    waiting_entry = entry
+                    break
+            time.sleep(1)
+        assert waiting_entry is not None, (
+            f"PR #{watch_pr_number} did not remain in WATCH and emit "
+            f"{watch_waiting_marker!r} within "
+            f"{WATCH_WAIT_LOG_DEADLINE_SEC}s; "
+            f"last_state={last_wait_state!r}, "
+            f"last_pr_number={last_wait_pr_number!r}, "
+            f"recent events={last_wait_events[-10:]!r}"
+        )
 
         # The fixture uses a separate Codex-named reviewer App, binds the
         # REQUEST_CHANGES review to the current head, and comments on the
