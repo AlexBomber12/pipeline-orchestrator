@@ -1129,7 +1129,7 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
     if conflicts:
         names = ", ".join(sorted(conflicts))
         raise TypeError(f"launch_process owns subprocess option(s): {names}")
-    if kwargs.get("close_fds") is False:
+    if "close_fds" in kwargs and not kwargs["close_fds"]:
         raise TypeError("launch_process requires close_fds=True")
     target_executable = os.fspath(kwargs.pop("executable", program[0]))
     if not target_executable:
@@ -1143,8 +1143,12 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
         target_env, protocol=pickle.HIGHEST_PROTOCOL
     )
     control_read, control_write = os.pipe()
-    ready_parent, ready_child = socket.socketpair()
-    ready_parent.setblocking(False)
+    try:
+        ready_parent, ready_child = socket.socketpair()
+    except BaseException:
+        os.close(control_read)
+        os.close(control_write)
+        raise
     process: asyncio.subprocess.Process | None = None
     witness_pid: int | None = None
     witness_pidfd: int | None = None
@@ -1153,6 +1157,7 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
     launch_cancellation: asyncio.CancelledError | None = None
     cancellation_deadline: float | None = None
     try:
+        ready_parent.setblocking(False)
         spawn_task = asyncio.create_task(
             asyncio.create_subprocess_exec(
                 sys.executable,
@@ -1271,7 +1276,15 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
         try:
             with open(f"/proc/{process.pid}/stat", encoding="utf-8") as stat_file:
                 leader_start_time = _parse_proc_stat(stat_file.read())[3]
-        except (OSError, IndexError, ValueError):
+        except (OSError, IndexError, ValueError) as exc:
+            disappeared = isinstance(exc, FileNotFoundError) or (
+                isinstance(exc, OSError)
+                and exc.errno in _DISAPPEARED_ERRNOS
+            )
+            if not disappeared:
+                raise RuntimeError(
+                    f"could not establish process-group leader identity: {exc}"
+                ) from exc
             leader_start_time = None
         identity = ProcessIdentity(
             process.pid, process.pid, process.pid, leader_start_time

@@ -6,6 +6,7 @@ import errno
 import math
 import os
 import signal
+import socket
 import sys
 import time
 from dataclasses import replace
@@ -1529,6 +1530,8 @@ async def test_launch_rejects_conflicts_and_unverified_session(
         )
     with pytest.raises(TypeError, match="requires close_fds=True"):
         await launch_process("/bin/true", close_fds=False)
+    with pytest.raises(TypeError, match="requires close_fds=True"):
+        await launch_process("/bin/true", close_fds=0)
     with pytest.raises(TypeError):
         await launch_process("/bin/true", env={"INVALID_VALUE": 1})
     with pytest.raises(ValueError, match="illegal environment variable name"):
@@ -1546,6 +1549,27 @@ async def test_launch_rejects_conflicts_and_unverified_session(
         await launch_process("true", executable="")
     with pytest.raises(FileNotFoundError):
         await launch_process("/definitely/missing/process-supervisor-command")
+
+    allocated_control_fds: list[int] = []
+    real_pipe = os.pipe
+
+    def tracked_pipe() -> tuple[int, int]:
+        pipe_fds = real_pipe()
+        allocated_control_fds.extend(pipe_fds)
+        return pipe_fds
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "pipe", tracked_pipe)
+        patch.setattr(
+            socket,
+            "socketpair",
+            lambda: (_ for _ in ()).throw(OSError("socketpair failed")),
+        )
+        with pytest.raises(OSError, match="socketpair failed"):
+            await launch_process("/bin/true")
+    for fd in allocated_control_fds:
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(fd)
 
     with monkeypatch.context() as patch:
         patch.setattr(process_supervisor, "_WITNESS_LAUNCHER", "pass")
@@ -1602,6 +1626,37 @@ async def test_launch_rejects_conflicts_and_unverified_session(
                 f"from pathlib import Path; Path({str(target_marker)!r}).touch()",
             )
     assert not target_marker.exists()
+
+    real_open = open
+    stat_reads = 0
+    unreadable_leader_pid: int | None = None
+
+    def unreadable_live_leader(
+        path: str, *args: Any, **kwargs: Any
+    ) -> Any:
+        nonlocal stat_reads, unreadable_leader_pid
+        if path.startswith("/proc/") and path.endswith("/stat"):
+            stat_reads += 1
+            if stat_reads == 3:
+                unreadable_leader_pid = int(path.split("/")[2])
+                raise PermissionError("leader stat denied")
+        return real_open(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            process_supervisor,
+            "open",
+            unreadable_live_leader,
+            raising=False,
+        )
+        with pytest.raises(RuntimeError, match="leader identity"):
+            await launch_process(
+                sys.executable,
+                "-c",
+                "import signal; signal.pause()",
+            )
+    assert unreadable_leader_pid is not None
+    assert not os.path.exists(f"/proc/{unreadable_leader_pid}")
 
     spawn_cancellation_marker = tmp_path / "spawn-cancelled-target-ran"
     spawn_started = asyncio.Event()
