@@ -1535,6 +1535,11 @@ async def test_launch_rejects_conflicts_and_unverified_session(
         await launch_process("/bin/true", env={"INVALID=NAME": "value"})
     with pytest.raises(ValueError, match="embedded null byte"):
         await launch_process("/bin/true", env={"VALID_NAME": "bad\0value"})
+    with pytest.raises(ValueError, match="names collide after encoding"):
+        await launch_process(
+            "true",
+            env={"PATH": os.defpath, b"PATH": os.fsencode(os.defpath)},
+        )
     with pytest.raises(FileNotFoundError):
         await launch_process("/definitely/missing/process-supervisor-command")
 

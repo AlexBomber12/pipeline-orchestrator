@@ -936,6 +936,7 @@ def _get_pidfd_opener() -> Any:
 
 def _validated_environment(environment: Any) -> dict[Any, Any]:
     copied = dict(os.environ if environment is None else environment)
+    encoded_names: set[bytes] = set()
     for key, value in copied.items():
         encoded_key = os.fsencode(key)
         encoded_value = os.fsencode(value)
@@ -943,6 +944,9 @@ def _validated_environment(environment: Any) -> dict[Any, Any]:
             raise ValueError("illegal environment variable name")
         if b"\0" in encoded_key or b"\0" in encoded_value:
             raise ValueError("embedded null byte")
+        if encoded_key in encoded_names:
+            raise ValueError("environment variable names collide after encoding")
+        encoded_names.add(encoded_key)
     return copied
 
 
