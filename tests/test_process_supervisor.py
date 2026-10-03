@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import errno
+import io
 import math
 import os
 import signal
@@ -577,6 +578,43 @@ async def test_reused_group_without_lifecycle_proof_is_not_signalled(
     assert result.detail == "lifecycle ownership witness is no longer live"
     assert delivered == []
     assert _pid_is_live(replacement_child_pid)
+
+
+@pytest.mark.asyncio
+async def test_recycled_leader_pid_uses_witness_owned_descendants(
+    process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed = await process_pool.launch(EARLY_EXIT_WITH_TERM_IGNORING_CHILD)
+    (child_pid,) = await _read_pids(managed.process)
+    assert managed.identity.leader_start_time is not None
+    async with asyncio.timeout(1):
+        while managed.process.returncode is None:
+            await asyncio.sleep(0)
+    assert managed.process.returncode == 0
+    assert _pid_is_live(child_pid)
+
+    fields = ["0"] * 20
+    fields[0] = "S"
+    fields[2] = str(managed.identity.process_group_id)
+    fields[3] = str(managed.identity.session_id)
+    fields[19] = str(managed.identity.leader_start_time + 1)
+    reused_stat = f"{managed.process.pid} (reused) {' '.join(fields)}"
+    leader_stat = f"/proc/{managed.process.pid}/stat"
+    real_open = open
+
+    def reused_leader(path: str, *args: Any, **kwargs: Any) -> Any:
+        if path == leader_stat:
+            return io.StringIO(reused_stat)
+        return real_open(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(process_supervisor, "open", reused_leader, raising=False)
+        result = await managed.cleanup(term_grace=0.05, kill_grace=0.5)
+
+    assert result.quiescent, result.detail
+    assert result.term_sent
+    assert result.kill_sent
+    await _wait_not_live(child_pid)
 
 
 @pytest.mark.asyncio

@@ -694,10 +694,10 @@ class SupervisedProcess:
             self.identity.leader_start_time is not None
             and start_time != self.identity.leader_start_time
         ):
-            return False, _GroupObservation(
-                _GroupState.UNPROVEN,
-                "process-group leader identity is unproven",
-            )
+            # This PID is no longer the unreaped direct child.  Treat it like
+            # a missing leader; the later full scan must still prove the
+            # original group through the stable witness or known identities.
+            return False, None
         if (
             pgid != self.identity.process_group_id
             or sid != self.identity.session_id
