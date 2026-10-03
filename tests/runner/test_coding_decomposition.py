@@ -270,9 +270,8 @@ def test_handle_coding_preserves_branch_marker_on_cleanup_failure(
         return (
             -1,
             "",
-            "Process supervision launch failed: RuntimeError: failed launch "
-            "cleanup could not confirm quiescence: branch marker cleanup "
-            "unconfirmed",
+            "Process supervision launch failed: RuntimeError: cleanup timed "
+            "out without a structured outcome",
         )
 
     monkeypatch.setattr(plugin, "run_auto_pr", fake_run)
@@ -413,8 +412,7 @@ def test_run_coder_failed_launch_cleanup_without_handle_parks_error(
         return (
             -1,
             "",
-            "Process supervision launch failed: RuntimeError: failed launch "
-            "cleanup could not confirm quiescence: witness still live",
+            "Process supervision launch failed: RuntimeError: cleanup exploded",
         )
 
     monkeypatch.setattr(plugin, "run_auto_pr", failed_launch)
@@ -439,7 +437,7 @@ def test_run_coder_failed_launch_cleanup_without_handle_parks_error(
 
     assert result is None
     assert runner.state.state == PipelineState.ERROR
-    assert "witness still live" in (runner.state.error_message or "")
+    assert "cleanup exploded" in (runner.state.error_message or "")
     assert runner._current_coder_supervised_process is None
     assert runner._coder_cleanup_failure_detail is not None
     assert asyncio.run(runner._hold_for_coder_cleanup()) is True

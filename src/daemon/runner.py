@@ -2259,12 +2259,14 @@ class PipelineRunner(
         self, result: tuple[int, str, str]
     ) -> None:
         """Retain launch cleanup failures that precede handle publication."""
-        stderr = result[2]
-        if "failed launch cleanup" not in stderr.lower():
+        stderr = result[2].strip()
+        if not stderr.lower().startswith("process supervision launch failed:"):
             return
-        self._coder_cleanup_failure_detail = stderr.strip() or (
-            "failed launch cleanup could not confirm quiescence"
-        )
+        # The CLI adapters cannot publish a supervised handle until launch
+        # succeeds, and their tuple result does not carry a structured cleanup
+        # outcome. Fail closed for every launch-supervision error rather than
+        # inferring quiescence from one exception-message spelling.
+        self._coder_cleanup_failure_detail = stderr
 
     async def _refresh_user_paused_from_redis(self) -> None:
         """Merge the persisted ``user_paused`` flag into in-memory state."""
