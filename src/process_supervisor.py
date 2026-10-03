@@ -1132,6 +1132,8 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
     if kwargs.get("close_fds") is False:
         raise TypeError("launch_process requires close_fds=True")
     target_executable = os.fspath(kwargs.pop("executable", program[0]))
+    if not target_executable:
+        raise ValueError("executable must not be empty")
     caller_pass_fds = tuple(kwargs.pop("pass_fds", ()))
     restore_signals = kwargs.get("restore_signals", True)
     signal_modes = _target_signal_modes(restore_signals)

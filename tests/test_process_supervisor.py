@@ -1540,6 +1540,10 @@ async def test_launch_rejects_conflicts_and_unverified_session(
             "true",
             env={"PATH": os.defpath, b"PATH": os.fsencode(os.defpath)},
         )
+    with pytest.raises(ValueError, match="executable must not be empty"):
+        await launch_process("")
+    with pytest.raises(ValueError, match="executable must not be empty"):
+        await launch_process("true", executable="")
     with pytest.raises(FileNotFoundError):
         await launch_process("/definitely/missing/process-supervisor-command")
 
