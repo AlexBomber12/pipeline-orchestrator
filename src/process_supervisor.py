@@ -318,6 +318,20 @@ class SupervisedProcess:
                 observation.state is _GroupState.QUIESCENT
                 and self.process.returncode is not None
             ):
+                membership_changed, reap_error = self._reap_adopted_zombies(
+                    observation.members
+                )
+                if reap_error is not None:
+                    return _GroupObservation(
+                        _GroupState.UNKNOWN, reap_error
+                    ), signal_sent
+                if membership_changed:
+                    quiet_members = None
+                    # Re-enumerate after every reap or disappearance.  The
+                    # resulting snapshot, not the stale zombie-only one, is
+                    # the evidence used to establish quiescence.
+                    await asyncio.sleep(0)
+                    continue
                 if observation.definitive:
                     return observation, signal_sent
                 if observation.witness_live:
@@ -685,6 +699,52 @@ class SupervisedProcess:
             # Outside a PID-1 daemon, the host's init process owns reaping.
             pass
 
+    def _reap_adopted_zombies(
+        self, members: tuple[tuple[int, int, str], ...]
+    ) -> tuple[bool, str | None]:
+        """Reap owned descendants adopted by a PID-1/subreaper caller."""
+        witness = self._lifecycle_witness
+        witness_identity = (
+            (witness.pid, witness.start_time) if witness is not None else None
+        )
+        membership_changed = False
+        for pid, start_time, state in members:
+            identity = (pid, start_time)
+            if (
+                state != "Z"
+                or identity == witness_identity
+                or pid == self.identity.leader_pid
+            ):
+                continue
+            pidfd, error = self._open_owned_pidfd(
+                pid, start_time, allow_zombie=True
+            )
+            if error is not None:
+                return membership_changed, error.detail
+            if pidfd is None:
+                membership_changed = True
+                continue
+            try:
+                try:
+                    waited = os.waitid(
+                        os.P_PIDFD, pidfd, os.WEXITED | os.WNOHANG
+                    )
+                except ChildProcessError:
+                    # A different parent (normally host init) owns reaping.
+                    continue
+                except OSError as exc:
+                    if exc.errno in _DISAPPEARED_ERRNOS:
+                        membership_changed = True
+                        continue
+                    return (
+                        membership_changed,
+                        f"could not reap owned process-group member: {exc}",
+                    )
+                membership_changed = membership_changed or waited is not None
+            finally:
+                os.close(pidfd)
+        return membership_changed, None
+
     def _revalidate_member(
         self, member: _GroupMember
     ) -> tuple[bool, _GroupObservation | None]:
@@ -711,7 +771,11 @@ class SupervisedProcess:
         )
 
     def _open_owned_pidfd(
-        self, pid: int, expected_start_time: int
+        self,
+        pid: int,
+        expected_start_time: int,
+        *,
+        allow_zombie: bool = False,
     ) -> tuple[int | None, _GroupObservation | None]:
         opener = getattr(os, "pidfd_open", None)
         if opener is None:
@@ -749,7 +813,7 @@ class SupervisedProcess:
                     "process identity changed while acquiring stable handle",
                 )
             if (
-                state == "Z"
+                (state == "Z" and not allow_zombie)
                 or pgid != self.identity.process_group_id
                 or sid != self.identity.session_id
             ):
