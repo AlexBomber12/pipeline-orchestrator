@@ -14,6 +14,7 @@ Verifies the three async helpers extracted from ``handle_coding``:
 from __future__ import annotations
 
 import asyncio
+import types
 from typing import Any
 
 import pytest
@@ -59,6 +60,9 @@ def test_prepare_coder_invocation_returns_kwargs_with_breach_env(
     assert runner._current_breach_run_id == "run-abc"
     assert "timeout" in kwargs
     assert kwargs["on_process_start"] == runner._track_current_coder_process
+    assert kwargs["on_supervised_process_start"] == (
+        runner._track_current_coder_supervised_process
+    )
 
 
 # ---------- _run_coder_with_supervision ----------
@@ -195,6 +199,318 @@ def test_run_coder_with_supervision_returns_completion_on_normal_exit(
     )
 
     assert result == (0, "out", "")
+
+
+def test_run_coder_cleanup_failure_precedes_normal_result_processing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    coder_name, plugin = runner._get_coder()
+
+    class _Process:
+        returncode = 0
+
+    class _Managed:
+        process = _Process()
+
+        async def cleanup(self, **kwargs: object) -> object:
+            return types.SimpleNamespace(
+                quiescent=False,
+                detail="owned descendant still live",
+            )
+
+    managed = _Managed()
+
+    async def cli_returns_after_failed_cleanup(
+        *args: Any, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        kwargs["on_process_start"](managed.process)
+        kwargs["on_supervised_process_start"](managed)
+        return (0, "out", "")
+
+    monkeypatch.setattr(plugin, "run_auto_pr", cli_returns_after_failed_cleanup)
+    monkeypatch.setattr(runner, "_check_late_breach", lambda *a, **kw: None)
+    monkeypatch.setattr(runner, "_cleanup_breach_marker", lambda *a, **kw: None)
+    runner._current_breach_dir = "/tmp/breach-cleanup-failure"
+    runner._current_breach_run_id = "run-cleanup-failure"
+
+    result = asyncio.run(
+        runner._run_coder_with_supervision(
+            coder_name,
+            plugin,
+            {
+                "on_process_start": runner._track_current_coder_process,
+                "on_supervised_process_start": (
+                    runner._track_current_coder_supervised_process
+                ),
+            },
+            target_branch="pr-001",
+            current_pr_id="PR-001",
+            pr_id="PR-001",
+            task_file="tasks/PR-001.md",
+            task_body="# PR-001\n",
+        )
+    )
+
+    assert result is None
+    assert runner.state.state == PipelineState.ERROR
+    assert "owned descendant still live" in (runner.state.error_message or "")
+    assert runner._current_coder_supervised_process is managed
+    assert runner._current_coder_process is managed.process
+
+
+def test_handle_coding_preserves_branch_marker_on_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    _coder_name, plugin = runner._get_coder()
+    branch_cleanup_calls: list[str] = []
+
+    async def fake_run(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        return (
+            -1,
+            "",
+            "Process supervision launch failed: RuntimeError: cleanup timed "
+            "out without a structured outcome",
+        )
+
+    monkeypatch.setattr(plugin, "run_auto_pr", fake_run)
+    monkeypatch.setattr(runner, "_check_late_breach", lambda *a, **kw: None)
+    monkeypatch.setattr(runner, "_cleanup_breach_marker", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        runner,
+        "_cleanup_expected_branch",
+        lambda: branch_cleanup_calls.append("removed"),
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert branch_cleanup_calls == []
+    assert any(
+        "Preserving expected-branch marker" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_run_coder_cancellation_confirms_cleanup_before_propagating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    coder_name, plugin = runner._get_coder()
+    runner._current_breach_dir = "/tmp/breach-cancel"
+    runner._current_breach_run_id = "run-cancel"
+    monkeypatch.setattr(runner, "_check_late_breach", lambda *a, **kw: None)
+    monkeypatch.setattr(runner, "_cleanup_breach_marker", lambda *a, **kw: None)
+
+    async def scenario() -> None:
+        started = asyncio.Event()
+        cleaned = asyncio.Event()
+
+        class _Process:
+            returncode = None
+
+        class _Managed:
+            process = _Process()
+
+            async def cleanup(self, **kwargs: object) -> object:
+                cleaned.set()
+                return types.SimpleNamespace(quiescent=True, detail=None)
+
+        managed = _Managed()
+
+        async def cli_waits(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+            kwargs["on_process_start"](managed.process)
+            kwargs["on_supervised_process_start"](managed)
+            started.set()
+            await asyncio.Future()
+            return (0, "", "")
+
+        monkeypatch.setattr(plugin, "run_auto_pr", cli_waits)
+        task = asyncio.create_task(
+            runner._run_coder_with_supervision(
+                coder_name,
+                plugin,
+                {
+                    "on_process_start": runner._track_current_coder_process,
+                    "on_supervised_process_start": (
+                        runner._track_current_coder_supervised_process
+                    ),
+                },
+                target_branch="pr-001",
+                current_pr_id="PR-001",
+                pr_id="PR-001",
+                task_file="tasks/PR-001.md",
+                task_body="# PR-001\n",
+            )
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cleaned.is_set()
+
+    asyncio.run(scenario())
+
+    assert runner._current_coder_supervised_process is None
+    assert runner._current_coder_process is None
+
+
+def test_run_coder_stop_during_launch_settles_before_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    coder_name, plugin = runner._get_coder()
+    runner._current_breach_dir = "/tmp/breach-launch-stop"
+    runner._current_breach_run_id = "run-launch-stop"
+    runner.redis.store[f"control:{runner.name}:stop"] = "1"
+    monkeypatch.setattr(runner, "_check_late_breach", lambda *a, **kw: None)
+    monkeypatch.setattr(runner, "_cleanup_breach_marker", lambda *a, **kw: None)
+
+    async def cli_launches_slowly(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        await asyncio.Future()
+        return (0, "", "")
+
+    monkeypatch.setattr(plugin, "run_auto_pr", cli_launches_slowly)
+
+    result = asyncio.run(
+        runner._run_coder_with_supervision(
+            coder_name,
+            plugin,
+            {
+                "on_process_start": runner._track_current_coder_process,
+                "on_supervised_process_start": (
+                    runner._track_current_coder_supervised_process
+                ),
+            },
+            target_branch="pr-001",
+            current_pr_id="PR-001",
+            pr_id="PR-001",
+            task_file="tasks/PR-001.md",
+            task_body="# PR-001\n",
+        )
+    )
+
+    assert result is None
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.user_paused is True
+    assert runner._coder_invocation_active is False
+    assert runner._current_coder_process is None
+
+
+def test_run_coder_failed_launch_cleanup_without_handle_parks_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    coder_name, plugin = runner._get_coder()
+    runner._current_breach_dir = "/tmp/breach-launch-cleanup"
+    runner._current_breach_run_id = "run-launch-cleanup"
+    monkeypatch.setattr(runner, "_check_late_breach", lambda *a, **kw: None)
+    monkeypatch.setattr(runner, "_cleanup_breach_marker", lambda *a, **kw: None)
+
+    async def failed_launch(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        return (
+            -1,
+            "",
+            "Process supervision launch failed: RuntimeError: cleanup exploded",
+        )
+
+    monkeypatch.setattr(plugin, "run_auto_pr", failed_launch)
+
+    result = asyncio.run(
+        runner._run_coder_with_supervision(
+            coder_name,
+            plugin,
+            {
+                "on_process_start": runner._track_current_coder_process,
+                "on_supervised_process_start": (
+                    runner._track_current_coder_supervised_process
+                ),
+            },
+            target_branch="pr-001",
+            current_pr_id="PR-001",
+            pr_id="PR-001",
+            task_file="tasks/PR-001.md",
+            task_body="# PR-001\n",
+        )
+    )
+
+    assert result is None
+    assert runner.state.state == PipelineState.ERROR
+    assert "cleanup exploded" in (runner.state.error_message or "")
+    assert runner._current_coder_supervised_process is None
+    assert runner._coder_cleanup_failure_detail is not None
+    assert asyncio.run(runner._hold_for_coder_cleanup()) is True
+
+
+def test_run_coder_breach_cleanup_failure_wins_over_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    coder_name, plugin = runner._get_coder()
+    runner._current_breach_dir = "/tmp/breach-cleanup"
+    runner._current_breach_run_id = "run-breach-cleanup"
+
+    class _Process:
+        returncode = None
+
+    class _Managed:
+        process = _Process()
+
+        async def cleanup(self, **kwargs: object) -> object:
+            return types.SimpleNamespace(
+                quiescent=False,
+                detail="breach cleanup unconfirmed",
+            )
+
+    managed = _Managed()
+
+    async def cli_waits(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        kwargs["on_process_start"](managed.process)
+        kwargs["on_supervised_process_start"](managed)
+        await asyncio.Future()
+        return (0, "", "")
+
+    async def breach_monitor(
+        self: object,
+        breach_dir: str,
+        run_id: str,
+        task: asyncio.Task,  # type: ignore[type-arg]
+        flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+        flag["breached"] = True
+        task.cancel()
+
+    monkeypatch.setattr(plugin, "run_auto_pr", cli_waits)
+    monkeypatch.setattr(
+        type(runner), "_monitor_inflight_breach", breach_monitor
+    )
+    monkeypatch.setattr(runner, "_check_late_breach", lambda *a, **kw: None)
+    monkeypatch.setattr(runner, "_cleanup_breach_marker", lambda *a, **kw: None)
+
+    result = asyncio.run(
+        runner._run_coder_with_supervision(
+            coder_name,
+            plugin,
+            {
+                "on_process_start": runner._track_current_coder_process,
+                "on_supervised_process_start": (
+                    runner._track_current_coder_supervised_process
+                ),
+            },
+            target_branch="pr-001",
+            current_pr_id="PR-001",
+            pr_id="PR-001",
+            task_file="tasks/PR-001.md",
+            task_body="# PR-001\n",
+        )
+    )
+
+    assert result is None
+    assert runner.state.state == PipelineState.ERROR
+    assert "breach cleanup unconfirmed" in (runner.state.error_message or "")
+    assert runner._current_coder_supervised_process is managed
 
 
 # ---------- _post_coder_resolution ----------
