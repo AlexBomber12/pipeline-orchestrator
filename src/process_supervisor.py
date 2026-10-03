@@ -17,6 +17,7 @@ import asyncio
 import errno
 import math
 import os
+import pickle
 import select
 import signal
 import socket
@@ -32,8 +33,19 @@ _DISAPPEARED_ERRNOS = {errno.ENOENT, errno.ESRCH}
 _LAUNCH_PROOF = object()
 _WITNESS_LAUNCHER = r"""
 import os
+import pickle
 import signal
 import sys
+
+
+def read_exact(fd, size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = os.read(fd, size - len(data))
+        if not chunk:
+            break
+        data.extend(chunk)
+    return bytes(data)
 
 control_fd = int(sys.argv[1])
 ready_fd = int(sys.argv[2])
@@ -62,8 +74,10 @@ witness_pid = os.read(pid_read, 64)
 os.close(pid_read)
 os.waitpid(broker_pid, 0)
 os.write(ready_fd, b"W" + witness_pid + b"\n")
-if os.read(ready_fd, 1) != b"A":
+header = read_exact(ready_fd, 9)
+if len(header) != 9 or header[:1] != b"A":
     os._exit(126)
+target_env = pickle.loads(read_exact(ready_fd, int.from_bytes(header[1:], "big")))
 os.close(control_fd)
 os.set_inheritable(ready_fd, False)
 if restore_signals:
@@ -72,7 +86,7 @@ if restore_signals:
         if target_signal is not None:
             signal.signal(target_signal, signal.SIG_DFL)
 try:
-    os.execvpe(target_executable, target_argv, os.environ)
+    os.execvpe(target_executable, target_argv, target_env)
 except OSError as exc:
     os.write(ready_fd, b"E" + str(exc.errno).encode("ascii") + b"\n")
     os._exit(127)
@@ -760,6 +774,11 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
     target_executable = os.fspath(kwargs.pop("executable", program[0]))
     caller_pass_fds = tuple(kwargs.pop("pass_fds", ()))
     restore_signals = kwargs.get("restore_signals", True)
+    requested_env = kwargs.pop("env", None)
+    target_env = dict(os.environ if requested_env is None else requested_env)
+    target_env_payload = pickle.dumps(
+        target_env, protocol=pickle.HIGHEST_PROTOCOL
+    )
     control_read, control_write = os.pipe()
     ready_parent, ready_child = socket.socketpair()
     ready_parent.setblocking(False)
@@ -771,6 +790,8 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
     try:
         process = await asyncio.create_subprocess_exec(
             sys.executable,
+            "-I",
+            "-S",
             "-c",
             _WITNESS_LAUNCHER,
             str(control_read),
@@ -831,7 +852,12 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
             or current_start_time != witness_start_time
         ):
             raise RuntimeError("lifecycle ownership witness changed during launch")
-        await loop.sock_sendall(ready_parent, b"A")
+        await loop.sock_sendall(
+            ready_parent,
+            b"A"
+            + len(target_env_payload).to_bytes(8, "big")
+            + target_env_payload,
+        )
         launcher_blocked = False
         while chunk := await loop.sock_recv(ready_parent, 64):
             exec_payload += chunk

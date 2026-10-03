@@ -226,6 +226,31 @@ async def test_launch_restores_default_sigpipe_disposition(
 
 
 @pytest.mark.asyncio
+async def test_target_environment_is_isolated_from_launcher(
+    process_pool: ProcessPool,
+) -> None:
+    managed = await launch_process(
+        "/bin/sh",
+        "-c",
+        'test "$TARGET_ONLY" = expected',
+        env={
+            "PYTHONHOME": "/definitely/invalid",
+            "PYTHONPATH": "/also/invalid",
+            "TARGET_ONLY": "expected",
+        },
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    process_pool.supervised.append(
+        (managed, managed.identity.process_group_id)
+    )
+
+    assert await managed.process.wait() == 0
+    result = await managed.cleanup(term_grace=0.5, kill_grace=0.5)
+    assert result.quiescent
+
+
+@pytest.mark.asyncio
 async def test_early_leader_exit_cleans_child_grandchild_and_retained_pipes(
     process_pool: ProcessPool,
 ) -> None:
