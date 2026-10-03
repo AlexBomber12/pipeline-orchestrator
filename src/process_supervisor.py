@@ -1063,23 +1063,36 @@ async def _await_launch_phase(
 async def _finish_failed_launch(
     process: asyncio.subprocess.Process | None,
     *,
-    owned_pidfds: list[tuple[tuple[int, int], int]],
+    owned_process: SupervisedProcess | None,
     control_fd: int,
     witness_pid: int | None,
     witness_pidfd: int | None,
 ) -> None:
+    if owned_process is not None:
+        result = await owned_process.cleanup(
+            term_grace=0,
+            kill_grace=_LAUNCH_CLEANUP_TIMEOUT_SECONDS,
+        )
+        if result.quiescent:
+            return
+        if process is not None and process.returncode is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                await asyncio.wait_for(
+                    process.wait(), _LAUNCH_CLEANUP_TIMEOUT_SECONDS
+                )
+            except TimeoutError:
+                pass
+        raise RuntimeError(
+            "failed launch cleanup could not confirm quiescence: "
+            f"{result.detail or 'unknown cleanup failure'}"
+        )
+
     try:
-        sender = getattr(signal, "pidfd_send_signal", None)
-        leader_signaled = False
-        if sender is not None:
-            for identity, pidfd in owned_pidfds:
-                try:
-                    sender(pidfd, signal.SIGKILL)
-                except OSError:
-                    continue
-                if process is not None and identity[0] == process.pid:
-                    leader_signaled = True
-        if process is not None and not leader_signaled:
+        if process is not None:
             try:
                 process.kill()
             except OSError:
@@ -1101,30 +1114,6 @@ async def _finish_failed_launch(
                     )
                 except TimeoutError:
                     pass
-        if owned_pidfds:
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + _LAUNCH_CLEANUP_TIMEOUT_SECONDS
-            pending = list(owned_pidfds)
-            while pending:
-                still_pending: list[tuple[tuple[int, int], int]] = []
-                for identity, pidfd in pending:
-                    try:
-                        waited = os.waitid(
-                            os.P_PIDFD, pidfd, os.WEXITED | os.WNOHANG
-                        )
-                    except ChildProcessError:
-                        continue
-                    except OSError as exc:
-                        if exc.errno in _DISAPPEARED_ERRNOS:
-                            continue
-                        still_pending.append((identity, pidfd))
-                    else:
-                        if waited is None:
-                            still_pending.append((identity, pidfd))
-                if not still_pending or loop.time() >= deadline:
-                    break
-                pending = still_pending
-                await asyncio.sleep(_POLL_INTERVAL_SECONDS)
         if witness_pid is not None:
             loop = asyncio.get_running_loop()
             deadline = loop.time() + _LAUNCH_CLEANUP_TIMEOUT_SECONDS
@@ -1152,12 +1141,13 @@ async def _finish_failed_launch(
     finally:
         if witness_pidfd is not None:
             os.close(witness_pidfd)
-        SupervisedProcess._close_pidfds(owned_pidfds)
 
 
 async def _wait_without_cancelling(task: asyncio.Task[None]) -> None:
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + (5 * _LAUNCH_CLEANUP_TIMEOUT_SECONDS)
+    # Owned cleanup may spend one bound each on KILL, leader publication,
+    # adopted-child reaping, witness exit, and forced witness exit.
+    deadline = loop.time() + (6 * _LAUNCH_CLEANUP_TIMEOUT_SECONDS)
     while not task.done():
         remaining = deadline - loop.time()
         if remaining <= 0:
@@ -1361,7 +1351,7 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
             ),
         )
     except BaseException:
-        owned_pidfds: list[tuple[tuple[int, int], int]] = []
+        owned_process: SupervisedProcess | None = None
         if (
             process is not None
             and witness_proven
@@ -1369,7 +1359,7 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
             and witness_start_time is not None
             and witness_pidfd is not None
         ):
-            failed_process = SupervisedProcess(
+            owned_process = SupervisedProcess(
                 process,
                 ProcessIdentity(
                     process.pid,
@@ -1385,20 +1375,10 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
                     control_write,
                 ),
             )
-            for _ in range(_SNAPSHOT_RETRIES):
-                observation, captured_pidfds = failed_process._snapshot_group(
-                    acquire_pidfds=True
-                )
-                if observation.state is not _GroupState.CHANGED:
-                    break
-            if observation.state is _GroupState.LIVE:
-                owned_pidfds = captured_pidfds
-            else:
-                SupervisedProcess._close_pidfds(captured_pidfds)
         cleanup_task = asyncio.create_task(
             _finish_failed_launch(
                 process,
-                owned_pidfds=owned_pidfds,
+                owned_process=owned_process,
                 control_fd=control_write,
                 witness_pid=witness_pid,
                 witness_pidfd=witness_pidfd,

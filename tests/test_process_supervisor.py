@@ -6,6 +6,7 @@ import errno
 import io
 import math
 import os
+import select
 import signal
 import socket
 import sys
@@ -1531,7 +1532,7 @@ async def test_launch_deadline_helpers_bound_stubborn_tasks(
         )
         await process_supervisor._finish_failed_launch(
             fake_process,  # type: ignore[arg-type]
-            owned_pidfds=[],
+            owned_process=None,
             control_fd=control_read,
             witness_pid=None,
             witness_pidfd=None,
@@ -1539,67 +1540,107 @@ async def test_launch_deadline_helpers_bound_stubborn_tasks(
     os.close(control_write)
     assert fake_process.kill_calls == 2
 
-    class StableLeaderProcess:
-        pid = os.getpid()
+    class OwnedCleanup:
+        def __init__(
+            self,
+            control_fd: int,
+            result: process_supervisor.CleanupResult,
+        ) -> None:
+            self.control_fd = control_fd
+            self.result = result
 
-        def kill(self) -> None:
-            raise AssertionError("stable leader handle must avoid numeric PID signaling")
-
-        async def wait(self) -> int:
-            return 0
-
-    stable_process = StableLeaderProcess()
-    owned_pidfds = [
-        ((stable_process.pid, 1), os.pidfd_open(stable_process.pid)),
-        ((stable_process.pid + 1, 2), os.pidfd_open(stable_process.pid)),
-        ((stable_process.pid + 2, 3), os.pidfd_open(stable_process.pid)),
-        ((stable_process.pid + 3, 4), os.pidfd_open(stable_process.pid)),
-    ]
-    signal_calls: list[tuple[int, signal.Signals]] = []
-
-    def signal_stable_handle(pidfd: int, sig: signal.Signals) -> None:
-        signal_calls.append((pidfd, sig))
-        if pidfd == owned_pidfds[1][1]:
-            raise ProcessLookupError
-
-    def reap_stable_handle(_idtype: int, pidfd: int, _options: int) -> Any:
-        if pidfd == owned_pidfds[0][1]:
-            raise ChildProcessError
-        if pidfd == owned_pidfds[1][1]:
-            raise ProcessLookupError(errno.ESRCH, "gone")
-        if pidfd == owned_pidfds[2][1]:
-            return None
-        raise PermissionError("not an adopted child")
+        async def cleanup(
+            self, *, term_grace: float, kill_grace: float
+        ) -> process_supervisor.CleanupResult:
+            assert term_grace == 0
+            assert kill_grace == process_supervisor._LAUNCH_CLEANUP_TIMEOUT_SECONDS
+            os.close(self.control_fd)
+            return self.result
 
     control_read, control_write = os.pipe()
-    with monkeypatch.context() as patch:
-        patch.setattr(os, "killpg", lambda *_args: pytest.fail("numeric group signal"))
-        patch.setattr(os, "waitid", reap_stable_handle)
-        patch.setattr(signal, "pidfd_send_signal", signal_stable_handle)
-        patch.setattr(
-            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.01
-        )
+    successful_owner = OwnedCleanup(
+        control_read,
+        process_supervisor.CleanupResult(
+            CleanupStatus.QUIESCENT, 0, True, True
+        ),
+    )
+    await process_supervisor._finish_failed_launch(
+        None,
+        owned_process=successful_owner,  # type: ignore[arg-type]
+        control_fd=control_read,
+        witness_pid=None,
+        witness_pidfd=None,
+    )
+    os.close(control_write)
+
+    class ReapableProcess:
+        returncode: int | None = None
+
+        def kill(self) -> None:
+            self.returncode = -signal.SIGKILL
+
+        async def wait(self) -> int:
+            assert self.returncode is not None
+            return self.returncode
+
+    control_read, control_write = os.pipe()
+    failed_owner = OwnedCleanup(
+        control_read,
+        process_supervisor.CleanupResult(
+            CleanupStatus.FAILED,
+            None,
+            False,
+            False,
+            "ownership lost",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="ownership lost"):
         await process_supervisor._finish_failed_launch(
-            stable_process,  # type: ignore[arg-type]
-            owned_pidfds=owned_pidfds,
+            ReapableProcess(),  # type: ignore[arg-type]
+            owned_process=failed_owner,  # type: ignore[arg-type]
             control_fd=control_read,
             witness_pid=None,
             witness_pidfd=None,
         )
     os.close(control_write)
-    assert signal_calls == [
-        (pidfd, signal.SIGKILL) for _, pidfd in owned_pidfds
-    ]
-    for _, pidfd in owned_pidfds:
-        with pytest.raises(OSError, match="Bad file descriptor"):
-            os.fstat(pidfd)
+
+    class UnreapableProcess:
+        returncode = None
+
+        def kill(self) -> None:
+            raise ProcessLookupError
+
+        async def wait(self) -> int:
+            await asyncio.Event().wait()
+            return 0
+
+    control_read, control_write = os.pipe()
+    failed_owner = OwnedCleanup(
+        control_read,
+        process_supervisor.CleanupResult(
+            CleanupStatus.FAILED, None, False, False, None
+        ),
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0
+        )
+        with pytest.raises(RuntimeError, match="unknown cleanup failure"):
+            await process_supervisor._finish_failed_launch(
+                UnreapableProcess(),  # type: ignore[arg-type]
+                owned_process=failed_owner,  # type: ignore[arg-type]
+                control_fd=control_read,
+                witness_pid=None,
+                witness_pidfd=None,
+            )
+    os.close(control_write)
 
     control_read, control_write = os.pipe()
     with monkeypatch.context() as patch:
         patch.setattr(os, "waitpid", lambda pid, _options: (pid, 0))
         await process_supervisor._finish_failed_launch(
             None,
-            owned_pidfds=[],
+            owned_process=None,
             control_fd=control_read,
             witness_pid=4321,
             witness_pidfd=None,
@@ -1617,7 +1658,7 @@ async def test_launch_deadline_helpers_bound_stubborn_tasks(
         )
         await process_supervisor._finish_failed_launch(
             None,
-            owned_pidfds=[],
+            owned_process=None,
             control_fd=control_read,
             witness_pid=4321,
             witness_pidfd=None,
@@ -1638,7 +1679,7 @@ async def test_launch_deadline_helpers_bound_stubborn_tasks(
         )
         await process_supervisor._finish_failed_launch(
             None,
-            owned_pidfds=[],
+            owned_process=None,
             control_fd=control_read,
             witness_pid=4321,
             witness_pidfd=stable_pidfd,
@@ -1957,6 +1998,78 @@ async def test_launch_rejects_conflicts_and_unverified_session(
         patch.setattr(asyncio, "create_subprocess_exec", spawn_failed)
         with pytest.raises(RuntimeError, match="spawn failed"):
             await launch_process(sys.executable, "-c", "pass")
+
+
+@pytest.mark.asyncio
+async def test_failed_launch_reconciles_descendant_forked_during_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trigger_read, trigger_write = os.pipe()
+    report_read, report_write = os.pipe()
+    observed_pids: list[int] = []
+    fork_requested = False
+    real_sender = signal.pidfd_send_signal
+    target = f"""
+import os
+import signal
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+os.read({trigger_read}, 1)
+child_pid = os.fork()
+if child_pid == 0:
+    while True:
+        signal.pause()
+os.write({report_write}, f"{{os.getpid()}} {{child_pid}}\\n".encode("ascii"))
+while True:
+    signal.pause()
+"""
+
+    def fork_before_first_signal(pidfd: int, sig: int) -> None:
+        nonlocal fork_requested
+        if not fork_requested:
+            fork_requested = True
+            os.write(trigger_write, b"x")
+            readable, _, _ = select.select([report_read], [], [], 1)
+            if not readable:
+                raise RuntimeError("target did not fork during signal delivery")
+            observed_pids.extend(
+                int(value) for value in os.read(report_read, 64).split()
+            )
+        real_sender(pidfd, sig)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "getpgid", lambda _pid: -1)
+            patch.setattr(signal, "pidfd_send_signal", fork_before_first_signal)
+            with pytest.raises(RuntimeError, match="dedicated session"):
+                await launch_process(
+                    sys.executable,
+                    "-c",
+                    target,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    pass_fds=(trigger_read, report_write),
+                )
+
+        assert fork_requested
+        assert len(observed_pids) == 2
+        await _wait_not_live(*observed_pids)
+    finally:
+        for fd in (trigger_read, trigger_write, report_read, report_write):
+            os.close(fd)
+        for pid in observed_pids:
+            if _pid_is_live(pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        if observed_pids:
+            await _wait_not_live(*observed_pids)
+        for pid in observed_pids:
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
 
 
 @pytest.mark.asyncio
