@@ -452,6 +452,31 @@ async def test_unknown_group_state_and_signal_errors_return_failure(
 
 
 @pytest.mark.asyncio
+async def test_proc_scan_ignores_disappeared_unrelated_entry(
+    process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed = await process_pool.launch(SLEEPING_PROCESS)
+    await _read_pids(managed.process)
+    real_open = open
+    skipped = False
+
+    def disappearing_entry(path: str, *args: Any, **kwargs: Any) -> Any:
+        nonlocal skipped
+        if path == "/proc/1/stat":
+            skipped = True
+            raise FileNotFoundError
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        process_supervisor, "open", disappearing_entry, raising=False
+    )
+    observation = managed._observe_group()
+
+    assert skipped
+    assert observation.state is _GroupState.LIVE
+
+
+@pytest.mark.asyncio
 async def test_signal_races_do_not_turn_disappearance_into_failure(
     process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
