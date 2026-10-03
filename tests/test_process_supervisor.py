@@ -226,6 +226,32 @@ async def test_launch_restores_default_sigpipe_disposition(
 
 
 @pytest.mark.asyncio
+async def test_launch_preserves_default_sigpipe_when_restore_is_disabled(
+    process_pool: ProcessPool,
+) -> None:
+    previous_sigpipe = signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    try:
+        managed = await launch_process(
+            "/bin/sleep",
+            "30",
+            restore_signals=False,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    finally:
+        signal.signal(signal.SIGPIPE, previous_sigpipe)
+    process_pool.supervised.append(
+        (managed, managed.identity.process_group_id)
+    )
+
+    managed.process.send_signal(signal.SIGPIPE)
+
+    assert await asyncio.wait_for(managed.process.wait(), timeout=1) == -signal.SIGPIPE
+    result = await managed.cleanup(term_grace=0.5, kill_grace=0.5)
+    assert result.quiescent
+
+
+@pytest.mark.asyncio
 async def test_target_environment_is_isolated_from_launcher(
     process_pool: ProcessPool,
 ) -> None:
@@ -1120,6 +1146,45 @@ async def test_launch_rejects_conflicts_and_unverified_session(
                 f"from pathlib import Path; Path({str(target_marker)!r}).touch()",
             )
     assert not target_marker.exists()
+
+    cancellation_marker = tmp_path / "cancelled-target-ran"
+    ready_received = asyncio.Event()
+    release_ready = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    real_read_witness_ready = process_supervisor._read_witness_ready
+    real_finish_failed_launch = process_supervisor._finish_failed_launch
+
+    async def delayed_ready(ready_socket: Any) -> bytes:
+        payload = await real_read_witness_ready(ready_socket)
+        ready_received.set()
+        await release_ready.wait()
+        return payload
+
+    async def delayed_cleanup(*args: Any, **kwargs: Any) -> None:
+        cleanup_started.set()
+        await release_cleanup.wait()
+        await real_finish_failed_launch(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(process_supervisor, "_read_witness_ready", delayed_ready)
+        patch.setattr(process_supervisor, "_finish_failed_launch", delayed_cleanup)
+        launch_task = asyncio.create_task(
+            launch_process(
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(cancellation_marker)!r}).touch()",
+            )
+        )
+        await asyncio.wait_for(ready_received.wait(), timeout=1)
+        launch_task.cancel()
+        release_ready.set()
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        launch_task.cancel()
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(launch_task, timeout=1)
+    assert not cancellation_marker.exists()
 
     with monkeypatch.context() as patch:
         patch.setattr(process_supervisor, "_get_pidfd_opener", lambda: None)

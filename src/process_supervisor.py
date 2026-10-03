@@ -30,6 +30,7 @@ _POLL_INTERVAL_SECONDS = 0.01
 _SNAPSHOT_RETRIES = 3
 _WITNESS_EXIT_GRACE_SECONDS = 1.0
 _DISAPPEARED_ERRNOS = {errno.ENOENT, errno.ESRCH}
+_RESTORED_SIGNAL_NAMES = ("SIGPIPE", "SIGXFZ", "SIGXFSZ")
 _LAUNCH_PROOF = object()
 _WITNESS_LAUNCHER = r"""
 import os
@@ -49,7 +50,7 @@ def read_exact(fd, size):
 
 control_fd = int(sys.argv[1])
 ready_fd = int(sys.argv[2])
-restore_signals = sys.argv[3] == "1"
+signal_modes = sys.argv[3]
 target_executable = sys.argv[4]
 target_argv = sys.argv[5:]
 max_fd = os.sysconf("SC_OPEN_MAX")
@@ -80,11 +81,11 @@ if len(header) != 9 or header[:1] != b"A":
 target_env = pickle.loads(read_exact(ready_fd, int.from_bytes(header[1:], "big")))
 os.close(control_fd)
 os.set_inheritable(ready_fd, False)
-if restore_signals:
-    for signal_name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
-        target_signal = getattr(signal, signal_name, None)
-        if target_signal is not None:
-            signal.signal(target_signal, signal.SIG_DFL)
+for signal_name, mode in zip(("SIGPIPE", "SIGXFZ", "SIGXFSZ"), signal_modes):
+    target_signal = getattr(signal, signal_name, None)
+    if target_signal is not None:
+        disposition = signal.SIG_IGN if mode == "I" else signal.SIG_DFL
+        signal.signal(target_signal, disposition)
 try:
     os.execvpe(target_executable, target_argv, target_env)
 except OSError as exc:
@@ -797,6 +798,67 @@ def _validated_environment(environment: Any) -> dict[Any, Any]:
     return copied
 
 
+def _target_signal_modes(restore_signals: bool) -> str:
+    modes = []
+    for signal_name in _RESTORED_SIGNAL_NAMES:
+        target_signal = getattr(signal, signal_name, None)
+        ignored = (
+            not restore_signals
+            and target_signal is not None
+            and signal.getsignal(target_signal) == signal.SIG_IGN
+        )
+        modes.append("I" if ignored else "D")
+    return "".join(modes)
+
+
+async def _read_witness_ready(ready_socket: socket.socket) -> bytes:
+    ready_payload = bytearray()
+    loop = asyncio.get_running_loop()
+    while b"\n" not in ready_payload:
+        chunk = await loop.sock_recv(ready_socket, 64)
+        if not chunk:
+            break
+        ready_payload.extend(chunk)
+    return bytes(ready_payload)
+
+
+async def _finish_failed_launch(
+    process: asyncio.subprocess.Process | None,
+    *,
+    group_contained: bool,
+    control_fd: int,
+    witness_pid: int | None,
+    witness_pidfd: int | None,
+) -> None:
+    if process is not None:
+        try:
+            if group_contained:
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
+    os.close(control_fd)
+    if process is not None:
+        await process.wait()
+    if witness_pid is not None:
+        try:
+            os.waitpid(witness_pid, 0)
+        except ChildProcessError:
+            pass
+    if witness_pidfd is not None:
+        os.close(witness_pidfd)
+
+
+async def _wait_without_cancelling(task: asyncio.Task[None]) -> None:
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    task.result()
+
+
 async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
     """Launch ``program`` in a new Linux session and retain its group identity."""
     conflicts = {"start_new_session", "process_group", "preexec_fn"} & kwargs.keys()
@@ -806,6 +868,7 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
     target_executable = os.fspath(kwargs.pop("executable", program[0]))
     caller_pass_fds = tuple(kwargs.pop("pass_fds", ()))
     restore_signals = kwargs.get("restore_signals", True)
+    signal_modes = _target_signal_modes(restore_signals)
     requested_env = kwargs.pop("env", None)
     target_env = _validated_environment(requested_env)
     target_env_payload = pickle.dumps(
@@ -828,7 +891,7 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
             _WITNESS_LAUNCHER,
             str(control_read),
             str(ready_child.fileno()),
-            "1" if restore_signals else "0",
+            signal_modes,
             target_executable,
             *program,
             start_new_session=True,
@@ -846,18 +909,22 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
         os.close(control_read)
         control_read = -1
         ready_child.close()
-        ready_payload = bytearray()
         loop = asyncio.get_running_loop()
-        while b"\n" not in ready_payload:
-            chunk = await loop.sock_recv(ready_parent, 64)
-            if not chunk:
-                break
-            ready_payload.extend(chunk)
-        ready_line, separator, exec_payload = bytes(ready_payload).partition(b"\n")
+        ready_task = asyncio.create_task(_read_witness_ready(ready_parent))
+        launch_cancellation: asyncio.CancelledError | None = None
+        while not ready_task.done():
+            try:
+                await asyncio.shield(ready_task)
+            except asyncio.CancelledError as exc:
+                launch_cancellation = exc
+        ready_payload = ready_task.result()
+        ready_line, separator, exec_payload = ready_payload.partition(b"\n")
         if not separator or not ready_line.startswith(b"W"):
             raise RuntimeError("lifecycle ownership witness did not start")
         witness_pid = int(ready_line[1:])
         launcher_blocked = True
+        if launch_cancellation is not None:
+            raise launch_cancellation
         with open(f"/proc/{witness_pid}/stat", encoding="utf-8") as stat_file:
             state, witness_pgid, witness_sid, witness_start_time = _parse_proc_stat(
                 stat_file.read()
@@ -936,26 +1003,18 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
             ),
         )
     except BaseException:
-        if process is not None:
-            try:
-                if witness_proven or launcher_blocked:
-                    os.killpg(process.pid, signal.SIGKILL)
-                else:
-                    process.kill()
-            except ProcessLookupError:
-                pass
-            os.close(control_write)
-            control_write = -1
-            await process.wait()
-        if witness_pid is not None:
-            try:
-                os.waitpid(witness_pid, 0)
-            except ChildProcessError:
-                pass
-        if witness_pidfd is not None:
-            os.close(witness_pidfd)
-        if control_write >= 0:
-            os.close(control_write)
+        cleanup_task = asyncio.create_task(
+            _finish_failed_launch(
+                process,
+                group_contained=witness_proven or launcher_blocked,
+                control_fd=control_write,
+                witness_pid=witness_pid,
+                witness_pidfd=witness_pidfd,
+            )
+        )
+        control_write = -1
+        witness_pidfd = None
+        await _wait_without_cancelling(cleanup_task)
         raise
     finally:
         if control_read >= 0:
