@@ -1075,17 +1075,6 @@ async def _finish_failed_launch(
         )
         if result.quiescent:
             return
-        if process is not None and process.returncode is None:
-            try:
-                process.kill()
-            except OSError:
-                pass
-            try:
-                await asyncio.wait_for(
-                    process.wait(), _LAUNCH_CLEANUP_TIMEOUT_SECONDS
-                )
-            except TimeoutError:
-                pass
         raise RuntimeError(
             "failed launch cleanup could not confirm quiescence: "
             f"{result.detail or 'unknown cleanup failure'}"

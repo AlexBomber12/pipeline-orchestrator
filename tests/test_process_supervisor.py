@@ -1573,15 +1573,14 @@ async def test_launch_deadline_helpers_bound_stubborn_tasks(
     )
     os.close(control_write)
 
-    class ReapableProcess:
-        returncode: int | None = None
+    class UnprovenProcess:
+        returncode = None
 
         def kill(self) -> None:
-            self.returncode = -signal.SIGKILL
+            pytest.fail("failed ownership proof must not fall back to numeric PID")
 
         async def wait(self) -> int:
-            assert self.returncode is not None
-            return self.returncode
+            pytest.fail("unproven leader must not be awaited as successful cleanup")
 
     control_read, control_write = os.pipe()
     failed_owner = OwnedCleanup(
@@ -1596,43 +1595,12 @@ async def test_launch_deadline_helpers_bound_stubborn_tasks(
     )
     with pytest.raises(RuntimeError, match="ownership lost"):
         await process_supervisor._finish_failed_launch(
-            ReapableProcess(),  # type: ignore[arg-type]
+            UnprovenProcess(),  # type: ignore[arg-type]
             owned_process=failed_owner,  # type: ignore[arg-type]
             control_fd=control_read,
             witness_pid=None,
             witness_pidfd=None,
         )
-    os.close(control_write)
-
-    class UnreapableProcess:
-        returncode = None
-
-        def kill(self) -> None:
-            raise ProcessLookupError
-
-        async def wait(self) -> int:
-            await asyncio.Event().wait()
-            return 0
-
-    control_read, control_write = os.pipe()
-    failed_owner = OwnedCleanup(
-        control_read,
-        process_supervisor.CleanupResult(
-            CleanupStatus.FAILED, None, False, False, None
-        ),
-    )
-    with monkeypatch.context() as patch:
-        patch.setattr(
-            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0
-        )
-        with pytest.raises(RuntimeError, match="unknown cleanup failure"):
-            await process_supervisor._finish_failed_launch(
-                UnreapableProcess(),  # type: ignore[arg-type]
-                owned_process=failed_owner,  # type: ignore[arg-type]
-                control_fd=control_read,
-                witness_pid=None,
-                witness_pidfd=None,
-            )
     os.close(control_write)
 
     control_read, control_write = os.pipe()
