@@ -369,6 +369,12 @@ def test_handle_fix_omits_extra_context_when_no_signals(
     assert "extra_context" not in captured["kwargs"]
     assert captured["kwargs"].get("pr_id") is None
     assert captured["kwargs"].get("task_file") is None
+    assert captured["kwargs"]["on_process_start"] == (
+        runner._track_current_coder_process
+    )
+    assert captured["kwargs"]["on_supervised_process_start"] == (
+        runner._track_current_coder_supervised_process
+    )
 
 
 def test_handle_fix_passes_pr_id_and_task_file_to_plugin(
@@ -436,33 +442,31 @@ def test_handle_fix_honors_stop_requested_during_fix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._patch_subprocess(monkeypatch)
-    stop_called = {"terminate": 0, "kill": 0, "wait": 0}
+    cleanup_calls: list[tuple[float, float]] = []
 
     class _FakeProc:
         def __init__(self) -> None:
             self.returncode: int | None = None
-            self._done = asyncio.Event()
 
-        def terminate(self) -> None:
-            stop_called["terminate"] += 1
-            self.returncode = -15
-            self._done.set()
+    class _FakeManaged:
+        def __init__(self, process: _FakeProc) -> None:
+            self.process = process
 
-        def kill(self) -> None:
-            stop_called["kill"] += 1
-            self.returncode = -9
-            self._done.set()
-
-        async def wait(self) -> int:
-            stop_called["wait"] += 1
-            await self._done.wait()
-            return self.returncode or 0
+        async def cleanup(
+            self, *, term_grace: float, kill_grace: float
+        ) -> object:
+            cleanup_calls.append((term_grace, kill_grace))
+            self.process.returncode = -15
+            return types.SimpleNamespace(quiescent=True, detail=None)
 
     async def fake_fix_review_async(*args: object, **kwargs: object) -> tuple[int, str, str]:
         proc = _FakeProc()
         on_process_start = kwargs["on_process_start"]
+        on_supervised_process_start = kwargs["on_supervised_process_start"]
         assert callable(on_process_start)
+        assert callable(on_supervised_process_start)
         on_process_start(proc)
+        on_supervised_process_start(_FakeManaged(proc))
         try:
             await asyncio.sleep(3600)
         except asyncio.CancelledError:
@@ -480,10 +484,166 @@ def test_handle_fix_honors_stop_requested_during_fix(
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.user_paused is True
     assert runner.state.error_message is None
-    assert stop_called["terminate"] == 1
-    assert stop_called["kill"] == 0
-    assert stop_called["wait"] >= 1
+    assert cleanup_calls == [(5, 5)]
     assert any("user stop requested" in entry["event"].lower() for entry in runner.state.history)
+
+
+def test_handle_fix_cleanup_failure_precedes_success_bookkeeping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    posted: list[str] = []
+
+    class _Process:
+        returncode = 0
+
+    class _Managed:
+        process = _Process()
+
+        async def cleanup(self, **kwargs: object) -> object:
+            return types.SimpleNamespace(
+                quiescent=False,
+                detail="FIX descendant still live",
+            )
+
+    managed = _Managed()
+
+    async def fake_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        kwargs["on_process_start"](managed.process)  # type: ignore[operator]
+        kwargs["on_supervised_process_start"](managed)  # type: ignore[operator]
+        return (0, "", "")
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda *args, **kwargs: posted.append("review"),
+    )
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-019")
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "FIX descendant still live" in (runner.state.error_message or "")
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.fix_iteration_count == 0
+    assert posted == []
+    assert runner._current_coder_supervised_process is managed
+
+
+def test_handle_fix_idle_cleanup_failure_wins_over_timeout_processing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+
+    class _Process:
+        returncode = None
+
+    class _Managed:
+        process = _Process()
+
+        async def cleanup(self, **kwargs: object) -> object:
+            return types.SimpleNamespace(
+                quiescent=False,
+                detail="idle cleanup unconfirmed",
+            )
+
+    managed = _Managed()
+
+    async def fake_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        kwargs["on_process_start"](managed.process)  # type: ignore[operator]
+        kwargs["on_supervised_process_start"](managed)  # type: ignore[operator]
+        await asyncio.Future()
+        return (0, "", "")
+
+    async def idle_cancel(
+        self: object,
+        pr_number: int,
+        idle_limit: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        idle_flag: dict[str, bool],
+    ) -> None:
+        await asyncio.sleep(0)
+        idle_flag["timed_out"] = True
+        await runner._terminate_current_coder()
+        target.cancel()
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+    monkeypatch.setattr(PipelineRunner, "_monitor_fix_idle", idle_cancel)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-019")
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "idle cleanup unconfirmed" in (runner.state.error_message or "")
+    assert "idle timeout" not in (runner.state.error_message or "").lower()
+    assert runner._current_coder_supervised_process is managed
+
+
+def test_handle_fix_external_terminal_waits_for_confirmed_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    external_bookkeeping: list[str] = []
+
+    class _Process:
+        returncode = None
+
+    class _Managed:
+        process = _Process()
+
+        async def cleanup(self, **kwargs: object) -> object:
+            return types.SimpleNamespace(
+                quiescent=False,
+                detail="external merge cleanup unconfirmed",
+            )
+
+    managed = _Managed()
+
+    async def fake_fix(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        kwargs["on_process_start"](managed.process)  # type: ignore[operator]
+        kwargs["on_supervised_process_start"](managed)  # type: ignore[operator]
+        await asyncio.Future()
+        return (0, "", "")
+
+    def external_monitor(
+        pr_number: int,
+        target: asyncio.Task,  # type: ignore[type-arg]
+        terminal_flag: dict[str, str | None],
+    ) -> asyncio.Task[None]:
+        async def trigger() -> None:
+            await asyncio.sleep(0)
+            terminal_flag["state"] = "MERGED"
+            await runner._terminate_current_coder()
+            target.cancel()
+
+        return asyncio.create_task(trigger())
+
+    async def record_external(state: str) -> None:
+        external_bookkeeping.append(state)
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", fake_fix)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-019")
+    monkeypatch.setattr(runner, "_run_coder_with_polling", external_monitor)
+    monkeypatch.setattr(
+        runner,
+        "_handle_external_terminal_pr_state",
+        record_external,
+    )
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "external merge cleanup unconfirmed" in (
+        runner.state.error_message or ""
+    )
+    assert external_bookkeeping == []
+    assert runner.state.current_pr is not None
 
 
 def test_handle_fix_escalates_at_iteration_cap_before_next_spawn(
@@ -4552,38 +4712,33 @@ def test_handle_external_terminal_pr_state_merged_saves_success_merged_record(
 
 
 def test_terminate_current_coder_uses_configured_grace(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``daemon.coder_terminate_grace_sec`` must drive the SIGTERM-to-SIGKILL
-    grace (Codex P3 on PR #223). Operators must be able to tune the grace
-    via config rather than the value being hard-coded."""
+    """The configured grace drives both bounded supervisor cleanup phases."""
     runner = h._make_runner()
     runner._app_config = h._app_cfg(coder_terminate_grace_sec=42)
-
-    captured_timeouts: list[float] = []
+    cleanup_calls: list[tuple[float, float]] = []
 
     class _Proc:
-        returncode = None
+        returncode = 0
 
-        def terminate(self) -> None:
-            return None
+    class _Managed:
+        process = _Proc()
 
-        async def wait(self) -> None:
-            return None
+        async def cleanup(
+            self, *, term_grace: float, kill_grace: float
+        ) -> object:
+            cleanup_calls.append((term_grace, kill_grace))
+            return types.SimpleNamespace(quiescent=True, detail=None)
 
-    runner._current_coder_process = _Proc()
+    managed = _Managed()
+    runner._track_current_coder_process(managed.process)  # type: ignore[arg-type]
+    runner._track_current_coder_supervised_process(managed)  # type: ignore[arg-type]
 
-    original_wait_for = asyncio.wait_for
+    assert asyncio.run(runner._terminate_current_coder()) is True
 
-    async def fake_wait_for(coro: object, timeout: float) -> object:
-        captured_timeouts.append(timeout)
-        return await original_wait_for(coro, timeout)
-
-    monkeypatch.setattr(runner_module.asyncio, "wait_for", fake_wait_for)
-
-    asyncio.run(runner._terminate_current_coder())
-
-    assert captured_timeouts == [42]
+    assert cleanup_calls == [(42, 42)]
+    assert runner._current_coder_process is None
+    assert runner._current_coder_supervised_process is None
 
 
 def test_maybe_retrigger_stale_review_returns_without_current_pr() -> None:
@@ -4850,88 +5005,93 @@ def test_feedback_check_returns_unknown_on_api_failure(
     assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.UNKNOWN
 
 
-def test_terminate_current_coder_clears_exited_process() -> None:
+def test_terminate_current_coder_cleans_exited_leader_group() -> None:
+    runner = h._make_runner()
+    cleanup_calls: list[tuple[float, float]] = []
+
+    class _Proc:
+        returncode = 0
+
+    class _Managed:
+        process = _Proc()
+
+        async def cleanup(
+            self, *, term_grace: float, kill_grace: float
+        ) -> object:
+            cleanup_calls.append((term_grace, kill_grace))
+            return types.SimpleNamespace(quiescent=True, detail=None)
+
+    managed = _Managed()
+    runner._track_current_coder_process(managed.process)  # type: ignore[arg-type]
+    runner._track_current_coder_supervised_process(managed)  # type: ignore[arg-type]
+
+    assert asyncio.run(runner._terminate_current_coder()) is True
+
+    assert cleanup_calls == [(5, 5)]
+    assert runner._current_coder_process is None
+    assert runner._current_coder_supervised_process is None
+
+
+def test_terminate_current_coder_rejects_raw_process_without_ownership() -> None:
+    runner = h._make_runner()
+
+    class _Proc:
+        returncode = None
+
+    process = _Proc()
+    runner._current_coder_process = process  # type: ignore[assignment]
+
+    assert asyncio.run(runner._terminate_current_coder()) is False
+
+    assert runner._current_coder_process is process
+    assert "no supervised ownership handle" in (
+        runner._coder_cleanup_failure_detail or ""
+    )
+
+
+def test_terminate_current_coder_retains_failed_handle() -> None:
     runner = h._make_runner()
 
     class _Proc:
         returncode = 0
 
-    runner._current_coder_process = _Proc()
+    class _Managed:
+        process = _Proc()
 
-    asyncio.run(runner._terminate_current_coder())
+        async def cleanup(self, **kwargs: object) -> object:
+            return types.SimpleNamespace(
+                quiescent=False,
+                detail="owned descendant still live",
+            )
 
-    assert runner._current_coder_process is None
+    managed = _Managed()
+    runner._track_current_coder_process(managed.process)  # type: ignore[arg-type]
+    runner._track_current_coder_supervised_process(managed)  # type: ignore[arg-type]
+
+    assert asyncio.run(runner._terminate_current_coder()) is False
+
+    assert runner._current_coder_process is managed.process
+    assert runner._current_coder_supervised_process is managed
+    assert runner._coder_cleanup_failure_detail == "owned descendant still live"
 
 
-def test_terminate_current_coder_handles_missing_process() -> None:
+def test_track_supervised_coder_never_overwrites_unclean_handle() -> None:
     runner = h._make_runner()
 
     class _Proc:
-        returncode = None
+        pass
 
-        def terminate(self) -> None:
-            raise ProcessLookupError
+    first = types.SimpleNamespace(process=_Proc())
+    second = types.SimpleNamespace(process=_Proc())
+    runner._track_current_coder_supervised_process(first)  # type: ignore[arg-type]
 
-    runner._current_coder_process = _Proc()
+    with pytest.raises(RuntimeError, match="cannot replace"):
+        runner._track_current_coder_supervised_process(  # type: ignore[arg-type]
+            second
+        )
 
-    asyncio.run(runner._terminate_current_coder())
-
-    assert runner._current_coder_process is None
-
-
-def test_terminate_current_coder_kills_after_timeout() -> None:
-    runner = h._make_runner()
-    calls: list[str] = []
-
-    class _Proc:
-        returncode = None
-
-        def terminate(self) -> None:
-            calls.append("terminate")
-
-        def kill(self) -> None:
-            calls.append("kill")
-
-        async def wait(self) -> None:
-            calls.append("wait")
-            if calls.count("wait") == 1:
-                raise asyncio.TimeoutError
-            return None
-
-    runner._current_coder_process = _Proc()
-
-    asyncio.run(runner._terminate_current_coder())
-
-    assert calls == ["terminate", "wait", "kill", "wait"]
-    assert runner._current_coder_process is None
-
-
-def test_terminate_current_coder_ignores_missing_process_on_kill() -> None:
-    runner = h._make_runner()
-    calls: list[str] = []
-
-    class _Proc:
-        returncode = None
-
-        def terminate(self) -> None:
-            calls.append("terminate")
-
-        def kill(self) -> None:
-            calls.append("kill")
-            raise ProcessLookupError
-
-        async def wait(self) -> None:
-            calls.append("wait")
-            if calls.count("wait") == 1:
-                raise asyncio.TimeoutError
-            return None
-
-    runner._current_coder_process = _Proc()
-
-    asyncio.run(runner._terminate_current_coder())
-
-    assert calls == ["terminate", "wait", "kill", "wait"]
-    assert runner._current_coder_process is None
+    assert runner._current_coder_supervised_process is first
+    assert runner._current_coder_process is first.process
 
 
 def test_verify_pushes_since_returns_false_when_remote_diverged(

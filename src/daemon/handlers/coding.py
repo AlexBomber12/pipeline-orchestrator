@@ -317,7 +317,16 @@ class CodingMixin:
                 current_pr_id=current_pr_id,
             )
         finally:
-            self._cleanup_expected_branch()
+            if (
+                self._current_coder_supervised_process is None
+                and self._current_coder_process is None
+            ):
+                self._cleanup_expected_branch()
+            else:
+                self.log_event(
+                    "[CLEANUP] Preserving expected-branch marker while "
+                    "coder cleanup remains unconfirmed."
+                )
 
     async def _prepare_coder_invocation(
         self,
@@ -353,6 +362,9 @@ class CodingMixin:
             **plugin_run_kwargs,
             "timeout": self.app_config.daemon.planned_pr_timeout_sec,
             "on_process_start": self._track_current_coder_process,
+            "on_supervised_process_start": (
+                self._track_current_coder_supervised_process
+            ),
         }
 
     async def _run_coder_with_supervision(
@@ -380,6 +392,7 @@ class CodingMixin:
         breach_flag: dict[str, bool] = {"breached": False}
 
         heartbeat = asyncio.create_task(self._publish_while_waiting("CODING"))
+        self._coder_invocation_active = True
         cli_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
             plugin.run_auto_pr(
                 self.repo_path,
@@ -397,27 +410,61 @@ class CodingMixin:
                 )
             )
         stop_monitor = asyncio.create_task(self._monitor_stop_request(cli_task))
+        result: tuple[int, str, str] | None = None
+        cancellation: asyncio.CancelledError | None = None
+        interruption: str | None = None
+        cleanup_confirmed = False
         try:
-            code, stdout, stderr = await cli_task
-        except asyncio.CancelledError:
+            result = await cli_task
+        except asyncio.CancelledError as exc:
             if self._stop_requested:
-                if current_pr_id is not None:
-                    self._user_stopped_task_pr_ids.add(current_pr_id)
-                    await self._suppress_task(
-                        current_pr_id,
-                        SuppressionReason.OPERATOR_STOPPED,
-                        {"source": "stop_requested_during_coder_run"},
-                    )
-                self.state.state = PipelineState.PAUSED
-                await self._clear_error_message_on_recovery(
-                    log_prefix="[CODING]",
-                    reason="user stop requested during coder run",
+                interruption = "stop"
+            elif breach_flag["breached"]:
+                interruption = "breach"
+            else:
+                cancellation = exc
+        finally:
+            stop_monitor.cancel()
+            if breach_monitor is not None:
+                breach_monitor.cancel()
+            heartbeat.cancel()
+            monitors = [stop_monitor, heartbeat]
+            if breach_monitor is not None:
+                monitors.append(breach_monitor)
+            await asyncio.gather(*monitors, return_exceptions=True)
+            self._coder_invocation_active = False
+            if result is not None:
+                self._record_unconfirmed_launch_cleanup(result)
+            if plugin.supports_breach_lifecycle:
+                self._check_late_breach(breach_dir, breach_run_id, breach_flag)
+                self._cleanup_breach_marker(breach_dir, breach_run_id)
+            cleanup_confirmed = await self._confirm_current_coder_cleanup(
+                "CODING completion"
+            )
+
+        if cancellation is not None:
+            raise cancellation
+        if not cleanup_confirmed:
+            return None
+
+        if interruption == "stop":
+            if current_pr_id is not None:
+                self._user_stopped_task_pr_ids.add(current_pr_id)
+                await self._suppress_task(
+                    current_pr_id,
+                    SuppressionReason.OPERATOR_STOPPED,
+                    {"source": "stop_requested_during_coder_run"},
                 )
-                await self._save_current_run_record("error")
-                self.log_event("[CODING] CODING aborted: user stop requested.")
-                return None
-            if not breach_flag["breached"]:
-                raise
+            self.state.state = PipelineState.PAUSED
+            await self._clear_error_message_on_recovery(
+                log_prefix="[CODING]",
+                reason="user stop requested during coder run",
+            )
+            await self._save_current_run_record("error")
+            self.log_event("[CODING] CODING aborted: user stop requested.")
+            return None
+
+        if interruption == "breach":
             await self._record_pre_pause_pr(
                 target_branch, "before breach-cancel pause"
             )
@@ -432,15 +479,6 @@ class CodingMixin:
                 f"paused until {self.state.rate_limited_until}."
             )
             return None
-        finally:
-            stop_monitor.cancel()
-            if breach_monitor is not None:
-                breach_monitor.cancel()
-            heartbeat.cancel()
-            self._current_coder_process = None
-            if plugin.supports_breach_lifecycle:
-                self._check_late_breach(breach_dir, breach_run_id, breach_flag)
-                self._cleanup_breach_marker(breach_dir, breach_run_id)
 
         if breach_flag["breached"]:
             await self._record_pre_pause_pr(
@@ -457,7 +495,8 @@ class CodingMixin:
                 f"paused until {self.state.rate_limited_until}."
             )
             return None
-        return (code, stdout, stderr)
+        assert result is not None
+        return result
 
     async def _record_pre_pause_pr(
         self,
