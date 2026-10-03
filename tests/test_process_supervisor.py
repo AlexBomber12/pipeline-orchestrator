@@ -477,6 +477,30 @@ async def test_proc_scan_ignores_disappeared_unrelated_entry(
 
 
 @pytest.mark.asyncio
+async def test_proc_scan_fails_closed_for_unreadable_owned_member(
+    process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed = await process_pool.launch(SLEEPING_PROCESS)
+    await _read_pids(managed.process)
+    real_open = open
+    member_path = f"/proc/{managed.process.pid}/stat"
+    monkeypatch.setattr(managed, "_check_leader_identity", lambda: None)
+
+    def unreadable_member(path: str, *args: Any, **kwargs: Any) -> Any:
+        if path == member_path:
+            raise PermissionError("member denied")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        process_supervisor, "open", unreadable_member, raising=False
+    )
+    observation = managed._observe_group()
+
+    assert observation.state is _GroupState.UNKNOWN
+    assert observation.detail == "could not inspect process-group member: member denied"
+
+
+@pytest.mark.asyncio
 async def test_signal_races_do_not_turn_disappearance_into_failure(
     process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
 ) -> None:

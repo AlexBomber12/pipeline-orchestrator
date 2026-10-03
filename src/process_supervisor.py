@@ -262,8 +262,17 @@ class SupervisedProcess:
                         state, member_pgid, member_sid, start_time = _parse_proc_stat(
                             stat
                         )
-                    except (OSError, IndexError, ValueError):
+                    except FileNotFoundError:
                         continue
+                    except (OSError, IndexError, ValueError) as exc:
+                        self._close_pidfds(pidfds)
+                        return (
+                            _GroupObservation(
+                                _GroupState.UNKNOWN,
+                                f"could not inspect process-group member: {exc}",
+                            ),
+                            [],
+                        )
                     if member_pgid != pgid:
                         continue
                     matched = True
