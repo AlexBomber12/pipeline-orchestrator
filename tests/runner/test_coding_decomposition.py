@@ -266,24 +266,14 @@ def test_handle_coding_preserves_branch_marker_on_cleanup_failure(
     _coder_name, plugin = runner._get_coder()
     branch_cleanup_calls: list[str] = []
 
-    class _Process:
-        returncode = 0
-
-    class _Managed:
-        process = _Process()
-
-        async def cleanup(self, **kwargs: object) -> object:
-            return types.SimpleNamespace(
-                quiescent=False,
-                detail="branch marker cleanup unconfirmed",
-            )
-
-    managed = _Managed()
-
     async def fake_run(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
-        kwargs["on_process_start"](managed.process)
-        kwargs["on_supervised_process_start"](managed)
-        return (0, "", "")
+        return (
+            -1,
+            "",
+            "Process supervision launch failed: RuntimeError: failed launch "
+            "cleanup could not confirm quiescence: branch marker cleanup "
+            "unconfirmed",
+        )
 
     monkeypatch.setattr(plugin, "run_auto_pr", fake_run)
     monkeypatch.setattr(runner, "_check_late_breach", lambda *a, **kw: None)

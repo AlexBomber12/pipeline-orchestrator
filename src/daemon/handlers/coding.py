@@ -320,6 +320,7 @@ class CodingMixin:
             if (
                 self._current_coder_supervised_process is None
                 and self._current_coder_process is None
+                and self._coder_cleanup_failure_detail is None
             ):
                 self._cleanup_expected_branch()
             else:
