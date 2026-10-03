@@ -6,7 +6,6 @@ import os
 import signal
 import sys
 import time
-from contextlib import nullcontext
 from dataclasses import replace
 from typing import Any
 
@@ -182,6 +181,26 @@ async def test_normal_completion_is_reaped_without_signals(
 
 
 @pytest.mark.asyncio
+async def test_repeated_fast_completion_reconciles_disappeared_members(
+    process_pool: ProcessPool,
+) -> None:
+    for _ in range(10):
+        managed = await launch_process(
+            "/bin/true",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        process_pool.supervised.append(
+            (managed, managed.identity.process_group_id)
+        )
+        assert await managed.process.wait() == 0
+        result = await managed.cleanup(term_grace=0.1, kill_grace=0.1)
+        assert result.quiescent
+        assert not result.term_sent
+        assert not result.kill_sent
+
+
+@pytest.mark.asyncio
 async def test_early_leader_exit_cleans_child_grandchild_and_retained_pipes(
     process_pool: ProcessPool,
 ) -> None:
@@ -200,6 +219,49 @@ async def test_early_leader_exit_cleans_child_grandchild_and_retained_pipes(
     assert not result.kill_sent
     assert stdout == b""
     assert stderr == b""
+
+
+@pytest.mark.asyncio
+async def test_early_leader_exit_cleanup_is_independent_of_output_pipes(
+    process_pool: ProcessPool,
+) -> None:
+    report_read, report_write = os.pipe()
+    code = f"""
+import os
+import signal
+import subprocess
+import sys
+
+child = subprocess.Popen([
+    sys.executable,
+    "-c",
+    "import signal; signal.pause()",
+])
+os.write({report_write}, str(child.pid).encode("ascii"))
+"""
+    managed = await launch_process(
+        sys.executable,
+        "-c",
+        code,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        pass_fds=(report_write,),
+    )
+    process_pool.supervised.append(
+        (managed, managed.identity.process_group_id)
+    )
+    os.close(report_write)
+    child_pid = int(await asyncio.to_thread(os.read, report_read, 64))
+    os.close(report_read)
+    assert await managed.process.wait() == 0
+    assert _pid_is_live(child_pid)
+
+    result = await managed.cleanup(term_grace=0.03, kill_grace=0.5)
+    await _wait_not_live(child_pid)
+
+    assert result.quiescent
+    assert result.term_sent
+    assert not result.kill_sent
 
 
 @pytest.mark.asyncio
@@ -314,9 +376,7 @@ async def test_reused_group_without_lifecycle_proof_is_not_signalled(
     result = await managed.cleanup(term_grace=0, kill_grace=0)
 
     assert result.status is CleanupStatus.FAILED
-    assert result.detail == (
-        "process-group continuity is unproven; refusing to signal"
-    )
+    assert result.detail == "lifecycle ownership witness is no longer live"
     assert delivered == []
     assert _pid_is_live(replacement_child_pid)
 
@@ -473,6 +533,21 @@ async def test_wait_and_signal_refuse_unconfirmed_states(
     assert timed_out.detail == "process group is quiet but leader was not reaped"
     assert managed._signal_group(signal.SIGTERM) == (False, None)
 
+    changed = _GroupObservation(_GroupState.CHANGED, "member disappeared")
+    snapshots = iter(((changed, []), (quiet, [])))
+    monkeypatch.setattr(
+        managed, "_snapshot_group", lambda **_kwargs: next(snapshots)
+    )
+    assert managed._signal_group(signal.SIGTERM) == (False, None)
+
+    monkeypatch.setattr(
+        managed, "_snapshot_group", lambda **_kwargs: (changed, [])
+    )
+    assert managed._signal_group(signal.SIGTERM) == (
+        False,
+        "process-group membership kept changing during signaling",
+    )
+
 
 @pytest.mark.asyncio
 async def test_quiet_snapshot_is_reconciled_before_success(
@@ -511,6 +586,11 @@ async def test_quiet_snapshot_is_reconciled_before_success(
     assert result.detail == (
         "process-group quiescence could not be confirmed before the grace period"
     )
+
+    observations = iter((parent_only, parent_only))
+    monkeypatch.setattr(managed, "_observe_group", lambda: next(observations))
+    assert await managed._wait_for_quiescence(0) is parent_only
+    monkeypatch.setattr(managed, "_observe_group", real_observe_group)
 
 
 @pytest.mark.asyncio
@@ -673,8 +753,8 @@ async def test_snapshot_refuses_identity_changes_and_handle_races(
         managed, "_open_owned_pidfd", lambda _pid, _start: (None, None)
     )
     observation, pidfds = managed._snapshot_group(acquire_pidfds=True)
-    assert observation.state is _GroupState.UNKNOWN
-    assert "stable handles" in observation.detail
+    assert observation.state is _GroupState.CHANGED
+    assert "members changed" in observation.detail
     assert pidfds == []
 
 
@@ -740,76 +820,46 @@ async def test_pidfd_acquisition_revalidates_process_identity(
 
 
 @pytest.mark.asyncio
-async def test_lifecycle_proof_errors_fail_closed(
+async def test_lifecycle_witness_failures_are_bounded_and_fail_closed(
     process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     managed = await process_pool.launch(SLEEPING_PROCESS)
     await _read_pids(managed.process)
-    assert managed.identity.leader_start_time is not None
-    member = _GroupMember(
-        managed.process.pid,
-        "S",
-        managed.identity.leader_start_time,
-    )
+    witness = managed._lifecycle_witness
+    assert witness is not None
+    witness_member = _GroupMember(witness.pid, "S", witness.start_time)
     unknown = _GroupObservation(_GroupState.UNKNOWN, "proof unavailable")
 
     with monkeypatch.context() as patch:
         patch.setattr(managed, "_revalidate_member", lambda _member: (False, unknown))
-        assert managed._prove_group_ownership([member]) is unknown
-
-    managed._known_members.clear()
-    zombie = replace(member, state="Z")
-    assert managed._prove_group_ownership([zombie]).state is _GroupState.UNPROVEN
+        assert managed._prove_group_ownership([witness_member]) is unknown
 
     with monkeypatch.context() as patch:
-        patch.setattr(
-            managed,
-            "_member_holds_lifecycle_proof",
-            lambda _pid: (False, unknown),
-        )
-        assert managed._prove_group_ownership([member]) is unknown
+        patch.setattr(managed, "_revalidate_member", lambda _member: (False, None))
+        observation = managed._prove_group_ownership([witness_member])
+        assert observation is not None
+        assert observation.detail == "lifecycle ownership witness is no longer live"
 
-    with monkeypatch.context() as patch:
-        patch.setattr(
-            managed,
-            "_member_holds_lifecycle_proof",
-            lambda _pid: (True, None),
-        )
-        patch.setattr(managed, "_revalidate_member", lambda _member: (False, unknown))
-        assert managed._prove_group_ownership([member]) is unknown
+    leader_member = _GroupMember(
+        managed.process.pid,
+        "S",
+        managed.identity.leader_start_time or 0,
+    )
+    witness.released = True
+    assert managed._prove_group_ownership([leader_member]) is None
+    unowned = replace(leader_member, start_time=leader_member.start_time + 1)
+    observation = managed._prove_group_ownership([unowned])
+    assert observation is not None
+    assert observation.detail == (
+        "process-group continuity is unproven; refusing to signal"
+    )
+    witness.released = False
 
-    proof_files = managed._lifecycle_proof_files
-    managed._lifecycle_proof_files = frozenset()
-    assert managed._member_holds_lifecycle_proof(member.pid) == (False, None)
-    managed._lifecycle_proof_files = proof_files
-
-    class VanishedFd:
-        def stat(self) -> os.stat_result:
-            raise FileNotFoundError
-
-    with monkeypatch.context() as patch:
-        patch.setattr(os, "scandir", lambda _path: nullcontext([VanishedFd()]))
-        assert managed._member_holds_lifecycle_proof(member.pid) == (False, None)
-
-    for error, expected in (
-        (FileNotFoundError(), None),
-        (PermissionError("denied"), "could not inspect lifecycle proof: denied"),
-    ):
-        with monkeypatch.context() as patch:
-            patch.setattr(
-                os,
-                "scandir",
-                lambda _path, error=error: (_ for _ in ()).throw(error),
-            )
-            holds_proof, observation = managed._member_holds_lifecycle_proof(
-                member.pid
-            )
-        assert not holds_proof
-        if expected is None:
-            assert observation is None
-        else:
-            assert observation is not None
-            assert observation.detail == expected
+    real_witness = managed._lifecycle_witness
+    managed._lifecycle_witness = None
+    assert not managed._witness_is_live()
+    managed._close_lifecycle_witness()
+    managed._lifecycle_witness = real_witness
 
     for error, expected in (
         (FileNotFoundError(), None),
@@ -822,13 +872,38 @@ async def test_lifecycle_proof_errors_fail_closed(
                 lambda *_args, error=error, **_kwargs: (_ for _ in ()).throw(error),
                 raising=False,
             )
-            stable, observation = managed._revalidate_member(member)
+            stable, observation = managed._revalidate_member(leader_member)
         assert not stable
         if expected is None:
             assert observation is None
         else:
             assert observation is not None
             assert observation.detail == expected
+
+    managed.process.terminate()
+    assert await managed.process.wait() == -signal.SIGTERM
+    witness_quiet = _GroupObservation(
+        _GroupState.QUIESCENT,
+        "witness still live",
+        ((witness.pid, witness.start_time, "S"),),
+        witness_live=True,
+    )
+    definitive = _GroupObservation(
+        _GroupState.QUIESCENT,
+        "group absent",
+        definitive=True,
+    )
+    real_observe_group = managed._observe_group
+    witness.released = True
+    monkeypatch.setattr(managed, "_observe_group", lambda: witness_quiet)
+    timed_out = await managed._wait_for_quiescence(0)
+    assert timed_out.detail == "lifecycle witness remained live after release"
+
+    observations = iter((witness_quiet, definitive))
+    monkeypatch.setattr(managed, "_observe_group", lambda: next(observations))
+    assert await managed._wait_for_quiescence(0.05) is definitive
+    monkeypatch.setattr(managed, "_observe_group", real_observe_group)
+    witness.released = False
 
 
 @pytest.mark.asyncio
@@ -847,15 +922,66 @@ async def test_launch_rejects_conflicts_and_unverified_session(
         SupervisedProcess(  # type: ignore[arg-type]
             object(), ProcessIdentity(2, 2, 2, 1), _proof=object()
         )
+    with pytest.raises(FileNotFoundError):
+        await launch_process("/definitely/missing/process-supervisor-command")
 
-    monkeypatch.setattr(os, "getpgid", lambda _pid: -1)
-    with pytest.raises(RuntimeError, match="dedicated session"):
-        await launch_process(
-            sys.executable,
-            "-c",
-            "import time; time.sleep(10)",
-            stdout=asyncio.subprocess.PIPE,
+    with monkeypatch.context() as patch:
+        patch.setattr(process_supervisor, "_WITNESS_LAUNCHER", "pass")
+        with pytest.raises(RuntimeError, match="witness did not start"):
+            await launch_process(sys.executable, "-c", "pass")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "getpgid", lambda _pid: -1)
+        with pytest.raises(RuntimeError, match="dedicated session"):
+            await launch_process(
+                sys.executable,
+                "-c",
+                "import time; time.sleep(10)",
+                stdout=asyncio.subprocess.PIPE,
+            )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            process_supervisor,
+            "_parse_proc_stat",
+            lambda _stat: ("S", -1, -1, 1),
         )
+        patch.setattr(
+            asyncio.subprocess.Process,
+            "kill",
+            lambda _process: (_ for _ in ()).throw(ProcessLookupError()),
+        )
+        with pytest.raises(RuntimeError, match="ownership witness"):
+            await launch_process(sys.executable, "-c", "pass")
+
+    real_parse_proc_stat = process_supervisor._parse_proc_stat
+    parse_calls = 0
+
+    def changed_witness(stat: str) -> tuple[str, int, int, int]:
+        nonlocal parse_calls
+        parse_calls += 1
+        parsed = real_parse_proc_stat(stat)
+        if parse_calls == 2:
+            return parsed[0], parsed[1], parsed[2], parsed[3] + 1
+        return parsed
+
+    with monkeypatch.context() as patch:
+        patch.setattr(process_supervisor, "_parse_proc_stat", changed_witness)
+        with pytest.raises(RuntimeError, match="witness changed"):
+            await launch_process(sys.executable, "-c", "pass")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(process_supervisor, "_get_pidfd_opener", lambda: None)
+        with pytest.raises(RuntimeError, match="pidfd_open is unavailable"):
+            await launch_process(sys.executable, "-c", "pass")
+
+    async def spawn_failed(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("spawn failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(asyncio, "create_subprocess_exec", spawn_failed)
+        with pytest.raises(RuntimeError, match="spawn failed"):
+            await launch_process(sys.executable, "-c", "pass")
 
 
 @pytest.mark.asyncio
@@ -869,6 +995,12 @@ async def test_early_launch_observation_and_unreadable_group_fallbacks(
     managed = await process_pool.launch("pass")
     assert await managed.process.wait() == 0
     monkeypatch.setattr(os, "getpgid", real_getpgid)
+    witness = managed._lifecycle_witness
+    assert witness is not None
+    managed._release_lifecycle_witness()
+    async with asyncio.timeout(1):
+        while os.path.exists(f"/proc/{witness.pid}"):
+            await asyncio.sleep(0.01)
 
     real_killpg = os.killpg
     monkeypatch.setattr(
@@ -886,20 +1018,36 @@ async def test_early_launch_observation_and_unreadable_group_fallbacks(
 
 
 @pytest.mark.asyncio
-async def test_launch_without_birth_token_refuses_live_group(
+async def test_missing_leader_birth_token_can_confirm_quiescence(
     process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def disappeared(*_args: Any, **_kwargs: Any) -> Any:
-        raise FileNotFoundError
+    real_open = open
+    stat_reads = 0
 
-    monkeypatch.setattr(process_supervisor, "open", disappeared, raising=False)
-    managed = await process_pool.launch(SLEEPING_PROCESS)
+    def leader_disappeared(path: str, *args: Any, **kwargs: Any) -> Any:
+        nonlocal stat_reads
+        if path.startswith("/proc/") and path.endswith("/stat"):
+            stat_reads += 1
+            if stat_reads == 3:
+                raise FileNotFoundError
+        return real_open(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            process_supervisor,
+            "open",
+            leader_disappeared,
+            raising=False,
+        )
+        managed = await process_pool.launch("pass")
     assert managed.identity.leader_start_time is None
-    monkeypatch.delattr(process_supervisor, "open")
-    await _read_pids(managed.process)
-    result = await managed.cleanup(term_grace=0, kill_grace=0)
-    assert result.status is CleanupStatus.FAILED
-    assert result.detail == "process-group leader identity is unproven"
+    assert await managed.process.wait() == 0
+
+    result = await managed.cleanup(term_grace=0.5, kill_grace=0.5)
+
+    assert result.quiescent
+    assert not result.term_sent
+    assert not result.kill_sent
 
 
 def test_parse_proc_stat_and_invalid_grace_validation() -> None:

@@ -6,10 +6,9 @@ session, moves to another process group, or crosses a container boundary needs
 separate containment (for example, a cgroup or container supervisor).
 TERM and KILL are delivered only through revalidated per-member Linux pidfds;
 the recyclable numeric process-group ID is never a signal-delivery target.
-After the leader exits, ownership continuity is proven by a member birth
-identity observed earlier or by an inherited, pinned stdout/stderr pipe from
-the launch.  If neither proof remains available, cleanup fails without
-signaling the numerically matching group.
+An internal same-session witness keeps ownership continuity independent of
+the caller's stdio choices.  If that proof is lost, cleanup fails without
+signaling a numerically matching group.
 """
 
 from __future__ import annotations
@@ -17,13 +16,55 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import select
 import signal
+import socket
+import sys
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
 _POLL_INTERVAL_SECONDS = 0.01
+_SNAPSHOT_RETRIES = 3
 _LAUNCH_PROOF = object()
+_WITNESS_LAUNCHER = r"""
+import os
+import sys
+
+control_fd = int(sys.argv[1])
+ready_fd = int(sys.argv[2])
+target_executable = sys.argv[3]
+target_argv = sys.argv[4:]
+max_fd = os.sysconf("SC_OPEN_MAX")
+pid_read, pid_write = os.pipe()
+
+broker_pid = os.fork()
+if broker_pid == 0:
+    os.close(pid_read)
+    witness_pid = os.fork()
+    if witness_pid == 0:
+        os.close(ready_fd)
+        os.closerange(0, control_fd)
+        os.closerange(control_fd + 1, max_fd)
+        while os.read(control_fd, 1):
+            pass
+        os._exit(0)
+    os.write(pid_write, str(witness_pid).encode("ascii"))
+    os._exit(0)
+
+os.close(pid_write)
+witness_pid = os.read(pid_read, 64)
+os.close(pid_read)
+os.waitpid(broker_pid, 0)
+os.write(ready_fd, b"W" + witness_pid + b"\n")
+os.close(control_fd)
+os.set_inheritable(ready_fd, False)
+try:
+    os.execvpe(target_executable, target_argv, os.environ)
+except OSError as exc:
+    os.write(ready_fd, b"E" + str(exc.errno).encode("ascii") + b"\n")
+    os._exit(127)
+"""
 
 
 class CleanupStatus(str, Enum):
@@ -61,6 +102,7 @@ class CleanupResult:
 class _GroupState(Enum):
     LIVE = "live"
     QUIESCENT = "quiescent"
+    CHANGED = "changed"
     UNPROVEN = "unproven"
     UNKNOWN = "unknown"
 
@@ -71,6 +113,7 @@ class _GroupObservation:
     detail: str
     members: tuple[tuple[int, int, str], ...] = ()
     definitive: bool = False
+    witness_live: bool = False
 
 
 @dataclass(frozen=True)
@@ -82,6 +125,15 @@ class _GroupMember:
     @property
     def identity(self) -> tuple[int, int]:
         return self.pid, self.start_time
+
+
+@dataclass
+class _LifecycleWitness:
+    pid: int
+    start_time: int
+    pidfd: int
+    control_fd: int
+    released: bool = False
 
 
 class SupervisedProcess:
@@ -98,22 +150,22 @@ class SupervisedProcess:
         identity: ProcessIdentity,
         *,
         _proof: object,
-        _lifecycle_proof_fds: tuple[int, ...] = (),
+        _lifecycle_witness: _LifecycleWitness | None = None,
     ) -> None:
         if _proof is not _LAUNCH_PROOF:
             raise TypeError("use launch_process() to create a supervised process")
         self._process = process
         self._identity = identity
         self._cleanup_task: asyncio.Task[CleanupResult] | None = None
-        self._lifecycle_proof_fds = list(_lifecycle_proof_fds)
-        self._lifecycle_proof_files = frozenset(
-            (file_stat.st_dev, file_stat.st_ino)
-            for file_stat in map(os.fstat, _lifecycle_proof_fds)
-        )
+        self._lifecycle_witness = _lifecycle_witness
         self._known_members: set[tuple[int, int]] = set()
         if identity.leader_start_time is not None:
             self._known_members.add(
                 (identity.leader_pid, identity.leader_start_time)
+            )
+        if _lifecycle_witness is not None:
+            self._known_members.add(
+                (_lifecycle_witness.pid, _lifecycle_witness.start_time)
             )
 
     @property
@@ -188,7 +240,7 @@ class SupervisedProcess:
                 return await self._success(term_sent, kill_sent)
             return self._failure(term_sent, kill_sent, observation.detail)
         finally:
-            self._close_lifecycle_proofs()
+            self._close_lifecycle_witness()
 
     async def _success(self, term_sent: bool, kill_sent: bool) -> CleanupResult:
         # A non-None returncode means asyncio's child watcher reaped the leader.
@@ -221,7 +273,33 @@ class SupervisedProcess:
                 observation.state is _GroupState.QUIESCENT
                 and self.process.returncode is not None
             ):
-                if observation.definitive or quiet_members == observation.members:
+                if observation.definitive:
+                    return observation
+                if observation.witness_live:
+                    witness = self._lifecycle_witness
+                    if (
+                        witness is not None
+                        and not witness.released
+                        and quiet_members == observation.members
+                    ):
+                        self._release_lifecycle_witness()
+                        quiet_members = None
+                    elif witness is not None and witness.released:
+                        remaining = deadline - loop.time()
+                        if remaining <= 0:
+                            return _GroupObservation(
+                                _GroupState.LIVE,
+                                "lifecycle witness remained live after release",
+                            )
+                        await asyncio.sleep(
+                            min(_POLL_INTERVAL_SECONDS, remaining)
+                        )
+                        continue
+                    else:
+                        quiet_members = observation.members
+                    await asyncio.sleep(0)
+                    continue
+                if quiet_members == observation.members:
                     return observation
                 if quiet_members is not None and loop.time() >= deadline:
                     return _GroupObservation(
@@ -247,7 +325,12 @@ class SupervisedProcess:
             await asyncio.sleep(min(_POLL_INTERVAL_SECONDS, remaining))
 
     def _signal_group(self, sig: signal.Signals) -> tuple[bool, str | None]:
-        observation, pidfds = self._snapshot_group(acquire_pidfds=True)
+        for _ in range(_SNAPSHOT_RETRIES):
+            observation, pidfds = self._snapshot_group(acquire_pidfds=True)
+            if observation.state is not _GroupState.CHANGED:
+                break
+        else:
+            return False, "process-group membership kept changing during signaling"
         if observation.state is _GroupState.QUIESCENT:
             return False, None
         if observation.state is not _GroupState.LIVE:
@@ -352,7 +435,19 @@ class SupervisedProcess:
                 [],
             )
 
-        live_members = [member for member in members if member.state != "Z"]
+        witness = self._lifecycle_witness
+        witness_identity = (
+            (witness.pid, witness.start_time) if witness is not None else None
+        )
+        witness_live = any(
+            member.identity == witness_identity and member.state != "Z"
+            for member in members
+        )
+        live_members = [
+            member
+            for member in members
+            if member.state != "Z" and member.identity != witness_identity
+        ]
         if acquire_pidfds:
             for member in live_members:
                 pidfd, error = self._open_owned_pidfd(
@@ -381,8 +476,8 @@ class SupervisedProcess:
             if acquire_pidfds and not pidfds:
                 return (
                     _GroupObservation(
-                        _GroupState.UNKNOWN,
-                        "owned members disappeared before stable handles were acquired",
+                        _GroupState.CHANGED,
+                        "owned members changed before stable handles were acquired",
                     ),
                     [],
                 )
@@ -391,6 +486,7 @@ class SupervisedProcess:
                     _GroupState.LIVE,
                     "owned process group is live",
                     fingerprint,
+                    witness_live=witness_live,
                 ),
                 pidfds,
             )
@@ -398,8 +494,9 @@ class SupervisedProcess:
             return (
                 _GroupObservation(
                     _GroupState.QUIESCENT,
-                    "owned process group contains only zombies",
+                    "owned process group has no live workload members",
                     fingerprint,
+                    witness_live=witness_live,
                 ),
                 [],
             )
@@ -433,11 +530,6 @@ class SupervisedProcess:
     def _check_leader_identity(
         self,
     ) -> tuple[bool, _GroupObservation | None]:
-        if self.identity.leader_start_time is None:
-            return False, _GroupObservation(
-                _GroupState.UNPROVEN,
-                "process-group leader identity is unproven",
-            )
         try:
             with open(
                 f"/proc/{self.identity.leader_pid}/stat", encoding="utf-8"
@@ -450,7 +542,10 @@ class SupervisedProcess:
                 _GroupState.UNKNOWN,
                 f"could not confirm leader identity: {exc}",
             )
-        if start_time != self.identity.leader_start_time:
+        if (
+            self.identity.leader_start_time is not None
+            and start_time != self.identity.leader_start_time
+        ):
             return False, _GroupObservation(
                 _GroupState.UNPROVEN,
                 "process-group leader identity is unproven",
@@ -468,62 +563,37 @@ class SupervisedProcess:
     def _prove_group_ownership(
         self, members: list[_GroupMember]
     ) -> _GroupObservation | None:
-        for member in members:
-            if member.identity not in self._known_members:
-                continue
-            stable, error = self._revalidate_member(member)
-            if error is not None:
-                return error
-            if stable:
-                return None
+        witness = self._lifecycle_witness
+        if witness is not None:
+            for member in members:
+                if member.identity != (witness.pid, witness.start_time):
+                    continue
+                stable, error = self._revalidate_member(member)
+                if error is not None:
+                    return error
+                if stable and member.state != "Z" and self._witness_is_live():
+                    return None
+                break
+            if not witness.released:
+                return _GroupObservation(
+                    _GroupState.UNPROVEN,
+                    "lifecycle ownership witness is no longer live",
+                )
 
-        proof_error: _GroupObservation | None = None
-        for member in members:
-            if member.state == "Z":
-                continue
-            holds_proof, error = self._member_holds_lifecycle_proof(member.pid)
-            if error is not None:
-                proof_error = error
-                continue
-            if not holds_proof:
-                continue
-            stable, error = self._revalidate_member(member)
-            if error is not None:
-                return error
-            if stable:
-                return None
-        if proof_error is not None:
-            return proof_error
+        if all(member.identity in self._known_members for member in members):
+            return None
         return _GroupObservation(
             _GroupState.UNPROVEN,
             "process-group continuity is unproven; refusing to signal",
         )
 
-    def _member_holds_lifecycle_proof(
-        self, pid: int
-    ) -> tuple[bool, _GroupObservation | None]:
-        if not self._lifecycle_proof_files:
-            return False, None
-        try:
-            with os.scandir(f"/proc/{pid}/fd") as entries:
-                for entry in entries:
-                    try:
-                        file_stat = entry.stat()
-                    except FileNotFoundError:
-                        continue
-                    if (
-                        file_stat.st_dev,
-                        file_stat.st_ino,
-                    ) in self._lifecycle_proof_files:
-                        return True, None
-        except FileNotFoundError:
-            return False, None
-        except OSError as exc:
-            return False, _GroupObservation(
-                _GroupState.UNKNOWN,
-                f"could not inspect lifecycle proof: {exc}",
-            )
-        return False, None
+    def _witness_is_live(self) -> bool:
+        witness = self._lifecycle_witness
+        if witness is None:
+            return False
+        poller = select.poll()
+        poller.register(witness.pidfd, select.POLLIN)
+        return not poller.poll(0)
 
     def _revalidate_member(
         self, member: _GroupMember
@@ -595,10 +665,20 @@ class SupervisedProcess:
         for pidfd in pidfds:
             os.close(pidfd)
 
-    def _close_lifecycle_proofs(self) -> None:
-        for proof_fd in self._lifecycle_proof_fds:
-            os.close(proof_fd)
-        self._lifecycle_proof_fds.clear()
+    def _release_lifecycle_witness(self) -> None:
+        witness = self._lifecycle_witness
+        if witness is None or witness.released:
+            return
+        os.close(witness.control_fd)
+        witness.released = True
+
+    def _close_lifecycle_witness(self) -> None:
+        witness = self._lifecycle_witness
+        if witness is None:
+            return
+        self._release_lifecycle_witness()
+        os.close(witness.pidfd)
+        self._lifecycle_witness = None
 
 
 def _parse_proc_stat(stat: str) -> tuple[str, int, int, int]:
@@ -607,49 +687,139 @@ def _parse_proc_stat(stat: str) -> tuple[str, int, int, int]:
     return fields[0], int(fields[2]), int(fields[3]), int(fields[19])
 
 
+def _get_pidfd_opener() -> Any:
+    return getattr(os, "pidfd_open", None)
+
+
 async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
     """Launch ``program`` in a new Linux session and retain its group identity."""
     conflicts = {"start_new_session", "process_group", "preexec_fn"} & kwargs.keys()
     if conflicts:
         names = ", ".join(sorted(conflicts))
         raise TypeError(f"launch_process owns subprocess option(s): {names}")
-    process = await asyncio.create_subprocess_exec(
-        *program, start_new_session=True, **kwargs
-    )
-    proof_fds = tuple(
-        os.dup(
-            process._transport.get_pipe_transport(child_fd)  # type: ignore[attr-defined]
-            .get_extra_info("pipe")
-            .fileno()
+    target_executable = os.fspath(kwargs.pop("executable", program[0]))
+    caller_pass_fds = tuple(kwargs.pop("pass_fds", ()))
+    control_read, control_write = os.pipe()
+    ready_parent, ready_child = socket.socketpair()
+    ready_parent.setblocking(False)
+    process: asyncio.subprocess.Process | None = None
+    witness_pidfd: int | None = None
+    witness_proven = False
+    try:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            _WITNESS_LAUNCHER,
+            str(control_read),
+            str(ready_child.fileno()),
+            target_executable,
+            *program,
+            start_new_session=True,
+            pass_fds=tuple(
+                sorted(
+                    {
+                        *caller_pass_fds,
+                        control_read,
+                        ready_child.fileno(),
+                    }
+                )
+            ),
+            **kwargs,
         )
-        for child_fd, option in ((1, "stdout"), (2, "stderr"))
-        if kwargs.get(option) == asyncio.subprocess.PIPE
-    )
-    try:
-        with open(f"/proc/{process.pid}/stat", encoding="utf-8") as stat_file:
-            leader_start_time = _parse_proc_stat(stat_file.read())[3]
-    except (OSError, IndexError, ValueError):
-        leader_start_time = None
-    identity = ProcessIdentity(
-        process.pid, process.pid, process.pid, leader_start_time
-    )
-    try:
-        pgid = os.getpgid(process.pid)
-        sid = os.getsid(process.pid)
-    except ProcessLookupError:
-        # start_new_session ran in the child before exec; an early exit can race
-        # this observational check without invalidating that launch proof.
-        pass
-    else:
-        if pgid != process.pid or sid != process.pid:
-            for proof_fd in proof_fds:
-                os.close(proof_fd)
-            process.kill()
+        os.close(control_read)
+        control_read = -1
+        ready_child.close()
+        ready_payload = bytearray()
+        loop = asyncio.get_running_loop()
+        while chunk := await loop.sock_recv(ready_parent, 64):
+            ready_payload.extend(chunk)
+        ready_lines = bytes(ready_payload).splitlines()
+        if not ready_lines or not ready_lines[0].startswith(b"W"):
+            raise RuntimeError("lifecycle ownership witness did not start")
+        witness_pid = int(ready_lines[0][1:])
+        exec_errno = (
+            int(ready_lines[1][1:])
+            if len(ready_lines) > 1 and ready_lines[1].startswith(b"E")
+            else None
+        )
+        with open(f"/proc/{witness_pid}/stat", encoding="utf-8") as stat_file:
+            state, witness_pgid, witness_sid, witness_start_time = _parse_proc_stat(
+                stat_file.read()
+            )
+        if (
+            state == "Z"
+            or witness_pgid != process.pid
+            or witness_sid != process.pid
+        ):
+            raise RuntimeError("could not establish lifecycle ownership witness")
+        witness_proven = True
+        opener = _get_pidfd_opener()
+        if opener is None:
+            raise RuntimeError("pidfd_open is unavailable on this Linux host")
+        witness_pidfd = opener(witness_pid)
+        with open(f"/proc/{witness_pid}/stat", encoding="utf-8") as stat_file:
+            current_state, current_pgid, current_sid, current_start_time = (
+                _parse_proc_stat(stat_file.read())
+            )
+        if (
+            current_state == "Z"
+            or current_pgid != witness_pgid
+            or current_sid != witness_sid
+            or current_start_time != witness_start_time
+        ):
+            raise RuntimeError("lifecycle ownership witness changed during launch")
+        if exec_errno is not None:
+            raise OSError(
+                exec_errno,
+                os.strerror(exec_errno),
+                target_executable,
+            )
+
+        try:
+            with open(f"/proc/{process.pid}/stat", encoding="utf-8") as stat_file:
+                leader_start_time = _parse_proc_stat(stat_file.read())[3]
+        except (OSError, IndexError, ValueError):
+            leader_start_time = None
+        identity = ProcessIdentity(
+            process.pid, process.pid, process.pid, leader_start_time
+        )
+        try:
+            pgid = os.getpgid(process.pid)
+            sid = os.getsid(process.pid)
+        except ProcessLookupError:
+            # The proven witness retains the dedicated session if the target
+            # exits before this observational check.
+            pass
+        else:
+            if pgid != process.pid or sid != process.pid:
+                raise RuntimeError("subprocess did not enter its dedicated session")
+        return SupervisedProcess(
+            process,
+            identity,
+            _proof=_LAUNCH_PROOF,
+            _lifecycle_witness=_LifecycleWitness(
+                witness_pid,
+                witness_start_time,
+                witness_pidfd,
+                control_write,
+            ),
+        )
+    except BaseException:
+        if process is not None:
+            try:
+                if witness_proven:
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except ProcessLookupError:
+                pass
             await process.wait()
-            raise RuntimeError("subprocess did not enter its dedicated session")
-    return SupervisedProcess(
-        process,
-        identity,
-        _proof=_LAUNCH_PROOF,
-        _lifecycle_proof_fds=proof_fds,
-    )
+        if witness_pidfd is not None:
+            os.close(witness_pidfd)
+        os.close(control_write)
+        raise
+    finally:
+        if control_read >= 0:
+            os.close(control_read)
+        ready_parent.close()
+        ready_child.close()
