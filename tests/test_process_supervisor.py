@@ -343,7 +343,7 @@ os.write({report_write}, str(child.pid).encode("ascii"))
 
 @pytest.mark.asyncio
 async def test_cleanup_reaps_adopted_workload_descendant(
-    process_pool: ProcessPool,
+    process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     previous = ctypes.c_int()
@@ -384,6 +384,46 @@ os.write({report_write}, str(child.pid).encode("ascii"))
 
         assert result.quiescent
         assert result.term_sent
+        assert not os.path.exists(f"/proc/{child_pid}")
+
+        failure_managed = await process_pool.launch(
+            """
+import subprocess
+import sys
+
+subprocess.Popen([
+    sys.executable,
+    "-c",
+    "import os, signal; print(os.getpid(), flush=True); signal.pause()",
+])
+"""
+        )
+        (child_pid,) = await _read_pids(failure_managed.process)
+        assert await failure_managed.process.wait() == 0
+        observation_failure = _GroupObservation(
+            _GroupState.UNKNOWN, "transient inspection failure"
+        )
+
+        async def fail_after_child_becomes_zombie(
+            _timeout: float, *, repeat_signal: signal.Signals | None = None
+        ) -> tuple[_GroupObservation, bool]:
+            del repeat_signal
+            async with asyncio.timeout(1):
+                while _pid_is_live(child_pid):
+                    await asyncio.sleep(0)
+            assert os.path.exists(f"/proc/{child_pid}")
+            return observation_failure, False
+
+        monkeypatch.setattr(
+            failure_managed,
+            "_wait_for_quiescence",
+            fail_after_child_becomes_zombie,
+        )
+
+        failed = await failure_managed.cleanup(term_grace=0, kill_grace=0)
+
+        assert failed.status is CleanupStatus.FAILED
+        assert failed.detail == "transient inspection failure"
         assert not os.path.exists(f"/proc/{child_pid}")
     finally:
         os.close(report_read)
@@ -711,7 +751,7 @@ async def test_quiet_snapshot_is_reconciled_before_success(
     real_observe_group = managed._observe_group
     real_reap_adopted_zombies = managed._reap_adopted_zombies
     monkeypatch.setattr(
-        managed, "_reap_adopted_zombies", lambda _members: (False, None)
+        managed, "_reap_adopted_zombies", lambda _members: (False, False, None)
     )
     monkeypatch.setattr(managed, "_observe_group", lambda: next(observations))
 
@@ -773,7 +813,7 @@ async def test_quiet_snapshot_is_reconciled_before_success(
     assert not signal_sent
 
     observations = iter((parent_only, definitive))
-    reap_results = iter(((True, None), (False, None)))
+    reap_results = iter(((True, False, None), (False, False, None)))
     monkeypatch.setattr(managed, "_observe_group", lambda: next(observations))
     monkeypatch.setattr(
         managed, "_reap_adopted_zombies", lambda _members: next(reap_results)
@@ -784,7 +824,7 @@ async def test_quiet_snapshot_is_reconciled_before_success(
     monkeypatch.setattr(
         managed,
         "_reap_adopted_zombies",
-        lambda _members: (False, "reaping failed"),
+        lambda _members: (False, False, "reaping failed"),
     )
     failed, signal_sent = await managed._wait_for_quiescence(0.05)
     assert failed.state is _GroupState.UNKNOWN
@@ -818,7 +858,11 @@ async def test_adopted_zombie_reaping_handles_races_and_errors(
             "_open_owned_pidfd",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError()),
         )
-        assert managed._reap_adopted_zombies(skipped_members) == (False, None)
+        assert managed._reap_adopted_zombies(skipped_members) == (
+            False,
+            False,
+            None,
+        )
 
     unknown = _GroupObservation(_GroupState.UNKNOWN, "handle unavailable")
     with monkeypatch.context() as patch:
@@ -828,6 +872,7 @@ async def test_adopted_zombie_reaping_handles_races_and_errors(
             lambda *_args, **_kwargs: (None, unknown),
         )
         assert managed._reap_adopted_zombies(((444, 4, "Z"),)) == (
+            False,
             False,
             "handle unavailable",
         )
@@ -840,15 +885,20 @@ async def test_adopted_zombie_reaping_handles_races_and_errors(
         )
         assert managed._reap_adopted_zombies(((444, 4, "Z"),)) == (
             True,
+            False,
             None,
         )
 
     cases = (
-        (ChildProcessError(), (False, None)),
-        (ProcessLookupError(errno.ESRCH, "gone"), (True, None)),
+        (ChildProcessError(), (False, False, None)),
+        (ProcessLookupError(errno.ESRCH, "gone"), (True, False, None)),
         (
             PermissionError(errno.EPERM, "denied"),
-            (False, "could not reap owned process-group member: [Errno 1] denied"),
+            (
+                False,
+                False,
+                "could not reap owned process-group member: [Errno 1] denied",
+            ),
         ),
     )
     for wait_error, expected in cases:
@@ -869,6 +919,38 @@ async def test_adopted_zombie_reaping_handles_races_and_errors(
             patch.setattr(os, "close", closed.append)
             assert managed._reap_adopted_zombies(((444, 4, "Z"),)) == expected
         assert closed == [99]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            managed,
+            "_open_owned_pidfd",
+            lambda *_args, **_kwargs: (99, None),
+        )
+        patch.setattr(os, "waitid", lambda *_args: None)
+        patch.setattr(os, "close", lambda _fd: None)
+        assert managed._reap_adopted_zombies(((444, 4, "Z"),)) == (
+            False,
+            True,
+            None,
+        )
+
+    drain_results = iter(((False, True, None), (False, False, None)))
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            managed,
+            "_reap_adopted_zombies",
+            lambda _members: next(drain_results),
+        )
+        await managed._drain_known_adopted_zombies()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(process_supervisor, "_WITNESS_EXIT_GRACE_SECONDS", 0)
+        patch.setattr(
+            managed,
+            "_reap_adopted_zombies",
+            lambda _members: (False, True, None),
+        )
+        await managed._drain_known_adopted_zombies()
 
 
 @pytest.mark.asyncio
@@ -1224,14 +1306,17 @@ async def test_lifecycle_witness_failures_are_bounded_and_fail_closed(
     )
     real_observe_group = managed._observe_group
     witness.released = True
-    monkeypatch.setattr(managed, "_observe_group", lambda: witness_quiet)
-    timed_out, signal_sent = await managed._wait_for_quiescence(0)
+    observations = iter((witness_quiet, definitive))
+    monkeypatch.setattr(managed, "_observe_group", lambda: next(observations))
+    assert await managed._wait_for_quiescence(0) == (definitive, False)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(process_supervisor, "_WITNESS_EXIT_GRACE_SECONDS", 0)
+        patch.setattr(managed, "_observe_group", lambda: witness_quiet)
+        timed_out, signal_sent = await managed._wait_for_quiescence(0)
     assert timed_out.detail == "lifecycle witness remained live after release"
     assert not signal_sent
 
-    observations = iter((witness_quiet, definitive))
-    monkeypatch.setattr(managed, "_observe_group", lambda: next(observations))
-    assert await managed._wait_for_quiescence(0.05) == (definitive, False)
     monkeypatch.setattr(managed, "_observe_group", real_observe_group)
     witness.released = False
 

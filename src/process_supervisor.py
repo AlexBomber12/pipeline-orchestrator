@@ -279,6 +279,7 @@ class SupervisedProcess:
                 return await self._success(term_sent, kill_sent)
             return self._failure(term_sent, kill_sent, observation.detail)
         finally:
+            await self._drain_known_adopted_zombies()
             await self._close_lifecycle_witness()
 
     async def _success(self, term_sent: bool, kill_sent: bool) -> CleanupResult:
@@ -310,6 +311,7 @@ class SupervisedProcess:
     ) -> tuple[_GroupObservation, bool]:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
+        witness_exit_deadline: float | None = None
         quiet_members: tuple[tuple[int, int, str], ...] | None = None
         signal_sent = False
         while True:
@@ -318,8 +320,8 @@ class SupervisedProcess:
                 observation.state is _GroupState.QUIESCENT
                 and self.process.returncode is not None
             ):
-                membership_changed, reap_error = self._reap_adopted_zombies(
-                    observation.members
+                membership_changed, _, reap_error = (
+                    self._reap_adopted_zombies(observation.members)
                 )
                 if reap_error is not None:
                     return _GroupObservation(
@@ -342,9 +344,16 @@ class SupervisedProcess:
                         and quiet_members == observation.members
                     ):
                         self._release_lifecycle_witness()
+                        witness_exit_deadline = (
+                            loop.time() + _WITNESS_EXIT_GRACE_SECONDS
+                        )
                         quiet_members = None
                     elif witness is not None and witness.released:
-                        remaining = deadline - loop.time()
+                        if witness_exit_deadline is None:
+                            witness_exit_deadline = (
+                                loop.time() + _WITNESS_EXIT_GRACE_SECONDS
+                            )
+                        remaining = witness_exit_deadline - loop.time()
                         if remaining <= 0:
                             return _GroupObservation(
                                 _GroupState.LIVE,
@@ -701,13 +710,14 @@ class SupervisedProcess:
 
     def _reap_adopted_zombies(
         self, members: tuple[tuple[int, int, str], ...]
-    ) -> tuple[bool, str | None]:
+    ) -> tuple[bool, bool, str | None]:
         """Reap owned descendants adopted by a PID-1/subreaper caller."""
         witness = self._lifecycle_witness
         witness_identity = (
             (witness.pid, witness.start_time) if witness is not None else None
         )
         membership_changed = False
+        adopted_child_pending = False
         for pid, start_time, state in members:
             identity = (pid, start_time)
             if (
@@ -720,7 +730,7 @@ class SupervisedProcess:
                 pid, start_time, allow_zombie=True
             )
             if error is not None:
-                return membership_changed, error.detail
+                return membership_changed, adopted_child_pending, error.detail
             if pidfd is None:
                 membership_changed = True
                 continue
@@ -738,12 +748,33 @@ class SupervisedProcess:
                         continue
                     return (
                         membership_changed,
+                        adopted_child_pending,
                         f"could not reap owned process-group member: {exc}",
                     )
-                membership_changed = membership_changed or waited is not None
+                if waited is None:
+                    adopted_child_pending = True
+                else:
+                    membership_changed = True
             finally:
                 os.close(pidfd)
-        return membership_changed, None
+        return membership_changed, adopted_child_pending, None
+
+    async def _drain_known_adopted_zombies(self) -> None:
+        """Boundedly reap known descendants before caching a cleanup result."""
+        known_members = tuple(
+            (pid, start_time, "Z")
+            for pid, start_time in self._known_members
+        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _WITNESS_EXIT_GRACE_SECONDS
+        while known_members:
+            _, pending, error = self._reap_adopted_zombies(known_members)
+            if error is None and not pending:
+                return
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(_POLL_INTERVAL_SECONDS, remaining))
 
     def _revalidate_member(
         self, member: _GroupMember
