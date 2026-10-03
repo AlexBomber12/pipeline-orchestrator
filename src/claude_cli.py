@@ -16,6 +16,12 @@ from typing import Callable
 from src.config import load_config
 from src.daemon.sandbox import build_bwrap_command, is_bubblewrap_available
 from src.diagnosis import build_diagnosis_prompt
+from src.process_supervisor import (
+    ProcessSupervisionError,
+    SupervisedProcess,
+    launch_process,
+    run_supervised_process,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -240,6 +246,7 @@ async def run_claude_async(
     model: str | None = None,
     system_prompt_file: str | None = "CLAUDE.md",
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
     breach_dir: str | None = None,
     breach_run_id: str | None = None,
     session_threshold: int | None = None,
@@ -270,9 +277,8 @@ async def run_claude_async(
             env["PIPELINE_WEEKLY_THRESHOLD"] = str(weekly_threshold)
 
     cmd = _maybe_wrap_sandbox(cmd, cwd)
-    proc: asyncio.subprocess.Process | None = None
     try:
-        proc = await asyncio.create_subprocess_exec(
+        managed = await launch_process(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -280,43 +286,41 @@ async def run_claude_async(
             stdin=asyncio.subprocess.DEVNULL,
             env=env,
         )
-        if on_process_start is not None:
-            on_process_start(proc)
-
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout
-        )
-        stdout = stdout_bytes.decode("utf-8", errors="replace")
-        stderr = stderr_bytes.decode("utf-8", errors="replace")
-        code = proc.returncode or 0
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            logger.warning("claude CLI subprocess did not exit within 5s after kill")
-        logger.error("claude CLI timed out after %ss", timeout)
-        return (-1, "", f"Timeout after {timeout}s")
-    except asyncio.CancelledError:
-        if proc is not None:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                logger.warning("claude CLI subprocess did not exit within 5s after kill")
-        logger.error("claude CLI task cancelled, subprocess killed")
-        raise
     except FileNotFoundError as exc:
         missing = getattr(exc, "filename", "")
         if missing and missing != cmd[0]:
             return (-1, "", f"cwd not found: {missing}")
         return (-1, "", "claude CLI not found")
+    except Exception as exc:
+        logger.error("supervised claude launch failed: %s", exc)
+        return (
+            -1,
+            "",
+            f"Process supervision launch failed: {type(exc).__name__}: {exc}",
+        )
+
+    try:
+        result = await run_supervised_process(
+            managed,
+            timeout=timeout,
+            on_process_start=on_process_start,
+            on_supervised_process_start=on_supervised_process_start,
+        )
+    except ProcessSupervisionError as exc:
+        logger.error("claude process supervision failed: %s", exc)
+        stdout = exc.stdout.decode("utf-8", errors="replace")
+        captured_stderr = exc.stderr.decode("utf-8", errors="replace")
+        if captured_stderr:
+            separator = "" if not stdout or stdout.endswith("\n") else "\n"
+            stdout = f"{stdout}{separator}[captured provider stderr]\n{captured_stderr}"
+        return (-1, stdout, f"Process supervision failed: {exc}")
+
+    if result.timed_out:
+        logger.error("claude CLI timed out after %ss", timeout)
+        return (-1, "", f"Timeout after {timeout}s")
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+    code = result.returncode
     logger.info("claude CLI exited with code %s", code)
     return (code, stdout, stderr)
 
@@ -326,6 +330,7 @@ async def run_planned_pr_async(
     model: str | None = None,
     timeout: int = 900,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
     breach_dir: str | None = None,
     breach_run_id: str | None = None,
     session_threshold: int | None = None,
@@ -341,6 +346,8 @@ async def run_planned_pr_async(
     }
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
+    if on_supervised_process_start is not None:
+        kwargs["on_supervised_process_start"] = on_supervised_process_start
     return await run_claude_async("PLANNED PR", repo_path, **kwargs)
 
 
@@ -353,6 +360,7 @@ async def run_auto_pr_async(
     model: str | None = None,
     timeout: int = 900,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
     breach_dir: str | None = None,
     breach_run_id: str | None = None,
     session_threshold: int | None = None,
@@ -369,6 +377,8 @@ async def run_auto_pr_async(
     }
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
+    if on_supervised_process_start is not None:
+        kwargs["on_supervised_process_start"] = on_supervised_process_start
     return await run_claude_async(
         _build_auto_pr_prompt(pr_id, task_file, task_body), repo_path, **kwargs
     )
@@ -379,6 +389,7 @@ async def fix_review_async(
     model: str | None = None,
     timeout: int | None = None,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
     breach_dir: str | None = None,
     breach_run_id: str | None = None,
     session_threshold: int | None = None,
@@ -397,6 +408,8 @@ async def fix_review_async(
     }
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
+    if on_supervised_process_start is not None:
+        kwargs["on_supervised_process_start"] = on_supervised_process_start
     return await run_claude_async(
         _build_fix_feedback_prompt(
             extra_context,

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import logging
 import math
 import os
 import pickle
@@ -24,7 +25,7 @@ import socket
 import sys
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
 
 _POLL_INTERVAL_SECONDS = 0.01
 _SNAPSHOT_RETRIES = 3
@@ -36,6 +37,13 @@ _WITNESS_EXIT_GRACE_SECONDS = 1.0
 _LAUNCH_PHASE_TIMEOUT_SECONDS = 10.0
 _LAUNCH_CANCELLATION_GRACE_SECONDS = 0.25
 _LAUNCH_CLEANUP_TIMEOUT_SECONDS = 1.0
+# Adapter execution waits for pipe EOF only after owned-process cleanup.  These
+# bounds keep a broken or escaped pipe holder from leaving output-reader tasks
+# pending indefinitely on failure paths.
+_OUTPUT_DRAIN_TIMEOUT_SECONDS = 1.0
+_OUTPUT_CANCEL_TIMEOUT_SECONDS = 1.0
+_ADAPTER_TERM_GRACE_SECONDS = 1.0
+_ADAPTER_KILL_GRACE_SECONDS = 1.0
 _DISAPPEARED_ERRNOS = {errno.ENOENT, errno.ESRCH}
 _RESTORED_SIGNAL_NAMES = ("SIGPIPE", "SIGXFZ", "SIGXFSZ")
 _LAUNCH_PROOF = object()
@@ -131,6 +139,25 @@ class CleanupResult:
     @property
     def quiescent(self) -> bool:
         return self.status is CleanupStatus.QUIESCENT
+
+
+@dataclass(frozen=True)
+class ProcessRunResult:
+    """Completed leader result plus output captured through group cleanup."""
+
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    timed_out: bool = False
+
+
+class ProcessSupervisionError(RuntimeError):
+    """An explicit launch-independent lifecycle or output-drain failure."""
+
+    def __init__(self, detail: str, *, stdout: bytes, stderr: bytes) -> None:
+        super().__init__(detail)
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 class _GroupState(Enum):
@@ -293,8 +320,8 @@ class SupervisedProcess:
             await self._close_lifecycle_witness()
 
     async def _success(self, term_sent: bool, kill_sent: bool) -> CleanupResult:
-        # A non-None returncode means asyncio's child watcher reaped the leader.
-        await self.process.wait()
+        # A non-None returncode means asyncio's child watcher reaped the leader;
+        # Process.wait() may still depend on inherited stdout/stderr reaching EOF.
         return CleanupResult(
             status=CleanupStatus.QUIESCENT,
             leader_returncode=self.process.returncode,
@@ -1151,6 +1178,204 @@ async def _wait_without_cancelling(task: asyncio.Task[None]) -> None:
         except TimeoutError:
             continue
     task.result()
+
+
+async def _capture_output(
+    stream: asyncio.StreamReader, buffer: bytearray
+) -> None:
+    """Read one subprocess pipe incrementally so cancellation keeps diagnostics."""
+    while chunk := await stream.read(64 * 1024):
+        buffer.extend(chunk)
+
+
+async def _wait_for_leader_exit(process: asyncio.subprocess.Process) -> int:
+    """Observe child-watcher returncode publication without waiting for pipe EOF."""
+    while process.returncode is None:
+        await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+    return process.returncode
+
+
+async def _await_task_preserving_cancellation(
+    task: asyncio.Task[Any],
+) -> tuple[Any, asyncio.CancelledError | None]:
+    """Let a bounded lifecycle task finish before propagating cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+    return task.result(), cancellation
+
+
+async def _settle_execution_tasks(
+    tasks: dict[str, asyncio.Task[Any]],
+) -> tuple[str | None, asyncio.CancelledError | None]:
+    """Settle output/wait tasks within the documented drain and cancel bounds."""
+    async def settle() -> str | None:
+        pending = {task for task in tasks.values() if not task.done()}
+        if pending:
+            _, pending = await asyncio.wait(
+                pending, timeout=_OUTPUT_DRAIN_TIMEOUT_SECONDS
+            )
+        timed_out_names = sorted(
+            name for name, task in tasks.items() if task in pending
+        )
+        for task in pending:
+            task.cancel()
+        if pending:
+            _, pending = await asyncio.wait(
+                pending, timeout=_OUTPUT_CANCEL_TIMEOUT_SECONDS
+            )
+            for task in pending:
+                task.add_done_callback(_consume_task_result)
+
+        failures = (
+            [
+                "execution task(s) did not finish within the output drain "
+                "bound: " + ", ".join(timed_out_names)
+            ]
+            if timed_out_names
+            else []
+        )
+        for name, task in tasks.items():
+            if not task.done() or task.cancelled():
+                continue
+            try:
+                task.result()
+            except BaseException as exc:
+                failures.append(f"{name} failed: {type(exc).__name__}: {exc}")
+        return "; ".join(failures) or None
+
+    settle_task = asyncio.create_task(settle())
+    return await _await_task_preserving_cancellation(settle_task)
+
+
+def _record_cancellation_failure(
+    cancellation: asyncio.CancelledError, detail: str
+) -> None:
+    logger = logging.getLogger(__name__)
+    logger.error("process cleanup during cancellation failed: %s", detail)
+    cancellation.add_note(f"process cleanup failed: {detail}")
+
+
+async def run_supervised_process(
+    managed: SupervisedProcess,
+    *,
+    timeout: float | None,
+    on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
+) -> ProcessRunResult:
+    """Run callbacks, wait for the leader, clean its group, and drain output.
+
+    Leader completion is observed through child-watcher returncode publication,
+    independently of pipe EOF.  Cleanup is allowed to finish despite caller
+    cancellation.  After cleanup, stdout/stderr readers receive one second to
+    observe EOF and one second to settle cancellation; any failure is explicit
+    and carries bytes captured so far.  The cleanup implementation itself is
+    bounded by its TERM/KILL, leader-reap, adopted-child, and lifecycle-witness
+    grace periods.
+    """
+    process = managed.process
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+    execution_tasks: dict[str, asyncio.Task[Any]] = {
+        "leader exit": asyncio.create_task(_wait_for_leader_exit(process))
+    }
+    if process.stdout is not None:
+        execution_tasks["stdout reader"] = asyncio.create_task(
+            _capture_output(process.stdout, stdout_buffer)
+        )
+    if process.stderr is not None:
+        execution_tasks["stderr reader"] = asyncio.create_task(
+            _capture_output(process.stderr, stderr_buffer)
+        )
+
+    primary_error: BaseException | None = None
+    cancellation: asyncio.CancelledError | None = None
+    timed_out = False
+    leader_task = execution_tasks["leader exit"]
+    try:
+        if on_process_start is not None:
+            on_process_start(process)
+        if on_supervised_process_start is not None:
+            on_supervised_process_start(managed)
+        if timeout is None:
+            await asyncio.shield(leader_task)
+        else:
+            await asyncio.wait_for(asyncio.shield(leader_task), timeout=timeout)
+    except asyncio.TimeoutError:
+        timed_out = True
+    except asyncio.CancelledError as exc:
+        cancellation = exc
+    except BaseException as exc:
+        primary_error = exc
+
+    cleanup_result: CleanupResult | None = None
+    cleanup_error: BaseException | None = None
+    cleanup_task = asyncio.create_task(
+        managed.cleanup(
+            term_grace=_ADAPTER_TERM_GRACE_SECONDS,
+            kill_grace=_ADAPTER_KILL_GRACE_SECONDS,
+        )
+    )
+    try:
+        cleanup_result, cleanup_cancellation = (
+            await _await_task_preserving_cancellation(cleanup_task)
+        )
+        if cleanup_cancellation is not None:
+            cancellation = cleanup_cancellation
+    except BaseException as exc:
+        cleanup_error = exc
+
+    task_error, settle_cancellation = await _settle_execution_tasks(
+        execution_tasks
+    )
+    if settle_cancellation is not None:
+        cancellation = settle_cancellation
+
+    stdout = bytes(stdout_buffer)
+    stderr = bytes(stderr_buffer)
+    failure_detail: str | None = None
+    if cleanup_error is not None:
+        failure_detail = (
+            "cleanup raised "
+            f"{type(cleanup_error).__name__}: {cleanup_error}"
+        )
+    elif cleanup_result is None:
+        failure_detail = "cleanup produced no result"
+    elif not cleanup_result.quiescent:
+        failure_detail = cleanup_result.detail or "cleanup could not confirm quiescence"
+    if task_error is not None:
+        failure_detail = (
+            f"{failure_detail}; {task_error}" if failure_detail else task_error
+        )
+
+    if cancellation is not None:
+        if failure_detail is not None:
+            _record_cancellation_failure(cancellation, failure_detail)
+        raise cancellation
+    if failure_detail is not None:
+        error = ProcessSupervisionError(
+            failure_detail,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        if primary_error is not None:
+            raise error from primary_error
+        raise error
+    if primary_error is not None:
+        raise primary_error
+
+    returncode = process.returncode
+    if returncode is None and cleanup_result is not None:
+        returncode = cleanup_result.leader_returncode
+    return ProcessRunResult(
+        returncode=returncode if returncode is not None else 0,
+        stdout=stdout,
+        stderr=stderr,
+        timed_out=timed_out,
+    )
 
 
 async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:

@@ -16,16 +16,21 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import src.claude_cli as claude_cli
+import src.codex_cli as codex_cli
 import src.process_supervisor as process_supervisor
 from src.process_supervisor import (
+    CleanupResult,
     CleanupStatus,
     ProcessIdentity,
+    ProcessSupervisionError,
     SupervisedProcess,
     _GroupMember,
     _GroupObservation,
     _GroupState,
     _parse_proc_stat,
     launch_process,
+    run_supervised_process,
 )
 
 SLEEPING_PROCESS = """
@@ -78,6 +83,35 @@ import subprocess
 import sys
 
 subprocess.Popen([sys.executable, "-c", {TERM_IGNORING_PROCESS!r}])
+"""
+
+FAKE_CODER_CLI = r"""#!/usr/bin/env python3
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+mode = os.environ.get("FAKE_CODER_MODE", "success")
+if mode in {"retained-pipe", "wait"}:
+    child_pid = os.fork()
+    if child_pid == 0:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        while True:
+            signal.pause()
+    Path(os.environ["FAKE_CODER_PIDS"]).write_text(
+        f"{os.getpid()} {child_pid}", encoding="utf-8"
+    )
+    print("leader-output", flush=True)
+    print("leader-diagnostic", file=sys.stderr, flush=True)
+    if mode == "retained-pipe":
+        raise SystemExit(int(os.environ.get("FAKE_CODER_EXIT", "0")))
+    while True:
+        signal.pause()
+
+print("provider-output", flush=True)
+print("provider-diagnostic", file=sys.stderr, flush=True)
+raise SystemExit(int(os.environ.get("FAKE_CODER_EXIT", "0")))
 """
 
 
@@ -161,6 +195,344 @@ async def _wait_not_live(*pids: int) -> None:
     async with asyncio.timeout(2):
         while any(_pid_is_live(pid) for pid in pids):
             await asyncio.sleep(0.01)
+
+
+@pytest.fixture
+def fake_coder_bin(tmp_path: Path) -> Path:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for executable in ("codex", "claude"):
+        path = bin_dir / executable
+        path.write_text(FAKE_CODER_CLI, encoding="utf-8")
+        path.chmod(0o755)
+    return bin_dir
+
+
+async def _run_fake_adapter(
+    provider: str,
+    cwd: Path,
+    *,
+    timeout: float | None = 5,
+    on_process_start: Any = None,
+    on_supervised_process_start: Any = None,
+) -> tuple[int, str, str]:
+    kwargs = {
+        "timeout": timeout,
+        "on_process_start": on_process_start,
+        "on_supervised_process_start": on_supervised_process_start,
+    }
+    if provider == "codex":
+        return await codex_cli.run_codex_async("test prompt", str(cwd), **kwargs)
+    return await claude_cli.run_claude_async(
+        "test prompt",
+        str(cwd),
+        system_prompt_file=None,
+        **kwargs,
+    )
+
+
+async def _read_fake_pids(path: Path) -> list[int]:
+    async with asyncio.timeout(2):
+        while not path.exists():
+            await asyncio.sleep(0.01)
+    return [int(value) for value in path.read_text(encoding="utf-8").split()]
+
+
+def _finished_reader(data: bytes = b"") -> asyncio.StreamReader:
+    reader = asyncio.StreamReader()
+    reader.feed_data(data)
+    reader.feed_eof()
+    return reader
+
+
+class _ExecutionProcess:
+    def __init__(self, *, stdout: Any = None, stderr: Any = None) -> None:
+        self.returncode: int | None = 0
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class _ExecutionManaged:
+    def __init__(
+        self,
+        process: _ExecutionProcess,
+        result: CleanupResult | None,
+        *,
+        error: BaseException | None = None,
+        clear_returncode: bool = False,
+    ) -> None:
+        self.process = process
+        self.result = result
+        self.error = error
+        self.clear_returncode = clear_returncode
+
+    async def cleanup(self, **_kwargs: Any) -> CleanupResult | None:
+        if self.error is not None:
+            raise self.error
+        if self.clear_returncode:
+            self.process.returncode = None
+        return self.result
+
+
+@pytest.mark.asyncio
+async def test_run_supervised_process_reports_output_and_cleanup_failures() -> None:
+    class FailingReader:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def read(self, _size: int) -> bytes:
+            self.calls += 1
+            if self.calls == 1:
+                return b"partial"
+            raise RuntimeError("reader broke")
+
+    quiescent = CleanupResult(CleanupStatus.QUIESCENT, 0, False, False)
+    process = _ExecutionProcess(
+        stdout=FailingReader(), stderr=_finished_reader(b"diagnostic")
+    )
+    with pytest.raises(ProcessSupervisionError, match="stdout reader failed") as caught:
+        await run_supervised_process(  # type: ignore[arg-type]
+            _ExecutionManaged(process, quiescent), timeout=1
+        )
+    assert caught.value.stdout == b"partial"
+    assert caught.value.stderr == b"diagnostic"
+
+    process = _ExecutionProcess()
+    with pytest.raises(ProcessSupervisionError, match="cleanup raised RuntimeError"):
+        await run_supervised_process(  # type: ignore[arg-type]
+            _ExecutionManaged(process, None, error=RuntimeError("cleanup broke")),
+            timeout=1,
+        )
+
+    process = _ExecutionProcess()
+    with pytest.raises(ProcessSupervisionError, match="cleanup produced no result"):
+        await run_supervised_process(  # type: ignore[arg-type]
+            _ExecutionManaged(process, None), timeout=1
+        )
+
+    failed = CleanupResult(CleanupStatus.FAILED, 0, True, True)
+    process = _ExecutionProcess()
+
+    def callback_failure(_managed: Any) -> None:
+        raise ValueError("callback broke")
+
+    with pytest.raises(ProcessSupervisionError, match="confirm quiescence") as caught:
+        await run_supervised_process(  # type: ignore[arg-type]
+            _ExecutionManaged(process, failed),
+            timeout=1,
+            on_supervised_process_start=callback_failure,
+        )
+    assert isinstance(caught.value.__cause__, ValueError)
+
+    process = _ExecutionProcess()
+    result = await run_supervised_process(  # type: ignore[arg-type]
+        _ExecutionManaged(
+            process,
+            CleanupResult(CleanupStatus.QUIESCENT, 9, False, False),
+            clear_returncode=True,
+        ),
+        timeout=None,
+    )
+    assert result.returncode == 9
+
+
+@pytest.mark.asyncio
+async def test_execution_wait_helpers_preserve_cancellation_and_are_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    inner = asyncio.create_task(release.wait())
+    waiter = asyncio.create_task(
+        process_supervisor._await_task_preserving_cancellation(inner)
+    )
+    await asyncio.sleep(0)
+    waiter.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    _, cancellation = await waiter
+    assert isinstance(cancellation, asyncio.CancelledError)
+
+    started = asyncio.Event()
+    stubborn_release = asyncio.Event()
+
+    async def stubborn() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await stubborn_release.wait()
+
+    async def broken() -> None:
+        raise RuntimeError("task broke")
+
+    stubborn_task = asyncio.create_task(stubborn())
+    broken_task = asyncio.create_task(broken())
+    await started.wait()
+    await asyncio.sleep(0)
+    monkeypatch.setattr(process_supervisor, "_OUTPUT_DRAIN_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(process_supervisor, "_OUTPUT_CANCEL_TIMEOUT_SECONDS", 0)
+    detail, cancellation = await process_supervisor._settle_execution_tasks(
+        {"stubborn": stubborn_task, "broken": broken_task}
+    )
+    assert cancellation is None
+    assert detail is not None
+    assert "stubborn" in detail
+    assert "broken failed: RuntimeError: task broke" in detail
+    stubborn_release.set()
+    await stubborn_task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_call", [1, 2])
+async def test_run_supervised_process_propagates_deferred_cancellation(
+    monkeypatch: pytest.MonkeyPatch, cancel_call: int
+) -> None:
+    real_await = process_supervisor._await_task_preserving_cancellation
+    call_count = 0
+
+    async def inject_cancellation(
+        task: asyncio.Task[Any],
+    ) -> tuple[Any, asyncio.CancelledError | None]:
+        nonlocal call_count
+        call_count += 1
+        result, _ = await real_await(task)
+        cancellation = asyncio.CancelledError() if call_count == cancel_call else None
+        return result, cancellation
+
+    monkeypatch.setattr(
+        process_supervisor,
+        "_await_task_preserving_cancellation",
+        inject_cancellation,
+    )
+    process = _ExecutionProcess()
+    managed = _ExecutionManaged(
+        process,
+        CleanupResult(CleanupStatus.QUIESCENT, 0, False, False),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_supervised_process(  # type: ignore[arg-type]
+            managed, timeout=1
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["codex", "claude"])
+@pytest.mark.parametrize("returncode", [0, 7])
+async def test_async_adapter_preserves_real_exit_and_output(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_coder_bin: Path,
+    tmp_path: Path,
+    provider: str,
+    returncode: int,
+) -> None:
+    monkeypatch.setenv("PATH", f"{fake_coder_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_CODER_MODE", "success")
+    monkeypatch.setenv("FAKE_CODER_EXIT", str(returncode))
+    monkeypatch.setattr(codex_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
+    monkeypatch.setattr(claude_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
+    raw_processes: list[asyncio.subprocess.Process] = []
+    managed_processes: list[SupervisedProcess] = []
+
+    result = await _run_fake_adapter(
+        provider,
+        tmp_path,
+        on_process_start=raw_processes.append,
+        on_supervised_process_start=managed_processes.append,
+    )
+
+    assert result == (returncode, "provider-output\n", "provider-diagnostic\n")
+    assert len(raw_processes) == 1
+    assert len(managed_processes) == 1
+    assert managed_processes[0].process is raw_processes[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["codex", "claude"])
+async def test_async_adapter_leader_exit_does_not_wait_for_retained_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_coder_bin: Path,
+    tmp_path: Path,
+    provider: str,
+) -> None:
+    pid_file = tmp_path / f"{provider}-retained-pipe.pids"
+    monkeypatch.setenv("PATH", f"{fake_coder_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_CODER_MODE", "retained-pipe")
+    monkeypatch.setenv("FAKE_CODER_PIDS", str(pid_file))
+    monkeypatch.setattr(codex_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
+    monkeypatch.setattr(claude_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
+
+    started = time.monotonic()
+    result = await _run_fake_adapter(provider, tmp_path, timeout=10)
+    elapsed = time.monotonic() - started
+    pids = await _read_fake_pids(pid_file)
+
+    assert result == (0, "leader-output\n", "leader-diagnostic\n")
+    assert elapsed < 4
+    await _wait_not_live(*pids)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["codex", "claude"])
+async def test_async_adapter_timeout_cleans_descendants(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_coder_bin: Path,
+    tmp_path: Path,
+    provider: str,
+) -> None:
+    pid_file = tmp_path / f"{provider}-timeout.pids"
+    monkeypatch.setenv("PATH", f"{fake_coder_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_CODER_MODE", "wait")
+    monkeypatch.setenv("FAKE_CODER_PIDS", str(pid_file))
+    monkeypatch.setattr(codex_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
+    monkeypatch.setattr(claude_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
+
+    result = await _run_fake_adapter(provider, tmp_path, timeout=0.05)
+    pids = await _read_fake_pids(pid_file)
+
+    assert result == (-1, "", "Timeout after 0.05s")
+    await _wait_not_live(*pids)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["codex", "claude"])
+async def test_async_adapter_cancellation_and_callback_failure_clean_descendants(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_coder_bin: Path,
+    tmp_path: Path,
+    provider: str,
+) -> None:
+    monkeypatch.setenv("PATH", f"{fake_coder_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_CODER_MODE", "wait")
+    monkeypatch.setattr(codex_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
+    monkeypatch.setattr(claude_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
+
+    cancel_pids = tmp_path / f"{provider}-cancel.pids"
+    monkeypatch.setenv("FAKE_CODER_PIDS", str(cancel_pids))
+    task = asyncio.create_task(_run_fake_adapter(provider, tmp_path))
+    cancel_pid_values = await _read_fake_pids(cancel_pids)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=4)
+    await _wait_not_live(*cancel_pid_values)
+
+    callback_pids = tmp_path / f"{provider}-callback.pids"
+    monkeypatch.setenv("FAKE_CODER_PIDS", str(callback_pids))
+
+    def fail_callback(_process: asyncio.subprocess.Process) -> None:
+        deadline = time.monotonic() + 1
+        while not callback_pids.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        raise RuntimeError("callback failed")
+
+    with pytest.raises(RuntimeError, match="callback failed"):
+        await _run_fake_adapter(
+            provider,
+            tmp_path,
+            on_process_start=fail_callback,
+        )
+    callback_pid_values = await _read_fake_pids(callback_pids)
+    await _wait_not_live(*callback_pid_values)
 
 
 @pytest.mark.asyncio
