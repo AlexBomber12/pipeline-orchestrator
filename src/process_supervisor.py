@@ -62,6 +62,8 @@ witness_pid = os.read(pid_read, 64)
 os.close(pid_read)
 os.waitpid(broker_pid, 0)
 os.write(ready_fd, b"W" + witness_pid + b"\n")
+if os.read(ready_fd, 1) != b"A":
+    os._exit(126)
 os.close(control_fd)
 os.set_inheritable(ready_fd, False)
 if restore_signals:
@@ -762,8 +764,10 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
     ready_parent, ready_child = socket.socketpair()
     ready_parent.setblocking(False)
     process: asyncio.subprocess.Process | None = None
+    witness_pid: int | None = None
     witness_pidfd: int | None = None
     witness_proven = False
+    launcher_blocked = False
     try:
         process = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -791,17 +795,16 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
         ready_child.close()
         ready_payload = bytearray()
         loop = asyncio.get_running_loop()
-        while chunk := await loop.sock_recv(ready_parent, 64):
+        while b"\n" not in ready_payload:
+            chunk = await loop.sock_recv(ready_parent, 64)
+            if not chunk:
+                break
             ready_payload.extend(chunk)
-        ready_lines = bytes(ready_payload).splitlines()
-        if not ready_lines or not ready_lines[0].startswith(b"W"):
+        ready_line, separator, exec_payload = bytes(ready_payload).partition(b"\n")
+        if not separator or not ready_line.startswith(b"W"):
             raise RuntimeError("lifecycle ownership witness did not start")
-        witness_pid = int(ready_lines[0][1:])
-        exec_errno = (
-            int(ready_lines[1][1:])
-            if len(ready_lines) > 1 and ready_lines[1].startswith(b"E")
-            else None
-        )
+        witness_pid = int(ready_line[1:])
+        launcher_blocked = True
         with open(f"/proc/{witness_pid}/stat", encoding="utf-8") as stat_file:
             state, witness_pgid, witness_sid, witness_start_time = _parse_proc_stat(
                 stat_file.read()
@@ -828,6 +831,16 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
             or current_start_time != witness_start_time
         ):
             raise RuntimeError("lifecycle ownership witness changed during launch")
+        await loop.sock_sendall(ready_parent, b"A")
+        launcher_blocked = False
+        while chunk := await loop.sock_recv(ready_parent, 64):
+            exec_payload += chunk
+        exec_lines = exec_payload.splitlines()
+        exec_errno = (
+            int(exec_lines[0][1:])
+            if exec_lines and exec_lines[0].startswith(b"E")
+            else None
+        )
         if exec_errno is not None:
             raise OSError(
                 exec_errno,
@@ -867,16 +880,24 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
     except BaseException:
         if process is not None:
             try:
-                if witness_proven:
+                if witness_proven or launcher_blocked:
                     os.killpg(process.pid, signal.SIGKILL)
                 else:
                     process.kill()
             except ProcessLookupError:
                 pass
+            os.close(control_write)
+            control_write = -1
             await process.wait()
+        if witness_pid is not None:
+            try:
+                os.waitpid(witness_pid, 0)
+            except ChildProcessError:
+                pass
         if witness_pidfd is not None:
             os.close(witness_pidfd)
-        os.close(control_write)
+        if control_write >= 0:
+            os.close(control_write)
         raise
     finally:
         if control_read >= 0:

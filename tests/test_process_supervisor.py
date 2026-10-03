@@ -8,6 +8,7 @@ import signal
 import sys
 import time
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -974,7 +975,7 @@ async def test_lifecycle_witness_failures_are_bounded_and_fail_closed(
 
 @pytest.mark.asyncio
 async def test_launch_rejects_conflicts_and_unverified_session(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with pytest.raises(TypeError, match="preexec_fn, start_new_session"):
         await launch_process(
@@ -993,6 +994,11 @@ async def test_launch_rejects_conflicts_and_unverified_session(
 
     with monkeypatch.context() as patch:
         patch.setattr(process_supervisor, "_WITNESS_LAUNCHER", "pass")
+        patch.setattr(
+            asyncio.subprocess.Process,
+            "kill",
+            lambda _process: (_ for _ in ()).throw(ProcessLookupError()),
+        )
         with pytest.raises(RuntimeError, match="witness did not start"):
             await launch_process(sys.executable, "-c", "pass")
 
@@ -1031,10 +1037,16 @@ async def test_launch_rejects_conflicts_and_unverified_session(
             return parsed[0], parsed[1], parsed[2], parsed[3] + 1
         return parsed
 
+    target_marker = tmp_path / "target-ran"
     with monkeypatch.context() as patch:
         patch.setattr(process_supervisor, "_parse_proc_stat", changed_witness)
         with pytest.raises(RuntimeError, match="witness changed"):
-            await launch_process(sys.executable, "-c", "pass")
+            await launch_process(
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(target_marker)!r}).touch()",
+            )
+    assert not target_marker.exists()
 
     with monkeypatch.context() as patch:
         patch.setattr(process_supervisor, "_get_pidfd_opener", lambda: None)
