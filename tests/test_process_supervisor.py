@@ -1452,7 +1452,7 @@ async def test_launch_deadline_helpers_bound_stubborn_tasks(
         )
         await process_supervisor._finish_failed_launch(
             fake_process,  # type: ignore[arg-type]
-            group_contained=False,
+            owned_pidfds=[],
             control_fd=control_read,
             witness_pid=None,
             witness_pidfd=None,
@@ -1460,12 +1460,67 @@ async def test_launch_deadline_helpers_bound_stubborn_tasks(
     os.close(control_write)
     assert fake_process.kill_calls == 2
 
+    class StableLeaderProcess:
+        pid = os.getpid()
+
+        def kill(self) -> None:
+            raise AssertionError("stable leader handle must avoid numeric PID signaling")
+
+        async def wait(self) -> int:
+            return 0
+
+    stable_process = StableLeaderProcess()
+    owned_pidfds = [
+        ((stable_process.pid, 1), os.pidfd_open(stable_process.pid)),
+        ((stable_process.pid + 1, 2), os.pidfd_open(stable_process.pid)),
+        ((stable_process.pid + 2, 3), os.pidfd_open(stable_process.pid)),
+        ((stable_process.pid + 3, 4), os.pidfd_open(stable_process.pid)),
+    ]
+    signal_calls: list[tuple[int, signal.Signals]] = []
+
+    def signal_stable_handle(pidfd: int, sig: signal.Signals) -> None:
+        signal_calls.append((pidfd, sig))
+        if pidfd == owned_pidfds[1][1]:
+            raise ProcessLookupError
+
+    def reap_stable_handle(_idtype: int, pidfd: int, _options: int) -> Any:
+        if pidfd == owned_pidfds[0][1]:
+            raise ChildProcessError
+        if pidfd == owned_pidfds[1][1]:
+            raise ProcessLookupError(errno.ESRCH, "gone")
+        if pidfd == owned_pidfds[2][1]:
+            return None
+        raise PermissionError("not an adopted child")
+
+    control_read, control_write = os.pipe()
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "killpg", lambda *_args: pytest.fail("numeric group signal"))
+        patch.setattr(os, "waitid", reap_stable_handle)
+        patch.setattr(signal, "pidfd_send_signal", signal_stable_handle)
+        patch.setattr(
+            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.01
+        )
+        await process_supervisor._finish_failed_launch(
+            stable_process,  # type: ignore[arg-type]
+            owned_pidfds=owned_pidfds,
+            control_fd=control_read,
+            witness_pid=None,
+            witness_pidfd=None,
+        )
+    os.close(control_write)
+    assert signal_calls == [
+        (pidfd, signal.SIGKILL) for _, pidfd in owned_pidfds
+    ]
+    for _, pidfd in owned_pidfds:
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(pidfd)
+
     control_read, control_write = os.pipe()
     with monkeypatch.context() as patch:
         patch.setattr(os, "waitpid", lambda pid, _options: (pid, 0))
         await process_supervisor._finish_failed_launch(
             None,
-            group_contained=False,
+            owned_pidfds=[],
             control_fd=control_read,
             witness_pid=4321,
             witness_pidfd=None,
@@ -1483,7 +1538,7 @@ async def test_launch_deadline_helpers_bound_stubborn_tasks(
         )
         await process_supervisor._finish_failed_launch(
             None,
-            group_contained=False,
+            owned_pidfds=[],
             control_fd=control_read,
             witness_pid=4321,
             witness_pidfd=None,
@@ -1504,7 +1559,7 @@ async def test_launch_deadline_helpers_bound_stubborn_tasks(
         )
         await process_supervisor._finish_failed_launch(
             None,
-            group_contained=False,
+            owned_pidfds=[],
             control_fd=control_read,
             witness_pid=4321,
             witness_pidfd=stable_pidfd,
