@@ -5094,6 +5094,140 @@ def test_track_supervised_coder_never_overwrites_unclean_handle() -> None:
     assert runner._current_coder_process is first.process
 
 
+def test_coder_tracking_rejects_every_mismatched_replacement() -> None:
+    class _Process:
+        returncode = None
+
+    first_process = _Process()
+    second_process = _Process()
+
+    runner = h._make_runner()
+    managed = types.SimpleNamespace(process=first_process)
+    runner._track_current_coder_supervised_process(managed)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="supervised coder process"):
+        runner._track_current_coder_process(second_process)  # type: ignore[arg-type]
+
+    runner = h._make_runner()
+    runner._track_current_coder_process(first_process)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="outstanding coder process"):
+        runner._track_current_coder_process(second_process)  # type: ignore[arg-type]
+
+    runner = h._make_runner()
+    runner._track_current_coder_process(first_process)  # type: ignore[arg-type]
+    mismatched = types.SimpleNamespace(process=second_process)
+    with pytest.raises(RuntimeError, match="does not match"):
+        runner._track_current_coder_supervised_process(  # type: ignore[arg-type]
+            mismatched
+        )
+
+
+def test_terminate_current_coder_records_cleanup_exception() -> None:
+    runner = h._make_runner()
+
+    class _Managed:
+        process = types.SimpleNamespace(returncode=None)
+
+        async def cleanup(self, **kwargs: object) -> object:
+            raise RuntimeError("cleanup exploded")
+
+    managed = _Managed()
+    runner._track_current_coder_supervised_process(managed)  # type: ignore[arg-type]
+
+    assert asyncio.run(runner._terminate_current_coder()) is False
+    assert "RuntimeError: cleanup exploded" in (
+        runner._coder_cleanup_failure_detail or ""
+    )
+    assert runner._current_coder_supervised_process is managed
+
+
+def test_terminate_current_coder_propagates_cancel_after_success() -> None:
+    runner = h._make_runner()
+
+    class _Managed:
+        process = types.SimpleNamespace(returncode=None)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def cleanup(self, **kwargs: object) -> object:
+            self.calls += 1
+            if self.calls == 1:
+                raise asyncio.CancelledError
+            return types.SimpleNamespace(quiescent=True, detail=None)
+
+    managed = _Managed()
+    runner._track_current_coder_supervised_process(managed)  # type: ignore[arg-type]
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(runner._terminate_current_coder())
+
+    assert managed.calls == 2
+    assert runner._current_coder_supervised_process is None
+    assert runner._current_coder_process is None
+
+
+def test_confirm_current_coder_parks_failure_before_propagating_cancel() -> None:
+    runner = h._make_runner()
+
+    class _Managed:
+        process = types.SimpleNamespace(returncode=None)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def cleanup(self, **kwargs: object) -> object:
+            self.calls += 1
+            if self.calls == 1:
+                raise asyncio.CancelledError
+            return types.SimpleNamespace(
+                quiescent=False,
+                detail="cancelled cleanup stayed live",
+            )
+
+    managed = _Managed()
+    runner._track_current_coder_supervised_process(managed)  # type: ignore[arg-type]
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(runner._confirm_current_coder_cleanup("cancel test"))
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "cancelled cleanup stayed live" in (runner.state.error_message or "")
+    assert runner._current_coder_supervised_process is managed
+
+
+@pytest.mark.parametrize("second_outcome", ["cancel", "error"])
+def test_terminate_current_coder_records_second_cleanup_failure(
+    second_outcome: str,
+) -> None:
+    runner = h._make_runner()
+
+    class _Managed:
+        process = types.SimpleNamespace(returncode=None)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def cleanup(self, **kwargs: object) -> object:
+            self.calls += 1
+            if self.calls == 1 or second_outcome == "cancel":
+                raise asyncio.CancelledError
+            raise RuntimeError("second cleanup exploded")
+
+    managed = _Managed()
+    runner._track_current_coder_supervised_process(managed)  # type: ignore[arg-type]
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(runner._terminate_current_coder())
+
+    expected = (
+        "cancelled repeatedly"
+        if second_outcome == "cancel"
+        else "RuntimeError: second cleanup exploded"
+    )
+    assert expected in (runner._coder_cleanup_failure_detail or "")
+    assert runner._current_coder_supervised_process is managed
+
+
 def test_verify_pushes_since_returns_false_when_remote_diverged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1168,33 +1168,31 @@ def test_handle_coding_stop_request_terminates_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._patch_subprocess(monkeypatch)
-    stop_called = {"terminate": 0, "kill": 0, "wait": 0}
+    cleanup_calls: list[tuple[float, float]] = []
 
     class _FakeProc:
         def __init__(self) -> None:
             self.returncode: int | None = None
-            self._done = asyncio.Event()
 
-        def terminate(self) -> None:
-            stop_called["terminate"] += 1
-            self.returncode = -15
-            self._done.set()
+    class _FakeManaged:
+        def __init__(self, process: _FakeProc) -> None:
+            self.process = process
 
-        def kill(self) -> None:
-            stop_called["kill"] += 1
-            self.returncode = -9
-            self._done.set()
-
-        async def wait(self) -> int:
-            stop_called["wait"] += 1
-            await self._done.wait()
-            return self.returncode or 0
+        async def cleanup(
+            self, *, term_grace: float, kill_grace: float
+        ) -> object:
+            cleanup_calls.append((term_grace, kill_grace))
+            self.process.returncode = -15
+            return types.SimpleNamespace(quiescent=True, detail=None)
 
     async def fake_run_auto_pr_async(*args: object, **kwargs: object) -> tuple[int, str, str]:
         proc = _FakeProc()
         on_process_start = kwargs["on_process_start"]
+        on_supervised_process_start = kwargs["on_supervised_process_start"]
         assert callable(on_process_start)
+        assert callable(on_supervised_process_start)
         on_process_start(proc)
+        on_supervised_process_start(_FakeManaged(proc))
         try:
             await asyncio.sleep(3600)
         except asyncio.CancelledError:
@@ -1221,9 +1219,7 @@ def test_handle_coding_stop_request_terminates_process(
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.user_paused is True
     assert runner.state.error_message is None
-    assert stop_called["terminate"] == 1
-    assert stop_called["kill"] == 0
-    assert stop_called["wait"] >= 1
+    assert cleanup_calls == [(5, 5)]
     assert any("user stop requested" in entry["event"].lower() for entry in runner.state.history)
 
 

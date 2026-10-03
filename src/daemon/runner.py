@@ -2377,7 +2377,7 @@ class PipelineRunner(
             message,
             save_run_record_as="error" if first_report else None,
             publish=True,
-            log_prefix="[CLEANUP]",
+            log_prefix="[ERROR]",
         )
 
     async def _confirm_current_coder_cleanup(self, context: str) -> bool:
@@ -2396,6 +2396,17 @@ class PipelineRunner(
 
     async def _hold_for_coder_cleanup(self) -> bool:
         """Block a runner cycle while owned coder cleanup is unconfirmed."""
+        # A non-process execution sentinel has no process identity to clean;
+        # leave it for the command layer to defer. Real asyncio subprocesses
+        # expose ``returncode`` and must fail closed here when the supervisor
+        # handle is missing.
+        if (
+            self._current_coder_supervised_process is None
+            and self._coder_cleanup_failure_detail is None
+            and self._current_coder_process is not None
+            and not hasattr(self._current_coder_process, "returncode")
+        ):
+            return False
         if (
             self._current_coder_supervised_process is None
             and self._current_coder_process is None

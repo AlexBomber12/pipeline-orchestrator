@@ -324,7 +324,7 @@ class CodingMixin:
                 self._cleanup_expected_branch()
             else:
                 self.log_event(
-                    "[CLEANUP] Preserving expected-branch marker while "
+                    "[INFRA] Preserving expected-branch marker while "
                     "coder cleanup remains unconfirmed."
                 )
 
