@@ -882,36 +882,44 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
     witness_pidfd: int | None = None
     witness_proven = False
     launcher_blocked = False
+    launch_cancellation: asyncio.CancelledError | None = None
     try:
-        process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-I",
-            "-S",
-            "-c",
-            _WITNESS_LAUNCHER,
-            str(control_read),
-            str(ready_child.fileno()),
-            signal_modes,
-            target_executable,
-            *program,
-            start_new_session=True,
-            pass_fds=tuple(
-                sorted(
-                    {
-                        *caller_pass_fds,
-                        control_read,
-                        ready_child.fileno(),
-                    }
-                )
-            ),
-            **kwargs,
+        spawn_task = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                _WITNESS_LAUNCHER,
+                str(control_read),
+                str(ready_child.fileno()),
+                signal_modes,
+                target_executable,
+                *program,
+                start_new_session=True,
+                pass_fds=tuple(
+                    sorted(
+                        {
+                            *caller_pass_fds,
+                            control_read,
+                            ready_child.fileno(),
+                        }
+                    )
+                ),
+                **kwargs,
+            )
         )
+        while not spawn_task.done():
+            try:
+                await asyncio.shield(spawn_task)
+            except asyncio.CancelledError as exc:
+                launch_cancellation = exc
+        process = spawn_task.result()
         os.close(control_read)
         control_read = -1
         ready_child.close()
         loop = asyncio.get_running_loop()
         ready_task = asyncio.create_task(_read_witness_ready(ready_parent))
-        launch_cancellation: asyncio.CancelledError | None = None
         while not ready_task.done():
             try:
                 await asyncio.shield(ready_task)

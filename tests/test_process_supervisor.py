@@ -1147,6 +1147,34 @@ async def test_launch_rejects_conflicts_and_unverified_session(
             )
     assert not target_marker.exists()
 
+    spawn_cancellation_marker = tmp_path / "spawn-cancelled-target-ran"
+    spawn_completed = asyncio.Event()
+    release_spawn = asyncio.Event()
+    real_create_subprocess_exec = asyncio.create_subprocess_exec
+
+    async def delayed_spawn(*args: Any, **kwargs: Any) -> Any:
+        spawned = await real_create_subprocess_exec(*args, **kwargs)
+        spawn_completed.set()
+        await release_spawn.wait()
+        return spawned
+
+    with monkeypatch.context() as patch:
+        patch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+        launch_task = asyncio.create_task(
+            launch_process(
+                sys.executable,
+                "-c",
+                "from pathlib import Path; "
+                f"Path({str(spawn_cancellation_marker)!r}).touch()",
+            )
+        )
+        await asyncio.wait_for(spawn_completed.wait(), timeout=1)
+        launch_task.cancel()
+        release_spawn.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(launch_task, timeout=1)
+    assert not spawn_cancellation_marker.exists()
+
     cancellation_marker = tmp_path / "cancelled-target-ran"
     ready_received = asyncio.Event()
     release_ready = asyncio.Event()
