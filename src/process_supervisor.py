@@ -14,6 +14,7 @@ signaling a numerically matching group.
 from __future__ import annotations
 
 import asyncio
+import errno
 import math
 import os
 import select
@@ -26,15 +27,19 @@ from typing import Any
 
 _POLL_INTERVAL_SECONDS = 0.01
 _SNAPSHOT_RETRIES = 3
+_WITNESS_EXIT_GRACE_SECONDS = 1.0
+_DISAPPEARED_ERRNOS = {errno.ENOENT, errno.ESRCH}
 _LAUNCH_PROOF = object()
 _WITNESS_LAUNCHER = r"""
 import os
+import signal
 import sys
 
 control_fd = int(sys.argv[1])
 ready_fd = int(sys.argv[2])
-target_executable = sys.argv[3]
-target_argv = sys.argv[4:]
+restore_signals = sys.argv[3] == "1"
+target_executable = sys.argv[4]
+target_argv = sys.argv[5:]
 max_fd = os.sysconf("SC_OPEN_MAX")
 pid_read, pid_write = os.pipe()
 
@@ -59,6 +64,11 @@ os.waitpid(broker_pid, 0)
 os.write(ready_fd, b"W" + witness_pid + b"\n")
 os.close(control_fd)
 os.set_inheritable(ready_fd, False)
+if restore_signals:
+    for signal_name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+        target_signal = getattr(signal, signal_name, None)
+        if target_signal is not None:
+            signal.signal(target_signal, signal.SIG_DFL)
 try:
     os.execvpe(target_executable, target_argv, os.environ)
 except OSError as exc:
@@ -240,7 +250,7 @@ class SupervisedProcess:
                 return await self._success(term_sent, kill_sent)
             return self._failure(term_sent, kill_sent, observation.detail)
         finally:
-            self._close_lifecycle_witness()
+            await self._close_lifecycle_witness()
 
     async def _success(self, term_sent: bool, kill_sent: bool) -> CleanupResult:
         # A non-None returncode means asyncio's child watcher reaped the leader.
@@ -392,6 +402,11 @@ class SupervisedProcess:
                     except FileNotFoundError:
                         continue
                     except (OSError, IndexError, ValueError) as exc:
+                        if (
+                            isinstance(exc, OSError)
+                            and exc.errno in _DISAPPEARED_ERRNOS
+                        ):
+                            continue
                         self._close_pidfds(pidfds)
                         return (
                             _GroupObservation(
@@ -538,6 +553,11 @@ class SupervisedProcess:
         except FileNotFoundError:
             return False, None
         except (OSError, IndexError, ValueError) as exc:
+            if (
+                isinstance(exc, OSError)
+                and exc.errno in _DISAPPEARED_ERRNOS
+            ):
+                return False, None
             return False, _GroupObservation(
                 _GroupState.UNKNOWN,
                 f"could not confirm leader identity: {exc}",
@@ -593,7 +613,20 @@ class SupervisedProcess:
             return False
         poller = select.poll()
         poller.register(witness.pidfd, select.POLLIN)
-        return not poller.poll(0)
+        if not poller.poll(0):
+            return True
+        self._reap_lifecycle_witness()
+        return False
+
+    def _reap_lifecycle_witness(self) -> None:
+        witness = self._lifecycle_witness
+        if witness is None:
+            return
+        try:
+            os.waitpid(witness.pid, os.WNOHANG)
+        except ChildProcessError:
+            # Outside a PID-1 daemon, the host's init process owns reaping.
+            pass
 
     def _revalidate_member(
         self, member: _GroupMember
@@ -604,6 +637,11 @@ class SupervisedProcess:
         except FileNotFoundError:
             return False, None
         except (OSError, IndexError, ValueError) as exc:
+            if (
+                isinstance(exc, OSError)
+                and exc.errno in _DISAPPEARED_ERRNOS
+            ):
+                return False, None
             return False, _GroupObservation(
                 _GroupState.UNKNOWN,
                 f"could not revalidate lifecycle ownership: {exc}",
@@ -639,6 +677,11 @@ class SupervisedProcess:
             except FileNotFoundError:
                 return None, None
             except (OSError, IndexError, ValueError) as exc:
+                if (
+                    isinstance(exc, OSError)
+                    and exc.errno in _DISAPPEARED_ERRNOS
+                ):
+                    return None, None
                 return None, _GroupObservation(
                     _GroupState.UNKNOWN,
                     f"could not revalidate stable process handle: {exc}",
@@ -672,11 +715,26 @@ class SupervisedProcess:
         os.close(witness.control_fd)
         witness.released = True
 
-    def _close_lifecycle_witness(self) -> None:
+    async def _close_lifecycle_witness(self) -> None:
         witness = self._lifecycle_witness
         if witness is None:
             return
         self._release_lifecycle_witness()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _WITNESS_EXIT_GRACE_SECONDS
+        while self._witness_is_live() and loop.time() < deadline:
+            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+        if self._witness_is_live():
+            sender = getattr(signal, "pidfd_send_signal", None)
+            if sender is not None:
+                try:
+                    sender(witness.pidfd, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            force_deadline = loop.time() + _WITNESS_EXIT_GRACE_SECONDS
+            while self._witness_is_live() and loop.time() < force_deadline:
+                await asyncio.sleep(0)
+        self._reap_lifecycle_witness()
         os.close(witness.pidfd)
         self._lifecycle_witness = None
 
@@ -699,6 +757,7 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
         raise TypeError(f"launch_process owns subprocess option(s): {names}")
     target_executable = os.fspath(kwargs.pop("executable", program[0]))
     caller_pass_fds = tuple(kwargs.pop("pass_fds", ()))
+    restore_signals = kwargs.get("restore_signals", True)
     control_read, control_write = os.pipe()
     ready_parent, ready_child = socket.socketpair()
     ready_parent.setblocking(False)
@@ -712,6 +771,7 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
             _WITNESS_LAUNCHER,
             str(control_read),
             str(ready_child.fileno()),
+            "1" if restore_signals else "0",
             target_executable,
             *program,
             start_new_session=True,

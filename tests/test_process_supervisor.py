@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import math
 import os
 import signal
@@ -198,6 +199,29 @@ async def test_repeated_fast_completion_reconciles_disappeared_members(
         assert result.quiescent
         assert not result.term_sent
         assert not result.kill_sent
+
+
+@pytest.mark.asyncio
+async def test_launch_restores_default_sigpipe_disposition(
+    process_pool: ProcessPool,
+) -> None:
+    managed = await launch_process(
+        "/bin/sleep",
+        "30",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    process_pool.supervised.append(
+        (managed, managed.identity.process_group_id)
+    )
+
+    managed.process.send_signal(signal.SIGPIPE)
+
+    assert await asyncio.wait_for(managed.process.wait(), timeout=1) == -signal.SIGPIPE
+    result = await managed.cleanup(term_grace=0.5, kill_grace=0.5)
+    assert result.quiescent
+    assert not result.term_sent
+    assert not result.kill_sent
 
 
 @pytest.mark.asyncio
@@ -609,9 +633,12 @@ async def test_unknown_group_state_and_signal_errors_return_failure(
     assert result.detail == "could not inspect /proc: proc unavailable"
 
 
+@pytest.mark.parametrize("disappearance", (FileNotFoundError, ProcessLookupError))
 @pytest.mark.asyncio
 async def test_proc_scan_ignores_disappeared_unrelated_entry(
-    process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
+    process_pool: ProcessPool,
+    monkeypatch: pytest.MonkeyPatch,
+    disappearance: type[OSError],
 ) -> None:
     managed = await process_pool.launch(SLEEPING_PROCESS)
     await _read_pids(managed.process)
@@ -622,7 +649,7 @@ async def test_proc_scan_ignores_disappeared_unrelated_entry(
         nonlocal skipped
         if path == "/proc/1/stat":
             skipped = True
-            raise FileNotFoundError
+            raise disappearance(errno.ESRCH, "disappeared")
         return real_open(path, *args, **kwargs)
 
     monkeypatch.setattr(
@@ -806,6 +833,22 @@ async def test_pidfd_acquisition_revalidates_process_identity(
     assert managed._check_leader_identity() == (False, None)
     monkeypatch.delattr(process_supervisor, "open")
 
+    def disappeared_with_esrch(*_args: Any, **_kwargs: Any) -> Any:
+        raise ProcessLookupError(errno.ESRCH, "disappeared")
+
+    monkeypatch.setattr(
+        process_supervisor,
+        "open",
+        disappeared_with_esrch,
+        raising=False,
+    )
+    assert managed._check_leader_identity() == (False, None)
+    assert managed._revalidate_member(
+        _GroupMember(pid, "S", start_time)
+    ) == (False, None)
+    assert managed._open_owned_pidfd(pid, start_time) == (None, None)
+    monkeypatch.delattr(process_supervisor, "open")
+
     pidfd, error = managed._open_owned_pidfd(pid, start_time + 1)
     assert pidfd is None
     assert error is not None
@@ -858,8 +901,19 @@ async def test_lifecycle_witness_failures_are_bounded_and_fail_closed(
     real_witness = managed._lifecycle_witness
     managed._lifecycle_witness = None
     assert not managed._witness_is_live()
-    managed._close_lifecycle_witness()
+    managed._reap_lifecycle_witness()
+    await managed._close_lifecycle_witness()
     managed._lifecycle_witness = real_witness
+
+    reaped: list[tuple[int, int]] = []
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            os,
+            "waitpid",
+            lambda pid, options: reaped.append((pid, options)) or (pid, 0),
+        )
+        managed._reap_lifecycle_witness()
+    assert reaped == [(witness.pid, os.WNOHANG)]
 
     for error, expected in (
         (FileNotFoundError(), None),
@@ -904,6 +958,18 @@ async def test_lifecycle_witness_failures_are_bounded_and_fail_closed(
     assert await managed._wait_for_quiescence(0.05) is definitive
     monkeypatch.setattr(managed, "_observe_group", real_observe_group)
     witness.released = False
+
+    liveness = iter((True, True, True, True, False))
+    with monkeypatch.context() as patch:
+        patch.setattr(process_supervisor, "_WITNESS_EXIT_GRACE_SECONDS", 0.01)
+        patch.setattr(managed, "_witness_is_live", lambda: next(liveness))
+        patch.setattr(
+            signal,
+            "pidfd_send_signal",
+            lambda _pidfd, _sig: (_ for _ in ()).throw(ProcessLookupError()),
+        )
+        await managed._close_lifecycle_witness()
+    assert managed._lifecycle_witness is None
 
 
 @pytest.mark.asyncio
