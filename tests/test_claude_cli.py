@@ -21,6 +21,44 @@ from src.claude_cli import (
     run_planned_pr,
     run_planned_pr_async,
 )
+from src.process_supervisor import CleanupResult, CleanupStatus
+
+
+class _FakeSupervisedProcess:
+    def __init__(self, process: MagicMock) -> None:
+        self.process = process
+
+    async def cleanup(
+        self, *, term_grace: float, kill_grace: float
+    ) -> CleanupResult:
+        del term_grace, kill_grace
+        try:
+            self.process.kill()
+        except ProcessLookupError:
+            pass
+        if "_cleanup_returncode" in self.process.__dict__:
+            self.process.returncode = self.process.__dict__["_cleanup_returncode"]
+        error = self.process.__dict__.get("_cleanup_error")
+        if error is not None:
+            raise error
+        return self.process.__dict__.get(
+            "_cleanup_result",
+            CleanupResult(
+                CleanupStatus.QUIESCENT,
+                self.process.returncode,
+                True,
+                False,
+            ),
+        )
+
+
+@pytest.fixture(autouse=True)
+def _adapt_async_launch(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_launch(*args: Any, **kwargs: Any) -> _FakeSupervisedProcess:
+        process = await asyncio.create_subprocess_exec(*args, **kwargs)
+        return _FakeSupervisedProcess(process)
+
+    monkeypatch.setattr("src.claude_cli.launch_process", fake_launch)
 
 
 class _FakeCompletedProcess:
@@ -365,13 +403,27 @@ def test_run_planned_pr_accepts_timeout(monkeypatch: pytest.MonkeyPatch) -> None
 # --- Async tests ---
 
 
-def _make_fake_proc(stdout: bytes = b"", stderr: bytes = b"", returncode: int = 0) -> MagicMock:
+def _make_fake_proc(
+    stdout: bytes = b"", stderr: bytes = b"", returncode: int = 0
+) -> MagicMock:
     proc = MagicMock()
-    proc.communicate = AsyncMock(return_value=(stdout, stderr))
+    stdout_reader = asyncio.StreamReader()
+    stdout_reader.feed_data(stdout)
+    stdout_reader.feed_eof()
+    stderr_reader = asyncio.StreamReader()
+    stderr_reader.feed_data(stderr)
+    stderr_reader.feed_eof()
+    proc.stdout = stdout_reader
+    proc.stderr = stderr_reader
     proc.returncode = returncode
     proc.kill = MagicMock()
-    proc.wait = AsyncMock()
+    proc.wait = AsyncMock(return_value=returncode)
     return proc
+
+
+def _block_until_cleanup(proc: MagicMock) -> None:
+    proc.returncode = None
+    proc.__dict__["_cleanup_returncode"] = 0
 
 
 @pytest.mark.asyncio
@@ -468,16 +520,16 @@ async def test_run_claude_async_generates_breach_run_id_when_missing(
 @pytest.mark.asyncio
 async def test_run_claude_async_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_proc = _make_fake_proc()
-    fake_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError)
+    _block_until_cleanup(fake_proc)
 
     async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
         return fake_proc
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
-    result = await run_claude_async("prompt", "/tmp", timeout=5)
+    result = await run_claude_async("prompt", "/tmp", timeout=0.01)
 
-    assert result == (-1, "", "Timeout after 5s")
+    assert result == (-1, "", "Timeout after 0.01s")
     fake_proc.kill.assert_called_once()
 
 
@@ -486,7 +538,7 @@ async def test_run_claude_async_timeout_ignores_missing_process_on_kill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_proc = _make_fake_proc()
-    fake_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError)
+    _block_until_cleanup(fake_proc)
     fake_proc.kill.side_effect = ProcessLookupError
 
     async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
@@ -494,39 +546,37 @@ async def test_run_claude_async_timeout_ignores_missing_process_on_kill(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
-    result = await run_claude_async("prompt", "/tmp", timeout=5)
+    result = await run_claude_async("prompt", "/tmp", timeout=0.01)
 
-    assert result == (-1, "", "Timeout after 5s")
-    fake_proc.wait.assert_awaited_once()
+    assert result == (-1, "", "Timeout after 0.01s")
 
 
 @pytest.mark.asyncio
-async def test_run_claude_async_timeout_returns_when_wait_cleanup_times_out(
+async def test_run_claude_async_cleanup_failure_is_explicit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_proc = _make_fake_proc()
-    fake_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError)
-    call_count = 0
+    fake_proc = _make_fake_proc(stdout=b"partial", stderr=b"rate limit exceeded")
+    fake_proc.__dict__["_cleanup_result"] = CleanupResult(
+        CleanupStatus.FAILED,
+        0,
+        True,
+        True,
+        "ownership proof lost",
+    )
 
     async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
         return fake_proc
 
-    async def fake_wait_for(coro: Any, timeout: Any) -> Any:
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return await coro
-        coro.close()
-        raise asyncio.TimeoutError
-
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
-    monkeypatch.setattr("src.claude_cli.asyncio.wait_for", fake_wait_for)
 
     result = await run_claude_async("prompt", "/tmp", timeout=5)
 
-    assert result == (-1, "", "Timeout after 5s")
+    assert result == (
+        -1,
+        "partial\n[captured provider stderr]\nrate limit exceeded",
+        "Process supervision failed: ownership proof lost",
+    )
     fake_proc.kill.assert_called_once()
-    fake_proc.wait.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -539,6 +589,26 @@ async def test_run_claude_async_not_found(monkeypatch: pytest.MonkeyPatch) -> No
     result = await run_claude_async("prompt", "/tmp")
 
     assert result == (-1, "", "claude CLI not found")
+
+
+@pytest.mark.asyncio
+async def test_run_claude_async_supervised_launch_failure_is_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def failed_launch(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("ownership proof unavailable")
+
+    monkeypatch.setattr("src.claude_cli.launch_process", failed_launch)
+
+    result = await run_claude_async("prompt", "/tmp")
+
+    assert result == (
+        -1,
+        "",
+        "Process supervision launch failed: RuntimeError: "
+        "ownership proof unavailable",
+    )
+    assert "rate limit" not in result[2].lower()
 
 
 @pytest.mark.asyncio
@@ -577,27 +647,37 @@ async def test_run_claude_async_bare_flags(monkeypatch: pytest.MonkeyPatch) -> N
 async def test_run_claude_async_cancelled_kills_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    started = asyncio.Event()
     fake_proc = _make_fake_proc()
-    fake_proc.communicate = AsyncMock(side_effect=asyncio.CancelledError)
+    _block_until_cleanup(fake_proc)
 
     async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
         return fake_proc
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
+    task = asyncio.create_task(
+        run_claude_async(
+            "prompt",
+            "/tmp",
+            on_process_start=lambda _proc: started.set(),
+        )
+    )
+    await started.wait()
+    task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await run_claude_async("prompt", "/tmp")
+        await task
 
     fake_proc.kill.assert_called_once()
-    fake_proc.wait.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_run_claude_async_cancelled_ignores_missing_process_on_kill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    started = asyncio.Event()
     fake_proc = _make_fake_proc()
-    fake_proc.communicate = AsyncMock(side_effect=asyncio.CancelledError)
+    _block_until_cleanup(fake_proc)
     fake_proc.kill.side_effect = ProcessLookupError
 
     async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
@@ -605,39 +685,57 @@ async def test_run_claude_async_cancelled_ignores_missing_process_on_kill(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
+    task = asyncio.create_task(
+        run_claude_async(
+            "prompt",
+            "/tmp",
+            on_process_start=lambda _proc: started.set(),
+        )
+    )
+    await started.wait()
+    task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await run_claude_async("prompt", "/tmp")
+        await task
 
-    fake_proc.wait.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_run_claude_async_cancelled_raises_when_wait_cleanup_times_out(
+async def test_run_claude_async_cancellation_records_cleanup_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    started = asyncio.Event()
     fake_proc = _make_fake_proc()
-    fake_proc.communicate = AsyncMock(side_effect=asyncio.CancelledError)
-    call_count = 0
+    _block_until_cleanup(fake_proc)
+    fake_proc.__dict__["_cleanup_result"] = CleanupResult(
+        CleanupStatus.FAILED,
+        None,
+        True,
+        True,
+        "cleanup could not prove quiescence",
+    )
 
     async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
         return fake_proc
 
-    async def fake_wait_for(coro: Any, timeout: Any) -> Any:
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return await coro
-        coro.close()
-        raise asyncio.TimeoutError
-
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
-    monkeypatch.setattr("src.claude_cli.asyncio.wait_for", fake_wait_for)
 
-    with pytest.raises(asyncio.CancelledError):
-        await run_claude_async("prompt", "/tmp")
+    task = asyncio.create_task(
+        run_claude_async(
+            "prompt",
+            "/tmp",
+            on_process_start=lambda _proc: started.set(),
+        )
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
 
     fake_proc.kill.assert_called_once()
-    fake_proc.wait.assert_called_once()
+    assert any(
+        "cleanup could not prove quiescence" in note
+        for note in getattr(caught.value, "__notes__", [])
+    )
 
 
 @pytest.mark.asyncio
@@ -666,6 +764,7 @@ async def test_run_claude_async_calls_on_process_start(
 ) -> None:
     fake_proc = _make_fake_proc(returncode=0)
     started: list[MagicMock] = []
+    supervised: list[_FakeSupervisedProcess] = []
 
     async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
         return fake_proc
@@ -676,10 +775,12 @@ async def test_run_claude_async_calls_on_process_start(
         "prompt",
         "/tmp",
         on_process_start=lambda proc: started.append(proc),
+        on_supervised_process_start=lambda managed: supervised.append(managed),
     )
 
     assert result == (0, "", "")
     assert started == [fake_proc]
+    assert [managed.process for managed in supervised] == [fake_proc]
 
 
 @pytest.mark.asyncio
@@ -723,6 +824,7 @@ async def test_run_planned_pr_async_forwards_on_process_start(
 ) -> None:
     captured: dict[str, Any] = {}
     callback = object()
+    supervised_callback = object()
 
     async def fake_run_claude_async(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
         captured["kwargs"] = kwargs
@@ -730,9 +832,17 @@ async def test_run_planned_pr_async_forwards_on_process_start(
 
     monkeypatch.setattr("src.claude_cli.run_claude_async", fake_run_claude_async)
 
-    await run_planned_pr_async("/data/repos/demo", on_process_start=callback)  # type: ignore[arg-type]
+    await run_planned_pr_async(
+        "/data/repos/demo",
+        on_process_start=callback,  # type: ignore[arg-type]
+        on_supervised_process_start=supervised_callback,  # type: ignore[arg-type]
+    )
 
     assert captured["kwargs"]["on_process_start"] is callback
+    assert (
+        captured["kwargs"]["on_supervised_process_start"]
+        is supervised_callback
+    )
 
 
 @pytest.mark.asyncio
@@ -778,6 +888,7 @@ async def test_fix_review_async_forwards_on_process_start(
 ) -> None:
     captured: dict[str, Any] = {}
     callback = object()
+    supervised_callback = object()
 
     async def fake_run_claude_async(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
         captured["kwargs"] = kwargs
@@ -785,9 +896,17 @@ async def test_fix_review_async_forwards_on_process_start(
 
     monkeypatch.setattr("src.claude_cli.run_claude_async", fake_run_claude_async)
 
-    await fix_review_async("/data/repos/demo", on_process_start=callback)  # type: ignore[arg-type]
+    await fix_review_async(
+        "/data/repos/demo",
+        on_process_start=callback,  # type: ignore[arg-type]
+        on_supervised_process_start=supervised_callback,  # type: ignore[arg-type]
+    )
 
     assert captured["kwargs"]["on_process_start"] is callback
+    assert (
+        captured["kwargs"]["on_supervised_process_start"]
+        is supervised_callback
+    )
 
 
 @pytest.mark.asyncio
@@ -899,6 +1018,7 @@ async def test_run_auto_pr_async_forwards_on_process_start(
 ) -> None:
     captured: dict[str, Any] = {}
     callback = object()
+    supervised_callback = object()
 
     async def fake_run_claude_async(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
         captured["kwargs"] = kwargs
@@ -912,9 +1032,14 @@ async def test_run_auto_pr_async_forwards_on_process_start(
         "tasks/PR-270.md",
         "<body>",
         on_process_start=callback,  # type: ignore[arg-type]
+        on_supervised_process_start=supervised_callback,  # type: ignore[arg-type]
     )
 
     assert captured["kwargs"]["on_process_start"] is callback
+    assert (
+        captured["kwargs"]["on_supervised_process_start"]
+        is supervised_callback
+    )
 
 
 def test_run_auto_pr_sync_formats_prompt_with_headers(

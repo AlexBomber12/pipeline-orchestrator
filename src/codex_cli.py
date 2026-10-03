@@ -15,6 +15,12 @@ from typing import Callable
 from src.config import load_config
 from src.daemon.sandbox import build_bwrap_command, is_bubblewrap_available
 from src.diagnosis import build_diagnosis_prompt
+from src.process_supervisor import (
+    ProcessSupervisionError,
+    SupervisedProcess,
+    launch_process,
+    run_supervised_process,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +90,7 @@ async def run_codex_async(
     timeout: int | None = 600,
     model: str | None = None,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
 ) -> tuple[int, str, str]:
     """Invoke ``codex exec`` with ``prompt`` inside ``cwd``.
 
@@ -104,52 +111,49 @@ async def run_codex_async(
     logger.info("[codex] running codex exec with prompt: %s", prompt[:80])
 
     cmd = _maybe_wrap_sandbox(cmd, cwd)
-    proc: asyncio.subprocess.Process | None = None
     try:
-        proc = await asyncio.create_subprocess_exec(
+        managed = await launch_process(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
             stdin=asyncio.subprocess.DEVNULL,
         )
-        if on_process_start is not None:
-            on_process_start(proc)
-
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout
-        )
-        stdout = stdout_bytes.decode("utf-8", errors="replace")
-        stderr = stderr_bytes.decode("utf-8", errors="replace")
-        code = proc.returncode or 0
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            logger.warning("[codex] subprocess did not exit within 5s after kill")
-        logger.error("[codex] codex exec timed out after %ss", timeout)
-        return (-1, "", f"Timeout after {timeout}s")
-    except asyncio.CancelledError:
-        if proc is not None:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                logger.warning("[codex] subprocess did not exit within 5s after kill")
-        logger.error("[codex] codex exec task cancelled, subprocess killed")
-        raise
     except FileNotFoundError as exc:
         missing = getattr(exc, "filename", "")
         if missing and missing != cmd[0]:
             return (-1, "", f"cwd not found: {missing}")
         return (-1, "", "codex CLI not found")
+    except Exception as exc:
+        logger.error("[codex] supervised launch failed: %s", exc)
+        return (
+            -1,
+            "",
+            f"Process supervision launch failed: {type(exc).__name__}: {exc}",
+        )
+
+    try:
+        result = await run_supervised_process(
+            managed,
+            timeout=timeout,
+            on_process_start=on_process_start,
+            on_supervised_process_start=on_supervised_process_start,
+        )
+    except ProcessSupervisionError as exc:
+        logger.error("[codex] process supervision failed: %s", exc)
+        stdout = exc.stdout.decode("utf-8", errors="replace")
+        captured_stderr = exc.stderr.decode("utf-8", errors="replace")
+        if captured_stderr:
+            separator = "" if not stdout or stdout.endswith("\n") else "\n"
+            stdout = f"{stdout}{separator}[captured provider stderr]\n{captured_stderr}"
+        return (-1, stdout, f"Process supervision failed: {exc}")
+
+    if result.timed_out:
+        logger.error("[codex] codex exec timed out after %ss", timeout)
+        return (-1, "", f"Timeout after {timeout}s")
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+    code = result.returncode
     logger.info("[codex] codex exec exited with code %s", code)
     return (code, stdout, stderr)
 
@@ -159,12 +163,15 @@ async def run_planned_pr_async(
     model: str | None = None,
     timeout: int = 900,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
     **_kwargs: object,
 ) -> tuple[int, str, str]:
     """Trigger a ``PLANNED PR`` run in ``repo_path`` via Codex CLI."""
     kwargs: dict[str, object] = {"timeout": timeout, "model": model}
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
+    if on_supervised_process_start is not None:
+        kwargs["on_supervised_process_start"] = on_supervised_process_start
     return await run_codex_async("PLANNED PR", repo_path, **kwargs)
 
 
@@ -184,12 +191,15 @@ async def run_auto_pr_async(
     model: str | None = None,
     timeout: int = 900,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
     **_kwargs: object,
 ) -> tuple[int, str, str]:
     """Trigger an ``AUTO PR`` run in ``repo_path`` via Codex CLI."""
     kwargs: dict[str, object] = {"timeout": timeout, "model": model}
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
+    if on_supervised_process_start is not None:
+        kwargs["on_supervised_process_start"] = on_supervised_process_start
     return await run_codex_async(
         _build_auto_pr_prompt(pr_id, task_file, task_body), repo_path, **kwargs
     )
@@ -222,6 +232,7 @@ async def fix_review_async(
     model: str | None = None,
     timeout: int | None = None,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
     extra_context: str | None = None,
     pr_id: str | None = None,
     task_file: str | None = None,
@@ -231,6 +242,8 @@ async def fix_review_async(
     kwargs: dict[str, object] = {"timeout": timeout, "model": model}
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
+    if on_supervised_process_start is not None:
+        kwargs["on_supervised_process_start"] = on_supervised_process_start
     return await run_codex_async(
         _build_fix_feedback_prompt(
             extra_context,
