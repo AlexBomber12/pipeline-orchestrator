@@ -259,6 +259,51 @@ def test_run_coder_cleanup_failure_precedes_normal_result_processing(
     assert runner._current_coder_process is managed.process
 
 
+def test_handle_coding_preserves_branch_marker_on_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    _coder_name, plugin = runner._get_coder()
+    branch_cleanup_calls: list[str] = []
+
+    class _Process:
+        returncode = 0
+
+    class _Managed:
+        process = _Process()
+
+        async def cleanup(self, **kwargs: object) -> object:
+            return types.SimpleNamespace(
+                quiescent=False,
+                detail="branch marker cleanup unconfirmed",
+            )
+
+    managed = _Managed()
+
+    async def fake_run(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        kwargs["on_process_start"](managed.process)
+        kwargs["on_supervised_process_start"](managed)
+        return (0, "", "")
+
+    monkeypatch.setattr(plugin, "run_auto_pr", fake_run)
+    monkeypatch.setattr(runner, "_check_late_breach", lambda *a, **kw: None)
+    monkeypatch.setattr(runner, "_cleanup_breach_marker", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        runner,
+        "_cleanup_expected_branch",
+        lambda: branch_cleanup_calls.append("removed"),
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert branch_cleanup_calls == []
+    assert any(
+        "Preserving expected-branch marker" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
 def test_run_coder_cancellation_confirms_cleanup_before_propagating(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
