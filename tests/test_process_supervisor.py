@@ -537,8 +537,10 @@ async def test_cleanup_reports_control_and_observation_failures(
         observation_error, "_signal_group", lambda _sig: (True, None)
     )
 
-    async def unknown_after_term(_timeout: float) -> _GroupObservation:
-        return unknown
+    async def unknown_after_term(
+        _timeout: float, *, repeat_signal: signal.Signals | None = None
+    ) -> tuple[_GroupObservation, bool]:
+        return unknown, False
 
     monkeypatch.setattr(
         observation_error, "_wait_for_quiescence", unknown_after_term
@@ -552,8 +554,10 @@ async def test_cleanup_reports_control_and_observation_failures(
     signal_results = iter(((True, None), (False, "kill failed")))
     monkeypatch.setattr(kill_error, "_signal_group", lambda _sig: next(signal_results))
 
-    async def still_live(_timeout: float) -> _GroupObservation:
-        return live
+    async def still_live(
+        _timeout: float, *, repeat_signal: signal.Signals | None = None
+    ) -> tuple[_GroupObservation, bool]:
+        return live, False
 
     monkeypatch.setattr(kill_error, "_wait_for_quiescence", still_live)
     result = await kill_error.cleanup(term_grace=0, kill_grace=0)
@@ -572,15 +576,16 @@ async def test_wait_and_signal_refuse_unconfirmed_states(
     monkeypatch.setattr(
         managed, "_snapshot_group", lambda **_kwargs: (unknown, [])
     )
-    assert await managed._wait_for_quiescence(0) is unknown
+    assert await managed._wait_for_quiescence(0) == (unknown, False)
     assert managed._signal_group(signal.SIGTERM) == (False, "unknown")
 
     monkeypatch.setattr(
         managed, "_snapshot_group", lambda **_kwargs: (quiet, [])
     )
-    timed_out = await managed._wait_for_quiescence(0)
+    timed_out, signal_sent = await managed._wait_for_quiescence(0)
     assert timed_out.state is _GroupState.LIVE
     assert timed_out.detail == "process group is quiet but leader was not reaped"
+    assert not signal_sent
     assert managed._signal_group(signal.SIGTERM) == (False, None)
 
     changed = _GroupObservation(_GroupState.CHANGED, "member disappeared")
@@ -619,28 +624,64 @@ async def test_quiet_snapshot_is_reconciled_before_success(
     real_observe_group = managed._observe_group
     monkeypatch.setattr(managed, "_observe_group", lambda: next(observations))
 
-    result = await managed._wait_for_quiescence(0)
+    result, signal_sent = await managed._wait_for_quiescence(0)
     monkeypatch.setattr(managed, "_observe_group", real_observe_group)
 
     assert result.state is _GroupState.LIVE
     assert result.detail == "process group remained live after the grace period"
+    assert not signal_sent
 
     changed_parent = replace(parent_only, members=((113, 12, "Z"),))
     observations = iter((parent_only, changed_parent))
     monkeypatch.setattr(managed, "_observe_group", lambda: next(observations))
 
-    result = await managed._wait_for_quiescence(0)
+    result, signal_sent = await managed._wait_for_quiescence(0)
     monkeypatch.setattr(managed, "_observe_group", real_observe_group)
 
     assert result.state is _GroupState.LIVE
     assert result.detail == (
         "process-group quiescence could not be confirmed before the grace period"
     )
+    assert not signal_sent
 
     observations = iter((parent_only, parent_only))
     monkeypatch.setattr(managed, "_observe_group", lambda: next(observations))
-    assert await managed._wait_for_quiescence(0) is parent_only
+    assert await managed._wait_for_quiescence(0) == (parent_only, False)
+
+    definitive = _GroupObservation(
+        _GroupState.QUIESCENT,
+        "group absent",
+        definitive=True,
+    )
+    observations = iter((omitted_descendant, definitive))
+    repeated_signals: list[signal.Signals] = []
+    real_signal_group = managed._signal_group
+
+    def record_repeated_signal(sig: signal.Signals) -> tuple[bool, None]:
+        repeated_signals.append(sig)
+        return True, None
+
+    monkeypatch.setattr(managed, "_observe_group", lambda: next(observations))
+    monkeypatch.setattr(managed, "_signal_group", record_repeated_signal)
+    assert await managed._wait_for_quiescence(
+        0.05, repeat_signal=signal.SIGKILL
+    ) == (definitive, True)
+    assert repeated_signals == [signal.SIGKILL]
+
+    monkeypatch.setattr(managed, "_observe_group", lambda: omitted_descendant)
+    monkeypatch.setattr(
+        managed,
+        "_signal_group",
+        lambda _sig: (False, "delivery failed"),
+    )
+    failed, signal_sent = await managed._wait_for_quiescence(
+        0.05, repeat_signal=signal.SIGKILL
+    )
+    assert failed.state is _GroupState.UNKNOWN
+    assert failed.detail == "delivery failed"
+    assert not signal_sent
     monkeypatch.setattr(managed, "_observe_group", real_observe_group)
+    monkeypatch.setattr(managed, "_signal_group", real_signal_group)
 
 
 @pytest.mark.asyncio
@@ -976,12 +1017,13 @@ async def test_lifecycle_witness_failures_are_bounded_and_fail_closed(
     real_observe_group = managed._observe_group
     witness.released = True
     monkeypatch.setattr(managed, "_observe_group", lambda: witness_quiet)
-    timed_out = await managed._wait_for_quiescence(0)
+    timed_out, signal_sent = await managed._wait_for_quiescence(0)
     assert timed_out.detail == "lifecycle witness remained live after release"
+    assert not signal_sent
 
     observations = iter((witness_quiet, definitive))
     monkeypatch.setattr(managed, "_observe_group", lambda: next(observations))
-    assert await managed._wait_for_quiescence(0.05) is definitive
+    assert await managed._wait_for_quiescence(0.05) == (definitive, False)
     monkeypatch.setattr(managed, "_observe_group", real_observe_group)
     witness.released = False
 

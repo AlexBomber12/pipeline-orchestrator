@@ -252,7 +252,10 @@ class SupervisedProcess:
                 if error is not None:
                     return self._failure(term_sent, kill_sent, error)
 
-            observation = await self._wait_for_quiescence(term_grace)
+            observation, repeated_term = await self._wait_for_quiescence(
+                term_grace, repeat_signal=signal.SIGTERM
+            )
+            term_sent = term_sent or repeated_term
             if observation.state is _GroupState.QUIESCENT:
                 return await self._success(term_sent, kill_sent)
             if observation.state in {_GroupState.UNPROVEN, _GroupState.UNKNOWN}:
@@ -261,7 +264,10 @@ class SupervisedProcess:
             kill_sent, error = self._signal_group(signal.SIGKILL)
             if error is not None:
                 return self._failure(term_sent, kill_sent, error)
-            observation = await self._wait_for_quiescence(kill_grace)
+            observation, repeated_kill = await self._wait_for_quiescence(
+                kill_grace, repeat_signal=signal.SIGKILL
+            )
+            kill_sent = kill_sent or repeated_kill
             if observation.state is _GroupState.QUIESCENT:
                 return await self._success(term_sent, kill_sent)
             return self._failure(term_sent, kill_sent, observation.detail)
@@ -289,10 +295,16 @@ class SupervisedProcess:
             detail=detail,
         )
 
-    async def _wait_for_quiescence(self, timeout: float) -> _GroupObservation:
+    async def _wait_for_quiescence(
+        self,
+        timeout: float,
+        *,
+        repeat_signal: signal.Signals | None = None,
+    ) -> tuple[_GroupObservation, bool]:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         quiet_members: tuple[tuple[int, int, str], ...] | None = None
+        signal_sent = False
         while True:
             observation = self._observe_group()
             if (
@@ -300,7 +312,7 @@ class SupervisedProcess:
                 and self.process.returncode is not None
             ):
                 if observation.definitive:
-                    return observation
+                    return observation, signal_sent
                 if observation.witness_live:
                     witness = self._lifecycle_witness
                     if (
@@ -316,7 +328,7 @@ class SupervisedProcess:
                             return _GroupObservation(
                                 _GroupState.LIVE,
                                 "lifecycle witness remained live after release",
-                            )
+                            ), signal_sent
                         await asyncio.sleep(
                             min(_POLL_INTERVAL_SECONDS, remaining)
                         )
@@ -326,13 +338,13 @@ class SupervisedProcess:
                     await asyncio.sleep(0)
                     continue
                 if quiet_members == observation.members:
-                    return observation
+                    return observation, signal_sent
                 if quiet_members is not None and loop.time() >= deadline:
                     return _GroupObservation(
                         _GroupState.LIVE,
                         "process-group quiescence could not be confirmed "
                         "before the grace period",
-                    )
+                    ), signal_sent
                 quiet_members = observation.members
                 # A second, fresh /proc enumeration is required because a
                 # parent can fork and exit while the first scan is in flight.
@@ -340,14 +352,22 @@ class SupervisedProcess:
                 continue
             quiet_members = None
             if observation.state in {_GroupState.UNPROVEN, _GroupState.UNKNOWN}:
-                return observation
+                return observation, signal_sent
+            if observation.state is _GroupState.LIVE and repeat_signal is not None:
+                sent, error = self._signal_group(repeat_signal)
+                signal_sent = signal_sent or sent
+                if error is not None:
+                    return (
+                        _GroupObservation(_GroupState.UNKNOWN, error),
+                        signal_sent,
+                    )
             remaining = deadline - loop.time()
             if remaining <= 0:
                 if observation.state is _GroupState.QUIESCENT:
                     detail = "process group is quiet but leader was not reaped"
                 else:
                     detail = "process group remained live after the grace period"
-                return _GroupObservation(_GroupState.LIVE, detail)
+                return _GroupObservation(_GroupState.LIVE, detail), signal_sent
             await asyncio.sleep(min(_POLL_INTERVAL_SECONDS, remaining))
 
     def _signal_group(self, sig: signal.Signals) -> tuple[bool, str | None]:
