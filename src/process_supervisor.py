@@ -6,6 +6,10 @@ session, moves to another process group, or crosses a container boundary needs
 separate containment (for example, a cgroup or container supervisor).
 TERM and KILL are delivered only through revalidated per-member Linux pidfds;
 the recyclable numeric process-group ID is never a signal-delivery target.
+After the leader exits, ownership continuity is proven by a member birth
+identity observed earlier or by an inherited, pinned stdout/stderr pipe from
+the launch.  If neither proof remains available, cleanup fails without
+signaling the numerically matching group.
 """
 
 from __future__ import annotations
@@ -65,6 +69,19 @@ class _GroupState(Enum):
 class _GroupObservation:
     state: _GroupState
     detail: str
+    members: tuple[tuple[int, int, str], ...] = ()
+    definitive: bool = False
+
+
+@dataclass(frozen=True)
+class _GroupMember:
+    pid: int
+    state: str
+    start_time: int
+
+    @property
+    def identity(self) -> tuple[int, int]:
+        return self.pid, self.start_time
 
 
 class SupervisedProcess:
@@ -81,12 +98,23 @@ class SupervisedProcess:
         identity: ProcessIdentity,
         *,
         _proof: object,
+        _lifecycle_proof_fds: tuple[int, ...] = (),
     ) -> None:
         if _proof is not _LAUNCH_PROOF:
             raise TypeError("use launch_process() to create a supervised process")
         self._process = process
         self._identity = identity
         self._cleanup_task: asyncio.Task[CleanupResult] | None = None
+        self._lifecycle_proof_fds = list(_lifecycle_proof_fds)
+        self._lifecycle_proof_files = frozenset(
+            (file_stat.st_dev, file_stat.st_ino)
+            for file_stat in map(os.fstat, _lifecycle_proof_fds)
+        )
+        self._known_members: set[tuple[int, int]] = set()
+        if identity.leader_start_time is not None:
+            self._known_members.add(
+                (identity.leader_pid, identity.leader_start_time)
+            )
 
     @property
     def process(self) -> asyncio.subprocess.Process:
@@ -134,30 +162,33 @@ class SupervisedProcess:
     async def _cleanup_impl(
         self, term_grace: float, kill_grace: float
     ) -> CleanupResult:
-        term_sent = False
-        kill_sent = False
+        try:
+            term_sent = False
+            kill_sent = False
 
-        observation = self._observe_group()
-        if observation.state in {_GroupState.UNPROVEN, _GroupState.UNKNOWN}:
-            return self._failure(term_sent, kill_sent, observation.detail)
-        if observation.state is _GroupState.LIVE:
-            term_sent, error = self._signal_group(signal.SIGTERM)
+            observation = self._observe_group()
+            if observation.state in {_GroupState.UNPROVEN, _GroupState.UNKNOWN}:
+                return self._failure(term_sent, kill_sent, observation.detail)
+            if observation.state is _GroupState.LIVE:
+                term_sent, error = self._signal_group(signal.SIGTERM)
+                if error is not None:
+                    return self._failure(term_sent, kill_sent, error)
+
+            observation = await self._wait_for_quiescence(term_grace)
+            if observation.state is _GroupState.QUIESCENT:
+                return await self._success(term_sent, kill_sent)
+            if observation.state in {_GroupState.UNPROVEN, _GroupState.UNKNOWN}:
+                return self._failure(term_sent, kill_sent, observation.detail)
+
+            kill_sent, error = self._signal_group(signal.SIGKILL)
             if error is not None:
                 return self._failure(term_sent, kill_sent, error)
-
-        observation = await self._wait_for_quiescence(term_grace)
-        if observation.state is _GroupState.QUIESCENT:
-            return await self._success(term_sent, kill_sent)
-        if observation.state in {_GroupState.UNPROVEN, _GroupState.UNKNOWN}:
+            observation = await self._wait_for_quiescence(kill_grace)
+            if observation.state is _GroupState.QUIESCENT:
+                return await self._success(term_sent, kill_sent)
             return self._failure(term_sent, kill_sent, observation.detail)
-
-        kill_sent, error = self._signal_group(signal.SIGKILL)
-        if error is not None:
-            return self._failure(term_sent, kill_sent, error)
-        observation = await self._wait_for_quiescence(kill_grace)
-        if observation.state is _GroupState.QUIESCENT:
-            return await self._success(term_sent, kill_sent)
-        return self._failure(term_sent, kill_sent, observation.detail)
+        finally:
+            self._close_lifecycle_proofs()
 
     async def _success(self, term_sent: bool, kill_sent: bool) -> CleanupResult:
         # A non-None returncode means asyncio's child watcher reaped the leader.
@@ -183,13 +214,27 @@ class SupervisedProcess:
     async def _wait_for_quiescence(self, timeout: float) -> _GroupObservation:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
+        quiet_members: tuple[tuple[int, int, str], ...] | None = None
         while True:
             observation = self._observe_group()
             if (
                 observation.state is _GroupState.QUIESCENT
                 and self.process.returncode is not None
             ):
-                return observation
+                if observation.definitive or quiet_members == observation.members:
+                    return observation
+                if quiet_members is not None and loop.time() >= deadline:
+                    return _GroupObservation(
+                        _GroupState.LIVE,
+                        "process-group quiescence could not be confirmed "
+                        "before the grace period",
+                    )
+                quiet_members = observation.members
+                # A second, fresh /proc enumeration is required because a
+                # parent can fork and exit while the first scan is in flight.
+                await asyncio.sleep(0)
+                continue
+            quiet_members = None
             if observation.state in {_GroupState.UNPROVEN, _GroupState.UNKNOWN}:
                 return observation
             remaining = deadline - loop.time()
@@ -243,11 +288,10 @@ class SupervisedProcess:
                 [],
             )
 
-        leader_error = self._check_leader_identity()
+        _, leader_error = self._check_leader_identity()
         if leader_error is not None:
             return leader_error, []
-        matched = False
-        live = False
+        members: list[_GroupMember] = []
         pidfds: list[int] = []
         try:
             with os.scandir("/proc") as entries:
@@ -275,7 +319,6 @@ class SupervisedProcess:
                         )
                     if member_pgid != pgid:
                         continue
-                    matched = True
                     if member_sid != self.identity.session_id:
                         self._close_pidfds(pidfds)
                         return (
@@ -297,18 +340,9 @@ class SupervisedProcess:
                             ),
                             [],
                         )
-                    if state == "Z":
-                        continue
-                    live = True
-                    if acquire_pidfds:
-                        pidfd, error = self._open_owned_pidfd(
-                            int(entry.name), start_time
-                        )
-                        if error is not None:
-                            self._close_pidfds(pidfds)
-                            return error, []
-                        if pidfd is not None:
-                            pidfds.append(pidfd)
+                    members.append(
+                        _GroupMember(int(entry.name), state, start_time)
+                    )
         except OSError as exc:
             self._close_pidfds(pidfds)
             return (
@@ -318,7 +352,32 @@ class SupervisedProcess:
                 [],
             )
 
-        if live:
+        live_members = [member for member in members if member.state != "Z"]
+        if acquire_pidfds:
+            for member in live_members:
+                pidfd, error = self._open_owned_pidfd(
+                    member.pid, member.start_time
+                )
+                if error is not None:
+                    self._close_pidfds(pidfds)
+                    return error, []
+                if pidfd is not None:
+                    pidfds.append(pidfd)
+
+        if members:
+            ownership_error = self._prove_group_ownership(members)
+            if ownership_error is not None:
+                self._close_pidfds(pidfds)
+                return ownership_error, []
+            self._known_members.update(member.identity for member in members)
+
+        fingerprint = tuple(
+            sorted(
+                (member.pid, member.start_time, member.state)
+                for member in members
+            )
+        )
+        if live_members:
             if acquire_pidfds and not pidfds:
                 return (
                     _GroupObservation(
@@ -328,14 +387,19 @@ class SupervisedProcess:
                     [],
                 )
             return (
-                _GroupObservation(_GroupState.LIVE, "owned process group is live"),
+                _GroupObservation(
+                    _GroupState.LIVE,
+                    "owned process group is live",
+                    fingerprint,
+                ),
                 pidfds,
             )
-        if matched:
+        if members:
             return (
                 _GroupObservation(
                     _GroupState.QUIESCENT,
                     "owned process group contains only zombies",
+                    fingerprint,
                 ),
                 [],
             )
@@ -344,7 +408,9 @@ class SupervisedProcess:
         except ProcessLookupError:
             return (
                 _GroupObservation(
-                    _GroupState.QUIESCENT, "process group disappeared"
+                    _GroupState.QUIESCENT,
+                    "process group disappeared",
+                    definitive=True,
                 ),
                 [],
             )
@@ -364,23 +430,120 @@ class SupervisedProcess:
             [],
         )
 
-    def _check_leader_identity(self) -> _GroupObservation | None:
+    def _check_leader_identity(
+        self,
+    ) -> tuple[bool, _GroupObservation | None]:
+        if self.identity.leader_start_time is None:
+            return False, _GroupObservation(
+                _GroupState.UNPROVEN,
+                "process-group leader identity is unproven",
+            )
         try:
             with open(
                 f"/proc/{self.identity.leader_pid}/stat", encoding="utf-8"
             ) as stat_file:
-                start_time = _parse_proc_stat(stat_file.read())[3]
+                _, pgid, sid, start_time = _parse_proc_stat(stat_file.read())
         except FileNotFoundError:
-            return None
+            return False, None
         except (OSError, IndexError, ValueError) as exc:
-            return _GroupObservation(
-                _GroupState.UNKNOWN, f"could not confirm leader identity: {exc}"
+            return False, _GroupObservation(
+                _GroupState.UNKNOWN,
+                f"could not confirm leader identity: {exc}",
             )
         if start_time != self.identity.leader_start_time:
-            return _GroupObservation(
-                _GroupState.UNPROVEN, "process-group leader identity is unproven"
+            return False, _GroupObservation(
+                _GroupState.UNPROVEN,
+                "process-group leader identity is unproven",
             )
-        return None
+        if (
+            pgid != self.identity.process_group_id
+            or sid != self.identity.session_id
+        ):
+            return False, _GroupObservation(
+                _GroupState.UNPROVEN,
+                "process-group identity no longer belongs to the owned session",
+            )
+        return True, None
+
+    def _prove_group_ownership(
+        self, members: list[_GroupMember]
+    ) -> _GroupObservation | None:
+        for member in members:
+            if member.identity not in self._known_members:
+                continue
+            stable, error = self._revalidate_member(member)
+            if error is not None:
+                return error
+            if stable:
+                return None
+
+        proof_error: _GroupObservation | None = None
+        for member in members:
+            if member.state == "Z":
+                continue
+            holds_proof, error = self._member_holds_lifecycle_proof(member.pid)
+            if error is not None:
+                proof_error = error
+                continue
+            if not holds_proof:
+                continue
+            stable, error = self._revalidate_member(member)
+            if error is not None:
+                return error
+            if stable:
+                return None
+        if proof_error is not None:
+            return proof_error
+        return _GroupObservation(
+            _GroupState.UNPROVEN,
+            "process-group continuity is unproven; refusing to signal",
+        )
+
+    def _member_holds_lifecycle_proof(
+        self, pid: int
+    ) -> tuple[bool, _GroupObservation | None]:
+        if not self._lifecycle_proof_files:
+            return False, None
+        try:
+            with os.scandir(f"/proc/{pid}/fd") as entries:
+                for entry in entries:
+                    try:
+                        file_stat = entry.stat()
+                    except FileNotFoundError:
+                        continue
+                    if (
+                        file_stat.st_dev,
+                        file_stat.st_ino,
+                    ) in self._lifecycle_proof_files:
+                        return True, None
+        except FileNotFoundError:
+            return False, None
+        except OSError as exc:
+            return False, _GroupObservation(
+                _GroupState.UNKNOWN,
+                f"could not inspect lifecycle proof: {exc}",
+            )
+        return False, None
+
+    def _revalidate_member(
+        self, member: _GroupMember
+    ) -> tuple[bool, _GroupObservation | None]:
+        try:
+            with open(f"/proc/{member.pid}/stat", encoding="utf-8") as stat_file:
+                _, pgid, sid, start_time = _parse_proc_stat(stat_file.read())
+        except FileNotFoundError:
+            return False, None
+        except (OSError, IndexError, ValueError) as exc:
+            return False, _GroupObservation(
+                _GroupState.UNKNOWN,
+                f"could not revalidate lifecycle ownership: {exc}",
+            )
+        return (
+            start_time == member.start_time
+            and pgid == self.identity.process_group_id
+            and sid == self.identity.session_id,
+            None,
+        )
 
     def _open_owned_pidfd(
         self, pid: int, expected_start_time: int
@@ -432,6 +595,11 @@ class SupervisedProcess:
         for pidfd in pidfds:
             os.close(pidfd)
 
+    def _close_lifecycle_proofs(self) -> None:
+        for proof_fd in self._lifecycle_proof_fds:
+            os.close(proof_fd)
+        self._lifecycle_proof_fds.clear()
+
 
 def _parse_proc_stat(stat: str) -> tuple[str, int, int, int]:
     """Return state, group, session, and start time from a Linux proc stat."""
@@ -447,6 +615,15 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
         raise TypeError(f"launch_process owns subprocess option(s): {names}")
     process = await asyncio.create_subprocess_exec(
         *program, start_new_session=True, **kwargs
+    )
+    proof_fds = tuple(
+        os.dup(
+            process._transport.get_pipe_transport(child_fd)  # type: ignore[attr-defined]
+            .get_extra_info("pipe")
+            .fileno()
+        )
+        for child_fd, option in ((1, "stdout"), (2, "stderr"))
+        if kwargs.get(option) == asyncio.subprocess.PIPE
     )
     try:
         with open(f"/proc/{process.pid}/stat", encoding="utf-8") as stat_file:
@@ -465,7 +642,14 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
         pass
     else:
         if pgid != process.pid or sid != process.pid:
+            for proof_fd in proof_fds:
+                os.close(proof_fd)
             process.kill()
             await process.wait()
             raise RuntimeError("subprocess did not enter its dedicated session")
-    return SupervisedProcess(process, identity, _proof=_LAUNCH_PROOF)
+    return SupervisedProcess(
+        process,
+        identity,
+        _proof=_LAUNCH_PROOF,
+        _lifecycle_proof_fds=proof_fds,
+    )

@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import Any
 
@@ -15,6 +16,7 @@ from src.process_supervisor import (
     CleanupStatus,
     ProcessIdentity,
     SupervisedProcess,
+    _GroupMember,
     _GroupObservation,
     _GroupState,
     _parse_proc_stat,
@@ -130,6 +132,7 @@ async def _force_stop(process: asyncio.subprocess.Process, pgid: int) -> None:
     except asyncio.TimeoutError:
         process.kill()
         await process.wait()
+    await asyncio.wait_for(process.communicate(), timeout=1)
 
 
 async def _read_pids(process: asyncio.subprocess.Process) -> list[int]:
@@ -280,6 +283,42 @@ async def test_unrelated_process_group_is_untouched(
     assert result.quiescent
     assert unrelated.returncode is None
     assert _pid_is_live(unrelated_pid)
+
+
+@pytest.mark.asyncio
+async def test_reused_group_without_lifecycle_proof_is_not_signalled(
+    process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    replacement = await process_pool.launch_raw(
+        EARLY_EXIT_WITH_TERM_IGNORING_CHILD
+    )
+    (replacement_child_pid,) = await _read_pids(replacement)
+    assert await replacement.wait() == 0
+    assert not os.path.exists(f"/proc/{replacement.pid}")
+
+    managed = await process_pool.launch(SLEEPING_PROCESS)
+    await _read_pids(managed.process)
+    managed._identity = ProcessIdentity(
+        replacement.pid,
+        replacement.pid,
+        replacement.pid,
+        1,
+    )
+    managed._known_members = {(replacement.pid, 1)}
+    delivered: list[int] = []
+
+    def record_signal(_pidfd: int, sig: int) -> None:
+        delivered.append(sig)
+
+    monkeypatch.setattr(signal, "pidfd_send_signal", record_signal)
+    result = await managed.cleanup(term_grace=0, kill_grace=0)
+
+    assert result.status is CleanupStatus.FAILED
+    assert result.detail == (
+        "process-group continuity is unproven; refusing to signal"
+    )
+    assert delivered == []
+    assert _pid_is_live(replacement_child_pid)
 
 
 @pytest.mark.asyncio
@@ -436,6 +475,45 @@ async def test_wait_and_signal_refuse_unconfirmed_states(
 
 
 @pytest.mark.asyncio
+async def test_quiet_snapshot_is_reconciled_before_success(
+    process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed = await process_pool.launch("pass")
+    assert await managed.process.wait() == 0
+    parent_only = _GroupObservation(
+        _GroupState.QUIESCENT,
+        "parent became a zombie during enumeration",
+        ((111, 10, "Z"),),
+    )
+    omitted_descendant = _GroupObservation(
+        _GroupState.LIVE,
+        "a descendant omitted from the prior scan is live",
+        ((112, 11, "S"),),
+    )
+    observations = iter((parent_only, omitted_descendant))
+    real_observe_group = managed._observe_group
+    monkeypatch.setattr(managed, "_observe_group", lambda: next(observations))
+
+    result = await managed._wait_for_quiescence(0)
+    monkeypatch.setattr(managed, "_observe_group", real_observe_group)
+
+    assert result.state is _GroupState.LIVE
+    assert result.detail == "process group remained live after the grace period"
+
+    changed_parent = replace(parent_only, members=((113, 12, "Z"),))
+    observations = iter((parent_only, changed_parent))
+    monkeypatch.setattr(managed, "_observe_group", lambda: next(observations))
+
+    result = await managed._wait_for_quiescence(0)
+    monkeypatch.setattr(managed, "_observe_group", real_observe_group)
+
+    assert result.state is _GroupState.LIVE
+    assert result.detail == (
+        "process-group quiescence could not be confirmed before the grace period"
+    )
+
+
+@pytest.mark.asyncio
 async def test_unknown_group_state_and_signal_errors_return_failure(
     process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -484,7 +562,9 @@ async def test_proc_scan_fails_closed_for_unreadable_owned_member(
     await _read_pids(managed.process)
     real_open = open
     member_path = f"/proc/{managed.process.pid}/stat"
-    monkeypatch.setattr(managed, "_check_leader_identity", lambda: None)
+    monkeypatch.setattr(
+        managed, "_check_leader_identity", lambda: (True, None)
+    )
 
     def unreadable_member(path: str, *args: Any, **kwargs: Any) -> Any:
         if path == member_path:
@@ -556,7 +636,9 @@ async def test_snapshot_refuses_identity_changes_and_handle_races(
     managed = await process_pool.launch(SLEEPING_PROCESS)
     await _read_pids(managed.process)
     assert managed.identity.leader_start_time is not None
-    monkeypatch.setattr(managed, "_check_leader_identity", lambda: None)
+    monkeypatch.setattr(
+        managed, "_check_leader_identity", lambda: (True, None)
+    )
     managed._identity = replace(
         managed.identity, leader_start_time=managed.identity.leader_start_time + 1
     )
@@ -566,7 +648,18 @@ async def test_snapshot_refuses_identity_changes_and_handle_races(
     assert pidfds == []
 
     managed._identity = replace(
-        managed.identity, leader_start_time=managed.identity.leader_start_time - 1
+        managed.identity,
+        leader_start_time=managed.identity.leader_start_time - 1,
+        session_id=managed.identity.session_id + 1,
+    )
+    observation, pidfds = managed._snapshot_group(acquire_pidfds=True)
+    assert observation.state is _GroupState.UNPROVEN
+    assert "owned session" in observation.detail
+    assert pidfds == []
+
+    managed._identity = replace(
+        managed.identity,
+        session_id=managed.identity.session_id - 1,
     )
     unknown = _GroupObservation(_GroupState.UNKNOWN, "handle error")
     monkeypatch.setattr(
@@ -616,7 +709,7 @@ async def test_pidfd_acquisition_revalidates_process_identity(
         raise PermissionError("unreadable")
 
     monkeypatch.setattr(process_supervisor, "open", unreadable, raising=False)
-    leader_error = managed._check_leader_identity()
+    _, leader_error = managed._check_leader_identity()
     assert leader_error is not None
     assert leader_error.detail == "could not confirm leader identity: unreadable"
     pidfd, error = managed._open_owned_pidfd(pid, start_time)
@@ -630,6 +723,7 @@ async def test_pidfd_acquisition_revalidates_process_identity(
 
     monkeypatch.setattr(process_supervisor, "open", disappeared, raising=False)
     assert managed._open_owned_pidfd(pid, start_time) == (None, None)
+    assert managed._check_leader_identity() == (False, None)
     monkeypatch.delattr(process_supervisor, "open")
 
     pidfd, error = managed._open_owned_pidfd(pid, start_time + 1)
@@ -643,6 +737,98 @@ async def test_pidfd_acquisition_revalidates_process_identity(
     )
     assert managed._open_owned_pidfd(pid, start_time) == (None, None)
     managed._identity = original_identity
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_proof_errors_fail_closed(
+    process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed = await process_pool.launch(SLEEPING_PROCESS)
+    await _read_pids(managed.process)
+    assert managed.identity.leader_start_time is not None
+    member = _GroupMember(
+        managed.process.pid,
+        "S",
+        managed.identity.leader_start_time,
+    )
+    unknown = _GroupObservation(_GroupState.UNKNOWN, "proof unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(managed, "_revalidate_member", lambda _member: (False, unknown))
+        assert managed._prove_group_ownership([member]) is unknown
+
+    managed._known_members.clear()
+    zombie = replace(member, state="Z")
+    assert managed._prove_group_ownership([zombie]).state is _GroupState.UNPROVEN
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            managed,
+            "_member_holds_lifecycle_proof",
+            lambda _pid: (False, unknown),
+        )
+        assert managed._prove_group_ownership([member]) is unknown
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            managed,
+            "_member_holds_lifecycle_proof",
+            lambda _pid: (True, None),
+        )
+        patch.setattr(managed, "_revalidate_member", lambda _member: (False, unknown))
+        assert managed._prove_group_ownership([member]) is unknown
+
+    proof_files = managed._lifecycle_proof_files
+    managed._lifecycle_proof_files = frozenset()
+    assert managed._member_holds_lifecycle_proof(member.pid) == (False, None)
+    managed._lifecycle_proof_files = proof_files
+
+    class VanishedFd:
+        def stat(self) -> os.stat_result:
+            raise FileNotFoundError
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "scandir", lambda _path: nullcontext([VanishedFd()]))
+        assert managed._member_holds_lifecycle_proof(member.pid) == (False, None)
+
+    for error, expected in (
+        (FileNotFoundError(), None),
+        (PermissionError("denied"), "could not inspect lifecycle proof: denied"),
+    ):
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                os,
+                "scandir",
+                lambda _path, error=error: (_ for _ in ()).throw(error),
+            )
+            holds_proof, observation = managed._member_holds_lifecycle_proof(
+                member.pid
+            )
+        assert not holds_proof
+        if expected is None:
+            assert observation is None
+        else:
+            assert observation is not None
+            assert observation.detail == expected
+
+    for error, expected in (
+        (FileNotFoundError(), None),
+        (PermissionError("denied"), "could not revalidate lifecycle ownership: denied"),
+    ):
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                process_supervisor,
+                "open",
+                lambda *_args, error=error, **_kwargs: (_ for _ in ()).throw(error),
+                raising=False,
+            )
+            stable, observation = managed._revalidate_member(member)
+        assert not stable
+        if expected is None:
+            assert observation is None
+        else:
+            assert observation is not None
+            assert observation.detail == expected
 
 
 @pytest.mark.asyncio
@@ -664,7 +850,12 @@ async def test_launch_rejects_conflicts_and_unverified_session(
 
     monkeypatch.setattr(os, "getpgid", lambda _pid: -1)
     with pytest.raises(RuntimeError, match="dedicated session"):
-        await launch_process(sys.executable, "-c", "import time; time.sleep(10)")
+        await launch_process(
+            sys.executable,
+            "-c",
+            "import time; time.sleep(10)",
+            stdout=asyncio.subprocess.PIPE,
+        )
 
 
 @pytest.mark.asyncio
