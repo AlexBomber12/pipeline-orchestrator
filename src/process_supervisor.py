@@ -28,7 +28,13 @@ from typing import Any
 
 _POLL_INTERVAL_SECONDS = 0.01
 _SNAPSHOT_RETRIES = 3
+# Zero-grace cleanup still gets a few immediate reconciliation scans, but
+# membership churn cannot extend a caller's TERM/KILL grace indefinitely.
+_RECONCILIATION_RETRIES_AFTER_DEADLINE = 3
 _WITNESS_EXIT_GRACE_SECONDS = 1.0
+_LAUNCH_PHASE_TIMEOUT_SECONDS = 10.0
+_LAUNCH_CANCELLATION_GRACE_SECONDS = 0.25
+_LAUNCH_CLEANUP_TIMEOUT_SECONDS = 1.0
 _DISAPPEARED_ERRNOS = {errno.ENOENT, errno.ESRCH}
 _RESTORED_SIGNAL_NAMES = ("SIGPIPE", "SIGXFZ", "SIGXFSZ")
 _LAUNCH_PROOF = object()
@@ -219,7 +225,9 @@ class SupervisedProcess:
 
         Concurrent and repeated calls share one result; the first call's grace
         values win.  Caller cancellation is remembered and re-raised only after
-        the shielded, bounded cleanup task finishes.
+        the shielded, bounded cleanup task finishes.  Each workload grace may
+        be followed by at most ``_RECONCILIATION_RETRIES_AFTER_DEADLINE`` fresh
+        snapshots; lifecycle-witness exit has its own bounded grace.
         """
         if self._cleanup_task is None:
             if (
@@ -312,8 +320,19 @@ class SupervisedProcess:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         witness_exit_deadline: float | None = None
+        retries_after_deadline = _RECONCILIATION_RETRIES_AFTER_DEADLINE
         quiet_members: tuple[tuple[int, int, str], ...] | None = None
         signal_sent = False
+
+        def retry_is_bounded() -> bool:
+            nonlocal retries_after_deadline
+            if loop.time() < deadline:
+                return True
+            if retries_after_deadline <= 0:
+                return False
+            retries_after_deadline -= 1
+            return True
+
         while True:
             observation = self._observe_group()
             if (
@@ -329,6 +348,12 @@ class SupervisedProcess:
                     ), signal_sent
                 if membership_changed:
                     quiet_members = None
+                    if not retry_is_bounded():
+                        return _GroupObservation(
+                            _GroupState.LIVE,
+                            "process-group membership kept changing after "
+                            "the grace period",
+                        ), signal_sent
                     # Re-enumerate after every reap or disappearance.  The
                     # resulting snapshot, not the stale zombie-only one, is
                     # the evidence used to establish quiescence.
@@ -365,6 +390,12 @@ class SupervisedProcess:
                         continue
                     else:
                         quiet_members = observation.members
+                        if not retry_is_bounded():
+                            return _GroupObservation(
+                                _GroupState.LIVE,
+                                "lifecycle witness membership kept changing "
+                                "after the grace period",
+                            ), signal_sent
                     await asyncio.sleep(0)
                     continue
                 if quiet_members == observation.members:
@@ -939,6 +970,75 @@ async def _read_witness_ready(ready_socket: socket.socket) -> bytes:
     return bytes(ready_payload)
 
 
+async def _read_until_eof(ready_socket: socket.socket) -> bytes:
+    payload = bytearray()
+    loop = asyncio.get_running_loop()
+    while chunk := await loop.sock_recv(ready_socket, 64):
+        payload.extend(chunk)
+    return bytes(payload)
+
+
+def _consume_task_result(task: asyncio.Task[Any]) -> None:
+    try:
+        task.result()
+    except BaseException:
+        pass
+
+
+async def _settle_cancelled_task(task: asyncio.Task[Any], timeout: float) -> None:
+    task.cancel()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            task.add_done_callback(_consume_task_result)
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                min(_POLL_INTERVAL_SECONDS, remaining),
+            )
+        except (asyncio.CancelledError, TimeoutError):
+            continue
+    _consume_task_result(task)
+
+
+async def _await_launch_phase(
+    task: asyncio.Task[Any],
+    *,
+    timeout_detail: str,
+    cancellation: asyncio.CancelledError | None,
+    cancellation_deadline: float | None,
+) -> tuple[Any, asyncio.CancelledError | None, float | None]:
+    """Await one launch phase with startup and post-cancellation bounds."""
+    loop = asyncio.get_running_loop()
+    phase_deadline = loop.time() + _LAUNCH_PHASE_TIMEOUT_SECONDS
+    while not task.done():
+        active_deadline = phase_deadline
+        if cancellation_deadline is not None:
+            active_deadline = min(active_deadline, cancellation_deadline)
+        remaining = active_deadline - loop.time()
+        if remaining <= 0:
+            await _settle_cancelled_task(
+                task, _LAUNCH_CLEANUP_TIMEOUT_SECONDS
+            )
+            if cancellation is not None:
+                raise cancellation
+            raise RuntimeError(timeout_detail)
+        try:
+            await asyncio.wait_for(asyncio.shield(task), remaining)
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+                cancellation_deadline = (
+                    loop.time() + _LAUNCH_CANCELLATION_GRACE_SECONDS
+                )
+        except TimeoutError:
+            continue
+    return task.result(), cancellation, cancellation_deadline
+
+
 async def _finish_failed_launch(
     process: asyncio.subprocess.Process | None,
     *,
@@ -957,21 +1057,64 @@ async def _finish_failed_launch(
             pass
     os.close(control_fd)
     if process is not None:
-        await process.wait()
-    if witness_pid is not None:
         try:
-            os.waitpid(witness_pid, 0)
-        except ChildProcessError:
-            pass
+            await asyncio.wait_for(
+                process.wait(), _LAUNCH_CLEANUP_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(
+                    process.wait(), _LAUNCH_CLEANUP_TIMEOUT_SECONDS
+                )
+            except TimeoutError:
+                pass
+    if witness_pid is not None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _LAUNCH_CLEANUP_TIMEOUT_SECONDS
+        force_sent = False
+        while True:
+            try:
+                reaped_pid, _ = os.waitpid(witness_pid, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if reaped_pid == witness_pid:
+                break
+            if loop.time() >= deadline:
+                if force_sent:
+                    break
+                sender = getattr(signal, "pidfd_send_signal", None)
+                if sender is not None and witness_pidfd is not None:
+                    try:
+                        sender(witness_pidfd, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                force_sent = True
+                deadline = loop.time() + _LAUNCH_CLEANUP_TIMEOUT_SECONDS
+                continue
+            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
     if witness_pidfd is not None:
         os.close(witness_pidfd)
 
 
 async def _wait_without_cancelling(task: asyncio.Task[None]) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + (5 * _LAUNCH_CLEANUP_TIMEOUT_SECONDS)
     while not task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            await _settle_cancelled_task(
+                task, _LAUNCH_CLEANUP_TIMEOUT_SECONDS
+            )
+            raise RuntimeError("failed launch cleanup exceeded its deadline")
         try:
-            await asyncio.shield(task)
+            await asyncio.wait_for(asyncio.shield(task), remaining)
         except asyncio.CancelledError:
+            continue
+        except TimeoutError:
             continue
     task.result()
 
@@ -1002,6 +1145,7 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
     witness_proven = False
     launcher_blocked = False
     launch_cancellation: asyncio.CancelledError | None = None
+    cancellation_deadline: float | None = None
     try:
         spawn_task = asyncio.create_task(
             asyncio.create_subprocess_exec(
@@ -1028,23 +1172,31 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
                 **kwargs,
             )
         )
-        while not spawn_task.done():
-            try:
-                await asyncio.shield(spawn_task)
-            except asyncio.CancelledError as exc:
-                launch_cancellation = exc
-        process = spawn_task.result()
+        (
+            process,
+            launch_cancellation,
+            cancellation_deadline,
+        ) = await _await_launch_phase(
+            spawn_task,
+            timeout_detail="subprocess creation exceeded its startup deadline",
+            cancellation=launch_cancellation,
+            cancellation_deadline=cancellation_deadline,
+        )
         os.close(control_read)
         control_read = -1
         ready_child.close()
         loop = asyncio.get_running_loop()
         ready_task = asyncio.create_task(_read_witness_ready(ready_parent))
-        while not ready_task.done():
-            try:
-                await asyncio.shield(ready_task)
-            except asyncio.CancelledError as exc:
-                launch_cancellation = exc
-        ready_payload = ready_task.result()
+        (
+            ready_payload,
+            launch_cancellation,
+            cancellation_deadline,
+        ) = await _await_launch_phase(
+            ready_task,
+            timeout_detail="lifecycle witness readiness exceeded its startup deadline",
+            cancellation=launch_cancellation,
+            cancellation_deadline=cancellation_deadline,
+        )
         ready_line, separator, exec_payload = ready_payload.partition(b"\n")
         if not separator or not ready_line.startswith(b"W"):
             raise RuntimeError("lifecycle ownership witness did not start")
@@ -1085,8 +1237,18 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
             + target_env_payload,
         )
         launcher_blocked = False
-        while chunk := await loop.sock_recv(ready_parent, 64):
-            exec_payload += chunk
+        exec_task = asyncio.create_task(_read_until_eof(ready_parent))
+        trailing_payload, launch_cancellation, cancellation_deadline = (
+            await _await_launch_phase(
+                exec_task,
+                timeout_detail="target exec exceeded its startup deadline",
+                cancellation=launch_cancellation,
+                cancellation_deadline=cancellation_deadline,
+            )
+        )
+        exec_payload += trailing_payload
+        if launch_cancellation is not None:
+            raise launch_cancellation
         exec_lines = exec_payload.splitlines()
         exec_errno = (
             int(exec_lines[0][1:])

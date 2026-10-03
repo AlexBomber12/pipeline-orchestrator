@@ -831,6 +831,68 @@ async def test_quiet_snapshot_is_reconciled_before_success(
     assert failed.detail == "reaping failed"
     assert not signal_sent
 
+    with monkeypatch.context() as patch:
+        changing_reaps = 0
+
+        def continually_reaped(
+            _members: tuple[tuple[int, int, str], ...],
+        ) -> tuple[bool, bool, None]:
+            nonlocal changing_reaps
+            changing_reaps += 1
+            return True, False, None
+
+        patch.setattr(
+            process_supervisor,
+            "_RECONCILIATION_RETRIES_AFTER_DEADLINE",
+            2,
+        )
+        patch.setattr(managed, "_observe_group", lambda: parent_only)
+        patch.setattr(managed, "_reap_adopted_zombies", continually_reaped)
+        bounded, signal_sent = await managed._wait_for_quiescence(0)
+    assert bounded.state is _GroupState.LIVE
+    assert bounded.detail == (
+        "process-group membership kept changing after the grace period"
+    )
+    assert not signal_sent
+    assert changing_reaps == 3
+
+    witness = managed._lifecycle_witness
+    assert witness is not None
+    changing_witness_scans = 0
+
+    def continually_changing_witness() -> _GroupObservation:
+        nonlocal changing_witness_scans
+        changing_witness_scans += 1
+        return _GroupObservation(
+            _GroupState.QUIESCENT,
+            "changing witness membership",
+            (
+                (witness.pid, witness.start_time, "S"),
+                (500 + changing_witness_scans, changing_witness_scans, "Z"),
+            ),
+            witness_live=True,
+        )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            process_supervisor,
+            "_RECONCILIATION_RETRIES_AFTER_DEADLINE",
+            2,
+        )
+        patch.setattr(managed, "_observe_group", continually_changing_witness)
+        patch.setattr(
+            managed,
+            "_reap_adopted_zombies",
+            lambda _members: (False, False, None),
+        )
+        bounded, signal_sent = await managed._wait_for_quiescence(0)
+    assert bounded.state is _GroupState.LIVE
+    assert bounded.detail == (
+        "lifecycle witness membership kept changing after the grace period"
+    )
+    assert not signal_sent
+    assert changing_witness_scans == 3
+
     monkeypatch.setattr(managed, "_observe_group", real_observe_group)
     monkeypatch.setattr(managed, "_signal_group", real_signal_group)
     monkeypatch.setattr(
@@ -1334,6 +1396,122 @@ async def test_lifecycle_witness_failures_are_bounded_and_fail_closed(
 
 
 @pytest.mark.asyncio
+async def test_launch_deadline_helpers_bound_stubborn_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def stubborn(started: asyncio.Event, release: asyncio.Event) -> None:
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    task = asyncio.create_task(stubborn(started, release))
+    await started.wait()
+    await process_supervisor._settle_cancelled_task(task, 0)
+    assert not task.done()
+    release.set()
+    await task
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    task = asyncio.create_task(stubborn(started, release))
+    await started.wait()
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.01
+        )
+        with pytest.raises(RuntimeError, match="cleanup exceeded"):
+            await process_supervisor._wait_without_cancelling(task)
+    release.set()
+    await task
+
+    class StubbornProcess:
+        pid = 987654
+
+        def __init__(self) -> None:
+            self.kill_calls = 0
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+            if self.kill_calls == 2:
+                raise ProcessLookupError
+
+        async def wait(self) -> int:
+            await asyncio.Event().wait()
+            return 0
+
+    fake_process = StubbornProcess()
+    control_read, control_write = os.pipe()
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0
+        )
+        await process_supervisor._finish_failed_launch(
+            fake_process,  # type: ignore[arg-type]
+            group_contained=False,
+            control_fd=control_read,
+            witness_pid=None,
+            witness_pidfd=None,
+        )
+    os.close(control_write)
+    assert fake_process.kill_calls == 2
+
+    control_read, control_write = os.pipe()
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "waitpid", lambda pid, _options: (pid, 0))
+        await process_supervisor._finish_failed_launch(
+            None,
+            group_contained=False,
+            control_fd=control_read,
+            witness_pid=4321,
+            witness_pidfd=None,
+        )
+    os.close(control_write)
+
+    wait_results = iter(((0, 0), (4321, 0)))
+    control_read, control_write = os.pipe()
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            os, "waitpid", lambda _pid, _options: next(wait_results)
+        )
+        patch.setattr(
+            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.01
+        )
+        await process_supervisor._finish_failed_launch(
+            None,
+            group_contained=False,
+            control_fd=control_read,
+            witness_pid=4321,
+            witness_pidfd=None,
+        )
+    os.close(control_write)
+
+    control_read, control_write = os.pipe()
+    stable_pidfd = os.pidfd_open(os.getpid())
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "waitpid", lambda _pid, _options: (0, 0))
+        patch.setattr(
+            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0
+        )
+        patch.setattr(
+            signal,
+            "pidfd_send_signal",
+            lambda _pidfd, _sig: (_ for _ in ()).throw(ProcessLookupError()),
+        )
+        await process_supervisor._finish_failed_launch(
+            None,
+            group_contained=False,
+            control_fd=control_read,
+            witness_pid=4321,
+            witness_pidfd=stable_pidfd,
+        )
+    os.close(control_write)
+
+
+@pytest.mark.asyncio
 async def test_launch_rejects_conflicts_and_unverified_session(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1417,18 +1595,22 @@ async def test_launch_rejects_conflicts_and_unverified_session(
     assert not target_marker.exists()
 
     spawn_cancellation_marker = tmp_path / "spawn-cancelled-target-ran"
-    spawn_completed = asyncio.Event()
-    release_spawn = asyncio.Event()
-    real_create_subprocess_exec = asyncio.create_subprocess_exec
+    spawn_started = asyncio.Event()
 
-    async def delayed_spawn(*args: Any, **kwargs: Any) -> Any:
-        spawned = await real_create_subprocess_exec(*args, **kwargs)
-        spawn_completed.set()
-        await release_spawn.wait()
-        return spawned
+    async def stalled_spawn(*_args: Any, **_kwargs: Any) -> Any:
+        spawn_started.set()
+        await asyncio.Event().wait()
 
     with monkeypatch.context() as patch:
-        patch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+        patch.setattr(asyncio, "create_subprocess_exec", stalled_spawn)
+        patch.setattr(
+            process_supervisor,
+            "_LAUNCH_CANCELLATION_GRACE_SECONDS",
+            0.01,
+        )
+        patch.setattr(
+            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.01
+        )
         launch_task = asyncio.create_task(
             launch_process(
                 sys.executable,
@@ -1437,19 +1619,101 @@ async def test_launch_rejects_conflicts_and_unverified_session(
                 f"Path({str(spawn_cancellation_marker)!r}).touch()",
             )
         )
-        await asyncio.wait_for(spawn_completed.wait(), timeout=1)
+        await asyncio.wait_for(spawn_started.wait(), timeout=1)
         launch_task.cancel()
-        release_spawn.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(launch_task, timeout=1)
     assert not spawn_cancellation_marker.exists()
 
     cancellation_marker = tmp_path / "cancelled-target-ran"
+    stalled_ready_started = asyncio.Event()
+    real_read_witness_ready = process_supervisor._read_witness_ready
+
+    async def observe_stalled_ready(ready_socket: Any) -> bytes:
+        stalled_ready_started.set()
+        return await real_read_witness_ready(ready_socket)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            process_supervisor,
+            "_WITNESS_LAUNCHER",
+            "import signal; signal.pause()",
+        )
+        patch.setattr(
+            process_supervisor, "_read_witness_ready", observe_stalled_ready
+        )
+        patch.setattr(
+            process_supervisor,
+            "_LAUNCH_CANCELLATION_GRACE_SECONDS",
+            0.01,
+        )
+        patch.setattr(
+            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.05
+        )
+        launch_task = asyncio.create_task(
+            launch_process(
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(cancellation_marker)!r}).touch()",
+            )
+        )
+        await asyncio.wait_for(stalled_ready_started.wait(), timeout=1)
+        launch_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(launch_task, timeout=1)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            process_supervisor,
+            "_WITNESS_LAUNCHER",
+            "import signal; signal.pause()",
+        )
+        patch.setattr(process_supervisor, "_LAUNCH_PHASE_TIMEOUT_SECONDS", 0.01)
+        patch.setattr(
+            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.05
+        )
+        with pytest.raises(RuntimeError, match="readiness exceeded"):
+            await asyncio.wait_for(
+                launch_process(sys.executable, "-c", "pass"), timeout=1
+            )
+
+    exec_wait_started = asyncio.Event()
+
+    async def briefly_delayed_exec_result(_ready_socket: Any) -> bytes:
+        exec_wait_started.set()
+        await asyncio.sleep(0.02)
+        return b""
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            process_supervisor,
+            "_read_until_eof",
+            briefly_delayed_exec_result,
+        )
+        patch.setattr(
+            process_supervisor,
+            "_LAUNCH_CANCELLATION_GRACE_SECONDS",
+            0.1,
+        )
+        patch.setattr(
+            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.05
+        )
+        launch_task = asyncio.create_task(
+            launch_process(
+                sys.executable,
+                "-c",
+                "import signal; signal.pause()",
+            )
+        )
+        await asyncio.wait_for(exec_wait_started.wait(), timeout=1)
+        launch_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(launch_task, timeout=1)
+
     ready_received = asyncio.Event()
     release_ready = asyncio.Event()
     cleanup_started = asyncio.Event()
     release_cleanup = asyncio.Event()
-    real_read_witness_ready = process_supervisor._read_witness_ready
     real_finish_failed_launch = process_supervisor._finish_failed_launch
 
     async def delayed_ready(ready_socket: Any) -> bytes:
