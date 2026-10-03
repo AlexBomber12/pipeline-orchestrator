@@ -205,6 +205,26 @@ async def test_repeated_fast_completion_reconciles_disappeared_members(
 
 
 @pytest.mark.asyncio
+async def test_zero_grace_fast_completion_confirms_leader_reaping(
+    process_pool: ProcessPool,
+) -> None:
+    for _ in range(20):
+        managed = await launch_process(
+            "/bin/true",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        process_pool.supervised.append(
+            (managed, managed.identity.process_group_id)
+        )
+
+        result = await managed.cleanup(term_grace=0, kill_grace=0)
+
+        assert result.quiescent, result.detail
+        assert result.leader_returncode is not None
+
+
+@pytest.mark.asyncio
 async def test_launch_restores_default_sigpipe_disposition(
     process_pool: ProcessPool,
 ) -> None:
@@ -710,11 +730,32 @@ async def test_wait_and_signal_refuse_unconfirmed_states(
     monkeypatch.setattr(
         managed, "_snapshot_group", lambda **_kwargs: (quiet, [])
     )
-    timed_out, signal_sent = await managed._wait_for_quiescence(0)
-    assert timed_out.state is _GroupState.LIVE
+    with monkeypatch.context() as patch:
+        patch.setattr(process_supervisor, "_LEADER_EXIT_GRACE_SECONDS", 0)
+        timed_out, signal_sent = await managed._wait_for_quiescence(0)
+    assert timed_out.state is _GroupState.UNKNOWN
     assert timed_out.detail == "process group is quiet but leader was not reaped"
     assert not signal_sent
     assert managed._signal_group(signal.SIGTERM) == (False, None)
+
+    class DelayedLeader:
+        returncode: int | None = None
+
+        async def wait(self) -> int:
+            await asyncio.sleep(0)
+            self.returncode = 0
+            return 0
+
+    delayed_leader = DelayedLeader()
+    delayed = SupervisedProcess(
+        delayed_leader,  # type: ignore[arg-type]
+        ProcessIdentity(999_999, 999_999, 999_999, 1),
+        _proof=process_supervisor._LAUNCH_PROOF,
+    )
+    definitive_quiet = replace(quiet, definitive=True)
+    monkeypatch.setattr(delayed, "_observe_group", lambda: definitive_quiet)
+    assert await delayed._wait_for_quiescence(0) == (definitive_quiet, False)
+    assert delayed_leader.returncode == 0
 
     changed = _GroupObservation(_GroupState.CHANGED, "member disappeared")
     snapshots = iter(((changed, []), (quiet, [])))

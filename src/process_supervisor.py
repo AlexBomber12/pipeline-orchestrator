@@ -31,6 +31,7 @@ _SNAPSHOT_RETRIES = 3
 # Zero-grace cleanup still gets a few immediate reconciliation scans, but
 # membership churn cannot extend a caller's TERM/KILL grace indefinitely.
 _RECONCILIATION_RETRIES_AFTER_DEADLINE = 3
+_LEADER_EXIT_GRACE_SECONDS = 1.0
 _WITNESS_EXIT_GRACE_SECONDS = 1.0
 _LAUNCH_PHASE_TIMEOUT_SECONDS = 10.0
 _LAUNCH_CANCELLATION_GRACE_SECONDS = 0.25
@@ -227,7 +228,8 @@ class SupervisedProcess:
         values win.  Caller cancellation is remembered and re-raised only after
         the shielded, bounded cleanup task finishes.  Each workload grace may
         be followed by at most ``_RECONCILIATION_RETRIES_AFTER_DEADLINE`` fresh
-        snapshots; lifecycle-witness exit has its own bounded grace.
+        snapshots; leader reaping and lifecycle-witness exit have separate
+        bounded confirmation graces.
         """
         if self._cleanup_task is None:
             if (
@@ -337,6 +339,23 @@ class SupervisedProcess:
             observation = self._observe_group()
             if (
                 observation.state is _GroupState.QUIESCENT
+                and self.process.returncode is None
+            ):
+                try:
+                    await asyncio.wait_for(
+                        self.process.wait(), _LEADER_EXIT_GRACE_SECONDS
+                    )
+                except TimeoutError:
+                    return _GroupObservation(
+                        _GroupState.UNKNOWN,
+                        "process group is quiet but leader was not reaped",
+                    ), signal_sent
+                # Re-enumerate after the child watcher publishes the return
+                # code; the earlier snapshot may have overlapped the exit.
+                quiet_members = None
+                continue
+            if (
+                observation.state is _GroupState.QUIESCENT
                 and self.process.returncode is not None
             ):
                 membership_changed, _, reap_error = (
@@ -424,10 +443,7 @@ class SupervisedProcess:
                     )
             remaining = deadline - loop.time()
             if remaining <= 0:
-                if observation.state is _GroupState.QUIESCENT:
-                    detail = "process group is quiet but leader was not reaped"
-                else:
-                    detail = "process group remained live after the grace period"
+                detail = "process group remained live after the grace period"
                 return _GroupObservation(_GroupState.LIVE, detail), signal_sent
             await asyncio.sleep(min(_POLL_INTERVAL_SECONDS, remaining))
 
