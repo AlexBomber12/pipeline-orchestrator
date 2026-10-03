@@ -785,6 +785,18 @@ def _get_pidfd_opener() -> Any:
     return getattr(os, "pidfd_open", None)
 
 
+def _validated_environment(environment: Any) -> dict[Any, Any]:
+    copied = dict(os.environ if environment is None else environment)
+    for key, value in copied.items():
+        encoded_key = os.fsencode(key)
+        encoded_value = os.fsencode(value)
+        if b"=" in encoded_key:
+            raise ValueError("illegal environment variable name")
+        if b"\0" in encoded_key or b"\0" in encoded_value:
+            raise ValueError("embedded null byte")
+    return copied
+
+
 async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
     """Launch ``program`` in a new Linux session and retain its group identity."""
     conflicts = {"start_new_session", "process_group", "preexec_fn"} & kwargs.keys()
@@ -795,7 +807,7 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
     caller_pass_fds = tuple(kwargs.pop("pass_fds", ()))
     restore_signals = kwargs.get("restore_signals", True)
     requested_env = kwargs.pop("env", None)
-    target_env = dict(os.environ if requested_env is None else requested_env)
+    target_env = _validated_environment(requested_env)
     target_env_payload = pickle.dumps(
         target_env, protocol=pickle.HIGHEST_PROTOCOL
     )

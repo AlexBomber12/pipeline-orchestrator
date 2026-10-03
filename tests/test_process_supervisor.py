@@ -1056,6 +1056,12 @@ async def test_launch_rejects_conflicts_and_unverified_session(
         SupervisedProcess(  # type: ignore[arg-type]
             object(), ProcessIdentity(2, 2, 2, 1), _proof=object()
         )
+    with pytest.raises(TypeError):
+        await launch_process("/bin/true", env={"INVALID_VALUE": 1})
+    with pytest.raises(ValueError, match="illegal environment variable name"):
+        await launch_process("/bin/true", env={"INVALID=NAME": "value"})
+    with pytest.raises(ValueError, match="embedded null byte"):
+        await launch_process("/bin/true", env={"VALID_NAME": "bad\0value"})
     with pytest.raises(FileNotFoundError):
         await launch_process("/definitely/missing/process-supervisor-command")
 
