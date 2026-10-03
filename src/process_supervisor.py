@@ -185,6 +185,12 @@ class SupervisedProcess:
         self._identity = identity
         self._cleanup_task: asyncio.Task[CleanupResult] | None = None
         self._lifecycle_witness = _lifecycle_witness
+        self._signaled_members: dict[
+            signal.Signals, set[tuple[int, int]]
+        ] = {
+            signal.SIGTERM: set(),
+            signal.SIGKILL: set(),
+        }
         self._known_members: set[tuple[int, int]] = set()
         if identity.leader_start_time is not None:
             self._known_members.add(
@@ -372,8 +378,12 @@ class SupervisedProcess:
             await asyncio.sleep(min(_POLL_INTERVAL_SECONDS, remaining))
 
     def _signal_group(self, sig: signal.Signals) -> tuple[bool, str | None]:
+        already_signaled = self._signaled_members.setdefault(sig, set())
         for _ in range(_SNAPSHOT_RETRIES):
-            observation, pidfds = self._snapshot_group(acquire_pidfds=True)
+            observation, pidfds = self._snapshot_group(
+                acquire_pidfds=True,
+                exclude_identities=already_signaled,
+            )
             if observation.state is not _GroupState.CHANGED:
                 break
         else:
@@ -388,13 +398,14 @@ class SupervisedProcess:
             return False, "pidfd signaling is unavailable on this Linux host"
         sent = False
         try:
-            for pidfd in pidfds:
+            for identity, pidfd in pidfds:
                 try:
                     sender(pidfd, sig)
                 except ProcessLookupError:
                     continue
                 except OSError as exc:
                     return sent, f"could not signal owned process-group member: {exc}"
+                already_signaled.add(identity)
                 sent = True
         finally:
             self._close_pidfds(pidfds)
@@ -406,8 +417,11 @@ class SupervisedProcess:
         return observation
 
     def _snapshot_group(
-        self, *, acquire_pidfds: bool
-    ) -> tuple[_GroupObservation, list[int]]:
+        self,
+        *,
+        acquire_pidfds: bool,
+        exclude_identities: set[tuple[int, int]] | None = None,
+    ) -> tuple[_GroupObservation, list[tuple[tuple[int, int], int]]]:
         pgid = self.identity.process_group_id
         if pgid <= 1 or pgid == os.getpgrp():
             return (
@@ -422,7 +436,7 @@ class SupervisedProcess:
         if leader_error is not None:
             return leader_error, []
         members: list[_GroupMember] = []
-        pidfds: list[int] = []
+        pidfds: list[tuple[tuple[int, int], int]] = []
         try:
             with os.scandir("/proc") as entries:
                 for entry in entries:
@@ -500,8 +514,14 @@ class SupervisedProcess:
             for member in members
             if member.state != "Z" and member.identity != witness_identity
         ]
+        signal_candidates = [
+            member
+            for member in live_members
+            if exclude_identities is None
+            or member.identity not in exclude_identities
+        ]
         if acquire_pidfds:
-            for member in live_members:
+            for member in signal_candidates:
                 pidfd, error = self._open_owned_pidfd(
                     member.pid, member.start_time
                 )
@@ -509,7 +529,7 @@ class SupervisedProcess:
                     self._close_pidfds(pidfds)
                     return error, []
                 if pidfd is not None:
-                    pidfds.append(pidfd)
+                    pidfds.append((member.identity, pidfd))
 
         if members:
             ownership_error = self._prove_group_ownership(members)
@@ -525,7 +545,7 @@ class SupervisedProcess:
             )
         )
         if live_members:
-            if acquire_pidfds and not pidfds:
+            if acquire_pidfds and signal_candidates and not pidfds:
                 return (
                     _GroupObservation(
                         _GroupState.CHANGED,
@@ -741,8 +761,10 @@ class SupervisedProcess:
                 os.close(pidfd)
 
     @staticmethod
-    def _close_pidfds(pidfds: list[int]) -> None:
-        for pidfd in pidfds:
+    def _close_pidfds(
+        pidfds: list[tuple[tuple[int, int], int]]
+    ) -> None:
+        for _, pidfd in pidfds:
             os.close(pidfd)
 
     def _release_lifecycle_witness(self) -> None:
@@ -865,6 +887,8 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
     if conflicts:
         names = ", ".join(sorted(conflicts))
         raise TypeError(f"launch_process owns subprocess option(s): {names}")
+    if kwargs.get("close_fds") is False:
+        raise TypeError("launch_process requires close_fds=True")
     target_executable = os.fspath(kwargs.pop("executable", program[0]))
     caller_pass_fds = tuple(kwargs.pop("pass_fds", ()))
     restore_signals = kwargs.get("restore_signals", True)

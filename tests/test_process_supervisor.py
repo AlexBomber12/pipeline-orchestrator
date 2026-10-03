@@ -805,6 +805,27 @@ async def test_signal_races_do_not_turn_disappearance_into_failure(
 
 
 @pytest.mark.asyncio
+async def test_term_is_delivered_once_per_owned_identity(
+    process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed = await process_pool.launch(TERM_IGNORING_PROCESS)
+    await _read_pids(managed.process)
+    real_pidfd_send_signal = signal.pidfd_send_signal
+    delivered: list[int] = []
+
+    def record_delivery(pidfd: int, sig: int) -> None:
+        delivered.append(sig)
+        real_pidfd_send_signal(pidfd, sig)
+
+    monkeypatch.setattr(signal, "pidfd_send_signal", record_delivery)
+
+    assert managed._signal_group(signal.SIGTERM) == (True, None)
+    assert managed._signal_group(signal.SIGTERM) == (False, None)
+    assert delivered == [signal.SIGTERM]
+    monkeypatch.setattr(signal, "pidfd_send_signal", real_pidfd_send_signal)
+
+
+@pytest.mark.asyncio
 async def test_pidfd_delivery_fails_closed_when_host_support_is_missing(
     process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1082,6 +1103,8 @@ async def test_launch_rejects_conflicts_and_unverified_session(
         SupervisedProcess(  # type: ignore[arg-type]
             object(), ProcessIdentity(2, 2, 2, 1), _proof=object()
         )
+    with pytest.raises(TypeError, match="requires close_fds=True"):
+        await launch_process("/bin/true", close_fds=False)
     with pytest.raises(TypeError):
         await launch_process("/bin/true", env={"INVALID_VALUE": 1})
     with pytest.raises(ValueError, match="illegal environment variable name"):
