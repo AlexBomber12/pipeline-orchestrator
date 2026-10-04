@@ -260,17 +260,13 @@ def _gh_api_paginated_evidence(path: str) -> PaginatedEvidence:
             raw = retry_transient(lambda u=url: gh_runner.run_gh(["api", u]), operation_name=f"gh api {url}")
         except RuntimeError as exc:
             return PaginatedEvidence(items, False, len(items) == 0, str(exc))
-        pages = raw if page_num == 1 and isinstance(raw, list) else [raw]
-        if not pages:
+        if not isinstance(raw, dict):
             return PaginatedEvidence(items, False, len(items) == 0, "malformed")
-        for page in pages:
-            if not isinstance(page, dict):
-                return PaginatedEvidence(items, False, len(items) == 0, "malformed")
-            items.append(page)
-        runs = items[-1].get("check_runs")
+        items.append(raw)
+        runs = raw.get("check_runs")
         if not isinstance(runs, list):
             return PaginatedEvidence(items, False, len(items) == 0, "malformed")
-        if isinstance(raw, list) or len(runs) < per_page:
+        if len(runs) < per_page:
             return PaginatedEvidence(items, True, len(items) == 0)
 
 

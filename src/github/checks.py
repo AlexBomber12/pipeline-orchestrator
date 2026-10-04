@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import json
 import time
-from collections import namedtuple
-from typing import Any
+from typing import Any, NamedTuple
 
 from src.github import cache, gh_runner
+from src.github.ci_evidence import CIEvidence, evaluate_ci_evidence
 from src.models import CIStatus
 from src.retry import retry_transient
 
@@ -39,13 +39,22 @@ _CI_STATUS_CACHE_TTL_SECONDS = 15.0
 #: watched repo — long-running daemons would retain full check-run
 #: payloads for SHAs that will never be queried again. Sweeping on write
 #: keeps the resident set ~O(unique SHAs queried within one TTL window).
-_CiSourceEvidence = namedtuple("_CiSourceEvidence", "complete empty error", defaults=[None])
-_CiStatusEvidence = namedtuple(
-    "_CiStatusEvidence",
-    "repo sha fetched_at check_runs status_payload check_runs_source status_source",
-)
+class _CiSourceResult(NamedTuple):
+    complete: bool
+    empty: bool
+    error: str | None = None
 
-_ci_status_cache: dict[tuple[str, str], _CiStatusEvidence] = {}
+
+class _CiRetrieval(NamedTuple):
+    evidence: CIEvidence
+    fetched_at: float
+    check_runs: list[dict]
+    status_payload: dict
+    check_runs_source: _CiSourceResult
+    status_source: _CiSourceResult
+
+
+_ci_status_cache: dict[tuple[str, str], _CiRetrieval] = {}
 
 
 _REST_CI_FAILURE_STATES = {
@@ -55,6 +64,7 @@ _REST_CI_FAILURE_STATES = {
     "CANCELLED",
     "TIMED_OUT",
     "ACTION_REQUIRED",
+    "STARTUP_FAILURE",
     # PR-251: ``stale`` is a GitHub Actions check-run conclusion meaning
     # the run is no longer relevant (workflow re-dispatched after a
     # newer push, or GitHub itself dropped the result). It must count
@@ -80,6 +90,7 @@ _REST_CHECK_RUN_CONCLUSIONS = {
     "NEUTRAL",
     "SKIPPED",
     "STALE",
+    "STARTUP_FAILURE",
     "SUCCESS",
     "TIMED_OUT",
 }
@@ -247,37 +258,53 @@ def _commit_status_state(value: object) -> str | None:
 
 
 def _check_run_state(run: dict) -> str | None:
+    conclusion_present = "conclusion" in run
     conclusion = run.get("conclusion")
-    if conclusion:
-        if not isinstance(conclusion, str):
+    conclusion_state: str | None = None
+    if conclusion_present and conclusion is not None:
+        if not isinstance(conclusion, str) or not conclusion:
             return None
-        upper = conclusion.upper()
-        return upper if upper in _REST_CHECK_RUN_CONCLUSIONS else None
+        conclusion_state = conclusion.upper()
+        if conclusion_state not in _REST_CHECK_RUN_CONCLUSIONS:
+            return None
+
+    status_present = "status" in run
     status = run.get("status")
-    if status:
-        if not isinstance(status, str):
+    status_state: str | None = None
+    if status_present:
+        if not isinstance(status, str) or not status:
             return None
-        upper = status.upper()
-        return upper if upper in _REST_CHECK_RUN_STATUSES else None
-    return None
+        status_state = status.upper()
+        if status_state not in _REST_CHECK_RUN_STATUSES:
+            return None
+
+    if status_state is None:
+        return conclusion_state
+    if status_state == "COMPLETED":
+        if conclusion_present and conclusion_state is None:
+            return None
+        return conclusion_state or status_state
+    if conclusion_state is not None:
+        return None
+    return status_state
 
 
-def _parse_status_payload(raw_status: object) -> tuple[dict, _CiSourceEvidence]:
+def _parse_status_payload(raw_status: object) -> tuple[dict, _CiSourceResult]:
     parsed: object = raw_status
     if isinstance(raw_status, str) and raw_status:
         try:
             parsed = json.loads(raw_status)
         except json.JSONDecodeError:
-            return {}, _CiSourceEvidence(False, False, "malformed")
+            return {}, _CiSourceResult(False, False, "malformed")
     if not isinstance(parsed, dict):
-        return {}, _CiSourceEvidence(False, False, "malformed")
+        return {}, _CiSourceResult(False, False, "malformed")
     combined_state = parsed.get("state")
     combined_state_upper = _commit_status_state(combined_state)
     if combined_state_upper is None:
-        return {}, _CiSourceEvidence(False, False, "malformed")
+        return {}, _CiSourceResult(False, False, "malformed")
     statuses_raw = parsed.get("statuses")
     if not isinstance(statuses_raw, list):
-        return {}, _CiSourceEvidence(False, False, "malformed")
+        return {}, _CiSourceResult(False, False, "malformed")
     statuses_malformed = False
     for status in statuses_raw:
         if not isinstance(status, dict):
@@ -287,25 +314,57 @@ def _parse_status_payload(raw_status: object) -> tuple[dict, _CiSourceEvidence]:
             statuses_malformed = True
     if statuses_malformed:
         if combined_state_upper in _REST_CI_FAILURE_STATES:
-            return parsed, _CiSourceEvidence(False, False, "malformed")
-        return {}, _CiSourceEvidence(False, False, "malformed")
-    return parsed, _CiSourceEvidence(True, len(statuses_raw) == 0)
+            return parsed, _CiSourceResult(False, False, "malformed")
+        return {}, _CiSourceResult(False, False, "malformed")
+    return parsed, _CiSourceResult(True, len(statuses_raw) == 0)
 
 
-def _retrieve_ci_status_evidence(repo: str, sha: str) -> _CiStatusEvidence:
+def _make_ci_retrieval(
+    repo: str,
+    sha: str,
+    fetched_at: float,
+    check_runs: list[dict],
+    status_payload: dict,
+    check_runs_source: _CiSourceResult,
+    status_source: _CiSourceResult,
+) -> _CiRetrieval:
+    statuses = status_payload.get("statuses", [])
+    status_records = (
+        [status for status in statuses if isinstance(status, dict)]
+        if isinstance(statuses, list)
+        else []
+    )
+    evidence = evaluate_ci_evidence(
+        repo=repo,
+        pr_number=None,
+        sha=sha,
+        check_runs=check_runs,
+        statuses=status_records,
+        check_runs_complete=check_runs_source.complete,
+        statuses_complete=status_source.complete,
+    )
+    return _CiRetrieval(
+        evidence,
+        fetched_at,
+        list(check_runs),
+        dict(status_payload),
+        check_runs_source,
+        status_source,
+    )
+
+
+def _retrieve_ci_status_evidence(repo: str, sha: str) -> _CiRetrieval:
     now = time.monotonic()
     if not sha:
-        empty = _CiSourceEvidence(True, True)
-        return _CiStatusEvidence(
-            repo, sha, now, [], {}, empty, empty
-        )
+        empty = _CiSourceResult(True, True)
+        return _make_ci_retrieval(repo, sha, now, [], {}, empty, empty)
 
     cache_key = (repo, sha)
     cached = _ci_status_cache.get(cache_key)
     if (
         cached is not None
-        and cached.repo == repo
-        and cached.sha == sha
+        and cached.evidence.repo == repo
+        and cached.evidence.sha == sha.lower()
         and (now - cached.fetched_at) < _CI_STATUS_CACHE_TTL_SECONDS
     ):
         return cached
@@ -332,7 +391,7 @@ def _retrieve_ci_status_evidence(repo: str, sha: str) -> _CiStatusEvidence:
                 check_runs.append(run)
             else:
                 check_runs_malformed = True
-    check_runs_source = _CiSourceEvidence(
+    check_runs_source = _CiSourceResult(
         cr_evidence.complete and not check_runs_malformed,
         cr_evidence.empty or (cr_evidence.complete and not check_runs),
         "malformed"
@@ -361,11 +420,11 @@ def _retrieve_ci_status_evidence(repo: str, sha: str) -> _CiStatusEvidence:
             operation_name=f"gh api {status_path}",
         )
     except RuntimeError as exc:
-        status_source = _CiSourceEvidence(False, False, _source_error(exc))
+        status_source = _CiSourceResult(False, False, _source_error(exc))
     else:
         status_payload, status_source = _parse_status_payload(raw_status)
 
-    evidence = _CiStatusEvidence(
+    retrieval = _make_ci_retrieval(
         repo,
         sha,
         now,
@@ -375,14 +434,17 @@ def _retrieve_ci_status_evidence(repo: str, sha: str) -> _CiStatusEvidence:
         status_source,
     )
     _evict_expired_ci_status_cache(now)
-    _ci_status_cache[cache_key] = evidence
-    return evidence
+    _ci_status_cache[cache_key] = retrieval
+    return retrieval
 
 
 def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
-    evidence = _retrieve_ci_status_evidence(repo, sha)
-    fetch_ok = evidence.check_runs_source.complete and evidence.status_source.complete
-    return list(evidence.check_runs), dict(evidence.status_payload), fetch_ok
+    retrieval = _retrieve_ci_status_evidence(repo, sha)
+    return (
+        list(retrieval.check_runs),
+        dict(retrieval.status_payload),
+        retrieval.evidence.sources_complete,
+    )
 
 
 def _map_rest_ci_status_to_enum(
@@ -399,15 +461,9 @@ def _map_rest_ci_status_to_enum(
     present the result follows ``empty_is_success`` so repos without
     required checks can still merge.
 
-    When ``fetch_ok`` is ``False`` and there is no observable check data,
-    the result still follows ``empty_is_success``: this matches the
-    GraphQL-rate-limit fallback in ``_get_open_prs_rest``, which already
-    returns SUCCESS for ``allow_merge_without_checks=True`` whenever the
-    primary fetch is unavailable. Diverging here would mean a transient
-    REST-budget squeeze (recurring in the e2e suite, where ``poll_interval_sec``
-    is 2s and per-token quota is shared across runs) leaves the daemon
-    permanently in WATCH on a testbed PR that has no checks at all,
-    burning more REST on each retry without ever converging.
+    ``fetch_ok=False`` always blocks SUCCESS, including when both payloads
+    are empty and ``empty_is_success`` is enabled. Missing evidence must
+    not be treated as evidence that the repository has no checks.
 
     The combined commit-status endpoint embeds at most the first page of
     ``statuses`` while ``status_payload["state"]`` reflects the aggregate

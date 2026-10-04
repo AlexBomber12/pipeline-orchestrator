@@ -3199,6 +3199,20 @@ def test_map_rest_ci_status_pending_when_states_missing_or_mixed() -> None:
     assert _map_rest_ci_status_to_enum([{"status": "success"}], {}) == CIStatus.PENDING
     assert _map_rest_ci_status_to_enum([{"conclusion": 1}], {}) == CIStatus.PENDING
     assert _map_rest_ci_status_to_enum([{"status": 1}], {}) == CIStatus.PENDING
+    assert (
+        _map_rest_ci_status_to_enum(
+            [{"conclusion": "success", "status": "success"}],
+            {"state": "success", "statuses": [{"state": "success"}]},
+        )
+        == CIStatus.PENDING
+    )
+    assert (
+        _map_rest_ci_status_to_enum(
+            [{"conclusion": "success", "status": "in_progress"}],
+            {"state": "success", "statuses": [{"state": "success"}]},
+        )
+        == CIStatus.PENDING
+    )
 
 
 def test_map_rest_ci_status_pending_from_status_in_progress() -> None:
@@ -3362,28 +3376,26 @@ def test_fetch_ci_status_rest_combines_check_runs_and_status(
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         calls.append(list(args))
         if any("check-runs" in a for a in args):
-            return [
-                {
-                    "total_count": 2,
+            path = next(a for a in args if "check-runs" in a)
+            if path.endswith("page=1"):
+                return {
+                    "total_count": 101,
                     "check_runs": [
-                        {"id": 1, "conclusion": "success"},
-                        {"id": 2, "conclusion": "neutral"},
+                        {"id": run_id, "conclusion": "success"}
+                        for run_id in range(100)
                     ],
-                },
-                {
-                    "total_count": 1,
-                    "check_runs": [
-                        {"id": 3, "status": "in_progress"},
-                    ],
-                },
-            ]
+                }
+            return {
+                "total_count": 101,
+                "check_runs": [{"id": 100, "status": "in_progress"}],
+            }
         return {"state": "pending", "statuses": [{"state": "pending"}]}
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
 
-    assert [r["id"] for r in check_runs] == [1, 2, 3]
+    assert [r["id"] for r in check_runs] == list(range(101))
     assert status_payload == {"state": "pending", "statuses": [{"state": "pending"}]}
     assert any("page=1" in a for c in calls for a in c)
     assert any("per_page=100" in a for c in calls for a in c)
@@ -3422,7 +3434,7 @@ def test_fetch_ci_status_rest_degrades_on_status_failure(
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
-            return [{"check_runs": [{"conclusion": "success"}]}]
+            return {"check_runs": [{"conclusion": "success"}]}
         raise RuntimeError("HTTP 503")
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
@@ -3482,7 +3494,7 @@ def test_fetch_ci_status_rest_partial_failure_status_side_with_empty_check_runs(
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
-            return [{"check_runs": []}]
+            return {"check_runs": []}
         raise RuntimeError("HTTP 403")
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
@@ -3501,7 +3513,7 @@ def test_fetch_ci_status_rest_parses_string_status_payload(
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
-            return [{"check_runs": []}]
+            return {"check_runs": []}
         return '{"state": "success", "statuses": [{"state": "success"}]}'
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
@@ -3517,7 +3529,7 @@ def test_fetch_ci_status_rest_string_status_invalid_json_falls_back(
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
-            return [{"check_runs": []}]
+            return {"check_runs": []}
         return "not-json"
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
@@ -3543,19 +3555,15 @@ def test_fetch_ci_status_rest_ignores_non_list_pages(
     assert check_runs == []
 
 
-def test_fetch_ci_status_rest_skips_non_dict_pages(
+def test_fetch_ci_status_rest_rejects_nonempty_outer_array(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Malformed check-runs pages make the source incomplete."""
+    """A plain single-page request cannot legitimately return an outer array."""
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
-            return [
-                "garbage",
-                {"check_runs": "also-garbage"},
-                {"check_runs": [{"conclusion": "success"}, "junk"]},
-            ]
-        return {}
+            return [{"check_runs": [{"conclusion": "success"}]}]
+        return {"state": "success", "statuses": [{"state": "success"}]}
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
@@ -3602,6 +3610,62 @@ def test_fetch_ci_status_rest_rejects_invalid_check_run_status(
     assert fetch_ok is False
 
 
+def test_fetch_ci_status_rest_validates_all_present_check_run_state_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Valid conclusions cannot mask invalid or inconsistent statuses."""
+    sha = "a" * 40
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in arg for arg in args):
+            return {
+                "check_runs": [
+                    {
+                        "id": 1,
+                        "name": "invalid-domain",
+                        "head_sha": sha,
+                        "conclusion": "success",
+                        "status": "success",
+                    },
+                    {
+                        "id": 2,
+                        "name": "inconsistent",
+                        "head_sha": sha,
+                        "conclusion": "success",
+                        "status": "in_progress",
+                    },
+                    {
+                        "id": 3,
+                        "name": "running",
+                        "head_sha": sha,
+                        "conclusion": None,
+                        "status": "in_progress",
+                    },
+                    {
+                        "id": 4,
+                        "name": "complete",
+                        "head_sha": sha,
+                        "conclusion": "success",
+                        "status": "completed",
+                    },
+                ]
+            }
+        return {"state": "success", "statuses": [{"state": "success"}]}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    retrieval = _retrieve_ci_status_evidence("owner/name", sha)
+    check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", sha)
+
+    assert [run["id"] for run in check_runs] == [3, 4]
+    assert status_payload == {"state": "success", "statuses": [{"state": "success"}]}
+    assert fetch_ok is False
+    assert retrieval.evidence.repo == "owner/name"
+    assert retrieval.evidence.sha == sha
+    assert retrieval.evidence.sources_complete is False
+    assert _map_rest_ci_status_to_enum(check_runs, status_payload, fetch_ok=fetch_ok) == CIStatus.PENDING
+
+
 def test_fetch_ci_status_rest_hydrates_annotations_for_failing_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3624,21 +3688,19 @@ def test_fetch_ci_status_rest_hydrates_annotations_for_failing_run(
                 }
             ]
         if "check-runs" in joined:
-            return [
-                {
-                    "check_runs": [
-                        {
-                            "id": 42,
-                            "conclusion": "failure",
-                            "annotations_count": 1,
-                            "annotations_url": (
-                                "https://api.github.com/repos/owner/name/"
-                                "check-runs/42/annotations"
-                            ),
-                        }
-                    ]
-                }
-            ]
+            return {
+                "check_runs": [
+                    {
+                        "id": 42,
+                        "conclusion": "failure",
+                        "annotations_count": 1,
+                        "annotations_url": (
+                            "https://api.github.com/repos/owner/name/"
+                            "check-runs/42/annotations"
+                        ),
+                    }
+                ]
+            }
         return {"state": "success", "statuses": []}
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
@@ -3677,21 +3739,19 @@ def test_fetch_ci_status_rest_skips_annotation_hydration_for_passing_runs(
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         calls.append(list(args))
         if any("check-runs" in a for a in args):
-            return [
-                {
-                    "check_runs": [
-                        {
-                            "id": 7,
-                            "conclusion": "success",
-                            "annotations_count": 3,
-                            "annotations_url": (
-                                "https://api.github.com/repos/owner/name/"
-                                "check-runs/7/annotations"
-                            ),
-                        }
-                    ]
-                }
-            ]
+            return {
+                "check_runs": [
+                    {
+                        "id": 7,
+                        "conclusion": "success",
+                        "annotations_count": 3,
+                        "annotations_url": (
+                            "https://api.github.com/repos/owner/name/"
+                            "check-runs/7/annotations"
+                        ),
+                    }
+                ]
+            }
         return {"state": "success", "statuses": []}
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
@@ -3712,21 +3772,19 @@ def test_fetch_ci_status_rest_skips_hydration_for_infra_conclusion(
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         calls.append(list(args))
         if any("check-runs" in a for a in args):
-            return [
-                {
-                    "check_runs": [
-                        {
-                            "id": 9,
-                            "conclusion": "cancelled",
-                            "annotations_count": 2,
-                            "annotations_url": (
-                                "https://api.github.com/repos/owner/name/"
-                                "check-runs/9/annotations"
-                            ),
-                        }
-                    ]
-                }
-            ]
+            return {
+                "check_runs": [
+                    {
+                        "id": 9,
+                        "conclusion": "cancelled",
+                        "annotations_count": 2,
+                        "annotations_url": (
+                            "https://api.github.com/repos/owner/name/"
+                            "check-runs/9/annotations"
+                        ),
+                    }
+                ]
+            }
         return {"state": "pending", "statuses": []}
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
@@ -3750,21 +3808,19 @@ def test_fetch_ci_status_rest_hydration_swallows_runtime_error(
         if "check-runs" in joined and "annotations" in joined:
             raise RuntimeError("HTTP 503")
         if "check-runs" in joined:
-            return [
-                {
-                    "check_runs": [
-                        {
-                            "id": 11,
-                            "conclusion": "failure",
-                            "annotations_count": 1,
-                            "annotations_url": (
-                                "https://api.github.com/repos/owner/name/"
-                                "check-runs/11/annotations"
-                            ),
-                        }
-                    ]
-                }
-            ]
+            return {
+                "check_runs": [
+                    {
+                        "id": 11,
+                        "conclusion": "failure",
+                        "annotations_count": 1,
+                        "annotations_url": (
+                            "https://api.github.com/repos/owner/name/"
+                            "check-runs/11/annotations"
+                        ),
+                    }
+                ]
+            }
         return {"state": "success", "statuses": []}
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
@@ -3780,7 +3836,7 @@ def test_retrieve_ci_status_evidence_distinguishes_source_outcomes(
 ) -> None:
     def fake_empty(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
-            return [{"total_count": 0, "check_runs": []}]
+            return {"total_count": 0, "check_runs": []}
         return {"state": "pending", "statuses": []}
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_empty)
@@ -3803,7 +3859,7 @@ def test_retrieve_ci_status_evidence_distinguishes_source_outcomes(
 
     def fake_timeout(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
-            return [{"check_runs": []}]
+            return {"check_runs": []}
         raise RuntimeError("net/http: TLS handshake timeout")
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_timeout)
@@ -3813,11 +3869,65 @@ def test_retrieve_ci_status_evidence_distinguishes_source_outcomes(
 
     def fake_malformed(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
-            return [{"check_runs": []}]
+            return {"check_runs": []}
         return "not-json"
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_malformed)
     assert _retrieve_ci_status_evidence("owner/name", "abc123").status_source.error == "malformed"
+
+
+def test_retrieve_ci_status_evidence_reuses_contract_across_cache_and_304(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sha = "a" * 40
+    status_calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in arg for arg in args):
+            return {
+                "check_runs": [
+                    {
+                        "id": 1,
+                        "name": "unit",
+                        "head_sha": sha,
+                        "status": "completed",
+                        "conclusion": "success",
+                        "app": {"id": 1},
+                    }
+                ]
+            }
+        status_calls.append(list(args))
+        if len(status_calls) == 1:
+            body = (
+                '{"state":"success","statuses":['
+                f'{{"context":"legacy","state":"success","sha":"{sha}",'
+                '"creator":{"login":"ci-bot"}}]}'
+            )
+            return _build_include_response(body, etag='W/"status-v1"')
+        return _build_include_response("", status=304, etag='W/"status-v1"')
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    first = _retrieve_ci_status_evidence("owner/name", sha)
+    cached = _retrieve_ci_status_evidence("owner/name", sha)
+
+    assert cached is first
+    assert first.evidence.repo == "owner/name"
+    assert first.evidence.sha == sha
+    assert first.evidence.sources_complete is True
+    assert first.evidence.policy_result == CIStatus.SUCCESS
+    assert first.evidence.observed_at == cached.evidence.observed_at
+    assert len(status_calls) == 1
+
+    clear_ci_status_cache()
+    revalidated = _retrieve_ci_status_evidence("owner/name", sha)
+
+    assert revalidated.status_payload == first.status_payload
+    assert revalidated.evidence.repo == first.evidence.repo
+    assert revalidated.evidence.sha == first.evidence.sha
+    assert revalidated.evidence.sources_complete is True
+    assert revalidated.evidence.policy_result == CIStatus.SUCCESS
+    assert any("If-None-Match" in arg for arg in status_calls[-1])
 
 
 def test_retrieve_ci_status_evidence_rejects_invalid_statuses_field(
@@ -3898,27 +4008,57 @@ def test_retrieve_ci_status_evidence_rejects_non_object_status_entries(
 def test_fetch_ci_status_rest_second_page_failure_is_incomplete(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fake_paginated(path: str) -> cache.PaginatedEvidence:
-        assert path == "repos/owner/name/commits/abc123/check-runs?per_page=100"
-        return cache.PaginatedEvidence(
-            [{"check_runs": [{"conclusion": "success"}]}],
-            complete=False,
-            empty=False,
-            error="HTTP 503",
-        )
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        path = next((arg for arg in args if "check-runs" in arg), "")
+        if path.endswith("page=1"):
+            return {
+                "check_runs": [
+                    {"id": run_id, "conclusion": "success"}
+                    for run_id in range(100)
+                ]
+            }
+        if path:
+            raise RuntimeError("HTTP 503")
+        return {"state": "success", "statuses": [{"state": "success"}]}
 
-    monkeypatch.setattr("src.github.cache._gh_api_paginated_evidence", fake_paginated)
-    monkeypatch.setattr(
-        "src.github.cache._etag_get",
-        lambda path: {"state": "success", "statuses": [{"state": "success"}]},
-    )
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
 
     check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
 
-    assert check_runs == [{"conclusion": "success"}]
+    assert len(check_runs) == 100
     assert status_payload == {"state": "success", "statuses": [{"state": "success"}]}
     assert fetch_ok is False
     assert _map_rest_ci_status_to_enum(check_runs, status_payload, fetch_ok=fetch_ok) == CIStatus.PENDING
+
+
+def test_fetch_ci_status_rest_later_outer_array_preserves_known_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        path = next((arg for arg in args if "check-runs" in arg), "")
+        if path.endswith("page=1"):
+            return {
+                "check_runs": [
+                    {"id": 0, "conclusion": "failure"},
+                    *[
+                        {"id": run_id, "conclusion": "success"}
+                        for run_id in range(1, 100)
+                    ],
+                ]
+            }
+        if path:
+            return [{"check_runs": [{"id": 100, "conclusion": "success"}]}]
+        return {"state": "success", "statuses": [{"state": "success"}]}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
+
+    assert len(check_runs) == 100
+    assert check_runs[0]["conclusion"] == "failure"
+    assert fetch_ok is False
+    assert _map_rest_ci_status_to_enum(check_runs, status_payload, fetch_ok=fetch_ok) == CIStatus.FAILURE
 
 
 def test_fetch_ci_status_rest_malformed_check_runs_field_is_incomplete(
@@ -3973,7 +4113,7 @@ def test_fetch_ci_status_rest_caches_per_repo_sha(
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         calls.append(list(args))
         if any("check-runs" in a for a in args):
-            return [{"check_runs": [{"conclusion": "success"}]}]
+            return {"check_runs": [{"conclusion": "success"}]}
         return {"state": "success", "statuses": [{"state": "success"}]}
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
@@ -3994,7 +4134,7 @@ def test_fetch_ci_status_rest_cache_misses_on_new_sha(
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
             sha = next(a for a in args if "check-runs" in a).split("/")[-2]
-            return [{"check_runs": [{"conclusion": "success", "id": sha}]}]
+            return {"check_runs": [{"conclusion": "success", "id": sha}]}
         return {"state": "success", "statuses": [{"state": "success"}]}
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
@@ -4010,23 +4150,26 @@ def test_fetch_ci_status_rest_ignores_wrong_sha_cache_entry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A poisoned cache entry under the right key but wrong SHA is not reused."""
-    from src.github.checks import _ci_status_cache, _CiSourceEvidence, _CiStatusEvidence
+    from src.github.checks import _ci_status_cache
 
-    _ci_status_cache[("owner/name", "abc123")] = _CiStatusEvidence(
-        "owner/name",
-        "oldsha",
-        1000.0,
-        [{"conclusion": "success", "id": "oldsha"}],
-        {"state": "success", "statuses": [{"state": "success"}]},
-        _CiSourceEvidence("check_runs", True, False),
-        _CiSourceEvidence("status", True, False),
+    monkeypatch.setattr("src.github.checks.time.monotonic", lambda: 1000.0)
+    monkeypatch.setattr(
+        "src.github.gh_runner.run_gh",
+        lambda args, **kwargs: {"check_runs": [{"conclusion": "success", "id": "oldsha"}]}
+        if any("check-runs" in arg for arg in args)
+        else {"state": "success", "statuses": [{"state": "success"}]},
+    )
+    _retrieve_ci_status_evidence("owner/name", "abc123")
+    cached = _ci_status_cache[("owner/name", "abc123")]
+    _ci_status_cache[("owner/name", "abc123")] = cached._replace(
+        evidence=cached.evidence._replace(sha="oldsha")
     )
 
     monkeypatch.setattr("src.github.checks.time.monotonic", lambda: 1001.0)
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
-            return [{"check_runs": [{"conclusion": "failure", "id": "abc123"}]}]
+            return {"check_runs": [{"conclusion": "failure", "id": "abc123"}]}
         return {"state": "success", "statuses": [{"state": "success"}]}
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
@@ -4041,17 +4184,14 @@ def test_fetch_ci_status_rest_expired_cache_entry_refetches_incomplete(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Expired complete evidence cannot silently acquire current provenance."""
-    from src.github.checks import _ci_status_cache, _CiSourceEvidence, _CiStatusEvidence
-
-    _ci_status_cache[("owner/name", "abc123")] = _CiStatusEvidence(
-        "owner/name",
-        "abc123",
-        1000.0,
-        [{"conclusion": "success"}],
-        {"state": "success", "statuses": [{"state": "success"}]},
-        _CiSourceEvidence("check_runs", True, False),
-        _CiSourceEvidence("status", True, False),
+    monkeypatch.setattr("src.github.checks.time.monotonic", lambda: 1000.0)
+    monkeypatch.setattr(
+        "src.github.gh_runner.run_gh",
+        lambda args, **kwargs: {"check_runs": [{"conclusion": "success"}]}
+        if any("check-runs" in arg for arg in args)
+        else {"state": "success", "statuses": [{"state": "success"}]},
     )
+    _retrieve_ci_status_evidence("owner/name", "abc123")
 
     monkeypatch.setattr("src.github.checks.time.monotonic", lambda: 1100.0)
 
@@ -4078,7 +4218,7 @@ def test_fetch_ci_status_rest_cache_expires_after_ttl(
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
             state["calls"] += 1
-            return [{"check_runs": [{"conclusion": "success", "name": f"call_{state['calls']}"}]}]
+            return {"check_runs": [{"conclusion": "success", "name": f"call_{state['calls']}"}]}
         return {"state": "pending", "statuses": []}
 
     fake_now = {"value": 1000.0}
@@ -4108,7 +4248,7 @@ def test_clear_ci_status_cache_forces_refetch(
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
             state["calls"] += 1
-            return [{"check_runs": [{"conclusion": f"call_{state['calls']}"}]}]
+            return {"check_runs": [{"conclusion": f"call_{state['calls']}"}]}
         return {}
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
@@ -4134,7 +4274,7 @@ def test_fetch_ci_status_rest_evicts_expired_entries_for_old_shas(
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
-            return [{"check_runs": [{"conclusion": "success"}]}]
+            return {"check_runs": [{"conclusion": "success"}]}
         return {"state": "success", "statuses": [{"state": "success"}]}
 
     fake_now = {"value": 1000.0}
@@ -4165,7 +4305,7 @@ def test_fetch_ci_status_rest_eviction_preserves_unexpired_entries(
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
         if any("check-runs" in a for a in args):
-            return [{"check_runs": [{"conclusion": "success"}]}]
+            return {"check_runs": [{"conclusion": "success"}]}
         return {"state": "success", "statuses": [{"state": "success"}]}
 
     fake_now = {"value": 1000.0}
