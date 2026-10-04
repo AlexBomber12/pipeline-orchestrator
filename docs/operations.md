@@ -67,3 +67,17 @@ runtime config loader does not read that file. Reload the daemon config
 through the normal inotify path, or restart the daemon container. Verify
 the rollback by checking the dashboard event log for legacy throttle
 decisions on the affected repository.
+
+## Required Check Adoption
+
+`RepoConfig.required_checks` lets a repository declare the exact GitHub
+check context names required before merge. Names are exact-match strings;
+for example, the tracked pipeline-orchestrator example declares `unit`
+and `integration`.
+
+Repositories without `required_checks` keep the existing weaker fallback:
+the daemon observes the contexts GitHub reports for the current PR instead
+of inventing required contexts from unrelated repositories. Preserved
+server configs and production overlays must opt in explicitly during the
+final production update; this repository change only updates committed
+examples and validation.
