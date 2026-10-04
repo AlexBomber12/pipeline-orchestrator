@@ -492,6 +492,26 @@ class CodingMixin:
             publication_monitors.append(monitor)
             return monitor
 
+        async def refresh_publication() -> gh_prs.BranchPublication | None:
+            assert publication_baseline is not None
+            publications = await asyncio.to_thread(
+                gh_prs.get_branch_publications,
+                self.owner_repo,
+                base_branch,
+                target_branch,
+            )
+            local_head = await asyncio.to_thread(
+                _local_branch_head_sha,
+                self.repo_path,
+                target_branch,
+            )
+            return _fresh_ready_publication(
+                publications,
+                baseline_numbers=publication_baseline,
+                not_before=publication_not_before,
+                expected_head_sha=local_head,
+            )
+
         publication_monitor = start_publication_monitor()
         breach_monitor: asyncio.Task[None] | None = None
         if plugin.supports_breach_lifecycle:
@@ -532,29 +552,12 @@ class CodingMixin:
                 if cli_task in completed:
                     break
                 try:
-                    before_cleanup = await asyncio.to_thread(
-                        gh_prs.get_branch_publications,
-                        self.owner_repo,
-                        base_branch,
-                        target_branch,
-                    )
-                    local_head = await asyncio.to_thread(
-                        _local_branch_head_sha,
-                        self.repo_path,
-                        target_branch,
-                    )
+                    publication_observed = await refresh_publication()
                 except Exception as exc:
                     publication_observed = None
                     self.log_event(
                         f"[CODING] Publication recheck failed before "
                         f"cleanup: {exc}; coder will continue."
-                    )
-                else:
-                    publication_observed = _fresh_ready_publication(
-                        before_cleanup,
-                        baseline_numbers=publication_baseline,
-                        not_before=publication_not_before,
-                        expected_head_sha=local_head,
                     )
                 if publication_observed is not None:
                     self.log_event(
@@ -575,6 +578,21 @@ class CodingMixin:
                     timeout=self.app_config.daemon.fix_poll_interval_sec,
                 )
                 if cli_task in completed:
+                    if not self._stop_requested and not breach_flag["breached"]:
+                        try:
+                            publication_observed = await refresh_publication()
+                        except Exception as exc:
+                            self.log_event(
+                                "[CODING] Publication recheck failed as coder "
+                                f"completed during renewed observation: {exc}; "
+                                "using ordinary completion handling."
+                            )
+                        else:
+                            if publication_observed is not None:
+                                self.log_event(
+                                    "[CODING] Verified publication as coder "
+                                    "completed during renewed observation."
+                                )
                     break
                 publication_monitor = start_publication_monitor()
             result = await cli_task

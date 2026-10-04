@@ -390,7 +390,7 @@ def test_unverified_pre_cleanup_recheck_leaves_coder_running(
     )
     _publication_snapshots(monkeypatch, [], [publication], third_read)
     if recheck == "mismatch":
-        local_heads = iter(["a" * 40, "c" * 40])
+        local_heads = iter(["a" * 40, "c" * 40, "c" * 40])
         monkeypatch.setattr(
             coding_module,
             "_local_branch_head_sha",
@@ -538,6 +538,57 @@ def test_publication_monitor_rearms_after_transient_recheck_failure(
     assert publication_reads == []
     assert managed.run_calls == 1
     assert managed.cleanup_calls == [(0, 0)]
+
+
+def test_cli_exit_during_rearm_delay_rechecks_published_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    runner.app_config.daemon.coder_terminate_grace_sec = 0
+    _coder_name, plugin = runner._get_coder()
+    observed = _publication(50, sha="a" * 40)
+    updated = _publication(50, sha="b" * 40)
+    publication_reads = iter([[], [observed], [updated], [updated]])
+    local_heads = iter(["b" * 40, "b" * 40, "b" * 40])
+    allow_cli_exit = asyncio.Event()
+    monitor_calls = 0
+
+    async def monitor(*args: object, **kwargs: object) -> BranchPublication:
+        nonlocal monitor_calls
+        monitor_calls += 1
+        return observed
+
+    async def cli_exits(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        await allow_cli_exit.wait()
+        return (1, "published corrected head", "coder exited nonzero")
+
+    original_log_event = runner.log_event
+
+    def capture_log(message: str, **kwargs: object) -> None:
+        original_log_event(message, **kwargs)
+        if "renewed publication observation" in message:
+            allow_cli_exit.set()
+
+    monkeypatch.setattr(
+        coding_module.gh_prs,
+        "get_branch_publications",
+        lambda *args, **kwargs: next(publication_reads),
+    )
+    monkeypatch.setattr(
+        coding_module,
+        "_local_branch_head_sha",
+        lambda *args, **kwargs: next(local_heads),
+    )
+    monkeypatch.setattr(runner, "_monitor_coding_publication", monitor)
+    monkeypatch.setattr(plugin, "run_auto_pr", cli_exits)
+    runner.log_event = capture_log  # type: ignore[method-assign]
+
+    asyncio.run(asyncio.wait_for(runner.handle_coding(), timeout=1))
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.head_sha == "b" * 40
+    assert monitor_calls == 1
 
 
 def test_stop_during_renewed_publication_observation_settles_monitor(
