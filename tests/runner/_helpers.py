@@ -473,6 +473,13 @@ def _patch_subprocess(
         return _FakeCompletedProcess(args=cmd, stdout=stdout, returncode=returncode)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    # CODING now takes a targeted publication baseline before CLI launch.
+    # Keep legacy handler tests hermetic; publication tests replace this stub.
+    monkeypatch.setattr(
+        coding_module.gh_prs,
+        "get_branch_publications",
+        lambda *args, **kwargs: [],
+    )
     if stub_auto_pr_read:
         _stub_auto_pr_task_body_read(monkeypatch)
     return calls

@@ -15,6 +15,7 @@ import re
 import subprocess
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -36,6 +37,54 @@ _BRANCH_NAME_RE = re.compile(r"^[^\x00-\x20\x7f~^:?*\\[]+$")
 _last_known_sha: dict[str, str] = {}
 _merged_prs_cache: dict[tuple[str, str], tuple[float, list["PRInfo"]]] = {}
 _MERGED_PRS_CACHE_TTL_SECONDS = 60.0
+_FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+
+
+@dataclass(frozen=True)
+class BranchPublication:
+    """Targeted GitHub evidence for one PR publication candidate.
+
+    This intentionally carries only publication metadata. CODING uses it
+    before WATCH owns CI and review observation, so fetching a candidate must
+    not fan out into check-run or review API reads.
+    """
+
+    number: int
+    title: str
+    base_branch: str
+    head_branch: str
+    head_sha: str
+    state: str
+    is_draft: bool
+    is_cross_repository: bool
+    created_at: datetime | None
+    url: str
+
+    @property
+    def is_verified_ready(self) -> bool:
+        """Return whether this is a ready, same-repository OPEN PR."""
+        return (
+            self.number > 0
+            and self.state == "OPEN"
+            and not self.is_draft
+            and not self.is_cross_repository
+            and isinstance(self.created_at, datetime)
+            and _FULL_SHA_RE.fullmatch(self.head_sha) is not None
+        )
+
+    def to_pr_info(self) -> PRInfo:
+        """Convert verified publication evidence to WATCH's PR model."""
+        return PRInfo(
+            number=self.number,
+            branch=self.head_branch,
+            title=self.title,
+            pr_id=extract_queue_pr_id(self.title),
+            head_sha=self.head_sha,
+            observed_head_shas={self.head_sha},
+            push_count=1,
+            url=self.url,
+            is_cross_repository=self.is_cross_repository,
+        )
 
 
 class GitHubPollError(Exception):
@@ -62,6 +111,76 @@ def clear_merged_prs_cache() -> None:
 def clear_last_known_sha() -> None:
     """Reset SHA tracking state (used in tests)."""
     _last_known_sha.clear()
+
+
+def get_branch_publications(
+    repo: str,
+    base_branch: str,
+    head_branch: str,
+) -> list[BranchPublication]:
+    """Return fresh, targeted publication metadata for one base/head pair.
+
+    The query includes all states so CODING can baseline pre-existing draft
+    or closed PR identities before starting the coder. The caller decides
+    which candidates are new for its dispatch. A short CLI timeout bounds
+    each observation, and unlike :func:`get_open_prs` this helper performs no
+    CI or review reads.
+    """
+    raw = gh_runner.run_gh(
+        [
+            "pr",
+            "list",
+            "--state",
+            "all",
+            "--base",
+            base_branch,
+            "--head",
+            head_branch,
+            "--limit",
+            "20",
+            "--json",
+            (
+                "number,title,baseRefName,headRefName,headRefOid,state,"
+                "isDraft,isCrossRepository,createdAt,url"
+            ),
+        ],
+        repo=repo,
+        timeout=10,
+    )
+    if not isinstance(raw, list):
+        return []
+
+    publications: list[BranchPublication] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        if (
+            entry.get("baseRefName") != base_branch
+            or entry.get("headRefName") != head_branch
+        ):
+            continue
+        number = entry.get("number")
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            continue
+        title = entry.get("title")
+        head_sha = entry.get("headRefOid")
+        state = entry.get("state")
+        url = entry.get("url")
+        publications.append(
+            BranchPublication(
+                number=number,
+                title=title if isinstance(title, str) else "",
+                base_branch=base_branch,
+                head_branch=head_branch,
+                head_sha=head_sha.strip() if isinstance(head_sha, str) else "",
+                state=state.upper() if isinstance(state, str) else "",
+                is_draft=entry.get("isDraft") is True,
+                is_cross_repository=entry.get("isCrossRepository") is True,
+                created_at=_parse_iso(entry.get("createdAt")),
+                url=url if isinstance(url, str) else "",
+            )
+        )
+    return publications
 
 
 def gh_pr_get_merged_branches(repo: str, branches: Iterable[str]) -> set[str]:

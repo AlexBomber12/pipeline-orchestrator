@@ -410,7 +410,32 @@ async def test_run_supervised_process_propagates_deferred_cancellation(
         CleanupResult(CleanupStatus.QUIESCENT, 0, False, False),
     )
 
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await run_supervised_process(  # type: ignore[arg-type]
+            managed, timeout=1
+        )
+
+    captured = process_supervisor.cancelled_process_result(caught.value)
+    assert captured == process_supervisor.ProcessRunResult(
+        returncode=0,
+        stdout=b"",
+        stderr=b"",
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_supervised_process_does_not_invent_missing_exit_code() -> None:
+    process = _ExecutionProcess()
+    managed = _ExecutionManaged(
+        process,
+        CleanupResult(CleanupStatus.QUIESCENT, None, False, False),
+        clear_returncode=True,
+    )
+
+    with pytest.raises(
+        ProcessSupervisionError,
+        match="without a leader return code",
+    ):
         await run_supervised_process(  # type: ignore[arg-type]
             managed, timeout=1
         )
@@ -512,8 +537,13 @@ async def test_async_adapter_cancellation_and_callback_failure_clean_descendants
     task = asyncio.create_task(_run_fake_adapter(provider, tmp_path))
     cancel_pid_values = await _read_fake_pids(cancel_pids)
     task.cancel()
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(asyncio.CancelledError) as cancelled:
         await asyncio.wait_for(task, timeout=4)
+    captured = process_supervisor.cancelled_process_result(cancelled.value)
+    assert captured is not None
+    assert captured.stdout == b"leader-output\n"
+    assert captured.stderr == b"leader-diagnostic\n"
+    assert captured.returncode != 0
     await _wait_not_live(*cancel_pid_values)
 
     callback_pids = tmp_path / f"{provider}-callback.pids"
