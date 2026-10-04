@@ -268,6 +268,8 @@ def _gh_api_paginated(path: str) -> list[dict] | None:
 
 def _gh_api_paginated_evidence(path: str) -> PaginatedEvidence:
     items: list[dict] = []
+    fetched = 0
+    expected_total: int | None = None
     sep = "&" if "?" in path else "?"
     per_page_match = re.search(r"(?:^|[?&])per_page=(\d+)", path)
     per_page = int(per_page_match.group(1)) if per_page_match else _ETAG_PAGINATED_DEFAULT_PER_PAGE
@@ -283,8 +285,40 @@ def _gh_api_paginated_evidence(path: str) -> PaginatedEvidence:
         runs = raw.get("check_runs")
         if not isinstance(runs, list):
             return PaginatedEvidence(items, False, len(items) == 0, "malformed")
-        if len(runs) < per_page:
-            return PaginatedEvidence(items, True, len(items) == 0)
+        fetched += len(runs)
+        expected_total, complete = _pagination_complete(
+            raw.get("total_count"), expected_total, len(runs), fetched, per_page
+        )
+        if complete is not None:
+            return PaginatedEvidence(
+                items,
+                complete,
+                fetched == 0,
+                None if complete else "malformed",
+            )
+
+
+def _pagination_complete(
+    raw_total: object,
+    expected_total: int | None,
+    page_count: int,
+    fetched: int,
+    per_page: int,
+) -> tuple[int | None, bool | None]:
+    if raw_total is not None:
+        if isinstance(raw_total, bool) or not isinstance(raw_total, int) or raw_total < 0:
+            return expected_total, False
+        if expected_total is None:
+            expected_total = raw_total
+        elif raw_total != expected_total:
+            return expected_total, False
+    if expected_total is not None:
+        if fetched == expected_total:
+            return expected_total, True
+        if fetched > expected_total or page_count == 0:
+            return expected_total, False
+        return expected_total, None
+    return expected_total, True if page_count < per_page else None
 
 
 def _etag_get_object_pages_evidence(path: str, list_field: str) -> PaginatedEvidence:
@@ -327,22 +361,17 @@ def _etag_get_object_pages_evidence(path: str, list_field: str) -> PaginatedEvid
         items.append(raw)
         fetched += len(page_items)
 
-        total_count = raw.get("total_count")
-        if total_count is not None:
-            if isinstance(total_count, bool) or not isinstance(total_count, int) or total_count < 0:
-                return PaginatedEvidence(items, False, fetched == 0, "malformed", min(observed_at))
-            if expected_total is None:
-                expected_total = total_count
-            elif total_count != expected_total:
-                return PaginatedEvidence(items, False, fetched == 0, "malformed", min(observed_at))
-
-        if expected_total is not None:
-            if fetched == expected_total:
-                return PaginatedEvidence(items, True, fetched == 0, observed_at=min(observed_at))
-            if fetched > expected_total or not page_items:
-                return PaginatedEvidence(items, False, fetched == 0, "malformed", min(observed_at))
-        elif len(page_items) < per_page:
-            return PaginatedEvidence(items, True, fetched == 0, observed_at=min(observed_at))
+        expected_total, complete = _pagination_complete(
+            raw.get("total_count"), expected_total, len(page_items), fetched, per_page
+        )
+        if complete is not None:
+            return PaginatedEvidence(
+                items,
+                complete,
+                fetched == 0,
+                None if complete else "malformed",
+                min(observed_at),
+            )
 
 
 def _etag_get_paginated(path: str) -> list[dict] | None:

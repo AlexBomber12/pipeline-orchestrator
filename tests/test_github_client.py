@@ -3316,6 +3316,21 @@ def test_map_rest_ci_status_combined_state_error_treated_as_failure() -> None:
         )
         == CIStatus.FAILURE
     )
+    assert (
+        _map_rest_ci_status_to_enum(
+            [{"conclusion": "success"}],
+            {"state": "failure", "statuses": []},
+        )
+        == CIStatus.FAILURE
+    )
+    assert (
+        _map_rest_ci_status_to_enum(
+            [],
+            {"state": "failure", "statuses": []},
+            empty_is_success=True,
+        )
+        == CIStatus.FAILURE
+    )
 
 
 def test_map_rest_ci_status_combined_state_pending_keeps_rollup_pending() -> None:
@@ -3594,6 +3609,25 @@ def test_fetch_ci_status_rest_empty_page_array_is_incomplete(
     assert check_runs == []
     assert status_payload == {"state": "success", "statuses": [{"state": "success"}]}
     assert fetch_ok is False
+
+
+def test_fetch_ci_status_rest_rejects_truncated_check_run_total(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in arg for arg in args):
+            return {"total_count": 1, "check_runs": []}
+        return {"state": "success", "statuses": [{"state": "success"}]}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    retrieval = _retrieve_ci_status_evidence("owner/name", "abc123")
+    check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
+
+    assert retrieval.check_runs_source.complete is False
+    assert retrieval.check_runs_source.error == "malformed"
+    assert fetch_ok is False
+    assert _map_rest_ci_status_to_enum(check_runs, status_payload, fetch_ok=fetch_ok) == CIStatus.PENDING
 
 
 def test_fetch_ci_status_rest_rejects_invalid_check_run_status(
@@ -4076,6 +4110,26 @@ def test_retrieve_ci_status_evidence_rejects_invalid_statuses_field(
     evidence = _retrieve_ci_status_evidence("owner/name", "abc123")
 
     assert evidence.status_source.error == "malformed"
+
+
+def test_retrieve_ci_status_evidence_preserves_empty_aggregate_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in arg for arg in args):
+            return {"check_runs": [{"conclusion": "success"}]}
+        return {"state": "failure", "total_count": 0, "statuses": []}
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    retrieval = _retrieve_ci_status_evidence("owner/name", "abc123")
+    check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
+
+    assert retrieval.status_source.complete is False
+    assert retrieval.status_source.error == "malformed"
+    assert status_payload == {"state": "failure", "total_count": 0, "statuses": []}
+    assert fetch_ok is False
+    assert _map_rest_ci_status_to_enum(check_runs, status_payload, fetch_ok=fetch_ok) == CIStatus.FAILURE
 
 
 def test_retrieve_ci_status_evidence_rejects_malformed_status_entries(

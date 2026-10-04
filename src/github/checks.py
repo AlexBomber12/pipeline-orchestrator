@@ -295,6 +295,8 @@ def _parse_status_payload(parsed: dict) -> tuple[dict, _CiSourceResult]:
     if combined_state_upper is None:
         return {}, _CiSourceResult(False, False, "malformed")
     statuses_raw = parsed.get("statuses", [])
+    if not statuses_raw and combined_state_upper in _REST_CI_FAILURE_STATES:
+        return parsed, _CiSourceResult(False, True, "malformed")
     statuses_malformed = False
     for status in statuses_raw:
         if not isinstance(status, dict):
@@ -512,7 +514,10 @@ def _map_rest_ci_status_to_enum(
         for status in statuses
     )
 
+    combined_state_upper = _commit_status_state(combined_state) or ""
     if not check_runs and not statuses:
+        if combined_state_upper in _REST_CI_FAILURE_STATES:
+            return CIStatus.FAILURE
         return CIStatus.SUCCESS if empty_is_success and fetch_ok else CIStatus.PENDING
 
     states: list[str] = []
@@ -530,11 +535,10 @@ def _map_rest_ci_status_to_enum(
         if upper in _REST_CI_FAILURE_STATES:
             failing_runs.append(run)
 
-    combined_state_upper = _commit_status_state(combined_state) or ""
-    if statuses and malformed_statuses:
+    if combined_state_upper in _REST_CI_FAILURE_STATES:
+        states.append(combined_state_upper)
+    elif statuses and malformed_statuses:
         fetch_ok = False
-        if combined_state_upper in _REST_CI_FAILURE_STATES:
-            states.append(combined_state_upper)
     elif statuses and combined_state_upper:
         states.append(combined_state_upper)
     if malformed_check_runs:
