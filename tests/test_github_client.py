@@ -4204,7 +4204,52 @@ def test_retrieve_ci_status_evidence_rejects_payload_for_another_sha(
     if source == "check_runs":
         assert check_runs == []
     else:
-        assert status_payload["sha"] == "oldsha"
+        assert retrieval.status_payload["sha"] == "oldsha"
+        assert status_payload == {}
+    assert (
+        _map_rest_ci_status_to_enum(check_runs, status_payload, fetch_ok=fetch_ok)
+        == CIStatus.PENDING
+    )
+
+
+def test_retrieve_ci_status_evidence_does_not_attribute_foreign_aggregate_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_sha = "a" * 40
+    foreign_sha = "b" * 40
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in arg for arg in args):
+            return _ci_check_page(
+                [{"name": "unit", "conclusion": "success", "app": {"id": 1}}],
+                sha=requested_sha,
+            )
+        return _ci_status_page(
+            "failure",
+            [
+                {
+                    "context": "legacy",
+                    "state": "failure",
+                    "sha": foreign_sha,
+                    "creator": {"login": "ci-bot"},
+                }
+            ],
+            sha=foreign_sha,
+        )
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    retrieval = _retrieve_ci_status_evidence("owner/name", requested_sha)
+    check_runs, status_payload, fetch_ok = _fetch_ci_status_rest(
+        "owner/name", requested_sha
+    )
+
+    assert retrieval.status_source.sha_matches is False
+    assert retrieval.status_payload["state"] == "failure"
+    assert retrieval.evidence.policy_result == CIStatus.PENDING
+    assert retrieval.evidence.pending_reason == "sources_incomplete"
+    assert status_payload == {}
+    assert fetch_ok is False
     assert (
         _map_rest_ci_status_to_enum(check_runs, status_payload, fetch_ok=fetch_ok)
         == CIStatus.PENDING

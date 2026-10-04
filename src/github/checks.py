@@ -43,6 +43,7 @@ class _CiSourceResult(NamedTuple):
     complete: bool
     empty: bool
     error: str | None = None
+    sha_matches: bool = True
 
 
 class _CiRetrieval(NamedTuple):
@@ -353,7 +354,12 @@ def _parse_status_pages(
         if pages.error
         else None
     )
-    return status_payload, _CiSourceResult(complete, parsed_source.empty, error)
+    return status_payload, _CiSourceResult(
+        complete,
+        parsed_source.empty,
+        error,
+        not sha_mismatch,
+    )
 
 
 def _make_ci_retrieval(
@@ -372,12 +378,13 @@ def _make_ci_retrieval(
         if isinstance(statuses, list)
         else []
     )
+    evidence_status_records = status_records if status_source.sha_matches else []
     evidence = evaluate_ci_evidence(
         repo=repo,
         pr_number=None,
         sha=sha,
         check_runs=check_runs,
-        statuses=status_records,
+        statuses=evidence_status_records,
         check_runs_complete=check_runs_source.complete,
         statuses_complete=status_source.complete,
         observed_at=observed_at,
@@ -388,7 +395,7 @@ def _make_ci_retrieval(
     # preserves that failure; carry it into the predecessor evidence contract
     # as well so callers cannot observe contradictory policy results.
     combined_state = _commit_status_state(status_payload.get("state"))
-    if combined_state in _REST_CI_FAILURE_STATES:
+    if status_source.sha_matches and combined_state in _REST_CI_FAILURE_STATES:
         evidence = evidence._replace(
             policy_result=CIStatus.FAILURE,
             pending_reason=None,
@@ -492,7 +499,7 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
     retrieval = _retrieve_ci_status_evidence(repo, sha)
     return (
         list(retrieval.check_runs),
-        dict(retrieval.status_payload),
+        dict(retrieval.status_payload) if retrieval.status_source.sha_matches else {},
         retrieval.evidence.sources_complete,
     )
 
