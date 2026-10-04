@@ -610,6 +610,29 @@ def test_publication_monitor_retries_transient_read_failure(
     asyncio.run(scenario())
 
 
+def test_unarmed_publication_monitor_waits_for_cli_and_returns_none() -> None:
+    runner = h._make_runner()
+
+    async def scenario() -> None:
+        release = asyncio.Event()
+        cli_task = asyncio.create_task(release.wait())
+        monitor = asyncio.create_task(
+            runner._monitor_coding_publication(
+                cli_task,  # type: ignore[arg-type]
+                base_branch="main",
+                target_branch="pr-001",
+                baseline_numbers=None,
+                not_before=datetime.now(timezone.utc),
+            )
+        )
+        await asyncio.sleep(0)
+        release.set()
+        await cli_task
+        assert await monitor is None
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("race", ["stop", "breach"])
 def test_stop_and_breach_win_publication_race(
     monkeypatch: pytest.MonkeyPatch,

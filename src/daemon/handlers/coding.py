@@ -482,13 +482,9 @@ class CodingMixin:
                 {cli_task, publication_monitor},
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if cli_task in completed:
-                result = await cli_task
-            else:
+            if cli_task not in completed:
                 publication_observed = publication_monitor.result()
-                if publication_observed is None:
-                    result = await cli_task
-                else:
+                if publication_observed is not None:
                     self.log_event(
                         f"[CODING] Verified publication of PR "
                         f"#{publication_observed.number}; allowing coder "
@@ -506,7 +502,7 @@ class CodingMixin:
                         )
                         await self._terminate_current_coder()
                         publication_cancel_requested = cli_task.cancel()
-                    result = await cli_task
+            result = await cli_task
         except asyncio.CancelledError as exc:
             if self._stop_requested:
                 interruption = "stop"
