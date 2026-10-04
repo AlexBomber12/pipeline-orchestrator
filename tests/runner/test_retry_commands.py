@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -20,7 +20,14 @@ from src.daemon import retry_commands as retry_module
 from src.daemon.retry_commands import RetryDispatch
 from src.inhibitor import InhibitorType, WorkInhibitor
 from src.keyspace import retry_command, retry_command_pending
-from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
+from src.models import (
+    CIStatus,
+    PipelineState,
+    PRInfo,
+    QueueTask,
+    ReviewStatus,
+    TaskStatus,
+)
 from src.retry_commands import (
     RetryCommandStatus,
     RetryEffectStage,
@@ -389,7 +396,12 @@ async def test_validation_reports_binding_and_safe_point_failures(
             lambda command: _task_text(branch="fix/changed"),
         )
     result = await runner._validate_retry_command(command)
-    assert result == RetryDispatch.HANDLED
+    expected_dispatch = (
+        RetryDispatch.ACTIVE_TASK_DEFERRED
+        if mutation == "other"
+        else RetryDispatch.HANDLED
+    )
+    assert result == expected_dispatch
     stored = await load_retry_command(runner.redis, runner.name, command.command_id)
     assert stored is not None
     assert stored.status == status
@@ -1070,6 +1082,213 @@ async def test_execution_marker_failures_refuse_dispatch_but_remain_recoverable(
     monkeypatch.setattr(retry_module, "update_retry_command", update_boom)
     assert await runner._start_retry_coding_execution() is False
     await runner._finish_retry_dispatch(RetryDispatch.CODING)
+
+
+@pytest.mark.asyncio
+async def test_deferred_retry_allows_active_watch_and_later_resumes_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retry_task_id = "PR-396"
+    retry_branch = "fix/pr-396"
+    retry_text = _task_text(task_id=retry_task_id, branch=retry_branch)
+    retry_pr = PRInfo(
+        number=556,
+        branch=retry_branch,
+        pr_id=retry_task_id,
+        head_sha="retry-head",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.PENDING,
+        last_activity=datetime.now(timezone.utc),
+        diff_scanned_at_sha="retry-head",
+    )
+    command = _command(
+        retry_text,
+        task_id=retry_task_id,
+        branch=retry_branch,
+        bound_pr=retry_pr,
+    )
+    runner = h._make_runner()
+    repo = tmp_path / "repo"
+    task_path = repo / command.task_file
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text(retry_text, encoding="utf-8")
+    runner.repo_path = str(repo)
+    runner._recovered = True
+
+    active_task = QueueTask(
+        pr_id="PR-400",
+        title="Active pipeline task",
+        status=TaskStatus.DOING,
+        task_file="tasks/PR-400.md",
+        branch="fix/pr-400",
+        priority=1,
+    )
+    active_pr = PRInfo(
+        number=559,
+        branch=active_task.branch,
+        pr_id=active_task.pr_id,
+        head_sha="active-head",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.PENDING,
+        last_activity=datetime.now(timezone.utc),
+        diff_scanned_at_sha="active-head",
+    )
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_task = active_task
+    runner.state.current_queue = [active_task]
+    runner.state.current_pr = active_pr
+    runner._last_push_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+    runner._last_push_at_pr_number = active_pr.number
+    await enqueue_retry_command(runner.redis, command)
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", _async_value(None))
+    monkeypatch.setattr(runner, "_check_github_api_budget", _async_value(True))
+    monkeypatch.setattr(runner, "preflight", _async_value(True))
+    monkeypatch.setattr(runner, "_retry_worktree_dirty", lambda: (False, ""))
+    monkeypatch.setattr(
+        runner, "_origin_retry_task_text", lambda current: retry_text
+    )
+    monkeypatch.setattr(
+        retry_module.gh_prs, "get_pr_state", lambda *args: "OPEN"
+    )
+    monkeypatch.setattr(
+        retry_module.gh_prs,
+        "get_last_push_age_seconds",
+        lambda *args: 0,
+    )
+
+    watch_polls: list[int] = []
+
+    def get_open_prs(*args, **kwargs):
+        if (
+            runner.state.current_task is not None
+            and runner.state.current_task.pr_id == active_task.pr_id
+        ):
+            watch_polls.append(active_pr.number)
+            review = (
+                ReviewStatus.CHANGES_REQUESTED
+                if len(watch_polls) >= 3
+                else ReviewStatus.PENDING
+            )
+            return [active_pr.model_copy(update={"review_status": review})]
+        return [retry_pr]
+
+    monkeypatch.setattr(retry_module.gh_prs, "get_open_prs", get_open_prs)
+    recent = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    monkeypatch.setattr(
+        "src.github.cache._gh_api_paginated",
+        lambda path: (
+            [
+                {
+                    "user": {"login": "chatgpt-codex-connector"},
+                    "body": "P1: fresh review finding",
+                    "created_at": recent,
+                }
+            ]
+            if "issues" in path and "/559/" in path
+            else []
+        ),
+    )
+    fix_calls: list[tuple[str, int]] = []
+
+    async def handle_fix() -> None:
+        assert runner.state.current_task is not None
+        assert runner.state.current_pr is not None
+        fix_calls.append(
+            (runner.state.current_task.pr_id, runner.state.current_pr.number)
+        )
+
+    monkeypatch.setattr(runner, "handle_fix", handle_fix)
+    status_commits: list[tuple[str, str]] = []
+
+    async def commit_status(task, status: str, reason: str, **kwargs):
+        status_commits.append((task.pr_id, status))
+        return True
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", commit_status)
+
+    for _ in range(3):
+        await runner._run_cycle_body()
+
+    deferred = await load_retry_command(
+        runner.redis, runner.name, command.command_id
+    )
+    assert deferred is not None
+    assert watch_polls == [559, 559, 559]
+    assert fix_calls == [(active_task.pr_id, active_pr.number)]
+    assert runner.state.current_task is not None
+    assert runner.state.current_task.pr_id == active_task.pr_id
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == active_pr.number
+    assert deferred.status == RetryCommandStatus.DEFERRED
+    assert deferred.request_binding == command.request_binding
+    assert "Another task (PR-400) is active in WATCH" in deferred.outcome_reason
+    assert deferred.retry_count is None
+    assert deferred.effect_stage == RetryEffectStage.NONE
+    assert deferred.execution_state == RetryExecutionState.NOT_STARTED
+    assert deferred.execution_started_at is None
+    assert deferred.processing_owner is None
+    assert command.command_id in runner.redis.zsets[
+        retry_command_pending(runner.name)
+    ]
+    assert status_commits == []
+
+    runner.state.state = PipelineState.IDLE
+    runner.state.current_task = None
+    runner.state.current_pr = None
+    await runner._run_cycle_body()
+
+    resumed = await load_retry_command(
+        runner.redis, runner.name, command.command_id
+    )
+    assert resumed is not None
+    assert resumed.status == RetryCommandStatus.APPLIED
+    assert resumed.selected_continuation == "watch"
+    assert resumed.retry_count == 1
+    assert resumed.execution_state == RetryExecutionState.WATCHING
+    assert status_commits == [(retry_task_id, "TODO")]
+    assert command.command_id not in runner.redis.zsets[
+        retry_command_pending(runner.name)
+    ]
+
+    runner._last_push_at = datetime.now(timezone.utc)
+    runner._last_push_at_pr_number = retry_pr.number
+    await runner._run_cycle_body()
+    still_resumed = await load_retry_command(
+        runner.redis, runner.name, command.command_id
+    )
+    assert still_resumed is not None
+    assert still_resumed.retry_count == 1
+    assert status_commits == [(retry_task_id, "TODO")]
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_keeps_other_handled_retry_outcomes_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, _command_record, _task, _repo = await _prepared_runner(tmp_path)
+    runner._recovered = True
+    ordinary_cycle_calls: list[str] = []
+    monkeypatch.setattr(runner, "ensure_repo_cloned", _async_value(None))
+    monkeypatch.setattr(
+        runner, "_refresh_user_paused_from_redis", _async_value(None)
+    )
+    monkeypatch.setattr(
+        runner, "_consume_retry_command", _async_value(RetryDispatch.HANDLED)
+    )
+    monkeypatch.setattr(runner, "publish_state", _async_value(None))
+
+    async def check_budget() -> bool:
+        ordinary_cycle_calls.append("budget")
+        return True
+
+    monkeypatch.setattr(runner, "_check_github_api_budget", check_budget)
+
+    await runner._run_cycle_body()
+
+    assert ordinary_cycle_calls == []
 
 
 @pytest.mark.asyncio

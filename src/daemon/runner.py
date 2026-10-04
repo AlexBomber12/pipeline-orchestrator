@@ -3023,18 +3023,21 @@ class PipelineRunner(
             retry_dispatch = await self._consume_retry_command()
             if retry_dispatch != RetryDispatch.NONE:
                 await self.publish_state()
-                if retry_dispatch == RetryDispatch.CODING:
-                    if await self._start_retry_coding_execution():
-                        try:
-                            await self.handle_coding()
-                        except asyncio.CancelledError:
-                            raise
-                        else:
-                            await self._finish_retry_dispatch(retry_dispatch)
-                elif retry_dispatch == RetryDispatch.WATCH:
-                    await self._finish_retry_dispatch(retry_dispatch)
-                await self.publish_state()
-                return
+                # A Retry deferred behind different active work remains
+                # pending while that work keeps ownership of this cycle.
+                if retry_dispatch != RetryDispatch.ACTIVE_TASK_DEFERRED:
+                    if retry_dispatch == RetryDispatch.CODING:
+                        if await self._start_retry_coding_execution():
+                            try:
+                                await self.handle_coding()
+                            except asyncio.CancelledError:
+                                raise
+                            else:
+                                await self._finish_retry_dispatch(retry_dispatch)
+                    elif retry_dispatch == RetryDispatch.WATCH:
+                        await self._finish_retry_dispatch(retry_dispatch)
+                    await self.publish_state()
+                    return
 
         if not await self._check_github_api_budget():
             await self.publish_state()
