@@ -10,23 +10,28 @@ of low-level "is this user a codex bot" plumbing.
 from __future__ import annotations
 
 import logging
-import re
 
+from src.config import load_config
 from src.github import cache, gh_runner
+from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_config
 from src.retry import is_transient_error
 
 logger = logging.getLogger(__name__)
 
-CODEX_BOT_LOGIN_PATTERN = re.compile(r"codex", re.IGNORECASE)
 _CODEX_ONBOARDING_TEXT = "create a Codex account and connect to github"
 
 
-def _is_codex_user(user_dict: dict | None) -> bool:
-    """Return True if the GitHub user object represents a Codex bot."""
-    if not isinstance(user_dict, dict):
-        return False
-    login = user_dict.get("login", "") or ""
-    return bool(CODEX_BOT_LOGIN_PATTERN.search(login))
+def _default_reviewer_policy() -> ReviewerPolicy:
+    return reviewer_policy_from_config(load_config())
+
+
+def _is_codex_user(
+    user_dict: dict | None,
+    policy: ReviewerPolicy | None = None,
+) -> bool:
+    """Return True if the GitHub user object is a trusted reviewer actor."""
+    selected = policy if policy is not None else _default_reviewer_policy()
+    return selected.is_trusted_user(user_dict)
 
 
 def _is_codex_onboarding_comment(comment: dict) -> bool:
@@ -35,36 +40,50 @@ def _is_codex_onboarding_comment(comment: dict) -> bool:
     return _CODEX_ONBOARDING_TEXT.lower() in body.lower()
 
 
-def _is_reaction_content(reaction: dict, content: str) -> bool:
+def _is_reaction_content(
+    reaction: dict,
+    content: str,
+    policy: ReviewerPolicy | None = None,
+) -> bool:
     """Return True when a reaction matches an exact content from Codex."""
     if not isinstance(reaction, dict):
         return False
     if reaction.get("content") != content:
         return False
-    return _is_codex_user(reaction.get("user"))
+    return _is_codex_user(reaction.get("user"), policy=policy)
 
 
-def _is_plus_one(reaction: dict) -> bool:
+def _is_plus_one(
+    reaction: dict,
+    policy: ReviewerPolicy | None = None,
+) -> bool:
     """Return True if the reaction is exactly +1 from a Codex user."""
-    return _is_reaction_content(reaction, "+1")
+    return _is_reaction_content(reaction, "+1", policy=policy)
 
 
 def _should_degrade_reactions_error(exc: RuntimeError) -> bool:
     return gh_runner._is_http_404_error(exc) or is_transient_error(exc)
 
 
-def _find_codex_plus_one_reaction(reactions: list[dict]) -> dict | None:
+def _find_codex_plus_one_reaction(
+    reactions: list[dict],
+    policy: ReviewerPolicy | None = None,
+) -> dict | None:
     """Return the most recent +1 reaction from a Codex user, or None."""
     best: dict | None = None
     for r in reactions:
-        if not _is_plus_one(r):
+        if not _is_plus_one(r, policy=policy):
             continue
         if best is None or (r.get("created_at") or "") > (best.get("created_at") or ""):
             best = r
     return best
 
 
-def _get_codex_issue_reactions(repo: str, pr_number: int) -> list[dict]:
+def _get_codex_issue_reactions(
+    repo: str,
+    pr_number: int,
+    policy: ReviewerPolicy | None = None,
+) -> list[dict]:
     """Fetch Codex reactions on a PR body."""
     try:
         reactions = cache._gh_api_paginated(f"repos/{repo}/issues/{pr_number}/reactions")
@@ -82,4 +101,9 @@ def _get_codex_issue_reactions(repo: str, pr_number: int) -> list[dict]:
         return []
     if not reactions:
         return []
-    return [r for r in reactions if isinstance(r, dict) and _is_codex_user(r.get("user"))]
+    selected = policy if policy is not None else _default_reviewer_policy()
+    return [
+        r
+        for r in reactions
+        if isinstance(r, dict) and _is_codex_user(r.get("user"), policy=selected)
+    ]

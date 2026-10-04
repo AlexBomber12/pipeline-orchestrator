@@ -701,7 +701,7 @@ def _patch_eyes_reaction_present(
         lambda repo, number: [
             {
                 "content": "eyes",
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
                 "created_at": "2026-04-30T12:30:00Z",
             }
         ],
@@ -721,7 +721,7 @@ def _patch_eyes_reaction_stale(
         lambda repo, number: [
             {
                 "content": "eyes",
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
                 "created_at": "2026-04-30T11:00:00Z",
             }
         ],

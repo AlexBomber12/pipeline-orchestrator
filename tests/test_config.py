@@ -9,6 +9,7 @@ import src.config as config_module
 from src.config import (
     AppConfig,
     RepoConfig,
+    TrustedReviewerIdentity,
     add_repository,
     load_config,
     normalize_repo_url,
@@ -141,6 +142,42 @@ def test_daemon_config_selector_defaults() -> None:
     assert cfg.exploration_epsilon == 0.15
 
 
+def test_daemon_config_default_trusted_reviewer_identity() -> None:
+    from src.config import DaemonConfig
+
+    cfg = DaemonConfig()
+
+    assert cfg.trusted_reviewer_identities == [
+        TrustedReviewerIdentity(
+            user_id=199175422,
+            login="chatgpt-codex-connector[bot]",
+        )
+    ]
+
+
+def test_daemon_config_rejects_malformed_reviewer_ids() -> None:
+    from pydantic import ValidationError
+    from src.config import DaemonConfig
+
+    for user_id in (None, 0, -1, True, "199175422"):
+        with pytest.raises(ValidationError):
+            DaemonConfig(
+                trusted_reviewer_identities=[{"user_id": user_id}]
+            )
+
+
+def test_trusted_reviewer_identity_blank_login_normalizes_to_none() -> None:
+    identity = TrustedReviewerIdentity(user_id=199175422, login="  ")
+
+    assert identity.login is None
+
+
+def test_trusted_reviewer_identity_missing_login_stays_none() -> None:
+    identity = TrustedReviewerIdentity(user_id=199175422, login=None)
+
+    assert identity.login is None
+
+
 def test_load_config_valid_yaml(tmp_path: Path) -> None:
     yaml_text = """
 repositories:
@@ -235,6 +272,9 @@ def test_save_config_round_trip(tmp_path: Path) -> None:
     )
     config.daemon.poll_interval_sec = 90
     config.daemon.error_handler_use_ai = False
+    config.daemon.trusted_reviewer_identities.append(
+        TrustedReviewerIdentity(user_id=200, login="second-reviewer")
+    )
     config.web.port = 9000
     config.auth.claude_config_dir = "/tmp/claude"
 
@@ -244,6 +284,40 @@ def test_save_config_round_trip(tmp_path: Path) -> None:
     assert path.is_file()
     loaded = load_config(str(path))
     assert loaded.model_dump() == config.model_dump()
+
+
+def test_load_config_reloads_trusted_reviewer_policy_snapshot(
+    tmp_path: Path,
+) -> None:
+    from src.github.reviewer_policy import reviewer_policy_from_config
+
+    path = tmp_path / "config.yml"
+    path.write_text(
+        """
+daemon:
+  trusted_reviewer_identities:
+    - user_id: 199175422
+      login: chatgpt-codex-connector[bot]
+""",
+        encoding="utf-8",
+    )
+    first = reviewer_policy_from_config(load_config(str(path)))
+
+    path.write_text(
+        """
+daemon:
+  trusted_reviewer_identities:
+    - user_id: 200
+      login: second-reviewer
+""",
+        encoding="utf-8",
+    )
+    second = reviewer_policy_from_config(load_config(str(path)))
+
+    assert first.is_trusted_user({"id": 199175422, "login": "renamed"})
+    assert not first.is_trusted_user({"id": 200, "login": "second-reviewer"})
+    assert second.is_trusted_user({"id": 200, "login": "second-reviewer"})
+    assert not second.is_trusted_user({"id": 199175422, "login": "renamed"})
 
 
 def test_save_config_atomic_overwrites_existing(tmp_path: Path) -> None:

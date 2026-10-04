@@ -108,6 +108,7 @@ _DAEMON_FIELDS = {
     "git_bundle_backup_daily_retention",
     "git_bundle_backup_weekly_retention",
     "coder_filesystem_isolation",
+    "trusted_reviewer_identities",
 }
 
 _DAEMON_ENV_OVERRIDES = {
@@ -261,6 +262,14 @@ class DaemonConfig(BaseModel):
     git_bundle_backup_daily_retention: int = Field(default=7, ge=1)
     git_bundle_backup_weekly_retention: int = Field(default=4, ge=0)
     coder_filesystem_isolation: bool = Field(default=False)
+    trusted_reviewer_identities: list["TrustedReviewerIdentity"] = Field(
+        default_factory=lambda: [
+            TrustedReviewerIdentity(
+                user_id=199175422,
+                login="chatgpt-codex-connector[bot]",
+            )
+        ]
+    )
 
     @property
     def usage_gate_rate_limit_session_pause_percent(self) -> int:
@@ -282,6 +291,28 @@ class DaemonConfig(BaseModel):
 class WebConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = Field(default=8000, ge=1, le=65535)
+
+
+class TrustedReviewerIdentity(BaseModel, frozen=True):
+    user_id: int = Field(gt=0)
+    login: str | None = None
+
+    @field_validator("user_id", mode="before")
+    @classmethod
+    def _user_id_must_be_positive_int(cls, v: Any) -> int:
+        if not isinstance(v, int) or isinstance(v, bool):
+            raise ValueError("trusted reviewer user_id must be a positive integer")
+        if v <= 0:
+            raise ValueError("trusted reviewer user_id must be positive")
+        return v
+
+    @field_validator("login")
+    @classmethod
+    def _blank_login_is_missing(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        cleaned = v.strip()
+        return cleaned or None
 
 
 class AuthConfig(BaseModel):

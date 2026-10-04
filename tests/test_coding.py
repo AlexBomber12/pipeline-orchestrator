@@ -600,7 +600,7 @@ def _patch_codex_reactions(
         [
             {
                 "content": "eyes",
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
                 "created_at": reaction_iso,
             }
         ]
@@ -680,7 +680,7 @@ def test_should_skip_codex_review_post_fails_open_on_push_time_error(
         lambda repo, number: [
             {
                 "content": "eyes",
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
                 "created_at": "2026-04-30T12:30:00Z",
             }
         ],
@@ -703,7 +703,7 @@ def test_should_skip_codex_review_post_fails_open_on_missing_push_time(
         lambda repo, number: [
             {
                 "content": "eyes",
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
                 "created_at": "2026-04-30T12:30:00Z",
             }
         ],
@@ -725,7 +725,7 @@ def test_should_skip_codex_review_post_skips_when_eyes_after_push(
         lambda repo, number: [
             {
                 "content": "eyes",
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
                 "created_at": "2026-04-30T12:30:00Z",
             }
         ],
@@ -747,7 +747,7 @@ def test_should_skip_codex_review_post_does_not_skip_when_eyes_predates_push(
         lambda repo, number: [
             {
                 "content": "eyes",
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
                 "created_at": "2026-04-30T11:00:00Z",
             }
         ],
@@ -776,7 +776,7 @@ def test_should_skip_codex_review_post_does_not_skip_on_backdated_head_commit(
         lambda repo, number: [
             {
                 "content": "eyes",
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
                 "created_at": "2026-04-30T11:30:00Z",
             }
         ],
@@ -801,7 +801,7 @@ def test_should_skip_codex_review_post_normalizes_naive_timestamps(
         lambda repo, number: [
             {
                 "content": "eyes",
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
                 "created_at": "2026-04-30T12:30:00",
             }
         ],
@@ -828,7 +828,7 @@ def test_should_skip_codex_review_post_ignores_eyes_without_created_at(
         lambda repo, number: [
             {
                 "content": "eyes",
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
             }
         ],
     )

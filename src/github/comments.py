@@ -11,7 +11,9 @@ from __future__ import annotations
 import subprocess
 from datetime import datetime, timezone
 
+from src.config import load_config
 from src.github import cache, gh_runner, reactions
+from src.github.reviewer_policy import reviewer_policy_from_config
 
 _REVIEW_FEEDBACK_TRUNCATE_CHARS = 5000
 
@@ -35,6 +37,7 @@ def get_latest_codex_feedback(repo: str, pr_number: int) -> str | None:
     from src.github.prs import get_pr_author
 
     pr_author = get_pr_author(repo, pr_number)
+    reviewer_policy = reviewer_policy_from_config(load_config())
     try:
         issue_comments = cache._gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
     except (RuntimeError, subprocess.TimeoutExpired, OSError):
@@ -55,7 +58,9 @@ def get_latest_codex_feedback(repo: str, pr_number: int) -> str | None:
 
     sections: list[str] = []
     for comment in issue_comments + review_comments:
-        if not reactions._is_codex_user(comment.get("user")):
+        if not reactions._is_codex_user(
+            comment.get("user"), policy=reviewer_policy
+        ):
             continue
         if reactions._is_codex_onboarding_comment(comment):
             continue

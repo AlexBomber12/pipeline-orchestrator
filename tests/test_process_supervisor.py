@@ -2258,7 +2258,7 @@ async def test_launch_rejects_conflicts_and_unverified_session(
             0.01,
         )
         patch.setattr(
-            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.05
+            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.1
         )
         launch_task = asyncio.create_task(
             launch_process(
@@ -2280,7 +2280,7 @@ async def test_launch_rejects_conflicts_and_unverified_session(
         )
         patch.setattr(process_supervisor, "_LAUNCH_PHASE_TIMEOUT_SECONDS", 0.01)
         patch.setattr(
-            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.05
+            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.1
         )
         with pytest.raises(RuntimeError, match="readiness exceeded"):
             await asyncio.wait_for(
@@ -2306,7 +2306,7 @@ async def test_launch_rejects_conflicts_and_unverified_session(
             0.1,
         )
         patch.setattr(
-            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.05
+            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.1
         )
         launch_task = asyncio.create_task(
             launch_process(
@@ -2532,6 +2532,33 @@ async def test_early_launch_observation_and_unreadable_group_fallbacks(
     assert cleanup.quiescent
     assert not cleanup.term_sent
     assert not cleanup.kill_sent
+
+
+def test_observe_group_reports_disappeared_group_without_proc_members(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    managed = process_supervisor.SupervisedProcess(
+        process=object(),  # type: ignore[arg-type]
+        identity=ProcessIdentity(
+            leader_pid=999_998,
+            process_group_id=999_999,
+            session_id=999_999,
+            leader_start_time=None,
+        ),
+        _proof=process_supervisor._LAUNCH_PROOF,
+    )
+    monkeypatch.setattr(os, "scandir", lambda _path: nullcontext(()))
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda _pgid, _sig: (_ for _ in ()).throw(ProcessLookupError),
+    )
+
+    observation = managed._observe_group()
+
+    assert observation.state is _GroupState.QUIESCENT
+    assert observation.detail == "process group disappeared"
+    assert observation.definitive is True
 
 
 @pytest.mark.asyncio

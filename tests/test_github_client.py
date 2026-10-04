@@ -54,6 +54,8 @@ from src.github.reviews import (
 )
 from src.models import CIStatus, ReviewStatus
 
+TRUSTED_REVIEWER_ID = 199175422
+
 
 def _find_api_path(cmd: list[str]) -> str:
     """Extract the API path from a gh command, handling --jq args."""
@@ -61,6 +63,10 @@ def _find_api_path(cmd: list[str]) -> str:
         if arg.startswith("repos/"):
             return arg
     return ""
+
+
+def _codex_user(login: str = "chatgpt-codex-connector[bot]") -> dict[str, int | str]:
+    return {"id": TRUSTED_REVIEWER_ID, "login": login}
 
 
 class _FakeCompletedProcess:
@@ -498,30 +504,39 @@ def test_get_merged_prs_refresh_bypasses_cache_and_replaces_cached_value(
     assert [pr.number for pr in cached] == [102]
 
 
-def test_is_codex_user_matches_bot_logins() -> None:
-    assert _is_codex_user({"login": "codex"}) is True
-    assert _is_codex_user({"login": "chatgpt-codex-conn"}) is True
-    assert _is_codex_user({"login": "codex-bot"}) is True
-    assert _is_codex_user({"login": "mycodexbot"}) is True
-    assert _is_codex_user({"login": "not-codex-related-thing"}) is True
+def test_is_codex_user_matches_trusted_id_after_rename() -> None:
+    assert _is_codex_user(_codex_user("codex")) is True
+    assert _is_codex_user(_codex_user("chatgpt-codex-conn")) is True
+    assert _is_codex_user(_codex_user("codex-bot")) is True
+    assert _is_codex_user(_codex_user("mycodexbot")) is True
+    assert _is_codex_user(_codex_user("not-codex-related-thing")) is True
 
 
-def test_is_codex_user_rejects_non_codex() -> None:
+def test_is_codex_user_rejects_untrusted_and_malformed_ids() -> None:
     assert _is_codex_user({"login": "AlexBomber12"}) is False
+    assert (
+        _is_codex_user(
+            {
+                "id": TRUSTED_REVIEWER_ID + 1,
+                "login": "chatgpt-codex-connector[bot]",
+            }
+        )
+        is False
+    )
     assert _is_codex_user({"login": "dependabot"}) is False
     assert _is_codex_user({"login": "codec-reviewer"}) is False
     assert _is_codex_user(None) is False
 
 
 def test_plus_one_requires_exact_content() -> None:
-    assert _is_plus_one({"content": "+1", "user": {"login": "codex-bot"}}) is True
-    assert _is_plus_one({"content": "thumbsup", "user": {"login": "codex-bot"}}) is False
-    assert _is_plus_one({"content": "heart", "user": {"login": "codex-bot"}}) is False
+    assert _is_plus_one({"content": "+1", "user": _codex_user("codex-bot")}) is True
+    assert _is_plus_one({"content": "thumbsup", "user": _codex_user("codex-bot")}) is False
+    assert _is_plus_one({"content": "heart", "user": _codex_user("codex-bot")}) is False
 
 
 def test_plus_one_requires_codex_user() -> None:
     assert _is_plus_one({"content": "+1", "user": {"login": "AlexBomber12"}}) is False
-    assert _is_plus_one({"content": "+1", "user": {"login": "codex-bot"}}) is True
+    assert _is_plus_one({"content": "+1", "user": _codex_user("codex-bot")}) is True
 
 
 def test_get_pr_review_status_approved_via_pr_body_reaction(
@@ -537,7 +552,7 @@ def test_get_pr_review_status_approved_via_pr_body_reaction(
         invocations.append(cmd)
         path = _find_api_path(cmd)
         if path.endswith("/issues/42/reactions"):
-            data = [{"content": "+1", "user": {"login": "chatgpt-codex-connector"}}]
+            data = [{"content": "+1", "user": _codex_user("chatgpt-codex-connector")}]
         elif "issues" in path and path.endswith("/comments"):
             data = [[]]
         elif "pulls" in path and path.endswith("/comments"):
@@ -574,12 +589,12 @@ def test_get_pr_review_status_approved_via_first_author_comment_reaction(
         elif "issues" in path and path.endswith("/comments"):
             data = [
                 [{"id": 10, "user": {"login": "author"}, "body": "@codex review"}],
-                [{"id": 20, "user": {"login": "chatgpt-codex-bot"}, "body": "LGTM"}],
+                [{"id": 20, "user": _codex_user("chatgpt-codex-bot"), "body": "LGTM"}],
             ]
         elif "pulls" in path and path.endswith("/comments"):
             data = []
         elif path.endswith("/reactions"):
-            data = [[{"content": "+1", "user": {"login": "chatgpt-codex-bot"}}]]
+            data = [[{"content": "+1", "user": _codex_user("chatgpt-codex-bot")}]]
         else:
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
@@ -610,7 +625,7 @@ def test_review_api_without_reaction_stays_pending(
             data = [
                 [
                     {
-                        "user": {"login": "chatgpt-codex-bot"},
+                        "user": _codex_user("chatgpt-codex-bot"),
                         "state": "APPROVED",
                         "commit_id": "bbbbbb2222",
                         "submitted_at": "2026-01-02T00:00:00Z",
@@ -646,7 +661,7 @@ def test_review_api_approved_requires_matching_head_sha(
             data = [
                 [
                     {
-                        "user": {"login": "chatgpt-codex-bot"},
+                        "user": _codex_user("chatgpt-codex-bot"),
                         "state": "APPROVED",
                         "commit_id": "oldsha1111",
                         "submitted_at": "2026-01-02T00:00:00Z",
@@ -680,7 +695,7 @@ def test_review_api_approval_does_not_override_post_anchor_codex_comment(
             data = [
                 [
                     {
-                        "user": {"login": "chatgpt-codex-bot"},
+                        "user": _codex_user("chatgpt-codex-bot"),
                         "state": "APPROVED",
                         "commit_id": "bbbbbb2222",
                         "submitted_at": "2026-01-02T00:00:00Z",
@@ -698,7 +713,7 @@ def test_review_api_approval_does_not_override_post_anchor_codex_comment(
                     },
                     {
                         "id": 20,
-                        "user": {"login": "chatgpt-codex-bot"},
+                        "user": _codex_user("chatgpt-codex-bot"),
                         "body": "P1: still broken",
                         "created_at": "2026-01-03T00:00:00Z",
                     },
@@ -732,7 +747,7 @@ def test_review_api_approved_beats_older_post_anchor_codex_comment(
             data = [
                 [
                     {
-                        "user": {"login": "chatgpt-codex-bot"},
+                        "user": _codex_user("chatgpt-codex-bot"),
                         "state": "APPROVED",
                         "commit_id": "bbbbbb2222",
                         "submitted_at": "2026-01-03T00:00:00Z",
@@ -750,7 +765,7 @@ def test_review_api_approved_beats_older_post_anchor_codex_comment(
                     },
                     {
                         "id": 20,
-                        "user": {"login": "chatgpt-codex-bot"},
+                        "user": _codex_user("chatgpt-codex-bot"),
                         "body": "P1: earlier finding",
                         "created_at": "2026-01-02T00:00:00Z",
                     },
@@ -786,13 +801,13 @@ def test_latest_codex_review_state_overrides_older_approval(
             data = [
                 [
                     {
-                        "user": {"login": "chatgpt-codex-bot"},
+                        "user": _codex_user("chatgpt-codex-bot"),
                         "state": "APPROVED",
                         "commit_id": "bbbbbb2222",
                         "submitted_at": "2026-01-02T00:00:00Z",
                     },
                     {
-                        "user": {"login": "chatgpt-codex-bot"},
+                        "user": _codex_user("chatgpt-codex-bot"),
                         "state": "CHANGES_REQUESTED",
                         "commit_id": "bbbbbb2222",
                         "submitted_at": "2026-01-03T00:00:00Z",
@@ -828,7 +843,7 @@ def test_review_api_errors_do_not_block_reaction_fallback(
             data = [
                 {
                     "content": "+1",
-                    "user": {"login": "chatgpt-codex-bot"},
+                    "user": _codex_user("chatgpt-codex-bot"),
                     "created_at": "2026-01-03T00:00:00Z",
                 }
             ]
@@ -863,7 +878,7 @@ def test_review_api_approved_does_not_trust_unknown_head_commit_time(
             data = [
                 [
                     {
-                        "user": {"login": "chatgpt-codex-bot"},
+                        "user": _codex_user("chatgpt-codex-bot"),
                         "state": "APPROVED",
                         "commit_id": "oldsha1111",
                         "submitted_at": "2026-01-02T00:00:00Z",
@@ -903,7 +918,7 @@ def test_get_pr_review_status_skips_teammate_comment(
         elif "pulls" in path and path.endswith("/comments"):
             data = []
         elif "comments/10/reactions" in path:
-            data = [[{"content": "+1", "user": {"login": "chatgpt-codex-bot"}}]]
+            data = [[{"content": "+1", "user": _codex_user("chatgpt-codex-bot")}]]
         elif path.endswith("/reactions"):
             data = []
         else:
@@ -935,7 +950,7 @@ def test_get_pr_review_status_ignores_non_trigger_author_comment(
         elif "pulls" in path and path.endswith("/comments"):
             data = []
         elif "comments/10/reactions" in path:
-            data = [[{"content": "+1", "user": {"login": "chatgpt-codex-bot"}}]]
+            data = [[{"content": "+1", "user": _codex_user("chatgpt-codex-bot")}]]
         elif path.endswith("/reactions"):
             data = []
         else:
@@ -987,7 +1002,7 @@ def test_get_pr_review_status_changes_requested_on_p1(
                     },
                     {
                         "id": 20,
-                        "user": {"login": "chatgpt-codex-bot"},
+                        "user": _codex_user("chatgpt-codex-bot"),
                         "body": "P1: fix this",
                         "created_at": "2026-01-01T00:01:00Z",
                     },
@@ -1021,7 +1036,7 @@ def test_get_pr_review_status_ignores_stale_p1(
                 [
                     {
                         "id": 5,
-                        "user": {"login": "chatgpt-codex-bot"},
+                        "user": _codex_user("chatgpt-codex-bot"),
                         "body": "P1: old issue",
                         "created_at": "2026-01-01T00:00:00Z",
                     },
@@ -1078,7 +1093,7 @@ def test_get_pr_review_status_uses_latest_author_comment(
         elif "comments/20/reactions" in path:
             data = []
         elif "comments/10/reactions" in path:
-            data = [[{"content": "+1", "user": {"login": "chatgpt-codex-bot"}}]]
+            data = [[{"content": "+1", "user": _codex_user("chatgpt-codex-bot")}]]
         else:
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
@@ -1109,7 +1124,7 @@ def test_review_status_changes_requested_without_p1_p2_tags(
                     },
                     {
                         "id": 20,
-                        "user": {"login": "chatgpt-codex-bot"},
+                        "user": _codex_user("chatgpt-codex-bot"),
                         "body": "Looks fine, consider renaming this variable",
                         "created_at": "2026-01-01T00:01:00Z",
                     },
@@ -1148,7 +1163,7 @@ def test_review_status_ignores_codex_onboarding_comment(
                     },
                     {
                         "id": 20,
-                        "user": {"login": "chatgpt-codex-connector"},
+                        "user": _codex_user("chatgpt-codex-connector"),
                         "body": ("To use Codex here, create a Codex account and connect to github."),
                         "created_at": "2026-01-01T00:01:00Z",
                     },
@@ -1222,7 +1237,7 @@ def test_review_status_approved_wins_over_codex_comment(
                     },
                     {
                         "id": 20,
-                        "user": {"login": "chatgpt-codex-bot"},
+                        "user": _codex_user("chatgpt-codex-bot"),
                         "body": "Looks good overall",
                         "created_at": "2026-01-01T00:01:00Z",
                     },
@@ -1231,9 +1246,9 @@ def test_review_status_approved_wins_over_codex_comment(
         elif "pulls" in path and path.endswith("/comments"):
             data = []
         elif "comments/10/reactions" in path:
-            data = [[{"content": "+1", "user": {"login": "chatgpt-codex-bot"}}]]
+            data = [[{"content": "+1", "user": _codex_user("chatgpt-codex-bot")}]]
         elif path.endswith("/reactions"):
-            data = [[{"content": "+1", "user": {"login": "chatgpt-codex-bot"}, "created_at": "2026-01-01T00:02:00Z"}]]
+            data = [[{"content": "+1", "user": _codex_user("chatgpt-codex-bot"), "created_at": "2026-01-01T00:02:00Z"}]]
         else:
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
@@ -1264,7 +1279,7 @@ def test_review_status_eyes_wins_over_codex_comment(
                     },
                     {
                         "id": 20,
-                        "user": {"login": "chatgpt-codex-bot"},
+                        "user": _codex_user("chatgpt-codex-bot"),
                         "body": "Reviewing now",
                         "created_at": "2026-01-01T00:01:00Z",
                     },
@@ -1273,7 +1288,7 @@ def test_review_status_eyes_wins_over_codex_comment(
         elif "pulls" in path and path.endswith("/comments"):
             data = []
         elif path.endswith("/reactions"):
-            data = [[{"content": "eyes", "user": {"login": "chatgpt-codex-bot"}}]]
+            data = [[{"content": "eyes", "user": _codex_user("chatgpt-codex-bot")}]]
         else:
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
@@ -1307,9 +1322,9 @@ def test_body_eyes_wins_over_anchor_plus_one(
         elif "pulls" in path and path.endswith("/comments"):
             data = []
         elif "comments/10/reactions" in path:
-            data = [[{"content": "+1", "user": {"login": "chatgpt-codex-bot"}}]]
+            data = [[{"content": "+1", "user": _codex_user("chatgpt-codex-bot")}]]
         elif path.endswith("/reactions"):
-            data = [[{"content": "eyes", "user": {"login": "chatgpt-codex-bot"}}]]
+            data = [[{"content": "eyes", "user": _codex_user("chatgpt-codex-bot")}]]
         else:
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
@@ -1343,9 +1358,9 @@ def test_anchor_eyes_wins_over_body_plus_one(
         elif "pulls" in path and path.endswith("/comments"):
             data = []
         elif "comments/10/reactions" in path:
-            data = [[{"content": "eyes", "user": {"login": "chatgpt-codex-bot"}}]]
+            data = [[{"content": "eyes", "user": _codex_user("chatgpt-codex-bot")}]]
         elif path.endswith("/reactions"):
-            data = [[{"content": "+1", "user": {"login": "chatgpt-codex-bot"}}]]
+            data = [[{"content": "+1", "user": _codex_user("chatgpt-codex-bot")}]]
         else:
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
@@ -1369,7 +1384,7 @@ def test_review_api_with_body_eyes_stays_eyes(
             data = [
                 [
                     {
-                        "user": {"login": "chatgpt-codex-bot"},
+                        "user": _codex_user("chatgpt-codex-bot"),
                         "state": "APPROVED",
                         "commit_id": "bbbbbb2222",
                         "submitted_at": "2026-01-02T00:00:00Z",
@@ -1390,7 +1405,7 @@ def test_review_api_with_body_eyes_stays_eyes(
         elif "pulls" in path and path.endswith("/comments"):
             data = []
         elif path.endswith("/reactions"):
-            data = [[{"content": "eyes", "user": {"login": "chatgpt-codex-bot"}}]]
+            data = [[{"content": "eyes", "user": _codex_user("chatgpt-codex-bot")}]]
         else:
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
@@ -1414,7 +1429,7 @@ def test_review_api_with_anchor_eyes_stays_eyes(
             data = [
                 [
                     {
-                        "user": {"login": "chatgpt-codex-bot"},
+                        "user": _codex_user("chatgpt-codex-bot"),
                         "state": "APPROVED",
                         "commit_id": "bbbbbb2222",
                         "submitted_at": "2026-01-02T00:00:00Z",
@@ -1435,7 +1450,7 @@ def test_review_api_with_anchor_eyes_stays_eyes(
         elif "pulls" in path and path.endswith("/comments"):
             data = []
         elif "comments/10/reactions" in path:
-            data = [[{"content": "eyes", "user": {"login": "chatgpt-codex-bot"}}]]
+            data = [[{"content": "eyes", "user": _codex_user("chatgpt-codex-bot")}]]
         elif path.endswith("/reactions"):
             data = []
         else:
@@ -1623,7 +1638,7 @@ def test_body_plus_one_before_head_commit_is_stale(
             data = [
                 {
                     "content": "+1",
-                    "user": {"login": "chatgpt-codex-connector"},
+                    "user": _codex_user("chatgpt-codex-connector"),
                     "created_at": "2026-01-01T00:00:00Z",
                 }
             ]
@@ -1653,7 +1668,7 @@ def test_body_plus_one_after_head_commit_approves(
             data = [
                 {
                     "content": "+1",
-                    "user": {"login": "chatgpt-codex-connector"},
+                    "user": _codex_user("chatgpt-codex-connector"),
                     "created_at": "2026-01-03T00:00:00Z",
                 }
             ]
@@ -1682,7 +1697,7 @@ def test_body_plus_one_no_commit_time_trusts(
             data = [
                 {
                     "content": "+1",
-                    "user": {"login": "chatgpt-codex-connector"},
+                    "user": _codex_user("chatgpt-codex-connector"),
                     "created_at": "2026-01-03T00:00:00Z",
                 }
             ]
@@ -1750,7 +1765,7 @@ def test_body_eyes_returns_before_comment_fetches(
         if "pulls" in path and path.endswith("/comments"):
             raise AssertionError("review comments should not be fetched after body eyes")
         if path.endswith("/reactions"):
-            data = [[{"content": "eyes", "user": {"login": "chatgpt-codex-bot"}}]]
+            data = [[{"content": "eyes", "user": _codex_user("chatgpt-codex-bot")}]]
         else:
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
@@ -1767,12 +1782,12 @@ def test_find_codex_plus_one_picks_newest() -> None:
     items = [
         {
             "content": "+1",
-            "user": {"login": "chatgpt-codex-connector"},
+            "user": _codex_user("chatgpt-codex-connector"),
             "created_at": "2026-01-01T00:00:00Z",
         },
         {
             "content": "+1",
-            "user": {"login": "chatgpt-codex-connector"},
+            "user": _codex_user("chatgpt-codex-connector"),
             "created_at": "2026-01-05T00:00:00Z",
         },
         {
@@ -1798,7 +1813,7 @@ def test_approval_without_head_sha(monkeypatch: pytest.MonkeyPatch) -> None:
             data = [
                 {
                     "content": "+1",
-                    "user": {"login": "chatgpt-codex-connector"},
+                    "user": _codex_user("chatgpt-codex-connector"),
                     "created_at": "2026-01-01T00:00:00Z",
                 }
             ]
@@ -2121,7 +2136,7 @@ def test_body_plus_one_stale_after_force_push_to_old_commit(
             data = [
                 {
                     "content": "+1",
-                    "user": {"login": "chatgpt-codex-connector"},
+                    "user": _codex_user("chatgpt-codex-connector"),
                     "created_at": "2026-01-10T00:00:00Z",
                 }
             ]
@@ -2129,7 +2144,7 @@ def test_body_plus_one_stale_after_force_push_to_old_commit(
             data = [
                 [
                     {
-                        "user": {"login": "chatgpt-codex-connector"},
+                        "user": _codex_user("chatgpt-codex-connector"),
                         "commit_id": "otherSha1234",
                         "submitted_at": "2026-02-15T00:00:00Z",
                     }
@@ -2161,7 +2176,7 @@ def test_body_plus_one_approved_when_codex_review_on_head(
             data = [
                 {
                     "content": "+1",
-                    "user": {"login": "chatgpt-codex-connector"},
+                    "user": _codex_user("chatgpt-codex-connector"),
                     "created_at": "2026-01-01T00:00:00Z",
                 }
             ]
@@ -2169,7 +2184,7 @@ def test_body_plus_one_approved_when_codex_review_on_head(
             data = [
                 [
                     {
-                        "user": {"login": "chatgpt-codex-connector"},
+                        "user": _codex_user("chatgpt-codex-connector"),
                         "commit_id": "currentHead",
                         "submitted_at": "2026-02-15T00:00:00Z",
                     }
@@ -2202,7 +2217,7 @@ def test_body_plus_one_same_second_as_head_approves(
             data = [
                 {
                     "content": "+1",
-                    "user": {"login": "chatgpt-codex-connector"},
+                    "user": _codex_user("chatgpt-codex-connector"),
                     "created_at": "2026-01-02T12:34:56Z",
                 }
             ]
@@ -2227,7 +2242,7 @@ def test_review_status_cached(monkeypatch: pytest.MonkeyPatch) -> None:
         call_count += 1
         path = _find_api_path(cmd)
         if path.endswith("/issues/42/reactions"):
-            data = [{"content": "+1", "user": {"login": "chatgpt-codex-connector"}}]
+            data = [{"content": "+1", "user": _codex_user("chatgpt-codex-connector")}]
         elif "issues" in path and path.endswith("/comments"):
             data = [[]]
         elif "pulls" in path and path.endswith("/comments"):
@@ -3140,7 +3155,7 @@ def test_get_codex_review_signals_skips_non_codex_and_invalid_timestamp(
                 "state": "approved",
             },
             {
-                "user": {"login": "chatgpt-codex-connector"},
+                "user": _codex_user("chatgpt-codex-connector"),
                 "commit_id": "sha2",
                 "submitted_at": "bad-timestamp",
                 "state": "approved",
@@ -3161,7 +3176,7 @@ def test_get_latest_codex_review_info_returns_tuple(
     submitted_at = datetime(2026, 4, 19, 11, 0, 0, tzinfo=_tz.utc)
     monkeypatch.setattr(
         "src.github.reviews._get_codex_review_signals",
-        lambda repo, pr_number: {
+        lambda repo, pr_number, policy=None: {
             "latest_sha": "sha123",
             "latest_time": submitted_at,
             "latest_state": "APPROVED",
@@ -4950,7 +4965,7 @@ def test_get_latest_codex_feedback_collects_post_anchor_codex_comments(
             return [
                 {
                     "id": 1,
-                    "user": {"login": "codex-bot"},
+                    "user": _codex_user("codex-bot"),
                     "body": "stale before-anchor feedback",
                     "created_at": "2026-04-26T00:00:00Z",
                 },
@@ -4962,7 +4977,7 @@ def test_get_latest_codex_feedback_collects_post_anchor_codex_comments(
                 },
                 {
                     "id": 3,
-                    "user": {"login": "codex-bot"},
+                    "user": _codex_user("codex-bot"),
                     "body": "P1: rename foo",
                     "created_at": "2026-04-27T01:00:00Z",
                 },
@@ -4977,7 +4992,7 @@ def test_get_latest_codex_feedback_collects_post_anchor_codex_comments(
             return [
                 {
                     "id": 5,
-                    "user": {"login": "codex-bot"},
+                    "user": _codex_user("codex-bot"),
                     "body": "P2: extract helper",
                     "created_at": "2026-04-27T03:00:00Z",
                 }
@@ -5030,7 +5045,7 @@ def test_get_latest_codex_feedback_skips_onboarding_comment(
                 },
                 {
                     "id": 2,
-                    "user": {"login": "codex-bot"},
+                    "user": _codex_user("codex-bot"),
                     "body": "Please create a Codex account and connect to github.",
                     "created_at": "2026-04-27T01:00:00Z",
                 },
@@ -5055,7 +5070,7 @@ def test_get_latest_codex_feedback_returns_all_codex_comments_when_no_anchor(
             return [
                 {
                     "id": 1,
-                    "user": {"login": "codex-bot"},
+                    "user": _codex_user("codex-bot"),
                     "body": "feedback before any anchor",
                     "created_at": "2026-04-27T01:00:00Z",
                 }
@@ -5081,7 +5096,7 @@ def test_get_latest_codex_feedback_skips_non_author_anchor(
             return [
                 {
                     "id": 1,
-                    "user": {"login": "codex-bot"},
+                    "user": _codex_user("codex-bot"),
                     "body": "P1: real feedback",
                     "created_at": "2026-04-27T00:00:00Z",
                 },
@@ -5163,7 +5178,7 @@ def test_get_latest_codex_feedback_truncates_oversized_output(
                 },
                 {
                     "id": 2,
-                    "user": {"login": "codex-bot"},
+                    "user": _codex_user("codex-bot"),
                     "body": big_body,
                     "created_at": "2026-04-27T01:00:00Z",
                 },
@@ -5197,7 +5212,7 @@ def test_get_latest_codex_feedback_skips_empty_codex_body(
                 },
                 {
                     "id": 2,
-                    "user": {"login": "codex-bot"},
+                    "user": _codex_user("codex-bot"),
                     "body": "   ",
                     "created_at": "2026-04-27T01:00:00Z",
                 },
