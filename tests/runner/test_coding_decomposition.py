@@ -103,6 +103,7 @@ class _BoundaryManaged:
     def __init__(self, *, quiescent: bool = True) -> None:
         self.process = _BoundaryProcess()
         self.quiescent = quiescent
+        self.run_calls = 0
         self.cleanup_calls: list[tuple[float, float]] = []
 
     async def cleanup(
@@ -129,6 +130,7 @@ def _install_waiting_cli(
     async def cli_waits(
         *args: object, **kwargs: Any
     ) -> tuple[int, str, str]:
+        managed.run_calls += 1
         kwargs["on_process_start"](managed.process)
         kwargs["on_supervised_process_start"](managed)
         try:
@@ -420,6 +422,185 @@ def test_unverified_pre_cleanup_recheck_leaves_coder_running(
     assert runner._current_coder_process is None
 
 
+def test_publication_monitor_rearms_after_sha_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    runner.app_config.daemon.coder_terminate_grace_sec = 0
+    runner.app_config.daemon.fix_poll_interval_sec = 0
+    _coder_name, plugin = runner._get_coder()
+    observed = _publication(47, sha="a" * 40)
+    updated = _publication(47, sha="b" * 40)
+    publication_reads: list[list[BranchPublication] | Exception] = [
+        [],
+        [observed],
+        [updated],
+        [updated],
+    ]
+
+    def fetch(*args: object, **kwargs: object) -> list[BranchPublication]:
+        snapshot = publication_reads.pop(0)
+        if isinstance(snapshot, Exception):
+            raise snapshot
+        return snapshot
+
+    monitor_inputs: list[tuple[set[int] | None, datetime]] = []
+
+    async def monitor(
+        cli_task: asyncio.Task[tuple[int, str, str]],
+        *,
+        base_branch: str,
+        target_branch: str,
+        baseline_numbers: set[int] | None,
+        not_before: datetime,
+    ) -> BranchPublication:
+        monitor_inputs.append((baseline_numbers, not_before))
+        return observed if len(monitor_inputs) == 1 else updated
+
+    local_heads = iter(["b" * 40, "b" * 40, "b" * 40])
+    monkeypatch.setattr(coding_module.gh_prs, "get_branch_publications", fetch)
+    monkeypatch.setattr(runner, "_monitor_coding_publication", monitor)
+    monkeypatch.setattr(
+        coding_module,
+        "_local_branch_head_sha",
+        lambda *args, **kwargs: next(local_heads),
+    )
+    managed = _BoundaryManaged()
+    _install_waiting_cli(monkeypatch, plugin, managed, propagate_cancel=True)
+    monkeypatch.setattr(
+        coding_module,
+        "cancelled_process_result",
+        lambda exc: ProcessRunResult(returncode=-15, stdout=b"out", stderr=b""),
+    )
+
+    asyncio.run(asyncio.wait_for(runner.handle_coding(), timeout=1))
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.head_sha == "b" * 40
+    assert len(monitor_inputs) == 2
+    assert monitor_inputs[0][0] == monitor_inputs[1][0] == set()
+    assert monitor_inputs[0][1] == monitor_inputs[1][1]
+    assert publication_reads == []
+    assert managed.run_calls == 1
+    assert managed.cleanup_calls == [(0, 0)]
+
+
+def test_publication_monitor_rearms_after_transient_recheck_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    runner.app_config.daemon.coder_terminate_grace_sec = 0
+    runner.app_config.daemon.fix_poll_interval_sec = 0
+    _coder_name, plugin = runner._get_coder()
+    publication = _publication(48)
+    publication_reads: list[list[BranchPublication] | Exception] = [
+        [],
+        RuntimeError("recheck unavailable"),
+        [publication],
+        [publication],
+    ]
+
+    def fetch(*args: object, **kwargs: object) -> list[BranchPublication]:
+        snapshot = publication_reads.pop(0)
+        if isinstance(snapshot, Exception):
+            raise snapshot
+        return snapshot
+
+    monitor_calls = 0
+
+    async def monitor(*args: object, **kwargs: object) -> BranchPublication:
+        nonlocal monitor_calls
+        monitor_calls += 1
+        return publication
+
+    monkeypatch.setattr(coding_module.gh_prs, "get_branch_publications", fetch)
+    monkeypatch.setattr(runner, "_monitor_coding_publication", monitor)
+    monkeypatch.setattr(
+        coding_module,
+        "_local_branch_head_sha",
+        lambda *args, **kwargs: publication.head_sha,
+    )
+    managed = _BoundaryManaged()
+    _install_waiting_cli(monkeypatch, plugin, managed, propagate_cancel=True)
+    monkeypatch.setattr(
+        coding_module,
+        "cancelled_process_result",
+        lambda exc: ProcessRunResult(returncode=-15, stdout=b"out", stderr=b""),
+    )
+
+    asyncio.run(asyncio.wait_for(runner.handle_coding(), timeout=1))
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 48
+    assert monitor_calls == 2
+    assert publication_reads == []
+    assert managed.run_calls == 1
+    assert managed.cleanup_calls == [(0, 0)]
+
+
+def test_stop_during_renewed_publication_observation_settles_monitor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    runner.app_config.daemon.coder_terminate_grace_sec = 0
+    runner.app_config.daemon.fix_poll_interval_sec = 0
+    _coder_name, plugin = runner._get_coder()
+    publication = _publication(49)
+    publication_reads = iter([[], [publication]])
+    renewed_started = asyncio.Event()
+    renewed_settled = asyncio.Event()
+    monitor_calls = 0
+
+    async def monitor(*args: object, **kwargs: object) -> BranchPublication:
+        nonlocal monitor_calls
+        monitor_calls += 1
+        if monitor_calls == 1:
+            return publication
+        renewed_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            renewed_settled.set()
+        raise AssertionError("renewed monitor unexpectedly returned")
+
+    async def cli_waits(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        await asyncio.Future()
+        raise AssertionError("coder unexpectedly returned")
+
+    async def stop_monitor(
+        cli_task: asyncio.Task[tuple[int, str, str]],
+    ) -> None:
+        await renewed_started.wait()
+        runner._stop_requested = True
+        runner.state.user_paused = True
+        cli_task.cancel()
+
+    monkeypatch.setattr(
+        coding_module.gh_prs,
+        "get_branch_publications",
+        lambda *args, **kwargs: next(publication_reads),
+    )
+    monkeypatch.setattr(
+        coding_module,
+        "_local_branch_head_sha",
+        lambda *args, **kwargs: "b" * 40,
+    )
+    monkeypatch.setattr(runner, "_monitor_coding_publication", monitor)
+    monkeypatch.setattr(runner, "_monitor_stop_request", stop_monitor)
+    monkeypatch.setattr(plugin, "run_auto_pr", cli_waits)
+    monkeypatch.setattr(runner, "_check_late_breach", lambda *a, **kw: None)
+    monkeypatch.setattr(runner, "_cleanup_breach_marker", lambda *a, **kw: None)
+
+    asyncio.run(asyncio.wait_for(runner.handle_coding(), timeout=1))
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.current_pr is None
+    assert monitor_calls == 2
+    assert renewed_settled.is_set()
+
+
 def test_ordinary_completion_settles_publication_monitor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -459,17 +640,26 @@ def test_empty_publication_monitor_result_resumes_cli_completion(
     runner = _runner_with_task(monkeypatch)
     _coder_name, plugin = runner._get_coder()
     monitor_done = asyncio.Event()
+    allow_cli_exit = asyncio.Event()
+    real_wait = asyncio.wait
 
     async def monitor(*args: object, **kwargs: object) -> None:
         monitor_done.set()
 
     async def cli_finishes(*args: object, **kwargs: object) -> tuple[int, str, str]:
         await monitor_done.wait()
-        await asyncio.sleep(0)
+        await allow_cli_exit.wait()
         return (0, "done", "")
+
+    async def wait_then_release_cli(*args: Any, **kwargs: Any):
+        completed, pending = await real_wait(*args, **kwargs)
+        if monitor_done.is_set() and len(args[0]) == 2:
+            allow_cli_exit.set()
+        return completed, pending
 
     monkeypatch.setattr(runner, "_monitor_coding_publication", monitor)
     monkeypatch.setattr(plugin, "run_auto_pr", cli_finishes)
+    monkeypatch.setattr(coding_module.asyncio, "wait", wait_then_release_cli)
     monkeypatch.setattr(
         coding_module.gh_prs,
         "get_open_prs",

@@ -473,15 +473,26 @@ class CodingMixin:
                 **coder_kwargs,
             )
         )
-        publication_monitor = asyncio.create_task(
-            self._monitor_coding_publication(
-                cli_task,
-                base_branch=base_branch,
-                target_branch=target_branch,
-                baseline_numbers=publication_baseline,
-                not_before=publication_not_before,
+        publication_monitors: list[
+            asyncio.Task[gh_prs.BranchPublication | None]
+        ] = []
+
+        def start_publication_monitor() -> asyncio.Task[
+            gh_prs.BranchPublication | None
+        ]:
+            monitor = asyncio.create_task(
+                self._monitor_coding_publication(
+                    cli_task,
+                    base_branch=base_branch,
+                    target_branch=target_branch,
+                    baseline_numbers=publication_baseline,
+                    not_before=publication_not_before,
+                )
             )
-        )
+            publication_monitors.append(monitor)
+            return monitor
+
+        publication_monitor = start_publication_monitor()
         breach_monitor: asyncio.Task[None] | None = None
         if plugin.supports_breach_lifecycle:
             breach_monitor = asyncio.create_task(
@@ -499,62 +510,73 @@ class CodingMixin:
         publication_process_failure: str | None = None
         cleanup_confirmed = False
         try:
-            completed, _ = await asyncio.wait(
-                {cli_task, publication_monitor},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if cli_task not in completed:
+            while True:
+                completed, _ = await asyncio.wait(
+                    {cli_task, publication_monitor},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if cli_task in completed:
+                    break
                 publication_observed = publication_monitor.result()
+                if publication_observed is None:
+                    break
+                self.log_event(
+                    f"[CODING] Verified publication of PR "
+                    f"#{publication_observed.number}; allowing coder "
+                    "natural-exit grace."
+                )
+                completed, _ = await asyncio.wait(
+                    {cli_task},
+                    timeout=self.app_config.daemon.coder_terminate_grace_sec,
+                )
+                if cli_task in completed:
+                    break
+                try:
+                    before_cleanup = await asyncio.to_thread(
+                        gh_prs.get_branch_publications,
+                        self.owner_repo,
+                        base_branch,
+                        target_branch,
+                    )
+                    local_head = await asyncio.to_thread(
+                        _local_branch_head_sha,
+                        self.repo_path,
+                        target_branch,
+                    )
+                except Exception as exc:
+                    publication_observed = None
+                    self.log_event(
+                        f"[CODING] Publication recheck failed before "
+                        f"cleanup: {exc}; coder will continue."
+                    )
+                else:
+                    publication_observed = _fresh_ready_publication(
+                        before_cleanup,
+                        baseline_numbers=publication_baseline,
+                        not_before=publication_not_before,
+                        expected_head_sha=local_head,
+                    )
                 if publication_observed is not None:
                     self.log_event(
-                        f"[CODING] Verified publication of PR "
-                        f"#{publication_observed.number}; allowing coder "
-                        "natural-exit grace."
+                        f"[CODING] Publication grace elapsed; "
+                        f"terminating owned coder group for PR "
+                        f"#{publication_observed.number}."
                     )
-                    completed, _ = await asyncio.wait(
-                        {cli_task},
-                        timeout=self.app_config.daemon.coder_terminate_grace_sec,
-                    )
-                    if cli_task not in completed:
-                        try:
-                            before_cleanup = await asyncio.to_thread(
-                                gh_prs.get_branch_publications,
-                                self.owner_repo,
-                                base_branch,
-                                target_branch,
-                            )
-                            local_head = await asyncio.to_thread(
-                                _local_branch_head_sha,
-                                self.repo_path,
-                                target_branch,
-                            )
-                        except Exception as exc:
-                            publication_observed = None
-                            self.log_event(
-                                f"[CODING] Publication recheck failed before "
-                                f"cleanup: {exc}; coder will continue."
-                            )
-                        else:
-                            publication_observed = _fresh_ready_publication(
-                                before_cleanup,
-                                baseline_numbers=publication_baseline,
-                                not_before=publication_not_before,
-                                expected_head_sha=local_head,
-                            )
-                        if publication_observed is not None:
-                            self.log_event(
-                                f"[CODING] Publication grace elapsed; "
-                                f"terminating owned coder group for PR "
-                                f"#{publication_observed.number}."
-                            )
-                            await self._terminate_current_coder()
-                            publication_cancel_requested = cli_task.cancel()
-                        else:
-                            self.log_event(
-                                "[CODING] Publication no longer matches the "
-                                "local task branch after grace; coder will "
-                                "continue."
-                            )
+                    await self._terminate_current_coder()
+                    publication_cancel_requested = cli_task.cancel()
+                    break
+                self.log_event(
+                    "[CODING] Publication no longer matches the local task "
+                    "branch after grace; coder will continue under renewed "
+                    "publication observation."
+                )
+                completed, _ = await asyncio.wait(
+                    {cli_task},
+                    timeout=self.app_config.daemon.fix_poll_interval_sec,
+                )
+                if cli_task in completed:
+                    break
+                publication_monitor = start_publication_monitor()
             result = await cli_task
         except asyncio.CancelledError as exc:
             if self._stop_requested:
@@ -581,11 +603,12 @@ class CodingMixin:
                 cancellation = exc
         finally:
             stop_monitor.cancel()
-            publication_monitor.cancel()
+            for publication_monitor in publication_monitors:
+                publication_monitor.cancel()
             if breach_monitor is not None:
                 breach_monitor.cancel()
             heartbeat.cancel()
-            monitors = [stop_monitor, publication_monitor, heartbeat]
+            monitors = [stop_monitor, heartbeat, *publication_monitors]
             if breach_monitor is not None:
                 monitors.append(breach_monitor)
             await asyncio.gather(*monitors, return_exceptions=True)
