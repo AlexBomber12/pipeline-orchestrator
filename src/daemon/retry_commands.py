@@ -38,6 +38,7 @@ from src.suppression.redis_store import RedisSuppressionStore
 class RetryDispatch(StrEnum):
     NONE = "none"
     HANDLED = "handled"
+    ACTIVE_TASK_DEFERRED = "active_task_deferred"
     CODING = "coding"
     WATCH = "watch"
 
@@ -203,10 +204,11 @@ class RetryCommandMixin:
             and active_task.pr_id != command.task_id
             and self.state.state in _ACTIVE_TASK_STATES
         ):
-            return await self._defer_retry_command(
+            await self._defer_retry_command(
                 command,
                 f"Another task ({active_task.pr_id}) is active in {self.state.state.value}.",
             )
+            return RetryDispatch.ACTIVE_TASK_DEFERRED
 
         dirty, detail = self._retry_worktree_dirty()
         if dirty is None:
