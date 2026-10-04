@@ -3200,6 +3200,10 @@ def test_map_rest_ci_status_pending_when_states_missing_or_mixed() -> None:
     assert _map_rest_ci_status_to_enum([{"conclusion": 1}], {}) == CIStatus.PENDING
     assert _map_rest_ci_status_to_enum([{"status": 1}], {}) == CIStatus.PENDING
     assert (
+        _map_rest_ci_status_to_enum([{"conclusion": None, "status": "completed"}], {})
+        == CIStatus.PENDING
+    )
+    assert (
         _map_rest_ci_status_to_enum(
             [{"conclusion": "success", "status": "success"}],
             {"state": "success", "statuses": [{"state": "success"}]},
