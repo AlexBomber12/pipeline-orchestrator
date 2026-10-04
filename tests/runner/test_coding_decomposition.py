@@ -591,6 +591,53 @@ def test_cli_exit_during_rearm_delay_rechecks_published_head(
     assert monitor_calls == 1
 
 
+def test_simultaneous_cli_and_publication_completion_rechecks_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    _coder_name, plugin = runner._get_coder()
+    publication = _publication(54, sha="b" * 40)
+    publication_reads = iter([[], [publication], [publication]])
+    real_wait = asyncio.wait
+    force_initial_pair = True
+
+    async def monitor(*args: object, **kwargs: object) -> BranchPublication:
+        return publication
+
+    async def cli_exits(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        return (1, "published", "coder exited nonzero")
+
+    async def wait_for_initial_pair(*args: Any, **kwargs: Any):
+        nonlocal force_initial_pair
+        tasks = args[0]
+        if force_initial_pair and len(tasks) == 2:
+            force_initial_pair = False
+            await asyncio.gather(*tasks, return_exceptions=True)
+            return set(tasks), set()
+        return await real_wait(*args, **kwargs)
+
+    monkeypatch.setattr(
+        coding_module.gh_prs,
+        "get_branch_publications",
+        lambda *args, **kwargs: next(publication_reads),
+    )
+    monkeypatch.setattr(
+        coding_module,
+        "_local_branch_head_sha",
+        lambda *args, **kwargs: publication.head_sha,
+    )
+    monkeypatch.setattr(runner, "_monitor_coding_publication", monitor)
+    monkeypatch.setattr(plugin, "run_auto_pr", cli_exits)
+    monkeypatch.setattr(coding_module.asyncio, "wait", wait_for_initial_pair)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 54
+    assert publication_reads.__length_hint__() == 0
+
+
 def test_stop_during_renewed_publication_observation_settles_monitor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

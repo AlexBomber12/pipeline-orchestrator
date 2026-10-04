@@ -512,6 +512,29 @@ class CodingMixin:
                 expected_head_sha=local_head,
             )
 
+        async def refresh_as_coder_completes() -> None:
+            nonlocal publication_observed
+            if (
+                publication_baseline is None
+                or self._stop_requested
+                or breach_flag["breached"]
+            ):
+                return
+            try:
+                publication_observed = await refresh_publication()
+            except Exception as exc:
+                self.log_event(
+                    "[CODING] Publication recheck failed as coder completed "
+                    f"under publication observation: {exc}; using ordinary "
+                    "completion handling."
+                )
+            else:
+                if publication_observed is not None:
+                    self.log_event(
+                        "[CODING] Verified publication as coder completed "
+                        "under publication observation."
+                    )
+
         publication_monitor = start_publication_monitor()
         breach_monitor: asyncio.Task[None] | None = None
         if plugin.supports_breach_lifecycle:
@@ -536,6 +559,7 @@ class CodingMixin:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if cli_task in completed:
+                    await refresh_as_coder_completes()
                     break
                 publication_observed = publication_monitor.result()
                 if publication_observed is None:
@@ -578,21 +602,7 @@ class CodingMixin:
                     timeout=self.app_config.daemon.fix_poll_interval_sec,
                 )
                 if cli_task in completed:
-                    if not self._stop_requested and not breach_flag["breached"]:
-                        try:
-                            publication_observed = await refresh_publication()
-                        except Exception as exc:
-                            self.log_event(
-                                "[CODING] Publication recheck failed as coder "
-                                f"completed during renewed observation: {exc}; "
-                                "using ordinary completion handling."
-                            )
-                        else:
-                            if publication_observed is not None:
-                                self.log_event(
-                                    "[CODING] Verified publication as coder "
-                                    "completed during renewed observation."
-                                )
+                    await refresh_as_coder_completes()
                     break
                 publication_monitor = start_publication_monitor()
             result = await cli_task
