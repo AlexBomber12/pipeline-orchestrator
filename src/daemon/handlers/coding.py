@@ -33,7 +33,11 @@ from src.github import cache as gh_cache
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.models import PipelineState, PRInfo
-from src.process_supervisor import ProcessSupervisionError, cancelled_process_result
+from src.process_supervisor import (
+    ProcessSupervisionError,
+    SupervisedProcess,
+    cancelled_process_result,
+)
 from src.subsource_registry import SuppressionReason
 
 
@@ -464,13 +468,27 @@ class CodingMixin:
 
         heartbeat = asyncio.create_task(self._publish_while_waiting("CODING"))
         self._coder_invocation_active = True
+        invocation_supervised_process: SupervisedProcess | None = None
+        configured_process_callback = coder_kwargs.get(
+            "on_supervised_process_start"
+        )
+
+        def retain_invocation_process(managed: SupervisedProcess) -> None:
+            nonlocal invocation_supervised_process
+            invocation_supervised_process = managed
+            if configured_process_callback is not None:
+                configured_process_callback(managed)
+
         cli_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
             plugin.run_auto_pr(
                 self.repo_path,
                 pr_id=pr_id,
                 task_file=task_file,
                 task_body=task_body,
-                **coder_kwargs,
+                **{
+                    **coder_kwargs,
+                    "on_supervised_process_start": retain_invocation_process,
+                },
             )
         )
         publication_monitors: list[
@@ -641,7 +659,10 @@ class CodingMixin:
                 monitors.append(breach_monitor)
             await asyncio.gather(*monitors, return_exceptions=True)
             self._coder_invocation_active = False
-            managed = self._current_coder_supervised_process
+            managed = (
+                invocation_supervised_process
+                or self._current_coder_supervised_process
+            )
             supervision_failure = (
                 getattr(managed, "supervision_failure", None)
                 if managed is not None

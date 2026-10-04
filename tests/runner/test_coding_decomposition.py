@@ -14,6 +14,7 @@ Verifies the three async helpers extracted from ``handle_coding``:
 from __future__ import annotations
 
 import asyncio
+import threading
 import types
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -923,6 +924,90 @@ def test_adapter_supervision_failure_blocks_publication_handoff(
     assert "partial output" in stored
     assert "provider diagnostic" in stored
     assert expected_failure in stored
+
+
+def test_publication_cleanup_keeps_invocation_supervision_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    runner.app_config.daemon.coder_terminate_grace_sec = 0
+    plugin = CodexPlugin()
+    publication = _publication(57)
+    release_failure = asyncio.Event()
+    adapter_finished = threading.Event()
+    loop: asyncio.AbstractEventLoop | None = None
+    publication_reads = 0
+
+    class DelayedFailingReader:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def read(self, _size: int) -> bytes:
+            self.calls += 1
+            if self.calls == 1:
+                return b"partial output"
+            await release_failure.wait()
+            raise OSError("reader broke during publication recheck")
+
+    managed = _AdapterManaged(fail_output=False, clear_returncode=False)
+    managed.process.stdout = DelayedFailingReader()
+
+    async def launch(*args: object, **kwargs: object) -> _AdapterManaged:
+        return managed
+
+    async def monitor(*args: object, **kwargs: object) -> BranchPublication:
+        return publication
+
+    def fetch(*args: object, **kwargs: object) -> list[BranchPublication]:
+        nonlocal publication_reads
+        publication_reads += 1
+        if publication_reads == 1:
+            return []
+        if publication_reads == 2:
+            assert loop is not None
+            loop.call_soon_threadsafe(release_failure.set)
+            if not adapter_finished.wait(timeout=2):
+                raise RuntimeError("adapter did not finish during recheck")
+        return [publication]
+
+    original_run_auto_pr = plugin.run_auto_pr
+
+    async def run_auto_pr(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        try:
+            return await original_run_auto_pr(*args, **kwargs)
+        finally:
+            adapter_finished.set()
+
+    monkeypatch.setattr(runner, "_get_coder", lambda: ("codex", plugin))
+    monkeypatch.setattr(runner, "_monitor_coding_publication", monitor)
+    monkeypatch.setattr(plugin, "run_auto_pr", run_auto_pr)
+    monkeypatch.setattr(codex_cli, "launch_process", launch)
+    monkeypatch.setattr(codex_cli, "_maybe_wrap_sandbox", lambda cmd, cwd: cmd)
+    monkeypatch.setattr(coding_module.gh_prs, "get_branch_publications", fetch)
+    monkeypatch.setattr(
+        coding_module,
+        "_local_branch_head_sha",
+        lambda *args, **kwargs: publication.head_sha,
+    )
+
+    async def scenario() -> None:
+        nonlocal loop
+        loop = asyncio.get_running_loop()
+        await runner.handle_coding()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=3))
+
+    assert publication_reads == 2
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_pr is None
+    assert "reader broke during publication recheck" in (
+        runner.state.error_message or ""
+    )
+    assert runner._current_coder_supervised_process is None
+    stored = runner.redis.store[f"cli_log:{runner.name}:latest"]
+    assert "partial output" in stored
+    assert "provider diagnostic" in stored
+    assert "reader broke during publication recheck" in stored
 
 
 @pytest.mark.parametrize("captured", [None, "timed_out"])
