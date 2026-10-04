@@ -28,8 +28,10 @@ _review_status_cache: dict[str, "ReviewStatus"] = {}
 _review_status_cache_cycle: int | None = None
 
 
-def _cache_key(repo: str, pr_number: int, head_sha: str) -> str:
-    return f"{repo}#{pr_number}#{head_sha}"
+def _cache_key(
+    repo: str, pr_number: int, head_sha: str, policy: ReviewerPolicy
+) -> str:
+    return f"{repo}#{pr_number}#{head_sha}#{policy.fingerprint!r}"
 
 
 def clear_review_status_cache() -> None:
@@ -73,16 +75,22 @@ def get_pr_review_status(
        the anchor for P1/P2 → CHANGES_REQUESTED.
     4. Otherwise → PENDING.
     """
+    reviewer_policy = (
+        policy if policy is not None else reviewer_policy_from_config(load_config())
+    )
+
     if head_sha:
-        ck = _cache_key(repo, pr_number, head_sha)
+        ck = _cache_key(repo, pr_number, head_sha, reviewer_policy)
         cached = _review_status_cache.get(ck)
         if cached is not None:
             return cached
 
-    result = _compute_review_status(repo, pr_number, pr_author, head_sha, policy)
+    result = _compute_review_status(
+        repo, pr_number, pr_author, head_sha, reviewer_policy
+    )
 
     if head_sha:
-        _review_status_cache[_cache_key(repo, pr_number, head_sha)] = result
+        _review_status_cache[_cache_key(repo, pr_number, head_sha, reviewer_policy)] = result
     return result
 
 

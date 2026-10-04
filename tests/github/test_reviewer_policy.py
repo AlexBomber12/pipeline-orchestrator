@@ -67,6 +67,19 @@ def test_explicit_second_actor_is_trusted_by_id() -> None:
     assert policy.diagnostic_login(999) is None
 
 
+def test_fingerprint_is_stable_for_same_identity_set() -> None:
+    policy_a = _policy(
+        TrustedReviewerIdentity(user_id=200, login="second-reviewer"),
+        TrustedReviewerIdentity(user_id=VERIFIED_ID, login="chatgpt-codex-connector[bot]"),
+    )
+    policy_b = _policy(
+        TrustedReviewerIdentity(user_id=VERIFIED_ID, login="chatgpt-codex-connector[bot]"),
+        TrustedReviewerIdentity(user_id=200, login="second-reviewer"),
+    )
+
+    assert policy_a.fingerprint == policy_b.fingerprint
+
+
 @pytest.mark.parametrize(
     "user",
     [

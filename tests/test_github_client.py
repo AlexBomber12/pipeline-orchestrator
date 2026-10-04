@@ -10,6 +10,7 @@ from datetime import timezone as _tz
 from typing import Any
 
 import pytest
+from src.config import TrustedReviewerIdentity
 from src.github import cache, checks, comments, prs, rate_limit, reactions, reviews  # noqa: F401
 from src.github import comments as gh_comments
 from src.github.cache import clear_etag_cache  # noqa: F401 — used in tests
@@ -45,6 +46,7 @@ from src.github.reactions import (
     _is_plus_one,
     _is_reaction_content,
 )
+from src.github.reviewer_policy import ReviewerPolicy
 from src.github.reviews import (
     _compute_review_status,
     _get_codex_review_signals,
@@ -2261,6 +2263,58 @@ def test_review_status_cached(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result1 == ReviewStatus.APPROVED
     assert result2 == ReviewStatus.APPROVED
     assert call_count == calls_after_first
+
+
+def test_review_status_cache_is_scoped_to_reviewer_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json as _json
+
+    clear_review_status_cache()
+    call_count = 0
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        nonlocal call_count
+        call_count += 1
+        path = _find_api_path(cmd)
+        if path.endswith("/issues/42/reactions"):
+            data = [{"content": "+1", "user": _codex_user("chatgpt-codex-connector")}]
+        elif "issues" in path and path.endswith("/comments"):
+            data = [[]]
+        elif "pulls" in path and path.endswith("/comments"):
+            data = [[]]
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    trusted_policy = ReviewerPolicy(
+        [TrustedReviewerIdentity(user_id=TRUSTED_REVIEWER_ID, login="codex")]
+    )
+    removed_reviewer_policy = ReviewerPolicy(
+        [TrustedReviewerIdentity(user_id=404, login="other-reviewer")]
+    )
+
+    result1 = get_pr_review_status(
+        "owner/name",
+        42,
+        pr_author="author",
+        head_sha="sha123",
+        policy=trusted_policy,
+    )
+    calls_after_first = call_count
+    result2 = get_pr_review_status(
+        "owner/name",
+        42,
+        pr_author="author",
+        head_sha="sha123",
+        policy=removed_reviewer_policy,
+    )
+
+    assert result1 == ReviewStatus.APPROVED
+    assert result2 == ReviewStatus.PENDING
+    assert call_count > calls_after_first
 
 
 def test_get_pr_metadata_single_call(monkeypatch: pytest.MonkeyPatch) -> None:

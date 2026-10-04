@@ -35,6 +35,13 @@ class ReviewerPolicy:
     def identities(self) -> tuple[TrustedReviewer, ...]:
         return tuple(self._by_id.values())
 
+    @property
+    def fingerprint(self) -> tuple[tuple[int, str | None], ...]:
+        """Stable identity for cache keys tied to this policy snapshot."""
+        return tuple(
+            sorted((identity.user_id, identity.login) for identity in self._by_id.values())
+        )
+
     def is_trusted_user(self, user: dict | None) -> bool:
         if not isinstance(user, dict):
             return False
