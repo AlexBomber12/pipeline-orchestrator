@@ -7,7 +7,6 @@ WATCH gate's CI status read. Reuses ``cache._etag_get`` and
 
 from __future__ import annotations
 
-import json
 import time
 from datetime import datetime
 from typing import Any, NamedTuple
@@ -290,22 +289,12 @@ def _check_run_state(run: dict) -> str | None:
     return status_state
 
 
-def _parse_status_payload(raw_status: object) -> tuple[dict, _CiSourceResult]:
-    parsed: object = raw_status
-    if isinstance(raw_status, str) and raw_status:
-        try:
-            parsed = json.loads(raw_status)
-        except json.JSONDecodeError:
-            return {}, _CiSourceResult(False, False, "malformed")
-    if not isinstance(parsed, dict):
-        return {}, _CiSourceResult(False, False, "malformed")
+def _parse_status_payload(parsed: dict) -> tuple[dict, _CiSourceResult]:
     combined_state = parsed.get("state")
     combined_state_upper = _commit_status_state(combined_state)
     if combined_state_upper is None:
         return {}, _CiSourceResult(False, False, "malformed")
-    statuses_raw = parsed.get("statuses")
-    if not isinstance(statuses_raw, list):
-        return {}, _CiSourceResult(False, False, "malformed")
+    statuses_raw = parsed.get("statuses", [])
     statuses_malformed = False
     for status in statuses_raw:
         if not isinstance(status, dict):
@@ -318,6 +307,39 @@ def _parse_status_payload(raw_status: object) -> tuple[dict, _CiSourceResult]:
             return parsed, _CiSourceResult(False, False, "malformed")
         return {}, _CiSourceResult(False, False, "malformed")
     return parsed, _CiSourceResult(True, len(statuses_raw) == 0)
+
+
+def _parse_status_pages(pages: cache.PaginatedEvidence) -> tuple[dict, _CiSourceResult]:
+    if not pages.items:
+        error = _source_error(RuntimeError(pages.error)) if pages.error else "malformed"
+        return {}, _CiSourceResult(False, pages.empty, error)
+
+    status_payload = dict(pages.items[0])
+    statuses: list[object] = []
+    page_states: list[str] = []
+    for page in pages.items:
+        page_statuses = page.get("statuses")
+        if isinstance(page_statuses, list):
+            statuses.extend(page_statuses)
+        state = _commit_status_state(page.get("state"))
+        if state is not None:
+            page_states.append(state)
+    if any(state in _REST_CI_FAILURE_STATES for state in page_states):
+        status_payload["state"] = "failure"
+    status_payload["statuses"] = statuses
+
+    status_payload, parsed_source = _parse_status_payload(status_payload)
+    inconsistent_states = len(page_states) != len(pages.items) or len(set(page_states)) != 1
+    malformed = inconsistent_states or parsed_source.error == "malformed" or pages.error == "malformed"
+    complete = pages.complete and parsed_source.complete and not malformed
+    error = (
+        "malformed"
+        if malformed
+        else _source_error(RuntimeError(pages.error))
+        if pages.error
+        else None
+    )
+    return status_payload, _CiSourceResult(complete, parsed_source.empty, error)
 
 
 def _make_ci_retrieval(
@@ -416,18 +438,9 @@ def _retrieve_ci_status_evidence(repo: str, sha: str) -> _CiRetrieval:
     for run in check_runs:
         _maybe_hydrate_annotations(repo, run)
 
-    status_path = f"repos/{repo}/commits/{sha}/status"
-    status_observed_at = None
-    try:
-        raw_status = retry_transient(
-            lambda: cache._etag_get(status_path),
-            operation_name=f"gh api {status_path}",
-        )
-    except RuntimeError as exc:
-        status_source = _CiSourceResult(False, False, _source_error(exc))
-    else:
-        status_observed_at = cache._etag_payload_observed_at(status_path, raw_status)
-        status_payload, status_source = _parse_status_payload(raw_status)
+    status_path = f"repos/{repo}/commits/{sha}/status?per_page=100"
+    status_pages = cache._etag_get_object_pages_evidence(status_path, "statuses")
+    status_payload, status_source = _parse_status_pages(status_pages)
 
     retrieval = _make_ci_retrieval(
         repo,
@@ -437,7 +450,7 @@ def _retrieve_ci_status_evidence(repo: str, sha: str) -> _CiRetrieval:
         dict(status_payload),
         check_runs_source,
         status_source,
-        status_observed_at,
+        status_pages.observed_at,
     )
     _evict_expired_ci_status_cache(now)
     _ci_status_cache[cache_key] = retrieval

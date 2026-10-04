@@ -3942,6 +3942,131 @@ def test_retrieve_ci_status_evidence_reuses_contract_across_cache_and_304(
     assert any("If-None-Match" in arg for arg in status_calls[-1])
 
 
+@pytest.mark.parametrize(
+    ("aggregate_state", "later_context", "later_time", "expected"),
+    [
+        ("success", "legacy", "2026-10-04T11:00:00Z", CIStatus.SUCCESS),
+        ("failure", "integration", "2026-10-04T13:00:00Z", CIStatus.FAILURE),
+    ],
+)
+def test_retrieve_ci_status_evidence_paginates_combined_statuses(
+    monkeypatch: pytest.MonkeyPatch,
+    aggregate_state: str,
+    later_context: str,
+    later_time: str,
+    expected: CIStatus,
+) -> None:
+    sha = "a" * 40
+    status_calls: list[str] = []
+
+    def status(context: str, state: str, updated_at: str) -> dict:
+        return {
+            "context": context,
+            "state": state,
+            "sha": sha,
+            "updated_at": updated_at,
+            "creator": {"login": "ci-bot"},
+        }
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in arg for arg in args):
+            return {"check_runs": []}
+        path = next(arg for arg in args if "/status?" in arg)
+        status_calls.append(path)
+        if path.endswith("page=1"):
+            return {
+                "state": aggregate_state,
+                "total_count": 101,
+                "statuses": [
+                    status("legacy", "success", "2026-10-04T12:00:00Z"),
+                    *[
+                        status(f"context-{index}", "success", "2026-10-04T12:00:00Z")
+                        for index in range(99)
+                    ],
+                ],
+            }
+        return {
+            "state": aggregate_state,
+            "total_count": 101,
+            "statuses": [
+                status(
+                    later_context,
+                    "failure",
+                    later_time,
+                )
+            ],
+        }
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+
+    retrieval = _retrieve_ci_status_evidence("owner/name", sha)
+    check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", sha)
+
+    assert check_runs == []
+    assert len(status_payload["statuses"]) == 101
+    assert fetch_ok is True
+    assert retrieval.status_source.complete is True
+    assert retrieval.evidence.sources_complete is True
+    assert retrieval.evidence.policy_result == expected
+    assert _map_rest_ci_status_to_enum(check_runs, status_payload, fetch_ok=fetch_ok) == expected
+    assert any(path.endswith("page=2") for path in status_calls)
+
+
+@pytest.mark.parametrize(
+    "responses",
+    [
+        [{"state": "success", "total_count": True, "statuses": []}],
+        [
+            {"state": "success", "total_count": 101, "statuses": [{}] * 100},
+            {"state": "success", "total_count": 100, "statuses": [{}]},
+        ],
+        [{"state": "success", "total_count": 1, "statuses": [{}, {}]}],
+    ],
+)
+def test_status_page_walker_rejects_inconsistent_totals(
+    monkeypatch: pytest.MonkeyPatch,
+    responses: list[dict],
+) -> None:
+    payloads = iter(responses)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda args: next(payloads))
+
+    evidence = cache._etag_get_object_pages_evidence(
+        "repos/owner/name/commits/abc/status?per_page=100",
+        "statuses",
+    )
+
+    assert evidence.complete is False
+    assert evidence.error == "malformed"
+
+
+def test_fetch_ci_status_rest_later_status_page_failure_preserves_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
+        if any("check-runs" in arg for arg in args):
+            return {"check_runs": []}
+        path = next(arg for arg in args if "/status?" in arg)
+        if path.endswith("page=1"):
+            return {
+                "state": "failure",
+                "total_count": 101,
+                "statuses": [{"state": "success"}] * 100,
+            }
+        raise RuntimeError("HTTP 503")
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+    monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
+
+    retrieval = _retrieve_ci_status_evidence("owner/name", "abc123")
+    check_runs, status_payload, fetch_ok = _fetch_ci_status_rest("owner/name", "abc123")
+
+    assert retrieval.status_source.complete is False
+    assert "HTTP 503" in retrieval.status_source.error
+    assert len(status_payload["statuses"]) == 100
+    assert fetch_ok is False
+    assert _map_rest_ci_status_to_enum(check_runs, status_payload, fetch_ok=fetch_ok) == CIStatus.FAILURE
+
+
 def test_retrieve_ci_status_evidence_rejects_invalid_statuses_field(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
