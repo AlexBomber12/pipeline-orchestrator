@@ -11,6 +11,7 @@ import signal
 import socket
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -2446,33 +2447,91 @@ while True:
 async def test_early_launch_observation_and_unreadable_group_fallbacks(
     process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    real_getpgid = os.getpgid
-    monkeypatch.setattr(
-        os, "getpgid", lambda _pid: (_ for _ in ()).throw(ProcessLookupError())
-    )
-    managed = await process_pool.launch("pass")
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            os,
+            "getpgid",
+            lambda _pid: (_ for _ in ()).throw(ProcessLookupError()),
+        )
+        managed = await process_pool.launch("pass")
     assert await managed.process.wait() == 0
-    monkeypatch.setattr(os, "getpgid", real_getpgid)
     witness = managed._lifecycle_witness
     assert witness is not None
     managed._release_lifecycle_witness()
+
+    witness_exit = select.poll()
+    witness_exit.register(witness.pidfd, select.POLLIN)
     async with asyncio.timeout(1):
-        while os.path.exists(f"/proc/{witness.pid}"):
-            await asyncio.sleep(0.01)
+        while not witness_exit.poll(0):
+            await asyncio.sleep(0)
 
-    real_killpg = os.killpg
-    monkeypatch.setattr(
-        os, "killpg", lambda _pgid, _sig: (_ for _ in ()).throw(PermissionError("denied"))
-    )
-    observation = managed._observe_group()
-    assert observation.state is _GroupState.UNKNOWN
-    assert observation.detail == "could not confirm process-group state: denied"
+    fields = ["0"] * 20
+    fields[0] = "Z"
+    fields[2] = str(managed.identity.process_group_id)
+    fields[3] = str(managed.identity.session_id)
+    fields[19] = str(witness.start_time)
+    exited_witness_stat = f"{witness.pid} (witness) {' '.join(fields)}"
+    leader_stat_path = f"/proc/{managed.identity.leader_pid}/stat"
+    witness_stat_path = f"/proc/{witness.pid}/stat"
 
-    monkeypatch.setattr(os, "killpg", lambda _pgid, _sig: None)
-    observation = managed._observe_group()
-    assert observation.state is _GroupState.UNKNOWN
-    assert observation.detail == "process group exists but no member could be proven owned"
-    monkeypatch.setattr(os, "killpg", real_killpg)
+    def visible_exited_witness(path: str, *args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        if path == leader_stat_path:
+            raise FileNotFoundError
+        assert path == witness_stat_path
+        return io.StringIO(exited_witness_stat)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            os,
+            "scandir",
+            lambda _path: nullcontext((Path(str(witness.pid)),)),
+        )
+        patch.setattr(
+            process_supervisor,
+            "open",
+            visible_exited_witness,
+            raising=False,
+        )
+        observation = managed._observe_group()
+    assert observation.state is _GroupState.QUIESCENT
+    assert observation.members == ((witness.pid, witness.start_time, "Z"),)
+    assert not observation.witness_live
+
+    def no_observable_members(path: str, *args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        assert path == leader_stat_path
+        raise FileNotFoundError
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "scandir", lambda _path: nullcontext(()))
+        patch.setattr(
+            process_supervisor,
+            "open",
+            no_observable_members,
+            raising=False,
+        )
+        patch.setattr(
+            os,
+            "killpg",
+            lambda _pgid, _sig: (_ for _ in ()).throw(PermissionError("denied")),
+        )
+        observation = managed._observe_group()
+        assert observation.state is _GroupState.UNKNOWN
+        assert observation.detail == "could not confirm process-group state: denied"
+
+        patch.setattr(os, "killpg", lambda _pgid, _sig: None)
+        observation = managed._observe_group()
+        assert observation.state is _GroupState.UNKNOWN
+        assert (
+            observation.detail
+            == "process group exists but no member could be proven owned"
+        )
+
+    cleanup = await managed.cleanup(term_grace=0.5, kill_grace=0.5)
+    assert cleanup.quiescent
+    assert not cleanup.term_sent
+    assert not cleanup.kill_sent
 
 
 @pytest.mark.asyncio
