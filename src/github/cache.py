@@ -271,8 +271,6 @@ def _gh_api_paginated_evidence(path: str) -> PaginatedEvidence:
     fetched = 0
     expected_total: int | None = None
     sep = "&" if "?" in path else "?"
-    per_page_match = re.search(r"(?:^|[?&])per_page=(\d+)", path)
-    per_page = int(per_page_match.group(1)) if per_page_match else _ETAG_PAGINATED_DEFAULT_PER_PAGE
     for page_num in itertools.count(1):
         url = f"{path}{sep}page={page_num}"
         try:
@@ -287,7 +285,7 @@ def _gh_api_paginated_evidence(path: str) -> PaginatedEvidence:
             return PaginatedEvidence(items, False, len(items) == 0, "malformed")
         fetched += len(runs)
         expected_total, complete = _pagination_complete(
-            raw.get("total_count"), expected_total, len(runs), fetched, per_page
+            raw.get("total_count"), expected_total, len(runs), fetched
         )
         if complete is not None:
             return PaginatedEvidence(
@@ -303,22 +301,20 @@ def _pagination_complete(
     expected_total: int | None,
     page_count: int,
     fetched: int,
-    per_page: int,
 ) -> tuple[int | None, bool | None]:
-    if raw_total is not None:
-        if isinstance(raw_total, bool) or not isinstance(raw_total, int) or raw_total < 0:
-            return expected_total, False
-        if expected_total is None:
-            expected_total = raw_total
-        elif raw_total != expected_total:
-            return expected_total, False
-    if expected_total is not None:
-        if fetched == expected_total:
-            return expected_total, True
-        if fetched > expected_total or page_count == 0:
-            return expected_total, False
-        return expected_total, None
-    return expected_total, True if page_count < per_page else None
+    if raw_total is None:
+        return expected_total, False
+    if isinstance(raw_total, bool) or not isinstance(raw_total, int) or raw_total < 0:
+        return expected_total, False
+    if expected_total is None:
+        expected_total = raw_total
+    elif raw_total != expected_total:
+        return expected_total, False
+    if fetched == expected_total:
+        return expected_total, True
+    if fetched > expected_total or page_count == 0:
+        return expected_total, False
+    return expected_total, None
 
 
 def _etag_get_object_pages_evidence(path: str, list_field: str) -> PaginatedEvidence:
@@ -328,9 +324,6 @@ def _etag_get_object_pages_evidence(path: str, list_field: str) -> PaginatedEvid
     fetched = 0
     expected_total: int | None = None
     sep = "&" if "?" in path else "?"
-    per_page_match = re.search(r"(?:^|[?&])per_page=(\d+)", path)
-    per_page = int(per_page_match.group(1)) if per_page_match else _ETAG_PAGINATED_DEFAULT_PER_PAGE
-
     for page_num in itertools.count(1):
         url = f"{path}{sep}page={page_num}"
         requested_at = datetime.now(timezone.utc)
@@ -362,7 +355,7 @@ def _etag_get_object_pages_evidence(path: str, list_field: str) -> PaginatedEvid
         fetched += len(page_items)
 
         expected_total, complete = _pagination_complete(
-            raw.get("total_count"), expected_total, len(page_items), fetched, per_page
+            raw.get("total_count"), expected_total, len(page_items), fetched
         )
         if complete is not None:
             return PaginatedEvidence(

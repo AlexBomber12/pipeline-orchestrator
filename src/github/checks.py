@@ -311,7 +311,10 @@ def _parse_status_payload(parsed: dict) -> tuple[dict, _CiSourceResult]:
     return parsed, _CiSourceResult(True, len(statuses_raw) == 0)
 
 
-def _parse_status_pages(pages: cache.PaginatedEvidence) -> tuple[dict, _CiSourceResult]:
+def _parse_status_pages(
+    pages: cache.PaginatedEvidence,
+    requested_sha: str,
+) -> tuple[dict, _CiSourceResult]:
     if not pages.items:
         error = _source_error(RuntimeError(pages.error)) if pages.error else "malformed"
         return {}, _CiSourceResult(False, pages.empty, error)
@@ -319,6 +322,7 @@ def _parse_status_pages(pages: cache.PaginatedEvidence) -> tuple[dict, _CiSource
     status_payload = dict(pages.items[0])
     statuses: list[object] = []
     page_states: list[str] = []
+    sha_mismatch = False
     for page in pages.items:
         page_statuses = page.get("statuses")
         if isinstance(page_statuses, list):
@@ -326,13 +330,21 @@ def _parse_status_pages(pages: cache.PaginatedEvidence) -> tuple[dict, _CiSource
         state = _commit_status_state(page.get("state"))
         if state is not None:
             page_states.append(state)
+        page_sha = page.get("sha")
+        if not isinstance(page_sha, str) or page_sha.lower() != requested_sha.lower():
+            sha_mismatch = True
     if any(state in _REST_CI_FAILURE_STATES for state in page_states):
         status_payload["state"] = "failure"
     status_payload["statuses"] = statuses
 
     status_payload, parsed_source = _parse_status_payload(status_payload)
     inconsistent_states = len(page_states) != len(pages.items) or len(set(page_states)) != 1
-    malformed = inconsistent_states or parsed_source.error == "malformed" or pages.error == "malformed"
+    malformed = (
+        inconsistent_states
+        or sha_mismatch
+        or parsed_source.error == "malformed"
+        or pages.error == "malformed"
+    )
     complete = pages.complete and parsed_source.complete and not malformed
     error = (
         "malformed"
@@ -414,7 +426,13 @@ def _retrieve_ci_status_evidence(repo: str, sha: str) -> _CiRetrieval:
             check_runs_malformed = True
             continue
         for run in runs:
-            if isinstance(run, dict) and _check_run_state(run):
+            run_sha = run.get("head_sha") if isinstance(run, dict) else None
+            if (
+                isinstance(run, dict)
+                and isinstance(run_sha, str)
+                and run_sha.lower() == sha.lower()
+                and _check_run_state(run)
+            ):
                 check_runs.append(run)
             else:
                 check_runs_malformed = True
@@ -442,7 +460,7 @@ def _retrieve_ci_status_evidence(repo: str, sha: str) -> _CiRetrieval:
 
     status_path = f"repos/{repo}/commits/{sha}/status?per_page=100"
     status_pages = cache._etag_get_object_pages_evidence(status_path, "statuses")
-    status_payload, status_source = _parse_status_pages(status_pages)
+    status_payload, status_source = _parse_status_pages(status_pages, sha)
 
     retrieval = _make_ci_retrieval(
         repo,
