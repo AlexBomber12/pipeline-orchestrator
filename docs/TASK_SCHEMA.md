@@ -108,33 +108,62 @@ must write the canonical uppercase values. Operator-uploaded specs should
 include `status: TODO` for explicit intent. The daemon owns terminal
 status writes; operators never edit the status field directly.
 
-## Small-task authoring policy
+## Small-task authoring and execution policy
 
 Apply this policy to every new or deliberately rewritten task; do not rewrite
 historical task files or completion records to adopt it.
 
+### Authoring and admission
+
 - Deliver one independently testable behavior or internal contract per task.
-- Target at most 150 changed production-code lines; 200 is the maximum.
-- Limit the complete PR to 500 added plus deleted lines, including tests,
-  fixtures, documentation, and review fixes.
-- Change at most 3 production-code files and 6 files overall. Existing stricter
-  work-mode limits still apply.
-- Decompose high-complexity work before execution. For medium complexity,
-  briefly justify that the change is local and the implementation approach is
-  known. Investigate unknown causes or architecture in a separate bounded task
-  before implementation.
+- Estimate at most 150 changed production-code lines as the target; 200 is the
+  admission maximum. Estimate at most 500 added plus deleted lines across
+  production code, tests, fixtures, and documentation, at most 3 production
+  files, and at most 6 files overall. Existing stricter work-mode admission
+  limits still apply.
+- Decompose work before implementation when an honest initial estimate exceeds
+  an admission limit. Also split high-complexity work before execution. For
+  medium complexity, briefly justify that the change is local and the
+  implementation approach is known. Investigate an unknown cause or approach
+  in a separate bounded task before specifying its implementation.
 - State the outcome, scope, exclusions, expected files, separate production and
   test estimates, total diff estimate, acceptance criteria, dependencies,
   verification, and stop condition.
-- Include tests for changed behavior in the same PR. If the behavior and
-  meaningful tests exceed a budget, split the behavior again before execution.
+- Include meaningful tests for changed behavior in the same PR. Expected file
+  paths are planning evidence, not an arbitrary allowlist that prevents a
+  necessary test or compatibility change. If a path is a genuine restriction,
+  state it explicitly as a scope boundary or exclusion.
 - Keep intermediate PRs independently verifiable and safe before connecting
   their consumers. Name every required predecessor explicitly as a dependency.
-- Count the whole PR against its base, not the latest commit or net growth. Do
-  not evade limits through minification, missing tests, or automatic budget
-  increases.
+- Give honest estimates. Do not fabricate or automatically increase them to
+  obtain admission.
 - Every task author must obtain the current canonical schema, inspect the
   relevant implementation, and validate the complete task body.
+
+### Execution of an admitted task
+
+The declared budget and expected file list remain planning baselines during
+implementation and review. Actual diff size and file counts are signals for
+scope review, not hard execution caps. Crossing an estimate alone does not
+require `ESCALATE` and must not prevent publication.
+
+- Make the smallest implementation, compatibility changes, regression tests,
+  and review fixes necessary to complete the original approved outcome. Do not
+  add unrelated behavior merely because a budget has headroom.
+- Count and report actual whole-PR additions, deletions, and changed files
+  against the PR base, not only the latest commit or net growth. Explain why
+  actual work grew beyond the estimates or expected file list.
+- Treat expected paths as planning signals unless the specification expressly
+  makes them restrictions. Explicit exclusions, repository boundaries,
+  security restrictions, and unrelated-feature boundaries remain binding.
+- Never use minification, omitted tests, weakened checks, fabricated estimates,
+  or unrelated additions to fit or bypass a budget.
+- Runtime guardrails, operator-approval requirements, CI gates, coverage rules,
+  and publication handoffs remain unchanged. In particular, this documentation
+  does not bypass the runtime large-diff guardrail or its operator review.
+- This policy does not automatically rewrite or override an explicit stop
+  condition in an existing task specification. Changing such a condition
+  requires a separate, deliberate update to that specification.
 
 ### Declared task budget
 
@@ -154,20 +183,25 @@ task_budget:
 ```
 
 `production_lines`, `test_lines`, and `other_lines` estimate production-code,
-test/fixture, and remaining changes respectively. They count additions plus
-deletions across the complete PR, including review fixes. The 150-line
-production target is advisory; estimates from 151 through the 200-line maximum
-remain valid when the other limits are met. `production_files` counts files
-containing production code, while `total_files` counts every changed file.
-`version` is currently `1`. `rationale` is optional for low-complexity tasks
-and required for medium-complexity tasks.
+test/fixture, and remaining changes respectively. The estimate anticipates
+additions plus deletions across the complete PR, including expected review-fix
+headroom. The 150-line production target is advisory; estimates from 151
+through the 200-line admission maximum remain valid when the other limits are
+met. `production_files` counts files expected to contain production code,
+while `total_files` counts every file expected to change. `version` remains
+`1`. `rationale` is optional for low-complexity tasks and required for
+medium-complexity tasks.
 
-MCP validation and dashboard uploads safely parse this opening frontmatter,
-reject malformed or ambiguous mappings, and pass it to the shared validator.
-A budget in the Markdown body does not count. New uploads and reuploads require
-a valid budget. Existing stored tasks and pending-upload references remain
-readable without one and are not migrated or retroactively rejected; actual
-PR-size and review-cycle enforcement remains separate follow-up work.
+The version 1 fields and current MCP/dashboard upload validation remain
+unchanged. MCP validation and dashboard uploads safely parse this opening
+frontmatter, reject malformed or ambiguous mappings, and pass it to the shared
+validator. A budget in the Markdown body does not count. New uploads and
+reuploads require a valid budget. Existing stored tasks and pending-upload
+references remain readable without one and are not migrated or retroactively
+rejected. These checks validate the planned size of a new specification at
+admission; they do not validate or cap the actual size of each later
+implementation or review fix. Runtime review and guardrail enforcement remain
+separate and unchanged.
 
 ## Frontmatter blocked_reason field
 
