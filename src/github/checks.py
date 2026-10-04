@@ -382,6 +382,17 @@ def _make_ci_retrieval(
         statuses_complete=status_source.complete,
         observed_at=observed_at,
     )
+    # The combined-status ``state`` is GitHub's latest-per-context aggregate
+    # and can retain a known failure even when the embedded history is empty,
+    # malformed, or only partially fetched. The compatibility mapper already
+    # preserves that failure; carry it into the predecessor evidence contract
+    # as well so callers cannot observe contradictory policy results.
+    combined_state = _commit_status_state(status_payload.get("state"))
+    if combined_state in _REST_CI_FAILURE_STATES:
+        evidence = evidence._replace(
+            policy_result=CIStatus.FAILURE,
+            pending_reason=None,
+        )
     return _CiRetrieval(
         evidence,
         fetched_at,

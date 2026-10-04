@@ -4235,6 +4235,7 @@ def test_fetch_ci_status_rest_later_status_page_failure_preserves_failure(
 
     assert retrieval.status_source.complete is False
     assert "HTTP 503" in retrieval.status_source.error
+    assert retrieval.evidence.policy_result == CIStatus.FAILURE
     assert len(status_payload["statuses"]) == 100
     assert fetch_ok is False
     assert _map_rest_ci_status_to_enum(check_runs, status_payload, fetch_ok=fetch_ok) == CIStatus.FAILURE
@@ -4270,6 +4271,8 @@ def test_retrieve_ci_status_evidence_preserves_empty_aggregate_failure(
 
     assert retrieval.status_source.complete is False
     assert retrieval.status_source.error == "malformed"
+    assert retrieval.evidence.policy_result == CIStatus.FAILURE
+    assert retrieval.evidence.pending_reason is None
     assert status_payload == _ci_status_page("failure", [])
     assert fetch_ok is False
     assert _map_rest_ci_status_to_enum(check_runs, status_payload, fetch_ok=fetch_ok) == CIStatus.FAILURE
@@ -4332,6 +4335,7 @@ def test_retrieve_ci_status_evidence_preserves_failure_with_malformed_entries(
 
     assert evidence.status_source.complete is False
     assert evidence.status_source.error == "malformed"
+    assert evidence.evidence.policy_result == CIStatus.FAILURE
     assert evidence.status_payload == _ci_status_page("failure", [{}])
 
 
