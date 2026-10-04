@@ -22,6 +22,7 @@ from src.github import cache as gh_cache
 from src.github import checks as gh_checks
 from src.github import gh_runner
 from src.github import prs as gh_prs
+from src.github.reviewer_policy import reviewer_policy_from_config
 from src.inhibitor import InhibitorType, is_work_inhibited
 from src.keyspace import ci_infra_retried
 from src.models import CIStatus, FeedbackCheckResult, PipelineState, ReviewStatus
@@ -861,9 +862,9 @@ class WatchMixin:
                 exc_info=True,
             )
             return FeedbackCheckResult.UNKNOWN
+        reviewer_policy = reviewer_policy_from_config(self.app_config)
         for c in reversed(comments + review_comments):
-            user = (c.get("user") or {}).get("login", "")
-            if "codex" not in user.lower():
+            if not reviewer_policy.is_trusted_user(c.get("user")):
                 continue
             created = gh_runner._parse_iso(c.get("created_at"))
             if created is None:

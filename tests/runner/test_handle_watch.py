@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 from src.coders import claude as claude_plugin_module
-from src.config import AppConfig, DaemonConfig, RepoConfig
+from src.config import AppConfig, DaemonConfig, RepoConfig, TrustedReviewerIdentity
 from src.daemon import runner as runner_module
 from src.daemon.handlers import watch as watch_module
 from src.daemon.runner import PipelineRunner
@@ -435,7 +435,7 @@ def test_watch_changes_requested_with_pending_ci_triggers_fix(
 
     comments = [
         {
-            "user": {"login": "chatgpt-codex-connector"},
+            "user": {"id": 199175422, "login": "chatgpt-codex-connector"},
             "body": "P1: missing null check",
             "created_at": recent.strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
@@ -1284,7 +1284,7 @@ def test_handle_watch_triggers_fix_new_feedback(
 
     comments = [
         {
-            "user": {"login": "chatgpt-codex-connector"},
+            "user": {"id": 199175422, "login": "chatgpt-codex-connector"},
             "body": "P1: missing null check",
             "created_at": recent.strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
@@ -1305,6 +1305,60 @@ def test_handle_watch_triggers_fix_new_feedback(
         fix_called.append(True)
 
     runner = h._make_runner()
+    runner._last_push_at = last_push
+    runner._last_push_at_pr_number = pr.number
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.handle_fix = fake_fix  # type: ignore[assignment]
+    asyncio.run(runner.handle_watch())
+
+    assert fix_called == [True]
+
+
+def test_handle_watch_triggers_fix_for_trusted_reviewer_without_codex_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh feedback from a configured reviewer uses stable user IDs."""
+    last_push = datetime.now(timezone.utc) - timedelta(minutes=10)
+    recent = datetime.now(timezone.utc) - timedelta(minutes=1)
+    pr = PRInfo(
+        number=42,
+        branch="pr-001",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=last_push,
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+
+    comments = [
+        {
+            "user": {"id": 123456789, "login": "trusted-reviewer[bot]"},
+            "body": "P1: missing null check",
+            "created_at": recent.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+    ]
+
+    def fake_paginated(path: str) -> list[dict]:
+        if "issues" in path:
+            return comments
+        return []
+
+    monkeypatch.setattr(
+        "src.github.cache._gh_api_paginated",
+        fake_paginated,
+    )
+    fix_called: list[bool] = []
+
+    async def fake_fix() -> None:
+        fix_called.append(True)
+
+    runner = h._make_runner()
+    runner.app_config.daemon.trusted_reviewer_identities = [
+        TrustedReviewerIdentity(user_id=123456789, login="trusted-reviewer[bot]")
+    ]
     runner._last_push_at = last_push
     runner._last_push_at_pr_number = pr.number
     runner.state.current_pr = pr

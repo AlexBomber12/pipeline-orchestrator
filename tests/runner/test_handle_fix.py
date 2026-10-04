@@ -4880,10 +4880,10 @@ def test_has_new_feedback_returns_true_without_last_push_timestamp() -> None:
     assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.NEW
 
 
-def test_has_new_feedback_returns_true_for_any_codex_comment_after_push(
+def test_has_new_feedback_returns_true_for_trusted_comment_after_push(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A Codex comment without P1/P2 posted after _last_push_at -> True."""
+    """A trusted reviewer comment after _last_push_at -> True."""
     runner = h._make_runner()
     runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
     runner._last_push_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -4892,7 +4892,7 @@ def test_has_new_feedback_returns_true_for_any_codex_comment_after_push(
         "src.github.cache._gh_api_paginated",
         lambda path: [
             {
-                "user": {"login": "chatgpt-codex-bot"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-bot"},
                 "body": "Consider renaming this variable",
                 "created_at": "2026-01-01T00:05:00Z",
             },
@@ -4905,7 +4905,7 @@ def test_has_new_feedback_returns_true_for_any_codex_comment_after_push(
 def test_has_new_feedback_returns_false_for_old_comments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A Codex comment posted before _last_push_at -> False."""
+    """A trusted reviewer comment posted before _last_push_at -> False."""
     runner = h._make_runner()
     runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
     runner._last_push_at = datetime(2026, 1, 1, 1, 0, 0, tzinfo=timezone.utc)
@@ -4914,7 +4914,7 @@ def test_has_new_feedback_returns_false_for_old_comments(
         "src.github.cache._gh_api_paginated",
         lambda path: [
             {
-                "user": {"login": "chatgpt-codex-bot"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-bot"},
                 "body": "Old feedback",
                 "created_at": "2026-01-01T00:30:00Z",
             },
@@ -4935,7 +4935,7 @@ def test_has_new_feedback_normalizes_naive_timestamps(
         "src.github.cache._gh_api_paginated",
         lambda path: [
             {
-                "user": {"login": "chatgpt-codex-bot"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-bot"},
                 "created_at": "2026-01-01T00:05:00",
             },
         ],
@@ -4977,7 +4977,7 @@ def test_has_new_feedback_skips_unparseable_codex_comment(
         "src.github.cache._gh_api_paginated",
         lambda path: [
             {
-                "user": {"login": "chatgpt-codex-bot"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-bot"},
                 "created_at": "not-a-date",
             },
         ],
