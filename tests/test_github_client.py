@@ -2423,7 +2423,7 @@ def test_get_open_prs_returns_prinfo_objects(
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
-        lambda repo, number, pr_author, head_sha: ReviewStatus.APPROVED,
+        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.APPROVED,
     )
 
     prs = get_open_prs("owner/name", allow_merge_without_checks=True)
@@ -2477,7 +2477,7 @@ def test_get_open_prs_invokes_rest_helper_with_head_sha(
     monkeypatch.setattr("src.github.checks._fetch_ci_status_rest", fake_fetch)
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
-        lambda repo, number, pr_author, head_sha: ReviewStatus.PENDING,
+        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
     )
 
     prs = get_open_prs("owner/name")
@@ -2511,7 +2511,7 @@ def test_get_open_prs_rest_fetch_failure_follows_allow_merge_without_checks(
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
-        lambda repo, number, pr_author, head_sha: ReviewStatus.PENDING,
+        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
     )
 
     prs = get_open_prs("owner/name", allow_merge_without_checks=True)
@@ -2547,7 +2547,7 @@ def test_get_open_prs_falls_back_to_rest_on_graphql_rate_limit(
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
-        lambda repo, number, pr_author, head_sha: ReviewStatus.PENDING,
+        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
     )
 
     prs = get_open_prs("owner/name", allow_merge_without_checks=True)

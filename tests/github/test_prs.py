@@ -5,7 +5,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 import pytest
+from src.config import AppConfig, DaemonConfig, TrustedReviewerIdentity
 from src.github import prs as gh_prs
+from src.github.reviewer_policy import ReviewerPolicy
 from src.models import ReviewStatus
 
 
@@ -199,10 +201,89 @@ def test_get_open_prs_preserves_quarantine_labels(
     monkeypatch.setattr(
         gh_prs.reviews,
         "get_pr_review_status",
-        lambda repo, number, pr_author, head_sha: ReviewStatus.PENDING,
+        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
     )
 
     [pr] = gh_prs.get_open_prs("octo/demo")
 
     assert pr.number == 7
     assert pr.quarantine_labels == {"quarantine:large_diff"}
+
+
+def test_get_open_prs_snapshots_reviewer_policy_once_per_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_loads = 0
+    observed_policies: list[ReviewerPolicy | None] = []
+
+    def fake_load_config() -> AppConfig:
+        nonlocal config_loads
+        config_loads += 1
+        return AppConfig(
+            daemon=DaemonConfig(
+                trusted_reviewer_identities=[
+                    TrustedReviewerIdentity(user_id=123, login="codex[bot]")
+                ]
+            )
+        )
+
+    monkeypatch.setattr(gh_prs, "load_config", fake_load_config)
+    monkeypatch.setattr(
+        gh_prs.gh_runner,
+        "run_gh",
+        lambda cmd, **kwargs: [
+            {
+                "number": 7,
+                "title": "PR-007: first",
+                "headRefName": "pr-007-first",
+                "headRefOid": "abc123",
+                "url": "https://github.com/octo/demo/pull/7",
+                "updatedAt": "2026-05-21T00:00:00Z",
+                "commits": [{"oid": "abc123"}],
+                "author": {"login": "alice"},
+                "isCrossRepository": False,
+                "labels": [],
+            },
+            {
+                "number": 8,
+                "title": "PR-008: second",
+                "headRefName": "pr-008-second",
+                "headRefOid": "def456",
+                "url": "https://github.com/octo/demo/pull/8",
+                "updatedAt": "2026-05-21T00:00:01Z",
+                "commits": [{"oid": "def456"}],
+                "author": {"login": "alice"},
+                "isCrossRepository": False,
+                "labels": [],
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        gh_prs.checks,
+        "_fetch_ci_status_rest",
+        lambda repo, sha: ([], [], True),
+    )
+
+    def fake_review_status(
+        repo: str,
+        number: int,
+        pr_author: str = "",
+        head_sha: str = "",
+        policy: ReviewerPolicy | None = None,
+    ) -> ReviewStatus:
+        observed_policies.append(policy)
+        return ReviewStatus.PENDING
+
+    monkeypatch.setattr(
+        gh_prs.reviews,
+        "get_pr_review_status",
+        fake_review_status,
+    )
+
+    prs = gh_prs.get_open_prs("octo/demo")
+
+    assert [pr.number for pr in prs] == [7, 8]
+    assert config_loads == 1
+    assert len(observed_policies) == 2
+    assert observed_policies[0] is observed_policies[1]
+    assert observed_policies[0] is not None

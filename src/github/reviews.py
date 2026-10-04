@@ -19,7 +19,7 @@ from src.github.gh_runner import (
     _is_http_404_error,
     _parse_iso,
 )
-from src.github.reviewer_policy import reviewer_policy_from_config
+from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_config
 from src.models import ReviewStatus
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,7 @@ def get_pr_review_status(
     pr_number: int,
     pr_author: str = "",
     head_sha: str = "",
+    policy: ReviewerPolicy | None = None,
 ) -> ReviewStatus:
     """Derive a Codex review status from PR issue comments, review comments, and reactions.
 
@@ -78,7 +79,7 @@ def get_pr_review_status(
         if cached is not None:
             return cached
 
-    result = _compute_review_status(repo, pr_number, pr_author, head_sha)
+    result = _compute_review_status(repo, pr_number, pr_author, head_sha, policy)
 
     if head_sha:
         _review_status_cache[_cache_key(repo, pr_number, head_sha)] = result
@@ -90,12 +91,15 @@ def _compute_review_status(
     pr_number: int,
     pr_author: str,
     head_sha: str,
+    policy: ReviewerPolicy | None = None,
 ) -> ReviewStatus:
     """Core review status logic, separated for caching."""
     body_eyes = False
     body_approved = False
     head_commit_time: datetime | None = None
-    reviewer_policy = reviewer_policy_from_config(load_config())
+    reviewer_policy = (
+        policy if policy is not None else reviewer_policy_from_config(load_config())
+    )
 
     try:
         codex_reactions = _reactions._get_codex_issue_reactions(

@@ -19,12 +19,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import quote
 
+from src.config import load_config
 from src.github import cache, checks, gh_runner, reviews
 from src.github.gh_runner import (
     _extract_commit_date,
     _extract_head_sha,
     _parse_iso,
 )
+from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_config
 from src.github.reviews import _begin_review_cache_cycle
 from src.models import CIStatus, PRInfo
 
@@ -264,6 +266,7 @@ def get_open_prs(
     """Return open PRs for ``repo`` (``owner/repo``) with CI and review status."""
 
     _begin_review_cache_cycle()
+    reviewer_policy = reviewer_policy_from_config(load_config())
     try:
         raw = gh_runner.run_gh(
             [
@@ -285,6 +288,7 @@ def get_open_prs(
         return _get_open_prs_rest(
             repo,
             allow_merge_without_checks=allow_merge_without_checks,
+            reviewer_policy=reviewer_policy,
         )
     if not isinstance(raw, list):
         return []
@@ -324,6 +328,7 @@ def get_open_prs(
                     number,
                     pr_author=(entry.get("author") or {}).get("login", ""),
                     head_sha=head_sha,
+                    policy=reviewer_policy,
                 ),
                 commits_count=len(commits),
                 push_count=1 if head_sha else 0,
@@ -347,6 +352,7 @@ def _get_open_prs_rest(
     repo: str,
     *,
     allow_merge_without_checks: bool,
+    reviewer_policy: ReviewerPolicy | None = None,
 ) -> list[PRInfo]:
     """Return open PRs via REST when GraphQL status rollup is unavailable."""
 
@@ -386,6 +392,7 @@ def _get_open_prs_rest(
                     number,
                     pr_author=user.get("login", ""),
                     head_sha=head_sha,
+                    policy=reviewer_policy,
                 ),
                 commits_count=1 if head_sha else 0,
                 push_count=1 if head_sha else 0,
