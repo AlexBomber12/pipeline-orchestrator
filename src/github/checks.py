@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
 from typing import Any, NamedTuple
 
 from src.github import cache, gh_runner
@@ -281,9 +282,9 @@ def _check_run_state(run: dict) -> str | None:
     if status_state is None:
         return conclusion_state
     if status_state == "COMPLETED":
-        if conclusion_present and conclusion_state is None:
+        if not conclusion_present or conclusion_state is None:
             return None
-        return conclusion_state or status_state
+        return conclusion_state
     if conclusion_state is not None:
         return None
     return status_state
@@ -327,6 +328,7 @@ def _make_ci_retrieval(
     status_payload: dict,
     check_runs_source: _CiSourceResult,
     status_source: _CiSourceResult,
+    observed_at: datetime | None = None,
 ) -> _CiRetrieval:
     statuses = status_payload.get("statuses", [])
     status_records = (
@@ -342,6 +344,7 @@ def _make_ci_retrieval(
         statuses=status_records,
         check_runs_complete=check_runs_source.complete,
         statuses_complete=status_source.complete,
+        observed_at=observed_at,
     )
     return _CiRetrieval(
         evidence,
@@ -414,6 +417,7 @@ def _retrieve_ci_status_evidence(repo: str, sha: str) -> _CiRetrieval:
         _maybe_hydrate_annotations(repo, run)
 
     status_path = f"repos/{repo}/commits/{sha}/status"
+    status_observed_at = None
     try:
         raw_status = retry_transient(
             lambda: cache._etag_get(status_path),
@@ -422,6 +426,7 @@ def _retrieve_ci_status_evidence(repo: str, sha: str) -> _CiRetrieval:
     except RuntimeError as exc:
         status_source = _CiSourceResult(False, False, _source_error(exc))
     else:
+        status_observed_at = cache._etag_payload_observed_at(status_path, raw_status)
         status_payload, status_source = _parse_status_payload(raw_status)
 
     retrieval = _make_ci_retrieval(
@@ -432,6 +437,7 @@ def _retrieve_ci_status_evidence(repo: str, sha: str) -> _CiRetrieval:
         dict(status_payload),
         check_runs_source,
         status_source,
+        status_observed_at,
     )
     _evict_expired_ci_status_cache(now)
     _ci_status_cache[cache_key] = retrieval

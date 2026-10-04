@@ -14,23 +14,31 @@ import collections
 import itertools
 import json
 import re
+from datetime import datetime, timezone
 from typing import NamedTuple
 
 from src.github import gh_runner
 from src.retry import retry_transient
 
+
+class ETagCacheEntry(NamedTuple):
+    etag: str
+    payload: object
+    observed_at: datetime
+
+
 #: In-memory ETag cache for single-resource REST GET helpers. Keyed by the
-#: ``gh api`` path (the same string passed to ``_etag_get``); the value is
-#: ``(etag, parsed_payload)``. Sending ``If-None-Match`` on a cached path
-#: lets GitHub respond with HTTP 304 and an empty body — and crucially that
-#: 304 does not consume rate-limit budget. Daemon polling re-queries the
-#: same handful of endpoints repeatedly with low data turnover, so most
-#: cycles hit 304 and become free.
+#: ``gh api`` path (the same string passed to ``_etag_get``); the value retains
+#: the ETag, parsed payload, and original observation time. Sending
+#: ``If-None-Match`` on a cached path lets GitHub respond with HTTP 304 and an
+#: empty body — and crucially that 304 does not consume rate-limit budget.
+#: Daemon polling re-queries the same handful of endpoints repeatedly with low
+#: data turnover, so most cycles hit 304 and become free.
 #:
-#: The cache is in-memory only (lost on daemon restart); a persistent
-#: cache could extend the cold-start grace but is not needed for the
-#: primary diet effect.
-_etag_cache: "collections.OrderedDict[str, tuple[str, object]]" = collections.OrderedDict()
+#: The cache is in-memory only (lost on daemon restart); a persistent cache
+#: could extend the cold-start grace but is not needed for the primary diet
+#: effect.
+_etag_cache: "collections.OrderedDict[str, ETagCacheEntry]" = collections.OrderedDict()
 _ETAG_CACHE_MAX_ENTRIES = 500
 
 
@@ -78,10 +86,18 @@ def _is_http_304_error(exc: Exception) -> bool:
 
 def _etag_cache_put(path: str, etag: str, payload: object) -> None:
     """Insert into the ETag cache with simple LRU eviction."""
-    _etag_cache[path] = (etag, payload)
+    _etag_cache[path] = ETagCacheEntry(etag, payload, datetime.now(timezone.utc))
     _etag_cache.move_to_end(path)
     while len(_etag_cache) > _ETAG_CACHE_MAX_ENTRIES:
         _etag_cache.popitem(last=False)
+
+
+def _etag_payload_observed_at(path: str, payload: object) -> datetime | None:
+    """Return the original observation time when ``payload`` came from the cache."""
+    cached = _etag_cache.get(path)
+    if cached is not None and cached.payload is payload:
+        return cached.observed_at
+    return None
 
 
 def _invalidate_etag_cache(prefix: str) -> None:
@@ -144,7 +160,7 @@ def _etag_get(path: str) -> object:
     args: list[str] = ["api", path, "--include"]
     cached = _etag_cache.get(path)
     if cached is not None:
-        args.extend(["-H", f"If-None-Match: {cached[0]}"])
+        args.extend(["-H", f"If-None-Match: {cached.etag}"])
 
     try:
         raw = gh_runner.run_gh(args)
@@ -152,7 +168,7 @@ def _etag_get(path: str) -> object:
         if _is_http_304_error(exc):
             if cached is not None:
                 _etag_cache.move_to_end(path)
-                return cached[1]
+                return cached.payload
             return _etag_get_no_cache(path)
         raise
 
@@ -171,7 +187,7 @@ def _etag_get(path: str) -> object:
             # Retry without If-None-Match to force a fresh 200 + body.
             return _etag_get_no_cache(path)
         _etag_cache.move_to_end(path)
-        return cached[1]
+        return cached.payload
     if status is None or not (200 <= status < 300):
         return None
     body = body.strip()

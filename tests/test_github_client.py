@@ -3185,7 +3185,7 @@ def test_map_rest_ci_status_success_requires_all_states_success_like() -> None:
             [
                 {"conclusion": "neutral"},
                 {"conclusion": "skipped"},
-                {"status": "completed"},
+                {"status": "completed", "conclusion": "success"},
             ],
             {"state": "success", "statuses": [{"state": "success"}]},
         )
@@ -3199,6 +3199,7 @@ def test_map_rest_ci_status_pending_when_states_missing_or_mixed() -> None:
     assert _map_rest_ci_status_to_enum([{"status": "success"}], {}) == CIStatus.PENDING
     assert _map_rest_ci_status_to_enum([{"conclusion": 1}], {}) == CIStatus.PENDING
     assert _map_rest_ci_status_to_enum([{"status": 1}], {}) == CIStatus.PENDING
+    assert _map_rest_ci_status_to_enum([{"status": "completed"}], {}) == CIStatus.PENDING
     assert (
         _map_rest_ci_status_to_enum([{"conclusion": None, "status": "completed"}], {})
         == CIStatus.PENDING
@@ -3652,6 +3653,12 @@ def test_fetch_ci_status_rest_validates_all_present_check_run_state_fields(
                         "conclusion": "success",
                         "status": "completed",
                     },
+                    {
+                        "id": 5,
+                        "name": "missing-conclusion",
+                        "head_sha": sha,
+                        "status": "completed",
+                    },
                 ]
             }
         return {"state": "success", "statuses": [{"state": "success"}]}
@@ -3931,6 +3938,7 @@ def test_retrieve_ci_status_evidence_reuses_contract_across_cache_and_304(
     assert revalidated.evidence.sha == first.evidence.sha
     assert revalidated.evidence.sources_complete is True
     assert revalidated.evidence.policy_result == CIStatus.SUCCESS
+    assert revalidated.evidence.observed_at == first.evidence.observed_at
     assert any("If-None-Match" in arg for arg in status_calls[-1])
 
 
@@ -4852,10 +4860,10 @@ def test_etag_get_first_call_populates_cache(
     assert payload == {"merged": True}
     assert "--include" in captured[0]
     assert not any("If-None-Match" in arg for arg in captured[0])
-    assert cache._etag_cache["repos/owner/name/pulls/42"] == (
-        'W/"abc"',
-        {"merged": True},
-    )
+    cached = cache._etag_cache["repos/owner/name/pulls/42"]
+    assert cached.etag == 'W/"abc"'
+    assert cached.payload == {"merged": True}
+    assert cached.observed_at.tzinfo is not None
 
 
 def test_etag_get_second_call_sends_if_none_match(
@@ -4926,10 +4934,9 @@ def test_etag_get_200_with_new_etag_replaces_cache(
 
     assert first == {"v": 1}
     assert second == {"v": 2}
-    assert cache._etag_cache["repos/owner/name/commits/abc"] == (
-        'W/"v2"',
-        {"v": 2},
-    )
+    cached = cache._etag_cache["repos/owner/name/commits/abc"]
+    assert cached.etag == 'W/"v2"'
+    assert cached.payload == {"v": 2}
 
 
 def test_etag_get_evicts_oldest_when_max_entries_exceeded(
@@ -4996,10 +5003,9 @@ def test_etag_get_304_without_cache_retries_without_if_none_match(
     assert payload == {"merged": True}
     assert len(captured) == 2
     assert not any("If-None-Match" in arg for arg in captured[1])
-    assert cache._etag_cache["repos/owner/name/pulls/3"] == (
-        'W/"v2"',
-        {"merged": True},
-    )
+    cached = cache._etag_cache["repos/owner/name/pulls/3"]
+    assert cached.etag == 'W/"v2"'
+    assert cached.payload == {"merged": True}
 
 
 def test_etag_get_304_no_cache_retry_returns_none_on_non_2xx(
