@@ -15,11 +15,15 @@ from __future__ import annotations
 
 import asyncio
 import types
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
 from src.daemon.handlers import CoderUnavailable
+from src.daemon.handlers import coding as coding_module
+from src.github.prs import BranchPublication
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
+from src.process_supervisor import ProcessRunResult
 
 from tests.runner import _helpers as h
 
@@ -37,6 +41,104 @@ def _runner_with_task(monkeypatch: pytest.MonkeyPatch):
     )
     runner._post_codex_review = lambda pr_number: True  # type: ignore[method-assign]
     return runner
+
+
+def _publication(
+    number: int,
+    *,
+    sha: str = "a" * 40,
+    state: str = "OPEN",
+    is_draft: bool = False,
+    created_at: datetime | None = None,
+) -> BranchPublication:
+    return BranchPublication(
+        number=number,
+        title="PR-001: Sample task",
+        base_branch="main",
+        head_branch="pr-001",
+        head_sha=sha,
+        state=state,
+        is_draft=is_draft,
+        is_cross_repository=False,
+        created_at=created_at
+        or datetime.now(timezone.utc) + timedelta(seconds=1),
+        url=f"https://github.com/octo/demo/pull/{number}",
+    )
+
+
+def _publication_snapshots(
+    monkeypatch: pytest.MonkeyPatch,
+    *snapshots: list[BranchPublication] | Exception,
+) -> list[int]:
+    calls: list[int] = []
+    local_head = {"value": "a" * 40}
+
+    def fetch(*args: object, **kwargs: object) -> list[BranchPublication]:
+        calls.append(len(calls) + 1)
+        snapshot = snapshots[min(len(calls) - 1, len(snapshots) - 1)]
+        if isinstance(snapshot, Exception):
+            raise snapshot
+        if snapshot:
+            local_head["value"] = snapshot[-1].head_sha
+        return snapshot
+
+    monkeypatch.setattr(
+        coding_module.gh_prs,
+        "get_branch_publications",
+        fetch,
+    )
+    monkeypatch.setattr(
+        coding_module,
+        "_local_branch_head_sha",
+        lambda *args, **kwargs: local_head["value"],
+    )
+    return calls
+
+
+class _BoundaryProcess:
+    returncode: int | None = None
+
+
+class _BoundaryManaged:
+    def __init__(self, *, quiescent: bool = True) -> None:
+        self.process = _BoundaryProcess()
+        self.quiescent = quiescent
+        self.cleanup_calls: list[tuple[float, float]] = []
+
+    async def cleanup(
+        self, *, term_grace: float, kill_grace: float
+    ) -> object:
+        self.cleanup_calls.append((term_grace, kill_grace))
+        if self.quiescent:
+            self.process.returncode = -15
+        return types.SimpleNamespace(
+            quiescent=self.quiescent,
+            detail=None if self.quiescent else "owned publication child still live",
+        )
+
+
+def _install_waiting_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin: object,
+    managed: _BoundaryManaged,
+    *,
+    stdout: str = "captured stdout",
+    stderr: str = "captured stderr",
+    propagate_cancel: bool = False,
+) -> None:
+    async def cli_waits(
+        *args: object, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        kwargs["on_process_start"](managed.process)
+        kwargs["on_supervised_process_start"](managed)
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            if propagate_cancel:
+                raise
+            return (-15, stdout, stderr)
+
+    monkeypatch.setattr(plugin, "run_auto_pr", cli_waits)
 
 
 # ---------- _prepare_coder_invocation ----------
@@ -198,7 +300,454 @@ def test_run_coder_with_supervision_returns_completion_on_normal_exit(
         )
     )
 
-    assert result == (0, "out", "")
+    assert result == (0, "out", "", None)
+
+
+def test_publication_terminates_group_preserves_output_and_refreshes_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    runner.app_config.daemon.coder_terminate_grace_sec = 0
+    _coder_name, plugin = runner._get_coder()
+    observed = _publication(41, sha="a" * 40)
+    final = _publication(41, sha="b" * 40)
+    calls = _publication_snapshots(monkeypatch, [], [observed], [final])
+    monkeypatch.setattr(
+        coding_module.gh_prs,
+        "get_open_prs",
+        lambda *args, **kwargs: pytest.fail("full WATCH lookup is premature"),
+    )
+    managed = _BoundaryManaged()
+    _install_waiting_cli(
+        monkeypatch, plugin, managed, propagate_cancel=True
+    )
+    monkeypatch.setattr(
+        coding_module,
+        "cancelled_process_result",
+        lambda exc: ProcessRunResult(
+            returncode=-15,
+            stdout=b"captured stdout",
+            stderr=b"captured stderr",
+        ),
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.head_sha == "b" * 40
+    assert managed.cleanup_calls == [(0, 0)]
+    assert calls == [1, 2, 3, 4]
+    stored = runner.redis.store[f"cli_log:{runner.name}:latest"]
+    assert "captured stdout" in stored and "captured stderr" in stored
+
+
+def test_publication_allows_normal_exit_during_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    _coder_name, plugin = runner._get_coder()
+    publication = _publication(42)
+    _publication_snapshots(monkeypatch, [], [publication], [publication])
+    publication_logged = asyncio.Event()
+    original_log_event = runner.log_event
+
+    def capture_log(message: str, **kwargs: object) -> None:
+        original_log_event(message, **kwargs)
+        if "Verified publication" in message:
+            publication_logged.set()
+
+    async def cli_finishes(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        await publication_logged.wait()
+        return (0, "finished naturally", "")
+
+    runner.log_event = capture_log  # type: ignore[method-assign]
+    monkeypatch.setattr(plugin, "run_auto_pr", cli_finishes)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 42
+    assert runner._current_coder_process is None
+
+
+@pytest.mark.parametrize("recheck", ["error", "mismatch"])
+def test_unverified_pre_cleanup_recheck_leaves_coder_running(
+    monkeypatch: pytest.MonkeyPatch,
+    recheck: str,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    runner.app_config.daemon.coder_terminate_grace_sec = 0
+    _coder_name, plugin = runner._get_coder()
+    publication = _publication(43)
+    third_read: list[BranchPublication] | Exception = (
+        RuntimeError("recheck unavailable")
+        if recheck == "error"
+        else [publication]
+    )
+    _publication_snapshots(monkeypatch, [], [publication], third_read)
+    if recheck == "mismatch":
+        local_heads = iter(["a" * 40, "c" * 40])
+        monkeypatch.setattr(
+            coding_module,
+            "_local_branch_head_sha",
+            lambda *args, **kwargs: next(local_heads),
+        )
+    continue_coder = asyncio.Event()
+    original_log_event = runner.log_event
+
+    def capture_log(message: str, **kwargs: object) -> None:
+        original_log_event(message, **kwargs)
+        if "coder will continue" in message:
+            continue_coder.set()
+
+    async def cli_finishes(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        await continue_coder.wait()
+        return (0, "finished", "")
+
+    runner.log_event = capture_log  # type: ignore[method-assign]
+    monkeypatch.setattr(plugin, "run_auto_pr", cli_finishes)
+    monkeypatch.setattr(
+        coding_module.gh_prs,
+        "get_open_prs",
+        lambda *args, **kwargs: [PRInfo(number=43, branch="pr-001")],
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_coder_process is None
+
+
+def test_ordinary_completion_settles_publication_monitor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    _coder_name, plugin = runner._get_coder()
+    monitor_started = asyncio.Event()
+    monitor_settled = asyncio.Event()
+
+    async def monitor(*args: object, **kwargs: object) -> None:
+        monitor_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            monitor_settled.set()
+
+    async def cli_finishes(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        await monitor_started.wait()
+        return (0, "done", "")
+
+    monkeypatch.setattr(runner, "_monitor_coding_publication", monitor)
+    monkeypatch.setattr(plugin, "run_auto_pr", cli_finishes)
+    monkeypatch.setattr(
+        coding_module.gh_prs,
+        "get_open_prs",
+        lambda *args, **kwargs: [PRInfo(number=43, branch="pr-001")],
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert monitor_settled.is_set()
+
+
+def test_empty_publication_monitor_result_resumes_cli_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    _coder_name, plugin = runner._get_coder()
+    monitor_done = asyncio.Event()
+
+    async def monitor(*args: object, **kwargs: object) -> None:
+        monitor_done.set()
+
+    async def cli_finishes(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        await monitor_done.wait()
+        await asyncio.sleep(0)
+        return (0, "done", "")
+
+    monkeypatch.setattr(runner, "_monitor_coding_publication", monitor)
+    monkeypatch.setattr(plugin, "run_auto_pr", cli_finishes)
+    monkeypatch.setattr(
+        coding_module.gh_prs,
+        "get_open_prs",
+        lambda *args, **kwargs: [PRInfo(number=44, branch="pr-001")],
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+
+
+def test_failed_publication_baseline_keeps_ordinary_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    _coder_name, plugin = runner._get_coder()
+    monkeypatch.setattr(
+        coding_module.gh_prs,
+        "get_branch_publications",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+    async def cli_finishes(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        await asyncio.sleep(0)
+        return (0, "done", "")
+
+    monkeypatch.setattr(plugin, "run_auto_pr", cli_finishes)
+    monkeypatch.setattr(
+        coding_module.gh_prs,
+        "get_open_prs",
+        lambda *args, **kwargs: [PRInfo(number=45, branch="pr-001")],
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert any(
+        "Publication baseline unavailable" in entry["event"]
+        for entry in runner.state.history
+    )
+
+
+def test_publication_cleanup_failure_blocks_handoff_and_keeps_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    runner.app_config.daemon.coder_terminate_grace_sec = 0
+    _coder_name, plugin = runner._get_coder()
+    publication = _publication(44)
+    calls = _publication_snapshots(monkeypatch, [], [publication])
+    branch_cleanup_calls: list[str] = []
+    managed = _BoundaryManaged(quiescent=False)
+    _install_waiting_cli(monkeypatch, plugin, managed)
+    monkeypatch.setattr(
+        runner,
+        "_cleanup_expected_branch",
+        lambda: branch_cleanup_calls.append("removed"),
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "owned publication child still live" in (runner.state.error_message or "")
+    assert runner._current_coder_supervised_process is managed
+    assert branch_cleanup_calls == []
+    assert calls == [1, 2, 3]
+
+
+@pytest.mark.parametrize("captured", [None, "timed_out"])
+def test_publication_cancellation_without_clean_process_result_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    captured: str | None,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    runner.app_config.daemon.coder_terminate_grace_sec = 0
+    _coder_name, plugin = runner._get_coder()
+    publication = _publication(46)
+    _publication_snapshots(monkeypatch, [], [publication])
+    managed = _BoundaryManaged()
+    _install_waiting_cli(
+        monkeypatch, plugin, managed, propagate_cancel=True
+    )
+    result = (
+        None
+        if captured is None
+        else ProcessRunResult(
+            returncode=-15,
+            stdout=b"partial output",
+            stderr=b"",
+            timed_out=True,
+        )
+    )
+    monkeypatch.setattr(
+        coding_module, "cancelled_process_result", lambda exc: result
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.ERROR
+    expected = "without a captured" if captured is None else "timeout overlapped"
+    assert expected in (runner.state.error_message or "")
+
+
+@pytest.mark.parametrize(
+    ("final_kind", "expected_state", "expected_number"),
+    [
+        ("changed_identity", PipelineState.WATCH, 52),
+        ("draft", PipelineState.ERROR, None),
+        ("closed", PipelineState.ERROR, None),
+        ("sha_mismatch", PipelineState.ERROR, None),
+        ("read_error", PipelineState.ERROR, None),
+    ],
+)
+def test_publication_refresh_rejects_stale_final_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    final_kind: str,
+    expected_state: PipelineState,
+    expected_number: int | None,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    runner.app_config.daemon.coder_terminate_grace_sec = 0
+    _coder_name, plugin = runner._get_coder()
+    observed = _publication(51)
+    final: BranchPublication | Exception = {
+        "changed_identity": _publication(52, sha="c" * 40),
+        "draft": _publication(51, is_draft=True),
+        "closed": _publication(51, state="CLOSED"),
+        "sha_mismatch": _publication(51, sha="b" * 40),
+        "read_error": RuntimeError("refresh unavailable"),
+    }[final_kind]
+    final_snapshot = final if isinstance(final, Exception) else [final]
+    _publication_snapshots(
+        monkeypatch, [], [observed], [observed], final_snapshot
+    )
+    if final_kind == "sha_mismatch":
+        local_heads = iter(["a" * 40, "a" * 40, "c" * 40])
+        monkeypatch.setattr(
+            coding_module,
+            "_local_branch_head_sha",
+            lambda *args, **kwargs: next(local_heads),
+        )
+    managed = _BoundaryManaged()
+    _install_waiting_cli(monkeypatch, plugin, managed, stderr="")
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == expected_state
+    if expected_number is None:
+        assert runner.state.current_pr is None
+        if final_kind == "read_error":
+            assert "refresh unavailable" in (runner.state.error_message or "")
+        else:
+            assert "changed or disappeared" in (runner.state.error_message or "")
+    else:
+        assert runner.state.current_pr is not None
+        assert runner.state.current_pr.number == expected_number
+
+
+def test_fresh_selector_rejects_stale_draft_and_invalid_evidence() -> None:
+    boundary = datetime.now(timezone.utc)
+    publications = [
+        _publication(1, created_at=boundary + timedelta(seconds=1)),
+        _publication(2, created_at=boundary - timedelta(seconds=1)),
+        _publication(3, is_draft=True, created_at=boundary + timedelta(seconds=1)),
+        _publication(4, sha="invalid", created_at=boundary + timedelta(seconds=1)),
+        _publication(5, sha="e" * 40, created_at=boundary + timedelta(seconds=1)),
+    ]
+
+    assert coding_module._fresh_ready_publication(
+        publications,
+        baseline_numbers={1},
+        not_before=boundary,
+        expected_head_sha="f" * 40,
+    ) is None
+
+
+def test_publication_monitor_retries_transient_read_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    publication = _publication(60)
+    _publication_snapshots(
+        monkeypatch,
+        RuntimeError("poll failed"),
+        [publication],
+    )
+    real_sleep = asyncio.sleep
+
+    async def yield_once(_seconds: float) -> None:
+        await real_sleep(0)
+
+    monkeypatch.setattr(coding_module.asyncio, "sleep", yield_once)
+
+    async def scenario() -> None:
+        cli_task = asyncio.create_task(asyncio.Event().wait())
+        try:
+            found = await runner._monitor_coding_publication(
+                cli_task,
+                base_branch="main",
+                target_branch="pr-001",
+                baseline_numbers=set(),
+                not_before=datetime.now(timezone.utc) - timedelta(seconds=1),
+            )
+            assert found == publication
+        finally:
+            cli_task.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_unarmed_publication_monitor_waits_for_cli_and_returns_none() -> None:
+    runner = h._make_runner()
+
+    async def scenario() -> None:
+        release = asyncio.Event()
+        cli_task = asyncio.create_task(release.wait())
+        monitor = asyncio.create_task(
+            runner._monitor_coding_publication(
+                cli_task,  # type: ignore[arg-type]
+                base_branch="main",
+                target_branch="pr-001",
+                baseline_numbers=None,
+                not_before=datetime.now(timezone.utc),
+            )
+        )
+        await asyncio.sleep(0)
+        release.set()
+        await cli_task
+        assert await monitor is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("race", ["stop", "breach"])
+def test_stop_and_breach_win_publication_race(
+    monkeypatch: pytest.MonkeyPatch,
+    race: str,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    _coder_name, plugin = runner._get_coder()
+    publication_ready = asyncio.Event()
+
+    async def publication_monitor(*args: object, **kwargs: object) -> BranchPublication:
+        publication_ready.set()
+        return _publication(61)
+
+    async def cli_waits(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        await asyncio.Future()
+        return (0, "", "")
+
+    monkeypatch.setattr(runner, "_monitor_coding_publication", publication_monitor)
+    monkeypatch.setattr(plugin, "run_auto_pr", cli_waits)
+    monkeypatch.setattr(runner, "_check_late_breach", lambda *a, **kw: None)
+    monkeypatch.setattr(runner, "_cleanup_breach_marker", lambda *a, **kw: None)
+    if race == "stop":
+        async def stop_monitor(cli_task: asyncio.Task[tuple[int, str, str]]) -> None:
+            await publication_ready.wait()
+            runner._stop_requested = True
+            runner.state.user_paused = True
+            cli_task.cancel()
+
+        monkeypatch.setattr(runner, "_monitor_stop_request", stop_monitor)
+    else:
+        async def breach_monitor(
+            breach_dir: str,
+            run_id: str,
+            cli_task: asyncio.Task[tuple[int, str, str]],
+            breach_flag: dict[str, bool],
+        ) -> None:
+            await publication_ready.wait()
+            breach_flag["breached"] = True
+            cli_task.cancel()
+
+        monkeypatch.setattr(runner, "_monitor_inflight_breach", breach_monitor)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.current_pr is None
 
 
 def test_run_coder_cleanup_failure_precedes_normal_result_processing(

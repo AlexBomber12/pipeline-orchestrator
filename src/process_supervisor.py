@@ -46,6 +46,7 @@ _ADAPTER_TERM_GRACE_SECONDS = 1.0
 _ADAPTER_KILL_GRACE_SECONDS = 1.0
 _DISAPPEARED_ERRNOS = {errno.ENOENT, errno.ESRCH}
 _RESTORED_SIGNAL_NAMES = ("SIGPIPE", "SIGXFZ", "SIGXFSZ")
+_CANCELLED_RESULT_ATTR = "_pipeline_process_run_result"
 _LAUNCH_PROOF = object()
 _WITNESS_LAUNCHER = r"""
 import os
@@ -149,6 +150,20 @@ class ProcessRunResult:
     stdout: bytes
     stderr: bytes
     timed_out: bool = False
+    failure_detail: str | None = None
+
+
+def cancelled_process_result(
+    cancellation: asyncio.CancelledError,
+) -> ProcessRunResult | None:
+    """Return output captured before a supervised wait was cancelled.
+
+    Cancellation still propagates to every existing caller. The attached
+    result is an opt-in handoff for callers that intentionally cancelled an
+    already-cleaned process and need its real exit status and diagnostics.
+    """
+    result = getattr(cancellation, _CANCELLED_RESULT_ATTR, None)
+    return result if isinstance(result, ProcessRunResult) else None
 
 
 class ProcessSupervisionError(RuntimeError):
@@ -1351,7 +1366,24 @@ async def run_supervised_process(
             f"{failure_detail}; {task_error}" if failure_detail else task_error
         )
 
+    returncode = process.returncode
+    if returncode is None and cleanup_result is not None:
+        returncode = cleanup_result.leader_returncode
+    run_result = (
+        ProcessRunResult(
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+            timed_out=timed_out,
+            failure_detail=failure_detail,
+        )
+        if returncode is not None
+        else None
+    )
+
     if cancellation is not None:
+        if run_result is not None:
+            setattr(cancellation, _CANCELLED_RESULT_ATTR, run_result)
         if failure_detail is not None:
             _record_cancellation_failure(cancellation, failure_detail)
         raise cancellation
@@ -1367,15 +1399,13 @@ async def run_supervised_process(
     if primary_error is not None:
         raise primary_error
 
-    returncode = process.returncode
-    if returncode is None and cleanup_result is not None:
-        returncode = cleanup_result.leader_returncode
-    return ProcessRunResult(
-        returncode=returncode if returncode is not None else 0,
-        stdout=stdout,
-        stderr=stderr,
-        timed_out=timed_out,
-    )
+    if run_result is None:
+        raise ProcessSupervisionError(
+            "cleanup confirmed quiescence without a leader return code",
+            stdout=stdout,
+            stderr=stderr,
+        )
+    return run_result
 
 
 async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
