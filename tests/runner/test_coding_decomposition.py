@@ -19,11 +19,19 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
+from src import codex_cli
+from src.coders.codex import CodexPlugin
 from src.daemon.handlers import CoderUnavailable
 from src.daemon.handlers import coding as coding_module
 from src.github.prs import BranchPublication
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
-from src.process_supervisor import ProcessRunResult
+from src.process_supervisor import (
+    CleanupResult,
+    CleanupStatus,
+    ProcessRunResult,
+    ProcessSupervisionError,
+    SupervisedProcess,
+)
 
 from tests.runner import _helpers as h
 
@@ -115,6 +123,48 @@ class _BoundaryManaged:
         return types.SimpleNamespace(
             quiescent=self.quiescent,
             detail=None if self.quiescent else "owned publication child still live",
+        )
+
+
+class _AdapterReader:
+    def __init__(self, *reads: bytes | BaseException) -> None:
+        self.reads = iter(reads)
+
+    async def read(self, _size: int) -> bytes:
+        value = next(self.reads, b"")
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
+class _AdapterProcess:
+    def __init__(self, *, fail_output: bool) -> None:
+        self.returncode: int | None = 0
+        stdout_reads: tuple[bytes | BaseException, ...] = (
+            (b"partial output", OSError("reader broke"))
+            if fail_output
+            else (b"partial output",)
+        )
+        self.stdout = _AdapterReader(*stdout_reads)
+        self.stderr = _AdapterReader(b"provider diagnostic")
+
+
+class _AdapterManaged(SupervisedProcess):
+    def __init__(self, *, fail_output: bool, clear_returncode: bool) -> None:
+        self._process = _AdapterProcess(fail_output=fail_output)
+        self._supervision_failure = None
+        self.clear_returncode = clear_returncode
+
+    async def cleanup(
+        self, *, term_grace: float, kill_grace: float
+    ) -> CleanupResult:
+        if self.clear_returncode:
+            self.process.returncode = None
+        return CleanupResult(
+            CleanupStatus.QUIESCENT,
+            None if self.clear_returncode else 0,
+            False,
+            False,
         )
 
 
@@ -823,6 +873,56 @@ def test_publication_cleanup_failure_blocks_handoff_and_keeps_ownership(
     assert runner._current_coder_supervised_process is managed
     assert branch_cleanup_calls == []
     assert calls == [1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    ("fail_output", "clear_returncode", "expected_failure"),
+    [
+        (True, False, "stdout reader failed: OSError: reader broke"),
+        (
+            False,
+            True,
+            "cleanup confirmed quiescence without a leader return code",
+        ),
+    ],
+)
+def test_adapter_supervision_failure_blocks_publication_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+    fail_output: bool,
+    clear_returncode: bool,
+    expected_failure: str,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    plugin = CodexPlugin()
+    publication = _publication(56)
+    _publication_snapshots(monkeypatch, [], [publication])
+    managed = _AdapterManaged(
+        fail_output=fail_output,
+        clear_returncode=clear_returncode,
+    )
+
+    async def launch(*args: object, **kwargs: object) -> _AdapterManaged:
+        return managed
+
+    async def monitor(*args: object, **kwargs: object) -> None:
+        await asyncio.Future()
+
+    monkeypatch.setattr(runner, "_get_coder", lambda: ("codex", plugin))
+    monkeypatch.setattr(runner, "_monitor_coding_publication", monitor)
+    monkeypatch.setattr(codex_cli, "launch_process", launch)
+    monkeypatch.setattr(codex_cli, "_maybe_wrap_sandbox", lambda cmd, cwd: cmd)
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_pr is None
+    assert expected_failure in (runner.state.error_message or "")
+    assert isinstance(managed.supervision_failure, ProcessSupervisionError)
+    assert runner._current_coder_supervised_process is None
+    stored = runner.redis.store[f"cli_log:{runner.name}:latest"]
+    assert "partial output" in stored
+    assert "provider diagnostic" in stored
+    assert expected_failure in stored
 
 
 @pytest.mark.parametrize("captured", [None, "timed_out"])

@@ -33,7 +33,7 @@ from src.github import cache as gh_cache
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.models import PipelineState, PRInfo
-from src.process_supervisor import cancelled_process_result
+from src.process_supervisor import ProcessSupervisionError, cancelled_process_result
 from src.subsource_registry import SuppressionReason
 
 
@@ -641,6 +641,17 @@ class CodingMixin:
                 monitors.append(breach_monitor)
             await asyncio.gather(*monitors, return_exceptions=True)
             self._coder_invocation_active = False
+            managed = self._current_coder_supervised_process
+            supervision_failure = (
+                getattr(managed, "supervision_failure", None)
+                if managed is not None
+                else None
+            )
+            if (
+                publication_process_failure is None
+                and isinstance(supervision_failure, ProcessSupervisionError)
+            ):
+                publication_process_failure = str(supervision_failure)
             if result is not None:
                 self._record_unconfirmed_launch_cleanup(result)
             if plugin.supports_breach_lifecycle:

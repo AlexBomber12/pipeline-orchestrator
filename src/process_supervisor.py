@@ -233,6 +233,7 @@ class SupervisedProcess:
         self._process = process
         self._identity = identity
         self._cleanup_task: asyncio.Task[CleanupResult] | None = None
+        self._supervision_failure: ProcessSupervisionError | None = None
         self._lifecycle_witness = _lifecycle_witness
         self._signaled_members: dict[
             signal.Signals, set[tuple[int, int]]
@@ -257,6 +258,11 @@ class SupervisedProcess:
     @property
     def identity(self) -> ProcessIdentity:
         return self._identity
+
+    @property
+    def supervision_failure(self) -> ProcessSupervisionError | None:
+        """Return the structured execution failure retained for its owner."""
+        return self._supervision_failure
 
     async def cleanup(
         self,
@@ -1274,6 +1280,20 @@ def _record_cancellation_failure(
     cancellation.add_note(f"process cleanup failed: {detail}")
 
 
+def _retained_supervision_error(
+    managed: SupervisedProcess,
+    detail: str,
+    *,
+    stdout: bytes,
+    stderr: bytes,
+) -> ProcessSupervisionError:
+    """Build an error and retain it on the real ownership handle."""
+    error = ProcessSupervisionError(detail, stdout=stdout, stderr=stderr)
+    if isinstance(managed, SupervisedProcess):
+        managed._supervision_failure = error
+    return error
+
+
 async def run_supervised_process(
     managed: SupervisedProcess,
     *,
@@ -1388,10 +1408,8 @@ async def run_supervised_process(
             _record_cancellation_failure(cancellation, failure_detail)
         raise cancellation
     if failure_detail is not None:
-        error = ProcessSupervisionError(
-            failure_detail,
-            stdout=stdout,
-            stderr=stderr,
+        error = _retained_supervision_error(
+            managed, failure_detail, stdout=stdout, stderr=stderr
         )
         if primary_error is not None:
             raise error from primary_error
@@ -1400,7 +1418,8 @@ async def run_supervised_process(
         raise primary_error
 
     if run_result is None:
-        raise ProcessSupervisionError(
+        raise _retained_supervision_error(
+            managed,
             "cleanup confirmed quiescence without a leader return code",
             stdout=stdout,
             stderr=stderr,
