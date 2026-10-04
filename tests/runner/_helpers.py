@@ -480,6 +480,11 @@ def _patch_subprocess(
         "get_branch_publications",
         lambda *args, **kwargs: [],
     )
+    monkeypatch.setattr(
+        coding_module,
+        "_local_branch_head_sha",
+        lambda *args, **kwargs: "a" * 40,
+    )
     if stub_auto_pr_read:
         _stub_auto_pr_task_body_read(monkeypatch)
     return calls

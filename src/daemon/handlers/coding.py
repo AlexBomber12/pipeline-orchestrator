@@ -123,6 +123,25 @@ def _remote_branch_exists(repo_path: str, branch: str) -> bool:
     return probe.returncode == 0 and bool(probe.stdout.strip())
 
 
+def _local_branch_head_sha(repo_path: str, branch: str) -> str | None:
+    """Return the local task branch commit when it is a full GitHub SHA."""
+    try:
+        probe = git_ops._git(
+            repo_path,
+            "rev-parse",
+            "--verify",
+            f"refs/heads/{branch}^{{commit}}",
+            timeout=10,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    sha = probe.stdout.strip() if probe.returncode == 0 else ""
+    if len(sha) != 40 or any(char not in "0123456789abcdefABCDEF" for char in sha):
+        return None
+    return sha
+
+
 @dataclass(frozen=True)
 class _PublicationResolution:
     """Final targeted publication state after coder cleanup."""
@@ -136,6 +155,7 @@ def _fresh_ready_publication(
     *,
     baseline_numbers: set[int],
     not_before: datetime,
+    expected_head_sha: str | None,
 ) -> gh_prs.BranchPublication | None:
     """Select verified evidence created during the active CODING dispatch."""
     candidates = [
@@ -145,6 +165,7 @@ def _fresh_ready_publication(
         and publication.number not in baseline_numbers
         and publication.created_at is not None
         and publication.created_at >= not_before
+        and publication.head_sha == expected_head_sha
     ]
     if not candidates:
         return None
@@ -495,13 +516,45 @@ class CodingMixin:
                         timeout=self.app_config.daemon.coder_terminate_grace_sec,
                     )
                     if cli_task not in completed:
-                        self.log_event(
-                            f"[CODING] Publication grace elapsed; terminating "
-                            f"owned coder group for PR "
-                            f"#{publication_observed.number}."
-                        )
-                        await self._terminate_current_coder()
-                        publication_cancel_requested = cli_task.cancel()
+                        try:
+                            before_cleanup = await asyncio.to_thread(
+                                gh_prs.get_branch_publications,
+                                self.owner_repo,
+                                base_branch,
+                                target_branch,
+                            )
+                            local_head = await asyncio.to_thread(
+                                _local_branch_head_sha,
+                                self.repo_path,
+                                target_branch,
+                            )
+                        except Exception as exc:
+                            publication_observed = None
+                            self.log_event(
+                                f"[CODING] Publication recheck failed before "
+                                f"cleanup: {exc}; coder will continue."
+                            )
+                        else:
+                            publication_observed = _fresh_ready_publication(
+                                before_cleanup,
+                                baseline_numbers=publication_baseline,
+                                not_before=publication_not_before,
+                                expected_head_sha=local_head,
+                            )
+                        if publication_observed is not None:
+                            self.log_event(
+                                f"[CODING] Publication grace elapsed; "
+                                f"terminating owned coder group for PR "
+                                f"#{publication_observed.number}."
+                            )
+                            await self._terminate_current_coder()
+                            publication_cancel_requested = cli_task.cancel()
+                        else:
+                            self.log_event(
+                                "[CODING] Publication no longer matches the "
+                                "local task branch after grace; coder will "
+                                "continue."
+                            )
             result = await cli_task
         except asyncio.CancelledError as exc:
             if self._stop_requested:
@@ -628,6 +681,11 @@ class CodingMixin:
                 base_branch,
                 target_branch,
             )
+            local_head = await asyncio.to_thread(
+                _local_branch_head_sha,
+                self.repo_path,
+                target_branch,
+            )
         except Exception as exc:
             publication = _PublicationResolution(failure=exc)
         else:
@@ -635,12 +693,14 @@ class CodingMixin:
                 refreshed,
                 baseline_numbers=publication_baseline,
                 not_before=publication_not_before,
+                expected_head_sha=local_head,
             )
             if final_evidence is None:
                 publication = _PublicationResolution(
                     failure=(
                         "Verified publication changed or disappeared after "
-                        "coder cleanup"
+                        "coder cleanup, or its head does not match the local "
+                        "task branch"
                     )
                 )
             else:
@@ -676,10 +736,16 @@ class CodingMixin:
                     f"{target_branch!r}: {exc}."
                 )
             else:
+                local_head = await asyncio.to_thread(
+                    _local_branch_head_sha,
+                    self.repo_path,
+                    target_branch,
+                )
                 candidate = _fresh_ready_publication(
                     publications,
                     baseline_numbers=baseline_numbers,
                     not_before=not_before,
+                    expected_head_sha=local_head,
                 )
                 if candidate is not None:
                     return candidate

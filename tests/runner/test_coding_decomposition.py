@@ -71,18 +71,26 @@ def _publication_snapshots(
     *snapshots: list[BranchPublication] | Exception,
 ) -> list[int]:
     calls: list[int] = []
+    local_head = {"value": "a" * 40}
 
     def fetch(*args: object, **kwargs: object) -> list[BranchPublication]:
         calls.append(len(calls) + 1)
         snapshot = snapshots[min(len(calls) - 1, len(snapshots) - 1)]
         if isinstance(snapshot, Exception):
             raise snapshot
+        if snapshot:
+            local_head["value"] = snapshot[-1].head_sha
         return snapshot
 
     monkeypatch.setattr(
         coding_module.gh_prs,
         "get_branch_publications",
         fetch,
+    )
+    monkeypatch.setattr(
+        coding_module,
+        "_local_branch_head_sha",
+        lambda *args, **kwargs: local_head["value"],
     )
     return calls
 
@@ -329,7 +337,7 @@ def test_publication_terminates_group_preserves_output_and_refreshes_head(
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.head_sha == "b" * 40
     assert managed.cleanup_calls == [(0, 0)]
-    assert calls == [1, 2, 3]
+    assert calls == [1, 2, 3, 4]
     stored = runner.redis.store[f"cli_log:{runner.name}:latest"]
     assert "captured stdout" in stored and "captured stderr" in stored
 
@@ -361,6 +369,54 @@ def test_publication_allows_normal_exit_during_grace(
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.number == 42
+    assert runner._current_coder_process is None
+
+
+@pytest.mark.parametrize("recheck", ["error", "mismatch"])
+def test_unverified_pre_cleanup_recheck_leaves_coder_running(
+    monkeypatch: pytest.MonkeyPatch,
+    recheck: str,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    runner.app_config.daemon.coder_terminate_grace_sec = 0
+    _coder_name, plugin = runner._get_coder()
+    publication = _publication(43)
+    third_read: list[BranchPublication] | Exception = (
+        RuntimeError("recheck unavailable")
+        if recheck == "error"
+        else [publication]
+    )
+    _publication_snapshots(monkeypatch, [], [publication], third_read)
+    if recheck == "mismatch":
+        local_heads = iter(["a" * 40, "c" * 40])
+        monkeypatch.setattr(
+            coding_module,
+            "_local_branch_head_sha",
+            lambda *args, **kwargs: next(local_heads),
+        )
+    continue_coder = asyncio.Event()
+    original_log_event = runner.log_event
+
+    def capture_log(message: str, **kwargs: object) -> None:
+        original_log_event(message, **kwargs)
+        if "coder will continue" in message:
+            continue_coder.set()
+
+    async def cli_finishes(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        await continue_coder.wait()
+        return (0, "finished", "")
+
+    runner.log_event = capture_log  # type: ignore[method-assign]
+    monkeypatch.setattr(plugin, "run_auto_pr", cli_finishes)
+    monkeypatch.setattr(
+        coding_module.gh_prs,
+        "get_open_prs",
+        lambda *args, **kwargs: [PRInfo(number=43, branch="pr-001")],
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    assert runner.state.state == PipelineState.WATCH
     assert runner._current_coder_process is None
 
 
@@ -478,7 +534,7 @@ def test_publication_cleanup_failure_blocks_handoff_and_keeps_ownership(
     assert "owned publication child still live" in (runner.state.error_message or "")
     assert runner._current_coder_supervised_process is managed
     assert branch_cleanup_calls == []
-    assert calls == [1, 2]
+    assert calls == [1, 2, 3]
 
 
 @pytest.mark.parametrize("captured", [None, "timed_out"])
@@ -522,6 +578,7 @@ def test_publication_cancellation_without_clean_process_result_fails_closed(
         ("changed_identity", PipelineState.WATCH, 52),
         ("draft", PipelineState.ERROR, None),
         ("closed", PipelineState.ERROR, None),
+        ("sha_mismatch", PipelineState.ERROR, None),
         ("read_error", PipelineState.ERROR, None),
     ],
 )
@@ -539,10 +596,20 @@ def test_publication_refresh_rejects_stale_final_evidence(
         "changed_identity": _publication(52, sha="c" * 40),
         "draft": _publication(51, is_draft=True),
         "closed": _publication(51, state="CLOSED"),
+        "sha_mismatch": _publication(51, sha="b" * 40),
         "read_error": RuntimeError("refresh unavailable"),
     }[final_kind]
     final_snapshot = final if isinstance(final, Exception) else [final]
-    _publication_snapshots(monkeypatch, [], [observed], final_snapshot)
+    _publication_snapshots(
+        monkeypatch, [], [observed], [observed], final_snapshot
+    )
+    if final_kind == "sha_mismatch":
+        local_heads = iter(["a" * 40, "a" * 40, "c" * 40])
+        monkeypatch.setattr(
+            coding_module,
+            "_local_branch_head_sha",
+            lambda *args, **kwargs: next(local_heads),
+        )
     managed = _BoundaryManaged()
     _install_waiting_cli(monkeypatch, plugin, managed, stderr="")
 
@@ -567,12 +634,14 @@ def test_fresh_selector_rejects_stale_draft_and_invalid_evidence() -> None:
         _publication(2, created_at=boundary - timedelta(seconds=1)),
         _publication(3, is_draft=True, created_at=boundary + timedelta(seconds=1)),
         _publication(4, sha="invalid", created_at=boundary + timedelta(seconds=1)),
+        _publication(5, sha="e" * 40, created_at=boundary + timedelta(seconds=1)),
     ]
 
     assert coding_module._fresh_ready_publication(
         publications,
         baseline_numbers={1},
         not_before=boundary,
+        expected_head_sha="f" * 40,
     ) is None
 
 
