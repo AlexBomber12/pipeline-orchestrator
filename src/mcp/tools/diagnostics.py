@@ -124,6 +124,10 @@ _PENDING_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?<![A-Za-z0-9_.-])(?:{_SENSITIVE_KEY_PATTERN})(?![A-Za-z0-9_.-]))"
     r"\s*[:=][ \t]*(?:[|>][-+]?)?[ \t]*$"
 )
+_PENDING_YAML_SENSITIVE_ASSIGNMENT = re.compile(
+    rf"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
+    rf"(?:{_SENSITIVE_KEY_PATTERN}))\s*:[ \t]*$"
+)
 _BLOCK_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
     rf"(?:{_SENSITIVE_KEY_PATTERN}))\s*[:=][ \t]*"
@@ -478,7 +482,11 @@ def _sensitive_state_before(
                 continue
             active_block_indent = None
         line = raw_line.decode("utf-8", errors="replace")
-        indented_match = _BLOCK_SENSITIVE_ASSIGNMENT.fullmatch(line) or _PLAIN_SENSITIVE_ASSIGNMENT.fullmatch(line)
+        indented_match = (
+            _BLOCK_SENSITIVE_ASSIGNMENT.fullmatch(line)
+            or _PLAIN_SENSITIVE_ASSIGNMENT.fullmatch(line)
+            or _PENDING_YAML_SENSITIVE_ASSIGNMENT.fullmatch(line)
+        )
         if indented_match is not None:
             active_block_indent = len(indented_match.group("indent"))
             block_state_known = True
@@ -607,7 +615,11 @@ def _redacted_file_units(
             marker = (
                 "[REDACTED SENSITIVE CONTINUATION]\n"
                 if sensitive_block_indent == -1
-                else "[REDACTED SENSITIVE BLOCK]\n"
+                else (
+                    "[REDACTED SENSITIVE VALUE]\n"
+                    if starts_with_sensitive_value
+                    else "[REDACTED SENSITIVE BLOCK]\n"
+                )
             )
             units.append((raw_unit, marker, 1))
             line_index = block_end
@@ -690,7 +702,27 @@ def _redacted_file_units(
                 units.append((raw_unit, safe_unit, replacements))
                 line_index = scalar_end
                 continue
-            if _PENDING_SENSITIVE_ASSIGNMENT.search(text_unit):
+            pending_yaml_match = _PENDING_YAML_SENSITIVE_ASSIGNMENT.fullmatch(text_unit.rstrip("\r\n"))
+            if pending_yaml_match is not None:
+                assignment_indent = len(pending_yaml_match.group("indent"))
+                value_end = line_index + 1
+                while value_end < len(raw_lines):
+                    if raw_lines[value_end].strip() and _line_indent(raw_lines[value_end]) <= assignment_indent:
+                        break
+                    value_end += 1
+                if value_end > line_index + 1:
+                    raw_unit = b"".join(raw_lines[line_index:value_end])
+                    units.append((raw_unit, "[REDACTED SENSITIVE ASSIGNMENT]\n", 1))
+                    line_index = value_end
+                    continue
+                if has_more_after_raw and value_end == len(raw_lines):
+                    warnings.append(
+                        "A sensitive YAML assignment crossed the bounded page window; its visible key was redacted."
+                    )
+                    units.append((raw_unit, "[REDACTED SENSITIVE ASSIGNMENT]\n", 1))
+                    line_index += 1
+                    continue
+            elif _PENDING_SENSITIVE_ASSIGNMENT.search(text_unit):
                 value_index = line_index + 1
                 while value_index < len(raw_lines) and not raw_lines[value_index].strip():
                     value_index += 1

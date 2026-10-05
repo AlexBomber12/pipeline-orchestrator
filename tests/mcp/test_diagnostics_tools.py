@@ -422,6 +422,12 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             'toml-second-secret"""',
             "PASSWORD=slash-first-secret\\",
             "slash-second-secret",
+            "password:",
+            "  yaml-first-secret",
+            "  yaml-second-secret",
+            "- password:",
+            "    sequence-first-secret",
+            "    sequence-second-secret",
             'INFO {"password":987654321,"debug":true}',
             '{"password":123456789}',
             '{"credentials":["user","fake-list-secret"]}',
@@ -463,6 +469,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         )
         + '\npassword = """ci-toml-first-secret\nci-toml-second-secret"""\n'
         + "PASSWORD=ci-slash-first-secret\\\nci-slash-second-secret\n"
+        + "password:\n  ci-yaml-first-secret\n  ci-yaml-second-secret\n"
+        + "- password:\n    ci-sequence-first-secret\n    ci-sequence-second-secret\n"
         + '2026-10-05 INFO {"password":987654322,"debug":true}\n',
         encoding="utf-8",
     )
@@ -492,6 +500,10 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "toml-second-secret" not in content
         assert "slash-first-secret" not in content
         assert "slash-second-secret" not in content
+        assert "yaml-first-secret" not in content
+        assert "yaml-second-secret" not in content
+        assert "sequence-first-secret" not in content
+        assert "sequence-second-secret" not in content
         assert "987654321" not in content
         assert "123456789" not in content
         assert "fake-list-secret" not in content
@@ -509,6 +521,10 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-toml-second-secret" not in content
         assert "ci-slash-first-secret" not in content
         assert "ci-slash-second-secret" not in content
+        assert "ci-yaml-first-secret" not in content
+        assert "ci-yaml-second-secret" not in content
+        assert "ci-sequence-first-secret" not in content
+        assert "ci-sequence-second-secret" not in content
         assert "987654322" not in content
         assert "debug" in content
 
@@ -530,6 +546,15 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
     )
     assert "ci-slash-second-secret" not in slash_continuation["content"]
     assert "[REDACTED SENSITIVE CONTINUATION]" in slash_continuation["content"]
+
+    yaml_continuation = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=ci_raw.index(b"  ci-yaml-second-secret"),
+        max_chars=200,
+    )
+    assert "ci-yaml-second-secret" not in yaml_continuation["content"]
+    assert "[REDACTED SENSITIVE BLOCK]" in yaml_continuation["content"]
 
 
 async def test_truncated_redis_logs_omit_unknown_leading_sensitive_context(
@@ -1435,6 +1460,50 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
     )
     assert units[0][1] == "[REDACTED SENSITIVE ASSIGNMENT]\n"
     assert warnings
+
+    warnings = []
+    value_units = diagnostics._redacted_file_units(
+        b"\n  continued-sensitive-value\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=True,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=False,
+        warnings=warnings,
+    )
+    assert value_units[0][1] == "[REDACTED SENSITIVE VALUE]\n"
+    assert "continued-sensitive-value" not in "".join(unit[1] for unit in value_units)
+
+    warnings = []
+    assignment_units = diagnostics._redacted_file_units(
+        b"PASSWORD=\n\nassignment-value\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=False,
+        warnings=warnings,
+    )
+    assert assignment_units[0][1] == "[REDACTED SENSITIVE ASSIGNMENT]\n"
+    assert "assignment-value" not in "".join(unit[1] for unit in assignment_units)
+
+    warnings = []
+    diagnostics._redacted_file_units(
+        b"PASSWORD=\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=True,
+        warnings=warnings,
+    )
+    assert any("crossed the bounded page window" in warning for warning in warnings)
 
     assert diagnostics._sensitive_state_before(BytesIO(b"\n\n"), 2, b"next\n") == (
         False,
