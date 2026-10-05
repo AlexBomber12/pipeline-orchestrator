@@ -494,6 +494,17 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     assert sources[-1]["availability"] == "missing"
     assert any("ci.log" in warning for warning in warnings)
 
+    sibling_events = tmp_path / "sibling-events"
+    selected_events = sibling_events / SLUG
+    other_events = sibling_events / "octo__sibling"
+    selected_events.mkdir(parents=True)
+    other_events.mkdir(parents=True)
+    (other_events / "2026-10-05.jsonl").write_text("sibling event secret", encoding="utf-8")
+    (selected_events / "2026-10-05.jsonl").symlink_to(other_events / "2026-10-05.jsonl")
+    monkeypatch.setattr(diagnostics, "_EVENTS_ROOT", sibling_events)
+    with pytest.raises(ValueError, match="escapes"):
+        await diagnostics.read_orchestrator_log(SLUG, "events:disk/2026-10-05")
+
 
 def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
     monkeypatch: pytest.MonkeyPatch,
@@ -612,6 +623,30 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
         "tokens_in": 123,
     }
     assert structured_count == 1
+    for camel_key in (
+        "accessToken",
+        "refreshToken",
+        "clientSecret",
+        "apiKey",
+        "authToken",
+        "privateKey",
+        "awsSecretAccessKey",
+        "secretAccessKey",
+        "sessionToken",
+    ):
+        structured, structured_count = diagnostics._redact_structure({camel_key: "camel-secret"})
+        assert structured == {camel_key: "[REDACTED]"}
+        assert structured_count == 1
+        redacted_camel, camel_count = diagnostics._redact_text(
+            json.dumps({camel_key: "camel-text-secret"})
+        )
+        assert "camel-text-secret" not in redacted_camel
+        assert camel_count == 1
+    pgp_key, pgp_replacements = diagnostics._redact_text(
+        "-----BEGIN PGP PRIVATE KEY BLOCK-----\npgp-secret\n-----END PGP PRIVATE KEY BLOCK-----"
+    )
+    assert pgp_key == "[REDACTED PRIVATE KEY]"
+    assert pgp_replacements == 1
     assert diagnostics._iso_z(datetime(2026, 10, 5, 12, 0)).endswith("Z")
 
     captured: dict[str, Any] = {}
@@ -952,9 +987,9 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
 
     private_payload = "private-key-material\n" * (diagnostics._MAX_FILE_SCAN_BYTES // 10)
     ci_path.write_text(
-        "before\n-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        "before\n-----BEGIN PGP PRIVATE KEY BLOCK-----\n"
         + private_payload
-        + "-----END OPENSSH PRIVATE KEY-----\nafter\n",
+        + "-----END PGP PRIVATE KEY BLOCK-----\nafter\n",
         encoding="utf-8",
     )
     cursor = 0

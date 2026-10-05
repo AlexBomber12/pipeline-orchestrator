@@ -87,6 +87,17 @@ _SENSITIVE_NAMES = (
     "private_key",
     "private-key",
     "aws_secret_access_key",
+    "proxyAuthorization",
+    "setCookie",
+    "accessToken",
+    "refreshToken",
+    "authToken",
+    "apiKey",
+    "clientSecret",
+    "privateKey",
+    "awsSecretAccessKey",
+    "secretAccessKey",
+    "sessionToken",
 )
 _SENSITIVE_NAME_PATTERN = "|".join(re.escape(name) for name in _SENSITIVE_NAMES)
 # Environment variables commonly prefix the credential role (for example,
@@ -170,17 +181,17 @@ _REDACTION_RULES = (
     ),
     (
         re.compile(
-            r"(?is)-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?"
-            r"-----END [^-\r\n]*PRIVATE KEY-----"
+            r"(?is)-----BEGIN [^-\r\n]*PRIVATE KEY(?: BLOCK)?-----.*?"
+            r"-----END [^-\r\n]*PRIVATE KEY(?: BLOCK)?-----"
         ),
         "[REDACTED PRIVATE KEY]",
     ),
     (
-        re.compile(r"(?is)-----BEGIN [^-\r\n]*PRIVATE KEY-----.*\Z"),
+        re.compile(r"(?is)-----BEGIN [^-\r\n]*PRIVATE KEY(?: BLOCK)?-----.*\Z"),
         "[REDACTED PRIVATE KEY]",
     ),
     (
-        re.compile(r"(?is)\A.*?-----END [^-\r\n]*PRIVATE KEY-----"),
+        re.compile(r"(?is)\A.*?-----END [^-\r\n]*PRIVATE KEY(?: BLOCK)?-----"),
         "[REDACTED PRIVATE KEY]",
     ),
     (
@@ -188,8 +199,8 @@ _REDACTION_RULES = (
         r"\1[REDACTED]\2",
     ),
 )
-_PRIVATE_KEY_BEGIN = re.compile(rb"-----BEGIN [^-\r\n]*PRIVATE KEY-----", re.IGNORECASE)
-_PRIVATE_KEY_END = re.compile(rb"-----END [^-\r\n]*PRIVATE KEY-----", re.IGNORECASE)
+_PRIVATE_KEY_BEGIN = re.compile(rb"-----BEGIN [^-\r\n]*PRIVATE KEY(?: BLOCK)?-----", re.IGNORECASE)
+_PRIVATE_KEY_END = re.compile(rb"-----END [^-\r\n]*PRIVATE KEY(?: BLOCK)?-----", re.IGNORECASE)
 
 
 def _utc_now() -> datetime:
@@ -1611,7 +1622,8 @@ def _read_file_source(
             datetime.strptime(date, "%Y-%m-%d")
         except ValueError as exc:
             raise ValueError("Invalid disk event partition date.") from exc
-        path = _safe_path(_EVENTS_ROOT, repo_slug, f"{date}.jsonl")
+        repo_event_root = _safe_path(_EVENTS_ROOT, repo_slug)
+        path = _safe_path(repo_event_root, f"{date}.jsonl")
         kind = "disk_event_log"
         mutable = date == _utc_now().date().isoformat()
         association = _association()
