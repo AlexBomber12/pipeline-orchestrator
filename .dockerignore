@@ -1,0 +1,38 @@
+# Version-control metadata
+.git
+
+# Local environments and caches
+.venv/
+venv/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+.nox/
+**/node_modules/
+.coverage
+.coverage.*
+htmlcov/
+
+# Generated development output
+artifacts/
+*.patch
+build/
+dist/
+*.egg-info/
+.daemon-runtime/
+
+# Runtime and integration-test state
+data/
+tests/e2e/data/
+tests/e2e/evidence/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+.cloudflared.env
+config.production.yml
+.claude/
