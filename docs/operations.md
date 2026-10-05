@@ -36,9 +36,10 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   prefixed JSON records are redacted structurally, and mixed lines exceeding
   the bounded embedded-JSON candidate limit are omitted. Malformed JSON values
   are also redacted by sensitive key, including non-string values and Azure
-  connection-string key aliases. Producer-added `[truncated]` markers are
-  preserved; because their removed prefix may contain a sensitive opener, the
-  retained Redis CLI tail is omitted fail-closed. Redis event
+  connection-string key aliases. Structured environment entries correlate a
+  sensitive `name` field with its sibling `value`. Producer-added `[truncated]`
+  markers are preserved; because their removed prefix may contain a sensitive
+  opener, the retained Redis CLI tail is omitted fail-closed. Redis event
   history is fetched through a
   read-only bounded script and reported as oversized, without materializing its
   records in the MCP process, when the retained list exceeds 256 KiB. Disk

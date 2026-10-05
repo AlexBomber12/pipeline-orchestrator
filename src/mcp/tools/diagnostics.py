@@ -406,12 +406,24 @@ def _redact_structure(value: Any, *, docker_auth_context: bool = False) -> tuple
     if isinstance(value, dict):
         result_dict: dict[Any, Any] = {}
         count = 0
+        sensitive_named_value = any(
+            isinstance(key, str)
+            and key.casefold().replace("_", "").replace("-", "") == "name"
+            and isinstance(item, str)
+            and _SENSITIVE_KEY.fullmatch(item)
+            for key, item in value.items()
+        )
         for key, item in value.items():
             normalized_key = (
                 key.casefold().replace("_", "").replace("-", "") if isinstance(key, str) else ""
             )
             docker_secret = docker_auth_context and normalized_key in {"auth", "identitytoken"}
-            if (isinstance(key, str) and _SENSITIVE_KEY.fullmatch(key)) or docker_secret:
+            named_secret = sensitive_named_value and normalized_key == "value"
+            if (
+                (isinstance(key, str) and _SENSITIVE_KEY.fullmatch(key))
+                or docker_secret
+                or named_secret
+            ):
                 safe, replacements = "[REDACTED]", 1
             else:
                 safe, replacements = _redact_structure(
