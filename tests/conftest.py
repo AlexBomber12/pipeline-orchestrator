@@ -33,6 +33,16 @@ def _mock_settings_codex_model_discovery(
         discover,
     )
 
+    async def direct_catalog_loader(
+        plugin: object, **kwargs: object
+    ) -> object:
+        return await plugin.get_model_catalog(**kwargs)
+
+    monkeypatch.setattr(
+        "src.web.app.DaemonModelCatalogLoader",
+        lambda _redis: direct_catalog_loader,
+    )
+
 
 @pytest.fixture(autouse=True)
 def isolate_analytics_dir(

@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Hashable
 
-from src.coder_registry import CoderPlugin, ModelMetadata
+from src.coder_registry import CoderPlugin, ModelCatalog, ModelMetadata
 from src.config import AppConfig
 
 logger = logging.getLogger(__name__)
@@ -52,10 +53,16 @@ class _CacheEntry:
 class ModelCatalogCache:
     """Short-lived catalogs coalesced per plugin and auth context."""
 
-    def __init__(self, *, ttl_seconds: float = _CATALOG_TTL_SECONDS) -> None:
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float = _CATALOG_TTL_SECONDS,
+        loader: Callable[..., Awaitable[ModelCatalog]] | None = None,
+    ) -> None:
         if ttl_seconds <= 0:
             raise ValueError("catalog TTL must be positive")
         self._ttl_seconds = ttl_seconds
+        self._loader = loader
         self._entries: dict[_CatalogKey, _CacheEntry] = {}
         self._in_flight: dict[
             _CatalogKey, asyncio.Task[ModelCatalogSnapshot]
@@ -143,10 +150,17 @@ class ModelCatalogCache:
         attempted_at = datetime.now(timezone.utc).isoformat()
         try:
             try:
-                catalog = await plugin.get_model_catalog(
-                    config=config,
-                    config_path=config_path,
-                )
+                if self._loader is None:
+                    catalog = await plugin.get_model_catalog(
+                        config=config,
+                        config_path=config_path,
+                    )
+                else:
+                    catalog = await self._loader(
+                        plugin,
+                        config=config,
+                        config_path=config_path,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:

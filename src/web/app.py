@@ -53,6 +53,7 @@ from src.events.sse import (
     RepoEventsUnavailableError,  # noqa: F401 — accessed by routes via _app.RepoEventsUnavailableError
     stream_repo_events,  # noqa: F401 — accessed by routes via _app.stream_repo_events
 )
+from src.model_catalog_bridge import DaemonModelCatalogLoader
 from src.web.services import (
     upload_validation as _upload_validation_service,
 )
@@ -300,7 +301,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     client = aioredis.from_url(redis_url, decode_responses=True)
     app.state.redis = client
     app.state.coder_registry = build_coder_registry()
-    app.state.model_catalog = ModelCatalogCache()
+    app.state.model_catalog = ModelCatalogCache(
+        loader=DaemonModelCatalogLoader(client)
+    )
     try:
         yield
     finally:

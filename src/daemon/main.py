@@ -53,6 +53,7 @@ from src.daemon.migrations.run_record_backfill import (
 )
 from src.daemon.runner import PipelineRunner
 from src.events.wake import repo_from_channel, subscribe_wake
+from src.model_catalog_bridge import serve_model_catalog_requests
 from src.models import PipelineState
 from src.sandbox.runtime_state import refresh_sandbox_state
 from src.usage import UsageProvider
@@ -765,6 +766,15 @@ async def main() -> None:
     # Keep a strong reference: the event loop only holds weak references
     # to tasks, so a discarded handle can be garbage-collected mid-await.
     _background_tasks: set[asyncio.Task[None]] = set()
+    model_catalog_task = asyncio.create_task(
+        serve_model_catalog_requests(
+            redis_client,
+            registry,
+            config_path=os.environ.get("PO_CONFIG_PATH", "config.yml"),
+        )
+    )
+    _background_tasks.add(model_catalog_task)
+    model_catalog_task.add_done_callback(_background_tasks.discard)
     watcher_task = asyncio.create_task(
         watch_config_file_changes(
             redis_client,
