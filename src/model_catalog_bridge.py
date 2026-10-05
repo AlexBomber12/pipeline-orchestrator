@@ -27,6 +27,7 @@ _RESPONSE_PREFIX = "orchestrator:model-catalog:response"
 _RESPONSE_TTL_SECONDS = 30
 _REQUEST_TIMEOUT_SECONDS = 7.0
 _POLL_INTERVAL_SECONDS = 0.05
+_MAX_PENDING_REQUESTS = 64
 
 
 def _response_key(request_id: str) -> str:
@@ -114,6 +115,11 @@ class DaemonModelCatalogLoader:
         )
         try:
             await self._redis.rpush(MODEL_CATALOG_REQUEST_QUEUE, request)
+            await self._redis.ltrim(
+                MODEL_CATALOG_REQUEST_QUEUE,
+                -_MAX_PENDING_REQUESTS,
+                -1,
+            )
         except Exception:
             raise ModelCatalogUnavailable(
                 "Daemon model catalog is unavailable"
@@ -137,6 +143,14 @@ class DaemonModelCatalogLoader:
                         ) from None
                 await asyncio.sleep(self._poll_interval_seconds)
         finally:
+            try:
+                await self._redis.lrem(
+                    MODEL_CATALOG_REQUEST_QUEUE,
+                    1,
+                    request,
+                )
+            except Exception:
+                pass
             try:
                 await self._redis.delete(response_key)
             except Exception:

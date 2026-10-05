@@ -22,6 +22,8 @@ class _BridgeRedis:
         self.queue: asyncio.Queue[tuple[str, bytes]] = asyncio.Queue()
         self.values: dict[str, str] = {}
         self.deleted: list[str] = []
+        self.trimmed: list[tuple[str, int, int]] = []
+        self.removed: list[tuple[str, int, str]] = []
 
     async def rpush(self, key: str, value: str) -> None:
         await self.queue.put((key, value.encode()))
@@ -34,6 +36,12 @@ class _BridgeRedis:
             return await asyncio.wait_for(self.queue.get(), timeout=timeout)
         except TimeoutError:
             return None
+
+    async def ltrim(self, key: str, start: int, end: int) -> None:
+        self.trimmed.append((key, start, end))
+
+    async def lrem(self, key: str, count: int, value: str) -> None:
+        self.removed.append((key, count, value))
 
     async def get(self, key: str) -> str | None:
         return self.values.get(key)
@@ -93,6 +101,13 @@ async def test_loader_round_trips_catalog_through_daemon(
     assert catalog.description == "1 model advertised by Codex CLI."
     assert catalog.models[0].invocation_id == "invoke-me"
     assert catalog.models[0].reasoning_efforts[0].description == "Balanced"
+    assert redis.trimmed == [
+        (bridge.MODEL_CATALOG_REQUEST_QUEUE, -64, -1)
+    ]
+    assert redis.removed[0][:2] == (
+        bridge.MODEL_CATALOG_REQUEST_QUEUE,
+        1,
+    )
     assert redis.deleted
     server.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -132,6 +147,9 @@ async def test_loader_reports_queue_read_payload_timeout_and_cleanup_failures(
 
         async def delete(self, key: str) -> None:
             raise ConnectionError(key)
+
+        async def lrem(self, key: str, count: int, value: str) -> None:
+            raise ConnectionError(key, count, value)
 
     with pytest.raises(ModelCatalogUnavailable, match="invalid"):
         await bridge.DaemonModelCatalogLoader(InvalidResponse())(
