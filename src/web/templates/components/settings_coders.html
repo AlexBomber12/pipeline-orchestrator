@@ -30,14 +30,35 @@
                                 hx-target="#settings-daemon"
                                 hx-swap="innerHTML">
                             <option value="" {% if coder.selected_model == "" %}selected{% endif %}>
-                                (default)
+                                {{ "CLI default" if coder.name == "codex" else "(default)" }}
                             </option>
-                            {% for model in coder.models %}
-                            <option value="{{ model }}" {% if coder.selected_model == model %}selected{% endif %}>
-                                {{ model }}
+                            {% for model in coder.model_options %}
+                            <option value="{{ model.value }}" {% if coder.selected_model == model.value %}selected{% endif %}>
+                                {{ model.label }}{% if model.is_advertised_default %} (advertised default){% elif model.is_missing %} (saved; not advertised){% endif %}
                             </option>
                             {% endfor %}
                         </select>
+                        {% if coder.name == "codex" %}
+                        {% set catalog = coder.model_catalog %}
+                        <div class="mt-2 flex flex-wrap items-center gap-2">
+                            <button type="button"
+                                    class="secondary-interactive rounded border border-white/10 bg-surface-3 px-2 py-1 text-xs text-gray-300"
+                                    hx-post="/partials/settings/codex-models/refresh"
+                                    hx-target="#settings-coders"
+                                    hx-swap="outerHTML"
+                                    hx-indicator="#codex-model-refreshing">
+                                Refresh models
+                            </button>
+                            <span id="codex-model-refreshing"
+                                  class="htmx-indicator text-xs text-warn"
+                                  aria-live="polite">Refreshing…</span>
+                        </div>
+                        <p class="mt-2 text-xs {% if catalog.status in ('unavailable', 'empty') %}text-fail{% elif catalog.status == 'stale' %}text-warn{% else %}text-gray-500{% endif %}"
+                           data-codex-catalog-status="{{ catalog.status }}">
+                            {{ catalog.message }}
+                            {% if catalog.refreshed_at %} Last updated {{ catalog.refreshed_at }}.{% endif %}
+                        </p>
+                        {% endif %}
                     </td>
                     <td class="py-3 pr-4">
                         <div class="flex items-center gap-2">

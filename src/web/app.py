@@ -55,6 +55,7 @@ from src.events.sse import (
 from src.web.services import (
     upload_validation as _upload_validation_service,
 )
+from src.web.services.codex_model_catalog import CodexModelCatalogCache
 from src.web.services.config_updates import (
     apply_config_mutation,  # noqa: F401 — accessed by routes via _app.apply_config_mutation
 )
@@ -297,9 +298,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     redis_url = os.environ.get("REDIS_URL", DEFAULT_REDIS_URL)
     client = aioredis.from_url(redis_url, decode_responses=True)
     app.state.redis = client
+    app.state.codex_model_catalog = CodexModelCatalogCache()
     try:
         yield
     finally:
+        await app.state.codex_model_catalog.close()
         try:
             await client.aclose()
         except Exception:

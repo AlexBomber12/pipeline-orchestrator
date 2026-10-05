@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -106,7 +107,10 @@ async def test_discovers_normalized_models_without_starting_work(
         ),
     ]
     process, calls = _install_process(monkeypatch, responses)
-    catalog = await discover_codex_models()
+    catalog = await discover_codex_models(
+        env={"HOME": "/data/auth"},
+        cwd="/workspace",
+    )
     assert catalog == (
         CodexModel(
             "gpt-one",
@@ -122,6 +126,8 @@ async def test_discovers_normalized_models_without_starting_work(
     )
     assert calls[0][0] == ("codex", "app-server")
     assert calls[0][1]["stderr"] is asyncio.subprocess.DEVNULL
+    assert calls[0][1]["env"] == {"HOME": "/data/auth"}
+    assert calls[0][1]["cwd"] == Path("/workspace")
     assert [message["method"] for message in process.stdin.messages] == [
         "initialize",
         "initialized",

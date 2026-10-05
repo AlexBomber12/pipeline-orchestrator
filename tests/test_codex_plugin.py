@@ -16,20 +16,10 @@ def test_codex_plugin_name() -> None:
     assert plugin.display_name == "Codex CLI"
 
 
-def test_codex_plugin_models_includes_default() -> None:
+def test_codex_plugin_models_defers_concrete_choices_to_discovery() -> None:
     plugin = CodexPlugin()
 
-    assert plugin.models == [
-        "",
-        "gpt-5.4",
-        "gpt-5.3-codex",
-        "gpt-5.3-codex-spark",
-        "gpt-5.2-codex",
-        "gpt-5.4-mini",
-        "gpt-5.1-codex-max",
-        "gpt-5.1-codex-mini",
-        "gpt-5.2",
-    ]
+    assert plugin.models == [""]
 
 
 @pytest.mark.asyncio
