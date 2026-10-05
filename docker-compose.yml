@@ -48,9 +48,13 @@ services:
     volumes:
       - .:/app:ro
       - ./data/repos:/data/repos:ro
+      - ./data/events:/data/events:ro
     environment:
       PYTHONUNBUFFERED: "1"
+      REDIS_URL: redis://redis:6379/0
     restart: unless-stopped
+    depends_on:
+      - redis
 
   cloudflared:
     image: cloudflare/cloudflared:latest

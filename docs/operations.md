@@ -5,6 +5,30 @@ Pipeline-orchestrator reads runtime connection settings such as
 longer has rollout flags: daemon startup always reconstructs queue state
 from structured `tasks/PR-*.md` headers.
 
+## Read-only MCP diagnostics
+
+The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
+
+- `get_orchestrator_status` returns a compact configured-repository overview;
+  pass a validated `owner__repo` slug for queue, inhibitor, Retry-command,
+  recent-event, and run-record detail. Snapshot age describes only the last
+  persisted `RepoState` write and is never presented as proof that a coder
+  process is alive.
+- `list_orchestrator_logs` discovers retained CLI snapshots, Redis repository
+  event history, disk event partitions, and the current checkout's
+  `artifacts/ci.log`. Every source reports retention, timestamps, mutability,
+  and whether task/run/SHA identity was actually recorded.
+- `read_orchestrator_log` reads a discovered source with a bounded character
+  cursor or a tail page. Diagnostic text is credential-redacted before it is
+  returned, and producer-added `[truncated]` markers are preserved.
+
+These tools only accept configured repository slugs and fixed source IDs; they
+cannot read arbitrary paths or Redis keys. Missing, malformed, expired, stale,
+and unavailable data is reported explicitly. Legacy CLI snapshots and mutable
+CI artifacts are not attributed to a task, run, or SHA because their producers
+do not record that association. Daemon stdout and live CLI streams are not
+persistently retained yet, so the tools report both as known logging gaps.
+
 ## Task format migration
 
 Task files are migrating from legacy status headers to explicit YAML
