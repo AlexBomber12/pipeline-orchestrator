@@ -33,7 +33,6 @@ from src.subsource_registry import SuppressionReason
 logger = logging.getLogger(__name__)
 _STALE_RETRIGGER_DEBOUNCE = timedelta(hours=1)
 _CODEX_BOT_ERROR_RETRIGGER_COOLDOWN = timedelta(minutes=5)
-_CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]"
 # PR-251: TTL for the per-(repo, pr, head_sha) infra-retry marker. Keys
 # self-expire so abandoned PRs (closed, merged, force-pushed) don't
 # accumulate state in Redis. A week is far longer than any single
@@ -387,7 +386,10 @@ class WatchMixin:
         # signal; fall through to stale-review only when bot-error did
         # not post.
         if review == ReviewStatus.EYES:
-            posted = self._maybe_retrigger_on_codex_bot_error(found.number)
+            posted = self._maybe_retrigger_on_codex_bot_error(
+                found.number,
+                reviewer_policy,
+            )
             if not posted:
                 await self._maybe_retrigger_stale_review(found.number)
                 if self.state.state != PipelineState.WATCH:
@@ -869,7 +871,9 @@ class WatchMixin:
                 exc_info=True,
             )
             return FeedbackCheckResult.UNKNOWN
-        reviewer_policy = reviewer_policy or reviewer_policy_from_config(self.app_config)
+        reviewer_policy = reviewer_policy or reviewer_policy_from_config(
+            self.app_config
+        )
         for c in reversed(comments + review_comments):
             if not reviewer_policy.is_trusted_user(c.get("user")):
                 continue
@@ -1005,8 +1009,12 @@ class WatchMixin:
             cache[pr_number] = reason
         return False
 
-    def _maybe_retrigger_on_codex_bot_error(self, pr_number: int) -> bool:
-        """Re-trigger ``@codex review`` when chatgpt-codex-connector[bot]
+    def _maybe_retrigger_on_codex_bot_error(
+        self,
+        pr_number: int,
+        reviewer_policy: ReviewerPolicy | None = None,
+    ) -> bool:
+        """Re-trigger ``@codex review`` when a trusted reviewer bot
         posted an error comment (e.g. "Something went wrong while reviewing")
         instead of a verdict. Only matches comments authored by the codex bot
         itself, and applies a 5-minute per-PR cooldown to avoid loops on a
@@ -1029,10 +1037,12 @@ class WatchMixin:
             )
             return False
 
+        reviewer_policy = reviewer_policy or reviewer_policy_from_config(
+            self.app_config
+        )
         latest_error_at: datetime | None = None
         for c in comments:
-            user = (c.get("user") or {}).get("login", "")
-            if user != _CODEX_BOT_LOGIN:
+            if not reviewer_policy.is_trusted_user(c.get("user")):
                 continue
             body = c.get("body") or ""
             if not any(pat in body for pat in CODEX_BOT_ERROR_PATTERNS):

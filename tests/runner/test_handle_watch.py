@@ -4957,7 +4957,7 @@ def test_call_sites_in_handle_watch_use_await(
         runner._last_push_at_pr_number = pr.number
         runner._maybe_retrigger_stale_review = fake_stale  # type: ignore[assignment]
         runner._maybe_retrigger_on_codex_bot_error = (  # type: ignore[assignment]
-            lambda pr_number: False
+            lambda pr_number, reviewer_policy=None: False
         )
 
         asyncio.run(runner.handle_watch())

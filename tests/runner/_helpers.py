@@ -768,11 +768,17 @@ def _codex_bot_pr(review: ReviewStatus = ReviewStatus.EYES) -> PRInfo:
 def _codex_bot_error_comment(
     body: str = "Something went wrong while reviewing this PR. Please try again.",
     *,
-    user: str = "chatgpt-codex-connector[bot]",
+    user: str | dict[str, Any] = "chatgpt-codex-connector[bot]",
     created_at: str | None = None,
 ) -> dict[str, Any]:
+    if isinstance(user, dict):
+        payload_user = user
+    elif user == "chatgpt-codex-connector[bot]":
+        payload_user = {"id": 199175422, "login": user}
+    else:
+        payload_user = {"login": user}
     return {
-        "user": {"login": user},
+        "user": payload_user,
         "body": body,
         "created_at": created_at or "2026-04-30T12:00:00Z",
     }

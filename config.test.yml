@@ -42,6 +42,11 @@ daemon:
   watch_slow_window_sec: 2
   watch_slow_poll_interval_sec: 2
   watch_fast_poll_interval_sec: 2
+  trusted_reviewer_identities:
+    - user_id: 199175422
+      login: chatgpt-codex-connector[bot]
+    - user_id: 336614745
+      login: po-testbed-codex-reviewer[bot]
 
 web:
   host: 0.0.0.0
