@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 from src.coders import claude as claude_plugin_module
-from src.config import AppConfig, DaemonConfig, RepoConfig
+from src.config import AppConfig, DaemonConfig, RepoConfig, TrustedReviewerIdentity
 from src.daemon import runner as runner_module
 from src.daemon.handlers import watch as watch_module
 from src.daemon.runner import PipelineRunner
@@ -56,6 +56,80 @@ def test_observe_watch_event_signature_resets_retrigger_count() -> None:
     runner._observe_watch_event_signature(updated)
 
     assert runner.state.current_pr.watch_retrigger_count == 0
+
+
+def test_handle_watch_reuses_poll_reviewer_policy_for_feedback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh_reviewer_id = 559
+    fresh_config = AppConfig(
+        daemon=DaemonConfig(
+            trusted_reviewer_identities=[
+                TrustedReviewerIdentity(
+                    user_id=fresh_reviewer_id,
+                    login="fresh-codex[bot]",
+                )
+            ]
+        )
+    )
+    observed_policies: list[object] = []
+    fix_calls: list[int] = []
+
+    def fake_get_open_prs(
+        repo: str,
+        allow_merge_without_checks: bool = False,
+        reviewer_policy: object = None,
+    ) -> list[PRInfo]:
+        observed_policies.append(reviewer_policy)
+        review_status = (
+            ReviewStatus.CHANGES_REQUESTED
+            if reviewer_policy is not None
+            and reviewer_policy.is_trusted_user({"id": fresh_reviewer_id})
+            else ReviewStatus.PENDING
+        )
+        return [
+            PRInfo(
+                number=400,
+                branch="pr-400-reviewer-policy",
+                head_sha="abc123",
+                ci_status=CIStatus.PENDING,
+                review_status=review_status,
+            )
+        ]
+
+    def fake_paginated(path: str) -> list[dict[str, object]]:
+        if "/issues/" in path:
+            return [
+                {
+                    "user": {"id": fresh_reviewer_id, "login": "fresh-codex[bot]"},
+                    "created_at": "2026-01-01T00:00:02Z",
+                }
+            ]
+        return []
+
+    async def fake_handle_fix() -> None:
+        fix_calls.append(400)
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=400,
+        branch="pr-400-reviewer-policy",
+        head_sha="abc123",
+    )
+    runner._last_push_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    runner._last_push_at_pr_number = 400
+
+    monkeypatch.setattr(watch_module, "load_config", lambda: fresh_config)
+    monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", fake_get_open_prs)
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *args: "OPEN")
+    monkeypatch.setattr(watch_module.gh_cache, "_gh_api_paginated", fake_paginated)
+    monkeypatch.setattr(runner, "handle_fix", fake_handle_fix)
+
+    asyncio.run(runner.handle_watch())
+
+    assert len(observed_policies) == 1
+    assert fix_calls == [400]
 
 
 def test_external_resolution_clears_current_pr_without_task() -> None:
@@ -435,7 +509,7 @@ def test_watch_changes_requested_with_pending_ci_triggers_fix(
 
     comments = [
         {
-            "user": {"login": "chatgpt-codex-connector"},
+            "user": {"id": 199175422, "login": "chatgpt-codex-connector"},
             "body": "P1: missing null check",
             "created_at": recent.strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
@@ -1284,7 +1358,7 @@ def test_handle_watch_triggers_fix_new_feedback(
 
     comments = [
         {
-            "user": {"login": "chatgpt-codex-connector"},
+            "user": {"id": 199175422, "login": "chatgpt-codex-connector"},
             "body": "P1: missing null check",
             "created_at": recent.strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
@@ -1305,6 +1379,61 @@ def test_handle_watch_triggers_fix_new_feedback(
         fix_called.append(True)
 
     runner = h._make_runner()
+    runner._last_push_at = last_push
+    runner._last_push_at_pr_number = pr.number
+    runner.state.current_pr = pr
+    runner.state.state = PipelineState.WATCH
+    runner.handle_fix = fake_fix  # type: ignore[assignment]
+    asyncio.run(runner.handle_watch())
+
+    assert fix_called == [True]
+
+
+def test_handle_watch_triggers_fix_for_trusted_reviewer_without_codex_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh feedback from a configured reviewer uses stable user IDs."""
+    last_push = datetime.now(timezone.utc) - timedelta(minutes=10)
+    recent = datetime.now(timezone.utc) - timedelta(minutes=1)
+    pr = PRInfo(
+        number=42,
+        branch="pr-001",
+        ci_status=CIStatus.SUCCESS,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+        last_activity=last_push,
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kw: [pr],
+    )
+
+    comments = [
+        {
+            "user": {"id": 123456789, "login": "trusted-reviewer[bot]"},
+            "body": "P1: missing null check",
+            "created_at": recent.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+    ]
+
+    def fake_paginated(path: str) -> list[dict]:
+        if "issues" in path:
+            return comments
+        return []
+
+    monkeypatch.setattr(
+        "src.github.cache._gh_api_paginated",
+        fake_paginated,
+    )
+    fix_called: list[bool] = []
+
+    async def fake_fix() -> None:
+        fix_called.append(True)
+
+    runner = h._make_runner()
+    runner.app_config.daemon.trusted_reviewer_identities = [
+        TrustedReviewerIdentity(user_id=123456789, login="trusted-reviewer[bot]")
+    ]
+    monkeypatch.setattr(watch_module, "load_config", lambda: runner.app_config)
     runner._last_push_at = last_push
     runner._last_push_at_pr_number = pr.number
     runner.state.current_pr = pr
@@ -4828,7 +4957,7 @@ def test_call_sites_in_handle_watch_use_await(
         runner._last_push_at_pr_number = pr.number
         runner._maybe_retrigger_stale_review = fake_stale  # type: ignore[assignment]
         runner._maybe_retrigger_on_codex_bot_error = (  # type: ignore[assignment]
-            lambda pr_number: False
+            lambda pr_number, reviewer_policy=None: False
         )
 
         asyncio.run(runner.handle_watch())

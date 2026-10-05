@@ -9,10 +9,12 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from src.config import load_config
 from src.daemon import git_ops
 from src.github import comments as gh_comments
 from src.github import gh_runner, reactions
 from src.github import prs as gh_prs
+from src.github.reviewer_policy import reviewer_policy_from_config
 
 
 def _author_already_requested_review(
@@ -77,14 +79,21 @@ class HungMixin:
         suppress a needed mention.
         """
         try:
+            reviewer_policy = reviewer_policy_from_config(load_config())
             codex_reactions = reactions._get_codex_issue_reactions(
-                self.owner_repo, pr_number,
+                self.owner_repo,
+                pr_number,
+                policy=reviewer_policy,
             )
         except Exception:
             return False
         eyes_reactions = [
             reaction for reaction in codex_reactions
-            if reactions._is_reaction_content(reaction, "eyes")
+            if reactions._is_reaction_content(
+                reaction,
+                "eyes",
+                policy=reviewer_policy,
+            )
         ]
         if not eyes_reactions:
             return False

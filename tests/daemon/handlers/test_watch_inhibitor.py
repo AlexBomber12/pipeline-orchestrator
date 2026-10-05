@@ -475,7 +475,7 @@ def test_handle_watch_skips_bot_error_retrigger_when_coder_rate_limited_unified(
         "src.github.cache._gh_api_paginated",
         lambda *_args, **_kwargs: [
             {
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
                 "body": "Something went wrong. Try again",
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }

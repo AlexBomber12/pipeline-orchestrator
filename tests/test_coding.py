@@ -600,7 +600,7 @@ def _patch_codex_reactions(
         [
             {
                 "content": "eyes",
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
                 "created_at": reaction_iso,
             }
         ]
@@ -609,7 +609,7 @@ def _patch_codex_reactions(
     )
     monkeypatch.setattr(
         "src.github.reactions._get_codex_issue_reactions",
-        lambda repo, number: payload,
+        lambda repo, number, policy=None: payload,
     )
     monkeypatch.setattr(
         "src.github.prs.get_pr_last_push_time",
@@ -669,6 +669,58 @@ def test_should_skip_codex_review_post_fails_open_on_api_error(
     assert runner._should_skip_codex_review_post(42) is False
 
 
+def test_should_skip_codex_review_post_reuses_one_reviewer_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    selected_policy = object()
+    observed_policies: list[object | None] = []
+
+    monkeypatch.setattr("src.daemon.handlers.hung.load_config", lambda: object())
+    monkeypatch.setattr(
+        "src.daemon.handlers.hung.reviewer_policy_from_config",
+        lambda config: selected_policy,
+    )
+
+    def fake_reactions(
+        repo: str,
+        pr_number: int,
+        policy: object | None = None,
+    ) -> list[dict]:
+        observed_policies.append(policy)
+        return [
+            {
+                "content": "eyes",
+                "user": {"id": 123, "login": "renamed-reviewer[bot]"},
+                "created_at": "2026-04-30T12:30:00Z",
+            }
+        ]
+
+    def fake_match(
+        reaction: dict,
+        content: str,
+        policy: object | None = None,
+    ) -> bool:
+        observed_policies.append(policy)
+        return content == "eyes"
+
+    monkeypatch.setattr(
+        "src.github.reactions._get_codex_issue_reactions",
+        fake_reactions,
+    )
+    monkeypatch.setattr(
+        "src.github.reactions._is_reaction_content",
+        fake_match,
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_pr_last_push_time",
+        lambda repo, number: gh_runner._parse_iso("2026-04-30T12:00:00Z"),
+    )
+
+    assert runner._should_skip_codex_review_post(42) is True
+    assert observed_policies == [selected_policy, selected_policy]
+
+
 def test_should_skip_codex_review_post_fails_open_on_push_time_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -677,10 +729,10 @@ def test_should_skip_codex_review_post_fails_open_on_push_time_error(
 
     monkeypatch.setattr(
         "src.github.reactions._get_codex_issue_reactions",
-        lambda repo, number: [
+        lambda repo, number, policy=None: [
             {
                 "content": "eyes",
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
                 "created_at": "2026-04-30T12:30:00Z",
             }
         ],
@@ -700,10 +752,10 @@ def test_should_skip_codex_review_post_fails_open_on_missing_push_time(
     runner = h._make_runner()
     monkeypatch.setattr(
         "src.github.reactions._get_codex_issue_reactions",
-        lambda repo, number: [
+        lambda repo, number, policy=None: [
             {
                 "content": "eyes",
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
                 "created_at": "2026-04-30T12:30:00Z",
             }
         ],
@@ -722,10 +774,10 @@ def test_should_skip_codex_review_post_skips_when_eyes_after_push(
     runner = h._make_runner()
     monkeypatch.setattr(
         "src.github.reactions._get_codex_issue_reactions",
-        lambda repo, number: [
+        lambda repo, number, policy=None: [
             {
                 "content": "eyes",
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
                 "created_at": "2026-04-30T12:30:00Z",
             }
         ],
@@ -744,10 +796,10 @@ def test_should_skip_codex_review_post_does_not_skip_when_eyes_predates_push(
     runner = h._make_runner()
     monkeypatch.setattr(
         "src.github.reactions._get_codex_issue_reactions",
-        lambda repo, number: [
+        lambda repo, number, policy=None: [
             {
                 "content": "eyes",
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
                 "created_at": "2026-04-30T11:00:00Z",
             }
         ],
@@ -773,10 +825,10 @@ def test_should_skip_codex_review_post_does_not_skip_on_backdated_head_commit(
     runner = h._make_runner()
     monkeypatch.setattr(
         "src.github.reactions._get_codex_issue_reactions",
-        lambda repo, number: [
+        lambda repo, number, policy=None: [
             {
                 "content": "eyes",
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
                 "created_at": "2026-04-30T11:30:00Z",
             }
         ],
@@ -798,10 +850,10 @@ def test_should_skip_codex_review_post_normalizes_naive_timestamps(
     runner = h._make_runner()
     monkeypatch.setattr(
         "src.github.reactions._get_codex_issue_reactions",
-        lambda repo, number: [
+        lambda repo, number, policy=None: [
             {
                 "content": "eyes",
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
                 "created_at": "2026-04-30T12:30:00",
             }
         ],
@@ -825,10 +877,10 @@ def test_should_skip_codex_review_post_ignores_eyes_without_created_at(
     runner = h._make_runner()
     monkeypatch.setattr(
         "src.github.reactions._get_codex_issue_reactions",
-        lambda repo, number: [
+        lambda repo, number, policy=None: [
             {
                 "content": "eyes",
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
             }
         ],
     )

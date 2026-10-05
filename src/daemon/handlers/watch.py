@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.cancellation import CancellationCause
+from src.config import load_config
 from src.daemon import guardrails
 from src.daemon.quarantine import apply_quarantine_label_for_violation
 from src.daemon.selector import CoderPurpose, resolve_active_coder, resolve_pause_coder
@@ -22,6 +23,7 @@ from src.github import cache as gh_cache
 from src.github import checks as gh_checks
 from src.github import gh_runner
 from src.github import prs as gh_prs
+from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_config
 from src.inhibitor import InhibitorType, is_work_inhibited
 from src.keyspace import ci_infra_retried
 from src.models import CIStatus, FeedbackCheckResult, PipelineState, ReviewStatus
@@ -31,7 +33,6 @@ from src.subsource_registry import SuppressionReason
 logger = logging.getLogger(__name__)
 _STALE_RETRIGGER_DEBOUNCE = timedelta(hours=1)
 _CODEX_BOT_ERROR_RETRIGGER_COOLDOWN = timedelta(minutes=5)
-_CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]"
 # PR-251: TTL for the per-(repo, pr, head_sha) infra-retry marker. Keys
 # self-expire so abandoned PRs (closed, merged, force-pushed) don't
 # accumulate state in Redis. A week is far longer than any single
@@ -140,9 +141,11 @@ class WatchMixin:
             return
 
         try:
+            reviewer_policy = reviewer_policy_from_config(load_config())
             prs = gh_prs.get_open_prs(
                 self.owner_repo,
                 allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+                reviewer_policy=reviewer_policy,
             )
         except Exception as exc:
             await self._transition_to_error(
@@ -346,8 +349,9 @@ class WatchMixin:
             )
             return
         elif review == ReviewStatus.CHANGES_REQUESTED:
-            result = self._has_new_codex_feedback_since_last_push()
+            result = self._has_new_codex_feedback_since_last_push(reviewer_policy)
             if result == FeedbackCheckResult.NEW:
+                self._fix_feedback_reviewer_policy = reviewer_policy
                 await self.handle_fix()
                 return
             if result == FeedbackCheckResult.UNKNOWN:
@@ -382,7 +386,10 @@ class WatchMixin:
         # signal; fall through to stale-review only when bot-error did
         # not post.
         if review == ReviewStatus.EYES:
-            posted = self._maybe_retrigger_on_codex_bot_error(found.number)
+            posted = self._maybe_retrigger_on_codex_bot_error(
+                found.number,
+                reviewer_policy,
+            )
             if not posted:
                 await self._maybe_retrigger_stale_review(found.number)
                 if self.state.state != PipelineState.WATCH:
@@ -829,7 +836,10 @@ class WatchMixin:
             if current_pr is not None:
                 current_pr.watch_retrigger_count = 0
 
-    def _has_new_codex_feedback_since_last_push(self) -> FeedbackCheckResult:
+    def _has_new_codex_feedback_since_last_push(
+        self,
+        reviewer_policy: ReviewerPolicy | None = None,
+    ) -> FeedbackCheckResult:
         """Check whether Codex posted any comment after ``self._last_push_at``.
 
         Returns a three-state :class:`FeedbackCheckResult`:
@@ -861,9 +871,11 @@ class WatchMixin:
                 exc_info=True,
             )
             return FeedbackCheckResult.UNKNOWN
+        reviewer_policy = reviewer_policy or reviewer_policy_from_config(
+            self.app_config
+        )
         for c in reversed(comments + review_comments):
-            user = (c.get("user") or {}).get("login", "")
-            if "codex" not in user.lower():
+            if not reviewer_policy.is_trusted_user(c.get("user")):
                 continue
             created = gh_runner._parse_iso(c.get("created_at"))
             if created is None:
@@ -997,8 +1009,12 @@ class WatchMixin:
             cache[pr_number] = reason
         return False
 
-    def _maybe_retrigger_on_codex_bot_error(self, pr_number: int) -> bool:
-        """Re-trigger ``@codex review`` when chatgpt-codex-connector[bot]
+    def _maybe_retrigger_on_codex_bot_error(
+        self,
+        pr_number: int,
+        reviewer_policy: ReviewerPolicy | None = None,
+    ) -> bool:
+        """Re-trigger ``@codex review`` when a trusted reviewer bot
         posted an error comment (e.g. "Something went wrong while reviewing")
         instead of a verdict. Only matches comments authored by the codex bot
         itself, and applies a 5-minute per-PR cooldown to avoid loops on a
@@ -1021,10 +1037,12 @@ class WatchMixin:
             )
             return False
 
+        reviewer_policy = reviewer_policy or reviewer_policy_from_config(
+            self.app_config
+        )
         latest_error_at: datetime | None = None
         for c in comments:
-            user = (c.get("user") or {}).get("login", "")
-            if user != _CODEX_BOT_LOGIN:
+            if not reviewer_policy.is_trusted_user(c.get("user")):
                 continue
             body = c.get("body") or ""
             if not any(pat in body for pat in CODEX_BOT_ERROR_PATTERNS):

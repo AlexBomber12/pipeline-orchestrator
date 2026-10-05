@@ -264,7 +264,7 @@ def test_get_open_prs_populates_observed_head_shas_with_current_head(
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
-        lambda repo, number, pr_author, head_sha: ReviewStatus.PENDING,
+        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
     )
 
     prs = get_open_prs("owner/name", allow_merge_without_checks=True)

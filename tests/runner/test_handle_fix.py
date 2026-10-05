@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 from src import codex_cli
 from src.coders import claude as claude_plugin_module
-from src.config import AppConfig, CoderType, DaemonConfig
+from src.config import AppConfig, CoderType, DaemonConfig, TrustedReviewerIdentity
 from src.daemon import fix_escalation as fix_escalation_module
 from src.daemon import fix_supervision as fix_supervision_module
 from src.daemon import git_ops as git_ops_module
@@ -68,10 +68,12 @@ def test_handle_fix_skipped_when_spend_ceiling_exceeded(
     )
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=77, branch="pr-309-token-spend-ceiling")
+    runner._fix_feedback_reviewer_policy = object()
 
     asyncio.run(runner.handle_fix())
 
     assert called == []
+    assert runner._fix_feedback_reviewer_policy is None
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.error_message is None
 
@@ -303,7 +305,7 @@ def test_handle_fix_injects_review_feedback_when_changes_requested(
     )
     monkeypatch.setattr(
         "src.github.comments.get_latest_codex_feedback",
-        lambda repo, pr_number: "P1: please rename foo to bar",
+        lambda repo, pr_number, policy=None: "P1: please rename foo to bar",
     )
     captured = h._capture_fix_kwargs(monkeypatch)
 
@@ -322,6 +324,49 @@ def test_handle_fix_injects_review_feedback_when_changes_requested(
     assert "CI failure logs" not in extra_context
 
 
+def test_handle_fix_uses_watch_reviewer_policy_for_feedback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    trusted_id = 998877
+
+    def fake_feedback(
+        repo: str,
+        pr_number: int,
+        policy: object | None = None,
+    ) -> str | None:
+        if policy is not None and policy.is_trusted_user({"id": trusted_id}):
+            return "P1: keep the original feedback visible"
+        return None
+
+    monkeypatch.setattr(fix_module, "_fetch_failed_ci_logs", lambda repo, branch: None)
+    monkeypatch.setattr(
+        "src.github.comments.get_latest_codex_feedback",
+        fake_feedback,
+    )
+    captured = h._capture_fix_kwargs(monkeypatch)
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=77,
+        branch="pr-019",
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+    )
+    runner._fix_feedback_reviewer_policy = fix_module.ReviewerPolicy(
+        [TrustedReviewerIdentity(user_id=trusted_id, login="trusted-reviewer")]
+    )
+    runner.app_config.daemon.trusted_reviewer_identities = [
+        TrustedReviewerIdentity(user_id=123, login="different-reviewer")
+    ]
+
+    asyncio.run(runner.handle_fix())
+
+    extra_context = captured["kwargs"]["extra_context"]
+    assert "Latest review feedback:" in extra_context
+    assert "P1: keep the original feedback visible" in extra_context
+
+
 def test_handle_fix_injects_both_ci_logs_and_review_feedback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -333,7 +378,7 @@ def test_handle_fix_injects_both_ci_logs_and_review_feedback(
     )
     monkeypatch.setattr(
         "src.github.comments.get_latest_codex_feedback",
-        lambda repo, pr_number: "review-feedback-text",
+        lambda repo, pr_number, policy=None: "review-feedback-text",
     )
     captured = h._capture_fix_kwargs(monkeypatch)
 
@@ -4880,10 +4925,10 @@ def test_has_new_feedback_returns_true_without_last_push_timestamp() -> None:
     assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.NEW
 
 
-def test_has_new_feedback_returns_true_for_any_codex_comment_after_push(
+def test_has_new_feedback_returns_true_for_trusted_comment_after_push(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A Codex comment without P1/P2 posted after _last_push_at -> True."""
+    """A trusted reviewer comment after _last_push_at -> True."""
     runner = h._make_runner()
     runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
     runner._last_push_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -4892,7 +4937,7 @@ def test_has_new_feedback_returns_true_for_any_codex_comment_after_push(
         "src.github.cache._gh_api_paginated",
         lambda path: [
             {
-                "user": {"login": "chatgpt-codex-bot"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-bot"},
                 "body": "Consider renaming this variable",
                 "created_at": "2026-01-01T00:05:00Z",
             },
@@ -4905,7 +4950,7 @@ def test_has_new_feedback_returns_true_for_any_codex_comment_after_push(
 def test_has_new_feedback_returns_false_for_old_comments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A Codex comment posted before _last_push_at -> False."""
+    """A trusted reviewer comment posted before _last_push_at -> False."""
     runner = h._make_runner()
     runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
     runner._last_push_at = datetime(2026, 1, 1, 1, 0, 0, tzinfo=timezone.utc)
@@ -4914,7 +4959,7 @@ def test_has_new_feedback_returns_false_for_old_comments(
         "src.github.cache._gh_api_paginated",
         lambda path: [
             {
-                "user": {"login": "chatgpt-codex-bot"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-bot"},
                 "body": "Old feedback",
                 "created_at": "2026-01-01T00:30:00Z",
             },
@@ -4935,7 +4980,7 @@ def test_has_new_feedback_normalizes_naive_timestamps(
         "src.github.cache._gh_api_paginated",
         lambda path: [
             {
-                "user": {"login": "chatgpt-codex-bot"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-bot"},
                 "created_at": "2026-01-01T00:05:00",
             },
         ],
@@ -4977,7 +5022,7 @@ def test_has_new_feedback_skips_unparseable_codex_comment(
         "src.github.cache._gh_api_paginated",
         lambda path: [
             {
-                "user": {"login": "chatgpt-codex-bot"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-bot"},
                 "created_at": "not-a-date",
             },
         ],
