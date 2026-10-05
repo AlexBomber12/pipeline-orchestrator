@@ -215,6 +215,7 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
                         "registry.example": {"auth": "status-docker-auth-secret"},
                     },
                     "jwtSecretKey": "status-secret-key-value",
+                    "tls.key": "status-tls-key-value",
                 },
             }
         ),
@@ -255,6 +256,7 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
     assert "structured-secret" not in json.dumps(result)
     assert "status-docker-auth-secret" not in json.dumps(result)
     assert "status-secret-key-value" not in json.dumps(result)
+    assert "status-tls-key-value" not in json.dumps(result)
     assert overview["observed"]["error"] == "Authorization: [REDACTED]"
     assert result["detail"]["queue"]["counts_by_status"] == {"DOING": 1}
     assert "history" not in result["detail"]["state"]
@@ -437,6 +439,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             'INFO {"password":987654321,"debug":true}',
             "DJANGO_SECRET_KEY=django-secret-key-value",
             '{"jwtSecretKey":"jwt-secret-key-value"}',
+            '{"data":{"tls.key":"redis-tls-key-value"}}',
             '{"password":123456789}',
             '{"credentials":["user","fake-list-secret"]}',
             json.dumps({"auths": {"registry": {"auth": docker_auth}}, "debug": True}),
@@ -483,6 +486,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "- password:\n    ci-sequence-first-secret\n    ci-sequence-second-secret\n"
         + "DJANGO_SECRET_KEY=ci-django-secret-key-value\n"
         + '{"jwtSecretKey":"ci-jwt-secret-key-value"}\n'
+        + '{"data":{"tls.key":"ci-tls-key-value"}}\n'
         + '2026-10-05 INFO {"password":987654322,"debug":true}\n',
         encoding="utf-8",
     )
@@ -523,6 +527,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "987654321" not in content
         assert "django-secret-key-value" not in content
         assert "jwt-secret-key-value" not in content
+        assert "redis-tls-key-value" not in content
         assert "123456789" not in content
         assert "fake-list-secret" not in content
         assert docker_auth not in content
@@ -550,6 +555,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "987654322" not in content
         assert "ci-django-secret-key-value" not in content
         assert "ci-jwt-secret-key-value" not in content
+        assert "ci-tls-key-value" not in content
         assert "debug" in content
 
     ci_raw = ci_path.read_bytes()
@@ -734,6 +740,9 @@ async def test_read_validation(kwargs: dict[str, Any], message: str, monkeypatch
 async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from src.mcp.tools import diagnostics
 
+    with pytest.raises(ValueError, match="escapes"):
+        diagnostics._safe_path(tmp_path / "allowed", "..", "outside")
+
     redis = FakeRedis()
     _patch_runtime(monkeypatch, redis, _config(_repo()))
     monkeypatch.setattr(diagnostics, "_REPOS_ROOT", tmp_path / "repos")
@@ -760,6 +769,22 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     with pytest.raises(ValueError, match="symlink"):
         await diagnostics.read_orchestrator_log(SLUG, "events:disk/2026-10-05")
 
+    in_repo_root = tmp_path / "in-repo-symlink"
+    in_repo_artifacts = in_repo_root / SLUG / "artifacts"
+    in_repo_tasks = in_repo_root / SLUG / "tasks"
+    in_repo_artifacts.mkdir(parents=True)
+    in_repo_tasks.mkdir(parents=True)
+    (in_repo_tasks / "PR-400.md").write_text("in-repo secret", encoding="utf-8")
+    (in_repo_artifacts / "ci.log").symlink_to(in_repo_tasks / "PR-400.md")
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", in_repo_root)
+    with pytest.raises(ValueError, match="symlink"):
+        await diagnostics.read_orchestrator_log(SLUG, "ci:artifact")
+    monkeypatch.setenv("PO_EVENTS_DIR", str(tmp_path / "empty-events"))
+    sources, warnings = diagnostics._file_log_sources(SLUG)
+    assert sources[-1]["source_id"] == "ci:artifact"
+    assert sources[-1]["availability"] == "missing"
+    assert any("symlink" in warning for warning in warnings)
+
     sibling_repos = tmp_path / "sibling-repos"
     selected_repo = sibling_repos / SLUG
     sibling_artifacts = sibling_repos / "octo__sibling" / "artifacts"
@@ -769,7 +794,7 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     (selected_repo / "artifacts").symlink_to(sibling_artifacts, target_is_directory=True)
     monkeypatch.setattr(diagnostics, "_REPOS_ROOT", sibling_repos)
     monkeypatch.setenv("PO_EVENTS_DIR", str(tmp_path / "empty-events"))
-    with pytest.raises(ValueError, match="escapes"):
+    with pytest.raises(ValueError, match="symlink"):
         await diagnostics.read_orchestrator_log(SLUG, "ci:artifact")
     sources, warnings = diagnostics._file_log_sources(SLUG)
     assert sources[-1]["source_id"] == "ci:artifact"
@@ -784,7 +809,7 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     (other_events / "2026-10-05.jsonl").write_text("sibling event secret", encoding="utf-8")
     (selected_events / "2026-10-05.jsonl").symlink_to(other_events / "2026-10-05.jsonl")
     monkeypatch.setenv("PO_EVENTS_DIR", str(sibling_events))
-    with pytest.raises(ValueError, match="escapes"):
+    with pytest.raises(ValueError, match="symlink"):
         await diagnostics.read_orchestrator_log(SLUG, "events:disk/2026-10-05")
 
     sibling_directory_events = tmp_path / "sibling-directory-events"

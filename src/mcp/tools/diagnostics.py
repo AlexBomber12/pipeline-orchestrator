@@ -111,6 +111,7 @@ _SENSITIVE_NAMES = (
     "secretAccessKey",
     "sessionToken",
     "keyData",
+    "tls.key",
     "docker_auth_config",
     "docker-auth-config",
     "dockerAuthConfig",
@@ -1430,7 +1431,12 @@ def _association(*, recorded: bool = False) -> dict[str, Any]:
 
 def _safe_path(root: Path, *parts: str) -> Path:
     resolved_root = root.resolve()
-    candidate = resolved_root.joinpath(*parts).resolve()
+    unresolved = resolved_root
+    for part in parts:
+        unresolved /= part
+        if unresolved.is_symlink():
+            raise ValueError("Diagnostic file path must not contain symlinks.")
+    candidate = unresolved.resolve()
     if not candidate.is_relative_to(resolved_root):
         raise ValueError("Resolved diagnostic path escapes its allowed root.")
     return candidate

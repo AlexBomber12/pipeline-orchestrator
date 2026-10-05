@@ -55,7 +55,8 @@ event-directory mount. For example, use
 `PO_EVENTS_DIR=/data/audit-events`.
 
 These tools only accept configured repository slugs and fixed source IDs; they
-cannot read arbitrary paths or Redis keys. Missing, malformed, expired, stale,
+cannot read arbitrary paths or Redis keys, and symlink components are rejected
+for fixed diagnostic files. Missing, malformed, expired, stale,
 and unavailable data is reported explicitly. Legacy CLI snapshots and mutable
 CI artifacts are not attributed to a task, run, or SHA because their producers
 do not record that association. Daemon stdout and live CLI streams are not
