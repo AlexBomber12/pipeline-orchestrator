@@ -7,6 +7,10 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from src.claude_cli import _CODER_EXECUTION_POLICY as _CLAUDE_EXECUTION_POLICY
+from src.codex_cli import (
+    _CODER_EXECUTION_POLICY as _CODEX_EXECUTION_POLICY,
+)
 from src.codex_cli import (
     _build_fix_feedback_prompt,
     diagnose_error_async,
@@ -312,6 +316,7 @@ async def test_fix_review_async_passes_prompt(
     assert prompt.startswith("Task: PR-270\n\nFile: tasks/PR-270.md\n\n")
     assert "\n\nFIX FEEDBACK\n\nDAEMON INVOCATION" in prompt
     assert "This FIX FEEDBACK run was dispatched" in prompt
+    assert "OPERATOR-AUTHORIZED EXECUTION POLICY" in prompt
     assert "one iteration" in prompt
     assert "scripts/make-review-artifacts.sh" in prompt
     assert "remote PR HEAD is the pushed local HEAD" in prompt
@@ -381,6 +386,11 @@ def test_build_fix_feedback_prompt_with_task_anchor() -> None:
     ) in prompt
     assert "\n\nFIX FEEDBACK\n\nDAEMON INVOCATION" in prompt
     assert prompt.endswith("some logs")
+
+
+def test_daemon_execution_policy_matches_claude() -> None:
+    """Both coder providers receive one execution contract."""
+    assert _CODEX_EXECUTION_POLICY == _CLAUDE_EXECUTION_POLICY
 
 
 def test_build_fix_feedback_prompt_legacy_fallbacks() -> None:
@@ -543,6 +553,7 @@ async def test_run_auto_pr_async_formats_prompt_with_headers(
         "AUTO PR\nTask: PR-270\nFile: tasks/PR-270.md\n\n<body>\n\n"
     )
     assert "This AUTO PR run was dispatched" in cmd[-1]
+    assert "OPERATOR-AUTHORIZED EXECUTION POLICY" in cmd[-1]
     assert "ready (not draft) PR" in cmd[-1]
     assert "scripts/make-review-artifacts.sh" in cmd[-1]
     assert "artifacts/pr.patch must be nonempty" in cmd[-1]
