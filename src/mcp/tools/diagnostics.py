@@ -1262,6 +1262,14 @@ def _safe_path(root: Path, *parts: str) -> Path:
     return candidate
 
 
+def _safe_repo_directory(root: Path, repo_slug: str) -> Path:
+    resolved_root = root.resolve()
+    selected = resolved_root / repo_slug
+    if selected.is_symlink() or selected.resolve() != selected:
+        raise ValueError("Selected repository diagnostic directory must not be a symlink.")
+    return selected
+
+
 async def _redis_log_sources(
     client: Any, repo_slug: str, observed_at: datetime
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -1556,7 +1564,7 @@ def _file_log_sources(repo_slug: str) -> tuple[list[dict[str, Any]], list[str]]:
     sources: list[dict[str, Any]] = []
     warnings: list[str] = []
     try:
-        event_dir = _safe_path(_EVENTS_ROOT, repo_slug)
+        event_dir = _safe_repo_directory(_EVENTS_ROOT, repo_slug)
     except ValueError as exc:
         return sources, [_error_text(exc)]
     if event_dir.is_dir():
@@ -1602,7 +1610,7 @@ def _file_log_sources(repo_slug: str) -> tuple[list[dict[str, Any]], list[str]]:
             )
 
     try:
-        repo_root = _safe_path(_REPOS_ROOT, repo_slug)
+        repo_root = _safe_repo_directory(_REPOS_ROOT, repo_slug)
         ci_path = _safe_path(repo_root, "artifacts", "ci.log")
         ci_stat = ci_path.stat() if ci_path.is_file() else None
     except (OSError, ValueError) as exc:
@@ -1914,7 +1922,7 @@ def _read_file_source(
     warnings: list[str] = []
     input_record_char_offset = record_char_offset
     if source_id == "ci:artifact":
-        repo_root = _safe_path(_REPOS_ROOT, repo_slug)
+        repo_root = _safe_repo_directory(_REPOS_ROOT, repo_slug)
         path = _safe_path(repo_root, "artifacts", "ci.log")
         kind = "current_checkout_ci_artifact"
         mutable = True
@@ -1928,7 +1936,7 @@ def _read_file_source(
             datetime.strptime(date, "%Y-%m-%d")
         except ValueError as exc:
             raise ValueError("Invalid disk event partition date.") from exc
-        repo_event_root = _safe_path(_EVENTS_ROOT, repo_slug)
+        repo_event_root = _safe_repo_directory(_EVENTS_ROOT, repo_slug)
         path = _safe_path(repo_event_root, f"{date}.jsonl")
         kind = "disk_event_log"
         mutable = date == _utc_now().date().isoformat()

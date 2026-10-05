@@ -476,7 +476,7 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     roots.mkdir()
     (roots / SLUG).symlink_to(outside, target_is_directory=True)
     monkeypatch.setattr(diagnostics, "_EVENTS_ROOT", roots)
-    with pytest.raises(ValueError, match="escapes"):
+    with pytest.raises(ValueError, match="symlink"):
         await diagnostics.read_orchestrator_log(SLUG, "events:disk/2026-10-05")
 
     sibling_repos = tmp_path / "sibling-repos"
@@ -505,6 +505,19 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     monkeypatch.setattr(diagnostics, "_EVENTS_ROOT", sibling_events)
     with pytest.raises(ValueError, match="escapes"):
         await diagnostics.read_orchestrator_log(SLUG, "events:disk/2026-10-05")
+
+    sibling_directory_events = tmp_path / "sibling-directory-events"
+    sibling_directory_events.mkdir()
+    sibling_directory = sibling_directory_events / "octo__sibling"
+    sibling_directory.mkdir()
+    (sibling_directory / "2026-10-05.jsonl").write_text("sibling event secret", encoding="utf-8")
+    (sibling_directory_events / SLUG).symlink_to(sibling_directory, target_is_directory=True)
+    monkeypatch.setattr(diagnostics, "_EVENTS_ROOT", sibling_directory_events)
+    with pytest.raises(ValueError, match="symlink"):
+        await diagnostics.read_orchestrator_log(SLUG, "events:disk/2026-10-05")
+    sources, warnings = diagnostics._file_log_sources(SLUG)
+    assert sources == []
+    assert any("symlink" in warning for warning in warnings)
 
 
 def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
