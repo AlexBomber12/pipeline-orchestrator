@@ -791,6 +791,18 @@ def test_model_save_rejects_unknown_codex_model_atomically(
     assert cfg.daemon.codex_model == ""
 
 
+def test_model_save_rejects_unknown_claude_model(empty_config: Path) -> None:
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"claude_model": "not-a-real-model"},
+        )
+
+    assert response.status_code == 422
+    assert "claude_model must be one of" in response.text
+    assert load_config(str(empty_config)).daemon.claude_model == "opus"
+
+
 def test_model_save_accepts_valid_model(empty_config: Path) -> None:
     with TestClient(app) as client:
         response = client.put(
