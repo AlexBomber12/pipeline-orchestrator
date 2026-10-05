@@ -92,6 +92,9 @@ class DummyCoderPlugin:
     ) -> tuple[int, str, str]:
         return (0, f"{repo_path}|{context}|{model}", "")
 
+    def resolve_model(self, daemon_config: DaemonConfig) -> str:
+        return self.model_setting.resolve(self.name, daemon_config)
+
     def build_run_kwargs(
         self,
         *,
@@ -99,7 +102,7 @@ class DummyCoderPlugin:
         breach_dir: str | None = None,
         breach_run_id: str | None = None,
     ) -> dict[str, Any]:
-        return {"model": daemon_config.claude_model}
+        return {"model": self.resolve_model(daemon_config)}
 
 
 def test_register_and_get() -> None:
@@ -263,6 +266,54 @@ def test_protocol_includes_build_run_kwargs() -> None:
     assert isinstance(CodexPlugin(), CoderPlugin)
 
 
+def test_protocol_includes_effective_model_resolution() -> None:
+    assert "resolve_model" in dir(CoderPlugin)
+    assert isinstance(ClaudePlugin(), CoderPlugin)
+    assert isinstance(CodexPlugin(), CoderPlugin)
+
+
+def test_builtin_model_resolution_prefers_generic_then_legacy() -> None:
+    daemon = DaemonConfig(
+        claude_model="legacy-claude",
+        codex_model="legacy-codex",
+        coder_settings={
+            "claude": {"model": "generic-claude"},
+            "codex": {"model": ""},
+        },
+    )
+
+    assert ClaudePlugin().resolve_model(daemon) == "generic-claude"
+    assert CodexPlugin().resolve_model(daemon) == ""
+
+
+def test_builtin_model_resolution_retains_legacy_defaults() -> None:
+    daemon = DaemonConfig(claude_model="sonnet", codex_model="legacy-codex")
+
+    assert ClaudePlugin().resolve_model(daemon) == "sonnet"
+    assert CodexPlugin().resolve_model(daemon) == "legacy-codex"
+    assert ClaudePlugin().resolve_model(DaemonConfig()) == "opus"
+    assert CodexPlugin().resolve_model(DaemonConfig()) == ""
+    assert (
+        ClaudePlugin().resolve_model(
+            DaemonConfig(coder_settings={"claude": {"model": ""}})
+        )
+        == "opus"
+    )
+
+
+def test_model_setting_rejects_non_string_constructed_value() -> None:
+    daemon = DaemonConfig.model_construct(
+        coder_settings={"custom": {"model": 123}}
+    )
+    setting = ModelSetting(None, "fallback", "Default")
+
+    with pytest.raises(
+        ValueError,
+        match=r"daemon\.coder_settings\.custom\.model must be a string",
+    ):
+        setting.resolve("custom", daemon)
+
+
 def test_claude_plugin_build_run_kwargs_with_breach() -> None:
     daemon = DaemonConfig(
         claude_model="opus",
@@ -319,6 +370,24 @@ def test_codex_plugin_build_run_kwargs_no_breach_keys() -> None:
         breach_run_id="abc123",
     )
     assert kwargs == {"model": "gpt-5.4"}
+
+
+def test_build_run_kwargs_uses_generic_model_over_legacy() -> None:
+    daemon = DaemonConfig(
+        claude_model="legacy-claude",
+        codex_model="legacy-codex",
+        coder_settings={
+            "claude": {"model": "generic-claude"},
+            "codex": {"model": "generic-codex"},
+        },
+    )
+
+    assert ClaudePlugin().build_run_kwargs(daemon_config=daemon)["model"] == (
+        "generic-claude"
+    )
+    assert CodexPlugin().build_run_kwargs(daemon_config=daemon) == {
+        "model": "generic-codex"
+    }
 
 
 def test_codex_plugin_build_run_kwargs_default_codex_model_empty() -> None:

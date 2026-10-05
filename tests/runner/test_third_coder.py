@@ -54,7 +54,7 @@ class FakeCoderPlugin:
     name = "fake"
     display_name = "Fake Coder"
     models = ["fake-1", "fake-2"]
-    model_setting = ModelSetting("claude_model", "fake-1", "(default)")
+    model_setting = ModelSetting(None, "fake-1", "(default)")
     model_catalog_refreshable = False
 
     def __init__(self) -> None:
@@ -116,6 +116,9 @@ class FakeCoderPlugin:
         self.diagnose_calls.append((repo_path, context, model))
         return (0, "FIX\nfake diagnose", "")
 
+    def resolve_model(self, daemon_config: DaemonConfig) -> str:
+        return self.model_setting.resolve(self.name, daemon_config)
+
     def build_run_kwargs(
         self,
         *,
@@ -123,12 +126,9 @@ class FakeCoderPlugin:
         breach_dir: str | None = None,
         breach_run_id: str | None = None,
     ) -> dict[str, Any]:
-        # Third coder uses ``claude_model`` config slot for its model;
-        # the test doesn't add a fake_model attribute to DaemonConfig.
-        # The point is the handler doesn't care which slot — the plugin
-        # decides. supports_breach_lifecycle is False so breach inputs
-        # are ignored.
-        return {"model": "fake-1"}
+        # No ``fake_model`` field exists on DaemonConfig; the plugin resolves
+        # its stable-ID namespace through the shared setting contract.
+        return {"model": self.resolve_model(daemon_config)}
 
 
 def test_fake_plugin_satisfies_protocol() -> None:

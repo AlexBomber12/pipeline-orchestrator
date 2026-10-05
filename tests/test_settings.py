@@ -830,6 +830,10 @@ def test_model_dropdown_includes_default_option(empty_config: Path) -> None:
     assert '<option value=""' in body
     assert "(default)" in body
     assert "CLI default" in body
+    assert 'name="coder_settings.claude.model"' in body
+    assert 'name="coder_settings.codex.model"' in body
+    assert 'name="claude_model"' not in body
+    assert 'name="codex_model"' not in body
     for model in ClaudePlugin.models:
         if model != "":
             assert f'value="{model}"' in body
@@ -840,7 +844,7 @@ class _ThirdCatalogPlugin:
     name = "third"
     display_name = "Third Coder"
     models = ["legacy-third"]
-    model_setting = ModelSetting("claude_model", "third-default", "Default")
+    model_setting = ModelSetting(None, "third-default", "Default")
     model_catalog_refreshable = False
 
     def model_catalog_cache_key(
@@ -859,6 +863,14 @@ class _ThirdCatalogPlugin:
             "Third-party static catalog.",
         )
 
+    def resolve_model(self, daemon_config: object) -> str:
+        return self.model_setting.resolve(self.name, daemon_config)
+
+    def build_run_kwargs(
+        self, *, daemon_config: object, **_kwargs: object
+    ) -> dict[str, str]:
+        return {"model": self.resolve_model(daemon_config)}
+
 
 def test_shared_catalog_rendering_supports_third_plugin_without_branches(
     empty_config: Path,
@@ -872,7 +884,102 @@ def test_shared_catalog_rendering_supports_third_plugin_without_branches(
     assert 'value="third-invoke"' in response.text
     assert "Third Display" in response.text
     assert "Third-party static catalog." in response.text
+    assert 'name="coder_settings.third.model"' in response.text
     assert "/partials/settings/coders/third/models/refresh" not in response.text
+
+
+def test_arbitrary_plugin_model_round_trips_without_core_field(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    unrelated:\n"
+        "      model: keep-me\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    plugin = _ThirdCatalogPlugin()
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.register(plugin)
+        rendered = client.get("/partials/settings/coders")
+        saved = client.put(
+            "/settings/daemon",
+            data={"coder_settings.third.model": "third-invoke"},
+        )
+
+    cfg = load_config(str(cfg_path))
+    assert rendered.status_code == 200
+    assert saved.status_code == 200
+    assert "third_model" not in type(cfg.daemon).model_fields
+    assert cfg.daemon.coder_settings == {
+        "unrelated": {"model": "keep-me"},
+        "third": {"model": "third-invoke"},
+    }
+    assert plugin.resolve_model(cfg.daemon) == "third-invoke"
+    assert plugin.build_run_kwargs(daemon_config=cfg.daemon) == {
+        "model": "third-invoke"
+    }
+
+
+def test_generic_model_submission_rejects_unregistered_plugin(
+    empty_config: Path,
+) -> None:
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"coder_settings.not-registered.model": "anything"},
+        )
+
+    assert response.status_code == 422
+    assert "Unknown coder settings plugin ID" in response.text
+    assert load_config(str(empty_config)).daemon.coder_settings == {}
+
+
+def test_generic_model_submission_rejects_unknown_setting_key(
+    empty_config: Path,
+) -> None:
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.not-model": "anything"},
+        )
+
+    assert response.status_code == 422
+    assert "Unknown coder setting" in response.text
+
+
+class _NonStringForm(dict[str, object]):
+    def multi_items(self) -> list[tuple[str, object]]:
+        return list(self.items())
+
+
+@pytest.mark.parametrize(
+    ("form", "message"),
+    [
+        (
+            _NonStringForm({"coder_settings.codex.model": object()}),
+            "coder_settings.codex.model must be a string",
+        ),
+        (
+            _NonStringForm({"codex_model": object()}),
+            "codex_model must be a string",
+        ),
+    ],
+)
+def test_model_submission_parser_rejects_non_string_values(
+    form: _NonStringForm,
+    message: str,
+) -> None:
+    from src.coders import build_coder_registry
+    from src.web.routes.settings import _submitted_coder_models
+
+    with pytest.raises(ValueError, match=message):
+        _submitted_coder_models(form, build_coder_registry())
 
 
 def test_dynamic_codex_choice_persists_invocation_slug_and_api_metadata(
@@ -892,7 +999,7 @@ def test_dynamic_codex_choice_persists_invocation_slug_and_api_metadata(
         fragment = client.get("/partials/settings/coders")
         response = client.put(
             "/settings/daemon",
-            data={"codex_model": "invoke-future"},
+            data={"coder_settings.codex.model": "invoke-future"},
         )
         reloaded = client.get("/partials/settings/coders")
         api_response = client.get("/api/coders")
@@ -904,7 +1011,8 @@ def test_dynamic_codex_choice_persists_invocation_slug_and_api_metadata(
     assert response.status_code == 200
     assert 'value="invoke-future" selected' in reloaded.text
     cfg = load_config(str(empty_config))
-    assert cfg.daemon.codex_model == "invoke-future"
+    assert cfg.daemon.codex_model == ""
+    assert cfg.daemon.coder_settings["codex"]["model"] == "invoke-future"
     run_kwargs = CodexPlugin().build_run_kwargs(daemon_config=cfg.daemon)
     assert run_kwargs == {
         "model": "invoke-future"
@@ -1013,7 +1121,7 @@ def test_codex_empty_catalog_rejects_new_slug_but_unrelated_save_works(
         settings_response = client.get("/settings")
         invalid_response = client.put(
             "/settings/daemon",
-            data={"codex_model": "unadvertised"},
+            data={"coder_settings.codex.model": "unadvertised"},
         )
         unrelated_response = client.put(
             "/settings/daemon",
@@ -1037,7 +1145,10 @@ def test_codex_discovery_failure_retains_saved_value_and_refresh_recovers(
 ) -> None:
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text(
-        "daemon:\n  codex_model: saved-custom\n",
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: saved-custom\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
@@ -1054,7 +1165,7 @@ def test_codex_discovery_failure_retains_saved_value_and_refresh_recovers(
         failed = client.get("/settings")
         retained = client.put(
             "/settings/daemon",
-            data={"codex_model": "saved-custom"},
+            data={"coder_settings.codex.model": "saved-custom"},
         )
         client.app.state.coder_registry.get("codex")._discover = recover
         refreshed = client.post(
@@ -1069,7 +1180,10 @@ def test_codex_discovery_failure_retains_saved_value_and_refresh_recovers(
     assert refreshed.status_code == 200
     assert 'value="recovered"' in refreshed.text
     assert "saved-custom (saved; not advertised)" in refreshed.text
-    assert load_config(str(cfg_path)).daemon.codex_model == "saved-custom"
+    assert (
+        load_config(str(cfg_path)).daemon.coder_settings["codex"]["model"]
+        == "saved-custom"
+    )
 
 
 def test_codex_default_can_be_saved_while_discovery_is_offline(
@@ -1078,7 +1192,10 @@ def test_codex_default_can_be_saved_while_discovery_is_offline(
 ) -> None:
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text(
-        "daemon:\n  codex_model: saved-custom\n",
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: saved-custom\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
@@ -1092,12 +1209,14 @@ def test_codex_default_can_be_saved_while_discovery_is_offline(
         failed = client.get("/settings")
         defaulted = client.put(
             "/settings/daemon",
-            data={"codex_model": ""},
+            data={"coder_settings.codex.model": ""},
         )
 
     assert failed.status_code == 200
     assert defaulted.status_code == 200
-    assert load_config(str(cfg_path)).daemon.codex_model == ""
+    cfg = load_config(str(cfg_path))
+    assert cfg.daemon.coder_settings["codex"]["model"] == ""
+    assert CodexPlugin().resolve_model(cfg.daemon) == ""
 
 
 def test_codex_refresh_updates_choices_without_changing_selection(
@@ -2408,6 +2527,8 @@ def test_codex_model_setting_saves(
     assert response.status_code == 200
     cfg = load_config(str(empty_config))
     assert cfg.daemon.codex_model == "gpt-5.4"
+    assert cfg.daemon.coder_settings["codex"]["model"] == "gpt-5.4"
+    assert CodexPlugin().resolve_model(cfg.daemon) == "gpt-5.4"
 
 
 def test_codex_model_setting_clears_to_default(
@@ -2427,6 +2548,8 @@ def test_codex_model_setting_clears_to_default(
     assert response.status_code == 200
     cfg = load_config(str(cfg_path))
     assert cfg.daemon.codex_model == ""
+    assert cfg.daemon.coder_settings["codex"]["model"] == ""
+    assert CodexPlugin().resolve_model(cfg.daemon) == ""
 
 
 def test_claude_model_setting_saves(
@@ -2444,6 +2567,8 @@ def test_claude_model_setting_saves(
     assert response.status_code == 200
     cfg = load_config(str(empty_config))
     assert cfg.daemon.claude_model == "sonnet"
+    assert cfg.daemon.coder_settings["claude"]["model"] == "sonnet"
+    assert ClaudePlugin().resolve_model(cfg.daemon) == "sonnet"
 
 
 def test_claude_model_setting_empty_uses_default(
@@ -2463,6 +2588,8 @@ def test_claude_model_setting_empty_uses_default(
     assert response.status_code == 200
     cfg = load_config(str(cfg_path))
     assert cfg.daemon.claude_model == "opus"
+    assert cfg.daemon.coder_settings["claude"]["model"] == "opus"
+    assert ClaudePlugin().resolve_model(cfg.daemon) == "opus"
 
 
 def test_repo_coder_override_saves(

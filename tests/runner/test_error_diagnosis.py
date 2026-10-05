@@ -527,6 +527,9 @@ def test_handle_error_dispatches_to_codex_plugin_when_codex_active(
     so the active coder's plugin alone is consulted.
     """
     runner = h._make_runner()
+    runner.app_config.daemon.coder_settings = {
+        "codex": {"model": "generic-codex"}
+    }
     claude_plugin = runner._registry.get("claude")
     codex_plugin = runner._registry.get("codex")
 
@@ -550,7 +553,7 @@ def test_handle_error_dispatches_to_codex_plugin_when_codex_active(
     asyncio.run(runner.handle_error())
 
     assert codex_calls and codex_calls[0][1] == "boom"
-    assert codex_calls[0][2] == runner.app_config.daemon.codex_model
+    assert codex_calls[0][2] == "generic-codex"
     assert claude_calls == []
 
 
@@ -574,6 +577,9 @@ def test_handle_error_dispatches_to_third_coder_plugin_without_handler_edits(
 
         def __init__(self) -> None:
             self.calls: list[tuple[str, str, str]] = []
+
+        def resolve_model(self, _daemon_config: object) -> str:
+            return "m1"
 
         async def diagnose_error(self, repo_path: str, context: str, model: str) -> tuple[int, str, str]:
             self.calls.append((repo_path, context, model))

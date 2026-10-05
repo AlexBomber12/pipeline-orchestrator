@@ -64,7 +64,9 @@ daemon:
   review_timeout_min: 20
   hung_fallback_codex_review: true
   error_handler_use_ai: true
-  claude_model: opus
+  coder_settings:
+    claude:
+      model: opus
   fix_idle_timeout_sec: 1800
   fix_iteration_cap: 15
   planned_pr_timeout_sec: 3600
@@ -79,6 +81,13 @@ auth:
 ```
 
 `PO_FIX_ITERATION_CAP` overrides `daemon.fix_iteration_cap` for daemon runs.
+
+Coder model choices are stored by stable plugin ID under
+`daemon.coder_settings`. Legacy `daemon.claude_model` and
+`daemon.codex_model` values remain supported as fallbacks when a plugin does
+not have an explicit generic `model` setting. An explicit generic value wins
+over its legacy fallback. Codex preserves `model: ""` as the CLI-default
+choice; Claude normalizes an empty choice to its `opus` default.
 
 ## Local development
 

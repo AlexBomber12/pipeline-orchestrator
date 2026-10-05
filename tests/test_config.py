@@ -130,6 +130,33 @@ def test_daemon_config_claude_model_default() -> None:
     from src.config import DaemonConfig
 
     assert DaemonConfig().claude_model == "opus"
+    assert DaemonConfig().coder_settings == {}
+
+
+def test_daemon_config_accepts_null_coder_settings_as_empty() -> None:
+    from src.config import DaemonConfig
+
+    assert DaemonConfig(coder_settings=None).coder_settings == {}  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("coder_settings", "message"),
+    [
+        ("not-a-mapping", "coder_settings must be a mapping"),
+        ({"": {}}, "plugin IDs must be non-empty strings"),
+        ({"codex": "not-a-mapping"}, "coder_settings.codex must be a mapping"),
+        ({"codex": {"model": 123}}, "coder_settings.codex.model must be a string"),
+    ],
+)
+def test_daemon_config_rejects_malformed_coder_settings(
+    coder_settings: object,
+    message: str,
+) -> None:
+    from pydantic import ValidationError
+    from src.config import DaemonConfig
+
+    with pytest.raises(ValidationError, match=message):
+        DaemonConfig(coder_settings=coder_settings)  # type: ignore[arg-type]
 
 
 def test_daemon_config_selector_defaults() -> None:
@@ -1068,6 +1095,81 @@ def test_update_daemon_config_codex_model(tmp_path: Path) -> None:
     cfg_path.write_text("daemon: {}\n", encoding="utf-8")
     updated = update_daemon_config(path=str(cfg_path), codex_model="o4-mini")
     assert updated.daemon.codex_model == "o4-mini"
+
+
+def test_update_daemon_config_merges_plugin_settings(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    other:\n"
+        "      model: keep-me\n"
+        "      token: preserved\n"
+        "    codex:\n"
+        "      extra: also-preserved\n",
+        encoding="utf-8",
+    )
+
+    updated = update_daemon_config(
+        path=str(cfg_path),
+        coder_settings={"codex": {"model": "new-model"}},
+    )
+
+    assert updated.daemon.coder_settings == {
+        "other": {"model": "keep-me", "token": "preserved"},
+        "codex": {"extra": "also-preserved", "model": "new-model"},
+    }
+
+
+def test_update_daemon_config_rejects_non_mapping_plugin_patch(
+    tmp_path: Path,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text("daemon: {}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="coder_settings must be a mapping"):
+        update_daemon_config(
+            path=str(cfg_path),
+            coder_settings="not-a-mapping",
+        )
+
+    assert cfg_path.read_text(encoding="utf-8") == "daemon: {}\n"
+
+
+def test_coder_settings_deep_merge_through_production_overlay(
+    tmp_path: Path,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: base-model\n"
+        "      retained: base-value\n"
+        "    arbitrary:\n"
+        "      model: arbitrary-model\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "config.production.yml").write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: production-model\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(str(cfg_path))
+
+    assert cfg.daemon.coder_settings == {
+        "codex": {
+            "model": "production-model",
+            "retained": "base-value",
+        },
+        "arbitrary": {"model": "arbitrary-model"},
+    }
+    from src.coders.codex import CodexPlugin
+
+    assert CodexPlugin().resolve_model(cfg.daemon) == "production-model"
 
 
 def test_update_repository_coder_override(tmp_path: Path) -> None:

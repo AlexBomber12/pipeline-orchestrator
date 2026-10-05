@@ -325,11 +325,7 @@ class ErrorMixin:
             ).stdout.strip()
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             pass
-        model = (
-            self.app_config.daemon.claude_model
-            if coder_name == "claude"
-            else self.app_config.daemon.codex_model
-        )
+        model = plugin.resolve_model(self.app_config.daemon)
         code, stdout, stderr = await plugin.diagnose_error(
             self.repo_path, context, model=model
         )
