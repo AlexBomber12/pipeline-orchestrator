@@ -376,6 +376,12 @@ def _line_indent(raw_line: bytes) -> int:
     return len(raw_line) - len(raw_line.lstrip(b" \t"))
 
 
+def _has_line_continuation(raw_line: bytes) -> bool:
+    content = raw_line.rstrip(b"\r\n")
+    trailing_backslashes = len(content) - len(content.rstrip(b"\\"))
+    return trailing_backslashes % 2 == 1
+
+
 def _has_closing_quote(value: str, quote: str) -> bool:
     index = 0
     while index < len(value):
@@ -456,6 +462,18 @@ def _sensitive_state_before(
     else:
         starts_inside_sensitive_block = None
         active_block_indent = None
+
+    if context_lines and _has_line_continuation(context_lines[-1]):
+        continuation_start = len(context_lines) - 1
+        while continuation_start > 0 and _has_line_continuation(context_lines[continuation_start - 1]):
+            continuation_start -= 1
+        continuation_line = context_lines[continuation_start].decode("utf-8", errors="replace")
+        if _PLAIN_SENSITIVE_ASSIGNMENT.fullmatch(continuation_line) is not None:
+            starts_inside_sensitive_block = True
+            active_block_indent = -1
+        elif continuation_start == 0 and search_start > 0:
+            starts_inside_sensitive_block = None
+            active_block_indent = None
 
     quote_state_known = search_start == 0
     active_quote: str | None = None
@@ -538,13 +556,25 @@ def _redacted_file_units(
         line_index = quote_end
     elif starts_inside_sensitive_block and sensitive_block_indent is not None:
         block_end = 0
-        while block_end < len(raw_lines):
-            if raw_lines[block_end].strip() and _line_indent(raw_lines[block_end]) <= sensitive_block_indent:
-                break
-            block_end += 1
+        if sensitive_block_indent == -1:
+            while block_end < len(raw_lines):
+                continued = _has_line_continuation(raw_lines[block_end])
+                block_end += 1
+                if not continued:
+                    break
+        else:
+            while block_end < len(raw_lines):
+                if raw_lines[block_end].strip() and _line_indent(raw_lines[block_end]) <= sensitive_block_indent:
+                    break
+                block_end += 1
         if block_end:
             raw_unit = b"".join(raw_lines[:block_end])
-            units.append((raw_unit, "[REDACTED SENSITIVE BLOCK]\n", 1))
+            marker = (
+                "[REDACTED SENSITIVE CONTINUATION]\n"
+                if sensitive_block_indent == -1
+                else "[REDACTED SENSITIVE BLOCK]\n"
+            )
+            units.append((raw_unit, marker, 1))
             line_index = block_end
     elif starts_with_sensitive_value:
         value_index = 0
@@ -605,10 +635,21 @@ def _redacted_file_units(
             if plain_match is not None:
                 scalar_indent = len(plain_match.group("indent"))
                 scalar_end = line_index + 1
-                while scalar_end < len(raw_lines):
-                    if raw_lines[scalar_end].strip() and _line_indent(raw_lines[scalar_end]) <= scalar_indent:
-                        break
-                    scalar_end += 1
+                if _has_line_continuation(raw_unit):
+                    continued = True
+                    while scalar_end < len(raw_lines) and continued:
+                        continued = _has_line_continuation(raw_lines[scalar_end])
+                        scalar_end += 1
+                    if continued and has_more_after_raw:
+                        warnings.append(
+                            "A backslash-continued sensitive assignment crossed the bounded page window; "
+                            "its visible segment was redacted."
+                        )
+                else:
+                    while scalar_end < len(raw_lines):
+                        if raw_lines[scalar_end].strip() and _line_indent(raw_lines[scalar_end]) <= scalar_indent:
+                            break
+                        scalar_end += 1
                 raw_unit = b"".join(raw_lines[line_index:scalar_end])
                 safe_unit, replacements = _redact_logical_text(text_unit)
                 units.append((raw_unit, safe_unit, replacements))
@@ -639,18 +680,22 @@ def _redacted_file_units(
 def _redact_log_content(text: str) -> tuple[str, int, list[str]]:
     """Redact an in-memory log using the same logical-unit policy as files."""
     warnings: list[str] = []
+    truncation_marker = "[truncated]\n"
+    prefix = truncation_marker if text.startswith(truncation_marker) else ""
+    content = text[len(prefix) :]
+    leading_context: bool | None = None if prefix and content else False
     units = _redacted_file_units(
-        text.encode("utf-8", errors="replace"),
-        starts_inside_private_key=False,
-        starts_with_sensitive_value=False,
-        starts_inside_sensitive_block=False,
+        content.encode("utf-8", errors="replace"),
+        starts_inside_private_key=leading_context,
+        starts_with_sensitive_value=leading_context,
+        starts_inside_sensitive_block=leading_context,
         sensitive_block_indent=None,
-        starts_inside_sensitive_quote=False,
+        starts_inside_sensitive_quote=leading_context,
         sensitive_quote=None,
         has_more_after_raw=False,
         warnings=warnings,
     )
-    return "".join(unit[1] for unit in units), sum(unit[2] for unit in units), warnings
+    return prefix + "".join(unit[1] for unit in units), sum(unit[2] for unit in units), warnings
 
 
 def _error_text(exc: Exception) -> str:

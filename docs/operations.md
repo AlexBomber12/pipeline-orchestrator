@@ -29,10 +29,13 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   inside a multiline private-key block; if that bounded scan cannot establish
   the state, the page is omitted fail-closed. It also inspects at most 1 MiB of
   preceding context so credential keys and plain, quoted, or block scalar values
-  split across lines or page boundaries remain redacted, with the same
+  split across lines or page boundaries remain redacted, including TOML
+  triple-quoted values and shell backslash continuations, with the same
   fail-closed behavior when context is indeterminate. Diagnostic text is
-  credential-redacted before it is returned, and producer-added
-  `[truncated]` markers are preserved. Redis event history is fetched through a
+  credential-redacted before it is returned. Producer-added `[truncated]`
+  markers are preserved; because their removed prefix may contain a sensitive
+  opener, the retained Redis CLI tail is omitted fail-closed. Redis event
+  history is fetched through a
   read-only bounded script and reported as oversized, without materializing its
   records in the MCP process, when the retained list exceeds 256 KiB. Disk
   partition discovery streams at most 200 directory candidates per request and

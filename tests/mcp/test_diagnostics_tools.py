@@ -420,6 +420,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             'fake-second-secret"',
             'password = """toml-first-secret',
             'toml-second-secret"""',
+            "PASSWORD=slash-first-secret\\",
+            "slash-second-secret",
             '{"password":123456789}',
             '{"credentials":["user","fake-list-secret"]}',
             json.dumps({"auths": {"registry": {"auth": docker_auth}}, "debug": True}),
@@ -458,7 +460,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                 "debug": True,
             }
         )
-        + '\npassword = """ci-toml-first-secret\nci-toml-second-secret"""\n',
+        + '\npassword = """ci-toml-first-secret\nci-toml-second-secret"""\n'
+        + "PASSWORD=ci-slash-first-secret\\\nci-slash-second-secret\n",
         encoding="utf-8",
     )
 
@@ -485,6 +488,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "fake-second-secret" not in content
         assert "toml-first-secret" not in content
         assert "toml-second-secret" not in content
+        assert "slash-first-secret" not in content
+        assert "slash-second-secret" not in content
         assert "123456789" not in content
         assert "fake-list-secret" not in content
         assert docker_auth not in content
@@ -499,6 +504,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert docker_auth not in content
         assert "ci-toml-first-secret" not in content
         assert "ci-toml-second-secret" not in content
+        assert "ci-slash-first-secret" not in content
+        assert "ci-slash-second-secret" not in content
         assert "debug" in content
 
     ci_raw = ci_path.read_bytes()
@@ -510,6 +517,41 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
     )
     assert "ci-toml-second-secret" not in triple_quote_continuation["content"]
     assert "[REDACTED SENSITIVE QUOTED SCALAR]" in triple_quote_continuation["content"]
+
+    slash_continuation = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=ci_raw.index(b"ci-slash-second-secret"),
+        max_chars=200,
+    )
+    assert "ci-slash-second-secret" not in slash_continuation["content"]
+    assert "[REDACTED SENSITIVE CONTINUATION]" in slash_continuation["content"]
+
+
+async def test_truncated_redis_logs_omit_unknown_leading_sensitive_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    timestamp = "2026-10-05T11:45:00+00:00"
+    truncated = (
+        "[truncated]\n"
+        "unknown-private-material\n"
+        "-----END PRIVATE KEY-----\n"
+        "unknown-multiline-secret\n"
+    )
+    redis.store[cli_log_latest(SLUG)] = truncated
+    redis.store[cli_log_history(SLUG, timestamp)] = truncated
+
+    for source_id in ("cli:latest", f"cli:history/{timestamp}"):
+        result = await diagnostics.read_orchestrator_log(SLUG, source_id, max_chars=1_000)
+        assert result["content"].startswith("[truncated]\n")
+        assert "unknown-private-material" not in result["content"]
+        assert "unknown-multiline-secret" not in result["content"]
+        assert "[CONTENT OMITTED: PRIVATE-KEY CONTEXT UNKNOWN]" in result["content"]
+        assert any("omitted fail-closed" in warning for warning in result["warnings"])
 
 
 async def test_custom_event_root_is_used_for_discovery_and_exact_reads(
@@ -1423,6 +1465,35 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
         len(distant_quote),
         b'last-secret"\n',
     )[3] is None
+    continued_assignment = b"PASSWORD=first\\\nsecond\\\n"
+    continued_state = diagnostics._sensitive_state_before(
+        BytesIO(continued_assignment),
+        len(continued_assignment),
+        b"third\n",
+    )
+    assert continued_state[1:3] == (True, -1)
+    unknown_continuation = b"x\\\n" * (
+        diagnostics._MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES // len(b"x\\\n") + 2
+    )
+    assert diagnostics._sensitive_state_before(
+        BytesIO(unknown_continuation),
+        len(unknown_continuation),
+        b"next\n",
+    )[1] is None
+    warnings = []
+    crossed_continuation = diagnostics._redacted_file_units(
+        b"PASSWORD=first-secret\\\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=True,
+        warnings=warnings,
+    )
+    assert crossed_continuation[0][1] == "PASSWORD=[REDACTED]\n"
+    assert any("backslash-continued" in warning for warning in warnings)
     warnings = []
     assert diagnostics._redacted_file_units(
         b"unknown\n",
