@@ -76,6 +76,9 @@ _SENSITIVE_NAMES = (
     "set-cookie",
     "token",
     "secret",
+    "secret_key",
+    "secret-key",
+    "secretKey",
     "credential",
     "credentials",
     "access_token",
@@ -340,6 +343,9 @@ def _redact_logical_text(text: str) -> tuple[str, int]:
     try:
         parsed = json.loads(text)
     except (TypeError, ValueError):
+        safe_text, replacements = _redact_text(text)
+        if replacements:
+            return safe_text, replacements
         return _redact_embedded_structures(text)
     if not isinstance(parsed, (dict, list)):
         return _redact_text(text)

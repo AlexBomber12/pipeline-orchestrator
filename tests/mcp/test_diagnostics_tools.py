@@ -214,6 +214,7 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
                     "auths": {
                         "registry.example": {"auth": "status-docker-auth-secret"},
                     },
+                    "jwtSecretKey": "status-secret-key-value",
                 },
             }
         ),
@@ -253,6 +254,7 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
     assert "state-secret" not in json.dumps(result)
     assert "structured-secret" not in json.dumps(result)
     assert "status-docker-auth-secret" not in json.dumps(result)
+    assert "status-secret-key-value" not in json.dumps(result)
     assert overview["observed"]["error"] == "Authorization: [REDACTED]"
     assert result["detail"]["queue"]["counts_by_status"] == {"DOING": 1}
     assert "history" not in result["detail"]["state"]
@@ -429,6 +431,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             "    sequence-first-secret",
             "    sequence-second-secret",
             'INFO {"password":987654321,"debug":true}',
+            "DJANGO_SECRET_KEY=django-secret-key-value",
+            '{"jwtSecretKey":"jwt-secret-key-value"}',
             '{"password":123456789}',
             '{"credentials":["user","fake-list-secret"]}',
             json.dumps({"auths": {"registry": {"auth": docker_auth}}, "debug": True}),
@@ -471,6 +475,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "PASSWORD=ci-slash-first-secret\\\nci-slash-second-secret\n"
         + "password:\n  ci-yaml-first-secret\n  ci-yaml-second-secret\n"
         + "- password:\n    ci-sequence-first-secret\n    ci-sequence-second-secret\n"
+        + "DJANGO_SECRET_KEY=ci-django-secret-key-value\n"
+        + '{"jwtSecretKey":"ci-jwt-secret-key-value"}\n'
         + '2026-10-05 INFO {"password":987654322,"debug":true}\n',
         encoding="utf-8",
     )
@@ -505,6 +511,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "sequence-first-secret" not in content
         assert "sequence-second-secret" not in content
         assert "987654321" not in content
+        assert "django-secret-key-value" not in content
+        assert "jwt-secret-key-value" not in content
         assert "123456789" not in content
         assert "fake-list-secret" not in content
         assert docker_auth not in content
@@ -526,6 +534,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-sequence-first-secret" not in content
         assert "ci-sequence-second-secret" not in content
         assert "987654322" not in content
+        assert "ci-django-secret-key-value" not in content
+        assert "ci-jwt-secret-key-value" not in content
         assert "debug" in content
 
     ci_raw = ci_path.read_bytes()
