@@ -40,9 +40,11 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   sensitive `name` field with its sibling `value`, and decoded multiline string
   fields use the same logical-unit policy as retained files. The redactor also
   covers same-indent pretty-JSON continuations, netrc password forms, and every
-  value below Kubernetes Secret `data` and `stringData`. Producer-added
-  `[truncated]` markers are preserved; because their removed prefix may contain
-  a sensitive opener, the retained Redis CLI tail is omitted fail-closed. Redis event
+  value below Kubernetes Secret `data` and `stringData` in structured or YAML
+  output, including reads that begin inside a YAML payload block. Excessive
+  structured nesting is omitted fail-closed. Producer-added `[truncated]`
+  markers are preserved; because their removed prefix may contain a sensitive
+  opener, the retained Redis CLI tail is omitted fail-closed. Redis event
   history is fetched through a
   read-only bounded script and reported as oversized, without materializing its
   records in the MCP process, when the retained list exceeds 256 KiB. Disk

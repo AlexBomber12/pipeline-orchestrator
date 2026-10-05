@@ -230,6 +230,11 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
                         "data": {".dockerconfigjson": "status-kube-data-secret"},
                         "stringData": {"config": "status-kube-string-secret"},
                     },
+                    "yaml": (
+                        "apiVersion: v1\nkind: Secret\ndata:\n"
+                        "  opaque: status-kube-yaml-secret\n"
+                        "stringData: {config: status-kube-yaml-inline-secret}\n"
+                    ),
                 },
             }
         ),
@@ -278,6 +283,8 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
     assert "status-netrc-secret" not in json.dumps(result)
     assert "status-kube-data-secret" not in json.dumps(result)
     assert "status-kube-string-secret" not in json.dumps(result)
+    assert "status-kube-yaml-secret" not in json.dumps(result)
+    assert "status-kube-yaml-inline-secret" not in json.dumps(result)
     assert "status-malformed-password" not in json.dumps(result)
     assert overview["observed"]["error"] == "Authorization: [REDACTED]"
     assert result["detail"]["queue"]["counts_by_status"] == {"DOING": 1}
@@ -480,6 +487,12 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                     "stringData": {"config": "redis-kube-string-secret"},
                 }
             ),
+            (
+                "apiVersion: v1\nkind: Secret\ndata:\n"
+                "  opaque: redis-kube-yaml-secret\n"
+                "stringData: {config: redis-kube-yaml-inline-secret}\n"
+                "---\nkind: ConfigMap\ndata:\n  harmless: retained-config-value"
+            ),
             json.dumps({"auths": {"registry": {"auth": docker_auth}}, "debug": True}),
             f"DOCKER_AUTH_CONFIG={{\"auths\":{{\"registry\":{{\"auth\":\"{docker_auth}\"}}}}}}",
             "ordinary suffix",
@@ -506,6 +519,11 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                     "data": {"opaque": "disk-kube-data-secret"},
                     "stringData": {"config": "disk-kube-string-secret"},
                 },
+                "yaml": (
+                    "apiVersion: v1\nkind: Secret\ndata:\n"
+                    "  opaque: disk-kube-yaml-secret\n"
+                    "stringData: {config: disk-kube-yaml-inline-secret}\n"
+                ),
                 "auths": {"registry": {"auth": docker_auth}},
                 "debug": True,
             }
@@ -528,6 +546,10 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                     "data": {"opaque": "ci-kube-data-secret"},
                     "stringData": {"config": "ci-kube-string-secret"},
                 },
+                "yaml": (
+                    "apiVersion: v1\nkind: Secret\ndata:\n"
+                    "  opaque: ci-structured-kube-yaml-secret\n"
+                ),
                 "auths": {"registry": {"auth": docker_auth}},
                 "debug": True,
             }
@@ -546,6 +568,10 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + '{"password":987650002,}\n'
         + '{\n"password":\n"ci-same-indent-secret"\n}\n'
         + "  password ci-multiline-netrc-secret\n"
+        + "apiVersion: v1\nkind: Secret\ndata:\n"
+        + "  opaque: ci-kube-yaml-secret\n"
+        + "stringData: {config: ci-kube-yaml-inline-secret}\n"
+        + "---\nkind: ConfigMap\ndata:\n  harmless: retained-ci-config-value\n"
         + '2026-10-05 INFO {"password":987654322,"debug":true}\n',
         encoding="utf-8",
     )
@@ -599,6 +625,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-netrc-secret" not in content
         assert "redis-kube-data-secret" not in content
         assert "redis-kube-string-secret" not in content
+        assert "redis-kube-yaml-secret" not in content
+        assert "redis-kube-yaml-inline-secret" not in content
+        assert "retained-config-value" in content
         assert docker_auth not in content
 
     for source_id, list_secret in (
@@ -622,6 +651,11 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-kube-string-secret" not in content
         assert "disk-kube-data-secret" not in content
         assert "disk-kube-string-secret" not in content
+        assert "ci-structured-kube-yaml-secret" not in content
+        assert "ci-kube-yaml-secret" not in content
+        assert "ci-kube-yaml-inline-secret" not in content
+        assert "disk-kube-yaml-secret" not in content
+        assert "disk-kube-yaml-inline-secret" not in content
         assert docker_auth not in content
         assert "ci-toml-first-secret" not in content
         assert "ci-toml-second-secret" not in content
@@ -646,6 +680,14 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "debug" in content
 
     ci_raw = ci_path.read_bytes()
+    yaml_secret_page = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=ci_raw.index(b"  opaque: ci-kube-yaml-secret"),
+        max_chars=200,
+    )
+    assert "ci-kube-yaml-secret" not in yaml_secret_page["content"]
+    assert "SENSITIVE" in yaml_secret_page["content"]
     triple_quote_continuation = await diagnostics.read_orchestrator_log(
         SLUG,
         "ci:artifact",
@@ -955,6 +997,66 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
         {"nested": ["[REDACTED]", "[REDACTED]"]},
         2,
     )
+    assert diagnostics._redact_all_values([], depth=diagnostics._MAX_STRUCTURED_DEPTH) == (
+        "[CONTENT OMITTED: STRUCTURED NESTING BOUND EXCEEDED]",
+        1,
+    )
+    deeply_nested_json = "[" * 1_100 + "0" + "]" * 1_100
+    nested_safe, nested_replacements = diagnostics._redact_logical_text(deeply_nested_json)
+    assert nested_safe == "[CONTENT OMITTED: STRUCTURED NESTING BOUND EXCEEDED]"
+    assert nested_replacements == 1
+    embedded_safe, embedded_replacements = diagnostics._redact_embedded_structures(
+        "INFO " + deeply_nested_json
+    )
+    assert embedded_safe == "[CONTENT OMITTED: STRUCTURED REDACTION BOUND EXCEEDED]"
+    assert embedded_replacements == 1
+    assert "STRUCTURED NESTING BOUND EXCEEDED" in diagnostics._bounded_event(
+        deeply_nested_json
+    )["raw_excerpt"]
+    nested_value: object = 0
+    for _ in range(diagnostics._MAX_STRUCTURED_DEPTH + 1):
+        nested_value = [nested_value]
+    bounded_nested, bounded_nested_count = diagnostics._redact_structure(nested_value)
+    assert "STRUCTURED NESTING BOUND EXCEEDED" in json.dumps(bounded_nested)
+    assert bounded_nested_count == 1
+
+    original_loads = diagnostics.json.loads
+    monkeypatch.setattr(
+        diagnostics.json,
+        "loads",
+        lambda _value: (_ for _ in ()).throw(RecursionError("nested")),
+    )
+    assert diagnostics._redact_logical_text("[]") == (
+        "[CONTENT OMITTED: STRUCTURED NESTING BOUND EXCEEDED]",
+        1,
+    )
+    assert "STRUCTURED NESTING BOUND EXCEEDED" in diagnostics._bounded_event("[]")[
+        "raw_excerpt"
+    ]
+    monkeypatch.setattr(diagnostics.json, "loads", original_loads)
+
+    original_decoder = diagnostics.json.JSONDecoder
+
+    class DeepDecoder:
+        def raw_decode(self, text: str, _start: int) -> tuple[object, int]:
+            return nested_value, len(text)
+
+    monkeypatch.setattr(diagnostics.json, "JSONDecoder", DeepDecoder)
+    assert diagnostics._redact_embedded_structures("INFO {}") == (
+        "[CONTENT OMITTED: STRUCTURED NESTING BOUND EXCEEDED]",
+        1,
+    )
+
+    class RecursiveDecoder:
+        def raw_decode(self, _text: str, _start: int) -> tuple[object, int]:
+            raise RecursionError("nested")
+
+    monkeypatch.setattr(diagnostics.json, "JSONDecoder", RecursiveDecoder)
+    assert diagnostics._redact_embedded_structures("INFO {}") == (
+        "[CONTENT OMITTED: STRUCTURED NESTING BOUND EXCEEDED]",
+        1,
+    )
+    monkeypatch.setattr(diagnostics.json, "JSONDecoder", original_decoder)
 
     state = RepoState(
         url="https://github.com/octo/demo",
@@ -1676,6 +1778,36 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
     )
     assert any("crossed the bounded page window" in warning for warning in warnings)
 
+    warnings = []
+    kubernetes_units = diagnostics._redacted_file_units(
+        b"kind: Secret\ndata:\n  opaque: kube-secret\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=True,
+        warnings=warnings,
+    )
+    assert "kube-secret" not in "".join(unit[1] for unit in kubernetes_units)
+    assert any("Kubernetes Secret YAML payload crossed" in warning for warning in warnings)
+
+    warnings = []
+    assert diagnostics._redacted_file_units(
+        b"visible\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=False,
+        warnings=warnings,
+        starts_inside_kubernetes_secret=None,
+    ) == [(b"visible\n", "[CONTENT OMITTED: KUBERNETES SECRET CONTEXT UNKNOWN]\n", 1)]
+    assert any("Kubernetes Secret YAML context exceeded" in warning for warning in warnings)
+
     assert diagnostics._sensitive_state_before(BytesIO(b"\n\n"), 2, b"next\n") == (
         False,
         False,
@@ -1683,6 +1815,31 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
         False,
         None,
         2,
+    )
+    assert diagnostics._kubernetes_yaml_state_before(BytesIO(b"\n\n"), 2, b"next\n") == (
+        False,
+        False,
+        None,
+        2,
+    )
+    context_limit = diagnostics._MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES
+    monkeypatch.setattr(diagnostics, "_MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES", 4)
+    assert diagnostics._kubernetes_yaml_state_before(BytesIO(b"abcde"), 5, b"next\n") == (
+        None,
+        None,
+        None,
+        4,
+    )
+    monkeypatch.setattr(diagnostics, "_MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES", 5)
+    assert diagnostics._kubernetes_yaml_state_before(
+        BytesIO(b"x\nfoo:"),
+        6,
+        b"  child: value\n",
+    ) == (None, None, None, 5)
+    monkeypatch.setattr(
+        diagnostics,
+        "_MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES",
+        context_limit,
     )
     completed_block = b"password: |\n  secret\nnext: value\n"
     assert diagnostics._sensitive_state_before(

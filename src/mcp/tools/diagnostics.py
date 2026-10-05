@@ -56,6 +56,7 @@ _MAX_REDIS_SCAN_CALLS = 4
 _MAX_REDIS_PENDING_KEYS = 200
 _MAX_DISK_PARTITION_CANDIDATES = 200
 _MAX_EMBEDDED_JSON_CANDIDATES = 64
+_MAX_STRUCTURED_DEPTH = 64
 _CLI_LATEST_TTL_SECONDS = 3600
 _CLI_HISTORY_TTL_SECONDS = 86400
 _HISTORY_CURSOR_PREFIX = "redis-history:"
@@ -143,6 +144,19 @@ _PENDING_YAML_SENSITIVE_ASSIGNMENT = re.compile(
 )
 _PENDING_JSON_SENSITIVE_ASSIGNMENT = re.compile(
     rf'(?i)^[ \t]*"(?:{_SENSITIVE_KEY_PATTERN})"\s*:\s*$'
+)
+_YAML_KIND_ASSIGNMENT = re.compile(
+    r"(?i)^[ \t]*(?:-[ \t]+)?(?:[\"']kind[\"']|kind)[ \t]*:[ \t]*"
+    r"(?P<kind>[^#\r\n]*?)[ \t]*(?:#.*)?$"
+)
+_YAML_SECRET_PAYLOAD_ASSIGNMENT = re.compile(
+    r"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?"
+    r"(?:[\"'](?:data|stringData)[\"']|(?:data|stringData))[ \t]*:[ \t]*"
+    r"(?P<value>[^\r\n]*)$"
+)
+_YAML_DOCUMENT_BOUNDARY = re.compile(r"^[ \t]*(?:---|\.\.\.)[ \t]*(?:#.*)?$")
+_YAML_MAPPING_ENTRY = re.compile(
+    r"^[ \t]*(?:-[ \t]+)?(?:[\"']?[-A-Za-z0-9_.]+[\"']?)[ \t]*:"
 )
 _BLOCK_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
@@ -411,12 +425,32 @@ def _redact_text(text: str) -> tuple[str, int]:
     return redacted, count + replacements
 
 
-def _redact_all_values(value: Any) -> tuple[Any, int]:
+def _structured_nesting_omission(text: str) -> tuple[str, int]:
+    trailing_newline = "\r\n" if text.endswith("\r\n") else "\n" if text.endswith("\n") else ""
+    return "[CONTENT OMITTED: STRUCTURED NESTING BOUND EXCEEDED]" + trailing_newline, 1
+
+
+def _structured_depth_exceeded(value: Any) -> bool:
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        item, depth = stack.pop()
+        if not isinstance(item, (dict, list)):
+            continue
+        if depth >= _MAX_STRUCTURED_DEPTH:
+            return True
+        children = item.values() if isinstance(item, dict) else item
+        stack.extend((child, depth + 1) for child in children)
+    return False
+
+
+def _redact_all_values(value: Any, *, depth: int = 0) -> tuple[Any, int]:
+    if depth >= _MAX_STRUCTURED_DEPTH and isinstance(value, (dict, list)):
+        return "[CONTENT OMITTED: STRUCTURED NESTING BOUND EXCEEDED]", 1
     if isinstance(value, dict):
         result: dict[Any, Any] = {}
         count = 0
         for key, item in value.items():
-            safe, replacements = _redact_all_values(item)
+            safe, replacements = _redact_all_values(item, depth=depth + 1)
             result[key] = safe
             count += replacements
         return result, count
@@ -424,14 +458,21 @@ def _redact_all_values(value: Any) -> tuple[Any, int]:
         result_list: list[Any] = []
         count = 0
         for item in value:
-            safe, replacements = _redact_all_values(item)
+            safe, replacements = _redact_all_values(item, depth=depth + 1)
             result_list.append(safe)
             count += replacements
         return result_list, count
     return "[REDACTED]", 1
 
 
-def _redact_structure(value: Any, *, docker_auth_context: bool = False) -> tuple[Any, int]:
+def _redact_structure(
+    value: Any,
+    *,
+    docker_auth_context: bool = False,
+    depth: int = 0,
+) -> tuple[Any, int]:
+    if depth >= _MAX_STRUCTURED_DEPTH and isinstance(value, (dict, list)):
+        return "[CONTENT OMITTED: STRUCTURED NESTING BOUND EXCEEDED]", 1
     if isinstance(value, str):
         safe, replacements, _ = _redact_log_content(value)
         return safe, replacements
@@ -439,7 +480,11 @@ def _redact_structure(value: Any, *, docker_auth_context: bool = False) -> tuple
         result: list[Any] = []
         count = 0
         for item in value:
-            safe, replacements = _redact_structure(item, docker_auth_context=docker_auth_context)
+            safe, replacements = _redact_structure(
+                item,
+                docker_auth_context=docker_auth_context,
+                depth=depth + 1,
+            )
             result.append(safe)
             count += replacements
         return result, count
@@ -471,7 +516,7 @@ def _redact_structure(value: Any, *, docker_auth_context: bool = False) -> tuple
                 "stringdata",
             }
             if kubernetes_secret_payload:
-                safe, replacements = _redact_all_values(item)
+                safe, replacements = _redact_all_values(item, depth=depth + 1)
             elif (
                 (isinstance(key, str) and _SENSITIVE_KEY.fullmatch(key))
                 or docker_secret
@@ -482,6 +527,7 @@ def _redact_structure(value: Any, *, docker_auth_context: bool = False) -> tuple
                 safe, replacements = _redact_structure(
                     item,
                     docker_auth_context=docker_auth_context or normalized_key == "auths",
+                    depth=depth + 1,
                 )
             result_dict[key] = safe
             count += replacements
@@ -493,6 +539,8 @@ def _redact_logical_text(text: str) -> tuple[str, int]:
     """Structurally redact a complete JSON record, otherwise redact ordinary text."""
     try:
         parsed = json.loads(text)
+    except RecursionError:
+        return _structured_nesting_omission(text)
     except (TypeError, ValueError):
         safe_text, replacements = _redact_text(text)
         if replacements:
@@ -500,6 +548,8 @@ def _redact_logical_text(text: str) -> tuple[str, int]:
         return _redact_embedded_structures(text)
     if not isinstance(parsed, (dict, list)):
         return _redact_text(text)
+    if _structured_depth_exceeded(parsed):
+        return _structured_nesting_omission(text)
     safe, replacements = _redact_structure(parsed)
     if replacements == 0:
         return _redact_text(text)
@@ -523,8 +573,12 @@ def _redact_embedded_structures(text: str) -> tuple[str, int]:
             continue
         try:
             parsed, end = decoder.raw_decode(text, start)
+        except RecursionError:
+            return _structured_nesting_omission(text)
         except (TypeError, ValueError):
             continue
+        if _structured_depth_exceeded(parsed):
+            return _structured_nesting_omission(text)
         safe, replacements = _redact_structure(parsed)
         if replacements == 0:
             continue
@@ -708,6 +762,78 @@ def _sensitive_state_before(
     )
 
 
+def _kubernetes_yaml_state_before(
+    handle: Any,
+    offset: int,
+    raw: bytes,
+) -> tuple[bool | None, bool | None, int | None, int]:
+    """Recover Kubernetes Secret YAML document and payload-block state."""
+    if offset <= 0:
+        return False, False, None, 0
+    search_start = max(0, offset - _MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES)
+    handle.seek(search_start)
+    context = handle.read(offset - search_start)
+    scanned_bytes = len(context)
+    if search_start > 0:
+        newline = context.find(b"\n")
+        if newline < 0:
+            return None, None, None, scanned_bytes
+        context = context[newline + 1 :]
+
+    state_known = search_start == 0
+    kubernetes_secret = False
+    payload_indent: int | None = None
+    for raw_line in context.splitlines():
+        if not raw_line.strip():
+            continue
+        indent = _line_indent(raw_line)
+        if payload_indent is not None and indent <= payload_indent:
+            payload_indent = None
+        line = raw_line.decode("utf-8", errors="replace")
+        if _YAML_DOCUMENT_BOUNDARY.fullmatch(line):
+            state_known = True
+            kubernetes_secret = False
+            payload_indent = None
+            continue
+        kind_match = _YAML_KIND_ASSIGNMENT.fullmatch(line)
+        if kind_match is not None:
+            state_known = True
+            kubernetes_secret = kind_match.group("kind").strip().strip("\"'").casefold() == "secret"
+            payload_indent = None
+            continue
+        payload_match = _YAML_SECRET_PAYLOAD_ASSIGNMENT.fullmatch(line)
+        if kubernetes_secret and payload_match is not None:
+            if not payload_match.group("value").strip():
+                payload_indent = len(payload_match.group("indent"))
+            continue
+        if indent == 0 and not (
+            line.lstrip().startswith(("#", "-")) or _YAML_MAPPING_ENTRY.match(line)
+        ):
+            state_known = True
+            kubernetes_secret = False
+            payload_indent = None
+
+    first_content_line = next((line for line in raw.splitlines() if line.strip()), None)
+    if first_content_line is None:
+        starts_inside_payload: bool | None = False
+        payload_indent = None
+    elif payload_indent is not None and _line_indent(first_content_line) > payload_indent:
+        starts_inside_payload = True
+    elif state_known:
+        starts_inside_payload = False
+        payload_indent = None
+    else:
+        starts_inside_payload = None
+        payload_indent = None
+
+    return (
+        kubernetes_secret if state_known else None,
+        starts_inside_payload,
+        payload_indent,
+        scanned_bytes,
+    )
+
+
 def _redacted_file_units(
     raw: bytes,
     *,
@@ -719,6 +845,9 @@ def _redacted_file_units(
     sensitive_quote: str | None,
     has_more_after_raw: bool,
     warnings: list[str],
+    starts_inside_kubernetes_secret: bool | None = False,
+    starts_inside_kubernetes_secret_data: bool | None = False,
+    kubernetes_secret_data_indent: int | None = None,
 ) -> list[tuple[bytes, str, int]]:
     """Redact complete logical units while preserving their source byte sizes."""
     if starts_inside_private_key is None:
@@ -741,10 +870,28 @@ def _redacted_file_units(
             "Sensitive-quoted-scalar context exceeded its bounded scan; page content was omitted fail-closed."
         )
         return [(raw, "[CONTENT OMITTED: SENSITIVE-QUOTE CONTEXT UNKNOWN]\n", 1)] if raw else []
+    if starts_inside_kubernetes_secret is None or starts_inside_kubernetes_secret_data is None:
+        warnings.append(
+            "Kubernetes Secret YAML context exceeded its bounded scan; page content was omitted fail-closed."
+        )
+        return [(raw, "[CONTENT OMITTED: KUBERNETES SECRET CONTEXT UNKNOWN]\n", 1)] if raw else []
     raw_lines = raw.splitlines(keepends=True)
     units: list[tuple[bytes, str, int]] = []
     line_index = 0
-    if starts_inside_sensitive_quote and sensitive_quote is not None:
+    if starts_inside_kubernetes_secret_data and kubernetes_secret_data_indent is not None:
+        payload_end = 0
+        while payload_end < len(raw_lines):
+            if (
+                raw_lines[payload_end].strip()
+                and _line_indent(raw_lines[payload_end]) <= kubernetes_secret_data_indent
+            ):
+                break
+            payload_end += 1
+        if payload_end:
+            raw_unit = b"".join(raw_lines[:payload_end])
+            units.append((raw_unit, "[REDACTED SENSITIVE KUBERNETES SECRET DATA]\n", 1))
+            line_index = payload_end
+    elif starts_inside_sensitive_quote and sensitive_quote is not None:
         quote_end = 0
         while quote_end < len(raw_lines):
             quote_end += 1
@@ -789,8 +936,41 @@ def _redacted_file_units(
             units.append((raw_unit, "[REDACTED SENSITIVE VALUE]\n", 1))
             line_index = value_index + 1
     inside_private_key = starts_inside_private_key
+    kubernetes_secret = starts_inside_kubernetes_secret
     while line_index < len(raw_lines):
         raw_unit = raw_lines[line_index]
+        text_unit = raw_unit.decode("utf-8", errors="replace")
+        stripped_unit = text_unit.rstrip("\r\n")
+        if _YAML_DOCUMENT_BOUNDARY.fullmatch(stripped_unit):
+            kubernetes_secret = False
+        kind_match = _YAML_KIND_ASSIGNMENT.fullmatch(stripped_unit)
+        if kind_match is not None:
+            kubernetes_secret = kind_match.group("kind").strip().strip("\"'").casefold() == "secret"
+        payload_match = _YAML_SECRET_PAYLOAD_ASSIGNMENT.fullmatch(stripped_unit)
+        if kubernetes_secret and payload_match is not None:
+            payload_value = payload_match.group("value").strip()
+            if payload_value:
+                units.append((raw_unit, "[REDACTED SENSITIVE KUBERNETES SECRET DATA]\n", 1))
+                line_index += 1
+                continue
+            payload_indent = len(payload_match.group("indent"))
+            payload_end = line_index + 1
+            while payload_end < len(raw_lines):
+                if (
+                    raw_lines[payload_end].strip()
+                    and _line_indent(raw_lines[payload_end]) <= payload_indent
+                ):
+                    break
+                payload_end += 1
+            raw_unit = b"".join(raw_lines[line_index:payload_end])
+            units.append((raw_unit, "[REDACTED SENSITIVE KUBERNETES SECRET DATA]\n", 1))
+            if payload_end == len(raw_lines) and has_more_after_raw:
+                warnings.append(
+                    "A Kubernetes Secret YAML payload crossed the bounded page window; "
+                    "its visible segment was redacted."
+                )
+            line_index = payload_end
+            continue
         if inside_private_key or _PRIVATE_KEY_BEGIN.search(raw_unit):
             end_index = line_index
             while end_index < len(raw_lines) and not _PRIVATE_KEY_END.search(raw_lines[end_index]):
@@ -808,7 +988,6 @@ def _redacted_file_units(
                 inside_private_key = True
             units.append((raw_unit, "[REDACTED PRIVATE KEY]\n", 1))
         else:
-            text_unit = raw_unit.decode("utf-8", errors="replace")
             quoted_match = _QUOTED_SENSITIVE_ASSIGNMENT.search(text_unit.rstrip("\r\n"))
             if quoted_match is not None:
                 quote = quoted_match.group("quote")
@@ -1108,11 +1287,27 @@ def _bounded_event(raw: object) -> dict[str, Any]:
     text = _decode(raw)
     try:
         parsed = json.loads(text)
+    except RecursionError as exc:
+        safe_text, _ = _structured_nesting_omission(text)
+        return {
+            "status": "malformed",
+            "error": _error_text(exc),
+            "raw_excerpt": safe_text[:500],
+            "record_truncated": len(safe_text) > 500,
+        }
     except (TypeError, ValueError) as exc:
         safe_text, _, _ = _redact_log_content(text)
         return {
             "status": "malformed",
             "error": _error_text(exc),
+            "raw_excerpt": safe_text[:500],
+            "record_truncated": len(safe_text) > 500,
+        }
+    if _structured_depth_exceeded(parsed):
+        safe_text, _ = _structured_nesting_omission(text)
+        return {
+            "status": "malformed",
+            "error": "Structured nesting exceeds the diagnostic bound.",
             "raw_excerpt": safe_text[:500],
             "record_truncated": len(safe_text) > 500,
         }
@@ -2364,6 +2559,12 @@ def _read_file_source(
                 sensitive_quote,
                 assignment_context_scanned_bytes,
             ) = _sensitive_state_before(handle, page_start, raw)
+            (
+                starts_inside_kubernetes_secret,
+                starts_inside_kubernetes_secret_data,
+                kubernetes_secret_data_indent,
+                kubernetes_context_scanned_bytes,
+            ) = _kubernetes_yaml_state_before(handle, page_start, raw)
             text = raw.decode("utf-8", errors="replace")
             redaction_units = _redacted_file_units(
                 raw,
@@ -2375,6 +2576,9 @@ def _read_file_source(
                 sensitive_quote=sensitive_quote,
                 has_more_after_raw=False,
                 warnings=warnings,
+                starts_inside_kubernetes_secret=starts_inside_kubernetes_secret,
+                starts_inside_kubernetes_secret_data=starts_inside_kubernetes_secret_data,
+                kubernetes_secret_data_indent=kubernetes_secret_data_indent,
             )
             redacted = "".join(unit[1] for unit in redaction_units)
             replacements = sum(unit[2] for unit in redaction_units)
@@ -2392,9 +2596,14 @@ def _read_file_source(
                 "returned_chars": len(content),
                 "source_size_bytes": stat.st_size,
                 "scanned_bytes": scanned_bytes,
-                "context_scanned_bytes": context_scanned_bytes + assignment_context_scanned_bytes,
+                "context_scanned_bytes": (
+                    context_scanned_bytes
+                    + assignment_context_scanned_bytes
+                    + kubernetes_context_scanned_bytes
+                ),
                 "private_key_context_scanned_bytes": context_scanned_bytes,
                 "sensitive_assignment_context_scanned_bytes": assignment_context_scanned_bytes,
+                "kubernetes_secret_context_scanned_bytes": kubernetes_context_scanned_bytes,
                 "scan_limit_bytes": _MAX_FILE_SCAN_BYTES,
                 "previous_cursor": (max(0, page_start - _MAX_FILE_SCAN_BYTES) if page_start > 0 else None),
                 "next_cursor": None,
@@ -2498,6 +2707,12 @@ def _read_file_source(
                 sensitive_quote,
                 assignment_context_scanned_bytes,
             ) = _sensitive_state_before(handle, page_start, raw)
+            (
+                starts_inside_kubernetes_secret,
+                starts_inside_kubernetes_secret_data,
+                kubernetes_secret_data_indent,
+                kubernetes_context_scanned_bytes,
+            ) = _kubernetes_yaml_state_before(handle, page_start, raw)
             redaction_units = _redacted_file_units(
                 raw,
                 starts_inside_private_key=starts_inside_private_key,
@@ -2508,6 +2723,9 @@ def _read_file_source(
                 sensitive_quote=sensitive_quote,
                 has_more_after_raw=has_more_after_raw,
                 warnings=warnings,
+                starts_inside_kubernetes_secret=starts_inside_kubernetes_secret,
+                starts_inside_kubernetes_secret_data=starts_inside_kubernetes_secret_data,
+                kubernetes_secret_data_indent=kubernetes_secret_data_indent,
             )
 
             parts: list[str] = []
@@ -2572,9 +2790,14 @@ def _read_file_source(
                 "returned_chars": len(content),
                 "source_size_bytes": stat.st_size,
                 "scanned_bytes": scanned_bytes,
-                "context_scanned_bytes": context_scanned_bytes + assignment_context_scanned_bytes,
+                "context_scanned_bytes": (
+                    context_scanned_bytes
+                    + assignment_context_scanned_bytes
+                    + kubernetes_context_scanned_bytes
+                ),
                 "private_key_context_scanned_bytes": context_scanned_bytes,
                 "sensitive_assignment_context_scanned_bytes": assignment_context_scanned_bytes,
+                "kubernetes_secret_context_scanned_bytes": kubernetes_context_scanned_bytes,
                 "scan_limit_bytes": _MAX_FILE_SCAN_BYTES,
                 "previous_cursor": (max(0, page_start - _MAX_FILE_SCAN_BYTES) if page_start > 0 else None),
                 "next_cursor": next_cursor,
