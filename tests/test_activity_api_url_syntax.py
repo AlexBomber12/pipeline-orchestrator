@@ -14,7 +14,11 @@ def test_get_pr_last_push_time_uses_activity_query_string(
 
     def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         calls.append(cmd)
-        stdout = "feature/fix&one#two\n" if "/pulls/" in cmd[2] else "2026-05-14T10:20:30Z\n"
+        stdout = (
+            '{"branch":"feature/fix&one#two","repo":"fork-owner/fork-repo"}\n'
+            if "/pulls/" in cmd[2]
+            else "2026-05-14T10:20:30Z\n"
+        )
         return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
     monkeypatch.setattr("src.github.gh_runner.subprocess.run", fake_run)
@@ -22,12 +26,19 @@ def test_get_pr_last_push_time_uses_activity_query_string(
     get_pr_last_push_time("owner/name", 42)
 
     assert calls == [
-        ["gh", "api", "repos/owner/name/pulls/42", "--jq", ".head.ref"],
+        [
+            "gh",
+            "api",
+            "repos/owner/name/pulls/42",
+            "--jq",
+            '{branch: .head.ref, repo: .head.repo.full_name}',
+        ],
         [
             "gh",
             "api",
             (
-                "repos/owner/name/activity?ref=refs%2Fheads%2Ffeature%2Ffix%26one%23two"
+                "repos/fork-owner/fork-repo/activity?"
+                "ref=refs%2Fheads%2Ffeature%2Ffix%26one%23two"
                 "&activity_type=push&per_page=1&direction=desc"
             ),
             "--jq",

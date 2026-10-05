@@ -698,7 +698,7 @@ def _patch_eyes_reaction_present(
     """Stub the EYES-skip pre-push gate to fire (fresh EYES after push)."""
     monkeypatch.setattr(
         "src.github.reactions._get_codex_issue_reactions",
-        lambda repo, number: [
+        lambda repo, number, policy=None: [
             {
                 "content": "eyes",
                 "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
@@ -718,7 +718,7 @@ def _patch_eyes_reaction_stale(
     """Stub a stale EYES reaction (predates push) — gate must NOT skip."""
     monkeypatch.setattr(
         "src.github.reactions._get_codex_issue_reactions",
-        lambda repo, number: [
+        lambda repo, number, policy=None: [
             {
                 "content": "eyes",
                 "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},

@@ -777,24 +777,36 @@ def get_pr_last_push_time(repo: str, pr_number: int) -> datetime | None:
     Anywhere we want "did X happen after this branch's latest push?",
     push time is the correct anchor.
 
-    Returns ``None`` on any API or parse failure (callers must fail
-    open).
+    Resolves activity against the PR head repository so fork-origin
+    branches use the fork's push feed rather than the base repository's.
+    Returns ``None`` on any API or parse failure; callers choose whether
+    missing freshness evidence should fail open or closed.
     """
 
     try:
-        branch_raw = gh_runner.run_gh([
+        head_raw = gh_runner.run_gh([
             "api",
             f"repos/{repo}/pulls/{pr_number}",
             "--jq",
-            ".head.ref",
+            '{branch: .head.ref, repo: .head.repo.full_name}',
         ])
-        branch = branch_raw.strip() if isinstance(branch_raw, str) else ""
-        if not branch:
+        branch = ""
+        head_repo = ""
+        if isinstance(head_raw, dict):
+            branch_value = head_raw.get("branch")
+            repo_value = head_raw.get("repo")
+            branch = branch_value.strip() if isinstance(branch_value, str) else ""
+            head_repo = repo_value.strip() if isinstance(repo_value, str) else ""
+        elif isinstance(head_raw, str):
+            # Preserve compatibility with simple test doubles and old gh output.
+            branch = head_raw.strip()
+            head_repo = repo
+        if not branch or not head_repo:
             return None
         ref = quote(f"refs/heads/{branch}", safe="")
         date_raw = gh_runner.run_gh([
             "api",
-            f"repos/{repo}/activity?ref={ref}&activity_type=push&per_page=1&direction=desc",
+            f"repos/{head_repo}/activity?ref={ref}&activity_type=push&per_page=1&direction=desc",
             "--jq",
             ".[0].timestamp // .[0].pushed_at",
         ])
@@ -802,7 +814,7 @@ def get_pr_last_push_time(repo: str, pr_number: int) -> datetime | None:
         if not date_str:
             date_raw = gh_runner.run_gh([
                 "api",
-                f"repos/{repo}/activity?ref={ref}&per_page=1&direction=desc",
+                f"repos/{head_repo}/activity?ref={ref}&per_page=1&direction=desc",
                 "--jq",
                 ".[0].timestamp // .[0].pushed_at",
             ])

@@ -3650,12 +3650,24 @@ def test_get_last_push_age_seconds_returns_none_on_parse_error(
 def test_get_pr_last_push_time_returns_parsed_datetime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    responses = iter(["feature-branch", "2026-04-30T11:59:30Z"])
-    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(responses))
+    responses = iter(
+        [
+            {"branch": "feature-branch", "repo": "fork-owner/fork-repo"},
+            "2026-04-30T11:59:30Z",
+        ]
+    )
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
+        calls.append(args)
+        return next(responses)
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
 
     result = get_pr_last_push_time("owner/name", 42)
 
     assert result == datetime(2026, 4, 30, 11, 59, 30, tzinfo=_tz.utc)
+    assert calls[1][1].startswith("repos/fork-owner/fork-repo/activity?")
 
 
 def test_review_freshness_delegates_to_pr_push_time(
@@ -3678,6 +3690,16 @@ def test_get_pr_last_push_time_returns_none_without_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: "")
+    assert get_pr_last_push_time("owner/name", 42) is None
+
+
+def test_get_pr_last_push_time_returns_none_without_head_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.github.gh_runner.run_gh",
+        lambda *args, **kwargs: {"branch": "feature", "repo": None},
+    )
     assert get_pr_last_push_time("owner/name", 42) is None
 
 
