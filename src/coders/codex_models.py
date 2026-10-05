@@ -102,7 +102,7 @@ def _normalize_model(item: object) -> CodexModel | None:
         raise CodexModelDiscoveryInvalid("invalid Codex model entry")
     if item.get("hidden", False):
         return None
-    identifier = item.get("model", item.get("id"))
+    identifier = item.get("model")
     name = item.get("displayName", identifier)
     is_default = item.get("isDefault", False)
     default_effort = item.get("defaultReasoningEffort")

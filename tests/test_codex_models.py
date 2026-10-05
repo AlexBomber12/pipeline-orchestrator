@@ -147,7 +147,7 @@ async def test_paginates_filters_hidden_and_accepts_absent_optional_fields(
                 {
                     "data": [
                         {"model": "hidden", "hidden": True},
-                        {"id": " visible-one ", "displayName": ""},
+                        {"id": "catalog-row", "model": " visible-one ", "displayName": ""},
                     ],
                     "nextCursor": "page-2",
                 },
@@ -173,9 +173,9 @@ async def test_paginates_filters_hidden_and_accepts_absent_optional_fields(
         ([_message(1, {}), {"id": 2, "error": {"message": "secret"}}], CodexModelDiscoveryUnavailable, {}),
         ([_message(1, {}), _message(2, {"data": {}})], CodexModelDiscoveryInvalid, {}),
         ([_message(1, {}), _message(2, {"data": [42]})], CodexModelDiscoveryInvalid, {}),
-        ([_message(1, {}), _message(2, {"data": [{"id": ""}]})], CodexModelDiscoveryInvalid, {}),
+        ([_message(1, {}), _message(2, {"data": [{"id": "catalog-row"}]})], CodexModelDiscoveryInvalid, {}),
         (
-            [_message(1, {}), _message(2, {"data": [{"id": "x", "supportedReasoningEfforts": [42]}]})],
+            [_message(1, {}), _message(2, {"data": [{"model": "x", "supportedReasoningEfforts": [42]}]})],
             CodexModelDiscoveryInvalid,
             {},
         ),
