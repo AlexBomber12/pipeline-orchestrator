@@ -23,10 +23,11 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
 - `read_orchestrator_log` reads a discovered source with a bounded continuation
   cursor or a tail page. Redis cursors address redacted characters; filesystem
   cursors address source bytes and each page window is at most 256 KiB. A
-  filesystem read may inspect older chunks to determine whether its window
-  begins inside a multiline private-key block. Diagnostic text is
-  credential-redacted before it is returned, and producer-added `[truncated]`
-  markers are preserved.
+  filesystem read may inspect up to 1 MiB of older context to determine whether
+  its window begins inside a multiline private-key block; if that bounded scan
+  cannot establish the state, the page is omitted fail-closed. Diagnostic text
+  is credential-redacted before it is returned, and producer-added
+  `[truncated]` markers are preserved.
 
 These tools only accept configured repository slugs and fixed source IDs; they
 cannot read arbitrary paths or Redis keys. Missing, malformed, expired, stale,

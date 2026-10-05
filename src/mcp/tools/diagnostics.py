@@ -48,6 +48,7 @@ _MAX_LOG_SOURCES = 100
 _MAX_READ_CHARS = 20_000
 _MAX_EVENT_RECORD_CHARS = 4_000
 _MAX_FILE_SCAN_BYTES = 256 * 1024
+_MAX_PRIVATE_KEY_CONTEXT_BYTES = 1024 * 1024
 _MAX_REDIS_SCAN_CALLS = 4
 _MAX_REDIS_PENDING_KEYS = 200
 _CLI_LATEST_TTL_SECONDS = 3600
@@ -87,7 +88,10 @@ _SENSITIVE_KEY_PATTERN = rf"(?:[A-Za-z0-9]+[_-])*(?:{_SENSITIVE_NAME_PATTERN})"
 _SENSITIVE_KEY = re.compile(rf"(?i)^(?:{_SENSITIVE_KEY_PATTERN})$")
 _REDACTION_RULES = (
     (
-        re.compile(r"(?im)^([ \t]*(?:cookie|set-cookie)[ \t]*:[ \t]*).*$"),
+        re.compile(
+            r"(?im)(\b(?:cookie|set-cookie|authorization|proxy-authorization)"
+            r"[ \t]*:[ \t]*).*$"
+        ),
         r"\1[REDACTED]",
     ),
     (
@@ -252,13 +256,18 @@ def _redact_structure(value: Any) -> tuple[Any, int]:
     return value, 0
 
 
-def _private_key_state_before(handle: Any, offset: int) -> tuple[bool, int]:
+def _private_key_state_before(handle: Any, offset: int) -> tuple[bool | None, int]:
     """Find the nearest PEM boundary before offset without loading the file."""
     search_end = offset
     suffix = b""
     scanned_bytes = 0
-    while search_end > 0:
-        search_start = max(0, search_end - _MAX_FILE_SCAN_BYTES)
+    while search_end > 0 and scanned_bytes < _MAX_PRIVATE_KEY_CONTEXT_BYTES:
+        read_size = min(
+            search_end,
+            _MAX_FILE_SCAN_BYTES,
+            _MAX_PRIVATE_KEY_CONTEXT_BYTES - scanned_bytes,
+        )
+        search_start = search_end - read_size
         handle.seek(search_start)
         chunk = handle.read(search_end - search_start)
         scanned_bytes += len(chunk)
@@ -271,16 +280,21 @@ def _private_key_state_before(handle: Any, offset: int) -> tuple[bool, int]:
             return max(markers, key=lambda item: item[0])[1], scanned_bytes
         suffix = chunk[:512]
         search_end = search_start
-    return False, scanned_bytes
+    return (None if search_end > 0 else False), scanned_bytes
 
 
 def _redacted_file_units(
     raw: bytes,
     *,
-    starts_inside_private_key: bool,
+    starts_inside_private_key: bool | None,
     warnings: list[str],
 ) -> list[tuple[bytes, str, int]]:
     """Redact complete logical units while preserving their source byte sizes."""
+    if starts_inside_private_key is None:
+        warnings.append(
+            "Private-key context exceeded the bounded backward scan; page content was omitted fail-closed."
+        )
+        return [(raw, "[CONTENT OMITTED: PRIVATE-KEY CONTEXT UNKNOWN]\n", 1)] if raw else []
     raw_lines = raw.splitlines(keepends=True)
     units: list[tuple[bytes, str, int]] = []
     line_index = 0
@@ -1457,7 +1471,11 @@ def _file_source_metadata(
         "mutable": mutable,
         "ordering": "oldest_first" if kind == "disk_event_log" else None,
         "page_window_bound_bytes": _MAX_FILE_SCAN_BYTES,
-        "private_key_context": "older chunks may be inspected to determine multiline redaction state",
+        "private_key_context": (
+            "older chunks may be inspected up to the context bound; "
+            "content is omitted fail-closed if state remains unknown"
+        ),
+        "private_key_context_bound_bytes": _MAX_PRIVATE_KEY_CONTEXT_BYTES,
     }
 
 

@@ -510,6 +510,10 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
             "-----BEGIN PRIVATE KEY-----\nmaterial\n-----END PRIVATE KEY-----",
             "redis://:redis-password@redis:6379/0",
             "Cookie: theme=dark; session_id=cookie-secret",
+            "> Cookie: theme=dark; session_id=prefixed-cookie-secret",
+            '< Authorization: Digest username="user", response="digest-secret"',
+            "> Proxy-Authorization: AWS4-HMAC-SHA256 Credential=user, Signature=sig-secret",
+            "* Set-Cookie: harmless=yes; auth=prefixed-set-cookie-secret",
         ]
     )
     redacted, replacements = diagnostics._redact_text(sensitive)
@@ -523,7 +527,11 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
     assert "material" not in redacted
     assert "redis-password" not in redacted
     assert "cookie-secret" not in redacted
-    assert replacements == 18
+    assert "prefixed-cookie-secret" not in redacted
+    assert "digest-secret" not in redacted
+    assert "sig-secret" not in redacted
+    assert "prefixed-set-cookie-secret" not in redacted
+    assert replacements == 22
     assert diagnostics._redact_text("tokens_in=123 tokens_out=456") == (
         "tokens_in=123 tokens_out=456",
         0,
@@ -895,6 +903,21 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
     assert "private-key-material" not in private_tail["content"]
     assert "after" in private_tail["content"]
     assert private_tail["pagination"]["context_scanned_bytes"] > 0
+
+    ordinary_size = diagnostics._MAX_PRIVATE_KEY_CONTEXT_BYTES + diagnostics._MAX_FILE_SCAN_BYTES * 2
+    ci_path.write_bytes((b"ordinary line\n" * (ordinary_size // len(b"ordinary line\n") + 1))[:ordinary_size])
+    fail_closed_tail = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        max_chars=200,
+        tail=True,
+    )
+    assert fail_closed_tail["content"] == "[CONTENT OMITTED: PRIVATE-KEY CONTEXT UNKNOWN]\n"
+    assert (
+        fail_closed_tail["pagination"]["context_scanned_bytes"]
+        == diagnostics._MAX_PRIVATE_KEY_CONTEXT_BYTES
+    )
+    assert any("omitted fail-closed" in warning for warning in fail_closed_tail["warnings"])
 
 
 async def test_filesystem_reader_omits_oversized_segments_and_lines(
