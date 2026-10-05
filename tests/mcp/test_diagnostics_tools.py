@@ -418,6 +418,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             "ordinary prefix",
             'export PASSWORD="fake-first-secret',
             'fake-second-secret"',
+            'password = """toml-first-secret',
+            'toml-second-secret"""',
             '{"password":123456789}',
             '{"credentials":["user","fake-list-secret"]}',
             json.dumps({"auths": {"registry": {"auth": docker_auth}}, "debug": True}),
@@ -456,7 +458,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                 "debug": True,
             }
         )
-        + "\n",
+        + '\npassword = """ci-toml-first-secret\nci-toml-second-secret"""\n',
         encoding="utf-8",
     )
 
@@ -481,6 +483,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ordinary suffix" in content
         assert "fake-first-secret" not in content
         assert "fake-second-secret" not in content
+        assert "toml-first-secret" not in content
+        assert "toml-second-secret" not in content
         assert "123456789" not in content
         assert "fake-list-secret" not in content
         assert docker_auth not in content
@@ -493,7 +497,19 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "123456789" not in content
         assert list_secret not in content
         assert docker_auth not in content
+        assert "ci-toml-first-secret" not in content
+        assert "ci-toml-second-secret" not in content
         assert "debug" in content
+
+    ci_raw = ci_path.read_bytes()
+    triple_quote_continuation = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=ci_raw.index(b"ci-toml-second-secret"),
+        max_chars=200,
+    )
+    assert "ci-toml-second-secret" not in triple_quote_continuation["content"]
+    assert "[REDACTED SENSITIVE QUOTED SCALAR]" in triple_quote_continuation["content"]
 
 
 async def test_custom_event_root_is_used_for_discovery_and_exact_reads(
@@ -694,6 +710,9 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
     assert diagnostics._has_closing_quote(r'escaped\"then-close"', '"') is True
     assert diagnostics._has_closing_quote("escaped''still-open", "'") is False
     assert diagnostics._has_closing_quote("escaped''then-close'", "'") is True
+    assert diagnostics._has_closing_quote('first-secret', '"""') is False
+    assert diagnostics._has_closing_quote('first-secret"""', '"""') is True
+    assert diagnostics._has_closing_quote("first-secret'''", "'''") is True
 
     state = RepoState(
         url="https://github.com/octo/demo",
@@ -798,6 +817,11 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
     )
     assert diagnostics._redact_logical_text('{"debug": true}\n') == ('{"debug": true}\n', 0)
     assert diagnostics._redact_logical_text("123") == ("123", 0)
+    same_line_toml, same_line_toml_count = diagnostics._redact_logical_text(
+        'password = """same-line-toml-secret"""'
+    )
+    assert "same-line-toml-secret" not in same_line_toml
+    assert same_line_toml_count == 1
     for partial_key in (
         "-----BEGIN PRIVATE KEY-----\npartial-secret",
         "[truncated]\npartial-secret\n-----END PRIVATE KEY-----",

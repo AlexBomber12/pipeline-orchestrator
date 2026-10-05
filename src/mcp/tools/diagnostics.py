@@ -131,7 +131,7 @@ _BLOCK_SENSITIVE_ASSIGNMENT = re.compile(
 _QUOTED_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
     rf"(?<![A-Za-z0-9_.-])(?:{_SENSITIVE_KEY_PATTERN})(?![A-Za-z0-9_.-]))"
-    r"\s*[:=][ \t]*(?P<quote>[\"'])(?P<value>.*)$"
+    r"\s*[:=][ \t]*(?P<quote>\"\"\"|'''|[\"'])(?P<value>.*)$"
 )
 _PLAIN_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
@@ -173,7 +173,7 @@ _REDACTION_RULES = (
         re.compile(
             rf"(?im)((?<![A-Za-z0-9_-])(?:{_SENSITIVE_KEY_PATTERN})"
             r"(?![A-Za-z0-9_-])\s*[:=]\s*)"
-            r"(?P<assignment_quote>[\"'])"
+            r"(?P<assignment_quote>\"\"\"|'''|[\"'])"
             r"(?:\\[^\r\n]|(?!(?P=assignment_quote))[^\\\r\n])*"
             r"(?P=assignment_quote)?"
         ),
@@ -380,10 +380,12 @@ def _has_closing_quote(value: str, quote: str) -> bool:
     index = 0
     while index < len(value):
         character = value[index]
-        if quote == '"' and character == "\\":
+        if quote in {'"', '"""'} and character == "\\":
             index += 2
             continue
-        if character == quote:
+        if len(quote) == 3 and value.startswith(quote, index):
+            return True
+        if len(quote) == 1 and character == quote:
             if quote == "'" and index + 1 < len(value) and value[index + 1] == "'":
                 index += 2
                 continue
