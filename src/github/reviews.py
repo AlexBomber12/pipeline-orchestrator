@@ -105,6 +105,7 @@ def _compute_review_status(
     body_eyes = False
     body_approved = False
     head_commit_time: datetime | None = None
+    head_commit_time_loaded = False
     reviewer_policy = (
         policy if policy is not None else reviewer_policy_from_config(load_config())
     )
@@ -136,35 +137,19 @@ def _compute_review_status(
                     latest_review_sha = review_info["latest_sha"]
                     reaction_time = _parse_iso(plus_one.get("created_at"))
                     head_commit_time = _get_commit_time(repo, head_sha)
-                    if latest_review_sha and latest_review_sha == head_sha:
-                        if (
-                            reaction_time
-                            and head_commit_time
-                            and reaction_time >= head_commit_time
-                        ):
-                            body_approved = True
-                        elif not head_commit_time:
-                            body_approved = True
-                    else:
+                    head_commit_time_loaded = True
+                    if head_commit_time is not None:
                         threshold = head_commit_time
-                        if (
+                        if latest_review_sha != head_sha and (
                             latest_review_time is not None
-                            and (
-                                threshold is None
-                                or latest_review_time > threshold
-                            )
+                            and latest_review_time > threshold
                         ):
                             threshold = latest_review_time
                         if (
                             reaction_time
-                            and threshold
                             and reaction_time >= threshold
                         ):
                             body_approved = True
-                        elif not threshold:
-                            body_approved = True
-                else:
-                    body_approved = True
             if not body_approved and any(
                 _reactions._is_reaction_content(
                     reaction, "eyes", policy=reviewer_policy
@@ -209,14 +194,24 @@ def _compute_review_status(
                     f"repos/{repo}/issues/comments/{cid}/reactions"
                 )
                 if anchor_reactions:
-                    if any(
-                        _reactions._is_plus_one(
-                            reaction, policy=reviewer_policy
-                        )
-                        for reaction in anchor_reactions
-                    ):
-                        anchor_approved = True
-                    elif any(
+                    anchor_plus_one = _reactions._find_codex_plus_one_reaction(
+                        anchor_reactions,
+                        policy=reviewer_policy,
+                    )
+                    if anchor_plus_one is not None:
+                        if head_sha:
+                            if not head_commit_time_loaded:
+                                head_commit_time = _get_commit_time(repo, head_sha)
+                                head_commit_time_loaded = True
+                            reaction_time = _parse_iso(
+                                anchor_plus_one.get("created_at")
+                            )
+                            anchor_approved = bool(
+                                reaction_time
+                                and head_commit_time
+                                and reaction_time >= head_commit_time
+                            )
+                    if not anchor_approved and any(
                         _reactions._is_reaction_content(
                             reaction, "eyes", policy=reviewer_policy
                         )

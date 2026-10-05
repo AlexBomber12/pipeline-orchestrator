@@ -926,7 +926,7 @@ async def test_cancellation_waits_for_shielded_cleanup(
     cleanup.cancel()
 
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(cleanup, timeout=5)
+        await asyncio.wait_for(cleanup, timeout=1)
 
     result = await managed.cleanup(term_grace=0, kill_grace=0)
     assert result.quiescent
@@ -2317,7 +2317,7 @@ async def test_launch_rejects_conflicts_and_unverified_session(
             0.01,
         )
         patch.setattr(
-            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.1
+            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.05
         )
         launch_task = asyncio.create_task(
             launch_process(
@@ -2339,7 +2339,7 @@ async def test_launch_rejects_conflicts_and_unverified_session(
         )
         patch.setattr(process_supervisor, "_LAUNCH_PHASE_TIMEOUT_SECONDS", 0.01)
         patch.setattr(
-            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.1
+            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.05
         )
         with pytest.raises(RuntimeError, match="readiness exceeded"):
             await asyncio.wait_for(
@@ -2385,7 +2385,7 @@ async def test_launch_rejects_conflicts_and_unverified_session(
             0.1,
         )
         patch.setattr(
-            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.5
+            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.05
         )
         launch_task = asyncio.create_task(
             launch_process(
@@ -2398,7 +2398,7 @@ async def test_launch_rejects_conflicts_and_unverified_session(
         launch_task.cancel()
         release_exec_result.set()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(launch_task, timeout=5)
+            await asyncio.wait_for(launch_task, timeout=1)
     assert len(exec_cleanup_tasks) == len(exec_cleanup_owners) == 1
     assert exec_cleanup_tasks[0].done()
     exec_owner = exec_cleanup_owners[0]

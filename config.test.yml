@@ -45,8 +45,6 @@ daemon:
   trusted_reviewer_identities:
     - user_id: 199175422
       login: chatgpt-codex-connector[bot]
-    - user_id: 336614745
-      login: po-testbed-codex-reviewer[bot]
 
 web:
   host: 0.0.0.0

@@ -73,7 +73,7 @@ def test_codex_bot_error_retrigger_uses_trusted_user_id(
 ) -> None:
     runner = h._make_runner()
     runner.app_config.daemon.trusted_reviewer_identities = [
-        TrustedReviewerIdentity(user_id=336614745, login="old-reviewer-name[bot]")
+        TrustedReviewerIdentity(user_id=424242424, login="old-reviewer-name[bot]")
     ]
     posted: list[int] = []
     monkeypatch.setattr(
@@ -81,7 +81,7 @@ def test_codex_bot_error_retrigger_uses_trusted_user_id(
         lambda path: [
             h._codex_bot_error_comment(
                 user={
-                    "id": 336614745,
+                    "id": 424242424,
                     "login": "renamed-reviewer[bot]",
                 },
                 body=OBSERVED_ERROR_BODY,
