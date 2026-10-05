@@ -14,6 +14,7 @@ import asyncio
 import random
 import re
 import time
+import types
 from pathlib import Path
 from typing import Any
 
@@ -61,7 +62,8 @@ class FakeCoderPlugin:
         self.run_planned_pr_calls: list[dict[str, Any]] = []
         self.run_auto_pr_calls: list[dict[str, Any]] = []
         self.fix_review_calls: list[dict[str, Any]] = []
-        self.diagnose_calls: list[tuple[str, str, str]] = []
+        self.run_prompt_calls: list[dict[str, Any]] = []
+        self.diagnose_calls: list[dict[str, Any]] = []
 
     def model_catalog_cache_key(
         self, *, config: AppConfig, config_path: str
@@ -91,6 +93,14 @@ class FakeCoderPlugin:
         self.fix_review_calls.append({"repo_path": repo_path, **kwargs})
         return (0, "fake stdout", "")
 
+    async def run_prompt(
+        self, prompt: str, repo_path: str, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        self.run_prompt_calls.append(
+            {"prompt": prompt, "repo_path": repo_path, **kwargs}
+        )
+        return (0, "fake stdout", "")
+
     def check_auth(self) -> dict[str, str]:
         return {"status": "ok", "detail": "fake auth ok"}
 
@@ -112,8 +122,17 @@ class FakeCoderPlugin:
     def default_weekly_pause_percent(self) -> int:
         return 100
 
-    async def diagnose_error(self, repo_path: str, context: str, model: str) -> tuple[int, str, str]:
-        self.diagnose_calls.append((repo_path, context, model))
+    async def diagnose_error(
+        self, repo_path: str, context: str, model: str, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        self.diagnose_calls.append(
+            {
+                "repo_path": repo_path,
+                "context": context,
+                "model": model,
+                **kwargs,
+            }
+        )
         return (0, "FIX\nfake diagnose", "")
 
     def build_run_kwargs(
@@ -250,6 +269,108 @@ def test_handle_fix_dispatches_to_fake_plugin(
     # head_after via the _patch_subprocess defaults), so the runner
     # transitions to WATCH after recording the push.
     assert runner.state.state == PipelineState.WATCH
+
+
+def test_handle_merge_dispatches_auxiliary_prompt_to_fake_plugin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Merge-conflict execution is plugin-owned for an arbitrary name."""
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
+            return h._FakeCompletedProcess(
+                args=cmd,
+                returncode=1,
+                stdout="CONFLICT (content): merge conflict in foo",
+            )
+        return h._FakeCompletedProcess(args=cmd, returncode=0)
+
+    fake = FakeCoderPlugin()
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda repo, number, body: None,
+    )
+
+    runner = h._make_runner()
+    runner._registry.register(fake)  # type: ignore[arg-type]
+    runner._get_auxiliary_coder = lambda: ("fake", fake)  # type: ignore[method-assign]
+    runner.state.current_pr = PRInfo(number=42, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.handle_merge())
+
+    assert len(fake.run_prompt_calls) == 1
+    call = fake.run_prompt_calls[0]
+    assert call["prompt"] == (
+        "Resolve all merge conflicts in the working tree. Keep both sides "
+        "where possible. Run scripts/ci.sh to verify."
+    )
+    assert call["repo_path"] == runner.repo_path
+    assert call["model"] == "fake-1"
+    assert call["timeout"] == 300
+    assert call["on_process_start"] == runner._track_current_coder_process
+    assert call["on_supervised_process_start"] == (
+        runner._track_current_coder_supervised_process
+    )
+    assert runner.state.state == PipelineState.WATCH
+
+
+def test_handle_merge_stop_cleans_auxiliary_process_and_aborts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git_calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
+        git_calls.append(cmd)
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
+            return h._FakeCompletedProcess(
+                args=cmd,
+                returncode=1,
+                stdout="CONFLICT (content): merge conflict in foo",
+            )
+        return h._FakeCompletedProcess(args=cmd, returncode=0)
+
+    class _Managed:
+        process = types.SimpleNamespace(returncode=0)
+
+        async def cleanup(self, **kwargs: object) -> object:
+            del kwargs
+            return types.SimpleNamespace(quiescent=True, detail=None)
+
+    managed = _Managed()
+    fake = FakeCoderPlugin()
+
+    async def wait_for_stop(
+        prompt: str, repo_path: str, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        del prompt, repo_path
+        kwargs["on_process_start"](managed.process)
+        kwargs["on_supervised_process_start"](managed)
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+    fake.run_prompt = wait_for_stop  # type: ignore[method-assign]
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = h._make_runner()
+    runner._get_auxiliary_coder = lambda: ("fake", fake)  # type: ignore[method-assign]
+    runner.redis.store[f"control:{runner.name}:stop"] = "1"
+    runner.state.current_pr = PRInfo(number=42, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.user_paused is True
+    assert runner._current_coder_process is None
+    assert runner._current_coder_supervised_process is None
+    assert any(cmd[:3] == ["git", "merge", "--abort"] for cmd in git_calls)
+    assert not any(cmd[:2] == ["git", "push"] for cmd in git_calls)
 
 
 class _OverridingPlugin(FakeCoderPlugin):

@@ -66,6 +66,16 @@ class DummyCoderPlugin:
     ) -> tuple[int, str, str]:
         return (0, repo_path, model or str(timeout))
 
+    async def run_prompt(
+        self,
+        prompt: str,
+        repo_path: str,
+        model: str | None,
+        timeout: int | None,
+        **kwargs: Any,
+    ) -> tuple[int, str, str]:
+        return (0, prompt, f"{repo_path}|{model}|{timeout}|{bool(kwargs)}")
+
     def check_auth(self) -> dict[str, str]:
         return {"status": "ok"}
 
@@ -88,7 +98,11 @@ class DummyCoderPlugin:
         return 80
 
     async def diagnose_error(
-        self, repo_path: str, context: str, model: str
+        self,
+        repo_path: str,
+        context: str,
+        model: str | None,
+        **kwargs: Any,
     ) -> tuple[int, str, str]:
         return (0, f"{repo_path}|{context}|{model}", "")
 
@@ -146,6 +160,13 @@ def test_protocol_includes_diagnose_error() -> None:
     assert isinstance(CodexPlugin(), CoderPlugin)
 
 
+def test_protocol_includes_run_prompt() -> None:
+    assert "run_prompt" in dir(CoderPlugin)
+    assert isinstance(DummyCoderPlugin("dummy", "Dummy"), CoderPlugin)
+    assert isinstance(ClaudePlugin(), CoderPlugin)
+    assert isinstance(CodexPlugin(), CoderPlugin)
+
+
 def test_protocol_includes_supports_breach_lifecycle() -> None:
     """``CoderPlugin`` declares ``supports_breach_lifecycle`` so handlers
     can gate breach monitoring without hardcoding coder names."""
@@ -194,11 +215,18 @@ def test_claude_plugin_diagnose_error_delegates(
     captured: dict[str, object] = {}
 
     async def fake(
-        repo_path: str, context: str, *, model: str | None = None
+        repo_path: str,
+        context: str,
+        *,
+        model: str | None = None,
+        on_process_start: object = None,
+        on_supervised_process_start: object = None,
     ) -> tuple[int, str, str]:
         captured["repo_path"] = repo_path
         captured["context"] = context
         captured["model"] = model
+        captured["on_process_start"] = on_process_start
+        captured["on_supervised_process_start"] = on_supervised_process_start
         return (0, "FIX", "")
 
     monkeypatch.setattr(claude_cli, "diagnose_error_async", fake)
@@ -214,6 +242,8 @@ def test_claude_plugin_diagnose_error_delegates(
         "repo_path": "/tmp/repo",
         "context": "ci red",
         "model": "opus",
+        "on_process_start": None,
+        "on_supervised_process_start": None,
     }
 
 
@@ -223,11 +253,18 @@ def test_codex_plugin_diagnose_error_delegates(
     captured: dict[str, object] = {}
 
     async def fake(
-        repo_path: str, context: str, *, model: str | None = None
+        repo_path: str,
+        context: str,
+        *,
+        model: str | None = None,
+        on_process_start: object = None,
+        on_supervised_process_start: object = None,
     ) -> tuple[int, str, str]:
         captured["repo_path"] = repo_path
         captured["context"] = context
         captured["model"] = model
+        captured["on_process_start"] = on_process_start
+        captured["on_supervised_process_start"] = on_supervised_process_start
         return (0, "SKIP", "")
 
     monkeypatch.setattr(codex_cli, "diagnose_error_async", fake)
@@ -243,7 +280,59 @@ def test_codex_plugin_diagnose_error_delegates(
         "repo_path": "/tmp/repo",
         "context": "ci red",
         "model": "gpt-5.4",
+        "on_process_start": None,
+        "on_supervised_process_start": None,
     }
+
+
+@pytest.mark.parametrize(
+    ("plugin", "module", "runner_name", "model"),
+    [
+        (ClaudePlugin(), claude_cli, "run_claude_async", "opus"),
+        (CodexPlugin(), codex_cli, "run_codex_async", "gpt-5.4"),
+    ],
+)
+def test_plugin_run_prompt_forwards_auxiliary_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin: CoderPlugin,
+    module: object,
+    runner_name: str,
+    model: str,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def process_callback(process: object) -> None:
+        del process
+
+    def supervised_callback(managed: object) -> None:
+        del managed
+
+    async def fake(prompt: str, repo_path: str, **kwargs: object):
+        captured.update(prompt=prompt, repo_path=repo_path, **kwargs)
+        return (0, "done", "")
+
+    monkeypatch.setattr(module, runner_name, fake)
+
+    result = asyncio.run(
+        plugin.run_prompt(
+            "resolve this",
+            "/tmp/repo",
+            model=model,
+            timeout=300,
+            on_process_start=process_callback,
+            on_supervised_process_start=supervised_callback,
+        )
+    )
+
+    assert result == (0, "done", "")
+    assert captured["prompt"] == "resolve this"
+    assert captured["repo_path"] == "/tmp/repo"
+    assert captured["model"] == model
+    assert captured["timeout"] == 300
+    assert captured["on_process_start"] is process_callback
+    assert captured["on_supervised_process_start"] is supervised_callback
+    if isinstance(plugin, ClaudePlugin):
+        assert captured["system_prompt_file"] is None
 
 
 def test_protocol_includes_run_auto_pr() -> None:

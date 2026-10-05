@@ -978,3 +978,118 @@ def test_pop_stop_request_returns_true_when_delete_fails(
     monkeypatch.setattr(runner.redis, "delete", boom_delete)
 
     assert asyncio.run(runner._pop_stop_request()) is True
+
+
+class _AuxiliaryManagedProcess:
+    def __init__(self, *, quiescent: bool = True) -> None:
+        self.process = types.SimpleNamespace(returncode=0)
+        self.quiescent = quiescent
+        self.cleanup_calls = 0
+
+    async def cleanup(self, **kwargs: object) -> object:
+        del kwargs
+        self.cleanup_calls += 1
+        return types.SimpleNamespace(
+            quiescent=self.quiescent,
+            detail=None if self.quiescent else "auxiliary child still live",
+        )
+
+
+def test_auxiliary_awaiter_releases_confirmed_runner_handle() -> None:
+    runner = h._make_runner()
+    managed = _AuxiliaryManagedProcess()
+    ownership_seen: list[bool] = []
+
+    async def invocation() -> tuple[int, str, str]:
+        runner._track_current_coder_process(managed.process)
+        runner._track_current_coder_supervised_process(managed)  # type: ignore[arg-type]
+        ownership_seen.append(
+            runner._current_coder_process is managed.process
+            and runner._current_coder_supervised_process is managed
+        )
+        return (0, "done", "")
+
+    result = asyncio.run(
+        runner._await_auxiliary_coder(
+            invocation(),
+            cleanup_context="test auxiliary completion",
+            log_prefix="[TEST]",
+        )
+    )
+
+    assert result == (0, "done", "")
+    assert ownership_seen == [True]
+    assert managed.cleanup_calls == 1
+    assert runner._current_coder_process is None
+    assert runner._current_coder_supervised_process is None
+
+
+@pytest.mark.parametrize(
+    ("quiescent", "expected_state"),
+    [(True, PipelineState.PAUSED), (False, PipelineState.ERROR)],
+)
+def test_auxiliary_awaiter_stop_preserves_cleanup_guarantee(
+    quiescent: bool,
+    expected_state: PipelineState,
+) -> None:
+    runner = h._make_runner()
+    runner.state.state = PipelineState.MERGE
+    runner.redis.store[f"control:{runner.name}:stop"] = "1"
+    managed = _AuxiliaryManagedProcess(quiescent=quiescent)
+
+    async def invocation() -> tuple[int, str, str]:
+        runner._track_current_coder_process(managed.process)
+        runner._track_current_coder_supervised_process(managed)  # type: ignore[arg-type]
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+    result = asyncio.run(
+        runner._await_auxiliary_coder(
+            invocation(),
+            cleanup_context="test auxiliary stop",
+            log_prefix="[TEST]",
+        )
+    )
+
+    assert result is None
+    assert runner.state.state == expected_state
+    assert runner.state.user_paused is True
+    if quiescent:
+        assert runner._current_coder_process is None
+        assert runner._current_coder_supervised_process is None
+    else:
+        assert runner._current_coder_process is managed.process
+        assert runner._current_coder_supervised_process is managed
+        assert "auxiliary child still live" in (runner.state.error_message or "")
+
+
+def test_auxiliary_awaiter_cancellation_cleans_before_propagating() -> None:
+    runner = h._make_runner()
+    managed = _AuxiliaryManagedProcess()
+    started = asyncio.Event()
+
+    async def invocation() -> tuple[int, str, str]:
+        runner._track_current_coder_process(managed.process)
+        runner._track_current_coder_supervised_process(managed)  # type: ignore[arg-type]
+        started.set()
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            runner._await_auxiliary_coder(
+                invocation(),
+                cleanup_context="test auxiliary cancellation",
+                log_prefix="[TEST]",
+            )
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    assert managed.cleanup_calls == 1
+    assert runner._current_coder_process is None
+    assert runner._current_coder_supervised_process is None

@@ -13,7 +13,6 @@ import logging
 import subprocess
 from datetime import datetime, timezone
 
-from src import claude_cli, codex_cli
 from src.analytics import log_merged_pr
 from src.analytics.coder_version import detect_coder_extension_version
 from src.branch_context import BranchContext
@@ -129,7 +128,7 @@ class MergeMixin:
                                 log_prefix="[MERGE]",
                             )
                             return
-                        coder_name, _plugin = selected
+                        coder_name, plugin = selected
                         if not await self.usage_gate(
                             proactive_coder=coder_name
                         ):
@@ -160,21 +159,32 @@ class MergeMixin:
                             "tree. Keep both sides where possible. "
                             "Run scripts/ci.sh to verify."
                         )
-                        if coder_name == "claude":
-                            code, _stdout, _stderr = await claude_cli.run_claude_async(
+                        plugin_run_kwargs = plugin.build_run_kwargs(
+                            daemon_config=self.app_config.daemon
+                        )
+                        auxiliary_result = await self._await_auxiliary_coder(
+                            plugin.run_prompt(
                                 prompt,
                                 self.repo_path,
+                                model=plugin_run_kwargs.get("model"),
                                 timeout=300,
-                                model=self.app_config.daemon.claude_model,
-                                system_prompt_file=None,
-                            )
-                        else:
-                            code, _stdout, _stderr = await codex_cli.run_codex_async(
-                                prompt,
-                                self.repo_path,
-                                timeout=300,
-                                model=self.app_config.daemon.codex_model,
-                            )
+                                on_process_start=self._track_current_coder_process,
+                                on_supervised_process_start=(
+                                    self._track_current_coder_supervised_process
+                                ),
+                            ),
+                            cleanup_context="MERGE conflict resolution",
+                            log_prefix="[MERGE]",
+                        )
+                        if auxiliary_result is None:
+                            if self.state.state == PipelineState.PAUSED:
+                                git_ops._git(
+                                    self.repo_path,
+                                    "merge", "--abort",
+                                    check=False,
+                                )
+                            return
+                        code, _stdout, _stderr = auxiliary_result
                         if code != 0:
                             self._detect_rate_limit(_stderr, coder_name=coder_name)
                             git_ops._git(
