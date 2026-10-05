@@ -38,7 +38,9 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   are also redacted by sensitive key, including non-string values and Azure
   connection-string key aliases. Structured environment entries correlate a
   sensitive `name` field with its sibling `value`, and decoded multiline string
-  fields use the same logical-unit policy as retained files. Producer-added
+  fields use the same logical-unit policy as retained files. The redactor also
+  covers same-indent pretty-JSON continuations, netrc password forms, and every
+  value below Kubernetes Secret `data` and `stringData`. Producer-added
   `[truncated]` markers are preserved; because their removed prefix may contain
   a sensitive opener, the retained Redis CLI tail is omitted fail-closed. Redis event
   history is fetched through a

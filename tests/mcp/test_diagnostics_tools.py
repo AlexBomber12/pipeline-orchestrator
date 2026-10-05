@@ -221,6 +221,15 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
                         {"name": "PASSWORD", "value": "status-name-value-secret"},
                     ],
                     "message": 'PASSWORD="status-structured-first\nstatus-structured-second"',
+                    "netrc": (
+                        "machine status.example login alice password status-netrc-secret"
+                    ),
+                    "resource": {
+                        "kind": "Secret",
+                        "metadata": {"name": "retained-name"},
+                        "data": {".dockerconfigjson": "status-kube-data-secret"},
+                        "stringData": {"config": "status-kube-string-secret"},
+                    },
                 },
             }
         ),
@@ -266,6 +275,9 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
     assert "status-name-value-secret" not in json.dumps(result)
     assert "status-structured-first" not in json.dumps(result)
     assert "status-structured-second" not in json.dumps(result)
+    assert "status-netrc-secret" not in json.dumps(result)
+    assert "status-kube-data-secret" not in json.dumps(result)
+    assert "status-kube-string-secret" not in json.dumps(result)
     assert "status-malformed-password" not in json.dumps(result)
     assert overview["observed"]["error"] == "Authorization: [REDACTED]"
     assert result["detail"]["queue"]["counts_by_status"] == {"DOING": 1}
@@ -459,6 +471,15 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             json.dumps(
                 {"message": 'PASSWORD="redis-structured-first\nredis-structured-second"'}
             ),
+            '{\n"password":\n"redis-same-indent-secret"\n}',
+            "machine redis.example login alice password redis-netrc-secret",
+            json.dumps(
+                {
+                    "kind": "Secret",
+                    "data": {".dockerconfigjson": "redis-kube-data-secret"},
+                    "stringData": {"config": "redis-kube-string-secret"},
+                }
+            ),
             json.dumps({"auths": {"registry": {"auth": docker_auth}}, "debug": True}),
             f"DOCKER_AUTH_CONFIG={{\"auths\":{{\"registry\":{{\"auth\":\"{docker_auth}\"}}}}}}",
             "ordinary suffix",
@@ -479,6 +500,12 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                 "credentials": ["user", "disk-list-secret"],
                 "env": [{"name": "API_KEY", "value": "disk-name-value-secret"}],
                 "message": 'PASSWORD="disk-structured-first\ndisk-structured-second"',
+                "netrc": "machine disk.example login alice password disk-netrc-secret",
+                "resource": {
+                    "kind": "Secret",
+                    "data": {"opaque": "disk-kube-data-secret"},
+                    "stringData": {"config": "disk-kube-string-secret"},
+                },
                 "auths": {"registry": {"auth": docker_auth}},
                 "debug": True,
             }
@@ -495,6 +522,12 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                 "credentials": ["user", "ci-list-secret"],
                 "env": [{"name": "CLIENT_SECRET", "value": "ci-name-value-secret"}],
                 "message": 'PASSWORD="ci-structured-first\nci-structured-second"',
+                "netrc": "machine ci.example login alice password ci-netrc-secret",
+                "resource": {
+                    "kind": "Secret",
+                    "data": {"opaque": "ci-kube-data-secret"},
+                    "stringData": {"config": "ci-kube-string-secret"},
+                },
                 "auths": {"registry": {"auth": docker_auth}},
                 "debug": True,
             }
@@ -511,6 +544,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "AccountKey=ci-azure-account-key-value\n"
         + '{"SharedAccessKey":"ci-azure-shared-key-value"}\n'
         + '{"password":987650002,}\n'
+        + '{\n"password":\n"ci-same-indent-secret"\n}\n'
+        + "  password ci-multiline-netrc-secret\n"
         + '2026-10-05 INFO {"password":987654322,"debug":true}\n',
         encoding="utf-8",
     )
@@ -560,6 +595,10 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-name-value-secret" not in content
         assert "redis-structured-first" not in content
         assert "redis-structured-second" not in content
+        assert "redis-same-indent-secret" not in content
+        assert "redis-netrc-secret" not in content
+        assert "redis-kube-data-secret" not in content
+        assert "redis-kube-string-secret" not in content
         assert docker_auth not in content
 
     for source_id, list_secret in (
@@ -575,6 +614,14 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-structured-second" not in content
         assert "disk-structured-first" not in content
         assert "disk-structured-second" not in content
+        assert "ci-same-indent-secret" not in content
+        assert "ci-netrc-secret" not in content
+        assert "ci-multiline-netrc-secret" not in content
+        assert "disk-netrc-secret" not in content
+        assert "ci-kube-data-secret" not in content
+        assert "ci-kube-string-secret" not in content
+        assert "disk-kube-data-secret" not in content
+        assert "disk-kube-string-secret" not in content
         assert docker_auth not in content
         assert "ci-toml-first-secret" not in content
         assert "ci-toml-second-secret" not in content
@@ -904,6 +951,10 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
         unterminated_nested_value
     )
     assert diagnostics._redact_malformed_keyed_values('{"password":') == ('{"password":', 0)
+    assert diagnostics._redact_all_values({"nested": ["one", 2]}) == (
+        {"nested": ["[REDACTED]", "[REDACTED]"]},
+        2,
+    )
 
     state = RepoState(
         url="https://github.com/octo/demo",

@@ -141,6 +141,9 @@ _PENDING_YAML_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
     rf"(?:{_SENSITIVE_KEY_PATTERN}))\s*:[ \t]*$"
 )
+_PENDING_JSON_SENSITIVE_ASSIGNMENT = re.compile(
+    rf'(?i)^[ \t]*"(?:{_SENSITIVE_KEY_PATTERN})"\s*:\s*$'
+)
 _BLOCK_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
     rf"(?:{_SENSITIVE_KEY_PATTERN}))\s*[:=][ \t]*"
@@ -181,6 +184,22 @@ _REDACTION_RULES = (
             r"(?i)((?<!\S)(?:-u|-U|--user|--proxy-user)(?:=|[ \t]+))"
             r"(?:(?P<user_quote>[\"'])(?:\\[^\r\n]|(?!(?P=user_quote))[^\\\r\n])*"
             r"(?P=user_quote)?|[^\s]+)"
+        ),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(
+            r"(?im)(\b(?:machine[ \t]+\S+|default)\b[^\r\n]*?\bpassword[ \t]+)(?![:=])"
+            r"(?:(?P<netrc_quote>[\"'])(?:\\[^\r\n]|(?!(?P=netrc_quote))[^\\\r\n])*"
+            r"(?P=netrc_quote)?|[^\s]+)"
+        ),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(
+            r"(?im)^([ \t]*(?:password|passwd)[ \t]+)(?![:=])"
+            r"(?:(?P<netrc_line_quote>[\"'])(?:\\[^\r\n]|"
+            r"(?!(?P=netrc_line_quote))[^\\\r\n])*(?P=netrc_line_quote)?|[^\s]+)"
         ),
         r"\1[REDACTED]",
     ),
@@ -392,6 +411,26 @@ def _redact_text(text: str) -> tuple[str, int]:
     return redacted, count + replacements
 
 
+def _redact_all_values(value: Any) -> tuple[Any, int]:
+    if isinstance(value, dict):
+        result: dict[Any, Any] = {}
+        count = 0
+        for key, item in value.items():
+            safe, replacements = _redact_all_values(item)
+            result[key] = safe
+            count += replacements
+        return result, count
+    if isinstance(value, list):
+        result_list: list[Any] = []
+        count = 0
+        for item in value:
+            safe, replacements = _redact_all_values(item)
+            result_list.append(safe)
+            count += replacements
+        return result_list, count
+    return "[REDACTED]", 1
+
+
 def _redact_structure(value: Any, *, docker_auth_context: bool = False) -> tuple[Any, int]:
     if isinstance(value, str):
         safe, replacements, _ = _redact_log_content(value)
@@ -407,6 +446,13 @@ def _redact_structure(value: Any, *, docker_auth_context: bool = False) -> tuple
     if isinstance(value, dict):
         result_dict: dict[Any, Any] = {}
         count = 0
+        kubernetes_secret = any(
+            isinstance(key, str)
+            and key.casefold().replace("_", "").replace("-", "") == "kind"
+            and isinstance(item, str)
+            and item.casefold() == "secret"
+            for key, item in value.items()
+        )
         sensitive_named_value = any(
             isinstance(key, str)
             and key.casefold().replace("_", "").replace("-", "") == "name"
@@ -420,7 +466,13 @@ def _redact_structure(value: Any, *, docker_auth_context: bool = False) -> tuple
             )
             docker_secret = docker_auth_context and normalized_key in {"auth", "identitytoken"}
             named_secret = sensitive_named_value and normalized_key == "value"
-            if (
+            kubernetes_secret_payload = kubernetes_secret and normalized_key in {
+                "data",
+                "stringdata",
+            }
+            if kubernetes_secret_payload:
+                safe, replacements = _redact_all_values(item)
+            elif (
                 (isinstance(key, str) and _SENSITIVE_KEY.fullmatch(key))
                 or docker_secret
                 or named_secret
@@ -825,6 +877,14 @@ def _redacted_file_units(
                     raw_unit = b"".join(raw_lines[line_index:value_end])
                     units.append((raw_unit, "[REDACTED SENSITIVE ASSIGNMENT]\n", 1))
                     line_index = value_end
+                    continue
+                if (
+                    _PENDING_JSON_SENSITIVE_ASSIGNMENT.fullmatch(text_unit.rstrip("\r\n"))
+                    and value_end < len(raw_lines)
+                ):
+                    raw_unit = b"".join(raw_lines[line_index : value_end + 1])
+                    units.append((raw_unit, "[REDACTED SENSITIVE ASSIGNMENT]\n", 1))
+                    line_index = value_end + 1
                     continue
                 if has_more_after_raw and value_end == len(raw_lines):
                     warnings.append(
