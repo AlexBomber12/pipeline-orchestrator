@@ -6,10 +6,16 @@ from typing import Any
 
 import pytest
 from src import claude_cli, codex_cli
-from src.coder_registry import CoderPlugin, CoderRegistry
+from src.coder_registry import (
+    CoderPlugin,
+    CoderRegistry,
+    ModelCatalog,
+    ModelMetadata,
+    ModelSetting,
+)
 from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
-from src.config import DaemonConfig
+from src.config import AppConfig, DaemonConfig
 
 
 class DummyCoderPlugin:
@@ -17,6 +23,26 @@ class DummyCoderPlugin:
         self.name = name
         self.display_name = display_name
         self.models = ["model-a", "model-b"]
+        self.model_setting = ModelSetting(
+            "claude_model", "model-a", "(default)"
+        )
+        self.model_catalog_refreshable = False
+
+    def model_catalog_cache_key(
+        self, *, config: AppConfig, config_path: str
+    ) -> str:
+        del config, config_path
+        return "static"
+
+    async def get_model_catalog(
+        self, *, config: AppConfig, config_path: str
+    ) -> ModelCatalog:
+        del config, config_path
+        return ModelCatalog(
+            tuple(ModelMetadata(model, model) for model in self.models),
+            "static_compatibility",
+            "Static test catalog.",
+        )
 
     async def run_planned_pr(
         self, repo_path: str, model: str | None, timeout: int

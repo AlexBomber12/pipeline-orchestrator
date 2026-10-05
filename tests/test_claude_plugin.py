@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from src.coder_registry import ModelMetadata
 from src.coders import claude as claude_module
 from src.coders.claude import ClaudePlugin
 from src.config import AppConfig
@@ -19,6 +20,22 @@ def test_claude_plugin_models() -> None:
     plugin = ClaudePlugin()
 
     assert plugin.models == ["opus", "sonnet"]
+
+
+@pytest.mark.asyncio
+async def test_claude_plugin_catalog_is_explicitly_static_compatibility() -> None:
+    catalog = await ClaudePlugin().get_model_catalog(
+        config=AppConfig(),
+        config_path="config.yml",
+    )
+
+    assert catalog.source == "static_compatibility"
+    assert "not live or account-verified" in catalog.description
+    assert catalog.models == (
+        ModelMetadata("opus", "opus", True),
+        ModelMetadata("sonnet", "sonnet"),
+    )
+    assert ClaudePlugin().model_catalog_refreshable is False
 
 
 @pytest.mark.asyncio

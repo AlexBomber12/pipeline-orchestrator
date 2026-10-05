@@ -29,7 +29,7 @@ def _mock_settings_codex_model_discovery(
         return (CodexModel("gpt-5.4", "GPT-5.4", True, None, ()),)
 
     monkeypatch.setattr(
-        "src.web.services.codex_model_catalog.discover_codex_models",
+        "src.coders.codex.discover_codex_models",
         discover,
     )
 

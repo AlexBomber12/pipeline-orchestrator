@@ -3,12 +3,54 @@
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Hashable, Protocol, runtime_checkable
 
 from src.usage import UsageProvider
 
 if TYPE_CHECKING:
-    from src.config import DaemonConfig
+    from src.config import AppConfig, DaemonConfig
+
+
+@dataclass(frozen=True)
+class ModelReasoningEffort:
+    """Reasoning-effort metadata advertised for one model."""
+
+    name: str
+    description: str | None = None
+
+
+@dataclass(frozen=True)
+class ModelMetadata:
+    """Provider-neutral metadata for one invokable model."""
+
+    invocation_id: str
+    display_name: str
+    is_default: bool = False
+    default_reasoning_effort: str | None = None
+    reasoning_efforts: tuple[ModelReasoningEffort, ...] = ()
+
+
+@dataclass(frozen=True)
+class ModelCatalog:
+    """A plugin-owned model catalog normalized for shared consumers."""
+
+    models: tuple[ModelMetadata, ...]
+    source: str
+    description: str
+
+
+@dataclass(frozen=True)
+class ModelSetting:
+    """Binding between a coder's catalog and its existing config field."""
+
+    config_field: str
+    default_value: str
+    default_label: str
+
+
+class ModelCatalogUnavailable(RuntimeError):
+    """A plugin could not provide a usable model catalog."""
 
 
 @runtime_checkable
@@ -21,6 +63,24 @@ class CoderPlugin(Protocol):
 
     @property
     def models(self) -> list[str]: ...
+
+    @property
+    def model_setting(self) -> ModelSetting: ...
+
+    @property
+    def model_catalog_refreshable(self) -> bool: ...
+
+    def model_catalog_cache_key(
+        self, *, config: "AppConfig", config_path: str
+    ) -> Hashable:
+        """Return the plugin/authentication context used to scope caching."""
+        ...
+
+    async def get_model_catalog(
+        self, *, config: "AppConfig", config_path: str
+    ) -> ModelCatalog:
+        """Return normalized model metadata without starting inference."""
+        ...
 
     async def run_planned_pr(
         self,

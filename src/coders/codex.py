@@ -9,6 +9,18 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from src import codex_cli
+from src.coder_registry import (
+    ModelCatalog,
+    ModelCatalogUnavailable,
+    ModelMetadata,
+    ModelReasoningEffort,
+    ModelSetting,
+)
+from src.coders.codex_models import (
+    CodexModelDiscoveryInvalid,
+    CodexModelDiscoveryUnavailable,
+    discover_codex_models,
+)
 from src.config import AppConfig, load_config
 from src.usage import OpenAIUsageProvider, UsageProvider
 
@@ -69,9 +81,79 @@ def _first_probe_line(text: str) -> str:
 class CodexPlugin:
     name = "codex"
     display_name = "Codex CLI"
-    # The empty value means "let the CLI choose". Concrete Codex choices are
-    # discovered dynamically by Settings and are not a plugin-level whitelist.
-    models = [""]
+    # Compatibility metadata for existing /api/coders consumers. Discovery,
+    # not this legacy list, is authoritative for new model selections.
+    models = [
+        "",
+        "gpt-5.4",
+        "gpt-5.3-codex",
+        "gpt-5.3-codex-spark",
+        "gpt-5.2-codex",
+        "gpt-5.4-mini",
+        "gpt-5.1-codex-max",
+        "gpt-5.1-codex-mini",
+        "gpt-5.2",
+    ]
+    model_setting = ModelSetting(
+        config_field="codex_model",
+        default_value="",
+        default_label="CLI default",
+    )
+    model_catalog_refreshable = True
+
+    def __init__(self, *, discover: Any | None = None) -> None:
+        self._discover = discover or discover_codex_models
+
+    def model_catalog_cache_key(
+        self, *, config: AppConfig, config_path: str
+    ) -> tuple[str, str]:
+        return (
+            config.auth.codex_home_dir,
+            str(Path(config_path).absolute().parent),
+        )
+
+    async def get_model_catalog(
+        self, *, config: AppConfig, config_path: str
+    ) -> ModelCatalog:
+        """Discover Codex metadata in the configured CLI auth context."""
+        home_dir, working_directory = self.model_catalog_cache_key(
+            config=config,
+            config_path=config_path,
+        )
+        env = dict(os.environ)
+        env["HOME"] = home_dir
+        # The configured CLI session is the supported discovery context. Do
+        # not accidentally switch the metadata probe to API billing.
+        env.pop("OPENAI_API_KEY", None)
+        try:
+            discovered = await self._discover(env=env, cwd=working_directory)
+        except (CodexModelDiscoveryInvalid, CodexModelDiscoveryUnavailable) as exc:
+            raise ModelCatalogUnavailable(
+                "Codex CLI model discovery is unavailable"
+            ) from exc
+        models = tuple(
+            ModelMetadata(
+                invocation_id=model.identifier,
+                display_name=model.display_name,
+                is_default=model.is_default,
+                default_reasoning_effort=model.default_reasoning_effort,
+                reasoning_efforts=tuple(
+                    ModelReasoningEffort(effort.name, effort.description)
+                    for effort in model.reasoning_efforts
+                ),
+            )
+            for model in discovered
+        )
+        return ModelCatalog(
+            models=models,
+            source="discovered",
+            description=(
+                f"{len(models)} model{'s' if len(models) != 1 else ''} "
+                "advertised by Codex CLI."
+                if models
+                else "Codex CLI advertised no usable models."
+            ),
+        )
 
     async def run_planned_pr(
         self,

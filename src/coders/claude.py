@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from src import claude_cli
+from src.coder_registry import ModelCatalog, ModelMetadata, ModelSetting
 from src.config import AppConfig, load_config
 from src.usage import OAuthUsageProvider, UsageProvider
 
@@ -49,6 +50,34 @@ class ClaudePlugin:
     name = "claude"
     display_name = "Claude Code"
     models = ["opus", "sonnet"]
+    model_setting = ModelSetting(
+        config_field="claude_model",
+        default_value="opus",
+        default_label="(default)",
+    )
+    model_catalog_refreshable = False
+
+    def model_catalog_cache_key(
+        self, *, config: AppConfig, config_path: str
+    ) -> tuple[str, tuple[str, ...]]:
+        del config, config_path
+        return ("static-compatibility", tuple(self.models))
+
+    async def get_model_catalog(
+        self, *, config: AppConfig, config_path: str
+    ) -> ModelCatalog:
+        """Expose legacy Claude choices without implying live discovery."""
+        del config, config_path
+        return ModelCatalog(
+            models=tuple(
+                ModelMetadata(model, model, is_default=model == "opus")
+                for model in self.models
+            ),
+            source="static_compatibility",
+            description=(
+                "Static compatibility choices; not live or account-verified."
+            ),
+        )
 
     async def run_planned_pr(
         self,

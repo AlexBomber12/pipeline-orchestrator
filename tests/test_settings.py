@@ -11,19 +11,21 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 from src import config as src_config
+from src.coder_registry import (
+    ModelCatalog,
+    ModelMetadata,
+    ModelSetting,
+)
 from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
 from src.coders.codex_models import CodexModel
-from src.config import load_config
+from src.config import AppConfig, load_config
 from src.models import PipelineState, RepoState
 from src.web import app as web_app
 from src.web.app import app
 from src.web.services import auth_probe as _auth_probe
-from src.web.services import codex_model_catalog as _codex_catalog
-from src.web.services.codex_model_catalog import (
-    CodexModelCatalogCache,
-    CodexModelDiscoveryContext,
-)
+from src.web.services import model_catalog as _model_catalog
+from src.web.services.model_catalog import ModelCatalogCache
 
 
 class _StubAioredisClient:
@@ -784,7 +786,7 @@ def test_model_save_rejects_unknown_codex_model_atomically(
 
     assert response.status_code == 422
     assert "text/html" in response.headers["content-type"]
-    assert "codex_model is not advertised by the Codex CLI" in response.text
+    assert "codex_model is not advertised by Codex CLI" in response.text
 
     cfg = load_config(str(empty_config))
     assert cfg.daemon.claude_model == "opus"
@@ -799,7 +801,7 @@ def test_model_save_rejects_unknown_claude_model(empty_config: Path) -> None:
         )
 
     assert response.status_code == 422
-    assert "claude_model must be one of" in response.text
+    assert "claude_model is not advertised by Claude Code" in response.text
     assert load_config(str(empty_config)).daemon.claude_model == "opus"
 
 
@@ -834,8 +836,48 @@ def test_model_dropdown_includes_default_option(empty_config: Path) -> None:
     assert 'value="gpt-5.4"' in body
 
 
+class _ThirdCatalogPlugin:
+    name = "third"
+    display_name = "Third Coder"
+    models = ["legacy-third"]
+    model_setting = ModelSetting("claude_model", "third-default", "Default")
+    model_catalog_refreshable = False
+
+    def model_catalog_cache_key(
+        self, *, config: AppConfig, config_path: str
+    ) -> str:
+        del config, config_path
+        return "third-static"
+
+    async def get_model_catalog(
+        self, *, config: AppConfig, config_path: str
+    ) -> ModelCatalog:
+        del config, config_path
+        return ModelCatalog(
+            (ModelMetadata("third-invoke", "Third Display"),),
+            "static_compatibility",
+            "Third-party static catalog.",
+        )
+
+
+def test_shared_catalog_rendering_supports_third_plugin_without_branches(
+    empty_config: Path,
+) -> None:
+    with TestClient(app) as client:
+        client.app.state.coder_registry.register(_ThirdCatalogPlugin())
+        response = client.get("/partials/settings/coders")
+
+    assert response.status_code == 200
+    assert "Third Coder" in response.text
+    assert 'value="third-invoke"' in response.text
+    assert "Third Display" in response.text
+    assert "Third-party static catalog." in response.text
+    assert "/partials/settings/coders/third/models/refresh" not in response.text
+
+
 def test_dynamic_codex_choice_persists_invocation_slug_and_api_metadata(
     empty_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     catalog = (
         CodexModel("invoke-future", "GPT Future", False, None, ()),
@@ -846,12 +888,13 @@ def test_dynamic_codex_choice_persists_invocation_slug_and_api_metadata(
         return catalog
 
     with TestClient(app) as client:
-        client.app.state.codex_model_catalog._discover = discover
+        client.app.state.coder_registry.get("codex")._discover = discover
         fragment = client.get("/partials/settings/coders")
         response = client.put(
             "/settings/daemon",
             data={"codex_model": "invoke-future"},
         )
+        reloaded = client.get("/partials/settings/coders")
         api_response = client.get("/api/coders")
 
     assert fragment.status_code == 200
@@ -859,28 +902,68 @@ def test_dynamic_codex_choice_persists_invocation_slug_and_api_metadata(
     assert "GPT Provider Default (advertised default)" in fragment.text
     assert fragment.text.index("invoke-future") < fragment.text.index("invoke-default")
     assert response.status_code == 200
+    assert 'value="invoke-future" selected' in reloaded.text
     cfg = load_config(str(empty_config))
     assert cfg.daemon.codex_model == "invoke-future"
-    assert CodexPlugin().build_run_kwargs(daemon_config=cfg.daemon) == {
+    run_kwargs = CodexPlugin().build_run_kwargs(daemon_config=cfg.daemon)
+    assert run_kwargs == {
         "model": "invoke-future"
+    }
+    captured: dict[str, object] = {}
+
+    async def run_cli(
+        repo_path: str,
+        *,
+        model: str | None,
+        timeout: int,
+        **_kwargs: object,
+    ) -> tuple[int, str, str]:
+        captured.update(repo_path=repo_path, model=model, timeout=timeout)
+        return (0, "ok", "")
+
+    monkeypatch.setattr(
+        "src.coders.codex.codex_cli.run_planned_pr_async",
+        run_cli,
+    )
+    assert asyncio.run(
+        CodexPlugin().run_planned_pr(
+            "/repo",
+            timeout=60,
+            **run_kwargs,
+        )
+    ) == (0, "ok", "")
+    assert captured == {
+        "repo_path": "/repo",
+        "model": "invoke-future",
+        "timeout": 60,
     }
 
     codex_row = next(
         row for row in api_response.json()["coders"] if row["name"] == "codex"
     )
-    assert codex_row["models"] == ["invoke-future", "invoke-default"]
+    assert "gpt-5.4" in codex_row["models"]
     assert codex_row["model_catalog"]["choices"] == [
         {
-            "identifier": "invoke-future",
+            "invocation_id": "invoke-future",
             "display_name": "GPT Future",
             "is_default": False,
+            "default_reasoning_effort": None,
+            "reasoning_efforts": [],
         },
         {
-            "identifier": "invoke-default",
+            "invocation_id": "invoke-default",
             "display_name": "GPT Provider Default",
             "is_default": True,
+            "default_reasoning_effort": None,
+            "reasoning_efforts": [],
         },
     ]
+    claude_row = next(
+        row for row in api_response.json()["coders"] if row["name"] == "claude"
+    )
+    assert claude_row["models"] == ["opus", "sonnet"]
+    assert claude_row["model_catalog"]["source"] == "static_compatibility"
+    assert "not live or account-verified" in claude_row["model_catalog"]["message"]
 
 
 def test_codex_discovery_uses_configured_session_context_without_api_key(
@@ -904,7 +987,7 @@ def test_codex_discovery_uses_configured_session_context_without_api_key(
         return (CodexModel("session-model", "Session Model", False, None, ()),)
 
     with TestClient(app) as client:
-        client.app.state.codex_model_catalog._discover = discover
+        client.app.state.coder_registry.get("codex")._discover = discover
         response = client.get("/api/coders")
 
     assert response.status_code == 200
@@ -926,7 +1009,7 @@ def test_codex_empty_catalog_rejects_new_slug_but_unrelated_save_works(
         return ()
 
     with TestClient(app) as client:
-        client.app.state.codex_model_catalog._discover = discover
+        client.app.state.coder_registry.get("codex")._discover = discover
         settings_response = client.get("/settings")
         invalid_response = client.put(
             "/settings/daemon",
@@ -938,9 +1021,9 @@ def test_codex_empty_catalog_rejects_new_slug_but_unrelated_save_works(
         )
 
     assert settings_response.status_code == 200
-    assert 'data-codex-catalog-status="empty"' in settings_response.text
+    assert 'data-model-catalog-status="empty"' in settings_response.text
     assert invalid_response.status_code == 422
-    assert "no usable Codex model catalog" in invalid_response.text
+    assert "no usable Codex CLI model catalog" in invalid_response.text
     assert unrelated_response.status_code == 200
     assert calls == 1
     cfg = load_config(str(empty_config))
@@ -967,17 +1050,19 @@ def test_codex_discovery_failure_retains_saved_value_and_refresh_recovers(
         return (CodexModel("recovered", "Recovered Model", True, None, ()),)
 
     with TestClient(app) as client:
-        client.app.state.codex_model_catalog._discover = fail
+        client.app.state.coder_registry.get("codex")._discover = fail
         failed = client.get("/settings")
         retained = client.put(
             "/settings/daemon",
             data={"codex_model": "saved-custom"},
         )
-        client.app.state.codex_model_catalog._discover = recover
-        refreshed = client.post("/partials/settings/codex-models/refresh")
+        client.app.state.coder_registry.get("codex")._discover = recover
+        refreshed = client.post(
+            "/partials/settings/coders/codex/models/refresh"
+        )
 
     assert failed.status_code == 200
-    assert 'data-codex-catalog-status="unavailable"' in failed.text
+    assert 'data-model-catalog-status="unavailable"' in failed.text
     assert "raw protocol secret" not in failed.text
     assert "saved-custom (saved; not advertised)" in failed.text
     assert retained.status_code == 200
@@ -985,6 +1070,34 @@ def test_codex_discovery_failure_retains_saved_value_and_refresh_recovers(
     assert 'value="recovered"' in refreshed.text
     assert "saved-custom (saved; not advertised)" in refreshed.text
     assert load_config(str(cfg_path)).daemon.codex_model == "saved-custom"
+
+
+def test_codex_default_can_be_saved_while_discovery_is_offline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n  codex_model: saved-custom\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    async def fail(**_kwargs: object) -> tuple[CodexModel, ...]:
+        raise RuntimeError("offline")
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.get("codex")._discover = fail
+        failed = client.get("/settings")
+        defaulted = client.put(
+            "/settings/daemon",
+            data={"codex_model": ""},
+        )
+
+    assert failed.status_code == 200
+    assert defaulted.status_code == 200
+    assert load_config(str(cfg_path)).daemon.codex_model == ""
 
 
 def test_codex_refresh_updates_choices_without_changing_selection(
@@ -1006,11 +1119,13 @@ def test_codex_refresh_updates_choices_without_changing_selection(
         return (CodexModel("new-slug", "New Model", True, None, ()),)
 
     with TestClient(app) as client:
-        cache = client.app.state.codex_model_catalog
-        cache._discover = initial
+        plugin = client.app.state.coder_registry.get("codex")
+        plugin._discover = initial
         first = client.get("/partials/settings/coders")
-        cache._discover = updated
-        refreshed = client.post("/partials/settings/codex-models/refresh")
+        plugin._discover = updated
+        refreshed = client.post(
+            "/partials/settings/coders/codex/models/refresh"
+        )
 
     assert 'value="original-slug" selected' in first.text
     assert 'value="new-slug"' in refreshed.text
@@ -1018,6 +1133,23 @@ def test_codex_refresh_updates_choices_without_changing_selection(
     assert 'hx-indicator="#codex-model-refreshing"' in refreshed.text
     assert "Refreshing…" in refreshed.text
     assert load_config(str(cfg_path)).daemon.codex_model == "original-slug"
+
+
+def test_model_refresh_rejects_unknown_and_static_plugins(
+    empty_config: Path,
+) -> None:
+    with TestClient(app) as client:
+        unknown = client.post(
+            "/partials/settings/coders/missing/models/refresh"
+        )
+        static = client.post(
+            "/partials/settings/coders/claude/models/refresh"
+        )
+
+    assert unknown.status_code == 404
+    assert unknown.text == "Unknown coder"
+    assert static.status_code == 422
+    assert static.text == "Model catalog is static"
 
 
 @pytest.mark.asyncio
@@ -1037,23 +1169,58 @@ async def test_codex_catalog_cache_coalesces_concurrent_refreshes() -> None:
         await release.wait()
         return models
 
-    cache = CodexModelCatalogCache(discover=discover)
-    context = CodexModelDiscoveryContext("/auth", "/workspace")
-    first = asyncio.create_task(cache.get(context))
+    plugin = CodexPlugin(discover=discover)
+    config = AppConfig.model_validate(
+        {"auth": {"codex_home_dir": "/auth"}}
+    )
+    cache = ModelCatalogCache()
+    first = asyncio.create_task(
+        cache.get(plugin, config=config, config_path="/workspace/config.yml")
+    )
     await started.wait()
-    second = asyncio.create_task(cache.get(context, refresh=True))
+    second = asyncio.create_task(
+        cache.get(
+            plugin,
+            config=config,
+            config_path="/workspace/config.yml",
+            refresh=True,
+        )
+    )
     await asyncio.sleep(0)
     release.set()
 
     first_snapshot, second_snapshot = await asyncio.gather(first, second)
-    cached_snapshot = await cache.get(context)
+    cached_snapshot = await cache.get(
+        plugin,
+        config=config,
+        config_path="/workspace/config.yml",
+    )
 
     assert calls == 1
     assert first_snapshot == second_snapshot == cached_snapshot
-    assert cached_snapshot.models == models
+    assert [model.invocation_id for model in cached_snapshot.models] == [
+        "first",
+        "second",
+    ]
     assert cached_snapshot.status == "available"
-    assert cached_snapshot.message == "2 Codex models loaded."
-    assert cache.peek(context) == cached_snapshot
+    assert cached_snapshot.message == "2 models advertised by Codex CLI."
+    assert (
+        cache.peek(
+            plugin,
+            config=config,
+            config_path="/workspace/config.yml",
+        )
+        == cached_snapshot
+    )
+    other_config = AppConfig.model_validate(
+        {"auth": {"codex_home_dir": "/other-auth"}}
+    )
+    await cache.get(
+        plugin,
+        config=other_config,
+        config_path="/workspace/config.yml",
+    )
+    assert calls == 2
     await cache.close()
 
 
@@ -1062,7 +1229,7 @@ async def test_codex_catalog_cache_expires_retains_last_known_and_handles_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clock = [0.0]
-    monkeypatch.setattr(_codex_catalog.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(_model_catalog.time, "monotonic", lambda: clock[0])
     model = CodexModel("known", "Known", False, None, ())
     should_fail = False
 
@@ -1071,28 +1238,42 @@ async def test_codex_catalog_cache_expires_retains_last_known_and_handles_empty(
             raise RuntimeError("unsafe provider detail")
         return (model,)
 
-    context = CodexModelDiscoveryContext("/auth", "/workspace")
-    cache = CodexModelCatalogCache(ttl_seconds=10, discover=discover)
-    ready = await cache.get(context)
+    config = AppConfig.model_validate(
+        {"auth": {"codex_home_dir": "/auth"}}
+    )
+    plugin = CodexPlugin(discover=discover)
+    cache = ModelCatalogCache(ttl_seconds=10)
+    ready = await cache.get(
+        plugin, config=config, config_path="/workspace/config.yml"
+    )
     clock[0] = 11
-    expired = cache.peek(context)
+    expired = cache.peek(
+        plugin, config=config, config_path="/workspace/config.yml"
+    )
     should_fail = True
-    stale = await cache.get(context)
+    stale = await cache.get(
+        plugin, config=config, config_path="/workspace/config.yml"
+    )
 
     assert ready.status == "available"
     assert expired.status == "stale"
     assert "refresh is due" in expired.message
     assert stale.status == "stale"
-    assert stale.models == (model,)
+    assert [candidate.invocation_id for candidate in stale.models] == ["known"]
     assert "unsafe provider detail" not in stale.message
 
     async def empty(**_kwargs: object) -> tuple[CodexModel, ...]:
         return ()
 
-    empty_cache = CodexModelCatalogCache(ttl_seconds=10, discover=empty)
-    empty_snapshot = await empty_cache.get(context)
+    empty_plugin = CodexPlugin(discover=empty)
+    empty_cache = ModelCatalogCache(ttl_seconds=10)
+    empty_snapshot = await empty_cache.get(
+        empty_plugin, config=config, config_path="/workspace/config.yml"
+    )
     clock[0] = 22
-    expired_empty = empty_cache.peek(context)
+    expired_empty = empty_cache.peek(
+        empty_plugin, config=config, config_path="/workspace/config.yml"
+    )
     assert empty_snapshot.status == "empty"
     assert expired_empty.status == "empty"
     assert not expired_empty.has_usable_models
@@ -1100,16 +1281,36 @@ async def test_codex_catalog_cache_expires_retains_last_known_and_handles_empty(
     async def unavailable(**_kwargs: object) -> tuple[CodexModel, ...]:
         raise RuntimeError("provider failed")
 
-    unavailable_cache = CodexModelCatalogCache(discover=unavailable)
-    unavailable_snapshot = await unavailable_cache.get(context)
+    unavailable_plugin = CodexPlugin(discover=unavailable)
+    unavailable_cache = ModelCatalogCache()
+    unavailable_snapshot = await unavailable_cache.get(
+        unavailable_plugin,
+        config=config,
+        config_path="/workspace/config.yml",
+    )
     assert unavailable_snapshot.status == "unavailable"
-    assert unavailable_cache.peek(context) == unavailable_snapshot
-    assert cache.peek(CodexModelDiscoveryContext("/other", "/workspace")).status == (
-        "not_loaded"
+    assert (
+        unavailable_cache.peek(
+            unavailable_plugin,
+            config=config,
+            config_path="/workspace/config.yml",
+        )
+        == unavailable_snapshot
+    )
+    other_config = AppConfig.model_validate(
+        {"auth": {"codex_home_dir": "/other"}}
+    )
+    assert (
+        cache.peek(
+            plugin,
+            config=other_config,
+            config_path="/workspace/config.yml",
+        ).status
+        == "not_loaded"
     )
 
     with pytest.raises(ValueError, match="TTL must be positive"):
-        CodexModelCatalogCache(ttl_seconds=0)
+        ModelCatalogCache(ttl_seconds=0)
 
 
 @pytest.mark.asyncio
@@ -1125,9 +1326,17 @@ async def test_codex_catalog_cache_cancels_owned_discovery_on_close() -> None:
             cancelled.set()
             raise
 
-    cache = CodexModelCatalogCache(discover=discover)
+    plugin = CodexPlugin(discover=discover)
+    config = AppConfig.model_validate(
+        {"auth": {"codex_home_dir": "/auth"}}
+    )
+    cache = ModelCatalogCache()
     pending = asyncio.create_task(
-        cache.get(CodexModelDiscoveryContext("/auth", "/workspace"))
+        cache.get(
+            plugin,
+            config=config,
+            config_path="/workspace/config.yml",
+        )
     )
     await started.wait()
     await cache.close()
@@ -1158,11 +1367,11 @@ def test_slow_codex_refresh_renders_selection_saved_during_request(
         return (CodexModel("new-choice", "New Choice", True, None, ()),)
 
     with TestClient(app) as client:
-        client.app.state.codex_model_catalog._discover = slow_discovery
+        client.app.state.coder_registry.get("codex")._discover = slow_discovery
 
         def refresh() -> None:
             refresh_result["response"] = client.post(
-                "/partials/settings/codex-models/refresh"
+                "/partials/settings/coders/codex/models/refresh"
             )
 
         thread = threading.Thread(target=refresh)

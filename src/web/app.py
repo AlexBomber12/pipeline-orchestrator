@@ -37,6 +37,7 @@ import redis.asyncio as aioredis
 from fastapi import FastAPI
 from fastapi.templating import Jinja2Templates
 
+from src.coders import build_coder_registry
 from src.config import (
     add_repository,  # noqa: F401 — accessed by routes via _app.add_repository
     load_config,  # noqa: F401 — accessed by routes via _app.load_config
@@ -55,10 +56,10 @@ from src.events.sse import (
 from src.web.services import (
     upload_validation as _upload_validation_service,
 )
-from src.web.services.codex_model_catalog import CodexModelCatalogCache
 from src.web.services.config_updates import (
     apply_config_mutation,  # noqa: F401 — accessed by routes via _app.apply_config_mutation
 )
+from src.web.services.model_catalog import ModelCatalogCache
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 CONFIG_PATH = os.environ.get("PO_CONFIG_PATH", "config.yml")
@@ -298,11 +299,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     redis_url = os.environ.get("REDIS_URL", DEFAULT_REDIS_URL)
     client = aioredis.from_url(redis_url, decode_responses=True)
     app.state.redis = client
-    app.state.codex_model_catalog = CodexModelCatalogCache()
+    app.state.coder_registry = build_coder_registry()
+    app.state.model_catalog = ModelCatalogCache()
     try:
         yield
     finally:
-        await app.state.codex_model_catalog.close()
+        await app.state.model_catalog.close()
         try:
             await client.aclose()
         except Exception:

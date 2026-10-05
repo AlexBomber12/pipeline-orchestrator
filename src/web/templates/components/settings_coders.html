@@ -23,14 +23,14 @@
                         <div class="font-medium text-gray-200">{{ coder.display_name }}</div>
                     </td>
                     <td class="py-3 pr-4">
-                        <select name="{{ 'claude_model' if coder.name == 'claude' else 'codex_model' }}"
+                        <select name="{{ coder.model_setting.config_field }}"
                                 class="primary-interactive min-w-40 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
                                 hx-put="/settings/daemon"
                                 hx-trigger="change"
                                 hx-target="#settings-daemon"
                                 hx-swap="innerHTML">
                             <option value="" {% if coder.selected_model == "" %}selected{% endif %}>
-                                {{ "CLI default" if coder.name == "codex" else "(default)" }}
+                                {{ coder.model_setting.default_label }}
                             </option>
                             {% for model in coder.model_options %}
                             <option value="{{ model.value }}" {% if coder.selected_model == model.value %}selected{% endif %}>
@@ -38,27 +38,28 @@
                             </option>
                             {% endfor %}
                         </select>
-                        {% if coder.name == "codex" %}
                         {% set catalog = coder.model_catalog %}
+                        {% if catalog.refreshable %}
                         <div class="mt-2 flex flex-wrap items-center gap-2">
                             <button type="button"
                                     class="secondary-interactive rounded border border-white/10 bg-surface-3 px-2 py-1 text-xs text-gray-300"
-                                    hx-post="/partials/settings/codex-models/refresh"
+                                    hx-post="/partials/settings/coders/{{ coder.name }}/models/refresh"
                                     hx-target="#settings-coders"
                                     hx-swap="outerHTML"
-                                    hx-indicator="#codex-model-refreshing">
+                                    hx-indicator="#{{ coder.name }}-model-refreshing">
                                 Refresh models
                             </button>
-                            <span id="codex-model-refreshing"
+                            <span id="{{ coder.name }}-model-refreshing"
                                   class="htmx-indicator text-xs text-warn"
                                   aria-live="polite">Refreshing…</span>
                         </div>
+                        {% endif %}
                         <p class="mt-2 text-xs {% if catalog.status in ('unavailable', 'empty') %}text-fail{% elif catalog.status == 'stale' %}text-warn{% else %}text-gray-500{% endif %}"
-                           data-codex-catalog-status="{{ catalog.status }}">
+                           data-model-catalog-status="{{ catalog.status }}"
+                           data-model-catalog-source="{{ catalog.source or '' }}">
                             {{ catalog.message }}
                             {% if catalog.refreshed_at %} Last updated {{ catalog.refreshed_at }}.{% endif %}
                         </p>
-                        {% endif %}
                     </td>
                     <td class="py-3 pr-4">
                         <div class="flex items-center gap-2">
