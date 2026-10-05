@@ -55,6 +55,7 @@ _MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES = 1024 * 1024
 _MAX_REDIS_SCAN_CALLS = 4
 _MAX_REDIS_PENDING_KEYS = 200
 _MAX_DISK_PARTITION_CANDIDATES = 200
+_MAX_EMBEDDED_JSON_CANDIDATES = 64
 _CLI_LATEST_TTL_SECONDS = 3600
 _CLI_HISTORY_TTL_SECONDS = 86400
 _HISTORY_CURSOR_PREFIX = "redis-history:"
@@ -335,7 +336,7 @@ def _redact_logical_text(text: str) -> tuple[str, int]:
     try:
         parsed = json.loads(text)
     except (TypeError, ValueError):
-        return _redact_text(text)
+        return _redact_embedded_structures(text)
     if not isinstance(parsed, (dict, list)):
         return _redact_text(text)
     safe, replacements = _redact_structure(parsed)
@@ -343,6 +344,40 @@ def _redact_logical_text(text: str) -> tuple[str, int]:
         return _redact_text(text)
     trailing_newline = "\r\n" if text.endswith("\r\n") else "\n" if text.endswith("\n") else ""
     return json.dumps(safe, ensure_ascii=False, separators=(",", ":"), default=str) + trailing_newline, replacements
+
+
+def _redact_embedded_structures(text: str) -> tuple[str, int]:
+    """Redact bounded JSON objects or arrays embedded in a prefixed log line."""
+    candidates = [index for index, character in enumerate(text) if character in "{["]
+    if len(candidates) > _MAX_EMBEDDED_JSON_CANDIDATES:
+        trailing_newline = "\r\n" if text.endswith("\r\n") else "\n" if text.endswith("\n") else ""
+        return "[CONTENT OMITTED: STRUCTURED REDACTION BOUND EXCEEDED]" + trailing_newline, 1
+
+    decoder = json.JSONDecoder()
+    parts: list[str] = []
+    consumed = 0
+    count = 0
+    for start in candidates:
+        if start < consumed:
+            continue
+        try:
+            parsed, end = decoder.raw_decode(text, start)
+        except (TypeError, ValueError):
+            continue
+        safe, replacements = _redact_structure(parsed)
+        if replacements == 0:
+            continue
+        safe_prefix, prefix_replacements = _redact_text(text[consumed:start])
+        parts.append(safe_prefix)
+        parts.append(json.dumps(safe, ensure_ascii=False, separators=(",", ":"), default=str))
+        consumed = end
+        count += prefix_replacements + replacements
+
+    if not parts:
+        return _redact_text(text)
+    safe_suffix, suffix_replacements = _redact_text(text[consumed:])
+    parts.append(safe_suffix)
+    return "".join(parts), count + suffix_replacements
 
 
 def _private_key_state_before(handle: Any, offset: int) -> tuple[bool | None, int]:

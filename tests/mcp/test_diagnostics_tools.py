@@ -422,6 +422,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             'toml-second-secret"""',
             "PASSWORD=slash-first-secret\\",
             "slash-second-secret",
+            'INFO {"password":987654321,"debug":true}',
             '{"password":123456789}',
             '{"credentials":["user","fake-list-secret"]}',
             json.dumps({"auths": {"registry": {"auth": docker_auth}}, "debug": True}),
@@ -461,7 +462,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             }
         )
         + '\npassword = """ci-toml-first-secret\nci-toml-second-secret"""\n'
-        + "PASSWORD=ci-slash-first-secret\\\nci-slash-second-secret\n",
+        + "PASSWORD=ci-slash-first-secret\\\nci-slash-second-secret\n"
+        + '2026-10-05 INFO {"password":987654322,"debug":true}\n',
         encoding="utf-8",
     )
 
@@ -490,6 +492,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "toml-second-secret" not in content
         assert "slash-first-secret" not in content
         assert "slash-second-secret" not in content
+        assert "987654321" not in content
         assert "123456789" not in content
         assert "fake-list-secret" not in content
         assert docker_auth not in content
@@ -506,6 +509,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-toml-second-secret" not in content
         assert "ci-slash-first-secret" not in content
         assert "ci-slash-second-secret" not in content
+        assert "987654322" not in content
         assert "debug" in content
 
     ci_raw = ci_path.read_bytes()
@@ -859,6 +863,20 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
     )
     assert diagnostics._redact_logical_text('{"debug": true}\n') == ('{"debug": true}\n', 0)
     assert diagnostics._redact_logical_text("123") == ("123", 0)
+    assert diagnostics._redact_embedded_structures('INFO {"debug":true}') == (
+        'INFO {"debug":true}',
+        0,
+    )
+    embedded_docker, embedded_docker_count = diagnostics._redact_embedded_structures(
+        'INFO {"auths":{"registry":{"auth":"embedded-docker-secret"}}}'
+    )
+    assert "embedded-docker-secret" not in embedded_docker
+    assert embedded_docker_count == 1
+    bounded_embedded, bounded_embedded_count = diagnostics._redact_embedded_structures(
+        "prefix " + "[" * (diagnostics._MAX_EMBEDDED_JSON_CANDIDATES + 1) + "\r\n"
+    )
+    assert bounded_embedded == "[CONTENT OMITTED: STRUCTURED REDACTION BOUND EXCEEDED]\r\n"
+    assert bounded_embedded_count == 1
     same_line_toml, same_line_toml_count = diagnostics._redact_logical_text(
         'password = """same-line-toml-secret"""'
     )

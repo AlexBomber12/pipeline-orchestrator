@@ -32,7 +32,9 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   split across lines or page boundaries remain redacted, including TOML
   triple-quoted values and shell backslash continuations, with the same
   fail-closed behavior when context is indeterminate. Diagnostic text is
-  credential-redacted before it is returned. Producer-added `[truncated]`
+  credential-redacted before it is returned; standalone and level/timestamp-
+  prefixed JSON records are redacted structurally, and mixed lines exceeding
+  the bounded embedded-JSON candidate limit are omitted. Producer-added `[truncated]`
   markers are preserved; because their removed prefix may contain a sensitive
   opener, the retained Redis CLI tail is omitted fail-closed. Redis event
   history is fetched through a
