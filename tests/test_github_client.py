@@ -25,6 +25,7 @@ from src.github.comments import (
 )
 from src.github.gh_runner import _parse_iso, get_repo_full_name, run_gh
 from src.github.prs import (
+    ExpectedHeadMismatch,
     clear_last_known_sha,
     clear_merged_prs_cache,
     get_branch_last_push_time,
@@ -1815,8 +1816,11 @@ def test_approval_without_head_sha(monkeypatch: pytest.MonkeyPatch) -> None:
     assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.APPROVED
 
 
-def test_merge_pr_uses_squash(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_merge_pr_uses_squash_and_expected_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     captured: dict[str, list[str]] = {}
+    expected = "a" * 40
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         captured["cmd"] = cmd
@@ -1824,7 +1828,7 @@ def test_merge_pr_uses_squash(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    merge_pr("owner/name", 42)
+    merge_pr("owner/name", 42, expected)
 
     assert captured["cmd"] == [
         "gh",
@@ -1833,9 +1837,52 @@ def test_merge_pr_uses_squash(monkeypatch: pytest.MonkeyPatch) -> None:
         "42",
         "--squash",
         "--delete-branch",
+        "--match-head-commit",
+        expected,
         "-R",
         "owner/name",
     ]
+
+
+def test_merge_pr_rejects_missing_full_expected_head() -> None:
+    with pytest.raises(ValueError, match="expected_head_sha"):
+        merge_pr("owner/name", 42, "abc123")
+
+
+def test_merge_pr_classifies_expected_head_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = "b" * 40
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(
+            stderr=(
+                "pull request head commit does not match expected head SHA"
+            ),
+            returncode=1,
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(ExpectedHeadMismatch):
+        merge_pr("owner/name", 42, expected)
+
+
+def test_merge_pr_reraises_non_head_mismatch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = "d" * 40
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        return _FakeCompletedProcess(
+            stderr="authentication failed",
+            returncode=1,
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="authentication failed"):
+        merge_pr("owner/name", 42, expected)
 
 
 def _iso_utc_now_minus(seconds: int) -> str:
@@ -5847,7 +5894,7 @@ def test_merge_pr_invalidates_pulls_cache(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    prs.merge_pr("owner/name", 42)
+    prs.merge_pr("owner/name", 42, "c" * 40)
 
     assert "repos/owner/name/pulls?state=open&per_page=100&page=1" not in cache._etag_cache
 

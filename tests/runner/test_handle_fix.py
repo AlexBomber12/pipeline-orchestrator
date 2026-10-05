@@ -3644,7 +3644,7 @@ def test_fix_iterations_survive_recovery_until_merge(
         "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
-    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)
     monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
 
     redis = h._FakeRedis()
