@@ -394,7 +394,8 @@ def _redact_text(text: str) -> tuple[str, int]:
 
 def _redact_structure(value: Any, *, docker_auth_context: bool = False) -> tuple[Any, int]:
     if isinstance(value, str):
-        return _redact_logical_text(value)
+        safe, replacements, _ = _redact_log_content(value)
+        return safe, replacements
     if isinstance(value, list):
         result: list[Any] = []
         count = 0

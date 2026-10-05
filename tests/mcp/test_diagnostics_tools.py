@@ -220,6 +220,7 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
                     "env": [
                         {"name": "PASSWORD", "value": "status-name-value-secret"},
                     ],
+                    "message": 'PASSWORD="status-structured-first\nstatus-structured-second"',
                 },
             }
         ),
@@ -263,6 +264,8 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
     assert "status-tls-key-value" not in json.dumps(result)
     assert "status-azure-access-key-value" not in json.dumps(result)
     assert "status-name-value-secret" not in json.dumps(result)
+    assert "status-structured-first" not in json.dumps(result)
+    assert "status-structured-second" not in json.dumps(result)
     assert "status-malformed-password" not in json.dumps(result)
     assert overview["observed"]["error"] == "Authorization: [REDACTED]"
     assert result["detail"]["queue"]["counts_by_status"] == {"DOING": 1}
@@ -453,6 +456,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             '{"password":123456789}',
             '{"credentials":["user","fake-list-secret"]}',
             '{"env":[{"name":"PASSWORD","value":"redis-name-value-secret"}]}',
+            json.dumps(
+                {"message": 'PASSWORD="redis-structured-first\nredis-structured-second"'}
+            ),
             json.dumps({"auths": {"registry": {"auth": docker_auth}}, "debug": True}),
             f"DOCKER_AUTH_CONFIG={{\"auths\":{{\"registry\":{{\"auth\":\"{docker_auth}\"}}}}}}",
             "ordinary suffix",
@@ -472,6 +478,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                 "password": 123456789,
                 "credentials": ["user", "disk-list-secret"],
                 "env": [{"name": "API_KEY", "value": "disk-name-value-secret"}],
+                "message": 'PASSWORD="disk-structured-first\ndisk-structured-second"',
                 "auths": {"registry": {"auth": docker_auth}},
                 "debug": True,
             }
@@ -487,6 +494,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                 "password": 123456789,
                 "credentials": ["user", "ci-list-secret"],
                 "env": [{"name": "CLIENT_SECRET", "value": "ci-name-value-secret"}],
+                "message": 'PASSWORD="ci-structured-first\nci-structured-second"',
                 "auths": {"registry": {"auth": docker_auth}},
                 "debug": True,
             }
@@ -550,6 +558,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "123456789" not in content
         assert "fake-list-secret" not in content
         assert "redis-name-value-secret" not in content
+        assert "redis-structured-first" not in content
+        assert "redis-structured-second" not in content
         assert docker_auth not in content
 
     for source_id, list_secret in (
@@ -561,6 +571,10 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert list_secret not in content
         assert "ci-name-value-secret" not in content
         assert "disk-name-value-secret" not in content
+        assert "ci-structured-first" not in content
+        assert "ci-structured-second" not in content
+        assert "disk-structured-first" not in content
+        assert "disk-structured-second" not in content
         assert docker_auth not in content
         assert "ci-toml-first-secret" not in content
         assert "ci-toml-second-secret" not in content
