@@ -842,6 +842,10 @@ def test_repo_required_checks_loads_from_yaml(tmp_path: Path) -> None:
         ("required_checks:\n      unit: true\n", "must be a list"),
         ("required_checks:\n      - 7\n", "must be check name strings"),
         ("required_checks:\n      - ''\n", "must not be blank"),
+        (
+            "required_checks:\n      - unit\n      - unit\n",
+            "must not be duplicated",
+        ),
     ],
 )
 def test_repo_required_checks_rejects_invalid_values(

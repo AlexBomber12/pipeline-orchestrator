@@ -195,6 +195,7 @@ class RepoConfig(BaseModel):
             return None
         if not isinstance(v, list):
             raise ValueError("required_checks must be a list of check names")
+        seen: set[str] = set()
         for item in v:
             if not isinstance(item, str):
                 raise ValueError(
@@ -202,6 +203,11 @@ class RepoConfig(BaseModel):
                 )
             if not item.strip():
                 raise ValueError("required_checks entries must not be blank")
+            if item in seen:
+                raise ValueError(
+                    "required_checks entries must not be duplicated"
+                )
+            seen.add(item)
         return v
 
 
