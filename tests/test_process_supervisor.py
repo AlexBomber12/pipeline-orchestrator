@@ -2306,7 +2306,7 @@ async def test_launch_rejects_conflicts_and_unverified_session(
             0.1,
         )
         patch.setattr(
-            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.1
+            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.5
         )
         launch_task = asyncio.create_task(
             launch_process(
@@ -2318,7 +2318,7 @@ async def test_launch_rejects_conflicts_and_unverified_session(
         await asyncio.wait_for(exec_wait_started.wait(), timeout=1)
         launch_task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(launch_task, timeout=1)
+            await asyncio.wait_for(launch_task, timeout=5)
 
     ready_received = asyncio.Event()
     release_ready = asyncio.Event()

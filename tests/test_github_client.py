@@ -57,6 +57,7 @@ from src.github.reviews import (
 from src.models import CIStatus, ReviewStatus
 
 TRUSTED_REVIEWER_ID = 199175422
+SECOND_TRUSTED_REVIEWER_ID = 200200200
 
 
 def _find_api_path(cmd: list[str]) -> str:
@@ -69,6 +70,10 @@ def _find_api_path(cmd: list[str]) -> str:
 
 def _codex_user(login: str = "chatgpt-codex-connector[bot]") -> dict[str, int | str]:
     return {"id": TRUSTED_REVIEWER_ID, "login": login}
+
+
+def _reviewer_user(user_id: int, login: str) -> dict[str, int | str]:
+    return {"id": user_id, "login": login}
 
 
 class _FakeCompletedProcess:
@@ -2199,6 +2204,76 @@ def test_body_plus_one_approved_when_codex_review_on_head(
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="currentHead") == ReviewStatus.APPROVED
+
+
+def test_body_plus_one_review_sha_must_match_reacting_actor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A current-head review by actor B must not refresh actor A's stale +1."""
+    import json as _json
+
+    clear_review_status_cache()
+    actor_a = _reviewer_user(TRUSTED_REVIEWER_ID, "chatgpt-codex-connector")
+    actor_b = _reviewer_user(SECOND_TRUSTED_REVIEWER_ID, "codex-second-reviewer")
+    policy = ReviewerPolicy(
+        [
+            TrustedReviewerIdentity(user_id=TRUSTED_REVIEWER_ID, login="codex"),
+            TrustedReviewerIdentity(
+                user_id=SECOND_TRUSTED_REVIEWER_ID,
+                login="codex-second-reviewer",
+            ),
+        ]
+    )
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        if _is_commits_path(cmd):
+            return _FakeCompletedProcess(stdout="2026-02-01T00:00:00Z")
+        path = _find_api_path(cmd)
+        if path.endswith("/issues/42/reactions"):
+            data = [
+                {
+                    "content": "+1",
+                    "user": actor_a,
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            ]
+        elif path.endswith("/pulls/42/reviews"):
+            data = [
+                [
+                    {
+                        "user": actor_b,
+                        "commit_id": "currentHead",
+                        "submitted_at": "2026-02-15T00:00:00Z",
+                        "state": "COMMENTED",
+                    }
+                ]
+            ]
+        elif path.endswith("/pulls/42/comments"):
+            data = [
+                [
+                    {
+                        "user": actor_b,
+                        "body": "P1: needs a fix",
+                        "created_at": "2026-02-15T00:00:01Z",
+                    }
+                ]
+            ]
+        else:
+            data = []
+        return _FakeCompletedProcess(stdout=_json.dumps(data))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert (
+        get_pr_review_status(
+            "owner/name",
+            42,
+            pr_author="author",
+            head_sha="currentHead",
+            policy=policy,
+        )
+        == ReviewStatus.CHANGES_REQUESTED
+    )
 
 
 def test_body_plus_one_same_second_as_head_approves(

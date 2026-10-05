@@ -121,7 +121,10 @@ def _compute_review_status(
                 if head_sha:
                     try:
                         review_info = _get_codex_review_signals(
-                            repo, pr_number, policy=reviewer_policy
+                            repo,
+                            pr_number,
+                            policy=reviewer_policy,
+                            actor=plus_one.get("user"),
                         )
                     except RuntimeError:
                         review_info = {
@@ -252,6 +255,7 @@ def _get_codex_review_signals(
     repo: str,
     pr_number: int,
     policy: _reactions.ReviewerPolicy | None = None,
+    actor: dict | None = None,
 ) -> dict[str, str | datetime | None]:
     """Return the latest Codex review timestamp, sha, and state."""
     try:
@@ -275,8 +279,14 @@ def _get_codex_review_signals(
     best_time: datetime | None = None
     best_raw = ""
     best_state = ""
+    actor_id = actor.get("id") if isinstance(actor, dict) else None
     for review in reviews:
-        if not _reactions._is_codex_user(review.get("user"), policy=policy):
+        user = review.get("user")
+        if not _reactions._is_codex_user(user, policy=policy):
+            continue
+        if actor_id is not None and (
+            not isinstance(user, dict) or user.get("id") != actor_id
+        ):
             continue
         submitted_raw = review.get("submitted_at") or ""
         parsed = _parse_iso(submitted_raw)
