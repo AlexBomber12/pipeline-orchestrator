@@ -58,6 +58,7 @@ _MAX_DISK_PARTITION_CANDIDATES = 200
 _CLI_LATEST_TTL_SECONDS = 3600
 _CLI_HISTORY_TTL_SECONDS = 86400
 _HISTORY_CURSOR_PREFIX = "redis-history:"
+_FILE_CURSOR_PREFIX = "file-record:"
 _BOUNDED_EVENT_HISTORY_SCRIPT = """
 local size = redis.call('MEMORY', 'USAGE', KEYS[1]) or 0
 local total = redis.call('LLEN', KEYS[1])
@@ -115,8 +116,17 @@ _PENDING_SENSITIVE_ASSIGNMENT = re.compile(
     r"\s*[:=][ \t]*(?:[|>][-+]?)?[ \t]*$"
 )
 _BLOCK_SENSITIVE_ASSIGNMENT = re.compile(
-    rf"(?i)^(?P<indent>[ \t]*)(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
-    rf"(?:{_SENSITIVE_KEY_PATTERN}))\s*[:=][ \t]*[|>][-+]?[ \t]*(?:#.*)?$"
+    rf"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
+    rf"(?:{_SENSITIVE_KEY_PATTERN}))\s*[:=][ \t]*"
+    r"[|>](?:[1-9][-+]?|[-+][1-9]?|)[ \t]*(?:#.*)?$"
+)
+_QUOTED_SENSITIVE_ASSIGNMENT = re.compile(
+    rf"(?i)^[ \t]*(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
+    rf"(?:{_SENSITIVE_KEY_PATTERN}))\s*[:=][ \t]*(?P<quote>[\"'])(?P<value>.*)$"
+)
+_PLAIN_SENSITIVE_ASSIGNMENT = re.compile(
+    rf"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
+    rf"(?:{_SENSITIVE_KEY_PATTERN}))\s*[:=][ \t]*(?P<value>(?![\"'|>])\S.*)$"
 )
 _REDACTION_RULES = (
     (
@@ -335,14 +345,30 @@ def _line_indent(raw_line: bytes) -> int:
     return len(raw_line) - len(raw_line.lstrip(b" \t"))
 
 
+def _has_closing_quote(value: str, quote: str) -> bool:
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if quote == '"' and character == "\\":
+            index += 2
+            continue
+        if character == quote:
+            if quote == "'" and index + 1 < len(value) and value[index + 1] == "'":
+                index += 2
+                continue
+            return True
+        index += 1
+    return False
+
+
 def _sensitive_state_before(
     handle: Any,
     offset: int,
     raw: bytes,
-) -> tuple[bool | None, bool | None, int | None, int]:
-    """Recover adjacent-value and YAML-block state with one bounded read."""
+) -> tuple[bool | None, bool | None, int | None, bool | None, str | None, int]:
+    """Recover adjacent-value and YAML scalar state with one bounded read."""
     if offset <= 0:
-        return False, False, None, 0
+        return False, False, None, False, None, 0
     search_start = max(0, offset - _MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES)
     handle.seek(search_start)
     context = handle.read(offset - search_start)
@@ -350,7 +376,7 @@ def _sensitive_state_before(
     if search_start > 0:
         newline = context.find(b"\n")
         if newline < 0:
-            return None, None, None, scanned_bytes
+            return None, None, None, None, None, scanned_bytes
         context = context[newline + 1 :]
 
     context_lines = context.splitlines()
@@ -378,9 +404,9 @@ def _sensitive_state_before(
                 continue
             active_block_indent = None
         line = raw_line.decode("utf-8", errors="replace")
-        block_match = _BLOCK_SENSITIVE_ASSIGNMENT.fullmatch(line)
-        if block_match is not None:
-            active_block_indent = len(block_match.group("indent"))
+        indented_match = _BLOCK_SENSITIVE_ASSIGNMENT.fullmatch(line) or _PLAIN_SENSITIVE_ASSIGNMENT.fullmatch(line)
+        if indented_match is not None:
+            active_block_indent = len(indented_match.group("indent"))
             block_state_known = True
         elif indent == 0:
             block_state_known = True
@@ -398,10 +424,37 @@ def _sensitive_state_before(
         starts_inside_sensitive_block = None
         active_block_indent = None
 
+    quote_state_known = search_start == 0
+    active_quote: str | None = None
+    for raw_line in context_lines:
+        line = raw_line.decode("utf-8", errors="replace")
+        if active_quote is not None:
+            if _has_closing_quote(line, active_quote):
+                active_quote = None
+                quote_state_known = True
+            continue
+        quoted_match = _QUOTED_SENSITIVE_ASSIGNMENT.fullmatch(line)
+        if quoted_match is not None:
+            quote = quoted_match.group("quote")
+            if not _has_closing_quote(quoted_match.group("value"), quote):
+                active_quote = quote
+            quote_state_known = True
+        elif raw_line.strip() and _line_indent(raw_line) == 0:
+            quote_state_known = True
+
+    if active_quote is not None:
+        starts_inside_sensitive_quote: bool | None = True
+    elif quote_state_known:
+        starts_inside_sensitive_quote = False
+    else:
+        starts_inside_sensitive_quote = None
+
     return (
         starts_with_sensitive_value,
         starts_inside_sensitive_block,
         active_block_indent,
+        starts_inside_sensitive_quote,
+        active_quote,
         scanned_bytes,
     )
 
@@ -413,6 +466,8 @@ def _redacted_file_units(
     starts_with_sensitive_value: bool | None,
     starts_inside_sensitive_block: bool | None,
     sensitive_block_indent: int | None,
+    starts_inside_sensitive_quote: bool | None,
+    sensitive_quote: str | None,
     has_more_after_raw: bool,
     warnings: list[str],
 ) -> list[tuple[bytes, str, int]]:
@@ -432,10 +487,25 @@ def _redacted_file_units(
             "Sensitive-block context exceeded its bounded scan; page content was omitted fail-closed."
         )
         return [(raw, "[CONTENT OMITTED: SENSITIVE-BLOCK CONTEXT UNKNOWN]\n", 1)] if raw else []
+    if starts_inside_sensitive_quote is None:
+        warnings.append(
+            "Sensitive-quoted-scalar context exceeded its bounded scan; page content was omitted fail-closed."
+        )
+        return [(raw, "[CONTENT OMITTED: SENSITIVE-QUOTE CONTEXT UNKNOWN]\n", 1)] if raw else []
     raw_lines = raw.splitlines(keepends=True)
     units: list[tuple[bytes, str, int]] = []
     line_index = 0
-    if starts_inside_sensitive_block and sensitive_block_indent is not None:
+    if starts_inside_sensitive_quote and sensitive_quote is not None:
+        quote_end = 0
+        while quote_end < len(raw_lines):
+            quote_end += 1
+            text_line = raw_lines[quote_end - 1].decode("utf-8", errors="replace")
+            if _has_closing_quote(text_line, sensitive_quote):
+                break
+        raw_unit = b"".join(raw_lines[:quote_end])
+        units.append((raw_unit, "[REDACTED SENSITIVE QUOTED SCALAR]\n", 1))
+        line_index = quote_end
+    elif starts_inside_sensitive_block and sensitive_block_indent is not None:
         block_end = 0
         while block_end < len(raw_lines):
             if raw_lines[block_end].strip() and _line_indent(raw_lines[block_end]) <= sensitive_block_indent:
@@ -474,6 +544,20 @@ def _redacted_file_units(
             units.append((raw_unit, "[REDACTED PRIVATE KEY]\n", 1))
         else:
             text_unit = raw_unit.decode("utf-8", errors="replace")
+            quoted_match = _QUOTED_SENSITIVE_ASSIGNMENT.fullmatch(text_unit.rstrip("\r\n"))
+            if quoted_match is not None:
+                quote = quoted_match.group("quote")
+                if not _has_closing_quote(quoted_match.group("value"), quote):
+                    quote_end = line_index + 1
+                    while quote_end < len(raw_lines):
+                        text_line = raw_lines[quote_end].decode("utf-8", errors="replace")
+                        quote_end += 1
+                        if _has_closing_quote(text_line, quote):
+                            break
+                    raw_unit = b"".join(raw_lines[line_index:quote_end])
+                    units.append((raw_unit, "[REDACTED SENSITIVE QUOTED SCALAR]\n", 1))
+                    line_index = quote_end
+                    continue
             block_match = _BLOCK_SENSITIVE_ASSIGNMENT.fullmatch(text_unit.rstrip("\r\n"))
             if block_match is not None:
                 block_indent = len(block_match.group("indent"))
@@ -485,6 +569,19 @@ def _redacted_file_units(
                 raw_unit = b"".join(raw_lines[line_index:block_end])
                 units.append((raw_unit, "[REDACTED SENSITIVE BLOCK]\n", 1))
                 line_index = block_end
+                continue
+            plain_match = _PLAIN_SENSITIVE_ASSIGNMENT.fullmatch(text_unit.rstrip("\r\n"))
+            if plain_match is not None:
+                scalar_indent = len(plain_match.group("indent"))
+                scalar_end = line_index + 1
+                while scalar_end < len(raw_lines):
+                    if raw_lines[scalar_end].strip() and _line_indent(raw_lines[scalar_end]) <= scalar_indent:
+                        break
+                    scalar_end += 1
+                raw_unit = b"".join(raw_lines[line_index:scalar_end])
+                safe_unit, replacements = _redact_text(text_unit)
+                units.append((raw_unit, safe_unit, replacements))
+                line_index = scalar_end
                 continue
             if _PENDING_SENSITIVE_ASSIGNMENT.search(text_unit):
                 value_index = line_index + 1
@@ -1312,6 +1409,43 @@ def _decode_log_cursor(value: int | str) -> tuple[str, int | dict[str, Any]]:
     return "history", {"scan_cursor": scan_cursor, "pending": pending, "started": started}
 
 
+def _encode_file_cursor(source_id: str, source_offset: int, record_char_offset: int) -> str:
+    payload = json.dumps(
+        {
+            "source_id": source_id,
+            "source_offset": source_offset,
+            "record_char_offset": record_char_offset,
+        },
+        separators=(",", ":"),
+    ).encode()
+    encoded = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    return f"{_FILE_CURSOR_PREFIX}{encoded}"
+
+
+def _decode_file_cursor(value: str, source_id: str) -> tuple[int, int]:
+    if not value.startswith(_FILE_CURSOR_PREFIX):
+        raise ValueError("Invalid filesystem continuation cursor.")
+    encoded = value.removeprefix(_FILE_CURSOR_PREFIX)
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        raw = base64.b64decode(encoded + padding, altchars=b"-_", validate=True)
+        payload = json.loads(raw)
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("Invalid filesystem continuation cursor.") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("source_id") != source_id
+        or isinstance(payload.get("source_offset"), bool)
+        or not isinstance(payload.get("source_offset"), int)
+        or payload["source_offset"] < 0
+        or isinstance(payload.get("record_char_offset"), bool)
+        or not isinstance(payload.get("record_char_offset"), int)
+        or payload["record_char_offset"] <= 0
+    ):
+        raise ValueError("Invalid filesystem continuation cursor.")
+    return payload["source_offset"], payload["record_char_offset"]
+
+
 async def _redis_history_page(
     client: Any,
     repo_slug: str,
@@ -1757,8 +1891,8 @@ def _file_source_metadata(
         ),
         "private_key_context_bound_bytes": _MAX_PRIVATE_KEY_CONTEXT_BYTES,
         "sensitive_assignment_context": (
-            "the preceding line may be inspected to preserve redaction when a credential key and value "
-            "straddle a page; content is omitted fail-closed if that state remains unknown"
+            "preceding context may be inspected to preserve redaction when a credential scalar "
+            "straddles a page; content is omitted fail-closed if that state remains unknown"
         ),
         "sensitive_assignment_context_bound_bytes": _MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES,
     }
@@ -1769,10 +1903,13 @@ def _read_file_source(
     source_id: str,
     *,
     cursor: int,
+    record_char_offset: int,
+    cursor_token: int | str,
     max_chars: int,
     tail: bool,
 ) -> tuple[str | None, dict[str, Any], list[str], dict[str, Any] | None, int]:
     warnings: list[str] = []
+    input_record_char_offset = record_char_offset
     if source_id == "ci:artifact":
         repo_root = _safe_path(_REPOS_ROOT, repo_slug)
         path = _safe_path(repo_root, "artifacts", "ci.log")
@@ -1847,6 +1984,8 @@ def _read_file_source(
                 starts_with_sensitive_value,
                 starts_inside_sensitive_block,
                 sensitive_block_indent,
+                starts_inside_sensitive_quote,
+                sensitive_quote,
                 assignment_context_scanned_bytes,
             ) = _sensitive_state_before(handle, page_start, raw)
             text = raw.decode("utf-8", errors="replace")
@@ -1856,6 +1995,8 @@ def _read_file_source(
                 starts_with_sensitive_value=starts_with_sensitive_value,
                 starts_inside_sensitive_block=starts_inside_sensitive_block,
                 sensitive_block_indent=sensitive_block_indent,
+                starts_inside_sensitive_quote=starts_inside_sensitive_quote,
+                sensitive_quote=sensitive_quote,
                 has_more_after_raw=False,
                 warnings=warnings,
             )
@@ -1869,7 +2010,7 @@ def _read_file_source(
             )
             pagination = {
                 "cursor": page_start,
-                "requested_cursor": cursor,
+                "requested_cursor": cursor_token,
                 "cursor_unit": "source_byte",
                 "max_chars": max_chars,
                 "returned_chars": len(content),
@@ -1918,7 +2059,7 @@ def _read_file_source(
                         warnings,
                         {
                             "cursor": page_start,
-                            "requested_cursor": cursor,
+                            "requested_cursor": cursor_token,
                             "cursor_unit": "source_byte",
                             "max_chars": max_chars,
                             "returned_chars": len(marker),
@@ -1955,7 +2096,7 @@ def _read_file_source(
                         warnings,
                         {
                             "cursor": page_start,
-                            "requested_cursor": cursor,
+                            "requested_cursor": cursor_token,
                             "cursor_unit": "source_byte",
                             "max_chars": max_chars,
                             "returned_chars": len(marker),
@@ -1977,6 +2118,8 @@ def _read_file_source(
                 starts_with_sensitive_value,
                 starts_inside_sensitive_block,
                 sensitive_block_indent,
+                starts_inside_sensitive_quote,
+                sensitive_quote,
                 assignment_context_scanned_bytes,
             ) = _sensitive_state_before(handle, page_start, raw)
             redaction_units = _redacted_file_units(
@@ -1985,6 +2128,8 @@ def _read_file_source(
                 starts_with_sensitive_value=starts_with_sensitive_value,
                 starts_inside_sensitive_block=starts_inside_sensitive_block,
                 sensitive_block_indent=sensitive_block_indent,
+                starts_inside_sensitive_quote=starts_inside_sensitive_quote,
+                sensitive_quote=sensitive_quote,
                 has_more_after_raw=has_more_after_raw,
                 warnings=warnings,
             )
@@ -1994,16 +2139,39 @@ def _read_file_source(
             consumed_bytes = 0
             replacements = 0
             malformed = 0
+            continuation_cursor: str | None = None
             for raw_unit, safe_unit, unit_replacements in redaction_units:
-                if parts and returned_chars + len(safe_unit) > max_chars:
+                unit_char_offset = record_char_offset if not parts and consumed_bytes == 0 else 0
+                if unit_char_offset >= len(safe_unit):
+                    raise ValueError("Filesystem continuation cursor no longer matches the source record.")
+                remaining_unit = safe_unit[unit_char_offset:]
+                available_chars = max_chars - returned_chars
+                if parts and len(remaining_unit) > available_chars:
                     break
-                if not parts and len(safe_unit) > max_chars:
-                    safe_unit = safe_unit[:max_chars]
-                    warnings.append("One source record exceeded max_chars and was truncated after redaction.")
-                parts.append(safe_unit)
-                returned_chars += len(safe_unit)
+                if len(remaining_unit) > available_chars:
+                    parts.append(remaining_unit[:available_chars])
+                    returned_chars += available_chars
+                    replacements += unit_replacements
+                    continuation_cursor = _encode_file_cursor(
+                        source_id,
+                        page_start + consumed_bytes,
+                        unit_char_offset + available_chars,
+                    )
+                    warnings.append(
+                        "One source record exceeded max_chars; use the opaque next_cursor to continue it."
+                    )
+                    if kind == "disk_event_log":
+                        malformed += sum(
+                            _bounded_event(line)["status"] == "malformed"
+                            for line in raw_unit.decode("utf-8", errors="replace").splitlines()
+                            if line
+                        )
+                    break
+                parts.append(remaining_unit)
+                returned_chars += len(remaining_unit)
                 consumed_bytes += len(raw_unit)
                 replacements += unit_replacements
+                record_char_offset = 0
                 if kind == "disk_event_log":
                     malformed += sum(
                         _bounded_event(line)["status"] == "malformed"
@@ -2014,11 +2182,16 @@ def _read_file_source(
                     break
             content = "".join(parts)
             next_position = page_start + consumed_bytes
-            next_cursor = next_position if next_position < stat.st_size else None
+            next_cursor: int | str | None = continuation_cursor
+            if next_cursor is None:
+                next_cursor = next_position if next_position < stat.st_size else None
             pagination = {
                 "cursor": page_start,
-                "requested_cursor": cursor,
+                "requested_cursor": cursor_token,
                 "cursor_unit": "source_byte",
+                "continuation_cursor_unit": "opaque_redacted_record_character",
+                "source_byte_cursor": page_start,
+                "record_character_offset": input_record_char_offset,
                 "max_chars": max_chars,
                 "returned_chars": len(content),
                 "source_size_bytes": stat.st_size,
@@ -2042,7 +2215,9 @@ def _read_file_source(
         stat=stat,
         malformed=malformed,
     )
-    source["source_truncated"] = cursor == 0 and content.startswith("[truncated]\n")
+    source["source_truncated"] = (
+        cursor == 0 and input_record_char_offset == 0 and content.startswith("[truncated]\n")
+    )
     return content, source, warnings, pagination, replacements
 
 
@@ -2069,20 +2244,20 @@ def _page_content(content: str, *, cursor: int, max_chars: int, tail: bool) -> t
 async def read_orchestrator_log(
     repo_slug: str,
     source_id: str,
-    cursor: int = 0,
+    cursor: int | str = 0,
     max_chars: int = 8_000,
     tail: bool = False,
 ) -> dict[str, Any]:
     """Read one discovered diagnostic source with bounded pagination.
 
-    Redis cursors are character offsets in redacted content; filesystem cursors
-    are byte offsets returned by the preceding page. Set ``tail`` to read the
-    final bounded window (useful for failure excerpts); tail mode requires the
-    default cursor. Credential-like and Authorization values are redacted before
-    return, while existing producer truncation markers are kept.
+    Redis cursors are character offsets in redacted content. Filesystem cursors
+    are source-byte offsets or opaque record continuations returned by the
+    preceding page. Set ``tail`` to read the final bounded window (useful for
+    failure excerpts); tail mode requires the default cursor. Credential-like
+    and Authorization values are redacted before return, while existing producer
+    truncation markers are kept.
     """
     _validate_configured_repo(repo_slug)
-    cursor = _validate_cursor(cursor)
     max_chars = _validate_limit(max_chars, maximum=_MAX_READ_CHARS, name="max_chars")
     if tail and cursor != 0:
         raise ValueError("cursor must be 0 when tail is true")
@@ -2109,7 +2284,13 @@ async def read_orchestrator_log(
     warnings: list[str]
     file_pagination: dict[str, Any] | None = None
     file_replacements = 0
-    if source_id in {"cli:latest", "events:redis"} or source_id.startswith(_CLI_HISTORY_SOURCE_PREFIX):
+    is_redis_source = source_id in {"cli:latest", "events:redis"} or source_id.startswith(
+        _CLI_HISTORY_SOURCE_PREFIX
+    )
+    if is_redis_source:
+        if not isinstance(cursor, int) or isinstance(cursor, bool):
+            raise ValueError("Redis source cursor must be a non-negative integer.")
+        redis_cursor = _validate_cursor(cursor)
         client: Any | None = None
         try:
             client = _new_redis_client()
@@ -2128,10 +2309,17 @@ async def read_orchestrator_log(
         finally:
             await _close_redis(client)
     else:
+        if isinstance(cursor, str):
+            file_cursor, record_char_offset = _decode_file_cursor(cursor, source_id)
+        else:
+            file_cursor = _validate_cursor(cursor)
+            record_char_offset = 0
         content, source, warnings, file_pagination, file_replacements = _read_file_source(
             repo_slug,
             source_id,
-            cursor=cursor,
+            cursor=file_cursor,
+            record_char_offset=record_char_offset,
+            cursor_token=cursor,
             max_chars=max_chars,
             tail=tail,
         )
@@ -2166,7 +2354,7 @@ async def read_orchestrator_log(
         }
 
     redacted, replacements = _redact_text(content)
-    page, pagination = _page_content(redacted, cursor=cursor, max_chars=max_chars, tail=tail)
+    page, pagination = _page_content(redacted, cursor=redis_cursor, max_chars=max_chars, tail=tail)
     source["source_truncated"] = content.startswith("[truncated]\n")
     return {
         "observed_at": _iso_z(observed_at),

@@ -22,14 +22,16 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   `SCAN` continuation and fetches no more history values than the page limit.
 - `read_orchestrator_log` reads a discovered source with a bounded continuation
   cursor or a tail page. Redis cursors address redacted characters; filesystem
-  cursors address source bytes and each page window is at most 256 KiB. A
-  filesystem read may inspect up to 1 MiB of older context to determine whether
-  its window begins inside a multiline private-key block; if that bounded scan
-  cannot establish the state, the page is omitted fail-closed. It also inspects
-  at most 64 KiB of preceding context so credential keys and values split across
-  lines or page boundaries remain redacted, with the same fail-closed behavior
-  when context is indeterminate. Diagnostic text is credential-redacted before
-  it is returned, and producer-added
+  cursors normally address source bytes. A record longer than `max_chars` uses
+  the returned opaque continuation cursor so no unreturned suffix is skipped;
+  each filesystem page window remains at most 256 KiB. A filesystem read may
+  inspect up to 1 MiB of older context to determine whether its window begins
+  inside a multiline private-key block; if that bounded scan cannot establish
+  the state, the page is omitted fail-closed. It also inspects at most 64 KiB of
+  preceding context so credential keys and plain, quoted, or block scalar values
+  split across lines or page boundaries remain redacted, with the same
+  fail-closed behavior when context is indeterminate. Diagnostic text is
+  credential-redacted before it is returned, and producer-added
   `[truncated]` markers are preserved. Redis event history is fetched through a
   read-only bounded script and reported as oversized, without materializing its
   records in the MCP process, when the retained list exceeds 256 KiB. Disk

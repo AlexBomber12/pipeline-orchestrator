@@ -516,6 +516,10 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
     assert diagnostics._parse_timestamp("not-a-time") is None
     assert diagnostics._parse_timestamp("2026-10-05T12:00:00").tzinfo is not None
     assert diagnostics._error_text(RuntimeError()) == "RuntimeError"
+    assert diagnostics._has_closing_quote(r'escaped\"still-open', '"') is False
+    assert diagnostics._has_closing_quote(r'escaped\"then-close"', '"') is True
+    assert diagnostics._has_closing_quote("escaped''still-open", "'") is False
+    assert diagnostics._has_closing_quote("escaped''then-close'", "'") is True
 
     state = RepoState(
         url="https://github.com/octo/demo",
@@ -1062,11 +1066,22 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
     assert "multiline-secret" not in value_page["content"]
     assert "[REDACTED SENSITIVE VALUE]" in value_page["content"]
 
-    plain_yaml = b"password: correct horse battery staple\nafter\n"
+    plain_yaml = b"password: correct horse\n  battery staple\nafter\n"
     ci_path.write_bytes(plain_yaml)
     plain_yaml_page = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", max_chars=200)
-    assert "correct horse battery staple" not in plain_yaml_page["content"]
+    assert "correct horse" not in plain_yaml_page["content"]
+    assert "battery staple" not in plain_yaml_page["content"]
     assert plain_yaml_page["content"].startswith("password: [REDACTED]")
+    plain_cursor = plain_yaml.index(b"  battery staple")
+    plain_continuation = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=plain_cursor,
+        max_chars=200,
+    )
+    assert "battery staple" not in plain_continuation["content"]
+    assert "[REDACTED SENSITIVE BLOCK]" in plain_continuation["content"]
+    assert "after" in plain_continuation["content"]
 
     block_yaml = b"before\npassword: |\n  first-secret\n  second-secret\nafter\n"
     ci_path.write_bytes(block_yaml)
@@ -1084,6 +1099,23 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
     assert "second-secret" not in block_continuation["content"]
     assert "[REDACTED SENSITIVE BLOCK]" in block_continuation["content"]
     assert "after" in block_continuation["content"]
+
+    quoted_yaml = b'before\npassword: "first-secret\n  second-secret"\nafter\n'
+    ci_path.write_bytes(quoted_yaml)
+    quoted_page = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", max_chars=200)
+    assert "first-secret" not in quoted_page["content"]
+    assert "second-secret" not in quoted_page["content"]
+    assert "[REDACTED SENSITIVE QUOTED SCALAR]" in quoted_page["content"]
+    quote_cursor = quoted_yaml.index(b"  second-secret")
+    quoted_continuation = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=quote_cursor,
+        max_chars=200,
+    )
+    assert "second-secret" not in quoted_continuation["content"]
+    assert "[REDACTED SENSITIVE QUOTED SCALAR]" in quoted_continuation["content"]
+    assert "after" in quoted_continuation["content"]
 
     ordinary_size = diagnostics._MAX_PRIVATE_KEY_CONTEXT_BYTES + diagnostics._MAX_FILE_SCAN_BYTES * 2
     ci_path.write_bytes((b"ordinary line\n" * (ordinary_size // len(b"ordinary line\n") + 1))[:ordinary_size])
@@ -1107,6 +1139,8 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
         starts_with_sensitive_value=False,
         starts_inside_sensitive_block=False,
         sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
         has_more_after_raw=True,
         warnings=warnings,
     )
@@ -1117,6 +1151,8 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
         False,
         False,
         None,
+        False,
+        None,
         2,
     )
     completed_block = b"password: |\n  secret\nnext: value\n"
@@ -1124,9 +1160,17 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
         BytesIO(completed_block),
         len(completed_block),
         b"  current\n",
-    ) == (False, False, None, len(completed_block))
+    ) == (False, False, None, False, None, len(completed_block))
+    completed_quote = b'password: "first\n  second"\n'
+    assert diagnostics._sensitive_state_before(
+        BytesIO(completed_quote),
+        len(completed_quote),
+        b"next\n",
+    ) == (False, False, None, False, None, len(completed_quote))
     unknown_context = b"x" * (diagnostics._MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES + 1)
     assert diagnostics._sensitive_state_before(BytesIO(unknown_context), len(unknown_context), b"  value\n") == (
+        None,
+        None,
         None,
         None,
         None,
@@ -1145,6 +1189,8 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
         starts_with_sensitive_value=None,
         starts_inside_sensitive_block=False,
         sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
         has_more_after_raw=False,
         warnings=warnings,
     )[0][1] == "[CONTENT OMITTED: SENSITIVE-ASSIGNMENT CONTEXT UNKNOWN]\n"
@@ -1155,9 +1201,23 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
         starts_with_sensitive_value=False,
         starts_inside_sensitive_block=None,
         sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
         has_more_after_raw=False,
         warnings=warnings,
     )[0][1] == "[CONTENT OMITTED: SENSITIVE-BLOCK CONTEXT UNKNOWN]\n"
+    warnings = []
+    assert diagnostics._redacted_file_units(
+        b"  unknown\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=None,
+        sensitive_quote=None,
+        has_more_after_raw=False,
+        warnings=warnings,
+    )[0][1] == "[CONTENT OMITTED: SENSITIVE-QUOTE CONTEXT UNKNOWN]\n"
 
 
 async def test_filesystem_reader_omits_oversized_segments_and_lines(
@@ -1192,7 +1252,50 @@ async def test_filesystem_reader_omits_oversized_segments_and_lines(
     ci_path.write_text("z" * 200 + "\n", encoding="utf-8")
     truncates_line = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", max_chars=10)
     assert truncates_line["content"] == "z" * 10
-    assert any("exceeded max_chars" in warning for warning in truncates_line["warnings"])
+    assert isinstance(truncates_line["pagination"]["next_cursor"], str)
+    continued_parts = [truncates_line["content"]]
+    continuation_cursor = truncates_line["pagination"]["next_cursor"]
+    while continuation_cursor is not None:
+        continuation_page = await diagnostics.read_orchestrator_log(
+            SLUG,
+            "ci:artifact",
+            cursor=continuation_cursor,
+            max_chars=10,
+        )
+        continued_parts.append(continuation_page["content"])
+        continuation_cursor = continuation_page["pagination"]["next_cursor"]
+    assert "".join(continued_parts) == "z" * 200 + "\n"
+
+    stale_cursor = diagnostics._encode_file_cursor("ci:artifact", 0, 999)
+    with pytest.raises(ValueError, match="no longer matches"):
+        await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", cursor=stale_cursor)
+    with pytest.raises(ValueError, match="continuation cursor"):
+        diagnostics._decode_file_cursor("not-a-cursor", "ci:artifact")
+    with pytest.raises(ValueError, match="continuation cursor"):
+        diagnostics._decode_file_cursor(f"{diagnostics._FILE_CURSOR_PREFIX}not-base64", "ci:artifact")
+
+    with pytest.raises(ValueError, match="continuation cursor"):
+        await diagnostics.read_orchestrator_log(
+            SLUG,
+            "events:disk/2026-10-05",
+            cursor=truncates_line["pagination"]["next_cursor"],
+        )
+    with pytest.raises(ValueError, match="Redis source cursor"):
+        await diagnostics.read_orchestrator_log(
+            SLUG,
+            "cli:latest",
+            cursor=truncates_line["pagination"]["next_cursor"],
+        )
+
+    event_path = tmp_path / "events" / SLUG / "2026-10-05.jsonl"
+    event_path.parent.mkdir(parents=True)
+    event_path.write_text(json.dumps({"event": "x" * 200}) + "\n", encoding="utf-8")
+    long_event = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "events:disk/2026-10-05",
+        max_chars=10,
+    )
+    assert isinstance(long_event["pagination"]["next_cursor"], str)
 
     ci_path.write_text(
         "before\n"
