@@ -110,6 +110,28 @@ except OSError as exc:
 """
 
 
+def _failed_launch_cleanup_timeout_seconds() -> float:
+    """Return the outer bound for every sequential failed-launch phase."""
+    # Owned cleanup can either confirm a stubborn witness in both its TERM and
+    # KILL passes, or spend the KILL grace before one witness confirmation.
+    # Leader publication precedes either path.  Finalization can then spend one
+    # witness grace draining adopted children and two closing the witness
+    # gracefully and forcibly.
+    owned_cleanup = (
+        _LEADER_EXIT_GRACE_SECONDS
+        + (3 * _WITNESS_EXIT_GRACE_SECONDS)
+        + max(
+            2 * _WITNESS_EXIT_GRACE_SECONDS,
+            _LAUNCH_CLEANUP_TIMEOUT_SECONDS
+            + _WITNESS_EXIT_GRACE_SECONDS,
+        )
+    )
+    # Before ownership is proven, leader wait/retry and witness wait/force each
+    # have two cleanup-timeout phases.
+    unowned_cleanup = 4 * _LAUNCH_CLEANUP_TIMEOUT_SECONDS
+    return max(owned_cleanup, unowned_cleanup)
+
+
 class CleanupStatus(str, Enum):
     """Final state of a supervised process-group cleanup."""
 
@@ -1182,9 +1204,7 @@ async def _finish_failed_launch(
 
 async def _wait_without_cancelling(task: asyncio.Task[None]) -> None:
     loop = asyncio.get_running_loop()
-    # Owned cleanup may spend one bound each on KILL, leader publication,
-    # adopted-child reaping, witness exit, and forced witness exit.
-    deadline = loop.time() + (6 * _LAUNCH_CLEANUP_TIMEOUT_SECONDS)
+    deadline = loop.time() + _failed_launch_cleanup_timeout_seconds()
     while not task.done():
         remaining = deadline - loop.time()
         if remaining <= 0:

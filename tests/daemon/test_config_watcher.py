@@ -16,15 +16,13 @@ def _write(path: Path, body: str) -> None:
     path.write_text(body, encoding="utf-8")
 
 
-async def _wait_until(condition, timeout: float = 3.0) -> bool:
-    """Spin on ``condition`` until True or until ``timeout`` elapses."""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while loop.time() < deadline:
-        if condition():
-            return True
-        await asyncio.sleep(0.02)
-    return condition()
+async def _wait_for_observation(
+    observations: asyncio.Queue[Any], expected: Any
+) -> None:
+    """Wait for an explicitly delivered watcher observation."""
+    async with asyncio.timeout(3):
+        while await observations.get() != expected:
+            pass
 
 
 async def _cancel(task: asyncio.Task[Any]) -> None:
@@ -41,17 +39,23 @@ def test_watcher_triggers_callback_on_file_modified(tmp_path: Path) -> None:
     target = tmp_path / "config.yml"
     _write(target, "x: 1\n")
     fired: list[int] = []
+    observations: asyncio.Queue[str] = asyncio.Queue()
 
     async def driver() -> None:
+        ready = asyncio.Event()
+
+        def callback() -> None:
+            fired.append(1)
+            observations.put_nowait(target.read_text(encoding="utf-8"))
+
         task = asyncio.create_task(
             config_watcher.watch_config_changes(
-                [target], lambda: fired.append(1)
+                [target], callback, ready_event=ready
             )
         )
-        # Give the watcher time to subscribe to the kernel before we mutate.
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(ready.wait(), timeout=2)
         _write(target, "x: 2\n")
-        await _wait_until(lambda: bool(fired))
+        await _wait_for_observation(observations, "x: 2\n")
         await _cancel(task)
 
     asyncio.run(driver())
@@ -111,17 +115,26 @@ def test_watcher_ignores_irrelevant_changes(tmp_path: Path) -> None:
     _write(target, "x: 1\n")
     _write(unrelated, "hello\n")
     fired: list[int] = []
+    observed = asyncio.Event()
 
     async def driver() -> None:
+        ready = asyncio.Event()
+
+        def callback() -> None:
+            fired.append(1)
+            observed.set()
+
         task = asyncio.create_task(
             config_watcher.watch_config_changes(
-                [target], lambda: fired.append(1)
+                [target], callback, ready_event=ready
             )
         )
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(ready.wait(), timeout=2)
         # Mutate an unrelated path; the watcher must NOT fire.
+        ready.clear()
         _write(unrelated, "world\n")
-        await asyncio.sleep(0.5)
+        await asyncio.wait_for(ready.wait(), timeout=2)
+        assert not observed.is_set()
         await _cancel(task)
 
     asyncio.run(driver())
@@ -134,18 +147,31 @@ def test_watcher_multiple_paths_each_triggers(tmp_path: Path) -> None:
     _write(primary, "x: 1\n")
     _write(secondary, "y: 1\n")
     fired: list[str] = []
+    observations: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
 
     async def driver() -> None:
+        ready = asyncio.Event()
+
+        def callback() -> None:
+            fired.append("hit")
+            observations.put_nowait(
+                (
+                    primary.read_text(encoding="utf-8"),
+                    secondary.read_text(encoding="utf-8"),
+                )
+            )
+
         task = asyncio.create_task(
             config_watcher.watch_config_changes(
-                [primary, secondary], lambda: fired.append("hit")
+                [primary, secondary], callback, ready_event=ready
             )
         )
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(ready.wait(), timeout=2)
         _write(primary, "x: 2\n")
-        await _wait_until(lambda: len(fired) >= 1)
+        await _wait_for_observation(observations, ("x: 2\n", "y: 1\n"))
+        await asyncio.wait_for(ready.wait(), timeout=2)
         _write(secondary, "y: 2\n")
-        await _wait_until(lambda: len(fired) >= 2)
+        await _wait_for_observation(observations, ("x: 2\n", "y: 2\n"))
         await _cancel(task)
 
     asyncio.run(driver())
@@ -156,24 +182,30 @@ def test_callback_exception_does_not_crash_watcher(tmp_path: Path) -> None:
     target = tmp_path / "config.yml"
     _write(target, "x: 1\n")
     fired: list[int] = []
+    observations: asyncio.Queue[str] = asyncio.Queue()
 
     def callback() -> None:
         fired.append(1)
+        observations.put_nowait(target.read_text(encoding="utf-8"))
         if len(fired) == 1:
             raise RuntimeError("simulated reload failure")
 
     async def driver() -> None:
+        ready = asyncio.Event()
         task = asyncio.create_task(
-            config_watcher.watch_config_changes([target], callback)
+            config_watcher.watch_config_changes(
+                [target], callback, ready_event=ready
+            )
         )
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(ready.wait(), timeout=2)
         _write(target, "x: 2\n")
-        await _wait_until(lambda: len(fired) >= 1)
+        await _wait_for_observation(observations, "x: 2\n")
         # The first invocation raised; the watcher must still be alive
         # and re-fire on the next event.
         assert not task.done()
+        await asyncio.wait_for(ready.wait(), timeout=2)
         _write(target, "x: 3\n")
-        await _wait_until(lambda: len(fired) >= 2)
+        await _wait_for_observation(observations, "x: 3\n")
         await _cancel(task)
 
     asyncio.run(driver())
@@ -436,27 +468,33 @@ def test_watcher_survives_atomic_save_via_rename(tmp_path: Path) -> None:
     target = tmp_path / "config.yml"
     _write(target, "x: 1\n")
     fired: list[int] = []
+    observations: asyncio.Queue[str] = asyncio.Queue()
 
     async def driver() -> None:
+        ready = asyncio.Event()
+
+        def callback() -> None:
+            fired.append(1)
+            observations.put_nowait(target.read_text(encoding="utf-8"))
+
         task = asyncio.create_task(
             config_watcher.watch_config_changes(
-                [target], lambda: fired.append(1)
+                [target], callback, ready_event=ready
             )
         )
-        # Give the watcher time to subscribe to the parent dir before
-        # the first rename.
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(ready.wait(), timeout=2)
         first_tmp = tmp_path / "config.yml.new1"
         _write(first_tmp, "x: 2\n")
         first_tmp.replace(target)
-        await _wait_until(lambda: len(fired) >= 1)
+        await _wait_for_observation(observations, "x: 2\n")
+        await asyncio.wait_for(ready.wait(), timeout=2)
         # Second atomic save against the new inode — the prior code
         # path that watched the file directly went deaf here because
         # the original inode was already unlinked by the first rename.
         second_tmp = tmp_path / "config.yml.new2"
         _write(second_tmp, "x: 3\n")
         second_tmp.replace(target)
-        await _wait_until(lambda: len(fired) >= 2)
+        await _wait_for_observation(observations, "x: 3\n")
         await _cancel(task)
 
     asyncio.run(driver())
@@ -477,17 +515,25 @@ def test_watcher_filters_unrelated_siblings_in_same_directory(
     _write(target, "x: 1\n")
     _write(sibling, "hello\n")
     fired: list[int] = []
+    observed = asyncio.Event()
 
     async def driver() -> None:
+        ready = asyncio.Event()
+
+        def callback() -> None:
+            fired.append(1)
+            observed.set()
+
         task = asyncio.create_task(
             config_watcher.watch_config_changes(
-                [target], lambda: fired.append(1)
+                [target], callback, ready_event=ready
             )
         )
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(ready.wait(), timeout=2)
+        ready.clear()
         _write(sibling, "world\n")
-        # Give plenty of time for any spurious event to propagate.
-        await asyncio.sleep(0.5)
+        await asyncio.wait_for(ready.wait(), timeout=2)
+        assert not observed.is_set()
         await _cancel(task)
 
     asyncio.run(driver())

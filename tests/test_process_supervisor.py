@@ -1880,6 +1880,58 @@ async def test_lifecycle_witness_failures_are_bounded_and_fail_closed(
 
 
 @pytest.mark.asyncio
+async def test_failed_launch_cleanup_can_exceed_former_outer_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    control_read, control_write = os.pipe()
+
+    class DelayedOwnedCleanup:
+        async def cleanup(
+            self, *, term_grace: float, kill_grace: float
+        ) -> CleanupResult:
+            assert term_grace == 0
+            assert kill_grace == 0.01
+            cleanup_started.set()
+            try:
+                await asyncio.wait_for(release_cleanup.wait(), timeout=0.2)
+            finally:
+                os.close(control_read)
+            return CleanupResult(CleanupStatus.QUIESCENT, -signal.SIGTERM, True, False)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.01
+        )
+        patch.setattr(process_supervisor, "_LEADER_EXIT_GRACE_SECONDS", 0.2)
+        patch.setattr(process_supervisor, "_WITNESS_EXIT_GRACE_SECONDS", 0.2)
+        assert process_supervisor._failed_launch_cleanup_timeout_seconds() == pytest.approx(
+            1.2
+        )
+        cleanup_task = asyncio.create_task(
+            process_supervisor._finish_failed_launch(
+                None,
+                owned_process=DelayedOwnedCleanup(),  # type: ignore[arg-type]
+                control_fd=control_read,
+                witness_pid=None,
+                witness_pidfd=None,
+            )
+        )
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        # The former 6 * cleanup-timeout wrapper expired after 0.06 seconds.
+        release_handle = asyncio.get_running_loop().call_later(
+            0.08, release_cleanup.set
+        )
+        try:
+            await process_supervisor._wait_without_cancelling(cleanup_task)
+        finally:
+            release_handle.cancel()
+    os.close(control_write)
+    assert cleanup_task.done()
+
+
+@pytest.mark.asyncio
 async def test_launch_deadline_helpers_bound_stubborn_tasks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1898,6 +1950,7 @@ async def test_launch_deadline_helpers_bound_stubborn_tasks(
     assert not task.done()
     release.set()
     await task
+    assert task.done()
 
     started = asyncio.Event()
     release = asyncio.Event()
@@ -1907,10 +1960,16 @@ async def test_launch_deadline_helpers_bound_stubborn_tasks(
         patch.setattr(
             process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0.01
         )
+        patch.setattr(process_supervisor, "_LEADER_EXIT_GRACE_SECONDS", 0.01)
+        patch.setattr(process_supervisor, "_WITNESS_EXIT_GRACE_SECONDS", 0.01)
+        assert process_supervisor._failed_launch_cleanup_timeout_seconds() == pytest.approx(
+            0.06
+        )
         with pytest.raises(RuntimeError, match="cleanup exceeded"):
             await process_supervisor._wait_without_cancelling(task)
     release.set()
     await task
+    assert task.done()
 
     class StubbornProcess:
         pid = 987654
@@ -2288,17 +2347,37 @@ async def test_launch_rejects_conflicts_and_unverified_session(
             )
 
     exec_wait_started = asyncio.Event()
+    release_exec_result = asyncio.Event()
+    exec_cleanup_tasks: list[asyncio.Task[None]] = []
+    exec_cleanup_owners: list[SupervisedProcess] = []
+    exec_cleanup_pids: list[int] = []
+    real_finish_failed_launch = process_supervisor._finish_failed_launch
 
-    async def briefly_delayed_exec_result(_ready_socket: Any) -> bytes:
+    async def blocked_exec_result(_ready_socket: Any) -> bytes:
         exec_wait_started.set()
-        await asyncio.sleep(0.02)
+        await release_exec_result.wait()
         return b""
+
+    async def tracked_exec_cleanup(*args: Any, **kwargs: Any) -> None:
+        cleanup_task = asyncio.current_task()
+        assert cleanup_task is not None
+        exec_cleanup_tasks.append(cleanup_task)
+        owned_process = kwargs["owned_process"]
+        assert isinstance(owned_process, SupervisedProcess)
+        exec_cleanup_owners.append(owned_process)
+        witness = owned_process._lifecycle_witness
+        assert witness is not None
+        exec_cleanup_pids.extend((owned_process.identity.leader_pid, witness.pid))
+        await real_finish_failed_launch(*args, **kwargs)
 
     with monkeypatch.context() as patch:
         patch.setattr(
             process_supervisor,
             "_read_until_eof",
-            briefly_delayed_exec_result,
+            blocked_exec_result,
+        )
+        patch.setattr(
+            process_supervisor, "_finish_failed_launch", tracked_exec_cleanup
         )
         patch.setattr(
             process_supervisor,
@@ -2317,14 +2396,25 @@ async def test_launch_rejects_conflicts_and_unverified_session(
         )
         await asyncio.wait_for(exec_wait_started.wait(), timeout=1)
         launch_task.cancel()
+        release_exec_result.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(launch_task, timeout=1)
+    assert len(exec_cleanup_tasks) == len(exec_cleanup_owners) == 1
+    assert exec_cleanup_tasks[0].done()
+    exec_owner = exec_cleanup_owners[0]
+    assert exec_owner._cleanup_task is not None
+    assert exec_owner._cleanup_task.done()
+    assert exec_owner.process.returncode is not None
+    assert len(exec_cleanup_pids) == 2
+    await _wait_not_live(*exec_cleanup_pids)
 
     ready_received = asyncio.Event()
     release_ready = asyncio.Event()
     cleanup_started = asyncio.Event()
     release_cleanup = asyncio.Event()
-    real_finish_failed_launch = process_supervisor._finish_failed_launch
+    repeated_cleanup_tasks: list[asyncio.Task[None]] = []
+    repeated_cleanup_processes: list[asyncio.subprocess.Process] = []
+    repeated_cleanup_pids: list[int] = []
 
     async def delayed_ready(ready_socket: Any) -> bytes:
         payload = await real_read_witness_ready(ready_socket)
@@ -2333,6 +2423,17 @@ async def test_launch_rejects_conflicts_and_unverified_session(
         return payload
 
     async def delayed_cleanup(*args: Any, **kwargs: Any) -> None:
+        cleanup_task = asyncio.current_task()
+        assert cleanup_task is not None
+        repeated_cleanup_tasks.append(cleanup_task)
+        owned_process = kwargs["owned_process"]
+        assert owned_process is None
+        process = args[0]
+        assert isinstance(process, asyncio.subprocess.Process)
+        repeated_cleanup_processes.append(process)
+        witness_pid = kwargs["witness_pid"]
+        assert isinstance(witness_pid, int)
+        repeated_cleanup_pids.extend((process.pid, witness_pid))
         cleanup_started.set()
         await release_cleanup.wait()
         await real_finish_failed_launch(*args, **kwargs)
@@ -2356,6 +2457,11 @@ async def test_launch_rejects_conflicts_and_unverified_session(
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(launch_task, timeout=1)
     assert not cancellation_marker.exists()
+    assert len(repeated_cleanup_tasks) == len(repeated_cleanup_processes) == 1
+    assert repeated_cleanup_tasks[0].done()
+    assert repeated_cleanup_processes[0].returncode is not None
+    assert len(repeated_cleanup_pids) == 2
+    await _wait_not_live(*repeated_cleanup_pids)
 
     with monkeypatch.context() as patch:
         patch.setattr(process_supervisor, "_get_pidfd_opener", lambda: None)
@@ -2532,6 +2638,33 @@ async def test_early_launch_observation_and_unreadable_group_fallbacks(
     assert cleanup.quiescent
     assert not cleanup.term_sent
     assert not cleanup.kill_sent
+
+
+def test_observe_group_reports_disappeared_group_without_proc_members(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    managed = SupervisedProcess(
+        process=object(),  # type: ignore[arg-type]
+        identity=ProcessIdentity(
+            leader_pid=999_998,
+            process_group_id=999_999,
+            session_id=999_999,
+            leader_start_time=None,
+        ),
+        _proof=process_supervisor._LAUNCH_PROOF,
+    )
+    monkeypatch.setattr(os, "scandir", lambda _path: nullcontext(()))
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda _pgid, _sig: (_ for _ in ()).throw(ProcessLookupError),
+    )
+
+    observation = managed._observe_group()
+
+    assert observation.state is _GroupState.QUIESCENT
+    assert observation.detail == "process group disappeared"
+    assert observation.definitive is True
 
 
 @pytest.mark.asyncio
