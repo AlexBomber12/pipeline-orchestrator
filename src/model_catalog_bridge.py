@@ -210,6 +210,11 @@ async def serve_model_catalog_requests(
     config_path: str,
 ) -> None:
     """Consume durable web requests for the lifetime of the daemon."""
+    # Lightweight Redis doubles and alternate clients may not implement lists.
+    # The ordinary daemon loop must remain usable when the optional discovery
+    # bridge cannot be installed.
+    if not callable(getattr(redis_client, "blpop", None)):
+        return
     while True:
         try:
             queued = await redis_client.blpop(

@@ -256,3 +256,12 @@ async def test_daemon_server_handles_idle_and_redis_failure(
             config_path="config.yml",
         )
     assert redis.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_daemon_server_disables_bridge_without_redis_list_support() -> None:
+    await bridge.serve_model_catalog_requests(
+        object(),
+        CoderRegistry(),
+        config_path="config.yml",
+    )
