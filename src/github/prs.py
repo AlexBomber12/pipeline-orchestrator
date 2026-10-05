@@ -804,20 +804,23 @@ def get_pr_last_push_time(repo: str, pr_number: int) -> datetime | None:
         if not branch or not head_repo:
             return None
         ref = quote(f"refs/heads/{branch}", safe="")
-        date_raw = gh_runner.run_gh([
-            "api",
-            f"repos/{head_repo}/activity?ref={ref}&per_page=100&direction=desc",
-            "--jq",
-            (
-                'map(select(.activity_type == "push" or '
-                '.activity_type == "force_push")) | '
-                ".[0].timestamp // .[0].pushed_at"
-            ),
-        ])
-        date_str = date_raw.strip() if isinstance(date_raw, str) else ""
-        if not date_str:
-            return None
-        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        push_times: list[datetime] = []
+        for activity_type in ("push", "force_push"):
+            date_raw = gh_runner.run_gh([
+                "api",
+                (
+                    f"repos/{head_repo}/activity?ref={ref}"
+                    f"&activity_type={activity_type}&per_page=1&direction=desc"
+                ),
+                "--jq",
+                ".[0].timestamp",
+            ])
+            date_str = date_raw.strip() if isinstance(date_raw, str) else ""
+            if date_str:
+                push_times.append(
+                    datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                )
+        return max(push_times, default=None)
     except Exception:
         return None
 

@@ -14,11 +14,12 @@ def test_get_pr_last_push_time_uses_activity_query_string(
 
     def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         calls.append(cmd)
-        stdout = (
-            '{"branch":"feature/fix&one#two","repo":"fork-owner/fork-repo"}\n'
-            if "/pulls/" in cmd[2]
-            else "2026-05-14T10:20:30Z\n"
-        )
+        if "/pulls/" in cmd[2]:
+            stdout = '{"branch":"feature/fix&one#two","repo":"fork-owner/fork-repo"}\n'
+        elif "activity_type=push" in cmd[2]:
+            stdout = "2026-05-14T10:20:30Z\n"
+        else:
+            stdout = "\n"
         return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
     monkeypatch.setattr("src.github.gh_runner.subprocess.run", fake_run)
@@ -39,14 +40,21 @@ def test_get_pr_last_push_time_uses_activity_query_string(
             (
                 "repos/fork-owner/fork-repo/activity?"
                 "ref=refs%2Fheads%2Ffeature%2Ffix%26one%23two"
-                "&per_page=100&direction=desc"
+                "&activity_type=push&per_page=1&direction=desc"
             ),
             "--jq",
+            ".[0].timestamp",
+        ],
+        [
+            "gh",
+            "api",
             (
-                'map(select(.activity_type == "push" or '
-                '.activity_type == "force_push")) | '
-                ".[0].timestamp // .[0].pushed_at"
+                "repos/fork-owner/fork-repo/activity?"
+                "ref=refs%2Fheads%2Ffeature%2Ffix%26one%23two"
+                "&activity_type=force_push&per_page=1&direction=desc"
             ),
+            "--jq",
+            ".[0].timestamp",
         ],
     ]
 
@@ -54,7 +62,7 @@ def test_get_pr_last_push_time_uses_activity_query_string(
 def test_get_pr_last_push_time_returns_parsed_datetime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    responses = iter(["feature-fix\n", "2026-05-14T10:20:30Z\n"])
+    responses = iter(["feature-fix\n", "2026-05-14T10:20:30Z\n", "\n"])
 
     def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(returncode=0, stdout=next(responses), stderr="")
@@ -72,10 +80,16 @@ def test_get_pr_last_push_time_returns_parsed_datetime(
     )
 
 
-def test_get_pr_last_push_time_filters_push_and_force_push_activity(
+def test_get_pr_last_push_time_chooses_newer_force_push_activity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    responses = iter(["feature-fix\n", "2026-05-14T10:20:40Z\n"])
+    responses = iter(
+        [
+            "feature-fix\n",
+            "2026-05-14T10:20:30Z\n",
+            "2026-05-14T10:20:40Z\n",
+        ]
+    )
     calls: list[list[str]] = []
 
     def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
@@ -95,15 +109,18 @@ def test_get_pr_last_push_time_filters_push_and_force_push_activity(
     )
     assert calls[1][2] == (
         "repos/owner/name/activity?ref=refs%2Fheads%2Ffeature-fix"
-        "&per_page=100&direction=desc"
+        "&activity_type=push&per_page=1&direction=desc"
     )
-    assert "force_push" in calls[1][4]
+    assert calls[2][2] == (
+        "repos/owner/name/activity?ref=refs%2Fheads%2Ffeature-fix"
+        "&activity_type=force_push&per_page=1&direction=desc"
+    )
 
 
 def test_get_pr_last_push_time_returns_none_when_activity_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    responses = iter(["feature-fix\n", "\n"])
+    responses = iter(["feature-fix\n", "\n", "\n"])
 
     def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(returncode=0, stdout=next(responses), stderr="")

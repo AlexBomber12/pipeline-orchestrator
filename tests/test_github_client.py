@@ -3624,7 +3624,7 @@ def test_get_last_push_age_seconds_returns_computed_age(
         def now(cls, tz: _tz | None = None) -> datetime:
             return cls(2026, 4, 19, 12, 0, 0, tzinfo=tz)
 
-    responses = iter(["feature-branch", "2026-04-19T11:59:30Z"])
+    responses = iter(["feature-branch", "2026-04-19T11:59:30Z", ""])
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(responses))
     monkeypatch.setattr("src.github.prs.datetime", _FakeDateTime)
 
@@ -3634,7 +3634,7 @@ def test_get_last_push_age_seconds_returns_computed_age(
 def test_get_last_push_age_seconds_returns_none_for_empty_push_timestamp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    responses = iter(["feature-branch", ""])
+    responses = iter(["feature-branch", "", ""])
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(responses))
     assert get_last_push_age_seconds("owner/name", 42) is None
 
@@ -3654,6 +3654,7 @@ def test_get_pr_last_push_time_returns_parsed_datetime(
         [
             {"branch": "feature-branch", "repo": "fork-owner/fork-repo"},
             "2026-04-30T11:59:30Z",
+            "",
         ]
     )
     calls: list[list[str]] = []
@@ -3706,7 +3707,7 @@ def test_get_pr_last_push_time_returns_none_without_head_repository(
 def test_get_pr_last_push_time_returns_none_when_activity_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    responses = iter(["feature-branch", ""])
+    responses = iter(["feature-branch", "", ""])
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(responses))
     assert get_pr_last_push_time("owner/name", 42) is None
 
