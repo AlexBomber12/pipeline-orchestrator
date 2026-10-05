@@ -546,6 +546,12 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
     assert oversized_secret["record_truncated"] is True
     assert "leaksecret" not in oversized_secret["record_excerpt"]
     assert "[REDACTED]" in oversized_secret["record_excerpt"]
+    progress = diagnostics._progress_evidence(
+        None,
+        {"records": []},
+        {"events": [diagnostics._bounded_event(huge)]},
+    )
+    assert progress["latest_retained_event_at"] == NOW.isoformat()
     malformed_secret = diagnostics._bounded_event('{"password":"word1 leaksecret ' + "x" * 600)
     assert "leaksecret" not in malformed_secret["raw_excerpt"]
     sensitive = "\n".join(
@@ -803,6 +809,23 @@ async def test_log_discovery_defensive_failures(tmp_path: Path, monkeypatch: pyt
     monkeypatch.setattr(diagnostics, "_REPOS_ROOT", tmp_path / "repos")
     _, warnings = diagnostics._file_log_sources(SLUG)
     assert any("2026-10-04" in warning for warning in warnings)
+
+    for index in range(diagnostics._MAX_DISK_PARTITION_CANDIDATES + 5):
+        (repo_dir / f"retained-{index:04d}.jsonl").write_text("event", encoding="utf-8")
+    _, warnings = diagnostics._file_log_sources(SLUG)
+    assert any("bounded candidate limit" in warning for warning in warnings)
+
+    real_scandir = diagnostics.os.scandir
+
+    def fail_event_scandir(path: Path):
+        if Path(path) == repo_dir:
+            raise OSError("directory unavailable")
+        return real_scandir(path)
+
+    monkeypatch.setattr(diagnostics.os, "scandir", fail_event_scandir)
+    _, warnings = diagnostics._file_log_sources(SLUG)
+    assert any("Could not discover disk event partitions" in warning for warning in warnings)
+    monkeypatch.setattr(diagnostics.os, "scandir", real_scandir)
 
     escaped_root = tmp_path / "escaped-events"
     escaped_root.mkdir()

@@ -14,6 +14,7 @@ import os
 import re
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,7 @@ _MAX_PRIVATE_KEY_CONTEXT_BYTES = 1024 * 1024
 _MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES = 64 * 1024
 _MAX_REDIS_SCAN_CALLS = 4
 _MAX_REDIS_PENDING_KEYS = 200
+_MAX_DISK_PARTITION_CANDIDATES = 200
 _CLI_LATEST_TTL_SECONDS = 3600
 _CLI_HISTORY_TTL_SECONDS = 86400
 _HISTORY_CURSOR_PREFIX = "redis-history:"
@@ -1006,6 +1008,8 @@ def _progress_evidence(
     for item in recent_events.get("events", []):
         record = item.get("record") if isinstance(item, dict) else None
         timestamp = record.get("timestamp") if isinstance(record, dict) else None
+        if timestamp is None and isinstance(item, dict):
+            timestamp = item.get("timestamp")
         if isinstance(timestamp, str):
             event_timestamps.append(timestamp)
     return {
@@ -1419,16 +1423,28 @@ def _file_log_sources(repo_slug: str) -> tuple[list[dict[str, Any]], list[str]]:
     except ValueError as exc:
         return sources, [_error_text(exc)]
     if event_dir.is_dir():
-        for path in sorted(event_dir.glob("*.jsonl"), reverse=True):
-            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}\.jsonl", path.name):
+        try:
+            with os.scandir(event_dir) as entries:
+                candidates = list(islice(entries, _MAX_DISK_PARTITION_CANDIDATES + 1))
+        except OSError as exc:
+            candidates = []
+            warnings.append(f"Could not discover disk event partitions: {_error_text(exc)}")
+        if len(candidates) > _MAX_DISK_PARTITION_CANDIDATES:
+            candidates.pop()
+            warnings.append(
+                "Disk event partition discovery reached its bounded candidate limit; "
+                "additional partitions may be undiscovered but remain readable by an exact source ID."
+            )
+        for entry in sorted(candidates, key=lambda item: item.name, reverse=True):
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}\.jsonl", entry.name):
                 continue
             try:
-                resolved = _safe_path(event_dir, path.name)
+                resolved = _safe_path(event_dir, entry.name)
                 stat = resolved.stat()
             except (OSError, ValueError) as exc:
-                warnings.append(f"Could not inspect event partition {path.name!r}: {_error_text(exc)}")
+                warnings.append(f"Could not inspect event partition {entry.name!r}: {_error_text(exc)}")
                 continue
-            date = path.stem
+            date = Path(entry.name).stem
             sources.append(
                 {
                     "source_id": f"events:disk/{date}",

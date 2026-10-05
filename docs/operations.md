@@ -32,7 +32,10 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   it is returned, and producer-added
   `[truncated]` markers are preserved. Redis event history is fetched through a
   read-only bounded script and reported as oversized, without materializing its
-  records in the MCP process, when the retained list exceeds 256 KiB.
+  records in the MCP process, when the retained list exceeds 256 KiB. Disk
+  partition discovery streams at most 200 directory candidates per request and
+  reports when that bound may leave additional partitions undiscovered; an
+  exact validated `events:disk/YYYY-MM-DD` source ID remains directly readable.
 
 These tools only accept configured repository slugs and fixed source IDs; they
 cannot read arbitrary paths or Redis keys. Missing, malformed, expired, stale,
