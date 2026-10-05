@@ -422,8 +422,12 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             'fake-second-secret"',
             'password = """toml-first-secret',
             'toml-second-secret"""',
-            "PASSWORD=slash-first-secret\\",
-            "slash-second-secret",
+            "PASSWORD=bare-slash-first-secret\\",
+            "bare-slash-second-secret",
+            "export PASSWORD=export-slash-first-secret\\",
+            "export-slash-second-secret",
+            "[env] PASSWORD=env-slash-first-secret\\",
+            "env-slash-second-secret",
             "password:",
             "  yaml-first-secret",
             "  yaml-second-secret",
@@ -472,7 +476,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             }
         )
         + '\npassword = """ci-toml-first-secret\nci-toml-second-secret"""\n'
-        + "PASSWORD=ci-slash-first-secret\\\nci-slash-second-secret\n"
+        + "PASSWORD=ci-bare-slash-first-secret\\\nci-bare-slash-second-secret\n"
+        + "export PASSWORD=ci-export-slash-first-secret\\\nci-export-slash-second-secret\n"
+        + "[env] PASSWORD=ci-env-slash-first-secret\\\nci-env-slash-second-secret\n"
         + "password:\n  ci-yaml-first-secret\n  ci-yaml-second-secret\n"
         + "- password:\n    ci-sequence-first-secret\n    ci-sequence-second-secret\n"
         + "DJANGO_SECRET_KEY=ci-django-secret-key-value\n"
@@ -504,8 +510,12 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "fake-second-secret" not in content
         assert "toml-first-secret" not in content
         assert "toml-second-secret" not in content
-        assert "slash-first-secret" not in content
-        assert "slash-second-secret" not in content
+        assert "bare-slash-first-secret" not in content
+        assert "bare-slash-second-secret" not in content
+        assert "export-slash-first-secret" not in content
+        assert "export-slash-second-secret" not in content
+        assert "env-slash-first-secret" not in content
+        assert "env-slash-second-secret" not in content
         assert "yaml-first-secret" not in content
         assert "yaml-second-secret" not in content
         assert "sequence-first-secret" not in content
@@ -527,8 +537,12 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert docker_auth not in content
         assert "ci-toml-first-secret" not in content
         assert "ci-toml-second-secret" not in content
-        assert "ci-slash-first-secret" not in content
-        assert "ci-slash-second-secret" not in content
+        assert "ci-bare-slash-first-secret" not in content
+        assert "ci-bare-slash-second-secret" not in content
+        assert "ci-export-slash-first-secret" not in content
+        assert "ci-export-slash-second-secret" not in content
+        assert "ci-env-slash-first-secret" not in content
+        assert "ci-env-slash-second-secret" not in content
         assert "ci-yaml-first-secret" not in content
         assert "ci-yaml-second-secret" not in content
         assert "ci-sequence-first-secret" not in content
@@ -551,11 +565,20 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
     slash_continuation = await diagnostics.read_orchestrator_log(
         SLUG,
         "ci:artifact",
-        cursor=ci_raw.index(b"ci-slash-second-secret"),
+        cursor=ci_raw.index(b"ci-bare-slash-second-secret"),
         max_chars=200,
     )
-    assert "ci-slash-second-secret" not in slash_continuation["content"]
+    assert "ci-bare-slash-second-secret" not in slash_continuation["content"]
     assert "[REDACTED SENSITIVE CONTINUATION]" in slash_continuation["content"]
+
+    prefixed_slash_continuation = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=ci_raw.index(b"ci-env-slash-second-secret"),
+        max_chars=200,
+    )
+    assert "ci-env-slash-second-secret" not in prefixed_slash_continuation["content"]
+    assert "[REDACTED SENSITIVE CONTINUATION]" in prefixed_slash_continuation["content"]
 
     yaml_continuation = await diagnostics.read_orchestrator_log(
         SLUG,

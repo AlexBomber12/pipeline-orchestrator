@@ -145,6 +145,11 @@ _PLAIN_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
     rf"(?:{_SENSITIVE_KEY_PATTERN}))\s*[:=][ \t]*(?P<value>(?![\"'|>])\S.*)$"
 )
+_PREFIXED_PLAIN_SENSITIVE_ASSIGNMENT = re.compile(
+    rf"(?i)(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
+    rf"(?<![A-Za-z0-9_.-])(?:{_SENSITIVE_KEY_PATTERN})(?![A-Za-z0-9_.-]))"
+    r"\s*[:=][ \t]*(?P<value>(?![\"'|>])\S.*)$"
+)
 _REDACTION_RULES = (
     (
         re.compile(
@@ -517,7 +522,7 @@ def _sensitive_state_before(
         while continuation_start > 0 and _has_line_continuation(context_lines[continuation_start - 1]):
             continuation_start -= 1
         continuation_line = context_lines[continuation_start].decode("utf-8", errors="replace")
-        if _PLAIN_SENSITIVE_ASSIGNMENT.fullmatch(continuation_line) is not None:
+        if _PREFIXED_PLAIN_SENSITIVE_ASSIGNMENT.search(continuation_line) is not None:
             starts_inside_sensitive_block = True
             active_block_indent = -1
         elif continuation_start == 0 and search_start > 0:
@@ -685,10 +690,16 @@ def _redacted_file_units(
                 line_index = block_end
                 continue
             plain_match = _PLAIN_SENSITIVE_ASSIGNMENT.fullmatch(text_unit.rstrip("\r\n"))
-            if plain_match is not None:
-                scalar_indent = len(plain_match.group("indent"))
+            continued_assignment = _has_line_continuation(raw_unit)
+            prefixed_continuation_match = (
+                _PREFIXED_PLAIN_SENSITIVE_ASSIGNMENT.search(text_unit.rstrip("\r\n"))
+                if continued_assignment
+                else None
+            )
+            if plain_match is not None or prefixed_continuation_match is not None:
+                scalar_indent = len(plain_match.group("indent")) if plain_match is not None else 0
                 scalar_end = line_index + 1
-                if _has_line_continuation(raw_unit):
+                if continued_assignment:
                     continued = True
                     while scalar_end < len(raw_lines) and continued:
                         continued = _has_line_continuation(raw_lines[scalar_end])
