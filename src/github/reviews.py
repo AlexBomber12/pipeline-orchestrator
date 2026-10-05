@@ -135,10 +135,17 @@ def _compute_review_status(
                     latest_review_time = review_info["latest_time"]
                     latest_review_sha = review_info["latest_sha"]
                     reaction_time = _parse_iso(plus_one.get("created_at"))
+                    head_commit_time = _get_commit_time(repo, head_sha)
                     if latest_review_sha and latest_review_sha == head_sha:
-                        body_approved = True
+                        if (
+                            reaction_time
+                            and head_commit_time
+                            and reaction_time >= head_commit_time
+                        ):
+                            body_approved = True
+                        elif not head_commit_time:
+                            body_approved = True
                     else:
-                        head_commit_time = _get_commit_time(repo, head_sha)
                         threshold = head_commit_time
                         if (
                             latest_review_time is not None

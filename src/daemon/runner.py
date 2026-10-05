@@ -489,6 +489,7 @@ class PipelineRunner(
         self._watch_entered_at: datetime | None = None
         self._watch_last_event_at: datetime | None = None
         self._watch_last_event_signature: tuple[Any, ...] | None = None
+        self._fix_feedback_reviewer_policy: Any | None = None
         self._github_api_pause_policy: BoundedRecoveryPolicy[
             "PipelineRunner"
         ] = BoundedRecoveryPolicy(

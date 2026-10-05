@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 from src.config import load_config
 from src.github import cache, gh_runner, reactions
-from src.github.reviewer_policy import reviewer_policy_from_config
+from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_config
 
 _REVIEW_FEEDBACK_TRUNCATE_CHARS = 5000
 
@@ -23,7 +23,11 @@ def post_comment(repo: str, pr_number: int, body: str) -> None:
     gh_runner.run_gh(["pr", "comment", str(pr_number), "--body", body], repo=repo)
 
 
-def get_latest_codex_feedback(repo: str, pr_number: int) -> str | None:
+def get_latest_codex_feedback(
+    repo: str,
+    pr_number: int,
+    policy: ReviewerPolicy | None = None,
+) -> str | None:
     """Return concatenated Codex feedback comments after the latest review anchor.
 
     Pulls from the same sources as ``_compute_review_status`` — Codex-authored
@@ -37,7 +41,7 @@ def get_latest_codex_feedback(repo: str, pr_number: int) -> str | None:
     from src.github.prs import get_pr_author
 
     pr_author = get_pr_author(repo, pr_number)
-    reviewer_policy = reviewer_policy_from_config(load_config())
+    reviewer_policy = policy or reviewer_policy_from_config(load_config())
     try:
         issue_comments = cache._gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
     except (RuntimeError, subprocess.TimeoutExpired, OSError):

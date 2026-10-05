@@ -25,6 +25,7 @@ from src.daemon.quarantine import apply_quarantine_label_for_violation
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
 from src.github import comments as gh_comments
 from src.github import gh_runner
+from src.github.reviewer_policy import ReviewerPolicy
 from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus
 from src.retry import retry_transient
 from src.subsource_registry import SuppressionReason
@@ -188,7 +189,9 @@ class FixMixin(BreachMixin):
         )
 
     async def _build_fix_feedback_context(
-        self, current_pr: PRInfo
+        self,
+        current_pr: PRInfo,
+        reviewer_policy: ReviewerPolicy | None = None,
     ) -> str | None:
         """Compose CI failure logs + latest review feedback for the FIX prompt.
 
@@ -210,6 +213,7 @@ class FixMixin(BreachMixin):
             feedback = await asyncio.to_thread(
                 gh_comments.get_latest_codex_feedback,
                 self.owner_repo, current_pr.number,
+                reviewer_policy,
             )
             if feedback:
                 sections.append("Latest review feedback:\n" + feedback)
@@ -364,8 +368,11 @@ class FixMixin(BreachMixin):
             fix_kwargs["pr_id"] = self.state.current_task.pr_id
             fix_kwargs["task_file"] = self.state.current_task.task_file
         if self.state.current_pr is not None:
+            reviewer_policy = self._fix_feedback_reviewer_policy
+            self._fix_feedback_reviewer_policy = None
             extra_context = await self._build_fix_feedback_context(
-                self.state.current_pr
+                self.state.current_pr,
+                reviewer_policy=reviewer_policy,
             )
             if extra_context is not None:
                 fix_kwargs["extra_context"] = extra_context

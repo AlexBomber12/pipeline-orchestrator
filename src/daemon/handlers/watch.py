@@ -352,6 +352,7 @@ class WatchMixin:
         elif review == ReviewStatus.CHANGES_REQUESTED:
             result = self._has_new_codex_feedback_since_last_push(reviewer_policy)
             if result == FeedbackCheckResult.NEW:
+                self._fix_feedback_reviewer_policy = reviewer_policy
                 await self.handle_fix()
                 return
             if result == FeedbackCheckResult.UNKNOWN:
