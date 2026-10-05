@@ -112,6 +112,10 @@ _PENDING_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?<![A-Za-z0-9_.-])(?:{_SENSITIVE_KEY_PATTERN})(?![A-Za-z0-9_.-]))"
     r"\s*[:=][ \t]*(?:[|>][-+]?)?[ \t]*$"
 )
+_BLOCK_SENSITIVE_ASSIGNMENT = re.compile(
+    rf"(?i)^(?P<indent>[ \t]*)(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
+    rf"(?:{_SENSITIVE_KEY_PATTERN}))\s*[:=][ \t]*[|>][-+]?[ \t]*(?:#.*)?$"
+)
 _REDACTION_RULES = (
     (
         re.compile(
@@ -157,8 +161,8 @@ _REDACTION_RULES = (
     (
         re.compile(
             rf"(?im)((?<![A-Za-z0-9_-])(?:{_SENSITIVE_KEY_PATTERN})"
-            r"(?![A-Za-z0-9_-])\s*[:=]\s*)"
-            r"(?!\[REDACTED\])(?:bearer\s+|basic\s+)?[^\s,;]+"
+            r"(?![A-Za-z0-9_-])\s*[:=](?![ \t]*\[REDACTED\])[ \t]*)"
+            r"(?:bearer[ \t]+|basic[ \t]+)?[^\r\n]*"
         ),
         r"\1[REDACTED]",
     ),
@@ -325,10 +329,18 @@ def _private_key_state_before(handle: Any, offset: int) -> tuple[bool | None, in
     return (None if search_end > 0 else False), scanned_bytes
 
 
-def _sensitive_value_state_before(handle: Any, offset: int) -> tuple[bool | None, int]:
-    """Check bounded preceding lines for a key whose value starts on this page."""
+def _line_indent(raw_line: bytes) -> int:
+    return len(raw_line) - len(raw_line.lstrip(b" \t"))
+
+
+def _sensitive_state_before(
+    handle: Any,
+    offset: int,
+    raw: bytes,
+) -> tuple[bool | None, bool | None, int | None, int]:
+    """Recover adjacent-value and YAML-block state with one bounded read."""
     if offset <= 0:
-        return False, 0
+        return False, False, None, 0
     search_start = max(0, offset - _MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES)
     handle.seek(search_start)
     context = handle.read(offset - search_start)
@@ -336,14 +348,60 @@ def _sensitive_value_state_before(handle: Any, offset: int) -> tuple[bool | None
     if search_start > 0:
         newline = context.find(b"\n")
         if newline < 0:
-            return None, scanned_bytes
+            return None, None, None, scanned_bytes
         context = context[newline + 1 :]
-    for raw_line in reversed(context.splitlines()):
+
+    context_lines = context.splitlines()
+    starts_with_sensitive_value: bool | None = None
+    for raw_line in reversed(context_lines):
         if not raw_line.strip():
             continue
         line = raw_line.decode("utf-8", errors="replace")
-        return _PENDING_SENSITIVE_ASSIGNMENT.search(line) is not None, scanned_bytes
-    return (False if search_start == 0 else None), scanned_bytes
+        starts_with_sensitive_value = (
+            _PENDING_SENSITIVE_ASSIGNMENT.search(line) is not None
+            and _BLOCK_SENSITIVE_ASSIGNMENT.fullmatch(line) is None
+        )
+        break
+    if starts_with_sensitive_value is None and search_start == 0:
+        starts_with_sensitive_value = False
+
+    block_state_known = search_start == 0
+    active_block_indent: int | None = None
+    for raw_line in context_lines:
+        if not raw_line.strip():
+            continue
+        indent = _line_indent(raw_line)
+        if active_block_indent is not None:
+            if indent > active_block_indent:
+                continue
+            active_block_indent = None
+        line = raw_line.decode("utf-8", errors="replace")
+        block_match = _BLOCK_SENSITIVE_ASSIGNMENT.fullmatch(line)
+        if block_match is not None:
+            active_block_indent = len(block_match.group("indent"))
+            block_state_known = True
+        elif indent == 0:
+            block_state_known = True
+
+    first_content_line = next((line for line in raw.splitlines() if line.strip()), None)
+    if first_content_line is None:
+        starts_inside_sensitive_block: bool | None = False
+        active_block_indent = None
+    elif active_block_indent is not None and _line_indent(first_content_line) > active_block_indent:
+        starts_inside_sensitive_block = True
+    elif _line_indent(first_content_line) == 0 or block_state_known:
+        starts_inside_sensitive_block = False
+        active_block_indent = None
+    else:
+        starts_inside_sensitive_block = None
+        active_block_indent = None
+
+    return (
+        starts_with_sensitive_value,
+        starts_inside_sensitive_block,
+        active_block_indent,
+        scanned_bytes,
+    )
 
 
 def _redacted_file_units(
@@ -351,6 +409,8 @@ def _redacted_file_units(
     *,
     starts_inside_private_key: bool | None,
     starts_with_sensitive_value: bool | None,
+    starts_inside_sensitive_block: bool | None,
+    sensitive_block_indent: int | None,
     has_more_after_raw: bool,
     warnings: list[str],
 ) -> list[tuple[bytes, str, int]]:
@@ -365,10 +425,25 @@ def _redacted_file_units(
             "Sensitive-assignment context exceeded its bounded scan; page content was omitted fail-closed."
         )
         return [(raw, "[CONTENT OMITTED: SENSITIVE-ASSIGNMENT CONTEXT UNKNOWN]\n", 1)] if raw else []
+    if starts_inside_sensitive_block is None:
+        warnings.append(
+            "Sensitive-block context exceeded its bounded scan; page content was omitted fail-closed."
+        )
+        return [(raw, "[CONTENT OMITTED: SENSITIVE-BLOCK CONTEXT UNKNOWN]\n", 1)] if raw else []
     raw_lines = raw.splitlines(keepends=True)
     units: list[tuple[bytes, str, int]] = []
     line_index = 0
-    if starts_with_sensitive_value:
+    if starts_inside_sensitive_block and sensitive_block_indent is not None:
+        block_end = 0
+        while block_end < len(raw_lines):
+            if raw_lines[block_end].strip() and _line_indent(raw_lines[block_end]) <= sensitive_block_indent:
+                break
+            block_end += 1
+        if block_end:
+            raw_unit = b"".join(raw_lines[:block_end])
+            units.append((raw_unit, "[REDACTED SENSITIVE BLOCK]\n", 1))
+            line_index = block_end
+    elif starts_with_sensitive_value:
         value_index = 0
         while value_index < len(raw_lines) and not raw_lines[value_index].strip():
             value_index += 1
@@ -397,14 +472,27 @@ def _redacted_file_units(
             units.append((raw_unit, "[REDACTED PRIVATE KEY]\n", 1))
         else:
             text_unit = raw_unit.decode("utf-8", errors="replace")
+            block_match = _BLOCK_SENSITIVE_ASSIGNMENT.fullmatch(text_unit.rstrip("\r\n"))
+            if block_match is not None:
+                block_indent = len(block_match.group("indent"))
+                block_end = line_index + 1
+                while block_end < len(raw_lines):
+                    if raw_lines[block_end].strip() and _line_indent(raw_lines[block_end]) <= block_indent:
+                        break
+                    block_end += 1
+                raw_unit = b"".join(raw_lines[line_index:block_end])
+                units.append((raw_unit, "[REDACTED SENSITIVE BLOCK]\n", 1))
+                line_index = block_end
+                continue
             if _PENDING_SENSITIVE_ASSIGNMENT.search(text_unit):
                 value_index = line_index + 1
                 while value_index < len(raw_lines) and not raw_lines[value_index].strip():
                     value_index += 1
                 if value_index < len(raw_lines):
                     raw_unit = b"".join(raw_lines[line_index : value_index + 1])
-                    text_unit = raw_unit.decode("utf-8", errors="replace")
-                    line_index = value_index
+                    units.append((raw_unit, "[REDACTED SENSITIVE ASSIGNMENT]\n", 1))
+                    line_index = value_index + 1
+                    continue
                 elif has_more_after_raw:
                     warnings.append(
                         "A sensitive assignment crossed the bounded page window; its visible key was redacted."
@@ -1739,14 +1827,19 @@ def _read_file_source(
                     page_start += newline + 1
                     raw = raw[newline + 1 :]
             starts_inside_private_key, context_scanned_bytes = _private_key_state_before(handle, page_start)
-            starts_with_sensitive_value, assignment_context_scanned_bytes = _sensitive_value_state_before(
-                handle, page_start
-            )
+            (
+                starts_with_sensitive_value,
+                starts_inside_sensitive_block,
+                sensitive_block_indent,
+                assignment_context_scanned_bytes,
+            ) = _sensitive_state_before(handle, page_start, raw)
             text = raw.decode("utf-8", errors="replace")
             redaction_units = _redacted_file_units(
                 raw,
                 starts_inside_private_key=starts_inside_private_key,
                 starts_with_sensitive_value=starts_with_sensitive_value,
+                starts_inside_sensitive_block=starts_inside_sensitive_block,
+                sensitive_block_indent=sensitive_block_indent,
                 has_more_after_raw=False,
                 warnings=warnings,
             )
@@ -1864,13 +1957,18 @@ def _read_file_source(
 
             has_more_after_raw = page_start + len(raw) < stat.st_size
             starts_inside_private_key, context_scanned_bytes = _private_key_state_before(handle, page_start)
-            starts_with_sensitive_value, assignment_context_scanned_bytes = _sensitive_value_state_before(
-                handle, page_start
-            )
+            (
+                starts_with_sensitive_value,
+                starts_inside_sensitive_block,
+                sensitive_block_indent,
+                assignment_context_scanned_bytes,
+            ) = _sensitive_state_before(handle, page_start, raw)
             redaction_units = _redacted_file_units(
                 raw,
                 starts_inside_private_key=starts_inside_private_key,
                 starts_with_sensitive_value=starts_with_sensitive_value,
+                starts_inside_sensitive_block=starts_inside_sensitive_block,
+                sensitive_block_indent=sensitive_block_indent,
                 has_more_after_raw=has_more_after_raw,
                 warnings=warnings,
             )

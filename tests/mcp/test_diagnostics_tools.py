@@ -1027,7 +1027,7 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
     ci_path.write_bytes(multiline)
     multiline_page = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", max_chars=200)
     assert "multiline-secret" not in multiline_page["content"]
-    assert "[REDACTED]" in multiline_page["content"]
+    assert "[REDACTED SENSITIVE ASSIGNMENT]" in multiline_page["content"]
 
     value_cursor = multiline.index(b'\n\n') + 1
     value_page = await diagnostics.read_orchestrator_log(
@@ -1038,6 +1038,29 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
     )
     assert "multiline-secret" not in value_page["content"]
     assert "[REDACTED SENSITIVE VALUE]" in value_page["content"]
+
+    plain_yaml = b"password: correct horse battery staple\nafter\n"
+    ci_path.write_bytes(plain_yaml)
+    plain_yaml_page = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", max_chars=200)
+    assert "correct horse battery staple" not in plain_yaml_page["content"]
+    assert plain_yaml_page["content"].startswith("password: [REDACTED]")
+
+    block_yaml = b"before\npassword: |\n  first-secret\n  second-secret\nafter\n"
+    ci_path.write_bytes(block_yaml)
+    block_yaml_page = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", max_chars=200)
+    assert "first-secret" not in block_yaml_page["content"]
+    assert "second-secret" not in block_yaml_page["content"]
+    assert "[REDACTED SENSITIVE BLOCK]" in block_yaml_page["content"]
+    block_cursor = block_yaml.index(b"  second-secret")
+    block_continuation = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=block_cursor,
+        max_chars=200,
+    )
+    assert "second-secret" not in block_continuation["content"]
+    assert "[REDACTED SENSITIVE BLOCK]" in block_continuation["content"]
+    assert "after" in block_continuation["content"]
 
     ordinary_size = diagnostics._MAX_PRIVATE_KEY_CONTEXT_BYTES + diagnostics._MAX_FILE_SCAN_BYTES * 2
     ci_path.write_bytes((b"ordinary line\n" * (ordinary_size // len(b"ordinary line\n") + 1))[:ordinary_size])
@@ -1059,26 +1082,59 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
         b'"password":\n',
         starts_inside_private_key=False,
         starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
         has_more_after_raw=True,
         warnings=warnings,
     )
     assert units[0][1] == "[REDACTED SENSITIVE ASSIGNMENT]\n"
     assert warnings
 
-    assert diagnostics._sensitive_value_state_before(BytesIO(b"\n\n"), 2) == (False, 2)
+    assert diagnostics._sensitive_state_before(BytesIO(b"\n\n"), 2, b"next\n") == (
+        False,
+        False,
+        None,
+        2,
+    )
+    completed_block = b"password: |\n  secret\nnext: value\n"
+    assert diagnostics._sensitive_state_before(
+        BytesIO(completed_block),
+        len(completed_block),
+        b"  current\n",
+    ) == (False, False, None, len(completed_block))
     unknown_context = b"x" * (diagnostics._MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES + 1)
-    assert diagnostics._sensitive_value_state_before(BytesIO(unknown_context), len(unknown_context)) == (
+    assert diagnostics._sensitive_state_before(BytesIO(unknown_context), len(unknown_context), b"  value\n") == (
+        None,
+        None,
         None,
         diagnostics._MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES,
     )
+    indeterminate_block = b"x\n" + b"  ordinary\n" * diagnostics._MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES
+    assert diagnostics._sensitive_state_before(
+        BytesIO(indeterminate_block),
+        len(indeterminate_block),
+        b"  value\n",
+    )[1] is None
     warnings = []
     assert diagnostics._redacted_file_units(
         b"unknown\n",
         starts_inside_private_key=False,
         starts_with_sensitive_value=None,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
         has_more_after_raw=False,
         warnings=warnings,
     )[0][1] == "[CONTENT OMITTED: SENSITIVE-ASSIGNMENT CONTEXT UNKNOWN]\n"
+    warnings = []
+    assert diagnostics._redacted_file_units(
+        b"  unknown\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=None,
+        sensitive_block_indent=None,
+        has_more_after_raw=False,
+        warnings=warnings,
+    )[0][1] == "[CONTENT OMITTED: SENSITIVE-BLOCK CONTEXT UNKNOWN]\n"
 
 
 async def test_filesystem_reader_omits_oversized_segments_and_lines(
