@@ -1841,7 +1841,7 @@ def test_handle_merge_falls_back_to_codex_for_conflict_resolution(
         proactive_coders.append(proactive_coder)
         return True
 
-    codex_calls: list[tuple[str, str]] = []
+    codex_calls: list[tuple[str, str, str | None]] = []
 
     async def fake_codex(
         prompt: str,
@@ -1850,7 +1850,7 @@ def test_handle_merge_falls_back_to_codex_for_conflict_resolution(
         model: str | None = None,
         **kwargs: Any,
     ) -> tuple[int, str, str]:
-        codex_calls.append((prompt, cwd))
+        codex_calls.append((prompt, cwd, model))
         return (0, "", "")
 
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
@@ -1874,6 +1874,9 @@ def test_handle_merge_falls_back_to_codex_for_conflict_resolution(
     )
 
     runner = h._make_runner()
+    runner.app_config.daemon.coder_settings = {
+        "codex": {"model": "generic-codex"}
+    }
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
     runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
@@ -1883,6 +1886,7 @@ def test_handle_merge_falls_back_to_codex_for_conflict_resolution(
     assert runner.state.state == PipelineState.WATCH
     assert proactive_coders == ["codex"]
     assert codex_calls, "Codex must be invoked on merge conflict fallback"
+    assert codex_calls[0][2] == "generic-codex"
     assert any(cmd[:2] == ("push", "origin") for cmd in git_calls)
 
 

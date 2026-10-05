@@ -106,6 +106,10 @@ class CodexPlugin:
     def __init__(self, *, discover: Any | None = None) -> None:
         self._discover = discover or discover_codex_models
 
+    def resolve_model(self, daemon_config: "DaemonConfig") -> str:
+        """Prefer the plugin-ID setting, including an explicit empty value."""
+        return self.model_setting.resolve(self.name, daemon_config)
+
     def model_catalog_cache_key(
         self, *, config: AppConfig, config_path: str
     ) -> tuple[str, str]:
@@ -327,4 +331,4 @@ class CodexPlugin:
         # breach inputs are accepted for Protocol uniformity but ignored —
         # supports_breach_lifecycle is False, so the plugin emits no
         # breach kwargs even when callers pass them unconditionally.
-        return {"model": daemon_config.codex_model}
+        return {"model": self.resolve_model(daemon_config)}

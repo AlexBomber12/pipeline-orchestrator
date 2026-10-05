@@ -7,7 +7,7 @@ next ``config_watcher`` tick. The nudge has two parts per affected repo:
 its next IDLE boundary, and ``PUBLISH`` on ``orchestrator:wake:{repo}``
 so the daemon's main loop short-circuits its sleep.
 
-For daemon-level fields (e.g. ``exploration_epsilon``, ``claude_model``)
+For daemon-level fields (e.g. ``exploration_epsilon``, ``coder_settings``)
 the affected set is every active repo, since daemon-level config feeds
 into every runner. The cost of waking N repos for a daemon-level write is
 acceptable for the small fleets this orchestrator targets; if that ever

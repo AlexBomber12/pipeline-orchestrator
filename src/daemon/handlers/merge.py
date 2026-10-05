@@ -17,7 +17,6 @@ from src.analytics import log_merged_pr
 from src.analytics.coder_version import detect_coder_extension_version
 from src.branch_context import BranchContext
 from src.cancellation import delete_retry_count, delete_task_spec_hash
-from src.config import CoderType
 from src.daemon import git_ops
 from src.github import cache as gh_cache
 from src.github import gh_runner
@@ -474,10 +473,8 @@ class MergeMixin:
             self.repo_config.coder or self.app_config.daemon.coder
         )
         coder_name = configured_coder.value
-        model = (
-            self.app_config.daemon.codex_model
-            if coder_name == CoderType.CODEX.value
-            else self.app_config.daemon.claude_model
+        model = self._registry.get(coder_name).resolve_model(
+            self.app_config.daemon
         )
         return coder_name, model
 

@@ -527,11 +527,14 @@ def test_handle_error_dispatches_to_codex_plugin_when_codex_active(
     so the active coder's plugin alone is consulted.
     """
     runner = h._make_runner()
+    runner.app_config.daemon.coder_settings = {
+        "codex": {"model": "generic-codex"}
+    }
     claude_plugin = runner._registry.get("claude")
     codex_plugin = runner._registry.get("codex")
 
     claude_calls: list[tuple[str, str, str]] = []
-    codex_calls: list[tuple[str, str, str]] = []
+    codex_calls: list[dict[str, Any]] = []
 
     async def claude_diag(
         repo_path: str, context: str, model: str, **kwargs: Any
@@ -542,7 +545,14 @@ def test_handle_error_dispatches_to_codex_plugin_when_codex_active(
     async def codex_diag(
         repo_path: str, context: str, model: str, **kwargs: Any
     ) -> tuple[int, str, str]:
-        codex_calls.append((repo_path, context, model))
+        codex_calls.append(
+            {
+                "repo_path": repo_path,
+                "context": context,
+                "model": model,
+                **kwargs,
+            }
+        )
         return (0, "SKIP", "")
 
     monkeypatch.setattr(claude_plugin, "diagnose_error", claude_diag)
@@ -553,8 +563,14 @@ def test_handle_error_dispatches_to_codex_plugin_when_codex_active(
 
     asyncio.run(runner.handle_error())
 
-    assert codex_calls and codex_calls[0][1] == "boom"
-    assert codex_calls[0][2] == runner.app_config.daemon.codex_model
+    assert codex_calls and codex_calls[0]["context"] == "boom"
+    assert codex_calls[0]["model"] == "generic-codex"
+    assert codex_calls[0]["on_process_start"] == (
+        runner._track_current_coder_process
+    )
+    assert codex_calls[0]["on_supervised_process_start"] == (
+        runner._track_current_coder_supervised_process
+    )
     assert claude_calls == []
 
 
@@ -579,6 +595,9 @@ def test_handle_error_dispatches_to_third_coder_plugin_without_handler_edits(
         def __init__(self) -> None:
             self.calls: list[dict[str, Any]] = []
 
+        def resolve_model(self, _daemon_config: object) -> str:
+            return "third-owned-model"
+
         async def diagnose_error(
             self,
             repo_path: str,
@@ -596,8 +615,10 @@ def test_handle_error_dispatches_to_third_coder_plugin_without_handler_edits(
             )
             return (0, "FIX\nsynthetic", "")
 
-        def build_run_kwargs(self, **kwargs: Any) -> dict[str, Any]:
-            return {"model": "third-owned-model"}
+        def build_run_kwargs(
+            self, *, daemon_config: object, **kwargs: Any
+        ) -> dict[str, Any]:
+            return {"model": self.resolve_model(daemon_config)}
 
     third = _ThirdCoderPlugin()
 
@@ -716,12 +737,13 @@ def test_handle_error_falls_back_to_codex_for_diagnosis(
     )
 
     runner = h._make_runner()
+    runner.app_config.daemon.codex_model = "legacy-codex"
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "boom"
 
     asyncio.run(runner.handle_error())
 
-    assert codex_calls == [(runner.repo_path, "boom", None)]
+    assert codex_calls == [(runner.repo_path, "boom", "legacy-codex")]
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message == "boom"
 

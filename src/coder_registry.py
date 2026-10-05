@@ -44,11 +44,36 @@ class ModelCatalog:
 
 @dataclass(frozen=True)
 class ModelSetting:
-    """Binding between a coder's catalog and its existing config field."""
+    """Plugin-owned binding for a model setting.
 
-    config_field: str
+    New values live under ``daemon.coder_settings.<plugin_id>.<setting_key>``.
+    ``config_field`` is an optional legacy fallback/input name; keeping that
+    mapping in plugin metadata lets shared consumers stay provider-neutral.
+    """
+
+    config_field: str | None
     default_value: str
     default_label: str
+    setting_key: str = "model"
+
+    def control_name(self, plugin_id: str) -> str:
+        """Return the generic Settings form field for ``plugin_id``."""
+        return f"coder_settings.{plugin_id}.{self.setting_key}"
+
+    def resolve(self, plugin_id: str, daemon_config: "DaemonConfig") -> str:
+        """Resolve generic value, legacy fallback, then plugin default."""
+        plugin_settings = daemon_config.coder_settings.get(plugin_id)
+        if plugin_settings is not None and self.setting_key in plugin_settings:
+            value = plugin_settings[self.setting_key]
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"daemon.coder_settings.{plugin_id}.{self.setting_key} "
+                    "must be a string"
+                )
+            return value
+        if self.config_field is not None:
+            return str(getattr(daemon_config, self.config_field))
+        return self.default_value
 
 
 class ModelCatalogUnavailable(RuntimeError):
@@ -68,6 +93,10 @@ class CoderPlugin(Protocol):
 
     @property
     def model_setting(self) -> ModelSetting: ...
+
+    def resolve_model(self, daemon_config: "DaemonConfig") -> str:
+        """Return the effective model invocation ID for this plugin."""
+        ...
 
     @property
     def model_catalog_refreshable(self) -> bool: ...

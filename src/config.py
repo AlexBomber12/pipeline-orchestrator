@@ -73,6 +73,7 @@ _DAEMON_FIELDS = {
     "exploration_epsilon",
     "coder",
     "codex_model",
+    "coder_settings",
     "github_api_pause_threshold_percent",
     "github_api_slowdown_threshold_percent",
     "github_api_slowdown_multiplier",
@@ -252,6 +253,9 @@ class DaemonConfig(BaseModel):
     exploration_epsilon: float = Field(default=0.15, ge=0.0, le=0.5)
     coder: CoderType = CoderType.CLAUDE
     codex_model: str = ""
+    # Plugin-local configuration keyed by stable registry ID. Values stay
+    # implementation-agnostic so parsing config never imports coder plugins.
+    coder_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
     github_api_pause_threshold_percent: int = Field(default=5, ge=0, le=100)
     github_api_slowdown_threshold_percent: int = Field(default=20, ge=0, le=100)
     github_api_slowdown_multiplier: int = Field(default=5, ge=1, le=60)
@@ -296,6 +300,28 @@ class DaemonConfig(BaseModel):
             )
         ]
     )
+
+    @field_validator("coder_settings", mode="before")
+    @classmethod
+    def _coder_settings_are_plugin_mappings(
+        cls, value: Any
+    ) -> dict[str, dict[str, Any]]:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("coder_settings must be a mapping")
+        for plugin_id, settings in value.items():
+            if not isinstance(plugin_id, str) or not plugin_id:
+                raise ValueError("coder_settings plugin IDs must be non-empty strings")
+            if not isinstance(settings, dict):
+                raise ValueError(
+                    f"coder_settings.{plugin_id} must be a mapping"
+                )
+            if "model" in settings and not isinstance(settings["model"], str):
+                raise ValueError(
+                    f"coder_settings.{plugin_id}.model must be a string"
+                )
+        return value
 
     @property
     def usage_gate_rate_limit_session_pause_percent(self) -> int:
@@ -787,10 +813,19 @@ def update_daemon_config(
         raise ValueError(f"Unknown daemon fields: {sorted(unknown)}")
 
     config = AppConfig.model_validate(_load_config_raw(path))
+    normalized_updates = dict(updates)
+    if "coder_settings" in normalized_updates:
+        coder_settings_patch = normalized_updates["coder_settings"]
+        if not isinstance(coder_settings_patch, dict):
+            raise ValueError("coder_settings must be a mapping")
+        normalized_updates["coder_settings"] = _deep_merge(
+            config.daemon.coder_settings,
+            coder_settings_patch,
+        )
     # Same reasoning as update_repository: go through model_validate so a
     # malformed patch raises instead of corrupting the on-disk config.
     config.daemon = DaemonConfig.model_validate(
-        {**config.daemon.model_dump(), **updates}
+        {**config.daemon.model_dump(), **normalized_updates}
     )
     save_config(config, path)
     return config

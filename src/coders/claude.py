@@ -59,6 +59,13 @@ class ClaudePlugin:
     )
     model_catalog_refreshable = False
 
+    def resolve_model(self, daemon_config: "DaemonConfig") -> str:
+        """Prefer the plugin-ID setting, then legacy ``claude_model``."""
+        return (
+            self.model_setting.resolve(self.name, daemon_config)
+            or self.model_setting.default_value
+        )
+
     def model_catalog_cache_key(
         self, *, config: AppConfig, config_path: str
     ) -> tuple[str, tuple[str, ...]]:
@@ -230,7 +237,7 @@ class ClaudePlugin:
         breach_dir: str | None = None,
         breach_run_id: str | None = None,
     ) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {"model": daemon_config.claude_model}
+        kwargs: dict[str, Any] = {"model": self.resolve_model(daemon_config)}
         if breach_dir is not None and breach_run_id is not None:
             kwargs["breach_dir"] = breach_dir
             kwargs["breach_run_id"] = breach_run_id

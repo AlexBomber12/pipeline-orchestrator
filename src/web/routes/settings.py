@@ -200,7 +200,7 @@ def _build_coder_rows(
     rows: list[dict[str, Any]] = []
     for plugin in registry.list_coders():
         setting = plugin.model_setting
-        selected_model = str(getattr(config.daemon, setting.config_field))
+        selected_model = plugin.resolve_model(config.daemon)
         catalog = catalogs.get(
             plugin.name,
             ModelCatalogSnapshot(
@@ -237,6 +237,8 @@ def _build_coder_rows(
                 "model_options": model_options,
                 "model_setting": {
                     "config_field": setting.config_field,
+                    "setting_key": setting.setting_key,
+                    "control_name": setting.control_name(plugin.name),
                     "default_value": setting.default_value,
                     "default_label": setting.default_label,
                 },
@@ -287,26 +289,66 @@ def _validate_coder_model(
     current_model: str,
     plugin: CoderPlugin,
     catalog: ModelCatalogSnapshot,
+    field_name: str | None = None,
 ) -> str:
     """Validate a changed selection against plugin-owned metadata."""
     setting = plugin.model_setting
+    display_field = field_name or setting.control_name(plugin.name)
     if model == "":
         return setting.default_value
     if model in {current_model, setting.default_value}:
         return model
     if not catalog.has_usable_models:
         raise ValueError(
-            f"{setting.config_field} cannot be changed because no usable "
+            f"{display_field} cannot be changed because no usable "
             f"{plugin.display_name} model catalog is available; keep the "
             "saved value or choose the default"
         )
     allowed_models = {candidate.invocation_id for candidate in catalog.models}
     if model not in allowed_models:
         raise ValueError(
-            f"{setting.config_field} is not advertised by "
+            f"{display_field} is not advertised by "
             f"{plugin.display_name}"
         )
     return model
+
+
+def _submitted_coder_models(
+    form: Any,
+    registry: CoderRegistry,
+) -> dict[str, tuple[str, str, bool]]:
+    """Return plugin-ID submissions as value, field name, legacy flag.
+
+    Generic controls win if a compatibility client submits both forms. Any
+    generic plugin ID or setting key must match registered plugin metadata.
+    """
+    plugins = {plugin.name: plugin for plugin in registry.list_coders()}
+    submitted: dict[str, tuple[str, str, bool]] = {}
+    prefix = "coder_settings."
+    for field_name, raw_value in form.multi_items():
+        if not field_name.startswith(prefix):
+            continue
+        remainder = field_name[len(prefix) :]
+        plugin_id, separator, setting_key = remainder.rpartition(".")
+        if not separator or plugin_id not in plugins:
+            raise ValueError(f"Unknown coder settings plugin ID: {plugin_id or remainder}")
+        plugin = plugins[plugin_id]
+        if setting_key != plugin.model_setting.setting_key:
+            raise ValueError(f"Unknown coder setting: {field_name}")
+        if not isinstance(raw_value, str):
+            raise ValueError(f"{field_name} must be a string")
+        submitted[plugin_id] = (raw_value, field_name, False)
+
+    for plugin in plugins.values():
+        legacy_field = plugin.model_setting.config_field
+        if plugin.name in submitted or legacy_field is None:
+            continue
+        if legacy_field in form:
+            raw_value = form[legacy_field]
+            if not isinstance(raw_value, str):
+                raise ValueError(f"{legacy_field} must be a string")
+            submitted[plugin.name] = (raw_value, legacy_field, True)
+    return submitted
 
 
 async def _model_catalog_snapshots(
@@ -633,8 +675,6 @@ async def put_settings_daemon(
     rate_limit_session_pause_percent: str | None = Form(None),
     rate_limit_weekly_pause_percent: str | None = Form(None),
     coder: str | None = Form(None),
-    claude_model: str | None = Form(None),
-    codex_model: str | None = Form(None),
 ) -> HTMLResponse:
     """Update daemon settings.
 
@@ -723,18 +763,13 @@ async def put_settings_daemon(
             if coder not in ("claude", "codex"):
                 raise ValueError("coder must be 'claude' or 'codex'")
             updates["coder"] = coder
-        submitted_models = {
-            "claude_model": claude_model,
-            "codex_model": codex_model,
-        }
         registry: CoderRegistry = request.app.state.coder_registry
         cache = request.app.state.model_catalog
-        for plugin in registry.list_coders():
-            field = plugin.model_setting.config_field
-            submitted = submitted_models.get(field)
-            if submitted is None:
-                continue
-            current_model = str(getattr(current_cfg.daemon, field))
+        submitted_models = _submitted_coder_models(await request.form(), registry)
+        coder_settings_updates: dict[str, dict[str, str]] = {}
+        for plugin_id, (submitted, field_name, is_legacy) in submitted_models.items():
+            plugin = registry.get(plugin_id)
+            current_model = plugin.resolve_model(current_cfg.daemon)
             should_load = (
                 submitted != ""
                 and submitted not in {
@@ -754,12 +789,23 @@ async def put_settings_daemon(
                     config=current_cfg,
                     config_path=_app.CONFIG_PATH,
                 )
-            updates[field] = _validate_coder_model(
+            validated = _validate_coder_model(
                 submitted,
                 current_model=current_model,
                 plugin=plugin,
                 catalog=catalog,
+                field_name=field_name,
             )
+            coder_settings_updates[plugin_id] = {
+                plugin.model_setting.setting_key: validated
+            }
+            legacy_field = plugin.model_setting.config_field
+            if is_legacy and legacy_field is not None:
+                # Compatibility submissions update both representations so
+                # old readers and the effective generic value cannot diverge.
+                updates[legacy_field] = validated
+        if coder_settings_updates:
+            updates["coder_settings"] = coder_settings_updates
     except ValueError as exc:
         return await _render_settings_daemon_error(request, str(exc), 422)
 
