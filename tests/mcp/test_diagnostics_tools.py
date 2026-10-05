@@ -216,10 +216,11 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
                     },
                     "jwtSecretKey": "status-secret-key-value",
                     "tls.key": "status-tls-key-value",
+                    "SharedAccessKey": "status-azure-access-key-value",
                 },
             }
         ),
-        "not-json",
+        '{"password":status-malformed-password,}',
     ]
     command = new_retry_command(
         repo_slug=SLUG,
@@ -257,6 +258,8 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
     assert "status-docker-auth-secret" not in json.dumps(result)
     assert "status-secret-key-value" not in json.dumps(result)
     assert "status-tls-key-value" not in json.dumps(result)
+    assert "status-azure-access-key-value" not in json.dumps(result)
+    assert "status-malformed-password" not in json.dumps(result)
     assert overview["observed"]["error"] == "Authorization: [REDACTED]"
     assert result["detail"]["queue"]["counts_by_status"] == {"DOING": 1}
     assert "history" not in result["detail"]["state"]
@@ -440,6 +443,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             "DJANGO_SECRET_KEY=django-secret-key-value",
             '{"jwtSecretKey":"jwt-secret-key-value"}',
             '{"data":{"tls.key":"redis-tls-key-value"}}',
+            "AccountKey=redis-azure-account-key-value",
+            '{"SharedAccessKey":"redis-azure-shared-key-value"}',
+            '{"password":987650000,}',
             '{"password":123456789}',
             '{"credentials":["user","fake-list-secret"]}',
             json.dumps({"auths": {"registry": {"auth": docker_auth}}, "debug": True}),
@@ -464,7 +470,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                 "debug": True,
             }
         )
-        + "\n",
+        + '\n{"password":987650001,}\n',
         encoding="utf-8",
     )
     ci_path = repos_root / SLUG / "artifacts" / "ci.log"
@@ -487,6 +493,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "DJANGO_SECRET_KEY=ci-django-secret-key-value\n"
         + '{"jwtSecretKey":"ci-jwt-secret-key-value"}\n'
         + '{"data":{"tls.key":"ci-tls-key-value"}}\n'
+        + "AccountKey=ci-azure-account-key-value\n"
+        + '{"SharedAccessKey":"ci-azure-shared-key-value"}\n'
+        + '{"password":987650002,}\n'
         + '2026-10-05 INFO {"password":987654322,"debug":true}\n',
         encoding="utf-8",
     )
@@ -528,6 +537,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "django-secret-key-value" not in content
         assert "jwt-secret-key-value" not in content
         assert "redis-tls-key-value" not in content
+        assert "redis-azure-account-key-value" not in content
+        assert "redis-azure-shared-key-value" not in content
+        assert "987650000" not in content
         assert "123456789" not in content
         assert "fake-list-secret" not in content
         assert docker_auth not in content
@@ -556,6 +568,10 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-django-secret-key-value" not in content
         assert "ci-jwt-secret-key-value" not in content
         assert "ci-tls-key-value" not in content
+        assert "ci-azure-account-key-value" not in content
+        assert "ci-azure-shared-key-value" not in content
+        assert "987650002" not in content
+        assert "987650001" not in content
         assert "debug" in content
 
     ci_raw = ci_path.read_bytes()
@@ -842,6 +858,28 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
     assert diagnostics._has_closing_quote('first-secret', '"""') is False
     assert diagnostics._has_closing_quote('first-secret"""', '"""') is True
     assert diagnostics._has_closing_quote("first-secret'''", "'''") is True
+    assert diagnostics._json_like_value_end("", 0) == 0
+    escaped_json_string = r'"escaped\"quote" trailing'
+    assert escaped_json_string[: diagnostics._json_like_value_end(escaped_json_string, 0)] == (
+        r'"escaped\"quote"'
+    )
+    unterminated_json_string = '"unterminated'
+    assert diagnostics._json_like_value_end(unterminated_json_string, 0) == len(
+        unterminated_json_string
+    )
+    nested_json_value = r'{"nested":["value",{"escaped":"a\"b"}]} trailing'
+    assert nested_json_value[: diagnostics._json_like_value_end(nested_json_value, 0)] == (
+        r'{"nested":["value",{"escaped":"a\"b"}]}'
+    )
+    mismatched_json_value = "[} trailing"
+    assert diagnostics._json_like_value_end(mismatched_json_value, 0) == len(
+        mismatched_json_value
+    )
+    unterminated_nested_value = '{"nested":[1,2]'
+    assert diagnostics._json_like_value_end(unterminated_nested_value, 0) == len(
+        unterminated_nested_value
+    )
+    assert diagnostics._redact_malformed_keyed_values('{"password":') == ('{"password":', 0)
 
     state = RepoState(
         url="https://github.com/octo/demo",

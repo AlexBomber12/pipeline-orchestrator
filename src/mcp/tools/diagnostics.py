@@ -79,6 +79,12 @@ _SENSITIVE_NAMES = (
     "secret_key",
     "secret-key",
     "secretKey",
+    "account_key",
+    "account-key",
+    "accountKey",
+    "shared_access_key",
+    "shared-access-key",
+    "sharedAccessKey",
     "credential",
     "credentials",
     "access_token",
@@ -123,6 +129,9 @@ _SENSITIVE_NAME_PATTERN = "|".join(re.escape(name) for name in _SENSITIVE_NAMES)
 # ordinary counters.
 _SENSITIVE_KEY_PATTERN = rf"[A-Za-z0-9_.-]*(?:{_SENSITIVE_NAME_PATTERN})"
 _SENSITIVE_KEY = re.compile(rf"(?i)^(?:{_SENSITIVE_KEY_PATTERN})$")
+_SENSITIVE_JSON_KEY_PREFIX = re.compile(
+    rf"(?i)(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"'])\s*:\s*"
+)
 _PENDING_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
     rf"(?<![A-Za-z0-9_.-])(?:{_SENSITIVE_KEY_PATTERN})(?![A-Za-z0-9_.-]))"
@@ -303,13 +312,84 @@ def _validate_configured_repo(repo_slug: str) -> tuple[AppConfig, RepoConfig]:
     return config, repo
 
 
+def _json_like_value_end(text: str, start: int) -> int:
+    if start >= len(text):
+        return start
+    opener = text[start]
+    if opener in {'"', "'"}:
+        index = start + 1
+        while index < len(text):
+            if opener == '"' and text[index] == "\\":
+                index += 2
+                continue
+            if text[index] == opener:
+                return index + 1
+            index += 1
+        return len(text)
+    if opener in "{[":
+        stack = [opener]
+        quote: str | None = None
+        index = start + 1
+        while index < len(text):
+            character = text[index]
+            if quote is not None:
+                if quote == '"' and character == "\\":
+                    index += 2
+                    continue
+                if character == quote:
+                    quote = None
+            elif character in {'"', "'"}:
+                quote = character
+            elif character in "{[":
+                stack.append(character)
+            elif character in "}]":
+                expected = "{" if character == "}" else "["
+                if stack[-1] != expected:
+                    return len(text)
+                stack.pop()
+                if not stack:
+                    return index + 1
+            index += 1
+        return len(text)
+    index = start
+    while index < len(text) and text[index] not in ",}]\r\n":
+        index += 1
+    return index
+
+
+def _redact_malformed_keyed_values(text: str) -> tuple[str, int]:
+    parts: list[str] = []
+    cursor = 0
+    search_from = 0
+    count = 0
+    while match := _SENSITIVE_JSON_KEY_PREFIX.search(text, search_from):
+        value_start = match.end()
+        value_end = _json_like_value_end(text, value_start)
+        if value_end <= value_start:
+            search_from = value_start
+            continue
+        if text[value_start:value_end] in {'"[REDACTED]"', "'[REDACTED]'"}:
+            search_from = value_end
+            continue
+        parts.append(text[cursor:value_start])
+        parts.append('"[REDACTED]"')
+        cursor = value_end
+        search_from = value_end
+        count += 1
+    if count == 0:
+        return text, 0
+    parts.append(text[cursor:])
+    return "".join(parts), count
+
+
 def _redact_text(text: str) -> tuple[str, int]:
     redacted = text
     count = 0
     for pattern, replacement in _REDACTION_RULES:
         redacted, replacements = pattern.subn(replacement, redacted)
         count += replacements
-    return redacted, count
+    redacted, replacements = _redact_malformed_keyed_values(redacted)
+    return redacted, count + replacements
 
 
 def _redact_structure(value: Any, *, docker_auth_context: bool = False) -> tuple[Any, int]:
