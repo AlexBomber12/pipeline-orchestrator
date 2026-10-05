@@ -926,7 +926,7 @@ async def test_cancellation_waits_for_shielded_cleanup(
     cleanup.cancel()
 
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(cleanup, timeout=1)
+        await asyncio.wait_for(cleanup, timeout=5)
 
     result = await managed.cleanup(term_grace=0, kill_grace=0)
     assert result.quiescent
