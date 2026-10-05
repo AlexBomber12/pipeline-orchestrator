@@ -1225,6 +1225,27 @@ async def test_codex_catalog_cache_coalesces_concurrent_refreshes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_static_catalog_bypasses_daemon_loader() -> None:
+    async def unavailable_loader(*_args: object, **_kwargs: object) -> ModelCatalog:
+        raise AssertionError("static catalog must not use daemon loader")
+
+    cache = ModelCatalogCache(loader=unavailable_loader)
+    config = AppConfig()
+    snapshot = await cache.get(
+        ClaudePlugin(),
+        config=config,
+        config_path="/workspace/config.yml",
+    )
+
+    assert snapshot.status == "available"
+    assert [model.invocation_id for model in snapshot.models] == [
+        "opus",
+        "sonnet",
+    ]
+    assert snapshot.source == "static_compatibility"
+
+
+@pytest.mark.asyncio
 async def test_codex_catalog_cache_expires_retains_last_known_and_handles_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

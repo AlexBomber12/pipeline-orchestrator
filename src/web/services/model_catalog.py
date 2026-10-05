@@ -150,7 +150,11 @@ class ModelCatalogCache:
         attempted_at = datetime.now(timezone.utc).isoformat()
         try:
             try:
-                if self._loader is None:
+                # Non-refreshable catalogs are explicit plugin metadata, so
+                # keep them available in the web control plane even while the
+                # daemon is offline.  Only refreshable discovery crosses the
+                # daemon bridge, where coder subprocess ownership belongs.
+                if self._loader is None or not plugin.model_catalog_refreshable:
                     catalog = await plugin.get_model_catalog(
                         config=config,
                         config_path=config_path,
