@@ -654,6 +654,8 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
         "githubToken",
         "spring.datasource.password",
         "gpgPassphrase",
+        "client-key-data",
+        "clientKeyData",
     ):
         structured, structured_count = diagnostics._redact_structure({camel_key: "camel-secret"})
         assert structured == {camel_key: "[REDACTED]"}
@@ -1123,6 +1125,14 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
     assert "second-secret" not in quoted_continuation["content"]
     assert "[REDACTED SENSITIVE QUOTED SCALAR]" in quoted_continuation["content"]
     assert "after" in quoted_continuation["content"]
+
+    for prefix in ("export ", "[env] "):
+        prefixed_quote = f'{prefix}PASSWORD="first-secret\nsecond-secret"\nafter\n'.encode()
+        ci_path.write_bytes(prefixed_quote)
+        prefixed_page = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", max_chars=200)
+        assert "first-secret" not in prefixed_page["content"]
+        assert "second-secret" not in prefixed_page["content"]
+        assert "[REDACTED SENSITIVE QUOTED SCALAR]" in prefixed_page["content"]
 
     distant_quote = b'PASSWORD="first\n' + b"column-zero-secret\n" * 4_000 + b'last-secret"\nafter\n'
     ci_path.write_bytes(distant_quote)

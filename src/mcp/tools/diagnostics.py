@@ -89,6 +89,8 @@ _SENSITIVE_NAMES = (
     "password",
     "passwd",
     "passphrase",
+    "key_data",
+    "key-data",
     "private_key",
     "private-key",
     "aws_secret_access_key",
@@ -103,6 +105,7 @@ _SENSITIVE_NAMES = (
     "awsSecretAccessKey",
     "secretAccessKey",
     "sessionToken",
+    "keyData",
 )
 _SENSITIVE_NAME_PATTERN = "|".join(re.escape(name) for name in _SENSITIVE_NAMES)
 # Credential roles may have environment-style, dotted, or camelCase prefixes
@@ -122,8 +125,9 @@ _BLOCK_SENSITIVE_ASSIGNMENT = re.compile(
     r"[|>](?:[1-9][-+]?|[-+][1-9]?|)[ \t]*(?:#.*)?$"
 )
 _QUOTED_SENSITIVE_ASSIGNMENT = re.compile(
-    rf"(?i)^[ \t]*(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
-    rf"(?:{_SENSITIVE_KEY_PATTERN}))\s*[:=][ \t]*(?P<quote>[\"'])(?P<value>.*)$"
+    rf"(?i)(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
+    rf"(?<![A-Za-z0-9_.-])(?:{_SENSITIVE_KEY_PATTERN})(?![A-Za-z0-9_.-]))"
+    r"\s*[:=][ \t]*(?P<quote>[\"'])(?P<value>.*)$"
 )
 _PLAIN_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
@@ -434,7 +438,7 @@ def _sensitive_state_before(
                 active_quote = None
                 quote_state_known = True
             continue
-        quoted_match = _QUOTED_SENSITIVE_ASSIGNMENT.fullmatch(line)
+        quoted_match = _QUOTED_SENSITIVE_ASSIGNMENT.search(line)
         if quoted_match is not None:
             quote = quoted_match.group("quote")
             if not _has_closing_quote(quoted_match.group("value"), quote):
@@ -543,7 +547,7 @@ def _redacted_file_units(
             units.append((raw_unit, "[REDACTED PRIVATE KEY]\n", 1))
         else:
             text_unit = raw_unit.decode("utf-8", errors="replace")
-            quoted_match = _QUOTED_SENSITIVE_ASSIGNMENT.fullmatch(text_unit.rstrip("\r\n"))
+            quoted_match = _QUOTED_SENSITIVE_ASSIGNMENT.search(text_unit.rstrip("\r\n"))
             if quoted_match is not None:
                 quote = quoted_match.group("quote")
                 if not _has_closing_quote(quoted_match.group("value"), quote):
