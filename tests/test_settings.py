@@ -770,19 +770,21 @@ def test_put_daemon_updates_optional_timeout_fields(empty_config: Path) -> None:
     assert cfg.daemon.rate_limit_weekly_pause_percent == 90
 
 
-def test_model_save_rejects_unknown_model(empty_config: Path) -> None:
+def test_model_save_rejects_unknown_codex_model_atomically(
+    empty_config: Path,
+) -> None:
     with TestClient(app) as client:
         response = client.put(
             "/settings/daemon",
             data={
-                "claude_model": "o3",
+                "claude_model": "sonnet",
                 "codex_model": "not-a-real-model",
             },
         )
 
     assert response.status_code == 422
     assert "text/html" in response.headers["content-type"]
-    assert "claude_model" in response.text or "codex_model" in response.text
+    assert "codex_model is not advertised by the Codex CLI" in response.text
 
     cfg = load_config(str(empty_config))
     assert cfg.daemon.claude_model == "opus"
