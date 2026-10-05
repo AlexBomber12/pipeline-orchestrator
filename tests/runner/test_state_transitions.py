@@ -54,17 +54,14 @@ from src.daemon import recovery as recovery_module  # noqa: F401  (sanity)
 from src.daemon import runner as runner_module
 from src.daemon.handlers import coding as coding_module  # noqa: F401  # noqa: F401,F811
 from src.daemon.handlers import error as error_module  # noqa: F401  # noqa: F401,F811
-from src.daemon.handlers import idle as idle_module  # noqa: F811
 from src.daemon.handlers import merge as merge_module  # noqa: F401  # noqa: F401,F811
 from src.daemon.handlers import watch as watch_module  # noqa: F401  # noqa: F401,F811
 from src.daemon.runner import PipelineRunner
-from src.keyspace import pipeline_state
 from src.models import (
     CIStatus,
     PipelineState,  # noqa: F811
     PRInfo,  # noqa: F811
     QueueTask,  # noqa: F811
-    RepoState,
     ReviewStatus,
     TaskStatus,  # noqa: F811
 )
@@ -386,7 +383,7 @@ def test_merge_clears_task_after_successful_merge(
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         "src.github.prs.merge_pr",
-        lambda repo, num: None,
+        lambda repo, num, expected_head_sha: None,
     )
     monkeypatch.setattr(
         runner_module.PipelineRunner,
@@ -532,7 +529,7 @@ def test_recovery_assigns_doing_task(
     )
     monkeypatch.setattr(
         "src.github.prs.get_pr_metadata",
-        lambda repo, num: {"head_commit_date": "2026-04-14T12:00:00Z"},
+        lambda repo, num, expected_head_sha: {"head_commit_date": "2026-04-14T12:00:00Z"},
     )
 
     runner = h._make_runner()
@@ -572,7 +569,7 @@ def test_recovery_assigns_matched_task(
     )
     monkeypatch.setattr(
         "src.github.prs.get_pr_metadata",
-        lambda repo, num: {"head_commit_date": "2026-04-14T12:00:00Z"},
+        lambda repo, num, expected_head_sha: {"head_commit_date": "2026-04-14T12:00:00Z"},
     )
 
     runner = h._make_runner()
@@ -1449,7 +1446,7 @@ def test_handle_coding_runs_three_retries_before_diagnostic(
 
 def test_handle_merge_success_sets_idle(monkeypatch: pytest.MonkeyPatch) -> None:
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)
     monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
 
     runner = h._make_runner()
@@ -1500,7 +1497,7 @@ def test_escalate_queue_sync_transitions_to_error_when_expired(
 def test_handle_merge_failure_sets_error(monkeypatch: pytest.MonkeyPatch) -> None:
     h._patch_subprocess(monkeypatch)
 
-    def boom(repo: str, num: int) -> None:
+    def boom(repo: str, num: int, expected_head_sha: str) -> None:
         raise RuntimeError("merge conflict")
 
     monkeypatch.setattr("src.github.prs.merge_pr", boom)
@@ -1530,7 +1527,7 @@ def test_handle_merge_syncs_with_main(monkeypatch: pytest.MonkeyPatch) -> None:
 
     merge_pr_calls: list[tuple[str, int]] = []
 
-    def fake_merge_pr(repo: str, num: int) -> None:
+    def fake_merge_pr(repo: str, num: int, expected_head_sha: str) -> None:
         merge_pr_calls.append((repo, num))
 
     monkeypatch.setattr("src.github.prs.merge_pr", fake_merge_pr)
@@ -1563,7 +1560,7 @@ def test_handle_merge_marks_pr_ready_before_merge(
         assert cmd == ["pr", "ready", "5"]
         call_order.append("ready")
 
-    def fake_merge_pr(repo: str, num: int) -> None:
+    def fake_merge_pr(repo: str, num: int, expected_head_sha: str) -> None:
         assert (repo, num) == (runner.owner_repo, 5)
         call_order.append("merge")
 
@@ -1594,7 +1591,7 @@ def test_handle_merge_ignores_pr_ready_failure(
         call_order.append("ready")
         raise RuntimeError("ready failed")
 
-    def fake_merge_pr(repo: str, num: int) -> None:
+    def fake_merge_pr(repo: str, num: int, expected_head_sha: str) -> None:
         assert (repo, num) == (runner.owner_repo, 5)
         call_order.append("merge")
 
@@ -1622,7 +1619,7 @@ def test_handle_merge_captures_success_stats_before_queue_sync(
         return h._FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
-    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)
 
     call_order: list[str] = []
 
@@ -1694,7 +1691,7 @@ def test_handle_merge_returns_to_watch_after_sync_push(
     merge_pr_calls: list[tuple[str, int]] = []
     monkeypatch.setattr(
         "src.github.prs.merge_pr",
-        lambda repo, num: merge_pr_calls.append((repo, num)),
+        lambda repo, num, expected_head_sha: merge_pr_calls.append((repo, num)),
     )
 
     post_calls: list[tuple[str, int, str]] = []
@@ -1792,7 +1789,7 @@ def test_handle_merge_resolves_conflict(
     merge_pr_calls: list[tuple[str, int]] = []
     monkeypatch.setattr(
         "src.github.prs.merge_pr",
-        lambda repo, num: merge_pr_calls.append((repo, num)),
+        lambda repo, num, expected_head_sha: merge_pr_calls.append((repo, num)),
     )
     monkeypatch.setattr(
         "src.github.comments.post_comment",
@@ -1975,7 +1972,7 @@ def test_handle_merge_skips_sync_for_cross_repo_pr(
     merge_pr_calls: list[tuple[str, int]] = []
     monkeypatch.setattr(
         "src.github.prs.merge_pr",
-        lambda repo, num: merge_pr_calls.append((repo, num)),
+        lambda repo, num, expected_head_sha: merge_pr_calls.append((repo, num)),
     )
     monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
 
@@ -2009,7 +2006,7 @@ def test_handle_merge_refreshes_pr_head_before_merge(
         return h._FakeCompletedProcess(args=cmd, returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_git)
-    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)
     monkeypatch.setattr(
         "src.github.comments.post_comment",
         lambda repo, num, body: None,
@@ -2116,7 +2113,7 @@ def test_handle_merge_aborts_on_unresolvable_conflict(
 
     merge_pr_calls: list[tuple[str, int]] = []
 
-    def fake_merge_pr(repo: str, num: int) -> None:
+    def fake_merge_pr(repo: str, num: int, expected_head_sha: str) -> None:
         merge_pr_calls.append((repo, num))
 
     monkeypatch.setattr("src.github.prs.merge_pr", fake_merge_pr)

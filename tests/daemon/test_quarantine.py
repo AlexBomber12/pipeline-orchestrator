@@ -182,7 +182,7 @@ def _stub_successful_merge(monkeypatch: pytest.MonkeyPatch) -> list[int]:
     monkeypatch.setattr(merge_module, "retry_transient", lambda op, **_: op())
     monkeypatch.setattr("src.github.cache._invalidate_etag_cache", lambda prefix: None)
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: "")
-    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: merged.append(num))
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: merged.append(num))
     monkeypatch.setattr(
         runner_module.subprocess,
         "run",

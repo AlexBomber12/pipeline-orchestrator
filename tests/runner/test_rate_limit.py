@@ -23,7 +23,6 @@ from src.daemon import runner as runner_module
 from src.daemon import selector as selector_module
 from src.daemon.handlers import breach as breach_module
 from src.daemon.handlers import coding as coding_module
-from src.daemon.handlers import idle as idle_module
 from src.daemon.runner import ErrorCategory, PipelineRunner, _classify_error
 from src.models import (
     CIStatus,
@@ -462,7 +461,7 @@ def test_handle_merge_pauses_when_conflict_resolution_hits_rate_limit(
 
     merge_pr_calls: list[tuple[str, int]] = []
 
-    def fake_merge_pr(repo: str, num: int) -> None:
+    def fake_merge_pr(repo: str, num: int, expected_head_sha: str) -> None:
         merge_pr_calls.append((repo, num))
 
     monkeypatch.setattr("src.github.prs.merge_pr", fake_merge_pr)
