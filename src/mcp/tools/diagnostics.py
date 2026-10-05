@@ -47,6 +47,7 @@ _MAX_PENDING_RETRIES = 20
 _MAX_LOG_SOURCES = 100
 _MAX_READ_CHARS = 20_000
 _MAX_EVENT_RECORD_CHARS = 4_000
+_MAX_REDIS_EVENT_HISTORY_BYTES = 256 * 1024
 _MAX_FILE_SCAN_BYTES = 256 * 1024
 _MAX_PRIVATE_KEY_CONTEXT_BYTES = 1024 * 1024
 _MAX_REDIS_SCAN_CALLS = 4
@@ -54,6 +55,14 @@ _MAX_REDIS_PENDING_KEYS = 200
 _CLI_LATEST_TTL_SECONDS = 3600
 _CLI_HISTORY_TTL_SECONDS = 86400
 _HISTORY_CURSOR_PREFIX = "redis-history:"
+_BOUNDED_EVENT_HISTORY_SCRIPT = """
+local size = redis.call('MEMORY', 'USAGE', KEYS[1]) or 0
+local total = redis.call('LLEN', KEYS[1])
+if size > tonumber(ARGV[3]) then
+  return {size, 1, total, {}}
+end
+return {size, 0, total, redis.call('LRANGE', KEYS[1], ARGV[1], ARGV[2])}
+"""
 
 _SENSITIVE_NAMES = (
     "authorization",
@@ -91,6 +100,14 @@ _REDACTION_RULES = (
         re.compile(
             r"(?im)(\b(?:cookie|set-cookie|authorization|proxy-authorization)"
             r"[ \t]*:[ \t]*).*$"
+        ),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(
+            rf"(?i)(--(?:{_SENSITIVE_KEY_PATTERN})(?:=|[ \t]+))"
+            r"(?:(?P<option_quote>[\"'])(?:\\[^\r\n]|(?!(?P=option_quote))[^\\\r\n])*"
+            r"(?P=option_quote)?|[^\s]+)"
         ),
         r"\1[REDACTED]",
     ),
@@ -528,16 +545,56 @@ def _bounded_event(raw: object) -> dict[str, Any]:
     return {"status": "valid", "record": safe_parsed, "record_truncated": False}
 
 
+async def _read_bounded_event_history(
+    redis_client: Any,
+    repo_slug: str,
+    *,
+    start: int,
+    stop: int,
+) -> tuple[list[object], int, int, bool]:
+    result = await redis_client.eval_ro(
+        _BOUNDED_EVENT_HISTORY_SCRIPT,
+        1,
+        repo_events_history(repo_slug),
+        start,
+        stop,
+        _MAX_REDIS_EVENT_HISTORY_BYTES,
+    )
+    if not isinstance(result, (list, tuple)) or len(result) != 4:
+        raise RuntimeError("Redis returned a malformed bounded event-history response.")
+    size_bytes = int(result[0])
+    oversized = bool(int(result[1]))
+    total = int(result[2])
+    raw_events = result[3]
+    if not isinstance(raw_events, (list, tuple)):
+        raise RuntimeError("Redis returned malformed bounded event-history records.")
+    return list(raw_events), total, size_bytes, oversized
+
+
 async def _recent_events(redis_client: Any, repo_slug: str, limit: int) -> dict[str, Any]:
     try:
-        total = int(await redis_client.llen(repo_events_history(repo_slug)))
-        raw_events = await redis_client.lrange(repo_events_history(repo_slug), 0, limit - 1)
+        raw_events, total, size_bytes, oversized = await _read_bounded_event_history(
+            redis_client,
+            repo_slug,
+            start=0,
+            stop=limit - 1,
+        )
     except Exception as exc:
         return {
             "status": "unavailable",
             "source": "redis_event_history",
             "events": [],
             "error": _error_text(exc),
+        }
+    if oversized:
+        return {
+            "status": "oversized",
+            "source": "redis_event_history",
+            "events": [],
+            "record_count": total,
+            "size_bytes_estimate": size_bytes,
+            "read_bound_bytes": _MAX_REDIS_EVENT_HISTORY_BYTES,
+            "error": "Redis event history exceeds the bounded diagnostic read limit.",
         }
     events = [_bounded_event(raw) for raw in raw_events]
     return {
@@ -548,6 +605,8 @@ async def _recent_events(redis_client: Any, repo_slug: str, limit: int) -> dict[
         "events": events,
         "malformed_records": sum(event["status"] == "malformed" for event in events),
         "possibly_truncated": total >= EVENT_HISTORY_LIMIT,
+        "size_bytes_estimate": size_bytes,
+        "read_bound_bytes": _MAX_REDIS_EVENT_HISTORY_BYTES,
         "error": None,
     }
 
@@ -944,8 +1003,12 @@ async def _redis_log_sources(
     try:
         latest = await client.get(latest_key)
         latest_ttl = int(await client.ttl(latest_key))
-        event_count = int(await client.llen(repo_events_history(repo_slug)))
-        event_edges = await client.lrange(repo_events_history(repo_slug), 0, -1)
+        event_edges, event_count, event_size_bytes, event_oversized = await _read_bounded_event_history(
+            client,
+            repo_slug,
+            start=0,
+            stop=-1,
+        )
     except Exception as exc:
         message = _error_text(exc)
         warnings.append(f"Redis diagnostic sources unavailable: {message}")
@@ -993,6 +1056,10 @@ async def _redis_log_sources(
         }
     )
 
+    if event_oversized:
+        warnings.append(
+            "Redis event history exceeds the bounded diagnostic read limit; record details were not materialized."
+        )
     event_timestamps: list[str] = []
     malformed_events = 0
     for raw in event_edges:
@@ -1009,19 +1076,21 @@ async def _redis_log_sources(
             "source_id": "events:redis",
             "kind": "repository_event_history",
             "storage": "redis",
-            "availability": "available" if event_count else "empty",
+            "availability": "oversized" if event_oversized else "available" if event_count else "empty",
             "timestamps": {
                 "newest_at": max(event_timestamps) if event_timestamps else None,
                 "oldest_at": min(event_timestamps) if event_timestamps else None,
                 "expires_at": None,
             },
             "record_count": event_count,
+            "size_bytes_estimate": event_size_bytes,
             "malformed_records": malformed_events,
             "retention": {
                 "entry_cap": EVENT_HISTORY_LIMIT,
                 "possibly_truncated": event_count >= EVENT_HISTORY_LIMIT,
                 "expiry": "none",
             },
+            "read_bound_bytes": _MAX_REDIS_EVENT_HISTORY_BYTES,
             "association": _association(),
             "mutable": True,
             "ordering": "newest_first",
@@ -1415,7 +1484,35 @@ async def _read_redis_source(
             warnings,
         )
     if source_id == "events:redis":
-        raw_events = await client.lrange(repo_events_history(repo_slug), 0, -1)
+        raw_events, total, size_bytes, oversized = await _read_bounded_event_history(
+            client,
+            repo_slug,
+            start=0,
+            stop=-1,
+        )
+        if oversized:
+            reason = "Redis event history exceeds the bounded diagnostic read limit."
+            warnings.append(reason)
+            return (
+                None,
+                {
+                    "kind": "repository_event_history",
+                    "storage": "redis",
+                    "availability": "oversized",
+                    "record_count": total,
+                    "size_bytes_estimate": size_bytes,
+                    "read_bound_bytes": _MAX_REDIS_EVENT_HISTORY_BYTES,
+                    "retention": {
+                        "entry_cap": EVENT_HISTORY_LIMIT,
+                        "possibly_truncated": total >= EVENT_HISTORY_LIMIT,
+                    },
+                    "association": _association(),
+                    "mutable": True,
+                    "ordering": "newest_first",
+                    "reason": reason,
+                },
+                warnings,
+            )
         malformed = sum(_bounded_event(item)["status"] == "malformed" for item in raw_events)
         if malformed:
             warnings.append(f"Source contains {malformed} malformed event record(s).")
@@ -1426,11 +1523,13 @@ async def _read_redis_source(
                 "kind": "repository_event_history",
                 "storage": "redis",
                 "availability": "available" if raw_events else "empty",
-                "record_count": len(raw_events),
+                "record_count": total,
+                "size_bytes_estimate": size_bytes,
+                "read_bound_bytes": _MAX_REDIS_EVENT_HISTORY_BYTES,
                 "malformed_records": malformed,
                 "retention": {
                     "entry_cap": EVENT_HISTORY_LIMIT,
-                    "possibly_truncated": len(raw_events) >= EVENT_HISTORY_LIMIT,
+                    "possibly_truncated": total >= EVENT_HISTORY_LIMIT,
                 },
                 "association": _association(),
                 "mutable": True,

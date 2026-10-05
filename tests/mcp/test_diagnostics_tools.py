@@ -94,6 +94,23 @@ class FakeRedis:
         next_cursor = cursor + len(page)
         return (0 if next_cursor >= len(keys) else next_cursor), page
 
+    async def eval_ro(
+        self,
+        script: str,
+        numkeys: int,
+        key: str,
+        start: int,
+        stop: int,
+        byte_limit: int,
+    ) -> list[object]:
+        self._check("eval_ro", (script, numkeys, key, start, stop, byte_limit))
+        values = self.lists.get(key, [])
+        size_bytes = sum(len(value if isinstance(value, bytes) else str(value).encode()) for value in values)
+        if size_bytes > byte_limit:
+            return [size_bytes, 1, len(values), []]
+        selected = values[start:] if stop == -1 else values[start : stop + 1]
+        return [size_bytes, 0, len(values), list(selected)]
+
     async def aclose(self) -> None:
         self.calls.append(("aclose", ""))
         self.closed = True
@@ -395,6 +412,19 @@ async def test_missing_expired_unretained_and_unavailable_logs(tmp_path: Path, m
         unavailable = await diagnostics.read_orchestrator_log(SLUG, source_id)
         assert unavailable["source"]["availability"] == "unavailable"
 
+    redis.lists[repo_events_history(SLUG)] = ["x" * (diagnostics._MAX_REDIS_EVENT_HISTORY_BYTES + 1)]
+    oversized = await diagnostics.read_orchestrator_log(SLUG, "events:redis")
+    assert oversized["source"]["availability"] == "oversized"
+    assert oversized["content"] == ""
+    assert oversized["source"]["read_bound_bytes"] == diagnostics._MAX_REDIS_EVENT_HISTORY_BYTES
+    assert not any(operation == "lrange" for operation, _ in redis.calls)
+    recent = await diagnostics._recent_events(redis, SLUG, 5)
+    assert recent["status"] == "oversized"
+    listed, warnings = await diagnostics._redis_log_sources(redis, SLUG, NOW)
+    event_source = next(source for source in listed if source["source_id"] == "events:redis")
+    assert event_source["availability"] == "oversized"
+    assert warnings
+
     redis.fail.add("get")
     unavailable = await diagnostics.read_orchestrator_log(SLUG, "cli:latest")
     assert unavailable["source"]["availability"] == "unavailable"
@@ -514,6 +544,9 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
             '< Authorization: Digest username="user", response="digest-secret"',
             "> Proxy-Authorization: AWS4-HMAC-SHA256 Credential=user, Signature=sig-secret",
             "* Set-Cookie: harmless=yes; auth=prefixed-set-cookie-secret",
+            "tool --password=option-secret",
+            "tool --MY_API_KEY 'quoted option secret'",
+            "tool --token plain-option-secret",
         ]
     )
     redacted, replacements = diagnostics._redact_text(sensitive)
@@ -531,7 +564,10 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
     assert "digest-secret" not in redacted
     assert "sig-secret" not in redacted
     assert "prefixed-set-cookie-secret" not in redacted
-    assert replacements == 22
+    assert "option-secret" not in redacted
+    assert "quoted option secret" not in redacted
+    assert "plain-option-secret" not in redacted
+    assert replacements == 25
     assert diagnostics._redact_text("tokens_in=123 tokens_out=456") == (
         "tokens_in=123 tokens_out=456",
         0,
@@ -578,10 +614,32 @@ async def test_status_helper_failures_remain_explicit() -> None:
     from src.mcp.tools import diagnostics
 
     redis = FakeRedis()
-    redis.fail.add("lrange")
+
+    async def malformed_event_response(*args: Any, **kwargs: Any) -> list[object]:
+        del args, kwargs
+        return [0]
+
+    redis.eval_ro = malformed_event_response  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="malformed bounded"):
+        await diagnostics._read_bounded_event_history(redis, SLUG, start=0, stop=-1)
+
+    async def malformed_event_records(*args: Any, **kwargs: Any) -> list[object]:
+        del args, kwargs
+        return [0, 0, 0, "not-a-list"]
+
+    redis.eval_ro = malformed_event_records  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="malformed bounded"):
+        await diagnostics._read_bounded_event_history(redis, SLUG, start=0, stop=-1)
+
+    redis = FakeRedis()
+    redis.fail.add("eval_ro")
     events = await diagnostics._recent_events(redis, SLUG, 5)
+    assert events["status"] == "unavailable"
+
+    redis = FakeRedis()
+    redis.fail.add("lrange")
     runs = await diagnostics._relevant_runs(redis, SLUG, "PR-9", 5)
-    assert events["status"] == runs["status"] == "unavailable"
+    assert runs["status"] == "unavailable"
 
     redis = FakeRedis()
     redis.fail.add("zcard")

@@ -27,7 +27,9 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   its window begins inside a multiline private-key block; if that bounded scan
   cannot establish the state, the page is omitted fail-closed. Diagnostic text
   is credential-redacted before it is returned, and producer-added
-  `[truncated]` markers are preserved.
+  `[truncated]` markers are preserved. Redis event history is fetched through a
+  read-only bounded script and reported as oversized, without materializing its
+  records in the MCP process, when the retained list exceeds 256 KiB.
 
 These tools only accept configured repository slugs and fixed source IDs; they
 cannot read arbitrary paths or Redis keys. Missing, malformed, expired, stale,
