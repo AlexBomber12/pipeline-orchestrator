@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from contextlib import suppress
+from pathlib import Path
 from typing import Any, NamedTuple
 
 
@@ -28,7 +30,13 @@ class CodexModelDiscoveryInvalid(RuntimeError): ...
 
 
 async def discover_codex_models(
-    *, timeout_seconds: float = 5.0, page_size: int = 50, max_pages: int = 10, max_output_bytes: int = 1_000_000
+    *,
+    timeout_seconds: float = 5.0,
+    page_size: int = 50,
+    max_pages: int = 10,
+    max_output_bytes: int = 1_000_000,
+    env: dict[str, str] | None = None,
+    cwd: str | os.PathLike[str] | None = None,
 ) -> tuple[CodexModel, ...]:
     """Return advertised visible models, not proof of account entitlement."""
     if min(timeout_seconds, page_size, max_pages, max_output_bytes) <= 0:
@@ -42,6 +50,8 @@ async def discover_codex_models(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
                 limit=max_output_bytes + 1,
+                env=env,
+                cwd=Path(cwd) if cwd is not None else None,
             )
             return await _discover(process, page_size, max_pages, max_output_bytes)
     except TimeoutError:

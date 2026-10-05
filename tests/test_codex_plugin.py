@@ -4,8 +4,20 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from src.coder_registry import (
+    ModelCatalogUnavailable,
+    ModelMetadata,
+    ModelReasoningEffort,
+)
 from src.coders import codex as codex_module
 from src.coders.codex import CodexPlugin
+from src.coders.codex_models import (
+    CodexModel,
+    CodexModelDiscoveryInvalid,
+    CodexModelDiscoveryUnavailable,
+    CodexReasoningEffort,
+)
+from src.config import AppConfig
 from src.usage import OpenAIUsageProvider
 
 
@@ -16,20 +28,76 @@ def test_codex_plugin_name() -> None:
     assert plugin.display_name == "Codex CLI"
 
 
-def test_codex_plugin_models_includes_default() -> None:
+def test_codex_plugin_models_remains_legacy_compatibility_metadata() -> None:
     plugin = CodexPlugin()
 
-    assert plugin.models == [
-        "",
-        "gpt-5.4",
-        "gpt-5.3-codex",
-        "gpt-5.3-codex-spark",
-        "gpt-5.2-codex",
-        "gpt-5.4-mini",
-        "gpt-5.1-codex-max",
-        "gpt-5.1-codex-mini",
-        "gpt-5.2",
-    ]
+    assert plugin.models[0] == ""
+    assert "gpt-5.4" in plugin.models
+
+
+@pytest.mark.asyncio
+async def test_codex_plugin_adapts_discovery_and_auth_context(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def discover(**kwargs: object) -> tuple[CodexModel, ...]:
+        captured.update(kwargs)
+        return (
+            CodexModel(
+                "invoke-new",
+                "Provider Name",
+                True,
+                "medium",
+                (CodexReasoningEffort("low", "Fast"),),
+            ),
+        )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-used")
+    config = AppConfig.model_validate(
+        {"auth": {"codex_home_dir": str(tmp_path / "auth")}}
+    )
+    catalog = await CodexPlugin(discover=discover).get_model_catalog(
+        config=config,
+        config_path=str(tmp_path / "config.yml"),
+    )
+
+    assert catalog.source == "discovered"
+    assert catalog.models == (
+        ModelMetadata(
+            "invoke-new",
+            "Provider Name",
+            True,
+            "medium",
+            (ModelReasoningEffort("low", "Fast"),),
+        ),
+    )
+    assert captured["cwd"] == str(tmp_path)
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["HOME"] == str(tmp_path / "auth")
+    assert "OPENAI_API_KEY" not in env
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        CodexModelDiscoveryUnavailable("offline"),
+        CodexModelDiscoveryInvalid("malformed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_codex_plugin_normalizes_discovery_failures(
+    error: Exception,
+) -> None:
+    async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
+        raise error
+
+    with pytest.raises(ModelCatalogUnavailable, match="unavailable"):
+        await CodexPlugin(discover=discover).get_model_catalog(
+            config=AppConfig(),
+            config_path="config.yml",
+        )
 
 
 @pytest.mark.asyncio

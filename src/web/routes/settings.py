@@ -24,8 +24,7 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from src.audit.webhook_log import write_webhook_audit
-from src.coder_registry import CoderPlugin
-from src.coders import build_coder_registry
+from src.coder_registry import CoderPlugin, CoderRegistry
 from src.config import (
     AppConfig,
     DaemonConfig,
@@ -41,6 +40,7 @@ from src.web.services.config_writer import (
     delete_daemon_fields,
     write_daemon_field,
 )
+from src.web.services.model_catalog import ModelCatalogSnapshot
 from src.web.services.repo_state import _find_repo_config_by_name
 
 router = APIRouter()
@@ -191,22 +191,82 @@ def _coerce_int(
 
 
 def _build_coder_rows(
-    config: AppConfig, auth: dict[str, dict[str, str]]
+    config: AppConfig,
+    auth: dict[str, dict[str, str]],
+    catalogs: dict[str, ModelCatalogSnapshot],
+    registry: CoderRegistry,
 ) -> list[dict[str, Any]]:
     """Return coder rows for the settings table and JSON API."""
     rows: list[dict[str, Any]] = []
-    for plugin in build_coder_registry().list_coders():
-        selected_model = (
-            config.daemon.claude_model
-            if plugin.name == "claude"
-            else config.daemon.codex_model
+    for plugin in registry.list_coders():
+        setting = plugin.model_setting
+        selected_model = str(getattr(config.daemon, setting.config_field))
+        catalog = catalogs.get(
+            plugin.name,
+            ModelCatalogSnapshot(
+                refreshable=plugin.model_catalog_refreshable
+            ),
         )
-        model_options = [model for model in plugin.models if model != ""]
+        invocation_ids = [model.invocation_id for model in catalog.models]
+        model_options = [
+            {
+                "value": model.invocation_id,
+                "label": model.display_name,
+                "is_advertised_default": model.is_default,
+                "is_missing": False,
+            }
+            for model in catalog.models
+        ]
+        if selected_model and selected_model not in invocation_ids:
+            model_options.insert(
+                0,
+                {
+                    "value": selected_model,
+                    "label": selected_model,
+                    "is_advertised_default": False,
+                    "is_missing": True,
+                },
+            )
         rows.append(
             {
                 "name": plugin.name,
                 "display_name": plugin.display_name,
-                "models": model_options,
+                # Preserve the existing static field for /api/coders clients;
+                # model_catalog is the authoritative normalized metadata.
+                "models": [model for model in plugin.models if model != ""],
+                "model_options": model_options,
+                "model_setting": {
+                    "config_field": setting.config_field,
+                    "default_value": setting.default_value,
+                    "default_label": setting.default_label,
+                },
+                "model_catalog": {
+                    "status": catalog.status,
+                    "message": catalog.message,
+                    "source": catalog.source,
+                    "refreshable": catalog.refreshable,
+                    "refreshed_at": catalog.refreshed_at,
+                    "attempted_at": catalog.attempted_at,
+                    "has_usable_models": catalog.has_usable_models,
+                    "choices": [
+                        {
+                            "invocation_id": model.invocation_id,
+                            "display_name": model.display_name,
+                            "is_default": model.is_default,
+                            "default_reasoning_effort": (
+                                model.default_reasoning_effort
+                            ),
+                            "reasoning_efforts": [
+                                {
+                                    "name": effort.name,
+                                    "description": effort.description,
+                                }
+                                for effort in model.reasoning_efforts
+                            ],
+                        }
+                        for model in catalog.models
+                    ],
+                },
                 "selected_model": selected_model,
                 "auth": auth.get(
                     plugin.name,
@@ -224,19 +284,59 @@ def _build_coder_rows(
 def _validate_coder_model(
     model: str,
     *,
-    field_name: str,
+    current_model: str,
     plugin: CoderPlugin,
-    default_model: str | None = None,
+    catalog: ModelCatalogSnapshot,
 ) -> str:
-    """Return a supported model value for ``plugin``."""
+    """Validate a changed selection against plugin-owned metadata."""
+    setting = plugin.model_setting
     if model == "":
-        return default_model if default_model is not None else model
-    allowed_models = {candidate for candidate in plugin.models if candidate != ""}
+        return setting.default_value
+    if model in {current_model, setting.default_value}:
+        return model
+    if not catalog.has_usable_models:
+        raise ValueError(
+            f"{setting.config_field} cannot be changed because no usable "
+            f"{plugin.display_name} model catalog is available; keep the "
+            "saved value or choose the default"
+        )
+    allowed_models = {candidate.invocation_id for candidate in catalog.models}
     if model not in allowed_models:
         raise ValueError(
-            f"{field_name} must be one of: {', '.join(sorted(allowed_models))}"
+            f"{setting.config_field} is not advertised by "
+            f"{plugin.display_name}"
         )
     return model
+
+
+async def _model_catalog_snapshots(
+    request: Request,
+    config: AppConfig,
+    *,
+    load: bool,
+    refresh_coder: str | None = None,
+) -> dict[str, ModelCatalogSnapshot]:
+    cache = request.app.state.model_catalog
+    registry: CoderRegistry = request.app.state.coder_registry
+
+    async def snapshot(plugin: CoderPlugin) -> ModelCatalogSnapshot:
+        refresh = plugin.name == refresh_coder
+        if load or refresh or not plugin.model_catalog_refreshable:
+            return await cache.get(
+                plugin,
+                config=config,
+                config_path=_app.CONFIG_PATH,
+                refresh=refresh,
+            )
+        return cache.peek(
+            plugin,
+            config=config,
+            config_path=_app.CONFIG_PATH,
+        )
+
+    plugins = registry.list_coders()
+    snapshots = await asyncio.gather(*(snapshot(plugin) for plugin in plugins))
+    return dict(zip((plugin.name for plugin in plugins), snapshots, strict=True))
 
 
 def _render_settings_repo_list(request: Request) -> HTMLResponse:
@@ -298,16 +398,36 @@ async def _settings_daemon_template_context(
     request: Request,
     *,
     use_cached_auth: bool = False,
+    load_model_catalogs: bool = True,
+    refresh_coder: str | None = None,
 ) -> dict[str, Any]:
     cfg = load_config(_app.CONFIG_PATH)
-    auth = (
-        _get_cached_auth_status()
-        if use_cached_auth
-        else await _collect_auth_status()
-    )
+    if use_cached_auth:
+        auth = _get_cached_auth_status()
+        catalogs = await _model_catalog_snapshots(
+            request,
+            cfg,
+            load=load_model_catalogs,
+            refresh_coder=refresh_coder,
+        )
+    else:
+        auth, catalogs = await asyncio.gather(
+            _collect_auth_status(),
+            _model_catalog_snapshots(
+                request,
+                cfg,
+                load=load_model_catalogs,
+                refresh_coder=refresh_coder,
+            ),
+        )
+    # Discovery may take several seconds. Reload after it completes so a slow
+    # refresh response cannot re-render an older model selection over a save
+    # that completed while the subprocess was running.
+    cfg = load_config(_app.CONFIG_PATH)
+    registry: CoderRegistry = request.app.state.coder_registry
     return {
         "daemon": cfg.daemon,
-        "coders": _build_coder_rows(cfg, auth),
+        "coders": _build_coder_rows(cfg, auth, catalogs, registry),
         "auth": auth,
     }
 
@@ -323,7 +443,11 @@ async def _render_settings_daemon_response(request: Request) -> HTMLResponse:
     return _app.templates.TemplateResponse(
         request,
         "components/settings_daemon_response.html",
-        await _settings_daemon_template_context(request, use_cached_auth=True),
+        await _settings_daemon_template_context(
+            request,
+            use_cached_auth=True,
+            load_model_catalogs=False,
+        ),
     )
 
 
@@ -331,7 +455,9 @@ async def _render_settings_daemon_error(
     request: Request, message: str, status_code: int
 ) -> HTMLResponse:
     context = await _settings_daemon_template_context(
-        request, use_cached_auth=True
+        request,
+        use_cached_auth=True,
+        load_model_catalogs=False,
     )
     return _app.templates.TemplateResponse(
         request,
@@ -344,8 +470,17 @@ async def _render_settings_daemon_error(
 @router.get("/settings", response_class=HTMLResponse)
 async def settings_page(request: Request) -> HTMLResponse:
     cfg = load_config(_app.CONFIG_PATH)
-    auth = await _collect_auth_status()
-    coder_rows = _build_coder_rows(cfg, auth)
+    auth, catalogs = await asyncio.gather(
+        _collect_auth_status(),
+        _model_catalog_snapshots(request, cfg, load=True),
+    )
+    cfg = load_config(_app.CONFIG_PATH)
+    coder_rows = _build_coder_rows(
+        cfg,
+        auth,
+        catalogs,
+        request.app.state.coder_registry,
+    )
     return _app.templates.TemplateResponse(
         request,
         "settings.html",
@@ -373,6 +508,34 @@ async def partial_settings_daemon(request: Request) -> HTMLResponse:
 @router.get("/partials/settings/coders", response_class=HTMLResponse)
 async def partial_settings_coders(request: Request) -> HTMLResponse:
     context = await _settings_daemon_template_context(request)
+    return _app.templates.TemplateResponse(
+        request,
+        "components/settings_coders_wrapper.html",
+        context,
+    )
+
+
+@router.post(
+    "/partials/settings/coders/{coder_name}/models/refresh",
+    response_class=HTMLResponse,
+)
+async def refresh_coder_models(
+    request: Request, coder_name: str
+) -> HTMLResponse:
+    """Refresh one plugin catalog without mutating configuration."""
+    registry: CoderRegistry = request.app.state.coder_registry
+    try:
+        plugin = registry.get(coder_name)
+    except KeyError:
+        return HTMLResponse("Unknown coder", status_code=404)
+    if not plugin.model_catalog_refreshable:
+        return HTMLResponse("Model catalog is static", status_code=422)
+    context = await _settings_daemon_template_context(
+        request,
+        use_cached_auth=True,
+        load_model_catalogs=False,
+        refresh_coder=coder_name,
+    )
     return _app.templates.TemplateResponse(
         request,
         "components/settings_coders_wrapper.html",
@@ -483,6 +646,7 @@ async def put_settings_daemon(
     would flag every in-flight PR as hung the moment it is created.
     """
     updates: dict[str, Any] = {}
+    current_cfg = load_config(_app.CONFIG_PATH)
     try:
         if poll_interval_sec is not None and poll_interval_sec != "":
             updates["poll_interval_sec"] = _coerce_int(
@@ -559,21 +723,43 @@ async def put_settings_daemon(
             if coder not in ("claude", "codex"):
                 raise ValueError("coder must be 'claude' or 'codex'")
             updates["coder"] = coder
-        if claude_model is not None or codex_model is not None:
-            registry = build_coder_registry()
-            if claude_model is not None:
-                updates["claude_model"] = _validate_coder_model(
-                    claude_model,
-                    field_name="claude_model",
-                    plugin=registry.get("claude"),
-                    default_model=DaemonConfig().claude_model,
+        submitted_models = {
+            "claude_model": claude_model,
+            "codex_model": codex_model,
+        }
+        registry: CoderRegistry = request.app.state.coder_registry
+        cache = request.app.state.model_catalog
+        for plugin in registry.list_coders():
+            field = plugin.model_setting.config_field
+            submitted = submitted_models.get(field)
+            if submitted is None:
+                continue
+            current_model = str(getattr(current_cfg.daemon, field))
+            should_load = (
+                submitted != ""
+                and submitted not in {
+                    current_model,
+                    plugin.model_setting.default_value,
+                }
+            )
+            if should_load:
+                catalog = await cache.get(
+                    plugin,
+                    config=current_cfg,
+                    config_path=_app.CONFIG_PATH,
                 )
-            if codex_model is not None:
-                updates["codex_model"] = _validate_coder_model(
-                    codex_model,
-                    field_name="codex_model",
-                    plugin=registry.get("codex"),
+            else:
+                catalog = cache.peek(
+                    plugin,
+                    config=current_cfg,
+                    config_path=_app.CONFIG_PATH,
                 )
+            updates[field] = _validate_coder_model(
+                submitted,
+                current_model=current_model,
+                plugin=plugin,
+                catalog=catalog,
+            )
     except ValueError as exc:
         return await _render_settings_daemon_error(request, str(exc), 422)
 
@@ -607,10 +793,23 @@ async def api_auth_status() -> JSONResponse:
 
 
 @router.get("/api/coders")
-async def api_coders() -> JSONResponse:
+async def api_coders(request: Request) -> JSONResponse:
     cfg = load_config(_app.CONFIG_PATH)
-    auth = await _collect_auth_status()
-    return JSONResponse({"coders": _build_coder_rows(cfg, auth)})
+    auth, catalogs = await asyncio.gather(
+        _collect_auth_status(),
+        _model_catalog_snapshots(request, cfg, load=True),
+    )
+    cfg = load_config(_app.CONFIG_PATH)
+    return JSONResponse(
+        {
+            "coders": _build_coder_rows(
+                cfg,
+                auth,
+                catalogs,
+                request.app.state.coder_registry,
+            )
+        }
+    )
 
 
 @router.get("/partials/settings/auth-status", response_class=HTMLResponse)

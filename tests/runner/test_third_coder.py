@@ -19,8 +19,14 @@ from typing import Any
 
 import pytest
 from src import codex_cli
-from src.coder_registry import CoderPlugin, CoderRegistry
-from src.config import DaemonConfig
+from src.coder_registry import (
+    CoderPlugin,
+    CoderRegistry,
+    ModelCatalog,
+    ModelMetadata,
+    ModelSetting,
+)
+from src.config import AppConfig, DaemonConfig
 from src.daemon import runner as runner_module
 from src.daemon.runner import PipelineRunner
 from src.daemon.selector import CoderResolution
@@ -48,12 +54,30 @@ class FakeCoderPlugin:
     name = "fake"
     display_name = "Fake Coder"
     models = ["fake-1", "fake-2"]
+    model_setting = ModelSetting("claude_model", "fake-1", "(default)")
+    model_catalog_refreshable = False
 
     def __init__(self) -> None:
         self.run_planned_pr_calls: list[dict[str, Any]] = []
         self.run_auto_pr_calls: list[dict[str, Any]] = []
         self.fix_review_calls: list[dict[str, Any]] = []
         self.diagnose_calls: list[tuple[str, str, str]] = []
+
+    def model_catalog_cache_key(
+        self, *, config: AppConfig, config_path: str
+    ) -> str:
+        del config, config_path
+        return "static"
+
+    async def get_model_catalog(
+        self, *, config: AppConfig, config_path: str
+    ) -> ModelCatalog:
+        del config, config_path
+        return ModelCatalog(
+            tuple(ModelMetadata(model, model) for model in self.models),
+            "static_compatibility",
+            "Static test catalog.",
+        )
 
     async def run_planned_pr(self, repo_path: str, **kwargs: Any) -> tuple[int, str, str]:
         self.run_planned_pr_calls.append({"repo_path": repo_path, **kwargs})

@@ -16,6 +16,32 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from src.coders.codex_models import CodexModel
+
+
+@pytest.fixture(autouse=True)
+def _mock_settings_codex_model_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep web tests deterministic and prevent real Codex subprocesses."""
+
+    async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
+        return (CodexModel("gpt-5.4", "GPT-5.4", True, None, ()),)
+
+    monkeypatch.setattr(
+        "src.coders.codex.discover_codex_models",
+        discover,
+    )
+
+    async def direct_catalog_loader(
+        plugin: object, **kwargs: object
+    ) -> object:
+        return await plugin.get_model_catalog(**kwargs)
+
+    monkeypatch.setattr(
+        "src.web.app.DaemonModelCatalogLoader",
+        lambda _redis: direct_catalog_loader,
+    )
 
 
 @pytest.fixture(autouse=True)
