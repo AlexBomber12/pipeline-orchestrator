@@ -64,6 +64,17 @@ from src.models import CIStatus, ReviewStatus
 
 TRUSTED_REVIEWER_ID = 199175422
 SECOND_TRUSTED_REVIEWER_ID = 200200200
+_REAL_GET_REVIEW_PUSH_TIME = reviews._get_pr_push_time
+
+
+@pytest.fixture(autouse=True)
+def _default_review_push_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep review-status tests deterministic without querying branch activity."""
+    monkeypatch.setattr(
+        reviews,
+        "_get_pr_push_time",
+        lambda repo, pr_number: datetime(2026, 1, 1, tzinfo=_tz.utc),
+    )
 
 
 def _find_api_path(cmd: list[str]) -> str:
@@ -1700,18 +1711,22 @@ def _is_commits_path(cmd: list[str]) -> bool:
     return False
 
 
-def test_body_plus_one_before_head_commit_is_stale(
+def test_body_plus_one_before_latest_push_is_stale_even_if_commit_is_older(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """+1 reaction created BEFORE the head commit's committer date must
-    be treated as stale — the approval predates the current push."""
+    """Push time, not an older rebased commit date, controls freshness."""
     import json as _json
 
     clear_review_status_cache()
+    monkeypatch.setattr(
+        reviews,
+        "_get_pr_push_time",
+        lambda repo, pr_number: datetime(2026, 1, 2, tzinfo=_tz.utc),
+    )
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         if _is_commits_path(cmd):
-            return _FakeCompletedProcess(stdout="2026-01-02T00:00:00Z")
+            raise AssertionError("review freshness must not query commit time")
         path = _find_api_path(cmd)
         if path.endswith("/issues/42/reactions"):
             data = [
@@ -1730,11 +1745,10 @@ def test_body_plus_one_before_head_commit_is_stale(
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222") == ReviewStatus.PENDING
 
 
-def test_body_plus_one_after_head_commit_approves(
+def test_body_plus_one_after_latest_push_approves(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """+1 reaction created AFTER the head commit's committer date must
-    be treated as approval of the current push."""
+    """A +1 created after the latest branch push approves that push."""
     import json as _json
 
     clear_review_status_cache()
@@ -1760,13 +1774,18 @@ def test_body_plus_one_after_head_commit_approves(
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="aabbcc112233") == ReviewStatus.APPROVED
 
 
-def test_body_plus_one_no_commit_time_stays_pending(
+def test_body_plus_one_no_push_time_stays_pending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An unavailable head time cannot prove that the +1 is current."""
+    """An unavailable push time cannot prove that the +1 is current."""
     import json as _json
 
     clear_review_status_cache()
+    monkeypatch.setattr(
+        reviews,
+        "_get_pr_push_time",
+        lambda repo, pr_number: None,
+    )
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         if _is_commits_path(cmd):
@@ -1827,13 +1846,20 @@ def test_body_plus_one_missing_or_malformed_reaction_time_stays_pending(
     )
 
 
-def test_no_plus_one_does_not_fetch_head_commit_time(
+def test_no_plus_one_does_not_fetch_latest_push_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Review and commit-time lookups should stay lazy when no +1 path needs them."""
+    """Review and push-time lookups should stay lazy when no +1 path needs them."""
     import json as _json
 
     clear_review_status_cache()
+    monkeypatch.setattr(
+        reviews,
+        "_get_pr_push_time",
+        lambda repo, pr_number: (_ for _ in ()).throw(
+            AssertionError("push-time lookup should not run without +1")
+        ),
+    )
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         if _is_commits_path(cmd):
@@ -2331,6 +2357,11 @@ def test_body_plus_one_review_on_head_still_requires_fresh_reaction(
     import json as _json
 
     clear_review_status_cache()
+    monkeypatch.setattr(
+        reviews,
+        "_get_pr_push_time",
+        lambda repo, pr_number: datetime(2026, 1, 10, tzinfo=_tz.utc),
+    )
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         if _is_commits_path(cmd):
@@ -2369,6 +2400,11 @@ def test_body_plus_one_review_on_head_approves_when_reaction_is_fresh(
     import json as _json
 
     clear_review_status_cache()
+    monkeypatch.setattr(
+        reviews,
+        "_get_pr_push_time",
+        lambda repo, pr_number: datetime(2026, 1, 10, tzinfo=_tz.utc),
+    )
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         if _is_commits_path(cmd):
@@ -2401,12 +2437,17 @@ def test_body_plus_one_review_on_head_approves_when_reaction_is_fresh(
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="currentHead") == ReviewStatus.APPROVED
 
 
-def test_body_plus_one_review_on_head_no_commit_time_stays_pending(
+def test_body_plus_one_review_on_head_no_push_time_stays_pending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import json as _json
 
     clear_review_status_cache()
+    monkeypatch.setattr(
+        reviews,
+        "_get_pr_push_time",
+        lambda repo, pr_number: None,
+    )
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         if _is_commits_path(cmd):
@@ -2445,6 +2486,11 @@ def test_unverifiable_body_plus_one_still_surfaces_current_findings(
     import json as _json
 
     clear_review_status_cache()
+    monkeypatch.setattr(
+        reviews,
+        "_get_pr_push_time",
+        lambda repo, pr_number: None,
+    )
     actor = _codex_user("chatgpt-codex-connector")
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
@@ -2532,8 +2578,9 @@ def test_anchor_plus_one_requires_verifiable_current_head_freshness(
 
     monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
     monkeypatch.setattr(
-        "src.github.reviews._get_commit_time",
-        lambda repo, sha: datetime(2026, 2, 1, tzinfo=_tz.utc),
+        reviews,
+        "_get_pr_push_time",
+        lambda repo, pr_number: datetime(2026, 2, 1, tzinfo=_tz.utc),
     )
 
     assert (
@@ -2573,8 +2620,9 @@ def test_anchor_plus_one_with_fresh_timestamp_approves_current_head(
 
     monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
     monkeypatch.setattr(
-        "src.github.reviews._get_commit_time",
-        lambda repo, sha: datetime(2026, 2, 1, tzinfo=_tz.utc),
+        reviews,
+        "_get_pr_push_time",
+        lambda repo, pr_number: datetime(2026, 2, 1, tzinfo=_tz.utc),
     )
 
     assert (
@@ -2590,6 +2638,11 @@ def test_body_plus_one_same_actor_current_review_with_findings_stays_requested(
     import json as _json
 
     clear_review_status_cache()
+    monkeypatch.setattr(
+        reviews,
+        "_get_pr_push_time",
+        lambda repo, pr_number: datetime(2026, 2, 1, tzinfo=_tz.utc),
+    )
     actor = _codex_user("chatgpt-codex-connector")
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
@@ -2649,6 +2702,11 @@ def test_body_plus_one_review_sha_must_match_reacting_actor(
     import json as _json
 
     clear_review_status_cache()
+    monkeypatch.setattr(
+        reviews,
+        "_get_pr_push_time",
+        lambda repo, pr_number: datetime(2026, 2, 1, tzinfo=_tz.utc),
+    )
     actor_a = _reviewer_user(TRUSTED_REVIEWER_ID, "chatgpt-codex-connector")
     actor_b = _reviewer_user(SECOND_TRUSTED_REVIEWER_ID, "codex-second-reviewer")
     policy = ReviewerPolicy(
@@ -2712,15 +2770,20 @@ def test_body_plus_one_review_sha_must_match_reacting_actor(
     )
 
 
-def test_body_plus_one_same_second_as_head_approves(
+def test_body_plus_one_same_second_as_latest_push_approves(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """+1 reaction created in the SAME second as the head commit's
-    committer date must count as fresh. GitHub timestamps are
-    second-granular, so a strict ``>`` would mark the valid case stale."""
+    """A reaction in the push's UTC second counts as fresh."""
     import json as _json
 
     clear_review_status_cache()
+    monkeypatch.setattr(
+        reviews,
+        "_get_pr_push_time",
+        lambda repo, pr_number: datetime(
+            2026, 1, 2, 12, 34, 56, tzinfo=_tz.utc
+        ),
+    )
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         if _is_commits_path(cmd):
@@ -3593,6 +3656,22 @@ def test_get_pr_last_push_time_returns_parsed_datetime(
     result = get_pr_last_push_time("owner/name", 42)
 
     assert result == datetime(2026, 4, 30, 11, 59, 30, tzinfo=_tz.utc)
+
+
+def test_review_freshness_delegates_to_pr_push_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = datetime(2026, 4, 30, 11, 59, 30, tzinfo=_tz.utc)
+    calls: list[tuple[str, int]] = []
+
+    def fake_last_push(repo: str, pr_number: int) -> datetime:
+        calls.append((repo, pr_number))
+        return expected
+
+    monkeypatch.setattr(prs, "get_pr_last_push_time", fake_last_push)
+
+    assert _REAL_GET_REVIEW_PUSH_TIME("owner/name", 42) == expected
+    assert calls == [("owner/name", 42)]
 
 
 def test_get_pr_last_push_time_returns_none_without_branch(

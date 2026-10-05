@@ -15,7 +15,6 @@ from src.config import load_config
 from src.github import cache
 from src.github import reactions as _reactions
 from src.github.gh_runner import (
-    _extract_commit_date,
     _is_http_404_error,
     _parse_iso,
 )
@@ -50,13 +49,11 @@ def _begin_review_cache_cycle() -> None:
     _review_status_cache_cycle += 1
 
 
-def _get_commit_time(repo: str, sha: str) -> datetime | None:
-    """Return the committer date of a commit, or None on failure."""
-    try:
-        payload = cache._etag_get(f"repos/{repo}/commits/{sha}")
-    except RuntimeError:
-        return None
-    return _parse_iso(_extract_commit_date(payload))
+def _get_pr_push_time(repo: str, pr_number: int) -> datetime | None:
+    """Return the actual latest push time without creating an import cycle."""
+    from src.github import prs
+
+    return prs.get_pr_last_push_time(repo, pr_number)
 
 
 def get_pr_review_status(
@@ -104,8 +101,8 @@ def _compute_review_status(
     """Core review status logic, separated for caching."""
     body_eyes = False
     body_approved = False
-    head_commit_time: datetime | None = None
-    head_commit_time_loaded = False
+    last_push_time: datetime | None = None
+    last_push_time_loaded = False
     reviewer_policy = (
         policy if policy is not None else reviewer_policy_from_config(load_config())
     )
@@ -136,10 +133,10 @@ def _compute_review_status(
                     latest_review_time = review_info["latest_time"]
                     latest_review_sha = review_info["latest_sha"]
                     reaction_time = _parse_iso(plus_one.get("created_at"))
-                    head_commit_time = _get_commit_time(repo, head_sha)
-                    head_commit_time_loaded = True
-                    if head_commit_time is not None:
-                        threshold = head_commit_time
+                    last_push_time = _get_pr_push_time(repo, pr_number)
+                    last_push_time_loaded = True
+                    if last_push_time is not None:
+                        threshold = last_push_time
                         if latest_review_sha != head_sha and (
                             latest_review_time is not None
                             and latest_review_time > threshold
@@ -200,16 +197,16 @@ def _compute_review_status(
                     )
                     if anchor_plus_one is not None:
                         if head_sha:
-                            if not head_commit_time_loaded:
-                                head_commit_time = _get_commit_time(repo, head_sha)
-                                head_commit_time_loaded = True
+                            if not last_push_time_loaded:
+                                last_push_time = _get_pr_push_time(repo, pr_number)
+                                last_push_time_loaded = True
                             reaction_time = _parse_iso(
                                 anchor_plus_one.get("created_at")
                             )
                             anchor_approved = bool(
                                 reaction_time
-                                and head_commit_time
-                                and reaction_time >= head_commit_time
+                                and last_push_time
+                                and reaction_time >= last_push_time
                             )
                     if not anchor_approved and any(
                         _reactions._is_reaction_content(
