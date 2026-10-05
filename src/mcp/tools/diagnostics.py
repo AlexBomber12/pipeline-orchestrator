@@ -74,24 +74,31 @@ _SENSITIVE_NAMES = (
     "aws_secret_access_key",
 )
 _SENSITIVE_NAME_PATTERN = "|".join(re.escape(name) for name in _SENSITIVE_NAMES)
+# Environment variables commonly prefix the credential role (for example,
+# ``DATABASE_PASSWORD`` and ``MY_API_KEY``). Match complete underscore/hyphen
+# separated prefixes while requiring the sensitive name to end the key, so
+# ordinary fields such as ``tokens_in`` are not mistaken for credentials.
+_SENSITIVE_KEY_PATTERN = rf"(?:[A-Za-z0-9]+[_-])*(?:{_SENSITIVE_NAME_PATTERN})"
 _REDACTION_RULES = (
     (
         re.compile(
-            rf"(?i)([\"'](?:{_SENSITIVE_NAME_PATTERN})[\"']\s*:\s*[\"'])"
+            rf"(?i)([\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']\s*:\s*[\"'])"
             r"[^\"'\r\n]*([\"'])"
         ),
         r"\1[REDACTED]\2",
     ),
     (
         re.compile(
-            rf"(?im)(\b(?:{_SENSITIVE_NAME_PATTERN})\b\s*[:=]\s*)"
+            rf"(?im)((?<![A-Za-z0-9_-])(?:{_SENSITIVE_KEY_PATTERN})"
+            r"(?![A-Za-z0-9_-])\s*[:=]\s*)"
             r"[\"'][^\"'\r\n]*[\"']"
         ),
         r"\1[REDACTED]",
     ),
     (
         re.compile(
-            rf"(?im)(\b(?:{_SENSITIVE_NAME_PATTERN})\b\s*[:=]\s*)"
+            rf"(?im)((?<![A-Za-z0-9_-])(?:{_SENSITIVE_KEY_PATTERN})"
+            r"(?![A-Za-z0-9_-])\s*[:=]\s*)"
             r"(?!\[REDACTED\])(?:bearer\s+|basic\s+)?[^\s,;]+"
         ),
         r"\1[REDACTED]",

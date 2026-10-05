@@ -461,6 +461,9 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
     sensitive = "\n".join(
         [
             "token='two word secret'",
+            "DATABASE_PASSWORD=database-secret",
+            "MY_API_KEY='plain api secret'",
+            '{"SERVICE_REFRESH_TOKEN":"json-secret"}',
             "AKIAABCDEFGHIJKLMNOP",
             "sk-ant-" + "a" * 30,
             "sk-" + "b" * 48,
@@ -474,9 +477,16 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
     )
     redacted, replacements = diagnostics._redact_text(sensitive)
     assert "two word secret" not in redacted
+    assert "database-secret" not in redacted
+    assert "plain api secret" not in redacted
+    assert "json-secret" not in redacted
     assert "material" not in redacted
     assert "redis-password" not in redacted
-    assert replacements == 10
+    assert replacements == 13
+    assert diagnostics._redact_text("tokens_in=123 tokens_out=456") == (
+        "tokens_in=123 tokens_out=456",
+        0,
+    )
     assert diagnostics._iso_z(datetime(2026, 10, 5, 12, 0)).endswith("Z")
 
     captured: dict[str, Any] = {}
