@@ -262,11 +262,12 @@ def _is_valid_branch_name(branch: str) -> bool:
 def get_open_prs(
     repo: str,
     allow_merge_without_checks: bool = False,
+    reviewer_policy: ReviewerPolicy | None = None,
 ) -> list[PRInfo]:
     """Return open PRs for ``repo`` (``owner/repo``) with CI and review status."""
 
     _begin_review_cache_cycle()
-    reviewer_policy = reviewer_policy_from_config(load_config())
+    reviewer_policy = reviewer_policy or reviewer_policy_from_config(load_config())
     try:
         raw = gh_runner.run_gh(
             [

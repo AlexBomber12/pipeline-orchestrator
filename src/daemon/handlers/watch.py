@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.cancellation import CancellationCause
+from src.config import load_config
 from src.daemon import guardrails
 from src.daemon.quarantine import apply_quarantine_label_for_violation
 from src.daemon.selector import CoderPurpose, resolve_active_coder, resolve_pause_coder
@@ -22,7 +23,7 @@ from src.github import cache as gh_cache
 from src.github import checks as gh_checks
 from src.github import gh_runner
 from src.github import prs as gh_prs
-from src.github.reviewer_policy import reviewer_policy_from_config
+from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_config
 from src.inhibitor import InhibitorType, is_work_inhibited
 from src.keyspace import ci_infra_retried
 from src.models import CIStatus, FeedbackCheckResult, PipelineState, ReviewStatus
@@ -141,9 +142,11 @@ class WatchMixin:
             return
 
         try:
+            reviewer_policy = reviewer_policy_from_config(load_config())
             prs = gh_prs.get_open_prs(
                 self.owner_repo,
                 allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+                reviewer_policy=reviewer_policy,
             )
         except Exception as exc:
             await self._transition_to_error(
@@ -347,7 +350,7 @@ class WatchMixin:
             )
             return
         elif review == ReviewStatus.CHANGES_REQUESTED:
-            result = self._has_new_codex_feedback_since_last_push()
+            result = self._has_new_codex_feedback_since_last_push(reviewer_policy)
             if result == FeedbackCheckResult.NEW:
                 await self.handle_fix()
                 return
@@ -830,7 +833,10 @@ class WatchMixin:
             if current_pr is not None:
                 current_pr.watch_retrigger_count = 0
 
-    def _has_new_codex_feedback_since_last_push(self) -> FeedbackCheckResult:
+    def _has_new_codex_feedback_since_last_push(
+        self,
+        reviewer_policy: ReviewerPolicy | None = None,
+    ) -> FeedbackCheckResult:
         """Check whether Codex posted any comment after ``self._last_push_at``.
 
         Returns a three-state :class:`FeedbackCheckResult`:
@@ -862,7 +868,7 @@ class WatchMixin:
                 exc_info=True,
             )
             return FeedbackCheckResult.UNKNOWN
-        reviewer_policy = reviewer_policy_from_config(self.app_config)
+        reviewer_policy = reviewer_policy or reviewer_policy_from_config(self.app_config)
         for c in reversed(comments + review_comments):
             if not reviewer_policy.is_trusted_user(c.get("user")):
                 continue
