@@ -39,6 +39,16 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   reports when that bound may leave additional partitions undiscovered; an
   exact validated `events:disk/YYYY-MM-DD` source ID remains directly readable.
 
+The web/daemon producers and MCP reader all resolve disk events from
+`PO_EVENTS_DIR` (default `/data/events`). Compose maps
+`PO_EVENTS_HOST_DIR` (default `./data/events`) to that container path: when
+selecting a custom event directory, set both values to the corresponding host
+and container locations. The producers' existing `/data` mounts must make the
+selected directory writable, while MCP receives only the explicit read-only
+event-directory mount. For example, use
+`PO_EVENTS_HOST_DIR=./data/audit-events` with
+`PO_EVENTS_DIR=/data/audit-events`.
+
 These tools only accept configured repository slugs and fixed source IDs; they
 cannot read arbitrary paths or Redis keys. Missing, malformed, expired, stale,
 and unavailable data is reported explicitly. Legacy CLI snapshots and mutable

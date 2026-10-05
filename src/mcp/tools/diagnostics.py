@@ -21,6 +21,7 @@ from typing import Any
 import redis.asyncio as aioredis
 
 from src.config import AppConfig, RepoConfig, load_config
+from src.events.disk_log import _resolve_events_dir
 from src.events.publisher import EVENT_HISTORY_LIMIT
 from src.keyspace import (
     cli_log_history,
@@ -38,7 +39,6 @@ from src.utils import repo_slug_from_url
 
 _DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 _REPOS_ROOT = Path("/data/repos")
-_EVENTS_ROOT = Path("/data/events")
 _REPO_SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*__[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _DISK_EVENT_SOURCE = re.compile(r"^events:disk/(\d{4}-\d{2}-\d{2})$")
 _CLI_HISTORY_SOURCE_PREFIX = "cli:history/"
@@ -76,6 +76,7 @@ _SENSITIVE_NAMES = (
     "token",
     "secret",
     "credential",
+    "credentials",
     "access_token",
     "access-token",
     "refresh_token",
@@ -106,6 +107,9 @@ _SENSITIVE_NAMES = (
     "secretAccessKey",
     "sessionToken",
     "keyData",
+    "docker_auth_config",
+    "docker-auth-config",
+    "dockerAuthConfig",
 )
 _SENSITIVE_NAME_PATTERN = "|".join(re.escape(name) for name in _SENSITIVE_NAMES)
 # Credential roles may have environment-style, dotted, or camelCase prefixes
@@ -294,14 +298,14 @@ def _redact_text(text: str) -> tuple[str, int]:
     return redacted, count
 
 
-def _redact_structure(value: Any) -> tuple[Any, int]:
+def _redact_structure(value: Any, *, docker_auth_context: bool = False) -> tuple[Any, int]:
     if isinstance(value, str):
-        return _redact_text(value)
+        return _redact_logical_text(value)
     if isinstance(value, list):
         result: list[Any] = []
         count = 0
         for item in value:
-            safe, replacements = _redact_structure(item)
+            safe, replacements = _redact_structure(item, docker_auth_context=docker_auth_context)
             result.append(safe)
             count += replacements
         return result, count
@@ -309,14 +313,36 @@ def _redact_structure(value: Any) -> tuple[Any, int]:
         result_dict: dict[Any, Any] = {}
         count = 0
         for key, item in value.items():
-            if isinstance(key, str) and _SENSITIVE_KEY.fullmatch(key):
+            normalized_key = (
+                key.casefold().replace("_", "").replace("-", "") if isinstance(key, str) else ""
+            )
+            docker_secret = docker_auth_context and normalized_key in {"auth", "identitytoken"}
+            if (isinstance(key, str) and _SENSITIVE_KEY.fullmatch(key)) or docker_secret:
                 safe, replacements = "[REDACTED]", 1
             else:
-                safe, replacements = _redact_structure(item)
+                safe, replacements = _redact_structure(
+                    item,
+                    docker_auth_context=docker_auth_context or normalized_key == "auths",
+                )
             result_dict[key] = safe
             count += replacements
         return result_dict, count
     return value, 0
+
+
+def _redact_logical_text(text: str) -> tuple[str, int]:
+    """Structurally redact a complete JSON record, otherwise redact ordinary text."""
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return _redact_text(text)
+    if not isinstance(parsed, (dict, list)):
+        return _redact_text(text)
+    safe, replacements = _redact_structure(parsed)
+    if replacements == 0:
+        return _redact_text(text)
+    trailing_newline = "\r\n" if text.endswith("\r\n") else "\n" if text.endswith("\n") else ""
+    return json.dumps(safe, ensure_ascii=False, separators=(",", ":"), default=str) + trailing_newline, replacements
 
 
 def _private_key_state_before(handle: Any, offset: int) -> tuple[bool | None, int]:
@@ -582,7 +608,7 @@ def _redacted_file_units(
                         break
                     scalar_end += 1
                 raw_unit = b"".join(raw_lines[line_index:scalar_end])
-                safe_unit, replacements = _redact_text(text_unit)
+                safe_unit, replacements = _redact_logical_text(text_unit)
                 units.append((raw_unit, safe_unit, replacements))
                 line_index = scalar_end
                 continue
@@ -602,10 +628,27 @@ def _redacted_file_units(
                     units.append((raw_unit, "[REDACTED SENSITIVE ASSIGNMENT]\n", 1))
                     line_index += 1
                     continue
-            safe_unit, replacements = _redact_text(text_unit)
+            safe_unit, replacements = _redact_logical_text(text_unit)
             units.append((raw_unit, safe_unit, replacements))
         line_index += 1
     return units
+
+
+def _redact_log_content(text: str) -> tuple[str, int, list[str]]:
+    """Redact an in-memory log using the same logical-unit policy as files."""
+    warnings: list[str] = []
+    units = _redacted_file_units(
+        text.encode("utf-8", errors="replace"),
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=False,
+        warnings=warnings,
+    )
+    return "".join(unit[1] for unit in units), sum(unit[2] for unit in units), warnings
 
 
 def _error_text(exc: Exception) -> str:
@@ -781,7 +824,7 @@ def _bounded_event(raw: object) -> dict[str, Any]:
     try:
         parsed = json.loads(text)
     except (TypeError, ValueError) as exc:
-        safe_text, _ = _redact_text(text)
+        safe_text, _, _ = _redact_log_content(text)
         return {
             "status": "malformed",
             "error": _error_text(exc),
@@ -1564,7 +1607,7 @@ def _file_log_sources(repo_slug: str) -> tuple[list[dict[str, Any]], list[str]]:
     sources: list[dict[str, Any]] = []
     warnings: list[str] = []
     try:
-        event_dir = _safe_repo_directory(_EVENTS_ROOT, repo_slug)
+        event_dir = _safe_repo_directory(_resolve_events_dir(), repo_slug)
     except ValueError as exc:
         return sources, [_error_text(exc)]
     if event_dir.is_dir():
@@ -1682,21 +1725,37 @@ async def list_orchestrator_logs(
     file_warnings: list[str] = []
     known_static_total: int | None = None
     try:
-        client = _new_redis_client()
+        redis_startup_error: str | None = None
+        try:
+            client = _new_redis_client()
+        except Exception as exc:
+            redis_startup_error = _error_text(exc)
         if cursor_kind == "history":
-            page, redis_warnings, next_cursor = await _redis_history_page(
-                client,
-                repo_slug,
-                observed_at,
-                cursor_state=cursor_value,
-                limit=limit,
-            )
+            if client is None:
+                page = [
+                    {
+                        "source_id": "redis:diagnostics",
+                        "kind": "redis_diagnostic_sources",
+                        "storage": "redis",
+                        "availability": "unavailable",
+                        "error": redis_startup_error,
+                        "association": _association(),
+                    }
+                ]
+                redis_warnings = [f"Redis diagnostic sources unavailable: {redis_startup_error}"]
+                next_cursor = None
+            else:
+                page, redis_warnings, next_cursor = await _redis_history_page(
+                    client,
+                    repo_slug,
+                    observed_at,
+                    cursor_state=cursor_value,
+                    limit=limit,
+                )
             phase = "redis_history"
         else:
-            try:
-                redis_sources, redis_warnings = await _redis_log_sources(client, repo_slug, observed_at)
-            except Exception as exc:
-                message = _error_text(exc)
+            if client is None:
+                message = redis_startup_error
                 redis_sources = [
                     {
                         "source_id": "redis:diagnostics",
@@ -1708,6 +1767,22 @@ async def list_orchestrator_logs(
                     }
                 ]
                 redis_warnings = [f"Redis diagnostic sources unavailable: {message}"]
+            else:
+                try:
+                    redis_sources, redis_warnings = await _redis_log_sources(client, repo_slug, observed_at)
+                except Exception as exc:
+                    message = _error_text(exc)
+                    redis_sources = [
+                        {
+                            "source_id": "redis:diagnostics",
+                            "kind": "redis_diagnostic_sources",
+                            "storage": "redis",
+                            "availability": "unavailable",
+                            "error": message,
+                            "association": _association(),
+                        }
+                    ]
+                    redis_warnings = [f"Redis diagnostic sources unavailable: {message}"]
             file_sources, file_warnings = _file_log_sources(repo_slug)
             sources = redis_sources + file_sources + _unretained_sources()
             sources.sort(
@@ -1936,7 +2011,7 @@ def _read_file_source(
             datetime.strptime(date, "%Y-%m-%d")
         except ValueError as exc:
             raise ValueError("Invalid disk event partition date.") from exc
-        repo_event_root = _safe_repo_directory(_EVENTS_ROOT, repo_slug)
+        repo_event_root = _safe_repo_directory(_resolve_events_dir(), repo_slug)
         path = _safe_path(repo_event_root, f"{date}.jsonl")
         kind = "disk_event_log"
         mutable = date == _utc_now().date().isoformat()
@@ -2364,7 +2439,8 @@ async def read_orchestrator_log(
             },
         }
 
-    redacted, replacements = _redact_text(content)
+    redacted, replacements, redaction_warnings = _redact_log_content(content)
+    warnings.extend(redaction_warnings)
     page, pagination = _page_content(redacted, cursor=redis_cursor, max_chars=max_chars, tail=tail)
     source["source_truncated"] = content.startswith("[truncated]\n")
     return {

@@ -211,6 +211,9 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
                 "data": {
                     "entry": {"event": "failure"},
                     "DATABASE_PASSWORD": "structured-secret",
+                    "auths": {
+                        "registry.example": {"auth": "status-docker-auth-secret"},
+                    },
                 },
             }
         ),
@@ -249,6 +252,7 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
     assert overview["observed"]["ci_status"] == "FAILURE"
     assert "state-secret" not in json.dumps(result)
     assert "structured-secret" not in json.dumps(result)
+    assert "status-docker-auth-secret" not in json.dumps(result)
     assert overview["observed"]["error"] == "Authorization: [REDACTED]"
     assert result["detail"]["queue"]["counts_by_status"] == {"DOING": 1}
     assert "history" not in result["detail"]["state"]
@@ -321,7 +325,7 @@ async def test_log_discovery_and_reads_are_bounded_and_redacted(
     repos_root = tmp_path / "repos"
     events_root = tmp_path / "events"
     monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
-    monkeypatch.setattr(diagnostics, "_EVENTS_ROOT", events_root)
+    monkeypatch.setenv("PO_EVENTS_DIR", str(events_root))
     latest = "[truncated]\nstart\nAuthorization: Bearer top-secret\nlast failure line"
     redis.store[cli_log_latest(SLUG)] = latest
     redis.ttls[cli_log_latest(SLUG)] = 1800
@@ -396,13 +400,170 @@ async def test_log_discovery_and_reads_are_bounded_and_redacted(
     assert before == (redis.store, redis.lists, redis.zsets, redis.ttls)
 
 
+async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    events_root = tmp_path / "custom-events"
+    repos_root = tmp_path / "repos"
+    monkeypatch.setenv("PO_EVENTS_DIR", str(events_root))
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+
+    docker_auth = "ZmFrZTpzZWNyZXQ="
+    redis_payload = "\n".join(
+        [
+            "ordinary prefix",
+            'export PASSWORD="fake-first-secret',
+            'fake-second-secret"',
+            '{"password":123456789}',
+            '{"credentials":["user","fake-list-secret"]}',
+            json.dumps({"auths": {"registry": {"auth": docker_auth}}, "debug": True}),
+            f"DOCKER_AUTH_CONFIG={{\"auths\":{{\"registry\":{{\"auth\":\"{docker_auth}\"}}}}}}",
+            "ordinary suffix",
+        ]
+    )
+    timestamp = "2026-10-05T11:45:00+00:00"
+    redis.store[cli_log_latest(SLUG)] = redis_payload
+    redis.store[cli_log_history(SLUG, timestamp)] = redis_payload
+
+    event_dir = events_root / SLUG
+    event_dir.mkdir(parents=True)
+    event_path = event_dir / "2026-10-05.jsonl"
+    event_path.write_text(
+        json.dumps(
+            {
+                "event_type": "failure",
+                "password": 123456789,
+                "credentials": ["user", "disk-list-secret"],
+                "auths": {"registry": {"auth": docker_auth}},
+                "debug": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.write_text(
+        json.dumps(
+            {
+                "password": 123456789,
+                "credentials": ["user", "ci-list-secret"],
+                "auths": {"registry": {"auth": docker_auth}},
+                "debug": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    async def read_all(source_id: str, *, max_chars: int) -> str:
+        cursor: int | str = 0
+        parts: list[str] = []
+        while True:
+            page = await diagnostics.read_orchestrator_log(
+                SLUG,
+                source_id,
+                cursor=cursor,
+                max_chars=max_chars,
+            )
+            parts.append(page["content"])
+            cursor = page["pagination"]["next_cursor"]
+            if cursor is None:
+                return "".join(parts)
+
+    for source_id in ("cli:latest", f"cli:history/{timestamp}"):
+        content = await read_all(source_id, max_chars=17)
+        assert "ordinary prefix" in content
+        assert "ordinary suffix" in content
+        assert "fake-first-secret" not in content
+        assert "fake-second-secret" not in content
+        assert "123456789" not in content
+        assert "fake-list-secret" not in content
+        assert docker_auth not in content
+
+    for source_id, list_secret in (
+        ("ci:artifact", "ci-list-secret"),
+        ("events:disk/2026-10-05", "disk-list-secret"),
+    ):
+        content = await read_all(source_id, max_chars=23)
+        assert "123456789" not in content
+        assert list_secret not in content
+        assert docker_auth not in content
+        assert "debug" in content
+
+
+async def test_custom_event_root_is_used_for_discovery_and_exact_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    custom_root = tmp_path / "selected-event-root"
+    monkeypatch.setenv("PO_EVENTS_DIR", str(custom_root))
+    event_path = custom_root / SLUG / "2026-10-05.jsonl"
+    event_path.parent.mkdir(parents=True)
+    event_path.write_text('{"event_type":"custom-root"}\n', encoding="utf-8")
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", tmp_path / "repos")
+
+    listed = await diagnostics.list_orchestrator_logs(SLUG)
+    assert any(source["source_id"] == "events:disk/2026-10-05" for source in listed["sources"])
+    read = await diagnostics.read_orchestrator_log(SLUG, "events:disk/2026-10-05")
+    assert "custom-root" in read["content"]
+
+
+async def test_redis_client_construction_failure_preserves_filesystem_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    config = _config(_repo())
+    mapping = {SLUG: config.repositories[0]}
+    monkeypatch.setattr(diagnostics, "_configured_repositories", lambda: (config, mapping))
+    monkeypatch.setattr(diagnostics, "_utc_now", lambda: NOW)
+    monkeypatch.setattr(
+        diagnostics,
+        "_new_redis_client",
+        lambda: (_ for _ in ()).throw(ValueError("invalid REDIS_URL password=redis-url-secret")),
+    )
+    events_root = tmp_path / "events"
+    monkeypatch.setenv("PO_EVENTS_DIR", str(events_root))
+    event_path = events_root / SLUG / "2026-10-05.jsonl"
+    event_path.parent.mkdir(parents=True)
+    event_path.write_text('{"event_type":"disk-available"}\n', encoding="utf-8")
+    repos_root = tmp_path / "repos"
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.write_text("ci available\n", encoding="utf-8")
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+
+    listed = await diagnostics.list_orchestrator_logs(SLUG)
+
+    sources = {source["source_id"]: source for source in listed["sources"]}
+    assert sources["redis:diagnostics"]["availability"] == "unavailable"
+    assert sources["events:disk/2026-10-05"]["availability"] == "available"
+    assert sources["ci:artifact"]["availability"] == "available"
+    assert "redis-url-secret" not in json.dumps(listed)
+
+    history_cursor = diagnostics._encode_history_cursor(0, [], started=False)
+    history = await diagnostics.list_orchestrator_logs(SLUG, cursor=history_cursor)
+    assert history["pagination"]["phase"] == "redis_history"
+    assert history["pagination"]["next_cursor"] is None
+    assert history["sources"][0]["source_id"] == "redis:diagnostics"
+    assert "redis-url-secret" not in json.dumps(history)
+
+
 async def test_missing_expired_unretained_and_unavailable_logs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from src.mcp.tools import diagnostics
 
     redis = FakeRedis()
     _patch_runtime(monkeypatch, redis, _config(_repo()))
     monkeypatch.setattr(diagnostics, "_REPOS_ROOT", tmp_path / "repos")
-    monkeypatch.setattr(diagnostics, "_EVENTS_ROOT", tmp_path / "events")
+    monkeypatch.setenv("PO_EVENTS_DIR", str(tmp_path / "events"))
 
     expired = await diagnostics.read_orchestrator_log(SLUG, "cli:history/2026-10-04T11:00:00+00:00")
     assert expired["source"]["availability"] == "missing_or_expired"
@@ -456,7 +617,7 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     redis = FakeRedis()
     _patch_runtime(monkeypatch, redis, _config(_repo()))
     monkeypatch.setattr(diagnostics, "_REPOS_ROOT", tmp_path / "repos")
-    monkeypatch.setattr(diagnostics, "_EVENTS_ROOT", tmp_path / "events")
+    monkeypatch.setenv("PO_EVENTS_DIR", str(tmp_path / "events"))
     with pytest.raises(ValueError, match="Invalid repo_slug"):
         await diagnostics.list_orchestrator_logs("../escape")
     with pytest.raises(ValueError, match="not configured"):
@@ -475,7 +636,7 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     roots = tmp_path / "symlink-events"
     roots.mkdir()
     (roots / SLUG).symlink_to(outside, target_is_directory=True)
-    monkeypatch.setattr(diagnostics, "_EVENTS_ROOT", roots)
+    monkeypatch.setenv("PO_EVENTS_DIR", str(roots))
     with pytest.raises(ValueError, match="symlink"):
         await diagnostics.read_orchestrator_log(SLUG, "events:disk/2026-10-05")
 
@@ -487,7 +648,7 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     (sibling_artifacts / "ci.log").write_text("sibling secret", encoding="utf-8")
     (selected_repo / "artifacts").symlink_to(sibling_artifacts, target_is_directory=True)
     monkeypatch.setattr(diagnostics, "_REPOS_ROOT", sibling_repos)
-    monkeypatch.setattr(diagnostics, "_EVENTS_ROOT", tmp_path / "empty-events")
+    monkeypatch.setenv("PO_EVENTS_DIR", str(tmp_path / "empty-events"))
     with pytest.raises(ValueError, match="escapes"):
         await diagnostics.read_orchestrator_log(SLUG, "ci:artifact")
     sources, warnings = diagnostics._file_log_sources(SLUG)
@@ -502,7 +663,7 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     other_events.mkdir(parents=True)
     (other_events / "2026-10-05.jsonl").write_text("sibling event secret", encoding="utf-8")
     (selected_events / "2026-10-05.jsonl").symlink_to(other_events / "2026-10-05.jsonl")
-    monkeypatch.setattr(diagnostics, "_EVENTS_ROOT", sibling_events)
+    monkeypatch.setenv("PO_EVENTS_DIR", str(sibling_events))
     with pytest.raises(ValueError, match="escapes"):
         await diagnostics.read_orchestrator_log(SLUG, "events:disk/2026-10-05")
 
@@ -512,7 +673,7 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     sibling_directory.mkdir()
     (sibling_directory / "2026-10-05.jsonl").write_text("sibling event secret", encoding="utf-8")
     (sibling_directory_events / SLUG).symlink_to(sibling_directory, target_is_directory=True)
-    monkeypatch.setattr(diagnostics, "_EVENTS_ROOT", sibling_directory_events)
+    monkeypatch.setenv("PO_EVENTS_DIR", str(sibling_directory_events))
     with pytest.raises(ValueError, match="symlink"):
         await diagnostics.read_orchestrator_log(SLUG, "events:disk/2026-10-05")
     sources, warnings = diagnostics._file_log_sources(SLUG)
@@ -635,6 +796,8 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
         "tokens_in=123 tokens_out=456",
         0,
     )
+    assert diagnostics._redact_logical_text('{"debug": true}\n') == ('{"debug": true}\n', 0)
+    assert diagnostics._redact_logical_text("123") == ("123", 0)
     for partial_key in (
         "-----BEGIN PRIVATE KEY-----\npartial-secret",
         "[truncated]\npartial-secret\n-----END PRIVATE KEY-----",
@@ -831,7 +994,7 @@ async def test_log_discovery_defensive_failures(tmp_path: Path, monkeypatch: pyt
     outside = tmp_path / "outside.jsonl"
     outside.write_text("outside", encoding="utf-8")
     (repo_dir / "2026-10-04.jsonl").symlink_to(outside)
-    monkeypatch.setattr(diagnostics, "_EVENTS_ROOT", events_root)
+    monkeypatch.setenv("PO_EVENTS_DIR", str(events_root))
     monkeypatch.setattr(diagnostics, "_REPOS_ROOT", tmp_path / "repos")
     _, warnings = diagnostics._file_log_sources(SLUG)
     assert any("2026-10-04" in warning for warning in warnings)
@@ -856,7 +1019,7 @@ async def test_log_discovery_defensive_failures(tmp_path: Path, monkeypatch: pyt
     escaped_root = tmp_path / "escaped-events"
     escaped_root.mkdir()
     (escaped_root / SLUG).symlink_to(tmp_path, target_is_directory=True)
-    monkeypatch.setattr(diagnostics, "_EVENTS_ROOT", escaped_root)
+    monkeypatch.setenv("PO_EVENTS_DIR", str(escaped_root))
     sources, warnings = diagnostics._file_log_sources(SLUG)
     assert sources == []
     assert warnings
@@ -864,7 +1027,7 @@ async def test_log_discovery_defensive_failures(tmp_path: Path, monkeypatch: pyt
     repos_root = tmp_path / "escaped-repos"
     repos_root.mkdir()
     (repos_root / SLUG).symlink_to(tmp_path, target_is_directory=True)
-    monkeypatch.setattr(diagnostics, "_EVENTS_ROOT", tmp_path / "empty-events")
+    monkeypatch.setenv("PO_EVENTS_DIR", str(tmp_path / "empty-events"))
     monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
     sources, warnings = diagnostics._file_log_sources(SLUG)
     assert sources[0]["source_id"] == "ci:artifact"
@@ -972,7 +1135,7 @@ async def test_list_outer_failure_and_file_read_error(tmp_path: Path, monkeypatc
 
     redis = FakeRedis()
     _patch_runtime(monkeypatch, redis, _config(_repo()))
-    monkeypatch.setattr(diagnostics, "_EVENTS_ROOT", tmp_path / "events")
+    monkeypatch.setenv("PO_EVENTS_DIR", str(tmp_path / "events"))
     repos_root = tmp_path / "repos"
     ci_path = repos_root / SLUG / "artifacts" / "ci.log"
     ci_path.parent.mkdir(parents=True)
@@ -1007,7 +1170,7 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
 
     redis = FakeRedis()
     _patch_runtime(monkeypatch, redis, _config(_repo()))
-    monkeypatch.setattr(diagnostics, "_EVENTS_ROOT", tmp_path / "events")
+    monkeypatch.setenv("PO_EVENTS_DIR", str(tmp_path / "events"))
     repos_root = tmp_path / "repos"
     monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
     ci_path = repos_root / SLUG / "artifacts" / "ci.log"
@@ -1281,7 +1444,7 @@ async def test_filesystem_reader_omits_oversized_segments_and_lines(
 
     redis = FakeRedis()
     _patch_runtime(monkeypatch, redis, _config(_repo()))
-    monkeypatch.setattr(diagnostics, "_EVENTS_ROOT", tmp_path / "events")
+    monkeypatch.setenv("PO_EVENTS_DIR", str(tmp_path / "events"))
     repos_root = tmp_path / "repos"
     monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
     ci_path = repos_root / SLUG / "artifacts" / "ci.log"
@@ -1386,7 +1549,10 @@ def test_compose_wires_read_only_runtime_sources() -> None:
     compose = yaml.safe_load(Path("docker-compose.yml").read_text(encoding="utf-8"))
     service = compose["services"]["mcp"]
     assert service["environment"]["REDIS_URL"] == "redis://redis:6379/0"
+    assert service["environment"]["PO_EVENTS_DIR"] == "${PO_EVENTS_DIR:-/data/events}"
+    assert compose["services"]["web"]["environment"]["PO_EVENTS_DIR"] == "${PO_EVENTS_DIR:-/data/events}"
+    assert compose["services"]["daemon"]["environment"]["PO_EVENTS_DIR"] == "${PO_EVENTS_DIR:-/data/events}"
     assert "redis" in service["depends_on"]
-    assert "./data/events:/data/events:ro" in service["volumes"]
+    assert "${PO_EVENTS_HOST_DIR:-./data/events}:${PO_EVENTS_DIR:-/data/events}:ro" in service["volumes"]
     assert all("docker.sock" not in volume for volume in service["volumes"])
     assert all("/data/auth" not in volume for volume in service["volumes"])
