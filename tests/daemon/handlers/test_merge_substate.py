@@ -24,14 +24,12 @@ import asyncio
 from datetime import datetime, timezone
 
 import pytest
-
 from src.daemon import git_ops as git_ops_module
 from src.daemon import runner as runner_module
 from src.daemon.handlers import merge as merge_module
 from src.daemon.runner import PipelineRunner
 from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
 from src.web.app import templates
-
 from tests.runner import _helpers as h
 
 
@@ -92,7 +90,7 @@ def _stub_successful_merge(monkeypatch: pytest.MonkeyPatch) -> None:
         "src.github.cache._invalidate_etag_cache", lambda prefix: None
     )
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: "")
-    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)
     monkeypatch.setattr(
         PipelineRunner,
         "_mark_task_done_in_snapshot",
@@ -260,7 +258,7 @@ def test_merge_phase_cleared_on_error_path(
     )
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: "")
 
-    def boom(repo: str, num: int) -> None:
+    def boom(repo: str, num: int, expected_head_sha: str) -> None:
         raise RuntimeError("merge_pr failed mid-flight")
 
     monkeypatch.setattr("src.github.prs.merge_pr", boom)
@@ -379,7 +377,7 @@ def test_handle_merge_from_watch_clears_phase_on_error(
     )
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: "")
 
-    def boom(repo: str, num: int) -> None:
+    def boom(repo: str, num: int, expected_head_sha: str) -> None:
         raise RuntimeError("merge_pr failed mid-flight")
 
     monkeypatch.setattr("src.github.prs.merge_pr", boom)

@@ -289,6 +289,7 @@ def test_fix_review_uses_fix_review_prompt(monkeypatch: pytest.MonkeyPatch) -> N
     prompt = captured["cmd"][-1]
     assert prompt.startswith("FIX FEEDBACK\n\n")
     assert "This FIX FEEDBACK run was dispatched" in prompt
+    assert "OPERATOR-AUTHORIZED EXECUTION POLICY" in prompt
     assert "one iteration" in prompt
     assert "scripts/make-review-artifacts.sh" in prompt
     assert "remote PR HEAD is the pushed local HEAD" in prompt
@@ -968,6 +969,7 @@ async def test_run_auto_pr_async_formats_prompt_with_headers(
         "AUTO PR\nTask: PR-270\nFile: tasks/PR-270.md\n\n<body>\n\n"
     )
     assert "This AUTO PR run was dispatched" in prompt
+    assert "OPERATOR-AUTHORIZED EXECUTION POLICY" in prompt
     assert "ready (not draft) PR" in prompt
     assert "scripts/make-review-artifacts.sh" in prompt
     assert "artifacts/pr.patch must be nonempty" in prompt

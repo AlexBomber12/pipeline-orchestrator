@@ -9,7 +9,7 @@ from src.cancellation import retry_count_key, task_spec_hash_key
 from src.daemon import git_ops as git_ops_module
 from src.daemon import runner as runner_module
 from src.daemon.handlers import merge as merge_module
-from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
+from src.models import PipelineState, PRInfo, QueueTask, ReviewStatus, TaskStatus
 
 from tests.runner import _helpers as h
 
@@ -18,7 +18,9 @@ def test_merge_cleans_up_hash_and_retry_counter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
+    monkeypatch.setattr(
+        "src.github.prs.merge_pr", lambda repo, num, expected_head: None
+    )
     monkeypatch.setattr(
         runner_module.PipelineRunner,
         "_mark_task_done_in_snapshot",
@@ -29,7 +31,7 @@ def test_merge_cleans_up_hash_and_retry_counter(
     runner.redis.store[task_spec_hash_key("octo__demo", "PR-001")] = "abc123"
     runner.redis.store[retry_count_key("octo__demo", "PR-001")] = "2"
     runner.state.state = PipelineState.MERGE
-    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001", head_sha="a" * 40)
     runner.state.current_task = QueueTask(
         pr_id="PR-001",
         title="Sample",
@@ -46,7 +48,9 @@ def test_merge_logs_cleanup_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
+    monkeypatch.setattr(
+        "src.github.prs.merge_pr", lambda repo, num, expected_head: None
+    )
     monkeypatch.setattr(
         runner_module.PipelineRunner,
         "_mark_task_done_in_snapshot",
@@ -55,7 +59,7 @@ def test_merge_logs_cleanup_failure(
 
     runner = h._make_runner()
     runner.state.state = PipelineState.MERGE
-    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001", head_sha="a" * 40)
     runner.state.current_task = QueueTask(
         pr_id="PR-001",
         title="Sample",
@@ -76,6 +80,82 @@ def test_merge_logs_cleanup_failure(
     asyncio.run(runner.handle_merge())
 
     assert any("Failed to clear retry metadata for PR-001" in event for event in events)
+
+
+def test_merge_passes_observed_full_head_to_merge_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    expected_head = "d" * 40
+    calls: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(
+        "src.github.prs.merge_pr",
+        lambda repo, num, expected_head_sha: calls.append(
+            (repo, num, expected_head_sha)
+        ),
+    )
+    monkeypatch.setattr(
+        runner_module.PipelineRunner,
+        "_mark_task_done_in_snapshot",
+        lambda self: None,
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.MERGE
+    runner.state.current_pr = PRInfo(
+        number=5,
+        branch="pr-001",
+        head_sha=expected_head,
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="Sample",
+        status=TaskStatus.DOING,
+    )
+
+    asyncio.run(runner.handle_merge())
+
+    assert calls == [("octo/demo", 5, expected_head)]
+
+
+def test_merge_expected_head_mismatch_returns_to_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    invalidated: list[str] = []
+
+    def stale_head(repo: str, num: int, expected_head_sha: str) -> None:
+        raise merge_module.gh_prs.ExpectedHeadMismatch("head changed")
+
+    monkeypatch.setattr("src.github.prs.merge_pr", stale_head)
+    monkeypatch.setattr(
+        "src.github.cache._invalidate_etag_cache",
+        lambda prefix: invalidated.append(prefix),
+    )
+
+    runner = h._make_runner()
+    runner.state.state = PipelineState.MERGE
+    runner.state.current_pr = PRInfo(
+        number=5,
+        branch="pr-001",
+        head_sha="e" * 40,
+        review_status=ReviewStatus.APPROVED,
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="Sample",
+        status=TaskStatus.DOING,
+    )
+
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr.review_status == ReviewStatus.PENDING
+    assert invalidated == ["repos/octo/demo/pulls"]
+    assert any(
+        "Expected HEAD mismatch" in entry.get("event", "")
+        for entry in runner.state.history
+    )
 
 
 def test_post_codex_review_bypass_author_dedup_skips_dedup_gate(

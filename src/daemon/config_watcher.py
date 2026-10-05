@@ -30,6 +30,7 @@ from src.keyspace import control_config_dirty
 logger = logging.getLogger(__name__)
 
 CONFIG_WATCH_INTERVAL_SEC = 5.0
+_WATCH_READY_PROBE_TIMEOUT_MS = 1_000
 
 
 def _resolve_config_path() -> Path:
@@ -108,6 +109,8 @@ def _normalize_path(path: Path | str) -> str:
 async def watch_config_changes(
     config_paths: list[Path],
     on_change_callback: Callable[[], None],
+    *,
+    ready_event: asyncio.Event | None = None,
 ) -> None:
     """Fire ``on_change_callback`` on inotify events for any of ``config_paths``.
 
@@ -126,6 +129,11 @@ async def watch_config_changes(
     Callback exceptions are logged and swallowed so the watcher loop
     keeps monitoring — a broken reload path must not silently disable
     every future config edit detection.
+
+    When ``ready_event`` is provided, it is set after a complete backend
+    watch cycle with no changes and cleared before a change batch is
+    delivered. Callers can await it before the first mutation and between
+    successive mutations instead of relying on registration sleeps.
 
     The watcher subscribes to each target file's *parent directory* and
     filters events back to the target paths instead of watching the
@@ -154,7 +162,25 @@ async def watch_config_changes(
     target_paths = {_normalize_path(p) for p in existing_paths}
     parent_dirs = sorted({_normalize_path(p.parent) for p in existing_paths})
 
-    async for changes in awatch(*parent_dirs, recursive=False):
+    async for changes in awatch(
+        *parent_dirs,
+        recursive=False,
+        rust_timeout=(
+            _WATCH_READY_PROBE_TIMEOUT_MS
+            if ready_event is not None
+            else None
+        ),
+        yield_on_timeout=ready_event is not None,
+    ):
+        if not changes:
+            # RustNotify constructs its native or polling snapshot before its
+            # first watch call can yield.  An empty timeout therefore provides
+            # an explicit registration/re-arm barrier without a guessed sleep.
+            if ready_event is not None:
+                ready_event.set()
+            continue
+        if ready_event is not None:
+            ready_event.clear()
         for change_type, changed_path in changes:
             if change_type not in (Change.modified, Change.added):
                 continue

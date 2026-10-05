@@ -143,7 +143,7 @@ def test_handle_merge_appends_outcome_row(
     isolate_analytics_dir: Path,
 ) -> None:
     _patch_subprocess(monkeypatch)
-    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)
     monkeypatch.setattr(
         "src.github.gh_runner.run_gh",
         lambda *a, **kw: {"state": "MERGED"},
@@ -214,7 +214,7 @@ def test_handle_merge_outcome_log_failure_does_not_block_merge(
     isolate_analytics_dir: Path,
 ) -> None:
     _patch_subprocess(monkeypatch)
-    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)
     monkeypatch.setattr(
         "src.github.gh_runner.run_gh",
         lambda *a, **kw: {"state": "MERGED"},

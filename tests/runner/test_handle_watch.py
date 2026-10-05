@@ -213,7 +213,7 @@ def test_handle_watch_approved_and_green_merges(
 
     merged: list[tuple[str, int]] = []
 
-    def fake_merge(repo: str, number: int) -> None:
+    def fake_merge(repo: str, number: int, expected_head_sha: str) -> None:
         merged.append((repo, number))
 
     monkeypatch.setattr("src.github.prs.merge_pr", fake_merge)
@@ -254,7 +254,7 @@ def test_handle_watch_rehydrates_quarantine_before_merge(
     merged: list[tuple[str, int]] = []
     monkeypatch.setattr(
         "src.github.prs.merge_pr",
-        lambda repo, number: merged.append((repo, number)),
+        lambda repo, number, expected_head_sha: merged.append((repo, number)),
     )
 
     runner = h._make_runner()
@@ -352,7 +352,7 @@ def test_handle_watch_green_but_auto_merge_disabled_stays_watching(
     merged: list[tuple[str, int]] = []
     monkeypatch.setattr(
         "src.github.prs.merge_pr",
-        lambda repo, number: merged.append((repo, number)),
+        lambda repo, number, expected_head_sha: merged.append((repo, number)),
     )
 
     runner = h._make_runner(auto_merge=False)
@@ -4043,7 +4043,7 @@ def test_handle_watch_returns_when_diff_scan_transitions_to_error(
     merged: list[tuple[str, int]] = []
     monkeypatch.setattr(
         "src.github.prs.merge_pr",
-        lambda repo, number: merged.append((repo, number)),
+        lambda repo, number, expected_head_sha: merged.append((repo, number)),
     )
 
     runner = h._make_runner()
@@ -4231,7 +4231,7 @@ def test_handle_watch_holds_merge_when_diff_fetch_fails_with_populated_patterns(
     merged: list[tuple[str, int]] = []
     monkeypatch.setattr(
         "src.github.prs.merge_pr",
-        lambda repo, number: merged.append((repo, number)),
+        lambda repo, number, expected_head_sha: merged.append((repo, number)),
     )
 
     runner = h._make_runner()

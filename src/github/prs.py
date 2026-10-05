@@ -97,6 +97,10 @@ class GhPrMergedBranchesUnavailable(Exception):
     """Raised when GitHub cannot confirm merged PR branches."""
 
 
+class ExpectedHeadMismatch(Exception):
+    """Raised when GitHub refuses a merge for a stale expected HEAD."""
+
+
 def extract_queue_pr_id(subject: str) -> str | None:
     """Return the canonical queue PR id from a title/subject prefix."""
     match = _QUEUE_PR_ID_RE.match(subject.strip())
@@ -563,8 +567,8 @@ def is_pr_merged(repo: str, pr_number: int) -> bool | None:
     return None
 
 
-def merge_pr(repo: str, pr_number: int) -> None:
-    """Merge a PR using ``gh pr merge --squash --delete-branch``.
+def merge_pr(repo: str, pr_number: int, expected_head_sha: str) -> None:
+    """Merge a PR using ``gh pr merge --match-head-commit``.
 
     Invalidates the cached ``repos/{repo}/pulls`` ETag entries on success
     so the next REST list fetch sees the merged PR drop out of
@@ -572,10 +576,36 @@ def merge_pr(repo: str, pr_number: int) -> None:
     still contains it.
     """
 
-    gh_runner.run_gh(
-        ["pr", "merge", str(pr_number), "--squash", "--delete-branch"], repo=repo
-    )
+    if _FULL_SHA_RE.fullmatch(expected_head_sha) is None:
+        raise ValueError("expected_head_sha must be a full 40-character SHA")
+
+    try:
+        gh_runner.run_gh(
+            [
+                "pr",
+                "merge",
+                str(pr_number),
+                "--squash",
+                "--delete-branch",
+                "--match-head-commit",
+                expected_head_sha,
+            ],
+            repo=repo,
+        )
+    except RuntimeError as exc:
+        if _is_match_head_mismatch_error(str(exc)):
+            raise ExpectedHeadMismatch(str(exc)) from exc
+        raise
     cache._invalidate_etag_cache(f"repos/{repo}/pulls")
+
+
+def _is_match_head_mismatch_error(message: str) -> bool:
+    stderr = message.rsplit("):", maxsplit=1)[-1].lower()
+    return (
+        "head" in stderr
+        and ("match" in stderr or "mismatch" in stderr or "expected" in stderr)
+        and ("commit" in stderr or "sha" in stderr or "oid" in stderr)
+    )
 
 
 def get_pr_author(repo: str, pr_number: int) -> str:

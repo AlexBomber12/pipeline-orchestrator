@@ -23,7 +23,7 @@ from src.daemon import git_ops
 from src.github import cache as gh_cache
 from src.github import gh_runner
 from src.github import prs as gh_prs
-from src.models import PipelineState, TaskStatus
+from src.models import PipelineState, ReviewStatus, TaskStatus
 from src.retry import retry_transient
 from src.subsource_registry import SuppressionReason
 
@@ -299,7 +299,22 @@ class MergeMixin:
         self.state.merge_phase = "merging"
         await self.publish_state()
         try:
-            gh_prs.merge_pr(self.owner_repo, number)
+            gh_prs.merge_pr(self.owner_repo, number, self.state.current_pr.head_sha)
+        except gh_prs.ExpectedHeadMismatch as exc:
+            self.state.current_pr.review_status = ReviewStatus.PENDING
+            self.state.state = PipelineState.WATCH
+            gh_cache._invalidate_etag_cache(f"repos/{self.owner_repo}/pulls")
+            self.log_event(
+                (
+                    f"[MERGE] Expected HEAD mismatch for PR #{number}; "
+                    "returning to WATCH and invalidating approval."
+                ),
+                tier="merge",
+                kind="head_mismatch",
+            )
+            logger.info("merge_pr expected-head mismatch: %s", exc)
+            await self.publish_state()
+            return
         except Exception as exc:
             await self._transition_to_error(
                 f"merge_pr failed: {exc}",

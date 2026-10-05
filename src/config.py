@@ -34,6 +34,7 @@ _REPO_FIELDS = {
     "active",
     "poll_interval_sec",
     "allow_merge_without_checks",
+    "required_checks",
     "allow_merge_without_review",
     "coder",
     "disabled_coders",
@@ -168,6 +169,7 @@ class RepoConfig(BaseModel):
     active: bool = True
     poll_interval_sec: int = 60
     allow_merge_without_checks: bool = False
+    required_checks: list[str] | None = None
     allow_merge_without_review: bool = False
     coder: CoderType | None = None
     disabled_coders: list[str] | None = None
@@ -183,6 +185,30 @@ class RepoConfig(BaseModel):
             raise ValueError("poll_interval_sec must be an integer")
         if v < 1:
             raise ValueError("poll_interval_sec must be at least 1")
+        return v
+
+    @field_validator("required_checks", mode="before")
+    @classmethod
+    def _required_checks_valid_names(
+        cls, v: Any
+    ) -> list[str] | None:
+        if v is None:
+            return None
+        if not isinstance(v, list):
+            raise ValueError("required_checks must be a list of check names")
+        seen: set[str] = set()
+        for item in v:
+            if not isinstance(item, str):
+                raise ValueError(
+                    "required_checks entries must be check name strings"
+                )
+            if not item.strip():
+                raise ValueError("required_checks entries must not be blank")
+            if item in seen:
+                raise ValueError(
+                    "required_checks entries must not be duplicated"
+                )
+            seen.add(item)
         return v
 
 
