@@ -7,6 +7,7 @@ import fnmatch
 import json
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -633,6 +634,9 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
         "awsSecretAccessKey",
         "secretAccessKey",
         "sessionToken",
+        "databasePassword",
+        "githubToken",
+        "spring.datasource.password",
     ):
         structured, structured_count = diagnostics._redact_structure({camel_key: "camel-secret"})
         assert structured == {camel_key: "[REDACTED]"}
@@ -1019,6 +1023,22 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
     assert "after" in private_tail["content"]
     assert private_tail["pagination"]["context_scanned_bytes"] > 0
 
+    multiline = b'before\n"password":\n\n  "multiline-secret"\nafter\n'
+    ci_path.write_bytes(multiline)
+    multiline_page = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", max_chars=200)
+    assert "multiline-secret" not in multiline_page["content"]
+    assert "[REDACTED]" in multiline_page["content"]
+
+    value_cursor = multiline.index(b'\n\n') + 1
+    value_page = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=value_cursor,
+        max_chars=200,
+    )
+    assert "multiline-secret" not in value_page["content"]
+    assert "[REDACTED SENSITIVE VALUE]" in value_page["content"]
+
     ordinary_size = diagnostics._MAX_PRIVATE_KEY_CONTEXT_BYTES + diagnostics._MAX_FILE_SCAN_BYTES * 2
     ci_path.write_bytes((b"ordinary line\n" * (ordinary_size // len(b"ordinary line\n") + 1))[:ordinary_size])
     fail_closed_tail = await diagnostics.read_orchestrator_log(
@@ -1029,10 +1049,36 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
     )
     assert fail_closed_tail["content"] == "[CONTENT OMITTED: PRIVATE-KEY CONTEXT UNKNOWN]\n"
     assert (
-        fail_closed_tail["pagination"]["context_scanned_bytes"]
+        fail_closed_tail["pagination"]["private_key_context_scanned_bytes"]
         == diagnostics._MAX_PRIVATE_KEY_CONTEXT_BYTES
     )
     assert any("omitted fail-closed" in warning for warning in fail_closed_tail["warnings"])
+
+    warnings: list[str] = []
+    units = diagnostics._redacted_file_units(
+        b'"password":\n',
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        has_more_after_raw=True,
+        warnings=warnings,
+    )
+    assert units[0][1] == "[REDACTED SENSITIVE ASSIGNMENT]\n"
+    assert warnings
+
+    assert diagnostics._sensitive_value_state_before(BytesIO(b"\n\n"), 2) == (False, 2)
+    unknown_context = b"x" * (diagnostics._MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES + 1)
+    assert diagnostics._sensitive_value_state_before(BytesIO(unknown_context), len(unknown_context)) == (
+        None,
+        diagnostics._MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES,
+    )
+    warnings = []
+    assert diagnostics._redacted_file_units(
+        b"unknown\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=None,
+        has_more_after_raw=False,
+        warnings=warnings,
+    )[0][1] == "[CONTENT OMITTED: SENSITIVE-ASSIGNMENT CONTEXT UNKNOWN]\n"
 
 
 async def test_filesystem_reader_omits_oversized_segments_and_lines(

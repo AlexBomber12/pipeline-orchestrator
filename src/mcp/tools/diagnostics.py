@@ -50,6 +50,7 @@ _MAX_EVENT_RECORD_CHARS = 4_000
 _MAX_REDIS_EVENT_HISTORY_BYTES = 256 * 1024
 _MAX_FILE_SCAN_BYTES = 256 * 1024
 _MAX_PRIVATE_KEY_CONTEXT_BYTES = 1024 * 1024
+_MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES = 64 * 1024
 _MAX_REDIS_SCAN_CALLS = 4
 _MAX_REDIS_PENDING_KEYS = 200
 _CLI_LATEST_TTL_SECONDS = 3600
@@ -100,12 +101,17 @@ _SENSITIVE_NAMES = (
     "sessionToken",
 )
 _SENSITIVE_NAME_PATTERN = "|".join(re.escape(name) for name in _SENSITIVE_NAMES)
-# Environment variables commonly prefix the credential role (for example,
-# ``DATABASE_PASSWORD`` and ``MY_API_KEY``). Match complete underscore/hyphen
-# separated prefixes while requiring the sensitive name to end the key, so
-# ordinary fields such as ``tokens_in`` are not mistaken for credentials.
-_SENSITIVE_KEY_PATTERN = rf"(?:[A-Za-z0-9]+[_-])*(?:{_SENSITIVE_NAME_PATTERN})"
+# Credential roles may have environment-style, dotted, or camelCase prefixes
+# (for example DATABASE_PASSWORD, spring.datasource.password, or githubToken).
+# Require the sensitive role to end the key so fields such as tokens_in remain
+# ordinary counters.
+_SENSITIVE_KEY_PATTERN = rf"[A-Za-z0-9_.-]*(?:{_SENSITIVE_NAME_PATTERN})"
 _SENSITIVE_KEY = re.compile(rf"(?i)^(?:{_SENSITIVE_KEY_PATTERN})$")
+_PENDING_SENSITIVE_ASSIGNMENT = re.compile(
+    rf"(?i)(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
+    rf"(?<![A-Za-z0-9_.-])(?:{_SENSITIVE_KEY_PATTERN})(?![A-Za-z0-9_.-]))"
+    r"\s*[:=][ \t]*(?:[|>][-+]?)?[ \t]*$"
+)
 _REDACTION_RULES = (
     (
         re.compile(
@@ -319,10 +325,33 @@ def _private_key_state_before(handle: Any, offset: int) -> tuple[bool | None, in
     return (None if search_end > 0 else False), scanned_bytes
 
 
+def _sensitive_value_state_before(handle: Any, offset: int) -> tuple[bool | None, int]:
+    """Check bounded preceding lines for a key whose value starts on this page."""
+    if offset <= 0:
+        return False, 0
+    search_start = max(0, offset - _MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES)
+    handle.seek(search_start)
+    context = handle.read(offset - search_start)
+    scanned_bytes = len(context)
+    if search_start > 0:
+        newline = context.find(b"\n")
+        if newline < 0:
+            return None, scanned_bytes
+        context = context[newline + 1 :]
+    for raw_line in reversed(context.splitlines()):
+        if not raw_line.strip():
+            continue
+        line = raw_line.decode("utf-8", errors="replace")
+        return _PENDING_SENSITIVE_ASSIGNMENT.search(line) is not None, scanned_bytes
+    return (False if search_start == 0 else None), scanned_bytes
+
+
 def _redacted_file_units(
     raw: bytes,
     *,
     starts_inside_private_key: bool | None,
+    starts_with_sensitive_value: bool | None,
+    has_more_after_raw: bool,
     warnings: list[str],
 ) -> list[tuple[bytes, str, int]]:
     """Redact complete logical units while preserving their source byte sizes."""
@@ -331,9 +360,22 @@ def _redacted_file_units(
             "Private-key context exceeded the bounded backward scan; page content was omitted fail-closed."
         )
         return [(raw, "[CONTENT OMITTED: PRIVATE-KEY CONTEXT UNKNOWN]\n", 1)] if raw else []
+    if starts_with_sensitive_value is None:
+        warnings.append(
+            "Sensitive-assignment context exceeded its bounded scan; page content was omitted fail-closed."
+        )
+        return [(raw, "[CONTENT OMITTED: SENSITIVE-ASSIGNMENT CONTEXT UNKNOWN]\n", 1)] if raw else []
     raw_lines = raw.splitlines(keepends=True)
     units: list[tuple[bytes, str, int]] = []
     line_index = 0
+    if starts_with_sensitive_value:
+        value_index = 0
+        while value_index < len(raw_lines) and not raw_lines[value_index].strip():
+            value_index += 1
+        if value_index < len(raw_lines):
+            raw_unit = b"".join(raw_lines[: value_index + 1])
+            units.append((raw_unit, "[REDACTED SENSITIVE VALUE]\n", 1))
+            line_index = value_index + 1
     inside_private_key = starts_inside_private_key
     while line_index < len(raw_lines):
         raw_unit = raw_lines[line_index]
@@ -355,6 +397,21 @@ def _redacted_file_units(
             units.append((raw_unit, "[REDACTED PRIVATE KEY]\n", 1))
         else:
             text_unit = raw_unit.decode("utf-8", errors="replace")
+            if _PENDING_SENSITIVE_ASSIGNMENT.search(text_unit):
+                value_index = line_index + 1
+                while value_index < len(raw_lines) and not raw_lines[value_index].strip():
+                    value_index += 1
+                if value_index < len(raw_lines):
+                    raw_unit = b"".join(raw_lines[line_index : value_index + 1])
+                    text_unit = raw_unit.decode("utf-8", errors="replace")
+                    line_index = value_index
+                elif has_more_after_raw:
+                    warnings.append(
+                        "A sensitive assignment crossed the bounded page window; its visible key was redacted."
+                    )
+                    units.append((raw_unit, "[REDACTED SENSITIVE ASSIGNMENT]\n", 1))
+                    line_index += 1
+                    continue
             safe_unit, replacements = _redact_text(text_unit)
             units.append((raw_unit, safe_unit, replacements))
         line_index += 1
@@ -1595,6 +1652,11 @@ def _file_source_metadata(
             "content is omitted fail-closed if state remains unknown"
         ),
         "private_key_context_bound_bytes": _MAX_PRIVATE_KEY_CONTEXT_BYTES,
+        "sensitive_assignment_context": (
+            "the preceding line may be inspected to preserve redaction when a credential key and value "
+            "straddle a page; content is omitted fail-closed if that state remains unknown"
+        ),
+        "sensitive_assignment_context_bound_bytes": _MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES,
     }
 
 
@@ -1677,10 +1739,15 @@ def _read_file_source(
                     page_start += newline + 1
                     raw = raw[newline + 1 :]
             starts_inside_private_key, context_scanned_bytes = _private_key_state_before(handle, page_start)
+            starts_with_sensitive_value, assignment_context_scanned_bytes = _sensitive_value_state_before(
+                handle, page_start
+            )
             text = raw.decode("utf-8", errors="replace")
             redaction_units = _redacted_file_units(
                 raw,
                 starts_inside_private_key=starts_inside_private_key,
+                starts_with_sensitive_value=starts_with_sensitive_value,
+                has_more_after_raw=False,
                 warnings=warnings,
             )
             redacted = "".join(unit[1] for unit in redaction_units)
@@ -1699,7 +1766,9 @@ def _read_file_source(
                 "returned_chars": len(content),
                 "source_size_bytes": stat.st_size,
                 "scanned_bytes": scanned_bytes,
-                "context_scanned_bytes": context_scanned_bytes,
+                "context_scanned_bytes": context_scanned_bytes + assignment_context_scanned_bytes,
+                "private_key_context_scanned_bytes": context_scanned_bytes,
+                "sensitive_assignment_context_scanned_bytes": assignment_context_scanned_bytes,
                 "scan_limit_bytes": _MAX_FILE_SCAN_BYTES,
                 "previous_cursor": (max(0, page_start - _MAX_FILE_SCAN_BYTES) if page_start > 0 else None),
                 "next_cursor": None,
@@ -1793,10 +1862,16 @@ def _read_file_source(
                     )
                 raw = raw[: newline + 1]
 
+            has_more_after_raw = page_start + len(raw) < stat.st_size
             starts_inside_private_key, context_scanned_bytes = _private_key_state_before(handle, page_start)
+            starts_with_sensitive_value, assignment_context_scanned_bytes = _sensitive_value_state_before(
+                handle, page_start
+            )
             redaction_units = _redacted_file_units(
                 raw,
                 starts_inside_private_key=starts_inside_private_key,
+                starts_with_sensitive_value=starts_with_sensitive_value,
+                has_more_after_raw=has_more_after_raw,
                 warnings=warnings,
             )
 
@@ -1834,7 +1909,9 @@ def _read_file_source(
                 "returned_chars": len(content),
                 "source_size_bytes": stat.st_size,
                 "scanned_bytes": scanned_bytes,
-                "context_scanned_bytes": context_scanned_bytes,
+                "context_scanned_bytes": context_scanned_bytes + assignment_context_scanned_bytes,
+                "private_key_context_scanned_bytes": context_scanned_bytes,
+                "sensitive_assignment_context_scanned_bytes": assignment_context_scanned_bytes,
                 "scan_limit_bytes": _MAX_FILE_SCAN_BYTES,
                 "previous_cursor": (max(0, page_start - _MAX_FILE_SCAN_BYTES) if page_start > 0 else None),
                 "next_cursor": next_cursor,
