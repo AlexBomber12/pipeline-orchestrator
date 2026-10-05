@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from src.cancellation import task_spec_content_hash, task_spec_hash_key
 from src.cancellation.storage import current_run_started_at_key
+from src.daemon.handlers import coding as coding_module
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 from src.usage import UsageSnapshot
 
@@ -540,6 +541,12 @@ def test_coding_post_coder_guardrail_violation_transitions_to_error(
     monkeypatch.setattr(runner, "_transition_to_error", fake_transition_to_error)
     monkeypatch.setattr(runner, "_save_cli_log", fake_save_cli_log)
     monkeypatch.setattr("src.daemon.handlers.coding.gh_prs.get_open_prs", fail_get_open_prs)
+    monkeypatch.setattr(
+        coding_module,
+        "apply_quarantine_label_for_violation",
+        lambda *args, **kwargs: None,
+    )
+    candidate = PRInfo(number=42, branch="pr-289a", pr_id="PR-289a")
 
     asyncio.run(
         runner._post_coder_resolution(
@@ -549,12 +556,16 @@ def test_coding_post_coder_guardrail_violation_transitions_to_error(
             "",
             target_branch="pr-289a",
             current_pr_id="PR-289a",
+            publication=coding_module._PublicationResolution(
+                candidate=candidate
+            ),
         )
     )
 
     assert transition_calls
     assert transition_calls[0][0].startswith("GUARDRAIL: repo_create:")
     assert transition_calls[0][1] == "[CODING]"
+    assert runner.state.quarantined_prs == {42}
 
 
 def test_coding_post_coder_guardrail_violation_scans_stderr(

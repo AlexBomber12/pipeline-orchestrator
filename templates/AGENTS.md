@@ -26,24 +26,46 @@ Quick rules
 - Task authors must retrieve canonical `docs/TASK_SCHEMA.md` with the
   `pipeline-orchestrator-mcp` tool `get_task_schema` and follow its small-task
   policy. This tool is permitted even when its server is absent from an MCP allowlist.
+- A small PR delivers one coherent, independently verifiable outcome. During
+  execution, estimates and expected paths are planning signals, not automatic
+  stop conditions; make the necessary implementation, compatibility, fixture,
+  regression-test, and review-fix changes and report the actual diff.
+- A small, self-contained defect that blocks completion or verification,
+  including a pre-existing test defect, may be repaired in the same PR. Explain
+  its cause, the incidental change, and validation in the PR description. A
+  separate repair task is optional when the repair becomes substantial or
+  independently useful.
+- This operator-authorized execution policy supersedes blanket stop or escalation
+  wording in older tasks only when the sole reason is an estimate, an expected
+  path, or a small incidental gate repair. Genuine feature exclusions,
+  repository and authorization boundaries, security and production restrictions,
+  credential rules, runtime guardrails, and process-ownership requirements remain
+  binding. Do not add discretionary features, broad refactors, dependency
+  upgrades, production operations, credential changes, or unrelated repo work.
 - Never commit secrets. Runtime secrets belong in `/data/secrets` (mounted) or injected via env vars.
-- Always run the local gate `scripts/ci.sh` until it exits with code 0.
-- Always generate review artifacts: `artifacts/ci.log`, `artifacts/pr.patch`, `artifacts/structure.txt`. These are for review only and must not appear in commits (.gitignore handles this).
+- Always attempt `scripts/make-review-artifacts.sh` as the final local full-gate
+  and artifact entrypoint; it runs `scripts/ci.sh`. Fix failures introduced by
+  the change. A nonzero result permits publication only when focused checks pass,
+  artifacts are complete, and the PR records the exact base SHA, a matching
+  reproduction in an isolated checkout of that SHA under comparable conditions,
+  and every remaining failure. Never describe that gate as green; an unexplained
+  failure does not qualify. Do not repeat an unchanged full-gate run.
+- Always generate `artifacts/ci.log`, `artifacts/pr.patch`, and `artifacts/structure.txt`, and confirm the review patch is nonempty before publication. These are for review only and must not appear in commits (.gitignore handles this).
 - Codex Review is "green" only when the Codex bot reacts with thumbs up (`+1`) on the PR body or the review anchor comment (see Codex Review gate). Do not use screenshots.
-- Do not drift from the plan and do not add "nice-to-have" work.
+- Do not drift from the approved outcome and do not add "nice-to-have" work.
 
 ### Work Modes
 Exact trigger phrases:
 - `AUTO PR` (daemon-only — invoked by pipeline-orchestrator with explicit Task/File headers)
 - `PLANNED PR` (manual VS Code workflow — queue-driven task discovery)
 - `MICRO PR: <one sentence description>` (manual VS Code workflow — small change)
-- `FIX FEEDBACK` (manual VS Code workflow — fix feedback on existing PR branch)
+- `FIX FEEDBACK` (manual VS Code workflow, or daemon workflow when the prompt includes the daemon handoff marker)
 
 Meaning:
 - `AUTO PR`: invoked by the daemon. Prompt contains `Task: PR-XXX` and `File: tasks/PR-XXX.md` headers followed by the full task body inline. Use the values from those headers directly. Do NOT consult `tasks/QUEUE.md` for task selection. Do NOT read other `tasks/PR-*.md` files. Work strictly from the inline task body.
 - `PLANNED PR`: manual invocation typically by a human in an editor. Use the active entry in `tasks/QUEUE.md` to determine PR_ID and TASK_FILE, then work strictly from that task file.
 - `MICRO PR: ...`: a tiny manual change. Do not touch `tasks/QUEUE.md` and do not create `tasks/PR-*.md`.
-- `FIX FEEDBACK`: apply fixes based on CI failures and review feedback on an existing PR branch. The daemon now injects the latest CI failure logs (last 5000 chars) and the Codex feedback comments posted after the most recent `@codex review` anchor (the same source that drives `ReviewStatus.CHANGES_REQUESTED`) directly into the prompt, so the coder receives that context inline; the coder may still fetch additional context via `gh` CLI when needed.
+- `FIX FEEDBACK`: apply fixes based on CI failures and review feedback on an existing PR branch. A daemon prompt explicitly identifies the invocation, includes `Task:` and `File:` metadata plus the current feedback, and ends at the one-iteration publication handoff described below. A manual prompt retains the review loop. The daemon injects the latest CI failure logs (last 5000 chars) and the Codex feedback comments posted after the most recent `@codex review` anchor (the same source that drives `ReviewStatus.CHANGES_REQUESTED`) directly into the prompt.
 
 ### Daemon Mode
 
@@ -54,6 +76,16 @@ When triggered by the pipeline orchestrator daemon (non-interactive):
 - NEVER use `git add -f` or explicitly stage files matched by .gitignore.
 - Artifacts (ci.log, pr.patch, structure.txt) are generated for Codex review but must not appear in commits. The .gitignore already excludes them.
 - NEVER commit .patch files to the repository under any circumstances.
+- For `AUTO PR`, finish after the ready PR is published and its repository, base, head branch, and HEAD SHA are verified. Report the evidence and exit; do not trigger or poll review, start a FIX round, or merge.
+- For daemon `FIX FEEDBACK`, address the supplied feedback and any necessary
+  small, self-contained blocker in one iteration, publish to the same branch,
+  verify the remote PR HEAD, report the evidence, and exit. Do not wait for
+  another review or act on findings that arrive during the invocation.
+- Green GitHub CI and current-change Codex approval are still merge requirements. After publication, the daemon owns review triggering, CI/review waiting, any later FIX dispatch, and merge decisions.
+- A baseline-failure publication exception does not relax merge requirements or
+  authorize unconfirmed coder-process cleanup. Cleanup still requires confirmed
+  process ownership.
+- If implementation or publication cannot complete, report the real blocker and emit `ESCALATE: <reason>` as the last nonempty stdout line. Never fabricate a PR, successful push, gate result, or approval.
 
 ### Codex Review gate (GitHub PR)
 
@@ -80,7 +112,7 @@ Definitions
 
 In `PLANNED PR` and `MICRO PR` flows, the coder posts `@codex review` as a PR comment immediately after PR creation AND after every push in the Fix loop. The comment body MUST be exactly the string `@codex review` with no prefix, no escape characters, no artifact list, no summary, and no trailing text. Artifact filenames belong in the PR description only, never in the trigger comment. The daemon deduplicates: if a valid `@codex review` trigger from the PR author already exists for the current HEAD SHA, the daemon skips its own post; if not, the daemon posts one as a safety net.
 
-Fix loop (used in `FIX FEEDBACK` mode)
+Manual fix loop (used only when `FIX FEEDBACK` does not contain the daemon handoff marker)
 1. Fetch PR comments, reviews, and reactions via GitHub CLI (`gh`). No screenshots.
 2. Check for Codex thumbs up on both the PR body and the review anchor comment.
 3. If a non-stale thumbs up exists (reaction created after the latest push), stop. The PR is green.
@@ -89,22 +121,26 @@ Fix loop (used in `FIX FEEDBACK` mode)
    - top-level PR comments
 5. If no new feedback exists after the latest push, stop. Do not fix already-resolved issues.
 6. Extract actionable items and fix them. Treat `P1` as mandatory; treat `P2` as mandatory unless the user explicitly waives them.
-7. Run `scripts/ci.sh` until exit code 0 and generate required review artifacts.
-8. Commit and push to the same PR branch.
+7. Run required focused checks, commit the change, then attempt
+   `scripts/make-review-artifacts.sh` and confirm the review artifacts are
+   complete and `artifacts/pr.patch` is nonempty. Fix introduced failures; use
+   the documented baseline-failure publication exception only with its required
+   evidence.
+8. Push to the same PR branch.
 9. Post `@codex review` as a new PR comment; the comment body must be exactly `@codex review` with no other text, prefix, or artifact list.
 10. Poll the PR for up to 15 minutes:
    - if a non-stale thumbs up appears, stop
    - if a new Codex feedback comment appears after the push, repeat the loop
 
 ### Required review artifacts
-Single entrypoint: `scripts/make-review-artifacts.sh`.
+Single entrypoint: `scripts/make-review-artifacts.sh`. Run it after the intended commit so `artifacts/pr.patch` represents the review change, then confirm that patch is nonempty before publication.
 
 If the script does not exist yet, manual fallback:
 - Save CI output to `artifacts/ci.log`
 - Save a patch to `artifacts/pr.patch` (diff from `origin/main` to HEAD)
 - Save project structure to `artifacts/structure.txt` (`find . -type f | grep -v __pycache__ | grep -v .git/ | grep -v node_modules | sort`)
 
-Artifacts are generated for Codex review but excluded from commits by .gitignore. Do not use `git add -f` to override this.
+Artifacts are generated for Codex review but excluded from commits by .gitignore. Do not use `git add -f` to override this. If code has not changed since a successful artifact-script run, do not repeat the full gate.
 
 ### Branch naming
 - PLANNED: use `Branch:` from the active `tasks/PR-*.md` as the source of truth.
@@ -117,7 +153,25 @@ Artifacts are generated for Codex review but excluded from commits by .gitignore
 <!-- pipeline-orchestrator: managed BEGIN auto_pr_runbook -->
 ### AUTO PR runbook (daemon-driven)
 
-Daemon-managed section. Content set by pipeline-orchestrator on first sync.
+When invoked with a prompt starting with `AUTO PR`:
+
+1. Parse the prompt header. The first three lines after `AUTO PR` are `Task: PR-XXX`, `File: tasks/PR-XXX.md`, and a blank line. The complete inline task body follows and ends before the `DAEMON INVOCATION -- PUBLICATION HANDOFF` marker.
+2. Use the `Task:` value as the canonical PR_ID for branch naming, commit message, and PR title.
+3. Use the `File:` value only as a label in the PR description; do not open the file from disk. Do not consult `tasks/QUEUE.md` or other `tasks/PR-*.md` files; the supplied body is authoritative.
+4. Create the task's specified branch from the freshly fetched base branch. Do not invent or modify its branch name.
+5. Complete the supplied coherent outcome under the execution policy, including
+   necessary compatibility work, fixtures, regression fixes, and small
+   self-contained blockers, while preserving genuine exclusions and authorization
+   boundaries. Run focused checks, commit the intended change, attempt
+   `scripts/make-review-artifacts.sh`, and confirm the review artifacts are
+   complete and `artifacts/pr.patch` is nonempty. A nonzero result permits
+   publication only under the documented confirmed-baseline exception.
+6. Push the task branch and open a ready (not draft) PR. Verify the PR repository, base branch, head branch, and HEAD SHA against the intended repository and local HEAD.
+7. Report the PR URL and verified publication evidence, then exit. Do not post `@codex review`, poll GitHub CI or review, start another review-fix round, or merge; the daemon owns all post-publication orchestration.
+8. If implementation or publication genuinely cannot complete under this policy,
+   report the blocker and use the strict `ESCALATE:` last-line protocol. Estimate
+   deviation, an unexpected necessary path, or a small incidental gate repair is
+   not by itself a reason to escalate. Never fabricate success evidence.
 <!-- pipeline-orchestrator: managed END auto_pr_runbook -->
 
 ### PLANNED PR runbook (queue-selected)
@@ -127,7 +181,11 @@ Daemon-managed section. Content set by pipeline-orchestrator on first sync.
 - Use the active entry in `tasks/QUEUE.md` to determine `PR_ID` and `TASK_FILE`. Do not guess or select a different task locally.
 - Read `TASK_FILE` fully before coding.
 - Create the branch from `origin/main`.
-- Implement only the scope defined in `TASK_FILE`. No extra refactors, upgrades, or bundled features.
+- Complete the coherent outcome defined in `TASK_FILE`, including necessary
+  compatibility work, fixtures, regression fixes, review fixes, and small
+  self-contained blockers. Preserve genuine exclusions and authorization
+  boundaries; do not add discretionary features, broad refactors, dependency
+  upgrades, or unrelated work.
 - During the PR, do not edit `tasks/PR-*.md` unless the user explicitly requests it.
 - CI and artifacts are mandatory.
 
@@ -136,10 +194,10 @@ Daemon-managed section. Content set by pipeline-orchestrator on first sync.
 - [ ] Recorded `PR_ID` and `TASK_FILE` from the active `tasks/QUEUE.md` entry
 - [ ] Read `TASK_FILE`
 - [ ] `git fetch origin main` and created branch from `origin/main`
-- [ ] Implemented only `TASK_FILE` scope
-- [ ] Ran `scripts/ci.sh` to exit 0
-- [ ] Generated `artifacts/ci.log`, `artifacts/pr.patch`, `artifacts/structure.txt` (not committed, excluded by .gitignore)
+- [ ] Completed the `TASK_FILE` outcome and documented any incidental repair or estimate/path deviation
 - [ ] Commit message: `<PR_ID>: <short summary>`
+- [ ] Attempted `scripts/make-review-artifacts.sh` after the commit; it exited 0, or the PR documents every item required by the confirmed-baseline exception
+- [ ] Generated `artifacts/ci.log`, nonempty `artifacts/pr.patch`, and `artifacts/structure.txt` (not committed, excluded by .gitignore)
 - [ ] Pushed branch
 - [ ] Created PR via GitHub CLI (`gh`) or provided manual PR steps
 - [ ] Posted `@codex review` comment on the PR (body must be exactly `@codex review`, no other text, prefix, or artifact list)
@@ -174,10 +232,10 @@ If any condition fails, MICRO is not allowed. Use PLANNED PR.
 - [ ] Preflight clean
 - [ ] `git fetch origin main`
 - [ ] Branch `micro-YYYYMMDD-<short-slug>` from `origin/main`
-- [ ] Only the requested change
-- [ ] Ran `scripts/ci.sh` to exit 0
-- [ ] Generated review artifacts (not committed, excluded by .gitignore)
+- [ ] Only the requested outcome and any necessary small blocker allowed by the execution policy
 - [ ] Commit: `MICRO: <short summary>`
+- [ ] Attempted `scripts/make-review-artifacts.sh` after the commit; it exited 0, or the PR documents every item required by the confirmed-baseline exception
+- [ ] Generated review artifacts with a nonempty `artifacts/pr.patch` (not committed, excluded by .gitignore)
 - [ ] Posted `@codex review` comment on the PR (body must be exactly `@codex review`, no other text, prefix, or artifact list)
 - [ ] Pushed branch and opened PR
 
@@ -186,11 +244,25 @@ If any condition fails, MICRO is not allowed. Use PLANNED PR.
 - Do not create a new branch
 - Stay on the existing PR branch
 - Do not edit `tasks/QUEUE.md` (auto-generated; manual edits are overwritten on next IDLE cycle) or `tasks/PR-*.md`
-- Fix only the review comments
-- Use the Codex Review gate above and stop only when a non-stale Codex thumbs up is present
-- Run `scripts/ci.sh` to exit 0
-- Generate review artifacts (not committed, excluded by .gitignore)
-- Commit and push to the same PR branch
+- Address the supplied review comments and any small, self-contained blocker
+  necessary to complete or verify those fixes. Do not address another PR or add
+  unrelated work.
+- When present, use the daemon prompt's explicit `Task:` and `File:` metadata.
+  The pre-push hook does not inspect semantic task scope; it validates the pushed
+  local source ref and remote destination branch against the daemon's expected
+  branch.
+- Run required focused checks and commit the change, then attempt
+  `scripts/make-review-artifacts.sh` and confirm the review artifacts are complete
+  and `artifacts/pr.patch` is nonempty. Fix introduced failures; a nonzero result
+  permits publication only under the documented confirmed-baseline exception.
+- Push to the same PR branch.
+- For a daemon invocation (identified by its handoff marker), perform exactly one iteration. Verify the remote PR HEAD equals the pushed local HEAD, report the evidence, and exit without triggering or waiting for review, handling newly arriving findings, or merging.
+- For a manual invocation, post `@codex review` after the push and use the manual Codex Review gate above until a non-stale thumbs up is present.
+- If the daemon iteration genuinely cannot implement or publish the change under
+  the execution policy, report the real blocker and follow the strict `ESCALATE:`
+  last-line protocol. Estimate deviation, an unexpected necessary path, or a
+  small incidental gate repair is not by itself a reason to escalate. Never
+  fabricate publication or gate evidence.
 
 ### Queue stability rules (PLANNED PR only)
 - `tasks/PR-*.md` files are the source of truth; `tasks/QUEUE.md` is a derived artifact.
@@ -226,14 +298,29 @@ Rules
 - Minimum test coverage: none  # or specify percentage
 
 ### CI specifics
-- Single entrypoint: `scripts/ci.sh`
+- Run task-specific focused checks while implementing. After committing the final
+  change and before publication, attempt `scripts/make-review-artifacts.sh` as the
+  single full-gate entrypoint; it invokes `scripts/ci.sh`. Fix failures introduced
+  by the PR and any small, self-contained defect that blocks completion or
+  verification. Do not repeat that unchanged full run separately.
 # TODO: describe what your CI checks (lint, type, unit, integration)
 
 If `scripts/ci.sh` does not exist yet, use the fallback:
 - `python -m ruff check .`
 - `python -m pytest -q` (if tests exist)
 
-Do not claim "green" unless the exit code is 0.
+The normal publication path requires the artifact script to exit 0. A confirmed
+pre-existing baseline failure may permit publication of a ready PR only when all
+focused checks pass and the review artifacts are complete. The PR description
+must record the exact base SHA, a matching reproduction in an isolated checkout
+of that SHA under comparable conditions, and every remaining failure. Never call
+a failed gate green. An unexplained failure does not qualify.
+
+Publication is not merge approval. Unit and integration CI, repository coverage
+requirements, and a valid current-change Codex approval must still pass before
+merge. Do not weaken checks, skip tests, change coverage settings, or alter
+workflow enforcement to obtain publication. The baseline exception also does not
+authorize cleanup of a coder process unless ownership has been confirmed.
 
 ## === LESSONS LEARNED (evolve over time) ===
 

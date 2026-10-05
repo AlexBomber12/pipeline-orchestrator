@@ -22,10 +22,15 @@ class _Runner:
 
     def __init__(self) -> None:
         self.events: list[str] = []
+        self.cleanup_calls = 0
         self.state = types.SimpleNamespace(coder="claude")
 
     def log_event(self, message: str) -> None:
         self.events.append(message)
+
+    async def _terminate_current_coder(self) -> bool:
+        self.cleanup_calls += 1
+        return True
 
 
 class _StopMonitor(Exception):
@@ -108,6 +113,7 @@ def test_idle_baseline_small_head_age_backdates(
     assert subtractions == [20.0]
     assert idle_flag["timed_out"] is True
     assert target.cancelled is True
+    assert runner.cleanup_calls == 1
     assert runner.events == ["[FIX] idle timeout (120s since last push), killing."]
 
 
@@ -162,6 +168,7 @@ def test_idle_baseline_large_head_age_starts_fresh(
     assert sleep_calls == 2
     assert idle_flag["timed_out"] is True
     assert target.cancelled is True
+    assert runner.cleanup_calls == 1
     assert runner.events == ["[FIX] idle timeout (120s since last push), killing."]
 
 
@@ -186,6 +193,7 @@ def test_idle_baseline_none_head_age_starts_fresh(
     assert subtractions == []
     assert idle_flag["timed_out"] is True
     assert target.cancelled is True
+    assert runner.cleanup_calls == 1
     assert runner.events == ["[FIX] idle timeout (120s since last push), killing."]
 
 

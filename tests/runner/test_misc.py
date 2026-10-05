@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import re
 import subprocess
+import types
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -606,7 +607,7 @@ def test_save_current_run_record_sets_duration_none_for_invalid_started_at() -> 
 
 def test_merge_finalizes_record(monkeypatch: pytest.MonkeyPatch) -> None:
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)
     monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
 
     runner = h._make_runner()
@@ -640,7 +641,7 @@ def test_merge_finalizes_record(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_merge_calculates_duration(monkeypatch: pytest.MonkeyPatch) -> None:
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num: None)
+    monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)
     monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
 
     fixed_now = datetime(2026, 4, 18, 12, 0, 6, 500000, tzinfo=timezone.utc)
@@ -775,6 +776,118 @@ def test_run_cycle_returns_after_preflight_failure(
     asyncio.run(runner.run_cycle())
 
     assert publishes == ["published"]
+
+
+def test_run_cycle_holds_before_commands_and_repository_work_on_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    runner._recovered = True
+    runner.state.state = PipelineState.MERGE
+    calls: list[str] = []
+
+    class _Process:
+        pass
+
+    class _Managed:
+        process = _Process()
+
+        async def cleanup(self, **kwargs: object) -> object:
+            calls.append("cleanup")
+            return types.SimpleNamespace(
+                quiescent=False,
+                detail="descendant identity could not be confirmed",
+            )
+
+    managed = _Managed()
+    runner._track_current_coder_process(managed.process)  # type: ignore[arg-type]
+    runner._track_current_coder_supervised_process(managed)  # type: ignore[arg-type]
+
+    async def forbidden(name: str, result: object = None) -> object:
+        calls.append(name)
+        return result
+
+    monkeypatch.setattr(
+        runner,
+        "_consume_approval_command",
+        lambda: forbidden("approval", False),
+    )
+    monkeypatch.setattr(
+        runner,
+        "ensure_repo_cloned",
+        lambda: forbidden("prepare_repo"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_consume_retry_command",
+        lambda: forbidden("retry"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "preflight",
+        lambda: forbidden("preflight", True),
+    )
+    monkeypatch.setattr(
+        runner,
+        "handle_merge",
+        lambda: forbidden("merge"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "handle_error",
+        lambda: forbidden("diagnosis"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_commit_task_status_change",
+        lambda *args, **kwargs: forbidden("task_status", True),
+    )
+    monkeypatch.setattr(runner, "publish_state", lambda: forbidden("publish"))
+
+    asyncio.run(runner._run_cycle_body())
+    runner.state.state = PipelineState.IDLE
+    asyncio.run(runner._run_cycle_body())
+
+    assert calls == ["cleanup", "publish", "cleanup", "publish"]
+    assert runner.state.state == PipelineState.ERROR
+    assert "descendant identity could not be confirmed" in (
+        runner.state.error_message or ""
+    )
+    assert runner._current_coder_supervised_process is managed
+    assert runner._current_coder_process is managed.process
+
+
+def test_run_cycle_releases_cleanup_hold_only_after_confirmed_quiescence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    calls: list[str] = []
+
+    class _Process:
+        pass
+
+    class _Managed:
+        process = _Process()
+
+        async def cleanup(self, **kwargs: object) -> object:
+            calls.append("cleanup")
+            return types.SimpleNamespace(quiescent=True, detail=None)
+
+    managed = _Managed()
+    runner._track_current_coder_process(managed.process)  # type: ignore[arg-type]
+    runner._track_current_coder_supervised_process(managed)  # type: ignore[arg-type]
+
+    async def consume_approval() -> bool:
+        calls.append("approval")
+        return True
+
+    monkeypatch.setattr(runner, "_consume_approval_command", consume_approval)
+
+    asyncio.run(runner._run_cycle_body())
+
+    assert calls == ["cleanup", "approval"]
+    assert runner._current_coder_supervised_process is None
+    assert runner._current_coder_process is None
 
 
 def test_sync_to_main_retries_fetch_on_timeout(

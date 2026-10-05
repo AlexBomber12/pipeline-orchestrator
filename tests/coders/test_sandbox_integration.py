@@ -9,10 +9,10 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from src import claude_cli, codex_cli
 from src.config import AppConfig, AuthConfig, DaemonConfig
 from src.daemon import sandbox as sandbox_mod
+from src.process_supervisor import CleanupResult, CleanupStatus
 
 
 def _config(*, isolation: bool) -> AppConfig:
@@ -35,11 +35,41 @@ def _patch_bwrap(monkeypatch: pytest.MonkeyPatch, *, available: bool) -> None:
 
 def _make_fake_proc(returncode: int = 0) -> MagicMock:
     proc = MagicMock()
-    proc.communicate = AsyncMock(return_value=(b"", b""))
+    proc.stdout = asyncio.StreamReader()
+    proc.stdout.feed_eof()
+    proc.stderr = asyncio.StreamReader()
+    proc.stderr.feed_eof()
     proc.returncode = returncode
     proc.kill = MagicMock()
-    proc.wait = AsyncMock()
+    proc.wait = AsyncMock(return_value=returncode)
     return proc
+
+
+class _FakeSupervisedProcess:
+    def __init__(self, process: MagicMock) -> None:
+        self.process = process
+
+    async def cleanup(self, **_kwargs: Any) -> CleanupResult:
+        return CleanupResult(
+            CleanupStatus.QUIESCENT,
+            self.process.returncode,
+            False,
+            False,
+        )
+
+
+def _patch_supervised_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    module: Any,
+    captured: dict[str, Any],
+    process: MagicMock,
+) -> None:
+    async def fake_launch(*args: Any, **kwargs: Any) -> _FakeSupervisedProcess:
+        captured["cmd"] = list(args)
+        captured["kwargs"] = kwargs
+        return _FakeSupervisedProcess(process)
+
+    monkeypatch.setattr(module, "launch_process", fake_launch)
 
 
 def test_coder_spawn_uses_bwrap_when_isolation_enabled_and_available(
@@ -144,16 +174,13 @@ async def test_codex_async_spawn_uses_bwrap_when_isolation_enabled_and_available
     captured: dict[str, Any] = {}
     fake_proc = _make_fake_proc()
 
-    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
-        captured["cmd"] = list(args)
-        return fake_proc
-
     monkeypatch.setattr(codex_cli, "load_config", lambda: _config(isolation=True))
     _patch_bwrap(monkeypatch, available=True)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    _patch_supervised_launch(monkeypatch, codex_cli, captured, fake_proc)
 
-    await codex_cli.run_codex_async("prompt", "/data/repos/demo")
+    result = await codex_cli.run_codex_async("prompt", "/data/repos/demo")
 
+    assert result == (0, "", "")
     assert captured["cmd"][0] == "bwrap"
     assert "codex" in captured["cmd"]
     assert "/data/repos/demo" in captured["cmd"]
@@ -167,16 +194,13 @@ async def test_codex_async_spawn_no_bwrap_when_isolation_disabled(
     captured: dict[str, Any] = {}
     fake_proc = _make_fake_proc()
 
-    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
-        captured["cmd"] = list(args)
-        return fake_proc
-
     monkeypatch.setattr(codex_cli, "load_config", lambda: _config(isolation=False))
     _patch_bwrap(monkeypatch, available=True)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    _patch_supervised_launch(monkeypatch, codex_cli, captured, fake_proc)
 
-    await codex_cli.run_codex_async("prompt", "/data/repos/demo")
+    result = await codex_cli.run_codex_async("prompt", "/data/repos/demo")
 
+    assert result == (0, "", "")
     assert captured["cmd"][0] == "codex"
 
 
@@ -188,17 +212,14 @@ async def test_codex_async_spawn_warns_when_bwrap_unavailable(
     captured: dict[str, Any] = {}
     fake_proc = _make_fake_proc()
 
-    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
-        captured["cmd"] = list(args)
-        return fake_proc
-
     monkeypatch.setattr(codex_cli, "load_config", lambda: _config(isolation=True))
     _patch_bwrap(monkeypatch, available=False)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    _patch_supervised_launch(monkeypatch, codex_cli, captured, fake_proc)
 
     with caplog.at_level(logging.WARNING, logger=codex_cli.logger.name):
-        await codex_cli.run_codex_async("prompt", "/data/repos/demo")
+        result = await codex_cli.run_codex_async("prompt", "/data/repos/demo")
 
+    assert result == (0, "", "")
     assert captured["cmd"][0] == "codex"
     assert any("[SANDBOX]" in rec.message for rec in caplog.records)
 
@@ -210,20 +231,19 @@ async def test_claude_async_spawn_uses_bwrap_when_isolation_enabled_and_availabl
     captured: dict[str, Any] = {}
     fake_proc = _make_fake_proc()
 
-    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
-        captured["cmd"] = list(args)
-        return fake_proc
-
     monkeypatch.setattr(claude_cli, "load_config", lambda: _config(isolation=True))
     _patch_bwrap(monkeypatch, available=True)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    _patch_supervised_launch(monkeypatch, claude_cli, captured, fake_proc)
 
-    await claude_cli.run_claude_async(
+    result = await claude_cli.run_claude_async(
         "prompt", "/data/repos/demo", system_prompt_file=None
     )
 
+    assert result == (0, "", "")
     assert captured["cmd"][0] == "bwrap"
     assert "claude" in captured["cmd"]
+    assert captured["kwargs"]["cwd"] == "/data/repos/demo"
+    assert "NODE_OPTIONS" in captured["kwargs"]["env"]
 
 
 def test_claude_spawn_mounts_home_dir_for_gitconfig(
@@ -259,17 +279,14 @@ async def test_codex_async_spawn_mounts_home_dir_for_gitconfig(
     captured: dict[str, Any] = {}
     fake_proc = _make_fake_proc()
 
-    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
-        captured["cmd"] = list(args)
-        return fake_proc
-
     monkeypatch.setenv("HOME", "/some/other/home")
     monkeypatch.setattr(codex_cli, "load_config", lambda: _config(isolation=True))
     _patch_bwrap(monkeypatch, available=True)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    _patch_supervised_launch(monkeypatch, codex_cli, captured, fake_proc)
 
-    await codex_cli.run_codex_async("prompt", "/data/repos/demo")
+    result = await codex_cli.run_codex_async("prompt", "/data/repos/demo")
 
+    assert result == (0, "", "")
     cmd = captured["cmd"]
     home_idx = cmd.index("/some/other/home")
     assert cmd[home_idx - 1] == "--bind"

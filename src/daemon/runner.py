@@ -125,6 +125,7 @@ from src.keyspace import (
 )
 from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, RepoState, TaskStatus
+from src.process_supervisor import SupervisedProcess
 from src.queue_parser import (
     TYPE_SYNONYMS,
     QueueValidationError,
@@ -417,6 +418,10 @@ class PipelineRunner(
         self._auth_status_cache: dict[str, dict[str, str]] = {}
         self._auth_status_cache_expires_at: datetime | None = None
         self._current_coder_process: asyncio.subprocess.Process | None = None
+        self._current_coder_supervised_process: SupervisedProcess | None = None
+        self._coder_invocation_active = False
+        self._coder_cleanup_failure_detail: str | None = None
+        self._coder_cleanup_error_reported = False
         self._retry_command_owner = f"{os.getpid()}:{uuid.uuid4()}"
         self._active_retry_command_id: str | None = None
         self._approval_receipt = None
@@ -2222,8 +2227,46 @@ class PipelineRunner(
     def _track_current_coder_process(
         self, proc: asyncio.subprocess.Process
     ) -> None:
-        """Remember the active coder subprocess for user-triggered stop."""
+        """Retain the raw subprocess without replacing an owned invocation."""
+        managed = self._current_coder_supervised_process
+        if managed is not None and managed.process is not proc:
+            raise RuntimeError(
+                "cannot replace an outstanding supervised coder process"
+            )
+        current = self._current_coder_process
+        if current is not None and current is not proc:
+            raise RuntimeError("cannot replace an outstanding coder process")
         self._current_coder_process = proc
+
+    def _track_current_coder_supervised_process(
+        self, managed: SupervisedProcess
+    ) -> None:
+        """Retain the ownership-proving handle for the active coder group."""
+        current = self._current_coder_supervised_process
+        if current is not None and current is not managed:
+            raise RuntimeError(
+                "cannot replace an outstanding supervised coder process"
+            )
+        raw_process = self._current_coder_process
+        if raw_process is not None and raw_process is not managed.process:
+            raise RuntimeError(
+                "supervised coder handle does not match the tracked process"
+            )
+        self._current_coder_process = managed.process
+        self._current_coder_supervised_process = managed
+
+    def _record_unconfirmed_launch_cleanup(
+        self, result: tuple[int, str, str]
+    ) -> None:
+        """Retain launch cleanup failures that precede handle publication."""
+        stderr = result[2].strip()
+        if not stderr.lower().startswith("process supervision launch failed:"):
+            return
+        # The CLI adapters cannot publish a supervised handle until launch
+        # succeeds, and their tuple result does not carry a structured cleanup
+        # outcome. Fail closed for every launch-supervision error rather than
+        # inferring quiescence from one exception-message spelling.
+        self._coder_cleanup_failure_detail = stderr
 
     async def _refresh_user_paused_from_redis(self) -> None:
         """Merge the persisted ``user_paused`` flag into in-memory state."""
@@ -2254,28 +2297,125 @@ class PipelineRunner(
             pass
         return True
 
-    async def _terminate_current_coder(self) -> None:
-        """Terminate the active coder subprocess with TERM then KILL."""
-        proc = self._current_coder_process
-        if proc is None or proc.returncode is not None:
-            self._current_coder_process = None
-            return
-        try:
-            proc.terminate()
-        except ProcessLookupError:
-            self._current_coder_process = None
-            return
+    async def _terminate_current_coder(self) -> bool:
+        """Clean the owned coder group and clear it only after quiescence."""
+        managed = self._current_coder_supervised_process
+        if managed is None:
+            if self._current_coder_process is None:
+                if self._coder_cleanup_failure_detail is not None:
+                    return False
+                # During launch, only settling the CLI task can prove whether
+                # the launch-side supervisor had an owned process to clean.
+                return not self._coder_invocation_active
+            self._coder_cleanup_failure_detail = (
+                "the coder subprocess has no supervised ownership handle"
+            )
+            return False
+
         grace = self.app_config.daemon.coder_terminate_grace_sec
+        cancellation: asyncio.CancelledError | None = None
         try:
-            await asyncio.wait_for(proc.wait(), timeout=grace)
-        except asyncio.TimeoutError:
+            result = await managed.cleanup(
+                term_grace=grace,
+                kill_grace=grace,
+            )
+        except asyncio.CancelledError as exc:
+            # SupervisedProcess.cleanup() finishes its shielded cleanup before
+            # re-raising cancellation. Re-read the cached result so ownership
+            # state is recorded before cancellation propagates.
+            cancellation = exc
             try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            await proc.wait()
-        finally:
-            self._current_coder_process = None
+                result = await managed.cleanup(
+                    term_grace=grace,
+                    kill_grace=grace,
+                )
+            except asyncio.CancelledError:
+                self._coder_cleanup_failure_detail = (
+                    "supervisor cleanup was cancelled repeatedly"
+                )
+                raise cancellation
+            except Exception as cleanup_exc:
+                self._coder_cleanup_failure_detail = (
+                    "supervisor cleanup raised "
+                    f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                )
+                raise cancellation
+        except Exception as exc:
+            self._coder_cleanup_failure_detail = (
+                f"supervisor cleanup raised {type(exc).__name__}: {exc}"
+            )
+            return False
+
+        if not result.quiescent:
+            self._coder_cleanup_failure_detail = (
+                result.detail or "supervisor could not confirm quiescence"
+            )
+            if cancellation is not None:
+                raise cancellation
+            return False
+
+        if self._current_coder_supervised_process is managed:
+            self._current_coder_supervised_process = None
+            if self._current_coder_process is managed.process:
+                self._current_coder_process = None
+        self._coder_cleanup_failure_detail = None
+        self._coder_cleanup_error_reported = False
+        if cancellation is not None:
+            raise cancellation
+        return True
+
+    async def _park_coder_cleanup_failure(self, context: str) -> None:
+        """Enter the fail-closed ERROR park for unconfirmed coder cleanup."""
+        detail = self._coder_cleanup_failure_detail or (
+            "supervisor cleanup did not confirm quiescence"
+        )
+        message = (
+            f"Owned coder cleanup failed during {context}: {detail}; "
+            "repository work is blocked until quiescence is confirmed"
+        )
+        first_report = not self._coder_cleanup_error_reported
+        self._coder_cleanup_error_reported = True
+        await self._transition_to_error(
+            message,
+            save_run_record_as="error" if first_report else None,
+            publish=True,
+            log_prefix="[ERROR]",
+        )
+
+    async def _confirm_current_coder_cleanup(self, context: str) -> bool:
+        """Require supervisor-confirmed quiescence before lifecycle handling."""
+        cancellation: asyncio.CancelledError | None = None
+        try:
+            confirmed = await self._terminate_current_coder()
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+            confirmed = self._current_coder_supervised_process is None
+        if not confirmed:
+            await self._park_coder_cleanup_failure(context)
+        if cancellation is not None:
+            raise cancellation
+        return confirmed
+
+    async def _hold_for_coder_cleanup(self) -> bool:
+        """Block a runner cycle while owned coder cleanup is unconfirmed."""
+        # A non-process execution sentinel has no process identity to clean;
+        # leave it for the command layer to defer. Real asyncio subprocesses
+        # expose ``returncode`` and must fail closed here when the supervisor
+        # handle is missing.
+        if (
+            self._current_coder_supervised_process is None
+            and self._coder_cleanup_failure_detail is None
+            and self._current_coder_process is not None
+            and not hasattr(self._current_coder_process, "returncode")
+        ):
+            return False
+        if (
+            self._current_coder_supervised_process is None
+            and self._current_coder_process is None
+            and self._coder_cleanup_failure_detail is None
+        ):
+            return False
+        return not await self._confirm_current_coder_cleanup("runner hold")
 
     async def _monitor_stop_request(
         self, cli_task: asyncio.Task[tuple[int, str, str]]
@@ -2847,6 +2987,13 @@ class PipelineRunner(
 
     async def _run_cycle_body(self) -> None:
         """Inner state-machine step; ``run_cycle`` wraps it for burn tracking."""
+        # This fail-closed gate intentionally precedes command consumption,
+        # clone/preparation, preflight and state dispatch. An operator state
+        # change or Retry cannot authorize repository work while an owned
+        # coder group remains unconfirmed.
+        if await self._hold_for_coder_cleanup():
+            return
+
         if await self._consume_approval_command():
             return
 
@@ -2875,18 +3022,21 @@ class PipelineRunner(
             retry_dispatch = await self._consume_retry_command()
             if retry_dispatch != RetryDispatch.NONE:
                 await self.publish_state()
-                if retry_dispatch == RetryDispatch.CODING:
-                    if await self._start_retry_coding_execution():
-                        try:
-                            await self.handle_coding()
-                        except asyncio.CancelledError:
-                            raise
-                        else:
-                            await self._finish_retry_dispatch(retry_dispatch)
-                elif retry_dispatch == RetryDispatch.WATCH:
-                    await self._finish_retry_dispatch(retry_dispatch)
-                await self.publish_state()
-                return
+                # A Retry deferred behind different active work remains
+                # pending while that work keeps ownership of this cycle.
+                if retry_dispatch != RetryDispatch.ACTIVE_TASK_DEFERRED:
+                    if retry_dispatch == RetryDispatch.CODING:
+                        if await self._start_retry_coding_execution():
+                            try:
+                                await self.handle_coding()
+                            except asyncio.CancelledError:
+                                raise
+                            else:
+                                await self._finish_retry_dispatch(retry_dispatch)
+                    elif retry_dispatch == RetryDispatch.WATCH:
+                        await self._finish_retry_dispatch(retry_dispatch)
+                    await self.publish_state()
+                    return
 
         if not await self._check_github_api_budget():
             await self.publish_state()

@@ -330,6 +330,36 @@ def test_remote_branch_exists_handles_subprocess_error(
     assert coding_module._remote_branch_exists("/tmp/nope", "any") is False
 
 
+def test_local_branch_head_sha_requires_verified_full_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sha = "a" * 40
+    monkeypatch.setattr(
+        git_ops,
+        "_git",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=f"{sha}\n", stderr=""
+        ),
+    )
+    assert coding_module._local_branch_head_sha("/repo", "pr-001") == sha
+
+    monkeypatch.setattr(
+        git_ops,
+        "_git",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="short\n", stderr=""
+        ),
+    )
+    assert coding_module._local_branch_head_sha("/repo", "pr-001") is None
+
+    monkeypatch.setattr(
+        git_ops,
+        "_git",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("git failed")),
+    )
+    assert coding_module._local_branch_head_sha("/repo", "pr-001") is None
+
+
 def test_remote_branch_exists_returns_false_on_empty_stdout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

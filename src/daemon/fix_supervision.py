@@ -94,6 +94,7 @@ async def monitor_fix_idle(
                 f"killing."
             )
             idle_flag["timed_out"] = True
+            await runner._terminate_current_coder()
             target.cancel()
             return
 

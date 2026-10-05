@@ -74,12 +74,14 @@ def test_required_contexts_must_be_successful_on_the_current_sha() -> None:
 def test_partial_sources_cannot_pass_but_known_failure_remains_visible() -> None:
     unknown = evaluate(check_runs_complete=False, required_contexts=[], empty_is_success=True)
     failed = evaluate(check_runs=[run("unit", "failure")], statuses_complete=False, required_contexts=["unit"])
+    startup_failed = evaluate(check_runs=[run("boot", "startup_failure")])
 
     assert unknown.sources_complete is False
     assert unknown.policy_result == CIStatus.PENDING
     assert unknown.pending_reason == "sources_incomplete"
     assert failed.policy_result == CIStatus.FAILURE
     assert failed.pending_reason is None
+    assert startup_failed.policy_result == CIStatus.FAILURE
 
 
 def test_reruns_use_authoritative_attempt_ordering() -> None:

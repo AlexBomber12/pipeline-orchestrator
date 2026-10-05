@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import subprocess
 from datetime import datetime, timezone
@@ -357,6 +356,9 @@ class FixMixin(BreachMixin):
         fix_kwargs: dict[str, object] = {
             **plugin_run_kwargs,
             "on_process_start": self._track_current_coder_process,
+            "on_supervised_process_start": (
+                self._track_current_coder_supervised_process
+            ),
         }
         if self.state.current_task is not None:
             fix_kwargs["pr_id"] = self.state.current_task.pr_id
@@ -367,6 +369,7 @@ class FixMixin(BreachMixin):
             )
             if extra_context is not None:
                 fix_kwargs["extra_context"] = extra_context
+        self._coder_invocation_active = True
         claude_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
             plugin.fix_review(
                 self.repo_path,
@@ -388,9 +391,14 @@ class FixMixin(BreachMixin):
             pr_number, claude_task, external_state_flag,
         )
         stop_cancelled = False
+        breach_cancelled = False
+        pending_cancellation: asyncio.CancelledError | None = None
+        coder_result: tuple[int, str, str] | None = None
+        cleanup_confirmed = False
         try:
-            code, stdout, stderr = await claude_task
-        except asyncio.CancelledError:
+            coder_result = await claude_task
+            code, stdout, stderr = coder_result
+        except asyncio.CancelledError as exc:
             if self._stop_requested:
                 stop_cancelled = True
                 code, stdout, stderr = 1, "", ""
@@ -403,39 +411,11 @@ class FixMixin(BreachMixin):
                 # P1 on PR #223).
                 code, stdout, stderr = 1, "", ""
             elif breach_flag["breached"]:
-                if self.state.current_pr is not None:
-                    # Breach pause is not a no-push success; reset the
-                    # streak so a no-push success → breach → no-push
-                    # success sequence is not treated as consecutive
-                    # (Codex P2 on PR #222).
-                    no_push_policy.reset(self.state.current_pr)
-                    self._rehydrate_last_push_at(self.state.current_pr)
-                    try:
-                        head_now = git_ops._git(
-                            self.repo_path, "rev-parse", "HEAD"
-                        ).stdout.strip()
-                    except Exception:
-                        head_now = ""
-                    if head_before and head_now and head_before != head_now:
-                        if not await fix_codex_trigger.maybe_post_codex_review_after_push(
-                            self,
-                            self.state.current_pr.number,
-                            "after breach-cancel fix push; manual review "
-                            "trigger required",
-                        ):
-                            return
-                self.state.state = PipelineState.PAUSED
-                await self._clear_error_message_on_recovery(
-                    log_prefix="[FIX]",
-                    reason="in-flight rate limit breach",
-                )
-                self.log_event(
-                    f"[FIX] FIX aborted: in-flight rate limit breach, "
-                    f"paused until {self.state.rate_limited_until}."
-                )
-                return
+                breach_cancelled = True
+                code, stdout, stderr = 1, "", ""
             elif not idle_flag["timed_out"]:
-                raise
+                pending_cancellation = exc
+                code, stdout, stderr = 1, "", ""
             else:
                 code, stdout, stderr = 1, "", ""
         finally:
@@ -445,13 +425,26 @@ class FixMixin(BreachMixin):
             idle_monitor.cancel()
             if external_state_monitor is not None:
                 external_state_monitor.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await external_state_monitor
             heartbeat.cancel()
-            self._current_coder_process = None
+            monitors = [stop_monitor, idle_monitor, heartbeat]
+            if breach_monitor is not None:
+                monitors.append(breach_monitor)
+            if external_state_monitor is not None:
+                monitors.append(external_state_monitor)
+            await asyncio.gather(*monitors, return_exceptions=True)
+            self._coder_invocation_active = False
+            if coder_result is not None:
+                self._record_unconfirmed_launch_cleanup(coder_result)
             if plugin.supports_breach_lifecycle:
                 self._check_late_breach(breach_dir, breach_run_id, breach_flag)
                 self._cleanup_breach_marker(breach_dir, breach_run_id)
+            cleanup_confirmed = await self._confirm_current_coder_cleanup(
+                "FIX completion"
+            )
+        if pending_cancellation is not None:
+            raise pending_cancellation
+        if not cleanup_confirmed:
+            return
         if external_state_flag["state"] is not None and not stop_cancelled:
             await self._handle_external_terminal_pr_state(
                 external_state_flag["state"]  # type: ignore[arg-type]
@@ -471,22 +464,38 @@ class FixMixin(BreachMixin):
                 except Exception:
                     head_now = ""
                 if head_before and head_now and head_before != head_now:
+                    trigger_context = (
+                        "after breach-cancel fix push; manual review "
+                        "trigger required"
+                        if breach_cancelled
+                        else "after late-breach fix push; manual review "
+                        "trigger required"
+                    )
                     if not await fix_codex_trigger.maybe_post_codex_review_after_push(
                         self,
                         self.state.current_pr.number,
-                        "after late-breach fix push; manual review "
-                        "trigger required",
+                        trigger_context,
                     ):
                         return
             self.state.state = PipelineState.PAUSED
             await self._clear_error_message_on_recovery(
                 log_prefix="[FIX]",
-                reason="late in-flight rate limit breach",
+                reason=(
+                    "in-flight rate limit breach"
+                    if breach_cancelled
+                    else "late in-flight rate limit breach"
+                ),
             )
-            self.log_event(
-                f"[FIX] FIX paused: late in-flight rate limit breach, "
-                f"paused until {self.state.rate_limited_until}."
-            )
+            if breach_cancelled:
+                self.log_event(
+                    f"[FIX] FIX aborted: in-flight rate limit breach, "
+                    f"paused until {self.state.rate_limited_until}."
+                )
+            else:
+                self.log_event(
+                    f"[FIX] FIX paused: late in-flight rate limit breach, "
+                    f"paused until {self.state.rate_limited_until}."
+                )
             return
 
         stop_requested_after_exit = False

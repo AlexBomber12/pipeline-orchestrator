@@ -14,22 +14,31 @@ import collections
 import itertools
 import json
 import re
+from datetime import datetime, timezone
+from typing import NamedTuple
 
 from src.github import gh_runner
 from src.retry import retry_transient
 
+
+class ETagCacheEntry(NamedTuple):
+    etag: str
+    payload: object
+    observed_at: datetime
+
+
 #: In-memory ETag cache for single-resource REST GET helpers. Keyed by the
-#: ``gh api`` path (the same string passed to ``_etag_get``); the value is
-#: ``(etag, parsed_payload)``. Sending ``If-None-Match`` on a cached path
-#: lets GitHub respond with HTTP 304 and an empty body — and crucially that
-#: 304 does not consume rate-limit budget. Daemon polling re-queries the
-#: same handful of endpoints repeatedly with low data turnover, so most
-#: cycles hit 304 and become free.
+#: ``gh api`` path (the same string passed to ``_etag_get``); the value retains
+#: the ETag, parsed payload, and original observation time. Sending
+#: ``If-None-Match`` on a cached path lets GitHub respond with HTTP 304 and an
+#: empty body — and crucially that 304 does not consume rate-limit budget.
+#: Daemon polling re-queries the same handful of endpoints repeatedly with low
+#: data turnover, so most cycles hit 304 and become free.
 #:
-#: The cache is in-memory only (lost on daemon restart); a persistent
-#: cache could extend the cold-start grace but is not needed for the
-#: primary diet effect.
-_etag_cache: "collections.OrderedDict[str, tuple[str, object]]" = collections.OrderedDict()
+#: The cache is in-memory only (lost on daemon restart); a persistent cache
+#: could extend the cold-start grace but is not needed for the primary diet
+#: effect.
+_etag_cache: "collections.OrderedDict[str, ETagCacheEntry]" = collections.OrderedDict()
 _ETAG_CACHE_MAX_ENTRIES = 500
 
 
@@ -45,6 +54,14 @@ _ETAG_PAGINATED_DEFAULT_PER_PAGE = 30
 
 _HTTP_STATUS_RE = re.compile(r"^HTTP/\S+\s+(\d{3})", re.MULTILINE)
 _HTTP_304_PATTERN = re.compile(r"\bHTTP\s+304\b")
+
+
+class PaginatedEvidence(NamedTuple):
+    items: list[dict]
+    complete: bool
+    empty: bool
+    error: str | None = None
+    observed_at: datetime | None = None
 
 
 def clear_etag_cache() -> None:
@@ -70,10 +87,18 @@ def _is_http_304_error(exc: Exception) -> bool:
 
 def _etag_cache_put(path: str, etag: str, payload: object) -> None:
     """Insert into the ETag cache with simple LRU eviction."""
-    _etag_cache[path] = (etag, payload)
+    _etag_cache[path] = ETagCacheEntry(etag, payload, datetime.now(timezone.utc))
     _etag_cache.move_to_end(path)
     while len(_etag_cache) > _ETAG_CACHE_MAX_ENTRIES:
         _etag_cache.popitem(last=False)
+
+
+def _etag_payload_observed_at(path: str, payload: object) -> datetime | None:
+    """Return the original observation time when ``payload`` came from the cache."""
+    cached = _etag_cache.get(path)
+    if cached is not None and cached.payload is payload:
+        return cached.observed_at
+    return None
 
 
 def _invalidate_etag_cache(prefix: str) -> None:
@@ -136,7 +161,7 @@ def _etag_get(path: str) -> object:
     args: list[str] = ["api", path, "--include"]
     cached = _etag_cache.get(path)
     if cached is not None:
-        args.extend(["-H", f"If-None-Match: {cached[0]}"])
+        args.extend(["-H", f"If-None-Match: {cached.etag}"])
 
     try:
         raw = gh_runner.run_gh(args)
@@ -144,7 +169,7 @@ def _etag_get(path: str) -> object:
         if _is_http_304_error(exc):
             if cached is not None:
                 _etag_cache.move_to_end(path)
-                return cached[1]
+                return cached.payload
             return _etag_get_no_cache(path)
         raise
 
@@ -163,7 +188,7 @@ def _etag_get(path: str) -> object:
             # Retry without If-None-Match to force a fresh 200 + body.
             return _etag_get_no_cache(path)
         _etag_cache.move_to_end(path)
-        return cached[1]
+        return cached.payload
     if status is None or not (200 <= status < 300):
         return None
     body = body.strip()
@@ -239,6 +264,107 @@ def _gh_api_paginated(path: str) -> list[dict] | None:
         elif isinstance(page, dict):
             items.append(page)
     return items
+
+
+def _gh_api_paginated_evidence(path: str) -> PaginatedEvidence:
+    items: list[dict] = []
+    fetched = 0
+    expected_total: int | None = None
+    sep = "&" if "?" in path else "?"
+    for page_num in itertools.count(1):
+        url = f"{path}{sep}page={page_num}"
+        try:
+            raw = retry_transient(lambda u=url: gh_runner.run_gh(["api", u]), operation_name=f"gh api {url}")
+        except RuntimeError as exc:
+            return PaginatedEvidence(items, False, len(items) == 0, str(exc))
+        if not isinstance(raw, dict):
+            return PaginatedEvidence(items, False, len(items) == 0, "malformed")
+        items.append(raw)
+        runs = raw.get("check_runs")
+        if not isinstance(runs, list):
+            return PaginatedEvidence(items, False, len(items) == 0, "malformed")
+        fetched += len(runs)
+        expected_total, complete = _pagination_complete(
+            raw.get("total_count"), expected_total, len(runs), fetched
+        )
+        if complete is not None:
+            return PaginatedEvidence(
+                items,
+                complete,
+                fetched == 0,
+                None if complete else "malformed",
+            )
+
+
+def _pagination_complete(
+    raw_total: object,
+    expected_total: int | None,
+    page_count: int,
+    fetched: int,
+) -> tuple[int | None, bool | None]:
+    if raw_total is None:
+        return expected_total, False
+    if isinstance(raw_total, bool) or not isinstance(raw_total, int) or raw_total < 0:
+        return expected_total, False
+    if expected_total is None:
+        expected_total = raw_total
+    elif raw_total != expected_total:
+        return expected_total, False
+    if fetched == expected_total:
+        return expected_total, True
+    if fetched > expected_total or page_count == 0:
+        return expected_total, False
+    return expected_total, None
+
+
+def _etag_get_object_pages_evidence(path: str, list_field: str) -> PaginatedEvidence:
+    """Fetch every object-shaped page while retaining ETag observation age."""
+    items: list[dict] = []
+    observed_at: list[datetime] = []
+    fetched = 0
+    expected_total: int | None = None
+    sep = "&" if "?" in path else "?"
+    for page_num in itertools.count(1):
+        url = f"{path}{sep}page={page_num}"
+        requested_at = datetime.now(timezone.utc)
+        try:
+            raw = retry_transient(lambda u=url: _etag_get(u), operation_name=f"gh api {url}")
+        except RuntimeError as exc:
+            return PaginatedEvidence(
+                items, False, fetched == 0, str(exc), min(observed_at) if observed_at else None
+            )
+        source_payload = raw
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                raw = None
+        if not isinstance(raw, dict):
+            return PaginatedEvidence(
+                items, False, fetched == 0, "malformed", min(observed_at) if observed_at else None
+            )
+        page_items = raw.get(list_field)
+        if not isinstance(page_items, list):
+            return PaginatedEvidence(
+                items, False, fetched == 0, "malformed", min(observed_at) if observed_at else None
+            )
+
+        page_observed_at = _etag_payload_observed_at(url, source_payload) or requested_at
+        observed_at.append(page_observed_at)
+        items.append(raw)
+        fetched += len(page_items)
+
+        expected_total, complete = _pagination_complete(
+            raw.get("total_count"), expected_total, len(page_items), fetched
+        )
+        if complete is not None:
+            return PaginatedEvidence(
+                items,
+                complete,
+                fetched == 0,
+                None if complete else "malformed",
+                min(observed_at),
+            )
 
 
 def _etag_get_paginated(path: str) -> list[dict] | None:

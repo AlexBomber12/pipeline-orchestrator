@@ -6,7 +6,9 @@ from src.models import CIStatus
 
 _SUCCESS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 _PENDING = {"PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING", "EXPECTED"}
-_FAILURE = {"FAILURE", "FAILED", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE"}
+_FAILURE = {
+    "FAILURE", "FAILED", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE", "STARTUP_FAILURE"
+}
 
 CIContextEvidence = namedtuple(
     "CIContextEvidence", "name state sha producer attempt observed_at run_id", defaults=[None, None, None, None]

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import subprocess
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
-
 from src.github import prs as gh_prs
 from src.models import ReviewStatus
 
@@ -13,6 +13,117 @@ class _FakeCompletedProcess:
     def __init__(self, stdout: str = "", returncode: int = 0) -> None:
         self.stdout = stdout
         self.returncode = returncode
+
+
+def test_get_branch_publications_uses_targeted_bounded_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[list[str], str | None, int]] = []
+    sha = "a" * 40
+
+    def fake_run_gh(
+        args: list[str], repo: str | None = None, timeout: int = 30
+    ) -> list[object]:
+        calls.append((args, repo, timeout))
+        return [
+            {
+                "number": 42,
+                "title": "PR-393: publication handoff",
+                "baseRefName": "main",
+                "headRefName": "feat/publication",
+                "headRefOid": sha,
+                "state": "OPEN",
+                "isDraft": False,
+                "isCrossRepository": False,
+                "createdAt": "2026-10-04T12:00:00Z",
+                "url": "https://github.com/octo/demo/pull/42",
+            },
+            {
+                "number": 43,
+                "baseRefName": "release",
+                "headRefName": "feat/publication",
+            },
+            "malformed",
+            {
+                "number": True,
+                "baseRefName": "main",
+                "headRefName": "feat/publication",
+            },
+        ]
+
+    monkeypatch.setattr(gh_prs.gh_runner, "run_gh", fake_run_gh)
+
+    [publication] = gh_prs.get_branch_publications(
+        "octo/demo", "main", "feat/publication"
+    )
+
+    assert publication.is_verified_ready is True
+    assert publication.created_at == datetime(
+        2026, 10, 4, 12, tzinfo=timezone.utc
+    )
+    assert publication.to_pr_info().head_sha == sha
+    args, repo, timeout = calls[0]
+    assert repo == "octo/demo"
+    assert timeout == 10
+    assert args[:8] == [
+        "pr",
+        "list",
+        "--state",
+        "all",
+        "--base",
+        "main",
+        "--head",
+        "feat/publication",
+    ]
+    assert "checks" not in args[-1]
+    assert "reviewDecision" not in args[-1]
+
+
+def test_get_branch_publications_rejects_non_list_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gh_prs.gh_runner, "run_gh", lambda *a, **kw: "bad")
+
+    assert gh_prs.get_branch_publications("octo/demo", "main", "feat/x") == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "verified"),
+    [
+        ({"state": "CLOSED"}, False),
+        ({"isDraft": True}, False),
+        ({"isCrossRepository": True}, False),
+        ({"headRefOid": "short"}, False),
+        ({"createdAt": "not-a-date"}, False),
+        ({}, True),
+    ],
+)
+def test_branch_publication_requires_verifiable_ready_evidence(
+    overrides: dict[str, object], verified: bool
+) -> None:
+    values: dict[str, object] = {
+        "number": 7,
+        "title": "PR-007: ready",
+        "base_branch": "main",
+        "head_branch": "feat/ready",
+        "head_sha": "b" * 40,
+        "state": "OPEN",
+        "is_draft": False,
+        "is_cross_repository": False,
+        "created_at": datetime(2026, 10, 4, tzinfo=timezone.utc),
+        "url": "https://github.com/octo/demo/pull/7",
+    }
+    key_map = {
+        "isDraft": "is_draft",
+        "isCrossRepository": "is_cross_repository",
+        "headRefOid": "head_sha",
+        "createdAt": "created_at",
+    }
+    for key, value in overrides.items():
+        values[key_map.get(key, key)] = value
+    publication = gh_prs.BranchPublication(**values)  # type: ignore[arg-type]
+
+    assert publication.is_verified_ready is verified
 
 
 def test_get_pr_diff_invokes_gh_cli_with_pr_number_and_repo(
