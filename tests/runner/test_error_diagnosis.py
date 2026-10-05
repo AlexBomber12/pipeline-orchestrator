@@ -534,14 +534,25 @@ def test_handle_error_dispatches_to_codex_plugin_when_codex_active(
     codex_plugin = runner._registry.get("codex")
 
     claude_calls: list[tuple[str, str, str]] = []
-    codex_calls: list[tuple[str, str, str]] = []
+    codex_calls: list[dict[str, Any]] = []
 
-    async def claude_diag(repo_path: str, context: str, model: str) -> tuple[int, str, str]:
+    async def claude_diag(
+        repo_path: str, context: str, model: str, **kwargs: Any
+    ) -> tuple[int, str, str]:
         claude_calls.append((repo_path, context, model))
         return (0, "SKIP", "")
 
-    async def codex_diag(repo_path: str, context: str, model: str) -> tuple[int, str, str]:
-        codex_calls.append((repo_path, context, model))
+    async def codex_diag(
+        repo_path: str, context: str, model: str, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        codex_calls.append(
+            {
+                "repo_path": repo_path,
+                "context": context,
+                "model": model,
+                **kwargs,
+            }
+        )
         return (0, "SKIP", "")
 
     monkeypatch.setattr(claude_plugin, "diagnose_error", claude_diag)
@@ -552,8 +563,14 @@ def test_handle_error_dispatches_to_codex_plugin_when_codex_active(
 
     asyncio.run(runner.handle_error())
 
-    assert codex_calls and codex_calls[0][1] == "boom"
-    assert codex_calls[0][2] == "generic-codex"
+    assert codex_calls and codex_calls[0]["context"] == "boom"
+    assert codex_calls[0]["model"] == "generic-codex"
+    assert codex_calls[0]["on_process_start"] == (
+        runner._track_current_coder_process
+    )
+    assert codex_calls[0]["on_supervised_process_start"] == (
+        runner._track_current_coder_supervised_process
+    )
     assert claude_calls == []
 
 
@@ -576,14 +593,32 @@ def test_handle_error_dispatches_to_third_coder_plugin_without_handler_edits(
         models = ["m1"]
 
         def __init__(self) -> None:
-            self.calls: list[tuple[str, str, str]] = []
+            self.calls: list[dict[str, Any]] = []
 
         def resolve_model(self, _daemon_config: object) -> str:
-            return "m1"
+            return "third-owned-model"
 
-        async def diagnose_error(self, repo_path: str, context: str, model: str) -> tuple[int, str, str]:
-            self.calls.append((repo_path, context, model))
+        async def diagnose_error(
+            self,
+            repo_path: str,
+            context: str,
+            model: str,
+            **kwargs: Any,
+        ) -> tuple[int, str, str]:
+            self.calls.append(
+                {
+                    "repo_path": repo_path,
+                    "context": context,
+                    "model": model,
+                    **kwargs,
+                }
+            )
             return (0, "FIX\nsynthetic", "")
+
+        def build_run_kwargs(
+            self, *, daemon_config: object, **kwargs: Any
+        ) -> dict[str, Any]:
+            return {"model": self.resolve_model(daemon_config)}
 
     third = _ThirdCoderPlugin()
 
@@ -595,10 +630,59 @@ def test_handle_error_dispatches_to_third_coder_plugin_without_handler_edits(
 
     asyncio.run(runner.handle_error())
 
-    assert third.calls and third.calls[0][1] == "boom from third"
+    assert third.calls and third.calls[0]["context"] == "boom from third"
+    assert third.calls[0]["model"] == "third-owned-model"
+    assert third.calls[0]["on_process_start"] == (
+        runner._track_current_coder_process
+    )
+    assert third.calls[0]["on_supervised_process_start"] == (
+        runner._track_current_coder_supervised_process
+    )
     # FIX verdict transitions back to IDLE.
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.error_message is None
+
+
+def test_handle_error_retains_auxiliary_handle_when_cleanup_is_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    plugin = runner._registry.get("claude")
+
+    class _Managed:
+        process = types.SimpleNamespace(returncode=0)
+
+        async def cleanup(self, **kwargs: object) -> object:
+            del kwargs
+            return types.SimpleNamespace(
+                quiescent=False,
+                detail="diagnosis child still live",
+            )
+
+    managed = _Managed()
+
+    async def diagnose(
+        repo_path: str,
+        context: str,
+        model: str | None,
+        **kwargs: Any,
+    ) -> tuple[int, str, str]:
+        del repo_path, context, model
+        kwargs["on_process_start"](managed.process)
+        kwargs["on_supervised_process_start"](managed)
+        return (0, "SKIP", "")
+
+    monkeypatch.setattr(plugin, "diagnose_error", diagnose)
+    runner._get_auxiliary_coder = lambda: ("claude", plugin)
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "diagnosis child still live" in (runner.state.error_message or "")
+    assert runner._current_coder_process is managed.process
+    assert runner._current_coder_supervised_process is managed
 
 
 # ---------------------------------------------------------------------------
@@ -633,6 +717,7 @@ def test_handle_error_falls_back_to_codex_for_diagnosis(
         repo_path: str,
         context: str,
         model: str | None = None,
+        **kwargs: Any,
     ) -> tuple[int, str, str]:
         codex_calls.append((repo_path, context, model))
         return (0, "ESCALATE", "")
@@ -652,12 +737,13 @@ def test_handle_error_falls_back_to_codex_for_diagnosis(
     )
 
     runner = h._make_runner()
+    runner.app_config.daemon.codex_model = "legacy-codex"
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = "boom"
 
     asyncio.run(runner.handle_error())
 
-    assert codex_calls == [(runner.repo_path, "boom", runner.app_config.daemon.codex_model)]
+    assert codex_calls == [(runner.repo_path, "boom", "legacy-codex")]
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message == "boom"
 
@@ -1094,7 +1180,12 @@ def test_handle_error_caps_at_3(monkeypatch: pytest.MonkeyPatch) -> None:
     """handle_error must stop invoking diagnose_error after 3 attempts."""
     calls: list[str] = []
 
-    async def fake_diag(path: str, ctx: str, model: str | None = None) -> tuple[int, str, str]:
+    async def fake_diag(
+        path: str,
+        ctx: str,
+        model: str | None = None,
+        **kwargs: Any,
+    ) -> tuple[int, str, str]:
         calls.append(ctx)
         return (0, "ESCALATE", "")
 

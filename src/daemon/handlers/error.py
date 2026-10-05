@@ -325,10 +325,25 @@ class ErrorMixin:
             ).stdout.strip()
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             pass
-        model = plugin.resolve_model(self.app_config.daemon)
-        code, stdout, stderr = await plugin.diagnose_error(
-            self.repo_path, context, model=model
+        plugin_run_kwargs = plugin.build_run_kwargs(
+            daemon_config=self.app_config.daemon
         )
+        diagnosis_result = await self._await_auxiliary_coder(
+            plugin.diagnose_error(
+                self.repo_path,
+                context,
+                model=plugin_run_kwargs.get("model"),
+                on_process_start=self._track_current_coder_process,
+                on_supervised_process_start=(
+                    self._track_current_coder_supervised_process
+                ),
+            ),
+            cleanup_context="ERROR diagnosis",
+            log_prefix="[ERROR]",
+        )
+        if diagnosis_result is None:
+            return
+        code, stdout, stderr = diagnosis_result
         self._detect_rate_limit(stderr, coder_name=coder_name)
         if self.state.rate_limited_until is not None:
             self.state.state = PipelineState.PAUSED

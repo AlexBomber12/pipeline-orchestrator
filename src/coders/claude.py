@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from src import claude_cli
 from src.coder_registry import ModelCatalog, ModelMetadata, ModelSetting
 from src.config import AppConfig, load_config
+from src.process_supervisor import SupervisedProcess
 from src.usage import OAuthUsageProvider, UsageProvider
 
 if TYPE_CHECKING:
@@ -140,6 +142,26 @@ class ClaudePlugin:
             **kwargs,
         )
 
+    async def run_prompt(
+        self,
+        prompt: str,
+        repo_path: str,
+        model: str | None,
+        timeout: int | None,
+        on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+        on_supervised_process_start: Callable[[SupervisedProcess], None]
+        | None = None,
+    ) -> tuple[int, str, str]:
+        return await claude_cli.run_claude_async(
+            prompt,
+            repo_path,
+            model=model,
+            timeout=timeout,
+            on_process_start=on_process_start,
+            on_supervised_process_start=on_supervised_process_start,
+            system_prompt_file=None,
+        )
+
     def check_auth(self, *, config_path: str = CONFIG_PATH) -> dict[str, str]:
         cfg = load_config(config_path)
         env = {
@@ -195,12 +217,17 @@ class ClaudePlugin:
         self,
         repo_path: str,
         context: str,
-        model: str,
+        model: str | None,
+        on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+        on_supervised_process_start: Callable[[SupervisedProcess], None]
+        | None = None,
     ) -> tuple[int, str, str]:
         return await claude_cli.diagnose_error_async(
             repo_path,
             context,
             model=model,
+            on_process_start=on_process_start,
+            on_supervised_process_start=on_supervised_process_start,
         )
 
     def build_run_kwargs(

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from src import codex_cli
 from src.coder_registry import (
@@ -22,6 +23,7 @@ from src.coders.codex_models import (
     discover_codex_models,
 )
 from src.config import AppConfig, load_config
+from src.process_supervisor import SupervisedProcess
 from src.usage import OpenAIUsageProvider, UsageProvider
 
 if TYPE_CHECKING:
@@ -213,6 +215,25 @@ class CodexPlugin:
             **kwargs,
         )
 
+    async def run_prompt(
+        self,
+        prompt: str,
+        repo_path: str,
+        model: str | None,
+        timeout: int | None,
+        on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+        on_supervised_process_start: Callable[[SupervisedProcess], None]
+        | None = None,
+    ) -> tuple[int, str, str]:
+        return await codex_cli.run_codex_async(
+            prompt,
+            repo_path,
+            model=model or None,
+            timeout=timeout,
+            on_process_start=on_process_start,
+            on_supervised_process_start=on_supervised_process_start,
+        )
+
     def check_auth(self, *, config_path: str = CONFIG_PATH) -> dict[str, str]:
         cfg = load_config(config_path)
         env = _auth_probe_env(HOME=cfg.auth.codex_home_dir)
@@ -287,12 +308,17 @@ class CodexPlugin:
         self,
         repo_path: str,
         context: str,
-        model: str,
+        model: str | None,
+        on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+        on_supervised_process_start: Callable[[SupervisedProcess], None]
+        | None = None,
     ) -> tuple[int, str, str]:
         return await codex_cli.diagnose_error_async(
             repo_path,
             context,
-            model=model,
+            model=model or None,
+            on_process_start=on_process_start,
+            on_supervised_process_start=on_supervised_process_start,
         )
 
     def build_run_kwargs(

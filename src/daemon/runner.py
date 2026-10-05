@@ -30,7 +30,7 @@ import subprocess
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Coroutine
 
 import redis.asyncio as aioredis
 from redis.exceptions import RedisError
@@ -2396,6 +2396,55 @@ class PipelineRunner(
         if cancellation is not None:
             raise cancellation
         return confirmed
+
+    async def _await_auxiliary_coder(
+        self,
+        invocation: Coroutine[Any, Any, tuple[int, str, str]],
+        *,
+        cleanup_context: str,
+        log_prefix: str,
+    ) -> tuple[int, str, str] | None:
+        """Await one plugin-owned helper invocation at an ownership boundary."""
+        self._stop_requested = False
+        self._coder_invocation_active = True
+        coder_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
+            invocation
+        )
+        stop_monitor = asyncio.create_task(self._monitor_stop_request(coder_task))
+        result: tuple[int, str, str] | None = None
+        cancellation: asyncio.CancelledError | None = None
+        stopped = False
+        cleanup_confirmed = False
+        try:
+            result = await coder_task
+            stopped = self._stop_requested
+        except asyncio.CancelledError as exc:
+            if self._stop_requested:
+                stopped = True
+            else:
+                cancellation = exc
+        finally:
+            stop_monitor.cancel()
+            await asyncio.gather(stop_monitor, return_exceptions=True)
+            self._coder_invocation_active = False
+            if result is not None:
+                self._record_unconfirmed_launch_cleanup(result)
+            cleanup_confirmed = await self._confirm_current_coder_cleanup(
+                cleanup_context
+            )
+
+        if cancellation is not None:
+            raise cancellation
+        if not cleanup_confirmed:
+            return None
+        if stopped:
+            self.state.state = PipelineState.PAUSED
+            self.log_event(
+                f"{log_prefix} Auxiliary coder stopped by operator; "
+                "repository paused."
+            )
+            return None
+        return result
 
     async def _hold_for_coder_cleanup(self) -> bool:
         """Block a runner cycle while owned coder cleanup is unconfirmed."""
