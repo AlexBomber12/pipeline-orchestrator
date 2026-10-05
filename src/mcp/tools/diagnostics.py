@@ -88,16 +88,19 @@ _REDACTION_RULES = (
     ),
     (
         re.compile(
-            rf"(?i)([\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']\s*:\s*[\"'])"
-            r"[^\"'\r\n]*([\"'])"
+            rf"(?i)([\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']\s*:\s*)"
+            r"(?P<json_quote>[\"'])(?:\\[^\r\n]|(?!(?P=json_quote))[^\\\r\n])*"
+            r"(?P=json_quote)"
         ),
-        r"\1[REDACTED]\2",
+        r"\1\g<json_quote>[REDACTED]\g<json_quote>",
     ),
     (
         re.compile(
             rf"(?im)((?<![A-Za-z0-9_-])(?:{_SENSITIVE_KEY_PATTERN})"
             r"(?![A-Za-z0-9_-])\s*[:=]\s*)"
-            r"[\"'][^\"'\r\n]*[\"']"
+            r"(?P<assignment_quote>[\"'])"
+            r"(?:\\[^\r\n]|(?!(?P=assignment_quote))[^\\\r\n])*"
+            r"(?P=assignment_quote)"
         ),
         r"\1[REDACTED]",
     ),
@@ -144,6 +147,8 @@ _REDACTION_RULES = (
         r"\1[REDACTED]\2",
     ),
 )
+_PRIVATE_KEY_BEGIN = re.compile(rb"-----BEGIN [^-\r\n]*PRIVATE KEY-----", re.IGNORECASE)
+_PRIVATE_KEY_END = re.compile(rb"-----END [^-\r\n]*PRIVATE KEY-----", re.IGNORECASE)
 
 
 def _utc_now() -> datetime:
@@ -1432,25 +1437,52 @@ def _read_file_source(
                     )
                 raw = raw[: newline + 1]
 
+            raw_lines = raw.splitlines(keepends=True)
+            redaction_units: list[tuple[bytes, str]] = []
+            line_index = 0
+            while line_index < len(raw_lines):
+                raw_unit = raw_lines[line_index]
+                if _PRIVATE_KEY_BEGIN.search(raw_unit):
+                    end_index = line_index
+                    while end_index < len(raw_lines) and not _PRIVATE_KEY_END.search(raw_lines[end_index]):
+                        end_index += 1
+                    if end_index < len(raw_lines):
+                        raw_unit = b"".join(raw_lines[line_index : end_index + 1])
+                        line_index = end_index
+                    else:
+                        raw_unit = b"".join(raw_lines[line_index:])
+                        warnings.append(
+                            "A private-key block crossed the bounded scan window; its visible segment was redacted."
+                        )
+                        line_index = len(raw_lines) - 1
+                redaction_units.append((raw_unit, raw_unit.decode("utf-8", errors="replace")))
+                line_index += 1
+
             parts: list[str] = []
             returned_chars = 0
             consumed_bytes = 0
             replacements = 0
             malformed = 0
-            for raw_line in raw.splitlines(keepends=True):
-                line = raw_line.decode("utf-8", errors="replace")
-                safe_line, line_replacements = _redact_text(line)
-                if parts and returned_chars + len(safe_line) > max_chars:
+            for raw_unit, text_unit in redaction_units:
+                safe_unit, unit_replacements = _redact_text(text_unit)
+                if _PRIVATE_KEY_BEGIN.search(raw_unit) and unit_replacements == 0:
+                    safe_unit = "[REDACTED PRIVATE KEY]\n"
+                    unit_replacements = 1
+                if parts and returned_chars + len(safe_unit) > max_chars:
                     break
-                if not parts and len(safe_line) > max_chars:
-                    safe_line = safe_line[:max_chars]
-                    warnings.append("One source line exceeded max_chars and was truncated after redaction.")
-                parts.append(safe_line)
-                returned_chars += len(safe_line)
-                consumed_bytes += len(raw_line)
-                replacements += line_replacements
-                if kind == "disk_event_log" and line.strip():
-                    malformed += _bounded_event(line)["status"] == "malformed"
+                if not parts and len(safe_unit) > max_chars:
+                    safe_unit = safe_unit[:max_chars]
+                    warnings.append("One source record exceeded max_chars and was truncated after redaction.")
+                parts.append(safe_unit)
+                returned_chars += len(safe_unit)
+                consumed_bytes += len(raw_unit)
+                replacements += unit_replacements
+                if kind == "disk_event_log":
+                    malformed += sum(
+                        _bounded_event(line)["status"] == "malformed"
+                        for line in text_unit.splitlines()
+                        if line
+                    )
                 if returned_chars >= max_chars:
                     break
             content = "".join(parts)

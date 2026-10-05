@@ -468,6 +468,10 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
             "DATABASE_PASSWORD=database-secret",
             "MY_API_KEY='plain api secret'",
             '{"SERVICE_REFRESH_TOKEN":"json-secret"}',
+            '''{"password":"abc'def"}''',
+            r'''{"client_secret":"abc\"def"}''',
+            '''password='abc"def' ''',
+            r'''password="abc\"def"''',
             "AKIAABCDEFGHIJKLMNOP",
             "sk-ant-" + "a" * 30,
             "sk-" + "b" * 48,
@@ -485,10 +489,13 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
     assert "database-secret" not in redacted
     assert "plain api secret" not in redacted
     assert "json-secret" not in redacted
+    assert "abc'def" not in redacted
+    assert r'abc\"def' not in redacted
+    assert 'abc"def' not in redacted
     assert "material" not in redacted
     assert "redis-password" not in redacted
     assert "cookie-secret" not in redacted
-    assert replacements == 14
+    assert replacements == 18
     assert diagnostics._redact_text("tokens_in=123 tokens_out=456") == (
         "tokens_in=123 tokens_out=456",
         0,
@@ -748,6 +755,26 @@ async def test_filesystem_reader_omits_oversized_segments_and_lines(
     truncates_line = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", max_chars=10)
     assert truncates_line["content"] == "z" * 10
     assert any("exceeded max_chars" in warning for warning in truncates_line["warnings"])
+
+    ci_path.write_text(
+        "before\n"
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        "private-key-material\n"
+        "-----END OPENSSH PRIVATE KEY-----\n"
+        "after\n",
+        encoding="utf-8",
+    )
+    private_key = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", max_chars=200)
+    assert private_key["content"] == "before\n[REDACTED PRIVATE KEY]\nafter\n"
+    assert "private-key-material" not in private_key["content"]
+
+    ci_path.write_text(
+        "-----BEGIN PRIVATE KEY-----\n" + "secret\n" * 100,
+        encoding="utf-8",
+    )
+    incomplete_key = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", max_chars=200)
+    assert incomplete_key["content"] == "[REDACTED PRIVATE KEY]\n"
+    assert any("crossed the bounded scan window" in warning for warning in incomplete_key["warnings"])
 
     ci_path.write_text("first line\nsecond line\n", encoding="utf-8")
     aligned = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", cursor=2, max_chars=20)
