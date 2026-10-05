@@ -199,6 +199,7 @@ def test_repo_config_defaults() -> None:
     # UI without a custom timeout inherits whatever PR-016's daemon
     # control is set to.
     assert repo.review_timeout_min is None
+    assert repo.required_checks is None
     assert repo.disabled_coders is None
     assert repo.governance_scan_enabled is None
 
@@ -230,6 +231,7 @@ def test_save_config_round_trip(tmp_path: Path) -> None:
                 branch="dev",
                 auto_merge=False,
                 review_timeout_min=30,
+                required_checks=["unit", "integration"],
             ),
         ],
     )
@@ -244,6 +246,19 @@ def test_save_config_round_trip(tmp_path: Path) -> None:
     assert path.is_file()
     loaded = load_config(str(path))
     assert loaded.model_dump() == config.model_dump()
+
+
+def test_save_config_omits_unset_required_checks(tmp_path: Path) -> None:
+    path = tmp_path / "config.yml"
+
+    save_config(
+        AppConfig(repositories=[RepoConfig(url="https://github.com/o/r.git")]),
+        str(path),
+    )
+
+    assert "required_checks" not in path.read_text(encoding="utf-8")
+    loaded = load_config(str(path))
+    assert loaded.repositories[0].required_checks is None
 
 
 def test_save_config_atomic_overwrites_existing(tmp_path: Path) -> None:
@@ -804,6 +819,50 @@ def test_repo_allow_merge_without_checks_default() -> None:
     assert repo.allow_merge_without_review is False
 
 
+def test_repo_required_checks_loads_from_yaml(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/repo\n"
+        "    required_checks:\n"
+        "      - unit\n"
+        "      - integration\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(str(cfg_path))
+
+    assert cfg.repositories[0].required_checks == ["unit", "integration"]
+
+
+@pytest.mark.parametrize(
+    ("yaml_value", "match"),
+    [
+        ("required_checks: unit\n", "must be a list"),
+        ("required_checks:\n      unit: true\n", "must be a list"),
+        ("required_checks:\n      - 7\n", "must be check name strings"),
+        ("required_checks:\n      - ''\n", "must not be blank"),
+        (
+            "required_checks:\n      - unit\n      - unit\n",
+            "must not be duplicated",
+        ),
+    ],
+)
+def test_repo_required_checks_rejects_invalid_values(
+    tmp_path: Path, yaml_value: str, match: str
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/repo\n"
+        f"    {yaml_value}",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=match):
+        load_config(str(cfg_path))
+
+
 def test_repo_allow_merge_without_checks_loads_from_yaml(tmp_path: Path) -> None:
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text(
@@ -866,6 +925,22 @@ def test_update_repository_allow_merge_without_checks(tmp_path: Path) -> None:
 
     reloaded = load_config(str(path))
     assert reloaded.repositories[0].allow_merge_without_checks is True
+
+
+def test_update_repository_required_checks(tmp_path: Path) -> None:
+    path = tmp_path / "config.yml"
+    save_config(AppConfig(), str(path))
+    add_repository("https://github.com/octo/alpha.git", str(path))
+
+    cfg = update_repository(
+        "https://github.com/octo/alpha.git",
+        str(path),
+        required_checks=["unit", "integration"],
+    )
+    assert cfg.repositories[0].required_checks == ["unit", "integration"]
+
+    reloaded = load_config(str(path))
+    assert reloaded.repositories[0].required_checks == ["unit", "integration"]
 
 
 def test_update_daemon_config_accepts_strict_queue_validation(
@@ -1355,3 +1430,15 @@ def test_committed_config_yml_uses_production_defaults() -> None:
     assert cfg.daemon.usage_api_beta_header == "oauth-2025-04-20"
     assert 50 <= cfg.daemon.rate_limit_session_pause_percent <= 100
     assert 50 <= cfg.daemon.rate_limit_weekly_pause_percent <= 100
+    required_checks_by_url = {
+        repo.url: repo.required_checks for repo in cfg.repositories
+    }
+    assert required_checks_by_url[
+        "https://github.com/AlexBomber12/pipeline-orchestrator.git"
+    ] == ["unit", "integration"]
+    assert required_checks_by_url[
+        "https://github.com/AlexBomber12/megaraid-dashboard"
+    ] is None
+    assert required_checks_by_url[
+        "https://github.com/AlexBomber12/sms-gateway-v2"
+    ] is None
