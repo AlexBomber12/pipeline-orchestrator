@@ -27,7 +27,7 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   each filesystem page window remains at most 256 KiB. A filesystem read may
   inspect up to 1 MiB of older context to determine whether its window begins
   inside a multiline private-key block; if that bounded scan cannot establish
-  the state, the page is omitted fail-closed. It also inspects at most 64 KiB of
+  the state, the page is omitted fail-closed. It also inspects at most 1 MiB of
   preceding context so credential keys and plain, quoted, or block scalar values
   split across lines or page boundaries remain redacted, with the same
   fail-closed behavior when context is indeterminate. Diagnostic text is

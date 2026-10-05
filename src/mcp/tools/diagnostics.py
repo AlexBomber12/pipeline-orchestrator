@@ -51,7 +51,7 @@ _MAX_EVENT_RECORD_CHARS = 4_000
 _MAX_REDIS_EVENT_HISTORY_BYTES = 256 * 1024
 _MAX_FILE_SCAN_BYTES = 256 * 1024
 _MAX_PRIVATE_KEY_CONTEXT_BYTES = 1024 * 1024
-_MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES = 64 * 1024
+_MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES = 1024 * 1024
 _MAX_REDIS_SCAN_CALLS = 4
 _MAX_REDIS_PENDING_KEYS = 200
 _MAX_DISK_PARTITION_CANDIDATES = 200
@@ -88,6 +88,7 @@ _SENSITIVE_NAMES = (
     "client-secret",
     "password",
     "passwd",
+    "passphrase",
     "private_key",
     "private-key",
     "aws_secret_access_key",
@@ -438,8 +439,6 @@ def _sensitive_state_before(
             quote = quoted_match.group("quote")
             if not _has_closing_quote(quoted_match.group("value"), quote):
                 active_quote = quote
-            quote_state_known = True
-        elif raw_line.strip() and _line_indent(raw_line) == 0:
             quote_state_known = True
 
     if active_quote is not None:

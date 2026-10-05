@@ -585,6 +585,9 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
             "tool --password=option-secret",
             "tool --MY_API_KEY 'quoted option secret'",
             "tool --token plain-option-secret",
+            "GPG_PASSPHRASE=dotenv-passphrase",
+            '{"passphrase":"json-passphrase"}',
+            "tool --passphrase option-passphrase",
             "curl --user alice:curl-secret",
             "curl -u bob:short-curl-secret",
             "curl -U proxy:proxy-curl-secret",
@@ -608,10 +611,13 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
     assert "option-secret" not in redacted
     assert "quoted option secret" not in redacted
     assert "plain-option-secret" not in redacted
+    assert "dotenv-passphrase" not in redacted
+    assert "json-passphrase" not in redacted
+    assert "option-passphrase" not in redacted
     assert "curl-secret" not in redacted
     assert "short-curl-secret" not in redacted
     assert "proxy-curl-secret" not in redacted
-    assert replacements == 28
+    assert replacements == 31
     assert diagnostics._redact_text("tokens_in=123 tokens_out=456") == (
         "tokens_in=123 tokens_out=456",
         0,
@@ -647,6 +653,7 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
         "databasePassword",
         "githubToken",
         "spring.datasource.password",
+        "gpgPassphrase",
     ):
         structured, structured_count = diagnostics._redact_structure({camel_key: "camel-secret"})
         assert structured == {camel_key: "[REDACTED]"}
@@ -1117,6 +1124,18 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
     assert "[REDACTED SENSITIVE QUOTED SCALAR]" in quoted_continuation["content"]
     assert "after" in quoted_continuation["content"]
 
+    distant_quote = b'PASSWORD="first\n' + b"column-zero-secret\n" * 4_000 + b'last-secret"\nafter\n'
+    ci_path.write_bytes(distant_quote)
+    distant_cursor = distant_quote.index(b'last-secret"')
+    distant_page = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=distant_cursor,
+        max_chars=200,
+    )
+    assert "last-secret" not in distant_page["content"]
+    assert distant_page["content"].startswith("[REDACTED SENSITIVE QUOTED SCALAR]")
+
     ordinary_size = diagnostics._MAX_PRIVATE_KEY_CONTEXT_BYTES + diagnostics._MAX_FILE_SCAN_BYTES * 2
     ci_path.write_bytes((b"ordinary line\n" * (ordinary_size // len(b"ordinary line\n") + 1))[:ordinary_size])
     fail_closed_tail = await diagnostics.read_orchestrator_log(
@@ -1176,12 +1195,24 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
         None,
         diagnostics._MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES,
     )
-    indeterminate_block = b"x\n" + b"  ordinary\n" * diagnostics._MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES
+    ordinary_line = b"  ordinary\n"
+    indeterminate_block = b"x\n" + ordinary_line * (
+        diagnostics._MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES // len(ordinary_line) + 2
+    )
     assert diagnostics._sensitive_state_before(
         BytesIO(indeterminate_block),
         len(indeterminate_block),
         b"  value\n",
     )[1] is None
+    secret_line = b"column-zero-secret\n"
+    distant_quote = b'PASSWORD="first\n' + secret_line * (
+        diagnostics._MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES // len(secret_line) + 2
+    )
+    assert diagnostics._sensitive_state_before(
+        BytesIO(distant_quote),
+        len(distant_quote),
+        b'last-secret"\n',
+    )[3] is None
     warnings = []
     assert diagnostics._redacted_file_units(
         b"unknown\n",
