@@ -743,6 +743,8 @@ async def test_run_claude_async_cancellation_records_cleanup_failure(
 async def test_diagnose_error_async_skips_system_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
     fake_proc = _make_fake_proc(stdout=b"FIX\nretry", returncode=0)
+    started: list[MagicMock] = []
+    supervised: list[_FakeSupervisedProcess] = []
 
     async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
         captured["cmd"] = list(args)
@@ -750,13 +752,21 @@ async def test_diagnose_error_async_skips_system_prompt(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
-    code, stdout, _ = await diagnose_error_async("/data/repos/demo", "git push failed")
+    code, stdout, _ = await diagnose_error_async(
+        "/data/repos/demo",
+        "git push failed",
+        on_process_start=started.append,
+        on_supervised_process_start=supervised.append,
+    )
 
     assert code == 0
     assert stdout == "FIX\nretry"
     cmd = captured["cmd"]
     assert "--append-system-prompt-file" not in cmd
     assert "CLAUDE.md" not in cmd
+    assert started == [fake_proc]
+    assert len(supervised) == 1
+    assert supervised[0].process is fake_proc
 
 
 @pytest.mark.asyncio

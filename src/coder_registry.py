@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Hashable, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Hashable, Protocol, runtime_checkable
 
+from src.process_supervisor import SupervisedProcess
 from src.usage import UsageProvider
 
 if TYPE_CHECKING:
@@ -110,6 +112,19 @@ class CoderPlugin(Protocol):
         **kwargs: Any,
     ) -> tuple[int, str, str]: ...
 
+    async def run_prompt(
+        self,
+        prompt: str,
+        repo_path: str,
+        model: str | None,
+        timeout: int | None,
+        on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+        on_supervised_process_start: Callable[[SupervisedProcess], None]
+        | None = None,
+    ) -> tuple[int, str, str]:
+        """Run provider-neutral auxiliary work under process supervision."""
+        ...
+
     def check_auth(self) -> dict[str, str]: ...
 
     def create_usage_provider(self, **kwargs: Any) -> UsageProvider | None: ...
@@ -141,7 +156,10 @@ class CoderPlugin(Protocol):
         self,
         repo_path: str,
         context: str,
-        model: str,
+        model: str | None,
+        on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+        on_supervised_process_start: Callable[[SupervisedProcess], None]
+        | None = None,
     ) -> tuple[int, str, str]: ...
 
     def build_run_kwargs(

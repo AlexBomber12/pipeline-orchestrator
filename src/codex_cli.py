@@ -298,11 +298,17 @@ async def fix_review_async(
 
 
 async def diagnose_error_async(
-    repo_path: str, context: str, model: str | None = None
+    repo_path: str,
+    context: str,
+    model: str | None = None,
+    on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
 ) -> tuple[int, str, str]:
     return await run_codex_async(
         build_diagnosis_prompt(repo_path, context),
         repo_path,
         timeout=120,
         model=model,
+        on_process_start=on_process_start,
+        on_supervised_process_start=on_supervised_process_start,
     )
