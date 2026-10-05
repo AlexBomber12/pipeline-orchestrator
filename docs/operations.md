@@ -18,9 +18,11 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   event history, disk event partitions, and the current checkout's
   `artifacts/ci.log`. Every source reports retention, timestamps, mutability,
   and whether task/run/SHA identity was actually recorded.
-- `read_orchestrator_log` reads a discovered source with a bounded character
-  cursor or a tail page. Diagnostic text is credential-redacted before it is
-  returned, and producer-added `[truncated]` markers are preserved.
+- `read_orchestrator_log` reads a discovered source with a bounded continuation
+  cursor or a tail page. Redis cursors address redacted characters; filesystem
+  cursors address source bytes and each call scans at most 256 KiB. Diagnostic
+  text is credential-redacted before it is returned, and producer-added
+  `[truncated]` markers are preserved.
 
 These tools only accept configured repository slugs and fixed source IDs; they
 cannot read arbitrary paths or Redis keys. Missing, malformed, expired, stale,

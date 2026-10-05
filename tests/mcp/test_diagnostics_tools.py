@@ -183,7 +183,10 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
                 "type": "event_log_append",
                 "repo": SLUG,
                 "timestamp": (NOW - timedelta(minutes=2)).isoformat(),
-                "data": {"entry": {"event": "failure"}},
+                "data": {
+                    "entry": {"event": "failure"},
+                    "DATABASE_PASSWORD": "structured-secret",
+                },
             }
         ),
         "not-json",
@@ -220,6 +223,7 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
     assert overview["observed"]["state"] == "WATCH"
     assert overview["observed"]["ci_status"] == "FAILURE"
     assert "state-secret" not in json.dumps(result)
+    assert "structured-secret" not in json.dumps(result)
     assert overview["observed"]["error"] == "Authorization: [REDACTED]"
     assert result["detail"]["queue"]["counts_by_status"] == {"DOING": 1}
     assert "history" not in result["detail"]["state"]
@@ -354,7 +358,7 @@ async def test_log_discovery_and_reads_are_bounded_and_redacted(
     assert ci_tail["source"]["association"]["recorded"] is False
 
     disk = await diagnostics.read_orchestrator_log(SLUG, "events:disk/2026-10-05")
-    assert disk["source"]["malformed_records"] == 1
+    assert disk["source"]["malformed_records_in_page"] == 1
     assert disk["warnings"]
     events = await diagnostics.read_orchestrator_log(SLUG, "events:redis")
     assert events["source"]["malformed_records"] == 1
@@ -473,6 +477,7 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
             "eyJ" + "a" * 12 + "." + "b" * 12 + "." + "c" * 12,
             "-----BEGIN PRIVATE KEY-----\nmaterial\n-----END PRIVATE KEY-----",
             "redis://:redis-password@redis:6379/0",
+            "Cookie: theme=dark; session_id=cookie-secret",
         ]
     )
     redacted, replacements = diagnostics._redact_text(sensitive)
@@ -482,11 +487,23 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
     assert "json-secret" not in redacted
     assert "material" not in redacted
     assert "redis-password" not in redacted
-    assert replacements == 13
+    assert "cookie-secret" not in redacted
+    assert replacements == 14
     assert diagnostics._redact_text("tokens_in=123 tokens_out=456") == (
         "tokens_in=123 tokens_out=456",
         0,
     )
+    structured, structured_count = diagnostics._redact_structure(
+        {
+            "data": {"DATABASE_PASSWORD": "plainsecret"},
+            "tokens_in": 123,
+        }
+    )
+    assert structured == {
+        "data": {"DATABASE_PASSWORD": "[REDACTED]"},
+        "tokens_in": 123,
+    }
+    assert structured_count == 1
     assert diagnostics._iso_z(datetime(2026, 10, 5, 12, 0)).endswith("Z")
 
     captured: dict[str, Any] = {}
@@ -649,16 +666,96 @@ async def test_list_outer_failure_and_file_read_error(tmp_path: Path, monkeypatc
     with pytest.raises(ValueError, match="Unknown Redis"):
         await diagnostics._read_redis_source(redis, SLUG, "unknown", NOW)
 
-    original_read_text = Path.read_text
+    original_open = Path.open
 
-    def fail_ci_read(self: Path, *args: Any, **kwargs: Any) -> str:
-        if self == ci_path:
+    def fail_ci_read(self: Path, *args: Any, **kwargs: Any):
+        if self == ci_path and args and args[0] == "rb":
             raise OSError("read failed")
-        return original_read_text(self, *args, **kwargs)
+        return original_open(self, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_text", fail_ci_read)
+    monkeypatch.setattr(Path, "open", fail_ci_read)
     missing = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact")
     assert missing["source"]["availability"] == "unavailable"
+
+
+async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    monkeypatch.setattr(diagnostics, "_EVENTS_ROOT", tmp_path / "events")
+    repos_root = tmp_path / "repos"
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    line = "ordinary diagnostic line\n"
+    ci_path.write_text(
+        line * ((diagnostics._MAX_FILE_SCAN_BYTES * 3) // len(line))
+        + "Cookie: safe=no; session=tail-secret\nEXACT TAIL FAILURE\n",
+        encoding="utf-8",
+    )
+
+    first = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", max_chars=1_000)
+    assert len(first["content"]) <= 1_000
+    assert first["pagination"]["cursor_unit"] == "source_byte"
+    assert first["pagination"]["scanned_bytes"] <= diagnostics._MAX_FILE_SCAN_BYTES
+    assert first["pagination"]["next_cursor"] is not None
+    second = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=first["pagination"]["next_cursor"],
+        max_chars=1_000,
+    )
+    assert second["pagination"]["cursor"] == first["pagination"]["next_cursor"]
+
+    tail = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", max_chars=1_000, tail=True)
+    assert "EXACT TAIL FAILURE" in tail["content"]
+    assert "tail-secret" not in tail["content"]
+    assert tail["pagination"]["scanned_bytes"] <= diagnostics._MAX_FILE_SCAN_BYTES
+    assert tail["pagination"]["has_older"] is True
+
+
+async def test_filesystem_reader_omits_oversized_segments_and_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    monkeypatch.setattr(diagnostics, "_EVENTS_ROOT", tmp_path / "events")
+    repos_root = tmp_path / "repos"
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.write_bytes(b"x" * (diagnostics._MAX_FILE_SCAN_BYTES * 2))
+
+    from_start = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", max_chars=20)
+    assert len(from_start["content"]) <= 20
+    assert any("exceeds" in warning for warning in from_start["warnings"])
+    from_middle = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", cursor=1, max_chars=20)
+    assert len(from_middle["content"]) <= 20
+    assert any("intersects" in warning for warning in from_middle["warnings"])
+    tail = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", max_chars=20, tail=True)
+    assert tail["content"] == ""
+    assert any("Tail window" in warning for warning in tail["warnings"])
+
+    ci_path.write_text("ok\n" + "y" * 200 + "\n", encoding="utf-8")
+    stops_before_line = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", max_chars=10)
+    assert stops_before_line["content"] == "ok\n"
+    assert stops_before_line["pagination"]["next_cursor"] == 3
+
+    ci_path.write_text("z" * 200 + "\n", encoding="utf-8")
+    truncates_line = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", max_chars=10)
+    assert truncates_line["content"] == "z" * 10
+    assert any("exceeded max_chars" in warning for warning in truncates_line["warnings"])
+
+    ci_path.write_text("first line\nsecond line\n", encoding="utf-8")
+    aligned = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", cursor=2, max_chars=20)
+    assert aligned["content"] == "second line\n"
+    assert aligned["pagination"]["cursor"] == len("first line\n")
+    eof = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact", cursor=10_000, max_chars=20)
+    assert eof["content"] == ""
+    assert eof["pagination"]["next_cursor"] is None
 
 
 def test_compose_wires_read_only_runtime_sources() -> None:

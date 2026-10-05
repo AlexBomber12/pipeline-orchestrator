@@ -46,6 +46,7 @@ _MAX_PENDING_RETRIES = 20
 _MAX_LOG_SOURCES = 100
 _MAX_READ_CHARS = 20_000
 _MAX_EVENT_RECORD_CHARS = 4_000
+_MAX_FILE_SCAN_BYTES = 256 * 1024
 _CLI_LATEST_TTL_SECONDS = 3600
 _CLI_HISTORY_TTL_SECONDS = 86400
 
@@ -79,7 +80,12 @@ _SENSITIVE_NAME_PATTERN = "|".join(re.escape(name) for name in _SENSITIVE_NAMES)
 # separated prefixes while requiring the sensitive name to end the key, so
 # ordinary fields such as ``tokens_in`` are not mistaken for credentials.
 _SENSITIVE_KEY_PATTERN = rf"(?:[A-Za-z0-9]+[_-])*(?:{_SENSITIVE_NAME_PATTERN})"
+_SENSITIVE_KEY = re.compile(rf"(?i)^(?:{_SENSITIVE_KEY_PATTERN})$")
 _REDACTION_RULES = (
+    (
+        re.compile(r"(?im)^([ \t]*(?:cookie|set-cookie)[ \t]*:[ \t]*).*$"),
+        r"\1[REDACTED]",
+    ),
     (
         re.compile(
             rf"(?i)([\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']\s*:\s*[\"'])"
@@ -219,7 +225,10 @@ def _redact_structure(value: Any) -> tuple[Any, int]:
         result_dict: dict[Any, Any] = {}
         count = 0
         for key, item in value.items():
-            safe, replacements = _redact_structure(item)
+            if isinstance(key, str) and _SENSITIVE_KEY.fullmatch(key):
+                safe, replacements = "[REDACTED]", 1
+            else:
+                safe, replacements = _redact_structure(item)
             result_dict[key] = safe
             count += replacements
         return result_dict, count
@@ -1205,7 +1214,47 @@ async def _read_redis_source(
     raise ValueError(f"Unknown Redis diagnostic source: {source_id!r}")
 
 
-def _read_file_source(repo_slug: str, source_id: str) -> tuple[str | None, dict[str, Any], list[str]]:
+def _file_source_metadata(
+    *,
+    kind: str,
+    mutable: bool,
+    association: dict[str, Any],
+    stat: Any,
+    malformed: int | None,
+) -> dict[str, Any]:
+    return {
+        "kind": kind,
+        "storage": "filesystem",
+        "availability": "available",
+        "timestamps": {
+            "modified_at": _iso_z(datetime.fromtimestamp(stat.st_mtime, timezone.utc)),
+            "expires_at": None,
+        },
+        "size_bytes": stat.st_size,
+        "malformed_records_in_page": malformed,
+        "retention": {
+            "policy": (
+                "mutable checkout artifact; may be replaced by the next gate run"
+                if kind == "current_checkout_ci_artifact"
+                else "retained until file removal"
+            ),
+            "truncated": False,
+        },
+        "association": association,
+        "mutable": mutable,
+        "ordering": "oldest_first" if kind == "disk_event_log" else None,
+        "read_bound_bytes": _MAX_FILE_SCAN_BYTES,
+    }
+
+
+def _read_file_source(
+    repo_slug: str,
+    source_id: str,
+    *,
+    cursor: int,
+    max_chars: int,
+    tail: bool,
+) -> tuple[str | None, dict[str, Any], list[str], dict[str, Any] | None, int]:
     warnings: list[str] = []
     if source_id == "ci:artifact":
         path = _safe_path(_REPOS_ROOT, repo_slug, "artifacts", "ci.log")
@@ -1236,10 +1285,12 @@ def _read_file_source(repo_slug: str, source_id: str) -> tuple[str | None, dict[
                 "mutable": mutable,
             },
             warnings,
+            None,
+            0,
         )
     try:
-        content = path.read_text(encoding="utf-8", errors="replace")
         stat = path.stat()
+        handle = path.open("rb")
     except OSError as exc:
         return (
             None,
@@ -1252,38 +1303,185 @@ def _read_file_source(repo_slug: str, source_id: str) -> tuple[str | None, dict[
                 "mutable": mutable,
             },
             warnings,
+            None,
+            0,
         )
-    malformed = 0
-    if kind == "disk_event_log":
-        malformed = sum(_bounded_event(line)["status"] == "malformed" for line in content.splitlines() if line)
-        if malformed:
-            warnings.append(f"Source contains {malformed} malformed event record(s).")
-    return (
-        content,
-        {
-            "kind": kind,
-            "storage": "filesystem",
-            "availability": "available",
-            "timestamps": {
-                "modified_at": _iso_z(datetime.fromtimestamp(stat.st_mtime, timezone.utc)),
-                "expires_at": None,
-            },
-            "size_bytes": stat.st_size,
-            "malformed_records": malformed if kind == "disk_event_log" else None,
-            "retention": {
-                "policy": (
-                    "mutable checkout artifact; may be replaced by the next gate run"
-                    if kind == "current_checkout_ci_artifact"
-                    else "retained until file removal"
-                ),
-                "truncated": False,
-            },
-            "association": association,
-            "mutable": mutable,
-            "ordering": "oldest_first" if kind == "disk_event_log" else None,
-        },
-        warnings,
+    with handle:
+        if tail:
+            raw_start = max(0, stat.st_size - _MAX_FILE_SCAN_BYTES)
+            handle.seek(raw_start)
+            raw = handle.read(_MAX_FILE_SCAN_BYTES)
+            scanned_bytes = len(raw)
+            page_start = raw_start
+            if raw_start > 0:
+                newline = raw.find(b"\n")
+                if newline < 0:
+                    warnings.append(
+                        "Tail window intersects a source line larger than the bounded scan window; content was omitted."
+                    )
+                    raw = b""
+                else:
+                    page_start += newline + 1
+                    raw = raw[newline + 1 :]
+            text = raw.decode("utf-8", errors="replace")
+            redacted, replacements = _redact_text(text)
+            content = redacted[-max_chars:]
+            malformed = (
+                sum(_bounded_event(line)["status"] == "malformed" for line in text.splitlines() if line)
+                if kind == "disk_event_log"
+                else None
+            )
+            pagination = {
+                "cursor": page_start,
+                "requested_cursor": cursor,
+                "cursor_unit": "source_byte",
+                "max_chars": max_chars,
+                "returned_chars": len(content),
+                "source_size_bytes": stat.st_size,
+                "scanned_bytes": scanned_bytes,
+                "scan_limit_bytes": _MAX_FILE_SCAN_BYTES,
+                "previous_cursor": (max(0, page_start - _MAX_FILE_SCAN_BYTES) if page_start > 0 else None),
+                "next_cursor": None,
+                "has_more": False,
+                "has_older": page_start > 0,
+                "tail": True,
+            }
+        else:
+            requested_cursor = min(cursor, stat.st_size)
+            page_start = requested_cursor
+            if page_start > 0:
+                handle.seek(page_start - 1)
+                previous = handle.read(1)
+            else:
+                previous = b"\n"
+            handle.seek(page_start)
+            raw = handle.read(_MAX_FILE_SCAN_BYTES)
+            scanned_bytes = len(raw)
+            if previous != b"\n" and raw:
+                newline = raw.find(b"\n")
+                if newline < 0:
+                    next_cursor = page_start + len(raw) if page_start + len(raw) < stat.st_size else None
+                    warning = (
+                        "Cursor intersects a source line larger than the bounded scan window; this segment was omitted."
+                    )
+                    warnings.append(warning)
+                    source = _file_source_metadata(
+                        kind=kind,
+                        mutable=mutable,
+                        association=association,
+                        stat=stat,
+                        malformed=0 if kind == "disk_event_log" else None,
+                    )
+                    marker = f"[source segment omitted: {_MAX_FILE_SCAN_BYTES} byte scan bound]\n"[:max_chars]
+                    return (
+                        marker,
+                        source,
+                        warnings,
+                        {
+                            "cursor": page_start,
+                            "requested_cursor": cursor,
+                            "cursor_unit": "source_byte",
+                            "max_chars": max_chars,
+                            "returned_chars": len(marker),
+                            "source_size_bytes": stat.st_size,
+                            "scanned_bytes": scanned_bytes,
+                            "scan_limit_bytes": _MAX_FILE_SCAN_BYTES,
+                            "previous_cursor": max(0, page_start - _MAX_FILE_SCAN_BYTES),
+                            "next_cursor": next_cursor,
+                            "has_more": next_cursor is not None,
+                            "tail": False,
+                        },
+                        0,
+                    )
+                page_start += newline + 1
+                raw = raw[newline + 1 :]
+
+            raw_end = page_start + len(raw)
+            if raw_end < stat.st_size and raw and not raw.endswith(b"\n"):
+                newline = raw.rfind(b"\n")
+                if newline < 0:
+                    warnings.append("Source line exceeds the bounded scan window; this segment was omitted.")
+                    next_cursor = page_start + len(raw)
+                    source = _file_source_metadata(
+                        kind=kind,
+                        mutable=mutable,
+                        association=association,
+                        stat=stat,
+                        malformed=0 if kind == "disk_event_log" else None,
+                    )
+                    marker = f"[source segment omitted: {_MAX_FILE_SCAN_BYTES} byte scan bound]\n"[:max_chars]
+                    return (
+                        marker,
+                        source,
+                        warnings,
+                        {
+                            "cursor": page_start,
+                            "requested_cursor": cursor,
+                            "cursor_unit": "source_byte",
+                            "max_chars": max_chars,
+                            "returned_chars": len(marker),
+                            "source_size_bytes": stat.st_size,
+                            "scanned_bytes": scanned_bytes,
+                            "scan_limit_bytes": _MAX_FILE_SCAN_BYTES,
+                            "previous_cursor": (max(0, page_start - _MAX_FILE_SCAN_BYTES) if page_start > 0 else None),
+                            "next_cursor": next_cursor,
+                            "has_more": True,
+                            "tail": False,
+                        },
+                        0,
+                    )
+                raw = raw[: newline + 1]
+
+            parts: list[str] = []
+            returned_chars = 0
+            consumed_bytes = 0
+            replacements = 0
+            malformed = 0
+            for raw_line in raw.splitlines(keepends=True):
+                line = raw_line.decode("utf-8", errors="replace")
+                safe_line, line_replacements = _redact_text(line)
+                if parts and returned_chars + len(safe_line) > max_chars:
+                    break
+                if not parts and len(safe_line) > max_chars:
+                    safe_line = safe_line[:max_chars]
+                    warnings.append("One source line exceeded max_chars and was truncated after redaction.")
+                parts.append(safe_line)
+                returned_chars += len(safe_line)
+                consumed_bytes += len(raw_line)
+                replacements += line_replacements
+                if kind == "disk_event_log" and line.strip():
+                    malformed += _bounded_event(line)["status"] == "malformed"
+                if returned_chars >= max_chars:
+                    break
+            content = "".join(parts)
+            next_position = page_start + consumed_bytes
+            next_cursor = next_position if next_position < stat.st_size else None
+            pagination = {
+                "cursor": page_start,
+                "requested_cursor": cursor,
+                "cursor_unit": "source_byte",
+                "max_chars": max_chars,
+                "returned_chars": len(content),
+                "source_size_bytes": stat.st_size,
+                "scanned_bytes": scanned_bytes,
+                "scan_limit_bytes": _MAX_FILE_SCAN_BYTES,
+                "previous_cursor": (max(0, page_start - _MAX_FILE_SCAN_BYTES) if page_start > 0 else None),
+                "next_cursor": next_cursor,
+                "has_more": next_cursor is not None,
+                "tail": False,
+            }
+
+    if malformed:
+        warnings.append(f"Page contains {malformed} malformed event record(s).")
+    source = _file_source_metadata(
+        kind=kind,
+        mutable=mutable,
+        association=association,
+        stat=stat,
+        malformed=malformed,
     )
+    source["source_truncated"] = cursor == 0 and content.startswith("[truncated]\n")
+    return content, source, warnings, pagination, replacements
 
 
 def _page_content(content: str, *, cursor: int, max_chars: int, tail: bool) -> tuple[str, dict[str, Any]]:
@@ -1294,6 +1492,7 @@ def _page_content(content: str, *, cursor: int, max_chars: int, tail: bool) -> t
     return page, {
         "cursor": start,
         "requested_cursor": cursor,
+        "cursor_unit": "redacted_character",
         "max_chars": max_chars,
         "returned_chars": len(page),
         "total_chars_after_redaction": total,
@@ -1314,10 +1513,11 @@ async def read_orchestrator_log(
 ) -> dict[str, Any]:
     """Read one discovered diagnostic source with bounded pagination.
 
-    ``cursor`` is a character offset in the redacted content. Set ``tail`` to
-    read the final page (useful for failure excerpts); tail mode requires the
-    default cursor. Credential-like and Authorization values are redacted
-    before pagination, while existing producer truncation markers are kept.
+    Redis cursors are character offsets in redacted content; filesystem cursors
+    are byte offsets returned by the preceding page. Set ``tail`` to read the
+    final bounded window (useful for failure excerpts); tail mode requires the
+    default cursor. Credential-like and Authorization values are redacted before
+    return, while existing producer truncation markers are kept.
     """
     _validate_configured_repo(repo_slug)
     cursor = _validate_cursor(cursor)
@@ -1345,6 +1545,8 @@ async def read_orchestrator_log(
     content: str | None
     source: dict[str, Any]
     warnings: list[str]
+    file_pagination: dict[str, Any] | None = None
+    file_replacements = 0
     if source_id in {"cli:latest", "events:redis"} or source_id.startswith(_CLI_HISTORY_SOURCE_PREFIX):
         client: Any | None = None
         try:
@@ -1364,7 +1566,13 @@ async def read_orchestrator_log(
         finally:
             await _close_redis(client)
     else:
-        content, source, warnings = _read_file_source(repo_slug, source_id)
+        content, source, warnings, file_pagination, file_replacements = _read_file_source(
+            repo_slug,
+            source_id,
+            cursor=cursor,
+            max_chars=max_chars,
+            tail=tail,
+        )
 
     if content is None:
         payload = {
@@ -1379,6 +1587,21 @@ async def read_orchestrator_log(
         safe, replacements = _redact_structure(payload)
         safe["redaction"] = {"applied": replacements > 0, "replacements": replacements}
         return safe
+
+    if file_pagination is not None:
+        return {
+            "observed_at": _iso_z(observed_at),
+            "repo_slug": repo_slug,
+            "source_id": source_id,
+            "source": source,
+            "content": content,
+            "pagination": file_pagination,
+            "warnings": warnings,
+            "redaction": {
+                "applied": file_replacements > 0,
+                "replacements": file_replacements,
+            },
+        }
 
     redacted, replacements = _redact_text(content)
     page, pagination = _page_content(redacted, cursor=cursor, max_chars=max_chars, tail=tail)
