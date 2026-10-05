@@ -478,6 +478,22 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     with pytest.raises(ValueError, match="escapes"):
         await diagnostics.read_orchestrator_log(SLUG, "events:disk/2026-10-05")
 
+    sibling_repos = tmp_path / "sibling-repos"
+    selected_repo = sibling_repos / SLUG
+    sibling_artifacts = sibling_repos / "octo__sibling" / "artifacts"
+    selected_repo.mkdir(parents=True)
+    sibling_artifacts.mkdir(parents=True)
+    (sibling_artifacts / "ci.log").write_text("sibling secret", encoding="utf-8")
+    (selected_repo / "artifacts").symlink_to(sibling_artifacts, target_is_directory=True)
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", sibling_repos)
+    monkeypatch.setattr(diagnostics, "_EVENTS_ROOT", tmp_path / "empty-events")
+    with pytest.raises(ValueError, match="escapes"):
+        await diagnostics.read_orchestrator_log(SLUG, "ci:artifact")
+    sources, warnings = diagnostics._file_log_sources(SLUG)
+    assert sources[-1]["source_id"] == "ci:artifact"
+    assert sources[-1]["availability"] == "missing"
+    assert any("ci.log" in warning for warning in warnings)
+
 
 def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
     monkeypatch: pytest.MonkeyPatch,
@@ -547,6 +563,9 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
             "tool --password=option-secret",
             "tool --MY_API_KEY 'quoted option secret'",
             "tool --token plain-option-secret",
+            "curl --user alice:curl-secret",
+            "curl -u bob:short-curl-secret",
+            "curl -U proxy:proxy-curl-secret",
         ]
     )
     redacted, replacements = diagnostics._redact_text(sensitive)
@@ -567,7 +586,10 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
     assert "option-secret" not in redacted
     assert "quoted option secret" not in redacted
     assert "plain-option-secret" not in redacted
-    assert replacements == 25
+    assert "curl-secret" not in redacted
+    assert "short-curl-secret" not in redacted
+    assert "proxy-curl-secret" not in redacted
+    assert replacements == 28
     assert diagnostics._redact_text("tokens_in=123 tokens_out=456") == (
         "tokens_in=123 tokens_out=456",
         0,

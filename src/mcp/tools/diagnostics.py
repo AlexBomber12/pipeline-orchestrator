@@ -113,6 +113,14 @@ _REDACTION_RULES = (
     ),
     (
         re.compile(
+            r"(?i)((?<!\S)(?:-u|-U|--user|--proxy-user)(?:=|[ \t]+))"
+            r"(?:(?P<user_quote>[\"'])(?:\\[^\r\n]|(?!(?P=user_quote))[^\\\r\n])*"
+            r"(?P=user_quote)?|[^\s]+)"
+        ),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(
             rf"(?i)([\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']\s*:\s*)"
             r"(?P<json_quote>[\"'])(?:\\[^\r\n]|(?!(?P=json_quote))[^\\\r\n])*"
             r"(?P=json_quote)?"
@@ -1285,7 +1293,8 @@ def _file_log_sources(repo_slug: str) -> tuple[list[dict[str, Any]], list[str]]:
             )
 
     try:
-        ci_path = _safe_path(_REPOS_ROOT, repo_slug, "artifacts", "ci.log")
+        repo_root = _safe_path(_REPOS_ROOT, repo_slug)
+        ci_path = _safe_path(repo_root, "artifacts", "ci.log")
         ci_stat = ci_path.stat() if ci_path.is_file() else None
     except (OSError, ValueError) as exc:
         ci_stat = None
@@ -1588,7 +1597,8 @@ def _read_file_source(
 ) -> tuple[str | None, dict[str, Any], list[str], dict[str, Any] | None, int]:
     warnings: list[str] = []
     if source_id == "ci:artifact":
-        path = _safe_path(_REPOS_ROOT, repo_slug, "artifacts", "ci.log")
+        repo_root = _safe_path(_REPOS_ROOT, repo_slug)
+        path = _safe_path(repo_root, "artifacts", "ci.log")
         kind = "current_checkout_ci_artifact"
         mutable = True
         association = _association()
