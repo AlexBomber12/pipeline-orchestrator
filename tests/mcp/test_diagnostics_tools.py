@@ -87,6 +87,13 @@ class FakeRedis:
             if fnmatch.fnmatch(key, match):
                 yield key
 
+    async def scan(self, *, cursor: int, match: str, count: int) -> tuple[int, list[str]]:
+        self._check("scan", (cursor, match, count))
+        keys = [key for key in sorted(self.store) if fnmatch.fnmatch(key, match)]
+        page = keys[cursor : cursor + count]
+        next_cursor = cursor + len(page)
+        return (0 if next_cursor >= len(keys) else next_cursor), page
+
     async def aclose(self) -> None:
         self.calls.append(("aclose", ""))
         self.closed = True
@@ -322,7 +329,8 @@ async def test_log_discovery_and_reads_are_bounded_and_redacted(
 
     first = await diagnostics.list_orchestrator_logs(SLUG, limit=3)
     second = await diagnostics.list_orchestrator_logs(SLUG, cursor=first["pagination"]["next_cursor"], limit=10)
-    sources = first["sources"] + second["sources"]
+    third = await diagnostics.list_orchestrator_logs(SLUG, cursor=second["pagination"]["next_cursor"], limit=10)
+    sources = first["sources"] + second["sources"] + third["sources"]
     ids = {source["source_id"] for source in sources}
     assert {
         "cli:latest",
@@ -343,7 +351,12 @@ async def test_log_discovery_and_reads_are_bounded_and_redacted(
         "sha": None,
         "note": "No task, run, or SHA association is recorded by this source.",
     }
-    assert any("malformed CLI history" in warning for warning in second["warnings"] + first["warnings"])
+    assert third["pagination"]["phase"] == "redis_history"
+    assert third["pagination"]["next_cursor"] is None
+    assert any(
+        "malformed CLI history" in warning
+        for warning in third["warnings"] + second["warnings"] + first["warnings"]
+    )
 
     cli_page = await diagnostics.read_orchestrator_log(SLUG, "cli:latest", max_chars=30)
     assert cli_page["content"].startswith("[truncated]\n")
@@ -423,6 +436,8 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
         await diagnostics.read_orchestrator_log(SLUG, "events:disk/2026-99-99")
     with pytest.raises(ValueError, match="Unknown filesystem"):
         await diagnostics.read_orchestrator_log(SLUG, "file:/etc/passwd")
+    with pytest.raises(ValueError, match="beyond"):
+        await diagnostics.list_orchestrator_logs(SLUG, cursor=999)
 
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -462,6 +477,19 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
     assert diagnostics._bounded_event("[]")["status"] == "malformed"
     huge = json.dumps({"timestamp": NOW.isoformat(), "data": "x" * 5_000})
     assert diagnostics._bounded_event(huge)["record_truncated"] is True
+    oversized_secret = diagnostics._bounded_event(
+        json.dumps(
+            {
+                "timestamp": NOW.isoformat(),
+                "password": "word1 leaksecret " + "x" * 5_000,
+            }
+        )
+    )
+    assert oversized_secret["record_truncated"] is True
+    assert "leaksecret" not in oversized_secret["record_excerpt"]
+    assert "[REDACTED]" in oversized_secret["record_excerpt"]
+    malformed_secret = diagnostics._bounded_event('{"password":"word1 leaksecret ' + "x" * 600)
+    assert "leaksecret" not in malformed_secret["raw_excerpt"]
     sensitive = "\n".join(
         [
             "token='two word secret'",
@@ -500,6 +528,13 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
         "tokens_in=123 tokens_out=456",
         0,
     )
+    for partial_key in (
+        "-----BEGIN PRIVATE KEY-----\npartial-secret",
+        "[truncated]\npartial-secret\n-----END PRIVATE KEY-----",
+    ):
+        safe_key, key_replacements = diagnostics._redact_text(partial_key)
+        assert safe_key == "[REDACTED PRIVATE KEY]"
+        assert key_replacements == 1
     structured, structured_count = diagnostics._redact_structure(
         {
             "data": {"DATABASE_PASSWORD": "plainsecret"},
@@ -605,18 +640,29 @@ async def test_log_discovery_defensive_failures(tmp_path: Path, monkeypatch: pyt
         return await original_get(key)
 
     redis.get = expire_during_scan  # type: ignore[method-assign]
-    sources, _ = await diagnostics._redis_log_sources(redis, SLUG, NOW)
-    assert not any(item["source_id"].startswith("cli:history/") for item in sources)
+    sources, _, _ = await diagnostics._redis_history_page(
+        redis,
+        SLUG,
+        NOW,
+        cursor_state={"scan_cursor": 0, "pending": [], "started": False},
+        limit=10,
+    )
+    assert sources[0]["availability"] == "missing_or_expired"
 
     redis = FakeRedis()
 
-    async def broken_scan(match: str):
-        del match
+    async def broken_scan(*, cursor: int, match: str, count: int):
+        del cursor, match, count
         raise ConnectionError("scan failure")
-        yield ""  # pragma: no cover - makes this an async generator
 
-    redis.scan_iter = broken_scan  # type: ignore[method-assign]
-    _, warnings = await diagnostics._redis_log_sources(redis, SLUG, NOW)
+    redis.scan = broken_scan  # type: ignore[method-assign]
+    _, warnings, _ = await diagnostics._redis_history_page(
+        redis,
+        SLUG,
+        NOW,
+        cursor_state={"scan_cursor": 0, "pending": [], "started": False},
+        limit=10,
+    )
     assert any("discovery incomplete" in warning for warning in warnings)
 
     events_root = tmp_path / "events"
@@ -648,6 +694,101 @@ async def test_log_discovery_defensive_failures(tmp_path: Path, monkeypatch: pyt
     assert sources[0]["source_id"] == "ci:artifact"
     assert sources[0]["availability"] == "missing"
     assert any("ci.log" in warning for warning in warnings)
+
+
+async def test_redis_history_discovery_uses_bounded_continuations() -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    for second in range(25):
+        timestamp = f"2026-10-05T11:00:{second:02d}+00:00"
+        key = cli_log_history(SLUG, timestamp)
+        redis.store[key] = f"history {second}"
+        redis.ttls[key] = 60
+
+    sources, warnings, next_cursor = await diagnostics._redis_history_page(
+        redis,
+        SLUG,
+        NOW,
+        cursor_state={"scan_cursor": 0, "pending": [], "started": False},
+        limit=2,
+    )
+    assert len(sources) == 2
+    assert warnings == []
+    assert next_cursor is not None
+    history_gets = [key for operation, key in redis.calls if operation == "get"]
+    assert len(history_gets) == 2
+    assert len([call for call in redis.calls if call[0] == "scan"]) == 1
+
+    kind, state = diagnostics._decode_log_cursor(next_cursor)
+    assert kind == "history"
+    redis.calls.clear()
+    second, _, continuation = await diagnostics._redis_history_page(
+        redis,
+        SLUG,
+        NOW,
+        cursor_state=state,
+        limit=2,
+    )
+    assert len(second) == 2
+    assert continuation is not None
+    assert not any(operation == "scan" for operation, _ in redis.calls)
+    assert len([key for operation, key in redis.calls if operation == "get"]) == 2
+
+
+async def test_redis_history_discovery_reports_defensive_bounds() -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    timestamps = [(NOW + timedelta(seconds=index)).isoformat() for index in range(205)]
+
+    async def oversized_scan(*, cursor: int, match: str, count: int) -> tuple[int, list[bytes]]:
+        del cursor, match, count
+        keys = [b"outside:key", cli_log_history(SLUG, "not-a-time").encode()]
+        keys.extend(cli_log_history(SLUG, timestamp).encode() for timestamp in timestamps)
+        return 0, keys
+
+    redis.scan = oversized_scan  # type: ignore[method-assign]
+    sources, warnings, continuation = await diagnostics._redis_history_page(
+        redis,
+        SLUG,
+        NOW,
+        cursor_state={"scan_cursor": 0, "pending": [], "started": False},
+        limit=1,
+    )
+    assert sources[0]["availability"] == "missing_or_expired"
+    assert continuation is not None
+    assert any("malformed CLI history" in warning for warning in warnings)
+    assert any("oversized scan batch" in warning for warning in warnings)
+
+    unavailable = FakeRedis()
+    unavailable.fail.add("get")
+    sources, _, continuation = await diagnostics._redis_history_page(
+        unavailable,
+        SLUG,
+        NOW,
+        cursor_state={"scan_cursor": 0, "pending": [timestamps[0]], "started": True},
+        limit=1,
+    )
+    assert sources[0]["availability"] == "unavailable"
+    assert "redis-secret" in sources[0]["error"]
+    assert continuation is None
+
+
+def test_log_discovery_cursor_validation() -> None:
+    from src.mcp.tools import diagnostics
+
+    assert diagnostics._decode_log_cursor(3) == ("static", 3)
+    for invalid in (True, "not-a-cursor", f"{diagnostics._HISTORY_CURSOR_PREFIX}not-base64"):
+        with pytest.raises(ValueError, match="cursor"):
+            diagnostics._decode_log_cursor(invalid)
+
+    encoded_list = diagnostics.base64.urlsafe_b64encode(b"[]").decode().rstrip("=")
+    with pytest.raises(ValueError, match="history cursor"):
+        diagnostics._decode_log_cursor(f"{diagnostics._HISTORY_CURSOR_PREFIX}{encoded_list}")
+    invalid_payload = diagnostics._encode_history_cursor(-1, [], started=False)
+    with pytest.raises(ValueError, match="history cursor"):
+        diagnostics._decode_log_cursor(invalid_payload)
 
 
 async def test_list_outer_failure_and_file_read_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -720,6 +861,40 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
     assert "tail-secret" not in tail["content"]
     assert tail["pagination"]["scanned_bytes"] <= diagnostics._MAX_FILE_SCAN_BYTES
     assert tail["pagination"]["has_older"] is True
+
+    private_payload = "private-key-material\n" * (diagnostics._MAX_FILE_SCAN_BYTES // 10)
+    ci_path.write_text(
+        "before\n-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        + private_payload
+        + "-----END OPENSSH PRIVATE KEY-----\nafter\n",
+        encoding="utf-8",
+    )
+    cursor = 0
+    pages: list[str] = []
+    while True:
+        page = await diagnostics.read_orchestrator_log(
+            SLUG,
+            "ci:artifact",
+            cursor=cursor,
+            max_chars=200,
+        )
+        assert "private-key-material" not in page["content"]
+        pages.append(page["content"])
+        next_cursor = page["pagination"]["next_cursor"]
+        if next_cursor is None:
+            break
+        cursor = next_cursor
+    assert "after" in "".join(pages)
+
+    private_tail = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        max_chars=200,
+        tail=True,
+    )
+    assert "private-key-material" not in private_tail["content"]
+    assert "after" in private_tail["content"]
+    assert private_tail["pagination"]["context_scanned_bytes"] > 0
 
 
 async def test_filesystem_reader_omits_oversized_segments_and_lines(

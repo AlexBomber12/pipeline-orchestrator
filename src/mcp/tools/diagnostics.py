@@ -8,6 +8,7 @@ data while answering a diagnostic query.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -47,8 +48,11 @@ _MAX_LOG_SOURCES = 100
 _MAX_READ_CHARS = 20_000
 _MAX_EVENT_RECORD_CHARS = 4_000
 _MAX_FILE_SCAN_BYTES = 256 * 1024
+_MAX_REDIS_SCAN_CALLS = 4
+_MAX_REDIS_PENDING_KEYS = 200
 _CLI_LATEST_TTL_SECONDS = 3600
 _CLI_HISTORY_TTL_SECONDS = 86400
+_HISTORY_CURSOR_PREFIX = "redis-history:"
 
 _SENSITIVE_NAMES = (
     "authorization",
@@ -90,7 +94,7 @@ _REDACTION_RULES = (
         re.compile(
             rf"(?i)([\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']\s*:\s*)"
             r"(?P<json_quote>[\"'])(?:\\[^\r\n]|(?!(?P=json_quote))[^\\\r\n])*"
-            r"(?P=json_quote)"
+            r"(?P=json_quote)?"
         ),
         r"\1\g<json_quote>[REDACTED]\g<json_quote>",
     ),
@@ -100,7 +104,7 @@ _REDACTION_RULES = (
             r"(?![A-Za-z0-9_-])\s*[:=]\s*)"
             r"(?P<assignment_quote>[\"'])"
             r"(?:\\[^\r\n]|(?!(?P=assignment_quote))[^\\\r\n])*"
-            r"(?P=assignment_quote)"
+            r"(?P=assignment_quote)?"
         ),
         r"\1[REDACTED]",
     ),
@@ -140,6 +144,14 @@ _REDACTION_RULES = (
             r"(?is)-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?"
             r"-----END [^-\r\n]*PRIVATE KEY-----"
         ),
+        "[REDACTED PRIVATE KEY]",
+    ),
+    (
+        re.compile(r"(?is)-----BEGIN [^-\r\n]*PRIVATE KEY-----.*\Z"),
+        "[REDACTED PRIVATE KEY]",
+    ),
+    (
+        re.compile(r"(?is)\A.*?-----END [^-\r\n]*PRIVATE KEY-----"),
         "[REDACTED PRIVATE KEY]",
     ),
     (
@@ -238,6 +250,65 @@ def _redact_structure(value: Any) -> tuple[Any, int]:
             count += replacements
         return result_dict, count
     return value, 0
+
+
+def _private_key_state_before(handle: Any, offset: int) -> tuple[bool, int]:
+    """Find the nearest PEM boundary before offset without loading the file."""
+    search_end = offset
+    suffix = b""
+    scanned_bytes = 0
+    while search_end > 0:
+        search_start = max(0, search_end - _MAX_FILE_SCAN_BYTES)
+        handle.seek(search_start)
+        chunk = handle.read(search_end - search_start)
+        scanned_bytes += len(chunk)
+        searchable = chunk + suffix
+        markers = [
+            *((match.start(), True) for match in _PRIVATE_KEY_BEGIN.finditer(searchable)),
+            *((match.start(), False) for match in _PRIVATE_KEY_END.finditer(searchable)),
+        ]
+        if markers:
+            return max(markers, key=lambda item: item[0])[1], scanned_bytes
+        suffix = chunk[:512]
+        search_end = search_start
+    return False, scanned_bytes
+
+
+def _redacted_file_units(
+    raw: bytes,
+    *,
+    starts_inside_private_key: bool,
+    warnings: list[str],
+) -> list[tuple[bytes, str, int]]:
+    """Redact complete logical units while preserving their source byte sizes."""
+    raw_lines = raw.splitlines(keepends=True)
+    units: list[tuple[bytes, str, int]] = []
+    line_index = 0
+    inside_private_key = starts_inside_private_key
+    while line_index < len(raw_lines):
+        raw_unit = raw_lines[line_index]
+        if inside_private_key or _PRIVATE_KEY_BEGIN.search(raw_unit):
+            end_index = line_index
+            while end_index < len(raw_lines) and not _PRIVATE_KEY_END.search(raw_lines[end_index]):
+                end_index += 1
+            if end_index < len(raw_lines):
+                raw_unit = b"".join(raw_lines[line_index : end_index + 1])
+                line_index = end_index
+                inside_private_key = False
+            else:
+                raw_unit = b"".join(raw_lines[line_index:])
+                warnings.append(
+                    "A private-key block crossed the bounded scan window; its visible segment was redacted."
+                )
+                line_index = len(raw_lines) - 1
+                inside_private_key = True
+            units.append((raw_unit, "[REDACTED PRIVATE KEY]\n", 1))
+        else:
+            text_unit = raw_unit.decode("utf-8", errors="replace")
+            safe_unit, replacements = _redact_text(text_unit)
+            units.append((raw_unit, safe_unit, replacements))
+        line_index += 1
+    return units
 
 
 def _error_text(exc: Exception) -> str:
@@ -413,29 +484,34 @@ def _bounded_event(raw: object) -> dict[str, Any]:
     try:
         parsed = json.loads(text)
     except (TypeError, ValueError) as exc:
+        safe_text, _ = _redact_text(text)
         return {
             "status": "malformed",
             "error": _error_text(exc),
-            "raw_excerpt": text[:500],
-            "record_truncated": len(text) > 500,
+            "raw_excerpt": safe_text[:500],
+            "record_truncated": len(safe_text) > 500,
         }
     if not isinstance(parsed, dict):
+        safe_parsed, _ = _redact_structure(parsed)
+        safe_text = json.dumps(safe_parsed, ensure_ascii=False, default=str)
         return {
             "status": "malformed",
             "error": "Event record is not a JSON object.",
-            "raw_excerpt": text[:500],
-            "record_truncated": len(text) > 500,
+            "raw_excerpt": safe_text[:500],
+            "record_truncated": len(safe_text) > 500,
         }
-    serialized = json.dumps(parsed, ensure_ascii=False, sort_keys=True, default=str)
-    if len(serialized) > _MAX_EVENT_RECORD_CHARS:
+    original_serialized = json.dumps(parsed, ensure_ascii=False, sort_keys=True, default=str)
+    safe_parsed, _ = _redact_structure(parsed)
+    serialized = json.dumps(safe_parsed, ensure_ascii=False, sort_keys=True, default=str)
+    if len(original_serialized) > _MAX_EVENT_RECORD_CHARS:
         return {
             "status": "valid",
-            "timestamp": parsed.get("timestamp"),
-            "type": parsed.get("type") or parsed.get("event_type"),
+            "timestamp": safe_parsed.get("timestamp"),
+            "type": safe_parsed.get("type") or safe_parsed.get("event_type"),
             "record_excerpt": serialized[:_MAX_EVENT_RECORD_CHARS],
             "record_truncated": True,
         }
-    return {"status": "valid", "record": parsed, "record_truncated": False}
+    return {"status": "valid", "record": safe_parsed, "record_truncated": False}
 
 
 async def _recent_events(redis_client: Any, repo_slug: str, limit: int) -> dict[str, Any]:
@@ -938,49 +1014,154 @@ async def _redis_log_sources(
         }
     )
 
-    prefix = cli_log_history(repo_slug, "")
-    malformed_keys = 0
+    return sources, warnings
+
+
+def _encode_history_cursor(scan_cursor: int, pending: list[str], *, started: bool) -> str:
+    payload = json.dumps(
+        {"scan_cursor": scan_cursor, "pending": pending, "started": started},
+        separators=(",", ":"),
+    ).encode()
+    encoded = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    return f"{_HISTORY_CURSOR_PREFIX}{encoded}"
+
+
+def _decode_log_cursor(value: int | str) -> tuple[str, int | dict[str, Any]]:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return "static", _validate_cursor(value)
+    if not isinstance(value, str) or not value.startswith(_HISTORY_CURSOR_PREFIX):
+        raise ValueError("cursor must be a non-negative static offset or a returned history cursor")
+    encoded = value.removeprefix(_HISTORY_CURSOR_PREFIX)
     try:
-        async for raw_key in client.scan_iter(match=cli_log_history(repo_slug, "*")):
-            key = _decode(raw_key)
-            if key == latest_key or not key.startswith(prefix):
-                continue
-            timestamp = key[len(prefix) :]
-            if _parse_timestamp(timestamp) is None:
-                malformed_keys += 1
-                continue
+        padding = "=" * (-len(encoded) % 4)
+        raw = base64.b64decode(encoded + padding, altchars=b"-_", validate=True)
+        payload = json.loads(raw)
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("Invalid history cursor.") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid history cursor.")
+    scan_cursor = payload.get("scan_cursor")
+    pending = payload.get("pending")
+    started = payload.get("started")
+    if (
+        isinstance(scan_cursor, bool)
+        or not isinstance(scan_cursor, int)
+        or scan_cursor < 0
+        or not isinstance(pending, list)
+        or len(pending) > _MAX_REDIS_PENDING_KEYS
+        or not isinstance(started, bool)
+        or any(
+            not isinstance(timestamp, str)
+            or _parse_timestamp(timestamp) is None
+            or "/" in timestamp
+            for timestamp in pending
+        )
+    ):
+        raise ValueError("Invalid history cursor.")
+    return "history", {"scan_cursor": scan_cursor, "pending": pending, "started": started}
+
+
+async def _redis_history_page(
+    client: Any,
+    repo_slug: str,
+    observed_at: datetime,
+    *,
+    cursor_state: dict[str, Any],
+    limit: int,
+) -> tuple[list[dict[str, Any]], list[str], str | None]:
+    warnings: list[str] = []
+    candidates = list(cursor_state["pending"])
+    scan_cursor = int(cursor_state["scan_cursor"])
+    started = bool(cursor_state["started"])
+    completed = started and scan_cursor == 0
+    scan_calls = 0
+    malformed_keys = 0
+    prefix = cli_log_history(repo_slug, "")
+
+    try:
+        while len(candidates) < limit and not completed and scan_calls < _MAX_REDIS_SCAN_CALLS:
+            scan_cursor, raw_keys = await client.scan(
+                cursor=scan_cursor,
+                match=cli_log_history(repo_slug, "*"),
+                count=max(10, limit),
+            )
+            scan_cursor = int(scan_cursor)
+            started = True
+            scan_calls += 1
+            for raw_key in raw_keys:
+                key = _decode(raw_key)
+                if not key.startswith(prefix):
+                    continue
+                timestamp = key[len(prefix) :]
+                if _parse_timestamp(timestamp) is None or "/" in timestamp:
+                    malformed_keys += 1
+                    continue
+                if timestamp not in candidates:
+                    candidates.append(timestamp)
+            completed = scan_cursor == 0
+    except Exception as exc:
+        warnings.append(f"CLI history discovery incomplete: {_error_text(exc)}")
+        completed = True
+
+    if malformed_keys:
+        warnings.append(
+            f"Ignored {malformed_keys} malformed CLI history key(s) in the constrained repository namespace."
+        )
+    if len(candidates) > _MAX_REDIS_PENDING_KEYS:
+        dropped = len(candidates) - _MAX_REDIS_PENDING_KEYS
+        candidates = candidates[:_MAX_REDIS_PENDING_KEYS]
+        warnings.append(
+            f"Redis returned an oversized scan batch; {dropped} source identifier(s) were omitted from continuation."
+        )
+
+    selected = candidates[:limit]
+    remaining = candidates[limit:]
+    sources: list[dict[str, Any]] = []
+    for timestamp in selected:
+        key = cli_log_history(repo_slug, timestamp)
+        try:
             value = await client.get(key)
             ttl = int(await client.ttl(key))
-            if value is None:
-                continue
-            text = _decode(value)
+        except Exception as exc:
             sources.append(
                 {
                     "source_id": f"{_CLI_HISTORY_SOURCE_PREFIX}{timestamp}",
                     "kind": "retained_cli_log",
                     "storage": "redis",
-                    "availability": "available",
-                    "timestamps": {
-                        "recorded_at": timestamp,
-                        **_ttl_metadata(ttl, observed_at),
-                    },
-                    "size_chars": len(text),
-                    "retention": {
-                        "producer_ttl_seconds": _CLI_HISTORY_TTL_SECONDS,
-                        "truncated": text.startswith("[truncated]\n"),
-                        "truncation_marker_preserved": True,
-                    },
+                    "availability": "unavailable",
+                    "error": _error_text(exc),
                     "association": _association(),
                     "mutable": False,
                 }
             )
-    except Exception as exc:
-        warnings.append(f"CLI history discovery incomplete: {_error_text(exc)}")
-    if malformed_keys:
-        warnings.append(
-            f"Ignored {malformed_keys} malformed CLI history key(s) in the constrained repository namespace."
+            continue
+        text = _decode(value) if value is not None else ""
+        sources.append(
+            {
+                "source_id": f"{_CLI_HISTORY_SOURCE_PREFIX}{timestamp}",
+                "kind": "retained_cli_log",
+                "storage": "redis",
+                "availability": "available" if value is not None else "missing_or_expired",
+                "timestamps": {
+                    "recorded_at": timestamp,
+                    **_ttl_metadata(ttl, observed_at),
+                },
+                "size_chars": len(text),
+                "retention": {
+                    "producer_ttl_seconds": _CLI_HISTORY_TTL_SECONDS,
+                    "truncated": text.startswith("[truncated]\n"),
+                    "truncation_marker_preserved": True,
+                },
+                "association": _association(),
+                "mutable": False,
+                "ordering": "redis_scan",
+            }
         )
-    return sources, warnings
+
+    next_cursor = None
+    if remaining or not completed:
+        next_cursor = _encode_history_cursor(scan_cursor, remaining, started=started)
+    return sources, warnings, next_cursor
 
 
 def _file_log_sources(repo_slug: str) -> tuple[list[dict[str, Any]], list[str]]:
@@ -1074,7 +1255,7 @@ def _unretained_sources() -> list[dict[str, Any]]:
 @mcp.tool()
 async def list_orchestrator_logs(
     repo_slug: str,
-    cursor: int = 0,
+    cursor: int | str = 0,
     limit: int = 50,
 ) -> dict[str, Any]:
     """Discover retained log sources for one configured repository.
@@ -1084,48 +1265,75 @@ async def list_orchestrator_logs(
     was actually recorded by its producer.
     """
     _validate_configured_repo(repo_slug)
-    cursor = _validate_cursor(cursor)
+    cursor_kind, cursor_value = _decode_log_cursor(cursor)
     limit = _validate_limit(limit, maximum=_MAX_LOG_SOURCES, name="limit")
     observed_at = _utc_now()
     client: Any | None = None
+    redis_warnings: list[str] = []
+    file_warnings: list[str] = []
+    known_static_total: int | None = None
     try:
         client = _new_redis_client()
-        redis_sources, redis_warnings = await _redis_log_sources(client, repo_slug, observed_at)
-    except Exception as exc:
-        message = _error_text(exc)
-        redis_sources = [
-            {
-                "source_id": "redis:diagnostics",
-                "kind": "redis_diagnostic_sources",
-                "storage": "redis",
-                "availability": "unavailable",
-                "error": message,
-                "association": _association(),
-            }
-        ]
-        redis_warnings = [f"Redis diagnostic sources unavailable: {message}"]
+        if cursor_kind == "history":
+            page, redis_warnings, next_cursor = await _redis_history_page(
+                client,
+                repo_slug,
+                observed_at,
+                cursor_state=cursor_value,
+                limit=limit,
+            )
+            phase = "redis_history"
+        else:
+            try:
+                redis_sources, redis_warnings = await _redis_log_sources(client, repo_slug, observed_at)
+            except Exception as exc:
+                message = _error_text(exc)
+                redis_sources = [
+                    {
+                        "source_id": "redis:diagnostics",
+                        "kind": "redis_diagnostic_sources",
+                        "storage": "redis",
+                        "availability": "unavailable",
+                        "error": message,
+                        "association": _association(),
+                    }
+                ]
+                redis_warnings = [f"Redis diagnostic sources unavailable: {message}"]
+            file_sources, file_warnings = _file_log_sources(repo_slug)
+            sources = redis_sources + file_sources + _unretained_sources()
+            sources.sort(
+                key=lambda item: (
+                    item["source_id"] not in {"cli:latest", "events:redis", "ci:artifact"},
+                    item["source_id"],
+                )
+            )
+            static_cursor = int(cursor_value)
+            if static_cursor > len(sources):
+                raise ValueError("Static source cursor is beyond the available source list.")
+            known_static_total = len(sources)
+            page = sources[static_cursor : static_cursor + limit]
+            next_static = static_cursor + len(page)
+            next_cursor = (
+                next_static
+                if next_static < len(sources)
+                else _encode_history_cursor(0, [], started=False)
+            )
+            phase = "static"
     finally:
         await _close_redis(client)
-    file_sources, file_warnings = _file_log_sources(repo_slug)
-    sources = redis_sources + file_sources + _unretained_sources()
-    sources.sort(
-        key=lambda item: (
-            item["source_id"] not in {"cli:latest", "events:redis", "ci:artifact"},
-            item["source_id"],
-        )
-    )
-    page = sources[cursor : cursor + limit]
-    next_cursor = cursor + len(page) if cursor + len(page) < len(sources) else None
     payload = {
         "observed_at": _iso_z(observed_at),
         "repo_slug": repo_slug,
         "sources": page,
         "warnings": redis_warnings + file_warnings,
         "pagination": {
+            "phase": phase,
             "cursor": cursor,
             "limit": limit,
             "returned": len(page),
-            "total": len(sources),
+            "total": None,
+            "known_static_total": known_static_total,
+            "history_total": "unknown_without_full_scan",
             "next_cursor": next_cursor,
         },
         "gaps": [
@@ -1248,7 +1456,8 @@ def _file_source_metadata(
         "association": association,
         "mutable": mutable,
         "ordering": "oldest_first" if kind == "disk_event_log" else None,
-        "read_bound_bytes": _MAX_FILE_SCAN_BYTES,
+        "page_window_bound_bytes": _MAX_FILE_SCAN_BYTES,
+        "private_key_context": "older chunks may be inspected to determine multiline redaction state",
     }
 
 
@@ -1328,8 +1537,15 @@ def _read_file_source(
                 else:
                     page_start += newline + 1
                     raw = raw[newline + 1 :]
+            starts_inside_private_key, context_scanned_bytes = _private_key_state_before(handle, page_start)
             text = raw.decode("utf-8", errors="replace")
-            redacted, replacements = _redact_text(text)
+            redaction_units = _redacted_file_units(
+                raw,
+                starts_inside_private_key=starts_inside_private_key,
+                warnings=warnings,
+            )
+            redacted = "".join(unit[1] for unit in redaction_units)
+            replacements = sum(unit[2] for unit in redaction_units)
             content = redacted[-max_chars:]
             malformed = (
                 sum(_bounded_event(line)["status"] == "malformed" for line in text.splitlines() if line)
@@ -1344,6 +1560,7 @@ def _read_file_source(
                 "returned_chars": len(content),
                 "source_size_bytes": stat.st_size,
                 "scanned_bytes": scanned_bytes,
+                "context_scanned_bytes": context_scanned_bytes,
                 "scan_limit_bytes": _MAX_FILE_SCAN_BYTES,
                 "previous_cursor": (max(0, page_start - _MAX_FILE_SCAN_BYTES) if page_start > 0 else None),
                 "next_cursor": None,
@@ -1437,37 +1654,19 @@ def _read_file_source(
                     )
                 raw = raw[: newline + 1]
 
-            raw_lines = raw.splitlines(keepends=True)
-            redaction_units: list[tuple[bytes, str]] = []
-            line_index = 0
-            while line_index < len(raw_lines):
-                raw_unit = raw_lines[line_index]
-                if _PRIVATE_KEY_BEGIN.search(raw_unit):
-                    end_index = line_index
-                    while end_index < len(raw_lines) and not _PRIVATE_KEY_END.search(raw_lines[end_index]):
-                        end_index += 1
-                    if end_index < len(raw_lines):
-                        raw_unit = b"".join(raw_lines[line_index : end_index + 1])
-                        line_index = end_index
-                    else:
-                        raw_unit = b"".join(raw_lines[line_index:])
-                        warnings.append(
-                            "A private-key block crossed the bounded scan window; its visible segment was redacted."
-                        )
-                        line_index = len(raw_lines) - 1
-                redaction_units.append((raw_unit, raw_unit.decode("utf-8", errors="replace")))
-                line_index += 1
+            starts_inside_private_key, context_scanned_bytes = _private_key_state_before(handle, page_start)
+            redaction_units = _redacted_file_units(
+                raw,
+                starts_inside_private_key=starts_inside_private_key,
+                warnings=warnings,
+            )
 
             parts: list[str] = []
             returned_chars = 0
             consumed_bytes = 0
             replacements = 0
             malformed = 0
-            for raw_unit, text_unit in redaction_units:
-                safe_unit, unit_replacements = _redact_text(text_unit)
-                if _PRIVATE_KEY_BEGIN.search(raw_unit) and unit_replacements == 0:
-                    safe_unit = "[REDACTED PRIVATE KEY]\n"
-                    unit_replacements = 1
+            for raw_unit, safe_unit, unit_replacements in redaction_units:
                 if parts and returned_chars + len(safe_unit) > max_chars:
                     break
                 if not parts and len(safe_unit) > max_chars:
@@ -1480,7 +1679,7 @@ def _read_file_source(
                 if kind == "disk_event_log":
                     malformed += sum(
                         _bounded_event(line)["status"] == "malformed"
-                        for line in text_unit.splitlines()
+                        for line in raw_unit.decode("utf-8", errors="replace").splitlines()
                         if line
                     )
                 if returned_chars >= max_chars:
@@ -1496,6 +1695,7 @@ def _read_file_source(
                 "returned_chars": len(content),
                 "source_size_bytes": stat.st_size,
                 "scanned_bytes": scanned_bytes,
+                "context_scanned_bytes": context_scanned_bytes,
                 "scan_limit_bytes": _MAX_FILE_SCAN_BYTES,
                 "previous_cursor": (max(0, page_start - _MAX_FILE_SCAN_BYTES) if page_start > 0 else None),
                 "next_cursor": next_cursor,
