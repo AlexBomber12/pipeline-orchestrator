@@ -68,10 +68,12 @@ def test_handle_fix_skipped_when_spend_ceiling_exceeded(
     )
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=77, branch="pr-309-token-spend-ceiling")
+    runner._fix_feedback_reviewer_policy = object()
 
     asyncio.run(runner.handle_fix())
 
     assert called == []
+    assert runner._fix_feedback_reviewer_policy is None
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.error_message is None
 

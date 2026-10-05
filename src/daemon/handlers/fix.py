@@ -224,6 +224,8 @@ class FixMixin(BreachMixin):
     async def handle_fix(self) -> None:
         """Run ``FIX FEEDBACK`` via the active coder CLI and return to WATCH."""
         self._stop_requested = False
+        fix_feedback_reviewer_policy = self._fix_feedback_reviewer_policy
+        self._fix_feedback_reviewer_policy = None
         # PR-358: a FIX entry begins a new review iteration; clear the
         # single-shot review_timeout repost flag so the next WATCH
         # iteration after this FIX can post one repost again if Codex
@@ -368,11 +370,9 @@ class FixMixin(BreachMixin):
             fix_kwargs["pr_id"] = self.state.current_task.pr_id
             fix_kwargs["task_file"] = self.state.current_task.task_file
         if self.state.current_pr is not None:
-            reviewer_policy = self._fix_feedback_reviewer_policy
-            self._fix_feedback_reviewer_policy = None
             extra_context = await self._build_fix_feedback_context(
                 self.state.current_pr,
-                reviewer_policy=reviewer_policy,
+                reviewer_policy=fix_feedback_reviewer_policy,
             )
             if extra_context is not None:
                 fix_kwargs["extra_context"] = extra_context
