@@ -1514,6 +1514,40 @@ async def test_tagged_flow_yaml_is_redacted_across_retained_readers(
         assert "retained-safe-tagged-flow" in result["content"]
 
 
+async def test_dense_logs_with_aliased_yaml_keys_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    repos_root = tmp_path / "repos"
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+    payload = (
+        "\n" * (diagnostics._MAX_REDACTION_PHYSICAL_LINES + 1)
+        + "- &kind_key kind\n"
+        + "- &payload_key data\n"
+        + "*kind_key: Secret\n"
+        + "*payload_key:\n"
+        + "  opaque: dense-alias-secret\n"
+    )
+    redis.store[cli_log_latest(SLUG)] = payload
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.write_text(payload, encoding="utf-8")
+
+    for source_id in ("cli:latest", "ci:artifact"):
+        result = await diagnostics.read_orchestrator_log(
+            SLUG,
+            source_id,
+            max_chars=20_000,
+        )
+        assert "dense-alias-secret" not in result["content"]
+        assert result["content"] == "[CONTENT OMITTED: PHYSICAL LINE BOUND EXCEEDED]\n"
+        assert any("Physical line count" in warning for warning in result["warnings"])
+
+
 async def test_multiline_explicit_yaml_keys_are_redacted_across_retained_readers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

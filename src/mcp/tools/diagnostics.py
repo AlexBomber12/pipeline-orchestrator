@@ -323,6 +323,7 @@ _HIGH_LINE_COMPLEX_SENSITIVE_ASSIGNMENT = re.compile(
 )
 _HIGH_LINE_EXPLICIT_YAML = re.compile(r"(?m)^[ \t]*(?:-[ \t]+)?[?:](?:[ \t]|$)")
 _HIGH_LINE_ESCAPED_MAPPING_KEY = re.compile(r"(?m)^[^\r\n:]*\\[^\r\n:]*:")
+_HIGH_LINE_ALIASED_MAPPING_KEY = re.compile(r"(?m)(?<![A-Za-z0-9_.-])\*[^\s,\[\]{}:]+[ \t]*:")
 _BLOCK_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
     rf"(?:{_SENSITIVE_KEY_PATTERN}))\s*(?:\+=|[:=])[ \t]*"
@@ -673,6 +674,7 @@ def _redact_high_line_plain_text(
         or _HIGH_LINE_COMPLEX_SENSITIVE_ASSIGNMENT.search(text) is not None
         or _HIGH_LINE_EXPLICIT_YAML.search(text) is not None
         or _HIGH_LINE_ESCAPED_MAPPING_KEY.search(text) is not None
+        or _HIGH_LINE_ALIASED_MAPPING_KEY.search(text) is not None
     ):
         return None
     return _redact_text(text)
