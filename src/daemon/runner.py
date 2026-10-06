@@ -329,8 +329,8 @@ class PipelineRunner(
         repo_config: RepoConfig,
         app_config: AppConfig,
         redis_client: aioredis.Redis,
-        claude_usage_provider: UsageProvider,
-        codex_usage_provider: UsageProvider,
+        claude_usage_provider: UsageProvider | None,
+        codex_usage_provider: UsageProvider | None,
         registry: CoderRegistry | None = None,
         usage_providers: Mapping[str, UsageProvider | None] | None = None,
     ) -> None:
@@ -463,7 +463,7 @@ class PipelineRunner(
         self._pending_repo_config: RepoConfig | None = None
         self._pending_app_config: AppConfig | None = None
         self._pending_usage_providers: (
-            tuple[UsageProvider, UsageProvider] | None
+            tuple[UsageProvider | None, UsageProvider | None] | None
         ) = None
         self._pending_usage_provider_map: (
             dict[str, UsageProvider | None] | None
@@ -706,8 +706,8 @@ class PipelineRunner(
 
     def set_usage_providers(
         self,
-        claude_usage_provider: UsageProvider,
-        codex_usage_provider: UsageProvider,
+        claude_usage_provider: UsageProvider | None,
+        codex_usage_provider: UsageProvider | None,
         *,
         usage_providers: Mapping[str, UsageProvider | None] | None = None,
     ) -> None:
@@ -807,8 +807,8 @@ class PipelineRunner(
         self,
         repo_config: RepoConfig,
         app_config: AppConfig,
-        claude_usage_provider: UsageProvider,
-        codex_usage_provider: UsageProvider,
+        claude_usage_provider: UsageProvider | None,
+        codex_usage_provider: UsageProvider | None,
         *,
         requires_idle_boundary: bool = False,
         usage_providers: Mapping[str, UsageProvider | None] | None = None,
@@ -874,12 +874,6 @@ class PipelineRunner(
             name: self._registry.get(name).create_usage_provider(config=app_config)
             for name in self._registry.coder_names()
         }
-        providers["claude"] = (
-            providers.get("claude") or self._claude_usage_provider
-        )
-        providers["codex"] = (
-            providers.get("codex") or self._codex_usage_provider
-        )
         return providers
 
     def _apply_staged_config_reload(self) -> None:

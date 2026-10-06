@@ -94,6 +94,9 @@ class ClaudeOverridePlugin(ClaudePlugin):
     def check_auth(self, **_kwargs: object) -> dict[str, str]:
         return {"status": "ok", "detail": "configured plugin auth"}
 
+    def create_usage_provider(self, **_kwargs: object) -> None:
+        return None
+
 
 class DigitLeadingTestPlugin(ConfiguredTestPlugin):
     name = "3rd"

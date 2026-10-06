@@ -507,6 +507,58 @@ def test_plugin_without_usage_provider_does_not_inherit_builtin_quota() -> None:
     assert runner.state.usage_api_degraded is False
 
 
+def test_telemetryless_builtin_override_starts_without_quota_substitution() -> None:
+    config = AppConfig(
+        repositories=[h._repo_cfg()],
+        daemon=DaemonConfig(coder="claude"),
+        coder_plugins={
+            "claude": (
+                "tests.configured_coder_plugin:build_claude_override"
+            )
+        },
+    )
+    registry = build_coder_registry(config)
+
+    claude_provider, codex_provider = main_module._create_usage_providers(
+        config, registry
+    )
+
+    assert claude_provider is None
+    assert codex_provider is not None
+    assert registry.usage_providers()["claude"] is None
+
+    runner = PipelineRunner(
+        config.repositories[0],
+        config,
+        h._FakeRedis(),
+        claude_provider,
+        codex_provider,
+        registry=registry,
+        usage_providers=registry.usage_providers(),
+    )
+    runner.state.coder = "claude"
+    runner._claude_usage_provider = h._FakeUsageProvider(
+        snapshot=UsageSnapshot(
+            session_percent=100,
+            session_resets_at=18,
+            weekly_percent=100,
+            weekly_resets_at=20,
+            fetched_at=time.time(),
+        )
+    )
+
+    rebuilt = runner._build_usage_provider_map_for_app_config(config)
+
+    assert rebuilt["claude"] is None
+    runner.set_usage_providers(
+        None,
+        codex_provider,
+        usage_providers=rebuilt,
+    )
+    assert asyncio.run(runner._fetch_usage_snapshot("claude")) is None
+    assert asyncio.run(runner.usage_gate(proactive_coder="claude")) is True
+
+
 def test_overridden_builtin_uses_registered_rate_limit_patterns() -> None:
     class _ClaudeOverride(FakeCoderPlugin):
         name = "claude"

@@ -1611,7 +1611,7 @@ def test_build_runner_passes_registry_when_supported(
     }
 
 
-def test_create_usage_providers_rejects_missing_builtin_provider() -> None:
+def test_create_usage_providers_allows_missing_builtin_provider() -> None:
     class _Plugin:
         def __init__(self, provider: object | None) -> None:
             self.provider = provider
@@ -1621,17 +1621,30 @@ def test_create_usage_providers_rejects_missing_builtin_provider() -> None:
             return self.provider
 
     class _Registry:
+        def __init__(self) -> None:
+            self.providers: dict[str, object | None] = {}
+
         def get(self, name: str) -> _Plugin:
             return {
                 "claude": _Plugin(None),
                 "codex": _Plugin(object()),
             }[name]
 
-    with pytest.raises(ValueError, match="must provide usage providers"):
-        main_module._create_usage_providers(
-            AppConfig(),
-            _Registry(),  # type: ignore[arg-type]
-        )
+        def set_usage_providers(
+            self, providers: dict[str, object | None]
+        ) -> None:
+            self.providers = dict(providers)
+
+    registry = _Registry()
+
+    claude, codex = main_module._create_usage_providers(
+        AppConfig(),
+        registry,  # type: ignore[arg-type]
+    )
+
+    assert claude is None
+    assert codex is not None
+    assert registry.providers == {"claude": None, "codex": codex}
 
 
 def test_main_logs_error_when_no_auth_is_configured(

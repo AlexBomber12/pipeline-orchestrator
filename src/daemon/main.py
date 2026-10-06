@@ -251,8 +251,8 @@ def _build_runner(
     repo: RepoConfig,
     config: AppConfig,
     redis_client: Any,
-    claude_usage_provider: UsageProvider,
-    codex_usage_provider: UsageProvider,
+    claude_usage_provider: UsageProvider | None,
+    codex_usage_provider: UsageProvider | None,
     registry: CoderRegistry,
 ) -> PipelineRunner | None:
     """Construct a runner, logging and swallowing init failures."""
@@ -281,7 +281,7 @@ def _build_runner(
 def _create_usage_providers(
     config: AppConfig,
     registry: CoderRegistry,
-) -> tuple[UsageProvider, UsageProvider]:
+) -> tuple[UsageProvider | None, UsageProvider | None]:
     """Create the shared daemon-level usage providers for the current config."""
     try:
         names = registry.coder_names()
@@ -294,10 +294,6 @@ def _create_usage_providers(
     }
     claude = providers.get("claude")
     codex = providers.get("codex")
-    if claude is None or codex is None:
-        raise ValueError(
-            "Configured 'claude' and 'codex' plugins must provide usage providers"
-        )
     if hasattr(registry, "set_usage_providers"):
         registry.set_usage_providers(providers)
     return claude, codex
@@ -307,8 +303,8 @@ def _sync_runners(
     runners: dict[str, PipelineRunner],
     config: AppConfig,
     redis_client: Any,
-    claude_usage_provider: UsageProvider,
-    codex_usage_provider: UsageProvider,
+    claude_usage_provider: UsageProvider | None,
+    codex_usage_provider: UsageProvider | None,
     registry: CoderRegistry,
     in_flight: dict[str, asyncio.Task[None]] | None = None,
 ) -> None:
