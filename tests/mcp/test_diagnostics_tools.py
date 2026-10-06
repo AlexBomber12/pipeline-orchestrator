@@ -1401,6 +1401,60 @@ async def test_explicit_secret_kind_ignores_kind_text_inside_block_scalars(
     assert "retained-explicit-kind-config" in inside_payload["content"]
 
 
+async def test_decorated_yaml_mapping_keys_are_redacted_across_retained_readers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    repos_root = tmp_path / "repos"
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+    payload = (
+        "kind: Secret\n!!str data:\n  opaque: tagged-payload-key-secret\n"
+        "---\nkind: Secret\n&payloadKey stringData:\n"
+        "  config: anchored-payload-key-secret\n"
+        "---\nkind: ConfigMap\n!!str data:\n"
+        "  harmless: retained-decorated-config\n"
+        "---\nkind: Pod\nenv:\n"
+        "  - name: PASSWORD\n    !!str value: tagged-value-field-secret\n"
+        "  - !!str name: API_KEY\n    &valueKey value: anchored-value-field-secret\n"
+        "  - name: SAFE\n    !!str value: retained-decorated-env\n"
+    )
+    redis.store[cli_log_latest(SLUG)] = payload
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.write_text(payload, encoding="utf-8")
+
+    for source_id in ("cli:latest", "ci:artifact"):
+        result = await diagnostics.read_orchestrator_log(
+            SLUG,
+            source_id,
+            max_chars=4_000,
+        )
+        assert "tagged-payload-key-secret" not in result["content"]
+        assert "anchored-payload-key-secret" not in result["content"]
+        assert "tagged-value-field-secret" not in result["content"]
+        assert "anchored-value-field-secret" not in result["content"]
+        assert "retained-decorated-config" in result["content"]
+        assert "retained-decorated-env" in result["content"]
+
+    raw = ci_path.read_bytes()
+    for excerpt in (
+        b"  opaque: tagged-payload-key-secret",
+        b"    !!str value: tagged-value-field-secret",
+    ):
+        page = await diagnostics.read_orchestrator_log(
+            SLUG,
+            "ci:artifact",
+            cursor=raw.index(excerpt),
+            max_chars=4_000,
+        )
+        assert "tagged-payload-key-secret" not in page["content"]
+        assert "tagged-value-field-secret" not in page["content"]
+
+
 async def test_truncated_redis_logs_omit_unknown_leading_sensitive_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1731,6 +1785,29 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
         "kind",
     ) == {0: "Secret", 3: "*kindValue"}
     assert diagnostics._yaml_mapping_scalar_values([b"kind: [\n"], "kind") == {}
+    assert diagnostics._yaml_mapping_scalar_field("!!str data:") == (0, False, "data", "")
+    assert diagnostics._yaml_mapping_scalar_field("  !!str value: hidden") == (
+        2,
+        False,
+        "value",
+        "hidden",
+    )
+    assert diagnostics._yaml_mapping_scalar_field("- &field name: PASSWORD") == (
+        2,
+        True,
+        "name",
+        "PASSWORD",
+    )
+    assert diagnostics._yaml_mapping_scalar_field("ordinary") is None
+    assert diagnostics._yaml_mapping_scalar_field('*field: "unterminated') is None
+    assert diagnostics._yaml_mapping_scalar_field("? data # :") is None
+    assert diagnostics._yaml_mapping_scalar_field("name: *field") == (
+        0,
+        False,
+        "name",
+        "*field",
+    )
+    assert diagnostics._yaml_has_payload_mapping_key("? !!str data") is True
     assert diagnostics._yaml_kind_entries(
         [
             b"? kind\n",

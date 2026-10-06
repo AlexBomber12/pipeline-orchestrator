@@ -1286,18 +1286,71 @@ def _yaml_explicit_value_end(
     return value_end, value_end == len(raw_lines) and has_more_after_raw
 
 
+def _yaml_mapping_scalar_field(text: str) -> tuple[int, bool, str, str] | None:
+    """Return one bounded semantic scalar-key field from a YAML line."""
+    if ":" not in text or _yaml_parse_complexity_exceeded(text):
+        return None
+    try:
+        tokens = list(yaml.scan(text))
+    except (RecursionError, yaml.YAMLError):
+        return None
+    for index, token in enumerate(tokens):
+        if not isinstance(token, yaml.tokens.ScalarToken):
+            continue
+        key_index = index - 1
+        while key_index >= 0 and isinstance(
+            tokens[key_index], (yaml.tokens.AnchorToken, yaml.tokens.TagToken)
+        ):
+            key_index -= 1
+        if key_index < 0 or not isinstance(tokens[key_index], yaml.tokens.KeyToken):
+            continue
+        prefix = text[: tokens[key_index].start_mark.column]
+        if re.fullmatch(r"[ \t]*(?:-[ \t]+)?", prefix) is None:
+            continue
+        value_index = index + 1
+        if value_index >= len(tokens) or not isinstance(tokens[value_index], yaml.tokens.ValueToken):
+            continue
+        raw_value = text[tokens[value_index].end_mark.column :].strip()
+        scalar_index = value_index + 1
+        while scalar_index < len(tokens) and isinstance(
+            tokens[scalar_index], (yaml.tokens.AnchorToken, yaml.tokens.TagToken)
+        ):
+            scalar_index += 1
+        value_token = tokens[scalar_index] if scalar_index < len(tokens) else None
+        if isinstance(value_token, yaml.tokens.ScalarToken):
+            value = str(value_token.value)
+        elif isinstance(value_token, yaml.tokens.AliasToken):
+            value = f"*{value_token.value}"
+        else:
+            value = raw_value
+        return (
+            tokens[key_index].start_mark.column,
+            prefix.lstrip().startswith("-"),
+            str(token.value),
+            value,
+        )
+    return None
+
+
 def _yaml_has_payload_mapping_key(text: str) -> bool:
     """Return whether one YAML line resolves a data/stringData mapping key."""
+    field = _yaml_mapping_scalar_field(text)
+    if field is not None:
+        normalized = field[2].casefold().replace("_", "").replace("-", "")
+        return normalized in {"data", "stringdata"}
     try:
         tokens = list(yaml.scan(text))
     except (RecursionError, yaml.YAMLError):
         return False
     for index, token in enumerate(tokens):
-        if (
-            isinstance(token, yaml.tokens.ScalarToken)
-            and index > 0
-            and isinstance(tokens[index - 1], yaml.tokens.KeyToken)
+        if not isinstance(token, yaml.tokens.ScalarToken):
+            continue
+        key_index = index - 1
+        while key_index >= 0 and isinstance(
+            tokens[key_index], (yaml.tokens.AnchorToken, yaml.tokens.TagToken)
         ):
+            key_index -= 1
+        if key_index >= 0 and isinstance(tokens[key_index], yaml.tokens.KeyToken):
             normalized = str(token.value).casefold().replace("_", "").replace("-", "")
             if normalized in {"data", "stringdata"}:
                 return True
@@ -1318,6 +1371,7 @@ def _yaml_secret_payload_lines(lines: list[bytes]) -> set[int]:
             or (
                 (
                     candidate.startswith("? ")
+                    or candidate.startswith(("!", "&"))
                     or (candidate.startswith('"') and "\\" in key_source)
                 )
                 and _yaml_has_payload_mapping_key(candidate)
@@ -1482,6 +1536,28 @@ def _has_closing_quote(value: str, quote: str) -> bool:
     return False
 
 
+def _yaml_env_field(text: str) -> tuple[int, bool, str, str] | None:
+    """Classify a literal or decorated YAML environment field."""
+    name_match = _YAML_ENV_NAME.fullmatch(text)
+    value_match = _YAML_ENV_VALUE.fullmatch(text)
+    literal = name_match or value_match
+    if literal is not None:
+        field = "name" if name_match is not None else "value"
+        value = literal.group(field)
+        return (
+            len(literal.group("indent")) + len(literal.group("dash") or ""),
+            literal.group("dash") is not None,
+            field,
+            value,
+        )
+    if not any(marker in text for marker in ("!", "&", "\\")):
+        return None
+    semantic = _yaml_mapping_scalar_field(text)
+    if semantic is None or semantic[2].casefold() not in {"name", "value"}:
+        return None
+    return semantic[0], semantic[1], semantic[2].casefold(), semantic[3]
+
+
 def _yaml_env_item(
     raw_lines: list[bytes],
     start: int,
@@ -1491,19 +1567,17 @@ def _yaml_env_item(
 ) -> tuple[int, bool, bool] | None:
     """Return a YAML env item boundary and whether its value is sensitive or uncertain."""
     first = raw_lines[start].decode("utf-8", errors="replace").rstrip("\r\n")
-    first_name = _YAML_ENV_NAME.fullmatch(first)
-    first_value = _YAML_ENV_VALUE.fullmatch(first)
+    first_field = _yaml_env_field(first)
     sequence_only = _YAML_SEQUENCE_ITEM_ONLY.fullmatch(first)
-    first_field = first_name or first_value
     is_sequence = sequence_only is not None or (
-        first_field is not None and first_field.group("dash") is not None
+        first_field is not None and first_field[1]
     )
     is_page_fragment = start == 0 and first_field is not None
     if not is_sequence and not is_page_fragment:
         return None
 
     item_indent = _line_indent(raw_lines[start])
-    fragment_indent = len(first_field.group("indent")) if first_field is not None else None
+    fragment_indent = first_field[0] if first_field is not None else None
     end = start + 1
     while end < len(raw_lines):
         candidate = raw_lines[end]
@@ -1525,22 +1599,20 @@ def _yaml_env_item(
     fields: list[tuple[int, str, str | None]] = []
     for raw_line in raw_lines[start:end]:
         line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-        name_match = _YAML_ENV_NAME.fullmatch(line)
-        value_match = _YAML_ENV_VALUE.fullmatch(line)
-        match = name_match or value_match
-        if match is None:
+        field = _yaml_env_field(line)
+        if field is None:
             continue
-        effective_indent = len(match.group("indent")) + len(match.group("dash") or "")
-        if name_match is not None:
+        effective_indent, _has_dash, field_name, field_value = field
+        if field_name == "name":
             fields.append(
                 (
                     effective_indent,
                     "name",
-                    _resolve_yaml_scalar(name_match.group("name"), yaml_anchors or {}),
+                    _resolve_yaml_scalar(field_value, yaml_anchors or {}),
                 )
             )
         else:
-            fields.append((effective_indent, "value", value_match.group("value")))
+            fields.append((effective_indent, "value", field_value))
     if not fields:
         return end, False, False
     direct_indent = min(field[0] for field in fields)
@@ -1605,31 +1677,31 @@ def _sensitive_state_before(
         ) or _yaml_explicit_sensitive_key(line) is not None
         break
     first_raw_line = next((line for line in raw.splitlines() if line.strip()), None)
-    first_raw_value = (
-        _YAML_ENV_VALUE.fullmatch(first_raw_line.decode("utf-8", errors="replace"))
+    first_raw_field = (
+        _yaml_env_field(first_raw_line.decode("utf-8", errors="replace"))
         if first_raw_line is not None
         else None
     )
-    if first_raw_value is not None:
-        value_indent = len(first_raw_value.group("indent"))
+    if first_raw_field is not None and first_raw_field[2] == "value":
+        value_indent = first_raw_field[0]
         for line_index in range(len(context_lines) - 1, -1, -1):
             raw_line = context_lines[line_index]
             if not raw_line.strip():
                 continue
             line = raw_line.decode("utf-8", errors="replace")
-            name_match = _YAML_ENV_NAME.fullmatch(line)
-            if name_match is not None and (
+            name_field = _yaml_env_field(line)
+            if name_field is not None and name_field[2] == "name" and (
                 (
-                    name_match.group("dash") is not None
-                    and len(name_match.group("indent")) < value_indent
+                    name_field[1]
+                    and name_field[0] <= value_indent
                 )
                 or (
-                    name_match.group("dash") is None
-                    and len(name_match.group("indent")) == value_indent
+                    not name_field[1]
+                    and name_field[0] == value_indent
                 )
             ):
                 name = _resolve_yaml_scalar(
-                    name_match.group("name"),
+                    name_field[3],
                     yaml_anchor_states[line_index],
                 )
                 starts_with_sensitive_value = name is None or _SENSITIVE_KEY.fullmatch(name) is not None
