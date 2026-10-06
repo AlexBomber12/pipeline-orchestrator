@@ -690,15 +690,22 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             "<password><![CDATA[redis-xml-cdata-secret]]></password>",
             "<password><value>redis-xml-nested-secret</value></password>",
             "<password>\nredis-xml-multiline-secret\n</password>",
+            '<password\n encoding="plain">redis-xml-multiline-start-secret</password>',
+            (
+                '<password\n encoding="plain"\n mode="test">'
+                "redis-xml-long-start-secret</password>"
+            ),
             (
                 "<clientSecret>\n<![CDATA[\n"
                 "redis-xml-multiline-cdata-secret\n]]>\n</clientSecret>"
             ),
             "<password/>",
+            "<password\n/>\nretained-after-split-self-close",
             '<property name="password" value="redis-xml-attribute-secret"/>',
             "<property value='redis-xml-reversed-secret' name='clientSecret'/>",
             "<username>retained-xml-element-value</username>",
             "<username>\nretained-xml-multiline-value\n</username>",
+            '<username\n encoding="plain">retained-xml-multiline-start-value</username>',
             '<property name="username" value="retained-xml-attribute-value"/>',
             json.dumps(
                 {
@@ -865,13 +872,16 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "<m:password><![CDATA[ci-xml-cdata-secret]]></m:password>\n"
         + "<m:password><value>ci-xml-nested-secret</value></m:password>\n"
         + "<m:password>\nci-xml-multiline-secret\n</m:password>\n"
+        + '<m:password\n encoding="plain">ci-xml-multiline-start-secret</m:password>\n'
         + "<m:clientSecret>\n<![CDATA[\nci-xml-multiline-cdata-secret\n]]>\n"
         + "</m:clientSecret>\n"
         + "<m:password/>\n"
+        + "<m:password\n/>\nretained-ci-after-split-self-close\n"
         + '<property name="apiKey" value="ci-xml-attribute-secret"/>\n'
         + "<property value='ci-xml-reversed-secret' name='refreshToken'/>\n"
         + "<m:username>retained-ci-xml-element-value</m:username>\n"
         + "<m:username>\nretained-ci-xml-multiline-value\n</m:username>\n"
+        + '<m:username\n encoding="plain">retained-ci-xml-multiline-start-value</m:username>\n'
         + '<property name="username" value="retained-ci-xml-attribute-value"/>\n'
         + "apiVersion: v1\ndata:\n"
         + "  opaque: ci-kube-yaml-secret\n"
@@ -994,12 +1004,16 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-xml-cdata-secret" not in content
         assert "redis-xml-nested-secret" not in content
         assert "redis-xml-multiline-secret" not in content
+        assert "redis-xml-multiline-start-secret" not in content
+        assert "redis-xml-long-start-secret" not in content
         assert "redis-xml-multiline-cdata-secret" not in content
         assert "<password/>" in content
+        assert "retained-after-split-self-close" in content
         assert "redis-xml-attribute-secret" not in content
         assert "redis-xml-reversed-secret" not in content
         assert "retained-xml-element-value" in content
         assert "retained-xml-multiline-value" in content
+        assert "retained-xml-multiline-start-value" in content
         assert "retained-xml-attribute-value" in content
         assert "redis-kube-data-secret" not in content
         assert "redis-kube-string-secret" not in content
@@ -1062,6 +1076,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-xml-cdata-secret" not in content
         assert "ci-xml-nested-secret" not in content
         assert "ci-xml-multiline-secret" not in content
+        assert "ci-xml-multiline-start-secret" not in content
         assert "ci-xml-multiline-cdata-secret" not in content
         assert "ci-xml-attribute-secret" not in content
         assert "ci-xml-reversed-secret" not in content
@@ -1134,6 +1149,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             assert "mariadb -p" in content
             assert "retained-ci-xml-element-value" in content
             assert "retained-ci-xml-multiline-value" in content
+            assert "retained-ci-xml-multiline-start-value" in content
+            assert "retained-ci-after-split-self-close" in content
             assert "retained-ci-xml-attribute-value" in content
             assert "retained-ci-list-config-value" in content
             assert "ci-kube-single-flow-secret" not in content
@@ -1161,6 +1178,15 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
     )
     assert "ci-xml-multiline-secret" not in xml_page["content"]
     assert "SENSITIVE XML ELEMENT" in xml_page["content"]
+
+    xml_start_page = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=ci_raw.index(b"ci-xml-multiline-start-secret"),
+        max_chars=200,
+    )
+    assert "ci-xml-multiline-start-secret" not in xml_start_page["content"]
+    assert "SENSITIVE XML ELEMENT" in xml_start_page["content"]
 
     java_property_page = await diagnostics.read_orchestrator_log(
         SLUG,

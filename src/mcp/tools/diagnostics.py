@@ -410,12 +410,12 @@ _HCL_BLOCK_START = re.compile(
 )
 _HCL_BLOCK_STATE_BASE = 4
 _XML_SENSITIVE_STATE_PREFIX = "\0xml:"
-_XML_SENSITIVE_ELEMENT_OPEN = re.compile(
-    rf"(?i)<(?P<xml_state_namespace>(?:[A-Za-z_][A-Za-z0-9_.-]*:)?)"
-    rf"(?P<xml_state_element>{_SENSITIVE_KEY_PATTERN})(?=[ \t/>])[^<>\r\n]*>"
+_XML_SENSITIVE_ELEMENT_START = re.compile(
+    rf"(?i)<(?=[A-Za-z_])(?P<xml_state_namespace>(?:[A-Za-z_][A-Za-z0-9_.-]*:)?)"
+    rf"(?P<xml_state_element>{_SENSITIVE_KEY_PATTERN})(?=[ \t\r\n/>]|$)"
 )
 _XML_SENSITIVE_ELEMENT_VALUE = re.compile(
-    rf"(?i)(?P<xml_open><(?P<xml_namespace>(?:[A-Za-z_][A-Za-z0-9_.-]*:)?)"
+    rf"(?i)(?P<xml_open><(?=[A-Za-z_])(?P<xml_namespace>(?:[A-Za-z_][A-Za-z0-9_.-]*:)?)"
     rf"(?P<xml_element>{_SENSITIVE_KEY_PATTERN})(?=[ \t/>])[^<>\r\n]*>)"
     r"(?P<xml_value>[^\r\n]*?)"
     r"(?P<xml_close></(?P=xml_namespace)(?P=xml_element)[ \t]*>)"
@@ -2106,19 +2106,30 @@ def _xml_sensitive_element_after(text: str, active: str | None) -> str | None:
     """Return the sensitive XML element left open after one bounded line."""
     cursor = 0
     while True:
+        if active is not None and active.startswith("?"):
+            tag = active[1:]
+            opening_end = text.find(">", cursor)
+            if opening_end < 0:
+                return active
+            self_closing = text[cursor:opening_end].rstrip().endswith("/")
+            cursor = opening_end + 1
+            active = None if self_closing else tag
         if active is not None:
             closing = re.search(rf"(?i)</{re.escape(active)}[ \t]*>", text[cursor:])
             if closing is None:
                 return active
             cursor += closing.end()
             active = None
-        opening = _XML_SENSITIVE_ELEMENT_OPEN.search(text, cursor)
+        opening = _XML_SENSITIVE_ELEMENT_START.search(text, cursor)
         if opening is None:
             return None
-        cursor = opening.end()
-        if opening.group(0).rstrip().endswith("/>"):
-            continue
-        active = opening.group("xml_state_namespace") + opening.group("xml_state_element")
+        tag = opening.group("xml_state_namespace") + opening.group("xml_state_element")
+        opening_end = text.find(">", opening.end())
+        if opening_end < 0:
+            return f"?{tag}"
+        self_closing = text[opening.end() : opening_end].rstrip().endswith("/")
+        cursor = opening_end + 1
+        active = None if self_closing else tag
 
 
 def _hcl_block_label_is_sensitive(match: re.Match[str]) -> bool:
