@@ -483,6 +483,31 @@ _REDACTION_RULES = (
     ),
     (
         re.compile(
+            rf"(?im)(?P<powershell_env_prefix>(?<![A-Za-z0-9_.-])"
+            rf"Set-Item[ \t]+(?P<powershell_path_quote>[\"']?)Env:(?:\\)?"
+            rf"(?:{_SENSITIVE_KEY_PATTERN})(?P=powershell_path_quote)[ \t]+"
+            r"(?:-Value[ \t]+)?)"
+            r"(?:(?P<powershell_value_quote>[\"'])(?:`[^\r\n]|"
+            r"(?!(?P=powershell_value_quote))[^\r\n])*(?P=powershell_value_quote)?|"
+            r"[^\s;&|]+)"
+        ),
+        r"\g<powershell_env_prefix>[REDACTED]",
+    ),
+    (
+        re.compile(
+            rf"(?im)(?P<powershell_named_prefix>(?<![A-Za-z0-9_.-])Set-Item"
+            rf"(?=[^\r\n;&|]*?(?<!\S)-(?:Literal)?Path[ \t]+"
+            rf"(?P<powershell_named_path_quote>[\"']?)Env:(?:\\)?"
+            rf"(?:{_SENSITIVE_KEY_PATTERN})(?P=powershell_named_path_quote))"
+            r"[^\r\n;&|]*?(?<!\S)-Value[ \t]+)"
+            r"(?:(?P<powershell_named_value_quote>[\"'])(?:`[^\r\n]|"
+            r"(?!(?P=powershell_named_value_quote))[^\r\n])*"
+            r"(?P=powershell_named_value_quote)?|[^\s;&|]+)"
+        ),
+        r"\g<powershell_named_prefix>[REDACTED]",
+    ),
+    (
+        re.compile(
             rf"(?im)(?P<aws_configure_prefix>(?<![A-Za-z0-9_.-])"
             rf"aws(?:\.exe)?(?=[ \t])[^\r\n;&|]*?(?<!\S)configure[ \t]+set[ \t]+"
             rf"(?:{_SENSITIVE_KEY_PATTERN})[ \t]+)"
