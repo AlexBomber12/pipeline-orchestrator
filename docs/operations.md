@@ -11,10 +11,12 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
 
 - `get_orchestrator_status` returns a compact configured-repository overview;
   pass a validated `owner__repo` slug for queue, inhibitor, Retry-command,
-  recent-event, and run-record detail. Pending Retry pages expose a `next_index`
-  accepted by the tool's `retry_cursor` parameter. Snapshot age describes only
-  the last persisted `RepoState` write and is never presented as proof that a
-  coder process is alive.
+  recent-event, and run-record detail. Pending Retry pages expose an opaque
+  score/member `next_cursor` accepted by the tool's `retry_cursor` parameter;
+  removing older commands between pages cannot shift later commands past that
+  cursor. Snapshot age describes only the last persisted `RepoState` write and
+  is never presented as proof that a coder process is alive. A failed snapshot
+  key does not suppress independent event, Retry, or run-record reads.
 - `list_orchestrator_logs` discovers retained CLI snapshots, Redis repository
   event history, disk event partitions, and the current checkout's
   `artifacts/ci.log`. Every source reports retention, timestamps, mutability,
@@ -43,7 +45,9 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   covers same-indent pretty-JSON continuations, netrc password forms, and every
   value below Kubernetes Secret `data` and `stringData` in structured or YAML
   output regardless of YAML key order, including reads that begin inside a YAML
-  payload block. YAML document markers are recognized only at document scope,
+  payload block. Composed YAML mapping keys cover aliased, escaped, and explicit
+  payload-key syntax rather than relying on their literal source spelling.
+  YAML document markers are recognized only at document scope,
   and sensitive environment `name` entries bind to their sibling `value`.
   YAML anchors and tags decorating Secret `kind` or environment `name` scalars
   are normalized before classification, and block-scalar `kind` values are
@@ -87,16 +91,15 @@ Pending Retry command payloads use the same bounded-read rule and retain their
 index score and remaining TTL in the explicit oversized result.
 
 Runtime diagnostics are available on the primary MCP service, whose published
-port remains bound to localhost. When the optional `cloudflared` profile is
-enabled, Compose routes the tunnel to an isolated `mcp-tunnel` compatibility
-instance with `MCP_RUNTIME_DIAGNOSTICS=0`; that instance has neither the Redis
-connection nor the event-directory mount. Existing non-diagnostic MCP tools
-remain available through the tunnel, but status and retained-log data cannot be
-discovered or read there. The tunnel network cannot reach the primary MCP
-service.
+port remains bound to localhost. The same service container runs two
+streamable-HTTP listeners: the host port maps to the opted-in diagnostics
+listener on container port 5174, while the optional `cloudflared` profile keeps
+its existing `mcp:5173` target and reaches a restricted listener started with
+`MCP_RUNTIME_DIAGNOSTICS=0`. Existing non-diagnostic MCP tools remain available
+through the tunnel, but status and retained-log tools are not registered there.
 
-Runtime diagnostics are opt-in at server startup. Compose sets
-`MCP_RUNTIME_DIAGNOSTICS=1` only on the localhost-published primary service; an
+Runtime diagnostics are opt-in at server startup. The MCP service entrypoint
+sets `MCP_RUNTIME_DIAGNOSTICS=1` only for its localhost-published listener; an
 unset value defaults to disabled for direct and custom deployments. Operators
 starting `python -m src.mcp` outside Compose must explicitly set the variable
 and retain an equivalent loopback-only or authenticated access boundary.
@@ -105,13 +108,15 @@ The web/daemon producers and MCP reader all resolve disk events from
 `PO_EVENTS_DIR` (default `/data/events`). Compose maps
 `PO_EVENTS_HOST_DIR` (default `./data/events`) to that container path: when
 selecting a custom event directory, set both values to the corresponding host
-and container locations. A one-shot `events-init` service creates the host bind
-directory with UID/GID 1000 ownership before the web, daemon, or MCP service
-starts, so fresh rootful-Docker deployments remain writable by the producers.
-Compose mounts the selected host directory explicitly read-write into both
-producers and read-only into MCP, so overrides outside `./data` resolve to the
-same storage for all three services. For example, use
-`PO_EVENTS_HOST_DIR=./data/audit-events` with
+and container locations. Before the first Compose start, create that host
+directory for UID/GID 1000. For the default, run
+`install -d -o 1000 -g 1000 -m 0750 ./data/events`. Compose sets
+`create_host_path: false` so Docker cannot
+silently replace this step with a root-owned bind directory. The selected host
+directory is mounted read-write into both producers and read-only into MCP, so
+overrides outside `./data` resolve to the same storage for all three services.
+For example, pre-create `./data/audit-events`, then set
+`PO_EVENTS_HOST_DIR=./data/audit-events` and
 `PO_EVENTS_DIR=/data/audit-events`.
 
 These tools only accept configured repository slugs and fixed source IDs; they

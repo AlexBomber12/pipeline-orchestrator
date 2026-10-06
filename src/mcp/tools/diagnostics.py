@@ -9,7 +9,9 @@ data while answering a diagnostic query.
 from __future__ import annotations
 
 import base64
+import binascii
 import json
+import math
 import os
 import re
 import stat as stat_module
@@ -68,6 +70,7 @@ _MAX_YAML_FLOW_DEPTH = 64
 _MAX_YAML_FLOW_TOKENS = 4_096
 _MAX_YAML_BLOCK_MAPPING_LINES = 4_096
 _MAX_YAML_PER_LINE_SCAN_CANDIDATES = 256
+_MAX_RETRY_CURSOR_CHARS = 1_024
 _CLI_LATEST_TTL_SECONDS = 3600
 _CLI_HISTORY_TTL_SECONDS = 86400
 _HISTORY_CURSOR_PREFIX = "redis-history:"
@@ -79,6 +82,33 @@ if size > tonumber(ARGV[3]) then
   return {size, 1, total, {}}
 end
 return {size, 0, total, redis.call('LRANGE', KEYS[1], ARGV[1], ARGV[2])}
+"""
+_BOUNDED_PENDING_RETRIES_SCRIPT = """
+local total = redis.call('ZCARD', KEYS[1])
+local first = 0
+if ARGV[1] ~= '' then
+  local cursor_score = tonumber(ARGV[1])
+  local cursor_member = ARGV[2]
+  local low = 0
+  local high = total
+  while low < high do
+    local middle = math.floor((low + high) / 2)
+    local row = redis.call('ZRANGE', KEYS[1], middle, middle, 'WITHSCORES')
+    if #row == 0 then
+      high = middle
+    else
+      local score = tonumber(row[2])
+      if score < cursor_score or (score == cursor_score and row[1] <= cursor_member) then
+        low = middle + 1
+      else
+        high = middle
+      end
+    end
+  end
+  first = low
+end
+local rows = redis.call('ZRANGE', KEYS[1], first, first + tonumber(ARGV[3]) - 1, 'WITHSCORES')
+return {total, first, rows}
 """
 
 _SENSITIVE_NAMES = (
@@ -364,6 +394,37 @@ def _validate_cursor(value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError("cursor must be a non-negative integer")
     return value
+
+
+def _retry_cursor(score: float, member: str) -> str:
+    payload = json.dumps(
+        {"score": score, "member": member},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def _validate_retry_cursor(value: str | None) -> tuple[float, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or len(value) > _MAX_RETRY_CURSOR_CHARS:
+        raise ValueError("retry_cursor must be a nonempty bounded cursor string")
+    try:
+        padding = "=" * (-len(value) % 4)
+        decoded = json.loads(base64.b64decode(value + padding, altchars=b"-_", validate=True))
+        score = float(decoded["score"])
+        member = decoded["member"]
+    except (binascii.Error, KeyError, TypeError, ValueError) as exc:
+        raise ValueError("retry_cursor is malformed") from exc
+    if (
+        not math.isfinite(score)
+        or not isinstance(member, str)
+        or not member
+        or len(member) > _MAX_RETRY_CURSOR_CHARS
+    ):
+        raise ValueError("retry_cursor is malformed")
+    return score, member
 
 
 def _new_redis_client() -> Any:
@@ -1081,15 +1142,52 @@ def _yaml_explicit_value_end(
     return value_end, value_end == len(raw_lines) and has_more_after_raw
 
 
+def _yaml_has_payload_mapping_key(text: str) -> bool:
+    """Return whether one YAML line resolves a data/stringData mapping key."""
+    try:
+        tokens = list(yaml.scan(text))
+    except (RecursionError, yaml.YAMLError):
+        return False
+    for index, token in enumerate(tokens):
+        if (
+            isinstance(token, yaml.tokens.ScalarToken)
+            and index > 0
+            and isinstance(tokens[index - 1], yaml.tokens.KeyToken)
+        ):
+            normalized = str(token.value).casefold().replace("_", "").replace("-", "")
+            if normalized in {"data", "stringdata"}:
+                return True
+    return False
+
+
 def _yaml_secret_payload_lines(lines: list[bytes]) -> set[int]:
-    """Find Secret payload keys using merge-aware YAML node composition."""
+    """Find Secret payload value lines using merge-aware YAML node composition."""
+    requires_composition = False
+    for raw_line in lines:
+        candidate = raw_line.decode("utf-8", errors="replace").lstrip(" \t")
+        if candidate.startswith("- "):
+            candidate = candidate[2:].lstrip(" \t")
+        key_source = candidate.split(":", 1)[0]
+        if (
+            candidate.startswith("<<:")
+            or (candidate.startswith("*") and ":" in candidate)
+            or (
+                (
+                    candidate.startswith("? ")
+                    or (candidate.startswith('"') and "\\" in key_source)
+                )
+                and _yaml_has_payload_mapping_key(candidate)
+            )
+        ):
+            requires_composition = True
+            break
+    if not requires_composition:
+        return set()
     document = b"".join(
         raw_line if raw_line.endswith((b"\n", b"\r")) else raw_line + b"\n"
         for raw_line in lines
     ).decode("utf-8", errors="replace")
     if _yaml_parse_complexity_exceeded(document):
-        return set()
-    if "<<" not in document or re.search(r"(?im)^[ \t]*(?:-[ \t]+)?(?:data|stringData)[ \t]*:", document) is None:
         return set()
     try:
         root = yaml.compose(document, Loader=yaml.SafeLoader)
@@ -1149,7 +1247,11 @@ def _yaml_secret_payload_lines(lines: list[bytes]) -> set[int]:
                         str(key_node.value).casefold().replace("_", "").replace("-", "")
                     )
                     if secret and normalized in {"data", "stringdata"}:
-                        payload_lines.add(key_node.start_mark.line)
+                        start_line = value_node.start_mark.line
+                        end_line = value_node.end_mark.line
+                        if end_line == start_line or value_node.end_mark.column > 0:
+                            end_line += 1
+                        payload_lines.update(range(start_line, max(start_line + 1, end_line)))
                 walk(value_node, depth + 1)
         else:
             for item in node.value:
@@ -1610,9 +1712,11 @@ def _kubernetes_yaml_state_before(
             payload_flow_depth = None
 
     combined_lines = context_lines + raw.splitlines(keepends=True)
+    combined_semantic_payload_lines: set[int] = set()
     combined_flags = _kubernetes_yaml_payload_flags(
         combined_lines,
         starts_inside_secret=False,
+        semantic_payload_lines=combined_semantic_payload_lines,
     )
     raw_line_index = len(context_lines)
     if payload_indent is None:
@@ -1641,12 +1745,18 @@ def _kubernetes_yaml_state_before(
                     for line in following_lines
                 )
             if active:
-                if combined_flags[index]:
+                if any(combined_flags[index : raw_line_index + 1]):
                     payload_indent = candidate_indent
                     payload_flow_depth = active_flow_depth
                 break
 
     first_content_line = next((line for line in raw.splitlines() if line.strip()), None)
+    if (
+        payload_indent is None
+        and first_content_line is not None
+        and raw_line_index in combined_semantic_payload_lines
+    ):
+        payload_indent = max(-1, _line_indent(first_content_line) - 1)
     inherited_secret_scope = secret_scopes[-1] if secret_scopes else None
     if inherited_secret_scope is not None and first_content_line is not None:
         first_text = first_content_line.decode("utf-8", errors="replace").rstrip("\r\n")
@@ -1697,6 +1807,7 @@ def _kubernetes_yaml_payload_flags(
     starts_inside_secret: bool,
     inherited_secret_scope: tuple[int, bool] | None = None,
     inherited_kind_seen: bool = False,
+    semantic_payload_lines: set[int] | None = None,
 ) -> list[bool]:
     """Mark lines whose YAML document has, or may have, Secret payloads."""
     flags = [False] * len(raw_lines)
@@ -1768,6 +1879,8 @@ def _kubernetes_yaml_payload_flags(
                 flags[index] = True
         for local_index in semantic_secret_payloads:
             flags[document_start + local_index] = True
+            if semantic_payload_lines is not None:
+                semantic_payload_lines.add(document_start + local_index)
         document_start = boundary + 1
         inherited_secret = False
         inherited_secret_scope = None
@@ -1831,11 +1944,13 @@ def _redacted_file_units(
         )
         return [(raw, "[CONTENT OMITTED: YAML BLOCK COMPLEXITY BOUND EXCEEDED]\n", 1)] if raw else []
     raw_lines = raw.splitlines(keepends=True)
+    semantic_kubernetes_payload_lines: set[int] = set()
     kubernetes_payload_flags = _kubernetes_yaml_payload_flags(
         raw_lines,
         starts_inside_secret=bool(starts_inside_kubernetes_secret),
         inherited_secret_scope=kubernetes_secret_scope,
         inherited_kind_seen=kubernetes_kind_context_known,
+        semantic_payload_lines=semantic_kubernetes_payload_lines,
     )
     units: list[tuple[bytes, str, int]] = []
     yaml_anchor_states = _yaml_anchor_state_by_line(raw_lines, yaml_scalar_anchors)
@@ -2010,6 +2125,14 @@ def _redacted_file_units(
                 line_index = item_end
                 continue
         payload_match = _YAML_SECRET_PAYLOAD_ASSIGNMENT.fullmatch(stripped_unit)
+        if line_index in semantic_kubernetes_payload_lines and payload_match is None:
+            payload_end = line_index + 1
+            while payload_end in semantic_kubernetes_payload_lines:
+                payload_end += 1
+            raw_unit = b"".join(raw_lines[line_index:payload_end])
+            units.append((raw_unit, "[REDACTED SENSITIVE KUBERNETES SECRET DATA]\n", 1))
+            line_index = payload_end
+            continue
         if kubernetes_payload_flags[line_index] and payload_match is not None:
             payload_value = payload_match.group("value").strip()
             continuation = _yaml_payload_continuation(payload_value)
@@ -2534,18 +2657,46 @@ async def _read_bounded_redis_value(
 async def _pending_retries(
     redis_client: Any,
     repo_slug: str,
-    cursor: int = 0,
+    cursor: str | None = None,
 ) -> dict[str, Any]:
     pending_key = retry_command_pending(repo_slug)
+    after = _validate_retry_cursor(cursor)
     try:
-        total = int(await redis_client.zcard(pending_key))
-        indexed = await redis_client.zrange(
+        page = await redis_client.eval_ro(
+            _BOUNDED_PENDING_RETRIES_SCRIPT,
+            1,
             pending_key,
-            cursor,
-            cursor + _MAX_PENDING_RETRIES - 1,
-            withscores=True,
+            "" if after is None else repr(after[0]),
+            "" if after is None else after[1],
+            _MAX_PENDING_RETRIES,
         )
     except Exception as exc:
+        return {
+            "status": "unavailable",
+            "count": None,
+            "commands": [],
+            "error": _error_text(exc),
+            "read_only_note": "No stale index members were pruned.",
+        }
+    if not isinstance(page, (list, tuple)) or len(page) != 3:
+        return {
+            "status": "unavailable",
+            "count": None,
+            "commands": [],
+            "error": "Redis returned a malformed pending-Retry page.",
+            "read_only_note": "No stale index members were pruned.",
+        }
+    try:
+        total = int(page[0])
+        first_index = int(page[1])
+        flat_rows = list(page[2])
+        if len(flat_rows) % 2:
+            raise ValueError("Pending Retry rows are incomplete.")
+        indexed = [
+            (flat_rows[index], float(flat_rows[index + 1]))
+            for index in range(0, len(flat_rows), 2)
+        ]
+    except (TypeError, ValueError) as exc:
         return {
             "status": "unavailable",
             "count": None,
@@ -2621,15 +2772,21 @@ async def _pending_retries(
                 "command": _retry_payload(command, ttl),
             }
         )
-    next_index = cursor + len(indexed)
+    next_index = first_index + len(indexed)
+    next_cursor = (
+        _retry_cursor(float(indexed[-1][1]), _decode(indexed[-1][0]))
+        if indexed and next_index < total
+        else None
+    )
     return {
         "status": "available",
         "count": total,
         "commands": commands,
         "cursor": cursor,
+        "position_at_observation": first_index,
         "page_limit": _MAX_PENDING_RETRIES,
         "truncated": next_index < total,
-        "continuation": ({"next_index": next_index} if next_index < total else None),
+        "continuation": ({"next_cursor": next_cursor} if next_cursor is not None else None),
         "error": None,
         "read_only_note": (
             "Index and payloads were read directly; missing or malformed members "
@@ -2836,7 +2993,7 @@ async def get_orchestrator_status(
     repo_slug: str | None = None,
     event_limit: int = 10,
     run_limit: int = 5,
-    retry_cursor: int = 0,
+    retry_cursor: str | None = None,
 ) -> dict[str, Any]:
     """Return runtime status without mutating orchestrator state.
 
@@ -2844,12 +3001,12 @@ async def get_orchestrator_status(
     Supply a configured ``owner__repo`` slug for queue, inhibitor, event,
     pending-Retry, and run-record detail. Snapshot freshness is reported
     separately from progress evidence and never treated as coder liveness.
-    Pass a returned pending-Retry ``next_index`` as ``retry_cursor`` to read
+    Pass a returned pending-Retry ``next_cursor`` as ``retry_cursor`` to read
     the next bounded page.
     """
     event_limit = _validate_limit(event_limit, maximum=_MAX_STATUS_EVENTS, name="event_limit")
     run_limit = _validate_limit(run_limit, maximum=_MAX_STATUS_RUNS, name="run_limit")
-    retry_cursor = _validate_cursor(retry_cursor)
+    _validate_retry_cursor(retry_cursor)
     observed_at = _utc_now()
     try:
         config, repositories = _configured_repositories()
@@ -2879,100 +3036,107 @@ async def get_orchestrator_status(
     state_sizes: list[int | None] = [None] * len(repositories)
     slugs = list(repositories)
     try:
-        client = _new_redis_client()
-    except Exception as exc:
-        redis_status = "unavailable"
-        redis_error = _error_text(exc)
-        state_errors = [redis_error] * len(repositories)
-    else:
-        for index, slug in enumerate(slugs):
-            try:
-                raw, size_bytes, oversized = await _read_bounded_redis_value(
-                    client,
-                    pipeline_state(slug),
-                    _MAX_REDIS_STATE_BYTES,
+        try:
+            client = _new_redis_client()
+        except Exception as exc:
+            redis_status = "unavailable"
+            redis_error = _error_text(exc)
+            state_errors = [redis_error] * len(repositories)
+        else:
+            for index, slug in enumerate(slugs):
+                try:
+                    raw, size_bytes, oversized = await _read_bounded_redis_value(
+                        client,
+                        pipeline_state(slug),
+                        _MAX_REDIS_STATE_BYTES,
+                    )
+                except Exception as exc:
+                    state_errors[index] = _error_text(exc)
+                    continue
+                state_sizes[index] = size_bytes
+                if oversized:
+                    state_statuses[index] = "oversized"
+                    state_errors[index] = (
+                        f"Stored pipeline state is {size_bytes} bytes; "
+                        f"the diagnostic read bound is {_MAX_REDIS_STATE_BYTES} bytes."
+                    )
+                else:
+                    state_statuses[index] = "available"
+                    state_raw[index] = raw
+            failed_reads = [
+                error
+                for status, error in zip(state_statuses, state_errors, strict=True)
+                if status == "unavailable"
+            ]
+            if failed_reads:
+                redis_status = "unavailable" if len(failed_reads) == len(slugs) else "partially_available"
+                redis_error = next(
+                    (error for error in failed_reads if error),
+                    "One or more snapshot reads failed.",
                 )
-            except Exception as exc:
-                state_errors[index] = _error_text(exc)
-                continue
-            state_sizes[index] = size_bytes
-            if oversized:
-                state_statuses[index] = "oversized"
-                state_errors[index] = (
-                    f"Stored pipeline state is {size_bytes} bytes; "
-                    f"the diagnostic read bound is {_MAX_REDIS_STATE_BYTES} bytes."
+
+        overviews: list[dict[str, Any]] = []
+        states: dict[str, RepoState | None] = {}
+        for index, slug in enumerate(slugs):
+            overview, state = _state_overview(
+                slug,
+                repositories[slug],
+                config,
+                state_raw[index],
+                redis_status=state_statuses[index],
+                redis_error=state_errors[index],
+                observed_at=observed_at,
+            )
+            overview["snapshot"]["source_size_bytes"] = state_sizes[index]
+            overview["snapshot"]["read_bound_bytes"] = _MAX_REDIS_STATE_BYTES
+            overviews.append(overview)
+            states[slug] = state
+
+        detail: dict[str, Any] | None = None
+        if repo_slug is not None:
+            state = states[repo_slug]
+            if client is not None:
+                events = await _recent_events(client, repo_slug, event_limit)
+                retries = await _pending_retries(client, repo_slug, retry_cursor)
+                runs = await _relevant_runs(
+                    client,
+                    repo_slug,
+                    state.current_task.pr_id if state is not None and state.current_task is not None else None,
+                    run_limit,
                 )
             else:
-                state_statuses[index] = "available"
-                state_raw[index] = raw
-        failed_reads = [
-            error
-            for status, error in zip(state_statuses, state_errors, strict=True)
-            if status == "unavailable"
-        ]
-        if failed_reads:
-            redis_status = "unavailable" if len(failed_reads) == len(slugs) else "partially_available"
-            redis_error = next((error for error in failed_reads if error), "One or more snapshot reads failed.")
+                unavailable = {"status": "unavailable", "error": redis_error}
+                events = {**unavailable, "source": "redis_event_history", "events": []}
+                retries = {**unavailable, "count": None, "commands": []}
+                runs = {**unavailable, "task_filter": None, "records": []}
+            detail = {
+                "repo_slug": repo_slug,
+                "state": _state_detail(state),
+                "queue": _queue_summary(state, observed_at),
+                "inhibitors": (
+                    [item.model_dump(mode="json") for item in state.active_inhibitors]
+                    if state is not None
+                    else []
+                ),
+                "state_history": _state_history(state, event_limit),
+                "recent_events": events,
+                "pending_retries": retries,
+                "run_records": runs,
+                "coder_progress": _progress_evidence(state, runs, events),
+            }
 
-    overviews: list[dict[str, Any]] = []
-    states: dict[str, RepoState | None] = {}
-    for index, slug in enumerate(slugs):
-        overview, state = _state_overview(
-            slug,
-            repositories[slug],
-            config,
-            state_raw[index],
-            redis_status=state_statuses[index],
-            redis_error=state_errors[index],
-            observed_at=observed_at,
-        )
-        overview["snapshot"]["source_size_bytes"] = state_sizes[index]
-        overview["snapshot"]["read_bound_bytes"] = _MAX_REDIS_STATE_BYTES
-        overviews.append(overview)
-        states[slug] = state
-
-    detail: dict[str, Any] | None = None
-    if repo_slug is not None:
-        state = states[repo_slug]
-        if client is not None and redis_status != "unavailable":
-            events = await _recent_events(client, repo_slug, event_limit)
-            retries = await _pending_retries(client, repo_slug, retry_cursor)
-            runs = await _relevant_runs(
-                client,
-                repo_slug,
-                state.current_task.pr_id if state is not None and state.current_task is not None else None,
-                run_limit,
-            )
-        else:
-            unavailable = {"status": "unavailable", "error": redis_error}
-            events = {**unavailable, "source": "redis_event_history", "events": []}
-            retries = {**unavailable, "count": None, "commands": []}
-            runs = {**unavailable, "task_filter": None, "records": []}
-        detail = {
-            "repo_slug": repo_slug,
-            "state": _state_detail(state),
-            "queue": _queue_summary(state, observed_at),
-            "inhibitors": (
-                [item.model_dump(mode="json") for item in state.active_inhibitors] if state is not None else []
-            ),
-            "state_history": _state_history(state, event_limit),
-            "recent_events": events,
-            "pending_retries": retries,
-            "run_records": runs,
-            "coder_progress": _progress_evidence(state, runs, events),
+        payload = {
+            "observed_at": _iso_z(observed_at),
+            "configuration": {"status": "available", "repository_count": len(slugs)},
+            "redis": {"status": redis_status, "error": redis_error},
+            "repositories": overviews,
+            "detail": detail,
         }
-
-    await _close_redis(client)
-    payload = {
-        "observed_at": _iso_z(observed_at),
-        "configuration": {"status": "available", "repository_count": len(slugs)},
-        "redis": {"status": redis_status, "error": redis_error},
-        "repositories": overviews,
-        "detail": detail,
-    }
-    safe, replacements = _redact_structure(payload)
-    safe["redaction"] = {"applied": replacements > 0, "replacements": replacements}
-    return safe
+        safe, replacements = _redact_structure(payload)
+        safe["redaction"] = {"applied": replacements > 0, "replacements": replacements}
+        return safe
+    finally:
+        await _close_redis(client)
 
 
 def _ttl_metadata(ttl: int, observed_at: datetime) -> dict[str, Any]:

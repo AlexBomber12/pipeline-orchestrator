@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import fnmatch
 import json
@@ -118,11 +119,21 @@ class FakeRedis:
         script: str,
         numkeys: int,
         key: str,
-        start: int,
-        stop: int,
-        byte_limit: int,
+        *args: object,
     ) -> list[object]:
-        self._check("eval_ro", (script, numkeys, key, start, stop, byte_limit))
+        self._check("eval_ro", (script, numkeys, key, *args))
+        if "ZCARD" in script:
+            cursor_score, cursor_member, page_limit = args
+            values = sorted(self.zsets.get(key, []), key=lambda item: (item[1], str(item[0])))
+            first = 0
+            if cursor_score != "":
+                cursor = (float(cursor_score), str(cursor_member))
+                while first < len(values) and (values[first][1], str(values[first][0])) <= cursor:
+                    first += 1
+            selected = values[first : first + int(page_limit)]
+            flattened = [item for member, score in selected for item in (member, score)]
+            return [len(values), first, flattened]
+        start, stop, byte_limit = (int(item) for item in args)
         values = self.lists.get(key, [])
         size_bytes = sum(len(value if isinstance(value, bytes) else str(value).encode()) for value in values)
         if size_bytes > byte_limit:
@@ -175,7 +186,9 @@ def _run(run_id: str, *, ended: bool = False) -> RunRecord:
 
 
 async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.mcp.tools.diagnostics import get_orchestrator_status
+    from src.mcp.tools import diagnostics
+
+    get_orchestrator_status = diagnostics.get_orchestrator_status
 
     redis = FakeRedis()
     config = _config(_repo())
@@ -315,8 +328,12 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
     assert result["detail"]["recent_events"]["malformed_records"] == 1
     retry_statuses = [item["status"] for item in result["detail"]["pending_retries"]["commands"]]
     assert retry_statuses == ["available", "missing_payload", "malformed"]
-    retry_page = await get_orchestrator_status(SLUG, retry_cursor=2)
-    assert retry_page["detail"]["pending_retries"]["cursor"] == 2
+    retry_cursor = diagnostics._retry_cursor(
+        command.requested_at.timestamp() + 1,
+        "missing-command",
+    )
+    retry_page = await get_orchestrator_status(SLUG, retry_cursor=retry_cursor)
+    assert retry_page["detail"]["pending_retries"]["cursor"] == retry_cursor
     assert [
         item["status"] for item in retry_page["detail"]["pending_retries"]["commands"]
     ] == ["malformed"]
@@ -349,7 +366,9 @@ async def test_status_reports_missing_malformed_and_redis_unavailable(
     unavailable = await get_orchestrator_status(SLUG)
     assert unavailable["redis"]["status"] == "unavailable"
     assert unavailable["repositories"][0]["snapshot"]["status"] == "unavailable"
-    assert unavailable["detail"]["pending_retries"]["status"] == "unavailable"
+    assert unavailable["detail"]["recent_events"]["status"] == "available"
+    assert unavailable["detail"]["pending_retries"]["status"] == "available"
+    assert unavailable["detail"]["run_records"]["status"] == "available"
     assert "redis-secret" not in json.dumps(unavailable)
 
     def fail_client():
@@ -361,6 +380,30 @@ async def test_status_reports_missing_malformed_and_redis_unavailable(
     disconnected = await get_orchestrator_status(SLUG)
     assert disconnected["redis"]["status"] == "unavailable"
     assert "connection-secret" not in json.dumps(disconnected)
+
+
+async def test_status_closes_redis_when_detail_read_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    started = asyncio.Event()
+
+    class BlockingRedis(FakeRedis):
+        async def eval_ro(self, *args: object) -> list[object]:
+            del args
+            started.set()
+            await asyncio.Event().wait()
+            return []
+
+    redis = BlockingRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    request = asyncio.create_task(diagnostics.get_orchestrator_status(SLUG))
+    await started.wait()
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    assert redis.closed is True
 
 
 async def test_status_configuration_failure_and_validation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -384,8 +427,8 @@ async def test_status_configuration_failure_and_validation(monkeypatch: pytest.M
         await diagnostics.get_orchestrator_status(event_limit=0)
     with pytest.raises(ValueError, match="run_limit"):
         await diagnostics.get_orchestrator_status(run_limit=999)
-    with pytest.raises(ValueError, match="cursor"):
-        await diagnostics.get_orchestrator_status(retry_cursor=-1)
+    with pytest.raises(ValueError, match="retry_cursor"):
+        await diagnostics.get_orchestrator_status(retry_cursor="malformed")
 
 
 async def test_log_discovery_and_reads_are_bounded_and_redacted(
@@ -1175,6 +1218,51 @@ async def test_yaml_explicit_keys_are_redacted_across_retained_readers(
     assert "retained-explicit-neighbor" in inside_block["content"]
 
 
+async def test_resolved_secret_payload_keys_are_redacted_across_retained_readers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    repos_root = tmp_path / "repos"
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+    payload = (
+        "dataKey: &payload data\nkind: Secret\n"
+        "*payload: {opaque: alias-payload-secret}\n"
+        "---\nkind: Secret\n? data\n:\n  opaque: explicit-payload-secret\n"
+        '---\nkind: Secret\n"da\\u0074a":\n  opaque: escaped-payload-secret\n'
+        "  second: escaped-payload-secret-two\n"
+        '---\nkind: ConfigMap\n"da\\u0074a":\n  safe: retained-config-payload\n'
+    )
+    redis.store[cli_log_latest(SLUG)] = payload
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.write_text(payload, encoding="utf-8")
+
+    for source_id in ("cli:latest", "ci:artifact"):
+        result = await diagnostics.read_orchestrator_log(
+            SLUG,
+            source_id,
+            max_chars=4_000,
+        )
+        assert "alias-payload-secret" not in result["content"]
+        assert "explicit-payload-secret" not in result["content"]
+        assert "escaped-payload-secret" not in result["content"]
+        assert "escaped-payload-secret-two" not in result["content"]
+        assert "retained-config-payload" in result["content"]
+
+    raw = ci_path.read_bytes()
+    alias_page = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=raw.index(b"*payload: {opaque: alias-payload-secret}"),
+        max_chars=4_000,
+    )
+    assert "alias-payload-secret" not in alias_page["content"]
+
+
 async def test_truncated_redis_logs_omit_unknown_leading_sensitive_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1513,7 +1601,7 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
             b"data:\n",
             b"  opaque: hidden\n",
         ]
-    ) == {3}
+    ) == {4}
     assert diagnostics._yaml_secret_payload_lines(
         [
             b"base: &resource\n",
@@ -1537,7 +1625,7 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
             b"? [complex, key]\n",
             b": visible\n",
         ]
-    ) == {5}
+    ) == {6}
     assert diagnostics._yaml_secret_payload_lines(
         [
             b"resource: &resource\n",
@@ -1545,8 +1633,12 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
             b"  data:\n",
             b"    opaque: fail-closed\n",
         ]
-    ) == {2}
+    ) == {3}
     assert diagnostics._yaml_secret_payload_lines([b"<<: [\n", b"data:\n"]) == set()
+    assert diagnostics._yaml_has_payload_mapping_key('? "da\\u0074a') is False
+    assert diagnostics._yaml_secret_payload_lines(
+        [b"<<: " + b"[" * (diagnostics._MAX_YAML_FLOW_DEPTH + 1)]
+    ) == set()
     assert diagnostics._yaml_sensitive_assignment(
         '  - "pass\\u0077ord": plainsecret'
     ) == (2, "plainsecret")
@@ -1569,6 +1661,12 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
         minimum_indent=0,
         has_more_after_raw=True,
     ) == (1, True)
+    retry_cursor = diagnostics._retry_cursor(1.5, "command")
+    assert diagnostics._validate_retry_cursor(retry_cursor) == (1.5, "command")
+    with pytest.raises(ValueError, match="nonempty bounded"):
+        diagnostics._validate_retry_cursor("")
+    with pytest.raises(ValueError, match="malformed"):
+        diagnostics._validate_retry_cursor(diagnostics._retry_cursor(float("nan"), "command"))
     assert (
         diagnostics._yaml_explicit_value_end(
             [b"ordinary\n"],
@@ -2065,7 +2163,25 @@ async def test_status_helper_failures_remain_explicit() -> None:
     assert runs["status"] == "unavailable"
 
     redis = FakeRedis()
-    redis.fail.add("zcard")
+    redis.fail.add("eval_ro")
+    retries = await diagnostics._pending_retries(redis, SLUG)
+    assert retries["status"] == "unavailable"
+
+    async def malformed_retry_page(*args: Any, **kwargs: Any) -> list[object]:
+        del args, kwargs
+        return [0]
+
+    redis = FakeRedis()
+    redis.eval_ro = malformed_retry_page  # type: ignore[method-assign]
+    retries = await diagnostics._pending_retries(redis, SLUG)
+    assert retries["status"] == "unavailable"
+
+    async def incomplete_retry_rows(*args: Any, **kwargs: Any) -> list[object]:
+        del args, kwargs
+        return [1, 0, ["command"]]
+
+    redis = FakeRedis()
+    redis.eval_ro = incomplete_retry_rows  # type: ignore[method-assign]
     retries = await diagnostics._pending_retries(redis, SLUG)
     assert retries["status"] == "unavailable"
 
@@ -2103,17 +2219,23 @@ async def test_status_helper_failures_remain_explicit() -> None:
     ]
     first_retry_page = await diagnostics._pending_retries(redis, SLUG)
     assert len(first_retry_page["commands"]) == diagnostics._MAX_PENDING_RETRIES
-    assert first_retry_page["continuation"] == {
-        "next_index": diagnostics._MAX_PENDING_RETRIES
-    }
+    next_cursor = first_retry_page["continuation"]["next_cursor"]
     second_retry_page = await diagnostics._pending_retries(
         redis,
         SLUG,
-        first_retry_page["continuation"]["next_index"],
+        next_cursor,
     )
-    assert second_retry_page["cursor"] == diagnostics._MAX_PENDING_RETRIES
+    assert second_retry_page["cursor"] == next_cursor
+    assert second_retry_page["position_at_observation"] == diagnostics._MAX_PENDING_RETRIES
     assert len(second_retry_page["commands"]) == 2
     assert second_retry_page["continuation"] is None
+
+    redis.zsets[retry_command_pending(SLUG)].pop(0)
+    stable_page = await diagnostics._pending_retries(redis, SLUG, next_cursor)
+    assert [item["command_id"] for item in stable_page["commands"]] == [
+        "command-20",
+        "command-21",
+    ]
 
 
 async def test_run_filtering_unavailable_record_and_limit() -> None:
@@ -3202,35 +3324,40 @@ def test_compose_wires_read_only_runtime_sources() -> None:
     import yaml
 
     compose = yaml.safe_load(Path("docker-compose.yml").read_text(encoding="utf-8"))
+    assert set(compose["services"]) == {"web", "daemon", "mcp", "cloudflared", "redis"}
     service = compose["services"]["mcp"]
-    initializer = compose["services"]["events-init"]
+    assert "events-init" not in compose["services"]
+    assert "mcp-tunnel" not in compose["services"]
     assert service["environment"]["REDIS_URL"] == "redis://redis:6379/0"
     assert service["environment"]["PO_EVENTS_DIR"] == "${PO_EVENTS_DIR:-/data/events}"
     assert compose["services"]["web"]["environment"]["PO_EVENTS_DIR"] == "${PO_EVENTS_DIR:-/data/events}"
     assert compose["services"]["daemon"]["environment"]["PO_EVENTS_DIR"] == "${PO_EVENTS_DIR:-/data/events}"
-    assert service["depends_on"]["redis"]["condition"] == "service_started"
-    assert service["depends_on"]["events-init"]["condition"] == "service_completed_successfully"
-    assert compose["services"]["web"]["depends_on"]["events-init"]["condition"] == (
-        "service_completed_successfully"
+    assert service["depends_on"] == ["redis"]
+    assert service["entrypoint"] == ["bash", "scripts/mcp-entrypoint.sh"]
+    assert service["ports"] == ["127.0.0.1:${MCP_PORT:-5173}:5174"]
+    for producer in ("web", "daemon"):
+        event_mount = next(
+            volume
+            for volume in compose["services"][producer]["volumes"]
+            if isinstance(volume, dict) and volume.get("target") == "${PO_EVENTS_DIR:-/data/events}"
+        )
+        assert event_mount["source"] == "${PO_EVENTS_HOST_DIR:-./data/events}"
+        assert event_mount["bind"]["create_host_path"] is False
+        assert event_mount.get("read_only", False) is False
+    event_mount = next(
+        volume
+        for volume in service["volumes"]
+        if isinstance(volume, dict) and volume.get("target") == "${PO_EVENTS_DIR:-/data/events}"
     )
-    assert compose["services"]["daemon"]["depends_on"]["events-init"]["condition"] == (
-        "service_completed_successfully"
-    )
-    assert initializer["user"] == "0:0"
-    assert initializer["command"] == ["install -d -o 1000 -g 1000 -m 0750 /events"]
-    assert "${PO_EVENTS_HOST_DIR:-./data/events}:/events" in initializer["volumes"]
-    producer_event_mount = "${PO_EVENTS_HOST_DIR:-./data/events}:${PO_EVENTS_DIR:-/data/events}"
-    assert producer_event_mount in compose["services"]["web"]["volumes"]
-    assert producer_event_mount in compose["services"]["daemon"]["volumes"]
-    assert "${PO_EVENTS_HOST_DIR:-./data/events}:${PO_EVENTS_DIR:-/data/events}:ro" in service["volumes"]
-    assert all("docker.sock" not in volume for volume in service["volumes"])
-    assert all("/data/auth" not in volume for volume in service["volumes"])
-    assert service["environment"]["MCP_RUNTIME_DIAGNOSTICS"] == "1"
-    tunnel_service = compose["services"]["mcp-tunnel"]
-    assert tunnel_service["profiles"] == ["cloudflared"]
-    assert tunnel_service["environment"]["MCP_RUNTIME_DIAGNOSTICS"] == "0"
-    assert "REDIS_URL" not in tunnel_service["environment"]
-    assert "PO_EVENTS_DIR" not in tunnel_service["environment"]
-    assert tunnel_service["networks"]["tunnel"]["aliases"] == ["mcp"]
-    assert compose["services"]["cloudflared"]["networks"] == ["tunnel"]
-    assert compose["services"]["cloudflared"]["depends_on"] == ["mcp-tunnel"]
+    assert event_mount["source"] == "${PO_EVENTS_HOST_DIR:-./data/events}"
+    assert event_mount["read_only"] is True
+    assert event_mount["bind"]["create_host_path"] is False
+    serialized_volumes = json.dumps(service["volumes"])
+    assert "docker.sock" not in serialized_volumes
+    assert "/data/auth" not in serialized_volumes
+    assert compose["services"]["cloudflared"]["depends_on"] == ["mcp"]
+
+    entrypoint = Path("scripts/mcp-entrypoint.sh").read_text(encoding="utf-8")
+    assert "MCP_RUNTIME_DIAGNOSTICS=0 MCP_SERVER_PORT=5173" in entrypoint
+    assert "MCP_RUNTIME_DIAGNOSTICS=1 MCP_SERVER_PORT=5174" in entrypoint
+    assert "env -u REDIS_URL -u PO_EVENTS_DIR" in entrypoint

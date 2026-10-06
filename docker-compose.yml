@@ -1,13 +1,4 @@
 services:
-  events-init:
-    build: .
-    entrypoint: ["sh", "-c"]
-    command: ["install -d -o 1000 -g 1000 -m 0750 /events"]
-    user: "0:0"
-    volumes:
-      - ${PO_EVENTS_HOST_DIR:-./data/events}:/events
-    restart: "no"
-
   web:
     build: .
     entrypoint: ["bash", "scripts/entrypoint.sh"]
@@ -19,7 +10,11 @@ services:
     volumes:
       - .:/app
       - ./data:/data
-      - ${PO_EVENTS_HOST_DIR:-./data/events}:${PO_EVENTS_DIR:-/data/events}
+      - type: bind
+        source: ${PO_EVENTS_HOST_DIR:-./data/events}
+        target: ${PO_EVENTS_DIR:-/data/events}
+        bind:
+          create_host_path: false
       - codex-auth:/data/auth/.codex
     environment:
       REDIS_URL: redis://redis:6379/0
@@ -29,10 +24,7 @@ services:
       HOME: /data/auth
     restart: unless-stopped
     depends_on:
-      events-init:
-        condition: service_completed_successfully
-      redis:
-        condition: service_started
+      - redis
 
   daemon:
     build: .
@@ -42,7 +34,11 @@ services:
     volumes:
       - .:/app:ro
       - ./data:/data
-      - ${PO_EVENTS_HOST_DIR:-./data/events}:${PO_EVENTS_DIR:-/data/events}
+      - type: bind
+        source: ${PO_EVENTS_HOST_DIR:-./data/events}
+        target: ${PO_EVENTS_DIR:-/data/events}
+        bind:
+          create_host_path: false
       - codex-auth:/data/auth/.codex
     environment:
       REDIS_URL: redis://redis:6379/0
@@ -52,52 +48,31 @@ services:
       HOME: /data/auth
     restart: unless-stopped
     depends_on:
-      events-init:
-        condition: service_completed_successfully
-      redis:
-        condition: service_started
+      - redis
 
   mcp:
     build: .
-    command: python -m src.mcp
+    entrypoint: ["bash", "scripts/mcp-entrypoint.sh"]
     user: "1000:1000"
     mem_limit: 1g
     ports:
-      - "127.0.0.1:${MCP_PORT:-5173}:5173"
+      - "127.0.0.1:${MCP_PORT:-5173}:5174"
     volumes:
       - .:/app:ro
       - ./data/repos:/data/repos:ro
-      - ${PO_EVENTS_HOST_DIR:-./data/events}:${PO_EVENTS_DIR:-/data/events}:ro
+      - type: bind
+        source: ${PO_EVENTS_HOST_DIR:-./data/events}
+        target: ${PO_EVENTS_DIR:-/data/events}
+        read_only: true
+        bind:
+          create_host_path: false
     environment:
       PYTHONUNBUFFERED: "1"
-      MCP_RUNTIME_DIAGNOSTICS: "1"
       REDIS_URL: redis://redis:6379/0
       PO_EVENTS_DIR: ${PO_EVENTS_DIR:-/data/events}
     restart: unless-stopped
     depends_on:
-      events-init:
-        condition: service_completed_successfully
-      redis:
-        condition: service_started
-
-  mcp-tunnel:
-    build: .
-    command: python -m src.mcp
-    user: "1000:1000"
-    mem_limit: 1g
-    profiles:
-      - cloudflared
-    volumes:
-      - .:/app:ro
-      - ./data/repos:/data/repos:ro
-    environment:
-      PYTHONUNBUFFERED: "1"
-      MCP_RUNTIME_DIAGNOSTICS: "0"
-    networks:
-      tunnel:
-        aliases:
-          - mcp
-    restart: unless-stopped
+      - redis
 
   cloudflared:
     image: cloudflare/cloudflared:latest
@@ -108,11 +83,9 @@ services:
       - path: .cloudflared.env
         required: false
     mem_limit: 256m
-    networks:
-      - tunnel
     restart: unless-stopped
     depends_on:
-      - mcp-tunnel
+      - mcp
 
   redis:
     image: redis:7-alpine
@@ -124,6 +97,3 @@ services:
 volumes:
   codex-auth:
   redis_data:
-
-networks:
-  tunnel:

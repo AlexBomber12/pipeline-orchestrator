@@ -1,8 +1,8 @@
 """MCP server entrypoint.
 
 Run with ``python -m src.mcp.server``. HTTP transport is exposed on
-``localhost:5173`` by the primary Compose service. The optional tunnel uses a
-separate compatibility instance with runtime diagnostics disabled.
+``localhost:5173`` by the primary Compose service. That container also runs a
+restricted compatibility listener for the optional tunnel.
 
 Tools register here via decorators in PR-245 and PR-246. This module
 handles only server instantiation, healthcheck, and run loop.
@@ -24,7 +24,15 @@ def _runtime_diagnostics_enabled() -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
-mcp = FastMCP("pipeline-orchestrator", host="0.0.0.0", port=5173)
+def _server_port() -> int:
+    value = int(os.environ.get("MCP_SERVER_PORT", "5173"))
+    if not 1 <= value <= 65_535:
+        raise ValueError("MCP_SERVER_PORT must be between 1 and 65535")
+    return value
+
+
+_PORT = _server_port()
+mcp = FastMCP("pipeline-orchestrator", host="0.0.0.0", port=_PORT)
 
 
 @mcp.tool()
@@ -47,9 +55,9 @@ if _runtime_diagnostics_enabled():
 
 
 def main() -> None:  # pragma: no cover - exercised only when running the server
-    """Run the MCP server with HTTP transport on port 5173."""
+    """Run the MCP server with HTTP transport on the configured port."""
     logging.basicConfig(level=logging.INFO)
-    logger.info("Starting MCP server on 0.0.0.0:5173")
+    logger.info("Starting MCP server on 0.0.0.0:%d", _PORT)
     mcp.run(transport="streamable-http")
 
 

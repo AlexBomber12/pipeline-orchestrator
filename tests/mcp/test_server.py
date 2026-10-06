@@ -56,6 +56,14 @@ def test_runtime_diagnostics_can_be_disabled_for_restricted_instances(
     monkeypatch.setenv("MCP_RUNTIME_DIAGNOSTICS", "yes")
     assert server._runtime_diagnostics_enabled() is True
 
+    monkeypatch.delenv("MCP_SERVER_PORT", raising=False)
+    assert server._server_port() == 5173
+    monkeypatch.setenv("MCP_SERVER_PORT", "5174")
+    assert server._server_port() == 5174
+    monkeypatch.setenv("MCP_SERVER_PORT", "0")
+    with pytest.raises(ValueError, match="between 1 and 65535"):
+        server._server_port()
+
 
 def test_restricted_mcp_instance_does_not_register_runtime_diagnostics() -> None:
     script = (
