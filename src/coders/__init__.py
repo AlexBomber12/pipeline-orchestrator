@@ -242,6 +242,28 @@ def _load_plugin(plugin_id: str, reference: object) -> CoderPlugin:
     return plugin
 
 
+def _validate_configured_model_setting(
+    plugin_id: str,
+    reference: str,
+    plugin: CoderPlugin,
+    daemon_config: DaemonConfig,
+) -> None:
+    """Reject values the plugin's shared model resolver cannot consume."""
+    plugin_settings = daemon_config.coder_settings.get(plugin_id)
+    if plugin_settings is None:
+        return
+    setting_key = plugin.model_setting.setting_key
+    if setting_key in plugin_settings and not isinstance(
+        plugin_settings[setting_key], str
+    ):
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "model setting validation",
+            f"daemon.coder_settings.{plugin_id}.{setting_key} must be a string",
+        )
+
+
 def build_coder_registry(config: AppConfig | None = None) -> CoderRegistry:
     """Build a registry from trusted ``module:factory`` references.
 
@@ -254,5 +276,13 @@ def build_coder_registry(config: AppConfig | None = None) -> CoderRegistry:
     )
     registry = CoderRegistry()
     for plugin_id, reference in references.items():
-        registry.register(_load_plugin(plugin_id, reference))
+        plugin = _load_plugin(plugin_id, reference)
+        if config is not None:
+            _validate_configured_model_setting(
+                plugin_id,
+                reference,
+                plugin,
+                config.daemon,
+            )
+        registry.register(plugin)
     return registry

@@ -871,6 +871,9 @@ class _ThirdCatalogPlugin:
     ) -> dict[str, str]:
         return {"model": self.resolve_model(daemon_config)}
 
+    def check_auth(self) -> dict[str, str]:
+        return {"status": "ok", "detail": "third authenticated"}
+
 
 def test_shared_catalog_rendering_supports_third_plugin_without_branches(
     empty_config: Path,
@@ -1880,7 +1883,7 @@ def test_api_auth_status_returns_ok_for_both(
     assert "octocat" in payload["gh"]["detail"]
 
 
-def test_api_auth_status_uses_configured_builtin_plugin(
+def test_api_auth_status_uses_every_configured_plugin(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1888,7 +1891,8 @@ def test_api_auth_status_uses_configured_builtin_plugin(
     cfg.write_text(
         "repositories: []\n"
         "coder_plugins:\n"
-        "  claude: tests.configured_coder_plugin:build_claude_override\n",
+        "  claude: tests.configured_coder_plugin:build_claude_override\n"
+        "  third: tests.configured_coder_plugin:build_test_plugin\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg))
@@ -1901,6 +1905,10 @@ def test_api_auth_status_uses_configured_builtin_plugin(
     assert response.json()["claude"] == {
         "status": "ok",
         "detail": "configured plugin auth",
+    }
+    assert response.json()["third"] == {
+        "status": "ok",
+        "detail": "configured test plugin auth",
     }
 
 

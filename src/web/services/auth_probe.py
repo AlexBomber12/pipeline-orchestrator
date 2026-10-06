@@ -160,22 +160,28 @@ def _check_gh_auth() -> dict[str, str]:
 async def _collect_auth_status(
     registry: CoderRegistry | None = None,
 ) -> dict[str, dict[str, str]]:
-    """Return ``{"claude": ..., "codex": ..., "gh": ...}`` auth status dicts.
+    """Return auth status for every registered coder plus GitHub CLI.
 
     Each probe invokes a blocking ``subprocess.run`` call with a 5s
     timeout, so they would block the event loop if awaited directly from
     an async handler. Dispatching them through ``asyncio.to_thread`` and
     ``asyncio.gather`` moves the blocking work onto the default thread
-    pool and runs probes concurrently, so the dashboard's 30s HTMX
-    auth-status poll cannot stall the worker for up to ~15s (three serial
-    5s timeouts) whenever a CLI is missing or slow.
+    pool and runs probes concurrently, so one slow or missing CLI does not
+    serially delay the remaining registered plugins and infrastructure probe.
     """
     active_registry = registry or build_coder_registry()
-    claude, codex, gh = await asyncio.gather(
-        asyncio.to_thread(_check_claude_auth, active_registry),
-        asyncio.to_thread(_check_codex_auth, active_registry),
-        asyncio.to_thread(_check_gh_auth),
-    )
+    plugin_ids = active_registry.coder_names()
+    probes = []
+    for plugin_id in plugin_ids:
+        if plugin_id == "claude":
+            probes.append(asyncio.to_thread(_check_claude_auth, active_registry))
+        elif plugin_id == "codex":
+            probes.append(asyncio.to_thread(_check_codex_auth, active_registry))
+        else:
+            probes.append(
+                asyncio.to_thread(_check_coder_auth, active_registry, plugin_id)
+            )
+    results = await asyncio.gather(*probes, asyncio.to_thread(_check_gh_auth))
     global _AUTH_STATUS_CACHE
-    _AUTH_STATUS_CACHE = {"claude": claude, "codex": codex, "gh": gh}
+    _AUTH_STATUS_CACHE = dict(zip((*plugin_ids, "gh"), results, strict=True))
     return _get_cached_auth_status()

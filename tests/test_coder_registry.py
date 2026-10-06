@@ -148,6 +148,40 @@ def test_build_registry_loads_configured_plugin_and_builtin_override() -> None:
     assert isinstance(registry.get("codex"), CodexPlugin)
 
 
+def test_build_registry_validates_configured_custom_model_setting_value() -> None:
+    reference = "tests.configured_coder_plugin:build_variant_setting_plugin"
+    config = AppConfig(
+        coder_plugins={"third": reference},
+        daemon=DaemonConfig(coder_settings={"third": {"variant": 123}}),
+    )
+
+    with pytest.raises(CoderPluginConfigurationError) as caught:
+        build_coder_registry(config)
+
+    message = str(caught.value)
+    assert repr("third") in message
+    assert repr(reference) in message
+    assert "failed at model setting validation" in message
+    assert "daemon.coder_settings.third.variant must be a string" in message
+
+
+def test_build_registry_accepts_string_custom_model_setting_value() -> None:
+    config = AppConfig(
+        coder_plugins={
+            "third": (
+                "tests.configured_coder_plugin:build_variant_setting_plugin"
+            )
+        },
+        daemon=DaemonConfig(
+            coder_settings={"third": {"variant": "third-invoke"}}
+        ),
+    )
+
+    registry = build_coder_registry(config)
+
+    assert registry.get("third").resolve_model(config.daemon) == "third-invoke"
+
+
 @pytest.mark.parametrize(
     ("plugin_id", "reference", "stage"),
     [

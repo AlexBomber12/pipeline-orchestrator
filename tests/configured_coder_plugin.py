@@ -19,6 +19,9 @@ class ConfiguredTestPlugin(ClaudePlugin):
         default_label="Test default",
     )
 
+    def check_auth(self) -> dict[str, str]:
+        return {"status": "ok", "detail": "configured test plugin auth"}
+
     async def run_planned_pr(self, *_args: object, **_kwargs: object) -> object:
         raise AssertionError("configured plugin inference must not start")
 
@@ -48,6 +51,15 @@ class DigitLeadingTestPlugin(ConfiguredTestPlugin):
     model_catalog_refreshable = True
 
 
+class VariantSettingTestPlugin(ConfiguredTestPlugin):
+    model_setting = ModelSetting(
+        config_field=None,
+        default_value="third-default",
+        default_label="Test default",
+        setting_key="variant",
+    )
+
+
 class MissingMetadataPlugin(ConfiguredTestPlugin):
     display_name = ""
 
@@ -70,6 +82,10 @@ def build_claude_override() -> ClaudeOverridePlugin:
 
 def build_digit_leading_plugin() -> DigitLeadingTestPlugin:
     return DigitLeadingTestPlugin()
+
+
+def build_variant_setting_plugin() -> VariantSettingTestPlugin:
+    return VariantSettingTestPlugin()
 
 
 def build_mismatched_plugin() -> ConfiguredTestPlugin:
