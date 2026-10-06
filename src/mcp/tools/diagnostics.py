@@ -168,7 +168,10 @@ def _new_redis_client() -> Any:
 
 async def _close_redis(client: Any | None) -> None:
     if client is not None:
-        await client.aclose()
+        try:
+            await client.aclose()
+        except Exception:
+            pass
 
 
 def _configured_repositories() -> tuple[AppConfig, dict[str, RepoConfig]]:

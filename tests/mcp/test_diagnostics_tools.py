@@ -468,6 +468,29 @@ async def test_status_connection_config_validation_and_cancellation_cleanup(
     assert blocking.closed is True
 
 
+async def test_redis_cleanup_preserves_results_and_propagates_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    class FailingCloseRedis(FakeRedis):
+        async def aclose(self) -> None:
+            raise ConnectionError("Authorization: Bearer close-secret")
+
+    redis = FailingCloseRedis()
+    _patch_runtime(monkeypatch, redis)
+    result = await diagnostics.get_orchestrator_status()
+    assert result["configuration"]["status"] == "available"
+    assert "close-secret" not in json.dumps(result)
+
+    class CancelledCloseRedis(FakeRedis):
+        async def aclose(self) -> None:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await diagnostics._close_redis(CancelledCloseRedis())
+
+
 def test_scalar_validation_and_configured_repo_guards(monkeypatch: pytest.MonkeyPatch) -> None:
     from src.mcp.tools import diagnostics
 
