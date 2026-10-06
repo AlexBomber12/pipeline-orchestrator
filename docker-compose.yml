@@ -1,4 +1,13 @@
 services:
+  events-init:
+    build: .
+    entrypoint: ["sh", "-c"]
+    command: ["install -d -o 1000 -g 1000 -m 0750 /events"]
+    user: "0:0"
+    volumes:
+      - ${PO_EVENTS_HOST_DIR:-./data/events}:/events
+    restart: "no"
+
   web:
     build: .
     entrypoint: ["bash", "scripts/entrypoint.sh"]
@@ -19,7 +28,10 @@ services:
       HOME: /data/auth
     restart: unless-stopped
     depends_on:
-      - redis
+      events-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
 
   daemon:
     build: .
@@ -38,7 +50,10 @@ services:
       HOME: /data/auth
     restart: unless-stopped
     depends_on:
-      - redis
+      events-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
 
   mcp:
     build: .
@@ -57,7 +72,10 @@ services:
       PO_EVENTS_DIR: ${PO_EVENTS_DIR:-/data/events}
     restart: unless-stopped
     depends_on:
-      - redis
+      events-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
 
   cloudflared:
     image: cloudflare/cloudflared:latest

@@ -483,9 +483,12 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             "//registry.example/:_auth=redis-npm-basic-secret",
             "MYSQL_PWD=redis-pwd-secret",
             "Driver=Postgres;UID=alice;PWD=redis-odbc-pwd-secret;Server=db",
+            "https://acct.blob.core.windows.net/c?sv=1&sp=r&sig=redis-sas-secret&se=tomorrow",
+            "SharedAccessSignature=sv=1&sig=redis-shared-sas-secret",
             '{"SharedAccessKey":"redis-azure-shared-key-value"}',
             '{"_auth":"redis-npm-json-secret"}',
             '{"MYSQL_PWD":"redis-pwd-json-secret"}',
+            '{"url":"https://acct.blob.core.windows.net/c?sv=1&sig=redis-json-sas-secret"}',
             '{"password":987650000,}',
             '{"password":123456789}',
             '{"credentials":["user","fake-list-secret"]}',
@@ -598,9 +601,12 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "//registry.example/:_auth=ci-npm-basic-secret\n"
         + "MYSQL_PWD=ci-pwd-secret\n"
         + "Driver=Postgres;UID=alice;PWD=ci-odbc-pwd-secret;Server=db\n"
+        + "https://acct.blob.core.windows.net/c?sv=1&sp=r&sig=ci-sas-secret&se=tomorrow\n"
+        + "SharedAccessSignature=sv=1&sig=ci-shared-sas-secret\n"
         + '{"SharedAccessKey":"ci-azure-shared-key-value"}\n'
         + '{"_auth":"ci-npm-json-secret"}\n'
         + '{"MYSQL_PWD":"ci-pwd-json-secret"}\n'
+        + '{"url":"https://acct.blob.core.windows.net/c?sv=1&sig=ci-json-sas-secret"}\n'
         + '{"password":987650002,}\n'
         + '{\n"password":\n"ci-same-indent-secret"\n}\n'
         + "  password ci-multiline-netrc-secret\n"
@@ -668,6 +674,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-pwd-secret" not in content
         assert "redis-odbc-pwd-secret" not in content
         assert "redis-pwd-json-secret" not in content
+        assert "redis-sas-secret" not in content
+        assert "redis-shared-sas-secret" not in content
+        assert "redis-json-sas-secret" not in content
         assert "987650000" not in content
         assert "123456789" not in content
         assert "fake-list-secret" not in content
@@ -747,6 +756,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-pwd-secret" not in content
         assert "ci-odbc-pwd-secret" not in content
         assert "ci-pwd-json-secret" not in content
+        assert "ci-sas-secret" not in content
+        assert "ci-shared-sas-secret" not in content
+        assert "ci-json-sas-secret" not in content
         assert "987650002" not in content
         assert "987650001" not in content
         assert "debug" in content
@@ -2269,11 +2281,22 @@ def test_compose_wires_read_only_runtime_sources() -> None:
 
     compose = yaml.safe_load(Path("docker-compose.yml").read_text(encoding="utf-8"))
     service = compose["services"]["mcp"]
+    initializer = compose["services"]["events-init"]
     assert service["environment"]["REDIS_URL"] == "redis://redis:6379/0"
     assert service["environment"]["PO_EVENTS_DIR"] == "${PO_EVENTS_DIR:-/data/events}"
     assert compose["services"]["web"]["environment"]["PO_EVENTS_DIR"] == "${PO_EVENTS_DIR:-/data/events}"
     assert compose["services"]["daemon"]["environment"]["PO_EVENTS_DIR"] == "${PO_EVENTS_DIR:-/data/events}"
-    assert "redis" in service["depends_on"]
+    assert service["depends_on"]["redis"]["condition"] == "service_started"
+    assert service["depends_on"]["events-init"]["condition"] == "service_completed_successfully"
+    assert compose["services"]["web"]["depends_on"]["events-init"]["condition"] == (
+        "service_completed_successfully"
+    )
+    assert compose["services"]["daemon"]["depends_on"]["events-init"]["condition"] == (
+        "service_completed_successfully"
+    )
+    assert initializer["user"] == "0:0"
+    assert initializer["command"] == ["install -d -o 1000 -g 1000 -m 0750 /events"]
+    assert "${PO_EVENTS_HOST_DIR:-./data/events}:/events" in initializer["volumes"]
     assert "${PO_EVENTS_HOST_DIR:-./data/events}:${PO_EVENTS_DIR:-/data/events}:ro" in service["volumes"]
     assert all("docker.sock" not in volume for volume in service["volumes"])
     assert all("/data/auth" not in volume for volume in service["volumes"])
