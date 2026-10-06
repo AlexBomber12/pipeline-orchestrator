@@ -1403,6 +1403,10 @@ async def test_static_catalog_bypasses_daemon_loader() -> None:
 async def test_configured_static_catalog_uses_daemon_loader() -> None:
     calls: list[str] = []
 
+    class UnsafeConfiguredCatalog(_ThirdCatalogPlugin):
+        def model_catalog_cache_key(self, **_kwargs: object) -> str:
+            raise AssertionError("configured cache key must stay out of web")
+
     async def daemon_loader(
         plugin: object, **_kwargs: object
     ) -> ModelCatalog:
@@ -1418,14 +1422,22 @@ async def test_configured_static_catalog_uses_daemon_loader() -> None:
         daemon_owned_plugins={"third"},
     )
     snapshot = await cache.get(
-        _ThirdCatalogPlugin(),
+        UnsafeConfiguredCatalog(),
         config=AppConfig(),
         config_path="/workspace/config.yml",
     )
+    changed = await cache.get(
+        UnsafeConfiguredCatalog(),
+        config=AppConfig(
+            daemon={"coder_settings": {"third": {"variant": "preview"}}}
+        ),
+        config_path="/workspace/config.yml",
+    )
 
-    assert calls == ["third"]
+    assert calls == ["third", "third"]
     assert snapshot.source == "daemon"
     assert [model.invocation_id for model in snapshot.models] == ["isolated"]
+    assert changed.source == "daemon"
 
 
 @pytest.mark.asyncio

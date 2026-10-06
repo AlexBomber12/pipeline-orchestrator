@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -71,10 +72,21 @@ class ModelCatalogCache:
         ] = {}
         self._lock = asyncio.Lock()
 
-    @staticmethod
     def _key(
-        plugin: CoderPlugin, *, config: AppConfig, config_path: str
+        self,
+        plugin: CoderPlugin,
+        *,
+        config: AppConfig,
+        config_path: str,
     ) -> _CatalogKey:
+        if plugin.name in self._daemon_owned_plugins:
+            config_digest = hashlib.sha256(
+                config.model_dump_json().encode("utf-8")
+            ).hexdigest()
+            return _CatalogKey(
+                plugin.name,
+                ("daemon", config_path, config_digest),
+            )
         return _CatalogKey(
             plugin.name,
             plugin.model_catalog_cache_key(
@@ -155,7 +167,7 @@ class ModelCatalogCache:
                 # Default non-refreshable catalogs are known static metadata.
                 # Configured implementations always cross the daemon bridge,
                 # even when they advertise a static catalog, because their
-                # protocol method may still launch provider subprocesses.
+                # protocol methods may still launch provider subprocesses.
                 if self._loader is not None and (
                     plugin.model_catalog_refreshable
                     or plugin.name in self._daemon_owned_plugins
