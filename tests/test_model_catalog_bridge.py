@@ -114,13 +114,19 @@ async def test_loader_round_trips_catalog_through_daemon(
         config=AppConfig(),
         config_path=config_path,
     )
+    metadata = await loader.load_plugin_metadata("codex")
 
     assert catalog.source == "discovered"
     assert catalog.description == "1 model advertised by Codex CLI."
     assert catalog.models[0].invocation_id == "invoke-me"
     assert catalog.models[0].reasoning_efforts[0].description == "Balanced"
+    assert metadata.name == "codex"
+    assert metadata.display_name == "Codex CLI"
+    assert metadata.model_setting.setting_key == "model"
+    assert metadata.model_catalog_refreshable is True
     assert redis.trimmed == [
-        (bridge.MODEL_CATALOG_REQUEST_QUEUE, -64, -1)
+        (bridge.MODEL_CATALOG_REQUEST_QUEUE, -64, -1),
+        (bridge.MODEL_CATALOG_REQUEST_QUEUE, -64, -1),
     ]
     assert redis.removed[0][:2] == (
         bridge.MODEL_CATALOG_REQUEST_QUEUE,
@@ -206,6 +212,43 @@ async def test_loader_reports_queue_read_payload_timeout_and_cleanup_failures(
 def test_parse_catalog_rejects_invalid_payloads(payload: object) -> None:
     with pytest.raises(ModelCatalogUnavailable):
         bridge._parse_catalog(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {"ok": True},
+        {
+            "ok": True,
+            "metadata": {
+                "name": "wrong",
+                "display_name": "Third",
+                "models": [],
+                "model_setting": {},
+                "model_catalog_refreshable": False,
+            },
+        },
+        {
+            "ok": True,
+            "metadata": {
+                "name": "third",
+                "display_name": "Third",
+                "models": [],
+                "model_setting": {
+                    "config_field": None,
+                    "default_value": 3,
+                    "default_label": "Default",
+                    "setting_key": "model",
+                },
+                "model_catalog_refreshable": False,
+            },
+        },
+    ],
+)
+def test_parse_plugin_metadata_rejects_invalid_payloads(payload: object) -> None:
+    with pytest.raises(ModelCatalogUnavailable):
+        bridge._parse_plugin_metadata(payload, expected_name="third")
 
 
 @pytest.mark.asyncio

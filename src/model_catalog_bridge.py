@@ -13,12 +13,14 @@ from typing import Any
 
 from src.coder_auth import terminate_plugin_worker
 from src.coder_registry import (
+    CoderMetadataView,
     CoderPlugin,
     CoderRegistry,
     ModelCatalog,
     ModelCatalogUnavailable,
     ModelMetadata,
     ModelReasoningEffort,
+    ModelSetting,
 )
 from src.config import DEFAULT_CODER_PLUGINS, AppConfig, load_config
 
@@ -47,6 +49,70 @@ def _catalog_payload(catalog: ModelCatalog) -> dict[str, Any]:
             "description": catalog.description,
         },
     }
+
+
+def _plugin_metadata_payload(plugin: CoderPlugin) -> dict[str, Any]:
+    setting = plugin.model_setting
+    return {
+        "ok": True,
+        "metadata": {
+            "name": plugin.name,
+            "display_name": plugin.display_name,
+            "models": plugin.models,
+            "model_setting": asdict(setting),
+            "model_catalog_refreshable": plugin.model_catalog_refreshable,
+        },
+    }
+
+
+def _parse_plugin_metadata(
+    payload: object,
+    *,
+    expected_name: str,
+) -> CoderMetadataView:
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        raise ModelCatalogUnavailable("Daemon coder metadata is unavailable")
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ModelCatalogUnavailable("Daemon returned invalid coder metadata")
+    name = metadata.get("name")
+    display_name = metadata.get("display_name")
+    models = metadata.get("models")
+    raw_setting = metadata.get("model_setting")
+    refreshable = metadata.get("model_catalog_refreshable")
+    if (
+        name != expected_name
+        or not isinstance(display_name, str)
+        or not display_name
+        or not isinstance(models, list)
+        or not all(isinstance(model, str) for model in models)
+        or not isinstance(raw_setting, dict)
+        or not isinstance(refreshable, bool)
+    ):
+        raise ModelCatalogUnavailable("Daemon returned invalid coder metadata")
+    config_field = raw_setting.get("config_field")
+    default_value = raw_setting.get("default_value")
+    default_label = raw_setting.get("default_label")
+    setting_key = raw_setting.get("setting_key")
+    if (
+        (config_field is not None and not isinstance(config_field, str))
+        or not isinstance(default_value, str)
+        or not isinstance(default_label, str)
+        or not isinstance(setting_key, str)
+    ):
+        raise ModelCatalogUnavailable("Daemon returned invalid coder metadata")
+    return CoderMetadataView(
+        name=name,
+        display_name=display_name,
+        models=list(models),
+        model_setting=ModelSetting(
+            config_field=config_field,
+            default_value=default_value,
+            default_label=default_label,
+            setting_key=setting_key,
+        ),
+        model_catalog_refreshable=refreshable,
+    )
 
 
 def _parse_catalog(payload: object) -> ModelCatalog:
@@ -198,12 +264,34 @@ class DaemonModelCatalogLoader:
         config_path: str,
     ) -> ModelCatalog:
         del config, config_path
+        return _parse_catalog(
+            await self._request(plugin.name, operation="catalog")
+        )
+
+    async def load_plugin_metadata(
+        self,
+        plugin_id: str,
+    ) -> CoderMetadataView:
+        """Load validated control-plane metadata from the daemon."""
+        return _parse_plugin_metadata(
+            await self._request(plugin_id, operation="metadata"),
+            expected_name=plugin_id,
+        )
+
+    async def _request(
+        self,
+        plugin_id: str,
+        *,
+        operation: str,
+    ) -> object:
+        """Round-trip one plugin metadata request through Redis."""
         request_id = uuid.uuid4().hex
         response_key = _response_key(request_id)
         request = json.dumps(
             {
                 "request_id": request_id,
-                "plugin": plugin.name,
+                "plugin": plugin_id,
+                "operation": operation,
                 "expires_at": time.time() + self._timeout_seconds,
             },
             separators=(",", ":"),
@@ -231,10 +319,10 @@ class DaemonModelCatalogLoader:
                     ) from None
                 if raw_response is not None:
                     try:
-                        return _parse_catalog(json.loads(raw_response))
+                        return json.loads(raw_response)
                     except (json.JSONDecodeError, TypeError):
                         raise ModelCatalogUnavailable(
-                            "Daemon returned invalid model metadata"
+                            "Daemon returned invalid plugin metadata"
                         ) from None
                 await asyncio.sleep(self._poll_interval_seconds)
         finally:
@@ -281,12 +369,14 @@ async def handle_model_catalog_request(
         return
     request_id = request.get("request_id")
     plugin_name = request.get("plugin")
+    operation = request.get("operation", "catalog")
     expires_at = request.get("expires_at")
     if (
         not isinstance(request_id, str)
         or len(request_id) != 32
         or not all(character in "0123456789abcdef" for character in request_id)
         or not isinstance(plugin_name, str)
+        or operation not in {"catalog", "metadata"}
         or not isinstance(expires_at, (int, float))
     ):
         return
@@ -299,6 +389,13 @@ async def handle_model_catalog_request(
         return
     try:
         plugin = registry.get(plugin_name)
+        if operation == "metadata":
+            await _store_response(
+                redis_client,
+                request_id,
+                _plugin_metadata_payload(plugin),
+            )
+            return
         reference = registry.reference_for(plugin_name)
         if (
             reference is not None

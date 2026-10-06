@@ -76,6 +76,30 @@ class ModelSetting:
         return self.default_value
 
 
+@dataclass(frozen=True)
+class CoderMetadataView:
+    """Non-executable plugin metadata used by the web control plane."""
+
+    name: str
+    display_name: str
+    models: list[str]
+    model_setting: ModelSetting
+    model_catalog_refreshable: bool
+
+    def resolve_model(self, daemon_config: "DaemonConfig") -> str:
+        """Resolve the configured model without invoking plugin code."""
+        return self.model_setting.resolve(self.name, daemon_config)
+
+    def build_run_kwargs(
+        self,
+        *,
+        daemon_config: "DaemonConfig",
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        """Expose model kwargs for provider-neutral settings consumers."""
+        return {"model": self.resolve_model(daemon_config)}
+
+
 class ModelCatalogUnavailable(RuntimeError):
     """A plugin could not provide a usable model catalog."""
 

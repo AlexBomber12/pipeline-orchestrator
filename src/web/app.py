@@ -24,6 +24,7 @@ split (``X`` is loaded on demand from whichever submodule now owns it).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import subprocess  # noqa: F401 — re-exported via web_app.subprocess for tests
@@ -37,6 +38,7 @@ import redis.asyncio as aioredis
 from fastapi import FastAPI
 from fastapi.templating import Jinja2Templates
 
+from src.coder_registry import CoderRegistry
 from src.coders import build_coder_registry
 from src.config import (
     DEFAULT_CODER_PLUGINS,
@@ -298,27 +300,53 @@ def __getattr__(name: str) -> Any:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # Plugin definitions are startup-only. Construct the registry before
-    # opening Redis so a bad trusted entry point cannot leak a new client.
+    # Configuration parsing is inert, and only known built-ins are constructed
+    # in web. Configured factories and metadata stay daemon-owned.
     config = load_config(CONFIG_PATH)
-    registry = build_coder_registry(config)
+    default_registry = build_coder_registry()
     redis_url = os.environ.get("REDIS_URL", DEFAULT_REDIS_URL)
     client = aioredis.from_url(redis_url, decode_responses=True)
     app.state.redis = client
-    app.state.coder_registry = registry
-    daemon_owned_catalogs = {
-        name
-        for name in registry.coder_names()
-        if registry.reference_for(name) != DEFAULT_CODER_PLUGINS.get(name)
-    }
-    app.state.model_catalog = ModelCatalogCache(
-        loader=DaemonModelCatalogLoader(client),
-        daemon_owned_plugins=daemon_owned_catalogs,
-    )
+    catalog_cache: ModelCatalogCache | None = None
     try:
+        catalog_loader = DaemonModelCatalogLoader(client)
+        configured_ids = [
+            plugin_id
+            for plugin_id, reference in config.coder_plugins.items()
+            if reference != DEFAULT_CODER_PLUGINS.get(plugin_id)
+        ]
+        metadata = await asyncio.gather(
+            *(
+                catalog_loader.load_plugin_metadata(plugin_id)
+                for plugin_id in configured_ids
+            )
+        )
+        configured_metadata = dict(
+            zip(configured_ids, metadata, strict=True)
+        )
+        registry = CoderRegistry()
+        for plugin_id, reference in config.coder_plugins.items():
+            plugin = (
+                default_registry.get(plugin_id)
+                if reference == DEFAULT_CODER_PLUGINS.get(plugin_id)
+                else configured_metadata[plugin_id]
+            )
+            registry.register(plugin, reference=reference)
+        app.state.coder_registry = registry
+        daemon_owned_catalogs = {
+            name
+            for name in registry.coder_names()
+            if registry.reference_for(name) != DEFAULT_CODER_PLUGINS.get(name)
+        }
+        catalog_cache = ModelCatalogCache(
+            loader=catalog_loader,
+            daemon_owned_plugins=daemon_owned_catalogs,
+        )
+        app.state.model_catalog = catalog_cache
         yield
     finally:
-        await app.state.model_catalog.close()
+        if catalog_cache is not None:
+            await catalog_cache.close()
         try:
             await client.aclose()
         except Exception:

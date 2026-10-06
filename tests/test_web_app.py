@@ -1490,7 +1490,7 @@ def test_lifespan_registry_failure_precedes_redis_client_creation(
     monkeypatch.setattr(
         web_app,
         "build_coder_registry",
-        lambda _config: (_ for _ in ()).throw(ValueError("bad plugin")),
+        lambda *_args: (_ for _ in ()).throw(ValueError("bad plugin")),
     )
 
     with pytest.raises(ValueError, match="bad plugin"):
@@ -1498,6 +1498,71 @@ def test_lifespan_registry_failure_precedes_redis_client_creation(
             pass
 
     assert opened is False
+
+
+def test_lifespan_gets_configured_metadata_without_loading_factory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.coder_registry import CoderMetadataView, ModelSetting
+    from src.coders import build_coder_registry as real_build_registry
+
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        "coder_plugins:\n"
+        "  third: unsafe.module:factory\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(config_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    build_calls: list[tuple[object, ...]] = []
+
+    def build_defaults(*args: object) -> object:
+        build_calls.append(args)
+        return real_build_registry()
+
+    class MetadataLoader:
+        def __init__(self, _redis: object) -> None:
+            self.requested: list[str] = []
+
+        async def load_plugin_metadata(
+            self, plugin_id: str
+        ) -> CoderMetadataView:
+            self.requested.append(plugin_id)
+            return CoderMetadataView(
+                name=plugin_id,
+                display_name="Daemon Metadata",
+                models=["third-default"],
+                model_setting=ModelSetting(
+                    None,
+                    "third-default",
+                    "Default",
+                ),
+                model_catalog_refreshable=False,
+            )
+
+        async def __call__(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("catalog loading is not part of startup")
+
+    loaders: list[MetadataLoader] = []
+
+    def loader_factory(redis: object) -> MetadataLoader:
+        loader = MetadataLoader(redis)
+        loaders.append(loader)
+        return loader
+
+    monkeypatch.setattr(web_app, "build_coder_registry", build_defaults)
+    monkeypatch.setattr(web_app, "DaemonModelCatalogLoader", loader_factory)
+
+    with TestClient(app) as client:
+        plugin = client.app.state.coder_registry.get("third")
+        assert plugin.display_name == "Daemon Metadata"
+        assert client.app.state.coder_registry.reference_for("third") == (
+            "unsafe.module:factory"
+        )
+
+    assert build_calls == [()]
+    assert loaders[0].requested == ["third"]
 
 
 def test_get_repo_state_unknown_repo_returns_idle_default(

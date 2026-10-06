@@ -123,7 +123,9 @@ and `codex_model` by `codex`); additional plugins must set their model
 metadata's `config_field` to `None` and use `coder_settings`. Configured model
 catalog methods run through the daemon in bounded worker processes, while the
 web cache key is derived from validated configuration; configured catalog code
-does not execute inside the web control plane.
+does not execute inside the web control plane. The daemon also supplies
+validated plugin metadata to web over Redis, so configured modules and
+factories are never imported or instantiated by FastAPI.
 
 Codex reasoning effort can be overridden for each new invocation with
 `daemon.coder_settings.codex.reasoning_effort`. Omit the key or set it to an
