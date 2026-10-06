@@ -109,13 +109,23 @@ def _check_coder_auth(
     plugin_id: str,
 ) -> dict[str, str]:
     """Probe one startup-registered coder in the active config context."""
-    check_auth = registry.get(plugin_id).check_auth
-    kwargs = (
-        {"config_path": _config_path()}
-        if "config_path" in inspect.signature(check_auth).parameters
-        else {}
-    )
-    return check_auth(**kwargs)
+    plugin = registry.get(plugin_id)
+    try:
+        check_auth = plugin.check_auth
+        kwargs = (
+            {"config_path": _config_path()}
+            if "config_path" in inspect.signature(check_auth).parameters
+            else {}
+        )
+        return check_auth(**kwargs)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "detail": (
+                f"{plugin.display_name} auth check failed "
+                f"({type(exc).__name__})"
+            ),
+        }
 
 
 def _check_claude_auth(

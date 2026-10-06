@@ -11,6 +11,7 @@ from src.coder_registry import CoderPlugin, CoderRegistry, ModelSetting
 from src.config import DEFAULT_CODER_PLUGINS, AppConfig, DaemonConfig
 
 _PLUGIN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_RESERVED_PLUGIN_IDS = frozenset({"gh"})
 
 
 class CoderPluginConfigurationError(ValueError):
@@ -209,6 +210,13 @@ def _load_plugin(plugin_id: str, reference: object) -> CoderPlugin:
             "plugin ID validation",
             "expected an ASCII letter/digit slug using only letters, digits, "
             "underscores, and hyphens",
+        )
+    if plugin_id in _RESERVED_PLUGIN_IDS:
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "plugin ID validation",
+            "ID is reserved for infrastructure status",
         )
     module_name, factory_name = _parse_reference(plugin_id, reference)
     assert isinstance(reference, str)

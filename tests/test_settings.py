@@ -1912,6 +1912,34 @@ def test_api_auth_status_uses_every_configured_plugin(
     }
 
 
+def test_configured_plugin_auth_failure_is_isolated_and_redacted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories: []\n"
+        "coder_plugins:\n"
+        "  third: tests.configured_coder_plugin:build_raising_auth_plugin\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        api_response = client.get("/api/auth-status")
+        settings_response = client.get("/settings")
+
+    assert api_response.status_code == 200
+    assert settings_response.status_code == 200
+    assert api_response.json()["third"] == {
+        "status": "error",
+        "detail": "Configured Test Coder auth check failed (RuntimeError)",
+    }
+    assert "must-not-leak" not in api_response.text
+    assert "must-not-leak" not in settings_response.text
+
+
 def test_api_auth_status_reports_errors(
     empty_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

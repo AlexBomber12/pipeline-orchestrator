@@ -323,6 +323,20 @@ def test_build_registry_rejects_route_unsafe_plugin_id(plugin_id: str) -> None:
     assert "failed at plugin ID validation" in message
 
 
+def test_build_registry_rejects_reserved_infrastructure_plugin_id() -> None:
+    reference = "tests.configured_coder_plugin:build_test_plugin"
+    config = AppConfig(coder_plugins={"gh": reference})
+
+    with pytest.raises(CoderPluginConfigurationError) as caught:
+        build_coder_registry(config)
+
+    message = str(caught.value)
+    assert repr("gh") in message
+    assert repr(reference) in message
+    assert "failed at plugin ID validation" in message
+    assert "reserved for infrastructure status" in message
+
+
 def test_build_registry_wraps_contract_inspection_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

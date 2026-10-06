@@ -60,6 +60,11 @@ class VariantSettingTestPlugin(ConfiguredTestPlugin):
     )
 
 
+class RaisingAuthTestPlugin(ConfiguredTestPlugin):
+    def check_auth(self) -> dict[str, str]:
+        raise RuntimeError("credential=must-not-leak")
+
+
 class MissingMetadataPlugin(ConfiguredTestPlugin):
     display_name = ""
 
@@ -86,6 +91,10 @@ def build_digit_leading_plugin() -> DigitLeadingTestPlugin:
 
 def build_variant_setting_plugin() -> VariantSettingTestPlugin:
     return VariantSettingTestPlugin()
+
+
+def build_raising_auth_plugin() -> RaisingAuthTestPlugin:
+    return RaisingAuthTestPlugin()
 
 
 def build_mismatched_plugin() -> ConfiguredTestPlugin:

@@ -95,7 +95,8 @@ choice; Claude normalizes an empty choice to its `opus` default.
 
 `coder_plugins` is a top-level mapping from a stable, route-safe plugin ID
 (ASCII letters/digits, underscores, and hyphens) to a trusted `module:factory`
-reference. The no-argument factory must already be importable
+reference. The ID `gh` is reserved for the dashboard's GitHub CLI
+infrastructure status. The no-argument factory must already be importable
 in both the web and daemon Python environments and must return a complete
 `CoderPlugin` whose `name` exactly matches the configured ID. Claude and Codex
 use the references shown above as compatibility defaults. An explicit entry
