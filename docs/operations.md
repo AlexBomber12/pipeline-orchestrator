@@ -56,7 +56,8 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   including nested list items and prefixed fallback forms. Flow-style YAML
   environment entries correlate sensitive `name` fields with sibling `value`
   fields in either order. Quoted YAML keys are decoded before sensitive-name
-  matching, including escaped spellings. Excessive structured nesting is
+  matching, including escaped spellings. YAML alias graphs visit each shared
+  collection at most once per classification. Excessive structured nesting is
   omitted fail-closed.
   Producer-added `[truncated]` markers are preserved; because their
   removed prefix may contain a sensitive opener, the retained Redis CLI tail is

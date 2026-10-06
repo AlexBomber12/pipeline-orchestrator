@@ -1348,6 +1348,24 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     assert not diagnostics._contains_sensitive_yaml_environment(cyclic)
     assert not diagnostics._contains_sensitive_yaml_key(cyclic)
 
+    class CountingDict(dict[str, Any]):
+        value_reads = 0
+
+        def values(self):
+            self.value_reads += 1
+            return super().values()
+
+    shared = CountingDict({"safe": "visible"})
+    alias_fanout = [shared, shared]
+    for classifier in (
+        diagnostics._contains_kubernetes_secret_payload,
+        diagnostics._contains_sensitive_yaml_environment,
+        diagnostics._contains_sensitive_yaml_key,
+    ):
+        shared.value_reads = 0
+        assert not classifier(alias_fanout)
+        assert shared.value_reads == 1
+
     redis = FakeRedis()
     _patch_runtime(monkeypatch, redis, _config(_repo()))
     monkeypatch.setattr(diagnostics, "_REPOS_ROOT", tmp_path / "repos")

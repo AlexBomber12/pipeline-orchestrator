@@ -699,28 +699,25 @@ def _contains_kubernetes_secret_payload(
     if identity in seen:
         return False
     seen.add(identity)
-    try:
-        if isinstance(value, dict):
-            normalized = {
-                key.casefold().replace("_", "").replace("-", ""): item
-                for key, item in value.items()
-                if isinstance(key, str)
-            }
-            if (
-                isinstance(normalized.get("kind"), str)
-                and normalized["kind"].casefold() == "secret"
-                and ("data" in normalized or "stringdata" in normalized)
-            ):
-                return True
-            children = value.values()
-        else:
-            children = value
-        return any(
-            _contains_kubernetes_secret_payload(child, depth=depth + 1, seen=seen)
-            for child in children
-        )
-    finally:
-        seen.remove(identity)
+    if isinstance(value, dict):
+        normalized = {
+            key.casefold().replace("_", "").replace("-", ""): item
+            for key, item in value.items()
+            if isinstance(key, str)
+        }
+        if (
+            isinstance(normalized.get("kind"), str)
+            and normalized["kind"].casefold() == "secret"
+            and ("data" in normalized or "stringdata" in normalized)
+        ):
+            return True
+        children = value.values()
+    else:
+        children = value
+    return any(
+        _contains_kubernetes_secret_payload(child, depth=depth + 1, seen=seen)
+        for child in children
+    )
 
 
 def _contains_sensitive_yaml_environment(
@@ -737,29 +734,26 @@ def _contains_sensitive_yaml_environment(
     if identity in seen:
         return False
     seen.add(identity)
-    try:
-        if isinstance(value, dict):
-            normalized = {
-                key.casefold().replace("_", "").replace("-", ""): item
-                for key, item in value.items()
-                if isinstance(key, str)
-            }
-            name = normalized.get("name")
-            if (
-                isinstance(name, str)
-                and _SENSITIVE_KEY.fullmatch(name) is not None
-                and "value" in normalized
-            ):
-                return True
-            children = value.values()
-        else:
-            children = value
-        return any(
-            _contains_sensitive_yaml_environment(child, depth=depth + 1, seen=seen)
-            for child in children
-        )
-    finally:
-        seen.remove(identity)
+    if isinstance(value, dict):
+        normalized = {
+            key.casefold().replace("_", "").replace("-", ""): item
+            for key, item in value.items()
+            if isinstance(key, str)
+        }
+        name = normalized.get("name")
+        if (
+            isinstance(name, str)
+            and _SENSITIVE_KEY.fullmatch(name) is not None
+            and "value" in normalized
+        ):
+            return True
+        children = value.values()
+    else:
+        children = value
+    return any(
+        _contains_sensitive_yaml_environment(child, depth=depth + 1, seen=seen)
+        for child in children
+    )
 
 
 def _contains_sensitive_yaml_key(
@@ -776,19 +770,16 @@ def _contains_sensitive_yaml_key(
     if identity in seen:
         return False
     seen.add(identity)
-    try:
-        if isinstance(value, dict):
-            if any(isinstance(key, str) and _SENSITIVE_KEY.fullmatch(key) for key in value):
-                return True
-            children = value.values()
-        else:
-            children = value
-        return any(
-            _contains_sensitive_yaml_key(child, depth=depth + 1, seen=seen)
-            for child in children
-        )
-    finally:
-        seen.remove(identity)
+    if isinstance(value, dict):
+        if any(isinstance(key, str) and _SENSITIVE_KEY.fullmatch(key) for key in value):
+            return True
+        children = value.values()
+    else:
+        children = value
+    return any(
+        _contains_sensitive_yaml_key(child, depth=depth + 1, seen=seen)
+        for child in children
+    )
 
 
 def _yaml_flow_sensitivity(text: str) -> str | None:
