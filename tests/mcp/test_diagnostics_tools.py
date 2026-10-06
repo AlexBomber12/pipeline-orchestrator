@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import fnmatch
+import hashlib
 import json
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -123,15 +124,43 @@ class FakeRedis:
     ) -> list[object]:
         self._check("eval_ro", (script, numkeys, key, *args))
         if "ZCARD" in script:
-            cursor_score, cursor_member, page_limit = args
+            cursor_score, cursor_member, cursor_digest, page_limit, member_limit, lookup_limit = args
             values = sorted(self.zsets.get(key, []), key=lambda item: (item[1], str(item[0])))
             first = 0
             if cursor_score != "":
-                cursor = (float(cursor_score), str(cursor_member))
-                while first < len(values) and (values[first][1], str(values[first][0])) <= cursor:
-                    first += 1
+                if cursor_member != "":
+                    cursor = (float(cursor_score), str(cursor_member))
+                    while first < len(values) and (values[first][1], str(values[first][0])) <= cursor:
+                        first += 1
+                else:
+                    while first < len(values) and values[first][1] < float(cursor_score):
+                        first += 1
+                    located = False
+                    for _ in range(int(lookup_limit)):
+                        if first >= len(values) or values[first][1] != float(cursor_score):
+                            break
+                        member = values[first][0]
+                        raw_member = member if isinstance(member, bytes) else str(member).encode()
+                        first += 1
+                        if hashlib.sha1(raw_member).hexdigest() == cursor_digest:
+                            located = True
+                            break
+                    if not located:
+                        return [len(values), -1, []]
             selected = values[first : first + int(page_limit)]
-            flattened = [item for member, score in selected for item in (member, score)]
+            flattened: list[object] = []
+            for offset, (member, score) in enumerate(selected):
+                raw_member = member if isinstance(member, bytes) else str(member).encode()
+                oversized = len(raw_member) > int(member_limit)
+                flattened.extend(
+                    (
+                        "" if oversized else member,
+                        score,
+                        first + offset,
+                        len(raw_member),
+                        hashlib.sha1(raw_member).hexdigest() if oversized else "",
+                    )
+                )
             return [len(values), first, flattened]
         if "LINDEX" in script:
             scan_limit, member_limit = (int(item) for item in args)
@@ -1732,11 +1761,19 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
         has_more_after_raw=True,
     ) == (1, True)
     retry_cursor = diagnostics._retry_cursor(1.5, "command")
-    assert diagnostics._validate_retry_cursor(retry_cursor) == (1.5, "command")
+    assert diagnostics._validate_retry_cursor(retry_cursor) == (1.5, "command", "")
+    digest_cursor = diagnostics._retry_cursor(1.5, "", member_sha1="a" * 40)
+    assert diagnostics._validate_retry_cursor(digest_cursor) == (1.5, "", "a" * 40)
     with pytest.raises(ValueError, match="nonempty bounded"):
         diagnostics._validate_retry_cursor("")
     with pytest.raises(ValueError, match="malformed"):
         diagnostics._validate_retry_cursor(diagnostics._retry_cursor(float("nan"), "command"))
+    with pytest.raises(ValueError, match="malformed"):
+        diagnostics._validate_retry_cursor(diagnostics._retry_cursor(1.5, ""))
+    with pytest.raises(ValueError, match="malformed"):
+        diagnostics._validate_retry_cursor(
+            diagnostics._retry_cursor(1.5, "", member_sha1="not-a-digest")
+        )
     assert (
         diagnostics._yaml_explicit_value_end(
             [b"ordinary\n"],
@@ -2324,6 +2361,76 @@ async def test_status_helper_failures_remain_explicit() -> None:
         "command-20",
         "command-21",
     ]
+
+
+async def test_pending_retry_index_members_are_bounded_and_paginated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    monkeypatch.setattr(diagnostics, "_MAX_PENDING_RETRIES", 2)
+    redis = FakeRedis()
+    pending_key = retry_command_pending(SLUG)
+    oversized_member = "x" * (diagnostics._MAX_RETRY_INDEX_MEMBER_BYTES + 1)
+    redis.zsets[pending_key] = [
+        ("safe-before", 1.0),
+        (oversized_member, 2.0),
+        ("safe-after", 3.0),
+    ]
+
+    first = await diagnostics._pending_retries(redis, SLUG)
+
+    assert [item["status"] for item in first["commands"]] == [
+        "missing_payload",
+        "oversized_index_member",
+    ]
+    assert first["commands"][1] == {
+        "status": "oversized_index_member",
+        "index": 1,
+        "index_score": 2.0,
+        "source_size_bytes": len(oversized_member),
+        "read_bound_bytes": diagnostics._MAX_RETRY_INDEX_MEMBER_BYTES,
+        "error": (
+            f"Stored pending Retry index member is {len(oversized_member)} bytes; "
+            f"the diagnostic read bound is {diagnostics._MAX_RETRY_INDEX_MEMBER_BYTES} bytes."
+        ),
+    }
+    assert oversized_member not in json.dumps(first)
+    next_cursor = first["continuation"]["next_cursor"]
+
+    second = await diagnostics._pending_retries(redis, SLUG, next_cursor)
+
+    assert [item["command_id"] for item in second["commands"]] == ["safe-after"]
+    assert second["continuation"] is None
+    assert not any(
+        operation in {"strlen", "getrange", "exists", "ttl"}
+        and oversized_member in str(value)
+        for operation, value in redis.calls
+    )
+
+    redis.zsets[pending_key].pop(1)
+    missing_cursor_member = await diagnostics._pending_retries(redis, SLUG, next_cursor)
+    assert missing_cursor_member["status"] == "unavailable"
+    assert "no longer locatable" in missing_cursor_member["error"]
+
+    async def missing_digest(*args: Any, **kwargs: Any) -> list[object]:
+        del args, kwargs
+        return [1, 0, ["", 1.0, 0, diagnostics._MAX_RETRY_INDEX_MEMBER_BYTES + 1, ""]]
+
+    redis.eval_ro = missing_digest  # type: ignore[method-assign]
+    malformed = await diagnostics._pending_retries(redis, SLUG)
+    assert malformed["status"] == "unavailable"
+
+    digest = hashlib.sha1(oversized_member.encode()).hexdigest()
+
+    async def dishonest_member_size(*args: Any, **kwargs: Any) -> list[object]:
+        del args, kwargs
+        return [1, 0, [oversized_member, 1.0, 0, 1, digest]]
+
+    redis.eval_ro = dishonest_member_size  # type: ignore[method-assign]
+    dishonest = await diagnostics._pending_retries(redis, SLUG)
+    assert dishonest["commands"][0]["status"] == "oversized_index_member"
+    assert dishonest["commands"][0]["source_size_bytes"] == len(oversized_member)
 
 
 async def test_run_filtering_unavailable_record_and_limit() -> None:
