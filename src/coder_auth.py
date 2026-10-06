@@ -11,8 +11,8 @@ import sys
 from src.coder_auth_worker import RESULT_PREFIX
 
 
-async def _terminate_worker(process: asyncio.subprocess.Process) -> None:
-    """Kill and reap one isolated auth worker process group."""
+async def terminate_plugin_worker(process: asyncio.subprocess.Process) -> None:
+    """Kill and reap one isolated plugin worker process group."""
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -54,10 +54,10 @@ async def isolated_auth_probe(
             timeout=timeout,
         )
     except asyncio.CancelledError:
-        await _terminate_worker(process)
+        await terminate_plugin_worker(process)
         raise
     except asyncio.TimeoutError:
-        await _terminate_worker(process)
+        await terminate_plugin_worker(process)
         return {
             "status": "error",
             "detail": f"{display_name} auth check timed out after {timeout:g}s",

@@ -120,7 +120,9 @@ values (`claude` and `codex`). Arbitrary registered IDs are therefore not yet
 complete support for executing additional providers. Legacy model-field
 fallbacks are likewise owned by their built-ins (`claude_model` by `claude`
 and `codex_model` by `codex`); additional plugins must set their model
-metadata's `config_field` to `None` and use `coder_settings`.
+metadata's `config_field` to `None` and use `coder_settings`. Configured model
+catalog methods run through the daemon in bounded worker processes; they do not
+execute inside the web control plane.
 
 Codex reasoning effort can be overridden for each new invocation with
 `daemon.coder_settings.codex.reasoning_effort`. Omit the key or set it to an

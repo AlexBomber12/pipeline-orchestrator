@@ -39,6 +39,7 @@ from fastapi.templating import Jinja2Templates
 
 from src.coders import build_coder_registry
 from src.config import (
+    DEFAULT_CODER_PLUGINS,
     add_repository,  # noqa: F401 — accessed by routes via _app.add_repository
     load_config,  # noqa: F401 — accessed by routes via _app.load_config
     remove_repository,  # noqa: F401 — accessed by routes via _app.remove_repository
@@ -305,8 +306,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     client = aioredis.from_url(redis_url, decode_responses=True)
     app.state.redis = client
     app.state.coder_registry = registry
+    daemon_owned_catalogs = {
+        name
+        for name in registry.coder_names()
+        if registry.reference_for(name) != DEFAULT_CODER_PLUGINS.get(name)
+    }
     app.state.model_catalog = ModelCatalogCache(
-        loader=DaemonModelCatalogLoader(client)
+        loader=DaemonModelCatalogLoader(client),
+        daemon_owned_plugins=daemon_owned_catalogs,
     )
     try:
         yield

@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 
 import pytest
 from src import model_catalog_bridge as bridge
 from src.coder_registry import (
     CoderRegistry,
+    ModelCatalog,
     ModelCatalogUnavailable,
+    ModelMetadata,
 )
 from src.coders.codex import CodexPlugin
 from src.coders.codex_models import CodexModel, CodexReasoningEffort
@@ -55,6 +58,21 @@ class _BridgeRedis:
     async def delete(self, key: str) -> None:
         self.deleted.append(key)
         self.values.pop(key, None)
+
+
+class _CatalogWorkerProcess:
+    def __init__(self, stdout: bytes, returncode: int = 0) -> None:
+        self.pid = 12345
+        self.returncode = returncode
+        self._stdout = stdout
+        self.reaped = False
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return self._stdout, b""
+
+    async def wait(self) -> int:
+        self.reaped = True
+        return self.returncode
 
 
 @pytest.mark.asyncio
@@ -188,6 +206,233 @@ async def test_loader_reports_queue_read_payload_timeout_and_cleanup_failures(
 def test_parse_catalog_rejects_invalid_payloads(payload: object) -> None:
     with pytest.raises(ModelCatalogUnavailable):
         bridge._parse_catalog(payload)
+
+
+@pytest.mark.asyncio
+async def test_configured_catalog_worker_response_redacts_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Plugin:
+        async def get_model_catalog(self, **_kwargs: object) -> ModelCatalog:
+            return ModelCatalog(
+                (ModelMetadata("third", "Third"),),
+                "configured",
+                "Configured catalog.",
+            )
+
+    monkeypatch.setattr("src.coders._load_plugin", lambda *_args: Plugin())
+    monkeypatch.setattr(bridge, "load_config", lambda _path: AppConfig())
+    response = await bridge._configured_catalog_worker_response(
+        "third", "module:factory", "/cfg"
+    )
+    assert bridge._parse_catalog(response).models[0].invocation_id == "third"
+
+    monkeypatch.setattr(
+        "src.coders._load_plugin",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("must-not-leak")),
+    )
+    assert await bridge._configured_catalog_worker_response(
+        "third", "module:factory", "/cfg"
+    ) == {"ok": False, "error": "catalog unavailable"}
+
+
+def test_configured_catalog_worker_main_validates_and_prints(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(bridge.sys, "argv", ["catalog-worker"])
+    with pytest.raises(SystemExit, match="2"):
+        bridge._configured_catalog_worker_main()
+
+    async def response(*_args: object) -> dict[str, object]:
+        return {"ok": False, "error": "unavailable"}
+
+    monkeypatch.setattr(bridge, "_configured_catalog_worker_response", response)
+    monkeypatch.setattr(
+        bridge.sys,
+        "argv",
+        [
+            "catalog-worker",
+            "--configured-worker",
+            "third",
+            "module:factory",
+            "/cfg",
+        ],
+    )
+    bridge._configured_catalog_worker_main()
+    assert capsys.readouterr().out.strip() == (
+        bridge._WORKER_RESULT_PREFIX
+        + '{"ok":false,"error":"unavailable"}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_isolated_configured_catalog_parses_worker_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = ModelCatalog(
+        (ModelMetadata("isolated", "Isolated"),),
+        "configured",
+        "Configured catalog.",
+    )
+    stdout = (
+        bridge._WORKER_RESULT_PREFIX
+        + json.dumps(bridge._catalog_payload(catalog), separators=(",", ":"))
+        + "\nnoise\n"
+    ).encode()
+    captured: dict[str, object] = {}
+
+    async def create(*args: object, **kwargs: object) -> _CatalogWorkerProcess:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return _CatalogWorkerProcess(stdout)
+
+    monkeypatch.setattr(bridge.asyncio, "create_subprocess_exec", create)
+    result = await bridge._isolated_configured_catalog(
+        "third", "module:factory", config_path="/cfg"
+    )
+
+    assert result == catalog
+    assert captured["args"] == (
+        bridge.sys.executable,
+        "-m",
+        "src.model_catalog_bridge",
+        "--configured-worker",
+        "third",
+        "module:factory",
+        "/cfg",
+    )
+    assert captured["kwargs"] == {
+        "stdout": bridge.asyncio.subprocess.PIPE,
+        "stderr": bridge.asyncio.subprocess.DEVNULL,
+        "start_new_session": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode", "message"),
+    [
+        (b"", 1, "worker failed"),
+        (
+            b"PIPELINE_CATALOG_RESULT:{bad json}\n",
+            0,
+            "invalid result",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_isolated_configured_catalog_rejects_worker_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: bytes,
+    returncode: int,
+    message: str,
+) -> None:
+    async def create(*_args: object, **_kwargs: object) -> _CatalogWorkerProcess:
+        return _CatalogWorkerProcess(stdout, returncode)
+
+    monkeypatch.setattr(bridge.asyncio, "create_subprocess_exec", create)
+    with pytest.raises(ModelCatalogUnavailable, match=message):
+        await bridge._isolated_configured_catalog(
+            "third", "module:factory", config_path="/cfg"
+        )
+
+
+@pytest.mark.asyncio
+async def test_isolated_configured_catalog_handles_start_timeout_and_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def failed_start(*_args: object, **_kwargs: object) -> object:
+        raise OSError("must-not-leak")
+
+    monkeypatch.setattr(
+        bridge.asyncio,
+        "create_subprocess_exec",
+        failed_start,
+    )
+    with pytest.raises(ModelCatalogUnavailable, match="failed to start"):
+        await bridge._isolated_configured_catalog(
+            "third", "module:factory", config_path="/cfg"
+        )
+
+    class BlockedProcess(_CatalogWorkerProcess):
+        async def communicate(self) -> tuple[bytes, bytes]:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    process = BlockedProcess(b"")
+    terminated: list[_CatalogWorkerProcess] = []
+
+    async def create(*_args: object, **_kwargs: object) -> _CatalogWorkerProcess:
+        return process
+
+    async def terminate(worker: _CatalogWorkerProcess) -> None:
+        terminated.append(worker)
+
+    monkeypatch.setattr(bridge.asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr(bridge, "terminate_plugin_worker", terminate)
+    with pytest.raises(ModelCatalogUnavailable, match="timed out"):
+        await bridge._isolated_configured_catalog(
+            "third",
+            "module:factory",
+            config_path="/cfg",
+            timeout_seconds=0.001,
+        )
+
+    async def cancel_scenario() -> None:
+        task = asyncio.create_task(
+            bridge._isolated_configured_catalog(
+                "third",
+                "module:factory",
+                config_path="/cfg",
+                timeout_seconds=60,
+            )
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    await cancel_scenario()
+    assert terminated == [process, process]
+
+
+@pytest.mark.asyncio
+async def test_daemon_handler_isolates_configured_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = _BridgeRedis()
+    registry = CoderRegistry()
+    plugin = CodexPlugin(discover=lambda **_kwargs: None)
+    registry.register(plugin, reference="operator.plugin:factory")
+    calls: list[tuple[str, str, str]] = []
+
+    async def isolated(
+        plugin_id: str,
+        reference: str,
+        *,
+        config_path: str,
+    ) -> ModelCatalog:
+        calls.append((plugin_id, reference, config_path))
+        return ModelCatalog((), "configured", "Isolated catalog.")
+
+    monkeypatch.setattr(bridge, "_isolated_configured_catalog", isolated)
+    await bridge.handle_model_catalog_request(
+        redis,
+        registry,
+        json.dumps(
+            {
+                "request_id": "c" * 32,
+                "plugin": "codex",
+                "expires_at": time.time() + 10,
+            }
+        ),
+        config_path="/cfg",
+    )
+
+    assert calls == [("codex", "operator.plugin:factory", "/cfg")]
+    response = json.loads(redis.values[bridge._response_key("c" * 32)])
+    assert response["ok"] is True
+    assert response["catalog"]["source"] == "configured"
 
 
 @pytest.mark.asyncio

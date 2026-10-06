@@ -1400,6 +1400,35 @@ async def test_static_catalog_bypasses_daemon_loader() -> None:
 
 
 @pytest.mark.asyncio
+async def test_configured_static_catalog_uses_daemon_loader() -> None:
+    calls: list[str] = []
+
+    async def daemon_loader(
+        plugin: object, **_kwargs: object
+    ) -> ModelCatalog:
+        calls.append(plugin.name)
+        return ModelCatalog(
+            (ModelMetadata("isolated", "Daemon-owned"),),
+            "daemon",
+            "Loaded outside the web process.",
+        )
+
+    cache = ModelCatalogCache(
+        loader=daemon_loader,
+        daemon_owned_plugins={"third"},
+    )
+    snapshot = await cache.get(
+        _ThirdCatalogPlugin(),
+        config=AppConfig(),
+        config_path="/workspace/config.yml",
+    )
+
+    assert calls == ["third"]
+    assert snapshot.source == "daemon"
+    assert [model.invocation_id for model in snapshot.models] == ["isolated"]
+
+
+@pytest.mark.asyncio
 async def test_codex_catalog_cache_expires_retains_last_known_and_handles_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

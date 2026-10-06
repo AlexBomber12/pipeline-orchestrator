@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 import time
 import uuid
 from dataclasses import asdict
 from typing import Any
 
+from src.coder_auth import terminate_plugin_worker
 from src.coder_registry import (
     CoderPlugin,
     CoderRegistry,
@@ -18,7 +20,7 @@ from src.coder_registry import (
     ModelMetadata,
     ModelReasoningEffort,
 )
-from src.config import AppConfig, load_config
+from src.config import DEFAULT_CODER_PLUGINS, AppConfig, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +30,8 @@ _RESPONSE_TTL_SECONDS = 30
 _REQUEST_TIMEOUT_SECONDS = 7.0
 _POLL_INTERVAL_SECONDS = 0.05
 _MAX_PENDING_REQUESTS = 64
+_CONFIGURED_CATALOG_TIMEOUT_SECONDS = 5.0
+_WORKER_RESULT_PREFIX = "PIPELINE_CATALOG_RESULT:"
 
 
 def _response_key(request_id: str) -> str:
@@ -79,6 +83,97 @@ def _parse_catalog(payload: object) -> ModelCatalog:
             "Daemon returned invalid model metadata"
         ) from None
     return ModelCatalog(models, source, description)
+
+
+async def _configured_catalog_worker_response(
+    plugin_id: str,
+    reference: str,
+    config_path: str,
+) -> dict[str, Any]:
+    """Load one configured plugin and serialize its catalog in a worker."""
+    try:
+        from src.coders import _load_plugin
+
+        plugin = _load_plugin(plugin_id, reference)
+        catalog = await plugin.get_model_catalog(
+            config=load_config(config_path),
+            config_path=config_path,
+        )
+    except Exception:
+        return {"ok": False, "error": "catalog unavailable"}
+    return _catalog_payload(catalog)
+
+
+def _configured_catalog_worker_main() -> None:
+    """Subprocess entry point for configured model catalog discovery."""
+    if len(sys.argv) != 5 or sys.argv[1] != "--configured-worker":
+        raise SystemExit(2)
+    result = asyncio.run(
+        _configured_catalog_worker_response(
+            sys.argv[2],
+            sys.argv[3],
+            sys.argv[4],
+        )
+    )
+    print(
+        f"{_WORKER_RESULT_PREFIX}"
+        f"{json.dumps(result, separators=(',', ':'))}"
+    )
+
+
+async def _isolated_configured_catalog(
+    plugin_id: str,
+    reference: str,
+    *,
+    config_path: str,
+    timeout_seconds: float = _CONFIGURED_CATALOG_TIMEOUT_SECONDS,
+) -> ModelCatalog:
+    """Discover configured plugin metadata in a bounded process group."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "src.model_catalog_bridge",
+            "--configured-worker",
+            plugin_id,
+            reference,
+            config_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        raise ModelCatalogUnavailable(
+            "Configured model catalog worker failed to start"
+        ) from None
+    try:
+        stdout, _ = await asyncio.wait_for(
+            process.communicate(),
+            timeout=timeout_seconds,
+        )
+    except asyncio.CancelledError:
+        await terminate_plugin_worker(process)
+        raise
+    except asyncio.TimeoutError:
+        await terminate_plugin_worker(process)
+        raise ModelCatalogUnavailable(
+            "Configured model catalog request timed out"
+        ) from None
+    if process.returncode != 0:
+        raise ModelCatalogUnavailable(
+            "Configured model catalog worker failed"
+        )
+    for raw_line in reversed(stdout.decode("utf-8", errors="replace").splitlines()):
+        if not raw_line.startswith(_WORKER_RESULT_PREFIX):
+            continue
+        try:
+            payload = json.loads(raw_line.removeprefix(_WORKER_RESULT_PREFIX))
+        except (json.JSONDecodeError, TypeError):
+            break
+        return _parse_catalog(payload)
+    raise ModelCatalogUnavailable(
+        "Configured model catalog worker returned an invalid result"
+    )
 
 
 class DaemonModelCatalogLoader:
@@ -204,11 +299,24 @@ async def handle_model_catalog_request(
         return
     try:
         plugin = registry.get(plugin_name)
-        config = load_config(config_path)
-        catalog = await plugin.get_model_catalog(
-            config=config,
-            config_path=config_path,
-        )
+        reference = registry.reference_for(plugin_name)
+        if (
+            reference is not None
+            and reference != DEFAULT_CODER_PLUGINS.get(plugin_name)
+        ):
+            catalog = await _isolated_configured_catalog(
+                plugin_name,
+                reference,
+                config_path=config_path,
+            )
+        else:
+            catalog = await asyncio.wait_for(
+                plugin.get_model_catalog(
+                    config=load_config(config_path),
+                    config_path=config_path,
+                ),
+                timeout=_CONFIGURED_CATALOG_TIMEOUT_SECONDS,
+            )
     except Exception:
         logger.warning("%s model discovery failed in daemon", plugin_name)
         payload = {"ok": False, "error": "catalog unavailable"}
@@ -247,3 +355,7 @@ async def serve_model_catalog_requests(
         except Exception:
             logger.warning("Model catalog bridge unavailable", exc_info=True)
             await asyncio.sleep(1)
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised in the isolated worker
+    _configured_catalog_worker_main()
