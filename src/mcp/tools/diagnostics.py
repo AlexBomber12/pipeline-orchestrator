@@ -122,6 +122,7 @@ _SENSITIVE_NAMES = (
     "docker_auth_config",
     "docker-auth-config",
     "dockerAuthConfig",
+    "_auth",
 )
 _SENSITIVE_NAME_PATTERN = "|".join(re.escape(name) for name in _SENSITIVE_NAMES)
 # Credential roles may have environment-style, dotted, or camelCase prefixes
@@ -146,7 +147,7 @@ _PENDING_JSON_SENSITIVE_ASSIGNMENT = re.compile(
     rf'(?i)^[ \t]*"(?:{_SENSITIVE_KEY_PATTERN})"\s*:\s*$'
 )
 _YAML_KIND_ASSIGNMENT = re.compile(
-    r"(?i)^(?:[\"']kind[\"']|kind)[ \t]*:[ \t]*"
+    r"(?i)^(?P<indent>[ \t]*)(?P<dash>-[ \t]+)?(?:[\"']kind[\"']|kind)[ \t]*:[ \t]*"
     r"(?P<kind>[^#\r\n]*?)[ \t]*(?:#.*)?$"
 )
 _YAML_SECRET_PAYLOAD_ASSIGNMENT = re.compile(
@@ -877,10 +878,10 @@ def _kubernetes_yaml_state_before(
     handle: Any,
     offset: int,
     raw: bytes,
-) -> tuple[bool | None, bool | None, int | None, int]:
+) -> tuple[bool | None, tuple[int, bool] | None, bool, bool | None, int | None, int]:
     """Recover Kubernetes Secret YAML document and payload-block state."""
     if offset <= 0:
-        return False, False, None, 0
+        return False, None, False, False, None, 0
     search_start = max(0, offset - _MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES)
     handle.seek(search_start)
     context = handle.read(offset - search_start)
@@ -888,35 +889,51 @@ def _kubernetes_yaml_state_before(
     if search_start > 0:
         newline = context.find(b"\n")
         if newline < 0:
-            return None, None, None, scanned_bytes
+            return None, None, False, None, None, scanned_bytes
         context = context[newline + 1 :]
 
     state_known = search_start == 0
-    kubernetes_secret = False
+    secret_scopes: list[tuple[int, bool]] = []
     kind_seen = False
     payload_indent: int | None = None
     for raw_line in context.splitlines():
         if not raw_line.strip():
             continue
         indent = _line_indent(raw_line)
-        if payload_indent is not None and indent <= payload_indent:
+        if payload_indent is not None:
+            if indent > payload_indent:
+                continue
             payload_indent = None
+        while secret_scopes:
+            scope_indent, sequence_scope = secret_scopes[-1]
+            if (sequence_scope and indent <= scope_indent) or (
+                not sequence_scope and indent < scope_indent
+            ):
+                secret_scopes.pop()
+                continue
+            break
         line = raw_line.decode("utf-8", errors="replace")
         if _YAML_DOCUMENT_BOUNDARY.fullmatch(line):
             state_known = True
-            kubernetes_secret = False
+            secret_scopes.clear()
             kind_seen = False
             payload_indent = None
             continue
         kind_match = _YAML_KIND_ASSIGNMENT.fullmatch(line)
         if kind_match is not None:
             state_known = True
-            kubernetes_secret = kind_match.group("kind").strip().strip("\"'").casefold() == "secret"
+            if kind_match.group("kind").strip().strip("\"'").casefold() == "secret":
+                secret_scopes.append(
+                    (
+                        len(kind_match.group("indent")),
+                        kind_match.group("dash") is not None,
+                    )
+                )
             kind_seen = True
             payload_indent = None
             continue
         payload_match = _YAML_SECRET_PAYLOAD_ASSIGNMENT.fullmatch(line)
-        if (kubernetes_secret or not kind_seen) and payload_match is not None:
+        if (secret_scopes or not kind_seen) and payload_match is not None:
             if not payload_match.group("value").strip():
                 payload_indent = len(payload_match.group("indent"))
             continue
@@ -924,10 +941,42 @@ def _kubernetes_yaml_state_before(
             line.lstrip().startswith(("#", "-")) or _YAML_MAPPING_ENTRY.match(line)
         ):
             state_known = True
-            kubernetes_secret = False
+            secret_scopes.clear()
             payload_indent = None
 
+    context_lines = context.splitlines(keepends=True)
+    combined_lines = context_lines + raw.splitlines(keepends=True)
+    combined_flags = _kubernetes_yaml_payload_flags(
+        combined_lines,
+        starts_inside_secret=False,
+    )
+    raw_line_index = len(context_lines)
+    if payload_indent is None:
+        for index in range(raw_line_index - 1, -1, -1):
+            payload_match = _YAML_SECRET_PAYLOAD_ASSIGNMENT.fullmatch(
+                combined_lines[index].decode("utf-8", errors="replace").rstrip("\r\n")
+            )
+            if payload_match is None or payload_match.group("value").strip():
+                continue
+            candidate_indent = len(payload_match.group("indent"))
+            if all(
+                not line.strip() or _line_indent(line) > candidate_indent
+                for line in combined_lines[index + 1 : raw_line_index]
+            ):
+                if combined_flags[index]:
+                    payload_indent = candidate_indent
+                break
+
     first_content_line = next((line for line in raw.splitlines() if line.strip()), None)
+    inherited_secret_scope = secret_scopes[-1] if secret_scopes else None
+    if inherited_secret_scope is not None and first_content_line is not None:
+        first_text = first_content_line.decode("utf-8", errors="replace").rstrip("\r\n")
+        scope_indent, sequence_scope = inherited_secret_scope
+        first_indent = _line_indent(first_content_line)
+        if _YAML_DOCUMENT_BOUNDARY.fullmatch(first_text) or (
+            sequence_scope and first_indent <= scope_indent
+        ) or (not sequence_scope and first_indent < scope_indent):
+            inherited_secret_scope = None
     if first_content_line is None:
         starts_inside_payload: bool | None = False
         payload_indent = None
@@ -941,7 +990,15 @@ def _kubernetes_yaml_state_before(
         payload_indent = None
 
     return (
-        (kubernetes_secret or (payload_indent is not None and not kind_seen)) if state_known else None,
+        (
+            combined_flags[raw_line_index]
+            if raw_line_index < len(combined_flags)
+            else bool(secret_scopes)
+        )
+        if state_known
+        else None,
+        inherited_secret_scope,
+        kind_seen,
         starts_inside_payload,
         payload_indent,
         scanned_bytes,
@@ -952,6 +1009,8 @@ def _kubernetes_yaml_payload_flags(
     raw_lines: list[bytes],
     *,
     starts_inside_secret: bool,
+    inherited_secret_scope: tuple[int, bool] | None = None,
+    inherited_kind_seen: bool = False,
 ) -> list[bool]:
     """Mark lines whose YAML document has, or may have, Secret payloads."""
     flags = [False] * len(raw_lines)
@@ -963,23 +1022,61 @@ def _kubernetes_yaml_payload_flags(
         if not at_end and _YAML_DOCUMENT_BOUNDARY.fullmatch(line) is None:
             continue
         document_lines = raw_lines[document_start:boundary]
-        kind_values = []
+        kind_matches: list[tuple[int, re.Match[str]]] = []
         has_payload = False
-        for document_line in document_lines:
+        for local_index, document_line in enumerate(document_lines):
             decoded = document_line.decode("utf-8", errors="replace").rstrip("\r\n")
             kind_match = _YAML_KIND_ASSIGNMENT.fullmatch(decoded)
             if kind_match is not None:
-                kind_values.append(kind_match.group("kind").strip().strip("\"'").casefold())
+                kind_matches.append((local_index, kind_match))
             if _YAML_SECRET_PAYLOAD_ASSIGNMENT.fullmatch(decoded) is not None:
                 has_payload = True
-        sensitive_document = (
-            "secret" in kind_values
-            or (not kind_values and (inherited_secret or has_payload))
-        )
-        for index in range(document_start, boundary):
-            flags[index] = sensitive_document
+        if inherited_secret or (not kind_matches and has_payload and not inherited_kind_seen):
+            inherited_end = len(document_lines)
+            if inherited_secret_scope is not None:
+                scope_indent, sequence_scope = inherited_secret_scope
+                for local_index, document_line in enumerate(document_lines):
+                    if not document_line.strip():
+                        continue
+                    indent = _line_indent(document_line)
+                    if (sequence_scope and indent <= scope_indent) or (
+                        not sequence_scope and indent < scope_indent
+                    ):
+                        inherited_end = local_index
+                        break
+            for index in range(document_start, document_start + inherited_end):
+                flags[index] = True
+        for local_index, kind_match in kind_matches:
+            if kind_match.group("kind").strip().strip("\"'").casefold() != "secret":
+                continue
+            kind_indent = len(kind_match.group("indent"))
+            sequence_scope = kind_match.group("dash") is not None
+            scope_start = local_index
+            if not sequence_scope:
+                for previous in range(local_index - 1, -1, -1):
+                    previous_line = document_lines[previous]
+                    if previous_line.strip() and _line_indent(previous_line) < kind_indent:
+                        scope_start = (
+                            previous if previous_line.lstrip().startswith(b"-") else previous + 1
+                        )
+                        break
+                    scope_start = previous
+            scope_end = local_index + 1
+            while scope_end < len(document_lines):
+                following = document_lines[scope_end]
+                if following.strip():
+                    following_indent = _line_indent(following)
+                    if (sequence_scope and following_indent <= kind_indent) or (
+                        not sequence_scope and following_indent < kind_indent
+                    ):
+                        break
+                scope_end += 1
+            for index in range(document_start + scope_start, document_start + scope_end):
+                flags[index] = True
         document_start = boundary + 1
         inherited_secret = False
+        inherited_secret_scope = None
+        inherited_kind_seen = False
     return flags
 
 
@@ -995,6 +1092,8 @@ def _redacted_file_units(
     has_more_after_raw: bool,
     warnings: list[str],
     starts_inside_kubernetes_secret: bool | None = False,
+    kubernetes_secret_scope: tuple[int, bool] | None = None,
+    kubernetes_kind_context_known: bool = False,
     starts_inside_kubernetes_secret_data: bool | None = False,
     kubernetes_secret_data_indent: int | None = None,
 ) -> list[tuple[bytes, str, int]]:
@@ -1028,6 +1127,8 @@ def _redacted_file_units(
     kubernetes_payload_flags = _kubernetes_yaml_payload_flags(
         raw_lines,
         starts_inside_secret=bool(starts_inside_kubernetes_secret),
+        inherited_secret_scope=kubernetes_secret_scope,
+        inherited_kind_seen=kubernetes_kind_context_known,
     )
     units: list[tuple[bytes, str, int]] = []
     line_index = 0
@@ -2750,6 +2851,8 @@ def _read_file_source(
             ) = _sensitive_state_before(handle, page_start, raw)
             (
                 starts_inside_kubernetes_secret,
+                kubernetes_secret_scope,
+                kubernetes_kind_context_known,
                 starts_inside_kubernetes_secret_data,
                 kubernetes_secret_data_indent,
                 kubernetes_context_scanned_bytes,
@@ -2766,6 +2869,8 @@ def _read_file_source(
                 has_more_after_raw=False,
                 warnings=warnings,
                 starts_inside_kubernetes_secret=starts_inside_kubernetes_secret,
+                kubernetes_secret_scope=kubernetes_secret_scope,
+                kubernetes_kind_context_known=kubernetes_kind_context_known,
                 starts_inside_kubernetes_secret_data=starts_inside_kubernetes_secret_data,
                 kubernetes_secret_data_indent=kubernetes_secret_data_indent,
             )
@@ -2898,6 +3003,8 @@ def _read_file_source(
             ) = _sensitive_state_before(handle, page_start, raw)
             (
                 starts_inside_kubernetes_secret,
+                kubernetes_secret_scope,
+                kubernetes_kind_context_known,
                 starts_inside_kubernetes_secret_data,
                 kubernetes_secret_data_indent,
                 kubernetes_context_scanned_bytes,
@@ -2913,6 +3020,8 @@ def _read_file_source(
                 has_more_after_raw=has_more_after_raw,
                 warnings=warnings,
                 starts_inside_kubernetes_secret=starts_inside_kubernetes_secret,
+                kubernetes_secret_scope=kubernetes_secret_scope,
+                kubernetes_kind_context_known=kubernetes_kind_context_known,
                 starts_inside_kubernetes_secret_data=starts_inside_kubernetes_secret_data,
                 kubernetes_secret_data_indent=kubernetes_secret_data_indent,
             )

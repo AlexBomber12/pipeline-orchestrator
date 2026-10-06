@@ -480,7 +480,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             '{"jwtSecretKey":"jwt-secret-key-value"}',
             '{"data":{"tls.key":"redis-tls-key-value"}}',
             "AccountKey=redis-azure-account-key-value",
+            "//registry.example/:_auth=redis-npm-basic-secret",
             '{"SharedAccessKey":"redis-azure-shared-key-value"}',
+            '{"_auth":"redis-npm-json-secret"}',
             '{"password":987650000,}',
             '{"password":123456789}',
             '{"credentials":["user","fake-list-secret"]}',
@@ -506,6 +508,10 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                 "    - name: PASSWORD\n      value: redis-kube-yaml-env-secret\n"
                 "    - value: redis-reversed-yaml-env-secret\n      name: PASSWORD\n"
                 "    -\n      value: redis-standalone-yaml-env-secret\n      name: API_KEY\n"
+                "---\nkind: List\nitems:\n"
+                "  - kind: Secret\n    data:\n      opaque: redis-list-kube-secret\n"
+                "  - data:\n      opaque: redis-reversed-list-kube-secret\n    kind: Secret\n"
+                "  - kind: ConfigMap\n    data:\n      harmless: retained-list-config-value\n"
                 "---\nkind: ConfigMap\ndata:\n  harmless: retained-config-value"
             ),
             json.dumps({"auths": {"registry": {"auth": docker_auth}}, "debug": True}),
@@ -586,7 +592,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + '{"jwtSecretKey":"ci-jwt-secret-key-value"}\n'
         + '{"data":{"tls.key":"ci-tls-key-value"}}\n'
         + "AccountKey=ci-azure-account-key-value\n"
+        + "//registry.example/:_auth=ci-npm-basic-secret\n"
         + '{"SharedAccessKey":"ci-azure-shared-key-value"}\n'
+        + '{"_auth":"ci-npm-json-secret"}\n'
         + '{"password":987650002,}\n'
         + '{\n"password":\n"ci-same-indent-secret"\n}\n'
         + "  password ci-multiline-netrc-secret\n"
@@ -598,6 +606,10 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "    - name: PASSWORD\n      value: ci-kube-yaml-env-secret\n"
         + "    - value: ci-reversed-yaml-env-secret\n      name: PASSWORD\n"
         + "    -\n      value: ci-standalone-yaml-env-secret\n      name: API_KEY\n"
+        + "---\nkind: List\nitems:\n"
+        + "  - kind: Secret\n    data:\n      opaque: ci-list-kube-secret\n"
+        + "  - data:\n      opaque: ci-reversed-list-kube-secret\n    kind: Secret\n"
+        + "  - kind: ConfigMap\n    data:\n      harmless: retained-ci-list-config-value\n"
         + "---\nkind: ConfigMap\ndata:\n  harmless: retained-ci-config-value\n"
         + '2026-10-05 INFO {"password":987654322,"debug":true}\n',
         encoding="utf-8",
@@ -645,6 +657,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-tls-key-value" not in content
         assert "redis-azure-account-key-value" not in content
         assert "redis-azure-shared-key-value" not in content
+        assert "redis-npm-basic-secret" not in content
+        assert "redis-npm-json-secret" not in content
         assert "987650000" not in content
         assert "123456789" not in content
         assert "fake-list-secret" not in content
@@ -660,6 +674,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-kube-yaml-env-secret" not in content
         assert "redis-reversed-yaml-env-secret" not in content
         assert "redis-standalone-yaml-env-secret" not in content
+        assert "redis-list-kube-secret" not in content
+        assert "redis-reversed-list-kube-secret" not in content
+        assert "retained-list-config-value" in content
         assert "retained-config-value" in content
         assert docker_auth not in content
 
@@ -716,9 +733,15 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-tls-key-value" not in content
         assert "ci-azure-account-key-value" not in content
         assert "ci-azure-shared-key-value" not in content
+        assert "ci-npm-basic-secret" not in content
+        assert "ci-npm-json-secret" not in content
         assert "987650002" not in content
         assert "987650001" not in content
         assert "debug" in content
+        assert "ci-list-kube-secret" not in content
+        assert "ci-reversed-list-kube-secret" not in content
+        if source_id == "ci:artifact":
+            assert "retained-ci-list-config-value" in content
 
     ci_raw = ci_path.read_bytes()
     sequence_page = await diagnostics.read_orchestrator_log(
@@ -747,6 +770,24 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
     )
     assert "ci-kube-yaml-secret" not in yaml_secret_page["content"]
     assert "SENSITIVE" in yaml_secret_page["content"]
+
+    nested_yaml_secret_page = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=ci_raw.index(b"      opaque: ci-list-kube-secret"),
+        max_chars=300,
+    )
+    assert "ci-list-kube-secret" not in nested_yaml_secret_page["content"]
+    assert "SENSITIVE" in nested_yaml_secret_page["content"]
+
+    reversed_nested_yaml_secret_page = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=ci_raw.index(b"      opaque: ci-reversed-list-kube-secret"),
+        max_chars=300,
+    )
+    assert "ci-reversed-list-kube-secret" not in reversed_nested_yaml_secret_page["content"]
+    assert "SENSITIVE" in reversed_nested_yaml_secret_page["content"]
     triple_quote_continuation = await diagnostics.read_orchestrator_log(
         SLUG,
         "ci:artifact",
@@ -1955,10 +1996,17 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
     )
     assert diagnostics._kubernetes_yaml_state_before(BytesIO(b"\n\n"), 2, b"next\n") == (
         False,
+        None,
+        False,
         False,
         None,
         2,
     )
+    assert diagnostics._kubernetes_yaml_payload_flags(
+        [b"\n", b"- kind: ConfigMap\n"],
+        starts_inside_secret=True,
+        inherited_secret_scope=(0, True),
+    ) == [True, False]
     env_context = b"    - name: PASSWORD\n\n"
     assert diagnostics._sensitive_state_before(
         BytesIO(env_context),
@@ -1976,6 +2024,8 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
     assert diagnostics._kubernetes_yaml_state_before(BytesIO(b"abcde"), 5, b"next\n") == (
         None,
         None,
+        False,
+        None,
         None,
         4,
     )
@@ -1984,7 +2034,7 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
         BytesIO(b"x\nfoo:"),
         6,
         b"  child: value\n",
-    ) == (None, None, None, 5)
+    ) == (None, None, False, None, None, 5)
     monkeypatch.setattr(
         diagnostics,
         "_MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES",
