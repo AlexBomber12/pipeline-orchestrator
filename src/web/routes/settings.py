@@ -1031,13 +1031,11 @@ async def put_settings_daemon(
         if stale_plugins:
             stale_message = (
                 "A newer model or effort selection was saved while metadata "
-                "loaded; the newer saved settings were kept."
+                "loaded; no submitted settings were saved. The newer saved "
+                "settings were kept."
             )
-            return await _render_settings_daemon_response(
-                request,
-                coder_messages={
-                    plugin_id: stale_message for plugin_id in stale_plugins
-                },
+            return await _render_settings_daemon_error(
+                request, stale_message, 409
             )
 
         coder_settings_updates: dict[str, dict[str, str]] = {}

@@ -1502,7 +1502,10 @@ def test_slow_effort_validation_does_not_overwrite_newer_selection(
         def save_old_request() -> None:
             result["response"] = client.put(
                 "/settings/daemon",
-                data={"coder_settings.codex.model": "new-model"},
+                data={
+                    "poll_interval_sec": "99",
+                    "coder_settings.codex.model": "new-model",
+                },
             )
 
         thread = threading.Thread(target=save_old_request)
@@ -1523,13 +1526,15 @@ def test_slow_effort_validation_does_not_overwrite_newer_selection(
     assert not thread.is_alive()
     response = result["response"]
     assert hasattr(response, "status_code")
-    assert response.status_code == 200
-    assert "the newer saved settings were kept" in response.text
+    assert response.status_code == 409
+    assert "no submitted settings were saved" in response.text
+    assert "newer saved settings were kept" in response.text
     cfg = load_config(str(cfg_path))
     assert cfg.daemon.coder_settings["codex"] == {
         "model": "newer-saved-model",
         "reasoning_effort": "newer-effort",
     }
+    assert cfg.daemon.poll_interval_sec == 60
 
 
 def test_generic_model_submission_rejects_unregistered_plugin(
