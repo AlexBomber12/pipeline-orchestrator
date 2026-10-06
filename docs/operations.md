@@ -44,9 +44,11 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   output regardless of YAML key order, including reads that begin inside a YAML
   payload block. YAML document markers are recognized only at document scope,
   and sensitive environment `name` entries bind to their sibling `value`.
-  Excessive structured nesting is omitted fail-closed. Producer-added `[truncated]`
-  markers are preserved; because their removed prefix may contain a sensitive
-  opener, the retained Redis CLI tail is omitted fail-closed. Redis event
+  Same-indent YAML sequence children and indented multiline INI values remain
+  within the sensitive unit. Excessive structured nesting is omitted
+  fail-closed. Producer-added `[truncated]` markers are preserved; because their
+  removed prefix may contain a sensitive opener, the retained Redis CLI tail is
+  omitted fail-closed. Redis event
   history is fetched through a
   read-only bounded script and reported as oversized, without materializing its
   records in the MCP process, when the retained list exceeds 256 KiB. Disk

@@ -466,6 +466,12 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             "password:",
             "  yaml-first-secret",
             "  yaml-second-secret",
+            "credentials:",
+            "- redis-sequence-user",
+            "- redis-same-indent-sequence-secret",
+            "password =",
+            "  redis-ini-first-secret",
+            "  redis-ini-second-secret",
             "- password:",
             "    sequence-first-secret",
             "    sequence-second-secret",
@@ -571,6 +577,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "export PASSWORD=ci-export-slash-first-secret\\\nci-export-slash-second-secret\n"
         + "[env] PASSWORD=ci-env-slash-first-secret\\\nci-env-slash-second-secret\n"
         + "password:\n  ci-yaml-first-secret\n  ci-yaml-second-secret\n"
+        + "credentials:\n- ci-sequence-user\n- ci-same-indent-sequence-secret\n"
+        + "password =\n  ci-ini-first-secret\n  ci-ini-second-secret\n"
         + "- password:\n    ci-sequence-first-secret\n    ci-sequence-second-secret\n"
         + "DJANGO_SECRET_KEY=ci-django-secret-key-value\n"
         + '{"jwtSecretKey":"ci-jwt-secret-key-value"}\n'
@@ -622,6 +630,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "env-slash-second-secret" not in content
         assert "yaml-first-secret" not in content
         assert "yaml-second-secret" not in content
+        assert "redis-same-indent-sequence-secret" not in content
+        assert "redis-ini-first-secret" not in content
+        assert "redis-ini-second-secret" not in content
         assert "sequence-first-secret" not in content
         assert "sequence-second-secret" not in content
         assert "987654321" not in content
@@ -686,6 +697,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-env-slash-second-secret" not in content
         assert "ci-yaml-first-secret" not in content
         assert "ci-yaml-second-secret" not in content
+        assert "ci-same-indent-sequence-secret" not in content
+        assert "ci-ini-first-secret" not in content
+        assert "ci-ini-second-secret" not in content
         assert "ci-sequence-first-secret" not in content
         assert "ci-sequence-second-secret" not in content
         assert "987654322" not in content
@@ -699,6 +713,24 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "debug" in content
 
     ci_raw = ci_path.read_bytes()
+    sequence_page = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=ci_raw.index(b"- ci-same-indent-sequence-secret"),
+        max_chars=200,
+    )
+    assert "ci-same-indent-sequence-secret" not in sequence_page["content"]
+    assert "SENSITIVE" in sequence_page["content"]
+
+    ini_page = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=ci_raw.index(b"  ci-ini-second-secret"),
+        max_chars=200,
+    )
+    assert "ci-ini-second-secret" not in ini_page["content"]
+    assert "SENSITIVE" in ini_page["content"]
+
     yaml_secret_page = await diagnostics.read_orchestrator_log(
         SLUG,
         "ci:artifact",

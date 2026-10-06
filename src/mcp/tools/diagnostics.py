@@ -716,7 +716,9 @@ def _sensitive_state_before(
             continue
         indent = _line_indent(raw_line)
         if active_block_indent is not None:
-            if indent > active_block_indent:
+            if indent > active_block_indent or (
+                indent == active_block_indent and raw_line.lstrip().startswith(b"-")
+            ):
                 continue
             active_block_indent = None
         line = raw_line.decode("utf-8", errors="replace")
@@ -728,6 +730,9 @@ def _sensitive_state_before(
         if indented_match is not None:
             active_block_indent = len(indented_match.group("indent"))
             block_state_known = True
+        elif _PENDING_SENSITIVE_ASSIGNMENT.search(line) is not None:
+            active_block_indent = indent
+            block_state_known = True
         elif indent == 0:
             block_state_known = True
 
@@ -735,7 +740,13 @@ def _sensitive_state_before(
     if first_content_line is None:
         starts_inside_sensitive_block: bool | None = False
         active_block_indent = None
-    elif active_block_indent is not None and _line_indent(first_content_line) > active_block_indent:
+    elif active_block_indent is not None and (
+        _line_indent(first_content_line) > active_block_indent
+        or (
+            _line_indent(first_content_line) == active_block_indent
+            and first_content_line.lstrip().startswith(b"-")
+        )
+    ):
         starts_inside_sensitive_block = True
     elif _line_indent(first_content_line) == 0 or block_state_known:
         starts_inside_sensitive_block = False
@@ -980,8 +991,16 @@ def _redacted_file_units(
                     break
         else:
             while block_end < len(raw_lines):
-                if raw_lines[block_end].strip() and _line_indent(raw_lines[block_end]) <= sensitive_block_indent:
-                    break
+                if raw_lines[block_end].strip():
+                    block_indent = _line_indent(raw_lines[block_end])
+                    same_indent_sequence = (
+                        block_indent == sensitive_block_indent
+                        and raw_lines[block_end].lstrip().startswith(b"-")
+                    )
+                    if block_indent < sensitive_block_indent or (
+                        block_indent == sensitive_block_indent and not same_indent_sequence
+                    ):
+                        break
                 block_end += 1
         if block_end:
             raw_unit = b"".join(raw_lines[:block_end])
@@ -1150,8 +1169,16 @@ def _redacted_file_units(
                 assignment_indent = len(pending_yaml_match.group("indent"))
                 value_end = line_index + 1
                 while value_end < len(raw_lines):
-                    if raw_lines[value_end].strip() and _line_indent(raw_lines[value_end]) <= assignment_indent:
-                        break
+                    if raw_lines[value_end].strip():
+                        value_indent = _line_indent(raw_lines[value_end])
+                        same_indent_sequence = (
+                            value_indent == assignment_indent
+                            and raw_lines[value_end].lstrip().startswith(b"-")
+                        )
+                        if value_indent < assignment_indent or (
+                            value_indent == assignment_indent and not same_indent_sequence
+                        ):
+                            break
                     value_end += 1
                 if value_end > line_index + 1:
                     raw_unit = b"".join(raw_lines[line_index:value_end])
@@ -1178,9 +1205,18 @@ def _redacted_file_units(
                 while value_index < len(raw_lines) and not raw_lines[value_index].strip():
                     value_index += 1
                 if value_index < len(raw_lines):
-                    raw_unit = b"".join(raw_lines[line_index : value_index + 1])
+                    assignment_indent = _line_indent(raw_unit)
+                    value_end = value_index + 1
+                    while value_end < len(raw_lines):
+                        if (
+                            raw_lines[value_end].strip()
+                            and _line_indent(raw_lines[value_end]) <= assignment_indent
+                        ):
+                            break
+                        value_end += 1
+                    raw_unit = b"".join(raw_lines[line_index:value_end])
                     units.append((raw_unit, "[REDACTED SENSITIVE ASSIGNMENT]\n", 1))
-                    line_index = value_index + 1
+                    line_index = value_end
                     continue
                 elif has_more_after_raw:
                     warnings.append(
