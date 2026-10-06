@@ -1479,12 +1479,19 @@ async def test_multiline_explicit_yaml_keys_are_redacted_across_retained_readers
     payload = (
         "? >-\n  password\n: multiline-credential-secret\n"
         "safe: retained-after-multiline-credential\n"
+        "---\n? !!str password\n: tagged-explicit-credential-secret\n"
+        "safe: retained-after-tagged-explicit-credential\n"
+        "---\n? &credentialKey password\n: anchored-explicit-credential-secret\n"
         "---\nkind: Secret\n? >-\n  data\n:\n"
         "  opaque: multiline-payload-key-secret\n"
         "---\nkind: Pod\nenv:\n"
         "  - name: PASSWORD\n    ? >-\n      value\n"
         "    : multiline-env-key-secret\n"
+        "  - ? !!str name\n    : PASSWORD\n"
+        "    ? &valueKey value\n    : decorated-explicit-env-secret\n"
         "  - name: SAFE\n    value: retained-after-multiline-env\n"
+        "  - ? !!str name\n    : SAFE\n"
+        "    ? !!str value\n    : retained-after-decorated-explicit-env\n"
     )
     redis.store[cli_log_latest(SLUG)] = payload
     ci_path = repos_root / SLUG / "artifacts" / "ci.log"
@@ -1498,17 +1505,25 @@ async def test_multiline_explicit_yaml_keys_are_redacted_across_retained_readers
             max_chars=4_000,
         )
         assert "multiline-credential-secret" not in result["content"]
+        assert "tagged-explicit-credential-secret" not in result["content"]
+        assert "anchored-explicit-credential-secret" not in result["content"]
         assert "multiline-payload-key-secret" not in result["content"]
         assert "multiline-env-key-secret" not in result["content"]
+        assert "decorated-explicit-env-secret" not in result["content"]
         assert "retained-after-multiline-credential" in result["content"]
+        assert "retained-after-tagged-explicit-credential" in result["content"]
         assert "retained-after-multiline-env" in result["content"]
+        assert "retained-after-decorated-explicit-env" in result["content"]
 
     raw = ci_path.read_bytes()
     for excerpt, secret in (
         (b"  password", "multiline-credential-secret"),
         (b": multiline-credential-secret", "multiline-credential-secret"),
+        (b"? !!str password", "tagged-explicit-credential-secret"),
+        (b": anchored-explicit-credential-secret", "anchored-explicit-credential-secret"),
         (b"  opaque: multiline-payload-key-secret", "multiline-payload-key-secret"),
         (b"    : multiline-env-key-secret", "multiline-env-key-secret"),
+        (b"    : decorated-explicit-env-secret", "decorated-explicit-env-secret"),
     ):
         page = await diagnostics.read_orchestrator_log(
             SLUG,
@@ -2185,6 +2200,8 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     assert diagnostics._yaml_explicit_sensitive_key("? password") == 0
     assert diagnostics._yaml_explicit_sensitive_key('? "pass\\u0077ord"') == 0
     assert diagnostics._yaml_explicit_sensitive_key("? harmless") is None
+    assert diagnostics._yaml_explicit_sensitive_key("? !!seq [password]") is None
+    assert diagnostics._yaml_explicit_sensitive_key("? !!map {password: visible}") is None
     assert diagnostics._yaml_explicit_sensitive_key('? "pass\\u0077ord') is None
     assert diagnostics._yaml_explicit_sensitive_key('"pass\\u0077ord": visible # ?') is None
     assert diagnostics._yaml_explicit_value_end(

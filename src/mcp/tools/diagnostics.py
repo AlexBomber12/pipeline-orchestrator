@@ -296,7 +296,6 @@ _YAML_EXPLICIT_SENSITIVE_KEY = re.compile(
     rf"(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|(?:{_SENSITIVE_KEY_PATTERN}))"
     r"[ \t]*(?:#.*)?$"
 )
-_YAML_EXPLICIT_KEY_PREFIX = re.compile(r"^[ \t]*(?:-[ \t]+)?\?[ \t]+$")
 _YAML_EXPLICIT_VALUE = re.compile(
     r"^(?P<indent>[ \t]*)(?:-[ \t]+)?\:[ \t]*(?P<value>[^\r\n]*)$"
 )
@@ -892,11 +891,26 @@ def _yaml_block_complexity_exceeded(text: str) -> bool:
     per_line_scan_candidates = 0
     for line in text.splitlines():
         mapping_line = _YAML_BLOCK_MAPPING_LINE.match(line) is not None
+        candidate = line.lstrip(" \t")
+        if candidate.startswith("- "):
+            candidate = candidate[2:].lstrip(" \t")
+        explicit_key = candidate.startswith("? ")
         if mapping_line:
             mapping_lines += 1
-        if mapping_line or _YAML_BLOCK_SEQUENCE_ITEM.match(line) is not None:
+        if (
+            mapping_line
+            or _YAML_BLOCK_SEQUENCE_ITEM.match(line) is not None
+            or explicit_key
+        ):
             block_tokens += 1
-        if "\\" in line and '"' in line and (":" in line or "?" in line):
+        if (
+            "\\" in line
+            and '"' in line
+            and (":" in line or "?" in line)
+        ) or (
+            explicit_key
+            and candidate[2:].lstrip(" \t").startswith(("!", "&"))
+        ):
             per_line_scan_candidates += 1
         if (
             mapping_lines > _MAX_YAML_BLOCK_MAPPING_LINES
@@ -1234,7 +1248,12 @@ def _yaml_explicit_sensitive_key(text: str) -> int | None:
     direct = _YAML_EXPLICIT_SENSITIVE_KEY.fullmatch(text)
     if direct is not None:
         return len(direct.group("indent"))
-    if "\\" not in text or '"' not in text or "?" not in text:
+    candidate = text.lstrip(" \t")
+    if candidate.startswith("- "):
+        candidate = candidate[2:].lstrip(" \t")
+    if not candidate.startswith("? ") or not candidate[2:].lstrip(" \t").startswith(
+        ("!", "&", '"')
+    ):
         return None
     try:
         tokens = list(yaml.scan(text))
@@ -1245,12 +1264,21 @@ def _yaml_explicit_sensitive_key(text: str) -> int | None:
             not isinstance(token, yaml.tokens.ScalarToken)
             or not isinstance(token.value, str)
             or _SENSITIVE_KEY.fullmatch(token.value) is None
-            or index == 0
-            or not isinstance(tokens[index - 1], yaml.tokens.KeyToken)
         ):
             continue
-        prefix = text[: token.start_mark.column]
-        if _YAML_EXPLICIT_KEY_PREFIX.fullmatch(prefix) is None:
+        key_index = index - 1
+        while key_index >= 0 and isinstance(
+            tokens[key_index], (yaml.tokens.AnchorToken, yaml.tokens.TagToken)
+        ):
+            key_index -= 1
+        if key_index < 0 or not isinstance(tokens[key_index], yaml.tokens.KeyToken):
+            continue
+        key_token = tokens[key_index]
+        prefix = text[: key_token.start_mark.column]
+        if (
+            key_token.end_mark.column <= key_token.start_mark.column
+            or re.fullmatch(r"[ \t]*(?:-[ \t]+)?", prefix) is None
+        ):
             continue
         suffix = text[token.end_mark.column :]
         if re.fullmatch(r"[ \t]*(?:#.*)?", suffix) is not None:
@@ -1556,7 +1584,6 @@ def _yaml_sensitive_env_lines(lines: list[bytes]) -> set[int]:
         candidate = raw_line.decode("utf-8", errors="replace").lstrip(" \t")
         if candidate.startswith("- "):
             candidate = candidate[2:].lstrip(" \t")
-        key_source = candidate.split(":", 1)[0]
         if (
             candidate.startswith("<<:")
             or (candidate.startswith("*") and ":" in candidate)
@@ -1567,8 +1594,7 @@ def _yaml_sensitive_env_lines(lines: list[bytes]) -> set[int]:
                 and field[2].casefold() == "value"
                 and _YAML_ALIAS_SCALAR.fullmatch(field[3]) is not None
             )
-            or candidate.startswith(("? |", "? >"))
-            or (candidate.startswith("? ") and "*" in key_source)
+            or candidate.startswith("? ")
             or (
                 ":" in candidate
                 and candidate.split(":", 1)[1].lstrip().startswith(("|", ">"))
