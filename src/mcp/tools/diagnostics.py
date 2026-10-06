@@ -253,7 +253,10 @@ _SENSITIVE_NAME_PATTERN = "|".join(re.escape(name) for name in _SENSITIVE_NAMES)
 # (for example DATABASE_PASSWORD, spring.datasource.password, or githubToken).
 # Require the sensitive role to end the key so fields such as tokens_in remain
 # ordinary counters.
-_SENSITIVE_KEY_PATTERN = rf"[A-Za-z0-9_.-]*(?:{_SENSITIVE_NAME_PATTERN})"
+_DELIMITED_PASS_KEY_PATTERN = r"(?:pass|[A-Za-z0-9_.-]+[_.-]pass)"
+_SENSITIVE_KEY_PATTERN = (
+    rf"(?:[A-Za-z0-9_.-]*(?:{_SENSITIVE_NAME_PATTERN})|{_DELIMITED_PASS_KEY_PATTERN})"
+)
 _SENSITIVE_KEY = re.compile(rf"(?i)^(?:{_SENSITIVE_KEY_PATTERN})$")
 _SENSITIVE_JSON_KEY_PREFIX = re.compile(
     rf"(?i)(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"'])\s*:\s*"

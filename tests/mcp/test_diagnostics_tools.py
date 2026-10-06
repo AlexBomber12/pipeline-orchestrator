@@ -1845,6 +1845,52 @@ async def test_dockerfile_env_word_assignments_are_redacted_across_retained_read
     assert "ENV SAFE retained-safe-docker-env" in continuation["content"]
 
 
+async def test_delimited_pass_credentials_are_redacted_without_broad_suffix_matching(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    repos_root = tmp_path / "repos"
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+    payload = (
+        "PASS=exact-pass-secret\n"
+        "DB_PASS=plain-pass-secret\n"
+        "export CACHE.PASS=exported-pass-secret\n"
+        "ENV SERVICE-PASS docker-pass-secret\n"
+        "env:\n"
+        "  - name: API_PASS\n"
+        "    value: yaml-pass-secret\n"
+        '{"BUILD_PASS":"json-pass-secret","COMPASS":"retained-compass"}\n'
+        "COMPASS=retained-compass-assignment\n"
+        "BYPASS=retained-bypass-assignment\n"
+        "TRESPASS=retained-trespass-assignment\n"
+    )
+    redis.store[cli_log_latest(SLUG)] = payload
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.write_text(payload, encoding="utf-8")
+
+    for source_id in ("cli:latest", "ci:artifact"):
+        result = await diagnostics.read_orchestrator_log(
+            SLUG,
+            source_id,
+            max_chars=4_000,
+        )
+        assert "exact-pass-secret" not in result["content"]
+        assert "plain-pass-secret" not in result["content"]
+        assert "exported-pass-secret" not in result["content"]
+        assert "docker-pass-secret" not in result["content"]
+        assert "yaml-pass-secret" not in result["content"]
+        assert "json-pass-secret" not in result["content"]
+        assert "retained-compass" in result["content"]
+        assert "retained-compass-assignment" in result["content"]
+        assert "retained-bypass-assignment" in result["content"]
+        assert "retained-trespass-assignment" in result["content"]
+
+
 async def test_sensitive_heredoc_bodies_are_redacted_across_retained_readers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
