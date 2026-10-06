@@ -481,8 +481,11 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             '{"data":{"tls.key":"redis-tls-key-value"}}',
             "AccountKey=redis-azure-account-key-value",
             "//registry.example/:_auth=redis-npm-basic-secret",
+            "MYSQL_PWD=redis-pwd-secret",
+            "Driver=Postgres;UID=alice;PWD=redis-odbc-pwd-secret;Server=db",
             '{"SharedAccessKey":"redis-azure-shared-key-value"}',
             '{"_auth":"redis-npm-json-secret"}',
+            '{"MYSQL_PWD":"redis-pwd-json-secret"}',
             '{"password":987650000,}',
             '{"password":123456789}',
             '{"credentials":["user","fake-list-secret"]}',
@@ -593,8 +596,11 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + '{"data":{"tls.key":"ci-tls-key-value"}}\n'
         + "AccountKey=ci-azure-account-key-value\n"
         + "//registry.example/:_auth=ci-npm-basic-secret\n"
+        + "MYSQL_PWD=ci-pwd-secret\n"
+        + "Driver=Postgres;UID=alice;PWD=ci-odbc-pwd-secret;Server=db\n"
         + '{"SharedAccessKey":"ci-azure-shared-key-value"}\n'
         + '{"_auth":"ci-npm-json-secret"}\n'
+        + '{"MYSQL_PWD":"ci-pwd-json-secret"}\n'
         + '{"password":987650002,}\n'
         + '{\n"password":\n"ci-same-indent-secret"\n}\n'
         + "  password ci-multiline-netrc-secret\n"
@@ -659,6 +665,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-azure-shared-key-value" not in content
         assert "redis-npm-basic-secret" not in content
         assert "redis-npm-json-secret" not in content
+        assert "redis-pwd-secret" not in content
+        assert "redis-odbc-pwd-secret" not in content
+        assert "redis-pwd-json-secret" not in content
         assert "987650000" not in content
         assert "123456789" not in content
         assert "fake-list-secret" not in content
@@ -735,6 +744,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-azure-shared-key-value" not in content
         assert "ci-npm-basic-secret" not in content
         assert "ci-npm-json-secret" not in content
+        assert "ci-pwd-secret" not in content
+        assert "ci-odbc-pwd-secret" not in content
+        assert "ci-pwd-json-secret" not in content
         assert "987650002" not in content
         assert "987650001" not in content
         assert "debug" in content

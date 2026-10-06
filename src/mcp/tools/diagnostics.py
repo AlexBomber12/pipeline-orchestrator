@@ -100,6 +100,7 @@ _SENSITIVE_NAMES = (
     "client-secret",
     "password",
     "passwd",
+    "pwd",
     "passphrase",
     "key_data",
     "key-data",
