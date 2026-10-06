@@ -67,6 +67,29 @@ SECOND_TRUSTED_REVIEWER_ID = 200200200
 _REAL_GET_REVIEW_PUSH_TIME = reviews._get_pr_push_time
 
 
+def _ci_retrieval(
+    repo: str,
+    sha: str,
+    check_runs: list[dict] | None = None,
+    status_payload: dict | None = None,
+    *,
+    complete: bool = True,
+) -> checks._CiRetrieval:
+    source = checks._CiSourceResult(complete, not check_runs)
+    status_source = checks._CiSourceResult(
+        complete, not (status_payload or {}).get("statuses")
+    )
+    return checks._make_ci_retrieval(
+        repo,
+        sha,
+        0.0,
+        check_runs or [],
+        status_payload or {},
+        source,
+        status_source,
+    )
+
+
 @pytest.fixture(autouse=True)
 def _default_review_push_time(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep review-status tests deterministic without querying branch activity."""
@@ -2978,15 +3001,37 @@ def test_map_rest_ci_status_failed_fetch_stays_pending() -> None:
     assert _map_rest_ci_status_to_enum([], {}, empty_is_success=False, fetch_ok=False) == CIStatus.PENDING
 
 
-def test_map_rest_ci_status_required_contexts_block_empty_exemption() -> None:
+def test_classify_ci_retrieval_accepts_unique_identified_required_checks() -> None:
+    sha = "a" * 40
+    retrieval = _ci_retrieval(
+        "owner/name",
+        sha,
+        [
+            {
+                "name": "unit",
+                "conclusion": "success",
+                "head_sha": sha,
+                "app": {"id": 1},
+            }
+        ],
+        {
+            "state": "success",
+            "statuses": [
+                {
+                    "context": "integration",
+                    "state": "success",
+                    "creator": {"login": "ci-bot"},
+                }
+            ],
+        },
+    )
+
     assert (
-        _map_rest_ci_status_to_enum(
-            [],
-            {"state": "pending", "statuses": []},
-            empty_is_success=True,
-            required_contexts=["unit"],
+        checks._classify_ci_retrieval(
+            retrieval,
+            required_contexts=["unit", "integration"],
         )
-        == CIStatus.PENDING
+        == CIStatus.SUCCESS
     )
 
 
@@ -3049,13 +3094,14 @@ def test_is_reaction_content_rejects_non_dict() -> None:
 def test_get_open_prs_returns_prinfo_objects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    head_sha = "a" * 40
     raw = [
         {"number": 0},
         {
             "number": 42,
             "title": "PR-110: Add coverage",
             "headRefName": "feature-branch",
-            "headRefOid": "abc123",
+            "headRefOid": head_sha,
             "url": "https://example.test/pr/42",
             "updatedAt": "2026-04-18T11:22:33Z",
             "commits": [{}, {}],
@@ -3074,8 +3120,8 @@ def test_get_open_prs_returns_prinfo_objects(
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     monkeypatch.setattr(
-        "src.github.checks._fetch_ci_status_rest",
-        lambda repo, sha: ([], {}, True),
+        "src.github.checks._retrieve_ci_status_evidence",
+        lambda repo, sha: _ci_retrieval(repo, sha),
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
@@ -3091,7 +3137,7 @@ def test_get_open_prs_returns_prinfo_objects(
     assert prs[0].review_status == ReviewStatus.APPROVED
     assert prs[0].commits_count == 2
     assert prs[0].push_count == 1
-    assert prs[0].observed_head_shas == {"abc123"}
+    assert prs[0].observed_head_shas == {head_sha}
     assert prs[0].url == "https://example.test/pr/42"
     assert prs[0].last_activity == datetime(2026, 4, 18, 11, 22, 33, tzinfo=_tz.utc)
     assert prs[0].is_escalated is True
@@ -3121,16 +3167,17 @@ def test_get_open_prs_invokes_rest_helper_with_head_sha(
     ]
     captured: list[tuple[str, str]] = []
 
-    def fake_fetch(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
+    def fake_fetch(repo: str, sha: str) -> checks._CiRetrieval:
         captured.append((repo, sha))
-        return (
-            [{"conclusion": "failure"}],
+        return _ci_retrieval(
+            repo,
+            sha,
+            [{"conclusion": "failure", "head_sha": sha}],
             {"state": "failure", "statuses": []},
-            True,
         )
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: raw)
-    monkeypatch.setattr("src.github.checks._fetch_ci_status_rest", fake_fetch)
+    monkeypatch.setattr("src.github.checks._retrieve_ci_status_evidence", fake_fetch)
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
         lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
@@ -3142,15 +3189,27 @@ def test_get_open_prs_invokes_rest_helper_with_head_sha(
     assert prs[0].ci_status == CIStatus.FAILURE
 
 
-def test_get_open_prs_enforces_required_checks_on_graphql_path(
+@pytest.mark.parametrize(
+    "runs",
+    [
+        [{"name": "unit", "conclusion": "success"}],
+        [
+            {"name": "unit", "conclusion": "success", "app": {"id": 1}},
+            {"name": "unit", "conclusion": "success", "app": {"id": 2}},
+        ],
+    ],
+)
+def test_get_open_prs_rejects_untrusted_required_check_provenance(
     monkeypatch: pytest.MonkeyPatch,
+    runs: list[dict],
 ) -> None:
+    head_sha = "d" * 40
     raw = [
         {
             "number": 7,
             "title": "PR-7: foo",
             "headRefName": "bar",
-            "headRefOid": "deadbeef",
+            "headRefOid": head_sha,
             "url": "u",
             "updatedAt": "2026-04-18T00:00:00Z",
             "commits": [],
@@ -3162,11 +3221,12 @@ def test_get_open_prs_enforces_required_checks_on_graphql_path(
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: raw)
     monkeypatch.setattr(
-        "src.github.checks._fetch_ci_status_rest",
-        lambda repo, sha: (
-            [{"name": "unit", "conclusion": "success"}],
+        "src.github.checks._retrieve_ci_status_evidence",
+        lambda repo, sha: _ci_retrieval(
+            repo,
+            sha,
+            [dict(run, head_sha=sha) for run in runs],
             {"state": "success", "statuses": []},
-            True,
         ),
     )
     monkeypatch.setattr(
@@ -3177,7 +3237,7 @@ def test_get_open_prs_enforces_required_checks_on_graphql_path(
     prs = get_open_prs(
         "owner/name",
         allow_merge_without_checks=True,
-        required_checks=["unit", "integration"],
+        required_checks=["unit"],
     )
 
     assert prs[0].ci_status == CIStatus.PENDING
@@ -3203,8 +3263,8 @@ def test_get_open_prs_rest_fetch_failure_follows_allow_merge_without_checks(
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: raw)
     monkeypatch.setattr(
-        "src.github.checks._fetch_ci_status_rest",
-        lambda repo, sha: ([], {}, False),
+        "src.github.checks._retrieve_ci_status_evidence",
+        lambda repo, sha: _ci_retrieval(repo, sha, complete=False),
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
@@ -3219,6 +3279,8 @@ def test_get_open_prs_rest_fetch_failure_follows_allow_merge_without_checks(
 def test_get_open_prs_falls_back_to_rest_on_graphql_rate_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    head_sha = "a" * 40
+
     def fail_graphql(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("GraphQL: API rate limit exceeded")
 
@@ -3232,7 +3294,7 @@ def test_get_open_prs_falls_back_to_rest_on_graphql_rate_limit(
                 "title": "PR-110: Add coverage",
                 "head": {
                     "ref": "feature-branch",
-                    "sha": "abc123",
+                    "sha": head_sha,
                     "repo": {"fork": True},
                 },
                 "html_url": "https://example.test/pr/42",
@@ -3243,8 +3305,8 @@ def test_get_open_prs_falls_back_to_rest_on_graphql_rate_limit(
         ],
     )
     monkeypatch.setattr(
-        "src.github.checks._fetch_ci_status_rest",
-        lambda repo, sha: ([], {}, True),
+        "src.github.checks._retrieve_ci_status_evidence",
+        lambda repo, sha: _ci_retrieval(repo, sha),
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
@@ -3297,8 +3359,10 @@ def test_get_open_prs_rest_fallback_requires_complete_ci_retrieval(
         ],
     )
     monkeypatch.setattr(
-        "src.github.checks._fetch_ci_status_rest",
-        lambda repo, sha: (check_runs, status_payload, False),
+        "src.github.checks._retrieve_ci_status_evidence",
+        lambda repo, sha: _ci_retrieval(
+            repo, sha, check_runs, status_payload, complete=False
+        ),
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
@@ -3310,9 +3374,22 @@ def test_get_open_prs_rest_fallback_requires_complete_ci_retrieval(
     assert prs[0].ci_status == CIStatus.PENDING
 
 
-def test_get_open_prs_rest_fallback_enforces_required_checks(
+@pytest.mark.parametrize(
+    "runs",
+    [
+        [{"name": "unit", "conclusion": "success"}],
+        [
+            {"name": "unit", "conclusion": "success", "app": {"id": 1}},
+            {"name": "unit", "conclusion": "success", "app": {"id": 2}},
+        ],
+    ],
+)
+def test_get_open_prs_rest_fallback_rejects_untrusted_required_check_provenance(
     monkeypatch: pytest.MonkeyPatch,
+    runs: list[dict],
 ) -> None:
+    head_sha = "a" * 40
+
     def fail_graphql(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("GraphQL: API rate limit exceeded")
 
@@ -3325,7 +3402,7 @@ def test_get_open_prs_rest_fallback_enforces_required_checks(
                 "title": "PR-110: Add coverage",
                 "head": {
                     "ref": "feature-branch",
-                    "sha": "abc123",
+                    "sha": head_sha,
                     "repo": {"fork": False},
                 },
                 "html_url": "https://example.test/pr/42",
@@ -3336,11 +3413,12 @@ def test_get_open_prs_rest_fallback_enforces_required_checks(
         ],
     )
     monkeypatch.setattr(
-        "src.github.checks._fetch_ci_status_rest",
-        lambda repo, sha: (
-            [{"name": "unit", "conclusion": "success"}],
+        "src.github.checks._retrieve_ci_status_evidence",
+        lambda repo, sha: _ci_retrieval(
+            repo,
+            sha,
+            [dict(run, head_sha=sha) for run in runs],
             {"state": "success", "statuses": []},
-            True,
         ),
     )
     monkeypatch.setattr(
@@ -3351,7 +3429,7 @@ def test_get_open_prs_rest_fallback_enforces_required_checks(
     prs = get_open_prs(
         "owner/name",
         allow_merge_without_checks=True,
-        required_checks=["unit", "integration"],
+        required_checks=["unit"],
     )
 
     assert prs[0].ci_status == CIStatus.PENDING
@@ -4273,73 +4351,6 @@ def test_map_rest_ci_status_stale_failure_in_history_does_not_override_combined_
             },
         )
         == CIStatus.SUCCESS
-    )
-
-
-def test_map_rest_ci_status_required_contexts_accept_check_runs_and_statuses() -> None:
-    assert (
-        _map_rest_ci_status_to_enum(
-            [
-                {"name": "unit", "conclusion": "success"},
-            ],
-            {
-                "state": "success",
-                "statuses": [
-                    {"context": "integration", "state": "success"},
-                ],
-            },
-            required_contexts=["unit", "integration"],
-        )
-        == CIStatus.SUCCESS
-    )
-
-
-def test_map_rest_ci_status_required_contexts_reject_malformed_evidence() -> None:
-    assert (
-        _map_rest_ci_status_to_enum(
-            [
-                "garbage",  # type: ignore[list-item]
-                {"name": " ", "conclusion": "success"},
-                {"name": "unit", "conclusion": "success"},
-            ],
-            {
-                "state": "success",
-                "statuses": [
-                    "garbage",
-                    {"context": "", "state": "success"},
-                    {"context": "integration", "state": "success"},
-                ],
-            },
-            required_contexts=["unit", "integration"],
-        )
-        == CIStatus.PENDING
-    )
-
-
-def test_required_context_helper_ignores_malformed_context_entries() -> None:
-    assert checks._required_contexts_satisfied(
-        ("unit",),
-        [
-            "garbage",  # type: ignore[list-item]
-            {"name": " ", "conclusion": "success"},
-            {"name": "unit", "conclusion": "success"},
-        ],
-        [
-            "garbage",
-            {"context": "", "state": "success"},
-        ],
-        "SUCCESS",
-    )
-
-
-def test_map_rest_ci_status_required_context_pending_blocks_success() -> None:
-    assert (
-        _map_rest_ci_status_to_enum(
-            [{"name": "unit", "status": "in_progress"}],
-            {"state": "success", "statuses": [{"context": "integration", "state": "success"}]},
-            required_contexts=["unit", "integration"],
-        )
-        == CIStatus.PENDING
     )
 
 

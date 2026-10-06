@@ -157,28 +157,6 @@ def test_status_transition_clears_tracker() -> None:
     assert key in redis.deleted
 
 
-def test_required_context_policy_survives_age_wrapper() -> None:
-    redis = _FakeRedis()
-    status, reason = asyncio.run(
-        classify_ci_status_with_age(
-            "octo/repo",
-            7,
-            "sha-aaa",
-            redis,
-            pending_max_seconds=1800,
-            runs_payload=[{"name": "unit", "conclusion": "success"}],
-            statuses_payload={"state": "success", "statuses": []},
-            empty_is_success=True,
-            fetch_ok=True,
-            required_contexts=["unit", "integration"],
-        )
-    )
-
-    assert status == CIStatus.PENDING
-    assert reason is None
-    assert _pending_tracker_key("octo/repo", 7, "sha-aaa") in redis.store
-
-
 def test_head_sha_rotation_resets_tracker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

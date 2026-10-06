@@ -505,12 +505,53 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
     )
 
 
+def _classify_ci_retrieval(
+    retrieval: _CiRetrieval,
+    *,
+    empty_is_success: bool = False,
+    required_contexts: Iterable[str] | None = None,
+) -> CIStatus:
+    """Classify a complete REST retrieval without discarding provenance policy."""
+
+    statuses = retrieval.status_payload.get("statuses", [])
+    evidence = evaluate_ci_evidence(
+        repo=retrieval.evidence.repo,
+        pr_number=None,
+        sha=retrieval.evidence.sha,
+        check_runs=retrieval.check_runs,
+        statuses=(
+            [status for status in statuses if isinstance(status, dict)]
+            if retrieval.status_source.sha_matches and isinstance(statuses, list)
+            else []
+        ),
+        check_runs_complete=retrieval.check_runs_source.complete,
+        statuses_complete=retrieval.status_source.complete,
+        required_contexts=required_contexts,
+        observed_at=retrieval.evidence.observed_at,
+        empty_is_success=empty_is_success,
+    )
+    mapped = _map_rest_ci_status_to_enum(
+        retrieval.check_runs,
+        retrieval.status_payload if retrieval.status_source.sha_matches else {},
+        empty_is_success=empty_is_success,
+        fetch_ok=retrieval.evidence.sources_complete,
+    )
+    # Keep the compatibility mapper's INFRA_FAILURE distinction and its
+    # combined-status failure fallback. Every success, however, must be
+    # authorized by the canonical evidence policy, which verifies source
+    # completeness, SHA attribution, and producer identity.
+    if mapped in {CIStatus.FAILURE, CIStatus.INFRA_FAILURE}:
+        return mapped
+    if evidence.policy_result != CIStatus.SUCCESS:
+        return evidence.policy_result
+    return mapped
+
+
 def _map_rest_ci_status_to_enum(
     check_runs: list[dict],
     status_payload: dict,
     empty_is_success: bool = False,
     fetch_ok: bool = True,
-    required_contexts: Iterable[str] | None = None,
 ) -> CIStatus:
     """Combine REST ``check-runs`` + commit ``status`` payloads into a ``CIStatus``.
 
@@ -553,12 +594,9 @@ def _map_rest_ci_status_to_enum(
     )
 
     combined_state_upper = _commit_status_state(combined_state) or ""
-    required = _normalize_required_contexts(required_contexts)
     if not check_runs and not statuses:
         if combined_state_upper in _REST_CI_FAILURE_STATES:
             return CIStatus.FAILURE
-        if required:
-            return CIStatus.PENDING
         return CIStatus.SUCCESS if empty_is_success and fetch_ok else CIStatus.PENDING
 
     states: list[str] = []
@@ -602,65 +640,9 @@ def _map_rest_ci_status_to_enum(
         ):
             return CIStatus.INFRA_FAILURE
         return CIStatus.FAILURE
-    if not fetch_ok:
-        return CIStatus.PENDING
-    if required and not _required_contexts_satisfied(
-        required,
-        check_runs,
-        statuses,
-        combined_state_upper,
-    ):
-        return CIStatus.PENDING
     if all(s in _REST_CI_SUCCESS_STATES for s in states) and fetch_ok:
         return CIStatus.SUCCESS
     return CIStatus.PENDING
-
-
-def _normalize_required_contexts(
-    required_contexts: Iterable[str] | None,
-) -> tuple[str, ...]:
-    if required_contexts is None:
-        return ()
-    return tuple(
-        context
-        for raw in required_contexts
-        if isinstance(raw, str) and (context := raw.strip())
-    )
-
-
-def _required_contexts_satisfied(
-    required_contexts: tuple[str, ...],
-    check_runs: list[dict],
-    statuses: list[object],
-    combined_state_upper: str,
-) -> bool:
-    successful: set[str] = set()
-    pending: set[str] = set()
-    for run in check_runs:
-        if not isinstance(run, dict):
-            continue
-        name = run.get("name")
-        if not isinstance(name, str) or not name.strip():
-            continue
-        state = _check_run_state(run)
-        if state in _REST_CI_SUCCESS_STATES:
-            successful.add(name.strip())
-        elif state is not None:
-            pending.add(name.strip())
-    for status in statuses:
-        if not isinstance(status, dict):
-            continue
-        name = status.get("context") or status.get("name")
-        if not isinstance(name, str) or not name.strip():
-            continue
-        state = _commit_status_state(status.get("state") or status.get("status"))
-        if state in _REST_CI_SUCCESS_STATES:
-            successful.add(name.strip())
-
-    for context in required_contexts:
-        if context not in successful or context in pending:
-            return False
-    return bool(combined_state_upper or successful)
 
 
 async def _clear_pending_tracker(
@@ -780,7 +762,6 @@ async def classify_ci_status_with_age(
     *,
     empty_is_success: bool = False,
     fetch_ok: bool = True,
-    required_contexts: Iterable[str] | None = None,
 ) -> tuple[CIStatus, str | None]:
     """Augment :func:`_map_rest_ci_status_to_enum` with stuck-PENDING reclassification.
 
@@ -800,7 +781,6 @@ async def classify_ci_status_with_age(
         statuses_payload,
         empty_is_success=empty_is_success,
         fetch_ok=fetch_ok,
-        required_contexts=required_contexts,
     )
     if raw_status != CIStatus.PENDING:
         await _clear_pending_tracker(redis_client, repo, pr_number, head_sha)

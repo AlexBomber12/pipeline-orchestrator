@@ -308,9 +308,7 @@ def get_open_prs(
         commits = entry.get("commits") or []
         head_sha = entry.get("headRefOid", "")
         title = entry.get("title", "")
-        check_runs, status_payload, fetch_ok = checks._fetch_ci_status_rest(
-            repo, head_sha
-        )
+        ci_retrieval = checks._retrieve_ci_status_evidence(repo, head_sha)
         labels = entry.get("labels") or []
         quarantine_labels = {
             label.get("name", "")
@@ -324,11 +322,9 @@ def get_open_prs(
                 branch=entry.get("headRefName", ""),
                 title=title,
                 pr_id=extract_queue_pr_id(title),
-                ci_status=checks._map_rest_ci_status_to_enum(
-                    check_runs,
-                    status_payload,
+                ci_status=checks._classify_ci_retrieval(
+                    ci_retrieval,
                     empty_is_success=allow_merge_without_checks,
-                    fetch_ok=fetch_ok,
                     required_contexts=required_checks,
                 ),
                 review_status=reviews.get_pr_review_status(
@@ -378,9 +374,7 @@ def _get_open_prs_rest(
         user = entry.get("user") or {}
         title = entry.get("title", "")
         head_sha = head.get("sha", "")
-        check_runs, status_payload, fetch_ok = checks._fetch_ci_status_rest(
-            repo, head_sha
-        )
+        ci_retrieval = checks._retrieve_ci_status_evidence(repo, head_sha)
         labels = entry.get("labels") or []
         quarantine_labels = {
             label.get("name", "")
@@ -394,11 +388,9 @@ def _get_open_prs_rest(
                 branch=head.get("ref", ""),
                 title=title,
                 pr_id=extract_queue_pr_id(title),
-                ci_status=checks._map_rest_ci_status_to_enum(
-                    check_runs,
-                    status_payload,
+                ci_status=checks._classify_ci_retrieval(
+                    ci_retrieval,
                     empty_is_success=allow_merge_without_checks,
-                    fetch_ok=fetch_ok,
                     required_contexts=required_checks,
                 ),
                 review_status=reviews.get_pr_review_status(
