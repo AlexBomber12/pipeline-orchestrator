@@ -123,6 +123,23 @@ class FakeRedis:
         *args: object,
     ) -> list[object]:
         self._check("eval_ro", (script, numkeys, key, *args))
+        if "'SCAN'" in script:
+            match, count, maximum_size, maximum_count = args
+            keys = [item for item in sorted(self.store) if fnmatch.fnmatch(item, str(match))]
+            cursor = int(key)
+            page = keys[cursor : cursor + int(count)]
+            next_cursor = cursor + len(page)
+            bounded: list[str] = []
+            oversized = 0
+            dropped = 0
+            for item in page:
+                if len(item.encode()) > int(maximum_size):
+                    oversized += 1
+                elif len(bounded) >= int(maximum_count):
+                    dropped += 1
+                else:
+                    bounded.append(item)
+            return [0 if next_cursor >= len(keys) else next_cursor, bounded, oversized, dropped]
         if "ZCARD" in script:
             cursor_score, cursor_member, cursor_digest, page_limit, member_limit, lookup_limit = args
             values = sorted(self.zsets.get(key, []), key=lambda item: (item[1], str(item[0])))
@@ -1343,6 +1360,47 @@ async def test_resolved_secret_payload_keys_are_redacted_across_retained_readers
     assert "alias-payload-secret" not in alias_page["content"]
 
 
+async def test_explicit_secret_kind_ignores_kind_text_inside_block_scalars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    repos_root = tmp_path / "repos"
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+    payload = (
+        "? kind\n: Secret\nmetadata:\n  annotations:\n    note: |\n"
+        "      kind: ConfigMap\ndata:\n  opaque: explicit-kind-secret\n"
+        "---\n? kind\n: ConfigMap\nmetadata:\n  annotations:\n    note: |\n"
+        "      kind: Secret\ndata:\n  harmless: retained-explicit-kind-config\n"
+    )
+    redis.store[cli_log_latest(SLUG)] = payload
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.write_text(payload, encoding="utf-8")
+
+    for source_id in ("cli:latest", "ci:artifact"):
+        result = await diagnostics.read_orchestrator_log(
+            SLUG,
+            source_id,
+            max_chars=2_000,
+        )
+        assert "explicit-kind-secret" not in result["content"]
+        assert "retained-explicit-kind-config" in result["content"]
+
+    raw = ci_path.read_bytes()
+    inside_payload = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=raw.index(b"  opaque: explicit-kind-secret"),
+        max_chars=2_000,
+    )
+    assert "explicit-kind-secret" not in inside_payload["content"]
+    assert "retained-explicit-kind-config" in inside_payload["content"]
+
+
 async def test_truncated_redis_logs_omit_unknown_leading_sensitive_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1673,6 +1731,18 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
         "kind",
     ) == {0: "Secret", 3: "*kindValue"}
     assert diagnostics._yaml_mapping_scalar_values([b"kind: [\n"], "kind") == {}
+    assert diagnostics._yaml_kind_entries(
+        [
+            b"? kind\n",
+            b": Secret\n",
+            b"note: |\n",
+            b"  kind: ConfigMap\n",
+        ]
+    ) == [(0, "Secret", 0, False)]
+    assert diagnostics._yaml_kind_entries([b"- ? kind\n", b"  : Secret\n"]) == [
+        (0, "Secret", 0, True)
+    ]
+    assert diagnostics._yaml_kind_entries([b"kind: [\n"]) == [(0, "[", 0, False)]
     assert diagnostics._yaml_secret_payload_lines(
         [
             b"base: &resource\n",
@@ -2646,11 +2716,11 @@ async def test_log_discovery_defensive_failures(tmp_path: Path, monkeypatch: pyt
 
     redis = FakeRedis()
 
-    async def broken_scan(*, cursor: int, match: str, count: int):
-        del cursor, match, count
+    async def broken_scan(*args: object):
+        del args
         raise ConnectionError("scan failure")
 
-    redis.scan = broken_scan  # type: ignore[method-assign]
+    redis.eval_ro = broken_scan  # type: ignore[method-assign]
     _, warnings, _ = await diagnostics._redis_history_page(
         redis,
         SLUG,
@@ -2730,7 +2800,7 @@ async def test_redis_history_discovery_uses_bounded_continuations() -> None:
     assert next_cursor is not None
     history_gets = [key for operation, key in redis.calls if operation == "getrange"]
     assert len(history_gets) == 2
-    assert len([call for call in redis.calls if call[0] == "scan"]) == 1
+    assert len([call for call in redis.calls if call[0] == "eval_ro"]) == 1
 
     kind, state = diagnostics._decode_log_cursor(next_cursor)
     assert kind == "history"
@@ -2744,7 +2814,7 @@ async def test_redis_history_discovery_uses_bounded_continuations() -> None:
     )
     assert len(second) == 2
     assert continuation is not None
-    assert not any(operation == "scan" for operation, _ in redis.calls)
+    assert not any(operation == "eval_ro" for operation, _ in redis.calls)
     assert len([key for operation, key in redis.calls if operation == "getrange"]) == 2
 
 
@@ -2754,13 +2824,17 @@ async def test_redis_history_discovery_reports_defensive_bounds() -> None:
     redis = FakeRedis()
     timestamps = [(NOW + timedelta(seconds=index)).isoformat() for index in range(205)]
 
-    async def oversized_scan(*, cursor: int, match: str, count: int) -> tuple[int, list[bytes]]:
-        del cursor, match, count
-        keys = [b"outside:key", cli_log_history(SLUG, "not-a-time").encode()]
+    async def oversized_scan(*args: object) -> list[object]:
+        del args
+        keys = [
+            b"outside:key",
+            cli_log_history(SLUG, "not-a-time").encode(),
+            b"x" * (diagnostics._MAX_REDIS_HISTORY_KEY_BYTES + 1),
+        ]
         keys.extend(cli_log_history(SLUG, timestamp).encode() for timestamp in timestamps)
-        return 0, keys
+        return [0, keys, 0, 0]
 
-    redis.scan = oversized_scan  # type: ignore[method-assign]
+    redis.eval_ro = oversized_scan  # type: ignore[method-assign]
     sources, warnings, continuation = await diagnostics._redis_history_page(
         redis,
         SLUG,
@@ -2771,7 +2845,24 @@ async def test_redis_history_discovery_reports_defensive_bounds() -> None:
     assert sources[0]["availability"] == "missing_or_expired"
     assert continuation is not None
     assert any("malformed CLI history" in warning for warning in warnings)
+    assert any("oversized CLI history key" in warning for warning in warnings)
     assert any("oversized scan batch" in warning for warning in warnings)
+
+    async def malformed_scan(*args: object) -> list[object]:
+        del args
+        return [0]
+
+    redis.eval_ro = malformed_scan  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="malformed bounded history scan"):
+        await diagnostics._bounded_history_scan(redis, 0, "history:*", 10)
+
+    async def malformed_scan_keys(*args: object) -> list[object]:
+        del args
+        return [0, "not-a-list", 0, 0]
+
+    redis.eval_ro = malformed_scan_keys  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="malformed bounded history keys"):
+        await diagnostics._bounded_history_scan(redis, 0, "history:*", 10)
 
     unavailable = FakeRedis()
     unavailable.fail.add("strlen")

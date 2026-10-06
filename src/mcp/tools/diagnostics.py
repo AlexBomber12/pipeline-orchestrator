@@ -66,6 +66,7 @@ _MAX_PRIVATE_KEY_CONTEXT_BYTES = 1024 * 1024
 _MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES = 1024 * 1024
 _MAX_REDIS_SCAN_CALLS = 4
 _MAX_REDIS_PENDING_KEYS = 200
+_MAX_REDIS_HISTORY_KEY_BYTES = 512
 _MAX_DISK_PARTITION_CANDIDATES = 200
 _MAX_EMBEDDED_JSON_CANDIDATES = 64
 _MAX_STRUCTURED_DEPTH = 64
@@ -161,6 +162,24 @@ for index = 0, count - 1 do
   table.insert(rows, size <= maximum and member or '')
 end
 return {total, rows}
+"""
+_BOUNDED_HISTORY_SCAN_SCRIPT = """
+local result = redis.call('SCAN', ARGV[1], 'MATCH', ARGV[2], 'COUNT', ARGV[3])
+local maximum_size = tonumber(ARGV[4])
+local maximum_count = tonumber(ARGV[5])
+local keys = {}
+local oversized = 0
+local dropped = 0
+for _, key in ipairs(result[2]) do
+  if string.len(key) > maximum_size then
+    oversized = oversized + 1
+  elseif #keys >= maximum_count then
+    dropped = dropped + 1
+  else
+    table.insert(keys, key)
+  end
+end
+return {result[1], keys, oversized, dropped}
 """
 
 _SENSITIVE_NAMES = (
@@ -1108,6 +1127,38 @@ def _yaml_mapping_scalar_values(lines: list[bytes], key: str) -> dict[int, str]:
     return values
 
 
+def _yaml_kind_entries(lines: list[bytes]) -> list[tuple[int, str, int, bool]]:
+    """Return semantic kind mappings with source scope information."""
+    semantic_values = _yaml_mapping_scalar_values(lines, "kind")
+    entries: list[tuple[int, str, int, bool]] = []
+    for line_index, value in semantic_values.items():
+        raw_line = lines[line_index]
+        text = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+        direct = _YAML_KIND_ASSIGNMENT.fullmatch(text)
+        indent = len(direct.group("indent")) if direct is not None else _line_indent(raw_line)
+        sequence_scope = (
+            direct.group("dash") is not None
+            if direct is not None
+            else raw_line.lstrip().startswith(b"-")
+        )
+        entries.append((line_index, value, indent, sequence_scope))
+    if semantic_values:
+        return sorted(entries)
+    for line_index, raw_line in enumerate(lines):
+        text = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+        direct = _YAML_KIND_ASSIGNMENT.fullmatch(text)
+        if direct is not None:
+            entries.append(
+                (
+                    line_index,
+                    direct.group("kind"),
+                    len(direct.group("indent")),
+                    direct.group("dash") is not None,
+                )
+            )
+    return sorted(entries)
+
+
 def _yaml_sensitive_assignment(text: str) -> tuple[int, str] | None:
     """Return indent and raw value for a decoded sensitive YAML mapping key."""
     if (
@@ -1758,7 +1809,10 @@ def _kubernetes_yaml_state_before(
     payload_flow_depth: int | None = None
     context_lines = context.splitlines(keepends=True)
     yaml_anchor_states = _yaml_anchor_state_by_line(context_lines, None)
-    yaml_kind_values = _yaml_mapping_scalar_values(context_lines, "kind")
+    yaml_kind_entries = {
+        line_index: (value, indent, sequence_scope)
+        for line_index, value, indent, sequence_scope in _yaml_kind_entries(context_lines)
+    }
     yaml_anchors = yaml_anchor_states[-1] if yaml_anchor_states else {}
     for context_index, raw_line in enumerate(context.splitlines()):
         if not raw_line.strip():
@@ -1794,17 +1848,27 @@ def _kubernetes_yaml_state_before(
             payload_flow_depth = None
             continue
         kind_match = _YAML_KIND_ASSIGNMENT.fullmatch(line)
-        if kind_match is not None:
+        kind_entry = yaml_kind_entries.get(context_index)
+        if kind_match is not None or kind_entry is not None:
             state_known = True
+            raw_kind = kind_entry[0] if kind_entry is not None else kind_match.group("kind")
             kind = _resolve_yaml_scalar(
-                yaml_kind_values.get(context_index, kind_match.group("kind")),
+                raw_kind,
                 yaml_anchor_states[context_index],
             )
             if kind is None or kind.casefold() == "secret":
+                kind_indent = (
+                    kind_entry[1] if kind_entry is not None else len(kind_match.group("indent"))
+                )
+                sequence_scope = (
+                    kind_entry[2]
+                    if kind_entry is not None
+                    else kind_match.group("dash") is not None
+                )
                 secret_scopes.append(
                     (
-                        len(kind_match.group("indent")),
-                        kind_match.group("dash") is not None,
+                        kind_indent,
+                        sequence_scope,
                     )
                 )
             kind_seen = True
@@ -1818,8 +1882,10 @@ def _kubernetes_yaml_state_before(
                 payload_indent = len(payload_match.group("indent"))
                 payload_flow_depth = continuation[1]
             continue
-        if indent == 0 and not (
-            line.lstrip().startswith(("#", "-")) or _YAML_MAPPING_ENTRY.match(line)
+        if (
+            indent == 0
+            and _YAML_EXPLICIT_VALUE.fullmatch(line) is None
+            and not (line.lstrip().startswith(("#", "-")) or _YAML_MAPPING_ENTRY.match(line))
         ):
             state_known = True
             secret_scopes.clear()
@@ -1935,18 +2001,14 @@ def _kubernetes_yaml_payload_flags(
             continue
         document_lines = raw_lines[document_start:boundary]
         yaml_anchor_states = _yaml_anchor_state_by_line(document_lines, None)
-        yaml_kind_values = _yaml_mapping_scalar_values(document_lines, "kind")
         semantic_secret_payloads = _yaml_secret_payload_lines(document_lines)
-        kind_matches: list[tuple[int, re.Match[str]]] = []
+        kind_entries = _yaml_kind_entries(document_lines)
         has_payload = False
-        for local_index, document_line in enumerate(document_lines):
+        for document_line in document_lines:
             decoded = document_line.decode("utf-8", errors="replace").rstrip("\r\n")
-            kind_match = _YAML_KIND_ASSIGNMENT.fullmatch(decoded)
-            if kind_match is not None:
-                kind_matches.append((local_index, kind_match))
             if _YAML_SECRET_PAYLOAD_ASSIGNMENT.fullmatch(decoded) is not None:
                 has_payload = True
-        if inherited_secret or (not kind_matches and has_payload and not inherited_kind_seen):
+        if inherited_secret or (not kind_entries and has_payload and not inherited_kind_seen):
             inherited_end = len(document_lines)
             if inherited_secret_scope is not None:
                 scope_indent, sequence_scope = inherited_secret_scope
@@ -1961,15 +2023,13 @@ def _kubernetes_yaml_payload_flags(
                         break
             for index in range(document_start, document_start + inherited_end):
                 flags[index] = True
-        for local_index, kind_match in kind_matches:
+        for local_index, raw_kind, kind_indent, sequence_scope in kind_entries:
             kind = _resolve_yaml_scalar(
-                yaml_kind_values.get(local_index, kind_match.group("kind")),
+                raw_kind,
                 yaml_anchor_states[local_index],
             )
             if kind is not None and kind.casefold() != "secret":
                 continue
-            kind_indent = len(kind_match.group("indent"))
-            sequence_scope = kind_match.group("dash") is not None
             scope_start = local_index
             if not sequence_scope:
                 for previous in range(local_index - 1, -1, -1):
@@ -3639,6 +3699,42 @@ def _decode_file_cursor(value: str, source_id: str) -> tuple[int, int]:
     return payload["source_offset"], payload["record_char_offset"]
 
 
+async def _bounded_history_scan(
+    client: Any,
+    cursor: int,
+    match: str,
+    count: int,
+) -> tuple[int, list[object], int, int]:
+    """Scan history keys without returning oversized names or batches."""
+    result = await client.eval_ro(
+        _BOUNDED_HISTORY_SCAN_SCRIPT,
+        0,
+        cursor,
+        match,
+        count,
+        _MAX_REDIS_HISTORY_KEY_BYTES,
+        _MAX_REDIS_PENDING_KEYS,
+    )
+    if not isinstance(result, (list, tuple)) or len(result) != 4:
+        raise RuntimeError("Redis returned a malformed bounded history scan.")
+    next_cursor = int(result[0])
+    raw_keys = result[1]
+    if not isinstance(raw_keys, (list, tuple)):
+        raise RuntimeError("Redis returned malformed bounded history keys.")
+    oversized = int(result[2])
+    dropped = int(result[3])
+    bounded_keys: list[object] = []
+    for raw_key in raw_keys:
+        observed_size = len(raw_key if isinstance(raw_key, bytes) else str(raw_key).encode())
+        if observed_size > _MAX_REDIS_HISTORY_KEY_BYTES:
+            oversized += 1
+        elif len(bounded_keys) < _MAX_REDIS_PENDING_KEYS:
+            bounded_keys.append(raw_key)
+        else:
+            dropped += 1
+    return next_cursor, bounded_keys, oversized, dropped
+
+
 async def _redis_history_page(
     client: Any,
     repo_slug: str,
@@ -3654,15 +3750,20 @@ async def _redis_history_page(
     completed = started and scan_cursor == 0
     scan_calls = 0
     malformed_keys = 0
+    oversized_keys = 0
+    dropped_keys = 0
     prefix = cli_log_history(repo_slug, "")
 
     try:
         while len(candidates) < limit and not completed and scan_calls < _MAX_REDIS_SCAN_CALLS:
-            scan_cursor, raw_keys = await client.scan(
-                cursor=scan_cursor,
-                match=cli_log_history(repo_slug, "*"),
-                count=max(10, limit),
+            scan_cursor, raw_keys, oversized, dropped = await _bounded_history_scan(
+                client,
+                scan_cursor,
+                cli_log_history(repo_slug, "*"),
+                max(10, limit),
             )
+            oversized_keys += oversized
+            dropped_keys += dropped
             scan_cursor = int(scan_cursor)
             started = True
             scan_calls += 1
@@ -3685,13 +3786,15 @@ async def _redis_history_page(
         warnings.append(
             f"Ignored {malformed_keys} malformed CLI history key(s) in the constrained repository namespace."
         )
-    if len(candidates) > _MAX_REDIS_PENDING_KEYS:
-        dropped = len(candidates) - _MAX_REDIS_PENDING_KEYS
-        candidates = candidates[:_MAX_REDIS_PENDING_KEYS]
+    if oversized_keys:
         warnings.append(
-            f"Redis returned an oversized scan batch; {dropped} source identifier(s) were omitted from continuation."
+            f"Ignored {oversized_keys} oversized CLI history key name(s) inside Redis."
         )
-
+    if dropped_keys:
+        warnings.append(
+            f"Redis returned an oversized scan batch; {dropped_keys} source identifier(s) "
+            "were omitted server-side."
+        )
     selected = candidates[:limit]
     remaining = candidates[limit:]
     sources: list[dict[str, Any]] = []
