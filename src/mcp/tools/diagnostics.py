@@ -1376,7 +1376,13 @@ def _yaml_secret_payload_lines(lines: list[bytes]) -> set[int]:
                     or candidate.startswith(("!", "&"))
                     or (candidate.startswith('"') and "\\" in key_source)
                 )
-                and _yaml_has_payload_mapping_key(candidate)
+                and (
+                    _yaml_has_payload_mapping_key(candidate)
+                    or (
+                        (field := _yaml_mapping_scalar_field(candidate)) is not None
+                        and field[2].casefold() == "kind"
+                    )
+                )
             )
         ):
             requires_composition = True

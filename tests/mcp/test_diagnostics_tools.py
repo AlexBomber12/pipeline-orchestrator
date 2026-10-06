@@ -1415,8 +1415,14 @@ async def test_decorated_yaml_mapping_keys_are_redacted_across_retained_readers(
         "kind: Secret\n!!str data:\n  opaque: tagged-payload-key-secret\n"
         "---\nkind: Secret\n&payloadKey stringData:\n"
         "  config: anchored-payload-key-secret\n"
+        "---\n!!str kind: Secret\nmetadata:\n  annotations:\n    kind: Note\n"
+        "data:\n  opaque: tagged-kind-key-secret\n"
+        "---\n&kindKey kind: Secret\nmetadata:\n  annotations:\n    kind: Note\n"
+        "stringData:\n  config: anchored-kind-key-secret\n"
         "---\nkind: ConfigMap\n!!str data:\n"
         "  harmless: retained-decorated-config\n"
+        "---\n!!str kind: ConfigMap\nmetadata:\n  annotations:\n    kind: Note\n"
+        "data:\n  harmless: retained-tagged-kind-config\n"
         "---\nkind: Pod\nenv:\n"
         "  - name: PASSWORD\n    !!str value: tagged-value-field-secret\n"
         "  - !!str name: API_KEY\n    &valueKey value: anchored-value-field-secret\n"
@@ -1435,14 +1441,18 @@ async def test_decorated_yaml_mapping_keys_are_redacted_across_retained_readers(
         )
         assert "tagged-payload-key-secret" not in result["content"]
         assert "anchored-payload-key-secret" not in result["content"]
+        assert "tagged-kind-key-secret" not in result["content"]
+        assert "anchored-kind-key-secret" not in result["content"]
         assert "tagged-value-field-secret" not in result["content"]
         assert "anchored-value-field-secret" not in result["content"]
         assert "retained-decorated-config" in result["content"]
+        assert "retained-tagged-kind-config" in result["content"]
         assert "retained-decorated-env" in result["content"]
 
     raw = ci_path.read_bytes()
     for excerpt in (
         b"  opaque: tagged-payload-key-secret",
+        b"  opaque: tagged-kind-key-secret",
         b"    !!str value: tagged-value-field-secret",
     ):
         page = await diagnostics.read_orchestrator_log(
@@ -1452,6 +1462,7 @@ async def test_decorated_yaml_mapping_keys_are_redacted_across_retained_readers(
             max_chars=4_000,
         )
         assert "tagged-payload-key-secret" not in page["content"]
+        assert "tagged-kind-key-secret" not in page["content"]
         assert "tagged-value-field-secret" not in page["content"]
 
 
