@@ -1565,6 +1565,55 @@ def test_lifespan_gets_configured_metadata_without_loading_factory(
     assert loaders[0].requested == ["third"]
 
 
+def test_lifespan_degrades_when_daemon_metadata_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.coder_registry import ModelCatalogUnavailable
+
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        "coder_plugins:\n"
+        "  third: unsafe.module:factory\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(config_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    class UnavailableLoader:
+        def __init__(self, _redis: object) -> None:
+            pass
+
+        async def load_plugin_metadata(self, _plugin_id: str) -> object:
+            raise ModelCatalogUnavailable("daemon offline")
+
+        async def __call__(self, *_args: object, **_kwargs: object) -> object:
+            raise ModelCatalogUnavailable("daemon offline")
+
+    monkeypatch.setattr(
+        web_app,
+        "DaemonModelCatalogLoader",
+        UnavailableLoader,
+    )
+
+    with TestClient(app) as client:
+        plugin = client.app.state.coder_registry.get("third")
+        rendered = client.get("/partials/settings/coders")
+        rejected = client.put(
+            "/settings/daemon",
+            data={"coder_settings.third.model": "unsafe-change"},
+        )
+
+    assert plugin.metadata_available is False
+    assert rendered.status_code == 200
+    assert "third (metadata unavailable)" in rendered.text
+    assert "model changes are disabled" in rendered.text
+    assert 'name="coder_settings.third.model"' in rendered.text
+    assert 'disabled aria-disabled="true"' in rendered.text
+    assert rejected.status_code == 422
+    assert "Coder metadata is unavailable: third" in rejected.text
+
+
 def test_get_repo_state_unknown_repo_returns_idle_default(
     empty_config: Path,
 ) -> None:

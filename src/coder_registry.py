@@ -85,6 +85,7 @@ class CoderMetadataView:
     models: list[str]
     model_setting: ModelSetting
     model_catalog_refreshable: bool
+    metadata_available: bool = True
 
     def resolve_model(self, daemon_config: "DaemonConfig") -> str:
         """Resolve the configured model without invoking plugin code."""

@@ -201,6 +201,7 @@ def _build_coder_rows(
     rows: list[dict[str, Any]] = []
     for plugin in registry.list_coders():
         setting = plugin.model_setting
+        metadata_available = getattr(plugin, "metadata_available", True)
         selected_model = plugin.resolve_model(config.daemon)
         catalog = catalogs.get(
             plugin.name,
@@ -271,6 +272,7 @@ def _build_coder_rows(
                     ],
                 },
                 "selected_model": selected_model,
+                "metadata_available": metadata_available,
                 "auth": auth.get(
                     plugin.name,
                     {
@@ -335,6 +337,10 @@ def _submitted_coder_models(
         if not separator or plugin_id not in plugins:
             raise ValueError(f"Unknown coder settings plugin ID: {plugin_id or remainder}")
         plugin = plugins[plugin_id]
+        if not getattr(plugin, "metadata_available", True):
+            raise ValueError(
+                f"Coder metadata is unavailable: {plugin_id}"
+            )
         if setting_key != plugin.model_setting.setting_key:
             raise ValueError(f"Unknown coder setting: {field_name}")
         if not isinstance(raw_value, str):
@@ -346,6 +352,10 @@ def _submitted_coder_models(
         if plugin.name in submitted or legacy_field is None:
             continue
         if legacy_field in form:
+            if not getattr(plugin, "metadata_available", True):
+                raise ValueError(
+                    f"Coder metadata is unavailable: {plugin.name}"
+                )
             raw_value = form[legacy_field]
             if not isinstance(raw_value, str):
                 raise ValueError(f"{legacy_field} must be a string")

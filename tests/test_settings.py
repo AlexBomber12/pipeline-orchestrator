@@ -1017,6 +1017,36 @@ def test_model_submission_parser_rejects_non_string_values(
         _submitted_coder_models(form, build_coder_registry())
 
 
+def test_model_submission_parser_rejects_unavailable_legacy_metadata() -> None:
+    from src.coder_registry import CoderMetadataView
+    from src.web.routes.settings import _submitted_coder_models
+
+    registry = CoderRegistry()
+    registry.register(
+        CoderMetadataView(
+            name="codex",
+            display_name="codex (metadata unavailable)",
+            models=[],
+            model_setting=ModelSetting(
+                "codex_model",
+                "",
+                "Metadata unavailable",
+            ),
+            model_catalog_refreshable=False,
+            metadata_available=False,
+        )
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Coder metadata is unavailable: codex",
+    ):
+        _submitted_coder_models(
+            _NonStringForm({"codex_model": "gpt-test"}),
+            registry,
+        )
+
+
 def test_dynamic_codex_choice_persists_invocation_slug_and_api_metadata(
     empty_config: Path,
     monkeypatch: pytest.MonkeyPatch,

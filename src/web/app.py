@@ -38,7 +38,7 @@ import redis.asyncio as aioredis
 from fastapi import FastAPI
 from fastapi.templating import Jinja2Templates
 
-from src.coder_registry import CoderRegistry
+from src.coder_registry import CoderMetadataView, CoderRegistry, ModelSetting
 from src.coders import build_coder_registry
 from src.config import (
     DEFAULT_CODER_PLUGINS,
@@ -298,6 +298,26 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _unavailable_coder_metadata(plugin_id: str) -> CoderMetadataView:
+    """Return a safe placeholder while daemon-owned metadata is unavailable."""
+    legacy_field = {
+        "claude": "claude_model",
+        "codex": "codex_model",
+    }.get(plugin_id)
+    return CoderMetadataView(
+        name=plugin_id,
+        display_name=f"{plugin_id} (metadata unavailable)",
+        models=[],
+        model_setting=ModelSetting(
+            config_field=legacy_field,
+            default_value="",
+            default_label="Metadata unavailable",
+        ),
+        model_catalog_refreshable=False,
+        metadata_available=False,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Configuration parsing is inert, and only known built-ins are constructed
@@ -319,11 +339,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             *(
                 catalog_loader.load_plugin_metadata(plugin_id)
                 for plugin_id in configured_ids
-            )
+            ),
+            return_exceptions=True,
         )
-        configured_metadata = dict(
-            zip(configured_ids, metadata, strict=True)
-        )
+        configured_metadata: dict[str, CoderMetadataView] = {}
+        for plugin_id, result in zip(configured_ids, metadata, strict=True):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "%s plugin metadata is unavailable from daemon",
+                    plugin_id,
+                )
+                configured_metadata[plugin_id] = _unavailable_coder_metadata(
+                    plugin_id
+                )
+            else:
+                configured_metadata[plugin_id] = result
         registry = CoderRegistry()
         for plugin_id, reference in config.coder_plugins.items():
             plugin = (

@@ -125,7 +125,9 @@ catalog methods run through the daemon in bounded worker processes, while the
 web cache key is derived from validated configuration; configured catalog code
 does not execute inside the web control plane. The daemon also supplies
 validated plugin metadata to web over Redis, so configured modules and
-factories are never imported or instantiated by FastAPI.
+factories are never imported or instantiated by FastAPI. If daemon metadata is
+temporarily unavailable, the dashboard still starts with that plugin marked
+unavailable and its model-setting control disabled.
 
 Codex reasoning effort can be overridden for each new invocation with
 `daemon.coder_settings.codex.reasoning_effort`. Omit the key or set it to an
