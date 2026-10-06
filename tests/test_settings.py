@@ -20,7 +20,7 @@ from src.coder_registry import (
 from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
 from src.coders.codex_models import CodexModel, CodexReasoningEffort
-from src.config import AppConfig, load_config
+from src.config import AppConfig, DaemonConfig, load_config
 from src.models import PipelineState, RepoState
 from src.web import app as web_app
 from src.web.app import app
@@ -1653,11 +1653,11 @@ def test_reasoning_effort_helpers_preserve_existing_unconfirmed_values() -> None
         "coder_settings.codex.model",
         False,
     )
-    malformed = AppConfig.model_validate(
-        {"daemon": {"coder_settings": {"codex": {"reasoning_effort": 3}}}}
+    malformed = DaemonConfig.model_construct(
+        coder_settings={"codex": {"reasoning_effort": 3}}
     )
     with pytest.raises(ValueError, match="reasoning_effort must be a string"):
-        _saved_reasoning_effort(malformed.daemon, "codex")
+        _saved_reasoning_effort(malformed, "codex")
 
 
 def test_dynamic_codex_choice_persists_invocation_slug_and_api_metadata(

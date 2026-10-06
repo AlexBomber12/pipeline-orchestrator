@@ -146,6 +146,10 @@ def test_daemon_config_accepts_null_coder_settings_as_empty() -> None:
         ({"": {}}, "plugin IDs must be non-empty strings"),
         ({"codex": "not-a-mapping"}, "coder_settings.codex must be a mapping"),
         ({"codex": {"model": 123}}, "coder_settings.codex.model must be a string"),
+        (
+            {"codex": {"reasoning_effort": 123}},
+            "coder_settings.codex.reasoning_effort must be a string",
+        ),
     ],
 )
 def test_daemon_config_rejects_malformed_coder_settings(

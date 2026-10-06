@@ -321,6 +321,12 @@ class DaemonConfig(BaseModel):
                 raise ValueError(
                     f"coder_settings.{plugin_id}.model must be a string"
                 )
+            if "reasoning_effort" in settings and not isinstance(
+                settings["reasoning_effort"], str
+            ):
+                raise ValueError(
+                    f"coder_settings.{plugin_id}.reasoning_effort must be a string"
+                )
         return value
 
     @property
