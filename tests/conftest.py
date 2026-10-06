@@ -50,7 +50,12 @@ def _mock_settings_codex_model_discovery(
                 )
             return await target.get_model_catalog(**kwargs)
 
-        async def load_plugin_metadata(self, plugin_id: str) -> object:
+        async def load_plugin_metadata(
+            self,
+            plugin_id: str,
+            *,
+            expected_reference: str,
+        ) -> object:
             from src.coders import _load_plugin
             from src.config import load_config
             from src.model_catalog_bridge import (
@@ -60,10 +65,31 @@ def _mock_settings_codex_model_discovery(
             from src.web import app as web_app
 
             config = load_config(web_app.CONFIG_PATH)
-            plugin = _load_plugin(plugin_id, config.coder_plugins[plugin_id])
+            assert config.coder_plugins[plugin_id] == expected_reference
+            plugin = _load_plugin(plugin_id, expected_reference)
             return _parse_plugin_metadata(
                 _plugin_metadata_payload(plugin),
                 expected_name=plugin_id,
+            )
+
+        async def load_auth_status(
+            self,
+            plugin_id: str,
+            *,
+            expected_reference: str,
+        ) -> dict[str, str]:
+            from src.coder_auth import isolated_auth_probe
+            from src.coders import _load_plugin
+            from src.web import app as web_app
+            from src.web.services import auth_probe
+
+            plugin = _load_plugin(plugin_id, expected_reference)
+            return await isolated_auth_probe(
+                plugin_id,
+                expected_reference,
+                plugin.display_name,
+                config_path=web_app.CONFIG_PATH,
+                timeout=auth_probe._AUTH_CHECK_TIMEOUT_SEC,
             )
 
     monkeypatch.setattr(

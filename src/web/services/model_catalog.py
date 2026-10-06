@@ -67,6 +67,7 @@ class ModelCatalogCache:
         self._loader = loader
         self._daemon_owned_plugins = frozenset(daemon_owned_plugins)
         self._entries: dict[_CatalogKey, _CacheEntry] = {}
+        self._latest_keys: dict[str, _CatalogKey] = {}
         self._in_flight: dict[
             _CatalogKey, asyncio.Task[ModelCatalogSnapshot]
         ] = {}
@@ -106,6 +107,7 @@ class ModelCatalogCache:
         """Return a fresh snapshot, coalescing concurrent plugin calls."""
         key = self._key(plugin, config=config, config_path=config_path)
         async with self._lock:
+            self._select_key(key)
             entry = self._entries.get(key)
             if (
                 not refresh
@@ -135,6 +137,7 @@ class ModelCatalogCache:
     ) -> ModelCatalogSnapshot:
         """Return cached metadata without starting a plugin operation."""
         key = self._key(plugin, config=config, config_path=config_path)
+        self._select_key(key)
         entry = self._entries.get(key)
         if entry is None:
             return ModelCatalogSnapshot(
@@ -152,6 +155,16 @@ class ModelCatalogCache:
                 _EXPIRED_MESSAGE if entry.snapshot.models else _EMPTY_MESSAGE
             ),
         )
+
+    def _select_key(self, key: _CatalogKey) -> None:
+        """Make ``key`` current and evict obsolete generations."""
+        previous = self._latest_keys.get(key.plugin_name)
+        if previous == key:
+            return
+        self._latest_keys[key.plugin_name] = key
+        for cached_key in tuple(self._entries):
+            if cached_key.plugin_name == key.plugin_name and cached_key != key:
+                self._entries.pop(cached_key, None)
 
     async def _refresh(
         self,
@@ -214,10 +227,11 @@ class ModelCatalogCache:
                     attempted_at=attempted_at,
                 )
             async with self._lock:
-                self._entries[key] = _CacheEntry(
-                    snapshot=snapshot,
-                    expires_at=time.monotonic() + self._ttl_seconds,
-                )
+                if self._latest_keys.get(key.plugin_name) == key:
+                    self._entries[key] = _CacheEntry(
+                        snapshot=snapshot,
+                        expires_at=time.monotonic() + self._ttl_seconds,
+                    )
             return snapshot
         finally:
             async with self._lock:
@@ -230,6 +244,7 @@ class ModelCatalogCache:
         async with self._lock:
             tasks = tuple(self._in_flight.values())
             self._in_flight.clear()
+            self._latest_keys.clear()
         for task in tasks:
             task.cancel()
         if tasks:

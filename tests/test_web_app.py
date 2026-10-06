@@ -1526,9 +1526,13 @@ def test_lifespan_gets_configured_metadata_without_loading_factory(
             self.requested: list[str] = []
 
         async def load_plugin_metadata(
-            self, plugin_id: str
+            self,
+            plugin_id: str,
+            *,
+            expected_reference: str,
         ) -> CoderMetadataView:
             self.requested.append(plugin_id)
+            assert expected_reference == "unsafe.module:factory"
             return CoderMetadataView(
                 name=plugin_id,
                 display_name="Daemon Metadata",
@@ -1584,7 +1588,13 @@ def test_lifespan_degrades_when_daemon_metadata_is_unavailable(
         def __init__(self, _redis: object) -> None:
             pass
 
-        async def load_plugin_metadata(self, _plugin_id: str) -> object:
+        async def load_plugin_metadata(
+            self,
+            _plugin_id: str,
+            *,
+            expected_reference: str,
+        ) -> object:
+            assert expected_reference == "unsafe.module:factory"
             raise ModelCatalogUnavailable("daemon offline")
 
         async def __call__(self, *_args: object, **_kwargs: object) -> object:

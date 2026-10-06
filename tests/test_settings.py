@@ -1465,6 +1465,7 @@ async def test_configured_static_catalog_uses_daemon_loader() -> None:
     )
 
     assert calls == ["third", "third"]
+    assert len(cache._entries) == 1
     assert snapshot.source == "daemon"
     assert [model.invocation_id for model in snapshot.models] == ["isolated"]
     assert changed.source == "daemon"
@@ -2048,6 +2049,34 @@ def test_direct_coder_auth_probe_redacts_plugin_exception() -> None:
     assert _auth_probe._check_coder_auth(registry, "third") == {
         "status": "error",
         "detail": "Configured Test Coder auth check failed (RuntimeError)",
+    }
+
+
+def test_configured_auth_probe_degrades_without_daemon_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.coder_registry import CoderMetadataView
+
+    registry = CoderRegistry()
+    registry.register(
+        CoderMetadataView(
+            name="third",
+            display_name="Third Coder",
+            models=[],
+            model_setting=ModelSetting(None, "", "Default"),
+            model_catalog_refreshable=False,
+        ),
+        reference="operator.plugin:factory",
+    )
+    monkeypatch.delattr(web_app.app.state, "plugin_bridge", raising=False)
+
+    result = asyncio.run(
+        _auth_probe._bounded_coder_auth_probe(registry, "third")
+    )
+
+    assert result == {
+        "status": "error",
+        "detail": "Third Coder auth check is unavailable",
     }
 
 

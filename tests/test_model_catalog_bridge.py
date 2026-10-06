@@ -78,6 +78,7 @@ class _CatalogWorkerProcess:
 @pytest.mark.asyncio
 async def test_loader_round_trips_catalog_through_daemon(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     redis = _BridgeRedis()
 
@@ -94,7 +95,30 @@ async def test_loader_round_trips_catalog_through_daemon(
 
     plugin = CodexPlugin(discover=discover)
     registry = CoderRegistry()
-    registry.register(plugin)
+    reference = "src.coders.codex:CodexPlugin"
+    registry.register(plugin, reference=reference)
+    auth_calls: list[tuple[str, str, str, str, float]] = []
+
+    async def auth_probe(
+        plugin_id: str,
+        factory_reference: str,
+        display_name: str,
+        *,
+        config_path: str,
+        timeout: float,
+    ) -> dict[str, str]:
+        auth_calls.append(
+            (
+                plugin_id,
+                factory_reference,
+                display_name,
+                config_path,
+                timeout,
+            )
+        )
+        return {"status": "ok", "detail": "daemon-owned"}
+
+    monkeypatch.setattr(bridge, "isolated_auth_probe", auth_probe)
     config_path = str(tmp_path / "config.yml")
     server = asyncio.create_task(
         bridge.serve_model_catalog_requests(
@@ -114,7 +138,14 @@ async def test_loader_round_trips_catalog_through_daemon(
         config=AppConfig(),
         config_path=config_path,
     )
-    metadata = await loader.load_plugin_metadata("codex")
+    metadata = await loader.load_plugin_metadata(
+        "codex",
+        expected_reference=reference,
+    )
+    auth = await loader.load_auth_status(
+        "codex",
+        expected_reference=reference,
+    )
 
     assert catalog.source == "discovered"
     assert catalog.description == "1 model advertised by Codex CLI."
@@ -124,7 +155,18 @@ async def test_loader_round_trips_catalog_through_daemon(
     assert metadata.display_name == "Codex CLI"
     assert metadata.model_setting.setting_key == "model"
     assert metadata.model_catalog_refreshable is True
+    assert auth == {"status": "ok", "detail": "daemon-owned"}
+    assert auth_calls == [
+        (
+            "codex",
+            reference,
+            "Codex CLI",
+            config_path,
+            bridge._CONFIGURED_CATALOG_TIMEOUT_SECONDS,
+        )
+    ]
     assert redis.trimmed == [
+        (bridge.MODEL_CATALOG_REQUEST_QUEUE, -64, -1),
         (bridge.MODEL_CATALOG_REQUEST_QUEUE, -64, -1),
         (bridge.MODEL_CATALOG_REQUEST_QUEUE, -64, -1),
     ]
@@ -133,6 +175,11 @@ async def test_loader_round_trips_catalog_through_daemon(
         1,
     )
     assert redis.deleted
+    with pytest.raises(ModelCatalogUnavailable, match="unavailable"):
+        await loader.load_plugin_metadata(
+            "codex",
+            expected_reference="old.module:factory",
+        )
     server.cancel()
     with pytest.raises(asyncio.CancelledError):
         await server
@@ -249,6 +296,19 @@ def test_parse_catalog_rejects_invalid_payloads(payload: object) -> None:
 def test_parse_plugin_metadata_rejects_invalid_payloads(payload: object) -> None:
     with pytest.raises(ModelCatalogUnavailable):
         bridge._parse_plugin_metadata(payload, expected_name="third")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {"ok": True},
+        {"ok": True, "auth": {"status": "unknown", "detail": "bad"}},
+    ],
+)
+def test_parse_auth_status_rejects_invalid_payloads(payload: object) -> None:
+    with pytest.raises(ModelCatalogUnavailable):
+        bridge._parse_auth_status(payload)
 
 
 @pytest.mark.asyncio

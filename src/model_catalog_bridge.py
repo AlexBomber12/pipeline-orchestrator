@@ -11,7 +11,7 @@ import uuid
 from dataclasses import asdict
 from typing import Any
 
-from src.coder_auth import terminate_plugin_worker
+from src.coder_auth import isolated_auth_probe, terminate_plugin_worker
 from src.coder_registry import (
     CoderMetadataView,
     CoderPlugin,
@@ -63,6 +63,23 @@ def _plugin_metadata_payload(plugin: CoderPlugin) -> dict[str, Any]:
             "model_catalog_refreshable": plugin.model_catalog_refreshable,
         },
     }
+
+
+def _parse_auth_status(payload: object) -> dict[str, str]:
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        raise ModelCatalogUnavailable("Daemon coder auth status is unavailable")
+    status = payload.get("auth")
+    if (
+        not isinstance(status, dict)
+        or status.get("status") not in {"ok", "error"}
+        or not isinstance(status.get("detail"), str)
+        or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in status.items()
+        )
+    ):
+        raise ModelCatalogUnavailable("Daemon returned invalid coder auth status")
+    return status
 
 
 def _parse_plugin_metadata(
@@ -271,11 +288,32 @@ class DaemonModelCatalogLoader:
     async def load_plugin_metadata(
         self,
         plugin_id: str,
+        *,
+        expected_reference: str,
     ) -> CoderMetadataView:
         """Load validated control-plane metadata from the daemon."""
         return _parse_plugin_metadata(
-            await self._request(plugin_id, operation="metadata"),
+            await self._request(
+                plugin_id,
+                operation="metadata",
+                expected_reference=expected_reference,
+            ),
             expected_name=plugin_id,
+        )
+
+    async def load_auth_status(
+        self,
+        plugin_id: str,
+        *,
+        expected_reference: str,
+    ) -> dict[str, str]:
+        """Run one configured auth probe inside the daemon boundary."""
+        return _parse_auth_status(
+            await self._request(
+                plugin_id,
+                operation="auth",
+                expected_reference=expected_reference,
+            )
         )
 
     async def _request(
@@ -283,19 +321,20 @@ class DaemonModelCatalogLoader:
         plugin_id: str,
         *,
         operation: str,
+        expected_reference: str | None = None,
     ) -> object:
         """Round-trip one plugin metadata request through Redis."""
         request_id = uuid.uuid4().hex
         response_key = _response_key(request_id)
-        request = json.dumps(
-            {
-                "request_id": request_id,
-                "plugin": plugin_id,
-                "operation": operation,
-                "expires_at": time.time() + self._timeout_seconds,
-            },
-            separators=(",", ":"),
-        )
+        request_payload = {
+            "request_id": request_id,
+            "plugin": plugin_id,
+            "operation": operation,
+            "expires_at": time.time() + self._timeout_seconds,
+        }
+        if expected_reference is not None:
+            request_payload["reference"] = expected_reference
+        request = json.dumps(request_payload, separators=(",", ":"))
         try:
             await self._redis.rpush(MODEL_CATALOG_REQUEST_QUEUE, request)
             await self._redis.ltrim(
@@ -370,13 +409,18 @@ async def handle_model_catalog_request(
     request_id = request.get("request_id")
     plugin_name = request.get("plugin")
     operation = request.get("operation", "catalog")
+    expected_reference = request.get("reference")
     expires_at = request.get("expires_at")
     if (
         not isinstance(request_id, str)
         or len(request_id) != 32
         or not all(character in "0123456789abcdef" for character in request_id)
         or not isinstance(plugin_name, str)
-        or operation not in {"catalog", "metadata"}
+        or operation not in {"auth", "catalog", "metadata"}
+        or (
+            operation in {"auth", "metadata"}
+            and not isinstance(expected_reference, str)
+        )
         or not isinstance(expires_at, (int, float))
     ):
         return
@@ -389,6 +433,14 @@ async def handle_model_catalog_request(
         return
     try:
         plugin = registry.get(plugin_name)
+        reference = registry.reference_for(plugin_name)
+        if operation in {"auth", "metadata"} and expected_reference != reference:
+            await _store_response(
+                redis_client,
+                request_id,
+                {"ok": False, "error": "plugin reference mismatch"},
+            )
+            return
         if operation == "metadata":
             await _store_response(
                 redis_client,
@@ -396,7 +448,21 @@ async def handle_model_catalog_request(
                 _plugin_metadata_payload(plugin),
             )
             return
-        reference = registry.reference_for(plugin_name)
+        if operation == "auth":
+            assert reference is not None
+            auth = await isolated_auth_probe(
+                plugin_name,
+                reference,
+                plugin.display_name,
+                config_path=config_path,
+                timeout=_CONFIGURED_CATALOG_TIMEOUT_SECONDS,
+            )
+            await _store_response(
+                redis_client,
+                request_id,
+                {"ok": True, "auth": auth},
+            )
+            return
         if (
             reference is not None
             and reference != DEFAULT_CODER_PLUGINS.get(plugin_name)

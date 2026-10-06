@@ -330,6 +330,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     catalog_cache: ModelCatalogCache | None = None
     try:
         catalog_loader = DaemonModelCatalogLoader(client)
+        app.state.plugin_bridge = catalog_loader
         configured_ids = [
             plugin_id
             for plugin_id, reference in config.coder_plugins.items()
@@ -337,7 +338,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ]
         metadata = await asyncio.gather(
             *(
-                catalog_loader.load_plugin_metadata(plugin_id)
+                catalog_loader.load_plugin_metadata(
+                    plugin_id,
+                    expected_reference=config.coder_plugins[plugin_id],
+                )
                 for plugin_id in configured_ids
             ),
             return_exceptions=True,

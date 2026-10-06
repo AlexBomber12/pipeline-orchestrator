@@ -14,7 +14,6 @@ import inspect
 import os
 import subprocess
 
-from src.coder_auth import isolated_auth_probe
 from src.coder_registry import CoderRegistry
 from src.coders import build_coder_registry
 from src.config import DEFAULT_CODER_PLUGINS, load_config
@@ -156,7 +155,7 @@ async def _bounded_coder_auth_probe(
             "detail": f"{plugin.display_name} auth check is unavailable",
         }
     if reference != DEFAULT_CODER_PLUGINS.get(plugin_id):
-        return await _isolated_coder_auth_probe(
+        return await _daemon_coder_auth_probe(
             plugin_id,
             reference,
             plugin.display_name,
@@ -165,19 +164,30 @@ async def _bounded_coder_auth_probe(
     return await asyncio.to_thread(probe, registry)
 
 
-async def _isolated_coder_auth_probe(
+async def _daemon_coder_auth_probe(
     plugin_id: str,
     reference: str,
     display_name: str,
 ) -> dict[str, str]:
-    """Probe trusted plugin code via the shared killable worker."""
-    return await isolated_auth_probe(
-        plugin_id,
-        reference,
-        display_name,
-        config_path=_config_path(),
-        timeout=_AUTH_CHECK_TIMEOUT_SEC,
-    )
+    """Ask the daemon to own a configured plugin auth probe."""
+    from src.web import app as _app
+
+    bridge = getattr(_app.app.state, "plugin_bridge", None)
+    if bridge is None:
+        return {
+            "status": "error",
+            "detail": f"{display_name} auth check is unavailable",
+        }
+    try:
+        return await bridge.load_auth_status(
+            plugin_id,
+            expected_reference=reference,
+        )
+    except Exception:
+        return {
+            "status": "error",
+            "detail": f"{display_name} auth check is unavailable from daemon",
+        }
 
 
 def _check_gh_auth() -> dict[str, str]:
