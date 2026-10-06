@@ -2181,6 +2181,61 @@ def test_isolated_auth_probe_handles_worker_exit_during_timeout_cleanup(
     }
 
 
+def test_isolated_auth_probe_terminates_worker_when_caller_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _BlockedProcess:
+        pid = 12345
+        returncode: int | None = None
+        reaped = False
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def wait(self) -> int:
+            self.reaped = True
+            self.returncode = -9
+            return -9
+
+    process = _BlockedProcess()
+    killed: list[tuple[int, int]] = []
+
+    async def fake_subprocess(*_args: object, **_kwargs: object) -> object:
+        return process
+
+    monkeypatch.setattr(
+        _coder_auth.asyncio,
+        "create_subprocess_exec",
+        fake_subprocess,
+    )
+    monkeypatch.setattr(
+        _coder_auth.os,
+        "killpg",
+        lambda pid, sig: killed.append((pid, sig)),
+    )
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            _coder_auth.isolated_auth_probe(
+                "third",
+                "module:factory",
+                "Worker",
+                config_path="/cfg",
+                timeout=60,
+            )
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    assert killed == [(process.pid, _coder_auth.signal.SIGKILL)]
+    assert process.reaped is True
+
+
 def test_api_auth_status_reports_errors(
     empty_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
