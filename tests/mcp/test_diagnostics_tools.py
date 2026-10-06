@@ -1702,8 +1702,12 @@ async def test_aliased_sensitive_value_definitions_are_redacted(
         "env:\n  - name: PASSWORD\n    value: *sharedEnv\n"
         "---\nsharedPayload: &sharedPayload standalone-payload-anchor-secret\n"
         "kind: Secret\ndata:\n  opaque: *sharedPayload\n"
+        "---\nflowShared: &flowShared standalone-flow-env-anchor-secret\n"
+        "env: [{name: PASSWORD, value: *flowShared}]\n"
         "---\nsafeShared: &safeShared retained-safe-anchor-value\n"
         "kind: ConfigMap\ndata:\n  harmless: *safeShared\n"
+        "---\nsafeFlowShared: &safeFlowShared retained-safe-flow-anchor-value\n"
+        "env: [{name: SAFE, value: *safeFlowShared}]\n"
     )
     redis.store[cli_log_latest(SLUG)] = payload
     ci_path = repos_root / SLUG / "artifacts" / "ci.log"
@@ -1718,12 +1722,15 @@ async def test_aliased_sensitive_value_definitions_are_redacted(
         )
         assert "standalone-env-anchor-secret" not in result["content"]
         assert "standalone-payload-anchor-secret" not in result["content"]
+        assert "standalone-flow-env-anchor-secret" not in result["content"]
         assert "retained-safe-anchor-value" in result["content"]
+        assert "retained-safe-flow-anchor-value" in result["content"]
 
     raw = ci_path.read_bytes()
     for secret in (
         b"standalone-env-anchor-secret",
         b"standalone-payload-anchor-secret",
+        b"standalone-flow-env-anchor-secret",
     ):
         page = await diagnostics.read_orchestrator_log(
             SLUG,

@@ -1734,6 +1734,10 @@ def _yaml_sensitive_env_lines(lines: list[bytes]) -> set[int]:
             or (candidate.startswith("*") and ":" in candidate)
             or (
                 "*" in candidate
+                and ("{" in candidate or "[" in candidate)
+            )
+            or (
+                "*" in candidate
                 and ":" in candidate
                 and (field := _yaml_mapping_scalar_field(candidate)) is not None
                 and field[2].casefold() == "value"
