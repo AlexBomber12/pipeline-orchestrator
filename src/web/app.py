@@ -71,6 +71,7 @@ REPOS_DIR = "/data/repos"
 UPLOADS_DIR = "/data/uploads"
 _UPLOAD_MAX_TOTAL_BYTES = 1_000_000  # 1 MB
 logger = logging.getLogger(__name__)
+_METADATA_RETRY_INTERVAL_SECONDS = 1.0
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
@@ -318,6 +319,34 @@ def _unavailable_coder_metadata(plugin_id: str) -> CoderMetadataView:
     )
 
 
+async def _retry_unavailable_coder_metadata(
+    loader: DaemonModelCatalogLoader,
+    registry: CoderRegistry,
+    references: dict[str, str],
+) -> None:
+    """Replace startup placeholders after the daemon bridge recovers."""
+    pending = dict(references)
+    while pending:
+        await asyncio.sleep(_METADATA_RETRY_INTERVAL_SECONDS)
+        plugin_ids = tuple(pending)
+        results = await asyncio.gather(
+            *(
+                loader.load_plugin_metadata(
+                    plugin_id,
+                    expected_reference=pending[plugin_id],
+                )
+                for plugin_id in plugin_ids
+            ),
+            return_exceptions=True,
+        )
+        for plugin_id, result in zip(plugin_ids, results, strict=True):
+            if isinstance(result, Exception):
+                continue
+            reference = pending.pop(plugin_id)
+            registry.register(result, reference=reference)
+            logger.info("%s plugin metadata recovered from daemon", plugin_id)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Configuration parsing is inert, and only known built-ins are constructed
@@ -328,6 +357,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     client = aioredis.from_url(redis_url, decode_responses=True)
     app.state.redis = client
     catalog_cache: ModelCatalogCache | None = None
+    metadata_retry_task: asyncio.Task[None] | None = None
     try:
         catalog_loader = DaemonModelCatalogLoader(client)
         app.state.plugin_bridge = catalog_loader
@@ -366,6 +396,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 else configured_metadata[plugin_id]
             )
             registry.register(plugin, reference=reference)
+        unavailable_references = {
+            plugin_id: config.coder_plugins[plugin_id]
+            for plugin_id in configured_ids
+            if not configured_metadata[plugin_id].metadata_available
+        }
+        if unavailable_references:
+            metadata_retry_task = asyncio.create_task(
+                _retry_unavailable_coder_metadata(
+                    catalog_loader,
+                    registry,
+                    unavailable_references,
+                )
+            )
         app.state.coder_registry = registry
         daemon_owned_catalogs = {
             name
@@ -379,6 +422,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.model_catalog = catalog_cache
         yield
     finally:
+        if metadata_retry_task is not None:
+            metadata_retry_task.cancel()
+            await asyncio.gather(metadata_retry_task, return_exceptions=True)
         if catalog_cache is not None:
             await catalog_cache.close()
         try:

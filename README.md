@@ -127,8 +127,11 @@ does not execute inside the web control plane. The daemon also supplies
 validated plugin metadata to web over Redis, so configured modules and
 factories are never imported or instantiated by FastAPI. If daemon metadata is
 temporarily unavailable, the dashboard still starts with that plugin marked
-unavailable and its model-setting control disabled. Configured authentication
-checks also cross the daemon bridge and remain bounded by its worker deadline.
+unavailable and its model-setting control disabled, then retries the daemon
+metadata until the control can recover without a web restart. Configured
+authentication checks also cross the daemon bridge and remain bounded by its
+worker deadline; independent metadata, authentication, and catalog requests
+run concurrently under a fixed daemon-side limit.
 
 Codex reasoning effort can be overridden for each new invocation with
 `daemon.coder_settings.codex.reasoning_effort`. Omit the key or set it to an

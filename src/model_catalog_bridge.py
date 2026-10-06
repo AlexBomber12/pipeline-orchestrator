@@ -32,6 +32,7 @@ _RESPONSE_TTL_SECONDS = 30
 _REQUEST_TIMEOUT_SECONDS = 7.0
 _POLL_INTERVAL_SECONDS = 0.05
 _MAX_PENDING_REQUESTS = 64
+_MAX_CONCURRENT_REQUESTS = 8
 _CONFIGURED_CATALOG_TIMEOUT_SECONDS = 5.0
 _WORKER_RESULT_PREFIX = "PIPELINE_CATALOG_RESULT:"
 
@@ -500,24 +501,52 @@ async def serve_model_catalog_requests(
     # bridge cannot be installed.
     if not callable(getattr(redis_client, "blpop", None)):
         return
-    while True:
+    pending: set[asyncio.Task[None]] = set()
+
+    def request_done(task: asyncio.Task[None]) -> None:
+        pending.discard(task)
         try:
-            queued = await redis_client.blpop(
-                MODEL_CATALOG_REQUEST_QUEUE,
-                timeout=1,
-            )
-            if queued is not None:
-                await handle_model_catalog_request(
-                    redis_client,
-                    registry,
-                    queued[1],
-                    config_path=config_path,
-                )
+            task.result()
         except asyncio.CancelledError:
-            raise
+            pass
         except Exception:
-            logger.warning("Model catalog bridge unavailable", exc_info=True)
-            await asyncio.sleep(1)
+            logger.warning("Model catalog bridge request failed", exc_info=True)
+
+    try:
+        while True:
+            try:
+                if len(pending) >= _MAX_CONCURRENT_REQUESTS:
+                    await asyncio.wait(
+                        tuple(pending),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    continue
+                queued = await redis_client.blpop(
+                    MODEL_CATALOG_REQUEST_QUEUE,
+                    timeout=1,
+                )
+                if queued is not None:
+                    task = asyncio.create_task(
+                        handle_model_catalog_request(
+                            redis_client,
+                            registry,
+                            queued[1],
+                            config_path=config_path,
+                        )
+                    )
+                    pending.add(task)
+                    task.add_done_callback(request_done)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("Model catalog bridge unavailable", exc_info=True)
+                await asyncio.sleep(1)
+    finally:
+        tasks = tuple(pending)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised in the isolated worker

@@ -625,6 +625,151 @@ async def test_daemon_server_handles_idle_and_redis_failure(
 
 
 @pytest.mark.asyncio
+async def test_daemon_server_dispatches_requests_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = [
+        (bridge.MODEL_CATALOG_REQUEST_QUEUE, b"first"),
+        (bridge.MODEL_CATALOG_REQUEST_QUEUE, b"second"),
+    ]
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+    active = 0
+    maximum_active = 0
+
+    class Redis:
+        async def blpop(
+            self, *_args: object, **_kwargs: object
+        ) -> tuple[str, bytes] | None:
+            if requests:
+                return requests.pop(0)
+            await release.wait()
+            return None
+
+    async def handle(
+        *_args: object,
+        **_kwargs: object,
+    ) -> None:
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        if active == 2:
+            both_started.set()
+        try:
+            await release.wait()
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(bridge, "handle_model_catalog_request", handle)
+    server = asyncio.create_task(
+        bridge.serve_model_catalog_requests(
+            Redis(),
+            CoderRegistry(),
+            config_path="config.yml",
+        )
+    )
+    await asyncio.wait_for(both_started.wait(), timeout=1)
+    assert maximum_active == 2
+
+    server.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await server
+
+
+@pytest.mark.asyncio
+async def test_daemon_server_bounds_concurrent_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = [
+        (bridge.MODEL_CATALOG_REQUEST_QUEUE, str(index).encode())
+        for index in range(bridge._MAX_CONCURRENT_REQUESTS + 1)
+    ]
+    at_capacity = asyncio.Event()
+    final_started = asyncio.Event()
+    release = asyncio.Event()
+    started = 0
+
+    class Redis:
+        async def blpop(
+            self, *_args: object, **_kwargs: object
+        ) -> tuple[str, bytes] | None:
+            if requests:
+                return requests.pop(0)
+            await asyncio.Future()
+
+    async def handle(
+        *_args: object,
+        **_kwargs: object,
+    ) -> None:
+        nonlocal started
+        started += 1
+        if started == bridge._MAX_CONCURRENT_REQUESTS:
+            at_capacity.set()
+        if started == bridge._MAX_CONCURRENT_REQUESTS + 1:
+            final_started.set()
+            return
+        await release.wait()
+
+    monkeypatch.setattr(bridge, "handle_model_catalog_request", handle)
+    server = asyncio.create_task(
+        bridge.serve_model_catalog_requests(
+            Redis(),
+            CoderRegistry(),
+            config_path="config.yml",
+        )
+    )
+    await asyncio.wait_for(at_capacity.wait(), timeout=1)
+    await asyncio.sleep(0)
+    assert started == bridge._MAX_CONCURRENT_REQUESTS
+
+    release.set()
+    await asyncio.wait_for(final_started.wait(), timeout=1)
+    server.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await server
+
+
+@pytest.mark.asyncio
+async def test_daemon_server_logs_request_task_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    requests = [(bridge.MODEL_CATALOG_REQUEST_QUEUE, b"request")]
+    failed = asyncio.Event()
+
+    class Redis:
+        async def blpop(
+            self, *_args: object, **_kwargs: object
+        ) -> tuple[str, bytes] | None:
+            if requests:
+                return requests.pop()
+            await asyncio.Future()
+
+    async def handle(*_args: object, **_kwargs: object) -> None:
+        failed.set()
+        raise RuntimeError("request failed")
+
+    monkeypatch.setattr(bridge, "handle_model_catalog_request", handle)
+    server = asyncio.create_task(
+        bridge.serve_model_catalog_requests(
+            Redis(),
+            CoderRegistry(),
+            config_path="config.yml",
+        )
+    )
+    await asyncio.wait_for(failed.wait(), timeout=1)
+    for _ in range(10):
+        if "Model catalog bridge request failed" in caplog.text:
+            break
+        await asyncio.sleep(0)
+    assert "Model catalog bridge request failed" in caplog.text
+
+    server.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await server
+
+
+@pytest.mark.asyncio
 async def test_daemon_server_disables_bridge_without_redis_list_support() -> None:
     await bridge.serve_model_catalog_requests(
         object(),

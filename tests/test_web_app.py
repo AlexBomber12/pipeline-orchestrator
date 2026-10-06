@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1622,6 +1623,67 @@ def test_lifespan_degrades_when_daemon_metadata_is_unavailable(
     assert 'disabled aria-disabled="true"' in rendered.text
     assert rejected.status_code == 422
     assert "Coder metadata is unavailable: third" in rejected.text
+
+
+def test_lifespan_recovers_configured_metadata_when_daemon_appears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.coder_registry import (
+        CoderMetadataView,
+        ModelCatalogUnavailable,
+        ModelSetting,
+    )
+
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        "coder_plugins:\n"
+        "  third: unsafe.module:factory\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(config_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    monkeypatch.setattr(web_app, "_METADATA_RETRY_INTERVAL_SECONDS", 0)
+
+    class RecoveringLoader:
+        def __init__(self, _redis: object) -> None:
+            self.calls = 0
+
+        async def load_plugin_metadata(
+            self,
+            plugin_id: str,
+            *,
+            expected_reference: str,
+        ) -> CoderMetadataView:
+            self.calls += 1
+            assert expected_reference == "unsafe.module:factory"
+            if self.calls < 3:
+                raise ModelCatalogUnavailable("daemon starting")
+            return CoderMetadataView(
+                name=plugin_id,
+                display_name="Recovered Coder",
+                models=["recovered-model"],
+                model_setting=ModelSetting(None, "recovered-model", "Default"),
+                model_catalog_refreshable=False,
+            )
+
+        async def __call__(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("catalog loading is not part of recovery")
+
+    monkeypatch.setattr(
+        web_app,
+        "DaemonModelCatalogLoader",
+        RecoveringLoader,
+    )
+
+    with TestClient(app) as client:
+        for _ in range(100):
+            plugin = client.app.state.coder_registry.get("third")
+            if plugin.metadata_available:
+                break
+            time.sleep(0.01)
+        assert plugin.display_name == "Recovered Coder"
+        assert plugin.model_setting.default_value == "recovered-model"
 
 
 def test_get_repo_state_unknown_repo_returns_idle_default(
