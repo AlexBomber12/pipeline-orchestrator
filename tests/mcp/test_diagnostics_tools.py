@@ -499,6 +499,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             "Driver=Postgres;UID=alice;PWD=redis-odbc-pwd-secret;Server=db",
             "https://acct.blob.core.windows.net/c?sv=1&sp=r&sig=redis-sas-secret&se=tomorrow",
             "SharedAccessSignature=sv=1&sig=redis-shared-sas-secret",
+            "https://example.cloudfront.net/file?Expires=1&Signature=redis-aws-signature&Key-Pair-Id=K1",
+            "https://s3.example/file?X-Amz-Signature=redis-amz-signature&X-Amz-Expires=60",
             '{"SharedAccessKey":"redis-azure-shared-key-value"}',
             '{"_auth":"redis-npm-json-secret"}',
             '{"MYSQL_PWD":"redis-pwd-json-secret"}',
@@ -619,6 +621,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "Driver=Postgres;UID=alice;PWD=ci-odbc-pwd-secret;Server=db\n"
         + "https://acct.blob.core.windows.net/c?sv=1&sp=r&sig=ci-sas-secret&se=tomorrow\n"
         + "SharedAccessSignature=sv=1&sig=ci-shared-sas-secret\n"
+        + "https://example.cloudfront.net/file?Expires=1&Signature=ci-aws-signature&Key-Pair-Id=K1\n"
+        + "https://s3.example/file?X-Amz-Signature=ci-amz-signature&X-Amz-Expires=60\n"
         + '{"SharedAccessKey":"ci-azure-shared-key-value"}\n'
         + '{"_auth":"ci-npm-json-secret"}\n'
         + '{"MYSQL_PWD":"ci-pwd-json-secret"}\n'
@@ -695,6 +699,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-sas-secret" not in content
         assert "redis-shared-sas-secret" not in content
         assert "redis-json-sas-secret" not in content
+        assert "redis-aws-signature" not in content
+        assert "redis-amz-signature" not in content
         assert "987650000" not in content
         assert "123456789" not in content
         assert "fake-list-secret" not in content
@@ -779,6 +785,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-sas-secret" not in content
         assert "ci-shared-sas-secret" not in content
         assert "ci-json-sas-secret" not in content
+        assert "ci-aws-signature" not in content
+        assert "ci-amz-signature" not in content
         assert "987650002" not in content
         assert "987650001" not in content
         assert "debug" in content
@@ -2432,6 +2440,9 @@ def test_compose_wires_read_only_runtime_sources() -> None:
     assert initializer["user"] == "0:0"
     assert initializer["command"] == ["install -d -o 1000 -g 1000 -m 0750 /events"]
     assert "${PO_EVENTS_HOST_DIR:-./data/events}:/events" in initializer["volumes"]
+    producer_event_mount = "${PO_EVENTS_HOST_DIR:-./data/events}:${PO_EVENTS_DIR:-/data/events}"
+    assert producer_event_mount in compose["services"]["web"]["volumes"]
+    assert producer_event_mount in compose["services"]["daemon"]["volumes"]
     assert "${PO_EVENTS_HOST_DIR:-./data/events}:${PO_EVENTS_DIR:-/data/events}:ro" in service["volumes"]
     assert all("docker.sock" not in volume for volume in service["volumes"])
     assert all("/data/auth" not in volume for volume in service["volumes"])

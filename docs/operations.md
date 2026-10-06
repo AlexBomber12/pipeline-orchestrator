@@ -66,9 +66,9 @@ selecting a custom event directory, set both values to the corresponding host
 and container locations. A one-shot `events-init` service creates the host bind
 directory with UID/GID 1000 ownership before the web, daemon, or MCP service
 starts, so fresh rootful-Docker deployments remain writable by the producers.
-The producers' existing `/data` mounts must make the selected directory
-writable, while MCP receives only the explicit read-only event-directory mount.
-For example, use
+Compose mounts the selected host directory explicitly read-write into both
+producers and read-only into MCP, so overrides outside `./data` resolve to the
+same storage for all three services. For example, use
 `PO_EVENTS_HOST_DIR=./data/audit-events` with
 `PO_EVENTS_DIR=/data/audit-events`.
 

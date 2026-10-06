@@ -19,6 +19,7 @@ services:
     volumes:
       - .:/app
       - ./data:/data
+      - ${PO_EVENTS_HOST_DIR:-./data/events}:${PO_EVENTS_DIR:-/data/events}
       - codex-auth:/data/auth/.codex
     environment:
       REDIS_URL: redis://redis:6379/0
@@ -41,6 +42,7 @@ services:
     volumes:
       - .:/app:ro
       - ./data:/data
+      - ${PO_EVENTS_HOST_DIR:-./data/events}:${PO_EVENTS_DIR:-/data/events}
       - codex-auth:/data/auth/.codex
     environment:
       REDIS_URL: redis://redis:6379/0

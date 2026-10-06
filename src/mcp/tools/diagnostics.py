@@ -107,6 +107,7 @@ _SENSITIVE_NAMES = (
     "passwd",
     "pwd",
     "sig",
+    "signature",
     "passphrase",
     "key_data",
     "key-data",
