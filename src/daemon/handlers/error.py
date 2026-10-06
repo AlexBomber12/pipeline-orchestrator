@@ -328,15 +328,18 @@ class ErrorMixin:
         plugin_run_kwargs = plugin.build_run_kwargs(
             daemon_config=self.app_config.daemon
         )
+        auxiliary_kwargs = {
+            **plugin_run_kwargs,
+            "on_process_start": self._track_current_coder_process,
+            "on_supervised_process_start": (
+                self._track_current_coder_supervised_process
+            ),
+        }
         diagnosis_result = await self._await_auxiliary_coder(
             plugin.diagnose_error(
                 self.repo_path,
                 context,
-                model=plugin_run_kwargs.get("model"),
-                on_process_start=self._track_current_coder_process,
-                on_supervised_process_start=(
-                    self._track_current_coder_supervised_process
-                ),
+                **auxiliary_kwargs,
             ),
             cleanup_context="ERROR diagnosis",
             log_prefix="[ERROR]",
