@@ -77,6 +77,8 @@ _MAX_YAML_BLOCK_TOKENS = 4_096
 _MAX_YAML_PER_LINE_SCAN_CANDIDATES = 256
 _MAX_REDACTION_PHYSICAL_LINES = 8_192
 _MAX_RETRY_CURSOR_CHARS = 1_024
+_MAX_HISTORY_CURSOR_CHARS = 192 * 1024
+_MAX_FILE_CURSOR_CHARS = 4 * 1024
 _CLI_LATEST_TTL_SECONDS = 3600
 _CLI_HISTORY_TTL_SECONDS = 86400
 _HISTORY_CURSOR_PREFIX = "redis-history:"
@@ -4447,6 +4449,8 @@ def _decode_log_cursor(value: int | str) -> tuple[str, int | dict[str, Any]]:
         return "static", _validate_cursor(value)
     if not isinstance(value, str) or not value.startswith(_HISTORY_CURSOR_PREFIX):
         raise ValueError("cursor must be a non-negative static offset or a returned history cursor")
+    if len(value) > _MAX_HISTORY_CURSOR_CHARS:
+        raise ValueError("Invalid history cursor.")
     encoded = value.removeprefix(_HISTORY_CURSOR_PREFIX)
     try:
         padding = "=" * (-len(encoded) % 4)
@@ -4491,7 +4495,11 @@ def _encode_file_cursor(source_id: str, source_offset: int, record_char_offset: 
 
 
 def _decode_file_cursor(value: str, source_id: str) -> tuple[int, int]:
-    if not value.startswith(_FILE_CURSOR_PREFIX):
+    if (
+        not isinstance(value, str)
+        or not value.startswith(_FILE_CURSOR_PREFIX)
+        or len(value) > _MAX_FILE_CURSOR_CHARS
+    ):
         raise ValueError("Invalid filesystem continuation cursor.")
     encoded = value.removeprefix(_FILE_CURSOR_PREFIX)
     try:

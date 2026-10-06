@@ -3770,7 +3770,7 @@ async def test_redis_history_discovery_reports_defensive_bounds() -> None:
     assert continuation is None
 
 
-def test_log_discovery_cursor_validation() -> None:
+def test_log_discovery_cursor_validation(monkeypatch: pytest.MonkeyPatch) -> None:
     from src.mcp.tools import diagnostics
 
     assert diagnostics._decode_log_cursor(3) == ("static", 3)
@@ -3784,6 +3784,22 @@ def test_log_discovery_cursor_validation() -> None:
     invalid_payload = diagnostics._encode_history_cursor(-1, [], started=False)
     with pytest.raises(ValueError, match="history cursor"):
         diagnostics._decode_log_cursor(invalid_payload)
+
+    def unexpected_decode(*args: object, **kwargs: object) -> bytes:
+        del args, kwargs
+        raise AssertionError("oversized cursors must be rejected before base64 decoding")
+
+    monkeypatch.setattr(diagnostics.base64, "b64decode", unexpected_decode)
+    oversized_history = diagnostics._HISTORY_CURSOR_PREFIX + "A" * (
+        diagnostics._MAX_HISTORY_CURSOR_CHARS + 1
+    )
+    with pytest.raises(ValueError, match="history cursor"):
+        diagnostics._decode_log_cursor(oversized_history)
+    oversized_file = diagnostics._FILE_CURSOR_PREFIX + "A" * (
+        diagnostics._MAX_FILE_CURSOR_CHARS + 1
+    )
+    with pytest.raises(ValueError, match="filesystem continuation cursor"):
+        diagnostics._decode_file_cursor(oversized_file, "ci:artifact")
 
 
 async def test_list_outer_failure_and_file_read_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
