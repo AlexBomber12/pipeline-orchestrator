@@ -366,7 +366,28 @@ _HCL_BLOCK_START = re.compile(
     r'(?im)^[ \t]*(?:variable|output)[ \t]+"(?P<label>(?:\\.|[^"\\])*)"[ \t]*\{'
 )
 _HCL_BLOCK_STATE_BASE = 4
+_XML_SENSITIVE_ELEMENT_VALUE = re.compile(
+    rf"(?i)(?P<xml_open><(?P<xml_namespace>(?:[A-Za-z_][A-Za-z0-9_.-]*:)?)"
+    rf"(?P<xml_element>{_SENSITIVE_KEY_PATTERN})(?=[ \t/>])[^<>\r\n]*>)"
+    r"(?P<xml_value>[^<\r\n]+?)"
+    r"(?P<xml_close></(?P=xml_namespace)(?P=xml_element)[ \t]*>)"
+)
+_XML_NAMED_SENSITIVE_VALUE = re.compile(
+    rf"(?i)(?P<xml_attribute_prefix><(?=[^<>\r\n]*[ \t]name[ \t]*=[ \t]*"
+    rf"(?P<xml_name_quote>[\"'])(?:{_SENSITIVE_KEY_PATTERN})(?P=xml_name_quote)"
+    r"[^<>\r\n]*>)[^<>\r\n]*?[ \t]value[ \t]*=[ \t]*)"
+    r"(?P<xml_value_quote>[\"'])(?:(?!(?P=xml_value_quote))[^\r\n])*"
+    r"(?P=xml_value_quote)"
+)
 _REDACTION_RULES = (
+    (
+        _XML_SENSITIVE_ELEMENT_VALUE,
+        r"\g<xml_open>[REDACTED]\g<xml_close>",
+    ),
+    (
+        _XML_NAMED_SENSITIVE_VALUE,
+        r"\g<xml_attribute_prefix>\g<xml_value_quote>[REDACTED]\g<xml_value_quote>",
+    ),
     (
         _FISH_SENSITIVE_ASSIGNMENT,
         r"\g<indent>\g<trace>\g<prefix>[REDACTED]",

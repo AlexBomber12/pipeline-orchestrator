@@ -650,6 +650,11 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             "machine redis.example login alice password redis-netrc-secret",
             "mysql -u root -predis-mysql-short-secret",
             "mysql -p",
+            "<password>redis-xml-element-secret</password>",
+            '<property name="password" value="redis-xml-attribute-secret"/>',
+            "<property value='redis-xml-reversed-secret' name='clientSecret'/>",
+            "<username>retained-xml-element-value</username>",
+            '<property name="username" value="retained-xml-attribute-value"/>',
             json.dumps(
                 {
                     "kind": "Secret",
@@ -802,6 +807,11 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "  password ci-multiline-netrc-secret\n"
         + "mariadb -u root -pci-mysql-short-secret\n"
         + "mariadb -p\n"
+        + "<m:password>ci-xml-element-secret</m:password>\n"
+        + '<property name="apiKey" value="ci-xml-attribute-secret"/>\n'
+        + "<property value='ci-xml-reversed-secret' name='refreshToken'/>\n"
+        + "<m:username>retained-ci-xml-element-value</m:username>\n"
+        + '<property name="username" value="retained-ci-xml-attribute-value"/>\n'
         + "apiVersion: v1\ndata:\n"
         + "  opaque: ci-kube-yaml-secret\n"
         + "kind: Secret\nmetadata:\n  annotations:\n    note: |\n      ---\n"
@@ -910,6 +920,11 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-netrc-secret" not in content
         assert "redis-mysql-short-secret" not in content
         assert "mysql -p" in content
+        assert "redis-xml-element-secret" not in content
+        assert "redis-xml-attribute-secret" not in content
+        assert "redis-xml-reversed-secret" not in content
+        assert "retained-xml-element-value" in content
+        assert "retained-xml-attribute-value" in content
         assert "redis-kube-data-secret" not in content
         assert "redis-kube-string-secret" not in content
         assert "redis-kube-yaml-secret" not in content
@@ -961,6 +976,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-netrc-secret" not in content
         assert "ci-multiline-netrc-secret" not in content
         assert "ci-mysql-short-secret" not in content
+        assert "ci-xml-element-secret" not in content
+        assert "ci-xml-attribute-secret" not in content
+        assert "ci-xml-reversed-secret" not in content
         assert "disk-netrc-secret" not in content
         assert "ci-kube-data-secret" not in content
         assert "ci-kube-string-secret" not in content
@@ -1024,6 +1042,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-aliased-kind-secret" not in content
         if source_id == "ci:artifact":
             assert "mariadb -p" in content
+            assert "retained-ci-xml-element-value" in content
+            assert "retained-ci-xml-attribute-value" in content
             assert "retained-ci-list-config-value" in content
             assert "ci-kube-single-flow-secret" not in content
             assert "ci-kube-multiline-flow-secret" not in content
