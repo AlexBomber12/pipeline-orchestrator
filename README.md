@@ -113,7 +113,10 @@ changing `coder_plugins`; config reload does not hot-swap implementations.
 Registration exposes shared metadata and generic model controls, but runtime
 repository/default selection is still limited to the existing `CoderType`
 values (`claude` and `codex`). Arbitrary registered IDs are therefore not yet
-complete support for executing additional providers.
+complete support for executing additional providers. Legacy model-field
+fallbacks are likewise owned by their built-ins (`claude_model` by `claude`
+and `codex_model` by `codex`); additional plugins must set their model
+metadata's `config_field` to `None` and use `coder_settings`.
 
 ## Local development
 

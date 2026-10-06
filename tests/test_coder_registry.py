@@ -253,6 +253,19 @@ def test_build_registry_accepts_string_custom_model_setting_value() -> None:
         ),
         (
             "third",
+            "tests.configured_coder_plugin:build_foreign_legacy_field_plugin",
+            "metadata validation",
+        ),
+        (
+            "claude",
+            (
+                "tests.configured_coder_plugin:"
+                "build_claude_foreign_legacy_field_plugin"
+            ),
+            "metadata validation",
+        ),
+        (
+            "third",
             "tests.configured_coder_plugin:build_non_string_default_value_plugin",
             "metadata validation",
         ),

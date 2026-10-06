@@ -12,6 +12,10 @@ from src.config import DEFAULT_CODER_PLUGINS, AppConfig, DaemonConfig
 
 _PLUGIN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _RESERVED_PLUGIN_IDS = frozenset({"gh"})
+_LEGACY_MODEL_FIELDS = {
+    "claude": "claude_model",
+    "codex": "codex_model",
+}
 
 
 class CoderPluginConfigurationError(ValueError):
@@ -153,17 +157,15 @@ def _validate_plugin_metadata(
             "plugin.model_setting must be ModelSetting metadata",
         )
     legacy_field = model_setting.config_field
-    if legacy_field is not None and (
-        not isinstance(legacy_field, str)
-        or legacy_field not in DaemonConfig.model_fields
-        or DaemonConfig.model_fields[legacy_field].annotation is not str
+    if legacy_field is not None and legacy_field != _LEGACY_MODEL_FIELDS.get(
+        plugin_id
     ):
         raise _configuration_error(
             plugin_id,
             reference,
             "metadata validation",
-            "plugin.model_setting.config_field must be None or name a string "
-            "DaemonConfig field",
+            "plugin.model_setting.config_field must be None or the legacy "
+            "model field owned by this built-in plugin ID",
         )
     if not isinstance(model_setting.default_value, str):
         raise _configuration_error(

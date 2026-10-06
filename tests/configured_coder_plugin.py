@@ -161,6 +161,26 @@ def build_non_model_legacy_field_plugin() -> ConfiguredTestPlugin:
     return plugin
 
 
+def build_foreign_legacy_field_plugin() -> ConfiguredTestPlugin:
+    plugin = ConfiguredTestPlugin()
+    plugin.model_setting = ModelSetting(
+        config_field="claude_model",
+        default_value="third-default",
+        default_label="Test default",
+    )
+    return plugin
+
+
+def build_claude_foreign_legacy_field_plugin() -> ClaudeOverridePlugin:
+    plugin = ClaudeOverridePlugin()
+    plugin.model_setting = ModelSetting(
+        config_field="codex_model",
+        default_value="",
+        default_label="CLI default",
+    )
+    return plugin
+
+
 def build_non_string_default_value_plugin() -> ConfiguredTestPlugin:
     plugin = ConfiguredTestPlugin()
     plugin.model_setting = ModelSetting(
