@@ -677,6 +677,10 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             "machine redis.example login alice password redis-netrc-secret",
             "spring.datasource.password redis-java-property-secret",
             "spring.datasource.username retained-java-property-user",
+            "docker login -u user -p redis-docker-short-secret",
+            "docker login -p",
+            "aws configure set aws_secret_access_key redis-aws-configure-secret",
+            "aws configure set region retained-aws-region",
             "mysql -u root -predis-mysql-short-secret",
             "mysql -p",
             "<password>redis-xml-element-secret</password>",
@@ -845,6 +849,10 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "  password ci-multiline-netrc-secret\n"
         + "service.clientSecret ci-java-property-secret with-spaces\n"
         + "service.username retained-ci-java-property-user\n"
+        + "docker login -p 'ci docker short secret'\n"
+        + "docker login -p\n"
+        + "+ aws configure set profile.prod.client_secret 'ci aws configure secret'\n"
+        + "+ aws configure set region retained-ci-aws-region\n"
         + "mariadb -u root -pci-mysql-short-secret\n"
         + "mariadb -p\n"
         + "<m:password>ci-xml-element-secret</m:password>\n"
@@ -967,6 +975,10 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-netrc-secret" not in content
         assert "redis-java-property-secret" not in content
         assert "retained-java-property-user" in content
+        assert "redis-docker-short-secret" not in content
+        assert "docker login -p" in content
+        assert "redis-aws-configure-secret" not in content
+        assert "retained-aws-region" in content
         assert "redis-mysql-short-secret" not in content
         assert "mysql -p" in content
         assert "redis-xml-element-secret" not in content
@@ -1032,6 +1044,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-multiline-netrc-secret" not in content
         assert "ci-java-property-secret" not in content
         assert "with-spaces" not in content
+        assert "ci docker short secret" not in content
+        assert "ci aws configure secret" not in content
         assert "ci-mysql-short-secret" not in content
         assert "ci-xml-element-secret" not in content
         assert "ci-xml-cdata-secret" not in content
@@ -1103,6 +1117,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-aliased-kind-secret" not in content
         if source_id == "ci:artifact":
             assert "retained-ci-java-property-user" in content
+            assert "docker login -p" in content
+            assert "retained-ci-aws-region" in content
             assert "mariadb -p" in content
             assert "retained-ci-xml-element-value" in content
             assert "retained-ci-xml-multiline-value" in content

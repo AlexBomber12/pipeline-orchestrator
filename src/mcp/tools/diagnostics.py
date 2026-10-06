@@ -472,6 +472,28 @@ _REDACTION_RULES = (
     ),
     (
         re.compile(
+            r"(?im)(?P<docker_password_prefix>(?<![A-Za-z0-9_.-])"
+            r"docker(?:\.exe)?[ \t]+login(?=[ \t])[^\r\n;&|]*?"
+            r"(?<!\S)-p(?:=|[ \t]+)?)"
+            r"(?:(?P<docker_password_quote>[\"'])(?:\\[^\r\n]|"
+            r"(?!(?P=docker_password_quote))[^\\\r\n])*(?P=docker_password_quote)?|"
+            r"[^\s;&|]+)"
+        ),
+        r"\g<docker_password_prefix>[REDACTED]",
+    ),
+    (
+        re.compile(
+            rf"(?im)(?P<aws_configure_prefix>(?<![A-Za-z0-9_.-])"
+            rf"aws(?:\.exe)?(?=[ \t])[^\r\n;&|]*?(?<!\S)configure[ \t]+set[ \t]+"
+            rf"(?:{_SENSITIVE_KEY_PATTERN})[ \t]+)"
+            r"(?:(?P<aws_configure_quote>[\"'])(?:\\[^\r\n]|"
+            r"(?!(?P=aws_configure_quote))[^\\\r\n])*(?P=aws_configure_quote)?|"
+            r"[^\s;&|]+)"
+        ),
+        r"\g<aws_configure_prefix>[REDACTED]",
+    ),
+    (
+        re.compile(
             r"(?i)((?<!\S)(?:-u|-U|--user|--proxy-user)(?:=|[ \t]+))"
             r"(?:(?P<user_quote>[\"'])(?:\\[^\r\n]|(?!(?P=user_quote))[^\\\r\n])*"
             r"(?P=user_quote)?|[^\s]+)"
