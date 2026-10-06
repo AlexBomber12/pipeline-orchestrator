@@ -39,6 +39,9 @@ class ClaudeOverridePlugin(ClaudePlugin):
     name = "claude"
     display_name = "Configured Claude"
 
+    def check_auth(self, **_kwargs: object) -> dict[str, str]:
+        return {"status": "ok", "detail": "configured plugin auth"}
+
 
 class MissingMetadataPlugin(ConfiguredTestPlugin):
     display_name = ""

@@ -10,9 +10,11 @@ read ``CONFIG_PATH`` lazily from :mod:`src.web.app` so test overrides
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import subprocess
 
+from src.coder_registry import CoderRegistry
 from src.coders import build_coder_registry
 from src.config import load_config
 
@@ -102,18 +104,32 @@ def _config_path() -> str:
     return _app.CONFIG_PATH
 
 
-def _check_claude_auth() -> dict[str, str]:
+def _check_coder_auth(
+    registry: CoderRegistry,
+    plugin_id: str,
+) -> dict[str, str]:
+    """Probe one startup-registered coder in the active config context."""
+    check_auth = registry.get(plugin_id).check_auth
+    kwargs = (
+        {"config_path": _config_path()}
+        if "config_path" in inspect.signature(check_auth).parameters
+        else {}
+    )
+    return check_auth(**kwargs)
+
+
+def _check_claude_auth(
+    registry: CoderRegistry | None = None,
+) -> dict[str, str]:
     """Probe the ``claude`` CLI and report its authorization status."""
-    return build_coder_registry().get("claude").check_auth(
-        config_path=_config_path()
-    )
+    return _check_coder_auth(registry or build_coder_registry(), "claude")
 
 
-def _check_codex_auth() -> dict[str, str]:
+def _check_codex_auth(
+    registry: CoderRegistry | None = None,
+) -> dict[str, str]:
     """Probe the ``codex`` CLI and report its authorization status."""
-    return build_coder_registry().get("codex").check_auth(
-        config_path=_config_path()
-    )
+    return _check_coder_auth(registry or build_coder_registry(), "codex")
 
 
 def _check_gh_auth() -> dict[str, str]:
@@ -141,7 +157,9 @@ def _check_gh_auth() -> dict[str, str]:
     return {"status": "error", "detail": detail}
 
 
-async def _collect_auth_status() -> dict[str, dict[str, str]]:
+async def _collect_auth_status(
+    registry: CoderRegistry | None = None,
+) -> dict[str, dict[str, str]]:
     """Return ``{"claude": ..., "codex": ..., "gh": ...}`` auth status dicts.
 
     Each probe invokes a blocking ``subprocess.run`` call with a 5s
@@ -152,9 +170,10 @@ async def _collect_auth_status() -> dict[str, dict[str, str]]:
     auth-status poll cannot stall the worker for up to ~15s (three serial
     5s timeouts) whenever a CLI is missing or slow.
     """
+    active_registry = registry or build_coder_registry()
     claude, codex, gh = await asyncio.gather(
-        asyncio.to_thread(_check_claude_auth),
-        asyncio.to_thread(_check_codex_auth),
+        asyncio.to_thread(_check_claude_auth, active_registry),
+        asyncio.to_thread(_check_codex_auth, active_registry),
         asyncio.to_thread(_check_gh_auth),
     )
     global _AUTH_STATUS_CACHE

@@ -917,6 +917,12 @@ def test_arbitrary_plugin_model_round_trips_without_core_field(
     assert rendered.status_code == 200
     assert saved.status_code == 200
     assert "Configured Test Coder" in rendered.text
+    assert "Metadata only" in rendered.text
+    assert not re.search(
+        r'<input type="radio"[^>]*value="third"',
+        rendered.text,
+        re.DOTALL,
+    )
     assert "third_model" not in type(cfg.daemon).model_fields
     assert cfg.daemon.coder_settings == {
         "unrelated": {"model": "keep-me"},
@@ -1851,6 +1857,30 @@ def test_api_auth_status_returns_ok_for_both(
     assert payload["gh"]["status"] == "ok"
     assert "Logged in" in payload["gh"]["detail"]
     assert "octocat" in payload["gh"]["detail"]
+
+
+def test_api_auth_status_uses_configured_builtin_plugin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories: []\n"
+        "coder_plugins:\n"
+        "  claude: tests.configured_coder_plugin:build_claude_override\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/api/auth-status")
+
+    assert response.status_code == 200
+    assert response.json()["claude"] == {
+        "status": "ok",
+        "detail": "configured plugin auth",
+    }
 
 
 def test_api_auth_status_reports_errors(

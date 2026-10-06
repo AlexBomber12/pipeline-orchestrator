@@ -74,6 +74,7 @@
                         </div>
                     </td>
                     <td class="py-3 align-top">
+                        {% if coder.runtime_selectable %}
                         <input type="radio"
                                name="coder"
                                value="{{ coder.name }}"
@@ -83,6 +84,9 @@
                                hx-trigger="change"
                                hx-target="#settings-daemon"
                                hx-swap="innerHTML">
+                        {% else %}
+                        <span class="text-xs text-gray-500">Metadata only</span>
+                        {% endif %}
                     </td>
                 </tr>
                 {% endfor %}
