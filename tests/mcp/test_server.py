@@ -49,9 +49,11 @@ def test_runtime_diagnostics_can_be_disabled_for_restricted_instances(
 ) -> None:
     from src.mcp import server
 
+    monkeypatch.delenv("MCP_RUNTIME_DIAGNOSTICS", raising=False)
+    assert server._runtime_diagnostics_enabled() is False
     monkeypatch.setenv("MCP_RUNTIME_DIAGNOSTICS", "off")
     assert server._runtime_diagnostics_enabled() is False
-    monkeypatch.setenv("MCP_RUNTIME_DIAGNOSTICS", "1")
+    monkeypatch.setenv("MCP_RUNTIME_DIAGNOSTICS", "yes")
     assert server._runtime_diagnostics_enabled() is True
 
 
@@ -79,3 +81,27 @@ def test_restricted_mcp_instance_does_not_register_runtime_diagnostics() -> None
         "list_orchestrator_logs",
         "read_orchestrator_log",
     }.intersection(names)
+
+
+def test_opted_in_mcp_instance_registers_runtime_diagnostics() -> None:
+    script = (
+        "import asyncio, json; "
+        "from src.mcp.server import mcp; "
+        "print(json.dumps(sorted(tool.name for tool in asyncio.run(mcp.list_tools()))))"
+    )
+    environment = {**os.environ, "MCP_RUNTIME_DIAGNOSTICS": "1"}
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    names = json.loads(completed.stdout.strip().splitlines()[-1])
+
+    assert {
+        "get_orchestrator_status",
+        "list_orchestrator_logs",
+        "read_orchestrator_log",
+    }.issubset(names)

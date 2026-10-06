@@ -67,6 +67,8 @@ reported explicitly. Task-filtered run lookup scans the complete retained
 200-entry repository index until it finds the requested number of matching
 records. Each referenced run-record value is also size-checked and read through
 a capped `GETRANGE`; oversized records are reported without being materialized.
+Pending Retry command payloads use the same bounded-read rule and retain their
+index score and remaining TTL in the explicit oversized result.
 
 Runtime diagnostics are available on the primary MCP service, whose published
 port remains bound to localhost. When the optional `cloudflared` profile is
@@ -76,6 +78,12 @@ connection nor the event-directory mount. Existing non-diagnostic MCP tools
 remain available through the tunnel, but status and retained-log data cannot be
 discovered or read there. The tunnel network cannot reach the primary MCP
 service.
+
+Runtime diagnostics are opt-in at server startup. Compose sets
+`MCP_RUNTIME_DIAGNOSTICS=1` only on the localhost-published primary service; an
+unset value defaults to disabled for direct and custom deployments. Operators
+starting `python -m src.mcp` outside Compose must explicitly set the variable
+and retain an equivalent loopback-only or authenticated access boundary.
 
 The web/daemon producers and MCP reader all resolve disk events from
 `PO_EVENTS_DIR` (default `/data/events`). Compose maps

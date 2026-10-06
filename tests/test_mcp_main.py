@@ -5,6 +5,7 @@ import runpy
 def test_all_mcp_tools_registered_on_canonical_instance() -> None:
     """Regression guard for the Sprint 13.5 dual-FastMCP-instance bug fixed in this MICRO PR."""
     from src.mcp.server import mcp
+    from src.mcp.tools import diagnostics  # noqa: F401
 
     tools = asyncio.run(mcp.list_tools())
     tool_names = {tool.name for tool in tools}

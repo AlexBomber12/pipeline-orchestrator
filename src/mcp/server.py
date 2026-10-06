@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 
 def _runtime_diagnostics_enabled() -> bool:
     """Keep sensitive diagnostics off explicitly restricted MCP instances."""
-    value = os.environ.get("MCP_RUNTIME_DIAGNOSTICS", "1").strip().lower()
-    return value not in {"0", "false", "no", "off"}
+    value = os.environ.get("MCP_RUNTIME_DIAGNOSTICS", "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 mcp = FastMCP("pipeline-orchestrator", host="0.0.0.0", port=5173)
@@ -43,7 +43,7 @@ def healthcheck() -> dict[str, str]:
 from src.mcp.tools import functional, readonly  # noqa: E402, F401
 
 if _runtime_diagnostics_enabled():
-    from src.mcp.tools import diagnostics  # noqa: E402, F401
+    from src.mcp.tools import diagnostics  # noqa: E402, F401  # pragma: no cover - subprocess startup test
 
 
 def main() -> None:  # pragma: no cover - exercised only when running the server

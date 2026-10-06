@@ -321,6 +321,7 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
     assert "do not prove" in result["detail"]["coder_progress"]["interpretation"]
     assert before == (redis.store, redis.lists, redis.zsets, redis.ttls)
     assert not ({"set", "expire", "delete", "zrem", "ltrim"} & {name for name, _ in redis.calls})
+    assert not ({"get", "mget"} & {name for name, _ in redis.calls})
     assert redis.closed is True
 
 
@@ -1549,9 +1550,31 @@ async def test_status_helper_failures_remain_explicit() -> None:
 
     redis = FakeRedis()
     redis.zsets[retry_command_pending(SLUG)] = [("command", 1.0)]
-    redis.fail.add("get")
+    redis.fail.add("strlen")
     retries = await diagnostics._pending_retries(redis, SLUG)
     assert retries["commands"][0]["status"] == "unavailable"
+
+    redis = FakeRedis()
+    redis.zsets[retry_command_pending(SLUG)] = [("oversized", 1.0)]
+    command_key = retry_command(SLUG, "oversized")
+    redis.store[command_key] = "x" * (diagnostics._MAX_REDIS_RETRY_COMMAND_BYTES + 1)
+    redis.ttls[command_key] = 120
+    retries = await diagnostics._pending_retries(redis, SLUG)
+    assert retries["commands"] == [
+        {
+            "status": "oversized",
+            "command_id": "oversized",
+            "index_score": 1.0,
+            "source_size_bytes": diagnostics._MAX_REDIS_RETRY_COMMAND_BYTES + 1,
+            "read_bound_bytes": diagnostics._MAX_REDIS_RETRY_COMMAND_BYTES,
+            "ttl_seconds_remaining": 120,
+            "error": (
+                f"Stored Retry command is {diagnostics._MAX_REDIS_RETRY_COMMAND_BYTES + 1} bytes; "
+                f"the diagnostic read bound is {diagnostics._MAX_REDIS_RETRY_COMMAND_BYTES} bytes."
+            ),
+        }
+    ]
+    assert not any(operation in {"get", "getrange"} for operation, _ in redis.calls)
 
 
 async def test_run_filtering_unavailable_record_and_limit() -> None:

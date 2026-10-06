@@ -54,6 +54,7 @@ _MAX_REDIS_EVENT_HISTORY_BYTES = 256 * 1024
 _MAX_REDIS_CLI_LOG_BYTES = 64 * 1024
 _MAX_REDIS_STATE_BYTES = 1024 * 1024
 _MAX_REDIS_RUN_RECORD_BYTES = 64 * 1024
+_MAX_REDIS_RETRY_COMMAND_BYTES = 64 * 1024
 _MAX_RUN_INDEX_ENTRIES = 200
 _MAX_FILE_SCAN_BYTES = 256 * 1024
 _MAX_PRIVATE_KEY_CONTEXT_BYTES = 1024 * 1024
@@ -1891,6 +1892,24 @@ def _retry_payload(command: RetryCommand, ttl_seconds: int) -> dict[str, Any]:
     return payload
 
 
+async def _read_bounded_redis_value(
+    client: Any,
+    key: str,
+    maximum: int,
+) -> tuple[object | None, int | None, bool]:
+    """Read one Redis string without materializing more than its allowed bound."""
+    reported_size = int(await client.strlen(key))
+    if reported_size > maximum:
+        return None, reported_size, True
+    bounded = await client.getrange(key, 0, maximum)
+    observed_size = max(reported_size, len(bounded or b""))
+    if observed_size > maximum:
+        return None, observed_size, True
+    if observed_size == 0 and not await client.exists(key):
+        return None, None, False
+    return bounded, observed_size, False
+
+
 async def _pending_retries(redis_client: Any, repo_slug: str) -> dict[str, Any]:
     pending_key = retry_command_pending(repo_slug)
     try:
@@ -1910,7 +1929,11 @@ async def _pending_retries(redis_client: Any, repo_slug: str) -> dict[str, Any]:
         command_id = _decode(raw_id)
         command_key = retry_command(repo_slug, command_id)
         try:
-            raw = await redis_client.get(command_key)
+            raw, size_bytes, oversized = await _read_bounded_redis_value(
+                redis_client,
+                command_key,
+                _MAX_REDIS_RETRY_COMMAND_BYTES,
+            )
             ttl = int(await redis_client.ttl(command_key))
         except Exception as exc:
             commands.append(
@@ -1919,6 +1942,22 @@ async def _pending_retries(redis_client: Any, repo_slug: str) -> dict[str, Any]:
                     "command_id": command_id,
                     "index_score": score,
                     "error": _error_text(exc),
+                }
+            )
+            continue
+        if oversized:
+            commands.append(
+                {
+                    "status": "oversized",
+                    "command_id": command_id,
+                    "index_score": score,
+                    "source_size_bytes": size_bytes,
+                    "read_bound_bytes": _MAX_REDIS_RETRY_COMMAND_BYTES,
+                    "ttl_seconds_remaining": ttl,
+                    "error": (
+                        f"Stored Retry command is {size_bytes} bytes; "
+                        f"the diagnostic read bound is {_MAX_REDIS_RETRY_COMMAND_BYTES} bytes."
+                    ),
                 }
             )
             continue
@@ -2009,24 +2048,6 @@ def _run_payload(raw: object, run_id: str) -> dict[str, Any]:
         )
     }
     return {"status": "available", "record": selected}
-
-
-async def _read_bounded_redis_value(
-    client: Any,
-    key: str,
-    maximum: int,
-) -> tuple[object | None, int | None, bool]:
-    """Read one Redis string without materializing more than its allowed bound."""
-    reported_size = int(await client.strlen(key))
-    if reported_size > maximum:
-        return None, reported_size, True
-    bounded = await client.getrange(key, 0, maximum)
-    observed_size = max(reported_size, len(bounded or b""))
-    if observed_size > maximum:
-        return None, observed_size, True
-    if observed_size == 0 and not await client.exists(key):
-        return None, None, False
-    return bounded, observed_size, False
 
 
 async def _relevant_runs(
