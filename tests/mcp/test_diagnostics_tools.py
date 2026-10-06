@@ -146,6 +146,7 @@ class FakeRedis:
                 cursor_member,
                 cursor_digest,
                 cursor_index,
+                cursor_score_tail,
                 page_limit,
                 member_limit,
                 lookup_limit,
@@ -161,13 +162,21 @@ class FakeRedis:
                     while first < len(values) and values[first][1] < float(cursor_score):
                         first += 1
                     located = False
-                    search_start = first
-                    search_end = min(len(values), first + int(lookup_limit))
-                    if cursor_index != "":
+                    group_end = first
+                    while (
+                        group_end < len(values)
+                        and values[group_end][1] == float(cursor_score)
+                    ):
+                        group_end += 1
+                    if cursor_score_tail != "":
+                        center = group_end - int(cursor_score_tail) - 1
+                    elif cursor_index != "":
                         center = int(cursor_index)
-                        search_start = max(0, center - int(lookup_limit) // 2)
-                        search_end = min(len(values), search_start + int(lookup_limit))
-                        search_start = max(0, search_end - int(lookup_limit))
+                    else:
+                        center = first
+                    search_start = max(first, center - int(lookup_limit) // 2)
+                    search_end = min(group_end, search_start + int(lookup_limit))
+                    search_start = max(first, search_end - int(lookup_limit))
                     for position in range(search_start, search_end):
                         if values[position][1] != float(cursor_score):
                             continue
@@ -177,6 +186,18 @@ class FakeRedis:
                             first = position + 1
                             located = True
                             break
+                    if (
+                        not located
+                        and cursor_score_tail != ""
+                        and cursor_index != ""
+                        and first <= int(cursor_index) < group_end
+                    ):
+                        position = int(cursor_index)
+                        member = values[position][0]
+                        raw_member = member if isinstance(member, bytes) else str(member).encode()
+                        if hashlib.sha1(raw_member).hexdigest() == cursor_digest:
+                            first = position + 1
+                            located = True
                     if not located:
                         return [len(values), -1, []]
             selected = values[first : first + int(page_limit)]
@@ -184,6 +205,11 @@ class FakeRedis:
             for offset, (member, score) in enumerate(selected):
                 raw_member = member if isinstance(member, bytes) else str(member).encode()
                 oversized = len(raw_member) > int(member_limit)
+                score_tail = sum(
+                    1
+                    for _later_member, later_score in values[first + offset + 1 :]
+                    if later_score == score
+                )
                 flattened.extend(
                     (
                         "" if oversized else member,
@@ -191,6 +217,7 @@ class FakeRedis:
                         first + offset,
                         len(raw_member),
                         hashlib.sha1(raw_member).hexdigest() if oversized else "",
+                        score_tail if oversized else "",
                     )
                 )
             return [len(values), first, flattened]
@@ -651,6 +678,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             "mysql -u root -predis-mysql-short-secret",
             "mysql -p",
             "<password>redis-xml-element-secret</password>",
+            "<password><![CDATA[redis-xml-cdata-secret]]></password>",
             '<property name="password" value="redis-xml-attribute-secret"/>',
             "<property value='redis-xml-reversed-secret' name='clientSecret'/>",
             "<username>retained-xml-element-value</username>",
@@ -808,6 +836,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "mariadb -u root -pci-mysql-short-secret\n"
         + "mariadb -p\n"
         + "<m:password>ci-xml-element-secret</m:password>\n"
+        + "<m:password><![CDATA[ci-xml-cdata-secret]]></m:password>\n"
         + '<property name="apiKey" value="ci-xml-attribute-secret"/>\n'
         + "<property value='ci-xml-reversed-secret' name='refreshToken'/>\n"
         + "<m:username>retained-ci-xml-element-value</m:username>\n"
@@ -921,6 +950,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-mysql-short-secret" not in content
         assert "mysql -p" in content
         assert "redis-xml-element-secret" not in content
+        assert "redis-xml-cdata-secret" not in content
         assert "redis-xml-attribute-secret" not in content
         assert "redis-xml-reversed-secret" not in content
         assert "retained-xml-element-value" in content
@@ -977,6 +1007,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-multiline-netrc-secret" not in content
         assert "ci-mysql-short-secret" not in content
         assert "ci-xml-element-secret" not in content
+        assert "ci-xml-cdata-secret" not in content
         assert "ci-xml-attribute-secret" not in content
         assert "ci-xml-reversed-secret" not in content
         assert "disk-netrc-secret" not in content
@@ -2710,20 +2741,34 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
         has_more_after_raw=True,
     ) == (1, True)
     retry_cursor = diagnostics._retry_cursor(1.5, "command")
-    assert diagnostics._validate_retry_cursor(retry_cursor) == (1.5, "command", "", None)
+    assert diagnostics._validate_retry_cursor(retry_cursor) == (
+        1.5,
+        "command",
+        "",
+        None,
+        None,
+    )
     digest_cursor = diagnostics._retry_cursor(1.5, "", member_sha1="a" * 40)
-    assert diagnostics._validate_retry_cursor(digest_cursor) == (1.5, "", "a" * 40, None)
+    assert diagnostics._validate_retry_cursor(digest_cursor) == (
+        1.5,
+        "",
+        "a" * 40,
+        None,
+        None,
+    )
     indexed_digest_cursor = diagnostics._retry_cursor(
         1.5,
         "",
         member_sha1="a" * 40,
         member_index=250,
+        member_score_tail=25,
     )
     assert diagnostics._validate_retry_cursor(indexed_digest_cursor) == (
         1.5,
         "",
         "a" * 40,
         250,
+        25,
     )
     with pytest.raises(ValueError, match="nonempty bounded"):
         diagnostics._validate_retry_cursor("")
@@ -2742,6 +2787,19 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     with pytest.raises(ValueError, match="malformed"):
         diagnostics._validate_retry_cursor(
             diagnostics._retry_cursor(1.5, "", member_sha1="a" * 40, member_index=-1)
+        )
+    with pytest.raises(ValueError, match="malformed"):
+        diagnostics._validate_retry_cursor(
+            diagnostics._retry_cursor(1.5, "command", member_score_tail=1)
+        )
+    with pytest.raises(ValueError, match="malformed"):
+        diagnostics._validate_retry_cursor(
+            diagnostics._retry_cursor(
+                1.5,
+                "",
+                member_sha1="a" * 40,
+                member_score_tail=-1,
+            )
         )
     assert (
         diagnostics._yaml_explicit_value_end(
@@ -3386,6 +3444,15 @@ async def test_pending_retry_index_members_are_bounded_and_paginated(
         for operation, value in redis.calls
     )
 
+    legacy_cursor = diagnostics._retry_cursor(
+        2.0,
+        "",
+        member_sha1=hashlib.sha1(oversized_member.encode()).hexdigest(),
+        member_index=1,
+    )
+    legacy_second = await diagnostics._pending_retries(redis, SLUG, legacy_cursor)
+    assert [item["command_id"] for item in legacy_second["commands"]] == ["safe-after"]
+
     redis.zsets[pending_key].pop(1)
     missing_cursor_member = await diagnostics._pending_retries(redis, SLUG, next_cursor)
     assert missing_cursor_member["status"] == "unavailable"
@@ -3393,7 +3460,11 @@ async def test_pending_retry_index_members_are_bounded_and_paginated(
 
     async def missing_digest(*args: Any, **kwargs: Any) -> list[object]:
         del args, kwargs
-        return [1, 0, ["", 1.0, 0, diagnostics._MAX_RETRY_INDEX_MEMBER_BYTES + 1, ""]]
+        return [
+            1,
+            0,
+            ["", 1.0, 0, diagnostics._MAX_RETRY_INDEX_MEMBER_BYTES + 1, "", 0],
+        ]
 
     redis.eval_ro = missing_digest  # type: ignore[method-assign]
     malformed = await diagnostics._pending_retries(redis, SLUG)
@@ -3403,7 +3474,7 @@ async def test_pending_retry_index_members_are_bounded_and_paginated(
 
     async def dishonest_member_size(*args: Any, **kwargs: Any) -> list[object]:
         del args, kwargs
-        return [1, 0, [oversized_member, 1.0, 0, 1, digest]]
+        return [1, 0, [oversized_member, 1.0, 0, 1, digest, 0]]
 
     redis.eval_ro = dishonest_member_size  # type: ignore[method-assign]
     dishonest = await diagnostics._pending_retries(redis, SLUG)
@@ -3437,6 +3508,38 @@ async def test_oversized_retry_cursor_pages_past_large_score_tie(
         cursor = continuation["next_cursor"]
 
     assert observed_indexes == list(range(diagnostics._MAX_RETRY_CURSOR_LOOKUP + 30))
+
+
+async def test_oversized_retry_cursor_survives_earlier_deletions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    monkeypatch.setattr(diagnostics, "_MAX_PENDING_RETRIES", 20)
+    redis = FakeRedis()
+    pending_key = retry_command_pending(SLUG)
+    member_prefix = "x" * diagnostics._MAX_RETRY_INDEX_MEMBER_BYTES
+    members = [
+        f"{member_prefix}{index:04d}"
+        for index in range(diagnostics._MAX_RETRY_CURSOR_LOOKUP + 50)
+    ]
+    redis.zsets[pending_key] = [(member, 1.0) for member in members]
+    cursor_index = diagnostics._MAX_RETRY_CURSOR_LOOKUP + 19
+    cursor_member = members[cursor_index]
+    cursor = diagnostics._retry_cursor(
+        1.0,
+        "",
+        member_sha1=hashlib.sha1(cursor_member.encode()).hexdigest(),
+        member_index=cursor_index,
+        member_score_tail=len(members) - cursor_index - 1,
+    )
+
+    del redis.zsets[pending_key][:120]
+    page = await diagnostics._pending_retries(redis, SLUG, cursor)
+
+    assert page["status"] == "available"
+    assert page["position_at_observation"] == cursor_index - 119
+    assert page["commands"][0]["index"] == cursor_index - 119
 
 
 async def test_run_filtering_unavailable_record_and_limit() -> None:

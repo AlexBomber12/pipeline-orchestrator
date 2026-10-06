@@ -99,6 +99,7 @@ if ARGV[1] ~= '' then
   local cursor_member = ARGV[2]
   local cursor_digest = ARGV[3]
   local cursor_index = ARGV[4]
+  local cursor_score_tail = ARGV[5]
   local low = 0
   local high = total
   while low < high do
@@ -120,15 +121,29 @@ if ARGV[1] ~= '' then
   first = low
   if cursor_digest ~= '' then
     local found = false
-    local lookup_limit = tonumber(ARGV[7])
+    local lookup_limit = tonumber(ARGV[8])
     local search_start = first
-    local search_end = math.min(total - 1, first + lookup_limit - 1)
-    if cursor_index ~= '' then
-      local center = tonumber(cursor_index)
-      search_start = math.max(0, center - math.floor(lookup_limit / 2))
-      search_end = math.min(total - 1, search_start + lookup_limit - 1)
-      search_start = math.max(0, search_end - lookup_limit + 1)
+    local group_low = first
+    local group_high = total
+    while group_low < group_high do
+      local middle = math.floor((group_low + group_high) / 2)
+      local row = redis.call('ZRANGE', KEYS[1], middle, middle, 'WITHSCORES')
+      if #row == 0 or tonumber(row[2]) > cursor_score then
+        group_high = middle
+      else
+        group_low = middle + 1
+      end
     end
+    local group_end = group_low
+    local center = first
+    if cursor_score_tail ~= '' then
+      center = group_end - tonumber(cursor_score_tail) - 1
+    elseif cursor_index ~= '' then
+      center = tonumber(cursor_index)
+    end
+    search_start = math.max(first, center - math.floor(lookup_limit / 2))
+    local search_end = math.min(group_end - 1, search_start + lookup_limit - 1)
+    search_start = math.max(first, search_end - lookup_limit + 1)
     for position = search_start, search_end do
       local row = redis.call('ZRANGE', KEYS[1], position, position, 'WITHSCORES')
       if #row > 0 and tonumber(row[2]) == cursor_score and redis.sha1hex(row[1]) == cursor_digest then
@@ -137,23 +152,51 @@ if ARGV[1] ~= '' then
         break
       end
     end
+    if not found and cursor_score_tail ~= '' and cursor_index ~= '' then
+      local legacy_position = tonumber(cursor_index)
+      if legacy_position >= first and legacy_position < group_end then
+        local row = redis.call('ZRANGE', KEYS[1], legacy_position, legacy_position, 'WITHSCORES')
+        if #row > 0 and tonumber(row[2]) == cursor_score and redis.sha1hex(row[1]) == cursor_digest then
+          first = legacy_position + 1
+          found = true
+        end
+      end
+    end
     if not found then
       return {total, -1, {}}
     end
   end
 end
-local raw = redis.call('ZRANGE', KEYS[1], first, first + tonumber(ARGV[5]) - 1, 'WITHSCORES')
-local maximum = tonumber(ARGV[6])
+local raw = redis.call('ZRANGE', KEYS[1], first, first + tonumber(ARGV[6]) - 1, 'WITHSCORES')
+local maximum = tonumber(ARGV[7])
 local rows = {}
 for offset = 1, #raw, 2 do
   local member = raw[offset]
   local size = string.len(member)
   local oversized = size > maximum
+  local position = first + math.floor((offset - 1) / 2)
+  local score_tail = ''
+  if oversized then
+    local score = tonumber(raw[offset + 1])
+    local low = position + 1
+    local high = total
+    while low < high do
+      local middle = math.floor((low + high) / 2)
+      local row = redis.call('ZRANGE', KEYS[1], middle, middle, 'WITHSCORES')
+      if #row == 0 or tonumber(row[2]) > score then
+        high = middle
+      else
+        low = middle + 1
+      end
+    end
+    score_tail = low - position - 1
+  end
   table.insert(rows, oversized and '' or member)
   table.insert(rows, raw[offset + 1])
-  table.insert(rows, first + math.floor((offset - 1) / 2))
+  table.insert(rows, position)
   table.insert(rows, size)
   table.insert(rows, oversized and redis.sha1hex(member) or '')
+  table.insert(rows, score_tail)
 end
 return {total, first, rows}
 """
@@ -369,7 +412,7 @@ _HCL_BLOCK_STATE_BASE = 4
 _XML_SENSITIVE_ELEMENT_VALUE = re.compile(
     rf"(?i)(?P<xml_open><(?P<xml_namespace>(?:[A-Za-z_][A-Za-z0-9_.-]*:)?)"
     rf"(?P<xml_element>{_SENSITIVE_KEY_PATTERN})(?=[ \t/>])[^<>\r\n]*>)"
-    r"(?P<xml_value>[^<\r\n]+?)"
+    r"(?P<xml_value><!\[CDATA\[(?:(?!\]\]>)[^\r\n])*\]\]>|[^<\r\n]+?)"
     r"(?P<xml_close></(?P=xml_namespace)(?P=xml_element)[ \t]*>)"
 )
 _XML_NAMED_SENSITIVE_VALUE = re.compile(
@@ -554,13 +597,20 @@ def _retry_cursor(
     *,
     member_sha1: str | None = None,
     member_index: int | None = None,
+    member_score_tail: int | None = None,
 ) -> str:
     if member_sha1 is not None:
-        identity = {"member_sha1": member_sha1, "member_index": member_index}
+        identity = {
+            "member_sha1": member_sha1,
+            "member_index": member_index,
+            "member_score_tail": member_score_tail,
+        }
     else:
         identity = {"member": member}
         if member_index is not None:
             identity["member_index"] = member_index
+        if member_score_tail is not None:
+            identity["member_score_tail"] = member_score_tail
     payload = json.dumps(
         {"score": score, **identity},
         sort_keys=True,
@@ -569,7 +619,9 @@ def _retry_cursor(
     return base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
 
-def _validate_retry_cursor(value: str | None) -> tuple[float, str, str, int | None] | None:
+def _validate_retry_cursor(
+    value: str | None,
+) -> tuple[float, str, str, int | None, int | None] | None:
     if value is None:
         return None
     if not isinstance(value, str) or not value or len(value) > _MAX_RETRY_CURSOR_CHARS:
@@ -581,6 +633,7 @@ def _validate_retry_cursor(value: str | None) -> tuple[float, str, str, int | No
         member = decoded.get("member", "")
         member_sha1 = decoded.get("member_sha1", "")
         member_index = decoded.get("member_index")
+        member_score_tail = decoded.get("member_score_tail")
     except (AttributeError, binascii.Error, KeyError, TypeError, ValueError) as exc:
         raise ValueError("retry_cursor is malformed") from exc
     if (
@@ -590,7 +643,7 @@ def _validate_retry_cursor(value: str | None) -> tuple[float, str, str, int | No
         or bool(member) == bool(member_sha1)
         or len(member) > _MAX_RETRY_CURSOR_CHARS
         or (member_sha1 and re.fullmatch(r"[0-9a-f]{40}", member_sha1) is None)
-        or (member and member_index is not None)
+        or (member and (member_index is not None or member_score_tail is not None))
         or (
             member_sha1
             and member_index is not None
@@ -600,9 +653,18 @@ def _validate_retry_cursor(value: str | None) -> tuple[float, str, str, int | No
                 or member_index < 0
             )
         )
+        or (
+            member_sha1
+            and member_score_tail is not None
+            and (
+                isinstance(member_score_tail, bool)
+                or not isinstance(member_score_tail, int)
+                or member_score_tail < 0
+            )
+        )
     ):
         raise ValueError("retry_cursor is malformed")
-    return score, member, member_sha1, member_index
+    return score, member, member_sha1, member_index, member_score_tail
 
 
 def _new_redis_client() -> Any:
@@ -3714,6 +3776,7 @@ async def _pending_retries(
             "" if after is None else after[1],
             "" if after is None else after[2],
             "" if after is None or after[3] is None else after[3],
+            "" if after is None or after[4] is None else after[4],
             _MAX_PENDING_RETRIES,
             _MAX_RETRY_INDEX_MEMBER_BYTES,
             _MAX_RETRY_CURSOR_LOOKUP,
@@ -3742,15 +3805,16 @@ async def _pending_retries(
                 "The oversized Retry cursor member is no longer locatable within the bounded scan."
             )
         flat_rows = list(page[2])
-        if len(flat_rows) % 5:
+        if len(flat_rows) % 6:
             raise ValueError("Pending Retry rows are incomplete.")
         indexed = []
-        for index in range(0, len(flat_rows), 5):
+        for index in range(0, len(flat_rows), 6):
             raw_id = flat_rows[index]
             score = float(flat_rows[index + 1])
             source_index = int(flat_rows[index + 2])
             size_bytes = int(flat_rows[index + 3])
             member_sha1 = flat_rows[index + 4]
+            member_score_tail = flat_rows[index + 5]
             observed_size = len(raw_id if isinstance(raw_id, bytes) else str(raw_id).encode())
             if observed_size > _MAX_RETRY_INDEX_MEMBER_BYTES:
                 size_bytes = max(size_bytes, observed_size)
@@ -3758,10 +3822,21 @@ async def _pending_retries(
             if oversized and (
                 not isinstance(member_sha1, str)
                 or re.fullmatch(r"[0-9a-f]{40}", member_sha1) is None
+                or isinstance(member_score_tail, bool)
+                or not isinstance(member_score_tail, int)
+                or member_score_tail < 0
             ):
                 raise ValueError("Oversized pending Retry row has no bounded cursor identity.")
             indexed.append(
-                (raw_id, score, source_index, size_bytes, member_sha1, oversized)
+                (
+                    raw_id,
+                    score,
+                    source_index,
+                    size_bytes,
+                    member_sha1,
+                    member_score_tail,
+                    oversized,
+                )
             )
     except (TypeError, ValueError) as exc:
         return {
@@ -3773,7 +3848,15 @@ async def _pending_retries(
         }
     commands: list[dict[str, Any]] = []
     for row in indexed:
-        raw_id, score, source_index, member_size_bytes, _member_sha1, member_oversized = row
+        (
+            raw_id,
+            score,
+            source_index,
+            member_size_bytes,
+            _member_sha1,
+            _member_score_tail,
+            member_oversized,
+        ) = row
         if member_oversized:
             commands.append(
                 {
@@ -3857,12 +3940,21 @@ async def _pending_retries(
     next_index = first_index + len(indexed)
     next_cursor = None
     if indexed and next_index < total:
-        last_id, last_score, _last_index, _last_size, last_sha1, last_oversized = indexed[-1]
+        (
+            last_id,
+            last_score,
+            _last_index,
+            _last_size,
+            last_sha1,
+            last_score_tail,
+            last_oversized,
+        ) = indexed[-1]
         next_cursor = _retry_cursor(
             float(last_score),
             "" if last_oversized else _decode(last_id),
             member_sha1=last_sha1 if last_oversized else None,
             member_index=_last_index if last_oversized else None,
+            member_score_tail=last_score_tail if last_oversized else None,
         )
     return {
         "status": "available",
