@@ -762,6 +762,35 @@ def _contains_sensitive_yaml_environment(
         seen.remove(identity)
 
 
+def _contains_sensitive_yaml_key(
+    value: Any,
+    *,
+    depth: int = 0,
+    seen: set[int] | None = None,
+) -> bool:
+    """Find a decoded sensitive mapping key in parsed YAML."""
+    if not isinstance(value, (dict, list)) or depth >= _MAX_STRUCTURED_DEPTH:
+        return False
+    seen = set() if seen is None else seen
+    identity = id(value)
+    if identity in seen:
+        return False
+    seen.add(identity)
+    try:
+        if isinstance(value, dict):
+            if any(isinstance(key, str) and _SENSITIVE_KEY.fullmatch(key) for key in value):
+                return True
+            children = value.values()
+        else:
+            children = value
+        return any(
+            _contains_sensitive_yaml_key(child, depth=depth + 1, seen=seen)
+            for child in children
+        )
+    finally:
+        seen.remove(identity)
+
+
 def _yaml_flow_sensitivity(text: str) -> str | None:
     """Classify a complete bounded YAML flow collection."""
     stripped = text.strip()
@@ -787,6 +816,8 @@ def _yaml_flow_sensitivity(text: str) -> str | None:
             return "KUBERNETES SECRET"
         if _contains_sensitive_yaml_environment(parsed):
             return "YAML ENVIRONMENT VALUE"
+        if _contains_sensitive_yaml_key(parsed):
+            return "YAML ASSIGNMENT"
     if _YAML_FLOW_KIND_SECRET.search(stripped) and _YAML_FLOW_SECRET_PAYLOAD.search(stripped):
         return "KUBERNETES SECRET"
     return None
@@ -878,6 +909,29 @@ def _yaml_mapping_scalar_values(lines: list[bytes], key: str) -> dict[int, str]:
         elif isinstance(value_token, yaml.tokens.AliasToken):
             values[token.start_mark.line] = f"*{value_token.value}"
     return values
+
+
+def _yaml_sensitive_assignment(text: str) -> tuple[int, str] | None:
+    """Return indent and raw value for a decoded sensitive YAML mapping key."""
+    try:
+        tokens = list(yaml.scan(text))
+    except (RecursionError, yaml.YAMLError):
+        return None
+    for index, token in enumerate(tokens):
+        if (
+            not isinstance(token, yaml.tokens.ScalarToken)
+            or not isinstance(token.value, str)
+            or _SENSITIVE_KEY.fullmatch(token.value) is None
+            or index == 0
+            or not isinstance(tokens[index - 1], yaml.tokens.KeyToken)
+        ):
+            continue
+        prefix = text[: token.start_mark.column]
+        if re.fullmatch(r"[ \t]*(?:-[ \t]+)?", prefix) is None:
+            continue
+        value_token = tokens[index + 1]
+        return len(prefix) - len(prefix.lstrip(" \t")), text[value_token.end_mark.column :].strip()
+    return None
 
 
 def _yaml_scalar_anchors(lines: list[bytes]) -> dict[str, str]:
@@ -1054,9 +1108,16 @@ def _sensitive_state_before(
         if not raw_line.strip():
             continue
         line = raw_line.decode("utf-8", errors="replace")
+        yaml_assignment = _yaml_sensitive_assignment(line)
         starts_with_sensitive_value = (
             _PENDING_SENSITIVE_ASSIGNMENT.search(line) is not None
             and _BLOCK_SENSITIVE_ASSIGNMENT.fullmatch(line) is None
+        ) or (
+            yaml_assignment is not None
+            and (
+                not yaml_assignment[1]
+                or yaml_assignment[1].startswith(("|", ">"))
+            )
         )
         break
     first_raw_line = next((line for line in raw.splitlines() if line.strip()), None)
@@ -1108,8 +1169,12 @@ def _sensitive_state_before(
             or _PLAIN_SENSITIVE_ASSIGNMENT.fullmatch(line)
             or _PENDING_YAML_SENSITIVE_ASSIGNMENT.fullmatch(line)
         )
+        yaml_assignment = _yaml_sensitive_assignment(line)
         if indented_match is not None:
             active_block_indent = len(indented_match.group("indent"))
+            block_state_known = True
+        elif yaml_assignment is not None:
+            active_block_indent = yaml_assignment[0]
             block_state_known = True
         elif _PENDING_SENSITIVE_ASSIGNMENT.search(line) is not None:
             active_block_indent = indent
@@ -1797,6 +1862,21 @@ def _redacted_file_units(
                     units.append((raw_unit, "[REDACTED SENSITIVE ASSIGNMENT]\n", 1))
                     line_index += 1
                     continue
+            yaml_assignment = _yaml_sensitive_assignment(text_unit.rstrip("\r\n"))
+            if yaml_assignment is not None:
+                assignment_indent = yaml_assignment[0]
+                value_end = line_index + 1
+                while value_end < len(raw_lines):
+                    if (
+                        raw_lines[value_end].strip()
+                        and _line_indent(raw_lines[value_end]) <= assignment_indent
+                    ):
+                        break
+                    value_end += 1
+                raw_unit = b"".join(raw_lines[line_index:value_end])
+                units.append((raw_unit, "[REDACTED SENSITIVE YAML ASSIGNMENT]\n", 1))
+                line_index = value_end
+                continue
             safe_unit, replacements = _redact_logical_text(text_unit)
             units.append((raw_unit, safe_unit, replacements))
         line_index += 1
@@ -2136,11 +2216,20 @@ async def _read_bounded_redis_value(
     return bounded, observed_size, False
 
 
-async def _pending_retries(redis_client: Any, repo_slug: str) -> dict[str, Any]:
+async def _pending_retries(
+    redis_client: Any,
+    repo_slug: str,
+    cursor: int = 0,
+) -> dict[str, Any]:
     pending_key = retry_command_pending(repo_slug)
     try:
         total = int(await redis_client.zcard(pending_key))
-        indexed = await redis_client.zrange(pending_key, 0, _MAX_PENDING_RETRIES - 1, withscores=True)
+        indexed = await redis_client.zrange(
+            pending_key,
+            cursor,
+            cursor + _MAX_PENDING_RETRIES - 1,
+            withscores=True,
+        )
     except Exception as exc:
         return {
             "status": "unavailable",
@@ -2217,12 +2306,15 @@ async def _pending_retries(redis_client: Any, repo_slug: str) -> dict[str, Any]:
                 "command": _retry_payload(command, ttl),
             }
         )
+    next_index = cursor + len(indexed)
     return {
         "status": "available",
         "count": total,
         "commands": commands,
-        "truncated": total > len(indexed),
-        "continuation": ({"next_index": len(indexed)} if total > len(indexed) else None),
+        "cursor": cursor,
+        "page_limit": _MAX_PENDING_RETRIES,
+        "truncated": next_index < total,
+        "continuation": ({"next_index": next_index} if next_index < total else None),
         "error": None,
         "read_only_note": (
             "Index and payloads were read directly; missing or malformed members "
@@ -2307,6 +2399,8 @@ async def _relevant_runs(
             )
         except Exception as exc:
             records.append({"status": "unavailable", "run_id": run_id, "error": _error_text(exc)})
+            if len(records) >= limit:
+                break
             continue
         if oversized:
             records.append(
@@ -2427,6 +2521,7 @@ async def get_orchestrator_status(
     repo_slug: str | None = None,
     event_limit: int = 10,
     run_limit: int = 5,
+    retry_cursor: int = 0,
 ) -> dict[str, Any]:
     """Return runtime status without mutating orchestrator state.
 
@@ -2434,9 +2529,12 @@ async def get_orchestrator_status(
     Supply a configured ``owner__repo`` slug for queue, inhibitor, event,
     pending-Retry, and run-record detail. Snapshot freshness is reported
     separately from progress evidence and never treated as coder liveness.
+    Pass a returned pending-Retry ``next_index`` as ``retry_cursor`` to read
+    the next bounded page.
     """
     event_limit = _validate_limit(event_limit, maximum=_MAX_STATUS_EVENTS, name="event_limit")
     run_limit = _validate_limit(run_limit, maximum=_MAX_STATUS_RUNS, name="run_limit")
+    retry_cursor = _validate_cursor(retry_cursor)
     observed_at = _utc_now()
     try:
         config, repositories = _configured_repositories()
@@ -2523,7 +2621,7 @@ async def get_orchestrator_status(
         state = states[repo_slug]
         if client is not None and redis_status != "unavailable":
             events = await _recent_events(client, repo_slug, event_limit)
-            retries = await _pending_retries(client, repo_slug)
+            retries = await _pending_retries(client, repo_slug, retry_cursor)
             runs = await _relevant_runs(
                 client,
                 repo_slug,

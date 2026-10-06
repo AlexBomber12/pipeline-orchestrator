@@ -315,6 +315,11 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
     assert result["detail"]["recent_events"]["malformed_records"] == 1
     retry_statuses = [item["status"] for item in result["detail"]["pending_retries"]["commands"]]
     assert retry_statuses == ["available", "missing_payload", "malformed"]
+    retry_page = await get_orchestrator_status(SLUG, retry_cursor=2)
+    assert retry_page["detail"]["pending_retries"]["cursor"] == 2
+    assert [
+        item["status"] for item in retry_page["detail"]["pending_retries"]["commands"]
+    ] == ["malformed"]
     assert result["detail"]["run_records"]["missing_indexed_records"] == 1
     assert result["detail"]["coder_progress"]["process_activity"] == "unknown"
     assert result["detail"]["coder_progress"]["unfinished_run_records"][0]["run_id"] == "run-active"
@@ -379,6 +384,8 @@ async def test_status_configuration_failure_and_validation(monkeypatch: pytest.M
         await diagnostics.get_orchestrator_status(event_limit=0)
     with pytest.raises(ValueError, match="run_limit"):
         await diagnostics.get_orchestrator_status(run_limit=999)
+    with pytest.raises(ValueError, match="cursor"):
+        await diagnostics.get_orchestrator_status(retry_cursor=-1)
 
 
 async def test_log_discovery_and_reads_are_bounded_and_redacted(
@@ -554,6 +561,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             "---",
             "env: [{name: SAFE, value: retained-flow-env-value}]",
             "---",
+            '"pass\\u0077ord": redis-escaped-yaml-secret',
+            '"pass\\u0061ge": retained-escaped-yaml-value',
             (
                 "apiVersion: v1\ndata:\n"
                 "  opaque: redis-kube-yaml-secret\n"
@@ -715,6 +724,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + " data: {harmless: retained-ci-multiline-flow-config}}\n"
         + "---\n"
         + "env: [{name: SAFE, value: retained-ci-flow-env-value}]\n"
+        + '"pass\\u0077ord": ci-escaped-yaml-secret\n'
+        + '"pass\\u0077ord": |-\n  ci-escaped-yaml-first\n  ci-escaped-yaml-second\n'
+        + '"pass\\u0061ge": retained-ci-escaped-yaml-value\n'
         + "---\nkind: ConfigMap\ndata:\n  harmless: retained-ci-config-value\n"
         + '2026-10-05 INFO {"password":987654322,"debug":true}\n',
         encoding="utf-8",
@@ -805,11 +817,13 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-flow-env-secret" not in content
         assert "redis-reversed-flow-env-secret" not in content
         assert "redis-multiline-flow-env-secret" not in content
+        assert "redis-escaped-yaml-secret" not in content
         assert "retained-list-config-value" in content
         assert "retained-config-value" in content
         assert "retained-single-flow-config" in content
         assert "retained-multiline-flow-config" in content
         assert "retained-flow-env-value" in content
+        assert "retained-escaped-yaml-value" in content
         assert docker_auth not in content
 
     for source_id, list_secret in (
@@ -896,9 +910,13 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             assert "ci-flow-env-secret" not in content
             assert "ci-reversed-flow-env-secret" not in content
             assert "ci-multiline-flow-env-secret" not in content
+            assert "ci-escaped-yaml-secret" not in content
+            assert "ci-escaped-yaml-first" not in content
+            assert "ci-escaped-yaml-second" not in content
             assert "retained-ci-single-flow-config" in content
             assert "retained-ci-multiline-flow-config" in content
             assert "retained-ci-flow-env-value" in content
+            assert "retained-ci-escaped-yaml-value" in content
             assert "retained-ci-block-kind-config-value" in content
             assert "retained-ci-aliased-yaml-env-value" in content
             assert "retained-ci-aliased-config-value" in content
@@ -984,6 +1002,15 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
     )
     assert "ci-block-kind-secret" not in block_kind_page["content"]
     assert "SENSITIVE" in block_kind_page["content"]
+
+    escaped_yaml_page = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=ci_raw.index(b"  ci-escaped-yaml-second"),
+        max_chars=300,
+    )
+    assert "ci-escaped-yaml-second" not in escaped_yaml_page["content"]
+    assert "SENSITIVE" in escaped_yaml_page["content"]
 
     decorated_env_page = await diagnostics.read_orchestrator_log(
         SLUG,
@@ -1274,6 +1301,14 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
         "kind",
     ) == {0: "Secret", 3: "*kindValue"}
     assert diagnostics._yaml_mapping_scalar_values([b"kind: [\n"], "kind") == {}
+    assert diagnostics._yaml_sensitive_assignment(
+        '  - "pass\\u0077ord": plainsecret'
+    ) == (2, "plainsecret")
+    assert diagnostics._yaml_sensitive_assignment('"pass\\u0061ge": visible') is None
+    assert diagnostics._yaml_sensitive_assignment('"pass\\u0077ord') is None
+    assert diagnostics._yaml_flow_sensitivity(
+        '{"pass\\u0077ord": hidden}'
+    ) == "YAML ASSIGNMENT"
     assert diagnostics._kubernetes_yaml_payload_flags(
         [
             b"kind: *laterKind\n",
@@ -1311,6 +1346,7 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     cyclic.append(cyclic)
     assert not diagnostics._contains_kubernetes_secret_payload(cyclic)
     assert not diagnostics._contains_sensitive_yaml_environment(cyclic)
+    assert not diagnostics._contains_sensitive_yaml_key(cyclic)
 
     redis = FakeRedis()
     _patch_runtime(monkeypatch, redis, _config(_repo()))
@@ -1432,7 +1468,12 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
     assert diagnostics._json_like_value_end(unterminated_nested_value, 0) == len(
         unterminated_nested_value
     )
+    assert diagnostics._json_like_value_end("plain,tail", 0) == len("plain")
     assert diagnostics._redact_malformed_keyed_values('{"password":') == ('{"password":', 0)
+    assert diagnostics._redact_malformed_keyed_values('"password":plain,') == (
+        '"password":"[REDACTED]",',
+        1,
+    )
     assert diagnostics._redact_all_values({"nested": ["one", 2]}) == (
         {"nested": ["[REDACTED]", "[REDACTED]"]},
         2,
@@ -1752,6 +1793,24 @@ async def test_status_helper_failures_remain_explicit() -> None:
     ]
     assert not any(operation in {"get", "getrange"} for operation, _ in redis.calls)
 
+    redis = FakeRedis()
+    redis.zsets[retry_command_pending(SLUG)] = [
+        (f"command-{index}", float(index)) for index in range(22)
+    ]
+    first_retry_page = await diagnostics._pending_retries(redis, SLUG)
+    assert len(first_retry_page["commands"]) == diagnostics._MAX_PENDING_RETRIES
+    assert first_retry_page["continuation"] == {
+        "next_index": diagnostics._MAX_PENDING_RETRIES
+    }
+    second_retry_page = await diagnostics._pending_retries(
+        redis,
+        SLUG,
+        first_retry_page["continuation"]["next_index"],
+    )
+    assert second_retry_page["cursor"] == diagnostics._MAX_PENDING_RETRIES
+    assert len(second_retry_page["commands"]) == 2
+    assert second_retry_page["continuation"] is None
+
 
 async def test_run_filtering_unavailable_record_and_limit() -> None:
     from src.mcp.tools import diagnostics
@@ -1786,6 +1845,9 @@ async def test_run_filtering_unavailable_record_and_limit() -> None:
         for key, _start, end in [value]
         if str(key).startswith("metrics:run:")
     )
+    capped_unavailable = await diagnostics._relevant_runs(redis, SLUG, "PR-9", 1)
+    assert [item["status"] for item in capped_unavailable["records"]] == ["unavailable"]
+    assert capped_unavailable["scanned_index_entries"] == 1
 
     oversized_redis = FakeRedis()
     oversized_redis.lists[index] = ["oversized", "wanted"]

@@ -11,9 +11,10 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
 
 - `get_orchestrator_status` returns a compact configured-repository overview;
   pass a validated `owner__repo` slug for queue, inhibitor, Retry-command,
-  recent-event, and run-record detail. Snapshot age describes only the last
-  persisted `RepoState` write and is never presented as proof that a coder
-  process is alive.
+  recent-event, and run-record detail. Pending Retry pages expose a `next_index`
+  accepted by the tool's `retry_cursor` parameter. Snapshot age describes only
+  the last persisted `RepoState` write and is never presented as proof that a
+  coder process is alive.
 - `list_orchestrator_logs` discovers retained CLI snapshots, Redis repository
   event history, disk event partitions, and the current checkout's
   `artifacts/ci.log`. Every source reports retention, timestamps, mutability,
@@ -54,7 +55,9 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   Kubernetes Secret manifests are parsed before ordinary line redaction,
   including nested list items and prefixed fallback forms. Flow-style YAML
   environment entries correlate sensitive `name` fields with sibling `value`
-  fields in either order. Excessive structured nesting is omitted fail-closed.
+  fields in either order. Quoted YAML keys are decoded before sensitive-name
+  matching, including escaped spellings. Excessive structured nesting is
+  omitted fail-closed.
   Producer-added `[truncated]` markers are preserved; because their
   removed prefix may contain a sensitive opener, the retained Redis CLI tail is
   omitted fail-closed. Redis event
