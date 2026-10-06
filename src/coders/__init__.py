@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import importlib
+import re
 from collections.abc import Callable, Mapping
 from typing import Any
 
 from src.coder_registry import CoderPlugin, CoderRegistry, ModelSetting
-from src.config import DEFAULT_CODER_PLUGINS, AppConfig
+from src.config import DEFAULT_CODER_PLUGINS, AppConfig, DaemonConfig
+
+_PLUGIN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
 class CoderPluginConfigurationError(ValueError):
@@ -148,6 +151,19 @@ def _validate_plugin_metadata(
             "metadata validation",
             "plugin.model_setting must be ModelSetting metadata",
         )
+    legacy_field = model_setting.config_field
+    if legacy_field is not None and (
+        not isinstance(legacy_field, str)
+        or legacy_field not in DaemonConfig.model_fields
+        or DaemonConfig.model_fields[legacy_field].annotation is not str
+    ):
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "metadata validation",
+            "plugin.model_setting.config_field must be None or name a string "
+            "DaemonConfig field",
+        )
     if (
         not isinstance(model_setting.setting_key, str)
         or not model_setting.setting_key
@@ -169,6 +185,14 @@ def _validate_plugin_metadata(
 
 
 def _load_plugin(plugin_id: str, reference: object) -> CoderPlugin:
+    if not isinstance(plugin_id, str) or not _PLUGIN_ID_PATTERN.fullmatch(plugin_id):
+        raise _configuration_error(
+            str(plugin_id),
+            reference,
+            "plugin ID validation",
+            "expected an ASCII letter/digit slug using only letters, digits, "
+            "underscores, and hyphens",
+        )
     module_name, factory_name = _parse_reference(plugin_id, reference)
     assert isinstance(reference, str)
     factory = _load_factory(plugin_id, reference, module_name, factory_name)

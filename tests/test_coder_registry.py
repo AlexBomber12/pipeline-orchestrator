@@ -201,6 +201,21 @@ def test_build_registry_loads_configured_plugin_and_builtin_override() -> None:
         ),
         (
             "third",
+            "tests.configured_coder_plugin:build_unknown_legacy_field_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_non_string_legacy_field_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_non_model_legacy_field_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
             "tests.configured_coder_plugin:build_empty_setting_key_plugin",
             "metadata validation",
         ),
@@ -245,6 +260,20 @@ def test_build_registry_rejects_non_string_reference_from_constructed_config() -
         match="failed at reference: expected a module:factory string",
     ):
         build_coder_registry(config)
+
+
+@pytest.mark.parametrize("plugin_id", ["third/plugin", "third#plugin"])
+def test_build_registry_rejects_route_unsafe_plugin_id(plugin_id: str) -> None:
+    reference = "tests.configured_coder_plugin:build_test_plugin"
+    config = AppConfig(coder_plugins={plugin_id: reference})
+
+    with pytest.raises(CoderPluginConfigurationError) as caught:
+        build_coder_registry(config)
+
+    message = str(caught.value)
+    assert repr(plugin_id) in message
+    assert repr(reference) in message
+    assert "failed at plugin ID validation" in message
 
 
 def test_build_registry_wraps_contract_inspection_failure(

@@ -93,8 +93,9 @@ not have an explicit generic `model` setting. An explicit generic value wins
 over its legacy fallback. Codex preserves `model: ""` as the CLI-default
 choice; Claude normalizes an empty choice to its `opus` default.
 
-`coder_plugins` is a top-level mapping from a stable plugin ID to a trusted
-`module:factory` reference. The no-argument factory must already be importable
+`coder_plugins` is a top-level mapping from a stable, route-safe plugin ID
+(ASCII letters/digits, underscores, and hyphens) to a trusted `module:factory`
+reference. The no-argument factory must already be importable
 in both the web and daemon Python environments and must return a complete
 `CoderPlugin` whose `name` exactly matches the configured ID. Claude and Codex
 use the references shown above as compatibility defaults. An explicit entry
