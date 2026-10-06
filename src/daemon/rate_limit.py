@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from src.config import DEFAULT_CODER_PLUGINS
 from src.daemon.notifications import send_spend_ceiling_warning
 from src.daemon.selector import resolve_pause_coder
 from src.models import PipelineState
@@ -582,7 +583,13 @@ class RateLimitMixin:
         pause_min = 30
 
         plugin = self._registry.get_optional(coder_name)
-        if plugin is not None and coder_name not in {"claude", "codex"}:
+        default_reference = DEFAULT_CODER_PLUGINS.get(coder_name)
+        uses_detailed_builtin_parser = (
+            plugin is not None
+            and default_reference is not None
+            and self._registry.reference_for(coder_name) == default_reference
+        )
+        if plugin is not None and not uses_detailed_builtin_parser:
             try:
                 triggered = any(
                     pattern.search(stderr)

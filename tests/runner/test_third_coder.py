@@ -493,6 +493,28 @@ def test_plugin_without_usage_provider_does_not_inherit_builtin_quota() -> None:
     assert runner.state.usage_api_degraded is False
 
 
+def test_overridden_builtin_uses_registered_rate_limit_patterns() -> None:
+    class _ClaudeOverride(FakeCoderPlugin):
+        name = "claude"
+
+        def rate_limit_patterns(self) -> list[re.Pattern[str]]:
+            return [re.compile("override throttle sentinel")]
+
+    runner = h._make_runner()
+    runner._registry.register(
+        _ClaudeOverride(),
+        reference="tests.example:build_claude_override",
+    )
+
+    runner._detect_rate_limit(
+        "override throttle sentinel",
+        coder_name="claude",
+    )
+
+    assert runner.state.rate_limit_reactive_coder == "claude"
+    assert runner.state.rate_limited_until is not None
+
+
 def test_handle_merge_dispatches_auxiliary_prompt_to_fake_plugin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
