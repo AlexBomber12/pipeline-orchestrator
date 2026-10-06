@@ -504,6 +504,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                 "stringData: {config: redis-kube-yaml-inline-secret}\n"
                 "---\nkind: Pod\nspec:\n  env:\n"
                 "    - name: PASSWORD\n      value: redis-kube-yaml-env-secret\n"
+                "    - value: redis-reversed-yaml-env-secret\n      name: PASSWORD\n"
+                "    -\n      value: redis-standalone-yaml-env-secret\n      name: API_KEY\n"
                 "---\nkind: ConfigMap\ndata:\n  harmless: retained-config-value"
             ),
             json.dumps({"auths": {"registry": {"auth": docker_auth}}, "debug": True}),
@@ -594,6 +596,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "stringData: {config: ci-kube-yaml-inline-secret}\n"
         + "---\nkind: Pod\nspec:\n  env:\n"
         + "    - name: PASSWORD\n      value: ci-kube-yaml-env-secret\n"
+        + "    - value: ci-reversed-yaml-env-secret\n      name: PASSWORD\n"
+        + "    -\n      value: ci-standalone-yaml-env-secret\n      name: API_KEY\n"
         + "---\nkind: ConfigMap\ndata:\n  harmless: retained-ci-config-value\n"
         + '2026-10-05 INFO {"password":987654322,"debug":true}\n',
         encoding="utf-8",
@@ -654,6 +658,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-kube-yaml-secret" not in content
         assert "redis-kube-yaml-inline-secret" not in content
         assert "redis-kube-yaml-env-secret" not in content
+        assert "redis-reversed-yaml-env-secret" not in content
+        assert "redis-standalone-yaml-env-secret" not in content
         assert "retained-config-value" in content
         assert docker_auth not in content
 
@@ -686,6 +692,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-structured-kube-yaml-env-secret" not in content
         assert "ci-kube-yaml-env-secret" not in content
         assert "disk-kube-yaml-env-secret" not in content
+        assert "ci-reversed-yaml-env-secret" not in content
+        assert "ci-standalone-yaml-env-secret" not in content
         assert docker_auth not in content
         assert "ci-toml-first-secret" not in content
         assert "ci-toml-second-secret" not in content
@@ -1847,6 +1855,8 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
     env_units = diagnostics._redacted_file_units(
         (
             b"- name: PASSWORD\n\n  # retained comment\n  value: yaml-env-secret\n"
+            b"- value: reversed-yaml-env-secret\n  name: PASSWORD\n"
+            b"-\n  value: standalone-yaml-env-secret\n  name: API_KEY\n"
             b"  extra: retained\n- name: SAFE\n  value: visible\n"
         ),
         starts_inside_private_key=False,
@@ -1860,7 +1870,52 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
     )
     env_content = "".join(unit[1] for unit in env_units)
     assert "yaml-env-secret" not in env_content
+    assert "reversed-yaml-env-secret" not in env_content
+    assert "standalone-yaml-env-secret" not in env_content
     assert "visible" in env_content
+
+    fragment_units = diagnostics._redacted_file_units(
+        b"value: fragment-yaml-env-secret\nname: PASSWORD\n---\nafter\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=False,
+        warnings=[],
+    )
+    fragment_content = "".join(unit[1] for unit in fragment_units)
+    assert "fragment-yaml-env-secret" not in fragment_content
+    assert "after" in fragment_content
+
+    fieldless_item_units = diagnostics._redacted_file_units(
+        b"-\n  command: run\nnext\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=False,
+        warnings=[],
+    )
+    assert "command: run" in "".join(unit[1] for unit in fieldless_item_units)
+
+    warnings = []
+    crossed_env_units = diagnostics._redacted_file_units(
+        b"- value: bounded-window-secret\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=True,
+        warnings=warnings,
+    )
+    assert "bounded-window-secret" not in "".join(unit[1] for unit in crossed_env_units)
+    assert any("YAML environment item crossed" in warning for warning in warnings)
 
     boundary_units = diagnostics._redacted_file_units(
         b"- name: PASSWORD\n- name: SAFE\n  value: visible\n",

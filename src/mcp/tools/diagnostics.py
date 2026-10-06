@@ -159,13 +159,14 @@ _YAML_MAPPING_ENTRY = re.compile(
     r"^[ \t]*(?:-[ \t]+)?(?:[\"']?[-A-Za-z0-9_.]+[\"']?)[ \t]*:"
 )
 _YAML_ENV_NAME = re.compile(
-    r"(?i)^(?P<indent>[ \t]*)-[ \t]+(?:[\"']name[\"']|name)[ \t]*:[ \t]*"
+    r"(?i)^(?P<indent>[ \t]*)(?P<dash>-[ \t]+)?(?:[\"']name[\"']|name)[ \t]*:[ \t]*"
     r"(?P<name>[^#\r\n]*?)[ \t]*(?:#.*)?$"
 )
 _YAML_ENV_VALUE = re.compile(
-    r"(?i)^(?P<indent>[ \t]*)(?:[\"']value[\"']|value)[ \t]*:[ \t]*"
+    r"(?i)^(?P<indent>[ \t]*)(?P<dash>-[ \t]+)?(?:[\"']value[\"']|value)[ \t]*:[ \t]*"
     r"(?P<value>[^\r\n]*)$"
 )
+_YAML_SEQUENCE_ITEM_ONLY = re.compile(r"^(?P<indent>[ \t]*)-[ \t]*(?:#.*)?$")
 _BLOCK_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
     rf"(?:{_SENSITIVE_KEY_PATTERN}))\s*[:=][ \t]*"
@@ -658,6 +659,69 @@ def _has_closing_quote(value: str, quote: str) -> bool:
     return False
 
 
+def _yaml_env_item(
+    raw_lines: list[bytes],
+    start: int,
+    *,
+    has_more_after_raw: bool,
+) -> tuple[int, bool, bool] | None:
+    """Return a YAML env item boundary and whether its value is sensitive or uncertain."""
+    first = raw_lines[start].decode("utf-8", errors="replace").rstrip("\r\n")
+    first_name = _YAML_ENV_NAME.fullmatch(first)
+    first_value = _YAML_ENV_VALUE.fullmatch(first)
+    sequence_only = _YAML_SEQUENCE_ITEM_ONLY.fullmatch(first)
+    first_field = first_name or first_value
+    is_sequence = sequence_only is not None or (
+        first_field is not None and first_field.group("dash") is not None
+    )
+    is_page_fragment = start == 0 and first_field is not None
+    if not is_sequence and not is_page_fragment:
+        return None
+
+    item_indent = _line_indent(raw_lines[start])
+    fragment_indent = len(first_field.group("indent")) if first_field is not None else None
+    end = start + 1
+    while end < len(raw_lines):
+        candidate = raw_lines[end]
+        if candidate.strip():
+            indent = _line_indent(candidate)
+            if is_sequence:
+                if indent <= item_indent:
+                    break
+            elif fragment_indent is not None and (
+                indent < fragment_indent
+                or (indent <= fragment_indent and candidate.lstrip().startswith(b"-"))
+                or _YAML_DOCUMENT_BOUNDARY.fullmatch(
+                    candidate.decode("utf-8", errors="replace").rstrip("\r\n")
+                )
+            ):
+                break
+        end += 1
+
+    fields: list[tuple[int, str, str]] = []
+    for raw_line in raw_lines[start:end]:
+        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+        name_match = _YAML_ENV_NAME.fullmatch(line)
+        value_match = _YAML_ENV_VALUE.fullmatch(line)
+        match = name_match or value_match
+        if match is None:
+            continue
+        effective_indent = len(match.group("indent")) + len(match.group("dash") or "")
+        if name_match is not None:
+            fields.append((effective_indent, "name", name_match.group("name").strip().strip("\"'")))
+        else:
+            fields.append((effective_indent, "value", value_match.group("value")))
+    if not fields:
+        return end, False, False
+    direct_indent = min(field[0] for field in fields)
+    direct_fields = [field for field in fields if field[0] == direct_indent]
+    has_value = any(field[1] == "value" for field in direct_fields)
+    names = [field[2] for field in direct_fields if field[1] == "name"]
+    sensitive = has_value and any(_SENSITIVE_KEY.fullmatch(name) is not None for name in names)
+    uncertain = has_value and not names and end == len(raw_lines) and has_more_after_raw
+    return end, sensitive, uncertain
+
+
 def _sensitive_state_before(
     handle: Any,
     offset: int,
@@ -700,7 +764,16 @@ def _sensitive_state_before(
                 continue
             line = raw_line.decode("utf-8", errors="replace")
             name_match = _YAML_ENV_NAME.fullmatch(line)
-            if name_match is not None and len(name_match.group("indent")) < value_indent:
+            if name_match is not None and (
+                (
+                    name_match.group("dash") is not None
+                    and len(name_match.group("indent")) < value_indent
+                )
+                or (
+                    name_match.group("dash") is None
+                    and len(name_match.group("indent")) == value_indent
+                )
+            ):
                 name = name_match.group("name").strip().strip("\"'")
                 starts_with_sensitive_value = _SENSITIVE_KEY.fullmatch(name) is not None
                 break
@@ -1028,6 +1101,23 @@ def _redacted_file_units(
         raw_unit = raw_lines[line_index]
         text_unit = raw_unit.decode("utf-8", errors="replace")
         stripped_unit = text_unit.rstrip("\r\n")
+        env_item = _yaml_env_item(
+            raw_lines,
+            line_index,
+            has_more_after_raw=has_more_after_raw,
+        )
+        if env_item is not None:
+            item_end, sensitive_env, uncertain_env = env_item
+            if sensitive_env or uncertain_env:
+                raw_unit = b"".join(raw_lines[line_index:item_end])
+                units.append((raw_unit, "[REDACTED SENSITIVE YAML ENV VALUE]\n", 1))
+                if uncertain_env:
+                    warnings.append(
+                        "A YAML environment item crossed the bounded page window before its name; "
+                        "its visible value was redacted fail-closed."
+                    )
+                line_index = item_end
+                continue
         payload_match = _YAML_SECRET_PAYLOAD_ASSIGNMENT.fullmatch(stripped_unit)
         if kubernetes_payload_flags[line_index] and payload_match is not None:
             payload_value = payload_match.group("value").strip()
@@ -1053,44 +1143,6 @@ def _redacted_file_units(
                 )
             line_index = payload_end
             continue
-        env_name_match = _YAML_ENV_NAME.fullmatch(stripped_unit)
-        if env_name_match is not None:
-            env_name = env_name_match.group("name").strip().strip("\"'")
-            if _SENSITIVE_KEY.fullmatch(env_name) is not None:
-                env_indent = len(env_name_match.group("indent"))
-                value_index = line_index + 1
-                while value_index < len(raw_lines):
-                    candidate = raw_lines[value_index]
-                    if not candidate.strip():
-                        value_index += 1
-                        continue
-                    candidate_text = candidate.decode("utf-8", errors="replace").rstrip("\r\n")
-                    value_match = _YAML_ENV_VALUE.fullmatch(candidate_text)
-                    if value_match is not None and len(value_match.group("indent")) > env_indent:
-                        item_end = value_index + 1
-                        while item_end < len(raw_lines):
-                            following = raw_lines[item_end]
-                            if following.strip() and (
-                                _line_indent(following) < env_indent
-                                or (
-                                    _line_indent(following) == env_indent
-                                    and following.lstrip().startswith(b"-")
-                                )
-                            ):
-                                break
-                            item_end += 1
-                        raw_unit = b"".join(raw_lines[line_index:item_end])
-                        units.append((raw_unit, "[REDACTED SENSITIVE YAML ENV VALUE]\n", 1))
-                        line_index = item_end
-                        break
-                    if _line_indent(candidate) < env_indent or (
-                        _line_indent(candidate) == env_indent
-                        and candidate.lstrip().startswith(b"-")
-                    ):
-                        break
-                    value_index += 1
-                if line_index > value_index:
-                    continue
         if inside_private_key or _PRIVATE_KEY_BEGIN.search(raw_unit):
             end_index = line_index
             while end_index < len(raw_lines) and not _PRIVATE_KEY_END.search(raw_lines[end_index]):
