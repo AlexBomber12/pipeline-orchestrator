@@ -27,6 +27,7 @@ from src.audit.webhook_log import write_webhook_audit
 from src.coder_registry import CoderPlugin, CoderRegistry
 from src.config import (
     AppConfig,
+    CoderType,
     DaemonConfig,
     load_config,
 )
@@ -200,6 +201,7 @@ def _build_coder_rows(
     rows: list[dict[str, Any]] = []
     for plugin in registry.list_coders():
         setting = plugin.model_setting
+        metadata_available = getattr(plugin, "metadata_available", True)
         selected_model = plugin.resolve_model(config.daemon)
         catalog = catalogs.get(
             plugin.name,
@@ -270,6 +272,7 @@ def _build_coder_rows(
                     ],
                 },
                 "selected_model": selected_model,
+                "metadata_available": metadata_available,
                 "auth": auth.get(
                     plugin.name,
                     {
@@ -278,6 +281,7 @@ def _build_coder_rows(
                     },
                 ),
                 "is_default": config.daemon.coder.value == plugin.name,
+                "runtime_selectable": plugin.name in CoderType,
             }
         )
     return rows
@@ -333,6 +337,10 @@ def _submitted_coder_models(
         if not separator or plugin_id not in plugins:
             raise ValueError(f"Unknown coder settings plugin ID: {plugin_id or remainder}")
         plugin = plugins[plugin_id]
+        if not getattr(plugin, "metadata_available", True):
+            raise ValueError(
+                f"Coder metadata is unavailable: {plugin_id}"
+            )
         if setting_key != plugin.model_setting.setting_key:
             raise ValueError(f"Unknown coder setting: {field_name}")
         if not isinstance(raw_value, str):
@@ -344,6 +352,10 @@ def _submitted_coder_models(
         if plugin.name in submitted or legacy_field is None:
             continue
         if legacy_field in form:
+            if not getattr(plugin, "metadata_available", True):
+                raise ValueError(
+                    f"Coder metadata is unavailable: {plugin.name}"
+                )
             raw_value = form[legacy_field]
             if not isinstance(raw_value, str):
                 raise ValueError(f"{legacy_field} must be a string")
@@ -444,6 +456,7 @@ async def _settings_daemon_template_context(
     refresh_coder: str | None = None,
 ) -> dict[str, Any]:
     cfg = load_config(_app.CONFIG_PATH)
+    registry: CoderRegistry = request.app.state.coder_registry
     if use_cached_auth:
         auth = _get_cached_auth_status()
         catalogs = await _model_catalog_snapshots(
@@ -454,7 +467,7 @@ async def _settings_daemon_template_context(
         )
     else:
         auth, catalogs = await asyncio.gather(
-            _collect_auth_status(),
+            _collect_auth_status(registry),
             _model_catalog_snapshots(
                 request,
                 cfg,
@@ -466,7 +479,6 @@ async def _settings_daemon_template_context(
     # refresh response cannot re-render an older model selection over a save
     # that completed while the subprocess was running.
     cfg = load_config(_app.CONFIG_PATH)
-    registry: CoderRegistry = request.app.state.coder_registry
     return {
         "daemon": cfg.daemon,
         "coders": _build_coder_rows(cfg, auth, catalogs, registry),
@@ -512,8 +524,9 @@ async def _render_settings_daemon_error(
 @router.get("/settings", response_class=HTMLResponse)
 async def settings_page(request: Request) -> HTMLResponse:
     cfg = load_config(_app.CONFIG_PATH)
+    registry: CoderRegistry = request.app.state.coder_registry
     auth, catalogs = await asyncio.gather(
-        _collect_auth_status(),
+        _collect_auth_status(registry),
         _model_catalog_snapshots(request, cfg, load=True),
     )
     cfg = load_config(_app.CONFIG_PATH)
@@ -521,7 +534,7 @@ async def settings_page(request: Request) -> HTMLResponse:
         cfg,
         auth,
         catalogs,
-        request.app.state.coder_registry,
+        registry,
     )
     return _app.templates.TemplateResponse(
         request,
@@ -834,15 +847,17 @@ async def put_settings_daemon(
 
 
 @router.get("/api/auth-status")
-async def api_auth_status() -> JSONResponse:
-    return JSONResponse(await _collect_auth_status())
+async def api_auth_status(request: Request) -> JSONResponse:
+    return JSONResponse(
+        await _collect_auth_status(request.app.state.coder_registry)
+    )
 
 
 @router.get("/api/coders")
 async def api_coders(request: Request) -> JSONResponse:
     cfg = load_config(_app.CONFIG_PATH)
     auth, catalogs = await asyncio.gather(
-        _collect_auth_status(),
+        _collect_auth_status(request.app.state.coder_registry),
         _model_catalog_snapshots(request, cfg, load=True),
     )
     cfg = load_config(_app.CONFIG_PATH)
@@ -860,7 +875,7 @@ async def api_coders(request: Request) -> JSONResponse:
 
 @router.get("/partials/settings/auth-status", response_class=HTMLResponse)
 async def partial_settings_auth_status(request: Request) -> HTMLResponse:
-    auth = await _collect_auth_status()
+    auth = await _collect_auth_status(request.app.state.coder_registry)
     return _app.templates.TemplateResponse(
         request,
         "components/settings_auth.html",

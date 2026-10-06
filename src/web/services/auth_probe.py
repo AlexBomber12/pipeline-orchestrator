@@ -10,11 +10,13 @@ read ``CONFIG_PATH`` lazily from :mod:`src.web.app` so test overrides
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import subprocess
 
+from src.coder_registry import CoderRegistry
 from src.coders import build_coder_registry
-from src.config import load_config
+from src.config import DEFAULT_CODER_PLUGINS, load_config
 
 _AUTH_CHECK_TIMEOUT_SEC = 5
 
@@ -102,18 +104,90 @@ def _config_path() -> str:
     return _app.CONFIG_PATH
 
 
-def _check_claude_auth() -> dict[str, str]:
+def _check_coder_auth(
+    registry: CoderRegistry,
+    plugin_id: str,
+) -> dict[str, str]:
+    """Probe one startup-registered coder in the active config context."""
+    plugin = registry.get(plugin_id)
+    try:
+        check_auth = plugin.check_auth
+        kwargs = (
+            {"config_path": _config_path()}
+            if "config_path" in inspect.signature(check_auth).parameters
+            else {}
+        )
+        return check_auth(**kwargs)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "detail": (
+                f"{plugin.display_name} auth check failed "
+                f"({type(exc).__name__})"
+            ),
+        }
+
+
+def _check_claude_auth(
+    registry: CoderRegistry | None = None,
+) -> dict[str, str]:
     """Probe the ``claude`` CLI and report its authorization status."""
-    return build_coder_registry().get("claude").check_auth(
-        config_path=_config_path()
-    )
+    return _check_coder_auth(registry or build_coder_registry(), "claude")
 
 
-def _check_codex_auth() -> dict[str, str]:
+def _check_codex_auth(
+    registry: CoderRegistry | None = None,
+) -> dict[str, str]:
     """Probe the ``codex`` CLI and report its authorization status."""
-    return build_coder_registry().get("codex").check_auth(
-        config_path=_config_path()
-    )
+    return _check_coder_auth(registry or build_coder_registry(), "codex")
+
+
+async def _bounded_coder_auth_probe(
+    registry: CoderRegistry,
+    plugin_id: str,
+) -> dict[str, str]:
+    """Run one plugin probe with a deadline that also ends its worker."""
+    plugin = registry.get(plugin_id)
+    reference = registry.reference_for(plugin_id)
+    if reference is None:
+        return {
+            "status": "error",
+            "detail": f"{plugin.display_name} auth check is unavailable",
+        }
+    if reference != DEFAULT_CODER_PLUGINS.get(plugin_id):
+        return await _daemon_coder_auth_probe(
+            plugin_id,
+            reference,
+            plugin.display_name,
+        )
+    probe = _check_claude_auth if plugin_id == "claude" else _check_codex_auth
+    return await asyncio.to_thread(probe, registry)
+
+
+async def _daemon_coder_auth_probe(
+    plugin_id: str,
+    reference: str,
+    display_name: str,
+) -> dict[str, str]:
+    """Ask the daemon to own a configured plugin auth probe."""
+    from src.web import app as _app
+
+    bridge = getattr(_app.app.state, "plugin_bridge", None)
+    if bridge is None:
+        return {
+            "status": "error",
+            "detail": f"{display_name} auth check is unavailable",
+        }
+    try:
+        return await bridge.load_auth_status(
+            plugin_id,
+            expected_reference=reference,
+        )
+    except Exception:
+        return {
+            "status": "error",
+            "detail": f"{display_name} auth check is unavailable from daemon",
+        }
 
 
 def _check_gh_auth() -> dict[str, str]:
@@ -141,22 +215,25 @@ def _check_gh_auth() -> dict[str, str]:
     return {"status": "error", "detail": detail}
 
 
-async def _collect_auth_status() -> dict[str, dict[str, str]]:
-    """Return ``{"claude": ..., "codex": ..., "gh": ...}`` auth status dicts.
+async def _collect_auth_status(
+    registry: CoderRegistry | None = None,
+) -> dict[str, dict[str, str]]:
+    """Return auth status for every registered coder plus GitHub CLI.
 
     Each probe invokes a blocking ``subprocess.run`` call with a 5s
     timeout, so they would block the event loop if awaited directly from
     an async handler. Dispatching them through ``asyncio.to_thread`` and
     ``asyncio.gather`` moves the blocking work onto the default thread
-    pool and runs probes concurrently, so the dashboard's 30s HTMX
-    auth-status poll cannot stall the worker for up to ~15s (three serial
-    5s timeouts) whenever a CLI is missing or slow.
+    pool and runs probes concurrently, so one slow or missing CLI does not
+    serially delay the remaining registered plugins and infrastructure probe.
     """
-    claude, codex, gh = await asyncio.gather(
-        asyncio.to_thread(_check_claude_auth),
-        asyncio.to_thread(_check_codex_auth),
-        asyncio.to_thread(_check_gh_auth),
-    )
+    active_registry = registry or build_coder_registry()
+    plugin_ids = active_registry.coder_names()
+    probes = [
+        _bounded_coder_auth_probe(active_registry, plugin_id)
+        for plugin_id in plugin_ids
+    ]
+    results = await asyncio.gather(*probes, asyncio.to_thread(_check_gh_auth))
     global _AUTH_STATUS_CACHE
-    _AUTH_STATUS_CACHE = {"claude": claude, "codex": codex, "gh": gh}
+    _AUTH_STATUS_CACHE = dict(zip((*plugin_ids, "gh"), results, strict=True))
     return _get_cached_auth_status()

@@ -52,9 +52,16 @@ from src.cancellation.availability import (
     ManualOverrideSource,
     is_operator_available,
 )
+from src.coder_auth import isolated_auth_probe
 from src.coder_registry import CoderPlugin, CoderRegistry
 from src.coders import build_coder_registry
-from src.config import AppConfig, CoderType, RepoConfig, load_config
+from src.config import (
+    DEFAULT_CODER_PLUGINS,
+    AppConfig,
+    CoderType,
+    RepoConfig,
+    load_config,
+)
 from src.daemon import (
     error_rate_tracker,
     git_ops,
@@ -328,7 +335,11 @@ class PipelineRunner(
         self.repo_config = repo_config
         self._app_config = app_config
         self.redis = redis_client
-        self._registry = registry or build_coder_registry()
+        self._registry = (
+            registry
+            if registry is not None
+            else build_coder_registry(app_config)
+        )
         self.name = repo_slug_from_url(repo_config.url)
         self.owner_repo = repo_owner_from_url(repo_config.url)
         self.repo_path = f"/data/repos/{self.name}"
@@ -996,16 +1007,33 @@ class PipelineRunner(
         ):
             return
 
-        def _probe() -> dict[str, dict[str, str]]:
-            statuses: dict[str, dict[str, str]] = {}
-            for name in self._registry.coder_names():
-                try:
-                    statuses[name] = self._registry.get(name).check_auth()
-                except Exception:
-                    statuses[name] = {"status": "error"}
-            return statuses
+        async def _probe(name: str) -> dict[str, str]:
+            try:
+                plugin = self._registry.get(name)
+                reference = self._registry.reference_for(name)
+                if reference != DEFAULT_CODER_PLUGINS.get(name):
+                    if reference is None:
+                        return await asyncio.to_thread(plugin.check_auth)
+                    return await isolated_auth_probe(
+                        name,
+                        reference,
+                        plugin.display_name,
+                        config_path=os.environ.get(
+                            "PO_CONFIG_PATH",
+                            "config.yml",
+                        ),
+                    )
+                return await asyncio.to_thread(plugin.check_auth)
+            except Exception:
+                return {"status": "error"}
 
-        self._auth_status_cache = await asyncio.to_thread(_probe)
+        # Additional configured IDs are metadata-only until runtime selection
+        # supports them. Never let their auth implementation participate in
+        # (or stall) a repository cycle. Runtime overrides use the same
+        # killable worker boundary as the web Settings probes.
+        names = [coder.value for coder in CoderType]
+        results = await asyncio.gather(*(_probe(name) for name in names))
+        self._auth_status_cache = dict(zip(names, results, strict=True))
         self._auth_status_cache_expires_at = now + timedelta(minutes=5)
 
     def _load_current_task_metadata(self) -> tuple[str, str]:

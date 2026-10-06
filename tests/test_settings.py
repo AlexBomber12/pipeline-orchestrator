@@ -10,8 +10,11 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from src import coder_auth as _coder_auth
+from src import coder_auth_worker as _auth_worker
 from src import config as src_config
 from src.coder_registry import (
+    CoderRegistry,
     ModelCatalog,
     ModelMetadata,
     ModelSetting,
@@ -871,6 +874,9 @@ class _ThirdCatalogPlugin:
     ) -> dict[str, str]:
         return {"model": self.resolve_model(daemon_config)}
 
+    def check_auth(self) -> dict[str, str]:
+        return {"status": "ok", "detail": "third authenticated"}
+
 
 def test_shared_catalog_rendering_supports_third_plugin_without_branches(
     empty_config: Path,
@@ -888,12 +894,35 @@ def test_shared_catalog_rendering_supports_third_plugin_without_branches(
     assert "/partials/settings/coders/third/models/refresh" not in response.text
 
 
+def test_refresh_indicator_is_css_safe_for_digit_leading_plugin_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "coder_plugins:\n"
+        "  3rd: tests.configured_coder_plugin:build_digit_leading_plugin\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/settings/coders")
+
+    assert response.status_code == 200
+    assert 'hx-indicator="#coder-3rd-model-refreshing"' in response.text
+    assert 'id="coder-3rd-model-refreshing"' in response.text
+
+
 def test_arbitrary_plugin_model_round_trips_without_core_field(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text(
+        "coder_plugins:\n"
+        "  third: tests.configured_coder_plugin:build_test_plugin\n"
         "daemon:\n"
         "  coder_settings:\n"
         "    unrelated:\n"
@@ -902,10 +931,9 @@ def test_arbitrary_plugin_model_round_trips_without_core_field(
     )
     monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
     monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
-    plugin = _ThirdCatalogPlugin()
 
     with TestClient(app) as client:
-        client.app.state.coder_registry.register(plugin)
+        plugin = client.app.state.coder_registry.get("third")
         rendered = client.get("/partials/settings/coders")
         saved = client.put(
             "/settings/daemon",
@@ -915,6 +943,13 @@ def test_arbitrary_plugin_model_round_trips_without_core_field(
     cfg = load_config(str(cfg_path))
     assert rendered.status_code == 200
     assert saved.status_code == 200
+    assert "Configured Test Coder" in rendered.text
+    assert "Metadata only" in rendered.text
+    assert not re.search(
+        r'<input type="radio"[^>]*value="third"',
+        rendered.text,
+        re.DOTALL,
+    )
     assert "third_model" not in type(cfg.daemon).model_fields
     assert cfg.daemon.coder_settings == {
         "unrelated": {"model": "keep-me"},
@@ -980,6 +1015,36 @@ def test_model_submission_parser_rejects_non_string_values(
 
     with pytest.raises(ValueError, match=message):
         _submitted_coder_models(form, build_coder_registry())
+
+
+def test_model_submission_parser_rejects_unavailable_legacy_metadata() -> None:
+    from src.coder_registry import CoderMetadataView
+    from src.web.routes.settings import _submitted_coder_models
+
+    registry = CoderRegistry()
+    registry.register(
+        CoderMetadataView(
+            name="codex",
+            display_name="codex (metadata unavailable)",
+            models=[],
+            model_setting=ModelSetting(
+                "codex_model",
+                "",
+                "Metadata unavailable",
+            ),
+            model_catalog_refreshable=False,
+            metadata_available=False,
+        )
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Coder metadata is unavailable: codex",
+    ):
+        _submitted_coder_models(
+            _NonStringForm({"codex_model": "gpt-test"}),
+            registry,
+        )
 
 
 def test_dynamic_codex_choice_persists_invocation_slug_and_api_metadata(
@@ -1249,7 +1314,7 @@ def test_codex_refresh_updates_choices_without_changing_selection(
     assert 'value="original-slug" selected' in first.text
     assert 'value="new-slug"' in refreshed.text
     assert "original-slug (saved; not advertised)" in refreshed.text
-    assert 'hx-indicator="#codex-model-refreshing"' in refreshed.text
+    assert 'hx-indicator="#coder-codex-model-refreshing"' in refreshed.text
     assert "Refreshing…" in refreshed.text
     assert load_config(str(cfg_path)).daemon.codex_model == "original-slug"
 
@@ -1362,6 +1427,48 @@ async def test_static_catalog_bypasses_daemon_loader() -> None:
         "sonnet",
     ]
     assert snapshot.source == "static_compatibility"
+
+
+@pytest.mark.asyncio
+async def test_configured_static_catalog_uses_daemon_loader() -> None:
+    calls: list[str] = []
+
+    class UnsafeConfiguredCatalog(_ThirdCatalogPlugin):
+        def model_catalog_cache_key(self, **_kwargs: object) -> str:
+            raise AssertionError("configured cache key must stay out of web")
+
+    async def daemon_loader(
+        plugin: object, **_kwargs: object
+    ) -> ModelCatalog:
+        calls.append(plugin.name)
+        return ModelCatalog(
+            (ModelMetadata("isolated", "Daemon-owned"),),
+            "daemon",
+            "Loaded outside the web process.",
+        )
+
+    cache = ModelCatalogCache(
+        loader=daemon_loader,
+        daemon_owned_plugins={"third"},
+    )
+    snapshot = await cache.get(
+        UnsafeConfiguredCatalog(),
+        config=AppConfig(),
+        config_path="/workspace/config.yml",
+    )
+    changed = await cache.get(
+        UnsafeConfiguredCatalog(),
+        config=AppConfig(
+            daemon={"coder_settings": {"third": {"variant": "preview"}}}
+        ),
+        config_path="/workspace/config.yml",
+    )
+
+    assert calls == ["third", "third"]
+    assert len(cache._entries) == 1
+    assert snapshot.source == "daemon"
+    assert [model.invocation_id for model in snapshot.models] == ["isolated"]
+    assert changed.source == "daemon"
 
 
 @pytest.mark.asyncio
@@ -1849,6 +1956,384 @@ def test_api_auth_status_returns_ok_for_both(
     assert payload["gh"]["status"] == "ok"
     assert "Logged in" in payload["gh"]["detail"]
     assert "octocat" in payload["gh"]["detail"]
+
+
+def test_api_auth_status_uses_every_configured_plugin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories: []\n"
+        "coder_plugins:\n"
+        "  claude: tests.configured_coder_plugin:build_claude_override\n"
+        "  third: tests.configured_coder_plugin:build_test_plugin\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/api/auth-status")
+
+    assert response.status_code == 200
+    assert response.json()["claude"] == {
+        "status": "ok",
+        "detail": "configured plugin auth",
+    }
+    assert response.json()["third"] == {
+        "status": "ok",
+        "detail": "configured test plugin auth",
+    }
+
+
+def test_configured_plugin_auth_failure_is_isolated_and_redacted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories: []\n"
+        "coder_plugins:\n"
+        "  third: tests.configured_coder_plugin:build_raising_auth_plugin\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        api_response = client.get("/api/auth-status")
+        settings_response = client.get("/settings")
+
+    assert api_response.status_code == 200
+    assert settings_response.status_code == 200
+    assert api_response.json()["third"] == {
+        "status": "error",
+        "detail": "Configured Test Coder auth check failed (RuntimeError)",
+    }
+    assert "must-not-leak" not in api_response.text
+    assert "must-not-leak" not in settings_response.text
+
+
+def test_configured_plugin_auth_probe_has_response_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories: []\n"
+        "coder_plugins:\n"
+        "  third: tests.configured_coder_plugin:build_slow_auth_plugin\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    monkeypatch.setattr(_auth_probe, "_AUTH_CHECK_TIMEOUT_SEC", 0.01)
+
+    with TestClient(app) as client:
+        response = client.get("/api/auth-status")
+
+    assert response.status_code == 200
+    assert response.json()["third"] == {
+        "status": "error",
+        "detail": "Configured Test Coder auth check timed out after 0.01s",
+    }
+
+
+def test_direct_coder_auth_probe_redacts_plugin_exception() -> None:
+    from tests.configured_coder_plugin import RaisingAuthTestPlugin
+
+    registry = CoderRegistry()
+    registry.register(RaisingAuthTestPlugin())
+
+    assert _auth_probe._check_coder_auth(registry, "third") == {
+        "status": "error",
+        "detail": "Configured Test Coder auth check failed (RuntimeError)",
+    }
+
+
+def test_configured_auth_probe_degrades_without_daemon_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.coder_registry import CoderMetadataView
+
+    registry = CoderRegistry()
+    registry.register(
+        CoderMetadataView(
+            name="third",
+            display_name="Third Coder",
+            models=[],
+            model_setting=ModelSetting(None, "", "Default"),
+            model_catalog_refreshable=False,
+        ),
+        reference="operator.plugin:factory",
+    )
+    monkeypatch.delattr(web_app.app.state, "plugin_bridge", raising=False)
+
+    result = asyncio.run(
+        _auth_probe._bounded_coder_auth_probe(registry, "third")
+    )
+
+    assert result == {
+        "status": "error",
+        "detail": "Third Coder auth check is unavailable",
+    }
+
+
+def test_auth_probe_worker_normalizes_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[str] = []
+
+    class _WithConfigPath:
+        display_name = "Worker Coder"
+
+        def check_auth(self, *, config_path: str) -> dict[str, str]:
+            seen.append(config_path)
+            return {"status": "ok", "detail": "ready"}
+
+    monkeypatch.setattr(
+        _auth_worker,
+        "_load_plugin",
+        lambda _plugin_id, _reference: _WithConfigPath(),
+    )
+    assert _auth_worker.run_probe("third", "module:factory", "/cfg") == {
+        "status": "ok",
+        "detail": "ready",
+    }
+    assert seen == ["/cfg"]
+
+    class _InvalidResult:
+        display_name = "Invalid Coder"
+
+        def check_auth(self) -> object:
+            return {"status": object()}
+
+    monkeypatch.setattr(
+        _auth_worker,
+        "_load_plugin",
+        lambda _plugin_id, _reference: _InvalidResult(),
+    )
+    assert _auth_worker.run_probe("third", "module:factory", "/cfg") == {
+        "status": "error",
+        "detail": "Invalid Coder auth check failed (TypeError)",
+    }
+
+    monkeypatch.setattr(
+        _auth_worker,
+        "_load_plugin",
+        lambda _plugin_id, _reference: (_ for _ in ()).throw(
+            RuntimeError("must-not-leak")
+        ),
+    )
+    assert _auth_worker.run_probe("third", "module:factory", "/cfg") == {
+        "status": "error",
+        "detail": "third auth check failed (RuntimeError)",
+    }
+
+
+def test_auth_probe_worker_main_validates_arguments_and_prints_result(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(_auth_worker.sys, "argv", ["auth-probe-worker"])
+    with pytest.raises(SystemExit, match="2"):
+        _auth_worker.main()
+
+    monkeypatch.setattr(
+        _auth_worker,
+        "run_probe",
+        lambda *_args: {"status": "ok", "detail": "ready"},
+    )
+    monkeypatch.setattr(
+        _auth_worker.sys,
+        "argv",
+        ["auth-probe-worker", "third", "module:factory", "/cfg"],
+    )
+    _auth_worker.main()
+
+    assert capsys.readouterr().out.strip() == (
+        _auth_worker.RESULT_PREFIX + '{"status":"ok","detail":"ready"}'
+    )
+
+
+class _FakeAuthProbeProcess:
+    def __init__(self, stdout: bytes, returncode: int) -> None:
+        self.pid = 12345
+        self.returncode = returncode
+        self._stdout = stdout
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return self._stdout, b""
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode", "expected_detail"),
+    [
+        (b"", 1, "Worker auth check worker failed"),
+        (
+            b"PIPELINE_AUTH_RESULT:{bad json}\nnoise\n",
+            0,
+            "Worker auth check returned an invalid result",
+        ),
+        (
+            b"PIPELINE_AUTH_RESULT:[]\n",
+            0,
+            "Worker auth check returned an invalid result",
+        ),
+    ],
+)
+def test_isolated_auth_probe_rejects_worker_failures_and_invalid_output(
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: bytes,
+    returncode: int,
+    expected_detail: str,
+) -> None:
+    async def fake_subprocess(*_args: object, **_kwargs: object) -> object:
+        return _FakeAuthProbeProcess(stdout, returncode)
+
+    monkeypatch.setattr(
+        _coder_auth.asyncio,
+        "create_subprocess_exec",
+        fake_subprocess,
+    )
+
+    result = asyncio.run(
+        _coder_auth.isolated_auth_probe(
+            "third",
+            "module:factory",
+            "Worker",
+            config_path="/cfg",
+        )
+    )
+
+    assert result == {"status": "error", "detail": expected_detail}
+
+
+def test_isolated_auth_probe_redacts_worker_start_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def failing_subprocess(*_args: object, **_kwargs: object) -> object:
+        raise OSError("must-not-leak")
+
+    monkeypatch.setattr(
+        _coder_auth.asyncio,
+        "create_subprocess_exec",
+        failing_subprocess,
+    )
+
+    result = asyncio.run(
+        _coder_auth.isolated_auth_probe(
+            "third",
+            "module:factory",
+            "Worker",
+            config_path="/cfg",
+        )
+    )
+
+    assert result == {
+        "status": "error",
+        "detail": "Worker auth check failed (OSError)",
+    }
+
+
+def test_isolated_auth_probe_handles_worker_exit_during_timeout_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _SlowProcess:
+        pid = 12345
+        returncode: int | None = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def wait(self) -> int:
+            self.returncode = 0
+            return 0
+
+    async def fake_subprocess(*_args: object, **_kwargs: object) -> object:
+        return _SlowProcess()
+
+    def exited_process_group(_pid: int, _signal: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(
+        _coder_auth.asyncio,
+        "create_subprocess_exec",
+        fake_subprocess,
+    )
+    monkeypatch.setattr(_coder_auth.os, "killpg", exited_process_group)
+
+    result = asyncio.run(
+        _coder_auth.isolated_auth_probe(
+            "third",
+            "module:factory",
+            "Worker",
+            config_path="/cfg",
+            timeout=0.001,
+        )
+    )
+
+    assert result == {
+        "status": "error",
+        "detail": "Worker auth check timed out after 0.001s",
+    }
+
+
+def test_isolated_auth_probe_terminates_worker_when_caller_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _BlockedProcess:
+        pid = 12345
+        returncode: int | None = None
+        reaped = False
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def wait(self) -> int:
+            self.reaped = True
+            self.returncode = -9
+            return -9
+
+    process = _BlockedProcess()
+    killed: list[tuple[int, int]] = []
+
+    async def fake_subprocess(*_args: object, **_kwargs: object) -> object:
+        return process
+
+    monkeypatch.setattr(
+        _coder_auth.asyncio,
+        "create_subprocess_exec",
+        fake_subprocess,
+    )
+    monkeypatch.setattr(
+        _coder_auth.os,
+        "killpg",
+        lambda pid, sig: killed.append((pid, sig)),
+    )
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            _coder_auth.isolated_auth_probe(
+                "third",
+                "module:factory",
+                "Worker",
+                config_path="/cfg",
+                timeout=60,
+            )
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    assert killed == [(process.pid, _coder_auth.signal.SIGKILL)]
+    assert process.reaped is True
 
 
 def test_api_auth_status_reports_errors(

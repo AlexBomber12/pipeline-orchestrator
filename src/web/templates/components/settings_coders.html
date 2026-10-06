@@ -25,6 +25,7 @@
                     <td class="py-3 pr-4">
                         <select name="{{ coder.model_setting.control_name }}"
                                 class="primary-interactive min-w-40 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono"
+                                {% if not coder.metadata_available %}disabled aria-disabled="true"{% endif %}
                                 hx-put="/settings/daemon"
                                 hx-trigger="change"
                                 hx-target="#settings-daemon"
@@ -38,6 +39,11 @@
                             </option>
                             {% endfor %}
                         </select>
+                        {% if not coder.metadata_available %}
+                        <p class="mt-2 text-xs text-fail">
+                            Plugin metadata is unavailable; model changes are disabled.
+                        </p>
+                        {% endif %}
                         {% set catalog = coder.model_catalog %}
                         {% if catalog.refreshable %}
                         <div class="mt-2 flex flex-wrap items-center gap-2">
@@ -46,10 +52,10 @@
                                     hx-post="/partials/settings/coders/{{ coder.name }}/models/refresh"
                                     hx-target="#settings-coders"
                                     hx-swap="outerHTML"
-                                    hx-indicator="#{{ coder.name }}-model-refreshing">
+                                    hx-indicator="#coder-{{ coder.name }}-model-refreshing">
                                 Refresh models
                             </button>
-                            <span id="{{ coder.name }}-model-refreshing"
+                            <span id="coder-{{ coder.name }}-model-refreshing"
                                   class="htmx-indicator text-xs text-warn"
                                   aria-live="polite">Refreshing…</span>
                         </div>
@@ -74,6 +80,7 @@
                         </div>
                     </td>
                     <td class="py-3 align-top">
+                        {% if coder.runtime_selectable %}
                         <input type="radio"
                                name="coder"
                                value="{{ coder.name }}"
@@ -83,6 +90,9 @@
                                hx-trigger="change"
                                hx-target="#settings-daemon"
                                hx-swap="innerHTML">
+                        {% else %}
+                        <span class="text-xs text-gray-500">Metadata only</span>
+                        {% endif %}
                     </td>
                 </tr>
                 {% endfor %}

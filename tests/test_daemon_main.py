@@ -433,6 +433,7 @@ def test_main_reload_drops_removed_repository(
 
 def test_main_reload_recreates_shared_usage_providers(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Reloading config must refresh the shared providers for all runners."""
     first = AppConfig(
@@ -445,6 +446,9 @@ def test_main_reload_recreates_shared_usage_providers(
             _repo("https://github.com/octo/beta.git"),
         ],
         daemon=DaemonConfig(poll_interval_sec=1),
+        coder_plugins={
+            "third": "tests.configured_coder_plugin:build_test_plugin"
+        },
     )
 
     _reset_fake_runner()
@@ -466,6 +470,15 @@ def test_main_reload_recreates_shared_usage_providers(
     claude_factory = _PluginFactory("claude")
     codex_factory = _PluginFactory("codex")
 
+    class _Registry:
+        def get(self, name: str) -> _PluginFactory:
+            return {
+                "claude": claude_factory,
+                "codex": codex_factory,
+            }[name]
+
+    registry = _Registry()
+
     monkeypatch.setattr(main_module, "load_config", fake_load_config)
     monkeypatch.setattr(
         main_module.aioredis,
@@ -478,8 +491,11 @@ def test_main_reload_recreates_shared_usage_providers(
         main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
     )
     monkeypatch.setattr(main_module, "CONFIG_RELOAD_CYCLES", 3)
-    monkeypatch.setattr(main_module, "ClaudePlugin", lambda: claude_factory)
-    monkeypatch.setattr(main_module, "CodexPlugin", lambda: codex_factory)
+    monkeypatch.setattr(
+        main_module,
+        "build_coder_registry",
+        lambda _config: registry,
+    )
 
     clock = [0.0]
     monkeypatch.setattr(main_module.time, "monotonic", lambda: clock[0])
@@ -505,6 +521,7 @@ def test_main_reload_recreates_shared_usage_providers(
     assert alpha.codex_usage_provider == f"codex-2-{id(second)}"
     assert beta.claude_usage_provider == f"claude-2-{id(second)}"
     assert beta.codex_usage_provider == f"codex-2-{id(second)}"
+    assert "plugin definitions are startup-only" in caplog.text
 
 
 def test_hot_reload_updates_repo_config_coder(
@@ -1432,6 +1449,71 @@ def test_clean_breach_dir_removes_stale_markers(tmp_path: Any) -> None:
         main_module._BREACH_DIR = original
 
 
+def test_main_builds_and_injects_configured_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+        coder_plugins={
+            "third": "tests.configured_coder_plugin:build_test_plugin"
+        },
+    )
+
+    class _RunnerWithRegistry(_FakeRunner):
+        def __init__(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            redis_client: Any,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+            registry: Any,
+        ) -> None:
+            self.registry = registry
+            super().__init__(
+                repo_config,
+                app_config,
+                redis_client,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+
+    _patch_main(monkeypatch, config, runner_cls=_RunnerWithRegistry)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    runner = _RunnerWithRegistry.instances[0]
+    assert runner.registry.coder_names() == ["claude", "codex", "third"]
+    assert runner.registry.get("third").display_name == "Configured Test Coder"
+
+
+def test_main_registry_failure_precedes_redis_client_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig()
+    _patch_main(monkeypatch, config)
+    opened = False
+
+    def from_url(*_args: Any, **_kwargs: Any) -> _FakeRedisClient:
+        nonlocal opened
+        opened = True
+        return _FakeRedisClient()
+
+    monkeypatch.setattr(main_module.aioredis, "from_url", from_url)
+    monkeypatch.setattr(
+        main_module,
+        "build_coder_registry",
+        lambda _config: (_ for _ in ()).throw(ValueError("bad plugin")),
+    )
+
+    with pytest.raises(ValueError, match="bad plugin"):
+        asyncio.run(main_module.main())
+
+    assert opened is False
+
+
 def test_clean_breach_dir_unlinks_file_marker(tmp_path: Any) -> None:
     breach_file = tmp_path / "breach-file"
     breach_file.write_text("stale")
@@ -1494,6 +1576,29 @@ def test_build_runner_passes_registry_when_supported(
         "codex": "codex-provider",
         "registry": registry,
     }
+
+
+def test_create_usage_providers_rejects_missing_builtin_provider() -> None:
+    class _Plugin:
+        def __init__(self, provider: object | None) -> None:
+            self.provider = provider
+
+        def create_usage_provider(self, *, config: AppConfig) -> object | None:
+            del config
+            return self.provider
+
+    class _Registry:
+        def get(self, name: str) -> _Plugin:
+            return {
+                "claude": _Plugin(None),
+                "codex": _Plugin(object()),
+            }[name]
+
+    with pytest.raises(ValueError, match="must provide usage providers"):
+        main_module._create_usage_providers(
+            AppConfig(),
+            _Registry(),  # type: ignore[arg-type]
+        )
 
 
 def test_main_logs_error_when_no_auth_is_configured(

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Hashable
+from typing import AbstractSet, Hashable
 
 from src.coder_registry import CoderPlugin, ModelCatalog, ModelMetadata
 from src.config import AppConfig
@@ -58,21 +59,35 @@ class ModelCatalogCache:
         *,
         ttl_seconds: float = _CATALOG_TTL_SECONDS,
         loader: Callable[..., Awaitable[ModelCatalog]] | None = None,
+        daemon_owned_plugins: AbstractSet[str] = frozenset(),
     ) -> None:
         if ttl_seconds <= 0:
             raise ValueError("catalog TTL must be positive")
         self._ttl_seconds = ttl_seconds
         self._loader = loader
+        self._daemon_owned_plugins = frozenset(daemon_owned_plugins)
         self._entries: dict[_CatalogKey, _CacheEntry] = {}
+        self._latest_keys: dict[str, _CatalogKey] = {}
         self._in_flight: dict[
             _CatalogKey, asyncio.Task[ModelCatalogSnapshot]
         ] = {}
         self._lock = asyncio.Lock()
 
-    @staticmethod
     def _key(
-        plugin: CoderPlugin, *, config: AppConfig, config_path: str
+        self,
+        plugin: CoderPlugin,
+        *,
+        config: AppConfig,
+        config_path: str,
     ) -> _CatalogKey:
+        if plugin.name in self._daemon_owned_plugins:
+            config_digest = hashlib.sha256(
+                config.model_dump_json().encode("utf-8")
+            ).hexdigest()
+            return _CatalogKey(
+                plugin.name,
+                ("daemon", config_path, config_digest),
+            )
         return _CatalogKey(
             plugin.name,
             plugin.model_catalog_cache_key(
@@ -92,6 +107,7 @@ class ModelCatalogCache:
         """Return a fresh snapshot, coalescing concurrent plugin calls."""
         key = self._key(plugin, config=config, config_path=config_path)
         async with self._lock:
+            self._select_key(key)
             entry = self._entries.get(key)
             if (
                 not refresh
@@ -121,6 +137,7 @@ class ModelCatalogCache:
     ) -> ModelCatalogSnapshot:
         """Return cached metadata without starting a plugin operation."""
         key = self._key(plugin, config=config, config_path=config_path)
+        self._select_key(key)
         entry = self._entries.get(key)
         if entry is None:
             return ModelCatalogSnapshot(
@@ -139,6 +156,16 @@ class ModelCatalogCache:
             ),
         )
 
+    def _select_key(self, key: _CatalogKey) -> None:
+        """Make ``key`` current and evict obsolete generations."""
+        previous = self._latest_keys.get(key.plugin_name)
+        if previous == key:
+            return
+        self._latest_keys[key.plugin_name] = key
+        for cached_key in tuple(self._entries):
+            if cached_key.plugin_name == key.plugin_name and cached_key != key:
+                self._entries.pop(cached_key, None)
+
     async def _refresh(
         self,
         key: _CatalogKey,
@@ -150,18 +177,21 @@ class ModelCatalogCache:
         attempted_at = datetime.now(timezone.utc).isoformat()
         try:
             try:
-                # Non-refreshable catalogs are explicit plugin metadata, so
-                # keep them available in the web control plane even while the
-                # daemon is offline.  Only refreshable discovery crosses the
-                # daemon bridge, where coder subprocess ownership belongs.
-                if self._loader is None or not plugin.model_catalog_refreshable:
-                    catalog = await plugin.get_model_catalog(
+                # Default non-refreshable catalogs are known static metadata.
+                # Configured implementations always cross the daemon bridge,
+                # even when they advertise a static catalog, because their
+                # protocol methods may still launch provider subprocesses.
+                if self._loader is not None and (
+                    plugin.model_catalog_refreshable
+                    or plugin.name in self._daemon_owned_plugins
+                ):
+                    catalog = await self._loader(
+                        plugin,
                         config=config,
                         config_path=config_path,
                     )
                 else:
-                    catalog = await self._loader(
-                        plugin,
+                    catalog = await plugin.get_model_catalog(
                         config=config,
                         config_path=config_path,
                     )
@@ -197,10 +227,11 @@ class ModelCatalogCache:
                     attempted_at=attempted_at,
                 )
             async with self._lock:
-                self._entries[key] = _CacheEntry(
-                    snapshot=snapshot,
-                    expires_at=time.monotonic() + self._ttl_seconds,
-                )
+                if self._latest_keys.get(key.plugin_name) == key:
+                    self._entries[key] = _CacheEntry(
+                        snapshot=snapshot,
+                        expires_at=time.monotonic() + self._ttl_seconds,
+                    )
             return snapshot
         finally:
             async with self._lock:
@@ -213,6 +244,7 @@ class ModelCatalogCache:
         async with self._lock:
             tasks = tuple(self._in_flight.values())
             self._in_flight.clear()
+            self._latest_keys.clear()
         for task in tasks:
             task.cancel()
         if tasks:

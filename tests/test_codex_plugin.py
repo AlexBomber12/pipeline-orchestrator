@@ -4,6 +4,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from src.coder_registry import (
     ModelCatalogUnavailable,
     ModelMetadata,
@@ -478,10 +479,21 @@ def test_codex_plugin_build_run_kwargs_resolves_reasoning_effort(
 
 
 @pytest.mark.parametrize("malformed", [None, 7, False, ["high"]])
+def test_daemon_config_rejects_malformed_reasoning_effort(
+    malformed: object,
+) -> None:
+    with pytest.raises(
+        ValidationError,
+        match=r"coder_settings\.codex\.reasoning_effort must be a string",
+    ):
+        DaemonConfig(coder_settings={"codex": {"reasoning_effort": malformed}})
+
+
+@pytest.mark.parametrize("malformed", [None, 7, False, ["high"]])
 def test_codex_plugin_rejects_malformed_reasoning_effort(
     malformed: object,
 ) -> None:
-    config = DaemonConfig(
+    config = DaemonConfig.model_construct(
         coder_settings={"codex": {"reasoning_effort": malformed}}
     )
 

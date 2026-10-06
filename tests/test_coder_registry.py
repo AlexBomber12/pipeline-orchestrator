@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import re
 from typing import Any
 
 import pytest
 from src import claude_cli, codex_cli
+from src import coders as coders_module
 from src.coder_registry import (
     CoderPlugin,
     CoderRegistry,
@@ -13,6 +15,7 @@ from src.coder_registry import (
     ModelMetadata,
     ModelSetting,
 )
+from src.coders import CoderPluginConfigurationError, build_coder_registry
 from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
 from src.config import AppConfig, DaemonConfig
@@ -119,6 +122,292 @@ class DummyCoderPlugin:
         return {"model": self.resolve_model(daemon_config)}
 
 
+def test_build_registry_without_config_keeps_builtin_compatibility() -> None:
+    registry = build_coder_registry()
+
+    assert registry.coder_names() == ["claude", "codex"]
+    assert isinstance(registry.get("claude"), ClaudePlugin)
+    assert isinstance(registry.get("codex"), CodexPlugin)
+
+
+def test_build_registry_loads_configured_plugin_and_builtin_override() -> None:
+    config = AppConfig(
+        coder_plugins={
+            "claude": (
+                "tests.configured_coder_plugin:build_claude_override"
+            ),
+            "third": "tests.configured_coder_plugin:build_test_plugin",
+        }
+    )
+
+    registry = build_coder_registry(config)
+
+    assert registry.coder_names() == ["claude", "codex", "third"]
+    assert registry.get("claude").display_name == "Configured Claude"
+    assert registry.get("third").name == "third"
+    assert isinstance(registry.get("codex"), CodexPlugin)
+
+
+def test_build_registry_validates_configured_custom_model_setting_value() -> None:
+    reference = "tests.configured_coder_plugin:build_variant_setting_plugin"
+    daemon = DaemonConfig.model_construct(
+        coder_settings={"third": {"variant": 123}}
+    )
+    config = AppConfig.model_construct(
+        coder_plugins={"third": reference},
+        daemon=daemon,
+    )
+
+    with pytest.raises(CoderPluginConfigurationError) as caught:
+        build_coder_registry(config)
+
+    message = str(caught.value)
+    assert repr("third") in message
+    assert repr(reference) in message
+    assert "failed at model setting validation" in message
+    assert "daemon.coder_settings.third.variant must be a string" in message
+
+
+def test_build_registry_accepts_string_custom_model_setting_value() -> None:
+    config = AppConfig(
+        coder_plugins={
+            "third": (
+                "tests.configured_coder_plugin:build_variant_setting_plugin"
+            )
+        },
+        daemon=DaemonConfig(
+            coder_settings={"third": {"variant": "third-invoke"}}
+        ),
+    )
+
+    registry = build_coder_registry(config)
+
+    assert registry.get("third").resolve_model(config.daemon) == "third-invoke"
+
+
+def test_build_registry_rejects_reasoning_effort_as_model_setting_key() -> None:
+    reference = (
+        "tests.configured_coder_plugin:build_reasoning_effort_setting_plugin"
+    )
+    config = AppConfig(coder_plugins={"third": reference})
+
+    with pytest.raises(CoderPluginConfigurationError) as caught:
+        build_coder_registry(config)
+
+    message = str(caught.value)
+    assert "failed at metadata validation" in message
+    assert "setting_key 'reasoning_effort' is reserved for plugin options" in message
+
+
+@pytest.mark.parametrize(
+    ("plugin_id", "reference", "stage"),
+    [
+        ("third", "missing-separator", "reference"),
+        ("third", ":factory", "reference"),
+        ("third", "missing.module:factory", "module import"),
+        (
+            "third",
+            "tests.configured_coder_plugin:missing_factory",
+            "factory lookup",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:NOT_CALLABLE",
+            "factory validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_incompatible_plugin",
+            "contract validation",
+        ),
+        (
+            "expected",
+            "tests.configured_coder_plugin:build_mismatched_plugin",
+            "identity validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_missing_metadata_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_raising_metadata_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_empty_name_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_invalid_models_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_invalid_model_setting_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_unknown_legacy_field_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_non_string_legacy_field_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_non_model_legacy_field_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_foreign_legacy_field_plugin",
+            "metadata validation",
+        ),
+        (
+            "claude",
+            (
+                "tests.configured_coder_plugin:"
+                "build_claude_foreign_legacy_field_plugin"
+            ),
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_non_string_default_value_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_empty_default_label_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_empty_setting_key_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_non_string_setting_key_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_dotted_setting_key_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_invalid_refreshable_plugin",
+            "metadata validation",
+        ),
+    ],
+)
+def test_build_registry_reports_configured_loading_stage(
+    plugin_id: str,
+    reference: str,
+    stage: str,
+) -> None:
+    config = AppConfig(coder_plugins={plugin_id: reference})
+
+    with pytest.raises(CoderPluginConfigurationError) as caught:
+        build_coder_registry(config)
+
+    message = str(caught.value)
+    assert repr(plugin_id) in message
+    assert repr(reference) in message
+    assert f"failed at {stage}" in message
+
+
+def test_build_registry_rejects_non_string_reference_from_constructed_config() -> None:
+    config = AppConfig.model_construct(coder_plugins={"third": 3})
+
+    with pytest.raises(
+        CoderPluginConfigurationError,
+        match="failed at reference: expected a module:factory string",
+    ):
+        build_coder_registry(config)
+
+
+@pytest.mark.parametrize("plugin_id", ["third/plugin", "third#plugin"])
+def test_build_registry_rejects_route_unsafe_plugin_id(plugin_id: str) -> None:
+    reference = "tests.configured_coder_plugin:build_test_plugin"
+    config = AppConfig(coder_plugins={plugin_id: reference})
+
+    with pytest.raises(CoderPluginConfigurationError) as caught:
+        build_coder_registry(config)
+
+    message = str(caught.value)
+    assert repr(plugin_id) in message
+    assert repr(reference) in message
+    assert "failed at plugin ID validation" in message
+
+
+def test_build_registry_rejects_reserved_infrastructure_plugin_id() -> None:
+    reference = "tests.configured_coder_plugin:build_test_plugin"
+    config = AppConfig(coder_plugins={"gh": reference})
+
+    with pytest.raises(CoderPluginConfigurationError) as caught:
+        build_coder_registry(config)
+
+    message = str(caught.value)
+    assert repr("gh") in message
+    assert repr(reference) in message
+    assert "failed at plugin ID validation" in message
+    assert "reserved for infrastructure status" in message
+
+
+def test_build_registry_wraps_contract_inspection_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_isinstance = builtins.isinstance
+
+    def raising_isinstance(value: object, class_or_tuple: object) -> bool:
+        if class_or_tuple is CoderPlugin:
+            raise RuntimeError("contract secret")
+        return real_isinstance(value, class_or_tuple)
+
+    monkeypatch.setattr(
+        coders_module,
+        "isinstance",
+        raising_isinstance,
+        raising=False,
+    )
+    config = AppConfig(
+        coder_plugins={
+            "third": "tests.configured_coder_plugin:build_test_plugin"
+        }
+    )
+
+    with pytest.raises(CoderPluginConfigurationError) as caught:
+        build_coder_registry(config)
+
+    message = str(caught.value)
+    assert "failed at contract validation" in message
+    assert "RuntimeError" in message
+    assert "contract secret" not in message
+
+
+def test_build_registry_redacts_factory_exception_detail() -> None:
+    reference = "tests.configured_coder_plugin:build_exploding_plugin"
+    config = AppConfig(coder_plugins={"third": reference})
+
+    with pytest.raises(CoderPluginConfigurationError) as caught:
+        build_coder_registry(config)
+
+    message = str(caught.value)
+    assert "failed at factory invocation" in message
+    assert "RuntimeError" in message
+    assert "must-not-leak" not in message
+
+
 def test_register_and_get() -> None:
     registry = CoderRegistry()
     plugin = DummyCoderPlugin(name="claude", display_name="Claude")
@@ -126,6 +415,17 @@ def test_register_and_get() -> None:
     registry.register(plugin)
 
     assert registry.get("claude") is plugin
+
+
+def test_register_tracks_and_clears_startup_reference() -> None:
+    registry = CoderRegistry()
+    plugin = DummyCoderPlugin(name="claude", display_name="Claude")
+
+    registry.register(plugin, reference="package.module:factory")
+    assert registry.reference_for("claude") == "package.module:factory"
+
+    registry.register(plugin)
+    assert registry.reference_for("claude") is None
 
 
 def test_get_unknown_raises() -> None:
