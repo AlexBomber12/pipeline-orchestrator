@@ -3097,6 +3097,149 @@ def test_classify_ci_retrieval_preserves_current_infra_failure() -> None:
     )
 
 
+@pytest.mark.parametrize("statuses", [[], [{}]])
+def test_classify_ci_retrieval_preserves_known_aggregate_failure(
+    statuses: list[dict],
+) -> None:
+    sha = "a" * 40
+    retrieval = _ci_retrieval(
+        "owner/name",
+        sha,
+        [],
+        {"state": "failure", "statuses": statuses},
+    )
+
+    assert retrieval.evidence.policy_result == CIStatus.FAILURE
+    assert (
+        checks._classify_ci_retrieval(retrieval, required_contexts=["unit"])
+        == CIStatus.FAILURE
+    )
+
+
+def test_classify_ci_retrieval_aggregate_failure_dominates_infra_run() -> None:
+    sha = "a" * 40
+    retrieval = _ci_retrieval(
+        "owner/name",
+        sha,
+        [
+            {
+                "id": 1,
+                "name": "unit",
+                "conclusion": "cancelled",
+                "head_sha": sha,
+                "app": {"id": 1},
+            }
+        ],
+        {"state": "failure", "statuses": []},
+    )
+
+    assert checks._classify_ci_retrieval(retrieval) == CIStatus.FAILURE
+
+
+def test_classify_ci_retrieval_treats_legacy_status_failure_as_logic() -> None:
+    sha = "a" * 40
+    retrieval = _ci_retrieval(
+        "owner/name",
+        sha,
+        [],
+        {
+            "state": "pending",
+            "statuses": [
+                {
+                    "context": "legacy",
+                    "state": "failure",
+                    "creator": {"login": "ci-bot"},
+                }
+            ],
+        },
+    )
+
+    assert checks._classify_ci_retrieval(retrieval) == CIStatus.FAILURE
+
+
+def test_classify_ci_retrieval_treats_ambiguous_run_id_as_logic() -> None:
+    sha = "a" * 40
+    retrieval = _ci_retrieval(
+        "owner/name",
+        sha,
+        [
+            {
+                "id": 1,
+                "name": "unit",
+                "conclusion": conclusion,
+                "head_sha": sha,
+                "app": {"id": 1},
+                "completed_at": completed_at,
+            }
+            for conclusion, completed_at in (
+                ("failure", "2026-10-06T10:00:00Z"),
+                ("cancelled", "2026-10-06T11:00:00Z"),
+            )
+        ],
+        {"state": "pending", "statuses": []},
+    )
+
+    assert checks._classify_ci_retrieval(retrieval) == CIStatus.FAILURE
+
+
+def test_classify_ci_retrieval_preserves_current_logic_failure() -> None:
+    sha = "a" * 40
+    retrieval = _ci_retrieval(
+        "owner/name",
+        sha,
+        [
+            {
+                "id": 1,
+                "name": "unit",
+                "conclusion": "failure",
+                "head_sha": sha,
+                "app": {"id": 1},
+            }
+        ],
+        {"state": "pending", "statuses": []},
+    )
+
+    assert checks._classify_ci_retrieval(retrieval) == CIStatus.FAILURE
+
+
+def test_classify_ci_retrieval_uses_latest_attempt_for_infra_failure() -> None:
+    sha = "a" * 40
+    retrieval = _ci_retrieval(
+        "owner/name",
+        sha,
+        [
+            {
+                "id": 1,
+                "name": "unit",
+                "conclusion": "failure",
+                "head_sha": sha,
+                "app": {"id": 1},
+                "run_attempt": 1,
+                "completed_at": "2026-10-06T10:00:00Z",
+            },
+            {
+                "id": 2,
+                "name": "unit",
+                "conclusion": "cancelled",
+                "head_sha": sha,
+                "app": {"id": 1},
+                "run_attempt": 2,
+                "completed_at": "2026-10-06T11:00:00Z",
+            },
+        ],
+        {"state": "pending", "statuses": []},
+    )
+
+    assert _map_rest_ci_status_to_enum(
+        retrieval.check_runs,
+        retrieval.status_payload,
+    ) == CIStatus.FAILURE
+    assert (
+        checks._classify_ci_retrieval(retrieval, required_contexts=["unit"])
+        == CIStatus.INFRA_FAILURE
+    )
+
+
 # ---------------------------------------------------------------------------
 # retry integration tests (PR-054)
 # ---------------------------------------------------------------------------

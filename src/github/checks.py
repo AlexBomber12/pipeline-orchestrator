@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Any, NamedTuple
 
 from src.github import cache, gh_runner
-from src.github.ci_evidence import CIEvidence, evaluate_ci_evidence
+from src.github.ci_evidence import CIEvidence, _latest, evaluate_ci_evidence
 from src.models import CIStatus
 from src.retry import retry_transient
 
@@ -530,19 +530,44 @@ def _classify_ci_retrieval(
         observed_at=retrieval.evidence.observed_at,
         empty_is_success=empty_is_success,
     )
-    mapped = _map_rest_ci_status_to_enum(
-        retrieval.check_runs,
-        retrieval.status_payload if retrieval.status_source.sha_matches else {},
-        empty_is_success=empty_is_success,
-        fetch_ok=retrieval.evidence.sources_complete,
-    )
-    # Keep the compatibility mapper's INFRA_FAILURE distinction only when
-    # canonical latest-per-producer evidence confirms that a current failure
-    # remains. The mapper intentionally sees the complete historical payload,
-    # so returning its failure first would let an older failed attempt override
-    # a successful rerun selected by ``evaluate_ci_evidence``.
+    # ``_make_ci_retrieval`` preserves this aggregate because GitHub can
+    # report a known commit-status failure while omitting or malforming the
+    # embedded status history. Keep it authoritative here too; the rebuilt
+    # evidence above cannot recover a context that the response omitted.
+    combined_state = _commit_status_state(retrieval.status_payload.get("state"))
+    if (
+        retrieval.status_source.sha_matches
+        and combined_state in _REST_CI_FAILURE_STATES
+    ):
+        return CIStatus.FAILURE
+
+    # Classify infrastructure failures from the canonical current attempts.
+    # The compatibility mapper intentionally sees the complete historical
+    # payload, where an older logic failure would otherwise override a newer
+    # infra-class rerun for the same check and producer.
     if evidence.policy_result == CIStatus.FAILURE:
-        return mapped if mapped == CIStatus.INFRA_FAILURE else CIStatus.FAILURE
+        latest_failures = [
+            context
+            for producers in _latest(evidence.contexts).values()
+            for context in producers.values()
+            if context.state == "failure"
+        ]
+        current_runs = []
+        for context in latest_failures:
+            if not context.run_id or context.run_id[0] != "check":
+                return CIStatus.FAILURE
+            matches = [
+                run
+                for run in retrieval.check_runs
+                if isinstance(run, dict) and run.get("id") == context.run_id[1]
+            ]
+            if len(matches) != 1:
+                return CIStatus.FAILURE
+            current_runs.append(matches[0])
+        if current_runs and all(_is_infra_failure(run) for run in current_runs):
+            return CIStatus.INFRA_FAILURE
+        return CIStatus.FAILURE
+
     return evidence.policy_result
 
 

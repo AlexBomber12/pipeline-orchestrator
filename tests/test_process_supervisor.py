@@ -2398,7 +2398,12 @@ async def test_launch_rejects_conflicts_and_unverified_session(
         launch_task.cancel()
         release_exec_result.set()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(launch_task, timeout=1)
+            await asyncio.wait_for(
+                launch_task,
+                timeout=(
+                    process_supervisor._failed_launch_cleanup_timeout_seconds() + 1
+                ),
+            )
     assert len(exec_cleanup_tasks) == len(exec_cleanup_owners) == 1
     assert exec_cleanup_tasks[0].done()
     exec_owner = exec_cleanup_owners[0]
@@ -2455,7 +2460,12 @@ async def test_launch_rejects_conflicts_and_unverified_session(
         launch_task.cancel()
         release_cleanup.set()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(launch_task, timeout=1)
+            await asyncio.wait_for(
+                launch_task,
+                timeout=(
+                    process_supervisor._failed_launch_cleanup_timeout_seconds() + 1
+                ),
+            )
     assert not cancellation_marker.exists()
     assert len(repeated_cleanup_tasks) == len(repeated_cleanup_processes) == 1
     assert repeated_cleanup_tasks[0].done()
