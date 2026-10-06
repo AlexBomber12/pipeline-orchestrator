@@ -34,6 +34,7 @@ def test_load_config_missing_file_returns_defaults(tmp_path: Path) -> None:
     assert cfg.web.port == 8000
     assert cfg.auth.claude_config_dir == "/data/auth/claude"
     assert cfg.auth.gh_config_dir == "/data/auth/gh"
+    assert cfg.coder_plugins == config_module.DEFAULT_CODER_PLUGINS
 
 
 def test_load_config_missing_file_applies_env_overrides(
@@ -150,6 +151,10 @@ def test_daemon_config_accepts_null_coder_settings_as_empty() -> None:
             {"codex": {"reasoning_effort": 123}},
             "coder_settings.codex.reasoning_effort must be a string",
         ),
+        (
+            {"third": {"variant": 123}},
+            "coder_settings.third.variant must be a string",
+        ),
     ],
 )
 def test_daemon_config_rejects_malformed_coder_settings(
@@ -161,6 +166,31 @@ def test_daemon_config_rejects_malformed_coder_settings(
 
     with pytest.raises(ValidationError, match=message):
         DaemonConfig(coder_settings=coder_settings)  # type: ignore[arg-type]
+
+
+def test_load_config_rejects_non_string_custom_setting_on_reload(
+    tmp_path: Path,
+) -> None:
+    from pydantic import ValidationError
+
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        "daemon:\n  coder_settings:\n    third:\n      variant: safe\n",
+        encoding="utf-8",
+    )
+    assert load_config(str(config_path)).daemon.coder_settings["third"] == {
+        "variant": "safe"
+    }
+
+    config_path.write_text(
+        "daemon:\n  coder_settings:\n    third:\n      variant: 123\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        ValidationError,
+        match=r"coder_settings\.third\.variant must be a string",
+    ):
+        load_config(str(config_path))
 
 
 def test_daemon_config_selector_defaults() -> None:
@@ -317,6 +347,77 @@ def test_save_config_round_trip(tmp_path: Path) -> None:
     assert path.is_file()
     loaded = load_config(str(path))
     assert loaded.model_dump() == config.model_dump()
+
+
+def test_coder_plugins_overlay_save_and_parse_do_not_invoke_factories(
+    tmp_path: Path,
+) -> None:
+    from src.coders import build_coder_registry
+
+    from tests import configured_coder_plugin as fixture
+
+    fixture.reset_factory_calls()
+    path = tmp_path / "config.yml"
+    path.write_text(
+        "coder_plugins:\n"
+        "  third: tests.configured_coder_plugin:build_test_plugin\n"
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    third:\n"
+        "      model: third-default\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "config.production.yml").write_text(
+        "coder_plugins:\n"
+        "  claude: tests.configured_coder_plugin:build_claude_override\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(str(path))
+    assert fixture.FACTORY_CALLS == 0
+    assert config.coder_plugins == {
+        "claude": "tests.configured_coder_plugin:build_claude_override",
+        "codex": "src.coders.codex:CodexPlugin",
+        "third": "tests.configured_coder_plugin:build_test_plugin",
+    }
+
+    save_config(config, str(path))
+    update_daemon_config(
+        path=str(path),
+        coder_settings={"third": {"model": "third-invoke"}},
+    )
+    reloaded = load_config(str(path))
+    assert fixture.FACTORY_CALLS == 0
+    assert reloaded.coder_plugins == config.coder_plugins
+    assert reloaded.daemon.coder_settings["third"]["model"] == "third-invoke"
+
+    registry = build_coder_registry(reloaded)
+    assert registry.get("third").display_name == "Configured Test Coder"
+    assert fixture.FACTORY_CALLS == 1
+
+
+@pytest.mark.parametrize(
+    ("coder_plugins", "message"),
+    [
+        ("not-a-mapping", "coder_plugins must be a mapping"),
+        ({"": "some.module:factory"}, "plugin IDs must be non-empty strings"),
+        ({"third": 3}, "coder_plugins.third must be a module:factory string"),
+    ],
+)
+def test_app_config_rejects_malformed_coder_plugin_mapping(
+    coder_plugins: object,
+    message: str,
+) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match=message):
+        AppConfig(coder_plugins=coder_plugins)  # type: ignore[arg-type]
+
+
+def test_app_config_accepts_null_coder_plugins_as_defaults() -> None:
+    config = AppConfig(coder_plugins=None)  # type: ignore[arg-type]
+
+    assert config.coder_plugins == config_module.DEFAULT_CODER_PLUGINS
 
 
 def test_load_config_reloads_trusted_reviewer_policy_snapshot(

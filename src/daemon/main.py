@@ -35,8 +35,6 @@ import redis.asyncio as aioredis
 
 from src.coder_registry import CoderRegistry
 from src.coders import build_coder_registry
-from src.coders.claude import ClaudePlugin
-from src.coders.codex import CodexPlugin
 from src.config import AppConfig, RepoConfig, load_config, normalize_repo_url
 from src.daemon.cascade_monitor import check_cascade_escalate_state
 from src.daemon.config_watcher import (
@@ -278,12 +276,18 @@ def _build_runner(
         return None
 
 
-def _create_usage_providers(config: AppConfig) -> tuple[UsageProvider, UsageProvider]:
+def _create_usage_providers(
+    config: AppConfig,
+    registry: CoderRegistry,
+) -> tuple[UsageProvider, UsageProvider]:
     """Create the shared daemon-level usage providers for the current config."""
-    return (
-        ClaudePlugin().create_usage_provider(config=config),
-        CodexPlugin().create_usage_provider(config=config),
-    )
+    claude = registry.get("claude").create_usage_provider(config=config)
+    codex = registry.get("codex").create_usage_provider(config=config)
+    if claude is None or codex is None:
+        raise ValueError(
+            "Configured 'claude' and 'codex' plugins must provide usage providers"
+        )
+    return claude, codex
 
 
 def _sync_runners(
@@ -706,8 +710,11 @@ async def main() -> None:
         )
 
     config = load_config()
-    registry = build_coder_registry()
-    claude_usage_provider, codex_usage_provider = _create_usage_providers(config)
+    registry = build_coder_registry(config)
+    claude_usage_provider, codex_usage_provider = _create_usage_providers(
+        config,
+        registry,
+    )
 
     _clean_breach_dir()
     if config.daemon.install_statusline_hook:
@@ -718,6 +725,18 @@ async def main() -> None:
 
     redis_url = os.environ.get("REDIS_URL", DEFAULT_REDIS_URL)
     redis_client = aioredis.from_url(redis_url, decode_responses=True)
+    # Publish configured metadata as soon as Redis is available so web startup
+    # never needs to import or instantiate operator-provided plugin code.
+    _background_tasks: set[asyncio.Task[None]] = set()
+    model_catalog_task = asyncio.create_task(
+        serve_model_catalog_requests(
+            redis_client,
+            registry,
+            config_path=os.environ.get("PO_CONFIG_PATH", "config.yml"),
+        )
+    )
+    _background_tasks.add(model_catalog_task)
+    model_catalog_task.add_done_callback(_background_tasks.discard)
     migrated_hung_repos = await migrate_hung_to_idle_on_startup(redis_client, logger)
     logger.info(
         "[MIGRATION] HUNG to IDLE startup migration rewrote %d repo(s)",
@@ -763,18 +782,8 @@ async def main() -> None:
         in_flight,
     )
 
-    # Keep a strong reference: the event loop only holds weak references
-    # to tasks, so a discarded handle can be garbage-collected mid-await.
-    _background_tasks: set[asyncio.Task[None]] = set()
-    model_catalog_task = asyncio.create_task(
-        serve_model_catalog_requests(
-            redis_client,
-            registry,
-            config_path=os.environ.get("PO_CONFIG_PATH", "config.yml"),
-        )
-    )
-    _background_tasks.add(model_catalog_task)
-    model_catalog_task.add_done_callback(_background_tasks.discard)
+    # Keep strong references: the event loop only holds weak references to
+    # tasks, so discarded handles can be garbage-collected mid-await.
     watcher_task = asyncio.create_task(
         watch_config_file_changes(
             redis_client,
@@ -824,8 +833,15 @@ async def main() -> None:
                     logger.info(
                         "Config change detected; reconciling runners"
                     )
+                    if new_config.coder_plugins != config.coder_plugins:
+                        logger.warning(
+                            "coder_plugins changed; plugin definitions are "
+                            "startup-only and require a service restart"
+                        )
                     config = new_config
-                    claude_usage_provider, codex_usage_provider = _create_usage_providers(config)
+                    claude_usage_provider, codex_usage_provider = (
+                        _create_usage_providers(config, registry)
+                    )
                     prev_keys = set(runners.keys())
                     _sync_runners(
                         runners,

@@ -151,6 +151,7 @@ class ClaudePlugin:
         on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
         on_supervised_process_start: Callable[[SupervisedProcess], None]
         | None = None,
+        **_kwargs: Any,
     ) -> tuple[int, str, str]:
         return await claude_cli.run_claude_async(
             prompt,
@@ -221,6 +222,7 @@ class ClaudePlugin:
         on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
         on_supervised_process_start: Callable[[SupervisedProcess], None]
         | None = None,
+        **_kwargs: Any,
     ) -> tuple[int, str, str]:
         return await claude_cli.diagnose_error_async(
             repo_path,

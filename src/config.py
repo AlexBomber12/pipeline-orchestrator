@@ -19,6 +19,11 @@ from pydantic import BaseModel, Field, field_validator
 
 OVERLAY_FILENAME = "config.production.yml"
 
+DEFAULT_CODER_PLUGINS = {
+    "claude": "src.coders.claude:ClaudePlugin",
+    "codex": "src.coders.codex:CodexPlugin",
+}
+
 
 class CoderType(str, Enum):
     CLAUDE = "claude"
@@ -317,16 +322,11 @@ class DaemonConfig(BaseModel):
                 raise ValueError(
                     f"coder_settings.{plugin_id} must be a mapping"
                 )
-            if "model" in settings and not isinstance(settings["model"], str):
-                raise ValueError(
-                    f"coder_settings.{plugin_id}.model must be a string"
-                )
-            if "reasoning_effort" in settings and not isinstance(
-                settings["reasoning_effort"], str
-            ):
-                raise ValueError(
-                    f"coder_settings.{plugin_id}.reasoning_effort must be a string"
-                )
+            for setting_key, setting_value in settings.items():
+                if not isinstance(setting_value, str):
+                    raise ValueError(
+                        f"coder_settings.{plugin_id}.{setting_key} must be a string"
+                    )
         return value
 
     @property
@@ -384,6 +384,34 @@ class AppConfig(BaseModel):
     daemon: DaemonConfig = Field(default_factory=DaemonConfig)
     web: WebConfig = Field(default_factory=WebConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
+    # Trusted, operator-managed Python entry points. Explicit YAML entries
+    # replace the matching built-in definition or add another stable ID.
+    # Importing and instantiation are deliberately deferred to registry
+    # construction so config reads, overlays, validation, and saves stay inert.
+    coder_plugins: dict[str, str] = Field(
+        default_factory=lambda: dict(DEFAULT_CODER_PLUGINS)
+    )
+
+    @field_validator("coder_plugins", mode="before")
+    @classmethod
+    def _merge_coder_plugin_defaults(cls, value: Any) -> dict[str, str]:
+        if value is None:
+            return dict(DEFAULT_CODER_PLUGINS)
+        if not isinstance(value, dict):
+            raise ValueError("coder_plugins must be a mapping")
+
+        configured: dict[str, str] = {}
+        for plugin_id, reference in value.items():
+            if not isinstance(plugin_id, str) or not plugin_id:
+                raise ValueError(
+                    "coder_plugins plugin IDs must be non-empty strings"
+                )
+            if not isinstance(reference, str):
+                raise ValueError(
+                    f"coder_plugins.{plugin_id} must be a module:factory string"
+                )
+            configured[plugin_id] = reference
+        return {**DEFAULT_CODER_PLUGINS, **configured}
 
 
 def _load_config_raw(path: str = "config.yml") -> dict[str, Any]:

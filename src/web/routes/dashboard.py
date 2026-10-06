@@ -41,7 +41,7 @@ from src.cancellation.storage import (
     list_pending_guardrail_decisions,
 )
 from src.coders import build_coder_registry
-from src.config import AppConfig, RepoConfig, load_config
+from src.config import AppConfig, CoderType, RepoConfig, load_config
 from src.daemon.github_rate_limit import (
     RateLimitBudget,
     read_graphql_budget,
@@ -674,6 +674,9 @@ async def _repo_template_context(
     )
     selected_repo_coder = _repo_coder_form_value(repo_config)
     active_repo_coder = _active_repo_coder(state)
+    registry = getattr(_app.app.state, "coder_registry", None)
+    if registry is None:
+        registry = build_coder_registry()
     return {
         "repo": state,
         "recent_graphql_burns": recent_graphql_burns,
@@ -681,7 +684,11 @@ async def _repo_template_context(
         "guardrail_pending": guardrail_pending,
         "repo_config": repo_config,
         "daemon": config.daemon,
-        "coders": build_coder_registry().list_coders(),
+        "coders": [
+            plugin
+            for plugin in registry.list_coders()
+            if plugin.name in CoderType
+        ],
         "effective_coder": effective_coder,
         "active_rate_limit_coder": active_rate_limit_coder,
         "active_rate_limit_coder_label": (

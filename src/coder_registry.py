@@ -76,6 +76,31 @@ class ModelSetting:
         return self.default_value
 
 
+@dataclass(frozen=True)
+class CoderMetadataView:
+    """Non-executable plugin metadata used by the web control plane."""
+
+    name: str
+    display_name: str
+    models: list[str]
+    model_setting: ModelSetting
+    model_catalog_refreshable: bool
+    metadata_available: bool = True
+
+    def resolve_model(self, daemon_config: "DaemonConfig") -> str:
+        """Resolve the configured model without invoking plugin code."""
+        return self.model_setting.resolve(self.name, daemon_config)
+
+    def build_run_kwargs(
+        self,
+        *,
+        daemon_config: "DaemonConfig",
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        """Expose model kwargs for provider-neutral settings consumers."""
+        return {"model": self.resolve_model(daemon_config)}
+
+
 class ModelCatalogUnavailable(RuntimeError):
     """A plugin could not provide a usable model catalog."""
 
@@ -150,6 +175,7 @@ class CoderPlugin(Protocol):
         on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
         on_supervised_process_start: Callable[[SupervisedProcess], None]
         | None = None,
+        **kwargs: Any,
     ) -> tuple[int, str, str]:
         """Run provider-neutral auxiliary work under process supervision."""
         ...
@@ -189,6 +215,7 @@ class CoderPlugin(Protocol):
         on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
         on_supervised_process_start: Callable[[SupervisedProcess], None]
         | None = None,
+        **kwargs: Any,
     ) -> tuple[int, str, str]: ...
 
     def build_run_kwargs(
@@ -198,16 +225,16 @@ class CoderPlugin(Protocol):
         breach_dir: str | None = None,
         breach_run_id: str | None = None,
     ) -> dict[str, Any]:
-        """Construct plugin-specific kwargs for run_planned_pr / fix_review.
+        """Construct plugin-specific kwargs for primary and auxiliary runs.
 
         Returns the model selection plus any plugin-specific extras
         (e.g. breach monitoring inputs for plugins that support the
         breach lifecycle). Handlers compose handler-specific keys
         (timeout, on_process_start, extra_context) on top of the
         returned dict and pass the merged mapping via ``**kwargs`` to
-        ``run_planned_pr`` / ``fix_review``. Plugins that ignore the
-        breach inputs (``supports_breach_lifecycle`` False) silently
-        drop them so callers can pass them unconditionally.
+        primary or auxiliary plugin method. Plugins that ignore the breach
+        inputs (``supports_breach_lifecycle`` False) silently drop them so
+        callers can pass them unconditionally.
         """
         ...
 
@@ -215,9 +242,19 @@ class CoderPlugin(Protocol):
 class CoderRegistry:
     def __init__(self) -> None:
         self._plugins: dict[str, CoderPlugin] = {}
+        self._references: dict[str, str] = {}
 
-    def register(self, plugin: CoderPlugin) -> None:
+    def register(
+        self,
+        plugin: CoderPlugin,
+        *,
+        reference: str | None = None,
+    ) -> None:
         self._plugins[plugin.name] = plugin
+        if reference is None:
+            self._references.pop(plugin.name, None)
+        else:
+            self._references[plugin.name] = reference
 
     def get(self, name: str) -> CoderPlugin:
         if name not in self._plugins:
@@ -229,3 +266,8 @@ class CoderRegistry:
 
     def coder_names(self) -> list[str]:
         return list(self._plugins.keys())
+
+    def reference_for(self, name: str) -> str | None:
+        """Return the startup factory reference for a configured plugin."""
+        self.get(name)
+        return self._references.get(name)

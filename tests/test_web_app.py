@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -22,8 +23,8 @@ from src.models import (
 )
 from src.web import app as web_app
 from src.web.app import (
-    _active_repo_coder,
     _active_rate_limit_coder,
+    _active_repo_coder,
     _build_recent_graphql_burns_view,
     _build_resources_view,
     _claude_usage_chip,
@@ -1473,6 +1474,216 @@ def test_lifespan_ignores_redis_close_errors(
         response = client.get("/")
 
     assert response.status_code == 200
+
+
+def test_lifespan_registry_failure_precedes_redis_client_creation(
+    empty_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened = False
+
+    def from_url(*_args: object, **_kwargs: object) -> _StubAioredisClient:
+        nonlocal opened
+        opened = True
+        return _StubAioredisClient()
+
+    monkeypatch.setattr(web_app.aioredis, "from_url", from_url)
+    monkeypatch.setattr(
+        web_app,
+        "build_coder_registry",
+        lambda *_args: (_ for _ in ()).throw(ValueError("bad plugin")),
+    )
+
+    with pytest.raises(ValueError, match="bad plugin"):
+        with TestClient(app):
+            pass
+
+    assert opened is False
+
+
+def test_lifespan_gets_configured_metadata_without_loading_factory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.coder_registry import CoderMetadataView, ModelSetting
+    from src.coders import build_coder_registry as real_build_registry
+
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        "coder_plugins:\n"
+        "  third: unsafe.module:factory\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(config_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    build_calls: list[tuple[object, ...]] = []
+
+    def build_defaults(*args: object) -> object:
+        build_calls.append(args)
+        return real_build_registry()
+
+    class MetadataLoader:
+        def __init__(self, _redis: object) -> None:
+            self.requested: list[str] = []
+
+        async def load_plugin_metadata(
+            self,
+            plugin_id: str,
+            *,
+            expected_reference: str,
+        ) -> CoderMetadataView:
+            self.requested.append(plugin_id)
+            assert expected_reference == "unsafe.module:factory"
+            return CoderMetadataView(
+                name=plugin_id,
+                display_name="Daemon Metadata",
+                models=["third-default"],
+                model_setting=ModelSetting(
+                    None,
+                    "third-default",
+                    "Default",
+                ),
+                model_catalog_refreshable=False,
+            )
+
+        async def __call__(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("catalog loading is not part of startup")
+
+    loaders: list[MetadataLoader] = []
+
+    def loader_factory(redis: object) -> MetadataLoader:
+        loader = MetadataLoader(redis)
+        loaders.append(loader)
+        return loader
+
+    monkeypatch.setattr(web_app, "build_coder_registry", build_defaults)
+    monkeypatch.setattr(web_app, "DaemonModelCatalogLoader", loader_factory)
+
+    with TestClient(app) as client:
+        plugin = client.app.state.coder_registry.get("third")
+        assert plugin.display_name == "Daemon Metadata"
+        assert client.app.state.coder_registry.reference_for("third") == (
+            "unsafe.module:factory"
+        )
+
+    assert build_calls == [()]
+    assert loaders[0].requested == ["third"]
+
+
+def test_lifespan_degrades_when_daemon_metadata_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.coder_registry import ModelCatalogUnavailable
+
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        "coder_plugins:\n"
+        "  third: unsafe.module:factory\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(config_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    class UnavailableLoader:
+        def __init__(self, _redis: object) -> None:
+            pass
+
+        async def load_plugin_metadata(
+            self,
+            _plugin_id: str,
+            *,
+            expected_reference: str,
+        ) -> object:
+            assert expected_reference == "unsafe.module:factory"
+            raise ModelCatalogUnavailable("daemon offline")
+
+        async def __call__(self, *_args: object, **_kwargs: object) -> object:
+            raise ModelCatalogUnavailable("daemon offline")
+
+    monkeypatch.setattr(
+        web_app,
+        "DaemonModelCatalogLoader",
+        UnavailableLoader,
+    )
+
+    with TestClient(app) as client:
+        plugin = client.app.state.coder_registry.get("third")
+        rendered = client.get("/partials/settings/coders")
+        rejected = client.put(
+            "/settings/daemon",
+            data={"coder_settings.third.model": "unsafe-change"},
+        )
+
+    assert plugin.metadata_available is False
+    assert rendered.status_code == 200
+    assert "third (metadata unavailable)" in rendered.text
+    assert "model changes are disabled" in rendered.text
+    assert 'name="coder_settings.third.model"' in rendered.text
+    assert 'disabled aria-disabled="true"' in rendered.text
+    assert rejected.status_code == 422
+    assert "Coder metadata is unavailable: third" in rejected.text
+
+
+def test_lifespan_recovers_configured_metadata_when_daemon_appears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.coder_registry import (
+        CoderMetadataView,
+        ModelCatalogUnavailable,
+        ModelSetting,
+    )
+
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        "coder_plugins:\n"
+        "  third: unsafe.module:factory\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(config_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    monkeypatch.setattr(web_app, "_METADATA_RETRY_INTERVAL_SECONDS", 0)
+
+    class RecoveringLoader:
+        def __init__(self, _redis: object) -> None:
+            self.calls = 0
+
+        async def load_plugin_metadata(
+            self,
+            plugin_id: str,
+            *,
+            expected_reference: str,
+        ) -> CoderMetadataView:
+            self.calls += 1
+            assert expected_reference == "unsafe.module:factory"
+            if self.calls < 3:
+                raise ModelCatalogUnavailable("daemon starting")
+            return CoderMetadataView(
+                name=plugin_id,
+                display_name="Recovered Coder",
+                models=["recovered-model"],
+                model_setting=ModelSetting(None, "recovered-model", "Default"),
+                model_catalog_refreshable=False,
+            )
+
+        async def __call__(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("catalog loading is not part of recovery")
+
+    monkeypatch.setattr(
+        web_app,
+        "DaemonModelCatalogLoader",
+        RecoveringLoader,
+    )
+
+    with TestClient(app) as client:
+        for _ in range(100):
+            plugin = client.app.state.coder_registry.get("third")
+            if plugin.metadata_available:
+                break
+            time.sleep(0.01)
+        assert plugin.display_name == "Recovered Coder"
+        assert plugin.model_setting.default_value == "recovered-model"
 
 
 def test_get_repo_state_unknown_repo_returns_idle_default(

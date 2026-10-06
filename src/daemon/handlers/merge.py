@@ -161,16 +161,19 @@ class MergeMixin:
                         plugin_run_kwargs = plugin.build_run_kwargs(
                             daemon_config=self.app_config.daemon
                         )
+                        auxiliary_kwargs = {
+                            **plugin_run_kwargs,
+                            "timeout": 300,
+                            "on_process_start": self._track_current_coder_process,
+                            "on_supervised_process_start": (
+                                self._track_current_coder_supervised_process
+                            ),
+                        }
                         auxiliary_result = await self._await_auxiliary_coder(
                             plugin.run_prompt(
                                 prompt,
                                 self.repo_path,
-                                model=plugin_run_kwargs.get("model"),
-                                timeout=300,
-                                on_process_start=self._track_current_coder_process,
-                                on_supervised_process_start=(
-                                    self._track_current_coder_supervised_process
-                                ),
+                                **auxiliary_kwargs,
                             ),
                             cleanup_context="MERGE conflict resolution",
                             log_prefix="[MERGE]",
