@@ -540,6 +540,21 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             "INFO {kind: Secret, stringData: {password: redis-kube-prefixed-flow-secret}}",
             "{kind: ConfigMap, data: {harmless: retained-single-flow-config}}",
             (
+                "{apiVersion: v1,\n kind: Secret,\n"
+                " data: {opaque: redis-kube-multiline-flow-secret}}"
+            ),
+            "env: [{name: PASSWORD, value: redis-flow-env-secret}]",
+            "env: [{value: redis-reversed-flow-env-secret, name: API_KEY}]",
+            "env: [{name: PASSWORD,\n value: redis-multiline-flow-env-secret}]",
+            "---",
+            (
+                "{apiVersion: v1,\n kind: ConfigMap,\n"
+                " data: {harmless: retained-multiline-flow-config}}"
+            ),
+            "---",
+            "env: [{name: SAFE, value: retained-flow-env-value}]",
+            "---",
+            (
                 "apiVersion: v1\ndata:\n"
                 "  opaque: redis-kube-yaml-secret\n"
                 "kind: Secret\nmetadata:\n  annotations:\n    note: |\n      ---\n"
@@ -684,6 +699,16 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "data:\n  harmless: retained-ci-aliased-config-value\n"
         + "---\n{apiVersion: v1, kind: Secret, data: {opaque: ci-kube-single-flow-secret}}\n"
         + "{kind: ConfigMap, data: {harmless: retained-ci-single-flow-config}}\n"
+        + "{apiVersion: v1,\n kind: Secret,\n"
+        + " data: {opaque: ci-kube-multiline-flow-secret}}\n"
+        + "env: [{name: PASSWORD, value: ci-flow-env-secret}]\n"
+        + "env: [{value: ci-reversed-flow-env-secret, name: API_KEY}]\n"
+        + "env: [{name: PASSWORD,\n value: ci-multiline-flow-env-secret}]\n"
+        + "---\n"
+        + "{apiVersion: v1,\n kind: ConfigMap,\n"
+        + " data: {harmless: retained-ci-multiline-flow-config}}\n"
+        + "---\n"
+        + "env: [{name: SAFE, value: retained-ci-flow-env-value}]\n"
         + "---\nkind: ConfigMap\ndata:\n  harmless: retained-ci-config-value\n"
         + '2026-10-05 INFO {"password":987654322,"debug":true}\n',
         encoding="utf-8",
@@ -768,9 +793,15 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "retained-aliased-config-value" in content
         assert "redis-kube-single-flow-secret" not in content
         assert "redis-kube-prefixed-flow-secret" not in content
+        assert "redis-kube-multiline-flow-secret" not in content
+        assert "redis-flow-env-secret" not in content
+        assert "redis-reversed-flow-env-secret" not in content
+        assert "redis-multiline-flow-env-secret" not in content
         assert "retained-list-config-value" in content
         assert "retained-config-value" in content
         assert "retained-single-flow-config" in content
+        assert "retained-multiline-flow-config" in content
+        assert "retained-flow-env-value" in content
         assert docker_auth not in content
 
     for source_id, list_secret in (
@@ -852,7 +883,13 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         if source_id == "ci:artifact":
             assert "retained-ci-list-config-value" in content
             assert "ci-kube-single-flow-secret" not in content
+            assert "ci-kube-multiline-flow-secret" not in content
+            assert "ci-flow-env-secret" not in content
+            assert "ci-reversed-flow-env-secret" not in content
+            assert "ci-multiline-flow-env-secret" not in content
             assert "retained-ci-single-flow-config" in content
+            assert "retained-ci-multiline-flow-config" in content
+            assert "retained-ci-flow-env-value" in content
             assert "retained-ci-aliased-yaml-env-value" in content
             assert "retained-ci-aliased-config-value" in content
 
@@ -1229,9 +1266,22 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     assert not diagnostics._is_single_line_flow_yaml_secret(
         "{kind: ConfigMap, data: {harmless: visible}}"
     )
+    assert diagnostics._yaml_flow_sensitivity(
+        "{apiVersion: v1,\n kind: Secret,\n data: {opaque: hidden}}"
+    ) == "KUBERNETES SECRET"
+    assert diagnostics._yaml_flow_sensitivity(
+        "env: [{name: PASSWORD, value: hidden}]"
+    ) == "YAML ENVIRONMENT VALUE"
+    assert diagnostics._yaml_flow_sensitivity(
+        "env: [{value: hidden, name: API_KEY}]"
+    ) == "YAML ENVIRONMENT VALUE"
+    assert diagnostics._yaml_flow_sensitivity(
+        "env: [{name: SAFE, value: visible}]"
+    ) is None
     cyclic: list[Any] = []
     cyclic.append(cyclic)
     assert not diagnostics._contains_kubernetes_secret_payload(cyclic)
+    assert not diagnostics._contains_sensitive_yaml_environment(cyclic)
 
     redis = FakeRedis()
     _patch_runtime(monkeypatch, redis, _config(_repo()))
@@ -2243,6 +2293,34 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
     )
     assert units[0][1] == "[REDACTED SENSITIVE ASSIGNMENT]\n"
     assert warnings
+
+    warnings = []
+    flow_units = diagnostics._redacted_file_units(
+        b"{kind: Secret, data:\n {opaque: bounded-flow-secret}\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=True,
+        warnings=warnings,
+    )
+    assert flow_units[0][1] == "[REDACTED SENSITIVE KUBERNETES SECRET]\n"
+    assert any("flow collection crossed" in warning for warning in warnings)
+
+    incomplete_json_units = diagnostics._redacted_file_units(
+        b'{\n"password":\n"bounded-json-secret"\n',
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=True,
+        warnings=[],
+    )
+    assert "bounded-json-secret" not in "".join(unit[1] for unit in incomplete_json_units)
 
     warnings = []
     value_units = diagnostics._redacted_file_units(

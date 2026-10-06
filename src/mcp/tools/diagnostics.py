@@ -723,31 +723,82 @@ def _contains_kubernetes_secret_payload(
         seen.remove(identity)
 
 
-def _is_single_line_flow_yaml_secret(text: str) -> bool:
-    """Recognize complete flow-style Secret manifests before ordinary redaction."""
-    stripped = text.strip()
-    lowered = stripped.casefold()
-    if "{" not in stripped or "kind" not in lowered or "secret" not in lowered:
+def _contains_sensitive_yaml_environment(
+    value: Any,
+    *,
+    depth: int = 0,
+    seen: set[int] | None = None,
+) -> bool:
+    """Find a sensitive YAML environment name/value mapping."""
+    if not isinstance(value, (dict, list)) or depth >= _MAX_STRUCTURED_DEPTH:
         return False
+    seen = set() if seen is None else seen
+    identity = id(value)
+    if identity in seen:
+        return False
+    seen.add(identity)
+    try:
+        if isinstance(value, dict):
+            normalized = {
+                key.casefold().replace("_", "").replace("-", ""): item
+                for key, item in value.items()
+                if isinstance(key, str)
+            }
+            name = normalized.get("name")
+            if (
+                isinstance(name, str)
+                and _SENSITIVE_KEY.fullmatch(name) is not None
+                and "value" in normalized
+            ):
+                return True
+            children = value.values()
+        else:
+            children = value
+        return any(
+            _contains_sensitive_yaml_environment(child, depth=depth + 1, seen=seen)
+            for child in children
+        )
+    finally:
+        seen.remove(identity)
+
+
+def _yaml_flow_sensitivity(text: str) -> str | None:
+    """Classify a complete bounded YAML flow collection."""
+    stripped = text.strip()
+    if "{" not in stripped and "[" not in stripped:
+        return None
     try:
         json_value = json.loads(stripped)
     except (RecursionError, TypeError, ValueError):
         pass
     else:
         if isinstance(json_value, (dict, list)):
-            return False
+            return None
     starts = [index for token in ("{", "[") if (index := stripped.find(token)) >= 0]
-    candidate = stripped[min(starts) :] if starts else stripped
-    try:
-        parsed = yaml.safe_load(candidate)
-    except (RecursionError, yaml.YAMLError):
-        parsed = None
-    if _contains_kubernetes_secret_payload(parsed):
-        return True
-    return bool(
-        _YAML_FLOW_KIND_SECRET.search(stripped)
-        and _YAML_FLOW_SECRET_PAYLOAD.search(stripped)
-    )
+    candidates = [stripped]
+    if starts and min(starts) > 0:
+        candidates.append(stripped[min(starts) :])
+    for candidate in candidates:
+        try:
+            parsed = yaml.safe_load(candidate)
+        except (RecursionError, yaml.YAMLError):
+            continue
+        if _contains_kubernetes_secret_payload(parsed):
+            return "KUBERNETES SECRET"
+        if _contains_sensitive_yaml_environment(parsed):
+            return "YAML ENVIRONMENT VALUE"
+    if _YAML_FLOW_KIND_SECRET.search(stripped) and _YAML_FLOW_SECRET_PAYLOAD.search(stripped):
+        return "KUBERNETES SECRET"
+    return None
+
+
+def _is_single_line_flow_yaml_secret(text: str) -> bool:
+    """Recognize complete flow-style Secret manifests before ordinary redaction."""
+    stripped = text.strip()
+    lowered = stripped.casefold()
+    if "{" not in stripped or "kind" not in lowered or "secret" not in lowered:
+        return False
+    return _yaml_flow_sensitivity(stripped) == "KUBERNETES SECRET"
 
 
 def _yaml_payload_continuation(value: str) -> tuple[str, int | None] | None:
@@ -1491,9 +1542,37 @@ def _redacted_file_units(
         raw_unit = raw_lines[line_index]
         text_unit = raw_unit.decode("utf-8", errors="replace")
         stripped_unit = text_unit.rstrip("\r\n")
-        if _is_single_line_flow_yaml_secret(stripped_unit):
-            units.append((raw_unit, "[REDACTED SENSITIVE KUBERNETES SECRET]\n", 1))
-            line_index += 1
+        flow_end = line_index + 1
+        flow_depth = _yaml_flow_delta(stripped_unit)
+        if flow_depth > 0:
+            while flow_end < len(raw_lines) and flow_depth > 0:
+                flow_depth += _yaml_flow_delta(
+                    raw_lines[flow_end].decode("utf-8", errors="replace")
+                )
+                flow_end += 1
+        flow_unit = b"".join(raw_lines[line_index:flow_end])
+        flow_sensitivity = _yaml_flow_sensitivity(
+            flow_unit.decode("utf-8", errors="replace")
+        )
+        if flow_sensitivity is not None:
+            units.append((flow_unit, f"[REDACTED SENSITIVE {flow_sensitivity}]\n", 1))
+            if flow_depth > 0 and flow_end == len(raw_lines) and has_more_after_raw:
+                warnings.append(
+                    "A sensitive YAML flow collection crossed the bounded page window; "
+                    "its visible segment was redacted."
+                )
+            line_index = flow_end
+            continue
+        if (
+            flow_end > line_index + 1
+            and flow_depth <= 0
+            and stripped_unit.lstrip().startswith(("{", "["))
+        ):
+            safe_unit, replacements = _redact_logical_text(
+                flow_unit.decode("utf-8", errors="replace")
+            )
+            units.append((flow_unit, safe_unit, replacements))
+            line_index = flow_end
             continue
         env_item = _yaml_env_item(
             raw_lines,

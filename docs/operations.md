@@ -49,10 +49,12 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   bounded, document-local anchor context; unresolved aliases fail closed, while
   resolved ConfigMap kinds and non-sensitive environment names remain visible.
   Same-indent YAML sequence children and indented multiline INI values remain
-  within the sensitive unit. Complete single-line flow-style Kubernetes Secret
-  manifests are parsed before ordinary line redaction, including nested list
-  items and prefixed fallback forms. Excessive structured nesting is omitted
-  fail-closed. Producer-added `[truncated]` markers are preserved; because their
+  within the sensitive unit. Complete bounded single- and multiline flow-style
+  Kubernetes Secret manifests are parsed before ordinary line redaction,
+  including nested list items and prefixed fallback forms. Flow-style YAML
+  environment entries correlate sensitive `name` fields with sibling `value`
+  fields in either order. Excessive structured nesting is omitted fail-closed.
+  Producer-added `[truncated]` markers are preserved; because their
   removed prefix may contain a sensitive opener, the retained Redis CLI tail is
   omitted fail-closed. Redis event
   history is fetched through a
