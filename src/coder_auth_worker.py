@@ -1,4 +1,4 @@
-"""Killable subprocess entry point for configured coder auth probes."""
+"""Subprocess entry point for configured coder authentication probes."""
 
 from __future__ import annotations
 

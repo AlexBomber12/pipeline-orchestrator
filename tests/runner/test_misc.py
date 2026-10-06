@@ -401,6 +401,12 @@ def test_refresh_auth_status_cache_marks_plugin_probe_errors() -> None:
     registry = CoderRegistry()
     registry.register(_Plugin("claude", {"status": "ok", "detail": "ready"}))
     registry.register(_Plugin("codex", RuntimeError("boom")))
+    registry.register(
+        _Plugin(
+            "third",
+            AssertionError("metadata-only plugin must not be probed"),
+        )
+    )
     claude_provider, codex_provider = h._usage_providers()
     runner = PipelineRunner(
         h._repo_cfg(),
@@ -419,6 +425,63 @@ def test_refresh_auth_status_cache_marks_plugin_probe_errors() -> None:
     }
     assert runner._auth_status_cache_expires_at is not None
     assert runner._auth_status_cache_expires_at > datetime.now(timezone.utc)
+
+
+def test_refresh_auth_status_cache_isolates_configured_runtime_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Plugin:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.display_name = name.title()
+
+        def check_auth(self) -> dict[str, str]:
+            return {"status": "ok", "detail": "direct"}
+
+    registry = CoderRegistry()
+    registry.register(
+        _Plugin("claude"),  # type: ignore[arg-type]
+        reference="tests.configured_coder_plugin:build_claude_override",
+    )
+    registry.register(_Plugin("codex"))  # type: ignore[arg-type]
+    claude_provider, codex_provider = h._usage_providers()
+    runner = PipelineRunner(
+        h._repo_cfg(),
+        h._app_cfg(),
+        h._FakeRedis(),
+        claude_provider,
+        codex_provider,
+        registry=registry,
+    )
+    calls: list[tuple[str, str, str, str]] = []
+
+    async def isolated(
+        plugin_id: str,
+        reference: str,
+        display_name: str,
+        *,
+        config_path: str,
+    ) -> dict[str, str]:
+        calls.append((plugin_id, reference, display_name, config_path))
+        return {"status": "ok", "detail": "isolated"}
+
+    monkeypatch.setattr(runner_module, "isolated_auth_probe", isolated)
+    monkeypatch.setenv("PO_CONFIG_PATH", "/runtime/config.yml")
+
+    asyncio.run(runner._refresh_auth_status_cache())
+
+    assert calls == [
+        (
+            "claude",
+            "tests.configured_coder_plugin:build_claude_override",
+            "Claude",
+            "/runtime/config.yml",
+        )
+    ]
+    assert runner._auth_status_cache == {
+        "claude": {"status": "ok", "detail": "isolated"},
+        "codex": {"status": "ok", "detail": "direct"},
+    }
 
 
 def test_compute_diff_stats_returns_populated_fields_on_clean_diff(

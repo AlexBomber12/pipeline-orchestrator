@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from src import coder_auth as _coder_auth
+from src import coder_auth_worker as _auth_worker
 from src import config as src_config
 from src.coder_registry import (
     CoderRegistry,
@@ -25,7 +27,6 @@ from src.models import PipelineState, RepoState
 from src.web import app as web_app
 from src.web.app import app
 from src.web.services import auth_probe as _auth_probe
-from src.web.services import auth_probe_worker as _auth_worker
 from src.web.services import model_catalog as _model_catalog
 from src.web.services.model_catalog import ModelCatalogCache
 
@@ -2092,16 +2093,17 @@ def test_isolated_auth_probe_rejects_worker_failures_and_invalid_output(
         return _FakeAuthProbeProcess(stdout, returncode)
 
     monkeypatch.setattr(
-        _auth_probe.asyncio,
+        _coder_auth.asyncio,
         "create_subprocess_exec",
         fake_subprocess,
     )
 
     result = asyncio.run(
-        _auth_probe._isolated_coder_auth_probe(
+        _coder_auth.isolated_auth_probe(
             "third",
             "module:factory",
             "Worker",
+            config_path="/cfg",
         )
     )
 
@@ -2115,16 +2117,17 @@ def test_isolated_auth_probe_redacts_worker_start_failure(
         raise OSError("must-not-leak")
 
     monkeypatch.setattr(
-        _auth_probe.asyncio,
+        _coder_auth.asyncio,
         "create_subprocess_exec",
         failing_subprocess,
     )
 
     result = asyncio.run(
-        _auth_probe._isolated_coder_auth_probe(
+        _coder_auth.isolated_auth_probe(
             "third",
             "module:factory",
             "Worker",
+            config_path="/cfg",
         )
     )
 
@@ -2156,18 +2159,19 @@ def test_isolated_auth_probe_handles_worker_exit_during_timeout_cleanup(
         raise ProcessLookupError
 
     monkeypatch.setattr(
-        _auth_probe.asyncio,
+        _coder_auth.asyncio,
         "create_subprocess_exec",
         fake_subprocess,
     )
-    monkeypatch.setattr(_auth_probe.os, "killpg", exited_process_group)
-    monkeypatch.setattr(_auth_probe, "_AUTH_CHECK_TIMEOUT_SEC", 0.001)
+    monkeypatch.setattr(_coder_auth.os, "killpg", exited_process_group)
 
     result = asyncio.run(
-        _auth_probe._isolated_coder_auth_probe(
+        _coder_auth.isolated_auth_probe(
             "third",
             "module:factory",
             "Worker",
+            config_path="/cfg",
+            timeout=0.001,
         )
     )
 
