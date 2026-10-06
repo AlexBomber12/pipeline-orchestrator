@@ -319,7 +319,7 @@ _HIGH_LINE_CONTEXTUAL_YAML = re.compile(
 _HIGH_LINE_COMPLEX_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?im)(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
     rf"(?<![A-Za-z0-9_.-])(?:{_SENSITIVE_KEY_PATTERN})(?![A-Za-z0-9_.-]))"
-    r"[ \t]*(?:\+=|[:=])[ \t]*(?:$|[|>]|\"|')"
+    r"[ \t]*(?:\+=|[:=])[ \t]*(?:$|[|><]|\"|')"
 )
 _HIGH_LINE_EXPLICIT_YAML = re.compile(r"(?m)^[ \t]*(?:-[ \t]+)?[?:](?:[ \t]|$)")
 _HIGH_LINE_ESCAPED_MAPPING_KEY = re.compile(r"(?m)^[^\r\n:]*\\[^\r\n:]*:")
@@ -352,6 +352,11 @@ _DOCKER_ENV_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?im)^(?P<indent>[ \t]*)(?P<prefix>ENV[ \t]+(?:{_SENSITIVE_KEY_PATTERN})[ \t]+)"
     r"(?P<value>\S.*)$"
 )
+_SENSITIVE_HEREDOC_START = re.compile(
+    r"<<(?P<strip>-?)[ \t]*(?P<quote>[\"']?)"
+    r"(?P<delimiter>[A-Za-z_][A-Za-z0-9_.-]{0,127})(?P=quote)(?=$|[ \t;)&|])"
+)
+_HEREDOC_STATE_PREFIX = "\0heredoc:"
 _REDACTION_RULES = (
     (
         _FISH_SENSITIVE_ASSIGNMENT,
@@ -1902,6 +1907,43 @@ def _has_closing_quote(value: str, quote: str) -> bool:
     return False
 
 
+def _sensitive_heredoc(text: str) -> tuple[str, bool] | None:
+    """Return a bounded heredoc delimiter for a sensitive assignment opener."""
+    assignment = _PLAIN_SENSITIVE_ASSIGNMENT.fullmatch(text)
+    if assignment is None:
+        assignment = _PREFIXED_PLAIN_SENSITIVE_ASSIGNMENT.search(text)
+    if assignment is None or "<<" not in assignment.group("value"):
+        return None
+    value = assignment.group("value")
+    matches = list(islice(_SENSITIVE_HEREDOC_START.finditer(value), 2))
+    if len(matches) != 1 or value.count("<<") != 1:
+        return "", False
+    match = matches[0]
+    return match.group("delimiter"), match.group("strip") == "-"
+
+
+def _heredoc_terminator(text: str, heredoc: tuple[str, bool]) -> bool:
+    """Match a heredoc terminator without interpreting its body."""
+    delimiter, allow_indent = heredoc
+    if not delimiter:
+        return False
+    candidate = text.rstrip("\r\n")
+    if allow_indent:
+        candidate = candidate.lstrip(" \t")
+    return candidate == delimiter
+
+
+def _heredoc_state(heredoc: tuple[str, bool]) -> str:
+    delimiter, allow_indent = heredoc
+    return f"{_HEREDOC_STATE_PREFIX}{int(allow_indent)}:{delimiter}"
+
+
+def _heredoc_from_state(state: str) -> tuple[str, bool]:
+    encoded = state.removeprefix(_HEREDOC_STATE_PREFIX)
+    allow_indent, _, delimiter = encoded.partition(":")
+    return delimiter, allow_indent == "1"
+
+
 def _yaml_env_field(text: str) -> tuple[int, bool, str, str] | None:
     """Classify a literal or decorated YAML environment field."""
     name_match = _YAML_ENV_NAME.fullmatch(text)
@@ -2186,8 +2228,17 @@ def _sensitive_state_before(
 
     quote_state_known = search_start == 0
     active_quote: str | None = None
+    active_heredoc: tuple[str, bool] | None = None
     for raw_line in context_lines:
         line = raw_line.decode("utf-8", errors="replace")
+        if active_heredoc is not None:
+            if _heredoc_terminator(line, active_heredoc):
+                active_heredoc = None
+            continue
+        heredoc = _sensitive_heredoc(line.rstrip("\r\n"))
+        if heredoc is not None:
+            active_heredoc = heredoc
+            continue
         if active_quote is not None:
             if _has_closing_quote(line, active_quote):
                 active_quote = None
@@ -2206,6 +2257,9 @@ def _sensitive_state_before(
         starts_inside_sensitive_quote = False
     else:
         starts_inside_sensitive_quote = None
+    if active_heredoc is not None:
+        starts_inside_sensitive_quote = True
+        active_quote = _heredoc_state(active_heredoc)
 
     combined_lines = context_lines + raw.splitlines()
     raw_line_index = len(context_lines)
@@ -2632,6 +2686,33 @@ def _redacted_file_units(
             raw_unit = b"".join(raw_lines[:payload_end])
             units.append((raw_unit, "[REDACTED SENSITIVE KUBERNETES SECRET DATA]\n", 1))
             line_index = payload_end
+    elif (
+        starts_inside_sensitive_quote
+        and sensitive_quote is not None
+        and sensitive_quote.startswith(_HEREDOC_STATE_PREFIX)
+    ):
+        heredoc = _heredoc_from_state(sensitive_quote)
+        heredoc_end = 0
+        terminated = False
+        while heredoc_end < len(raw_lines):
+            heredoc_end += 1
+            if _heredoc_terminator(
+                raw_lines[heredoc_end - 1].decode("utf-8", errors="replace"),
+                heredoc,
+            ):
+                terminated = True
+                break
+        raw_unit = b"".join(raw_lines[:heredoc_end])
+        units.append((raw_unit, "[REDACTED SENSITIVE HEREDOC]\n", 1))
+        if not terminated:
+            warnings.append(
+                "A sensitive heredoc crossed the bounded page window; "
+                "its visible segment was redacted."
+                if has_more_after_raw
+                else "A sensitive heredoc had no recognized terminator; "
+                "the remaining content was redacted fail-closed."
+            )
+        line_index = heredoc_end
     elif starts_inside_sensitive_quote and sensitive_quote is not None:
         quote_end = 0
         while quote_end < len(raw_lines):
@@ -2865,6 +2946,31 @@ def _redacted_file_units(
                 inside_private_key = True
             units.append((raw_unit, "[REDACTED PRIVATE KEY]\n", 1))
         else:
+            heredoc = _sensitive_heredoc(text_unit.rstrip("\r\n"))
+            if heredoc is not None:
+                heredoc_end = line_index + 1
+                terminated = False
+                while heredoc_end < len(raw_lines):
+                    if _heredoc_terminator(
+                        raw_lines[heredoc_end].decode("utf-8", errors="replace"),
+                        heredoc,
+                    ):
+                        heredoc_end += 1
+                        terminated = True
+                        break
+                    heredoc_end += 1
+                raw_unit = b"".join(raw_lines[line_index:heredoc_end])
+                units.append((raw_unit, "[REDACTED SENSITIVE HEREDOC]\n", 1))
+                if not terminated:
+                    warnings.append(
+                        "A sensitive heredoc crossed the bounded page window; "
+                        "its visible segment was redacted."
+                        if has_more_after_raw
+                        else "A sensitive heredoc had no recognized terminator; "
+                        "the remaining content was redacted fail-closed."
+                    )
+                line_index = heredoc_end
+                continue
             quoted_match = _QUOTED_SENSITIVE_ASSIGNMENT.search(text_unit.rstrip("\r\n"))
             if quoted_match is not None:
                 quote = quoted_match.group("quote")

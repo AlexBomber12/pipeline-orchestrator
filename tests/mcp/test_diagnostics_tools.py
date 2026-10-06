@@ -1845,6 +1845,123 @@ async def test_dockerfile_env_word_assignments_are_redacted_across_retained_read
     assert "ENV SAFE retained-safe-docker-env" in continuation["content"]
 
 
+async def test_sensitive_heredoc_bodies_are_redacted_across_retained_readers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    repos_root = tmp_path / "repos"
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+    payload = (
+        "password = <<EOT\n"
+        "hcl-heredoc-secret\n"
+        "EOT\n"
+        "token = <<-TOKEN\n"
+        "  indented-heredoc-secret\n"
+        "  TOKEN\n"
+        "PASSWORD=$(cat <<'EOF'\n"
+        "shell-heredoc-secret\n"
+        "EOF\n"
+        ")\n"
+        "SAFE=retained-safe-after-heredoc\n"
+    )
+    redis.store[cli_log_latest(SLUG)] = payload
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.write_text(payload, encoding="utf-8")
+
+    for source_id in ("cli:latest", "ci:artifact"):
+        result = await diagnostics.read_orchestrator_log(
+            SLUG,
+            source_id,
+            max_chars=4_000,
+        )
+        assert "hcl-heredoc-secret" not in result["content"]
+        assert "indented-heredoc-secret" not in result["content"]
+        assert "shell-heredoc-secret" not in result["content"]
+        assert "SAFE=retained-safe-after-heredoc" in result["content"]
+
+    raw = ci_path.read_bytes()
+    for secret in (
+        b"hcl-heredoc-secret",
+        b"indented-heredoc-secret",
+        b"shell-heredoc-secret",
+    ):
+        page = await diagnostics.read_orchestrator_log(
+            SLUG,
+            "ci:artifact",
+            cursor=raw.index(secret),
+            max_chars=4_000,
+        )
+        assert secret.decode() not in page["content"]
+        assert "SAFE=retained-safe-after-heredoc" in page["content"]
+
+    warnings: list[str] = []
+    crossed = diagnostics._redacted_file_units(
+        b"password = <<EOT\ncrossed-heredoc-secret\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=True,
+        warnings=warnings,
+    )
+    assert "crossed-heredoc-secret" not in crossed[0][1]
+    assert any("heredoc crossed" in warning for warning in warnings)
+
+    warnings = []
+    inside_crossed = diagnostics._redacted_file_units(
+        b"inside-crossed-heredoc-secret\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=True,
+        sensitive_quote=diagnostics._heredoc_state(("EOT", False)),
+        has_more_after_raw=True,
+        warnings=warnings,
+    )
+    assert "inside-crossed-heredoc-secret" not in inside_crossed[0][1]
+    assert any("heredoc crossed" in warning for warning in warnings)
+
+    warnings = []
+    unrecognized = diagnostics._redacted_file_units(
+        b"password = <<$BAD\nunrecognized-heredoc-secret\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=False,
+        warnings=warnings,
+    )
+    assert "unrecognized-heredoc-secret" not in unrecognized[0][1]
+    assert any("no recognized terminator" in warning for warning in warnings)
+
+    warnings = []
+    dense = diagnostics._redacted_file_units(
+        (
+            b"\n" * (diagnostics._MAX_REDACTION_PHYSICAL_LINES + 1)
+            + b"password = <<EOT\ndense-heredoc-secret\nEOT\n"
+        ),
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=False,
+        warnings=warnings,
+    )
+    assert dense[0][1] == "[CONTENT OMITTED: PHYSICAL LINE BOUND EXCEEDED]\n"
+
+
 async def test_truncated_redis_logs_omit_unknown_leading_sensitive_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
