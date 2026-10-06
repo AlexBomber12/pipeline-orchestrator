@@ -55,6 +55,9 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   partition discovery streams at most 200 directory candidates per request and
   reports when that bound may leave additional partitions undiscovered; an
   exact validated `events:disk/YYYY-MM-DD` source ID remains directly readable.
+  Redis CLI values are size-checked with `STRLEN` and fetched only through a
+  capped `GETRANGE`; oversized legacy or malformed values are reported without
+  being materialized in the MCP process.
 
 The web/daemon producers and MCP reader all resolve disk events from
 `PO_EVENTS_DIR` (default `/data/events`). Compose maps
@@ -71,7 +74,9 @@ For example, use
 
 These tools only accept configured repository slugs and fixed source IDs; they
 cannot read arbitrary paths or Redis keys, and symlink components are rejected
-for fixed diagnostic files. Missing, malformed, expired, stale,
+for fixed diagnostic files. File reads are opened relative to anchored
+directory descriptors with no-follow semantics so path replacement races also
+fail closed. Missing, malformed, expired, stale,
 and unavailable data is reported explicitly. Legacy CLI snapshots and mutable
 CI artifacts are not attributed to a task, run, or SHA because their producers
 do not record that association. Daemon stdout and live CLI streams are not

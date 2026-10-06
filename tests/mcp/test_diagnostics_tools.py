@@ -55,6 +55,20 @@ class FakeRedis:
         self._check("get", key)
         return self.store.get(key)
 
+    async def strlen(self, key: str) -> int:
+        self._check("strlen", key)
+        value = self.store.get(key)
+        if value is None:
+            return 0
+        return len(value if isinstance(value, bytes) else str(value).encode())
+
+    async def getrange(self, key: str, start: int, end: int) -> object:
+        self._check("getrange", (key, start, end))
+        value = self.store.get(key, b"")
+        raw = value if isinstance(value, bytes) else str(value).encode()
+        selected = raw[start : end + 1]
+        return selected if isinstance(value, bytes) else selected.decode(errors="replace")
+
     async def ttl(self, key: str) -> int:
         self._check("ttl", key)
         if key not in self.store:
@@ -518,6 +532,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                 "  - kind: Secret\n    data:\n      opaque: redis-list-kube-secret\n"
                 "  - data:\n      opaque: redis-reversed-list-kube-secret\n    kind: Secret\n"
                 "  - kind: ConfigMap\n    data:\n      harmless: retained-list-config-value\n"
+                "---\nkind: Secret\ndata: {\n  opaque: redis-kube-flow-secret\n}\n"
+                "---\nkind: Secret\ndata: &payload\n  opaque: redis-kube-anchor-secret\n"
                 "---\nkind: ConfigMap\ndata:\n  harmless: retained-config-value"
             ),
             json.dumps({"auths": {"registry": {"auth": docker_auth}}, "debug": True}),
@@ -622,6 +638,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "  - kind: Secret\n    data:\n      opaque: ci-list-kube-secret\n"
         + "  - data:\n      opaque: ci-reversed-list-kube-secret\n    kind: Secret\n"
         + "  - kind: ConfigMap\n    data:\n      harmless: retained-ci-list-config-value\n"
+        + "---\nkind: Secret\ndata: {\n  opaque: ci-kube-flow-secret\n}\n"
+        + "---\nkind: Secret\ndata: &payload\n  opaque: ci-kube-anchor-secret\n"
         + "---\nkind: ConfigMap\ndata:\n  harmless: retained-ci-config-value\n"
         + '2026-10-05 INFO {"password":987654322,"debug":true}\n',
         encoding="utf-8",
@@ -694,6 +712,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-standalone-yaml-env-secret" not in content
         assert "redis-list-kube-secret" not in content
         assert "redis-reversed-list-kube-secret" not in content
+        assert "redis-kube-flow-secret" not in content
+        assert "redis-kube-anchor-secret" not in content
         assert "retained-list-config-value" in content
         assert "retained-config-value" in content
         assert docker_auth not in content
@@ -764,6 +784,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "debug" in content
         assert "ci-list-kube-secret" not in content
         assert "ci-reversed-list-kube-secret" not in content
+        assert "ci-kube-flow-secret" not in content
+        assert "ci-kube-anchor-secret" not in content
         if source_id == "ci:artifact":
             assert "retained-ci-list-config-value" in content
 
@@ -812,6 +834,24 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
     )
     assert "ci-reversed-list-kube-secret" not in reversed_nested_yaml_secret_page["content"]
     assert "SENSITIVE" in reversed_nested_yaml_secret_page["content"]
+
+    flow_yaml_secret_page = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=ci_raw.index(b"  opaque: ci-kube-flow-secret"),
+        max_chars=300,
+    )
+    assert "ci-kube-flow-secret" not in flow_yaml_secret_page["content"]
+    assert "SENSITIVE" in flow_yaml_secret_page["content"]
+
+    anchored_yaml_secret_page = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=ci_raw.index(b"  opaque: ci-kube-anchor-secret"),
+        max_chars=300,
+    )
+    assert "ci-kube-anchor-secret" not in anchored_yaml_secret_page["content"]
+    assert "SENSITIVE" in anchored_yaml_secret_page["content"]
     triple_quote_continuation = await diagnostics.read_orchestrator_log(
         SLUG,
         "ci:artifact",
@@ -966,7 +1006,50 @@ async def test_missing_expired_unretained_and_unavailable_logs(tmp_path: Path, m
     assert event_source["availability"] == "oversized"
     assert warnings
 
-    redis.fail.add("get")
+    oversized_value = "x" * (diagnostics._MAX_REDIS_CLI_LOG_BYTES + 1)
+    latest_key = cli_log_latest(SLUG)
+    redis.store[latest_key] = oversized_value
+    redis.ttls[latest_key] = 60
+    oversized_cli = await diagnostics.read_orchestrator_log(SLUG, "cli:latest")
+    assert oversized_cli["source"]["availability"] == "oversized"
+    assert oversized_cli["source"]["size_bytes"] == len(oversized_value)
+    assert oversized_cli["source"]["read_bound_bytes"] == diagnostics._MAX_REDIS_CLI_LOG_BYTES
+    assert oversized_cli["content"] == ""
+    listed, warnings = await diagnostics._redis_log_sources(redis, SLUG, NOW)
+    latest_source = next(source for source in listed if source["source_id"] == "cli:latest")
+    assert latest_source["availability"] == "oversized"
+    assert warnings
+
+    timestamp = "2026-10-05T10:00:00+00:00"
+    history_key = cli_log_history(SLUG, timestamp)
+    redis.store[history_key] = oversized_value
+    redis.ttls[history_key] = 60
+    oversized_history = await diagnostics.read_orchestrator_log(
+        SLUG, f"cli:history/{timestamp}"
+    )
+    assert oversized_history["source"]["availability"] == "oversized"
+    history_sources, warnings, _ = await diagnostics._redis_history_page(
+        redis,
+        SLUG,
+        NOW,
+        cursor_state={"scan_cursor": 0, "pending": [timestamp], "started": True},
+        limit=1,
+    )
+    assert history_sources[0]["availability"] == "oversized"
+    assert warnings
+    assert not any(
+        operation == "get" and key in {latest_key, history_key}
+        for operation, key in redis.calls
+    )
+    assert all(
+        end == diagnostics._MAX_REDIS_CLI_LOG_BYTES
+        for operation, value in redis.calls
+        if operation == "getrange"
+        for key, _start, end in [value]
+        if key in {latest_key, history_key}
+    )
+
+    redis.fail.add("strlen")
     unavailable = await diagnostics.read_orchestrator_log(SLUG, "cli:latest")
     assert unavailable["source"]["availability"] == "unavailable"
     assert "redis-secret" not in json.dumps(unavailable)
@@ -995,6 +1078,15 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
 
     with pytest.raises(ValueError, match="escapes"):
         diagnostics._safe_path(tmp_path / "allowed", "..", "outside")
+    with pytest.raises(ValueError, match="path component"):
+        diagnostics._open_diagnostic_file(tmp_path)
+    directory_source = tmp_path / "directory-source"
+    directory_source.mkdir()
+    with pytest.raises(OSError, match="regular file"):
+        diagnostics._open_diagnostic_file(tmp_path, directory_source.name)
+    assert diagnostics._yaml_flow_delta('{"value": "escaped \\" } [ text"}') == 0
+    assert diagnostics._yaml_flow_delta("{'value': ']'}") == 0
+    assert diagnostics._yaml_flow_delta("{ # ignored }") == 1
 
     redis = FakeRedis()
     _patch_runtime(monkeypatch, redis, _config(_repo()))
@@ -1452,7 +1544,7 @@ async def test_log_discovery_defensive_failures(tmp_path: Path, monkeypatch: pyt
     from src.mcp.tools import diagnostics
 
     redis = FakeRedis()
-    redis.fail.add("get")
+    redis.fail.add("strlen")
     sources, warnings = await diagnostics._redis_log_sources(redis, SLUG, NOW)
     assert all(item["availability"] == "unavailable" for item in sources)
     assert warnings
@@ -1460,14 +1552,15 @@ async def test_log_discovery_defensive_failures(tmp_path: Path, monkeypatch: pyt
     redis = FakeRedis()
     history_key = cli_log_history(SLUG, "2026-10-05T11:00:00+00:00")
     redis.store[history_key] = "value"
-    original_get = redis.get
+    original_getrange = redis.getrange
 
-    async def expire_during_scan(key: str) -> object | None:
+    async def expire_during_scan(key: str, start: int, end: int) -> object:
         if key == history_key:
-            return None
-        return await original_get(key)
+            redis.store.pop(key, None)
+            return ""
+        return await original_getrange(key, start, end)
 
-    redis.get = expire_during_scan  # type: ignore[method-assign]
+    redis.getrange = expire_during_scan  # type: ignore[method-assign]
     sources, _, _ = await diagnostics._redis_history_page(
         redis,
         SLUG,
@@ -1561,7 +1654,7 @@ async def test_redis_history_discovery_uses_bounded_continuations() -> None:
     assert len(sources) == 2
     assert warnings == []
     assert next_cursor is not None
-    history_gets = [key for operation, key in redis.calls if operation == "get"]
+    history_gets = [key for operation, key in redis.calls if operation == "getrange"]
     assert len(history_gets) == 2
     assert len([call for call in redis.calls if call[0] == "scan"]) == 1
 
@@ -1578,7 +1671,7 @@ async def test_redis_history_discovery_uses_bounded_continuations() -> None:
     assert len(second) == 2
     assert continuation is not None
     assert not any(operation == "scan" for operation, _ in redis.calls)
-    assert len([key for operation, key in redis.calls if operation == "get"]) == 2
+    assert len([key for operation, key in redis.calls if operation == "getrange"]) == 2
 
 
 async def test_redis_history_discovery_reports_defensive_bounds() -> None:
@@ -1607,7 +1700,7 @@ async def test_redis_history_discovery_reports_defensive_bounds() -> None:
     assert any("oversized scan batch" in warning for warning in warnings)
 
     unavailable = FakeRedis()
-    unavailable.fail.add("get")
+    unavailable.fail.add("strlen")
     sources, _, continuation = await diagnostics._redis_history_page(
         unavailable,
         SLUG,
@@ -1659,16 +1752,56 @@ async def test_list_outer_failure_and_file_read_error(tmp_path: Path, monkeypatc
     with pytest.raises(ValueError, match="Unknown Redis"):
         await diagnostics._read_redis_source(redis, SLUG, "unknown", NOW)
 
-    original_open = Path.open
+    def fail_ci_read(root: Path, *parts: str):
+        del root, parts
+        raise OSError("read failed")
 
-    def fail_ci_read(self: Path, *args: Any, **kwargs: Any):
-        if self == ci_path and args and args[0] == "rb":
-            raise OSError("read failed")
-        return original_open(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "open", fail_ci_read)
+    monkeypatch.setattr(diagnostics, "_open_diagnostic_file", fail_ci_read)
     missing = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact")
     assert missing["source"]["availability"] == "unavailable"
+
+
+async def test_filesystem_open_rejects_symlink_replacement_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    repos_root = tmp_path / "repos"
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.write_text("ordinary content\n", encoding="utf-8")
+    outside = tmp_path / "outside-secret"
+    outside.write_text("outside-race-secret\n", encoding="utf-8")
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+    monkeypatch.setenv("PO_EVENTS_DIR", str(tmp_path / "events"))
+
+    real_open = diagnostics.os.open
+    swapped = False
+    observed_flags: list[int] = []
+
+    def swap_before_open(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        observed_flags.append(flags)
+        if path == "ci.log" and dir_fd is not None and not swapped:
+            swapped = True
+            ci_path.unlink()
+            ci_path.symlink_to(outside)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(diagnostics.os, "open", swap_before_open)
+    result = await diagnostics.read_orchestrator_log(SLUG, "ci:artifact")
+    assert swapped is True
+    assert result["source"]["availability"] == "unavailable"
+    assert "outside-race-secret" not in json.dumps(result)
+    assert observed_flags and all(flags & diagnostics.os.O_NOFOLLOW for flags in observed_flags)
 
 
 async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2024,6 +2157,7 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
         False,
         False,
         None,
+        None,
         2,
     )
     assert diagnostics._kubernetes_yaml_payload_flags(
@@ -2051,6 +2185,7 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
         False,
         None,
         None,
+        None,
         4,
     )
     monkeypatch.setattr(diagnostics, "_MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES", 5)
@@ -2058,7 +2193,7 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
         BytesIO(b"x\nfoo:"),
         6,
         b"  child: value\n",
-    ) == (None, None, False, None, None, 5)
+    ) == (None, None, False, None, None, None, 5)
     monkeypatch.setattr(
         diagnostics,
         "_MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES",

@@ -12,6 +12,7 @@ import base64
 import json
 import os
 import re
+import stat as stat_module
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from itertools import islice
@@ -49,6 +50,7 @@ _MAX_LOG_SOURCES = 100
 _MAX_READ_CHARS = 20_000
 _MAX_EVENT_RECORD_CHARS = 4_000
 _MAX_REDIS_EVENT_HISTORY_BYTES = 256 * 1024
+_MAX_REDIS_CLI_LOG_BYTES = 64 * 1024
 _MAX_FILE_SCAN_BYTES = 256 * 1024
 _MAX_PRIVATE_KEY_CONTEXT_BYTES = 1024 * 1024
 _MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES = 1024 * 1024
@@ -173,6 +175,7 @@ _YAML_ENV_VALUE = re.compile(
     r"(?P<value>[^\r\n]*)$"
 )
 _YAML_SEQUENCE_ITEM_ONLY = re.compile(r"^(?P<indent>[ \t]*)-[ \t]*(?:#.*)?$")
+_YAML_NODE_PREFIX = re.compile(r"^(?:&[^\s]+|![^\s]+)(?:\s+|$)")
 _BLOCK_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
     rf"(?:{_SENSITIVE_KEY_PATTERN}))\s*[:=][ \t]*"
@@ -641,6 +644,47 @@ def _line_indent(raw_line: bytes) -> int:
     return len(raw_line) - len(raw_line.lstrip(b" \t"))
 
 
+def _yaml_flow_delta(text: str) -> int:
+    """Count unquoted YAML flow-collection delimiters in one line."""
+    delta = 0
+    quote: str | None = None
+    escaped = False
+    for character in text:
+        if escaped:
+            escaped = False
+            continue
+        if quote == '"' and character == "\\":
+            escaped = True
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            continue
+        if character in {'"', "'"}:
+            quote = character
+        elif character in "{[":
+            delta += 1
+        elif character in "}]":
+            delta -= 1
+        elif character == "#":
+            break
+    return delta
+
+
+def _yaml_payload_continuation(value: str) -> tuple[str, int | None] | None:
+    """Classify a Secret payload value that continues onto following lines."""
+    remainder = value.strip()
+    while prefix := _YAML_NODE_PREFIX.match(remainder):
+        remainder = remainder[prefix.end() :].lstrip()
+    if not remainder or remainder.startswith(("|", ">")):
+        return "block", None
+    if remainder.startswith(("{", "[")):
+        depth = _yaml_flow_delta(remainder)
+        if depth > 0:
+            return "flow", depth
+    return None
+
+
 def _has_line_continuation(raw_line: bytes) -> bool:
     content = raw_line.rstrip(b"\r\n")
     trailing_backslashes = len(content) - len(content.rstrip(b"\\"))
@@ -883,10 +927,18 @@ def _kubernetes_yaml_state_before(
     handle: Any,
     offset: int,
     raw: bytes,
-) -> tuple[bool | None, tuple[int, bool] | None, bool, bool | None, int | None, int]:
+) -> tuple[
+    bool | None,
+    tuple[int, bool] | None,
+    bool,
+    bool | None,
+    int | None,
+    int | None,
+    int,
+]:
     """Recover Kubernetes Secret YAML document and payload-block state."""
     if offset <= 0:
-        return False, None, False, False, None, 0
+        return False, None, False, False, None, None, 0
     search_start = max(0, offset - _MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES)
     handle.seek(search_start)
     context = handle.read(offset - search_start)
@@ -894,18 +946,28 @@ def _kubernetes_yaml_state_before(
     if search_start > 0:
         newline = context.find(b"\n")
         if newline < 0:
-            return None, None, False, None, None, scanned_bytes
+            return None, None, False, None, None, None, scanned_bytes
         context = context[newline + 1 :]
 
     state_known = search_start == 0
     secret_scopes: list[tuple[int, bool]] = []
     kind_seen = False
     payload_indent: int | None = None
+    payload_flow_depth: int | None = None
     for raw_line in context.splitlines():
         if not raw_line.strip():
             continue
         indent = _line_indent(raw_line)
         if payload_indent is not None:
+            if payload_flow_depth is not None:
+                payload_flow_depth += _yaml_flow_delta(
+                    raw_line.decode("utf-8", errors="replace")
+                )
+                if payload_flow_depth > 0:
+                    continue
+                payload_indent = None
+                payload_flow_depth = None
+                continue
             if indent > payload_indent:
                 continue
             payload_indent = None
@@ -923,6 +985,7 @@ def _kubernetes_yaml_state_before(
             secret_scopes.clear()
             kind_seen = False
             payload_indent = None
+            payload_flow_depth = None
             continue
         kind_match = _YAML_KIND_ASSIGNMENT.fullmatch(line)
         if kind_match is not None:
@@ -936,11 +999,14 @@ def _kubernetes_yaml_state_before(
                 )
             kind_seen = True
             payload_indent = None
+            payload_flow_depth = None
             continue
         payload_match = _YAML_SECRET_PAYLOAD_ASSIGNMENT.fullmatch(line)
         if (secret_scopes or not kind_seen) and payload_match is not None:
-            if not payload_match.group("value").strip():
+            continuation = _yaml_payload_continuation(payload_match.group("value"))
+            if continuation is not None:
                 payload_indent = len(payload_match.group("indent"))
+                payload_flow_depth = continuation[1]
             continue
         if indent == 0 and not (
             line.lstrip().startswith(("#", "-")) or _YAML_MAPPING_ENTRY.match(line)
@@ -948,6 +1014,7 @@ def _kubernetes_yaml_state_before(
             state_known = True
             secret_scopes.clear()
             payload_indent = None
+            payload_flow_depth = None
 
     context_lines = context.splitlines(keepends=True)
     combined_lines = context_lines + raw.splitlines(keepends=True)
@@ -961,15 +1028,30 @@ def _kubernetes_yaml_state_before(
             payload_match = _YAML_SECRET_PAYLOAD_ASSIGNMENT.fullmatch(
                 combined_lines[index].decode("utf-8", errors="replace").rstrip("\r\n")
             )
-            if payload_match is None or payload_match.group("value").strip():
+            if payload_match is None:
                 continue
             candidate_indent = len(payload_match.group("indent"))
-            if all(
-                not line.strip() or _line_indent(line) > candidate_indent
-                for line in combined_lines[index + 1 : raw_line_index]
-            ):
+            continuation = _yaml_payload_continuation(payload_match.group("value"))
+            if continuation is None:
+                continue
+            mode, initial_flow_depth = continuation
+            following_lines = combined_lines[index + 1 : raw_line_index]
+            active_flow_depth = initial_flow_depth
+            if mode == "flow" and active_flow_depth is not None:
+                active_flow_depth += sum(
+                    _yaml_flow_delta(line.decode("utf-8", errors="replace"))
+                    for line in following_lines
+                )
+                active = active_flow_depth > 0
+            else:
+                active = all(
+                    not line.strip() or _line_indent(line) > candidate_indent
+                    for line in following_lines
+                )
+            if active:
                 if combined_flags[index]:
                     payload_indent = candidate_indent
+                    payload_flow_depth = active_flow_depth
                 break
 
     first_content_line = next((line for line in raw.splitlines() if line.strip()), None)
@@ -985,14 +1067,19 @@ def _kubernetes_yaml_state_before(
     if first_content_line is None:
         starts_inside_payload: bool | None = False
         payload_indent = None
-    elif payload_indent is not None and _line_indent(first_content_line) > payload_indent:
+        payload_flow_depth = None
+    elif payload_indent is not None and (
+        payload_flow_depth is not None or _line_indent(first_content_line) > payload_indent
+    ):
         starts_inside_payload = True
     elif state_known:
         starts_inside_payload = False
         payload_indent = None
+        payload_flow_depth = None
     else:
         starts_inside_payload = None
         payload_indent = None
+        payload_flow_depth = None
 
     return (
         (
@@ -1006,6 +1093,7 @@ def _kubernetes_yaml_state_before(
         kind_seen,
         starts_inside_payload,
         payload_indent,
+        payload_flow_depth,
         scanned_bytes,
     )
 
@@ -1101,6 +1189,7 @@ def _redacted_file_units(
     kubernetes_kind_context_known: bool = False,
     starts_inside_kubernetes_secret_data: bool | None = False,
     kubernetes_secret_data_indent: int | None = None,
+    kubernetes_secret_data_flow_depth: int | None = None,
 ) -> list[tuple[bytes, str, int]]:
     """Redact complete logical units while preserving their source byte sizes."""
     if starts_inside_private_key is None:
@@ -1139,13 +1228,21 @@ def _redacted_file_units(
     line_index = 0
     if starts_inside_kubernetes_secret_data and kubernetes_secret_data_indent is not None:
         payload_end = 0
-        while payload_end < len(raw_lines):
-            if (
-                raw_lines[payload_end].strip()
-                and _line_indent(raw_lines[payload_end]) <= kubernetes_secret_data_indent
-            ):
-                break
-            payload_end += 1
+        if kubernetes_secret_data_flow_depth is not None:
+            flow_depth = kubernetes_secret_data_flow_depth
+            while payload_end < len(raw_lines) and flow_depth > 0:
+                flow_depth += _yaml_flow_delta(
+                    raw_lines[payload_end].decode("utf-8", errors="replace")
+                )
+                payload_end += 1
+        else:
+            while payload_end < len(raw_lines):
+                if (
+                    raw_lines[payload_end].strip()
+                    and _line_indent(raw_lines[payload_end]) <= kubernetes_secret_data_indent
+                ):
+                    break
+                payload_end += 1
         if payload_end:
             raw_unit = b"".join(raw_lines[:payload_end])
             units.append((raw_unit, "[REDACTED SENSITIVE KUBERNETES SECRET DATA]\n", 1))
@@ -1227,19 +1324,28 @@ def _redacted_file_units(
         payload_match = _YAML_SECRET_PAYLOAD_ASSIGNMENT.fullmatch(stripped_unit)
         if kubernetes_payload_flags[line_index] and payload_match is not None:
             payload_value = payload_match.group("value").strip()
-            if payload_value:
+            continuation = _yaml_payload_continuation(payload_value)
+            if payload_value and continuation is None:
                 units.append((raw_unit, "[REDACTED SENSITIVE KUBERNETES SECRET DATA]\n", 1))
                 line_index += 1
                 continue
             payload_indent = len(payload_match.group("indent"))
             payload_end = line_index + 1
-            while payload_end < len(raw_lines):
-                if (
-                    raw_lines[payload_end].strip()
-                    and _line_indent(raw_lines[payload_end]) <= payload_indent
-                ):
-                    break
-                payload_end += 1
+            flow_depth = continuation[1] if continuation is not None else None
+            if flow_depth is not None:
+                while payload_end < len(raw_lines) and flow_depth > 0:
+                    flow_depth += _yaml_flow_delta(
+                        raw_lines[payload_end].decode("utf-8", errors="replace")
+                    )
+                    payload_end += 1
+            else:
+                while payload_end < len(raw_lines):
+                    if (
+                        raw_lines[payload_end].strip()
+                        and _line_indent(raw_lines[payload_end]) <= payload_indent
+                    ):
+                        break
+                    payload_end += 1
             raw_unit = b"".join(raw_lines[line_index:payload_end])
             units.append((raw_unit, "[REDACTED SENSITIVE KUBERNETES SECRET DATA]\n", 1))
             if payload_end == len(raw_lines) and has_more_after_raw:
@@ -2072,6 +2178,15 @@ def _association(*, recorded: bool = False) -> dict[str, Any]:
     }
 
 
+async def _read_bounded_cli_value(client: Any, key: str) -> tuple[object | None, int, bool]:
+    """Read at most the retained CLI producer cap without materializing oversized values."""
+    reported_size = int(await client.strlen(key))
+    bounded = await client.getrange(key, 0, _MAX_REDIS_CLI_LOG_BYTES)
+    observed_size = max(reported_size, len(bounded or b""))
+    oversized = observed_size > _MAX_REDIS_CLI_LOG_BYTES
+    return (None if oversized else bounded), observed_size, oversized
+
+
 def _safe_path(root: Path, *parts: str) -> Path:
     resolved_root = root.resolve()
     unresolved = resolved_root
@@ -2093,6 +2208,34 @@ def _safe_repo_directory(root: Path, repo_slug: str) -> Path:
     return selected
 
 
+def _open_diagnostic_file(root: Path, *parts: str) -> tuple[Any, os.stat_result]:
+    """Open a fixed diagnostic file beneath an anchored root without following symlinks."""
+    if not parts or any(
+        not part or part in {".", ".."} or "/" in part or "\\" in part for part in parts
+    ):
+        raise ValueError("Invalid diagnostic file path component.")
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    directory_fd = os.open(root.resolve(), directory_flags)
+    file_fd: int | None = None
+    try:
+        for part in parts[:-1]:
+            next_fd = os.open(part, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(parts[-1], file_flags, dir_fd=directory_fd)
+        opened_stat = os.fstat(file_fd)
+        if not stat_module.S_ISREG(opened_stat.st_mode):
+            raise OSError("Diagnostic source is not a regular file.")
+        handle = os.fdopen(file_fd, "rb")
+        file_fd = None
+        return handle, opened_stat
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        os.close(directory_fd)
+
+
 async def _redis_log_sources(
     client: Any, repo_slug: str, observed_at: datetime
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -2100,7 +2243,9 @@ async def _redis_log_sources(
     warnings: list[str] = []
     latest_key = cli_log_latest(repo_slug)
     try:
-        latest = await client.get(latest_key)
+        latest, latest_size_bytes, latest_oversized = await _read_bounded_cli_value(
+            client, latest_key
+        )
         latest_ttl = int(await client.ttl(latest_key))
         event_edges, event_count, event_size_bytes, event_oversized = await _read_bounded_event_history(
             client,
@@ -2133,21 +2278,36 @@ async def _redis_log_sources(
         )
         return sources, warnings
 
+    latest_exists = latest_ttl != -2
     latest_text = _decode(latest) if latest is not None else ""
+    if latest_oversized:
+        warnings.append(
+            "Retained CLI latest log exceeds the bounded diagnostic read limit; content was not materialized."
+        )
     sources.append(
         {
             "source_id": "cli:latest",
             "kind": "retained_cli_log",
             "storage": "redis",
-            "availability": "available" if latest is not None else "missing_or_expired",
+            "availability": (
+                "oversized"
+                if latest_oversized
+                else "available"
+                if latest_exists
+                else "missing_or_expired"
+            ),
             "timestamps": {
                 "recorded_at": None,
                 **_ttl_metadata(latest_ttl, observed_at),
             },
-            "size_chars": len(latest_text) if latest is not None else 0,
+            "size_chars": len(latest_text) if latest_exists and not latest_oversized else None,
+            "size_bytes": latest_size_bytes,
+            "read_bound_bytes": _MAX_REDIS_CLI_LOG_BYTES,
             "retention": {
                 "producer_ttl_seconds": _CLI_LATEST_TTL_SECONDS,
-                "truncated": latest_text.startswith("[truncated]\n"),
+                "truncated": (
+                    latest_text.startswith("[truncated]\n") if not latest_oversized else None
+                ),
                 "truncation_marker_preserved": True,
             },
             "association": _association(),
@@ -2339,7 +2499,7 @@ async def _redis_history_page(
     for timestamp in selected:
         key = cli_log_history(repo_slug, timestamp)
         try:
-            value = await client.get(key)
+            value, size_bytes, oversized = await _read_bounded_cli_value(client, key)
             ttl = int(await client.ttl(key))
         except Exception as exc:
             sources.append(
@@ -2354,21 +2514,31 @@ async def _redis_history_page(
                 }
             )
             continue
+        exists = ttl != -2
         text = _decode(value) if value is not None else ""
+        if oversized:
+            warnings.append(
+                f"Retained CLI history log {timestamp} exceeds the bounded diagnostic read limit; "
+                "content was not materialized."
+            )
         sources.append(
             {
                 "source_id": f"{_CLI_HISTORY_SOURCE_PREFIX}{timestamp}",
                 "kind": "retained_cli_log",
                 "storage": "redis",
-                "availability": "available" if value is not None else "missing_or_expired",
+                "availability": (
+                    "oversized" if oversized else "available" if exists else "missing_or_expired"
+                ),
                 "timestamps": {
                     "recorded_at": timestamp,
                     **_ttl_metadata(ttl, observed_at),
                 },
-                "size_chars": len(text),
+                "size_chars": len(text) if exists and not oversized else None,
+                "size_bytes": size_bytes,
+                "read_bound_bytes": _MAX_REDIS_CLI_LOG_BYTES,
                 "retention": {
                     "producer_ttl_seconds": _CLI_HISTORY_TTL_SECONDS,
-                    "truncated": text.startswith("[truncated]\n"),
+                    "truncated": text.startswith("[truncated]\n") if not oversized else None,
                     "truncation_marker_preserved": True,
                 },
                 "association": _association(),
@@ -2625,14 +2795,38 @@ async def _read_redis_source(
     warnings: list[str] = []
     if source_id == "cli:latest":
         key = cli_log_latest(repo_slug)
-        raw = await client.get(key)
+        raw, size_bytes, oversized = await _read_bounded_cli_value(client, key)
         ttl = int(await client.ttl(key))
+        if oversized:
+            reason = "Retained CLI log exceeds the bounded diagnostic read limit."
+            warnings.append(reason)
+            return (
+                None,
+                {
+                    "kind": "retained_cli_log",
+                    "storage": "redis",
+                    "availability": "oversized",
+                    "size_bytes": size_bytes,
+                    "read_bound_bytes": _MAX_REDIS_CLI_LOG_BYTES,
+                    "timestamps": {"recorded_at": None, **_ttl_metadata(ttl, observed_at)},
+                    "retention": {
+                        "producer_ttl_seconds": _CLI_LATEST_TTL_SECONDS,
+                        "truncation_marker_preserved": True,
+                    },
+                    "association": _association(),
+                    "mutable": True,
+                    "reason": reason,
+                },
+                warnings,
+            )
         return (
-            _decode(raw) if raw is not None else None,
+            _decode(raw) if ttl != -2 and raw is not None else None,
             {
                 "kind": "retained_cli_log",
                 "storage": "redis",
-                "availability": "available" if raw is not None else "missing_or_expired",
+                "availability": "available" if ttl != -2 else "missing_or_expired",
+                "size_bytes": size_bytes,
+                "read_bound_bytes": _MAX_REDIS_CLI_LOG_BYTES,
                 "timestamps": {"recorded_at": None, **_ttl_metadata(ttl, observed_at)},
                 "retention": {
                     "producer_ttl_seconds": _CLI_LATEST_TTL_SECONDS,
@@ -2646,14 +2840,38 @@ async def _read_redis_source(
     timestamp = _parse_cli_history_source(source_id)
     if timestamp is not None:
         key = cli_log_history(repo_slug, timestamp)
-        raw = await client.get(key)
+        raw, size_bytes, oversized = await _read_bounded_cli_value(client, key)
         ttl = int(await client.ttl(key))
+        if oversized:
+            reason = "Retained CLI log exceeds the bounded diagnostic read limit."
+            warnings.append(reason)
+            return (
+                None,
+                {
+                    "kind": "retained_cli_log",
+                    "storage": "redis",
+                    "availability": "oversized",
+                    "size_bytes": size_bytes,
+                    "read_bound_bytes": _MAX_REDIS_CLI_LOG_BYTES,
+                    "timestamps": {"recorded_at": timestamp, **_ttl_metadata(ttl, observed_at)},
+                    "retention": {
+                        "producer_ttl_seconds": _CLI_HISTORY_TTL_SECONDS,
+                        "truncation_marker_preserved": True,
+                    },
+                    "association": _association(),
+                    "mutable": False,
+                    "reason": reason,
+                },
+                warnings,
+            )
         return (
-            _decode(raw) if raw is not None else None,
+            _decode(raw) if ttl != -2 and raw is not None else None,
             {
                 "kind": "retained_cli_log",
                 "storage": "redis",
-                "availability": "available" if raw is not None else "missing_or_expired",
+                "availability": "available" if ttl != -2 else "missing_or_expired",
+                "size_bytes": size_bytes,
+                "read_bound_bytes": _MAX_REDIS_CLI_LOG_BYTES,
                 "timestamps": {"recorded_at": timestamp, **_ttl_metadata(ttl, observed_at)},
                 "retention": {
                     "producer_ttl_seconds": _CLI_HISTORY_TTL_SECONDS,
@@ -2779,6 +2997,8 @@ def _read_file_source(
     if source_id == "ci:artifact":
         repo_root = _safe_repo_directory(_REPOS_ROOT, repo_slug)
         path = _safe_path(repo_root, "artifacts", "ci.log")
+        open_root = _REPOS_ROOT
+        open_parts = (repo_slug, "artifacts", "ci.log")
         kind = "current_checkout_ci_artifact"
         mutable = True
         association = _association()
@@ -2793,6 +3013,8 @@ def _read_file_source(
             raise ValueError("Invalid disk event partition date.") from exc
         repo_event_root = _safe_repo_directory(_resolve_events_dir(), repo_slug)
         path = _safe_path(repo_event_root, f"{date}.jsonl")
+        open_root = _resolve_events_dir()
+        open_parts = (repo_slug, f"{date}.jsonl")
         kind = "disk_event_log"
         mutable = date == _utc_now().date().isoformat()
         association = _association()
@@ -2811,8 +3033,7 @@ def _read_file_source(
             0,
         )
     try:
-        stat = path.stat()
-        handle = path.open("rb")
+        handle, stat = _open_diagnostic_file(open_root, *open_parts)
     except OSError as exc:
         return (
             None,
@@ -2860,6 +3081,7 @@ def _read_file_source(
                 kubernetes_kind_context_known,
                 starts_inside_kubernetes_secret_data,
                 kubernetes_secret_data_indent,
+                kubernetes_secret_data_flow_depth,
                 kubernetes_context_scanned_bytes,
             ) = _kubernetes_yaml_state_before(handle, page_start, raw)
             text = raw.decode("utf-8", errors="replace")
@@ -2878,6 +3100,7 @@ def _read_file_source(
                 kubernetes_kind_context_known=kubernetes_kind_context_known,
                 starts_inside_kubernetes_secret_data=starts_inside_kubernetes_secret_data,
                 kubernetes_secret_data_indent=kubernetes_secret_data_indent,
+                kubernetes_secret_data_flow_depth=kubernetes_secret_data_flow_depth,
             )
             redacted = "".join(unit[1] for unit in redaction_units)
             replacements = sum(unit[2] for unit in redaction_units)
@@ -3012,6 +3235,7 @@ def _read_file_source(
                 kubernetes_kind_context_known,
                 starts_inside_kubernetes_secret_data,
                 kubernetes_secret_data_indent,
+                kubernetes_secret_data_flow_depth,
                 kubernetes_context_scanned_bytes,
             ) = _kubernetes_yaml_state_before(handle, page_start, raw)
             redaction_units = _redacted_file_units(
@@ -3029,6 +3253,7 @@ def _read_file_source(
                 kubernetes_kind_context_known=kubernetes_kind_context_known,
                 starts_inside_kubernetes_secret_data=starts_inside_kubernetes_secret_data,
                 kubernetes_secret_data_indent=kubernetes_secret_data_indent,
+                kubernetes_secret_data_flow_depth=kubernetes_secret_data_flow_depth,
             )
 
             parts: list[str] = []
