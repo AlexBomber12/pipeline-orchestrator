@@ -644,7 +644,9 @@ def test_handle_watch_reclassified_pending_routes_to_fix(
 ) -> None:
     """PR-250: stuck-PENDING reclassification routes WATCH through handle_fix.
 
-    The PR's raw CI status is PENDING, but the Redis tracker shows the
+    The PR's canonical CI status is PENDING even though its raw runs look
+    successful (for example, because producer identity is missing), and the
+    Redis tracker shows the
     same head_sha has been PENDING longer than ``ci_pending_max_min``
     minutes. ``classify_ci_status_with_age`` reclassifies as FAILURE,
     a ``stuck_pending`` event is logged, and ``handle_fix`` is invoked.
@@ -662,7 +664,7 @@ def test_handle_watch_reclassified_pending_routes_to_fix(
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
     monkeypatch.setattr(
         "src.github.checks._fetch_ci_status_rest",
-        lambda repo, sha: ([{"status": "in_progress"}], {}, True),
+        lambda repo, sha: ([{"conclusion": "success"}], {}, True),
     )
 
     fix_calls: list[None] = []

@@ -132,6 +132,83 @@ def test_pending_beyond_threshold_returns_failure(
     assert reason == "stuck_pending"
 
 
+def test_canonical_pending_ages_when_legacy_payload_looks_successful(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provenance-policy PENDING must not be cleared by the legacy mapper."""
+    redis = _FakeRedis()
+    runs, statuses = _runs_success()
+    base = 1_700_000_000.0
+    monkeypatch.setattr(checks.time, "time", lambda: base)
+
+    initial, initial_reason = asyncio.run(
+        classify_ci_status_with_age(
+            "octo/repo",
+            7,
+            "sha-aaa",
+            redis,
+            pending_max_seconds=1800,
+            runs_payload=runs,
+            statuses_payload=statuses,
+            canonical_status=CIStatus.PENDING,
+        )
+    )
+
+    assert initial == CIStatus.PENDING
+    assert initial_reason is None
+    key = _pending_tracker_key("octo/repo", 7, "sha-aaa")
+    assert key in redis.store
+
+    monkeypatch.setattr(checks.time, "time", lambda: base + 35 * 60)
+    terminal, terminal_reason = asyncio.run(
+        classify_ci_status_with_age(
+            "octo/repo",
+            7,
+            "sha-aaa",
+            redis,
+            pending_max_seconds=1800,
+            runs_payload=runs,
+            statuses_payload=statuses,
+            canonical_status=CIStatus.PENDING,
+        )
+    )
+
+    assert terminal == CIStatus.FAILURE
+    assert terminal_reason == "stuck_pending"
+
+
+@pytest.mark.parametrize(
+    "canonical_status",
+    [CIStatus.SUCCESS, CIStatus.FAILURE, CIStatus.INFRA_FAILURE],
+)
+def test_canonical_terminal_status_clears_pending_tracker(
+    canonical_status: CIStatus,
+) -> None:
+    """Success and both failure classes retain terminal transition behavior."""
+    redis = _FakeRedis()
+    key = _pending_tracker_key("octo/repo", 7, "sha-aaa")
+    redis.store[key] = "1700000000.0"
+    runs, statuses = _runs_pending()
+
+    status, reason = asyncio.run(
+        classify_ci_status_with_age(
+            "octo/repo",
+            7,
+            "sha-aaa",
+            redis,
+            pending_max_seconds=1800,
+            runs_payload=runs,
+            statuses_payload=statuses,
+            canonical_status=canonical_status,
+        )
+    )
+
+    assert status == canonical_status
+    assert reason is None
+    assert key not in redis.store
+    assert key in redis.deleted
+
+
 def test_status_transition_clears_tracker() -> None:
     """Raw status leaving PENDING drops the Redis anchor."""
     redis = _FakeRedis()

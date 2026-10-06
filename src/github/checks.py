@@ -786,26 +786,33 @@ async def classify_ci_status_with_age(
     *,
     empty_is_success: bool = False,
     fetch_ok: bool = True,
+    canonical_status: CIStatus | None = None,
 ) -> tuple[CIStatus, str | None]:
     """Augment :func:`_map_rest_ci_status_to_enum` with stuck-PENDING reclassification.
 
-    Returns ``(status, reclassification_reason)``. When the raw status is
+    Returns ``(status, reclassification_reason)``. When the canonical status is
     PENDING for longer than ``pending_max_seconds`` on the same
     ``head_sha``, returns ``(CIStatus.FAILURE, "stuck_pending")``;
-    otherwise returns the raw status with reason ``None``. The
+    otherwise returns the selected status with reason ``None``. The
     first-seen-PENDING timestamp is tracked per ``head_sha`` in Redis so
     a fresh push naturally resets the clock, and the tracker is cleared
-    whenever the raw status leaves PENDING so a transient regression
+    whenever the canonical status leaves PENDING so a transient regression
     back into PENDING starts a new window.
+
+    ``canonical_status`` lets callers retain provenance and required-context
+    policy already applied while hydrating the PR. When omitted, the legacy
+    REST payload mapper remains the source of the status.
 
     PR-250.
     """
-    raw_status = _map_rest_ci_status_to_enum(
-        runs_payload,
-        statuses_payload,
-        empty_is_success=empty_is_success,
-        fetch_ok=fetch_ok,
-    )
+    raw_status = canonical_status
+    if raw_status is None:
+        raw_status = _map_rest_ci_status_to_enum(
+            runs_payload,
+            statuses_payload,
+            empty_is_success=empty_is_success,
+            fetch_ok=fetch_ok,
+        )
     if raw_status != CIStatus.PENDING:
         await _clear_pending_tracker(redis_client, repo, pr_number, head_sha)
         return raw_status, None

@@ -794,6 +794,7 @@ class WatchMixin:
             statuses_payload,
             empty_is_success=self.repo_config.allow_merge_without_checks,
             fetch_ok=fetch_ok,
+            canonical_status=found.ci_status,
         )
         if reason != "stuck_pending":
             return
