@@ -164,6 +164,23 @@ def _validate_plugin_metadata(
             "plugin.model_setting.config_field must be None or name a string "
             "DaemonConfig field",
         )
+    if not isinstance(model_setting.default_value, str):
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "metadata validation",
+            "plugin.model_setting.default_value must be a string",
+        )
+    if (
+        not isinstance(model_setting.default_label, str)
+        or not model_setting.default_label
+    ):
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "metadata validation",
+            "plugin.model_setting.default_label must be a non-empty string",
+        )
     if (
         not isinstance(model_setting.setting_key, str)
         or not model_setting.setting_key

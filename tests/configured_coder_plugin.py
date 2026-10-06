@@ -127,6 +127,26 @@ def build_non_model_legacy_field_plugin() -> ConfiguredTestPlugin:
     return plugin
 
 
+def build_non_string_default_value_plugin() -> ConfiguredTestPlugin:
+    plugin = ConfiguredTestPlugin()
+    plugin.model_setting = ModelSetting(
+        config_field=None,
+        default_value=3,  # type: ignore[arg-type]
+        default_label="Test default",
+    )
+    return plugin
+
+
+def build_empty_default_label_plugin() -> ConfiguredTestPlugin:
+    plugin = ConfiguredTestPlugin()
+    plugin.model_setting = ModelSetting(
+        config_field=None,
+        default_value="third-default",
+        default_label="",
+    )
+    return plugin
+
+
 def build_empty_setting_key_plugin() -> ConfiguredTestPlugin:
     plugin = ConfiguredTestPlugin()
     plugin.model_setting = ModelSetting(

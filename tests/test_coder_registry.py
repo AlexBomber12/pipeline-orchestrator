@@ -216,6 +216,16 @@ def test_build_registry_loads_configured_plugin_and_builtin_override() -> None:
         ),
         (
             "third",
+            "tests.configured_coder_plugin:build_non_string_default_value_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_empty_default_label_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
             "tests.configured_coder_plugin:build_empty_setting_key_plugin",
             "metadata validation",
         ),
