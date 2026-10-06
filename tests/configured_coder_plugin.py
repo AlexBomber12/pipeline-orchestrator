@@ -108,6 +108,28 @@ def build_empty_setting_key_plugin() -> ConfiguredTestPlugin:
     return plugin
 
 
+def build_non_string_setting_key_plugin() -> ConfiguredTestPlugin:
+    plugin = ConfiguredTestPlugin()
+    plugin.model_setting = ModelSetting(
+        config_field=None,
+        default_value="third-default",
+        default_label="Test default",
+        setting_key=3,  # type: ignore[arg-type]
+    )
+    return plugin
+
+
+def build_dotted_setting_key_plugin() -> ConfiguredTestPlugin:
+    plugin = ConfiguredTestPlugin()
+    plugin.model_setting = ModelSetting(
+        config_field=None,
+        default_value="third-default",
+        default_label="Test default",
+        setting_key="reasoning.effort",
+    )
+    return plugin
+
+
 def build_invalid_refreshable_plugin() -> ConfiguredTestPlugin:
     plugin = ConfiguredTestPlugin()
     plugin.model_catalog_refreshable = "yes"  # type: ignore[assignment]

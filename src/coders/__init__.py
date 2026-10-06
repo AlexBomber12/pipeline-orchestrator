@@ -148,12 +148,16 @@ def _validate_plugin_metadata(
             "metadata validation",
             "plugin.model_setting must be ModelSetting metadata",
         )
-    if not model_setting.setting_key:
+    if (
+        not isinstance(model_setting.setting_key, str)
+        or not model_setting.setting_key
+        or "." in model_setting.setting_key
+    ):
         raise _configuration_error(
             plugin_id,
             reference,
             "metadata validation",
-            "plugin.model_setting.setting_key must be non-empty",
+            "plugin.model_setting.setting_key must be a non-empty, dot-free string",
         )
     if not isinstance(refreshable, bool):
         raise _configuration_error(
