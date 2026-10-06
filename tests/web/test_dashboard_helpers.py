@@ -20,6 +20,11 @@ async def test_repo_template_context_invokes_load_config_via_to_thread(monkeypat
         "_build_recent_graphql_burns_view",
         AsyncMock(return_value=None),
     )
+    monkeypatch.delattr(
+        dashboard_routes._app.app.state,
+        "coder_registry",
+        raising=False,
+    )
     monkeypatch.setattr(dashboard_routes, "build_coder_registry", lambda: registry)
 
     await dashboard_routes._repo_template_context(
