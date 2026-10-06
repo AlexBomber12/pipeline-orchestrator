@@ -1531,6 +1531,8 @@ async def test_indirect_yaml_env_fields_are_redacted_across_retained_readers(
     monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
     payload = (
         "fieldName: &fieldName name\nvalueField: &valueField value\n"
+        "sharedValue: &sharedValue anchored-env-secret\n"
+        "safeSharedValue: &safeSharedValue retained-safe-anchored-env\n"
         "credentialEnv: &credentialEnv\n"
         "  name: CLIENT_SECRET\n  value: direct-composed-env-secret\n"
         "nameOnly: &nameOnly\n  name: PASSWORD\n"
@@ -1538,6 +1540,8 @@ async def test_indirect_yaml_env_fields_are_redacted_across_retained_readers(
         "safeEnv: &safeEnv\n  name: SAFE\n  value: retained-safe-merged-env\n"
         "env:\n"
         "  - *fieldName: PASSWORD\n    *valueField: aliased-field-env-secret\n"
+        "  - name: PASSWORD\n    value: *sharedValue\n"
+        "  - name: SAFE\n    value: *safeSharedValue\n"
         "  - <<: *credentialEnv\n"
         "  - <<: [*nameOnly, *valueOnly]\n"
         "  - <<: *safeEnv\n"
@@ -1560,16 +1564,19 @@ async def test_indirect_yaml_env_fields_are_redacted_across_retained_readers(
         assert "direct-composed-env-secret" not in result["content"]
         assert "split-merged-env-secret" not in result["content"]
         assert "aliased-field-env-secret" not in result["content"]
+        assert "anchored-env-secret" not in result["content"]
         assert "block-name-env-secret" not in result["content"]
         assert "tagged-block-name-env-secret" not in result["content"]
         assert "escaped-block-name-env-secret" not in result["content"]
         assert "retained-safe-merged-env" in result["content"]
+        assert "retained-safe-anchored-env" in result["content"]
         assert "retained-safe-block-name-env" in result["content"]
 
     raw = ci_path.read_bytes()
     for secret in (
         b"direct-composed-env-secret",
         b"aliased-field-env-secret",
+        b"anchored-env-secret",
         b"block-name-env-secret",
         b"tagged-block-name-env-secret",
         b"escaped-block-name-env-secret",
@@ -1877,6 +1884,13 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     block_heavy = "a: b\n" * (diagnostics._MAX_YAML_BLOCK_MAPPING_LINES + 1)
     assert diagnostics._yaml_block_complexity_exceeded(block_heavy)
     assert diagnostics._yaml_parse_complexity_exceeded(block_heavy)
+    sequence_heavy = (
+        "- &item {name: USER, value: ok}\n"
+        "- <<: *item\n"
+        + "- ordinary\n" * diagnostics._MAX_YAML_BLOCK_TOKENS
+    )
+    assert diagnostics._yaml_block_complexity_exceeded(sequence_heavy)
+    assert diagnostics._yaml_parse_complexity_exceeded(sequence_heavy)
     decoded_key_heavy = '? "pass\\u0061ge"\n' * (
         diagnostics._MAX_YAML_PER_LINE_SCAN_CANDIDATES + 1
     )
@@ -1908,7 +1922,21 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
             has_more_after_raw=False,
             warnings=block_warnings,
         )
+        sequence_units = diagnostics._redacted_file_units(
+            sequence_heavy.encode(),
+            starts_inside_private_key=False,
+            starts_with_sensitive_value=False,
+            starts_inside_sensitive_block=False,
+            sensitive_block_indent=None,
+            starts_inside_sensitive_quote=False,
+            sensitive_quote=None,
+            has_more_after_raw=False,
+            warnings=block_warnings,
+        )
     assert block_units[0][1] == "[CONTENT OMITTED: YAML BLOCK COMPLEXITY BOUND EXCEEDED]\n"
+    assert sequence_units[0][1] == (
+        "[CONTENT OMITTED: YAML BLOCK COMPLEXITY BOUND EXCEEDED]\n"
+    )
     assert any("block syntax" in warning for warning in block_warnings)
 
     real_scan = diagnostics.yaml.scan

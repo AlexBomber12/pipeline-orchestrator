@@ -73,6 +73,7 @@ _MAX_STRUCTURED_DEPTH = 64
 _MAX_YAML_FLOW_DEPTH = 64
 _MAX_YAML_FLOW_TOKENS = 4_096
 _MAX_YAML_BLOCK_MAPPING_LINES = 4_096
+_MAX_YAML_BLOCK_TOKENS = 4_096
 _MAX_YAML_PER_LINE_SCAN_CANDIDATES = 256
 _MAX_RETRY_CURSOR_CHARS = 1_024
 _CLI_LATEST_TTL_SECONDS = 3600
@@ -286,6 +287,7 @@ _YAML_ENV_VALUE = re.compile(
     r"(?P<value>[^\r\n]*)$"
 )
 _YAML_SEQUENCE_ITEM_ONLY = re.compile(r"^(?P<indent>[ \t]*)-[ \t]*(?:#.*)?$")
+_YAML_BLOCK_SEQUENCE_ITEM = re.compile(r"^[ \t]*-(?:[ \t]+|$)")
 _YAML_BLOCK_MAPPING_LINE = re.compile(
     r"^[ \t]*(?:-[ \t]+)?(?:[\"']?[-A-Za-z0-9_.]+[\"']?)[ \t]*:(?:[ \t]|$)"
 )
@@ -886,14 +888,19 @@ def _yaml_flow_complexity_exceeded(text: str) -> bool:
 def _yaml_block_complexity_exceeded(text: str) -> bool:
     """Bound block-mapping tokenization before invoking PyYAML."""
     mapping_lines = 0
+    block_tokens = 0
     per_line_scan_candidates = 0
     for line in text.splitlines():
-        if _YAML_BLOCK_MAPPING_LINE.match(line) is not None:
+        mapping_line = _YAML_BLOCK_MAPPING_LINE.match(line) is not None
+        if mapping_line:
             mapping_lines += 1
+        if mapping_line or _YAML_BLOCK_SEQUENCE_ITEM.match(line) is not None:
+            block_tokens += 1
         if "\\" in line and '"' in line and (":" in line or "?" in line):
             per_line_scan_candidates += 1
         if (
             mapping_lines > _MAX_YAML_BLOCK_MAPPING_LINES
+            or block_tokens > _MAX_YAML_BLOCK_TOKENS
             or per_line_scan_candidates > _MAX_YAML_PER_LINE_SCAN_CANDIDATES
         ):
             return True
@@ -1369,6 +1376,13 @@ def _yaml_secret_payload_lines(lines: list[bytes]) -> set[int]:
         if (
             candidate.startswith("<<:")
             or (candidate.startswith("*") and ":" in candidate)
+            or (
+                "*" in candidate
+                and ":" in candidate
+                and (field := _yaml_mapping_scalar_field(candidate)) is not None
+                and field[2].casefold() == "value"
+                and _YAML_ALIAS_SCALAR.fullmatch(field[3]) is not None
+            )
             or candidate.startswith(("? |", "? >"))
             or (
                 (
