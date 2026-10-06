@@ -381,6 +381,12 @@ def test_app_config_rejects_malformed_coder_plugin_mapping(
         AppConfig(coder_plugins=coder_plugins)  # type: ignore[arg-type]
 
 
+def test_app_config_accepts_null_coder_plugins_as_defaults() -> None:
+    config = AppConfig(coder_plugins=None)  # type: ignore[arg-type]
+
+    assert config.coder_plugins == config_module.DEFAULT_CODER_PLUGINS
+
+
 def test_load_config_reloads_trusted_reviewer_policy_snapshot(
     tmp_path: Path,
 ) -> None:

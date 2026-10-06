@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import re
 from typing import Any
 
 import pytest
 from src import claude_cli, codex_cli
+from src import coders as coders_module
 from src.coder_registry import (
     CoderPlugin,
     CoderRegistry,
@@ -150,6 +152,7 @@ def test_build_registry_loads_configured_plugin_and_builtin_override() -> None:
     ("plugin_id", "reference", "stage"),
     [
         ("third", "missing-separator", "reference"),
+        ("third", ":factory", "reference"),
         ("third", "missing.module:factory", "module import"),
         (
             "third",
@@ -176,6 +179,36 @@ def test_build_registry_loads_configured_plugin_and_builtin_override() -> None:
             "tests.configured_coder_plugin:build_missing_metadata_plugin",
             "metadata validation",
         ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_raising_metadata_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_empty_name_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_invalid_models_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_invalid_model_setting_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_empty_setting_key_plugin",
+            "metadata validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_invalid_refreshable_plugin",
+            "metadata validation",
+        ),
     ],
 )
 def test_build_registry_reports_configured_loading_stage(
@@ -192,6 +225,47 @@ def test_build_registry_reports_configured_loading_stage(
     assert repr(plugin_id) in message
     assert repr(reference) in message
     assert f"failed at {stage}" in message
+
+
+def test_build_registry_rejects_non_string_reference_from_constructed_config() -> None:
+    config = AppConfig.model_construct(coder_plugins={"third": 3})
+
+    with pytest.raises(
+        CoderPluginConfigurationError,
+        match="failed at reference: expected a module:factory string",
+    ):
+        build_coder_registry(config)
+
+
+def test_build_registry_wraps_contract_inspection_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_isinstance = builtins.isinstance
+
+    def raising_isinstance(value: object, class_or_tuple: object) -> bool:
+        if class_or_tuple is CoderPlugin:
+            raise RuntimeError("contract secret")
+        return real_isinstance(value, class_or_tuple)
+
+    monkeypatch.setattr(
+        coders_module,
+        "isinstance",
+        raising_isinstance,
+        raising=False,
+    )
+    config = AppConfig(
+        coder_plugins={
+            "third": "tests.configured_coder_plugin:build_test_plugin"
+        }
+    )
+
+    with pytest.raises(CoderPluginConfigurationError) as caught:
+        build_coder_registry(config)
+
+    message = str(caught.value)
+    assert "failed at contract validation" in message
+    assert "RuntimeError" in message
+    assert "contract secret" not in message
 
 
 def test_build_registry_redacts_factory_exception_detail() -> None:
