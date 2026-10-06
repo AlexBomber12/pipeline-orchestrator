@@ -259,8 +259,12 @@ def test_get_open_prs_populates_observed_head_shas_with_current_head(
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
     monkeypatch.setattr(
-        "src.github.checks._fetch_ci_status_rest",
-        lambda repo, sha: ([], {}, True),
+        "src.github.checks._retrieve_ci_status_evidence",
+        lambda repo, sha: object(),
+    )
+    monkeypatch.setattr(
+        "src.github.checks._classify_ci_retrieval",
+        lambda *args, **kwargs: CIStatus.SUCCESS,
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
