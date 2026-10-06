@@ -1940,6 +1940,31 @@ def test_configured_plugin_auth_failure_is_isolated_and_redacted(
     assert "must-not-leak" not in settings_response.text
 
 
+def test_configured_plugin_auth_probe_has_response_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories: []\n"
+        "coder_plugins:\n"
+        "  third: tests.configured_coder_plugin:build_slow_auth_plugin\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    monkeypatch.setattr(_auth_probe, "_AUTH_CHECK_TIMEOUT_SEC", 0.01)
+
+    with TestClient(app) as client:
+        response = client.get("/api/auth-status")
+
+    assert response.status_code == 200
+    assert response.json()["third"] == {
+        "status": "error",
+        "detail": "Configured Test Coder auth check timed out after 0.01s",
+    }
+
+
 def test_api_auth_status_reports_errors(
     empty_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

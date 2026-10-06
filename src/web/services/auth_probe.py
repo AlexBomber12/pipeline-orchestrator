@@ -142,6 +142,36 @@ def _check_codex_auth(
     return _check_coder_auth(registry or build_coder_registry(), "codex")
 
 
+async def _bounded_coder_auth_probe(
+    registry: CoderRegistry,
+    plugin_id: str,
+) -> dict[str, str]:
+    """Run one synchronous plugin probe without blocking a web response."""
+    if plugin_id == "claude":
+        probe = _check_claude_auth
+        args = (registry,)
+    elif plugin_id == "codex":
+        probe = _check_codex_auth
+        args = (registry,)
+    else:
+        probe = _check_coder_auth
+        args = (registry, plugin_id)
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(probe, *args),
+            timeout=_AUTH_CHECK_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        plugin = registry.get(plugin_id)
+        return {
+            "status": "error",
+            "detail": (
+                f"{plugin.display_name} auth check timed out after "
+                f"{_AUTH_CHECK_TIMEOUT_SEC:g}s"
+            ),
+        }
+
+
 def _check_gh_auth() -> dict[str, str]:
     """Probe the ``gh`` CLI and report its authorization status."""
     cfg = load_config(_config_path())
@@ -181,16 +211,10 @@ async def _collect_auth_status(
     """
     active_registry = registry or build_coder_registry()
     plugin_ids = active_registry.coder_names()
-    probes = []
-    for plugin_id in plugin_ids:
-        if plugin_id == "claude":
-            probes.append(asyncio.to_thread(_check_claude_auth, active_registry))
-        elif plugin_id == "codex":
-            probes.append(asyncio.to_thread(_check_codex_auth, active_registry))
-        else:
-            probes.append(
-                asyncio.to_thread(_check_coder_auth, active_registry, plugin_id)
-            )
+    probes = [
+        _bounded_coder_auth_probe(active_registry, plugin_id)
+        for plugin_id in plugin_ids
+    ]
     results = await asyncio.gather(*probes, asyncio.to_thread(_check_gh_auth))
     global _AUTH_STATUS_CACHE
     _AUTH_STATUS_CACHE = dict(zip((*plugin_ids, "gh"), results, strict=True))

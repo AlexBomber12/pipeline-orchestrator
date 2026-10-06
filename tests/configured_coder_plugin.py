@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from src.coder_registry import ModelSetting
 from src.coders.claude import ClaudePlugin
 
@@ -65,6 +67,12 @@ class RaisingAuthTestPlugin(ConfiguredTestPlugin):
         raise RuntimeError("credential=must-not-leak")
 
 
+class SlowAuthTestPlugin(ConfiguredTestPlugin):
+    def check_auth(self) -> dict[str, str]:
+        time.sleep(0.05)
+        return {"status": "ok", "detail": "too late"}
+
+
 class MissingMetadataPlugin(ConfiguredTestPlugin):
     display_name = ""
 
@@ -95,6 +103,10 @@ def build_variant_setting_plugin() -> VariantSettingTestPlugin:
 
 def build_raising_auth_plugin() -> RaisingAuthTestPlugin:
     return RaisingAuthTestPlugin()
+
+
+def build_slow_auth_plugin() -> SlowAuthTestPlugin:
+    return SlowAuthTestPlugin()
 
 
 def build_mismatched_plugin() -> ConfiguredTestPlugin:
