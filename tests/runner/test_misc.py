@@ -39,6 +39,23 @@ claude_cli = claude_plugin_module.claude_cli
 # ---------------------------------------------------------------------------
 
 
+def test_git_rev_parse_returns_empty_for_nonzero_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    monkeypatch.setattr(
+        runner_module.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args,
+            returncode=1,
+            stdout="",
+        ),
+    )
+
+    assert runner._git_rev_parse("HEAD") == ""
+
+
 def test_runner_builds_configured_registry_when_not_injected() -> None:
     config = AppConfig(
         coder_plugins={

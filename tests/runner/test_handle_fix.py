@@ -3639,6 +3639,7 @@ def test_fix_iterations_survive_recovery_until_merge(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    h._patch_subprocess(monkeypatch)
     parsed_tasks = [
         QueueTask(
             pr_id="PR-001",
