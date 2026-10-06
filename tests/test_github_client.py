@@ -3035,6 +3035,68 @@ def test_classify_ci_retrieval_accepts_unique_identified_required_checks() -> No
     )
 
 
+def test_classify_ci_retrieval_uses_successful_latest_rerun() -> None:
+    sha = "a" * 40
+    retrieval = _ci_retrieval(
+        "owner/name",
+        sha,
+        [
+            {
+                "id": 1,
+                "name": "unit",
+                "conclusion": "failure",
+                "head_sha": sha,
+                "app": {"id": 1},
+                "run_attempt": 1,
+                "completed_at": "2026-10-06T10:00:00Z",
+            },
+            {
+                "id": 2,
+                "name": "unit",
+                "conclusion": "success",
+                "head_sha": sha,
+                "app": {"id": 1},
+                "run_attempt": 2,
+                "completed_at": "2026-10-06T11:00:00Z",
+            },
+        ],
+        {"state": "pending", "statuses": []},
+    )
+
+    assert _map_rest_ci_status_to_enum(
+        retrieval.check_runs,
+        retrieval.status_payload,
+    ) == CIStatus.FAILURE
+    assert (
+        checks._classify_ci_retrieval(retrieval, required_contexts=["unit"])
+        == CIStatus.SUCCESS
+    )
+
+
+def test_classify_ci_retrieval_preserves_current_infra_failure() -> None:
+    sha = "a" * 40
+    retrieval = _ci_retrieval(
+        "owner/name",
+        sha,
+        [
+            {
+                "id": 1,
+                "name": "unit",
+                "conclusion": "cancelled",
+                "head_sha": sha,
+                "app": {"id": 1},
+                "completed_at": "2026-10-06T11:00:00Z",
+            }
+        ],
+        {"state": "pending", "statuses": []},
+    )
+
+    assert (
+        checks._classify_ci_retrieval(retrieval, required_contexts=["unit"])
+        == CIStatus.INFRA_FAILURE
+    )
+
+
 # ---------------------------------------------------------------------------
 # retry integration tests (PR-054)
 # ---------------------------------------------------------------------------
@@ -3151,12 +3213,13 @@ def test_get_open_prs_invokes_rest_helper_with_head_sha(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Each PR's head SHA is passed through to the REST CI status fetch."""
+    sha = "d" * 40
     raw = [
         {
             "number": 7,
             "title": "PR-7: foo",
             "headRefName": "bar",
-            "headRefOid": "deadbeef",
+            "headRefOid": sha,
             "url": "u",
             "updatedAt": "2026-04-18T00:00:00Z",
             "commits": [],
@@ -3172,7 +3235,14 @@ def test_get_open_prs_invokes_rest_helper_with_head_sha(
         return _ci_retrieval(
             repo,
             sha,
-            [{"conclusion": "failure", "head_sha": sha}],
+            [
+                {
+                    "name": "unit",
+                    "conclusion": "failure",
+                    "head_sha": sha,
+                    "app": {"id": 1},
+                }
+            ],
             {"state": "failure", "statuses": []},
         )
 
@@ -3185,7 +3255,7 @@ def test_get_open_prs_invokes_rest_helper_with_head_sha(
 
     prs = get_open_prs("owner/name")
 
-    assert captured == [("owner/name", "deadbeef")]
+    assert captured == [("owner/name", sha)]
     assert prs[0].ci_status == CIStatus.FAILURE
 
 

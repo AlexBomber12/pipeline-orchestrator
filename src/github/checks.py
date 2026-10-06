@@ -536,15 +536,14 @@ def _classify_ci_retrieval(
         empty_is_success=empty_is_success,
         fetch_ok=retrieval.evidence.sources_complete,
     )
-    # Keep the compatibility mapper's INFRA_FAILURE distinction and its
-    # combined-status failure fallback. Every success, however, must be
-    # authorized by the canonical evidence policy, which verifies source
-    # completeness, SHA attribution, and producer identity.
-    if mapped in {CIStatus.FAILURE, CIStatus.INFRA_FAILURE}:
-        return mapped
-    if evidence.policy_result != CIStatus.SUCCESS:
-        return evidence.policy_result
-    return mapped
+    # Keep the compatibility mapper's INFRA_FAILURE distinction only when
+    # canonical latest-per-producer evidence confirms that a current failure
+    # remains. The mapper intentionally sees the complete historical payload,
+    # so returning its failure first would let an older failed attempt override
+    # a successful rerun selected by ``evaluate_ci_evidence``.
+    if evidence.policy_result == CIStatus.FAILURE:
+        return mapped if mapped == CIStatus.INFRA_FAILURE else CIStatus.FAILURE
+    return evidence.policy_result
 
 
 def _map_rest_ci_status_to_enum(
