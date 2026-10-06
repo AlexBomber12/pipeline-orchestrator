@@ -488,9 +488,7 @@ _REDACTION_RULES = (
     ),
     (
         re.compile(
-            r"(?im)^([ \t]*(?:password|passwd)[ \t]+)(?![:=])"
-            r"(?:(?P<netrc_line_quote>[\"'])(?:\\[^\r\n]|"
-            r"(?!(?P=netrc_line_quote))[^\\\r\n])*(?P=netrc_line_quote)?|[^\s]+)"
+            rf"(?im)^([ \t]*(?:{_SENSITIVE_KEY_PATTERN})[ \t]+)(?![:=])[^\r\n]+$"
         ),
         r"\1[REDACTED]",
     ),

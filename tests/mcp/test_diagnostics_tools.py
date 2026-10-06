@@ -675,6 +675,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             ),
             '{\n"password":\n"redis-same-indent-secret"\n}',
             "machine redis.example login alice password redis-netrc-secret",
+            "spring.datasource.password redis-java-property-secret",
+            "spring.datasource.username retained-java-property-user",
             "mysql -u root -predis-mysql-short-secret",
             "mysql -p",
             "<password>redis-xml-element-secret</password>",
@@ -841,6 +843,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + '{"password":987650002,}\n'
         + '{\n"password":\n"ci-same-indent-secret"\n}\n'
         + "  password ci-multiline-netrc-secret\n"
+        + "service.clientSecret ci-java-property-secret with-spaces\n"
+        + "service.username retained-ci-java-property-user\n"
         + "mariadb -u root -pci-mysql-short-secret\n"
         + "mariadb -p\n"
         + "<m:password>ci-xml-element-secret</m:password>\n"
@@ -961,6 +965,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-structured-second" not in content
         assert "redis-same-indent-secret" not in content
         assert "redis-netrc-secret" not in content
+        assert "redis-java-property-secret" not in content
+        assert "retained-java-property-user" in content
         assert "redis-mysql-short-secret" not in content
         assert "mysql -p" in content
         assert "redis-xml-element-secret" not in content
@@ -1024,6 +1030,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-same-indent-secret" not in content
         assert "ci-netrc-secret" not in content
         assert "ci-multiline-netrc-secret" not in content
+        assert "ci-java-property-secret" not in content
+        assert "with-spaces" not in content
         assert "ci-mysql-short-secret" not in content
         assert "ci-xml-element-secret" not in content
         assert "ci-xml-cdata-secret" not in content
@@ -1094,6 +1102,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-block-kind-secret" not in content
         assert "ci-aliased-kind-secret" not in content
         if source_id == "ci:artifact":
+            assert "retained-ci-java-property-user" in content
             assert "mariadb -p" in content
             assert "retained-ci-xml-element-value" in content
             assert "retained-ci-xml-multiline-value" in content
@@ -1124,6 +1133,15 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
     )
     assert "ci-xml-multiline-secret" not in xml_page["content"]
     assert "SENSITIVE XML ELEMENT" in xml_page["content"]
+
+    java_property_page = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=ci_raw.index(b"ci-java-property-secret"),
+        max_chars=200,
+    )
+    assert "ci-java-property-secret" not in java_property_page["content"]
+    assert "retained-ci-java-property-user" in java_property_page["content"]
 
     sequence_page = await diagnostics.read_orchestrator_log(
         SLUG,
