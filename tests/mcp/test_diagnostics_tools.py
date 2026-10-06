@@ -141,7 +141,15 @@ class FakeRedis:
                     bounded.append(item)
             return [0 if next_cursor >= len(keys) else next_cursor, bounded, oversized, dropped]
         if "ZCARD" in script:
-            cursor_score, cursor_member, cursor_digest, page_limit, member_limit, lookup_limit = args
+            (
+                cursor_score,
+                cursor_member,
+                cursor_digest,
+                cursor_index,
+                page_limit,
+                member_limit,
+                lookup_limit,
+            ) = args
             values = sorted(self.zsets.get(key, []), key=lambda item: (item[1], str(item[0])))
             first = 0
             if cursor_score != "":
@@ -153,13 +161,20 @@ class FakeRedis:
                     while first < len(values) and values[first][1] < float(cursor_score):
                         first += 1
                     located = False
-                    for _ in range(int(lookup_limit)):
-                        if first >= len(values) or values[first][1] != float(cursor_score):
-                            break
-                        member = values[first][0]
+                    search_start = first
+                    search_end = min(len(values), first + int(lookup_limit))
+                    if cursor_index != "":
+                        center = int(cursor_index)
+                        search_start = max(0, center - int(lookup_limit) // 2)
+                        search_end = min(len(values), search_start + int(lookup_limit))
+                        search_start = max(0, search_end - int(lookup_limit))
+                    for position in range(search_start, search_end):
+                        if values[position][1] != float(cursor_score):
+                            continue
+                        member = values[position][0]
                         raw_member = member if isinstance(member, bytes) else str(member).encode()
-                        first += 1
                         if hashlib.sha1(raw_member).hexdigest() == cursor_digest:
+                            first = position + 1
                             located = True
                             break
                     if not located:
@@ -1668,7 +1683,12 @@ async def test_shell_append_assignments_are_redacted_across_retained_readers(
         'PASSWORD+="quoted-append-secret"\n'
         "+ PASSWORD+=continued-append-secret\\\n"
         "continued-append-secret-two\n"
+        "set -gx PASSWORD fish-assignment-secret\n"
+        "+ set --global --export API_KEY traced-fish-assignment-secret\n"
+        "+ set -gx CLIENT_SECRET continued-fish-assignment-secret\\\n"
+        "continued-fish-assignment-secret-two\n"
         "SAFE+=retained-safe-append\n"
+        "set -gx SAFE retained-safe-fish-assignment\n"
     )
     redis.store[cli_log_latest(SLUG)] = payload
     ci_path = repos_root / SLUG / "artifacts" / "ci.log"
@@ -1686,7 +1706,12 @@ async def test_shell_append_assignments_are_redacted_across_retained_readers(
         assert "quoted-append-secret" not in result["content"]
         assert "continued-append-secret" not in result["content"]
         assert "continued-append-secret-two" not in result["content"]
+        assert "fish-assignment-secret" not in result["content"]
+        assert "traced-fish-assignment-secret" not in result["content"]
+        assert "continued-fish-assignment-secret" not in result["content"]
+        assert "continued-fish-assignment-secret-two" not in result["content"]
         assert "retained-safe-append" in result["content"]
+        assert "retained-safe-fish-assignment" in result["content"]
 
     raw = ci_path.read_bytes()
     continuation = await diagnostics.read_orchestrator_log(
@@ -1697,6 +1722,15 @@ async def test_shell_append_assignments_are_redacted_across_retained_readers(
     )
     assert "continued-append-secret-two" not in continuation["content"]
     assert "retained-safe-append" in continuation["content"]
+
+    fish_continuation = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=raw.index(b"continued-fish-assignment-secret-two"),
+        max_chars=4_000,
+    )
+    assert "continued-fish-assignment-secret-two" not in fish_continuation["content"]
+    assert "retained-safe-fish-assignment" in fish_continuation["content"]
 
 
 async def test_truncated_redis_logs_omit_unknown_leading_sensitive_context(
@@ -2217,9 +2251,21 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
         has_more_after_raw=True,
     ) == (1, True)
     retry_cursor = diagnostics._retry_cursor(1.5, "command")
-    assert diagnostics._validate_retry_cursor(retry_cursor) == (1.5, "command", "")
+    assert diagnostics._validate_retry_cursor(retry_cursor) == (1.5, "command", "", None)
     digest_cursor = diagnostics._retry_cursor(1.5, "", member_sha1="a" * 40)
-    assert diagnostics._validate_retry_cursor(digest_cursor) == (1.5, "", "a" * 40)
+    assert diagnostics._validate_retry_cursor(digest_cursor) == (1.5, "", "a" * 40, None)
+    indexed_digest_cursor = diagnostics._retry_cursor(
+        1.5,
+        "",
+        member_sha1="a" * 40,
+        member_index=250,
+    )
+    assert diagnostics._validate_retry_cursor(indexed_digest_cursor) == (
+        1.5,
+        "",
+        "a" * 40,
+        250,
+    )
     with pytest.raises(ValueError, match="nonempty bounded"):
         diagnostics._validate_retry_cursor("")
     with pytest.raises(ValueError, match="malformed"):
@@ -2229,6 +2275,14 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     with pytest.raises(ValueError, match="malformed"):
         diagnostics._validate_retry_cursor(
             diagnostics._retry_cursor(1.5, "", member_sha1="not-a-digest")
+        )
+    with pytest.raises(ValueError, match="malformed"):
+        diagnostics._validate_retry_cursor(
+            diagnostics._retry_cursor(1.5, "command", member_index=1)
+        )
+    with pytest.raises(ValueError, match="malformed"):
+        diagnostics._validate_retry_cursor(
+            diagnostics._retry_cursor(1.5, "", member_sha1="a" * 40, member_index=-1)
         )
     assert (
         diagnostics._yaml_explicit_value_end(
@@ -2887,6 +2941,34 @@ async def test_pending_retry_index_members_are_bounded_and_paginated(
     dishonest = await diagnostics._pending_retries(redis, SLUG)
     assert dishonest["commands"][0]["status"] == "oversized_index_member"
     assert dishonest["commands"][0]["source_size_bytes"] == len(oversized_member)
+
+
+async def test_oversized_retry_cursor_pages_past_large_score_tie(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    monkeypatch.setattr(diagnostics, "_MAX_PENDING_RETRIES", 20)
+    redis = FakeRedis()
+    pending_key = retry_command_pending(SLUG)
+    member_prefix = "x" * diagnostics._MAX_RETRY_INDEX_MEMBER_BYTES
+    redis.zsets[pending_key] = [
+        (f"{member_prefix}{index:04d}", 1.0)
+        for index in range(diagnostics._MAX_RETRY_CURSOR_LOOKUP + 30)
+    ]
+
+    cursor = None
+    observed_indexes: list[int] = []
+    while True:
+        page = await diagnostics._pending_retries(redis, SLUG, cursor)
+        assert page["status"] == "available"
+        observed_indexes.extend(item["index"] for item in page["commands"])
+        continuation = page["continuation"]
+        if continuation is None:
+            break
+        cursor = continuation["next_cursor"]
+
+    assert observed_indexes == list(range(diagnostics._MAX_RETRY_CURSOR_LOOKUP + 30))
 
 
 async def test_run_filtering_unavailable_record_and_limit() -> None:

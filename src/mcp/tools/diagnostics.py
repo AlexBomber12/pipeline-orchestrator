@@ -95,6 +95,7 @@ if ARGV[1] ~= '' then
   local cursor_score = tonumber(ARGV[1])
   local cursor_member = ARGV[2]
   local cursor_digest = ARGV[3]
+  local cursor_index = ARGV[4]
   local low = 0
   local high = total
   while low < high do
@@ -116,27 +117,30 @@ if ARGV[1] ~= '' then
   first = low
   if cursor_digest ~= '' then
     local found = false
-    local examined = 0
-    while first < total and examined < tonumber(ARGV[6]) do
-      local row = redis.call('ZRANGE', KEYS[1], first, first, 'WITHSCORES')
-      if #row == 0 or tonumber(row[2]) ~= cursor_score then
-        break
-      end
-      examined = examined + 1
-      if redis.sha1hex(row[1]) == cursor_digest then
-        first = first + 1
+    local lookup_limit = tonumber(ARGV[7])
+    local search_start = first
+    local search_end = math.min(total - 1, first + lookup_limit - 1)
+    if cursor_index ~= '' then
+      local center = tonumber(cursor_index)
+      search_start = math.max(0, center - math.floor(lookup_limit / 2))
+      search_end = math.min(total - 1, search_start + lookup_limit - 1)
+      search_start = math.max(0, search_end - lookup_limit + 1)
+    end
+    for position = search_start, search_end do
+      local row = redis.call('ZRANGE', KEYS[1], position, position, 'WITHSCORES')
+      if #row > 0 and tonumber(row[2]) == cursor_score and redis.sha1hex(row[1]) == cursor_digest then
+        first = position + 1
         found = true
         break
       end
-      first = first + 1
     end
     if not found then
       return {total, -1, {}}
     end
   end
 end
-local raw = redis.call('ZRANGE', KEYS[1], first, first + tonumber(ARGV[4]) - 1, 'WITHSCORES')
-local maximum = tonumber(ARGV[5])
+local raw = redis.call('ZRANGE', KEYS[1], first, first + tonumber(ARGV[5]) - 1, 'WITHSCORES')
+local maximum = tonumber(ARGV[6])
 local rows = {}
 for offset = 1, #raw, 2 do
   local member = raw[offset]
@@ -327,7 +331,16 @@ _PREFIXED_PLAIN_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?<![A-Za-z0-9_.-])(?:{_SENSITIVE_KEY_PATTERN})(?![A-Za-z0-9_.-]))"
     r"\s*(?:\+=|[:=])[ \t]*(?P<value>(?![\"'|>])\S.*)$"
 )
+_FISH_SENSITIVE_ASSIGNMENT = re.compile(
+    rf"(?im)^(?P<indent>[ \t]*)(?P<trace>\+[ \t]+)?(?P<prefix>set"
+    rf"(?:[ \t]+(?:--|--?[A-Za-z-]+))*[ \t]+(?:{_SENSITIVE_KEY_PATTERN})[ \t]+)"
+    r"(?P<value>\S.*)$"
+)
 _REDACTION_RULES = (
+    (
+        _FISH_SENSITIVE_ASSIGNMENT,
+        r"\g<indent>\g<trace>\g<prefix>[REDACTED]",
+    ),
     (
         re.compile(
             r"(?im)(\b(?:cookie|set-cookie|authorization|proxy-authorization)"
@@ -474,8 +487,14 @@ def _retry_cursor(
     member: str,
     *,
     member_sha1: str | None = None,
+    member_index: int | None = None,
 ) -> str:
-    identity = {"member_sha1": member_sha1} if member_sha1 is not None else {"member": member}
+    if member_sha1 is not None:
+        identity = {"member_sha1": member_sha1, "member_index": member_index}
+    else:
+        identity = {"member": member}
+        if member_index is not None:
+            identity["member_index"] = member_index
     payload = json.dumps(
         {"score": score, **identity},
         sort_keys=True,
@@ -484,7 +503,7 @@ def _retry_cursor(
     return base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
 
-def _validate_retry_cursor(value: str | None) -> tuple[float, str, str] | None:
+def _validate_retry_cursor(value: str | None) -> tuple[float, str, str, int | None] | None:
     if value is None:
         return None
     if not isinstance(value, str) or not value or len(value) > _MAX_RETRY_CURSOR_CHARS:
@@ -495,6 +514,7 @@ def _validate_retry_cursor(value: str | None) -> tuple[float, str, str] | None:
         score = float(decoded["score"])
         member = decoded.get("member", "")
         member_sha1 = decoded.get("member_sha1", "")
+        member_index = decoded.get("member_index")
     except (AttributeError, binascii.Error, KeyError, TypeError, ValueError) as exc:
         raise ValueError("retry_cursor is malformed") from exc
     if (
@@ -504,9 +524,19 @@ def _validate_retry_cursor(value: str | None) -> tuple[float, str, str] | None:
         or bool(member) == bool(member_sha1)
         or len(member) > _MAX_RETRY_CURSOR_CHARS
         or (member_sha1 and re.fullmatch(r"[0-9a-f]{40}", member_sha1) is None)
+        or (member and member_index is not None)
+        or (
+            member_sha1
+            and member_index is not None
+            and (
+                isinstance(member_index, bool)
+                or not isinstance(member_index, int)
+                or member_index < 0
+            )
+        )
     ):
         raise ValueError("retry_cursor is malformed")
-    return score, member, member_sha1
+    return score, member, member_sha1, member_index
 
 
 def _new_redis_client() -> Any:
@@ -1977,6 +2007,7 @@ def _sensitive_state_before(
         indented_match = (
             _BLOCK_SENSITIVE_ASSIGNMENT.fullmatch(line)
             or _PLAIN_SENSITIVE_ASSIGNMENT.fullmatch(line)
+            or _FISH_SENSITIVE_ASSIGNMENT.fullmatch(line)
             or _PENDING_YAML_SENSITIVE_ASSIGNMENT.fullmatch(line)
         )
         yaml_assignment = _yaml_sensitive_assignment(line)
@@ -2041,7 +2072,10 @@ def _sensitive_state_before(
         while continuation_start > 0 and _has_line_continuation(context_lines[continuation_start - 1]):
             continuation_start -= 1
         continuation_line = context_lines[continuation_start].decode("utf-8", errors="replace")
-        if _PREFIXED_PLAIN_SENSITIVE_ASSIGNMENT.search(continuation_line) is not None:
+        if (
+            _PREFIXED_PLAIN_SENSITIVE_ASSIGNMENT.search(continuation_line) is not None
+            or _FISH_SENSITIVE_ASSIGNMENT.fullmatch(continuation_line) is not None
+        ):
             starts_inside_sensitive_block = True
             active_block_indent = -1
         elif continuation_start == 0 and search_start > 0:
@@ -2738,14 +2772,25 @@ def _redacted_file_units(
                 line_index = block_end
                 continue
             plain_match = _PLAIN_SENSITIVE_ASSIGNMENT.fullmatch(text_unit.rstrip("\r\n"))
+            fish_match = _FISH_SENSITIVE_ASSIGNMENT.fullmatch(text_unit.rstrip("\r\n"))
             continued_assignment = _has_line_continuation(raw_unit)
             prefixed_continuation_match = (
                 _PREFIXED_PLAIN_SENSITIVE_ASSIGNMENT.search(text_unit.rstrip("\r\n"))
                 if continued_assignment
                 else None
             )
-            if plain_match is not None or prefixed_continuation_match is not None:
-                scalar_indent = len(plain_match.group("indent")) if plain_match is not None else 0
+            if (
+                plain_match is not None
+                or fish_match is not None
+                or prefixed_continuation_match is not None
+            ):
+                scalar_indent = (
+                    len(plain_match.group("indent"))
+                    if plain_match is not None
+                    else len(fish_match.group("indent"))
+                    if fish_match is not None
+                    else 0
+                )
                 scalar_end = line_index + 1
                 if continued_assignment:
                     continued = True
@@ -3215,6 +3260,7 @@ async def _pending_retries(
             "" if after is None else repr(after[0]),
             "" if after is None else after[1],
             "" if after is None else after[2],
+            "" if after is None or after[3] is None else after[3],
             _MAX_PENDING_RETRIES,
             _MAX_RETRY_INDEX_MEMBER_BYTES,
             _MAX_RETRY_CURSOR_LOOKUP,
@@ -3363,6 +3409,7 @@ async def _pending_retries(
             float(last_score),
             "" if last_oversized else _decode(last_id),
             member_sha1=last_sha1 if last_oversized else None,
+            member_index=_last_index if last_oversized else None,
         )
     return {
         "status": "available",
