@@ -49,7 +49,9 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   are normalized before classification, and block-scalar `kind` values are
   parsed across their physical lines. Scalar aliases are resolved from bounded,
   document-local anchor context; unresolved aliases fail closed, while resolved
-  ConfigMap kinds and non-sensitive environment names remain visible.
+  ConfigMap kinds and non-sensitive environment names remain visible. YAML
+  mapping merges are composed to classify inherited Secret kinds without
+  attributing neighboring ConfigMap payloads to them.
   Same-indent YAML sequence children and indented multiline INI values remain
   within the sensitive unit. Complete bounded single- and multiline flow-style
   Kubernetes Secret manifests are parsed before ordinary line redaction,
@@ -57,8 +59,9 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   environment entries correlate sensitive `name` fields with sibling `value`
   fields in either order. Quoted YAML keys are decoded before sensitive-name
   matching, including escaped spellings. YAML alias graphs visit each shared
-  collection at most once per classification. Excessive structured nesting is
-  omitted fail-closed.
+  collection at most once per classification. Excessive flow depth or token
+  counts are rejected before PyYAML parsing, and excessive structured nesting
+  is omitted fail-closed.
   Producer-added `[truncated]` markers are preserved; because their
   removed prefix may contain a sensitive opener, the retained Redis CLI tail is
   omitted fail-closed. Redis event

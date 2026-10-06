@@ -64,6 +64,8 @@ _MAX_REDIS_PENDING_KEYS = 200
 _MAX_DISK_PARTITION_CANDIDATES = 200
 _MAX_EMBEDDED_JSON_CANDIDATES = 64
 _MAX_STRUCTURED_DEPTH = 64
+_MAX_YAML_FLOW_DEPTH = 64
+_MAX_YAML_FLOW_TOKENS = 4_096
 _CLI_LATEST_TTL_SECONDS = 3600
 _CLI_HISTORY_TTL_SECONDS = 86400
 _HISTORY_CURSOR_PREFIX = "redis-history:"
@@ -685,6 +687,46 @@ def _yaml_flow_delta(text: str) -> int:
     return delta
 
 
+def _yaml_flow_complexity_exceeded(text: str) -> bool:
+    """Reject excessive flow nesting/tokens before invoking PyYAML."""
+    depth = 0
+    tokens = 0
+    quote: str | None = None
+    escaped = False
+    comment = False
+    for character in text:
+        if character in "\r\n":
+            comment = False
+            continue
+        if comment:
+            continue
+        if escaped:
+            escaped = False
+            continue
+        if quote == '"' and character == "\\":
+            escaped = True
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            continue
+        if character in {'"', "'"}:
+            quote = character
+        elif character == "#":
+            comment = True
+        elif character in "[{":
+            depth += 1
+            tokens += 1
+        elif character in "]}":
+            depth = max(0, depth - 1)
+            tokens += 1
+        elif depth > 0 and character in ",:":
+            tokens += 1
+        if depth > _MAX_YAML_FLOW_DEPTH or tokens > _MAX_YAML_FLOW_TOKENS:
+            return True
+    return False
+
+
 def _contains_kubernetes_secret_payload(
     value: Any,
     *,
@@ -787,6 +829,8 @@ def _yaml_flow_sensitivity(text: str) -> str | None:
     stripped = text.strip()
     if "{" not in stripped and "[" not in stripped:
         return None
+    if _yaml_flow_complexity_exceeded(stripped):
+        return "YAML FLOW COMPLEXITY BOUND EXCEEDED"
     try:
         json_value = json.loads(stripped)
     except (RecursionError, TypeError, ValueError):
@@ -851,6 +895,8 @@ def _yaml_anchor_definitions(lines: list[bytes]) -> list[tuple[int, str, str]]:
         raw_line if raw_line.endswith((b"\n", b"\r")) else raw_line + b"\n"
         for raw_line in lines
     ).decode("utf-8", errors="replace")
+    if _yaml_flow_complexity_exceeded(document):
+        return []
     try:
         tokens = list(yaml.scan(document))
     except (RecursionError, yaml.YAMLError):
@@ -876,6 +922,8 @@ def _yaml_mapping_scalar_values(lines: list[bytes], key: str) -> dict[int, str]:
         raw_line if raw_line.endswith((b"\n", b"\r")) else raw_line + b"\n"
         for raw_line in lines
     ).decode("utf-8", errors="replace")
+    if _yaml_flow_complexity_exceeded(document):
+        return {}
     try:
         tokens = list(yaml.scan(document))
     except (RecursionError, yaml.YAMLError):
@@ -904,6 +952,8 @@ def _yaml_mapping_scalar_values(lines: list[bytes], key: str) -> dict[int, str]:
 
 def _yaml_sensitive_assignment(text: str) -> tuple[int, str] | None:
     """Return indent and raw value for a decoded sensitive YAML mapping key."""
+    if _yaml_flow_complexity_exceeded(text):
+        return None
     try:
         tokens = list(yaml.scan(text))
     except (RecursionError, yaml.YAMLError):
@@ -923,6 +973,84 @@ def _yaml_sensitive_assignment(text: str) -> tuple[int, str] | None:
         value_token = tokens[index + 1]
         return len(prefix) - len(prefix.lstrip(" \t")), text[value_token.end_mark.column :].strip()
     return None
+
+
+def _yaml_secret_payload_lines(lines: list[bytes]) -> set[int]:
+    """Find Secret payload keys using merge-aware YAML node composition."""
+    document = b"".join(
+        raw_line if raw_line.endswith((b"\n", b"\r")) else raw_line + b"\n"
+        for raw_line in lines
+    ).decode("utf-8", errors="replace")
+    if _yaml_flow_complexity_exceeded(document):
+        return set()
+    if "<<" not in document or re.search(r"(?im)^[ \t]*(?:-[ \t]+)?(?:data|stringData)[ \t]*:", document) is None:
+        return set()
+    try:
+        root = yaml.compose(document, Loader=yaml.SafeLoader)
+    except (RecursionError, yaml.YAMLError):
+        return set()
+
+    kind_cache: dict[int, bool] = {}
+    resolving: set[int] = set()
+
+    def merged_mappings(node: Any) -> list[Any]:
+        if isinstance(node, yaml.nodes.MappingNode):
+            return [node]
+        if isinstance(node, yaml.nodes.SequenceNode):
+            return [item for item in node.value if isinstance(item, yaml.nodes.MappingNode)]
+        return []
+
+    def has_secret_kind(node: Any, depth: int = 0) -> bool:
+        identity = id(node)
+        if identity in kind_cache:
+            return kind_cache[identity]
+        if identity in resolving or depth >= _MAX_STRUCTURED_DEPTH:
+            return True
+        resolving.add(identity)
+        direct_kind: str | None = None
+        merges: list[Any] = []
+        for key_node, value_node in node.value:
+            if not isinstance(key_node, yaml.nodes.ScalarNode):
+                continue
+            normalized = str(key_node.value).casefold().replace("_", "").replace("-", "")
+            if normalized == "kind" and isinstance(value_node, yaml.nodes.ScalarNode):
+                direct_kind = str(value_node.value)
+            elif key_node.tag == "tag:yaml.org,2002:merge" or key_node.value == "<<":
+                merges.extend(merged_mappings(value_node))
+        if direct_kind is not None:
+            result = direct_kind.casefold() == "secret"
+        else:
+            result = any(has_secret_kind(item, depth + 1) for item in merges)
+        resolving.remove(identity)
+        kind_cache[identity] = result
+        return result
+
+    payload_lines: set[int] = set()
+    visited: set[int] = set()
+
+    def walk(node: Any, depth: int = 0) -> None:
+        if not isinstance(node, (yaml.nodes.MappingNode, yaml.nodes.SequenceNode)):
+            return
+        identity = id(node)
+        if identity in visited or depth >= _MAX_STRUCTURED_DEPTH:
+            return
+        visited.add(identity)
+        if isinstance(node, yaml.nodes.MappingNode):
+            secret = has_secret_kind(node)
+            for key_node, value_node in node.value:
+                if isinstance(key_node, yaml.nodes.ScalarNode):
+                    normalized = (
+                        str(key_node.value).casefold().replace("_", "").replace("-", "")
+                    )
+                    if secret and normalized in {"data", "stringdata"}:
+                        payload_lines.add(key_node.start_mark.line)
+                walk(value_node, depth + 1)
+        else:
+            for item in node.value:
+                walk(item, depth + 1)
+
+    walk(root)
+    return payload_lines
 
 
 def _yaml_scalar_anchors(lines: list[bytes]) -> dict[str, str]:
@@ -1440,6 +1568,7 @@ def _kubernetes_yaml_payload_flags(
         document_lines = raw_lines[document_start:boundary]
         yaml_anchor_states = _yaml_anchor_state_by_line(document_lines, None)
         yaml_kind_values = _yaml_mapping_scalar_values(document_lines, "kind")
+        semantic_secret_payloads = _yaml_secret_payload_lines(document_lines)
         kind_matches: list[tuple[int, re.Match[str]]] = []
         has_payload = False
         for local_index, document_line in enumerate(document_lines):
@@ -1495,6 +1624,8 @@ def _kubernetes_yaml_payload_flags(
                 scope_end += 1
             for index in range(document_start + scope_start, document_start + scope_end):
                 flags[index] = True
+        for local_index in semantic_secret_payloads:
+            flags[document_start + local_index] = True
         document_start = boundary + 1
         inherited_secret = False
         inherited_secret_scope = None
@@ -1547,6 +1678,11 @@ def _redacted_file_units(
             "Kubernetes Secret YAML context exceeded its bounded scan; page content was omitted fail-closed."
         )
         return [(raw, "[CONTENT OMITTED: KUBERNETES SECRET CONTEXT UNKNOWN]\n", 1)] if raw else []
+    if _yaml_flow_complexity_exceeded(raw.decode("utf-8", errors="replace")):
+        warnings.append(
+            "YAML flow syntax exceeded the bounded parse complexity; page content was omitted fail-closed."
+        )
+        return [(raw, "[CONTENT OMITTED: YAML FLOW COMPLEXITY BOUND EXCEEDED]\n", 1)] if raw else []
     raw_lines = raw.splitlines(keepends=True)
     kubernetes_payload_flags = _kubernetes_yaml_payload_flags(
         raw_lines,

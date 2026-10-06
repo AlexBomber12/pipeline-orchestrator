@@ -1076,6 +1076,52 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
     assert "[REDACTED SENSITIVE BLOCK]" in yaml_continuation["content"]
 
 
+async def test_yaml_merge_kinds_are_classified_across_retained_readers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    repos_root = tmp_path / "repos"
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+    payload = (
+        "base: &secretResource\n  kind: Secret\n"
+        "<<: *secretResource\ndata:\n  opaque: merged-kind-secret\n"
+        "---\nbase: &configResource\n  kind: ConfigMap\n"
+        "<<: *configResource\ndata:\n  harmless: retained-merged-kind-config\n"
+    )
+    redis.store[cli_log_latest(SLUG)] = payload
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.write_text(payload, encoding="utf-8")
+
+    redis_result = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "cli:latest",
+        max_chars=2_000,
+    )
+    file_result = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        max_chars=2_000,
+    )
+    for result in (redis_result, file_result):
+        assert "merged-kind-secret" not in result["content"]
+        assert "retained-merged-kind-config" in result["content"]
+
+    raw = ci_path.read_bytes()
+    mid_payload = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=raw.index(b"  opaque: merged-kind-secret"),
+        max_chars=300,
+    )
+    assert "merged-kind-secret" not in mid_payload["content"]
+    assert "SENSITIVE" in mid_payload["content"]
+
+
 async def test_truncated_redis_logs_omit_unknown_leading_sensitive_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1274,6 +1320,52 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     assert diagnostics._yaml_flow_delta('{"value": "escaped \\" } [ text"}') == 0
     assert diagnostics._yaml_flow_delta("{'value': ']'}") == 0
     assert diagnostics._yaml_flow_delta("{ # ignored }") == 1
+    excessive_flow = "[" * (diagnostics._MAX_YAML_FLOW_DEPTH + 1)
+    assert diagnostics._yaml_flow_complexity_exceeded(excessive_flow)
+    assert diagnostics._yaml_flow_sensitivity(excessive_flow) == (
+        "YAML FLOW COMPLEXITY BOUND EXCEEDED"
+    )
+    excessive_lines = [excessive_flow.encode()]
+    assert diagnostics._yaml_anchor_definitions(excessive_lines) == []
+    assert diagnostics._yaml_mapping_scalar_values(excessive_lines, "kind") == {}
+    assert diagnostics._yaml_sensitive_assignment(excessive_flow) is None
+    assert diagnostics._yaml_secret_payload_lines(excessive_lines) == set()
+    complexity_warnings: list[str] = []
+    with monkeypatch.context() as yaml_patch:
+        yaml_patch.setattr(
+            diagnostics.yaml,
+            "scan",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("bounded flow must not reach yaml.scan")
+            ),
+        )
+        yaml_patch.setattr(
+            diagnostics.yaml,
+            "safe_load",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("bounded flow must not reach yaml.safe_load")
+            ),
+        )
+        yaml_patch.setattr(
+            diagnostics.yaml,
+            "compose",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("bounded flow must not reach yaml.compose")
+            ),
+        )
+        complexity_units = diagnostics._redacted_file_units(
+            excessive_flow.encode(),
+            starts_inside_private_key=False,
+            starts_with_sensitive_value=False,
+            starts_inside_sensitive_block=False,
+            sensitive_block_indent=None,
+            starts_inside_sensitive_quote=False,
+            sensitive_quote=None,
+            has_more_after_raw=False,
+            warnings=complexity_warnings,
+        )
+    assert complexity_units[0][1] == "[CONTENT OMITTED: YAML FLOW COMPLEXITY BOUND EXCEEDED]\n"
+    assert any("parse complexity" in warning for warning in complexity_warnings)
     assert diagnostics._yaml_node_scalar("&resourceKind !!str 'Secret'") == "Secret"
     anchors = diagnostics._yaml_scalar_anchors(
         [
@@ -1301,6 +1393,48 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
         "kind",
     ) == {0: "Secret", 3: "*kindValue"}
     assert diagnostics._yaml_mapping_scalar_values([b"kind: [\n"], "kind") == {}
+    assert diagnostics._yaml_secret_payload_lines(
+        [
+            b"base: &resource\n",
+            b"  kind: Secret\n",
+            b"<<: *resource\n",
+            b"data:\n",
+            b"  opaque: hidden\n",
+        ]
+    ) == {3}
+    assert diagnostics._yaml_secret_payload_lines(
+        [
+            b"base: &resource\n",
+            b"  kind: ConfigMap\n",
+            b"<<: *resource\n",
+            b"data:\n",
+            b"  harmless: visible\n",
+        ]
+    ) == set()
+    assert diagnostics._yaml_secret_payload_lines(
+        [
+            b"secret: &secret\n",
+            b"  kind: Secret\n",
+            b"config: &config\n",
+            b"  kind: ConfigMap\n",
+            b"<<: [*config, *secret]\n",
+            b"data:\n",
+            b"  opaque: hidden\n",
+            b"invalid:\n",
+            b"  <<: scalar\n",
+            b"? [complex, key]\n",
+            b": visible\n",
+        ]
+    ) == {5}
+    assert diagnostics._yaml_secret_payload_lines(
+        [
+            b"resource: &resource\n",
+            b"  <<: *resource\n",
+            b"  data:\n",
+            b"    opaque: fail-closed\n",
+        ]
+    ) == {2}
+    assert diagnostics._yaml_secret_payload_lines([b"<<: [\n", b"data:\n"]) == set()
     assert diagnostics._yaml_sensitive_assignment(
         '  - "pass\\u0077ord": plainsecret'
     ) == (2, "plainsecret")
