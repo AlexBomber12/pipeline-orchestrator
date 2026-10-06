@@ -69,6 +69,10 @@ class FakeRedis:
         selected = raw[start : end + 1]
         return selected if isinstance(value, bytes) else selected.decode(errors="replace")
 
+    async def exists(self, key: str) -> int:
+        self._check("exists", key)
+        return int(key in self.store)
+
     async def ttl(self, key: str) -> int:
         self._check("ttl", key)
         if key not in self.store:
@@ -335,12 +339,22 @@ async def test_status_reports_missing_malformed_and_redis_unavailable(
     assert [item["snapshot"]["status"] for item in result["repositories"]] == ["missing", "malformed"]
     assert all(item["observed"]["state"] is None for item in result["repositories"])
 
-    redis.fail.add("mget")
+    redis.fail.add("strlen")
     unavailable = await get_orchestrator_status(SLUG)
     assert unavailable["redis"]["status"] == "unavailable"
     assert unavailable["repositories"][0]["snapshot"]["status"] == "unavailable"
     assert unavailable["detail"]["pending_retries"]["status"] == "unavailable"
     assert "redis-secret" not in json.dumps(unavailable)
+
+    def fail_client():
+        raise ConnectionError("Authorization: Bearer connection-secret")
+
+    from src.mcp.tools import diagnostics
+
+    monkeypatch.setattr(diagnostics, "_new_redis_client", fail_client)
+    disconnected = await get_orchestrator_status(SLUG)
+    assert disconnected["redis"]["status"] == "unavailable"
+    assert "connection-secret" not in json.dumps(disconnected)
 
 
 async def test_status_configuration_failure_and_validation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1548,6 +1562,55 @@ async def test_run_filtering_unavailable_record_and_limit() -> None:
     assert history["events"][0]["record_truncated"] is True
 
 
+async def test_task_filtered_runs_scan_the_full_bounded_recent_index() -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    index = MetricsStore._recent_key("PR-9", SLUG)
+    other_ids = [f"other-{number}" for number in range(25)]
+    redis.lists[index] = [*other_ids, "wanted"]
+    for run_id in other_ids:
+        record = asdict(_run(run_id))
+        record["task_id"] = "PR-8"
+        redis.store[MetricsStore._record_key(run_id)] = json.dumps(record)
+    redis.store[MetricsStore._record_key("wanted")] = json.dumps(asdict(_run("wanted")))
+
+    result = await diagnostics._relevant_runs(redis, SLUG, "PR-9", 1)
+
+    assert result["records"][0]["record"]["run_id"] == "wanted"
+    assert result["scanned_index_entries"] == 26
+    assert result["scan_limit"] == diagnostics._MAX_RUN_INDEX_ENTRIES
+
+
+async def test_status_bounds_pipeline_snapshots_before_fetching(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    redis.store[pipeline_state(SLUG)] = "x" * (diagnostics._MAX_REDIS_STATE_BYTES + 1)
+
+    result = await diagnostics.get_orchestrator_status()
+
+    snapshot = result["repositories"][0]["snapshot"]
+    assert snapshot["status"] == "oversized"
+    assert snapshot["source_size_bytes"] == diagnostics._MAX_REDIS_STATE_BYTES + 1
+    assert snapshot["read_bound_bytes"] == diagnostics._MAX_REDIS_STATE_BYTES
+    assert not any(operation in {"get", "mget", "getrange"} for operation, _ in redis.calls)
+
+    raced = FakeRedis()
+    raced.store["pipeline:raced"] = b"x" * (diagnostics._MAX_REDIS_STATE_BYTES + 1)
+
+    async def stale_strlen(key: str) -> int:
+        raced._check("strlen", key)
+        return 1
+
+    raced.strlen = stale_strlen  # type: ignore[method-assign]
+    raw, size_bytes, oversized = await diagnostics._read_bounded_state_value(raced, "pipeline:raced")
+    assert raw is None
+    assert size_bytes == diagnostics._MAX_REDIS_STATE_BYTES + 1
+    assert oversized is True
+
+
 async def test_log_discovery_defensive_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from src.mcp.tools import diagnostics
 
@@ -2446,3 +2509,12 @@ def test_compose_wires_read_only_runtime_sources() -> None:
     assert "${PO_EVENTS_HOST_DIR:-./data/events}:${PO_EVENTS_DIR:-/data/events}:ro" in service["volumes"]
     assert all("docker.sock" not in volume for volume in service["volumes"])
     assert all("/data/auth" not in volume for volume in service["volumes"])
+    assert service["environment"]["MCP_RUNTIME_DIAGNOSTICS"] == "1"
+    tunnel_service = compose["services"]["mcp-tunnel"]
+    assert tunnel_service["profiles"] == ["cloudflared"]
+    assert tunnel_service["environment"]["MCP_RUNTIME_DIAGNOSTICS"] == "0"
+    assert "REDIS_URL" not in tunnel_service["environment"]
+    assert "PO_EVENTS_DIR" not in tunnel_service["environment"]
+    assert tunnel_service["networks"]["tunnel"]["aliases"] == ["mcp"]
+    assert compose["services"]["cloudflared"]["networks"] == ["tunnel"]
+    assert compose["services"]["cloudflared"]["depends_on"] == ["mcp-tunnel"]

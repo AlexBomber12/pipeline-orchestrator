@@ -51,6 +51,8 @@ _MAX_READ_CHARS = 20_000
 _MAX_EVENT_RECORD_CHARS = 4_000
 _MAX_REDIS_EVENT_HISTORY_BYTES = 256 * 1024
 _MAX_REDIS_CLI_LOG_BYTES = 64 * 1024
+_MAX_REDIS_STATE_BYTES = 1024 * 1024
+_MAX_RUN_INDEX_ENTRIES = 200
 _MAX_FILE_SCAN_BYTES = 256 * 1024
 _MAX_PRIVATE_KEY_CONTEXT_BYTES = 1024 * 1024
 _MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES = 1024 * 1024
@@ -1938,7 +1940,7 @@ async def _relevant_runs(
     limit: int,
 ) -> dict[str, Any]:
     index_key = MetricsStore._recent_key(task_id or "PR", repo_slug)
-    scan_limit = min(200, max(20, limit * 4))
+    scan_limit = _MAX_RUN_INDEX_ENTRIES
     try:
         raw_ids = await redis_client.lrange(index_key, 0, scan_limit - 1)
     except Exception as exc:
@@ -1950,7 +1952,9 @@ async def _relevant_runs(
         }
     records: list[dict[str, Any]] = []
     missing = 0
+    scanned = 0
     for raw_id in raw_ids:
+        scanned += 1
         run_id = _decode(raw_id)
         try:
             raw = await redis_client.get(MetricsStore._record_key(run_id))
@@ -1971,11 +1975,25 @@ async def _relevant_runs(
         "task_filter": task_id,
         "records": records,
         "missing_indexed_records": missing,
-        "scanned_index_entries": len(raw_ids),
+        "scanned_index_entries": scanned,
         "scan_limit": scan_limit,
         "truncated": len(raw_ids) >= scan_limit or len(records) >= limit,
         "error": None,
     }
+
+
+async def _read_bounded_state_value(client: Any, key: str) -> tuple[object | None, int | None, bool]:
+    """Read one pipeline snapshot without materializing an oversized value."""
+    reported_size = int(await client.strlen(key))
+    if reported_size > _MAX_REDIS_STATE_BYTES:
+        return None, reported_size, True
+    bounded = await client.getrange(key, 0, _MAX_REDIS_STATE_BYTES)
+    observed_size = max(reported_size, len(bounded or b""))
+    if observed_size > _MAX_REDIS_STATE_BYTES:
+        return None, observed_size, True
+    if observed_size == 0 and not await client.exists(key):
+        return None, None, False
+    return bounded, observed_size, False
 
 
 def _state_history(state: RepoState | None, limit: int) -> dict[str, Any]:
@@ -2094,13 +2112,41 @@ async def get_orchestrator_status(
     redis_status = "available"
     redis_error: str | None = None
     state_raw: list[object | None] = [None] * len(repositories)
+    state_statuses = ["unavailable"] * len(repositories)
+    state_errors: list[str | None] = [None] * len(repositories)
+    state_sizes: list[int | None] = [None] * len(repositories)
     slugs = list(repositories)
     try:
         client = _new_redis_client()
-        state_raw = await client.mget([pipeline_state(slug) for slug in slugs])
     except Exception as exc:
         redis_status = "unavailable"
         redis_error = _error_text(exc)
+        state_errors = [redis_error] * len(repositories)
+    else:
+        for index, slug in enumerate(slugs):
+            try:
+                raw, size_bytes, oversized = await _read_bounded_state_value(client, pipeline_state(slug))
+            except Exception as exc:
+                state_errors[index] = _error_text(exc)
+                continue
+            state_sizes[index] = size_bytes
+            if oversized:
+                state_statuses[index] = "oversized"
+                state_errors[index] = (
+                    f"Stored pipeline state is {size_bytes} bytes; "
+                    f"the diagnostic read bound is {_MAX_REDIS_STATE_BYTES} bytes."
+                )
+            else:
+                state_statuses[index] = "available"
+                state_raw[index] = raw
+        failed_reads = [
+            error
+            for status, error in zip(state_statuses, state_errors, strict=True)
+            if status == "unavailable"
+        ]
+        if failed_reads:
+            redis_status = "unavailable" if len(failed_reads) == len(slugs) else "partially_available"
+            redis_error = next((error for error in failed_reads if error), "One or more snapshot reads failed.")
 
     overviews: list[dict[str, Any]] = []
     states: dict[str, RepoState | None] = {}
@@ -2110,17 +2156,19 @@ async def get_orchestrator_status(
             repositories[slug],
             config,
             state_raw[index],
-            redis_status=redis_status,
-            redis_error=redis_error,
+            redis_status=state_statuses[index],
+            redis_error=state_errors[index],
             observed_at=observed_at,
         )
+        overview["snapshot"]["source_size_bytes"] = state_sizes[index]
+        overview["snapshot"]["read_bound_bytes"] = _MAX_REDIS_STATE_BYTES
         overviews.append(overview)
         states[slug] = state
 
     detail: dict[str, Any] | None = None
     if repo_slug is not None:
         state = states[repo_slug]
-        if redis_status == "available" and client is not None:
+        if client is not None and redis_status != "unavailable":
             events = await _recent_events(client, repo_slug, event_limit)
             retries = await _pending_retries(client, repo_slug)
             runs = await _relevant_runs(

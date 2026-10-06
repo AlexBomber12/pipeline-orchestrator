@@ -59,6 +59,21 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   capped `GETRANGE`; oversized legacy or malformed values are reported without
   being materialized in the MCP process.
 
+Pipeline state snapshots use the same bounded-read rule: each key is
+size-checked and read through a capped `GETRANGE`, with oversized snapshots
+reported explicitly. Task-filtered run lookup scans the complete retained
+200-entry repository index until it finds the requested number of matching
+records.
+
+Runtime diagnostics are available on the primary MCP service, whose published
+port remains bound to localhost. When the optional `cloudflared` profile is
+enabled, Compose routes the tunnel to an isolated `mcp-tunnel` compatibility
+instance with `MCP_RUNTIME_DIAGNOSTICS=0`; that instance has neither the Redis
+connection nor the event-directory mount. Existing non-diagnostic MCP tools
+remain available through the tunnel, but status and retained-log data cannot be
+discovered or read there. The tunnel network cannot reach the primary MCP
+service.
+
 The web/daemon producers and MCP reader all resolve disk events from
 `PO_EVENTS_DIR` (default `/data/events`). Compose maps
 `PO_EVENTS_HOST_DIR` (default `./data/events`) to that container path: when
