@@ -1962,6 +1962,111 @@ async def test_sensitive_heredoc_bodies_are_redacted_across_retained_readers(
     assert dense[0][1] == "[CONTENT OMITTED: PHYSICAL LINE BOUND EXCEEDED]\n"
 
 
+async def test_sensitive_hcl_blocks_are_redacted_across_retained_readers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    repos_root = tmp_path / "repos"
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+    payload = (
+        'variable "database_password" { default = "inline-hcl-secret" }\n'
+        'variable "escaped_pass\\u0077ord" {\n'
+        '  default = "escaped-label-hcl-secret"\n'
+        '}\n'
+        'output "api_token" {\n'
+        '  /* multiline-comment-start\n'
+        '  } ignored-comment-brace\n'
+        '  */\n'
+        '  # } ignored-hash-comment-brace\n'
+        '  // } ignored-slash-comment-brace\n'
+        '  value = { nested = "nested-hcl-secret" }\n'
+        '  description = "} quoted-brace-secondary-secret"\n'
+        '}\n'
+        'variable "pass\\qword" { default = "malformed-label-hcl-secret" }\n'
+        'variable "region" {\n'
+        '  default = "retained-safe-hcl-region"\n'
+        '}\n'
+    )
+    redis.store[cli_log_latest(SLUG)] = payload
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.write_text(payload, encoding="utf-8")
+
+    for source_id in ("cli:latest", "ci:artifact"):
+        result = await diagnostics.read_orchestrator_log(
+            SLUG,
+            source_id,
+            max_chars=4_000,
+        )
+        assert "inline-hcl-secret" not in result["content"]
+        assert "escaped-label-hcl-secret" not in result["content"]
+        assert "nested-hcl-secret" not in result["content"]
+        assert "quoted-brace-secondary-secret" not in result["content"]
+        assert "malformed-label-hcl-secret" not in result["content"]
+        assert "retained-safe-hcl-region" in result["content"]
+
+    raw = ci_path.read_bytes()
+    for secret in (b"escaped-label-hcl-secret", b"nested-hcl-secret"):
+        page = await diagnostics.read_orchestrator_log(
+            SLUG,
+            "ci:artifact",
+            cursor=raw.index(secret),
+            max_chars=4_000,
+        )
+        assert secret.decode() not in page["content"]
+        assert "retained-safe-hcl-region" in page["content"]
+
+    warnings: list[str] = []
+    crossed = diagnostics._redacted_file_units(
+        b'variable "database_password" {\ndefault = "crossed-hcl-secret"\n',
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=True,
+        warnings=warnings,
+    )
+    assert "crossed-hcl-secret" not in crossed[0][1]
+    assert any("HCL block crossed" in warning for warning in warnings)
+
+    warnings = []
+    inside_crossed = diagnostics._redacted_file_units(
+        b'default = "inside-crossed-hcl-secret"\n',
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=True,
+        sensitive_block_indent=diagnostics._encode_hcl_block_state(1, False),
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=True,
+        warnings=warnings,
+    )
+    assert "inside-crossed-hcl-secret" not in inside_crossed[0][1]
+    assert any("HCL block crossed" in warning for warning in warnings)
+
+    dense = diagnostics._redacted_file_units(
+        (
+            b"\n" * (diagnostics._MAX_REDACTION_PHYSICAL_LINES + 1)
+            + b'variable "database_password" { default = "dense-hcl-secret" }\n'
+        ),
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=False,
+        warnings=[],
+    )
+    assert dense[0][1] == "[CONTENT OMITTED: PHYSICAL LINE BOUND EXCEEDED]\n"
+
+
 async def test_truncated_redis_logs_omit_unknown_leading_sensitive_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

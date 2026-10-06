@@ -357,6 +357,10 @@ _SENSITIVE_HEREDOC_START = re.compile(
     r"(?P<delimiter>[A-Za-z_][A-Za-z0-9_.-]{0,127})(?P=quote)(?=$|[ \t;)&|])"
 )
 _HEREDOC_STATE_PREFIX = "\0heredoc:"
+_HCL_BLOCK_START = re.compile(
+    r'(?im)^[ \t]*(?:variable|output)[ \t]+"(?P<label>(?:\\.|[^"\\])*)"[ \t]*\{'
+)
+_HCL_BLOCK_STATE_BASE = 4
 _REDACTION_RULES = (
     (
         _FISH_SENSITIVE_ASSIGNMENT,
@@ -688,6 +692,7 @@ def _redact_high_line_plain_text(
         or _HIGH_LINE_EXPLICIT_YAML.search(text) is not None
         or _HIGH_LINE_ESCAPED_MAPPING_KEY.search(text) is not None
         or _HIGH_LINE_ALIASED_MAPPING_KEY.search(text) is not None
+        or _contains_sensitive_hcl_block(text)
     ):
         return None
     return _redact_text(text)
@@ -1944,6 +1949,74 @@ def _heredoc_from_state(state: str) -> tuple[str, bool]:
     return delimiter, allow_indent == "1"
 
 
+def _hcl_block_label_is_sensitive(match: re.Match[str]) -> bool:
+    raw_label = match.group("label")
+    try:
+        label = json.loads(f'"{raw_label}"') if "\\" in raw_label else raw_label
+    except (TypeError, ValueError):
+        return True
+    return not isinstance(label, str) or _SENSITIVE_KEY.fullmatch(label) is not None
+
+
+def _hcl_brace_delta(text: str, inside_comment: bool = False) -> tuple[int, bool]:
+    """Count HCL braces while ignoring quoted strings and comments."""
+    delta = 0
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(text):
+        if inside_comment:
+            end = text.find("*/", index)
+            if end < 0:
+                return delta, True
+            inside_comment = False
+            index = end + 2
+            continue
+        character = text[index]
+        following = text[index : index + 2]
+        if escaped:
+            escaped = False
+        elif quote is not None:
+            if character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+        elif following == "/*":
+            inside_comment = True
+            index += 2
+            continue
+        elif following == "//" or character == "#":
+            break
+        elif character in {'"', "'"}:
+            quote = character
+        elif character == "{":
+            delta += 1
+        elif character == "}":
+            delta -= 1
+        index += 1
+    return delta, inside_comment
+
+
+def _sensitive_hcl_block_state(text: str) -> tuple[int, bool] | None:
+    match = _HCL_BLOCK_START.search(text)
+    if match is None or not _hcl_block_label_is_sensitive(match):
+        return None
+    return _hcl_brace_delta(text)
+
+
+def _contains_sensitive_hcl_block(text: str) -> bool:
+    return any(_hcl_block_label_is_sensitive(match) for match in _HCL_BLOCK_START.finditer(text))
+
+
+def _encode_hcl_block_state(depth: int, inside_comment: bool) -> int:
+    return -(_HCL_BLOCK_STATE_BASE + depth * 2 + int(inside_comment))
+
+
+def _decode_hcl_block_state(state: int) -> tuple[int, bool]:
+    encoded = -state - _HCL_BLOCK_STATE_BASE
+    return encoded // 2, bool(encoded % 2)
+
+
 def _yaml_env_field(text: str) -> tuple[int, bool, str, str] | None:
     """Classify a literal or decorated YAML environment field."""
     name_match = _YAML_ENV_NAME.fullmatch(text)
@@ -2225,6 +2298,27 @@ def _sensitive_state_before(
         elif continuation_start == 0 and search_start > 0:
             starts_inside_sensitive_block = None
             active_block_indent = None
+
+    active_hcl_depth = 0
+    active_hcl_comment = False
+    for raw_line in context_lines:
+        line = raw_line.decode("utf-8", errors="replace")
+        if active_hcl_depth > 0:
+            delta, active_hcl_comment = _hcl_brace_delta(line, active_hcl_comment)
+            active_hcl_depth += delta
+            if active_hcl_depth <= 0:
+                active_hcl_depth = 0
+                active_hcl_comment = False
+            continue
+        hcl_state = _sensitive_hcl_block_state(line)
+        if hcl_state is not None and hcl_state[0] > 0:
+            active_hcl_depth, active_hcl_comment = hcl_state
+    if active_hcl_depth > 0:
+        starts_inside_sensitive_block = True
+        active_block_indent = _encode_hcl_block_state(
+            active_hcl_depth,
+            active_hcl_comment,
+        )
 
     quote_state_known = search_start == 0
     active_quote: str | None = None
@@ -2687,6 +2781,31 @@ def _redacted_file_units(
             units.append((raw_unit, "[REDACTED SENSITIVE KUBERNETES SECRET DATA]\n", 1))
             line_index = payload_end
     elif (
+        starts_inside_sensitive_block
+        and sensitive_block_indent is not None
+        and sensitive_block_indent <= -_HCL_BLOCK_STATE_BASE
+    ):
+        hcl_depth, hcl_comment = _decode_hcl_block_state(sensitive_block_indent)
+        hcl_end = 0
+        while hcl_end < len(raw_lines) and hcl_depth > 0:
+            delta, hcl_comment = _hcl_brace_delta(
+                raw_lines[hcl_end].decode("utf-8", errors="replace"),
+                hcl_comment,
+            )
+            hcl_depth += delta
+            hcl_end += 1
+        raw_unit = b"".join(raw_lines[:hcl_end])
+        units.append((raw_unit, "[REDACTED SENSITIVE HCL BLOCK]\n", 1))
+        if hcl_depth > 0:
+            warnings.append(
+                "A sensitive HCL block crossed the bounded page window; "
+                "its visible segment was redacted."
+                if has_more_after_raw
+                else "A sensitive HCL block had no closing brace; "
+                "the remaining content was redacted fail-closed."
+            )
+        line_index = hcl_end
+    elif (
         starts_inside_sensitive_quote
         and sensitive_quote is not None
         and sensitive_quote.startswith(_HEREDOC_STATE_PREFIX)
@@ -2946,6 +3065,29 @@ def _redacted_file_units(
                 inside_private_key = True
             units.append((raw_unit, "[REDACTED PRIVATE KEY]\n", 1))
         else:
+            hcl_state = _sensitive_hcl_block_state(text_unit.rstrip("\r\n"))
+            if hcl_state is not None:
+                hcl_depth, hcl_comment = hcl_state
+                hcl_end = line_index + 1
+                while hcl_end < len(raw_lines) and hcl_depth > 0:
+                    delta, hcl_comment = _hcl_brace_delta(
+                        raw_lines[hcl_end].decode("utf-8", errors="replace"),
+                        hcl_comment,
+                    )
+                    hcl_depth += delta
+                    hcl_end += 1
+                raw_unit = b"".join(raw_lines[line_index:hcl_end])
+                units.append((raw_unit, "[REDACTED SENSITIVE HCL BLOCK]\n", 1))
+                if hcl_depth > 0:
+                    warnings.append(
+                        "A sensitive HCL block crossed the bounded page window; "
+                        "its visible segment was redacted."
+                        if has_more_after_raw
+                        else "A sensitive HCL block had no closing brace; "
+                        "the remaining content was redacted fail-closed."
+                    )
+                line_index = hcl_end
+                continue
             heredoc = _sensitive_heredoc(text_unit.rstrip("\r\n"))
             if heredoc is not None:
                 heredoc_end = line_index + 1
