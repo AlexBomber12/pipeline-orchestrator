@@ -297,10 +297,14 @@ def __getattr__(name: str) -> Any:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # Plugin definitions are startup-only. Construct the registry before
+    # opening Redis so a bad trusted entry point cannot leak a new client.
+    config = load_config(CONFIG_PATH)
+    registry = build_coder_registry(config)
     redis_url = os.environ.get("REDIS_URL", DEFAULT_REDIS_URL)
     client = aioredis.from_url(redis_url, decode_responses=True)
     app.state.redis = client
-    app.state.coder_registry = build_coder_registry()
+    app.state.coder_registry = registry
     app.state.model_catalog = ModelCatalogCache(
         loader=DaemonModelCatalogLoader(client)
     )

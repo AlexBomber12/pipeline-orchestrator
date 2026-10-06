@@ -328,7 +328,11 @@ class PipelineRunner(
         self.repo_config = repo_config
         self._app_config = app_config
         self.redis = redis_client
-        self._registry = registry or build_coder_registry()
+        self._registry = (
+            registry
+            if registry is not None
+            else build_coder_registry(app_config)
+        )
         self.name = repo_slug_from_url(repo_config.url)
         self.owner_repo = repo_owner_from_url(repo_config.url)
         self.repo_path = f"/data/repos/{self.name}"

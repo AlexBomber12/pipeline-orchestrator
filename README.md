@@ -59,6 +59,10 @@ repositories:
     branch: main
     auto_merge: true
 
+coder_plugins:
+  claude: src.coders.claude:ClaudePlugin
+  codex: src.coders.codex:CodexPlugin
+
 daemon:
   poll_interval_sec: 60
   review_timeout_min: 20
@@ -88,6 +92,23 @@ Coder model choices are stored by stable plugin ID under
 not have an explicit generic `model` setting. An explicit generic value wins
 over its legacy fallback. Codex preserves `model: ""` as the CLI-default
 choice; Claude normalizes an empty choice to its `opus` default.
+
+`coder_plugins` is a top-level mapping from a stable plugin ID to a trusted
+`module:factory` reference. The no-argument factory must already be importable
+in both the web and daemon Python environments and must return a complete
+`CoderPlugin` whose `name` exactly matches the configured ID. Claude and Codex
+use the references shown above as compatibility defaults. An explicit entry
+with either ID replaces that default; any other ID adds a registry entry.
+Plugin options remain separate under `daemon.coder_settings.<plugin-id>`.
+
+Plugin modules are operator-managed code: loading a reference does not install
+packages, download code, or sandbox the import. Definitions are loaded only at
+service startup, so deploy the module and restart both `web` and `daemon` after
+changing `coder_plugins`; config reload does not hot-swap implementations.
+Registration exposes shared metadata and generic model controls, but runtime
+repository/default selection is still limited to the existing `CoderType`
+values (`claude` and `codex`). Arbitrary registered IDs are therefore not yet
+complete support for executing additional providers.
 
 ## Local development
 

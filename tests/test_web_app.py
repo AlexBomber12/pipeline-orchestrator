@@ -22,8 +22,8 @@ from src.models import (
 )
 from src.web import app as web_app
 from src.web.app import (
-    _active_repo_coder,
     _active_rate_limit_coder,
+    _active_repo_coder,
     _build_recent_graphql_burns_view,
     _build_resources_view,
     _claude_usage_chip,
@@ -1473,6 +1473,31 @@ def test_lifespan_ignores_redis_close_errors(
         response = client.get("/")
 
     assert response.status_code == 200
+
+
+def test_lifespan_registry_failure_precedes_redis_client_creation(
+    empty_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened = False
+
+    def from_url(*_args: object, **_kwargs: object) -> _StubAioredisClient:
+        nonlocal opened
+        opened = True
+        return _StubAioredisClient()
+
+    monkeypatch.setattr(web_app.aioredis, "from_url", from_url)
+    monkeypatch.setattr(
+        web_app,
+        "build_coder_registry",
+        lambda _config: (_ for _ in ()).throw(ValueError("bad plugin")),
+    )
+
+    with pytest.raises(ValueError, match="bad plugin"):
+        with TestClient(app):
+            pass
+
+    assert opened is False
 
 
 def test_get_repo_state_unknown_repo_returns_idle_default(

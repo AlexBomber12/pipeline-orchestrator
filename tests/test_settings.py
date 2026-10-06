@@ -894,6 +894,8 @@ def test_arbitrary_plugin_model_round_trips_without_core_field(
 ) -> None:
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text(
+        "coder_plugins:\n"
+        "  third: tests.configured_coder_plugin:build_test_plugin\n"
         "daemon:\n"
         "  coder_settings:\n"
         "    unrelated:\n"
@@ -902,10 +904,9 @@ def test_arbitrary_plugin_model_round_trips_without_core_field(
     )
     monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
     monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
-    plugin = _ThirdCatalogPlugin()
 
     with TestClient(app) as client:
-        client.app.state.coder_registry.register(plugin)
+        plugin = client.app.state.coder_registry.get("third")
         rendered = client.get("/partials/settings/coders")
         saved = client.put(
             "/settings/daemon",
@@ -915,6 +916,7 @@ def test_arbitrary_plugin_model_round_trips_without_core_field(
     cfg = load_config(str(cfg_path))
     assert rendered.status_code == 200
     assert saved.status_code == 200
+    assert "Configured Test Coder" in rendered.text
     assert "third_model" not in type(cfg.daemon).model_fields
     assert cfg.daemon.coder_settings == {
         "unrelated": {"model": "keep-me"},

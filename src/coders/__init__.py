@@ -1,15 +1,213 @@
-"""Coder plugin implementations."""
+"""Configuration-driven coder plugin registry construction."""
 
 from __future__ import annotations
 
-from src.coder_registry import CoderRegistry
-from src.coders.claude import ClaudePlugin
-from src.coders.codex import CodexPlugin
+import importlib
+from collections.abc import Callable, Mapping
+from typing import Any
+
+from src.coder_registry import CoderPlugin, CoderRegistry, ModelSetting
+from src.config import DEFAULT_CODER_PLUGINS, AppConfig
 
 
-def build_coder_registry() -> CoderRegistry:
-    """Return the default registry used by the daemon."""
+class CoderPluginConfigurationError(ValueError):
+    """A configured coder plugin could not be loaded safely."""
+
+
+def _configuration_error(
+    plugin_id: str,
+    reference: object,
+    stage: str,
+    detail: str,
+) -> CoderPluginConfigurationError:
+    return CoderPluginConfigurationError(
+        f"Coder plugin {plugin_id!r} reference {reference!r} failed at "
+        f"{stage}: {detail}"
+    )
+
+
+def _parse_reference(plugin_id: str, reference: object) -> tuple[str, str]:
+    if not isinstance(reference, str):
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "reference",
+            "expected a module:factory string",
+        )
+    if reference.count(":") != 1:
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "reference",
+            "expected exactly one ':' separator",
+        )
+    module_name, factory_name = reference.split(":", 1)
+    if not module_name or not factory_name:
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "reference",
+            "module and factory names must be non-empty",
+        )
+    return module_name, factory_name
+
+
+def _load_factory(
+    plugin_id: str,
+    reference: str,
+    module_name: str,
+    factory_name: str,
+) -> Callable[[], Any]:
+    try:
+        module = importlib.import_module(module_name)
+    except Exception as exc:
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "module import",
+            type(exc).__name__,
+        ) from None
+
+    try:
+        factory = getattr(module, factory_name)
+    except Exception as exc:
+        detail = (
+            "factory was not found"
+            if isinstance(exc, AttributeError)
+            else type(exc).__name__
+        )
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "factory lookup",
+            detail,
+        ) from None
+    if not callable(factory):
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "factory validation",
+            "resolved object is not callable",
+        )
+    return factory
+
+
+def _validate_plugin_metadata(
+    plugin_id: str,
+    reference: str,
+    plugin: CoderPlugin,
+) -> None:
+    try:
+        name = plugin.name
+        display_name = plugin.display_name
+        models = plugin.models
+        model_setting = plugin.model_setting
+        refreshable = plugin.model_catalog_refreshable
+    except Exception as exc:
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "metadata validation",
+            f"metadata access raised {type(exc).__name__}",
+        ) from None
+
+    if not isinstance(name, str) or not name:
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "metadata validation",
+            "plugin.name must be a non-empty string",
+        )
+    if name != plugin_id:
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "identity validation",
+            f"factory declared plugin.name {name!r}",
+        )
+    if not isinstance(display_name, str) or not display_name:
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "metadata validation",
+            "plugin.display_name must be a non-empty string",
+        )
+    if not isinstance(models, list) or not all(
+        isinstance(model, str) for model in models
+    ):
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "metadata validation",
+            "plugin.models must be a list of strings",
+        )
+    if not isinstance(model_setting, ModelSetting):
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "metadata validation",
+            "plugin.model_setting must be ModelSetting metadata",
+        )
+    if not model_setting.setting_key:
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "metadata validation",
+            "plugin.model_setting.setting_key must be non-empty",
+        )
+    if not isinstance(refreshable, bool):
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "metadata validation",
+            "plugin.model_catalog_refreshable must be a boolean",
+        )
+
+
+def _load_plugin(plugin_id: str, reference: object) -> CoderPlugin:
+    module_name, factory_name = _parse_reference(plugin_id, reference)
+    assert isinstance(reference, str)
+    factory = _load_factory(plugin_id, reference, module_name, factory_name)
+    try:
+        plugin = factory()
+    except Exception as exc:
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "factory invocation",
+            f"factory raised {type(exc).__name__}",
+        ) from None
+    try:
+        compatible = isinstance(plugin, CoderPlugin)
+    except Exception as exc:
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "contract validation",
+            f"contract inspection raised {type(exc).__name__}",
+        ) from None
+    if not compatible:
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "contract validation",
+            "factory result does not implement CoderPlugin",
+        )
+    _validate_plugin_metadata(plugin_id, reference, plugin)
+    return plugin
+
+
+def build_coder_registry(config: AppConfig | None = None) -> CoderRegistry:
+    """Build a registry from trusted ``module:factory`` references.
+
+    With no configuration, the compatibility defaults load Claude and Codex.
+    ``AppConfig`` merges explicit definitions over those defaults, so built-ins
+    and operator-configured plugins always use this same import path.
+    """
+    references: Mapping[str, str] = (
+        config.coder_plugins if config is not None else DEFAULT_CODER_PLUGINS
+    )
     registry = CoderRegistry()
-    registry.register(ClaudePlugin())
-    registry.register(CodexPlugin())
+    for plugin_id, reference in references.items():
+        registry.register(_load_plugin(plugin_id, reference))
     return registry

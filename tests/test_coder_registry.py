@@ -13,6 +13,7 @@ from src.coder_registry import (
     ModelMetadata,
     ModelSetting,
 )
+from src.coders import CoderPluginConfigurationError, build_coder_registry
 from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
 from src.config import AppConfig, DaemonConfig
@@ -117,6 +118,93 @@ class DummyCoderPlugin:
         breach_run_id: str | None = None,
     ) -> dict[str, Any]:
         return {"model": self.resolve_model(daemon_config)}
+
+
+def test_build_registry_without_config_keeps_builtin_compatibility() -> None:
+    registry = build_coder_registry()
+
+    assert registry.coder_names() == ["claude", "codex"]
+    assert isinstance(registry.get("claude"), ClaudePlugin)
+    assert isinstance(registry.get("codex"), CodexPlugin)
+
+
+def test_build_registry_loads_configured_plugin_and_builtin_override() -> None:
+    config = AppConfig(
+        coder_plugins={
+            "claude": (
+                "tests.configured_coder_plugin:build_claude_override"
+            ),
+            "third": "tests.configured_coder_plugin:build_test_plugin",
+        }
+    )
+
+    registry = build_coder_registry(config)
+
+    assert registry.coder_names() == ["claude", "codex", "third"]
+    assert registry.get("claude").display_name == "Configured Claude"
+    assert registry.get("third").name == "third"
+    assert isinstance(registry.get("codex"), CodexPlugin)
+
+
+@pytest.mark.parametrize(
+    ("plugin_id", "reference", "stage"),
+    [
+        ("third", "missing-separator", "reference"),
+        ("third", "missing.module:factory", "module import"),
+        (
+            "third",
+            "tests.configured_coder_plugin:missing_factory",
+            "factory lookup",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:NOT_CALLABLE",
+            "factory validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_incompatible_plugin",
+            "contract validation",
+        ),
+        (
+            "expected",
+            "tests.configured_coder_plugin:build_mismatched_plugin",
+            "identity validation",
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_missing_metadata_plugin",
+            "metadata validation",
+        ),
+    ],
+)
+def test_build_registry_reports_configured_loading_stage(
+    plugin_id: str,
+    reference: str,
+    stage: str,
+) -> None:
+    config = AppConfig(coder_plugins={plugin_id: reference})
+
+    with pytest.raises(CoderPluginConfigurationError) as caught:
+        build_coder_registry(config)
+
+    message = str(caught.value)
+    assert repr(plugin_id) in message
+    assert repr(reference) in message
+    assert f"failed at {stage}" in message
+
+
+def test_build_registry_redacts_factory_exception_detail() -> None:
+    reference = "tests.configured_coder_plugin:build_exploding_plugin"
+    config = AppConfig(coder_plugins={"third": reference})
+
+    with pytest.raises(CoderPluginConfigurationError) as caught:
+        build_coder_registry(config)
+
+    message = str(caught.value)
+    assert "failed at factory invocation" in message
+    assert "RuntimeError" in message
+    assert "must-not-leak" not in message
 
 
 def test_register_and_get() -> None:

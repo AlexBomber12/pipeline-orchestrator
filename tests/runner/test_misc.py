@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 from src.coder_registry import CoderRegistry
 from src.coders import claude as claude_plugin_module
+from src.config import AppConfig
 from src.daemon import git_ops as git_ops_module
 from src.daemon import recovery_policy as recovery_policy_module
 from src.daemon import runner as runner_module
@@ -36,6 +37,48 @@ claude_cli = claude_plugin_module.claude_cli
 # ---------------------------------------------------------------------------
 # PR-224b moved from tests/test_runner.py — misc group
 # ---------------------------------------------------------------------------
+
+
+def test_runner_builds_configured_registry_when_not_injected() -> None:
+    config = AppConfig(
+        coder_plugins={
+            "third": "tests.configured_coder_plugin:build_test_plugin"
+        }
+    )
+    claude_provider, codex_provider = h._usage_providers()
+
+    runner = PipelineRunner(
+        h._repo_cfg(),
+        config,
+        h._FakeRedis(),
+        claude_provider,
+        codex_provider,
+    )
+
+    assert runner._registry.coder_names() == ["claude", "codex", "third"]
+
+
+def test_runner_preserves_explicitly_injected_empty_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    injected = CoderRegistry()
+    monkeypatch.setattr(
+        runner_module,
+        "build_coder_registry",
+        lambda _config: (_ for _ in ()).throw(AssertionError("must not build")),
+    )
+    claude_provider, codex_provider = h._usage_providers()
+
+    runner = PipelineRunner(
+        h._repo_cfg(),
+        AppConfig(),
+        h._FakeRedis(),
+        claude_provider,
+        codex_provider,
+        registry=injected,
+    )
+
+    assert runner._registry is injected
 
 
 def test_preflight_returns_true_on_clean_repo(
