@@ -404,7 +404,7 @@ def test_refresh_auth_status_cache_marks_plugin_probe_errors() -> None:
     registry.register(
         _Plugin(
             "third",
-            AssertionError("metadata-only plugin must not be probed"),
+            AssertionError("configured plugin probe failed"),
         )
     )
     claude_provider, codex_provider = h._usage_providers()
@@ -422,6 +422,7 @@ def test_refresh_auth_status_cache_marks_plugin_probe_errors() -> None:
     assert runner._auth_status_cache == {
         "claude": {"status": "ok", "detail": "ready"},
         "codex": {"status": "error"},
+        "third": {"status": "error"},
     }
     assert runner._auth_status_cache_expires_at is not None
     assert runner._auth_status_cache_expires_at > datetime.now(timezone.utc)
@@ -444,6 +445,10 @@ def test_refresh_auth_status_cache_isolates_configured_runtime_override(
         reference="tests.configured_coder_plugin:build_claude_override",
     )
     registry.register(_Plugin("codex"))  # type: ignore[arg-type]
+    registry.register(
+        _Plugin("third"),  # type: ignore[arg-type]
+        reference="tests.configured_coder_plugin:build_test_plugin",
+    )
     claude_provider, codex_provider = h._usage_providers()
     runner = PipelineRunner(
         h._repo_cfg(),
@@ -476,11 +481,18 @@ def test_refresh_auth_status_cache_isolates_configured_runtime_override(
             "tests.configured_coder_plugin:build_claude_override",
             "Claude",
             "/runtime/config.yml",
-        )
+        ),
+        (
+            "third",
+            "tests.configured_coder_plugin:build_test_plugin",
+            "Third",
+            "/runtime/config.yml",
+        ),
     ]
     assert runner._auth_status_cache == {
         "claude": {"status": "ok", "detail": "isolated"},
         "codex": {"status": "ok", "detail": "direct"},
+        "third": {"status": "ok", "detail": "isolated"},
     }
 
 

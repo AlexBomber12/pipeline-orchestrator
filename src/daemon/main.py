@@ -266,6 +266,8 @@ def _build_runner(
         }
         if "registry" in inspect.signature(PipelineRunner).parameters:
             kwargs["registry"] = registry
+        if "usage_providers" in inspect.signature(PipelineRunner).parameters:
+            kwargs["usage_providers"] = registry.usage_providers()
         return PipelineRunner(**kwargs)
     except Exception:
         logger.error(
@@ -281,12 +283,23 @@ def _create_usage_providers(
     registry: CoderRegistry,
 ) -> tuple[UsageProvider, UsageProvider]:
     """Create the shared daemon-level usage providers for the current config."""
-    claude = registry.get("claude").create_usage_provider(config=config)
-    codex = registry.get("codex").create_usage_provider(config=config)
+    try:
+        names = registry.coder_names()
+    except AttributeError:
+        # Compatibility for narrow test doubles and pre-registry callers.
+        names = ["claude", "codex"]
+    providers = {
+        name: registry.get(name).create_usage_provider(config=config)
+        for name in names
+    }
+    claude = providers.get("claude")
+    codex = providers.get("codex")
     if claude is None or codex is None:
         raise ValueError(
             "Configured 'claude' and 'codex' plugins must provide usage providers"
         )
+    if hasattr(registry, "set_usage_providers"):
+        registry.set_usage_providers(providers)
     return claude, codex
 
 
@@ -359,6 +372,8 @@ def _sync_runners(
                     stage_kwargs["requires_idle_boundary"] = (
                         needs_idle_boundary_defer
                     )
+                if "usage_providers" in params:
+                    stage_kwargs["usage_providers"] = registry.usage_providers()
                 runner.stage_config_reload(
                     repo,
                     config,
@@ -369,9 +384,15 @@ def _sync_runners(
             else:
                 runner.repo_config = repo
                 runner.app_config = config
+                usage_kwargs: dict[str, Any] = {}
+                if "usage_providers" in inspect.signature(
+                    runner.set_usage_providers
+                ).parameters:
+                    usage_kwargs["usage_providers"] = registry.usage_providers()
                 runner.set_usage_providers(
                     claude_usage_provider,
                     codex_usage_provider,
+                    **usage_kwargs,
                 )
                 if hasattr(runner, "clear_staged_config_reload"):
                     runner.clear_staged_config_reload()

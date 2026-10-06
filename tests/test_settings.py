@@ -3526,6 +3526,28 @@ def test_settings_repo_list_shows_value_when_override_set(
     assert 'value="60"' in body
 
 
+def test_settings_repo_list_marks_builtin_coder_override_selected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/codex-repo.git\n"
+        "    branch: main\n"
+        "    coder: codex\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/settings/repo-list")
+
+    assert response.status_code == 200
+    assert 'option value="codex" selected' in response.text
+
+
 def test_update_daemon_rate_limit_session(
     empty_config: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3726,7 +3748,7 @@ def test_coder_setting_saves_and_reloads(
 
     assert response.status_code == 200
     cfg = load_config(str(empty_config))
-    assert cfg.daemon.coder.value == "codex"
+    assert cfg.daemon.coder == "codex"
 
 
 def test_codex_model_setting_saves(
@@ -3824,7 +3846,7 @@ def test_repo_coder_override_saves(
     assert response.status_code == 200
     cfg = load_config(str(one_repo_config))
     assert cfg.repositories[0].coder is not None
-    assert cfg.repositories[0].coder.value == "codex"
+    assert cfg.repositories[0].coder == "codex"
 
 
 def test_repo_coder_override_clear(
@@ -3985,7 +4007,7 @@ def test_repo_coder_change_posts_selector_updates_config_and_sets_dirty_flag(
     assert "Switching to Codex CLI." in response.text
     cfg = load_config(str(one_repo_config))
     assert cfg.repositories[0].coder is not None
-    assert cfg.repositories[0].coder.value == "codex"
+    assert cfg.repositories[0].coder == "codex"
     assert fake_redis.store["control:example__alpha:config_dirty"] == "1"
     assert published == [
         (
@@ -4180,7 +4202,7 @@ def test_put_repo_detail_coder_still_updates_summary_fragment(
     assert 'hx-post="/repos/example__alpha/coder"' not in response.text
     cfg = load_config(str(one_repo_config))
     assert cfg.repositories[0].coder is not None
-    assert cfg.repositories[0].coder.value == "codex"
+    assert cfg.repositories[0].coder == "codex"
 
 
 def test_put_repo_detail_coder_handles_missing_invalid_clear_and_write_error(

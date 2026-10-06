@@ -577,7 +577,7 @@ def test_hot_reload_updates_repo_config_coder(
 
     alpha = next(r for r in _FakeRunner.instances if r.name == "octo__alpha")
     assert alpha.repo_config.coder is not None
-    assert alpha.repo_config.coder.value == "codex"
+    assert alpha.repo_config.coder == "codex"
 
 
 def test_sync_runners_stages_config_reload_when_runner_supports_it() -> None:
@@ -605,13 +605,20 @@ def test_sync_runners_stages_config_reload_when_runner_supports_it() -> None:
             app_config: AppConfig,
             claude_usage_provider: Any,
             codex_usage_provider: Any,
+            *,
+            usage_providers: Any,
         ) -> None:
             self.staged = (
                 repo_config,
                 app_config,
                 claude_usage_provider,
                 codex_usage_provider,
+                usage_providers,
             )
+
+    class _Registry:
+        def usage_providers(self) -> dict[str, str]:
+            return {"third": "third-provider"}
 
     daemon_config = DaemonConfig(poll_interval_sec=1)
     config = AppConfig(
@@ -636,16 +643,17 @@ def test_sync_runners_stages_config_reload_when_runner_supports_it() -> None:
         _FakeRedisClient(),
         "claude-provider",
         "codex-provider",
-        registry=None,  # type: ignore[arg-type]
+        registry=_Registry(),  # type: ignore[arg-type]
     )
 
     assert runner.staged is not None
-    staged_repo, staged_app, staged_claude, staged_codex = runner.staged
+    staged_repo, staged_app, staged_claude, staged_codex, staged_usage = runner.staged
     assert staged_repo.coder is not None
-    assert staged_repo.coder.value == "codex"
+    assert staged_repo.coder == "codex"
     assert staged_app is config
     assert staged_claude == "claude-provider"
     assert staged_codex == "codex-provider"
+    assert staged_usage == {"third": "third-provider"}
 
 
 def test_sync_runners_applies_active_flag_change_immediately() -> None:
@@ -684,6 +692,23 @@ def test_sync_runners_applies_active_flag_change_immediately() -> None:
         def clear_staged_config_reload(self) -> None:
             self.staged = None
 
+        def set_usage_providers(
+            self,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+            *,
+            usage_providers: Any,
+        ) -> None:
+            super().set_usage_providers(
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+            self.usage_providers = usage_providers
+
+    class _Registry:
+        def usage_providers(self) -> dict[str, str]:
+            return {"third": "third-provider"}
+
     config = AppConfig(
         repositories=[_repo("https://github.com/octo/alpha.git", active=True, coder="codex")],
         daemon=DaemonConfig(poll_interval_sec=1),
@@ -704,16 +729,17 @@ def test_sync_runners_applies_active_flag_change_immediately() -> None:
         _FakeRedisClient(),
         "claude-provider",
         "codex-provider",
-        registry=None,  # type: ignore[arg-type]
+        registry=_Registry(),  # type: ignore[arg-type]
     )
 
     assert runner.staged is None
     assert runner.repo_config.active is True
     assert runner.repo_config.coder is not None
-    assert runner.repo_config.coder.value == "codex"
+    assert runner.repo_config.coder == "codex"
     assert runner.app_config is config
     assert runner.claude_usage_provider == "claude-provider"
     assert runner.codex_usage_provider == "codex-provider"
+    assert runner.usage_providers == {"third": "third-provider"}
 
 
 def test_sync_runners_clears_staged_reload_after_immediate_active_update() -> None:
@@ -777,7 +803,7 @@ def test_sync_runners_clears_staged_reload_after_immediate_active_update() -> No
 
     assert runner.repo_config.active is False
     assert runner.repo_config.coder is not None
-    assert runner.repo_config.coder.value == "codex"
+    assert runner.repo_config.coder == "codex"
     assert runner.staged is None
 
 
@@ -840,7 +866,7 @@ def test_sync_runners_applies_config_immediately_when_runner_is_in_error() -> No
 
     assert runner.staged is None
     assert runner.repo_config.coder is not None
-    assert runner.repo_config.coder.value == "codex"
+    assert runner.repo_config.coder == "codex"
     assert runner.app_config is config
 
 
@@ -914,7 +940,7 @@ def test_sync_runners_applies_non_coder_repo_changes_immediately() -> None:
 
     assert runner.staged is None
     assert runner.repo_config.coder is not None
-    assert runner.repo_config.coder.value == "codex"
+    assert runner.repo_config.coder == "codex"
     assert runner.repo_config.auto_merge is False
     assert runner.app_config is config
     assert runner.claude_usage_provider == "claude-provider"
@@ -1055,7 +1081,7 @@ def test_sync_runners_updates_watching_runner_without_staging_support() -> None:
     )
 
     assert runner.repo_config.coder is not None
-    assert runner.repo_config.coder.value == "codex"
+    assert runner.repo_config.coder == "codex"
     assert runner.app_config is config
     assert runner.claude_usage_provider == "claude-provider"
     assert runner.codex_usage_provider == "codex-provider"
@@ -1546,6 +1572,7 @@ def test_build_runner_passes_registry_when_supported(
             claude_usage_provider: Any,
             codex_usage_provider: Any,
             registry: Any,
+            usage_providers: Any,
         ) -> None:
             seen["repo"] = repo_config
             seen["config"] = app_config
@@ -1553,9 +1580,14 @@ def test_build_runner_passes_registry_when_supported(
             seen["claude"] = claude_usage_provider
             seen["codex"] = codex_usage_provider
             seen["registry"] = registry
+            seen["usage_providers"] = usage_providers
+
+    class _Registry:
+        def usage_providers(self) -> dict[str, str]:
+            return {"third": "third-provider"}
 
     monkeypatch.setattr(main_module, "PipelineRunner", _RunnerWithRegistry)
-    registry = object()
+    registry = _Registry()
     redis_client = object()
 
     runner = main_module._build_runner(
@@ -1575,6 +1607,7 @@ def test_build_runner_passes_registry_when_supported(
         "claude": "claude-provider",
         "codex": "codex-provider",
         "registry": registry,
+        "usage_providers": {"third": "third-provider"},
     }
 
 

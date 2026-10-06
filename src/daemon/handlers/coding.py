@@ -29,6 +29,7 @@ from src.daemon import git_ops
 from src.daemon.guardrails import scan_stdout
 from src.daemon.handlers import CoderUnavailable
 from src.daemon.quarantine import apply_quarantine_label_for_violation
+from src.daemon.selector import CoderSelectionUnavailable
 from src.github import cache as gh_cache
 from src.github import gh_runner
 from src.github import prs as gh_prs
@@ -217,7 +218,15 @@ class CodingMixin:
         # statuses; selecting first would let a stale/empty auth cache
         # pick an ineligible coder that no later refresh can undo.
         await self._refresh_auth_status_cache()
-        coder_name, plugin = self._get_coder()
+        try:
+            coder_name, plugin = self._get_coder()
+        except CoderSelectionUnavailable as exc:
+            await self._transition_to_error(
+                str(exc),
+                publish=False,
+                log_prefix="[CODING]",
+            )
+            return
 
         # Start the run record before the branch guard so a malformed
         # task (no Branch:) still produces error telemetry — otherwise

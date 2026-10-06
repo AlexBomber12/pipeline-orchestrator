@@ -236,6 +236,7 @@ class ErrorMixin:
             )
             await self.publish_state()
             return
+        await self._refresh_auth_status_cache()
         selected = self._get_auxiliary_coder()
         if selected is None:
             self.log_event(
@@ -244,17 +245,16 @@ class ErrorMixin:
             )
             return
         coder_name, plugin = selected
-        provider = (
-            self._claude_usage_provider
-            if coder_name == "claude"
-            else self._codex_usage_provider
-        )
+        provider = self._usage_provider_for(coder_name)
         # Soft-skip diagnosis rather than pausing the repo when the selected
         # diagnosis coder is already over its usage threshold.
-        try:
-            snapshot = await asyncio.to_thread(provider.fetch)
-        except Exception:
+        if provider is None:
             snapshot = None
+        else:
+            try:
+                snapshot = await asyncio.to_thread(provider.fetch)
+            except Exception:
+                snapshot = None
         if snapshot and (
             snapshot.session_percent
             >= self.app_config.daemon.rate_limit_session_pause_percent

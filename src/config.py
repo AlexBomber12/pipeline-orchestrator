@@ -17,6 +17,8 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field, field_validator
 
+from src.coder_ids import validate_coder_plugin_id
+
 OVERLAY_FILENAME = "config.production.yml"
 
 DEFAULT_CODER_PLUGINS = {
@@ -28,6 +30,9 @@ DEFAULT_CODER_PLUGINS = {
 class CoderType(str, Enum):
     CLAUDE = "claude"
     CODEX = "codex"
+
+
+BUILTIN_CODER_IDS = frozenset(coder.value for coder in CoderType)
 
 logger = logging.getLogger(__name__)
 
@@ -177,10 +182,17 @@ class RepoConfig(BaseModel):
     allow_merge_without_checks: bool = False
     required_checks: list[str] | None = None
     allow_merge_without_review: bool = False
-    coder: CoderType | None = None
+    coder: str | None = None
     disabled_coders: list[str] | None = None
     governance_scan_enabled: bool | None = None
     feature_flags: FeatureFlags = Field(default_factory=FeatureFlags)
+
+    @field_validator("coder", mode="before")
+    @classmethod
+    def _coder_is_plugin_id(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        return validate_coder_plugin_id(value)
 
     @field_validator("poll_interval_sec", mode="before")
     @classmethod
@@ -256,7 +268,7 @@ class DaemonConfig(BaseModel):
         }
     )
     exploration_epsilon: float = Field(default=0.15, ge=0.0, le=0.5)
-    coder: CoderType = CoderType.CLAUDE
+    coder: str = CoderType.CLAUDE.value
     codex_model: str = ""
     # Plugin-local configuration keyed by stable registry ID. Values stay
     # implementation-agnostic so parsing config never imports coder plugins.
@@ -305,6 +317,11 @@ class DaemonConfig(BaseModel):
             )
         ]
     )
+
+    @field_validator("coder", mode="before")
+    @classmethod
+    def _coder_is_plugin_id(cls, value: Any) -> str:
+        return validate_coder_plugin_id(value)
 
     @field_validator("coder_settings", mode="before")
     @classmethod

@@ -28,6 +28,7 @@ import random
 import re
 import subprocess
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Coroutine
@@ -58,7 +59,6 @@ from src.coders import build_coder_registry
 from src.config import (
     DEFAULT_CODER_PLUGINS,
     AppConfig,
-    CoderType,
     RepoConfig,
     load_config,
 )
@@ -107,6 +107,7 @@ from src.daemon.repo_ops import RepoOpsMixin
 from src.daemon.retry_commands import RetryCommandMixin, RetryDispatch
 from src.daemon.selector import (
     CoderPurpose,
+    CoderSelectionUnavailable,
     SelectionContext,
     resolve_active_coder,
     resolve_pause_coder,
@@ -331,6 +332,7 @@ class PipelineRunner(
         claude_usage_provider: UsageProvider,
         codex_usage_provider: UsageProvider,
         registry: CoderRegistry | None = None,
+        usage_providers: Mapping[str, UsageProvider | None] | None = None,
     ) -> None:
         self.repo_config = repo_config
         self._app_config = app_config
@@ -423,6 +425,15 @@ class PipelineRunner(
         self._usage_degraded_logged = False
         self._claude_usage_provider = claude_usage_provider
         self._codex_usage_provider = codex_usage_provider
+        self._usage_providers: dict[str, UsageProvider | None] = dict(
+            usage_providers or {}
+        )
+        self._usage_providers.update(
+            {
+                "claude": claude_usage_provider,
+                "codex": codex_usage_provider,
+            }
+        )
         self._metrics_store = MetricsStore(redis_client)
         self._current_run_record: RunRecord | None = None
         self._selector_rng = random.Random()
@@ -453,6 +464,9 @@ class PipelineRunner(
         self._pending_app_config: AppConfig | None = None
         self._pending_usage_providers: (
             tuple[UsageProvider, UsageProvider] | None
+        ) = None
+        self._pending_usage_provider_map: (
+            dict[str, UsageProvider | None] | None
         ) = None
         # True iff the staged change is one that intentionally needs to
         # land on an IDLE boundary (currently: coder-only swaps mid-PR).
@@ -694,10 +708,28 @@ class PipelineRunner(
         self,
         claude_usage_provider: UsageProvider,
         codex_usage_provider: UsageProvider,
+        *,
+        usage_providers: Mapping[str, UsageProvider | None] | None = None,
     ) -> None:
         """Swap in the shared daemon-level usage providers."""
         self._claude_usage_provider = claude_usage_provider
         self._codex_usage_provider = codex_usage_provider
+        if usage_providers is not None:
+            self._usage_providers = dict(usage_providers)
+        self._usage_providers.update(
+            {
+                "claude": claude_usage_provider,
+                "codex": codex_usage_provider,
+            }
+        )
+
+    def _usage_provider_for(self, coder_name: str) -> UsageProvider | None:
+        """Return only the provider owned by ``coder_name``, if available."""
+        if coder_name == "claude":
+            return self._claude_usage_provider
+        if coder_name == "codex":
+            return self._codex_usage_provider
+        return self._usage_providers.get(coder_name)
 
     def _availability_sources(self) -> list[Any]:
         cfg = self.app_config.daemon
@@ -779,6 +811,7 @@ class PipelineRunner(
         codex_usage_provider: UsageProvider,
         *,
         requires_idle_boundary: bool = False,
+        usage_providers: Mapping[str, UsageProvider | None] | None = None,
     ) -> None:
         """Queue config changes to apply at the next safe task-pickup boundary.
 
@@ -800,6 +833,9 @@ class PipelineRunner(
         self._pending_usage_providers = (
             claude_usage_provider,
             codex_usage_provider,
+        )
+        self._pending_usage_provider_map = (
+            dict(usage_providers) if usage_providers is not None else None
         )
         self._pending_requires_idle_boundary = (
             self._pending_requires_idle_boundary or requires_idle_boundary
@@ -829,21 +865,22 @@ class PipelineRunner(
         self._error_diagnose_policy.reset(self)
         self._idle_dispatch_deferred = False
 
-    def _build_usage_providers_for_app_config(
+    def _build_usage_provider_map_for_app_config(
         self,
         app_config: AppConfig,
-    ) -> tuple[UsageProvider, UsageProvider]:
-        """Rebuild shared usage providers from the active config snapshot."""
-        claude_provider = self._registry.get("claude").create_usage_provider(
-            config=app_config
+    ) -> dict[str, UsageProvider | None]:
+        """Rebuild providers for the startup-loaded registry only."""
+        providers = {
+            name: self._registry.get(name).create_usage_provider(config=app_config)
+            for name in self._registry.coder_names()
+        }
+        providers["claude"] = (
+            providers.get("claude") or self._claude_usage_provider
         )
-        codex_provider = self._registry.get("codex").create_usage_provider(
-            config=app_config
+        providers["codex"] = (
+            providers.get("codex") or self._codex_usage_provider
         )
-        return (
-            claude_provider or self._claude_usage_provider,
-            codex_provider or self._codex_usage_provider,
-        )
+        return providers
 
     def _apply_staged_config_reload(self) -> None:
         """Apply any queued config changes now that the runner is safe to swap."""
@@ -852,7 +889,10 @@ class PipelineRunner(
         self.repo_config = self._pending_repo_config
         self.app_config = self._pending_app_config
         if self._pending_usage_providers is not None:
-            self.set_usage_providers(*self._pending_usage_providers)
+            self.set_usage_providers(
+                *self._pending_usage_providers,
+                usage_providers=self._pending_usage_provider_map,
+            )
         self.clear_staged_config_reload()
 
     def clear_staged_config_reload(self) -> None:
@@ -860,6 +900,7 @@ class PipelineRunner(
         self._pending_repo_config = None
         self._pending_app_config = None
         self._pending_usage_providers = None
+        self._pending_usage_provider_map = None
         self._pending_requires_idle_boundary = False
 
     async def reload_repo_config_if_dirty(self) -> None:
@@ -888,8 +929,14 @@ class PipelineRunner(
             if repo_slug_from_url(repo.url) == self.name:
                 self.repo_config = repo
                 self.app_config = config
+                providers = self._build_usage_provider_map_for_app_config(config)
+                claude = providers["claude"]
+                codex = providers["codex"]
+                assert claude is not None and codex is not None
                 self.set_usage_providers(
-                    *self._build_usage_providers_for_app_config(config)
+                    claude,
+                    codex,
+                    usage_providers=providers,
                 )
                 self.clear_staged_config_reload()
                 await self.redis.delete(dirty_key)
@@ -967,28 +1014,20 @@ class PipelineRunner(
     def _get_coder(
         self, *, allow_exploration: bool = True
     ) -> tuple[str, CoderPlugin]:
-        """Return ``(coder_name, coder_plugin)`` for the active coder.
-
-        When the active task pins a specific coder via ``Coder:`` and no
-        eligible coder is available, fall back to the pinned coder rather
-        than the repo/global default to preserve the hard-pin guarantee.
-        """
+        """Return the selector's runnable coder without bypassing its gates."""
         result = self._select_coder(allow_exploration=allow_exploration)
         if result is not None:
             self.state.coder = result[0]
             return result
         pin = self._active_task_coder_pin()
-        if pin in ("claude", "codex"):
-            self.state.coder = pin
-            return pin, self._registry.get(pin)
-        ctx = self._selection_context(task_coder_pin="")
-        fallback = resolve_pause_coder(ctx)
-        if fallback.plugin is not None:
-            self.state.coder = fallback.name
-            return fallback.name, fallback.plugin
-        coder_name = (self.repo_config.coder or self.app_config.daemon.coder).value
-        self.state.coder = coder_name
-        return coder_name, self._registry.get(coder_name)
+        if pin and pin != "any":
+            raise CoderSelectionUnavailable(
+                f"Task pinned to {pin} but coder unavailable"
+            )
+        configured = self.repo_config.coder or self.app_config.daemon.coder
+        raise CoderSelectionUnavailable(
+            f"Configured coder {configured} is unavailable and no fallback is eligible"
+        )
 
     def _get_auxiliary_coder(self) -> tuple[str, CoderPlugin] | None:
         """Return the eligible coder for diagnosis/merge helper workflows."""
@@ -1027,11 +1066,10 @@ class PipelineRunner(
             except Exception:
                 return {"status": "error"}
 
-        # Additional configured IDs are metadata-only until runtime selection
-        # supports them. Never let their auth implementation participate in
-        # (or stall) a repository cycle. Runtime overrides use the same
-        # killable worker boundary as the web Settings probes.
-        names = [coder.value for coder in CoderType]
+        # The startup-loaded registry is authoritative. Configured plugins use
+        # the killable worker boundary; adding a definition during hot reload
+        # cannot add it to this name set until the daemon restarts.
+        names = self._registry.coder_names()
         results = await asyncio.gather(*(_probe(name) for name in names))
         self._auth_status_cache = dict(zip(names, results, strict=True))
         self._auth_status_cache_expires_at = now + timedelta(minutes=5)
@@ -2519,12 +2557,12 @@ class PipelineRunner(
         active_coder = self.state.coder or resolve_pause_coder(ctx).name
         self.state.coder = active_coder
         if self.repo_config.active:
-            provider = (
-                self._claude_usage_provider
-                if active_coder != CoderType.CODEX.value
-                else self._codex_usage_provider
+            provider = self._usage_provider_for(active_coder)
+            snap = (
+                await asyncio.to_thread(provider.fetch)
+                if provider is not None
+                else None
             )
-            snap = await asyncio.to_thread(provider.fetch)
             if snap is not None:
                 self.state.usage_session_percent = snap.session_percent
                 self.state.usage_session_resets_at = snap.session_resets_at
@@ -2535,7 +2573,10 @@ class PipelineRunner(
                 self.state.usage_session_resets_at = None
                 self.state.usage_weekly_percent = None
                 self.state.usage_weekly_resets_at = None
-            self.state.usage_api_degraded = provider.consecutive_failures >= 10
+            self.state.usage_api_degraded = bool(
+                provider is not None
+                and getattr(provider, "consecutive_failures", 0) >= 10
+            )
         self.state.last_updated = datetime.now(timezone.utc)
         state_key = pipeline_state(self.name)
 

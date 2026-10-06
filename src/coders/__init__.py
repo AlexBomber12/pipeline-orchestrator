@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import importlib
-import re
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from src.coder_ids import CODER_PLUGIN_ID_PATTERN
 from src.coder_registry import CoderPlugin, CoderRegistry, ModelSetting
 from src.config import DEFAULT_CODER_PLUGINS, AppConfig, DaemonConfig
 
-_PLUGIN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _RESERVED_PLUGIN_IDS = frozenset({"gh"})
 _RESERVED_MODEL_SETTING_KEYS = frozenset({"reasoning_effort"})
 _LEGACY_MODEL_FIELDS = {
@@ -214,7 +213,7 @@ def _validate_plugin_metadata(
 
 
 def _load_plugin(plugin_id: str, reference: object) -> CoderPlugin:
-    if not isinstance(plugin_id, str) or not _PLUGIN_ID_PATTERN.fullmatch(plugin_id):
+    if not isinstance(plugin_id, str) or not CODER_PLUGIN_ID_PATTERN.fullmatch(plugin_id):
         raise _configuration_error(
             str(plugin_id),
             reference,

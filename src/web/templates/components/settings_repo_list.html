@@ -91,8 +91,8 @@
                         hx-target="#settings-repo-list"
                         hx-swap="innerHTML">
                     <option value="" {% if repo.coder is none %}selected{% endif %}>Inherit</option>
-                    <option value="claude" {% if repo.coder is not none and repo.coder.value == "claude" %}selected{% endif %}>Claude</option>
-                    <option value="codex" {% if repo.coder is not none and repo.coder.value == "codex" %}selected{% endif %}>Codex</option>
+                    <option value="claude" {% if repo.coder == "claude" %}selected{% endif %}>Claude</option>
+                    <option value="codex" {% if repo.coder == "codex" %}selected{% endif %}>Codex</option>
                 </select>
             </td>
             <td class="px-4 py-2 text-right">

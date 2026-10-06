@@ -23,6 +23,7 @@ from src.daemon.guardrails import scan_stdout
 from src.daemon.handlers.breach import BreachMixin
 from src.daemon.quarantine import apply_quarantine_label_for_violation
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
+from src.daemon.selector import CoderSelectionUnavailable
 from src.github import comments as gh_comments
 from src.github import gh_runner
 from src.github.reviewer_policy import ReviewerPolicy
@@ -240,7 +241,15 @@ class FixMixin(BreachMixin):
             BranchContext.from_runner(self).log_summary(),
         )
         await self._refresh_auth_status_cache()
-        coder_name, plugin = self._get_coder(allow_exploration=False)
+        try:
+            coder_name, plugin = self._get_coder(allow_exploration=False)
+        except CoderSelectionUnavailable as exc:
+            await self._transition_to_error(
+                str(exc),
+                publish=False,
+                log_prefix="[FIX]",
+            )
+            return
         if not await self.usage_gate(proactive_coder=coder_name):
             return
 

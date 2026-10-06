@@ -16,5 +16,5 @@ def _effective_coder_name(
 ) -> str:
     """Return the effective coder name for a repo."""
     if repo_config is not None and repo_config.coder is not None:
-        return repo_config.coder.value
-    return config.daemon.coder.value
+        return repo_config.coder
+    return config.daemon.coder

@@ -209,7 +209,7 @@ def test_post_repo_coder_writes_config_sets_dirty_publishes_wake(
     # Writer was called: the on-disk config now reflects the new coder.
     cfg = load_config(str(one_repo_config))
     assert cfg.repositories[0].coder is not None
-    assert cfg.repositories[0].coder.value == "codex"
+    assert cfg.repositories[0].coder == "codex"
 
     # Dirty flag was set.
     assert fake.store.get("control:example__alpha:config_dirty") == "1"
@@ -291,7 +291,7 @@ def test_put_settings_repo_name_writes_config_sets_dirty_publishes_wake(
     # Writer was called.
     cfg = load_config(str(one_repo_config))
     assert cfg.repositories[0].coder is not None
-    assert cfg.repositories[0].coder.value == "codex"
+    assert cfg.repositories[0].coder == "codex"
 
     # Dirty flag set.
     assert fake.store.get("control:example__alpha:config_dirty") == "1"
@@ -488,7 +488,7 @@ def test_put_settings_repo_name_succeeds_when_publish_wake_fails(
     # Config write succeeded.
     cfg = load_config(str(one_repo_config))
     assert cfg.repositories[0].coder is not None
-    assert cfg.repositories[0].coder.value == "codex"
+    assert cfg.repositories[0].coder == "codex"
 
     # The dirty flag was still set synchronously even though publish failed.
     assert fake.store.get("control:example__alpha:config_dirty") == "1"
