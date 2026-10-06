@@ -1481,6 +1481,39 @@ async def test_decorated_yaml_mapping_keys_are_redacted_across_retained_readers(
         assert "tagged-value-field-secret" not in page["content"]
 
 
+async def test_tagged_flow_yaml_is_redacted_across_retained_readers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    repos_root = tmp_path / "repos"
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+    payload = (
+        "env: [{name: PASSWORD, value: !plain tagged-flow-env-secret}]\n"
+        "---\n{kind: Secret, data: {opaque: !plain tagged-flow-payload-secret}}\n"
+        "---\n{password: !plain tagged-flow-assignment-secret}\n"
+        "---\nenv: [{name: SAFE, value: !plain retained-safe-tagged-flow}]\n"
+    )
+    redis.store[cli_log_latest(SLUG)] = payload
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.write_text(payload, encoding="utf-8")
+
+    for source_id in ("cli:latest", "ci:artifact"):
+        result = await diagnostics.read_orchestrator_log(
+            SLUG,
+            source_id,
+            max_chars=4_000,
+        )
+        assert "tagged-flow-env-secret" not in result["content"]
+        assert "tagged-flow-payload-secret" not in result["content"]
+        assert "tagged-flow-assignment-secret" not in result["content"]
+        assert "retained-safe-tagged-flow" in result["content"]
+
+
 async def test_multiline_explicit_yaml_keys_are_redacted_across_retained_readers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1987,6 +2020,7 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     )
     assert diagnostics._yaml_block_complexity_exceeded(sequence_heavy)
     assert diagnostics._yaml_parse_complexity_exceeded(sequence_heavy)
+    physical_line_heavy = "\n" * (diagnostics._MAX_REDACTION_PHYSICAL_LINES + 1)
     decoded_key_heavy = '? "pass\\u0061ge"\n' * (
         diagnostics._MAX_YAML_PER_LINE_SCAN_CANDIDATES + 1
     )
@@ -2029,10 +2063,37 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
             has_more_after_raw=False,
             warnings=block_warnings,
         )
+        physical_line_units = diagnostics._redacted_file_units(
+            physical_line_heavy.encode(),
+            starts_inside_private_key=False,
+            starts_with_sensitive_value=False,
+            starts_inside_sensitive_block=False,
+            sensitive_block_indent=None,
+            starts_inside_sensitive_quote=False,
+            sensitive_quote=None,
+            has_more_after_raw=False,
+            warnings=block_warnings,
+        )
     assert block_units[0][1] == "[CONTENT OMITTED: YAML BLOCK COMPLEXITY BOUND EXCEEDED]\n"
     assert sequence_units[0][1] == (
         "[CONTENT OMITTED: YAML BLOCK COMPLEXITY BOUND EXCEEDED]\n"
     )
+    assert physical_line_units == [(physical_line_heavy.encode(), physical_line_heavy, 0)]
+    risky_physical_line_units = diagnostics._redacted_file_units(
+        (physical_line_heavy + "password:\n  hidden\n").encode(),
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=False,
+        warnings=block_warnings,
+    )
+    assert risky_physical_line_units[0][1] == (
+        "[CONTENT OMITTED: PHYSICAL LINE BOUND EXCEEDED]\n"
+    )
+    assert any("Physical line count" in warning for warning in block_warnings)
     assert any("block syntax" in warning for warning in block_warnings)
 
     real_scan = diagnostics.yaml.scan

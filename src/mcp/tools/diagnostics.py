@@ -75,6 +75,7 @@ _MAX_YAML_FLOW_TOKENS = 4_096
 _MAX_YAML_BLOCK_MAPPING_LINES = 4_096
 _MAX_YAML_BLOCK_TOKENS = 4_096
 _MAX_YAML_PER_LINE_SCAN_CANDIDATES = 256
+_MAX_REDACTION_PHYSICAL_LINES = 8_192
 _MAX_RETRY_CURSOR_CHARS = 1_024
 _CLI_LATEST_TTL_SECONDS = 3600
 _CLI_HISTORY_TTL_SECONDS = 86400
@@ -312,6 +313,16 @@ _YAML_FLOW_KIND_SECRET = re.compile(
 _YAML_FLOW_SECRET_PAYLOAD = re.compile(
     r"(?i)(?:[{,][ \t]*)(?:[\"']?(?:data|stringData)[\"']?)[ \t]*:"
 )
+_HIGH_LINE_CONTEXTUAL_YAML = re.compile(
+    r"(?i)(?:[\"']?(?:name|kind|data|stringData)[\"']?)[ \t]*:"
+)
+_HIGH_LINE_COMPLEX_SENSITIVE_ASSIGNMENT = re.compile(
+    rf"(?im)(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
+    rf"(?<![A-Za-z0-9_.-])(?:{_SENSITIVE_KEY_PATTERN})(?![A-Za-z0-9_.-]))"
+    r"[ \t]*(?:\+=|[:=])[ \t]*(?:$|[|>]|\"|')"
+)
+_HIGH_LINE_EXPLICIT_YAML = re.compile(r"(?m)^[ \t]*(?:-[ \t]+)?[?:](?:[ \t]|$)")
+_HIGH_LINE_ESCAPED_MAPPING_KEY = re.compile(r"(?m)^[^\r\n:]*\\[^\r\n:]*:")
 _BLOCK_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
     rf"(?:{_SENSITIVE_KEY_PATTERN}))\s*(?:\+=|[:=])[ \t]*"
@@ -644,6 +655,27 @@ def _redact_text(text: str) -> tuple[str, int]:
         count += replacements
     redacted, replacements = _redact_malformed_keyed_values(redacted)
     return redacted, count + replacements
+
+
+def _redact_high_line_plain_text(
+    text: str,
+    *,
+    starts_inside_private_key: bool,
+) -> tuple[str, int] | None:
+    """Fast-path dense ordinary logs without attempting per-line YAML analysis."""
+    if starts_inside_private_key and _PRIVATE_KEY_END.search(text.encode()) is None:
+        trailing_newline = "\n" if text.endswith(("\n", "\r")) else ""
+        return f"[REDACTED PRIVATE KEY]{trailing_newline}", 1
+    if (
+        "\\\n" in text
+        or "\\\r\n" in text
+        or _HIGH_LINE_CONTEXTUAL_YAML.search(text) is not None
+        or _HIGH_LINE_COMPLEX_SENSITIVE_ASSIGNMENT.search(text) is not None
+        or _HIGH_LINE_EXPLICIT_YAML.search(text) is not None
+        or _HIGH_LINE_ESCAPED_MAPPING_KEY.search(text) is not None
+    ):
+        return None
+    return _redact_text(text)
 
 
 def _structured_nesting_omission(text: str) -> tuple[str, int]:
@@ -1053,6 +1085,57 @@ def _contains_sensitive_yaml_key(
     )
 
 
+def _yaml_node_sensitivity(root: Any) -> str | None:
+    """Classify composed YAML nodes without constructing application tags."""
+    found_secret = False
+    found_environment = False
+    found_assignment = False
+    seen: set[int] = set()
+    pending = [(root, 0)]
+    while pending:
+        node, depth = pending.pop()
+        if (
+            not isinstance(node, (yaml.nodes.MappingNode, yaml.nodes.SequenceNode))
+            or depth >= _MAX_STRUCTURED_DEPTH
+            or id(node) in seen
+        ):
+            continue
+        seen.add(id(node))
+        if isinstance(node, yaml.nodes.MappingNode):
+            fields: dict[str, Any] = {}
+            for key_node, value_node in node.value:
+                if isinstance(key_node, yaml.nodes.ScalarNode):
+                    key = str(key_node.value)
+                    normalized = key.casefold().replace("_", "").replace("-", "")
+                    fields[normalized] = value_node
+                    if _SENSITIVE_KEY.fullmatch(key) is not None:
+                        found_assignment = True
+                pending.append((value_node, depth + 1))
+            kind = fields.get("kind")
+            if (
+                isinstance(kind, yaml.nodes.ScalarNode)
+                and str(kind.value).casefold() == "secret"
+                and ("data" in fields or "stringdata" in fields)
+            ):
+                found_secret = True
+            name = fields.get("name")
+            if (
+                isinstance(name, yaml.nodes.ScalarNode)
+                and _SENSITIVE_KEY.fullmatch(str(name.value)) is not None
+                and "value" in fields
+            ):
+                found_environment = True
+        else:
+            pending.extend((item, depth + 1) for item in node.value)
+    if found_secret:
+        return "KUBERNETES SECRET"
+    if found_environment:
+        return "YAML ENVIRONMENT VALUE"
+    if found_assignment:
+        return "YAML ASSIGNMENT"
+    return None
+
+
 def _yaml_flow_sensitivity(text: str) -> str | None:
     """Classify a complete bounded YAML flow collection."""
     stripped = text.strip()
@@ -1075,6 +1158,13 @@ def _yaml_flow_sensitivity(text: str) -> str | None:
         try:
             parsed = yaml.safe_load(candidate)
         except (RecursionError, yaml.YAMLError):
+            try:
+                composed = yaml.compose(candidate, Loader=yaml.SafeLoader)
+            except (RecursionError, yaml.YAMLError):
+                continue
+            sensitivity = _yaml_node_sensitivity(composed)
+            if sensitivity is not None:
+                return sensitivity
             continue
         if _contains_kubernetes_secret_payload(parsed):
             return "KUBERNETES SECRET"
@@ -2467,12 +2557,30 @@ def _redacted_file_units(
             "Kubernetes Secret YAML context exceeded its bounded scan; page content was omitted fail-closed."
         )
         return [(raw, "[CONTENT OMITTED: KUBERNETES SECRET CONTEXT UNKNOWN]\n", 1)] if raw else []
-    if _yaml_flow_complexity_exceeded(raw.decode("utf-8", errors="replace")):
+    decoded_raw = raw.decode("utf-8", errors="replace")
+    line_breaks = decoded_raw.count("\n") + decoded_raw.count("\r") - decoded_raw.count("\r\n")
+    physical_lines = line_breaks + int(
+        bool(decoded_raw) and not decoded_raw.endswith(("\n", "\r"))
+    )
+    if physical_lines > _MAX_REDACTION_PHYSICAL_LINES:
+        fast_redaction = _redact_high_line_plain_text(
+            decoded_raw,
+            starts_inside_private_key=starts_inside_private_key,
+        )
+        if fast_redaction is not None:
+            safe_text, replacements = fast_redaction
+            return [(raw, safe_text, replacements)] if raw else []
+        warnings.append(
+            "Physical line count exceeded the bounded redaction work limit; "
+            "page content was omitted fail-closed."
+        )
+        return [(raw, "[CONTENT OMITTED: PHYSICAL LINE BOUND EXCEEDED]\n", 1)] if raw else []
+    if _yaml_flow_complexity_exceeded(decoded_raw):
         warnings.append(
             "YAML flow syntax exceeded the bounded parse complexity; page content was omitted fail-closed."
         )
         return [(raw, "[CONTENT OMITTED: YAML FLOW COMPLEXITY BOUND EXCEEDED]\n", 1)] if raw else []
-    if _yaml_block_complexity_exceeded(raw.decode("utf-8", errors="replace")):
+    if _yaml_block_complexity_exceeded(decoded_raw):
         warnings.append(
             "YAML block syntax exceeded the bounded parse complexity; page content was omitted fail-closed."
         )
@@ -5014,7 +5122,7 @@ def _read_file_source(
             if next_cursor is None:
                 next_cursor = next_position if next_position < stat.st_size else None
             pagination = {
-                "cursor": page_start,
+                "cursor": cursor_token if isinstance(cursor_token, str) else page_start,
                 "requested_cursor": cursor_token,
                 "cursor_unit": "source_byte",
                 "continuation_cursor_unit": "opaque_redacted_record_character",
