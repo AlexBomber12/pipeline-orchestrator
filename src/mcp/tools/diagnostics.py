@@ -58,6 +58,7 @@ _MAX_REDIS_STATE_BYTES = 1024 * 1024
 _MAX_REDIS_RUN_RECORD_BYTES = 64 * 1024
 _MAX_REDIS_RETRY_COMMAND_BYTES = 64 * 1024
 _MAX_RUN_INDEX_ENTRIES = 200
+_MAX_RUN_INDEX_MEMBER_BYTES = 512
 _MAX_FILE_SCAN_BYTES = 256 * 1024
 _MAX_PRIVATE_KEY_CONTEXT_BYTES = 1024 * 1024
 _MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES = 1024 * 1024
@@ -109,6 +110,20 @@ if ARGV[1] ~= '' then
 end
 local rows = redis.call('ZRANGE', KEYS[1], first, first + tonumber(ARGV[3]) - 1, 'WITHSCORES')
 return {total, first, rows}
+"""
+_BOUNDED_RUN_INDEX_SCRIPT = """
+local total = redis.call('LLEN', KEYS[1])
+local count = math.min(total, tonumber(ARGV[1]))
+local maximum = tonumber(ARGV[2])
+local rows = {}
+for index = 0, count - 1 do
+  local member = redis.call('LINDEX', KEYS[1], index)
+  local size = string.len(member)
+  table.insert(rows, index)
+  table.insert(rows, size)
+  table.insert(rows, size <= maximum and member or '')
+end
+return {total, rows}
 """
 
 _SENSITIVE_NAMES = (
@@ -1077,6 +1092,38 @@ def _yaml_sensitive_assignment(text: str) -> tuple[int, str] | None:
     return None
 
 
+def _yaml_alias_sensitive_assignment(
+    text: str,
+    anchors: dict[str, str],
+) -> tuple[int, str] | None:
+    """Return an alias-key assignment when its key is sensitive or unresolved."""
+    if "*" not in text or ":" not in text or _yaml_parse_complexity_exceeded(text):
+        return None
+    try:
+        tokens = list(yaml.scan(text))
+    except (RecursionError, yaml.YAMLError):
+        return None
+    for index, token in enumerate(tokens):
+        if (
+            not isinstance(token, yaml.tokens.AliasToken)
+            or index == 0
+            or not isinstance(tokens[index - 1], yaml.tokens.KeyToken)
+            or index + 1 >= len(tokens)
+            or not isinstance(tokens[index + 1], yaml.tokens.ValueToken)
+        ):
+            continue
+        prefix = text[: token.start_mark.column]
+        if re.fullmatch(r"[ \t]*(?:-[ \t]+)?", prefix) is None:
+            continue
+        resolved = _resolve_yaml_scalar(f"*{token.value}", anchors)
+        if resolved is not None and _SENSITIVE_KEY.fullmatch(resolved) is None:
+            return None
+        value_token = tokens[index + 1]
+        indent = len(prefix) - len(prefix.lstrip(" \t"))
+        return indent, text[value_token.end_mark.column :].strip()
+    return None
+
+
 def _yaml_explicit_sensitive_key(text: str) -> int | None:
     """Return the indent of a sensitive scalar used as an explicit YAML key."""
     direct = _YAML_EXPLICIT_SENSITIVE_KEY.fullmatch(text)
@@ -1431,13 +1478,18 @@ def _sensitive_state_before(
         return None, None, None, None, None, scanned_bytes
 
     context_lines = context.splitlines()
-    yaml_anchors = _yaml_scalar_anchors(context_lines)
+    yaml_anchor_states = _yaml_anchor_state_by_line(context_lines, None)
     starts_with_sensitive_value: bool | None = None
-    for raw_line in reversed(context_lines):
+    for line_index in range(len(context_lines) - 1, -1, -1):
+        raw_line = context_lines[line_index]
         if not raw_line.strip():
             continue
         line = raw_line.decode("utf-8", errors="replace")
         yaml_assignment = _yaml_sensitive_assignment(line)
+        alias_assignment = _yaml_alias_sensitive_assignment(
+            line,
+            yaml_anchor_states[line_index],
+        )
         starts_with_sensitive_value = (
             _PENDING_SENSITIVE_ASSIGNMENT.search(line) is not None
             and _BLOCK_SENSITIVE_ASSIGNMENT.fullmatch(line) is None
@@ -1446,6 +1498,12 @@ def _sensitive_state_before(
             and (
                 not yaml_assignment[1]
                 or yaml_assignment[1].startswith(("|", ">"))
+            )
+        ) or (
+            alias_assignment is not None
+            and (
+                not alias_assignment[1]
+                or alias_assignment[1].startswith(("|", ">"))
             )
         ) or _yaml_explicit_sensitive_key(line) is not None
         break
@@ -1457,7 +1515,8 @@ def _sensitive_state_before(
     )
     if first_raw_value is not None:
         value_indent = len(first_raw_value.group("indent"))
-        for raw_line in reversed(context_lines):
+        for line_index in range(len(context_lines) - 1, -1, -1):
+            raw_line = context_lines[line_index]
             if not raw_line.strip():
                 continue
             line = raw_line.decode("utf-8", errors="replace")
@@ -1472,7 +1531,10 @@ def _sensitive_state_before(
                     and len(name_match.group("indent")) == value_indent
                 )
             ):
-                name = _resolve_yaml_scalar(name_match.group("name"), yaml_anchors)
+                name = _resolve_yaml_scalar(
+                    name_match.group("name"),
+                    yaml_anchor_states[line_index],
+                )
                 starts_with_sensitive_value = name is None or _SENSITIVE_KEY.fullmatch(name) is not None
                 break
             if raw_line.lstrip().startswith(b"-") and _line_indent(raw_line) <= value_indent:
@@ -1483,7 +1545,7 @@ def _sensitive_state_before(
     block_state_known = search_start == 0
     active_block_indent: int | None = None
     pending_explicit_indent: int | None = None
-    for raw_line in context_lines:
+    for line_index, raw_line in enumerate(context_lines):
         if not raw_line.strip():
             continue
         indent = _line_indent(raw_line)
@@ -1513,6 +1575,10 @@ def _sensitive_state_before(
             or _PENDING_YAML_SENSITIVE_ASSIGNMENT.fullmatch(line)
         )
         yaml_assignment = _yaml_sensitive_assignment(line)
+        alias_assignment = _yaml_alias_sensitive_assignment(
+            line,
+            yaml_anchor_states[line_index],
+        )
         explicit_key_indent = _yaml_explicit_sensitive_key(line)
         if explicit_key_indent is not None:
             pending_explicit_indent = explicit_key_indent
@@ -1522,6 +1588,9 @@ def _sensitive_state_before(
             block_state_known = True
         elif yaml_assignment is not None:
             active_block_indent = yaml_assignment[0]
+            block_state_known = True
+        elif alias_assignment is not None:
+            active_block_indent = alias_assignment[0]
             block_state_known = True
         elif _PENDING_SENSITIVE_ASSIGNMENT.search(line) is not None:
             active_block_indent = indent
@@ -2301,6 +2370,24 @@ def _redacted_file_units(
                     line_index += 1
                     continue
             yaml_assignment = _yaml_sensitive_assignment(text_unit.rstrip("\r\n"))
+            alias_assignment = _yaml_alias_sensitive_assignment(
+                text_unit.rstrip("\r\n"),
+                yaml_anchor_states[line_index],
+            )
+            if alias_assignment is not None:
+                assignment_indent = alias_assignment[0]
+                value_end = line_index + 1
+                while value_end < len(raw_lines):
+                    if (
+                        raw_lines[value_end].strip()
+                        and _line_indent(raw_lines[value_end]) <= assignment_indent
+                    ):
+                        break
+                    value_end += 1
+                raw_unit = b"".join(raw_lines[line_index:value_end])
+                units.append((raw_unit, "[REDACTED SENSITIVE YAML ALIAS VALUE]\n", 1))
+                line_index = value_end
+                continue
             if yaml_assignment is not None:
                 assignment_indent = yaml_assignment[0]
                 value_end = line_index + 1
@@ -2849,7 +2936,30 @@ async def _relevant_runs(
     index_key = MetricsStore._recent_key(task_id or "PR", repo_slug)
     scan_limit = _MAX_RUN_INDEX_ENTRIES
     try:
-        raw_ids = await redis_client.lrange(index_key, 0, scan_limit - 1)
+        page = await redis_client.eval_ro(
+            _BOUNDED_RUN_INDEX_SCRIPT,
+            1,
+            index_key,
+            scan_limit,
+            _MAX_RUN_INDEX_MEMBER_BYTES,
+        )
+        if not isinstance(page, (list, tuple)) or len(page) != 2:
+            raise RuntimeError("Redis returned a malformed bounded run-index response.")
+        total = int(page[0])
+        flat_rows = list(page[1])
+        if len(flat_rows) % 3:
+            raise RuntimeError("Redis returned incomplete bounded run-index rows.")
+        indexed_ids = []
+        for row in range(0, len(flat_rows), 3):
+            source_index = int(flat_rows[row])
+            size_bytes = int(flat_rows[row + 1])
+            raw_id = flat_rows[row + 2]
+            observed_size = len(raw_id if isinstance(raw_id, bytes) else str(raw_id).encode())
+            if observed_size > _MAX_RUN_INDEX_MEMBER_BYTES:
+                size_bytes = max(size_bytes, observed_size)
+            indexed_ids.append(
+                (source_index, size_bytes, None if size_bytes > _MAX_RUN_INDEX_MEMBER_BYTES else raw_id)
+            )
     except Exception as exc:
         return {
             "status": "unavailable",
@@ -2860,8 +2970,26 @@ async def _relevant_runs(
     records: list[dict[str, Any]] = []
     missing = 0
     scanned = 0
-    for raw_id in raw_ids:
+    oversized_index_members = 0
+    for source_index, member_size_bytes, raw_id in indexed_ids:
         scanned += 1
+        if raw_id is None:
+            oversized_index_members += 1
+            records.append(
+                {
+                    "status": "oversized_index_member",
+                    "index": source_index,
+                    "source_size_bytes": member_size_bytes,
+                    "read_bound_bytes": _MAX_RUN_INDEX_MEMBER_BYTES,
+                    "error": (
+                        f"Stored run-index member is {member_size_bytes} bytes; "
+                        f"the diagnostic read bound is {_MAX_RUN_INDEX_MEMBER_BYTES} bytes."
+                    ),
+                }
+            )
+            if len(records) >= limit:
+                break
+            continue
         run_id = _decode(raw_id)
         try:
             raw, size_bytes, oversized = await _read_bounded_redis_value(
@@ -2904,9 +3032,10 @@ async def _relevant_runs(
         "task_filter": task_id,
         "records": records,
         "missing_indexed_records": missing,
+        "oversized_index_members": oversized_index_members,
         "scanned_index_entries": scanned,
         "scan_limit": scan_limit,
-        "truncated": len(raw_ids) >= scan_limit or len(records) >= limit,
+        "truncated": total > scanned or len(records) >= limit,
         "error": None,
     }
 
@@ -3226,6 +3355,58 @@ async def _redis_log_sources(
             client, latest_key
         )
         latest_ttl = int(await client.ttl(latest_key))
+    except Exception as exc:
+        message = _error_text(exc)
+        warnings.append(f"Redis retained CLI log unavailable: {message}")
+        sources.append(
+            {
+                "source_id": "cli:latest",
+                "kind": "retained_cli_log",
+                "storage": "redis",
+                "availability": "unavailable",
+                "error": message,
+                "association": _association(),
+            }
+        )
+    else:
+        latest_exists = latest_ttl != -2
+        latest_text = _decode(latest) if latest is not None else ""
+        if latest_oversized:
+            warnings.append(
+                "Retained CLI latest log exceeds the bounded diagnostic read limit; content was not materialized."
+            )
+        sources.append(
+            {
+                "source_id": "cli:latest",
+                "kind": "retained_cli_log",
+                "storage": "redis",
+                "availability": (
+                    "oversized"
+                    if latest_oversized
+                    else "available"
+                    if latest_exists
+                    else "missing_or_expired"
+                ),
+                "timestamps": {
+                    "recorded_at": None,
+                    **_ttl_metadata(latest_ttl, observed_at),
+                },
+                "size_chars": len(latest_text) if latest_exists and not latest_oversized else None,
+                "size_bytes": latest_size_bytes,
+                "read_bound_bytes": _MAX_REDIS_CLI_LOG_BYTES,
+                "retention": {
+                    "producer_ttl_seconds": _CLI_LATEST_TTL_SECONDS,
+                    "truncated": (
+                        latest_text.startswith("[truncated]\n") if not latest_oversized else None
+                    ),
+                    "truncation_marker_preserved": True,
+                },
+                "association": _association(),
+                "mutable": True,
+            }
+        )
+
+    try:
         event_edges, event_count, event_size_bytes, event_oversized = await _read_bounded_event_history(
             client,
             repo_slug,
@@ -3234,65 +3415,18 @@ async def _redis_log_sources(
         )
     except Exception as exc:
         message = _error_text(exc)
-        warnings.append(f"Redis diagnostic sources unavailable: {message}")
-        sources.extend(
-            [
-                {
-                    "source_id": "cli:latest",
-                    "kind": "retained_cli_log",
-                    "storage": "redis",
-                    "availability": "unavailable",
-                    "error": message,
-                    "association": _association(),
-                },
-                {
-                    "source_id": "events:redis",
-                    "kind": "repository_event_history",
-                    "storage": "redis",
-                    "availability": "unavailable",
-                    "error": message,
-                    "association": _association(),
-                },
-            ]
+        warnings.append(f"Redis event history unavailable: {message}")
+        sources.append(
+            {
+                "source_id": "events:redis",
+                "kind": "repository_event_history",
+                "storage": "redis",
+                "availability": "unavailable",
+                "error": message,
+                "association": _association(),
+            }
         )
         return sources, warnings
-
-    latest_exists = latest_ttl != -2
-    latest_text = _decode(latest) if latest is not None else ""
-    if latest_oversized:
-        warnings.append(
-            "Retained CLI latest log exceeds the bounded diagnostic read limit; content was not materialized."
-        )
-    sources.append(
-        {
-            "source_id": "cli:latest",
-            "kind": "retained_cli_log",
-            "storage": "redis",
-            "availability": (
-                "oversized"
-                if latest_oversized
-                else "available"
-                if latest_exists
-                else "missing_or_expired"
-            ),
-            "timestamps": {
-                "recorded_at": None,
-                **_ttl_metadata(latest_ttl, observed_at),
-            },
-            "size_chars": len(latest_text) if latest_exists and not latest_oversized else None,
-            "size_bytes": latest_size_bytes,
-            "read_bound_bytes": _MAX_REDIS_CLI_LOG_BYTES,
-            "retention": {
-                "producer_ttl_seconds": _CLI_LATEST_TTL_SECONDS,
-                "truncated": (
-                    latest_text.startswith("[truncated]\n") if not latest_oversized else None
-                ),
-                "truncation_marker_preserved": True,
-            },
-            "association": _association(),
-            "mutable": True,
-        }
-    )
 
     if event_oversized:
         warnings.append(

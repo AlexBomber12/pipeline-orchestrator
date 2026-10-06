@@ -133,6 +133,14 @@ class FakeRedis:
             selected = values[first : first + int(page_limit)]
             flattened = [item for member, score in selected for item in (member, score)]
             return [len(values), first, flattened]
+        if "LINDEX" in script:
+            scan_limit, member_limit = (int(item) for item in args)
+            values = self.lists.get(key, [])
+            rows: list[object] = []
+            for index, member in enumerate(values[:scan_limit]):
+                size_bytes = len(member if isinstance(member, bytes) else str(member).encode())
+                rows.extend((index, size_bytes, member if size_bytes <= member_limit else ""))
+            return [len(values), rows]
         start, stop, byte_limit = (int(item) for item in args)
         values = self.lists.get(key, [])
         size_bytes = sum(len(value if isinstance(value, bytes) else str(value).encode()) for value in values)
@@ -1218,6 +1226,49 @@ async def test_yaml_explicit_keys_are_redacted_across_retained_readers(
     assert "retained-explicit-neighbor" in inside_block["content"]
 
 
+async def test_yaml_alias_keys_are_redacted_across_retained_readers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    repos_root = tmp_path / "repos"
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+    payload = (
+        "unused: &field password\n"
+        "*field: alias-key-secret\n"
+        "blockName: &blockName api_token\n"
+        "*blockName: |\n  alias-key-block-secret\n"
+        "safeName: &safeName harmless\n"
+        "*safeName: retained-safe-alias-value\n"
+    )
+    redis.store[cli_log_latest(SLUG)] = payload
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.write_text(payload, encoding="utf-8")
+
+    for source_id in ("cli:latest", "ci:artifact"):
+        result = await diagnostics.read_orchestrator_log(
+            SLUG,
+            source_id,
+            max_chars=2_000,
+        )
+        assert "alias-key-secret" not in result["content"]
+        assert "alias-key-block-secret" not in result["content"]
+        assert "retained-safe-alias-value" in result["content"]
+
+    raw = ci_path.read_bytes()
+    inside_block = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=raw.index(b"  alias-key-block-secret"),
+        max_chars=2_000,
+    )
+    assert "alias-key-block-secret" not in inside_block["content"]
+
+
 async def test_resolved_secret_payload_keys_are_redacted_across_retained_readers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1644,6 +1695,25 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     ) == (2, "plainsecret")
     assert diagnostics._yaml_sensitive_assignment("ordinary: visible") is None
     assert diagnostics._yaml_sensitive_assignment('"pass\\u0077ord": "') is None
+    assert diagnostics._yaml_alias_sensitive_assignment(
+        "  - *field: plainsecret",
+        {"field": "password"},
+    ) == (2, "plainsecret")
+    assert diagnostics._yaml_alias_sensitive_assignment(
+        "*field: visible",
+        {"field": "harmless"},
+    ) is None
+    assert diagnostics._yaml_alias_sensitive_assignment("*missing: fail-closed", {}) == (
+        0,
+        "fail-closed",
+    )
+    assert diagnostics._yaml_alias_sensitive_assignment("ordinary: visible", {}) is None
+    assert diagnostics._yaml_alias_sensitive_assignment("*field visible", {}) is None
+    assert diagnostics._yaml_alias_sensitive_assignment('*field: "unterminated', {}) is None
+    assert diagnostics._yaml_alias_sensitive_assignment(
+        "outer: {*field: nested}",
+        {"field": "password"},
+    ) is None
     assert diagnostics._yaml_explicit_sensitive_key("? password") == 0
     assert diagnostics._yaml_explicit_sensitive_key('? "pass\\u0077ord"') == 0
     assert diagnostics._yaml_explicit_sensitive_key("? harmless") is None
@@ -2158,7 +2228,25 @@ async def test_status_helper_failures_remain_explicit() -> None:
     assert events["status"] == "unavailable"
 
     redis = FakeRedis()
-    redis.fail.add("lrange")
+    redis.fail.add("eval_ro")
+    runs = await diagnostics._relevant_runs(redis, SLUG, "PR-9", 5)
+    assert runs["status"] == "unavailable"
+
+    async def malformed_run_page(*args: Any, **kwargs: Any) -> list[object]:
+        del args, kwargs
+        return [0]
+
+    redis = FakeRedis()
+    redis.eval_ro = malformed_run_page  # type: ignore[method-assign]
+    runs = await diagnostics._relevant_runs(redis, SLUG, "PR-9", 5)
+    assert runs["status"] == "unavailable"
+
+    async def incomplete_run_rows(*args: Any, **kwargs: Any) -> list[object]:
+        del args, kwargs
+        return [1, [0]]
+
+    redis = FakeRedis()
+    redis.eval_ro = incomplete_run_rows  # type: ignore[method-assign]
     runs = await diagnostics._relevant_runs(redis, SLUG, "PR-9", 5)
     assert runs["status"] == "unavailable"
 
@@ -2297,6 +2385,42 @@ async def test_run_filtering_unavailable_record_and_limit() -> None:
     capped = await diagnostics._relevant_runs(oversized_redis, SLUG, "PR-9", 1)
     assert [item["status"] for item in capped["records"]] == ["oversized"]
 
+    oversized_member = "x" * (diagnostics._MAX_RUN_INDEX_MEMBER_BYTES + 1)
+    bounded_index_redis = FakeRedis()
+    bounded_index_redis.lists[index] = [oversized_member, "wanted"]
+    bounded_index_redis.store[MetricsStore._record_key("wanted")] = json.dumps(
+        asdict(_run("wanted"))
+    )
+    bounded_index = await diagnostics._relevant_runs(
+        bounded_index_redis,
+        SLUG,
+        "PR-9",
+        2,
+    )
+    assert bounded_index["records"][0] == {
+        "status": "oversized_index_member",
+        "index": 0,
+        "source_size_bytes": len(oversized_member),
+        "read_bound_bytes": diagnostics._MAX_RUN_INDEX_MEMBER_BYTES,
+        "error": (
+            f"Stored run-index member is {len(oversized_member)} bytes; "
+            f"the diagnostic read bound is {diagnostics._MAX_RUN_INDEX_MEMBER_BYTES} bytes."
+        ),
+    }
+    assert bounded_index["records"][1]["record"]["run_id"] == "wanted"
+    assert bounded_index["oversized_index_members"] == 1
+    assert oversized_member not in json.dumps(bounded_index)
+    assert not any(operation == "lrange" for operation, _ in bounded_index_redis.calls)
+
+    async def dishonest_run_page(*args: Any, **kwargs: Any) -> list[object]:
+        del args, kwargs
+        return [1, [0, 1, oversized_member]]
+
+    bounded_index_redis.eval_ro = dishonest_run_page  # type: ignore[method-assign]
+    dishonest = await diagnostics._relevant_runs(bounded_index_redis, SLUG, "PR-9", 1)
+    assert dishonest["records"][0]["status"] == "oversized_index_member"
+    assert dishonest["records"][0]["source_size_bytes"] == len(oversized_member)
+
     assert diagnostics._state_history(None, 2)["status"] == "unavailable"
     state = RepoState(
         url="https://github.com/octo/demo",
@@ -2366,7 +2490,30 @@ async def test_log_discovery_defensive_failures(tmp_path: Path, monkeypatch: pyt
     redis = FakeRedis()
     redis.fail.add("strlen")
     sources, warnings = await diagnostics._redis_log_sources(redis, SLUG, NOW)
-    assert all(item["availability"] == "unavailable" for item in sources)
+    by_id = {item["source_id"]: item for item in sources}
+    assert by_id["cli:latest"]["availability"] == "unavailable"
+    assert by_id["events:redis"]["availability"] == "empty"
+    assert warnings
+
+    redis = FakeRedis()
+    redis.store[cli_log_latest(SLUG)] = "retained"
+    original_eval_ro = redis.eval_ro
+
+    async def corrupt_event_history(
+        script: str,
+        numkeys: int,
+        key: str,
+        *args: object,
+    ) -> list[object]:
+        if key == repo_events_history(SLUG):
+            raise TypeError("event history has the wrong Redis type")
+        return await original_eval_ro(script, numkeys, key, *args)
+
+    redis.eval_ro = corrupt_event_history  # type: ignore[method-assign]
+    sources, warnings = await diagnostics._redis_log_sources(redis, SLUG, NOW)
+    by_id = {item["source_id"]: item for item in sources}
+    assert by_id["cli:latest"]["availability"] == "available"
+    assert by_id["events:redis"]["availability"] == "unavailable"
     assert warnings
 
     redis = FakeRedis()
