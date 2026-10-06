@@ -544,11 +544,14 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                 "  opaque: redis-kube-yaml-secret\n"
                 "kind: Secret\nmetadata:\n  annotations:\n    note: |\n      ---\n"
                 "stringData: {config: redis-kube-yaml-inline-secret}\n"
-                "---\nkind: Pod\nspec:\n  env:\n"
+                "---\nkind: Pod\ncredentialName: &credentialName PASSWORD\n"
+                "safeName: &safeName SAFE\nspec:\n  env:\n"
                 "    - name: PASSWORD\n      value: redis-kube-yaml-env-secret\n"
                 "    - value: redis-reversed-yaml-env-secret\n      name: PASSWORD\n"
                 "    -\n      value: redis-standalone-yaml-env-secret\n      name: API_KEY\n"
                 "    - name: &credential PASSWORD\n      value: redis-decorated-yaml-env-secret\n"
+                "    - name: *credentialName\n      value: redis-aliased-yaml-env-secret\n"
+                "    - name: *safeName\n      value: retained-aliased-yaml-env-value\n"
                 "---\nkind: List\nitems:\n"
                 "  - kind: Secret\n    data:\n      opaque: redis-list-kube-secret\n"
                 "  - data:\n      opaque: redis-reversed-list-kube-secret\n    kind: Secret\n"
@@ -556,6 +559,10 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                 "---\nkind: Secret\ndata: {\n  opaque: redis-kube-flow-secret\n}\n"
                 "---\nkind: Secret\ndata: &payload\n  opaque: redis-kube-anchor-secret\n"
                 "---\nkind: &resourceKind Secret\ndata:\n  opaque: redis-decorated-kind-secret\n"
+                "---\nkindValue: &kindValue Secret\nkind: *kindValue\n"
+                "data:\n  opaque: redis-aliased-kind-secret\n"
+                "---\nkindValue: &configKind ConfigMap\nkind: *configKind\n"
+                "data:\n  harmless: retained-aliased-config-value\n"
                 "---\nkind: ConfigMap\ndata:\n  harmless: retained-config-value"
             ),
             json.dumps({"auths": {"registry": {"auth": docker_auth}}, "debug": True}),
@@ -656,11 +663,14 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "  opaque: ci-kube-yaml-secret\n"
         + "kind: Secret\nmetadata:\n  annotations:\n    note: |\n      ---\n"
         + "stringData: {config: ci-kube-yaml-inline-secret}\n"
-        + "---\nkind: Pod\nspec:\n  env:\n"
+        + "---\nkind: Pod\ncredentialName: &credentialName PASSWORD\n"
+        + "safeName: &safeName SAFE\nspec:\n  env:\n"
         + "    - name: PASSWORD\n      value: ci-kube-yaml-env-secret\n"
         + "    - value: ci-reversed-yaml-env-secret\n      name: PASSWORD\n"
         + "    -\n      value: ci-standalone-yaml-env-secret\n      name: API_KEY\n"
         + "    - name: &credential PASSWORD\n      value: ci-decorated-yaml-env-secret\n"
+        + "    - name: *credentialName\n      value: ci-aliased-yaml-env-secret\n"
+        + "    - name: *safeName\n      value: retained-ci-aliased-yaml-env-value\n"
         + "---\nkind: List\nitems:\n"
         + "  - kind: Secret\n    data:\n      opaque: ci-list-kube-secret\n"
         + "  - data:\n      opaque: ci-reversed-list-kube-secret\n    kind: Secret\n"
@@ -668,7 +678,11 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "---\nkind: Secret\ndata: {\n  opaque: ci-kube-flow-secret\n}\n"
         + "---\nkind: Secret\ndata: &payload\n  opaque: ci-kube-anchor-secret\n"
         + "---\nkind: &resourceKind Secret\ndata:\n  opaque: ci-decorated-kind-secret\n"
-        + "{apiVersion: v1, kind: Secret, data: {opaque: ci-kube-single-flow-secret}}\n"
+        + "---\nkindValue: &kindValue Secret\nkind: *kindValue\n"
+        + "data:\n  opaque: ci-aliased-kind-secret\n"
+        + "---\nkindValue: &configKind ConfigMap\nkind: *configKind\n"
+        + "data:\n  harmless: retained-ci-aliased-config-value\n"
+        + "---\n{apiVersion: v1, kind: Secret, data: {opaque: ci-kube-single-flow-secret}}\n"
         + "{kind: ConfigMap, data: {harmless: retained-ci-single-flow-config}}\n"
         + "---\nkind: ConfigMap\ndata:\n  harmless: retained-ci-config-value\n"
         + '2026-10-05 INFO {"password":987654322,"debug":true}\n',
@@ -743,11 +757,15 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-reversed-yaml-env-secret" not in content
         assert "redis-standalone-yaml-env-secret" not in content
         assert "redis-decorated-yaml-env-secret" not in content
+        assert "redis-aliased-yaml-env-secret" not in content
+        assert "retained-aliased-yaml-env-value" in content
         assert "redis-list-kube-secret" not in content
         assert "redis-reversed-list-kube-secret" not in content
         assert "redis-kube-flow-secret" not in content
         assert "redis-kube-anchor-secret" not in content
         assert "redis-decorated-kind-secret" not in content
+        assert "redis-aliased-kind-secret" not in content
+        assert "retained-aliased-config-value" in content
         assert "redis-kube-single-flow-secret" not in content
         assert "redis-kube-prefixed-flow-secret" not in content
         assert "retained-list-config-value" in content
@@ -789,6 +807,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-reversed-yaml-env-secret" not in content
         assert "ci-standalone-yaml-env-secret" not in content
         assert "ci-decorated-yaml-env-secret" not in content
+        assert "ci-aliased-yaml-env-secret" not in content
         assert docker_auth not in content
         assert "ci-toml-first-secret" not in content
         assert "ci-toml-second-secret" not in content
@@ -829,10 +848,13 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-kube-flow-secret" not in content
         assert "ci-kube-anchor-secret" not in content
         assert "ci-decorated-kind-secret" not in content
+        assert "ci-aliased-kind-secret" not in content
         if source_id == "ci:artifact":
             assert "retained-ci-list-config-value" in content
             assert "ci-kube-single-flow-secret" not in content
             assert "retained-ci-single-flow-config" in content
+            assert "retained-ci-aliased-yaml-env-value" in content
+            assert "retained-ci-aliased-config-value" in content
 
     ci_raw = ci_path.read_bytes()
     sequence_page = await diagnostics.read_orchestrator_log(
@@ -915,6 +937,24 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
     )
     assert "ci-decorated-yaml-env-secret" not in decorated_env_page["content"]
     assert "SENSITIVE" in decorated_env_page["content"]
+
+    aliased_kind_page = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=ci_raw.index(b"  opaque: ci-aliased-kind-secret"),
+        max_chars=300,
+    )
+    assert "ci-aliased-kind-secret" not in aliased_kind_page["content"]
+    assert "SENSITIVE" in aliased_kind_page["content"]
+
+    aliased_env_page = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=ci_raw.index(b"      value: ci-aliased-yaml-env-secret"),
+        max_chars=300,
+    )
+    assert "ci-aliased-yaml-env-secret" not in aliased_env_page["content"]
+    assert "SENSITIVE" in aliased_env_page["content"]
 
     triple_quote_continuation = await diagnostics.read_orchestrator_log(
         SLUG,
@@ -1152,6 +1192,31 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     assert diagnostics._yaml_flow_delta("{'value': ']'}") == 0
     assert diagnostics._yaml_flow_delta("{ # ignored }") == 1
     assert diagnostics._yaml_node_scalar("&resourceKind !!str 'Secret'") == "Secret"
+    anchors = diagnostics._yaml_scalar_anchors(
+        [
+            b"kindValue: &kindValue Secret\n",
+            b'note: "fake &kindValue ConfigMap"\n',
+            b"literal: |\n  fake: &kindValue ConfigMap\n",
+            b"aliasValue: &aliasValue *kindValue\n",
+            b"taggedValue: &taggedValue !!str Secret\n",
+        ]
+    )
+    assert diagnostics._resolve_yaml_scalar("*aliasValue", anchors) == "Secret"
+    assert diagnostics._resolve_yaml_scalar("*taggedValue", anchors) == "Secret"
+    assert diagnostics._resolve_yaml_scalar("*missing", anchors) is None
+    assert diagnostics._resolve_yaml_scalar("*cycle", {"cycle": "*cycle"}) is None
+    assert diagnostics._yaml_scalar_anchors(
+        [b"kindValue: &kindValue Secret\n", b"---\n", b"kindValue: &kindValue ConfigMap\n"]
+    ) == {"kindValue": "ConfigMap"}
+    assert diagnostics._kubernetes_yaml_payload_flags(
+        [
+            b"kind: *laterKind\n",
+            b"data:\n",
+            b"  opaque: fail-closed\n",
+            b"kindValue: &laterKind ConfigMap\n",
+        ],
+        starts_inside_secret=False,
+    ) == [True, True, True, True]
     assert diagnostics._is_single_line_flow_yaml_secret(
         "[{kind: ConfigMap, data: {safe: visible}}, {data: {opaque: hidden}, kind: Secret}]"
     )
@@ -2346,6 +2411,7 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
         False,
         None,
         None,
+        {},
         2,
     )
     assert diagnostics._kubernetes_yaml_payload_flags(
@@ -2374,6 +2440,7 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
         None,
         None,
         None,
+        {},
         4,
     )
     monkeypatch.setattr(diagnostics, "_MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES", 5)
@@ -2381,7 +2448,7 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
         BytesIO(b"x\nfoo:"),
         6,
         b"  child: value\n",
-    ) == (None, None, False, None, None, None, 5)
+    ) == (None, None, False, None, None, None, {}, 5)
     monkeypatch.setattr(
         diagnostics,
         "_MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES",

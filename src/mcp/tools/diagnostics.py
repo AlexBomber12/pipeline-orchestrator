@@ -182,6 +182,7 @@ _YAML_ENV_VALUE = re.compile(
 )
 _YAML_SEQUENCE_ITEM_ONLY = re.compile(r"^(?P<indent>[ \t]*)-[ \t]*(?:#.*)?$")
 _YAML_NODE_PREFIX = re.compile(r"^(?:&[^\s]+|![^\s]+)(?:\s+|$)")
+_YAML_ALIAS_SCALAR = re.compile(r"^\*(?P<anchor>[^\s,\[\]{}]+)$")
 _YAML_FLOW_KIND_SECRET = re.compile(
     r"(?i)(?:[{,][ \t]*)(?:[\"']?kind[\"']?)[ \t]*:[ \t]*"
     r"(?:[\"']?secret[\"']?)(?=[ \t]*[,}])"
@@ -771,6 +772,84 @@ def _yaml_node_scalar(value: str) -> str:
     return remainder.strip().strip("\"'")
 
 
+def _yaml_anchor_definitions(lines: list[bytes]) -> list[tuple[int, str, str]]:
+    """Tokenize real scalar-anchor definitions with their bounded line index."""
+    document = b"".join(
+        raw_line if raw_line.endswith((b"\n", b"\r")) else raw_line + b"\n"
+        for raw_line in lines
+    ).decode("utf-8", errors="replace")
+    try:
+        tokens = list(yaml.scan(document))
+    except (RecursionError, yaml.YAMLError):
+        return []
+    definitions: list[tuple[int, str, str]] = []
+    for index, token in enumerate(tokens):
+        if not isinstance(token, yaml.tokens.AnchorToken):
+            continue
+        value_index = index + 1
+        while value_index < len(tokens) and isinstance(tokens[value_index], yaml.tokens.TagToken):
+            value_index += 1
+        value_token = tokens[value_index] if value_index < len(tokens) else None
+        if isinstance(value_token, yaml.tokens.ScalarToken):
+            definitions.append((token.start_mark.line, token.value, str(value_token.value)))
+        elif isinstance(value_token, yaml.tokens.AliasToken):
+            definitions.append((token.start_mark.line, token.value, f"*{value_token.value}"))
+    return definitions
+
+
+def _yaml_scalar_anchors(lines: list[bytes]) -> dict[str, str]:
+    """Collect scalar anchors from the current bounded YAML document."""
+    document_start = 0
+    for index, raw_line in enumerate(lines):
+        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+        if _YAML_DOCUMENT_BOUNDARY.fullmatch(line):
+            document_start = index + 1
+    return {
+        name: value
+        for _line, name, value in _yaml_anchor_definitions(lines[document_start:])
+    }
+
+
+def _yaml_anchor_state_by_line(
+    lines: list[bytes],
+    inherited: dict[str, str] | None,
+) -> list[dict[str, str]]:
+    """Map each bounded line to its document-local scalar anchor table."""
+    states: list[dict[str, str]] = [{} for _ in lines]
+    document_start = 0
+    for boundary in range(len(lines) + 1):
+        at_end = boundary == len(lines)
+        line = "" if at_end else lines[boundary].decode("utf-8", errors="replace").rstrip("\r\n")
+        if not at_end and _YAML_DOCUMENT_BOUNDARY.fullmatch(line) is None:
+            continue
+        anchors = dict(inherited or {}) if document_start == 0 else {}
+        definitions: dict[int, list[tuple[str, str]]] = {}
+        for local_line, name, value in _yaml_anchor_definitions(lines[document_start:boundary]):
+            definitions.setdefault(local_line, []).append((name, value))
+        for local_line in range(boundary - document_start):
+            if local_line in definitions:
+                anchors = dict(anchors)
+                anchors.update(definitions[local_line])
+            states[document_start + local_line] = anchors
+        if not at_end:
+            states[boundary] = {}
+        document_start = boundary + 1
+    return states
+
+
+def _resolve_yaml_scalar(value: str, anchors: dict[str, str]) -> str | None:
+    """Resolve a scalar alias through bounded, document-local anchor state."""
+    resolved = _yaml_node_scalar(value)
+    visited: set[str] = set()
+    while alias := _YAML_ALIAS_SCALAR.fullmatch(resolved):
+        name = alias.group("anchor")
+        if name in visited or name not in anchors:
+            return None
+        visited.add(name)
+        resolved = _yaml_node_scalar(anchors[name])
+    return resolved
+
+
 def _has_line_continuation(raw_line: bytes) -> bool:
     content = raw_line.rstrip(b"\r\n")
     trailing_backslashes = len(content) - len(content.rstrip(b"\\"))
@@ -800,6 +879,7 @@ def _yaml_env_item(
     start: int,
     *,
     has_more_after_raw: bool,
+    yaml_anchors: dict[str, str] | None = None,
 ) -> tuple[int, bool, bool] | None:
     """Return a YAML env item boundary and whether its value is sensitive or uncertain."""
     first = raw_lines[start].decode("utf-8", errors="replace").rstrip("\r\n")
@@ -834,7 +914,7 @@ def _yaml_env_item(
                 break
         end += 1
 
-    fields: list[tuple[int, str, str]] = []
+    fields: list[tuple[int, str, str | None]] = []
     for raw_line in raw_lines[start:end]:
         line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
         name_match = _YAML_ENV_NAME.fullmatch(line)
@@ -844,7 +924,13 @@ def _yaml_env_item(
             continue
         effective_indent = len(match.group("indent")) + len(match.group("dash") or "")
         if name_match is not None:
-            fields.append((effective_indent, "name", _yaml_node_scalar(name_match.group("name"))))
+            fields.append(
+                (
+                    effective_indent,
+                    "name",
+                    _resolve_yaml_scalar(name_match.group("name"), yaml_anchors or {}),
+                )
+            )
         else:
             fields.append((effective_indent, "value", value_match.group("value")))
     if not fields:
@@ -853,7 +939,9 @@ def _yaml_env_item(
     direct_fields = [field for field in fields if field[0] == direct_indent]
     has_value = any(field[1] == "value" for field in direct_fields)
     names = [field[2] for field in direct_fields if field[1] == "name"]
-    sensitive = has_value and any(_SENSITIVE_KEY.fullmatch(name) is not None for name in names)
+    sensitive = has_value and any(
+        name is None or _SENSITIVE_KEY.fullmatch(name) is not None for name in names
+    )
     uncertain = has_value and not names and end == len(raw_lines) and has_more_after_raw
     return end, sensitive, uncertain
 
@@ -877,6 +965,7 @@ def _sensitive_state_before(
         context = context[newline + 1 :]
 
     context_lines = context.splitlines()
+    yaml_anchors = _yaml_scalar_anchors(context_lines)
     starts_with_sensitive_value: bool | None = None
     for raw_line in reversed(context_lines):
         if not raw_line.strip():
@@ -910,8 +999,8 @@ def _sensitive_state_before(
                     and len(name_match.group("indent")) == value_indent
                 )
             ):
-                name = _yaml_node_scalar(name_match.group("name"))
-                starts_with_sensitive_value = _SENSITIVE_KEY.fullmatch(name) is not None
+                name = _resolve_yaml_scalar(name_match.group("name"), yaml_anchors)
+                starts_with_sensitive_value = name is None or _SENSITIVE_KEY.fullmatch(name) is not None
                 break
             if raw_line.lstrip().startswith(b"-") and _line_indent(raw_line) <= value_indent:
                 break
@@ -1020,11 +1109,12 @@ def _kubernetes_yaml_state_before(
     bool | None,
     int | None,
     int | None,
+    dict[str, str],
     int,
 ]:
     """Recover Kubernetes Secret YAML document and payload-block state."""
     if offset <= 0:
-        return False, None, False, False, None, None, 0
+        return False, None, False, False, None, None, {}, 0
     search_start = max(0, offset - _MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES)
     handle.seek(search_start)
     context = handle.read(offset - search_start)
@@ -1032,7 +1122,7 @@ def _kubernetes_yaml_state_before(
     if search_start > 0:
         newline = context.find(b"\n")
         if newline < 0:
-            return None, None, False, None, None, None, scanned_bytes
+            return None, None, False, None, None, None, {}, scanned_bytes
         context = context[newline + 1 :]
 
     state_known = search_start == 0
@@ -1040,7 +1130,10 @@ def _kubernetes_yaml_state_before(
     kind_seen = False
     payload_indent: int | None = None
     payload_flow_depth: int | None = None
-    for raw_line in context.splitlines():
+    context_lines = context.splitlines(keepends=True)
+    yaml_anchor_states = _yaml_anchor_state_by_line(context_lines, None)
+    yaml_anchors = yaml_anchor_states[-1] if yaml_anchor_states else {}
+    for context_index, raw_line in enumerate(context.splitlines()):
         if not raw_line.strip():
             continue
         indent = _line_indent(raw_line)
@@ -1076,7 +1169,8 @@ def _kubernetes_yaml_state_before(
         kind_match = _YAML_KIND_ASSIGNMENT.fullmatch(line)
         if kind_match is not None:
             state_known = True
-            if _yaml_node_scalar(kind_match.group("kind")).casefold() == "secret":
+            kind = _resolve_yaml_scalar(kind_match.group("kind"), yaml_anchor_states[context_index])
+            if kind is None or kind.casefold() == "secret":
                 secret_scopes.append(
                     (
                         len(kind_match.group("indent")),
@@ -1102,7 +1196,6 @@ def _kubernetes_yaml_state_before(
             payload_indent = None
             payload_flow_depth = None
 
-    context_lines = context.splitlines(keepends=True)
     combined_lines = context_lines + raw.splitlines(keepends=True)
     combined_flags = _kubernetes_yaml_payload_flags(
         combined_lines,
@@ -1180,6 +1273,7 @@ def _kubernetes_yaml_state_before(
         starts_inside_payload,
         payload_indent,
         payload_flow_depth,
+        yaml_anchors,
         scanned_bytes,
     )
 
@@ -1201,6 +1295,7 @@ def _kubernetes_yaml_payload_flags(
         if not at_end and _YAML_DOCUMENT_BOUNDARY.fullmatch(line) is None:
             continue
         document_lines = raw_lines[document_start:boundary]
+        yaml_anchor_states = _yaml_anchor_state_by_line(document_lines, None)
         kind_matches: list[tuple[int, re.Match[str]]] = []
         has_payload = False
         for local_index, document_line in enumerate(document_lines):
@@ -1226,7 +1321,11 @@ def _kubernetes_yaml_payload_flags(
             for index in range(document_start, document_start + inherited_end):
                 flags[index] = True
         for local_index, kind_match in kind_matches:
-            if _yaml_node_scalar(kind_match.group("kind")).casefold() != "secret":
+            kind = _resolve_yaml_scalar(
+                kind_match.group("kind"),
+                yaml_anchor_states[local_index],
+            )
+            if kind is not None and kind.casefold() != "secret":
                 continue
             kind_indent = len(kind_match.group("indent"))
             sequence_scope = kind_match.group("dash") is not None
@@ -1276,6 +1375,7 @@ def _redacted_file_units(
     starts_inside_kubernetes_secret_data: bool | None = False,
     kubernetes_secret_data_indent: int | None = None,
     kubernetes_secret_data_flow_depth: int | None = None,
+    yaml_scalar_anchors: dict[str, str] | None = None,
 ) -> list[tuple[bytes, str, int]]:
     """Redact complete logical units while preserving their source byte sizes."""
     if starts_inside_private_key is None:
@@ -1311,6 +1411,7 @@ def _redacted_file_units(
         inherited_kind_seen=kubernetes_kind_context_known,
     )
     units: list[tuple[bytes, str, int]] = []
+    yaml_anchor_states = _yaml_anchor_state_by_line(raw_lines, yaml_scalar_anchors)
     line_index = 0
     if starts_inside_kubernetes_secret_data and kubernetes_secret_data_indent is not None:
         payload_end = 0
@@ -1398,6 +1499,7 @@ def _redacted_file_units(
             raw_lines,
             line_index,
             has_more_after_raw=has_more_after_raw,
+            yaml_anchors=yaml_anchor_states[line_index],
         )
         if env_item is not None:
             item_end, sensitive_env, uncertain_env = env_item
@@ -3266,6 +3368,7 @@ def _read_file_source(
                 starts_inside_kubernetes_secret_data,
                 kubernetes_secret_data_indent,
                 kubernetes_secret_data_flow_depth,
+                yaml_scalar_anchors,
                 kubernetes_context_scanned_bytes,
             ) = _kubernetes_yaml_state_before(handle, page_start, raw)
             text = raw.decode("utf-8", errors="replace")
@@ -3285,6 +3388,7 @@ def _read_file_source(
                 starts_inside_kubernetes_secret_data=starts_inside_kubernetes_secret_data,
                 kubernetes_secret_data_indent=kubernetes_secret_data_indent,
                 kubernetes_secret_data_flow_depth=kubernetes_secret_data_flow_depth,
+                yaml_scalar_anchors=yaml_scalar_anchors,
             )
             redacted = "".join(unit[1] for unit in redaction_units)
             replacements = sum(unit[2] for unit in redaction_units)
@@ -3420,6 +3524,7 @@ def _read_file_source(
                 starts_inside_kubernetes_secret_data,
                 kubernetes_secret_data_indent,
                 kubernetes_secret_data_flow_depth,
+                yaml_scalar_anchors,
                 kubernetes_context_scanned_bytes,
             ) = _kubernetes_yaml_state_before(handle, page_start, raw)
             redaction_units = _redacted_file_units(
@@ -3438,6 +3543,7 @@ def _read_file_source(
                 starts_inside_kubernetes_secret_data=starts_inside_kubernetes_secret_data,
                 kubernetes_secret_data_indent=kubernetes_secret_data_indent,
                 kubernetes_secret_data_flow_depth=kubernetes_secret_data_flow_depth,
+                yaml_scalar_anchors=yaml_scalar_anchors,
             )
 
             parts: list[str] = []
