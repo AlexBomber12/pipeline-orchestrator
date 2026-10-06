@@ -1455,6 +1455,59 @@ async def test_decorated_yaml_mapping_keys_are_redacted_across_retained_readers(
         assert "tagged-value-field-secret" not in page["content"]
 
 
+async def test_multiline_explicit_yaml_keys_are_redacted_across_retained_readers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    repos_root = tmp_path / "repos"
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+    payload = (
+        "? >-\n  password\n: multiline-credential-secret\n"
+        "safe: retained-after-multiline-credential\n"
+        "---\nkind: Secret\n? >-\n  data\n:\n"
+        "  opaque: multiline-payload-key-secret\n"
+        "---\nkind: Pod\nenv:\n"
+        "  - name: PASSWORD\n    ? >-\n      value\n"
+        "    : multiline-env-key-secret\n"
+        "  - name: SAFE\n    value: retained-after-multiline-env\n"
+    )
+    redis.store[cli_log_latest(SLUG)] = payload
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.write_text(payload, encoding="utf-8")
+
+    for source_id in ("cli:latest", "ci:artifact"):
+        result = await diagnostics.read_orchestrator_log(
+            SLUG,
+            source_id,
+            max_chars=4_000,
+        )
+        assert "multiline-credential-secret" not in result["content"]
+        assert "multiline-payload-key-secret" not in result["content"]
+        assert "multiline-env-key-secret" not in result["content"]
+        assert "retained-after-multiline-credential" in result["content"]
+        assert "retained-after-multiline-env" in result["content"]
+
+    raw = ci_path.read_bytes()
+    for excerpt, secret in (
+        (b"  password", "multiline-credential-secret"),
+        (b": multiline-credential-secret", "multiline-credential-secret"),
+        (b"  opaque: multiline-payload-key-secret", "multiline-payload-key-secret"),
+        (b"    : multiline-env-key-secret", "multiline-env-key-secret"),
+    ):
+        page = await diagnostics.read_orchestrator_log(
+            SLUG,
+            "ci:artifact",
+            cursor=raw.index(excerpt),
+            max_chars=4_000,
+        )
+        assert secret not in page["content"]
+
+
 async def test_truncated_redis_logs_omit_unknown_leading_sensitive_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1808,6 +1861,17 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
         "*field",
     )
     assert diagnostics._yaml_has_payload_mapping_key("? !!str data") is True
+    assert diagnostics._yaml_composed_documents(
+        [b"a: b\n" * (diagnostics._MAX_YAML_BLOCK_MAPPING_LINES + 1)]
+    ) == []
+    with monkeypatch.context() as depth_patch:
+        depth_patch.setattr(diagnostics, "_MAX_STRUCTURED_DEPTH", 0)
+        assert diagnostics._yaml_sensitive_mapping_lines(
+            [b"? >-\n", b"  password\n", b": hidden\n"]
+        ) == set()
+        assert diagnostics._yaml_sensitive_env_lines(
+            [b"- name: PASSWORD\n", b"  ? >-\n", b"    value\n", b"  : hidden\n"]
+        ) == set()
     assert diagnostics._yaml_kind_entries(
         [
             b"? kind\n",

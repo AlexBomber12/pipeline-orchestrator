@@ -1368,6 +1368,7 @@ def _yaml_secret_payload_lines(lines: list[bytes]) -> set[int]:
         if (
             candidate.startswith("<<:")
             or (candidate.startswith("*") and ":" in candidate)
+            or candidate.startswith(("? |", "? >"))
             or (
                 (
                     candidate.startswith("? ")
@@ -1457,6 +1458,108 @@ def _yaml_secret_payload_lines(lines: list[bytes]) -> set[int]:
 
     walk(root)
     return payload_lines
+
+
+def _yaml_composed_documents(lines: list[bytes]) -> list[Any]:
+    """Compose bounded YAML documents for semantic redaction helpers."""
+    document = b"".join(
+        raw_line if raw_line.endswith((b"\n", b"\r")) else raw_line + b"\n"
+        for raw_line in lines
+    ).decode("utf-8", errors="replace")
+    if _yaml_parse_complexity_exceeded(document):
+        return []
+    try:
+        return list(yaml.compose_all(document, Loader=yaml.SafeLoader))
+    except (RecursionError, yaml.YAMLError):
+        return []
+
+
+def _yaml_node_line_span(node: Any) -> range:
+    start = node.start_mark.line
+    end = node.end_mark.line
+    if end == start or node.end_mark.column > 0:
+        end += 1
+    return range(start, max(start + 1, end))
+
+
+def _yaml_sensitive_mapping_lines(lines: list[bytes]) -> set[int]:
+    """Find value spans for multiline explicit sensitive YAML keys."""
+    if not any(
+        raw_line.decode("utf-8", errors="replace").lstrip().startswith(("? |", "? >"))
+        for raw_line in lines
+    ):
+        return set()
+    sensitive_lines: set[int] = set()
+    visited: set[int] = set()
+
+    def walk(node: Any, depth: int = 0) -> None:
+        if not isinstance(node, (yaml.nodes.MappingNode, yaml.nodes.SequenceNode)):
+            return
+        identity = id(node)
+        if identity in visited or depth >= _MAX_STRUCTURED_DEPTH:
+            return
+        visited.add(identity)
+        if isinstance(node, yaml.nodes.MappingNode):
+            for key_node, value_node in node.value:
+                if (
+                    isinstance(key_node, yaml.nodes.ScalarNode)
+                    and _SENSITIVE_KEY.fullmatch(str(key_node.value)) is not None
+                ):
+                    sensitive_lines.update(_yaml_node_line_span(key_node))
+                    sensitive_lines.update(_yaml_node_line_span(value_node))
+                walk(value_node, depth + 1)
+        else:
+            for item in node.value:
+                walk(item, depth + 1)
+
+    for root in _yaml_composed_documents(lines):
+        walk(root)
+    return sensitive_lines
+
+
+def _yaml_sensitive_env_lines(lines: list[bytes]) -> set[int]:
+    """Find composed YAML environment items with sensitive name/value siblings."""
+    if not any(
+        raw_line.decode("utf-8", errors="replace").lstrip().startswith(("? |", "? >"))
+        for raw_line in lines
+    ):
+        return set()
+    sensitive_lines: set[int] = set()
+    visited: set[int] = set()
+
+    def walk(node: Any, depth: int = 0) -> None:
+        if not isinstance(node, (yaml.nodes.MappingNode, yaml.nodes.SequenceNode)):
+            return
+        identity = id(node)
+        if identity in visited or depth >= _MAX_STRUCTURED_DEPTH:
+            return
+        visited.add(identity)
+        if isinstance(node, yaml.nodes.MappingNode):
+            fields = {
+                str(key_node.value).casefold(): value_node
+                for key_node, value_node in node.value
+                if isinstance(key_node, yaml.nodes.ScalarNode)
+                and str(key_node.value).casefold() in {"name", "value"}
+            }
+            name_node = fields.get("name")
+            if (
+                name_node is not None
+                and "value" in fields
+                and (
+                    not isinstance(name_node, yaml.nodes.ScalarNode)
+                    or _SENSITIVE_KEY.fullmatch(str(name_node.value)) is not None
+                )
+            ):
+                sensitive_lines.update(_yaml_node_line_span(node))
+            for _key_node, value_node in node.value:
+                walk(value_node, depth + 1)
+        else:
+            for item in node.value:
+                walk(item, depth + 1)
+
+    for root in _yaml_composed_documents(lines):
+        walk(root)
+    return sensitive_lines
 
 
 def _yaml_scalar_anchors(lines: list[bytes]) -> dict[str, str]:
@@ -1835,6 +1938,23 @@ def _sensitive_state_before(
     else:
         starts_inside_sensitive_quote = None
 
+    combined_lines = context_lines + raw.splitlines()
+    raw_line_index = len(context_lines)
+    semantic_sensitive_lines = _yaml_sensitive_mapping_lines(combined_lines)
+    semantic_sensitive_lines.update(_yaml_sensitive_env_lines(combined_lines))
+    first_raw_index = next(
+        (
+            raw_line_index + index
+            for index, raw_line in enumerate(raw.splitlines())
+            if raw_line.strip()
+        ),
+        None,
+    )
+    if first_raw_index is not None and first_raw_index in semantic_sensitive_lines:
+        starts_with_sensitive_value = False
+        starts_inside_sensitive_block = True
+        active_block_indent = -2
+
     return (
         starts_with_sensitive_value,
         starts_inside_sensitive_block,
@@ -2191,6 +2311,8 @@ def _redacted_file_units(
         )
         return [(raw, "[CONTENT OMITTED: YAML BLOCK COMPLEXITY BOUND EXCEEDED]\n", 1)] if raw else []
     raw_lines = raw.splitlines(keepends=True)
+    semantic_sensitive_yaml_lines = _yaml_sensitive_mapping_lines(raw_lines)
+    semantic_sensitive_yaml_lines.update(_yaml_sensitive_env_lines(raw_lines))
     semantic_kubernetes_payload_lines: set[int] = set()
     kubernetes_payload_flags = _kubernetes_yaml_payload_flags(
         raw_lines,
@@ -2235,7 +2357,23 @@ def _redacted_file_units(
         line_index = quote_end
     elif starts_inside_sensitive_block and sensitive_block_indent is not None:
         block_end = 0
-        if sensitive_block_indent == -1:
+        if sensitive_block_indent == -2:
+            while block_end < len(raw_lines):
+                explicit_value = _YAML_EXPLICIT_VALUE.fullmatch(
+                    raw_lines[block_end].decode("utf-8", errors="replace").rstrip("\r\n")
+                )
+                if explicit_value is None:
+                    block_end += 1
+                    continue
+                explicit_end = _yaml_explicit_value_end(
+                    raw_lines,
+                    block_end,
+                    minimum_indent=0,
+                    has_more_after_raw=has_more_after_raw,
+                )
+                block_end = explicit_end[0] if explicit_end is not None else block_end + 1
+                break
+        elif sensitive_block_indent == -1:
             while block_end < len(raw_lines):
                 continued = _has_line_continuation(raw_lines[block_end])
                 block_end += 1
@@ -2259,6 +2397,8 @@ def _redacted_file_units(
             marker = (
                 "[REDACTED SENSITIVE CONTINUATION]\n"
                 if sensitive_block_indent == -1
+                else "[REDACTED SENSITIVE YAML VALUE]\n"
+                if sensitive_block_indent == -2
                 else (
                     "[REDACTED SENSITIVE VALUE]\n"
                     if starts_with_sensitive_value
@@ -2299,6 +2439,14 @@ def _redacted_file_units(
         raw_unit = raw_lines[line_index]
         text_unit = raw_unit.decode("utf-8", errors="replace")
         stripped_unit = text_unit.rstrip("\r\n")
+        if line_index in semantic_sensitive_yaml_lines:
+            semantic_end = line_index + 1
+            while semantic_end in semantic_sensitive_yaml_lines:
+                semantic_end += 1
+            raw_unit = b"".join(raw_lines[line_index:semantic_end])
+            units.append((raw_unit, "[REDACTED SENSITIVE YAML VALUE]\n", 1))
+            line_index = semantic_end
+            continue
         flow_end = line_index + 1
         flow_depth = _yaml_flow_delta(stripped_unit)
         if flow_depth > 0:
