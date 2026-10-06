@@ -3548,6 +3548,29 @@ def test_settings_repo_list_marks_builtin_coder_override_selected(
     assert 'option value="codex" selected' in response.text
 
 
+def test_settings_repo_list_shows_custom_coder_override_as_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/custom-repo.git\n"
+        "    branch: main\n"
+        "    coder: third\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/settings/repo-list")
+
+    assert response.status_code == 200
+    assert 'option value="third" selected disabled' in response.text
+    assert "third (configured)" in response.text
+
+
 def test_update_daemon_rate_limit_session(
     empty_config: Path,
     monkeypatch: pytest.MonkeyPatch,
