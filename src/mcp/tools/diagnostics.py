@@ -255,7 +255,7 @@ _SENSITIVE_JSON_KEY_PREFIX = re.compile(
 _PENDING_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
     rf"(?<![A-Za-z0-9_.-])(?:{_SENSITIVE_KEY_PATTERN})(?![A-Za-z0-9_.-]))"
-    r"\s*[:=][ \t]*(?:[|>][-+]?)?[ \t]*$"
+    r"\s*(?:\+=|[:=])[ \t]*(?:[|>][-+]?)?[ \t]*$"
 )
 _PENDING_YAML_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
@@ -309,22 +309,22 @@ _YAML_FLOW_SECRET_PAYLOAD = re.compile(
 )
 _BLOCK_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
-    rf"(?:{_SENSITIVE_KEY_PATTERN}))\s*[:=][ \t]*"
+    rf"(?:{_SENSITIVE_KEY_PATTERN}))\s*(?:\+=|[:=])[ \t]*"
     r"[|>](?:[1-9][-+]?|[-+][1-9]?|)[ \t]*(?:#.*)?$"
 )
 _QUOTED_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
     rf"(?<![A-Za-z0-9_.-])(?:{_SENSITIVE_KEY_PATTERN})(?![A-Za-z0-9_.-]))"
-    r"\s*[:=][ \t]*(?P<quote>\"\"\"|'''|[\"'])(?P<value>.*)$"
+    r"\s*(?:\+=|[:=])[ \t]*(?P<quote>\"\"\"|'''|[\"'])(?P<value>.*)$"
 )
 _PLAIN_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
-    rf"(?:{_SENSITIVE_KEY_PATTERN}))\s*[:=][ \t]*(?P<value>(?![\"'|>])\S.*)$"
+    rf"(?:{_SENSITIVE_KEY_PATTERN}))\s*(?:\+=|[:=])[ \t]*(?P<value>(?![\"'|>])\S.*)$"
 )
 _PREFIXED_PLAIN_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
     rf"(?<![A-Za-z0-9_.-])(?:{_SENSITIVE_KEY_PATTERN})(?![A-Za-z0-9_.-]))"
-    r"\s*[:=][ \t]*(?P<value>(?![\"'|>])\S.*)$"
+    r"\s*(?:\+=|[:=])[ \t]*(?P<value>(?![\"'|>])\S.*)$"
 )
 _REDACTION_RULES = (
     (
@@ -377,7 +377,7 @@ _REDACTION_RULES = (
     (
         re.compile(
             rf"(?im)((?<![A-Za-z0-9_-])(?:{_SENSITIVE_KEY_PATTERN})"
-            r"(?![A-Za-z0-9_-])\s*[:=]\s*)"
+            r"(?![A-Za-z0-9_-])\s*(?:\+=|[:=])\s*)"
             r"(?P<assignment_quote>\"\"\"|'''|[\"'])"
             r"(?:\\[^\r\n]|(?!(?P=assignment_quote))[^\\\r\n])*"
             r"(?P=assignment_quote)?"
@@ -387,7 +387,8 @@ _REDACTION_RULES = (
     (
         re.compile(
             rf"(?im)((?<![A-Za-z0-9_-])(?:{_SENSITIVE_KEY_PATTERN})"
-            r"(?![A-Za-z0-9_-])\s*[:=](?![ \t]*\[REDACTED\])[ \t]*)"
+            r"(?![A-Za-z0-9_-])\s*(?:\+=|[:=])"
+            r"(?![ \t]*\[REDACTED\])[ \t]*)"
             r"(?:bearer[ \t]+|basic[ \t]+)?[^\r\n]*"
         ),
         r"\1[REDACTED]",
@@ -1519,13 +1520,74 @@ def _yaml_sensitive_mapping_lines(lines: list[bytes]) -> set[int]:
 
 def _yaml_sensitive_env_lines(lines: list[bytes]) -> set[int]:
     """Find composed YAML environment items with sensitive name/value siblings."""
-    if not any(
-        raw_line.decode("utf-8", errors="replace").lstrip().startswith(("? |", "? >"))
-        for raw_line in lines
-    ):
+    requires_composition = False
+    for raw_line in lines:
+        candidate = raw_line.decode("utf-8", errors="replace").lstrip(" \t")
+        if candidate.startswith("- "):
+            candidate = candidate[2:].lstrip(" \t")
+        key_source = candidate.split(":", 1)[0]
+        if (
+            candidate.startswith("<<:")
+            or (candidate.startswith("*") and ":" in candidate)
+            or candidate.startswith(("? |", "? >"))
+            or (candidate.startswith("? ") and "*" in key_source)
+        ):
+            requires_composition = True
+            break
+    if not requires_composition:
         return set()
+
     sensitive_lines: set[int] = set()
     visited: set[int] = set()
+    field_cache: dict[int, tuple[dict[str, Any], bool]] = {}
+    resolving: set[int] = set()
+
+    def merged_mappings(node: Any) -> tuple[list[Any], bool]:
+        if isinstance(node, yaml.nodes.MappingNode):
+            return [node], False
+        if isinstance(node, yaml.nodes.SequenceNode):
+            mappings = [
+                item for item in node.value if isinstance(item, yaml.nodes.MappingNode)
+            ]
+            return mappings, len(mappings) != len(node.value)
+        return [], True
+
+    def resolved_fields(
+        node: Any,
+        depth: int = 0,
+    ) -> tuple[dict[str, Any], bool]:
+        identity = id(node)
+        if identity in field_cache:
+            return field_cache[identity]
+        if identity in resolving or depth >= _MAX_STRUCTURED_DEPTH:
+            return {}, True
+        resolving.add(identity)
+        fields: dict[str, Any] = {}
+        uncertain = False
+        merges: list[Any] = []
+        for key_node, value_node in node.value:
+            if not isinstance(key_node, yaml.nodes.ScalarNode):
+                continue
+            key = str(key_node.value).casefold()
+            if key_node.tag == "tag:yaml.org,2002:merge" or key == "<<":
+                merged, malformed = merged_mappings(value_node)
+                merges.extend(merged)
+                uncertain = uncertain or malformed
+        for merged in merges:
+            merged_fields, merged_uncertain = resolved_fields(merged, depth + 1)
+            uncertain = uncertain or merged_uncertain
+            for key, value in merged_fields.items():
+                fields.setdefault(key, value)
+        for key_node, value_node in node.value:
+            if not isinstance(key_node, yaml.nodes.ScalarNode):
+                continue
+            key = str(key_node.value).casefold()
+            if key in {"name", "value"}:
+                fields[key] = value_node
+        resolving.remove(identity)
+        result = fields, uncertain
+        field_cache[identity] = result
+        return result
 
     def walk(node: Any, depth: int = 0) -> None:
         if not isinstance(node, (yaml.nodes.MappingNode, yaml.nodes.SequenceNode)):
@@ -1535,22 +1597,19 @@ def _yaml_sensitive_env_lines(lines: list[bytes]) -> set[int]:
             return
         visited.add(identity)
         if isinstance(node, yaml.nodes.MappingNode):
-            fields = {
-                str(key_node.value).casefold(): value_node
-                for key_node, value_node in node.value
-                if isinstance(key_node, yaml.nodes.ScalarNode)
-                and str(key_node.value).casefold() in {"name", "value"}
-            }
+            fields, uncertain = resolved_fields(node)
             name_node = fields.get("name")
+            value_node = fields.get("value")
             if (
-                name_node is not None
-                and "value" in fields
+                value_node is not None
                 and (
-                    not isinstance(name_node, yaml.nodes.ScalarNode)
+                    (name_node is None and uncertain)
+                    or not isinstance(name_node, yaml.nodes.ScalarNode)
                     or _SENSITIVE_KEY.fullmatch(str(name_node.value)) is not None
                 )
             ):
                 sensitive_lines.update(_yaml_node_line_span(node))
+                sensitive_lines.update(_yaml_node_line_span(value_node))
             for _key_node, value_node in node.value:
                 walk(value_node, depth + 1)
         else:

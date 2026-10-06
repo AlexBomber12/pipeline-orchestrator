@@ -1508,6 +1508,103 @@ async def test_multiline_explicit_yaml_keys_are_redacted_across_retained_readers
         assert secret not in page["content"]
 
 
+async def test_indirect_yaml_env_fields_are_redacted_across_retained_readers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    repos_root = tmp_path / "repos"
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+    payload = (
+        "fieldName: &fieldName name\nvalueField: &valueField value\n"
+        "credentialEnv: &credentialEnv\n"
+        "  name: CLIENT_SECRET\n  value: direct-composed-env-secret\n"
+        "nameOnly: &nameOnly\n  name: PASSWORD\n"
+        "valueOnly: &valueOnly\n  value: split-merged-env-secret\n"
+        "safeEnv: &safeEnv\n  name: SAFE\n  value: retained-safe-merged-env\n"
+        "env:\n"
+        "  - *fieldName: PASSWORD\n    *valueField: aliased-field-env-secret\n"
+        "  - <<: *credentialEnv\n"
+        "  - <<: [*nameOnly, *valueOnly]\n"
+        "  - <<: *safeEnv\n"
+    )
+    redis.store[cli_log_latest(SLUG)] = payload
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.write_text(payload, encoding="utf-8")
+
+    for source_id in ("cli:latest", "ci:artifact"):
+        result = await diagnostics.read_orchestrator_log(
+            SLUG,
+            source_id,
+            max_chars=4_000,
+        )
+        assert "direct-composed-env-secret" not in result["content"]
+        assert "split-merged-env-secret" not in result["content"]
+        assert "aliased-field-env-secret" not in result["content"]
+        assert "retained-safe-merged-env" in result["content"]
+
+    raw = ci_path.read_bytes()
+    for secret in (b"direct-composed-env-secret", b"aliased-field-env-secret"):
+        page = await diagnostics.read_orchestrator_log(
+            SLUG,
+            "ci:artifact",
+            cursor=raw.index(secret),
+            max_chars=4_000,
+        )
+        assert secret.decode() not in page["content"]
+
+
+async def test_shell_append_assignments_are_redacted_across_retained_readers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    repos_root = tmp_path / "repos"
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+    payload = (
+        "PASSWORD+=plain-append-secret\n"
+        "+ PASSWORD+=xtrace-append-secret\n"
+        'PASSWORD+="quoted-append-secret"\n'
+        "+ PASSWORD+=continued-append-secret\\\n"
+        "continued-append-secret-two\n"
+        "SAFE+=retained-safe-append\n"
+    )
+    redis.store[cli_log_latest(SLUG)] = payload
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.write_text(payload, encoding="utf-8")
+
+    for source_id in ("cli:latest", "ci:artifact"):
+        result = await diagnostics.read_orchestrator_log(
+            SLUG,
+            source_id,
+            max_chars=4_000,
+        )
+        assert "plain-append-secret" not in result["content"]
+        assert "xtrace-append-secret" not in result["content"]
+        assert "quoted-append-secret" not in result["content"]
+        assert "continued-append-secret" not in result["content"]
+        assert "continued-append-secret-two" not in result["content"]
+        assert "retained-safe-append" in result["content"]
+
+    raw = ci_path.read_bytes()
+    continuation = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=raw.index(b"continued-append-secret-two"),
+        max_chars=4_000,
+    )
+    assert "continued-append-secret-two" not in continuation["content"]
+    assert "retained-safe-append" in continuation["content"]
+
+
 async def test_truncated_redis_logs_omit_unknown_leading_sensitive_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1872,6 +1969,17 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
         assert diagnostics._yaml_sensitive_env_lines(
             [b"- name: PASSWORD\n", b"  ? >-\n", b"    value\n", b"  : hidden\n"]
         ) == set()
+    assert diagnostics._yaml_sensitive_env_lines(
+        [
+            b"- <<: scalar\n",
+            b"  ? [complex, key]\n",
+            b"  : ignored\n",
+            b"  value: hidden\n",
+        ]
+    ) == {0, 1, 2, 3}
+    assert diagnostics._yaml_sensitive_env_lines(
+        [b"env: &env\n", b"  <<: *env\n", b"  value: hidden\n"]
+    ) == {0, 1, 2}
     assert diagnostics._yaml_kind_entries(
         [
             b"? kind\n",
