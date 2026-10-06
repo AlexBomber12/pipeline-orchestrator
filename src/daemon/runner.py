@@ -926,7 +926,6 @@ class PipelineRunner(
                 providers = self._build_usage_provider_map_for_app_config(config)
                 claude = providers["claude"]
                 codex = providers["codex"]
-                assert claude is not None and codex is not None
                 self.set_usage_providers(
                     claude,
                     codex,

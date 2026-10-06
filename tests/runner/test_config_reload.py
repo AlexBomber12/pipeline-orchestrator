@@ -10,6 +10,7 @@ import asyncio
 
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
+from src.coders import build_coder_registry
 from src.config import AppConfig, CoderType, DaemonConfig, RepoConfig
 from src.models import PipelineState
 
@@ -47,6 +48,38 @@ def test_reload_repo_config_if_dirty_updates_coder_at_idle_boundary(
     assert (
         runner.state.history[-1]["event"]
         == "[INFRA] Reloaded repo config from config.yml."
+    )
+
+
+def test_dirty_reload_applies_telemetryless_builtin_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner()
+    dirty_key = "control:octo__demo:config_dirty"
+    runner.redis.store[dirty_key] = "1"
+    reloaded = AppConfig(
+        repositories=[runner.repo_config],
+        daemon=DaemonConfig(coder="claude"),
+        coder_plugins={
+            "claude": (
+                "tests.configured_coder_plugin:build_claude_override"
+            )
+        },
+    )
+    runner._registry = build_coder_registry(reloaded)
+    monkeypatch.setattr(
+        runner_module,
+        "load_config",
+        lambda path="config.yml": reloaded,
+    )
+
+    asyncio.run(runner.reload_repo_config_if_dirty())
+
+    assert dirty_key not in runner.redis.store
+    assert runner._claude_usage_provider is None
+    assert runner._usage_providers["claude"] is None
+    assert runner.state.history[-1]["event"] == (
+        "[INFRA] Reloaded repo config from config.yml."
     )
 
 
