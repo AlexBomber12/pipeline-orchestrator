@@ -400,7 +400,11 @@ class FixMixin(BreachMixin):
         if plugin.supports_breach_lifecycle:
             breach_monitor = asyncio.create_task(
                 self._monitor_inflight_breach(
-                    breach_dir, breach_run_id, claude_task, breach_flag,
+                    breach_dir,
+                    breach_run_id,
+                    plugin.name,
+                    claude_task,
+                    breach_flag,
                 )
             )
         external_state_monitor = self._run_coder_with_polling(
@@ -452,7 +456,12 @@ class FixMixin(BreachMixin):
             if coder_result is not None:
                 self._record_unconfirmed_launch_cleanup(coder_result)
             if plugin.supports_breach_lifecycle:
-                self._check_late_breach(breach_dir, breach_run_id, breach_flag)
+                self._check_late_breach(
+                    breach_dir,
+                    breach_run_id,
+                    plugin.name,
+                    breach_flag,
+                )
                 self._cleanup_breach_marker(breach_dir, breach_run_id)
             cleanup_confirmed = await self._confirm_current_coder_cleanup(
                 "FIX completion"

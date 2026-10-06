@@ -1602,8 +1602,12 @@ def test_coding_deletes_expected_branch_on_late_breach_pause(
         return (0, "ok", "")
 
     def fake_check_late_breach(
-        breach_dir: Any, run_id: Any, breach_flag: dict[str, bool]
+        breach_dir: Any,
+        run_id: Any,
+        coder_name: str,
+        breach_flag: dict[str, bool],
     ) -> None:
+        assert coder_name == "claude"
         breach_flag["breached"] = True
 
     monkeypatch.setattr(plugin, "run_auto_pr", fake_run_auto_pr)

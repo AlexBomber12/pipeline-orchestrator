@@ -1651,6 +1651,7 @@ def test_handle_fix_stop_cancel_resets_no_push_counter(
         self: object,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,  # type: ignore[type-arg]
         breach_flag: dict[str, bool],
     ) -> None:
@@ -1778,6 +1779,7 @@ def test_handle_fix_finishes_push_bookkeeping_before_stop_cancel_pause(
         self: object,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,  # type: ignore[type-arg]
         breach_flag: dict[str, bool],
     ) -> None:
@@ -1862,6 +1864,7 @@ def test_handle_fix_stop_cancel_skips_push_bookkeeping_when_remote_head_is_stale
         self: object,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,  # type: ignore[type-arg]
         breach_flag: dict[str, bool],
     ) -> None:
@@ -1946,6 +1949,7 @@ def test_handle_fix_stop_cancel_records_push_when_remote_advanced_past_local_hea
         self: object,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,  # type: ignore[type-arg]
         breach_flag: dict[str, bool],
     ) -> None:
@@ -2765,6 +2769,7 @@ def test_handle_fix_ignores_initial_rev_parse_failure_and_logs_iteration_zero(
         self: object,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,  # type: ignore[type-arg]
         breach_flag: dict[str, bool],
     ) -> None:
@@ -2809,6 +2814,7 @@ def test_handle_fix_reraises_unexpected_cancelled_error(
         self: object,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,  # type: ignore[type-arg]
         breach_flag: dict[str, bool],
     ) -> None:
@@ -2971,6 +2977,7 @@ def test_handle_fix_stop_cancel_returns_when_rev_parse_after_fix_fails(
         self: object,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,
         breach_flag: dict[str, bool],
     ) -> None:
@@ -3034,6 +3041,7 @@ def test_handle_fix_stop_cancel_logs_fetch_failure_after_stop(
         self: object,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,
         breach_flag: dict[str, bool],
     ) -> None:
@@ -3095,6 +3103,7 @@ def test_handle_fix_stop_cancel_logs_remote_rev_parse_failure_after_stop(
         self: object,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,
         breach_flag: dict[str, bool],
     ) -> None:
@@ -3158,6 +3167,7 @@ def test_handle_fix_stop_cancel_logs_merge_base_failure_after_stop(
         self: object,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,
         breach_flag: dict[str, bool],
     ) -> None:
@@ -3215,6 +3225,7 @@ def test_handle_fix_stop_cancel_short_circuits_when_head_matches_before(
         self: object,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,
         breach_flag: dict[str, bool],
     ) -> None:
@@ -3277,6 +3288,7 @@ def test_handle_fix_stop_cancel_errors_when_review_post_fails(
         self: object,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,
         breach_flag: dict[str, bool],
     ) -> None:

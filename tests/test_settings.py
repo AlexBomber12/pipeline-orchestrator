@@ -1004,6 +1004,34 @@ def test_arbitrary_plugin_model_round_trips_without_core_field(
     }
 
 
+def test_configured_custom_daemon_coder_renders_as_read_only_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "coder_plugins:\n"
+        "  third: tests.configured_coder_plugin:build_test_plugin\n"
+        "daemon:\n"
+        "  coder: third\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        rendered = client.get("/partials/settings/coders")
+
+    assert rendered.status_code == 200
+    assert "Configured Test Coder" in rendered.text
+    assert "Configured default (read-only)" in rendered.text
+    assert not re.search(
+        r'<input type="radio"[^>]*value="third"',
+        rendered.text,
+        re.DOTALL,
+    )
+
+
 def test_reasoning_effort_choices_render_from_selected_model_and_match_api(
     empty_config: Path,
 ) -> None:

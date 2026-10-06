@@ -156,7 +156,11 @@
                                hx-target="#settings-daemon"
                                hx-swap="innerHTML">
                         {% else %}
+                        {% if coder.is_default %}
+                        <span class="text-xs font-medium text-accent">Configured default (read-only)</span>
+                        {% else %}
                         <span class="text-xs text-gray-500">Metadata only</span>
+                        {% endif %}
                         {% endif %}
                     </td>
                 </tr>

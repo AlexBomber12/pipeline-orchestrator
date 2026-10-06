@@ -567,7 +567,11 @@ class CodingMixin:
         if plugin.supports_breach_lifecycle:
             breach_monitor = asyncio.create_task(
                 self._monitor_inflight_breach(
-                    breach_dir, breach_run_id, cli_task, breach_flag,
+                    breach_dir,
+                    breach_run_id,
+                    plugin.name,
+                    cli_task,
+                    breach_flag,
                 )
             )
         stop_monitor = asyncio.create_task(self._monitor_stop_request(cli_task))
@@ -685,7 +689,12 @@ class CodingMixin:
             if result is not None:
                 self._record_unconfirmed_launch_cleanup(result)
             if plugin.supports_breach_lifecycle:
-                self._check_late_breach(breach_dir, breach_run_id, breach_flag)
+                self._check_late_breach(
+                    breach_dir,
+                    breach_run_id,
+                    plugin.name,
+                    breach_flag,
+                )
                 self._cleanup_breach_marker(breach_dir, breach_run_id)
             cleanup_confirmed = await self._confirm_current_coder_cleanup(
                 "CODING completion"

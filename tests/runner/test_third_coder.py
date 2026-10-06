@@ -326,6 +326,18 @@ def test_configured_plugin_reaches_normal_coding_and_fix_dispatch(
         codex_provider,
         registry=registry,
     )
+    breach_attributions: list[str] = []
+
+    def capture_late_breach(
+        breach_dir: str,
+        run_id: str,
+        coder_name: str,
+        breach_flag: dict[str, bool],
+    ) -> None:
+        del breach_dir, run_id, breach_flag
+        breach_attributions.append(coder_name)
+
+    monkeypatch.setattr(runner, "_check_late_breach", capture_late_breach)
     runner.repo_path = str(tmp_path)
     (tmp_path / ".git" / "info").mkdir(parents=True)
     (tmp_path / "tasks").mkdir()
@@ -359,6 +371,7 @@ def test_configured_plugin_reaches_normal_coding_and_fix_dispatch(
     plugin = registry.get("third")
     assert len(plugin.run_auto_pr_calls) == 1
     assert plugin.run_auto_pr_calls[0]["model"] == "third-default"
+    assert breach_attributions == ["third"]
     assert runner.state.coder == "third"
     assert runner.state.state == PipelineState.WATCH
 
@@ -372,6 +385,7 @@ def test_configured_plugin_reaches_normal_coding_and_fix_dispatch(
 
     assert len(plugin.fix_review_calls) == 1
     assert plugin.fix_review_calls[0]["model"] == "third-default"
+    assert breach_attributions == ["third", "third"]
     assert runner.state.state == PipelineState.WATCH
 
 
