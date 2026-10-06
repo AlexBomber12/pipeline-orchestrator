@@ -435,15 +435,22 @@ def test_scalar_validation_and_configured_repo_guards(monkeypatch: pytest.Monkey
 
     assert diagnostics._utc_now().tzinfo is timezone.utc
     sentinel = object()
+    redis_options = {}
+
+    def capture_redis_options(url: str, **options: object) -> object:
+        redis_options["url"] = url
+        redis_options.update(options)
+        return sentinel
+
     monkeypatch.setenv("REDIS_URL", "redis://example.invalid/1")
-    monkeypatch.setattr(
-        diagnostics.aioredis,
-        "from_url",
-        lambda url, *, decode_responses: sentinel
-        if url == "redis://example.invalid/1" and decode_responses is False
-        else None,
-    )
+    monkeypatch.setattr(diagnostics.aioredis, "from_url", capture_redis_options)
     assert diagnostics._new_redis_client() is sentinel
+    assert redis_options == {
+        "url": "redis://example.invalid/1",
+        "decode_responses": False,
+        "socket_connect_timeout": diagnostics._REDIS_TIMEOUT_SECONDS,
+        "socket_timeout": diagnostics._REDIS_TIMEOUT_SECONDS,
+    }
     assert diagnostics._timestamp(NOW) == NOW
     assert diagnostics._timestamp(datetime(2026, 1, 1)) == datetime(2026, 1, 1, tzinfo=timezone.utc)
     assert diagnostics._timestamp("2026-01-01T00:00:00Z") is not None

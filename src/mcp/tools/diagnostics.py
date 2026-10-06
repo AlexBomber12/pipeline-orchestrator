@@ -30,6 +30,7 @@ from src.retry_commands import RetryCommand
 from src.utils import repo_slug_from_url
 
 _DEFAULT_REDIS_URL = "redis://localhost:6379/0"
+_REDIS_TIMEOUT_SECONDS = 5.0
 _REPO_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*__[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _TASK_ID = re.compile(r"^PR-[1-9][0-9]*$")
 _SHA = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -159,6 +160,8 @@ def _new_redis_client() -> Any:
     return aioredis.from_url(
         os.environ.get("REDIS_URL", _DEFAULT_REDIS_URL),
         decode_responses=False,
+        socket_connect_timeout=_REDIS_TIMEOUT_SECONDS,
+        socket_timeout=_REDIS_TIMEOUT_SECONDS,
     )
 
 
