@@ -2023,6 +2023,12 @@ async def test_sensitive_hcl_blocks_are_redacted_across_retained_readers(
         'variable "escaped_pass\\u0077ord" {\n'
         '  default = "escaped-label-hcl-secret"\n'
         '}\n'
+        'variable "heredoc_password" {\n'
+        '  default = <<EOF\n'
+        '  } ignored-heredoc-brace\n'
+        '  hcl-heredoc-after-brace-secret\n'
+        'EOF\n'
+        '}\n'
         'output "api_token" {\n'
         '  /* multiline-comment-start\n'
         '  } ignored-comment-brace\n'
@@ -2050,13 +2056,18 @@ async def test_sensitive_hcl_blocks_are_redacted_across_retained_readers(
         )
         assert "inline-hcl-secret" not in result["content"]
         assert "escaped-label-hcl-secret" not in result["content"]
+        assert "hcl-heredoc-after-brace-secret" not in result["content"]
         assert "nested-hcl-secret" not in result["content"]
         assert "quoted-brace-secondary-secret" not in result["content"]
         assert "malformed-label-hcl-secret" not in result["content"]
         assert "retained-safe-hcl-region" in result["content"]
 
     raw = ci_path.read_bytes()
-    for secret in (b"escaped-label-hcl-secret", b"nested-hcl-secret"):
+    for secret in (
+        b"escaped-label-hcl-secret",
+        b"hcl-heredoc-after-brace-secret",
+        b"nested-hcl-secret",
+    ):
         page = await diagnostics.read_orchestrator_log(
             SLUG,
             "ci:artifact",
@@ -2111,6 +2122,11 @@ async def test_sensitive_hcl_blocks_are_redacted_across_retained_readers(
         warnings=[],
     )
     assert dense[0][1] == "[CONTENT OMITTED: PHYSICAL LINE BOUND EXCEEDED]\n"
+    assert diagnostics._hcl_brace_delta("default = <<$BAD") == (
+        0,
+        False,
+        ("", False),
+    )
 
 
 async def test_truncated_redis_logs_omit_unknown_leading_sensitive_context(

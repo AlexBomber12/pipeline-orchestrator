@@ -1961,9 +1961,19 @@ def _hcl_block_label_is_sensitive(match: re.Match[str]) -> bool:
     return not isinstance(label, str) or _SENSITIVE_KEY.fullmatch(label) is not None
 
 
-def _hcl_brace_delta(text: str, inside_comment: bool = False) -> tuple[int, bool]:
+def _hcl_brace_delta(
+    text: str,
+    inside_comment: bool = False,
+    heredoc: tuple[str, bool] | None = None,
+) -> tuple[int, bool, tuple[str, bool] | None]:
     """Count HCL braces while ignoring quoted strings and comments."""
     delta = 0
+    if heredoc is not None:
+        return (0, inside_comment, None) if _heredoc_terminator(text, heredoc) else (
+            0,
+            inside_comment,
+            heredoc,
+        )
     quote: str | None = None
     escaped = False
     index = 0
@@ -1971,7 +1981,7 @@ def _hcl_brace_delta(text: str, inside_comment: bool = False) -> tuple[int, bool
         if inside_comment:
             end = text.find("*/", index)
             if end < 0:
-                return delta, True
+                return delta, True, heredoc
             inside_comment = False
             index = end + 2
             continue
@@ -1990,6 +2000,14 @@ def _hcl_brace_delta(text: str, inside_comment: bool = False) -> tuple[int, bool
             continue
         elif following == "//" or character == "#":
             break
+        elif following == "<<":
+            match = _SENSITIVE_HEREDOC_START.match(text, index)
+            heredoc = (
+                (match.group("delimiter"), match.group("strip") == "-")
+                if match is not None
+                else ("", False)
+            )
+            break
         elif character in {'"', "'"}:
             quote = character
         elif character == "{":
@@ -1997,10 +2015,12 @@ def _hcl_brace_delta(text: str, inside_comment: bool = False) -> tuple[int, bool
         elif character == "}":
             delta -= 1
         index += 1
-    return delta, inside_comment
+    return delta, inside_comment, heredoc
 
 
-def _sensitive_hcl_block_state(text: str) -> tuple[int, bool] | None:
+def _sensitive_hcl_block_state(
+    text: str,
+) -> tuple[int, bool, tuple[str, bool] | None] | None:
     match = _HCL_BLOCK_START.search(text)
     if match is None or not _hcl_block_label_is_sensitive(match):
         return None
@@ -2304,18 +2324,24 @@ def _sensitive_state_before(
 
     active_hcl_depth = 0
     active_hcl_comment = False
+    active_hcl_heredoc: tuple[str, bool] | None = None
     for raw_line in context_lines:
         line = raw_line.decode("utf-8", errors="replace")
         if active_hcl_depth > 0:
-            delta, active_hcl_comment = _hcl_brace_delta(line, active_hcl_comment)
+            delta, active_hcl_comment, active_hcl_heredoc = _hcl_brace_delta(
+                line,
+                active_hcl_comment,
+                active_hcl_heredoc,
+            )
             active_hcl_depth += delta
             if active_hcl_depth <= 0:
                 active_hcl_depth = 0
                 active_hcl_comment = False
+                active_hcl_heredoc = None
             continue
         hcl_state = _sensitive_hcl_block_state(line)
         if hcl_state is not None and hcl_state[0] > 0:
-            active_hcl_depth, active_hcl_comment = hcl_state
+            active_hcl_depth, active_hcl_comment, active_hcl_heredoc = hcl_state
     if active_hcl_depth > 0:
         starts_inside_sensitive_block = True
         active_block_indent = _encode_hcl_block_state(
@@ -2357,6 +2383,9 @@ def _sensitive_state_before(
     if active_heredoc is not None:
         starts_inside_sensitive_quote = True
         active_quote = _heredoc_state(active_heredoc)
+    if active_hcl_depth > 0 and active_hcl_heredoc is not None:
+        starts_inside_sensitive_quote = True
+        active_quote = _heredoc_state(active_hcl_heredoc)
 
     combined_lines = context_lines + raw.splitlines()
     raw_line_index = len(context_lines)
@@ -2789,11 +2818,19 @@ def _redacted_file_units(
         and sensitive_block_indent <= -_HCL_BLOCK_STATE_BASE
     ):
         hcl_depth, hcl_comment = _decode_hcl_block_state(sensitive_block_indent)
+        hcl_heredoc = (
+            _heredoc_from_state(sensitive_quote)
+            if starts_inside_sensitive_quote
+            and sensitive_quote is not None
+            and sensitive_quote.startswith(_HEREDOC_STATE_PREFIX)
+            else None
+        )
         hcl_end = 0
         while hcl_end < len(raw_lines) and hcl_depth > 0:
-            delta, hcl_comment = _hcl_brace_delta(
+            delta, hcl_comment, hcl_heredoc = _hcl_brace_delta(
                 raw_lines[hcl_end].decode("utf-8", errors="replace"),
                 hcl_comment,
+                hcl_heredoc,
             )
             hcl_depth += delta
             hcl_end += 1
@@ -3070,12 +3107,13 @@ def _redacted_file_units(
         else:
             hcl_state = _sensitive_hcl_block_state(text_unit.rstrip("\r\n"))
             if hcl_state is not None:
-                hcl_depth, hcl_comment = hcl_state
+                hcl_depth, hcl_comment, hcl_heredoc = hcl_state
                 hcl_end = line_index + 1
                 while hcl_end < len(raw_lines) and hcl_depth > 0:
-                    delta, hcl_comment = _hcl_brace_delta(
+                    delta, hcl_comment, hcl_heredoc = _hcl_brace_delta(
                         raw_lines[hcl_end].decode("utf-8", errors="replace"),
                         hcl_comment,
+                        hcl_heredoc,
                     )
                     hcl_depth += delta
                     hcl_end += 1
