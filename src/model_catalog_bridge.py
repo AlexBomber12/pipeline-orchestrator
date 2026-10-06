@@ -281,9 +281,19 @@ class DaemonModelCatalogLoader:
         config: AppConfig,
         config_path: str,
     ) -> ModelCatalog:
-        del config, config_path
+        del config_path
+        try:
+            expected_reference = config.coder_plugins[plugin.name]
+        except KeyError:
+            raise ModelCatalogUnavailable(
+                "Daemon model catalog is unavailable"
+            ) from None
         return _parse_catalog(
-            await self._request(plugin.name, operation="catalog")
+            await self._request(
+                plugin.name,
+                operation="catalog",
+                expected_reference=expected_reference,
+            )
         )
 
     async def load_plugin_metadata(
@@ -418,10 +428,7 @@ async def handle_model_catalog_request(
         or not all(character in "0123456789abcdef" for character in request_id)
         or not isinstance(plugin_name, str)
         or operation not in {"auth", "catalog", "metadata"}
-        or (
-            operation in {"auth", "metadata"}
-            and not isinstance(expected_reference, str)
-        )
+        or not isinstance(expected_reference, str)
         or not isinstance(expires_at, (int, float))
     ):
         return
@@ -435,7 +442,7 @@ async def handle_model_catalog_request(
     try:
         plugin = registry.get(plugin_name)
         reference = registry.reference_for(plugin_name)
-        if operation in {"auth", "metadata"} and expected_reference != reference:
+        if expected_reference != reference:
             await _store_response(
                 redis_client,
                 request_id,

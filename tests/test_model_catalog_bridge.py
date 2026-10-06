@@ -238,6 +238,13 @@ async def test_loader_reports_queue_read_payload_timeout_and_cleanup_failures(
             config_path="config.yml",
         )
 
+    with pytest.raises(ModelCatalogUnavailable, match="unavailable"):
+        await bridge.DaemonModelCatalogLoader(_BridgeRedis())(
+            plugin,
+            config=AppConfig.model_construct(coder_plugins={}),
+            config_path="config.yml",
+        )
+
 
 @pytest.mark.parametrize(
     "payload",
@@ -526,6 +533,7 @@ async def test_daemon_handler_isolates_configured_catalog(
             {
                 "request_id": "c" * 32,
                 "plugin": "codex",
+                "reference": "operator.plugin:factory",
                 "expires_at": time.time() + 10,
             }
         ),
@@ -536,6 +544,25 @@ async def test_daemon_handler_isolates_configured_catalog(
     response = json.loads(redis.values[bridge._response_key("c" * 32)])
     assert response["ok"] is True
     assert response["catalog"]["source"] == "configured"
+
+    await bridge.handle_model_catalog_request(
+        redis,
+        registry,
+        json.dumps(
+            {
+                "request_id": "d" * 32,
+                "plugin": "codex",
+                "reference": "old.plugin:factory",
+                "expires_at": time.time() + 10,
+            }
+        ),
+        config_path="/cfg",
+    )
+    assert calls == [("codex", "operator.plugin:factory", "/cfg")]
+    assert json.loads(redis.values[bridge._response_key("d" * 32)]) == {
+        "ok": False,
+        "error": "plugin reference mismatch",
+    }
 
 
 @pytest.mark.asyncio
@@ -567,6 +594,7 @@ async def test_daemon_handler_ignores_invalid_and_expires_stale_requests(
             {
                 "request_id": request_id,
                 "plugin": "codex",
+                "reference": "src.coders.codex:CodexPlugin",
                 "expires_at": 99,
             }
         ).encode(),
@@ -584,6 +612,7 @@ async def test_daemon_handler_ignores_invalid_and_expires_stale_requests(
             {
                 "request_id": "b" * 32,
                 "plugin": "missing",
+                "reference": "missing.module:factory",
                 "expires_at": 200,
             }
         ),
