@@ -16,7 +16,7 @@ trap shutdown EXIT TERM INT
 # Port 5173 remains the tunnel-compatible listener and deliberately has no
 # runtime diagnostics. The localhost-published port maps to the opted-in 5174
 # listener in the same MCP service container.
-env -u REDIS_URL -u PO_EVENTS_DIR \
+env -u REDIS_URL \
     MCP_RUNTIME_DIAGNOSTICS=0 MCP_SERVER_PORT=5173 \
     python -m src.mcp &
 child_pids+=("$!")

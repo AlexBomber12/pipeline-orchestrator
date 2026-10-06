@@ -10,15 +10,9 @@ services:
     volumes:
       - .:/app
       - ./data:/data
-      - type: bind
-        source: ${PO_EVENTS_HOST_DIR:-./data/events}
-        target: ${PO_EVENTS_DIR:-/data/events}
-        bind:
-          create_host_path: false
       - codex-auth:/data/auth/.codex
     environment:
       REDIS_URL: redis://redis:6379/0
-      PO_EVENTS_DIR: ${PO_EVENTS_DIR:-/data/events}
       CLAUDE_CONFIG_DIR: /data/auth/claude
       GH_CONFIG_DIR: /data/auth/gh
       HOME: /data/auth
@@ -34,15 +28,9 @@ services:
     volumes:
       - .:/app:ro
       - ./data:/data
-      - type: bind
-        source: ${PO_EVENTS_HOST_DIR:-./data/events}
-        target: ${PO_EVENTS_DIR:-/data/events}
-        bind:
-          create_host_path: false
       - codex-auth:/data/auth/.codex
     environment:
       REDIS_URL: redis://redis:6379/0
-      PO_EVENTS_DIR: ${PO_EVENTS_DIR:-/data/events}
       CLAUDE_CONFIG_DIR: /data/auth/claude
       GH_CONFIG_DIR: /data/auth/gh
       HOME: /data/auth
@@ -60,16 +48,9 @@ services:
     volumes:
       - .:/app:ro
       - ./data/repos:/data/repos:ro
-      - type: bind
-        source: ${PO_EVENTS_HOST_DIR:-./data/events}
-        target: ${PO_EVENTS_DIR:-/data/events}
-        read_only: true
-        bind:
-          create_host_path: false
     environment:
       PYTHONUNBUFFERED: "1"
       REDIS_URL: redis://redis:6379/0
-      PO_EVENTS_DIR: ${PO_EVENTS_DIR:-/data/events}
     restart: unless-stopped
     depends_on:
       - redis

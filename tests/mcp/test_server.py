@@ -84,11 +84,7 @@ def test_restricted_mcp_instance_does_not_register_runtime_diagnostics() -> None
 
     assert "healthcheck" in names
     assert "get_task_schema" in names
-    assert not {
-        "get_orchestrator_status",
-        "list_orchestrator_logs",
-        "read_orchestrator_log",
-    }.intersection(names)
+    assert "get_orchestrator_status" not in names
 
 
 def test_opted_in_mcp_instance_registers_runtime_diagnostics() -> None:
@@ -108,8 +104,6 @@ def test_opted_in_mcp_instance_registers_runtime_diagnostics() -> None:
     )
     names = json.loads(completed.stdout.strip().splitlines()[-1])
 
-    assert {
-        "get_orchestrator_status",
-        "list_orchestrator_logs",
-        "read_orchestrator_log",
-    }.issubset(names)
+    assert "get_orchestrator_status" in names
+    assert "list_orchestrator_logs" not in names
+    assert "read_orchestrator_log" not in names

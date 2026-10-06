@@ -18,8 +18,6 @@ def test_all_mcp_tools_registered_on_canonical_instance() -> None:
         "get_agents_md_template",
         "get_repo_task_status",
         "get_orchestrator_status",
-        "list_orchestrator_logs",
-        "read_orchestrator_log",
     }
 
 

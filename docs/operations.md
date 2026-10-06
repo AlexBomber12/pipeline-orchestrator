@@ -7,88 +7,18 @@ from structured `tasks/PR-*.md` headers.
 
 ## Read-only MCP diagnostics
 
-The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
+The localhost-scoped Orchestrator MCP exposes `get_orchestrator_status` for a
+compact overview of configured repositories. Pass a validated `owner__repo`
+slug for structured pipeline, inhibitor, cancellation, pending Retry-command,
+and run-record metadata. Results use explicit field allowlists and fixed status
+codes: task text, error messages, exception text, arbitrary payload fields, and
+other free-form producer content are not returned.
 
-- `get_orchestrator_status` returns a compact configured-repository overview;
-  pass a validated `owner__repo` slug for queue, inhibitor, Retry-command,
-  recent-event, and run-record detail. Pending Retry pages expose an opaque
-  score/member `next_cursor` accepted by the tool's `retry_cursor` parameter;
-  removing older commands between pages cannot shift later commands past that
-  cursor. Snapshot age describes only the last persisted `RepoState` write and
-  is never presented as proof that a coder process is alive. A failed snapshot
-  key does not suppress independent event, Retry, or run-record reads.
-- `list_orchestrator_logs` discovers retained CLI snapshots, Redis repository
-  event history, disk event partitions, and the current checkout's
-  `artifacts/ci.log`. Every source reports retention, timestamps, mutability,
-  and whether task/run/SHA identity was actually recorded. Static sources use
-  integer offsets; the returned opaque Redis-history cursor preserves bounded
-  `SCAN` continuation and fetches no more history values than the page limit.
-- `read_orchestrator_log` reads a discovered source with a bounded continuation
-  cursor or a tail page. Redis cursors address redacted characters; filesystem
-  cursors normally address source bytes. A record longer than `max_chars` uses
-  the returned opaque continuation cursor so no unreturned suffix is skipped;
-  each filesystem page window remains at most 256 KiB. A filesystem read may
-  inspect up to 1 MiB of older context to determine whether its window begins
-  inside a multiline private-key block; if that bounded scan cannot establish
-  the state, the page is omitted fail-closed. It also inspects at most 1 MiB of
-  preceding context so credential keys and plain, quoted, or block scalar values
-  split across lines or page boundaries remain redacted, including TOML
-  triple-quoted values and shell backslash continuations, with the same
-  fail-closed behavior when context is indeterminate. Diagnostic text is
-  credential-redacted before it is returned; standalone and level/timestamp-
-  prefixed JSON records are redacted structurally, and mixed lines exceeding
-  the bounded embedded-JSON candidate limit are omitted. Malformed JSON values
-  are also redacted by sensitive key, including non-string values and Azure
-  connection-string key aliases. Structured environment entries correlate a
-  sensitive `name` field with its sibling `value`, and decoded multiline string
-  fields use the same logical-unit policy as retained files. The redactor also
-  covers same-indent pretty-JSON continuations, netrc password forms, and every
-  value below Kubernetes Secret `data` and `stringData` in structured or YAML
-  output regardless of YAML key order, including reads that begin inside a YAML
-  payload block. Composed YAML mapping keys cover aliased, escaped, and explicit
-  payload-key syntax rather than relying on their literal source spelling.
-  YAML document markers are recognized only at document scope,
-  and sensitive environment `name` entries bind to their sibling `value`.
-  YAML anchors and tags decorating Secret `kind` or environment `name` scalars
-  are normalized before classification, and block-scalar `kind` values are
-  parsed across their physical lines. Scalar aliases are resolved from bounded,
-  document-local anchor context; unresolved aliases fail closed, while resolved
-  ConfigMap kinds and non-sensitive environment names remain visible. YAML
-  mapping merges are composed to classify inherited Secret kinds without
-  attributing neighboring ConfigMap payloads to them.
-  Same-indent YAML sequence children and indented multiline INI values remain
-  within the sensitive unit. Complete bounded single- and multiline flow-style
-  Kubernetes Secret manifests are parsed before ordinary line redaction,
-  including nested list items and prefixed fallback forms. Flow-style YAML
-  environment entries correlate sensitive `name` fields with sibling `value`
-  fields in either order. Quoted YAML keys are decoded before sensitive-name
-  matching, including escaped spellings. YAML alias graphs visit each shared
-  collection at most once per classification. YAML explicit-key credentials are
-  consumed with their values across pagination boundaries. Excessive flow depth,
-  flow token counts, or block-mapping line counts are rejected before PyYAML
-  parsing, and ordinary block mappings do not trigger per-line parser calls.
-  Excessive structured nesting is omitted fail-closed.
-  Producer-added `[truncated]` markers are preserved; because their
-  removed prefix may contain a sensitive opener, the retained Redis CLI tail is
-  omitted fail-closed. Redis event
-  history is fetched through a
-  read-only bounded script and reported as oversized, without materializing its
-  records in the MCP process, when the retained list exceeds 256 KiB. Disk
-  partition discovery streams at most 200 directory candidates per request and
-  reports when that bound may leave additional partitions undiscovered; an
-  exact validated `events:disk/YYYY-MM-DD` source ID remains directly readable.
-  Redis CLI values are size-checked with `STRLEN` and fetched only through a
-  capped `GETRANGE`; oversized legacy or malformed values are reported without
-  being materialized in the MCP process.
-
-Pipeline state snapshots use the same bounded-read rule: each key is
-size-checked and read through a capped `GETRANGE`, with oversized snapshots
-reported explicitly. Task-filtered run lookup scans the complete retained
-200-entry repository index until it finds the requested number of matching
-records. Each referenced run-record value is also size-checked and read through
-a capped `GETRANGE`; oversized records are reported without being materialized.
-Pending Retry command payloads use the same bounded-read rule and retain their
-index score and remaining TTL in the explicit oversized result.
+Redis values and indexes are read with fixed size and count bounds. Missing,
+malformed, oversized, and unavailable sources are reported independently.
+These reads do not refresh TTLs, prune stale index members, or mutate daemon
+state. Snapshot age describes only the persisted `RepoState` observation; even
+a fresh snapshot is not evidence that a coder process is alive or progressing.
 
 Runtime diagnostics are available on the primary MCP service, whose published
 port remains bound to localhost. The same service container runs two
@@ -96,7 +26,7 @@ streamable-HTTP listeners: the host port maps to the opted-in diagnostics
 listener on container port 5174, while the optional `cloudflared` profile keeps
 its existing `mcp:5173` target and reaches a restricted listener started with
 `MCP_RUNTIME_DIAGNOSTICS=0`. Existing non-diagnostic MCP tools remain available
-through the tunnel, but status and retained-log tools are not registered there.
+through the tunnel, but runtime status is not registered there.
 
 Runtime diagnostics are opt-in at server startup. The MCP service entrypoint
 sets `MCP_RUNTIME_DIAGNOSTICS=1` only for its localhost-published listener; an
@@ -104,30 +34,9 @@ unset value defaults to disabled for direct and custom deployments. Operators
 starting `python -m src.mcp` outside Compose must explicitly set the variable
 and retain an equivalent loopback-only or authenticated access boundary.
 
-The web/daemon producers and MCP reader all resolve disk events from
-`PO_EVENTS_DIR` (default `/data/events`). Compose maps
-`PO_EVENTS_HOST_DIR` (default `./data/events`) to that container path: when
-selecting a custom event directory, set both values to the corresponding host
-and container locations. Before the first Compose start, create that host
-directory for UID/GID 1000. For the default, run
-`install -d -o 1000 -g 1000 -m 0750 ./data/events`. Compose sets
-`create_host_path: false` so Docker cannot
-silently replace this step with a root-owned bind directory. The selected host
-directory is mounted read-write into both producers and read-only into MCP, so
-overrides outside `./data` resolve to the same storage for all three services.
-For example, pre-create `./data/audit-events`, then set
-`PO_EVENTS_HOST_DIR=./data/audit-events` and
-`PO_EVENTS_DIR=/data/audit-events`.
-
-These tools only accept configured repository slugs and fixed source IDs; they
-cannot read arbitrary paths or Redis keys, and symlink components are rejected
-for fixed diagnostic files. File reads are opened relative to anchored
-directory descriptors with no-follow semantics so path replacement races also
-fail closed. Missing, malformed, expired, stale,
-and unavailable data is reported explicitly. Legacy CLI snapshots and mutable
-CI artifacts are not attributed to a task, run, or SHA because their producers
-do not record that association. Daemon stdout and live CLI streams are not
-persistently retained yet, so the tools report both as known logging gaps.
+Raw CLI, CI, event, artifact, daemon-stdout, and live-stream retrieval is not
+exposed. Persistent capture and a separately reviewed safe log-export contract
+remain follow-up work.
 
 ## Task format migration
 
