@@ -1380,7 +1380,6 @@ def _yaml_secret_payload_lines(lines: list[bytes]) -> set[int]:
                 "*" in candidate
                 and ":" in candidate
                 and (field := _yaml_mapping_scalar_field(candidate)) is not None
-                and field[2].casefold() == "value"
                 and _YAML_ALIAS_SCALAR.fullmatch(field[3]) is not None
             )
             or candidate.startswith(("? |", "? >"))
@@ -1451,6 +1450,21 @@ def _yaml_secret_payload_lines(lines: list[bytes]) -> set[int]:
 
     payload_lines: set[int] = set()
     visited: set[int] = set()
+    payload_value_visited: set[int] = set()
+
+    def include_payload_values(node: Any, depth: int = 0) -> None:
+        identity = id(node)
+        if identity in payload_value_visited or depth >= _MAX_STRUCTURED_DEPTH:
+            return
+        payload_value_visited.add(identity)
+        if isinstance(node, yaml.nodes.ScalarNode):
+            payload_lines.update(_yaml_node_line_span(node))
+        elif isinstance(node, yaml.nodes.MappingNode):
+            for _key_node, value_node in node.value:
+                include_payload_values(value_node, depth + 1)
+        elif isinstance(node, yaml.nodes.SequenceNode):
+            for item in node.value:
+                include_payload_values(item, depth + 1)
 
     def walk(node: Any, depth: int = 0) -> None:
         if not isinstance(node, (yaml.nodes.MappingNode, yaml.nodes.SequenceNode)):
@@ -1467,11 +1481,8 @@ def _yaml_secret_payload_lines(lines: list[bytes]) -> set[int]:
                         str(key_node.value).casefold().replace("_", "").replace("-", "")
                     )
                     if secret and normalized in {"data", "stringdata"}:
-                        start_line = value_node.start_mark.line
-                        end_line = value_node.end_mark.line
-                        if end_line == start_line or value_node.end_mark.column > 0:
-                            end_line += 1
-                        payload_lines.update(range(start_line, max(start_line + 1, end_line)))
+                        payload_lines.update(_yaml_node_line_span(value_node))
+                        include_payload_values(value_node)
                 walk(value_node, depth + 1)
         else:
             for item in node.value:
@@ -1549,6 +1560,13 @@ def _yaml_sensitive_env_lines(lines: list[bytes]) -> set[int]:
         if (
             candidate.startswith("<<:")
             or (candidate.startswith("*") and ":" in candidate)
+            or (
+                "*" in candidate
+                and ":" in candidate
+                and (field := _yaml_mapping_scalar_field(candidate)) is not None
+                and field[2].casefold() == "value"
+                and _YAML_ALIAS_SCALAR.fullmatch(field[3]) is not None
+            )
             or candidate.startswith(("? |", "? >"))
             or (candidate.startswith("? ") and "*" in key_source)
             or (

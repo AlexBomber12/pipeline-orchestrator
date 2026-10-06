@@ -29,8 +29,13 @@ Sources of truth:
 ## Quick Start
 
 ```sh
+install -d -o 1000 -g 1000 -m 0750 ./data/events
 docker compose up --build
 ```
+
+The event directory must exist before Compose starts because the web and daemon
+write retained events there while MCP mounts the same directory read-only.
+Compose deliberately does not create this bind source as root.
 
 On first run, log in to the tools that the daemon shells out to:
 

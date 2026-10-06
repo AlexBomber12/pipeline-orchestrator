@@ -1590,6 +1590,53 @@ async def test_indirect_yaml_env_fields_are_redacted_across_retained_readers(
         assert secret.decode() not in page["content"]
 
 
+async def test_aliased_sensitive_value_definitions_are_redacted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    repos_root = tmp_path / "repos"
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+    payload = (
+        "sharedEnv: &sharedEnv standalone-env-anchor-secret\n"
+        "env:\n  - name: PASSWORD\n    value: *sharedEnv\n"
+        "---\nsharedPayload: &sharedPayload standalone-payload-anchor-secret\n"
+        "kind: Secret\ndata:\n  opaque: *sharedPayload\n"
+        "---\nsafeShared: &safeShared retained-safe-anchor-value\n"
+        "kind: ConfigMap\ndata:\n  harmless: *safeShared\n"
+    )
+    redis.store[cli_log_latest(SLUG)] = payload
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.write_text(payload, encoding="utf-8")
+
+    for source_id in ("cli:latest", "ci:artifact"):
+        result = await diagnostics.read_orchestrator_log(
+            SLUG,
+            source_id,
+            max_chars=4_000,
+        )
+        assert "standalone-env-anchor-secret" not in result["content"]
+        assert "standalone-payload-anchor-secret" not in result["content"]
+        assert "retained-safe-anchor-value" in result["content"]
+
+    raw = ci_path.read_bytes()
+    for secret in (
+        b"standalone-env-anchor-secret",
+        b"standalone-payload-anchor-secret",
+    ):
+        page = await diagnostics.read_orchestrator_log(
+            SLUG,
+            "ci:artifact",
+            cursor=raw.index(secret),
+            max_chars=4_000,
+        )
+        assert secret.decode() not in page["content"]
+
+
 async def test_shell_append_assignments_are_redacted_across_retained_readers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2054,6 +2101,26 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
             b"  opaque: hidden\n",
         ]
     ) == {4}
+    assert diagnostics._yaml_secret_payload_lines(
+        [
+            b"base: &resource\n",
+            b"  kind: Secret\n",
+            b"<<: *resource\n",
+            b"data:\n",
+            b"  - &value hidden\n",
+            b"  - *value\n",
+        ]
+    ) == {4, 5}
+    with monkeypatch.context() as depth_patch:
+        depth_patch.setattr(diagnostics, "_MAX_STRUCTURED_DEPTH", 1)
+        assert diagnostics._yaml_secret_payload_lines(
+            [
+                b"!!str kind: Secret\n",
+                b"data:\n",
+                b"  nested:\n",
+                b"    opaque: hidden\n",
+            ]
+        ) == {2, 3}
     assert diagnostics._yaml_secret_payload_lines(
         [
             b"base: &resource\n",
