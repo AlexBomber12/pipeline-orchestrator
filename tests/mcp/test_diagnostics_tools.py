@@ -869,6 +869,19 @@ def test_run_metadata_allowlist_and_validation() -> None:
     assert diagnostics._run_metadata(json.dumps(asdict(run)), identifier, SLUG)["cause_subsource"] is None
 
 
+@pytest.mark.parametrize("attempt_index", [0, True, 1.5, float("nan"), float("inf")])
+def test_run_metadata_rejects_non_positive_integer_attempt_indices(
+    attempt_index: object,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    run = _run(ended=True)
+    payload = asdict(run)
+    payload["attempt_index"] = attempt_index
+
+    assert diagnostics._run_metadata(json.dumps(payload), run.run_id, SLUG) is None
+
+
 async def test_run_source_bounds_filtering_and_malformed_records() -> None:
     from src.mcp.tools import diagnostics
 

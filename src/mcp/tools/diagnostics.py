@@ -618,6 +618,9 @@ def _run_metadata(raw: object, expected_id: str, slug: str) -> dict[str, Any] | 
     if decoded.get("ended_at") is None:
         payload["outcome"] = decoded.get("outcome", "")
         payload["cause"] = decoded.get("cause")
+    attempt_index = _positive_number(payload["attempt_index"])
+    if attempt_index is None:
+        return None
     unfinished = ended_at is None
     cause_subsource = _subsource(payload["cause_subsource"])
     return {
@@ -627,7 +630,7 @@ def _run_metadata(raw: object, expected_id: str, slug: str) -> dict[str, Any] | 
         "ended_at": ended_at,
         "duration_ms": _positive_int(payload["duration_ms"]),
         "phase": payload["run_phase"],
-        "attempt_index": payload["attempt_index"],
+        "attempt_index": attempt_index,
         "fix_iterations": _positive_int(payload["fix_iterations"]),
         "outcome": "in_progress" if unfinished else payload["outcome"],
         "cause": None if unfinished else payload["cause"],
