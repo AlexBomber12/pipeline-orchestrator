@@ -231,9 +231,12 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
                         "stringData": {"config": "status-kube-string-secret"},
                     },
                     "yaml": (
-                        "apiVersion: v1\nkind: Secret\ndata:\n"
+                        "apiVersion: v1\ndata:\n"
                         "  opaque: status-kube-yaml-secret\n"
+                        "kind: Secret\nmetadata:\n  annotations:\n    note: |\n      ---\n"
                         "stringData: {config: status-kube-yaml-inline-secret}\n"
+                        "---\nkind: Pod\nspec:\n  env:\n"
+                        "    - name: PASSWORD\n      value: status-kube-yaml-env-secret\n"
                     ),
                 },
             }
@@ -285,6 +288,7 @@ async def test_status_detail_is_truthful_redacted_and_read_only(monkeypatch: pyt
     assert "status-kube-string-secret" not in json.dumps(result)
     assert "status-kube-yaml-secret" not in json.dumps(result)
     assert "status-kube-yaml-inline-secret" not in json.dumps(result)
+    assert "status-kube-yaml-env-secret" not in json.dumps(result)
     assert "status-malformed-password" not in json.dumps(result)
     assert overview["observed"]["error"] == "Authorization: [REDACTED]"
     assert result["detail"]["queue"]["counts_by_status"] == {"DOING": 1}
@@ -488,9 +492,12 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                 }
             ),
             (
-                "apiVersion: v1\nkind: Secret\ndata:\n"
+                "apiVersion: v1\ndata:\n"
                 "  opaque: redis-kube-yaml-secret\n"
+                "kind: Secret\nmetadata:\n  annotations:\n    note: |\n      ---\n"
                 "stringData: {config: redis-kube-yaml-inline-secret}\n"
+                "---\nkind: Pod\nspec:\n  env:\n"
+                "    - name: PASSWORD\n      value: redis-kube-yaml-env-secret\n"
                 "---\nkind: ConfigMap\ndata:\n  harmless: retained-config-value"
             ),
             json.dumps({"auths": {"registry": {"auth": docker_auth}}, "debug": True}),
@@ -520,9 +527,12 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                     "stringData": {"config": "disk-kube-string-secret"},
                 },
                 "yaml": (
-                    "apiVersion: v1\nkind: Secret\ndata:\n"
+                    "apiVersion: v1\ndata:\n"
                     "  opaque: disk-kube-yaml-secret\n"
+                    "kind: Secret\nmetadata:\n  annotations:\n    note: |\n      ---\n"
                     "stringData: {config: disk-kube-yaml-inline-secret}\n"
+                    "---\nkind: Pod\nspec:\n  env:\n"
+                    "    - name: PASSWORD\n      value: disk-kube-yaml-env-secret\n"
                 ),
                 "auths": {"registry": {"auth": docker_auth}},
                 "debug": True,
@@ -547,8 +557,10 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                     "stringData": {"config": "ci-kube-string-secret"},
                 },
                 "yaml": (
-                    "apiVersion: v1\nkind: Secret\ndata:\n"
+                    "apiVersion: v1\ndata:\n"
                     "  opaque: ci-structured-kube-yaml-secret\n"
+                    "kind: Secret\n---\nkind: Pod\nspec:\n  env:\n"
+                    "    - name: PASSWORD\n      value: ci-structured-kube-yaml-env-secret\n"
                 ),
                 "auths": {"registry": {"auth": docker_auth}},
                 "debug": True,
@@ -568,9 +580,12 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + '{"password":987650002,}\n'
         + '{\n"password":\n"ci-same-indent-secret"\n}\n'
         + "  password ci-multiline-netrc-secret\n"
-        + "apiVersion: v1\nkind: Secret\ndata:\n"
+        + "apiVersion: v1\ndata:\n"
         + "  opaque: ci-kube-yaml-secret\n"
+        + "kind: Secret\nmetadata:\n  annotations:\n    note: |\n      ---\n"
         + "stringData: {config: ci-kube-yaml-inline-secret}\n"
+        + "---\nkind: Pod\nspec:\n  env:\n"
+        + "    - name: PASSWORD\n      value: ci-kube-yaml-env-secret\n"
         + "---\nkind: ConfigMap\ndata:\n  harmless: retained-ci-config-value\n"
         + '2026-10-05 INFO {"password":987654322,"debug":true}\n',
         encoding="utf-8",
@@ -627,6 +642,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-kube-string-secret" not in content
         assert "redis-kube-yaml-secret" not in content
         assert "redis-kube-yaml-inline-secret" not in content
+        assert "redis-kube-yaml-env-secret" not in content
         assert "retained-config-value" in content
         assert docker_auth not in content
 
@@ -656,6 +672,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-kube-yaml-inline-secret" not in content
         assert "disk-kube-yaml-secret" not in content
         assert "disk-kube-yaml-inline-secret" not in content
+        assert "ci-structured-kube-yaml-env-secret" not in content
+        assert "ci-kube-yaml-env-secret" not in content
+        assert "disk-kube-yaml-env-secret" not in content
         assert docker_auth not in content
         assert "ci-toml-first-secret" not in content
         assert "ci-toml-second-secret" not in content
@@ -1793,6 +1812,37 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
     assert "kube-secret" not in "".join(unit[1] for unit in kubernetes_units)
     assert any("Kubernetes Secret YAML payload crossed" in warning for warning in warnings)
 
+    env_units = diagnostics._redacted_file_units(
+        (
+            b"- name: PASSWORD\n\n  # retained comment\n  value: yaml-env-secret\n"
+            b"  extra: retained\n- name: SAFE\n  value: visible\n"
+        ),
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=False,
+        warnings=[],
+    )
+    env_content = "".join(unit[1] for unit in env_units)
+    assert "yaml-env-secret" not in env_content
+    assert "visible" in env_content
+
+    boundary_units = diagnostics._redacted_file_units(
+        b"- name: PASSWORD\n- name: SAFE\n  value: visible\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=False,
+        warnings=[],
+    )
+    assert "visible" in "".join(unit[1] for unit in boundary_units)
+
     warnings = []
     assert diagnostics._redacted_file_units(
         b"visible\n",
@@ -1822,6 +1872,18 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
         None,
         2,
     )
+    env_context = b"    - name: PASSWORD\n\n"
+    assert diagnostics._sensitive_state_before(
+        BytesIO(env_context),
+        len(env_context),
+        b"      value: page-secret\n",
+    )[0] is True
+    non_name_context = b"    - command: run\n"
+    assert diagnostics._sensitive_state_before(
+        BytesIO(non_name_context),
+        len(non_name_context),
+        b"      value: visible\n",
+    )[0] is False
     context_limit = diagnostics._MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES
     monkeypatch.setattr(diagnostics, "_MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES", 4)
     assert diagnostics._kubernetes_yaml_state_before(BytesIO(b"abcde"), 5, b"next\n") == (

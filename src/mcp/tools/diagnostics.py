@@ -146,7 +146,7 @@ _PENDING_JSON_SENSITIVE_ASSIGNMENT = re.compile(
     rf'(?i)^[ \t]*"(?:{_SENSITIVE_KEY_PATTERN})"\s*:\s*$'
 )
 _YAML_KIND_ASSIGNMENT = re.compile(
-    r"(?i)^[ \t]*(?:-[ \t]+)?(?:[\"']kind[\"']|kind)[ \t]*:[ \t]*"
+    r"(?i)^(?:[\"']kind[\"']|kind)[ \t]*:[ \t]*"
     r"(?P<kind>[^#\r\n]*?)[ \t]*(?:#.*)?$"
 )
 _YAML_SECRET_PAYLOAD_ASSIGNMENT = re.compile(
@@ -154,9 +154,17 @@ _YAML_SECRET_PAYLOAD_ASSIGNMENT = re.compile(
     r"(?:[\"'](?:data|stringData)[\"']|(?:data|stringData))[ \t]*:[ \t]*"
     r"(?P<value>[^\r\n]*)$"
 )
-_YAML_DOCUMENT_BOUNDARY = re.compile(r"^[ \t]*(?:---|\.\.\.)[ \t]*(?:#.*)?$")
+_YAML_DOCUMENT_BOUNDARY = re.compile(r"^(?:---|\.\.\.)[ \t]*(?:#.*)?$")
 _YAML_MAPPING_ENTRY = re.compile(
     r"^[ \t]*(?:-[ \t]+)?(?:[\"']?[-A-Za-z0-9_.]+[\"']?)[ \t]*:"
+)
+_YAML_ENV_NAME = re.compile(
+    r"(?i)^(?P<indent>[ \t]*)-[ \t]+(?:[\"']name[\"']|name)[ \t]*:[ \t]*"
+    r"(?P<name>[^#\r\n]*?)[ \t]*(?:#.*)?$"
+)
+_YAML_ENV_VALUE = re.compile(
+    r"(?i)^(?P<indent>[ \t]*)(?:[\"']value[\"']|value)[ \t]*:[ \t]*"
+    r"(?P<value>[^\r\n]*)$"
 )
 _BLOCK_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
@@ -679,6 +687,25 @@ def _sensitive_state_before(
             and _BLOCK_SENSITIVE_ASSIGNMENT.fullmatch(line) is None
         )
         break
+    first_raw_line = next((line for line in raw.splitlines() if line.strip()), None)
+    first_raw_value = (
+        _YAML_ENV_VALUE.fullmatch(first_raw_line.decode("utf-8", errors="replace"))
+        if first_raw_line is not None
+        else None
+    )
+    if first_raw_value is not None:
+        value_indent = len(first_raw_value.group("indent"))
+        for raw_line in reversed(context_lines):
+            if not raw_line.strip():
+                continue
+            line = raw_line.decode("utf-8", errors="replace")
+            name_match = _YAML_ENV_NAME.fullmatch(line)
+            if name_match is not None and len(name_match.group("indent")) < value_indent:
+                name = name_match.group("name").strip().strip("\"'")
+                starts_with_sensitive_value = _SENSITIVE_KEY.fullmatch(name) is not None
+                break
+            if raw_line.lstrip().startswith(b"-") and _line_indent(raw_line) <= value_indent:
+                break
     if starts_with_sensitive_value is None and search_start == 0:
         starts_with_sensitive_value = False
 
@@ -782,6 +809,7 @@ def _kubernetes_yaml_state_before(
 
     state_known = search_start == 0
     kubernetes_secret = False
+    kind_seen = False
     payload_indent: int | None = None
     for raw_line in context.splitlines():
         if not raw_line.strip():
@@ -793,16 +821,18 @@ def _kubernetes_yaml_state_before(
         if _YAML_DOCUMENT_BOUNDARY.fullmatch(line):
             state_known = True
             kubernetes_secret = False
+            kind_seen = False
             payload_indent = None
             continue
         kind_match = _YAML_KIND_ASSIGNMENT.fullmatch(line)
         if kind_match is not None:
             state_known = True
             kubernetes_secret = kind_match.group("kind").strip().strip("\"'").casefold() == "secret"
+            kind_seen = True
             payload_indent = None
             continue
         payload_match = _YAML_SECRET_PAYLOAD_ASSIGNMENT.fullmatch(line)
-        if kubernetes_secret and payload_match is not None:
+        if (kubernetes_secret or not kind_seen) and payload_match is not None:
             if not payload_match.group("value").strip():
                 payload_indent = len(payload_match.group("indent"))
             continue
@@ -827,11 +857,46 @@ def _kubernetes_yaml_state_before(
         payload_indent = None
 
     return (
-        kubernetes_secret if state_known else None,
+        (kubernetes_secret or (payload_indent is not None and not kind_seen)) if state_known else None,
         starts_inside_payload,
         payload_indent,
         scanned_bytes,
     )
+
+
+def _kubernetes_yaml_payload_flags(
+    raw_lines: list[bytes],
+    *,
+    starts_inside_secret: bool,
+) -> list[bool]:
+    """Mark lines whose YAML document has, or may have, Secret payloads."""
+    flags = [False] * len(raw_lines)
+    document_start = 0
+    inherited_secret = starts_inside_secret
+    for boundary in range(len(raw_lines) + 1):
+        at_end = boundary == len(raw_lines)
+        line = "" if at_end else raw_lines[boundary].decode("utf-8", errors="replace").rstrip("\r\n")
+        if not at_end and _YAML_DOCUMENT_BOUNDARY.fullmatch(line) is None:
+            continue
+        document_lines = raw_lines[document_start:boundary]
+        kind_values = []
+        has_payload = False
+        for document_line in document_lines:
+            decoded = document_line.decode("utf-8", errors="replace").rstrip("\r\n")
+            kind_match = _YAML_KIND_ASSIGNMENT.fullmatch(decoded)
+            if kind_match is not None:
+                kind_values.append(kind_match.group("kind").strip().strip("\"'").casefold())
+            if _YAML_SECRET_PAYLOAD_ASSIGNMENT.fullmatch(decoded) is not None:
+                has_payload = True
+        sensitive_document = (
+            "secret" in kind_values
+            or (not kind_values and (inherited_secret or has_payload))
+        )
+        for index in range(document_start, boundary):
+            flags[index] = sensitive_document
+        document_start = boundary + 1
+        inherited_secret = False
+    return flags
 
 
 def _redacted_file_units(
@@ -876,6 +941,10 @@ def _redacted_file_units(
         )
         return [(raw, "[CONTENT OMITTED: KUBERNETES SECRET CONTEXT UNKNOWN]\n", 1)] if raw else []
     raw_lines = raw.splitlines(keepends=True)
+    kubernetes_payload_flags = _kubernetes_yaml_payload_flags(
+        raw_lines,
+        starts_inside_secret=bool(starts_inside_kubernetes_secret),
+    )
     units: list[tuple[bytes, str, int]] = []
     line_index = 0
     if starts_inside_kubernetes_secret_data and kubernetes_secret_data_indent is not None:
@@ -936,18 +1005,12 @@ def _redacted_file_units(
             units.append((raw_unit, "[REDACTED SENSITIVE VALUE]\n", 1))
             line_index = value_index + 1
     inside_private_key = starts_inside_private_key
-    kubernetes_secret = starts_inside_kubernetes_secret
     while line_index < len(raw_lines):
         raw_unit = raw_lines[line_index]
         text_unit = raw_unit.decode("utf-8", errors="replace")
         stripped_unit = text_unit.rstrip("\r\n")
-        if _YAML_DOCUMENT_BOUNDARY.fullmatch(stripped_unit):
-            kubernetes_secret = False
-        kind_match = _YAML_KIND_ASSIGNMENT.fullmatch(stripped_unit)
-        if kind_match is not None:
-            kubernetes_secret = kind_match.group("kind").strip().strip("\"'").casefold() == "secret"
         payload_match = _YAML_SECRET_PAYLOAD_ASSIGNMENT.fullmatch(stripped_unit)
-        if kubernetes_secret and payload_match is not None:
+        if kubernetes_payload_flags[line_index] and payload_match is not None:
             payload_value = payload_match.group("value").strip()
             if payload_value:
                 units.append((raw_unit, "[REDACTED SENSITIVE KUBERNETES SECRET DATA]\n", 1))
@@ -971,6 +1034,44 @@ def _redacted_file_units(
                 )
             line_index = payload_end
             continue
+        env_name_match = _YAML_ENV_NAME.fullmatch(stripped_unit)
+        if env_name_match is not None:
+            env_name = env_name_match.group("name").strip().strip("\"'")
+            if _SENSITIVE_KEY.fullmatch(env_name) is not None:
+                env_indent = len(env_name_match.group("indent"))
+                value_index = line_index + 1
+                while value_index < len(raw_lines):
+                    candidate = raw_lines[value_index]
+                    if not candidate.strip():
+                        value_index += 1
+                        continue
+                    candidate_text = candidate.decode("utf-8", errors="replace").rstrip("\r\n")
+                    value_match = _YAML_ENV_VALUE.fullmatch(candidate_text)
+                    if value_match is not None and len(value_match.group("indent")) > env_indent:
+                        item_end = value_index + 1
+                        while item_end < len(raw_lines):
+                            following = raw_lines[item_end]
+                            if following.strip() and (
+                                _line_indent(following) < env_indent
+                                or (
+                                    _line_indent(following) == env_indent
+                                    and following.lstrip().startswith(b"-")
+                                )
+                            ):
+                                break
+                            item_end += 1
+                        raw_unit = b"".join(raw_lines[line_index:item_end])
+                        units.append((raw_unit, "[REDACTED SENSITIVE YAML ENV VALUE]\n", 1))
+                        line_index = item_end
+                        break
+                    if _line_indent(candidate) < env_indent or (
+                        _line_indent(candidate) == env_indent
+                        and candidate.lstrip().startswith(b"-")
+                    ):
+                        break
+                    value_index += 1
+                if line_index > value_index:
+                    continue
         if inside_private_key or _PRIVATE_KEY_BEGIN.search(raw_unit):
             end_index = line_index
             while end_index < len(raw_lines) and not _PRIVATE_KEY_END.search(raw_lines[end_index]):
