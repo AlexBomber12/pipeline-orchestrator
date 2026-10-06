@@ -12,6 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 from src import config as src_config
 from src.coder_registry import (
+    CoderRegistry,
     ModelCatalog,
     ModelMetadata,
     ModelSetting,
@@ -24,6 +25,7 @@ from src.models import PipelineState, RepoState
 from src.web import app as web_app
 from src.web.app import app
 from src.web.services import auth_probe as _auth_probe
+from src.web.services import auth_probe_worker as _auth_worker
 from src.web.services import model_catalog as _model_catalog
 from src.web.services.model_catalog import ModelCatalogCache
 
@@ -1962,6 +1964,216 @@ def test_configured_plugin_auth_probe_has_response_timeout(
     assert response.json()["third"] == {
         "status": "error",
         "detail": "Configured Test Coder auth check timed out after 0.01s",
+    }
+
+
+def test_direct_coder_auth_probe_redacts_plugin_exception() -> None:
+    from tests.configured_coder_plugin import RaisingAuthTestPlugin
+
+    registry = CoderRegistry()
+    registry.register(RaisingAuthTestPlugin())
+
+    assert _auth_probe._check_coder_auth(registry, "third") == {
+        "status": "error",
+        "detail": "Configured Test Coder auth check failed (RuntimeError)",
+    }
+
+
+def test_auth_probe_worker_normalizes_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[str] = []
+
+    class _WithConfigPath:
+        display_name = "Worker Coder"
+
+        def check_auth(self, *, config_path: str) -> dict[str, str]:
+            seen.append(config_path)
+            return {"status": "ok", "detail": "ready"}
+
+    monkeypatch.setattr(
+        _auth_worker,
+        "_load_plugin",
+        lambda _plugin_id, _reference: _WithConfigPath(),
+    )
+    assert _auth_worker.run_probe("third", "module:factory", "/cfg") == {
+        "status": "ok",
+        "detail": "ready",
+    }
+    assert seen == ["/cfg"]
+
+    class _InvalidResult:
+        display_name = "Invalid Coder"
+
+        def check_auth(self) -> object:
+            return {"status": object()}
+
+    monkeypatch.setattr(
+        _auth_worker,
+        "_load_plugin",
+        lambda _plugin_id, _reference: _InvalidResult(),
+    )
+    assert _auth_worker.run_probe("third", "module:factory", "/cfg") == {
+        "status": "error",
+        "detail": "Invalid Coder auth check failed (TypeError)",
+    }
+
+    monkeypatch.setattr(
+        _auth_worker,
+        "_load_plugin",
+        lambda _plugin_id, _reference: (_ for _ in ()).throw(
+            RuntimeError("must-not-leak")
+        ),
+    )
+    assert _auth_worker.run_probe("third", "module:factory", "/cfg") == {
+        "status": "error",
+        "detail": "third auth check failed (RuntimeError)",
+    }
+
+
+def test_auth_probe_worker_main_validates_arguments_and_prints_result(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(_auth_worker.sys, "argv", ["auth-probe-worker"])
+    with pytest.raises(SystemExit, match="2"):
+        _auth_worker.main()
+
+    monkeypatch.setattr(
+        _auth_worker,
+        "run_probe",
+        lambda *_args: {"status": "ok", "detail": "ready"},
+    )
+    monkeypatch.setattr(
+        _auth_worker.sys,
+        "argv",
+        ["auth-probe-worker", "third", "module:factory", "/cfg"],
+    )
+    _auth_worker.main()
+
+    assert capsys.readouterr().out.strip() == (
+        _auth_worker.RESULT_PREFIX + '{"status":"ok","detail":"ready"}'
+    )
+
+
+class _FakeAuthProbeProcess:
+    def __init__(self, stdout: bytes, returncode: int) -> None:
+        self.pid = 12345
+        self.returncode = returncode
+        self._stdout = stdout
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return self._stdout, b""
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode", "expected_detail"),
+    [
+        (b"", 1, "Worker auth check worker failed"),
+        (
+            b"PIPELINE_AUTH_RESULT:{bad json}\nnoise\n",
+            0,
+            "Worker auth check returned an invalid result",
+        ),
+        (
+            b"PIPELINE_AUTH_RESULT:[]\n",
+            0,
+            "Worker auth check returned an invalid result",
+        ),
+    ],
+)
+def test_isolated_auth_probe_rejects_worker_failures_and_invalid_output(
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: bytes,
+    returncode: int,
+    expected_detail: str,
+) -> None:
+    async def fake_subprocess(*_args: object, **_kwargs: object) -> object:
+        return _FakeAuthProbeProcess(stdout, returncode)
+
+    monkeypatch.setattr(
+        _auth_probe.asyncio,
+        "create_subprocess_exec",
+        fake_subprocess,
+    )
+
+    result = asyncio.run(
+        _auth_probe._isolated_coder_auth_probe(
+            "third",
+            "module:factory",
+            "Worker",
+        )
+    )
+
+    assert result == {"status": "error", "detail": expected_detail}
+
+
+def test_isolated_auth_probe_redacts_worker_start_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def failing_subprocess(*_args: object, **_kwargs: object) -> object:
+        raise OSError("must-not-leak")
+
+    monkeypatch.setattr(
+        _auth_probe.asyncio,
+        "create_subprocess_exec",
+        failing_subprocess,
+    )
+
+    result = asyncio.run(
+        _auth_probe._isolated_coder_auth_probe(
+            "third",
+            "module:factory",
+            "Worker",
+        )
+    )
+
+    assert result == {
+        "status": "error",
+        "detail": "Worker auth check failed (OSError)",
+    }
+
+
+def test_isolated_auth_probe_handles_worker_exit_during_timeout_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _SlowProcess:
+        pid = 12345
+        returncode: int | None = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def wait(self) -> int:
+            self.returncode = 0
+            return 0
+
+    async def fake_subprocess(*_args: object, **_kwargs: object) -> object:
+        return _SlowProcess()
+
+    def exited_process_group(_pid: int, _signal: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(
+        _auth_probe.asyncio,
+        "create_subprocess_exec",
+        fake_subprocess,
+    )
+    monkeypatch.setattr(_auth_probe.os, "killpg", exited_process_group)
+    monkeypatch.setattr(_auth_probe, "_AUTH_CHECK_TIMEOUT_SEC", 0.001)
+
+    result = asyncio.run(
+        _auth_probe._isolated_coder_auth_probe(
+            "third",
+            "module:factory",
+            "Worker",
+        )
+    )
+
+    assert result == {
+        "status": "error",
+        "detail": "Worker auth check timed out after 0.001s",
     }
 
 

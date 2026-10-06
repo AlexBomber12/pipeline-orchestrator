@@ -403,6 +403,17 @@ def test_register_and_get() -> None:
     assert registry.get("claude") is plugin
 
 
+def test_register_tracks_and_clears_startup_reference() -> None:
+    registry = CoderRegistry()
+    plugin = DummyCoderPlugin(name="claude", display_name="Claude")
+
+    registry.register(plugin, reference="package.module:factory")
+    assert registry.reference_for("claude") == "package.module:factory"
+
+    registry.register(plugin)
+    assert registry.reference_for("claude") is None
+
+
 def test_get_unknown_raises() -> None:
     registry = CoderRegistry()
 

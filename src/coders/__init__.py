@@ -294,5 +294,5 @@ def build_coder_registry(config: AppConfig | None = None) -> CoderRegistry:
                 plugin,
                 config.daemon,
             )
-        registry.register(plugin)
+        registry.register(plugin, reference=reference)
     return registry

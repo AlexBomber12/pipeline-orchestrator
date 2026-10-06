@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
+import signal
 import subprocess
+import sys
 
 from src.coder_registry import CoderRegistry
 from src.coders import build_coder_registry
-from src.config import load_config
+from src.config import DEFAULT_CODER_PLUGINS, load_config
+from src.web.services.auth_probe_worker import RESULT_PREFIX
 
 _AUTH_CHECK_TIMEOUT_SEC = 5
 
@@ -146,30 +150,94 @@ async def _bounded_coder_auth_probe(
     registry: CoderRegistry,
     plugin_id: str,
 ) -> dict[str, str]:
-    """Run one synchronous plugin probe without blocking a web response."""
-    if plugin_id == "claude":
-        probe = _check_claude_auth
-        args = (registry,)
-    elif plugin_id == "codex":
-        probe = _check_codex_auth
-        args = (registry,)
-    else:
-        probe = _check_coder_auth
-        args = (registry, plugin_id)
-    try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(probe, *args),
-            timeout=_AUTH_CHECK_TIMEOUT_SEC,
+    """Run one plugin probe with a deadline that also ends its worker."""
+    plugin = registry.get(plugin_id)
+    reference = registry.reference_for(plugin_id)
+    if reference is None:
+        return {
+            "status": "error",
+            "detail": f"{plugin.display_name} auth check is unavailable",
+        }
+    if reference != DEFAULT_CODER_PLUGINS.get(plugin_id):
+        return await _isolated_coder_auth_probe(
+            plugin_id,
+            reference,
+            plugin.display_name,
         )
-    except asyncio.TimeoutError:
-        plugin = registry.get(plugin_id)
+    probe = _check_claude_auth if plugin_id == "claude" else _check_codex_auth
+    return await asyncio.to_thread(probe, registry)
+
+
+async def _isolated_coder_auth_probe(
+    plugin_id: str,
+    reference: str,
+    display_name: str,
+) -> dict[str, str]:
+    """Probe trusted plugin code in a killable subprocess."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "src.web.services.auth_probe_worker",
+            plugin_id,
+            reference,
+            _config_path(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
         return {
             "status": "error",
             "detail": (
-                f"{plugin.display_name} auth check timed out after "
+                f"{display_name} auth check failed ({type(exc).__name__})"
+            ),
+        }
+    try:
+        stdout, _ = await asyncio.wait_for(
+            process.communicate(),
+            timeout=_AUTH_CHECK_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await process.wait()
+        return {
+            "status": "error",
+            "detail": (
+                f"{display_name} auth check timed out after "
                 f"{_AUTH_CHECK_TIMEOUT_SEC:g}s"
             ),
         }
+    if process.returncode != 0:
+        return {
+            "status": "error",
+            "detail": f"{display_name} auth check worker failed",
+        }
+    for raw_line in reversed(stdout.decode("utf-8", errors="replace").splitlines()):
+        if not raw_line.startswith(RESULT_PREFIX):
+            continue
+        try:
+            result = json.loads(raw_line.removeprefix(RESULT_PREFIX))
+        except (json.JSONDecodeError, TypeError):
+            break
+        if (
+            isinstance(result, dict)
+            and result.get("status") in {"ok", "error"}
+            and isinstance(result.get("detail"), str)
+            and all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in result.items()
+            )
+        ):
+            return result
+        break
+    return {
+        "status": "error",
+        "detail": f"{display_name} auth check returned an invalid result",
+    }
 
 
 def _check_gh_auth() -> dict[str, str]:
