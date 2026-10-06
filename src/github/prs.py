@@ -28,7 +28,7 @@ from src.github.gh_runner import (
 )
 from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_config
 from src.github.reviews import _begin_review_cache_cycle
-from src.models import CIStatus, PRInfo
+from src.models import PRInfo
 
 logger = logging.getLogger(__name__)
 
@@ -267,6 +267,7 @@ def get_open_prs(
     repo: str,
     allow_merge_without_checks: bool = False,
     reviewer_policy: ReviewerPolicy | None = None,
+    required_checks: Iterable[str] | None = None,
 ) -> list[PRInfo]:
     """Return open PRs for ``repo`` (``owner/repo``) with CI and review status."""
 
@@ -294,6 +295,7 @@ def get_open_prs(
             repo,
             allow_merge_without_checks=allow_merge_without_checks,
             reviewer_policy=reviewer_policy,
+            required_checks=required_checks,
         )
     if not isinstance(raw, list):
         return []
@@ -327,6 +329,7 @@ def get_open_prs(
                     status_payload,
                     empty_is_success=allow_merge_without_checks,
                     fetch_ok=fetch_ok,
+                    required_contexts=required_checks,
                 ),
                 review_status=reviews.get_pr_review_status(
                     repo,
@@ -358,6 +361,7 @@ def _get_open_prs_rest(
     *,
     allow_merge_without_checks: bool,
     reviewer_policy: ReviewerPolicy | None = None,
+    required_checks: Iterable[str] | None = None,
 ) -> list[PRInfo]:
     """Return open PRs via REST when GraphQL status rollup is unavailable."""
 
@@ -374,6 +378,9 @@ def _get_open_prs_rest(
         user = entry.get("user") or {}
         title = entry.get("title", "")
         head_sha = head.get("sha", "")
+        check_runs, status_payload, fetch_ok = checks._fetch_ci_status_rest(
+            repo, head_sha
+        )
         labels = entry.get("labels") or []
         quarantine_labels = {
             label.get("name", "")
@@ -387,10 +394,12 @@ def _get_open_prs_rest(
                 branch=head.get("ref", ""),
                 title=title,
                 pr_id=extract_queue_pr_id(title),
-                ci_status=(
-                    CIStatus.SUCCESS
-                    if allow_merge_without_checks
-                    else CIStatus.PENDING
+                ci_status=checks._map_rest_ci_status_to_enum(
+                    check_runs,
+                    status_payload,
+                    empty_is_success=allow_merge_without_checks,
+                    fetch_ok=fetch_ok,
+                    required_contexts=required_checks,
                 ),
                 review_status=reviews.get_pr_review_status(
                     repo,

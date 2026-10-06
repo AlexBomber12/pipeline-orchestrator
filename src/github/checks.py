@@ -8,6 +8,7 @@ WATCH gate's CI status read. Reuses ``cache._etag_get`` and
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable
 from datetime import datetime
 from typing import Any, NamedTuple
 
@@ -509,6 +510,7 @@ def _map_rest_ci_status_to_enum(
     status_payload: dict,
     empty_is_success: bool = False,
     fetch_ok: bool = True,
+    required_contexts: Iterable[str] | None = None,
 ) -> CIStatus:
     """Combine REST ``check-runs`` + commit ``status`` payloads into a ``CIStatus``.
 
@@ -551,9 +553,12 @@ def _map_rest_ci_status_to_enum(
     )
 
     combined_state_upper = _commit_status_state(combined_state) or ""
+    required = _normalize_required_contexts(required_contexts)
     if not check_runs and not statuses:
         if combined_state_upper in _REST_CI_FAILURE_STATES:
             return CIStatus.FAILURE
+        if required:
+            return CIStatus.PENDING
         return CIStatus.SUCCESS if empty_is_success and fetch_ok else CIStatus.PENDING
 
     states: list[str] = []
@@ -597,9 +602,65 @@ def _map_rest_ci_status_to_enum(
         ):
             return CIStatus.INFRA_FAILURE
         return CIStatus.FAILURE
+    if not fetch_ok:
+        return CIStatus.PENDING
+    if required and not _required_contexts_satisfied(
+        required,
+        check_runs,
+        statuses,
+        combined_state_upper,
+    ):
+        return CIStatus.PENDING
     if all(s in _REST_CI_SUCCESS_STATES for s in states) and fetch_ok:
         return CIStatus.SUCCESS
     return CIStatus.PENDING
+
+
+def _normalize_required_contexts(
+    required_contexts: Iterable[str] | None,
+) -> tuple[str, ...]:
+    if required_contexts is None:
+        return ()
+    return tuple(
+        context
+        for raw in required_contexts
+        if isinstance(raw, str) and (context := raw.strip())
+    )
+
+
+def _required_contexts_satisfied(
+    required_contexts: tuple[str, ...],
+    check_runs: list[dict],
+    statuses: list[object],
+    combined_state_upper: str,
+) -> bool:
+    successful: set[str] = set()
+    pending: set[str] = set()
+    for run in check_runs:
+        if not isinstance(run, dict):
+            continue
+        name = run.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        state = _check_run_state(run)
+        if state in _REST_CI_SUCCESS_STATES:
+            successful.add(name.strip())
+        elif state is not None:
+            pending.add(name.strip())
+    for status in statuses:
+        if not isinstance(status, dict):
+            continue
+        name = status.get("context") or status.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        state = _commit_status_state(status.get("state") or status.get("status"))
+        if state in _REST_CI_SUCCESS_STATES:
+            successful.add(name.strip())
+
+    for context in required_contexts:
+        if context not in successful or context in pending:
+            return False
+    return bool(combined_state_upper or successful)
 
 
 async def _clear_pending_tracker(
@@ -719,6 +780,7 @@ async def classify_ci_status_with_age(
     *,
     empty_is_success: bool = False,
     fetch_ok: bool = True,
+    required_contexts: Iterable[str] | None = None,
 ) -> tuple[CIStatus, str | None]:
     """Augment :func:`_map_rest_ci_status_to_enum` with stuck-PENDING reclassification.
 
@@ -738,6 +800,7 @@ async def classify_ci_status_with_age(
         statuses_payload,
         empty_is_success=empty_is_success,
         fetch_ok=fetch_ok,
+        required_contexts=required_contexts,
     )
     if raw_status != CIStatus.PENDING:
         await _clear_pending_tracker(redis_client, repo, pr_number, head_sha)

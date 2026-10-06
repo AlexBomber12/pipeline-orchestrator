@@ -2978,6 +2978,18 @@ def test_map_rest_ci_status_failed_fetch_stays_pending() -> None:
     assert _map_rest_ci_status_to_enum([], {}, empty_is_success=False, fetch_ok=False) == CIStatus.PENDING
 
 
+def test_map_rest_ci_status_required_contexts_block_empty_exemption() -> None:
+    assert (
+        _map_rest_ci_status_to_enum(
+            [],
+            {"state": "pending", "statuses": []},
+            empty_is_success=True,
+            required_contexts=["unit"],
+        )
+        == CIStatus.PENDING
+    )
+
+
 # ---------------------------------------------------------------------------
 # retry integration tests (PR-054)
 # ---------------------------------------------------------------------------
@@ -3130,6 +3142,47 @@ def test_get_open_prs_invokes_rest_helper_with_head_sha(
     assert prs[0].ci_status == CIStatus.FAILURE
 
 
+def test_get_open_prs_enforces_required_checks_on_graphql_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = [
+        {
+            "number": 7,
+            "title": "PR-7: foo",
+            "headRefName": "bar",
+            "headRefOid": "deadbeef",
+            "url": "u",
+            "updatedAt": "2026-04-18T00:00:00Z",
+            "commits": [],
+            "author": {"login": "a"},
+            "labels": [],
+            "isCrossRepository": False,
+        }
+    ]
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *a, **kw: raw)
+    monkeypatch.setattr(
+        "src.github.checks._fetch_ci_status_rest",
+        lambda repo, sha: (
+            [{"name": "unit", "conclusion": "success"}],
+            {"state": "success", "statuses": []},
+            True,
+        ),
+    )
+    monkeypatch.setattr(
+        "src.github.reviews.get_pr_review_status",
+        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
+    )
+
+    prs = get_open_prs(
+        "owner/name",
+        allow_merge_without_checks=True,
+        required_checks=["unit", "integration"],
+    )
+
+    assert prs[0].ci_status == CIStatus.PENDING
+
+
 def test_get_open_prs_rest_fetch_failure_follows_allow_merge_without_checks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3190,6 +3243,10 @@ def test_get_open_prs_falls_back_to_rest_on_graphql_rate_limit(
         ],
     )
     monkeypatch.setattr(
+        "src.github.checks._fetch_ci_status_rest",
+        lambda repo, sha: ([], {}, True),
+    )
+    monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
         lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
     )
@@ -3203,6 +3260,101 @@ def test_get_open_prs_falls_back_to_rest_on_graphql_rate_limit(
     assert prs[0].last_activity == datetime(2026, 4, 18, 11, 22, 33, tzinfo=_tz.utc)
     assert prs[0].is_escalated is True
     assert prs[0].is_cross_repository is True
+
+
+@pytest.mark.parametrize(
+    ("check_runs", "status_payload"),
+    [
+        ([], {"state": "success", "statuses": [{"state": "success"}]}),
+        ([{"name": "unit", "conclusion": "success"}], {}),
+    ],
+)
+def test_get_open_prs_rest_fallback_requires_complete_ci_retrieval(
+    monkeypatch: pytest.MonkeyPatch,
+    check_runs: list[dict],
+    status_payload: dict,
+) -> None:
+    def fail_graphql(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("GraphQL: API rate limit exceeded")
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fail_graphql)
+    monkeypatch.setattr(
+        "src.github.cache._gh_api_paginated",
+        lambda path: [
+            {
+                "number": 42,
+                "title": "PR-110: Add coverage",
+                "head": {
+                    "ref": "feature-branch",
+                    "sha": "abc123",
+                    "repo": {"fork": False},
+                },
+                "html_url": "https://example.test/pr/42",
+                "updated_at": "2026-04-18T11:22:33Z",
+                "user": {"login": "alice"},
+                "labels": [],
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        "src.github.checks._fetch_ci_status_rest",
+        lambda repo, sha: (check_runs, status_payload, False),
+    )
+    monkeypatch.setattr(
+        "src.github.reviews.get_pr_review_status",
+        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
+    )
+
+    prs = get_open_prs("owner/name", allow_merge_without_checks=True)
+
+    assert prs[0].ci_status == CIStatus.PENDING
+
+
+def test_get_open_prs_rest_fallback_enforces_required_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_graphql(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("GraphQL: API rate limit exceeded")
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fail_graphql)
+    monkeypatch.setattr(
+        "src.github.cache._gh_api_paginated",
+        lambda path: [
+            {
+                "number": 42,
+                "title": "PR-110: Add coverage",
+                "head": {
+                    "ref": "feature-branch",
+                    "sha": "abc123",
+                    "repo": {"fork": False},
+                },
+                "html_url": "https://example.test/pr/42",
+                "updated_at": "2026-04-18T11:22:33Z",
+                "user": {"login": "alice"},
+                "labels": [],
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        "src.github.checks._fetch_ci_status_rest",
+        lambda repo, sha: (
+            [{"name": "unit", "conclusion": "success"}],
+            {"state": "success", "statuses": []},
+            True,
+        ),
+    )
+    monkeypatch.setattr(
+        "src.github.reviews.get_pr_review_status",
+        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
+    )
+
+    prs = get_open_prs(
+        "owner/name",
+        allow_merge_without_checks=True,
+        required_checks=["unit", "integration"],
+    )
+
+    assert prs[0].ci_status == CIStatus.PENDING
 
 
 def test_get_open_prs_propagates_non_rate_limit_errors(
@@ -4121,6 +4273,73 @@ def test_map_rest_ci_status_stale_failure_in_history_does_not_override_combined_
             },
         )
         == CIStatus.SUCCESS
+    )
+
+
+def test_map_rest_ci_status_required_contexts_accept_check_runs_and_statuses() -> None:
+    assert (
+        _map_rest_ci_status_to_enum(
+            [
+                {"name": "unit", "conclusion": "success"},
+            ],
+            {
+                "state": "success",
+                "statuses": [
+                    {"context": "integration", "state": "success"},
+                ],
+            },
+            required_contexts=["unit", "integration"],
+        )
+        == CIStatus.SUCCESS
+    )
+
+
+def test_map_rest_ci_status_required_contexts_reject_malformed_evidence() -> None:
+    assert (
+        _map_rest_ci_status_to_enum(
+            [
+                "garbage",  # type: ignore[list-item]
+                {"name": " ", "conclusion": "success"},
+                {"name": "unit", "conclusion": "success"},
+            ],
+            {
+                "state": "success",
+                "statuses": [
+                    "garbage",
+                    {"context": "", "state": "success"},
+                    {"context": "integration", "state": "success"},
+                ],
+            },
+            required_contexts=["unit", "integration"],
+        )
+        == CIStatus.PENDING
+    )
+
+
+def test_required_context_helper_ignores_malformed_context_entries() -> None:
+    assert checks._required_contexts_satisfied(
+        ("unit",),
+        [
+            "garbage",  # type: ignore[list-item]
+            {"name": " ", "conclusion": "success"},
+            {"name": "unit", "conclusion": "success"},
+        ],
+        [
+            "garbage",
+            {"context": "", "state": "success"},
+        ],
+        "SUCCESS",
+    )
+
+
+def test_map_rest_ci_status_required_context_pending_blocks_success() -> None:
+    assert (
+        _map_rest_ci_status_to_enum(
+            [{"name": "unit", "status": "in_progress"}],
+            {"state": "success", "statuses": [{"context": "integration", "state": "success"}]},
+            required_contexts=["unit", "integration"],
+        )
+        == CIStatus.PENDING
     )
 
 
