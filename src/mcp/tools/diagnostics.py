@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import redis.asyncio as aioredis
+import yaml
 
 from src.config import AppConfig, RepoConfig, load_config
 from src.events.disk_log import _resolve_events_dir
@@ -52,6 +53,7 @@ _MAX_EVENT_RECORD_CHARS = 4_000
 _MAX_REDIS_EVENT_HISTORY_BYTES = 256 * 1024
 _MAX_REDIS_CLI_LOG_BYTES = 64 * 1024
 _MAX_REDIS_STATE_BYTES = 1024 * 1024
+_MAX_REDIS_RUN_RECORD_BYTES = 64 * 1024
 _MAX_RUN_INDEX_ENTRIES = 200
 _MAX_FILE_SCAN_BYTES = 256 * 1024
 _MAX_PRIVATE_KEY_CONTEXT_BYTES = 1024 * 1024
@@ -179,6 +181,13 @@ _YAML_ENV_VALUE = re.compile(
 )
 _YAML_SEQUENCE_ITEM_ONLY = re.compile(r"^(?P<indent>[ \t]*)-[ \t]*(?:#.*)?$")
 _YAML_NODE_PREFIX = re.compile(r"^(?:&[^\s]+|![^\s]+)(?:\s+|$)")
+_YAML_FLOW_KIND_SECRET = re.compile(
+    r"(?i)(?:[{,][ \t]*)(?:[\"']?kind[\"']?)[ \t]*:[ \t]*"
+    r"(?:[\"']?secret[\"']?)(?=[ \t]*[,}])"
+)
+_YAML_FLOW_SECRET_PAYLOAD = re.compile(
+    r"(?i)(?:[{,][ \t]*)(?:[\"']?(?:data|stringData)[\"']?)[ \t]*:"
+)
 _BLOCK_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|"
     rf"(?:{_SENSITIVE_KEY_PATTERN}))\s*[:=][ \t]*"
@@ -672,6 +681,71 @@ def _yaml_flow_delta(text: str) -> int:
         elif character == "#":
             break
     return delta
+
+
+def _contains_kubernetes_secret_payload(
+    value: Any,
+    *,
+    depth: int = 0,
+    seen: set[int] | None = None,
+) -> bool:
+    """Find a Kubernetes Secret payload in a parsed, bounded YAML value."""
+    if not isinstance(value, (dict, list)) or depth >= _MAX_STRUCTURED_DEPTH:
+        return False
+    seen = set() if seen is None else seen
+    identity = id(value)
+    if identity in seen:
+        return False
+    seen.add(identity)
+    try:
+        if isinstance(value, dict):
+            normalized = {
+                key.casefold().replace("_", "").replace("-", ""): item
+                for key, item in value.items()
+                if isinstance(key, str)
+            }
+            if (
+                isinstance(normalized.get("kind"), str)
+                and normalized["kind"].casefold() == "secret"
+                and ("data" in normalized or "stringdata" in normalized)
+            ):
+                return True
+            children = value.values()
+        else:
+            children = value
+        return any(
+            _contains_kubernetes_secret_payload(child, depth=depth + 1, seen=seen)
+            for child in children
+        )
+    finally:
+        seen.remove(identity)
+
+
+def _is_single_line_flow_yaml_secret(text: str) -> bool:
+    """Recognize complete flow-style Secret manifests before ordinary redaction."""
+    stripped = text.strip()
+    lowered = stripped.casefold()
+    if "{" not in stripped or "kind" not in lowered or "secret" not in lowered:
+        return False
+    try:
+        json_value = json.loads(stripped)
+    except (RecursionError, TypeError, ValueError):
+        pass
+    else:
+        if isinstance(json_value, (dict, list)):
+            return False
+    starts = [index for token in ("{", "[") if (index := stripped.find(token)) >= 0]
+    candidate = stripped[min(starts) :] if starts else stripped
+    try:
+        parsed = yaml.safe_load(candidate)
+    except (RecursionError, yaml.YAMLError):
+        parsed = None
+    if _contains_kubernetes_secret_payload(parsed):
+        return True
+    return bool(
+        _YAML_FLOW_KIND_SECRET.search(stripped)
+        and _YAML_FLOW_SECRET_PAYLOAD.search(stripped)
+    )
 
 
 def _yaml_payload_continuation(value: str) -> tuple[str, int | None] | None:
@@ -1307,6 +1381,10 @@ def _redacted_file_units(
         raw_unit = raw_lines[line_index]
         text_unit = raw_unit.decode("utf-8", errors="replace")
         stripped_unit = text_unit.rstrip("\r\n")
+        if _is_single_line_flow_yaml_secret(stripped_unit):
+            units.append((raw_unit, "[REDACTED SENSITIVE KUBERNETES SECRET]\n", 1))
+            line_index += 1
+            continue
         env_item = _yaml_env_item(
             raw_lines,
             line_index,
@@ -1933,6 +2011,24 @@ def _run_payload(raw: object, run_id: str) -> dict[str, Any]:
     return {"status": "available", "record": selected}
 
 
+async def _read_bounded_redis_value(
+    client: Any,
+    key: str,
+    maximum: int,
+) -> tuple[object | None, int | None, bool]:
+    """Read one Redis string without materializing more than its allowed bound."""
+    reported_size = int(await client.strlen(key))
+    if reported_size > maximum:
+        return None, reported_size, True
+    bounded = await client.getrange(key, 0, maximum)
+    observed_size = max(reported_size, len(bounded or b""))
+    if observed_size > maximum:
+        return None, observed_size, True
+    if observed_size == 0 and not await client.exists(key):
+        return None, None, False
+    return bounded, observed_size, False
+
+
 async def _relevant_runs(
     redis_client: Any,
     repo_slug: str,
@@ -1957,9 +2053,29 @@ async def _relevant_runs(
         scanned += 1
         run_id = _decode(raw_id)
         try:
-            raw = await redis_client.get(MetricsStore._record_key(run_id))
+            raw, size_bytes, oversized = await _read_bounded_redis_value(
+                redis_client,
+                MetricsStore._record_key(run_id),
+                _MAX_REDIS_RUN_RECORD_BYTES,
+            )
         except Exception as exc:
             records.append({"status": "unavailable", "run_id": run_id, "error": _error_text(exc)})
+            continue
+        if oversized:
+            records.append(
+                {
+                    "status": "oversized",
+                    "run_id": run_id,
+                    "source_size_bytes": size_bytes,
+                    "read_bound_bytes": _MAX_REDIS_RUN_RECORD_BYTES,
+                    "error": (
+                        f"Stored run record is {size_bytes} bytes; "
+                        f"the diagnostic read bound is {_MAX_REDIS_RUN_RECORD_BYTES} bytes."
+                    ),
+                }
+            )
+            if len(records) >= limit:
+                break
             continue
         if raw is None:
             missing += 1
@@ -1980,20 +2096,6 @@ async def _relevant_runs(
         "truncated": len(raw_ids) >= scan_limit or len(records) >= limit,
         "error": None,
     }
-
-
-async def _read_bounded_state_value(client: Any, key: str) -> tuple[object | None, int | None, bool]:
-    """Read one pipeline snapshot without materializing an oversized value."""
-    reported_size = int(await client.strlen(key))
-    if reported_size > _MAX_REDIS_STATE_BYTES:
-        return None, reported_size, True
-    bounded = await client.getrange(key, 0, _MAX_REDIS_STATE_BYTES)
-    observed_size = max(reported_size, len(bounded or b""))
-    if observed_size > _MAX_REDIS_STATE_BYTES:
-        return None, observed_size, True
-    if observed_size == 0 and not await client.exists(key):
-        return None, None, False
-    return bounded, observed_size, False
 
 
 def _state_history(state: RepoState | None, limit: int) -> dict[str, Any]:
@@ -2125,7 +2227,11 @@ async def get_orchestrator_status(
     else:
         for index, slug in enumerate(slugs):
             try:
-                raw, size_bytes, oversized = await _read_bounded_state_value(client, pipeline_state(slug))
+                raw, size_bytes, oversized = await _read_bounded_redis_value(
+                    client,
+                    pipeline_state(slug),
+                    _MAX_REDIS_STATE_BYTES,
+                )
             except Exception as exc:
                 state_errors[index] = _error_text(exc)
                 continue

@@ -535,6 +535,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                     "stringData": {"config": "redis-kube-string-secret"},
                 }
             ),
+            "{apiVersion: v1, kind: Secret, data: {opaque: redis-kube-single-flow-secret}}",
+            "INFO {kind: Secret, stringData: {password: redis-kube-prefixed-flow-secret}}",
+            "{kind: ConfigMap, data: {harmless: retained-single-flow-config}}",
             (
                 "apiVersion: v1\ndata:\n"
                 "  opaque: redis-kube-yaml-secret\n"
@@ -658,6 +661,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "  - kind: ConfigMap\n    data:\n      harmless: retained-ci-list-config-value\n"
         + "---\nkind: Secret\ndata: {\n  opaque: ci-kube-flow-secret\n}\n"
         + "---\nkind: Secret\ndata: &payload\n  opaque: ci-kube-anchor-secret\n"
+        + "{apiVersion: v1, kind: Secret, data: {opaque: ci-kube-single-flow-secret}}\n"
+        + "{kind: ConfigMap, data: {harmless: retained-ci-single-flow-config}}\n"
         + "---\nkind: ConfigMap\ndata:\n  harmless: retained-ci-config-value\n"
         + '2026-10-05 INFO {"password":987654322,"debug":true}\n',
         encoding="utf-8",
@@ -734,8 +739,11 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-reversed-list-kube-secret" not in content
         assert "redis-kube-flow-secret" not in content
         assert "redis-kube-anchor-secret" not in content
+        assert "redis-kube-single-flow-secret" not in content
+        assert "redis-kube-prefixed-flow-secret" not in content
         assert "retained-list-config-value" in content
         assert "retained-config-value" in content
+        assert "retained-single-flow-config" in content
         assert docker_auth not in content
 
     for source_id, list_secret in (
@@ -810,6 +818,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-kube-anchor-secret" not in content
         if source_id == "ci:artifact":
             assert "retained-ci-list-config-value" in content
+            assert "ci-kube-single-flow-secret" not in content
+            assert "retained-ci-single-flow-config" in content
 
     ci_raw = ci_path.read_bytes()
     sequence_page = await diagnostics.read_orchestrator_log(
@@ -1109,6 +1119,21 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     assert diagnostics._yaml_flow_delta('{"value": "escaped \\" } [ text"}') == 0
     assert diagnostics._yaml_flow_delta("{'value': ']'}") == 0
     assert diagnostics._yaml_flow_delta("{ # ignored }") == 1
+    assert diagnostics._is_single_line_flow_yaml_secret(
+        "[{kind: ConfigMap, data: {safe: visible}}, {data: {opaque: hidden}, kind: Secret}]"
+    )
+    assert diagnostics._is_single_line_flow_yaml_secret(
+        "INFO {kind: Secret, data: {opaque: hidden}}"
+    )
+    assert diagnostics._is_single_line_flow_yaml_secret(
+        "INFO [{kind: Secret, data: {opaque: hidden}}"
+    )
+    assert not diagnostics._is_single_line_flow_yaml_secret(
+        "{kind: ConfigMap, data: {harmless: visible}}"
+    )
+    cyclic: list[Any] = []
+    cyclic.append(cyclic)
+    assert not diagnostics._contains_kubernetes_secret_payload(cyclic)
 
     redis = FakeRedis()
     _patch_runtime(monkeypatch, redis, _config(_repo()))
@@ -1540,17 +1565,50 @@ async def test_run_filtering_unavailable_record_and_limit() -> None:
     redis.store[MetricsStore._record_key("other-task")] = json.dumps(other)
     redis.store[MetricsStore._record_key("wanted")] = json.dumps(asdict(_run("wanted")))
     redis.store[MetricsStore._record_key("extra")] = json.dumps(asdict(_run("extra")))
-    original_get = redis.get
+    original_strlen = redis.strlen
 
-    async def selective_get(key: str) -> object | None:
+    async def selective_strlen(key: str) -> int:
         if key == MetricsStore._record_key("unavailable"):
             raise ConnectionError("record unavailable")
-        return await original_get(key)
+        return await original_strlen(key)
 
-    redis.get = selective_get  # type: ignore[method-assign]
+    redis.strlen = selective_strlen  # type: ignore[method-assign]
     result = await diagnostics._relevant_runs(redis, SLUG, "PR-9", 2)
     assert [item["status"] for item in result["records"]] == ["unavailable", "available"]
     assert result["records"][1]["record"]["run_id"] == "wanted"
+    assert not any(
+        operation == "get" and str(key).startswith("metrics:run:")
+        for operation, key in redis.calls
+    )
+    assert all(
+        end == diagnostics._MAX_REDIS_RUN_RECORD_BYTES
+        for operation, value in redis.calls
+        if operation == "getrange"
+        for key, _start, end in [value]
+        if str(key).startswith("metrics:run:")
+    )
+
+    oversized_redis = FakeRedis()
+    oversized_redis.lists[index] = ["oversized", "wanted"]
+    oversized_redis.store[MetricsStore._record_key("oversized")] = (
+        "x" * (diagnostics._MAX_REDIS_RUN_RECORD_BYTES + 1)
+    )
+    oversized_redis.store[MetricsStore._record_key("wanted")] = json.dumps(asdict(_run("wanted")))
+    oversized = await diagnostics._relevant_runs(oversized_redis, SLUG, "PR-9", 2)
+    assert oversized["records"][0] == {
+        "status": "oversized",
+        "run_id": "oversized",
+        "source_size_bytes": diagnostics._MAX_REDIS_RUN_RECORD_BYTES + 1,
+        "read_bound_bytes": diagnostics._MAX_REDIS_RUN_RECORD_BYTES,
+        "error": (
+            f"Stored run record is {diagnostics._MAX_REDIS_RUN_RECORD_BYTES + 1} bytes; "
+            f"the diagnostic read bound is {diagnostics._MAX_REDIS_RUN_RECORD_BYTES} bytes."
+        ),
+    }
+    assert oversized["records"][1]["record"]["run_id"] == "wanted"
+    assert not any(operation == "get" for operation, _ in oversized_redis.calls)
+    capped = await diagnostics._relevant_runs(oversized_redis, SLUG, "PR-9", 1)
+    assert [item["status"] for item in capped["records"]] == ["oversized"]
 
     assert diagnostics._state_history(None, 2)["status"] == "unavailable"
     state = RepoState(
@@ -1605,7 +1663,11 @@ async def test_status_bounds_pipeline_snapshots_before_fetching(monkeypatch: pyt
         return 1
 
     raced.strlen = stale_strlen  # type: ignore[method-assign]
-    raw, size_bytes, oversized = await diagnostics._read_bounded_state_value(raced, "pipeline:raced")
+    raw, size_bytes, oversized = await diagnostics._read_bounded_redis_value(
+        raced,
+        "pipeline:raced",
+        diagnostics._MAX_REDIS_STATE_BYTES,
+    )
     assert raw is None
     assert size_bytes == diagnostics._MAX_REDIS_STATE_BYTES + 1
     assert oversized is True

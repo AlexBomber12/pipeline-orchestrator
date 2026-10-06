@@ -45,7 +45,9 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   payload block. YAML document markers are recognized only at document scope,
   and sensitive environment `name` entries bind to their sibling `value`.
   Same-indent YAML sequence children and indented multiline INI values remain
-  within the sensitive unit. Excessive structured nesting is omitted
+  within the sensitive unit. Complete single-line flow-style Kubernetes Secret
+  manifests are parsed before ordinary line redaction, including nested list
+  items and prefixed fallback forms. Excessive structured nesting is omitted
   fail-closed. Producer-added `[truncated]` markers are preserved; because their
   removed prefix may contain a sensitive opener, the retained Redis CLI tail is
   omitted fail-closed. Redis event
@@ -63,7 +65,8 @@ Pipeline state snapshots use the same bounded-read rule: each key is
 size-checked and read through a capped `GETRANGE`, with oversized snapshots
 reported explicitly. Task-filtered run lookup scans the complete retained
 200-entry repository index until it finds the requested number of matching
-records.
+records. Each referenced run-record value is also size-checked and read through
+a capped `GETRANGE`; oversized records are reported without being materialized.
 
 Runtime diagnostics are available on the primary MCP service, whose published
 port remains bound to localhost. When the optional `cloudflared` profile is
