@@ -1537,6 +1537,16 @@ def _yaml_sensitive_env_lines(lines: list[bytes]) -> set[int]:
             or (candidate.startswith("*") and ":" in candidate)
             or candidate.startswith(("? |", "? >"))
             or (candidate.startswith("? ") and "*" in key_source)
+            or (
+                ":" in candidate
+                and candidate.split(":", 1)[1].lstrip().startswith(("|", ">"))
+                and (
+                    "name" in candidate.casefold()
+                    or ("\\" in candidate and '"' in candidate)
+                )
+                and (field := _yaml_mapping_scalar_field(candidate)) is not None
+                and field[2].casefold() == "name"
+            )
         ):
             requires_composition = True
             break

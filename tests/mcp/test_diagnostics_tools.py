@@ -1541,6 +1541,10 @@ async def test_indirect_yaml_env_fields_are_redacted_across_retained_readers(
         "  - <<: *credentialEnv\n"
         "  - <<: [*nameOnly, *valueOnly]\n"
         "  - <<: *safeEnv\n"
+        "  - name: >-\n      PASSWORD\n    value: block-name-env-secret\n"
+        "  - !!str name: >-\n      API_KEY\n    value: tagged-block-name-env-secret\n"
+        '  - "na\\u006de": >-\n      PASSWORD\n    value: escaped-block-name-env-secret\n'
+        "  - name: |-\n      SAFE\n    value: retained-safe-block-name-env\n"
     )
     redis.store[cli_log_latest(SLUG)] = payload
     ci_path = repos_root / SLUG / "artifacts" / "ci.log"
@@ -1556,10 +1560,20 @@ async def test_indirect_yaml_env_fields_are_redacted_across_retained_readers(
         assert "direct-composed-env-secret" not in result["content"]
         assert "split-merged-env-secret" not in result["content"]
         assert "aliased-field-env-secret" not in result["content"]
+        assert "block-name-env-secret" not in result["content"]
+        assert "tagged-block-name-env-secret" not in result["content"]
+        assert "escaped-block-name-env-secret" not in result["content"]
         assert "retained-safe-merged-env" in result["content"]
+        assert "retained-safe-block-name-env" in result["content"]
 
     raw = ci_path.read_bytes()
-    for secret in (b"direct-composed-env-secret", b"aliased-field-env-secret"):
+    for secret in (
+        b"direct-composed-env-secret",
+        b"aliased-field-env-secret",
+        b"block-name-env-secret",
+        b"tagged-block-name-env-secret",
+        b"escaped-block-name-env-secret",
+    ):
         page = await diagnostics.read_orchestrator_log(
             SLUG,
             "ci:artifact",
