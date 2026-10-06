@@ -67,6 +67,8 @@ daemon:
   coder_settings:
     claude:
       model: opus
+    codex:
+      reasoning_effort: high
   fix_idle_timeout_sec: 1800
   fix_iteration_cap: 15
   planned_pr_timeout_sec: 3600
@@ -88,6 +90,11 @@ Coder model choices are stored by stable plugin ID under
 not have an explicit generic `model` setting. An explicit generic value wins
 over its legacy fallback. Codex preserves `model: ""` as the CLI-default
 choice; Claude normalizes an empty choice to its `opus` default.
+
+Codex reasoning effort can be overridden for each new invocation with
+`daemon.coder_settings.codex.reasoning_effort`. Omit the key or set it to an
+empty string to let the Codex CLI use its configured/default effort. A nonempty
+value is forwarded unchanged; supported values depend on the selected model.
 
 ## Local development
 

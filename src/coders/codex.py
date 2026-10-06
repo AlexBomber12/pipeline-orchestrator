@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 CONFIG_PATH = os.environ.get("PO_CONFIG_PATH", "config.yml")
 _AUTH_CHECK_TIMEOUT_SEC = 5
+_REASONING_EFFORT_SETTING = "reasoning_effort"
 _CODEX_RETRY_PATTERN = re.compile(
     r"try again in\s+"
     r"(?:(\d+)\s*days?)?\s*"
@@ -109,6 +110,23 @@ class CodexPlugin:
     def resolve_model(self, daemon_config: "DaemonConfig") -> str:
         """Prefer the plugin-ID setting, including an explicit empty value."""
         return self.model_setting.resolve(self.name, daemon_config)
+
+    def _resolve_reasoning_effort(
+        self, daemon_config: "DaemonConfig"
+    ) -> str | None:
+        """Return the configured override without validating provider choices."""
+        plugin_settings = daemon_config.coder_settings.get(self.name)
+        if (
+            plugin_settings is None
+            or _REASONING_EFFORT_SETTING not in plugin_settings
+        ):
+            return None
+        value = plugin_settings[_REASONING_EFFORT_SETTING]
+        if not isinstance(value, str):
+            raise ValueError(
+                "daemon.coder_settings.codex.reasoning_effort must be a string"
+            )
+        return value or None
 
     def model_catalog_cache_key(
         self, *, config: AppConfig, config_path: str
@@ -224,11 +242,14 @@ class CodexPlugin:
         on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
         on_supervised_process_start: Callable[[SupervisedProcess], None]
         | None = None,
+        reasoning_effort: str | None = None,
+        **_kwargs: Any,
     ) -> tuple[int, str, str]:
         return await codex_cli.run_codex_async(
             prompt,
             repo_path,
             model=model or None,
+            reasoning_effort=reasoning_effort,
             timeout=timeout,
             on_process_start=on_process_start,
             on_supervised_process_start=on_supervised_process_start,
@@ -312,11 +333,14 @@ class CodexPlugin:
         on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
         on_supervised_process_start: Callable[[SupervisedProcess], None]
         | None = None,
+        reasoning_effort: str | None = None,
+        **_kwargs: Any,
     ) -> tuple[int, str, str]:
         return await codex_cli.diagnose_error_async(
             repo_path,
             context,
             model=model or None,
+            reasoning_effort=reasoning_effort,
             on_process_start=on_process_start,
             on_supervised_process_start=on_supervised_process_start,
         )
@@ -331,4 +355,8 @@ class CodexPlugin:
         # breach inputs are accepted for Protocol uniformity but ignored —
         # supports_breach_lifecycle is False, so the plugin emits no
         # breach kwargs even when callers pass them unconditionally.
-        return {"model": self.resolve_model(daemon_config)}
+        kwargs: dict[str, Any] = {"model": self.resolve_model(daemon_config)}
+        reasoning_effort = self._resolve_reasoning_effort(daemon_config)
+        if reasoning_effort is not None:
+            kwargs[_REASONING_EFFORT_SETTING] = reasoning_effort
+        return kwargs

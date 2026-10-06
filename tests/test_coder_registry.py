@@ -260,12 +260,14 @@ def test_codex_plugin_diagnose_error_delegates(
         context: str,
         *,
         model: str | None = None,
+        reasoning_effort: str | None = None,
         on_process_start: object = None,
         on_supervised_process_start: object = None,
     ) -> tuple[int, str, str]:
         captured["repo_path"] = repo_path
         captured["context"] = context
         captured["model"] = model
+        captured["reasoning_effort"] = reasoning_effort
         captured["on_process_start"] = on_process_start
         captured["on_supervised_process_start"] = on_supervised_process_start
         return (0, "SKIP", "")
@@ -274,7 +276,10 @@ def test_codex_plugin_diagnose_error_delegates(
 
     code, stdout, stderr = asyncio.run(
         CodexPlugin().diagnose_error(
-            "/tmp/repo", "ci red", model="gpt-5.4"
+            "/tmp/repo",
+            "ci red",
+            model="gpt-5.4",
+            reasoning_effort="high",
         )
     )
 
@@ -283,6 +288,7 @@ def test_codex_plugin_diagnose_error_delegates(
         "repo_path": "/tmp/repo",
         "context": "ci red",
         "model": "gpt-5.4",
+        "reasoning_effort": "high",
         "on_process_start": None,
         "on_supervised_process_start": None,
     }

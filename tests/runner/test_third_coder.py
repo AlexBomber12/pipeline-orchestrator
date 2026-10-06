@@ -285,7 +285,7 @@ def test_handle_merge_dispatches_auxiliary_prompt_to_fake_plugin(
             )
         return h._FakeCompletedProcess(args=cmd, returncode=0)
 
-    fake = FakeCoderPlugin()
+    fake = _OverridingPlugin()
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     monkeypatch.setattr(
         "src.github.comments.post_comment",
@@ -315,6 +315,9 @@ def test_handle_merge_dispatches_auxiliary_prompt_to_fake_plugin(
     assert call["on_supervised_process_start"] == (
         runner._track_current_coder_supervised_process
     )
+    assert call["provider_option"] == "configured"
+    assert call["timeout"] != _OverridingPlugin.SENTINEL_TIMEOUT
+    assert call["on_process_start"] is not _OverridingPlugin.SENTINEL_HOOK
     assert runner.state.state == PipelineState.WATCH
 
 
@@ -392,6 +395,7 @@ class _OverridingPlugin(FakeCoderPlugin):
     ) -> dict[str, Any]:
         return {
             "model": "fake-1",
+            "provider_option": "configured",
             "timeout": self.SENTINEL_TIMEOUT,
             "on_process_start": self.SENTINEL_HOOK,
         }

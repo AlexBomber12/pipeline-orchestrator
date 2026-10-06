@@ -150,6 +150,7 @@ class CoderPlugin(Protocol):
         on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
         on_supervised_process_start: Callable[[SupervisedProcess], None]
         | None = None,
+        **kwargs: Any,
     ) -> tuple[int, str, str]:
         """Run provider-neutral auxiliary work under process supervision."""
         ...
@@ -189,6 +190,7 @@ class CoderPlugin(Protocol):
         on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
         on_supervised_process_start: Callable[[SupervisedProcess], None]
         | None = None,
+        **kwargs: Any,
     ) -> tuple[int, str, str]: ...
 
     def build_run_kwargs(
@@ -198,16 +200,16 @@ class CoderPlugin(Protocol):
         breach_dir: str | None = None,
         breach_run_id: str | None = None,
     ) -> dict[str, Any]:
-        """Construct plugin-specific kwargs for run_planned_pr / fix_review.
+        """Construct plugin-specific kwargs for primary and auxiliary runs.
 
         Returns the model selection plus any plugin-specific extras
         (e.g. breach monitoring inputs for plugins that support the
         breach lifecycle). Handlers compose handler-specific keys
         (timeout, on_process_start, extra_context) on top of the
         returned dict and pass the merged mapping via ``**kwargs`` to
-        ``run_planned_pr`` / ``fix_review``. Plugins that ignore the
-        breach inputs (``supports_breach_lifecycle`` False) silently
-        drop them so callers can pass them unconditionally.
+        primary or auxiliary plugin method. Plugins that ignore the breach
+        inputs (``supports_breach_lifecycle`` False) silently drop them so
+        callers can pass them unconditionally.
         """
         ...
 
