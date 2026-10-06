@@ -493,6 +493,7 @@ def test_scalar_validation_and_configured_repo_guards(monkeypatch: pytest.Monkey
     assert diagnostics._timestamp(datetime(2026, 1, 1)) == datetime(2026, 1, 1, tzinfo=timezone.utc)
     assert diagnostics._timestamp("2026-01-01T00:00:00Z") is not None
     assert diagnostics._timestamp("bad") is None
+    assert diagnostics._timestamp("0001-01-01T00:00:00+23:59") is None
     assert diagnostics._timestamp(123) is None
     assert diagnostics._timestamp_text("bad") is None
     assert diagnostics._positive_int(0) == 0
@@ -899,6 +900,8 @@ def test_run_metadata_allowlist_and_validation() -> None:
     assert diagnostics._run_metadata(json.dumps(asdict(run)), identifier, SLUG) is None
     run.repo_name = SLUG
     run.started_at = "bad"
+    assert diagnostics._run_metadata(json.dumps(asdict(run)), identifier, SLUG) is None
+    run.started_at = "0001-01-01T00:00:00+23:59"
     assert diagnostics._run_metadata(json.dumps(asdict(run)), identifier, SLUG) is None
     run.started_at = NOW.isoformat()
     run.ended_at = "bad"

@@ -88,18 +88,18 @@ def _iso_z(value: datetime) -> str:
 
 
 def _timestamp(value: object) -> datetime | None:
-    if isinstance(value, datetime):
-        parsed = value
-    elif isinstance(value, str) and value:
-        try:
+    try:
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str) and value:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
+        else:
             return None
-    else:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (OverflowError, ValueError):
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def _timestamp_text(value: object) -> str | None:
