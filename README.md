@@ -101,6 +101,9 @@ in both the web and daemon Python environments and must return a complete
 use the references shown above as compatibility defaults. An explicit entry
 with either ID replaces that default; any other ID adds a registry entry.
 Plugin options remain separate under `daemon.coder_settings.<plugin-id>`.
+Those persisted option values are strings, which keeps configured model keys
+safe across both startup and config-file reload validation without importing
+plugin modules during configuration parsing.
 
 Plugin modules are operator-managed code: loading a reference does not install
 packages, download code, or sandbox the import. Definitions are loaded only at

@@ -322,10 +322,11 @@ class DaemonConfig(BaseModel):
                 raise ValueError(
                     f"coder_settings.{plugin_id} must be a mapping"
                 )
-            if "model" in settings and not isinstance(settings["model"], str):
-                raise ValueError(
-                    f"coder_settings.{plugin_id}.model must be a string"
-                )
+            for setting_key, setting_value in settings.items():
+                if not isinstance(setting_value, str):
+                    raise ValueError(
+                        f"coder_settings.{plugin_id}.{setting_key} must be a string"
+                    )
         return value
 
     @property

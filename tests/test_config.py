@@ -147,6 +147,10 @@ def test_daemon_config_accepts_null_coder_settings_as_empty() -> None:
         ({"": {}}, "plugin IDs must be non-empty strings"),
         ({"codex": "not-a-mapping"}, "coder_settings.codex must be a mapping"),
         ({"codex": {"model": 123}}, "coder_settings.codex.model must be a string"),
+        (
+            {"third": {"variant": 123}},
+            "coder_settings.third.variant must be a string",
+        ),
     ],
 )
 def test_daemon_config_rejects_malformed_coder_settings(
@@ -158,6 +162,31 @@ def test_daemon_config_rejects_malformed_coder_settings(
 
     with pytest.raises(ValidationError, match=message):
         DaemonConfig(coder_settings=coder_settings)  # type: ignore[arg-type]
+
+
+def test_load_config_rejects_non_string_custom_setting_on_reload(
+    tmp_path: Path,
+) -> None:
+    from pydantic import ValidationError
+
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        "daemon:\n  coder_settings:\n    third:\n      variant: safe\n",
+        encoding="utf-8",
+    )
+    assert load_config(str(config_path)).daemon.coder_settings["third"] == {
+        "variant": "safe"
+    }
+
+    config_path.write_text(
+        "daemon:\n  coder_settings:\n    third:\n      variant: 123\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        ValidationError,
+        match=r"coder_settings\.third\.variant must be a string",
+    ):
+        load_config(str(config_path))
 
 
 def test_daemon_config_selector_defaults() -> None:

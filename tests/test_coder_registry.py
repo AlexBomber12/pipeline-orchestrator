@@ -150,9 +150,12 @@ def test_build_registry_loads_configured_plugin_and_builtin_override() -> None:
 
 def test_build_registry_validates_configured_custom_model_setting_value() -> None:
     reference = "tests.configured_coder_plugin:build_variant_setting_plugin"
-    config = AppConfig(
+    daemon = DaemonConfig.model_construct(
+        coder_settings={"third": {"variant": 123}}
+    )
+    config = AppConfig.model_construct(
         coder_plugins={"third": reference},
-        daemon=DaemonConfig(coder_settings={"third": {"variant": 123}}),
+        daemon=daemon,
     )
 
     with pytest.raises(CoderPluginConfigurationError) as caught:
