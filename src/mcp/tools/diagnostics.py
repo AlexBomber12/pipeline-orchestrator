@@ -763,6 +763,14 @@ def _yaml_payload_continuation(value: str) -> tuple[str, int | None] | None:
     return None
 
 
+def _yaml_node_scalar(value: str) -> str:
+    """Normalize anchors and tags that decorate a plain YAML scalar."""
+    remainder = value.strip()
+    while prefix := _YAML_NODE_PREFIX.match(remainder):
+        remainder = remainder[prefix.end() :].lstrip()
+    return remainder.strip().strip("\"'")
+
+
 def _has_line_continuation(raw_line: bytes) -> bool:
     content = raw_line.rstrip(b"\r\n")
     trailing_backslashes = len(content) - len(content.rstrip(b"\\"))
@@ -836,7 +844,7 @@ def _yaml_env_item(
             continue
         effective_indent = len(match.group("indent")) + len(match.group("dash") or "")
         if name_match is not None:
-            fields.append((effective_indent, "name", name_match.group("name").strip().strip("\"'")))
+            fields.append((effective_indent, "name", _yaml_node_scalar(name_match.group("name"))))
         else:
             fields.append((effective_indent, "value", value_match.group("value")))
     if not fields:
@@ -902,7 +910,7 @@ def _sensitive_state_before(
                     and len(name_match.group("indent")) == value_indent
                 )
             ):
-                name = name_match.group("name").strip().strip("\"'")
+                name = _yaml_node_scalar(name_match.group("name"))
                 starts_with_sensitive_value = _SENSITIVE_KEY.fullmatch(name) is not None
                 break
             if raw_line.lstrip().startswith(b"-") and _line_indent(raw_line) <= value_indent:
@@ -1068,7 +1076,7 @@ def _kubernetes_yaml_state_before(
         kind_match = _YAML_KIND_ASSIGNMENT.fullmatch(line)
         if kind_match is not None:
             state_known = True
-            if kind_match.group("kind").strip().strip("\"'").casefold() == "secret":
+            if _yaml_node_scalar(kind_match.group("kind")).casefold() == "secret":
                 secret_scopes.append(
                     (
                         len(kind_match.group("indent")),
@@ -1218,7 +1226,7 @@ def _kubernetes_yaml_payload_flags(
             for index in range(document_start, document_start + inherited_end):
                 flags[index] = True
         for local_index, kind_match in kind_matches:
-            if kind_match.group("kind").strip().strip("\"'").casefold() != "secret":
+            if _yaml_node_scalar(kind_match.group("kind")).casefold() != "secret":
                 continue
             kind_indent = len(kind_match.group("indent"))
             sequence_scope = kind_match.group("dash") is not None

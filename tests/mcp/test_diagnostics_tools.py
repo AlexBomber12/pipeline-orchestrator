@@ -548,12 +548,14 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                 "    - name: PASSWORD\n      value: redis-kube-yaml-env-secret\n"
                 "    - value: redis-reversed-yaml-env-secret\n      name: PASSWORD\n"
                 "    -\n      value: redis-standalone-yaml-env-secret\n      name: API_KEY\n"
+                "    - name: &credential PASSWORD\n      value: redis-decorated-yaml-env-secret\n"
                 "---\nkind: List\nitems:\n"
                 "  - kind: Secret\n    data:\n      opaque: redis-list-kube-secret\n"
                 "  - data:\n      opaque: redis-reversed-list-kube-secret\n    kind: Secret\n"
                 "  - kind: ConfigMap\n    data:\n      harmless: retained-list-config-value\n"
                 "---\nkind: Secret\ndata: {\n  opaque: redis-kube-flow-secret\n}\n"
                 "---\nkind: Secret\ndata: &payload\n  opaque: redis-kube-anchor-secret\n"
+                "---\nkind: &resourceKind Secret\ndata:\n  opaque: redis-decorated-kind-secret\n"
                 "---\nkind: ConfigMap\ndata:\n  harmless: retained-config-value"
             ),
             json.dumps({"auths": {"registry": {"auth": docker_auth}}, "debug": True}),
@@ -587,8 +589,10 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                     "  opaque: disk-kube-yaml-secret\n"
                     "kind: Secret\nmetadata:\n  annotations:\n    note: |\n      ---\n"
                     "stringData: {config: disk-kube-yaml-inline-secret}\n"
+                    "---\nkind: !resource Secret\ndata:\n  opaque: disk-decorated-kind-secret\n"
                     "---\nkind: Pod\nspec:\n  env:\n"
                     "    - name: PASSWORD\n      value: disk-kube-yaml-env-secret\n"
+                    "    - name: !!str PASSWORD\n      value: disk-decorated-yaml-env-secret\n"
                 ),
                 "auths": {"registry": {"auth": docker_auth}},
                 "debug": True,
@@ -656,12 +660,14 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "    - name: PASSWORD\n      value: ci-kube-yaml-env-secret\n"
         + "    - value: ci-reversed-yaml-env-secret\n      name: PASSWORD\n"
         + "    -\n      value: ci-standalone-yaml-env-secret\n      name: API_KEY\n"
+        + "    - name: &credential PASSWORD\n      value: ci-decorated-yaml-env-secret\n"
         + "---\nkind: List\nitems:\n"
         + "  - kind: Secret\n    data:\n      opaque: ci-list-kube-secret\n"
         + "  - data:\n      opaque: ci-reversed-list-kube-secret\n    kind: Secret\n"
         + "  - kind: ConfigMap\n    data:\n      harmless: retained-ci-list-config-value\n"
         + "---\nkind: Secret\ndata: {\n  opaque: ci-kube-flow-secret\n}\n"
         + "---\nkind: Secret\ndata: &payload\n  opaque: ci-kube-anchor-secret\n"
+        + "---\nkind: &resourceKind Secret\ndata:\n  opaque: ci-decorated-kind-secret\n"
         + "{apiVersion: v1, kind: Secret, data: {opaque: ci-kube-single-flow-secret}}\n"
         + "{kind: ConfigMap, data: {harmless: retained-ci-single-flow-config}}\n"
         + "---\nkind: ConfigMap\ndata:\n  harmless: retained-ci-config-value\n"
@@ -736,10 +742,12 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-kube-yaml-env-secret" not in content
         assert "redis-reversed-yaml-env-secret" not in content
         assert "redis-standalone-yaml-env-secret" not in content
+        assert "redis-decorated-yaml-env-secret" not in content
         assert "redis-list-kube-secret" not in content
         assert "redis-reversed-list-kube-secret" not in content
         assert "redis-kube-flow-secret" not in content
         assert "redis-kube-anchor-secret" not in content
+        assert "redis-decorated-kind-secret" not in content
         assert "redis-kube-single-flow-secret" not in content
         assert "redis-kube-prefixed-flow-secret" not in content
         assert "retained-list-config-value" in content
@@ -776,8 +784,11 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-structured-kube-yaml-env-secret" not in content
         assert "ci-kube-yaml-env-secret" not in content
         assert "disk-kube-yaml-env-secret" not in content
+        assert "disk-decorated-yaml-env-secret" not in content
+        assert "disk-decorated-kind-secret" not in content
         assert "ci-reversed-yaml-env-secret" not in content
         assert "ci-standalone-yaml-env-secret" not in content
+        assert "ci-decorated-yaml-env-secret" not in content
         assert docker_auth not in content
         assert "ci-toml-first-secret" not in content
         assert "ci-toml-second-secret" not in content
@@ -817,6 +828,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-reversed-list-kube-secret" not in content
         assert "ci-kube-flow-secret" not in content
         assert "ci-kube-anchor-secret" not in content
+        assert "ci-decorated-kind-secret" not in content
         if source_id == "ci:artifact":
             assert "retained-ci-list-config-value" in content
             assert "ci-kube-single-flow-secret" not in content
@@ -885,6 +897,25 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
     )
     assert "ci-kube-anchor-secret" not in anchored_yaml_secret_page["content"]
     assert "SENSITIVE" in anchored_yaml_secret_page["content"]
+
+    decorated_kind_page = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=ci_raw.index(b"  opaque: ci-decorated-kind-secret"),
+        max_chars=300,
+    )
+    assert "ci-decorated-kind-secret" not in decorated_kind_page["content"]
+    assert "SENSITIVE" in decorated_kind_page["content"]
+
+    decorated_env_page = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=ci_raw.index(b"      value: ci-decorated-yaml-env-secret"),
+        max_chars=300,
+    )
+    assert "ci-decorated-yaml-env-secret" not in decorated_env_page["content"]
+    assert "SENSITIVE" in decorated_env_page["content"]
+
     triple_quote_continuation = await diagnostics.read_orchestrator_log(
         SLUG,
         "ci:artifact",
@@ -1120,6 +1151,7 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     assert diagnostics._yaml_flow_delta('{"value": "escaped \\" } [ text"}') == 0
     assert diagnostics._yaml_flow_delta("{'value': ']'}") == 0
     assert diagnostics._yaml_flow_delta("{ # ignored }") == 1
+    assert diagnostics._yaml_node_scalar("&resourceKind !!str 'Secret'") == "Secret"
     assert diagnostics._is_single_line_flow_yaml_secret(
         "[{kind: ConfigMap, data: {safe: visible}}, {data: {opaque: hidden}, kind: Secret}]"
     )

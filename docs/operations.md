@@ -44,6 +44,8 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   output regardless of YAML key order, including reads that begin inside a YAML
   payload block. YAML document markers are recognized only at document scope,
   and sensitive environment `name` entries bind to their sibling `value`.
+  YAML anchors and tags decorating Secret `kind` or environment `name` scalars
+  are normalized before either classification.
   Same-indent YAML sequence children and indented multiline INI values remain
   within the sensitive unit. Complete single-line flow-style Kubernetes Secret
   manifests are parsed before ordinary line redaction, including nested list
