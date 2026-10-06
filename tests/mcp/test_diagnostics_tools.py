@@ -1800,6 +1800,51 @@ async def test_shell_append_assignments_are_redacted_across_retained_readers(
     assert "retained-safe-fish-assignment" in fish_continuation["content"]
 
 
+async def test_dockerfile_env_word_assignments_are_redacted_across_retained_readers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    repos_root = tmp_path / "repos"
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+    payload = (
+        "ENV PASSWORD docker-env-secret\n"
+        'env API_KEY "quoted-docker-env-secret"\n'
+        "ENV CLIENT_SECRET continued-docker-env-secret\\\n"
+        "continued-docker-env-secret-two\n"
+        "ENV SAFE retained-safe-docker-env\n"
+    )
+    redis.store[cli_log_latest(SLUG)] = payload
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.write_text(payload, encoding="utf-8")
+
+    for source_id in ("cli:latest", "ci:artifact"):
+        result = await diagnostics.read_orchestrator_log(
+            SLUG,
+            source_id,
+            max_chars=4_000,
+        )
+        assert "docker-env-secret" not in result["content"]
+        assert "quoted-docker-env-secret" not in result["content"]
+        assert "continued-docker-env-secret" not in result["content"]
+        assert "continued-docker-env-secret-two" not in result["content"]
+        assert "ENV SAFE retained-safe-docker-env" in result["content"]
+
+    raw = ci_path.read_bytes()
+    continuation = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=raw.index(b"continued-docker-env-secret-two"),
+        max_chars=4_000,
+    )
+    assert "continued-docker-env-secret-two" not in continuation["content"]
+    assert "ENV SAFE retained-safe-docker-env" in continuation["content"]
+
+
 async def test_truncated_redis_logs_omit_unknown_leading_sensitive_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

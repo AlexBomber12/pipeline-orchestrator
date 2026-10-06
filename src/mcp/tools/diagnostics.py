@@ -348,10 +348,18 @@ _FISH_SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?:[ \t]+(?:--|--?[A-Za-z-]+))*[ \t]+(?:{_SENSITIVE_KEY_PATTERN})[ \t]+)"
     r"(?P<value>\S.*)$"
 )
+_DOCKER_ENV_SENSITIVE_ASSIGNMENT = re.compile(
+    rf"(?im)^(?P<indent>[ \t]*)(?P<prefix>ENV[ \t]+(?:{_SENSITIVE_KEY_PATTERN})[ \t]+)"
+    r"(?P<value>\S.*)$"
+)
 _REDACTION_RULES = (
     (
         _FISH_SENSITIVE_ASSIGNMENT,
         r"\g<indent>\g<trace>\g<prefix>[REDACTED]",
+    ),
+    (
+        _DOCKER_ENV_SENSITIVE_ASSIGNMENT,
+        r"\g<indent>\g<prefix>[REDACTED]",
     ),
     (
         re.compile(
@@ -2100,6 +2108,7 @@ def _sensitive_state_before(
             _BLOCK_SENSITIVE_ASSIGNMENT.fullmatch(line)
             or _PLAIN_SENSITIVE_ASSIGNMENT.fullmatch(line)
             or _FISH_SENSITIVE_ASSIGNMENT.fullmatch(line)
+            or _DOCKER_ENV_SENSITIVE_ASSIGNMENT.fullmatch(line)
             or _PENDING_YAML_SENSITIVE_ASSIGNMENT.fullmatch(line)
         )
         yaml_assignment = _yaml_sensitive_assignment(line)
@@ -2167,6 +2176,7 @@ def _sensitive_state_before(
         if (
             _PREFIXED_PLAIN_SENSITIVE_ASSIGNMENT.search(continuation_line) is not None
             or _FISH_SENSITIVE_ASSIGNMENT.fullmatch(continuation_line) is not None
+            or _DOCKER_ENV_SENSITIVE_ASSIGNMENT.fullmatch(continuation_line) is not None
         ):
             starts_inside_sensitive_block = True
             active_block_indent = -1
@@ -2883,6 +2893,9 @@ def _redacted_file_units(
                 continue
             plain_match = _PLAIN_SENSITIVE_ASSIGNMENT.fullmatch(text_unit.rstrip("\r\n"))
             fish_match = _FISH_SENSITIVE_ASSIGNMENT.fullmatch(text_unit.rstrip("\r\n"))
+            docker_env_match = _DOCKER_ENV_SENSITIVE_ASSIGNMENT.fullmatch(
+                text_unit.rstrip("\r\n")
+            )
             continued_assignment = _has_line_continuation(raw_unit)
             prefixed_continuation_match = (
                 _PREFIXED_PLAIN_SENSITIVE_ASSIGNMENT.search(text_unit.rstrip("\r\n"))
@@ -2892,6 +2905,7 @@ def _redacted_file_units(
             if (
                 plain_match is not None
                 or fish_match is not None
+                or docker_env_match is not None
                 or prefixed_continuation_match is not None
             ):
                 scalar_indent = (
@@ -2899,6 +2913,8 @@ def _redacted_file_units(
                     if plain_match is not None
                     else len(fish_match.group("indent"))
                     if fish_match is not None
+                    else len(docker_env_match.group("indent"))
+                    if docker_env_match is not None
                     else 0
                 )
                 scalar_end = line_index + 1
