@@ -46,10 +46,10 @@
                                     hx-post="/partials/settings/coders/{{ coder.name }}/models/refresh"
                                     hx-target="#settings-coders"
                                     hx-swap="outerHTML"
-                                    hx-indicator="#{{ coder.name }}-model-refreshing">
+                                    hx-indicator="#coder-{{ coder.name }}-model-refreshing">
                                 Refresh models
                             </button>
-                            <span id="{{ coder.name }}-model-refreshing"
+                            <span id="coder-{{ coder.name }}-model-refreshing"
                                   class="htmx-indicator text-xs text-warn"
                                   aria-live="polite">Refreshing…</span>
                         </div>

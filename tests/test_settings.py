@@ -888,6 +888,27 @@ def test_shared_catalog_rendering_supports_third_plugin_without_branches(
     assert "/partials/settings/coders/third/models/refresh" not in response.text
 
 
+def test_refresh_indicator_is_css_safe_for_digit_leading_plugin_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "coder_plugins:\n"
+        "  3rd: tests.configured_coder_plugin:build_digit_leading_plugin\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/settings/coders")
+
+    assert response.status_code == 200
+    assert 'hx-indicator="#coder-3rd-model-refreshing"' in response.text
+    assert 'id="coder-3rd-model-refreshing"' in response.text
+
+
 def test_arbitrary_plugin_model_round_trips_without_core_field(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

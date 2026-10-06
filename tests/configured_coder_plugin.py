@@ -43,6 +43,11 @@ class ClaudeOverridePlugin(ClaudePlugin):
         return {"status": "ok", "detail": "configured plugin auth"}
 
 
+class DigitLeadingTestPlugin(ConfiguredTestPlugin):
+    name = "3rd"
+    model_catalog_refreshable = True
+
+
 class MissingMetadataPlugin(ConfiguredTestPlugin):
     display_name = ""
 
@@ -61,6 +66,10 @@ def build_test_plugin() -> ConfiguredTestPlugin:
 
 def build_claude_override() -> ClaudeOverridePlugin:
     return ClaudeOverridePlugin()
+
+
+def build_digit_leading_plugin() -> DigitLeadingTestPlugin:
+    return DigitLeadingTestPlugin()
 
 
 def build_mismatched_plugin() -> ConfiguredTestPlugin:
