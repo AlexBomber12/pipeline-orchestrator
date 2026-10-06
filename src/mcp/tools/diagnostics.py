@@ -409,10 +409,15 @@ _HCL_BLOCK_START = re.compile(
     r'(?im)^[ \t]*(?:variable|output)[ \t]+"(?P<label>(?:\\.|[^"\\])*)"[ \t]*\{'
 )
 _HCL_BLOCK_STATE_BASE = 4
+_XML_SENSITIVE_STATE_PREFIX = "\0xml:"
+_XML_SENSITIVE_ELEMENT_OPEN = re.compile(
+    rf"(?i)<(?P<xml_state_namespace>(?:[A-Za-z_][A-Za-z0-9_.-]*:)?)"
+    rf"(?P<xml_state_element>{_SENSITIVE_KEY_PATTERN})(?=[ \t/>])[^<>\r\n]*>"
+)
 _XML_SENSITIVE_ELEMENT_VALUE = re.compile(
     rf"(?i)(?P<xml_open><(?P<xml_namespace>(?:[A-Za-z_][A-Za-z0-9_.-]*:)?)"
     rf"(?P<xml_element>{_SENSITIVE_KEY_PATTERN})(?=[ \t/>])[^<>\r\n]*>)"
-    r"(?P<xml_value><!\[CDATA\[(?:(?!\]\]>)[^\r\n])*\]\]>|[^<\r\n]+?)"
+    r"(?P<xml_value>[^\r\n]*?)"
     r"(?P<xml_close></(?P=xml_namespace)(?P=xml_element)[ \t]*>)"
 )
 _XML_NAMED_SENSITIVE_VALUE = re.compile(
@@ -2052,6 +2057,25 @@ def _heredoc_from_state(state: str) -> tuple[str, bool]:
     return delimiter, allow_indent == "1"
 
 
+def _xml_sensitive_element_after(text: str, active: str | None) -> str | None:
+    """Return the sensitive XML element left open after one bounded line."""
+    cursor = 0
+    while True:
+        if active is not None:
+            closing = re.search(rf"(?i)</{re.escape(active)}[ \t]*>", text[cursor:])
+            if closing is None:
+                return active
+            cursor += closing.end()
+            active = None
+        opening = _XML_SENSITIVE_ELEMENT_OPEN.search(text, cursor)
+        if opening is None:
+            return None
+        cursor = opening.end()
+        if opening.group(0).rstrip().endswith("/>"):
+            continue
+        active = opening.group("xml_state_namespace") + opening.group("xml_state_element")
+
+
 def _hcl_block_label_is_sensitive(match: re.Match[str]) -> bool:
     raw_label = match.group("label")
     try:
@@ -2452,8 +2476,14 @@ def _sensitive_state_before(
     quote_state_known = search_start == 0
     active_quote: str | None = None
     active_heredoc: tuple[str, bool] | None = None
+    active_xml: str | None = None
     for raw_line in context_lines:
         line = raw_line.decode("utf-8", errors="replace")
+        if active_xml is not None:
+            active_xml = _xml_sensitive_element_after(line, active_xml)
+            quote_state_known = True
+            if active_xml is not None:
+                continue
         if active_heredoc is not None:
             if _heredoc_terminator(line, active_heredoc):
                 active_heredoc = None
@@ -2467,6 +2497,10 @@ def _sensitive_state_before(
                 active_quote = None
                 quote_state_known = True
             continue
+        active_xml = _xml_sensitive_element_after(line, None)
+        if active_xml is not None:
+            quote_state_known = True
+            continue
         quoted_match = _QUOTED_SENSITIVE_ASSIGNMENT.search(line)
         if quoted_match is not None:
             quote = quoted_match.group("quote")
@@ -2474,7 +2508,10 @@ def _sensitive_state_before(
                 active_quote = quote
             quote_state_known = True
 
-    if active_quote is not None:
+    if active_xml is not None:
+        starts_inside_sensitive_quote: bool | None = True
+        active_quote = f"{_XML_SENSITIVE_STATE_PREFIX}{active_xml}"
+    elif active_quote is not None:
         starts_inside_sensitive_quote: bool | None = True
     elif quote_state_known:
         starts_inside_sensitive_quote = False
@@ -2948,6 +2985,30 @@ def _redacted_file_units(
     elif (
         starts_inside_sensitive_quote
         and sensitive_quote is not None
+        and sensitive_quote.startswith(_XML_SENSITIVE_STATE_PREFIX)
+    ):
+        active_xml = sensitive_quote.removeprefix(_XML_SENSITIVE_STATE_PREFIX)
+        xml_end = 0
+        while xml_end < len(raw_lines) and active_xml is not None:
+            active_xml = _xml_sensitive_element_after(
+                raw_lines[xml_end].decode("utf-8", errors="replace"),
+                active_xml,
+            )
+            xml_end += 1
+        raw_unit = b"".join(raw_lines[:xml_end])
+        units.append((raw_unit, "[REDACTED SENSITIVE XML ELEMENT]\n", 1))
+        if active_xml is not None:
+            warnings.append(
+                "A sensitive XML element crossed the bounded page window; "
+                "its visible segment was redacted."
+                if has_more_after_raw
+                else "A sensitive XML element had no closing tag; "
+                "the remaining content was redacted fail-closed."
+            )
+        line_index = xml_end
+    elif (
+        starts_inside_sensitive_quote
+        and sensitive_quote is not None
         and sensitive_quote.startswith(_HEREDOC_STATE_PREFIX)
     ):
         heredoc = _heredoc_from_state(sensitive_quote)
@@ -3066,6 +3127,27 @@ def _redacted_file_units(
         raw_unit = raw_lines[line_index]
         text_unit = raw_unit.decode("utf-8", errors="replace")
         stripped_unit = text_unit.rstrip("\r\n")
+        active_xml = _xml_sensitive_element_after(stripped_unit, None)
+        if active_xml is not None:
+            xml_end = line_index + 1
+            while xml_end < len(raw_lines) and active_xml is not None:
+                active_xml = _xml_sensitive_element_after(
+                    raw_lines[xml_end].decode("utf-8", errors="replace"),
+                    active_xml,
+                )
+                xml_end += 1
+            raw_unit = b"".join(raw_lines[line_index:xml_end])
+            units.append((raw_unit, "[REDACTED SENSITIVE XML ELEMENT]\n", 1))
+            if active_xml is not None:
+                warnings.append(
+                    "A sensitive XML element crossed the bounded page window; "
+                    "its visible segment was redacted."
+                    if has_more_after_raw
+                    else "A sensitive XML element had no closing tag; "
+                    "the remaining content was redacted fail-closed."
+                )
+            line_index = xml_end
+            continue
         if line_index in semantic_sensitive_yaml_lines:
             semantic_end = line_index + 1
             while semantic_end in semantic_sensitive_yaml_lines:

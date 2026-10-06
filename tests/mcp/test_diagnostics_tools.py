@@ -679,9 +679,17 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             "mysql -p",
             "<password>redis-xml-element-secret</password>",
             "<password><![CDATA[redis-xml-cdata-secret]]></password>",
+            "<password><value>redis-xml-nested-secret</value></password>",
+            "<password>\nredis-xml-multiline-secret\n</password>",
+            (
+                "<clientSecret>\n<![CDATA[\n"
+                "redis-xml-multiline-cdata-secret\n]]>\n</clientSecret>"
+            ),
+            "<password/>",
             '<property name="password" value="redis-xml-attribute-secret"/>',
             "<property value='redis-xml-reversed-secret' name='clientSecret'/>",
             "<username>retained-xml-element-value</username>",
+            "<username>\nretained-xml-multiline-value\n</username>",
             '<property name="username" value="retained-xml-attribute-value"/>',
             json.dumps(
                 {
@@ -837,9 +845,15 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "mariadb -p\n"
         + "<m:password>ci-xml-element-secret</m:password>\n"
         + "<m:password><![CDATA[ci-xml-cdata-secret]]></m:password>\n"
+        + "<m:password><value>ci-xml-nested-secret</value></m:password>\n"
+        + "<m:password>\nci-xml-multiline-secret\n</m:password>\n"
+        + "<m:clientSecret>\n<![CDATA[\nci-xml-multiline-cdata-secret\n]]>\n"
+        + "</m:clientSecret>\n"
+        + "<m:password/>\n"
         + '<property name="apiKey" value="ci-xml-attribute-secret"/>\n'
         + "<property value='ci-xml-reversed-secret' name='refreshToken'/>\n"
         + "<m:username>retained-ci-xml-element-value</m:username>\n"
+        + "<m:username>\nretained-ci-xml-multiline-value\n</m:username>\n"
         + '<property name="username" value="retained-ci-xml-attribute-value"/>\n'
         + "apiVersion: v1\ndata:\n"
         + "  opaque: ci-kube-yaml-secret\n"
@@ -951,9 +965,14 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "mysql -p" in content
         assert "redis-xml-element-secret" not in content
         assert "redis-xml-cdata-secret" not in content
+        assert "redis-xml-nested-secret" not in content
+        assert "redis-xml-multiline-secret" not in content
+        assert "redis-xml-multiline-cdata-secret" not in content
+        assert "<password/>" in content
         assert "redis-xml-attribute-secret" not in content
         assert "redis-xml-reversed-secret" not in content
         assert "retained-xml-element-value" in content
+        assert "retained-xml-multiline-value" in content
         assert "retained-xml-attribute-value" in content
         assert "redis-kube-data-secret" not in content
         assert "redis-kube-string-secret" not in content
@@ -1008,6 +1027,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-mysql-short-secret" not in content
         assert "ci-xml-element-secret" not in content
         assert "ci-xml-cdata-secret" not in content
+        assert "ci-xml-nested-secret" not in content
+        assert "ci-xml-multiline-secret" not in content
+        assert "ci-xml-multiline-cdata-secret" not in content
         assert "ci-xml-attribute-secret" not in content
         assert "ci-xml-reversed-secret" not in content
         assert "disk-netrc-secret" not in content
@@ -1074,6 +1096,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         if source_id == "ci:artifact":
             assert "mariadb -p" in content
             assert "retained-ci-xml-element-value" in content
+            assert "retained-ci-xml-multiline-value" in content
             assert "retained-ci-xml-attribute-value" in content
             assert "retained-ci-list-config-value" in content
             assert "ci-kube-single-flow-secret" not in content
@@ -1093,6 +1116,15 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             assert "retained-ci-aliased-config-value" in content
 
     ci_raw = ci_path.read_bytes()
+    xml_page = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=ci_raw.index(b"ci-xml-multiline-secret"),
+        max_chars=200,
+    )
+    assert "ci-xml-multiline-secret" not in xml_page["content"]
+    assert "SENSITIVE XML ELEMENT" in xml_page["content"]
+
     sequence_page = await diagnostics.read_orchestrator_log(
         SLUG,
         "ci:artifact",
@@ -3181,6 +3213,26 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
         0,
     )
     assert diagnostics._redact_text("psql -p5432") == ("psql -p5432", 0)
+    unclosed_xml, unclosed_xml_count, unclosed_xml_warnings = (
+        diagnostics._redact_log_content("<password>\nunclosed-xml-secret\n")
+    )
+    assert "unclosed-xml-secret" not in unclosed_xml
+    assert unclosed_xml_count == 1
+    assert "no closing tag" in unclosed_xml_warnings[0]
+    inside_xml_warnings: list[str] = []
+    inside_xml_units = diagnostics._redacted_file_units(
+        b"inside-xml-secret\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=True,
+        sensitive_quote=f"{diagnostics._XML_SENSITIVE_STATE_PREFIX}password",
+        has_more_after_raw=True,
+        warnings=inside_xml_warnings,
+    )
+    assert inside_xml_units[0][1] == "[REDACTED SENSITIVE XML ELEMENT]\n"
+    assert "crossed the bounded page window" in inside_xml_warnings[0]
     assert diagnostics._redact_text("tokens_in=123 tokens_out=456") == (
         "tokens_in=123 tokens_out=456",
         0,
