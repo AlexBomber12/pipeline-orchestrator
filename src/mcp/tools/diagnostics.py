@@ -236,7 +236,20 @@ def _snapshot_result(
     if raw is None:
         return _snapshot_unavailable("missing", "snapshot_missing"), None
     try:
-        state = RepoState.model_validate_json(_decode(raw))
+        decoded = json.loads(_decode(raw))
+        if not isinstance(decoded, dict):
+            raise ValueError
+        if (
+            not isinstance(decoded.get("state"), str)
+            or not isinstance(decoded.get("active"), bool)
+            or not isinstance(decoded.get("user_paused"), bool)
+            or not isinstance(decoded.get("last_updated"), str)
+        ):
+            raise ValueError
+        source_timestamp = _timestamp(decoded["last_updated"])
+        if source_timestamp is None:
+            raise ValueError
+        state = RepoState.model_validate(decoded)
     except Exception:
         result = _snapshot_unavailable("malformed", "snapshot_invalid")
         result["source_size_bytes"] = size_bytes
@@ -246,10 +259,6 @@ def _snapshot_result(
         result["source_size_bytes"] = size_bytes
         return result, None
 
-    source_timestamp = state.last_updated
-    if source_timestamp.tzinfo is None:
-        source_timestamp = source_timestamp.replace(tzinfo=timezone.utc)
-    source_timestamp = source_timestamp.astimezone(timezone.utc)
     age = (observed_at - source_timestamp).total_seconds()
     stale_after = _stale_after_seconds(config, repo)
     status = "clock_skew" if age < -5 else "fresh" if age <= stale_after else "stale"

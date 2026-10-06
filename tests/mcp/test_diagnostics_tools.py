@@ -344,6 +344,40 @@ async def test_status_overview_reports_missing_malformed_oversized_and_partial_s
     assert result["detail"]["pending_retries"]["status"] == "available"
 
 
+async def test_sparse_snapshot_cannot_default_to_fresh_idle_and_other_reads_continue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis)
+    redis.store[pipeline_state(SLUG)] = json.dumps(
+        {
+            "name": SLUG,
+            "url": "https://github.com/octo/demo.git",
+        }
+    )
+    command = _command()
+    redis.zsets[retry_command_pending(SLUG)] = [(command.command_id, command.requested_at.timestamp())]
+    redis.store[retry_command(SLUG, command.command_id)] = command.model_dump_json()
+    run = _run()
+    redis.lists[MetricsStore._recent_key("PR", SLUG)] = [run.run_id]
+    redis.store[MetricsStore._record_key(run.run_id)] = json.dumps(asdict(run))
+
+    result = await diagnostics.get_orchestrator_status(SLUG)
+
+    overview = result["repositories"][0]
+    assert overview["snapshot"]["status"] == "malformed"
+    assert overview["snapshot"]["code"] == "snapshot_invalid"
+    assert overview["snapshot"]["source_timestamp"] is None
+    assert overview["snapshot"]["age_seconds"] is None
+    assert overview["pipeline"] is None
+    assert result["detail"]["pipeline"] is None
+    assert result["detail"]["pending_retries"]["records"][0]["status"] == "available"
+    assert result["detail"]["run_records"]["records"][0]["status"] == "available"
+    assert result["detail"]["run_records"]["task_filter"] is None
+
+
 async def test_status_connection_config_validation_and_cancellation_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -502,6 +536,16 @@ async def test_bounded_string_and_snapshot_contracts() -> None:
         observed_at=NOW,
     )
     assert malformed["status"] == "malformed" and state is None
+    non_object, state = diagnostics._snapshot_result(
+        "[]",
+        size_bytes=2,
+        oversized=False,
+        slug=SLUG,
+        repo=repo,
+        config=config,
+        observed_at=NOW,
+    )
+    assert non_object["status"] == "malformed" and state is None
     mismatch_state = _state().model_copy(update={"name": OTHER_SLUG})
     mismatch, state = diagnostics._snapshot_result(
         mismatch_state.model_dump_json(),
@@ -546,6 +590,82 @@ async def test_bounded_string_and_snapshot_contracts() -> None:
         observed_at=NOW,
     )
     assert naive_result["status"] == "fresh"
+
+
+@pytest.mark.parametrize(
+    ("timestamp_present", "timestamp_value"),
+    [
+        (False, None),
+        (True, "not-a-timestamp"),
+        (True, 1_759_664_400),
+    ],
+)
+def test_snapshot_requires_a_valid_producer_timestamp(
+    timestamp_present: bool,
+    timestamp_value: object,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    payload = json.loads(_state(updated=NOW).model_dump_json())
+    if timestamp_present:
+        payload["last_updated"] = timestamp_value
+    else:
+        payload.pop("last_updated")
+
+    result, state = diagnostics._snapshot_result(
+        json.dumps(payload),
+        size_bytes=100,
+        oversized=False,
+        slug=SLUG,
+        repo=_repo(),
+        config=_config(_repo()),
+        observed_at=NOW,
+    )
+
+    assert result["status"] == "malformed"
+    assert result["code"] == "snapshot_invalid"
+    assert result["source_timestamp"] is None
+    assert result["age_seconds"] is None
+    assert state is None
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("state", None),
+        ("active", None),
+        ("user_paused", None),
+        ("state", 1),
+        ("state", "NOT_A_STATE"),
+        ("active", "true"),
+        ("user_paused", 0),
+    ],
+)
+def test_snapshot_requires_producer_state_and_control_flags(
+    field: str,
+    replacement: object,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    payload = json.loads(_state(updated=NOW).model_dump_json())
+    if replacement is None:
+        payload.pop(field)
+    else:
+        payload[field] = replacement
+
+    result, state = diagnostics._snapshot_result(
+        json.dumps(payload),
+        size_bytes=100,
+        oversized=False,
+        slug=SLUG,
+        repo=_repo(),
+        config=_config(_repo()),
+        observed_at=NOW,
+    )
+
+    assert result["status"] == "malformed"
+    assert result["code"] == "snapshot_invalid"
+    assert state is None
 
 
 def test_pipeline_and_inhibitor_allowlists() -> None:
