@@ -1122,6 +1122,59 @@ async def test_yaml_merge_kinds_are_classified_across_retained_readers(
     assert "SENSITIVE" in mid_payload["content"]
 
 
+async def test_yaml_explicit_keys_are_redacted_across_retained_readers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis, _config(_repo()))
+    repos_root = tmp_path / "repos"
+    monkeypatch.setattr(diagnostics, "_REPOS_ROOT", repos_root)
+    payload = (
+        "? password\n: plain-explicit-secret\n"
+        '? "pass\\u0077ord"\n: |\n  escaped-explicit-secret\n'
+        "safe: retained-explicit-neighbor\n"
+    )
+    redis.store[cli_log_latest(SLUG)] = payload
+    ci_path = repos_root / SLUG / "artifacts" / "ci.log"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.write_text(payload, encoding="utf-8")
+
+    redis_result = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "cli:latest",
+        max_chars=2_000,
+    )
+    file_result = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        max_chars=2_000,
+    )
+    for result in (redis_result, file_result):
+        assert "plain-explicit-secret" not in result["content"]
+        assert "escaped-explicit-secret" not in result["content"]
+        assert "retained-explicit-neighbor" in result["content"]
+
+    raw = ci_path.read_bytes()
+    at_value = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=raw.index(b": plain-explicit-secret"),
+        max_chars=2_000,
+    )
+    inside_block = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=raw.index(b"  escaped-explicit-secret"),
+        max_chars=2_000,
+    )
+    assert "plain-explicit-secret" not in at_value["content"]
+    assert "escaped-explicit-secret" not in inside_block["content"]
+    assert "retained-explicit-neighbor" in inside_block["content"]
+
+
 async def test_truncated_redis_logs_omit_unknown_leading_sensitive_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1366,6 +1419,65 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
         )
     assert complexity_units[0][1] == "[CONTENT OMITTED: YAML FLOW COMPLEXITY BOUND EXCEEDED]\n"
     assert any("parse complexity" in warning for warning in complexity_warnings)
+    block_heavy = "a: b\n" * (diagnostics._MAX_YAML_BLOCK_MAPPING_LINES + 1)
+    assert diagnostics._yaml_block_complexity_exceeded(block_heavy)
+    assert diagnostics._yaml_parse_complexity_exceeded(block_heavy)
+    decoded_key_heavy = '? "pass\\u0061ge"\n' * (
+        diagnostics._MAX_YAML_PER_LINE_SCAN_CANDIDATES + 1
+    )
+    assert diagnostics._yaml_block_complexity_exceeded(decoded_key_heavy)
+    block_warnings: list[str] = []
+    with monkeypatch.context() as yaml_patch:
+        yaml_patch.setattr(
+            diagnostics.yaml,
+            "scan",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("bounded block YAML must not reach yaml.scan")
+            ),
+        )
+        yaml_patch.setattr(
+            diagnostics.yaml,
+            "compose",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("bounded block YAML must not reach yaml.compose")
+            ),
+        )
+        block_units = diagnostics._redacted_file_units(
+            block_heavy.encode(),
+            starts_inside_private_key=False,
+            starts_with_sensitive_value=False,
+            starts_inside_sensitive_block=False,
+            sensitive_block_indent=None,
+            starts_inside_sensitive_quote=False,
+            sensitive_quote=None,
+            has_more_after_raw=False,
+            warnings=block_warnings,
+        )
+    assert block_units[0][1] == "[CONTENT OMITTED: YAML BLOCK COMPLEXITY BOUND EXCEEDED]\n"
+    assert any("block syntax" in warning for warning in block_warnings)
+
+    real_scan = diagnostics.yaml.scan
+    scan_calls = 0
+
+    def counted_scan(*args: object, **kwargs: object) -> object:
+        nonlocal scan_calls
+        scan_calls += 1
+        return real_scan(*args, **kwargs)
+
+    with monkeypatch.context() as yaml_patch:
+        yaml_patch.setattr(diagnostics.yaml, "scan", counted_scan)
+        diagnostics._redacted_file_units(
+            b"a: b\n" * 200,
+            starts_inside_private_key=False,
+            starts_with_sensitive_value=False,
+            starts_inside_sensitive_block=False,
+            sensitive_block_indent=None,
+            starts_inside_sensitive_quote=False,
+            sensitive_quote=None,
+            has_more_after_raw=False,
+            warnings=[],
+        )
+    assert scan_calls == 3
     assert diagnostics._yaml_node_scalar("&resourceKind !!str 'Secret'") == "Secret"
     anchors = diagnostics._yaml_scalar_anchors(
         [
@@ -1438,6 +1550,46 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     assert diagnostics._yaml_sensitive_assignment(
         '  - "pass\\u0077ord": plainsecret'
     ) == (2, "plainsecret")
+    assert diagnostics._yaml_sensitive_assignment("ordinary: visible") is None
+    assert diagnostics._yaml_sensitive_assignment('"pass\\u0077ord": "') is None
+    assert diagnostics._yaml_explicit_sensitive_key("? password") == 0
+    assert diagnostics._yaml_explicit_sensitive_key('? "pass\\u0077ord"') == 0
+    assert diagnostics._yaml_explicit_sensitive_key("? harmless") is None
+    assert diagnostics._yaml_explicit_sensitive_key('? "pass\\u0077ord') is None
+    assert diagnostics._yaml_explicit_sensitive_key('"pass\\u0077ord": visible # ?') is None
+    assert diagnostics._yaml_explicit_value_end(
+        [b"\n", b": visible\n"],
+        0,
+        minimum_indent=0,
+        has_more_after_raw=False,
+    ) == (2, False)
+    assert diagnostics._yaml_explicit_value_end(
+        [b"\n"],
+        0,
+        minimum_indent=0,
+        has_more_after_raw=True,
+    ) == (1, True)
+    assert (
+        diagnostics._yaml_explicit_value_end(
+            [b"ordinary\n"],
+            0,
+            minimum_indent=0,
+            has_more_after_raw=False,
+        )
+        is None
+    )
+    assert diagnostics._yaml_explicit_value_end(
+        [b": {nested:\n", b"  visible}\n"],
+        0,
+        minimum_indent=0,
+        has_more_after_raw=False,
+    ) == (2, False)
+    assert diagnostics._yaml_explicit_value_end(
+        [b": {nested:\n"],
+        0,
+        minimum_indent=0,
+        has_more_after_raw=True,
+    ) == (1, True)
     assert diagnostics._yaml_sensitive_assignment('"pass\\u0061ge": visible') is None
     assert diagnostics._yaml_sensitive_assignment('"pass\\u0077ord') is None
     assert diagnostics._yaml_flow_sensitivity(
@@ -2717,6 +2869,48 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
     ) == [(b"visible\n", "[CONTENT OMITTED: KUBERNETES SECRET CONTEXT UNKNOWN]\n", 1)]
     assert any("Kubernetes Secret YAML context exceeded" in warning for warning in warnings)
 
+    warnings = []
+    starts_with_explicit = diagnostics._redacted_file_units(
+        b": |\n  crossed-explicit-secret\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=True,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=True,
+        warnings=warnings,
+    )
+    assert "crossed-explicit-secret" not in "".join(unit[1] for unit in starts_with_explicit)
+    assert any("explicit YAML sensitive value crossed" in warning for warning in warnings)
+
+    unmatched_explicit = diagnostics._redacted_file_units(
+        b"? password\nordinary\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=False,
+        warnings=[],
+    )
+    assert "ordinary" in "".join(unit[1] for unit in unmatched_explicit)
+    warnings = []
+    crossed_explicit = diagnostics._redacted_file_units(
+        b"? password\n: |\n  crossed-explicit-secret\n",
+        starts_inside_private_key=False,
+        starts_with_sensitive_value=False,
+        starts_inside_sensitive_block=False,
+        sensitive_block_indent=None,
+        starts_inside_sensitive_quote=False,
+        sensitive_quote=None,
+        has_more_after_raw=True,
+        warnings=warnings,
+    )
+    assert "crossed-explicit-secret" not in "".join(unit[1] for unit in crossed_explicit)
+    assert any("explicit YAML sensitive value crossed" in warning for warning in warnings)
+
     assert diagnostics._sensitive_state_before(BytesIO(b"\n\n"), 2, b"next\n") == (
         False,
         False,
@@ -2752,6 +2946,23 @@ async def test_filesystem_reads_use_bounded_byte_windows(tmp_path: Path, monkeyp
         len(non_name_context),
         b"      value: visible\n",
     )[0] is False
+    unmatched_explicit_context = b"? password\nordinary\n"
+    assert diagnostics._sensitive_state_before(
+        BytesIO(unmatched_explicit_context),
+        len(unmatched_explicit_context),
+        b"next\n",
+    )[0] is False
+    block_heavy_context = b"a: b\n" * (diagnostics._MAX_YAML_BLOCK_MAPPING_LINES + 1)
+    assert diagnostics._sensitive_state_before(
+        BytesIO(block_heavy_context),
+        len(block_heavy_context),
+        b"next\n",
+    ) == (None, None, None, None, None, len(block_heavy_context))
+    assert diagnostics._kubernetes_yaml_state_before(
+        BytesIO(block_heavy_context),
+        len(block_heavy_context),
+        b"next\n",
+    ) == (None, None, False, None, None, None, {}, len(block_heavy_context))
     context_limit = diagnostics._MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES
     monkeypatch.setattr(diagnostics, "_MAX_SENSITIVE_ASSIGNMENT_CONTEXT_BYTES", 4)
     assert diagnostics._kubernetes_yaml_state_before(BytesIO(b"abcde"), 5, b"next\n") == (

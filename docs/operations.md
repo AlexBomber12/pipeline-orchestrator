@@ -59,9 +59,11 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   environment entries correlate sensitive `name` fields with sibling `value`
   fields in either order. Quoted YAML keys are decoded before sensitive-name
   matching, including escaped spellings. YAML alias graphs visit each shared
-  collection at most once per classification. Excessive flow depth or token
-  counts are rejected before PyYAML parsing, and excessive structured nesting
-  is omitted fail-closed.
+  collection at most once per classification. YAML explicit-key credentials are
+  consumed with their values across pagination boundaries. Excessive flow depth,
+  flow token counts, or block-mapping line counts are rejected before PyYAML
+  parsing, and ordinary block mappings do not trigger per-line parser calls.
+  Excessive structured nesting is omitted fail-closed.
   Producer-added `[truncated]` markers are preserved; because their
   removed prefix may contain a sensitive opener, the retained Redis CLI tail is
   omitted fail-closed. Redis event

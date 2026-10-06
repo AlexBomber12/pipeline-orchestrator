@@ -66,6 +66,8 @@ _MAX_EMBEDDED_JSON_CANDIDATES = 64
 _MAX_STRUCTURED_DEPTH = 64
 _MAX_YAML_FLOW_DEPTH = 64
 _MAX_YAML_FLOW_TOKENS = 4_096
+_MAX_YAML_BLOCK_MAPPING_LINES = 4_096
+_MAX_YAML_PER_LINE_SCAN_CANDIDATES = 256
 _CLI_LATEST_TTL_SECONDS = 3600
 _CLI_HISTORY_TTL_SECONDS = 86400
 _HISTORY_CURSOR_PREFIX = "redis-history:"
@@ -183,6 +185,18 @@ _YAML_ENV_VALUE = re.compile(
     r"(?P<value>[^\r\n]*)$"
 )
 _YAML_SEQUENCE_ITEM_ONLY = re.compile(r"^(?P<indent>[ \t]*)-[ \t]*(?:#.*)?$")
+_YAML_BLOCK_MAPPING_LINE = re.compile(
+    r"^[ \t]*(?:-[ \t]+)?(?:[\"']?[-A-Za-z0-9_.]+[\"']?)[ \t]*:(?:[ \t]|$)"
+)
+_YAML_EXPLICIT_SENSITIVE_KEY = re.compile(
+    rf"(?i)^(?P<indent>[ \t]*)(?:-[ \t]+)?\?[ \t]+"
+    rf"(?:[\"'](?:{_SENSITIVE_KEY_PATTERN})[\"']|(?:{_SENSITIVE_KEY_PATTERN}))"
+    r"[ \t]*(?:#.*)?$"
+)
+_YAML_EXPLICIT_KEY_PREFIX = re.compile(r"^[ \t]*(?:-[ \t]+)?\?[ \t]+$")
+_YAML_EXPLICIT_VALUE = re.compile(
+    r"^(?P<indent>[ \t]*)(?:-[ \t]+)?\:[ \t]*(?P<value>[^\r\n]*)$"
+)
 _YAML_NODE_PREFIX = re.compile(r"^(?:&[^\s]+|![^\s]+)(?:\s+|$)")
 _YAML_ALIAS_SCALAR = re.compile(r"^\*(?P<anchor>[^\s,\[\]{}]+)$")
 _YAML_FLOW_KIND_SECRET = re.compile(
@@ -727,6 +741,28 @@ def _yaml_flow_complexity_exceeded(text: str) -> bool:
     return False
 
 
+def _yaml_block_complexity_exceeded(text: str) -> bool:
+    """Bound block-mapping tokenization before invoking PyYAML."""
+    mapping_lines = 0
+    per_line_scan_candidates = 0
+    for line in text.splitlines():
+        if _YAML_BLOCK_MAPPING_LINE.match(line) is not None:
+            mapping_lines += 1
+        if "\\" in line and '"' in line and (":" in line or "?" in line):
+            per_line_scan_candidates += 1
+        if (
+            mapping_lines > _MAX_YAML_BLOCK_MAPPING_LINES
+            or per_line_scan_candidates > _MAX_YAML_PER_LINE_SCAN_CANDIDATES
+        ):
+            return True
+    return False
+
+
+def _yaml_parse_complexity_exceeded(text: str) -> bool:
+    """Bound the flow and block syntax that may be sent to PyYAML."""
+    return _yaml_flow_complexity_exceeded(text) or _yaml_block_complexity_exceeded(text)
+
+
 def _contains_kubernetes_secret_payload(
     value: Any,
     *,
@@ -895,7 +931,7 @@ def _yaml_anchor_definitions(lines: list[bytes]) -> list[tuple[int, str, str]]:
         raw_line if raw_line.endswith((b"\n", b"\r")) else raw_line + b"\n"
         for raw_line in lines
     ).decode("utf-8", errors="replace")
-    if _yaml_flow_complexity_exceeded(document):
+    if _yaml_parse_complexity_exceeded(document):
         return []
     try:
         tokens = list(yaml.scan(document))
@@ -922,7 +958,7 @@ def _yaml_mapping_scalar_values(lines: list[bytes], key: str) -> dict[int, str]:
         raw_line if raw_line.endswith((b"\n", b"\r")) else raw_line + b"\n"
         for raw_line in lines
     ).decode("utf-8", errors="replace")
-    if _yaml_flow_complexity_exceeded(document):
+    if _yaml_parse_complexity_exceeded(document):
         return {}
     try:
         tokens = list(yaml.scan(document))
@@ -952,7 +988,12 @@ def _yaml_mapping_scalar_values(lines: list[bytes], key: str) -> dict[int, str]:
 
 def _yaml_sensitive_assignment(text: str) -> tuple[int, str] | None:
     """Return indent and raw value for a decoded sensitive YAML mapping key."""
-    if _yaml_flow_complexity_exceeded(text):
+    if (
+        "\\" not in text
+        or '"' not in text
+        or ":" not in text
+        or _yaml_parse_complexity_exceeded(text)
+    ):
         return None
     try:
         tokens = list(yaml.scan(text))
@@ -975,13 +1016,78 @@ def _yaml_sensitive_assignment(text: str) -> tuple[int, str] | None:
     return None
 
 
+def _yaml_explicit_sensitive_key(text: str) -> int | None:
+    """Return the indent of a sensitive scalar used as an explicit YAML key."""
+    direct = _YAML_EXPLICIT_SENSITIVE_KEY.fullmatch(text)
+    if direct is not None:
+        return len(direct.group("indent"))
+    if "\\" not in text or '"' not in text or "?" not in text:
+        return None
+    try:
+        tokens = list(yaml.scan(text))
+    except (RecursionError, yaml.YAMLError):
+        return None
+    for index, token in enumerate(tokens):
+        if (
+            not isinstance(token, yaml.tokens.ScalarToken)
+            or not isinstance(token.value, str)
+            or _SENSITIVE_KEY.fullmatch(token.value) is None
+            or index == 0
+            or not isinstance(tokens[index - 1], yaml.tokens.KeyToken)
+        ):
+            continue
+        prefix = text[: token.start_mark.column]
+        if _YAML_EXPLICIT_KEY_PREFIX.fullmatch(prefix) is None:
+            continue
+        suffix = text[token.end_mark.column :]
+        if re.fullmatch(r"[ \t]*(?:#.*)?", suffix) is not None:
+            return len(prefix) - len(prefix.lstrip(" \t"))
+    return None
+
+
+def _yaml_explicit_value_end(
+    raw_lines: list[bytes],
+    value_index: int,
+    *,
+    minimum_indent: int,
+    has_more_after_raw: bool,
+) -> tuple[int, bool] | None:
+    """Return the end of an explicit YAML value and whether it crosses the window."""
+    while value_index < len(raw_lines) and not raw_lines[value_index].strip():
+        value_index += 1
+    if value_index >= len(raw_lines):
+        return value_index, has_more_after_raw
+    text = raw_lines[value_index].decode("utf-8", errors="replace").rstrip("\r\n")
+    value_match = _YAML_EXPLICIT_VALUE.fullmatch(text)
+    if value_match is None or len(value_match.group("indent")) < minimum_indent:
+        return None
+    value_end = value_index + 1
+    continuation = _yaml_payload_continuation(value_match.group("value"))
+    if continuation is None:
+        return value_end, False
+    mode, flow_depth = continuation
+    if mode == "flow" and flow_depth is not None:
+        while value_end < len(raw_lines) and flow_depth > 0:
+            flow_depth += _yaml_flow_delta(
+                raw_lines[value_end].decode("utf-8", errors="replace")
+            )
+            value_end += 1
+        return value_end, flow_depth > 0 and has_more_after_raw
+    value_indent = len(value_match.group("indent"))
+    while value_end < len(raw_lines):
+        if raw_lines[value_end].strip() and _line_indent(raw_lines[value_end]) <= value_indent:
+            break
+        value_end += 1
+    return value_end, value_end == len(raw_lines) and has_more_after_raw
+
+
 def _yaml_secret_payload_lines(lines: list[bytes]) -> set[int]:
     """Find Secret payload keys using merge-aware YAML node composition."""
     document = b"".join(
         raw_line if raw_line.endswith((b"\n", b"\r")) else raw_line + b"\n"
         for raw_line in lines
     ).decode("utf-8", errors="replace")
-    if _yaml_flow_complexity_exceeded(document):
+    if _yaml_parse_complexity_exceeded(document):
         return set()
     if "<<" not in document or re.search(r"(?im)^[ \t]*(?:-[ \t]+)?(?:data|stringData)[ \t]*:", document) is None:
         return set()
@@ -1219,6 +1325,8 @@ def _sensitive_state_before(
         if newline < 0:
             return None, None, None, None, None, scanned_bytes
         context = context[newline + 1 :]
+    if _yaml_parse_complexity_exceeded(context.decode("utf-8", errors="replace")):
+        return None, None, None, None, None, scanned_bytes
 
     context_lines = context.splitlines()
     yaml_anchors = _yaml_scalar_anchors(context_lines)
@@ -1237,7 +1345,7 @@ def _sensitive_state_before(
                 not yaml_assignment[1]
                 or yaml_assignment[1].startswith(("|", ">"))
             )
-        )
+        ) or _yaml_explicit_sensitive_key(line) is not None
         break
     first_raw_line = next((line for line in raw.splitlines() if line.strip()), None)
     first_raw_value = (
@@ -1272,6 +1380,7 @@ def _sensitive_state_before(
 
     block_state_known = search_start == 0
     active_block_indent: int | None = None
+    pending_explicit_indent: int | None = None
     for raw_line in context_lines:
         if not raw_line.strip():
             continue
@@ -1283,13 +1392,30 @@ def _sensitive_state_before(
                 continue
             active_block_indent = None
         line = raw_line.decode("utf-8", errors="replace")
+        if pending_explicit_indent is not None:
+            explicit_value = _YAML_EXPLICIT_VALUE.fullmatch(line)
+            if (
+                explicit_value is not None
+                and len(explicit_value.group("indent")) >= pending_explicit_indent
+            ):
+                continuation = _yaml_payload_continuation(explicit_value.group("value"))
+                if continuation is not None:
+                    active_block_indent = len(explicit_value.group("indent"))
+                block_state_known = True
+                pending_explicit_indent = None
+                continue
+            pending_explicit_indent = None
         indented_match = (
             _BLOCK_SENSITIVE_ASSIGNMENT.fullmatch(line)
             or _PLAIN_SENSITIVE_ASSIGNMENT.fullmatch(line)
             or _PENDING_YAML_SENSITIVE_ASSIGNMENT.fullmatch(line)
         )
         yaml_assignment = _yaml_sensitive_assignment(line)
-        if indented_match is not None:
+        explicit_key_indent = _yaml_explicit_sensitive_key(line)
+        if explicit_key_indent is not None:
+            pending_explicit_indent = explicit_key_indent
+            block_state_known = True
+        elif indented_match is not None:
             active_block_indent = len(indented_match.group("indent"))
             block_state_known = True
         elif yaml_assignment is not None:
@@ -1302,6 +1428,20 @@ def _sensitive_state_before(
             block_state_known = True
 
     first_content_line = next((line for line in raw.splitlines() if line.strip()), None)
+    first_explicit_value = (
+        _YAML_EXPLICIT_VALUE.fullmatch(
+            first_content_line.decode("utf-8", errors="replace").rstrip("\r\n")
+        )
+        if first_content_line is not None
+        else None
+    )
+    if (
+        pending_explicit_indent is not None
+        and first_explicit_value is not None
+        and len(first_explicit_value.group("indent")) >= pending_explicit_indent
+    ):
+        starts_with_sensitive_value = True
+
     if first_content_line is None:
         starts_inside_sensitive_block: bool | None = False
         active_block_indent = None
@@ -1391,6 +1531,8 @@ def _kubernetes_yaml_state_before(
         if newline < 0:
             return None, None, False, None, None, None, {}, scanned_bytes
         context = context[newline + 1 :]
+    if _yaml_parse_complexity_exceeded(context.decode("utf-8", errors="replace")):
+        return None, None, False, None, None, None, {}, scanned_bytes
 
     state_known = search_start == 0
     secret_scopes: list[tuple[int, bool]] = []
@@ -1683,6 +1825,11 @@ def _redacted_file_units(
             "YAML flow syntax exceeded the bounded parse complexity; page content was omitted fail-closed."
         )
         return [(raw, "[CONTENT OMITTED: YAML FLOW COMPLEXITY BOUND EXCEEDED]\n", 1)] if raw else []
+    if _yaml_block_complexity_exceeded(raw.decode("utf-8", errors="replace")):
+        warnings.append(
+            "YAML block syntax exceeded the bounded parse complexity; page content was omitted fail-closed."
+        )
+        return [(raw, "[CONTENT OMITTED: YAML BLOCK COMPLEXITY BOUND EXCEEDED]\n", 1)] if raw else []
     raw_lines = raw.splitlines(keepends=True)
     kubernetes_payload_flags = _kubernetes_yaml_payload_flags(
         raw_lines,
@@ -1763,9 +1910,28 @@ def _redacted_file_units(
         while value_index < len(raw_lines) and not raw_lines[value_index].strip():
             value_index += 1
         if value_index < len(raw_lines):
-            raw_unit = b"".join(raw_lines[: value_index + 1])
+            value_end = value_index + 1
+            explicit_value = _YAML_EXPLICIT_VALUE.fullmatch(
+                raw_lines[value_index].decode("utf-8", errors="replace").rstrip("\r\n")
+            )
+            crossed = False
+            if explicit_value is not None:
+                explicit_end = _yaml_explicit_value_end(
+                    raw_lines,
+                    value_index,
+                    minimum_indent=0,
+                    has_more_after_raw=has_more_after_raw,
+                )
+                if explicit_end is not None:
+                    value_end, crossed = explicit_end
+            raw_unit = b"".join(raw_lines[:value_end])
             units.append((raw_unit, "[REDACTED SENSITIVE VALUE]\n", 1))
-            line_index = value_index + 1
+            if crossed:
+                warnings.append(
+                    "An explicit YAML sensitive value crossed the bounded page window; "
+                    "its visible segment was redacted."
+                )
+            line_index = value_end
     inside_private_key = starts_inside_private_key
     while line_index < len(raw_lines):
         raw_unit = raw_lines[line_index]
@@ -1802,6 +1968,28 @@ def _redacted_file_units(
             )
             units.append((flow_unit, safe_unit, replacements))
             line_index = flow_end
+            continue
+        explicit_key_indent = _yaml_explicit_sensitive_key(stripped_unit)
+        if explicit_key_indent is not None:
+            explicit_end = _yaml_explicit_value_end(
+                raw_lines,
+                line_index + 1,
+                minimum_indent=explicit_key_indent,
+                has_more_after_raw=has_more_after_raw,
+            )
+            if explicit_end is None:
+                value_end = line_index + 1
+                crossed = False
+            else:
+                value_end, crossed = explicit_end
+            raw_unit = b"".join(raw_lines[line_index:value_end])
+            units.append((raw_unit, "[REDACTED SENSITIVE YAML EXPLICIT VALUE]\n", 1))
+            if crossed:
+                warnings.append(
+                    "An explicit YAML sensitive value crossed the bounded page window; "
+                    "its visible segment was redacted."
+                )
+            line_index = value_end
             continue
         env_item = _yaml_env_item(
             raw_lines,
