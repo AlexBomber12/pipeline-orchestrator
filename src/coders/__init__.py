@@ -12,6 +12,7 @@ from src.config import DEFAULT_CODER_PLUGINS, AppConfig, DaemonConfig
 
 _PLUGIN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _RESERVED_PLUGIN_IDS = frozenset({"gh"})
+_RESERVED_MODEL_SETTING_KEYS = frozenset({"reasoning_effort"})
 _LEGACY_MODEL_FIELDS = {
     "claude": "claude_model",
     "codex": "codex_model",
@@ -194,6 +195,14 @@ def _validate_plugin_metadata(
             reference,
             "metadata validation",
             "plugin.model_setting.setting_key must be a non-empty, dot-free string",
+        )
+    if model_setting.setting_key in _RESERVED_MODEL_SETTING_KEYS:
+        raise _configuration_error(
+            plugin_id,
+            reference,
+            "metadata validation",
+            f"plugin.model_setting.setting_key {model_setting.setting_key!r} "
+            "is reserved for plugin options",
         )
     if not isinstance(refreshable, bool):
         raise _configuration_error(

@@ -62,6 +62,15 @@ class VariantSettingTestPlugin(ConfiguredTestPlugin):
     )
 
 
+class ReasoningEffortSettingTestPlugin(ConfiguredTestPlugin):
+    model_setting = ModelSetting(
+        config_field=None,
+        default_value="third-default",
+        default_label="Test default",
+        setting_key="reasoning_effort",
+    )
+
+
 class RaisingAuthTestPlugin(ConfiguredTestPlugin):
     def check_auth(self) -> dict[str, str]:
         raise RuntimeError("credential=must-not-leak")
@@ -99,6 +108,10 @@ def build_digit_leading_plugin() -> DigitLeadingTestPlugin:
 
 def build_variant_setting_plugin() -> VariantSettingTestPlugin:
     return VariantSettingTestPlugin()
+
+
+def build_reasoning_effort_setting_plugin() -> ReasoningEffortSettingTestPlugin:
+    return ReasoningEffortSettingTestPlugin()
 
 
 def build_raising_auth_plugin() -> RaisingAuthTestPlugin:

@@ -71,6 +71,8 @@ daemon:
   coder_settings:
     claude:
       model: opus
+    codex:
+      reasoning_effort: high
   fix_idle_timeout_sec: 1800
   fix_iteration_cap: 15
   planned_pr_timeout_sec: 3600
@@ -104,7 +106,9 @@ with either ID replaces that default; any other ID adds a registry entry.
 Plugin options remain separate under `daemon.coder_settings.<plugin-id>`.
 Those persisted option values are strings, which keeps configured model keys
 safe across both startup and config-file reload validation without importing
-plugin modules during configuration parsing.
+plugin modules during configuration parsing. A plugin model binding cannot use
+`reasoning_effort` as its `setting_key`; that key is reserved for the plugin's
+execution option.
 
 Plugin modules are operator-managed code: loading a reference does not install
 packages, download code, or sandbox the import. Definitions are loaded only at
@@ -117,6 +121,11 @@ complete support for executing additional providers. Legacy model-field
 fallbacks are likewise owned by their built-ins (`claude_model` by `claude`
 and `codex_model` by `codex`); additional plugins must set their model
 metadata's `config_field` to `None` and use `coder_settings`.
+
+Codex reasoning effort can be overridden for each new invocation with
+`daemon.coder_settings.codex.reasoning_effort`. Omit the key or set it to an
+empty string to let the Codex CLI use its configured/default effort. A nonempty
+value is forwarded unchanged; supported values depend on the selected model.
 
 ## Local development
 

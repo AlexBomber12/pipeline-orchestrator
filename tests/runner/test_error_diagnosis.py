@@ -528,7 +528,10 @@ def test_handle_error_dispatches_to_codex_plugin_when_codex_active(
     """
     runner = h._make_runner()
     runner.app_config.daemon.coder_settings = {
-        "codex": {"model": "generic-codex"}
+        "codex": {
+            "model": "generic-codex",
+            "reasoning_effort": "high",
+        }
     }
     claude_plugin = runner._registry.get("claude")
     codex_plugin = runner._registry.get("codex")
@@ -565,6 +568,7 @@ def test_handle_error_dispatches_to_codex_plugin_when_codex_active(
 
     assert codex_calls and codex_calls[0]["context"] == "boom"
     assert codex_calls[0]["model"] == "generic-codex"
+    assert codex_calls[0]["reasoning_effort"] == "high"
     assert codex_calls[0]["on_process_start"] == (
         runner._track_current_coder_process
     )
