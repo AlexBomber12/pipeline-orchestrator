@@ -168,10 +168,10 @@ def _state(*, updated: datetime | None = None) -> RepoState:
     )
 
 
-def _command(*, command_id: str | None = None):
+def _command(*, command_id: str | None = None, task_id: str = "PR-9"):
     command = new_retry_command(
         repo_slug=SLUG,
-        task_id="PR-9",
+        task_id=task_id,
         task_file="tasks/secret.md",
         task_branch="secret-branch",
         task_fingerprint="secret-fingerprint",
@@ -378,6 +378,44 @@ async def test_sparse_snapshot_cannot_default_to_fresh_idle_and_other_reads_cont
     assert result["detail"]["run_records"]["task_filter"] is None
 
 
+async def test_zero_padded_task_id_preserves_associated_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis)
+    task_id = "PR-001"
+    state = _state(updated=NOW)
+    state.current_task.pr_id = task_id
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+
+    command = _command(task_id=task_id)
+    redis.zsets[retry_command_pending(SLUG)] = [(command.command_id, command.requested_at.timestamp())]
+    redis.store[retry_command(SLUG, command.command_id)] = command.model_dump_json()
+    run = _run(task_id=task_id)
+    redis.lists[MetricsStore._recent_key(task_id, SLUG)] = [run.run_id]
+    redis.store[MetricsStore._record_key(run.run_id)] = json.dumps(asdict(run))
+    redis.store[cause_key(SLUG, task_id)] = json.dumps(
+        {
+            "category": "ERROR",
+            "payload": {"subsource": "guardrail"},
+            "created_at": NOW.isoformat(),
+            "task_id": task_id,
+            "repo_slug": SLUG,
+        }
+    )
+
+    result = await diagnostics.get_orchestrator_status(SLUG)
+
+    detail = result["detail"]
+    assert detail["pipeline"]["current_task"] == {"id": task_id, "status": "DOING"}
+    assert detail["current_cancellation"]["classification"]["task_id"] == task_id
+    assert detail["pending_retries"]["records"][0]["metadata"]["task_id"] == task_id
+    assert detail["run_records"]["task_filter"] == task_id
+    assert detail["run_records"]["records"][0]["metadata"]["task_id"] == task_id
+
+
 async def test_status_connection_config_validation_and_cancellation_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -462,6 +500,7 @@ def test_scalar_validation_and_configured_repo_guards(monkeypatch: pytest.Monkey
     assert diagnostics._positive_int(-1) is None
     assert diagnostics._positive_number(0) is None
     assert diagnostics._task_id("PR-1") == "PR-1"
+    assert diagnostics._task_id("PR-001") == "PR-001"
     assert diagnostics._task_id("secret") is None
     assert diagnostics._sha(HEAD_SHA.upper()) == HEAD_SHA
     assert diagnostics._sha("abc") is None
