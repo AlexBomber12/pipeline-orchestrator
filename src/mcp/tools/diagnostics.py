@@ -392,6 +392,17 @@ _REDACTION_RULES = (
     ),
     (
         re.compile(
+            r"(?im)(?P<mysql_prefix>(?<![A-Za-z0-9_.-])"
+            r"(?:mysql(?:admin|binlog|check|import|pump|show|slap|test|sh)?|mysqldump|"
+            r"mariadb(?:-(?:admin|check|dump|import|show|slap))?)(?:\.exe)?(?=[ \t])"
+            r"[^\r\n;&|]*?(?<!\S)-p)"
+            r"(?:(?P<mysql_quote>[\"'])(?:\\[^\r\n]|(?!(?P=mysql_quote))[^\\\r\n])*"
+            r"(?P=mysql_quote)?|[^\s;&|]+)"
+        ),
+        r"\g<mysql_prefix>[REDACTED]",
+    ),
+    (
+        re.compile(
             r"(?i)((?<!\S)(?:-u|-U|--user|--proxy-user)(?:=|[ \t]+))"
             r"(?:(?P<user_quote>[\"'])(?:\\[^\r\n]|(?!(?P=user_quote))[^\\\r\n])*"
             r"(?P=user_quote)?|[^\s]+)"

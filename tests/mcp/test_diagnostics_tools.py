@@ -648,6 +648,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             ),
             '{\n"password":\n"redis-same-indent-secret"\n}',
             "machine redis.example login alice password redis-netrc-secret",
+            "mysql -u root -predis-mysql-short-secret",
+            "mysql -p",
             json.dumps(
                 {
                     "kind": "Secret",
@@ -798,6 +800,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + '{"password":987650002,}\n'
         + '{\n"password":\n"ci-same-indent-secret"\n}\n'
         + "  password ci-multiline-netrc-secret\n"
+        + "mariadb -u root -pci-mysql-short-secret\n"
+        + "mariadb -p\n"
         + "apiVersion: v1\ndata:\n"
         + "  opaque: ci-kube-yaml-secret\n"
         + "kind: Secret\nmetadata:\n  annotations:\n    note: |\n      ---\n"
@@ -904,6 +908,8 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-structured-second" not in content
         assert "redis-same-indent-secret" not in content
         assert "redis-netrc-secret" not in content
+        assert "redis-mysql-short-secret" not in content
+        assert "mysql -p" in content
         assert "redis-kube-data-secret" not in content
         assert "redis-kube-string-secret" not in content
         assert "redis-kube-yaml-secret" not in content
@@ -954,6 +960,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-same-indent-secret" not in content
         assert "ci-netrc-secret" not in content
         assert "ci-multiline-netrc-secret" not in content
+        assert "ci-mysql-short-secret" not in content
         assert "disk-netrc-secret" not in content
         assert "ci-kube-data-secret" not in content
         assert "ci-kube-string-secret" not in content
@@ -1016,6 +1023,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-block-kind-secret" not in content
         assert "ci-aliased-kind-secret" not in content
         if source_id == "ci:artifact":
+            assert "mariadb -p" in content
             assert "retained-ci-list-config-value" in content
             assert "ci-kube-single-flow-secret" not in content
             assert "ci-kube-multiline-flow-secret" not in content
@@ -3059,6 +3067,8 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
             "curl --user alice:curl-secret",
             "curl -u bob:short-curl-secret",
             "curl -U proxy:proxy-curl-secret",
+            "mysql -u root -pmysql-short-option-secret",
+            "mariadb-dump -p'mariadb short option secret' database",
         ]
     )
     redacted, replacements = diagnostics._redact_text(sensitive)
@@ -3085,7 +3095,14 @@ def test_small_contract_helpers_cover_clock_skew_and_bounded_records(
     assert "curl-secret" not in redacted
     assert "short-curl-secret" not in redacted
     assert "proxy-curl-secret" not in redacted
-    assert replacements == 31
+    assert "mysql-short-option-secret" not in redacted
+    assert "mariadb short option secret" not in redacted
+    assert replacements == 34
+    assert diagnostics._redact_text("mysql -p") == (
+        "mysql -p",
+        0,
+    )
+    assert diagnostics._redact_text("psql -p5432") == ("psql -p5432", 0)
     assert diagnostics._redact_text("tokens_in=123 tokens_out=456") == (
         "tokens_in=123 tokens_out=456",
         0,
