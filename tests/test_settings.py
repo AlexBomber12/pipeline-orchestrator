@@ -17,12 +17,13 @@ from src.coder_registry import (
     CoderRegistry,
     ModelCatalog,
     ModelMetadata,
+    ModelReasoningEffort,
     ModelSetting,
 )
 from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
-from src.coders.codex_models import CodexModel
-from src.config import AppConfig, load_config
+from src.coders.codex_models import CodexModel, CodexReasoningEffort
+from src.config import AppConfig, DaemonConfig, load_config
 from src.models import PipelineState, RepoState
 from src.web import app as web_app
 from src.web.app import app
@@ -878,6 +879,48 @@ class _ThirdCatalogPlugin:
         return {"status": "ok", "detail": "third authenticated"}
 
 
+class _EffortCatalogPlugin:
+    name = "vendor-test"
+    display_name = "Vendor Test"
+    models: list[str] = []
+    model_setting = ModelSetting(None, "", "CLI default")
+    model_catalog_refreshable = False
+
+    def model_catalog_cache_key(
+        self, *, config: AppConfig, config_path: str
+    ) -> str:
+        del config, config_path
+        return "vendor-test-static"
+
+    async def get_model_catalog(
+        self, *, config: AppConfig, config_path: str
+    ) -> ModelCatalog:
+        del config, config_path
+        return ModelCatalog(
+            (
+                ModelMetadata(
+                    "vendor-model",
+                    "Vendor Model",
+                    default_reasoning_effort="balanced",
+                    reasoning_efforts=(
+                        ModelReasoningEffort("quick", "Short deliberation"),
+                        ModelReasoningEffort("balanced", "Balanced"),
+                    ),
+                ),
+            ),
+            "plugin_metadata",
+            "Vendor-owned catalog.",
+        )
+
+    def resolve_model(self, daemon_config: object) -> str:
+        return self.model_setting.resolve(self.name, daemon_config)
+
+    def build_run_kwargs(
+        self, *, daemon_config: object, **_kwargs: object
+    ) -> dict[str, str]:
+        return {"model": self.resolve_model(daemon_config)}
+
+
 def test_shared_catalog_rendering_supports_third_plugin_without_branches(
     empty_config: Path,
 ) -> None:
@@ -961,6 +1004,621 @@ def test_arbitrary_plugin_model_round_trips_without_core_field(
     }
 
 
+def test_reasoning_effort_choices_render_from_selected_model_and_match_api(
+    empty_config: Path,
+) -> None:
+    catalog = (
+        CodexModel(
+            "reasoning-model",
+            "Reasoning Model",
+            True,
+            "balanced",
+            (
+                CodexReasoningEffort("quick", "Short deliberation"),
+                CodexReasoningEffort("balanced", "Balanced response"),
+            ),
+        ),
+    )
+
+    async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
+        return catalog
+
+    with TestClient(app) as client:
+        plugin = client.app.state.coder_registry.get("codex")
+        plugin._discover = discover
+        client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.model": "reasoning-model"},
+        )
+        rendered = client.get("/partials/settings/coders")
+        api_response = client.get("/api/coders")
+
+    assert rendered.status_code == 200
+    assert 'name="coder_settings.codex.reasoning_effort"' in rendered.text
+    assert "CLI default (no application override)" in rendered.text
+    assert "quick" in rendered.text
+    assert "Short deliberation" in rendered.text
+    assert "Catalogue metadata advertises" in rendered.text
+    assert "does not confirm the effective CLI setting" in rendered.text
+    assert "subsequent coder launches" in rendered.text
+    codex_row = next(
+        row for row in api_response.json()["coders"] if row["name"] == "codex"
+    )
+    assert codex_row["reasoning_effort"] == {
+        "control_name": "coder_settings.codex.reasoning_effort",
+        "selected_value": "",
+        "choices": [
+            {"value": "quick", "description": "Short deliberation"},
+            {"value": "balanced", "description": "Balanced response"},
+        ],
+        "can_select": True,
+        "support_confirmed": True,
+        "saved_is_advertised": True,
+        "default_reasoning_effort": "balanced",
+        "status": "available",
+        "message": "Choose an application override or keep the CLI default.",
+        "update_message": None,
+    }
+
+
+def test_saved_model_and_effort_feed_codex_execution_kwargs(
+    empty_config: Path,
+) -> None:
+    async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
+        return (
+            CodexModel(
+                "execution-model",
+                "Execution Model",
+                True,
+                "medium",
+                (
+                    CodexReasoningEffort("medium", "Balanced"),
+                    CodexReasoningEffort("high", "Thorough"),
+                ),
+            ),
+        )
+
+    with TestClient(app) as client:
+        plugin = client.app.state.coder_registry.get("codex")
+        plugin._discover = discover
+        selected_model = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.model": "execution-model"},
+        )
+        saved_effort = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.reasoning_effort": "high"},
+        )
+        reloaded = client.get("/partials/settings/coders")
+        persisted = load_config(str(empty_config))
+        run_kwargs = plugin.build_run_kwargs(daemon_config=persisted.daemon)
+
+    assert selected_model.status_code == 200
+    assert saved_effort.status_code == 200
+    assert reloaded.status_code == 200
+    assert 'value="execution-model" selected' in reloaded.text
+    assert 'value="high" selected' in reloaded.text
+    assert persisted.daemon.coder_settings["codex"] == {
+        "model": "execution-model",
+        "reasoning_effort": "high",
+    }
+    assert run_kwargs == {
+        "model": "execution-model",
+        "reasoning_effort": "high",
+    }
+
+
+def test_reasoning_effort_requires_explicit_model_and_can_clear_saved_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: ''\n"
+        "      reasoning_effort: legacy-saved\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        rendered = client.get("/partials/settings/coders")
+        rejected = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.reasoning_effort": "high"},
+        )
+        cleared = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.reasoning_effort": ""},
+        )
+
+    assert 'data-reasoning-effort-status="explicit_model_required"' in (
+        rendered.text
+    )
+    assert "Select an explicit model" in rendered.text
+    assert "legacy-saved" in rendered.text
+    assert "Use CLI default" in rendered.text
+    assert rejected.status_code == 422
+    assert "requires an explicitly selected model" in rejected.text
+    assert cleared.status_code == 200
+    cfg = load_config(str(cfg_path))
+    assert cfg.daemon.coder_settings["codex"]["reasoning_effort"] == ""
+
+
+def test_reasoning_effort_persists_and_preserves_unrelated_plugin_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: model-a\n"
+        "      custom_option: keep-codex\n"
+        "    unrelated:\n"
+        "      token: keep-other\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
+        return (
+            CodexModel(
+                "model-a",
+                "Model A",
+                True,
+                "medium",
+                (
+                    CodexReasoningEffort("low", "Fast"),
+                    CodexReasoningEffort("medium", "Balanced"),
+                ),
+            ),
+        )
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.get("codex")._discover = discover
+        saved = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.reasoning_effort": "low"},
+        )
+        reloaded = client.get("/partials/settings/coders")
+        persisted = load_config(str(cfg_path))
+        cleared = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.reasoning_effort": ""},
+        )
+
+    assert saved.status_code == 200
+    assert 'value="low" selected' in reloaded.text
+    assert persisted.daemon.coder_settings == {
+        "codex": {
+            "model": "model-a",
+            "custom_option": "keep-codex",
+            "reasoning_effort": "low",
+        },
+        "unrelated": {"token": "keep-other"},
+    }
+    assert cleared.status_code == 200
+    cfg = load_config(str(cfg_path))
+    assert cfg.daemon.coder_settings["codex"] == {
+        "model": "model-a",
+        "custom_option": "keep-codex",
+        "reasoning_effort": "",
+    }
+    assert cfg.daemon.coder_settings["unrelated"] == {"token": "keep-other"}
+
+
+def test_model_change_preserves_compatible_effort_and_clears_incompatible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: model-a\n"
+        "      reasoning_effort: medium\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
+        return (
+            CodexModel(
+                "model-a",
+                "Model A",
+                False,
+                "medium",
+                (
+                    CodexReasoningEffort("low", None),
+                    CodexReasoningEffort("medium", None),
+                ),
+            ),
+            CodexModel(
+                "model-b",
+                "Model B",
+                True,
+                "medium",
+                (
+                    CodexReasoningEffort("medium", None),
+                    CodexReasoningEffort("high", None),
+                ),
+            ),
+        )
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.get("codex")._discover = discover
+        compatible = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.model": "model-b"},
+        )
+        after_compatible = load_config(str(cfg_path))
+        selected_high = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.reasoning_effort": "high"},
+        )
+        incompatible = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.model": "model-a"},
+        )
+
+    assert compatible.status_code == 200
+    assert after_compatible.daemon.coder_settings["codex"] == {
+        "model": "model-b",
+        "reasoning_effort": "medium",
+    }
+    assert selected_high.status_code == 200
+    assert incompatible.status_code == 200
+    assert "Reasoning effort reset to CLI default" in incompatible.text
+    assert "not advertised for model model-a" in incompatible.text
+    cfg = load_config(str(cfg_path))
+    assert cfg.daemon.coder_settings["codex"] == {
+        "model": "model-a",
+        "reasoning_effort": "",
+    }
+
+
+def test_model_change_to_cli_default_clears_saved_effort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: model-a\n"
+        "      reasoning_effort: low\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.model": ""},
+        )
+
+    assert response.status_code == 200
+    assert "an explicit model is required" in response.text
+    assert load_config(str(cfg_path)).daemon.coder_settings["codex"] == {
+        "model": "",
+        "reasoning_effort": "",
+    }
+
+
+def test_invalid_combined_model_effort_submission_is_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  poll_interval_sec: 60\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: model-a\n"
+        "      reasoning_effort: low\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
+        return (
+            CodexModel(
+                "model-a",
+                "Model A",
+                False,
+                "low",
+                (CodexReasoningEffort("low", None),),
+            ),
+            CodexModel(
+                "model-b",
+                "Model B",
+                True,
+                "high",
+                (CodexReasoningEffort("high", None),),
+            ),
+        )
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.get("codex")._discover = discover
+        response = client.put(
+            "/settings/daemon",
+            data={
+                "poll_interval_sec": "99",
+                "coder_settings.codex.model": "model-b",
+                "coder_settings.codex.reasoning_effort": "unsupported",
+            },
+        )
+
+    assert response.status_code == 422
+    assert "is not advertised for model model-b" in response.text
+    cfg = load_config(str(cfg_path))
+    assert cfg.daemon.poll_interval_sec == 60
+    assert cfg.daemon.coder_settings["codex"] == {
+        "model": "model-a",
+        "reasoning_effort": "low",
+    }
+
+
+def test_saved_effort_survives_catalog_failure_and_refresh_then_can_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: saved-model\n"
+        "      reasoning_effort: saved-effort\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    async def fail(**_kwargs: object) -> tuple[CodexModel, ...]:
+        raise RuntimeError("private failure detail")
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.get("codex")._discover = fail
+        failed = client.get("/partials/settings/coders")
+        refreshed = client.post(
+            "/partials/settings/coders/codex/models/refresh"
+        )
+        retained = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.reasoning_effort": "saved-effort"},
+        )
+        rejected = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.reasoning_effort": "new-effort"},
+        )
+        before_clear = load_config(str(cfg_path))
+        cleared = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.reasoning_effort": ""},
+        )
+
+    for response in (failed, refreshed):
+        assert response.status_code == 200
+        assert "saved-effort" in response.text
+        assert "support" in response.text
+        assert "private failure detail" not in response.text
+    assert (
+        before_clear.daemon.coder_settings["codex"]["reasoning_effort"]
+        == "saved-effort"
+    )
+    assert retained.status_code == 200
+    assert rejected.status_code == 422
+    assert "metadata for model saved-model is unavailable" in rejected.text
+    assert cleared.status_code == 200
+    assert (
+        load_config(str(cfg_path)).daemon.coder_settings["codex"][
+            "reasoning_effort"
+        ]
+        == ""
+    )
+
+
+def test_stale_catalog_keeps_saved_effort_visible_without_claiming_support(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: known-model\n"
+        "      reasoning_effort: low\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    async def available(**_kwargs: object) -> tuple[CodexModel, ...]:
+        return (
+            CodexModel(
+                "known-model",
+                "Known Model",
+                True,
+                "low",
+                (CodexReasoningEffort("low", "Fast"),),
+            ),
+        )
+
+    async def fail(**_kwargs: object) -> tuple[CodexModel, ...]:
+        raise RuntimeError("offline")
+
+    with TestClient(app) as client:
+        plugin = client.app.state.coder_registry.get("codex")
+        plugin._discover = available
+        ready = client.get("/partials/settings/coders")
+        plugin._discover = fail
+        stale = client.post(
+            "/partials/settings/coders/codex/models/refresh"
+        )
+
+    assert 'data-reasoning-effort-status="available"' in ready.text
+    assert 'data-reasoning-effort-status="stale"' in stale.text
+    assert 'value="low" selected' in stale.text
+    assert "current support is unconfirmed" in stale.text
+    assert (
+        load_config(str(cfg_path)).daemon.coder_settings["codex"][
+            "reasoning_effort"
+        ]
+        == "low"
+    )
+
+
+def test_arbitrary_plugin_effort_uses_generic_storage_and_no_provider_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    vendor-test:\n"
+        "      model: vendor-model\n"
+        "    unrelated:\n"
+        "      keep: value\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.register(_EffortCatalogPlugin())
+        rendered = client.get("/partials/settings/coders")
+        saved = client.put(
+            "/settings/daemon",
+            data={"coder_settings.vendor-test.reasoning_effort": "quick"},
+        )
+
+    assert rendered.status_code == 200
+    assert "Vendor Test" in rendered.text
+    assert 'name="coder_settings.vendor-test.reasoning_effort"' in rendered.text
+    assert "Short deliberation" in rendered.text
+    assert saved.status_code == 200
+    assert load_config(str(cfg_path)).daemon.coder_settings == {
+        "vendor-test": {
+            "model": "vendor-model",
+            "reasoning_effort": "quick",
+        },
+        "unrelated": {"keep": "value"},
+    }
+
+
+def test_model_without_effort_metadata_has_no_selectable_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    third:\n"
+        "      model: third-invoke\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.register(_ThirdCatalogPlugin())
+        response = client.get("/partials/settings/coders")
+
+    assert response.status_code == 200
+    assert 'data-reasoning-effort-status="not_advertised"' in response.text
+    assert "advertises no reasoning-effort overrides" in response.text
+    assert 'name="coder_settings.third.reasoning_effort"' not in response.text
+
+
+def test_slow_effort_validation_does_not_overwrite_newer_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: old-model\n"
+        "      reasoning_effort: low\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    started = threading.Event()
+    release = threading.Event()
+    result: dict[str, object] = {}
+
+    async def slow_discovery(**_kwargs: object) -> tuple[CodexModel, ...]:
+        started.set()
+        await asyncio.to_thread(release.wait)
+        return (
+            CodexModel(
+                "new-model",
+                "New Model",
+                True,
+                "high",
+                (CodexReasoningEffort("high", None),),
+            ),
+        )
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.get("codex")._discover = slow_discovery
+
+        def save_old_request() -> None:
+            result["response"] = client.put(
+                "/settings/daemon",
+                data={
+                    "poll_interval_sec": "99",
+                    "coder_settings.codex.model": "new-model",
+                },
+            )
+
+        thread = threading.Thread(target=save_old_request)
+        thread.start()
+        assert started.wait(timeout=2)
+        src_config.update_daemon_config(
+            path=str(cfg_path),
+            coder_settings={
+                "codex": {
+                    "model": "newer-saved-model",
+                    "reasoning_effort": "newer-effort",
+                }
+            },
+        )
+        release.set()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    response = result["response"]
+    assert hasattr(response, "status_code")
+    assert response.status_code == 409
+    assert "no submitted settings were saved" in response.text
+    assert "newer saved settings were kept" in response.text
+    cfg = load_config(str(cfg_path))
+    assert cfg.daemon.coder_settings["codex"] == {
+        "model": "newer-saved-model",
+        "reasoning_effort": "newer-effort",
+    }
+    assert cfg.daemon.poll_interval_sec == 60
+
+
 def test_generic_model_submission_rejects_unregistered_plugin(
     empty_config: Path,
 ) -> None:
@@ -1004,6 +1662,12 @@ class _NonStringForm(dict[str, object]):
             _NonStringForm({"codex_model": object()}),
             "codex_model must be a string",
         ),
+        (
+            _NonStringForm(
+                {"coder_settings.codex.reasoning_effort": object()}
+            ),
+            "coder_settings.codex.reasoning_effort must be a string",
+        ),
     ],
 )
 def test_model_submission_parser_rejects_non_string_values(
@@ -1015,6 +1679,72 @@ def test_model_submission_parser_rejects_non_string_values(
 
     with pytest.raises(ValueError, match=message):
         _submitted_coder_models(form, build_coder_registry())
+
+
+def test_reasoning_effort_helpers_preserve_existing_unconfirmed_values() -> None:
+    from src.coders import build_coder_registry
+    from src.web.routes.settings import (
+        _saved_reasoning_effort,
+        _submitted_coder_models,
+        _validate_reasoning_effort,
+    )
+    from src.web.services.model_catalog import ModelCatalogSnapshot
+
+    unavailable = ModelCatalogSnapshot(status="unavailable")
+    assert (
+        _validate_reasoning_effort(
+            "saved",
+            current_effort="saved",
+            current_model="",
+            selected_model="",
+            model_changed=False,
+            catalog=unavailable,
+            field_name="effort",
+        )
+        == "saved"
+    )
+    assert (
+        _validate_reasoning_effort(
+            "saved",
+            current_effort="saved",
+            current_model="known",
+            selected_model="known",
+            model_changed=False,
+            catalog=unavailable,
+            field_name="effort",
+        )
+        == "saved"
+    )
+    no_efforts = ModelCatalogSnapshot(
+        models=(ModelMetadata("known", "Known"),),
+        status="available",
+    )
+    assert (
+        _validate_reasoning_effort(
+            "saved",
+            current_effort="saved",
+            current_model="known",
+            selected_model="known",
+            model_changed=False,
+            catalog=no_efforts,
+            field_name="effort",
+        )
+        == "saved"
+    )
+    submitted = _submitted_coder_models(
+        _NonStringForm({"coder_settings.codex.model": "gpt-5.4"}),
+        build_coder_registry(),
+    )
+    assert submitted["codex"] == (
+        "gpt-5.4",
+        "coder_settings.codex.model",
+        False,
+    )
+    malformed = DaemonConfig.model_construct(
+        coder_settings={"codex": {"reasoning_effort": 3}}
+    )
+    with pytest.raises(ValueError, match="reasoning_effort must be a string"):
+        _saved_reasoning_effort(malformed, "codex")
 
 
 def test_model_submission_parser_rejects_unavailable_legacy_metadata() -> None:
@@ -1070,7 +1800,9 @@ def test_dynamic_codex_choice_persists_invocation_slug_and_api_metadata(
         api_response = client.get("/api/coders")
 
     assert fragment.status_code == 200
-    assert '<option value="invoke-future" >\n                                GPT Future' in fragment.text
+    assert re.search(
+        r'<option value="invoke-future" >\s+GPT Future', fragment.text
+    )
     assert "GPT Provider Default (advertised default)" in fragment.text
     assert fragment.text.index("invoke-future") < fragment.text.index("invoke-default")
     assert response.status_code == 200
