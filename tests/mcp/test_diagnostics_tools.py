@@ -574,8 +574,11 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
                 "---\nkind: Secret\ndata: {\n  opaque: redis-kube-flow-secret\n}\n"
                 "---\nkind: Secret\ndata: &payload\n  opaque: redis-kube-anchor-secret\n"
                 "---\nkind: &resourceKind Secret\ndata:\n  opaque: redis-decorated-kind-secret\n"
+                "---\nkind: >-\n  Secret\ndata:\n  opaque: redis-block-kind-secret\n"
                 "---\nkindValue: &kindValue Secret\nkind: *kindValue\n"
                 "data:\n  opaque: redis-aliased-kind-secret\n"
+                "---\nkind: |-\n  ConfigMap\ndata:\n"
+                "  harmless: retained-block-kind-config-value\n"
                 "---\nkindValue: &configKind ConfigMap\nkind: *configKind\n"
                 "data:\n  harmless: retained-aliased-config-value\n"
                 "---\nkind: ConfigMap\ndata:\n  harmless: retained-config-value"
@@ -693,8 +696,11 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         + "---\nkind: Secret\ndata: {\n  opaque: ci-kube-flow-secret\n}\n"
         + "---\nkind: Secret\ndata: &payload\n  opaque: ci-kube-anchor-secret\n"
         + "---\nkind: &resourceKind Secret\ndata:\n  opaque: ci-decorated-kind-secret\n"
+        + "---\nkind: >-\n  Secret\ndata:\n  opaque: ci-block-kind-secret\n"
         + "---\nkindValue: &kindValue Secret\nkind: *kindValue\n"
         + "data:\n  opaque: ci-aliased-kind-secret\n"
+        + "---\nkind: |-\n  ConfigMap\ndata:\n"
+        + "  harmless: retained-ci-block-kind-config-value\n"
         + "---\nkindValue: &configKind ConfigMap\nkind: *configKind\n"
         + "data:\n  harmless: retained-ci-aliased-config-value\n"
         + "---\n{apiVersion: v1, kind: Secret, data: {opaque: ci-kube-single-flow-secret}}\n"
@@ -789,7 +795,9 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "redis-kube-flow-secret" not in content
         assert "redis-kube-anchor-secret" not in content
         assert "redis-decorated-kind-secret" not in content
+        assert "redis-block-kind-secret" not in content
         assert "redis-aliased-kind-secret" not in content
+        assert "retained-block-kind-config-value" in content
         assert "retained-aliased-config-value" in content
         assert "redis-kube-single-flow-secret" not in content
         assert "redis-kube-prefixed-flow-secret" not in content
@@ -879,6 +887,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
         assert "ci-kube-flow-secret" not in content
         assert "ci-kube-anchor-secret" not in content
         assert "ci-decorated-kind-secret" not in content
+        assert "ci-block-kind-secret" not in content
         assert "ci-aliased-kind-secret" not in content
         if source_id == "ci:artifact":
             assert "retained-ci-list-config-value" in content
@@ -890,6 +899,7 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
             assert "retained-ci-single-flow-config" in content
             assert "retained-ci-multiline-flow-config" in content
             assert "retained-ci-flow-env-value" in content
+            assert "retained-ci-block-kind-config-value" in content
             assert "retained-ci-aliased-yaml-env-value" in content
             assert "retained-ci-aliased-config-value" in content
 
@@ -965,6 +975,15 @@ async def test_all_retained_log_kinds_share_structured_and_multiline_redaction(
     )
     assert "ci-decorated-kind-secret" not in decorated_kind_page["content"]
     assert "SENSITIVE" in decorated_kind_page["content"]
+
+    block_kind_page = await diagnostics.read_orchestrator_log(
+        SLUG,
+        "ci:artifact",
+        cursor=ci_raw.index(b"  opaque: ci-block-kind-secret"),
+        max_chars=300,
+    )
+    assert "ci-block-kind-secret" not in block_kind_page["content"]
+    assert "SENSITIVE" in block_kind_page["content"]
 
     decorated_env_page = await diagnostics.read_orchestrator_log(
         SLUG,
@@ -1245,6 +1264,16 @@ async def test_source_and_repository_isolation(tmp_path: Path, monkeypatch: pyte
     assert diagnostics._yaml_scalar_anchors(
         [b"kindValue: &kindValue Secret\n", b"---\n", b"kindValue: &kindValue ConfigMap\n"]
     ) == {"kindValue": "ConfigMap"}
+    assert diagnostics._yaml_mapping_scalar_values(
+        [
+            b"kind: >-\n",
+            b"  Secret\n",
+            b"---\n",
+            b"kind: *kindValue\n",
+        ],
+        "kind",
+    ) == {0: "Secret", 3: "*kindValue"}
+    assert diagnostics._yaml_mapping_scalar_values([b"kind: [\n"], "kind") == {}
     assert diagnostics._kubernetes_yaml_payload_flags(
         [
             b"kind: *laterKind\n",

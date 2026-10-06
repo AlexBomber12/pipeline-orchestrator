@@ -848,6 +848,38 @@ def _yaml_anchor_definitions(lines: list[bytes]) -> list[tuple[int, str, str]]:
     return definitions
 
 
+def _yaml_mapping_scalar_values(lines: list[bytes], key: str) -> dict[int, str]:
+    """Return scalar mapping values keyed by their source-line index."""
+    document = b"".join(
+        raw_line if raw_line.endswith((b"\n", b"\r")) else raw_line + b"\n"
+        for raw_line in lines
+    ).decode("utf-8", errors="replace")
+    try:
+        tokens = list(yaml.scan(document))
+    except (RecursionError, yaml.YAMLError):
+        return {}
+    values: dict[int, str] = {}
+    for index, token in enumerate(tokens):
+        if (
+            not isinstance(token, yaml.tokens.ScalarToken)
+            or str(token.value).casefold() != key.casefold()
+            or index == 0
+            or not isinstance(tokens[index - 1], yaml.tokens.KeyToken)
+        ):
+            continue
+        value_index = index + 2
+        while value_index < len(tokens) and isinstance(
+            tokens[value_index], (yaml.tokens.AnchorToken, yaml.tokens.TagToken)
+        ):
+            value_index += 1
+        value_token = tokens[value_index] if value_index < len(tokens) else None
+        if isinstance(value_token, yaml.tokens.ScalarToken):
+            values[token.start_mark.line] = str(value_token.value)
+        elif isinstance(value_token, yaml.tokens.AliasToken):
+            values[token.start_mark.line] = f"*{value_token.value}"
+    return values
+
+
 def _yaml_scalar_anchors(lines: list[bytes]) -> dict[str, str]:
     """Collect scalar anchors from the current bounded YAML document."""
     document_start = 0
@@ -1183,6 +1215,7 @@ def _kubernetes_yaml_state_before(
     payload_flow_depth: int | None = None
     context_lines = context.splitlines(keepends=True)
     yaml_anchor_states = _yaml_anchor_state_by_line(context_lines, None)
+    yaml_kind_values = _yaml_mapping_scalar_values(context_lines, "kind")
     yaml_anchors = yaml_anchor_states[-1] if yaml_anchor_states else {}
     for context_index, raw_line in enumerate(context.splitlines()):
         if not raw_line.strip():
@@ -1220,7 +1253,10 @@ def _kubernetes_yaml_state_before(
         kind_match = _YAML_KIND_ASSIGNMENT.fullmatch(line)
         if kind_match is not None:
             state_known = True
-            kind = _resolve_yaml_scalar(kind_match.group("kind"), yaml_anchor_states[context_index])
+            kind = _resolve_yaml_scalar(
+                yaml_kind_values.get(context_index, kind_match.group("kind")),
+                yaml_anchor_states[context_index],
+            )
             if kind is None or kind.casefold() == "secret":
                 secret_scopes.append(
                     (
@@ -1347,6 +1383,7 @@ def _kubernetes_yaml_payload_flags(
             continue
         document_lines = raw_lines[document_start:boundary]
         yaml_anchor_states = _yaml_anchor_state_by_line(document_lines, None)
+        yaml_kind_values = _yaml_mapping_scalar_values(document_lines, "kind")
         kind_matches: list[tuple[int, re.Match[str]]] = []
         has_payload = False
         for local_index, document_line in enumerate(document_lines):
@@ -1373,7 +1410,7 @@ def _kubernetes_yaml_payload_flags(
                 flags[index] = True
         for local_index, kind_match in kind_matches:
             kind = _resolve_yaml_scalar(
-                kind_match.group("kind"),
+                yaml_kind_values.get(local_index, kind_match.group("kind")),
                 yaml_anchor_states[local_index],
             )
             if kind is not None and kind.casefold() != "secret":

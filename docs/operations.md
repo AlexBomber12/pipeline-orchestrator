@@ -45,9 +45,10 @@ The localhost-scoped Orchestrator MCP exposes three incident-inspection tools:
   payload block. YAML document markers are recognized only at document scope,
   and sensitive environment `name` entries bind to their sibling `value`.
   YAML anchors and tags decorating Secret `kind` or environment `name` scalars
-  are normalized before either classification. Scalar aliases are resolved from
-  bounded, document-local anchor context; unresolved aliases fail closed, while
-  resolved ConfigMap kinds and non-sensitive environment names remain visible.
+  are normalized before classification, and block-scalar `kind` values are
+  parsed across their physical lines. Scalar aliases are resolved from bounded,
+  document-local anchor context; unresolved aliases fail closed, while resolved
+  ConfigMap kinds and non-sensitive environment names remain visible.
   Same-indent YAML sequence children and indented multiline INI values remain
   within the sensitive unit. Complete bounded single- and multiline flow-style
   Kubernetes Secret manifests are parsed before ordinary line redaction,
