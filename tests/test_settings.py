@@ -1278,7 +1278,7 @@ def test_codex_refresh_updates_choices_without_changing_selection(
     assert 'value="original-slug" selected' in first.text
     assert 'value="new-slug"' in refreshed.text
     assert "original-slug (saved; not advertised)" in refreshed.text
-    assert 'hx-indicator="#codex-model-refreshing"' in refreshed.text
+    assert 'hx-indicator="#coder-codex-model-refreshing"' in refreshed.text
     assert "Refreshing…" in refreshed.text
     assert load_config(str(cfg_path)).daemon.codex_model == "original-slug"
 
