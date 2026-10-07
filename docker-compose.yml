@@ -51,6 +51,10 @@ services:
     environment:
       PYTHONUNBUFFERED: "1"
       REDIS_URL: redis://redis:6379/0
+      MCP_REMOTE_DIAGNOSTICS: "${MCP_REMOTE_DIAGNOSTICS:-0}"
+      MCP_PUBLIC_HOSTNAME: "${MCP_PUBLIC_HOSTNAME:-}"
+      MCP_CLOUDFLARE_ACCESS_ISSUER: "${MCP_CLOUDFLARE_ACCESS_ISSUER:-}"
+      MCP_CLOUDFLARE_ACCESS_AUDIENCE: "${MCP_CLOUDFLARE_ACCESS_AUDIENCE:-}"
     restart: unless-stopped
     depends_on:
       - redis
