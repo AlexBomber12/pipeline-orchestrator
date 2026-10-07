@@ -186,14 +186,23 @@ async def _configured_catalog_worker_response(
     plugin_id: str,
     reference: str,
     config_path: str,
+    expected_credential_location: str | None = None,
 ) -> dict[str, Any]:
     """Load one configured plugin and serialize its catalog in a worker."""
     try:
         from src.coders import _load_plugin
 
         plugin = _load_plugin(plugin_id, reference)
+        config = load_config(config_path)
+        if expected_credential_location is not None:
+            actual_location = resolve_device_login_credential_location(
+                plugin,
+                config=config,
+            )
+            if actual_location != expected_credential_location:
+                return {"ok": False, "error": "catalog unavailable"}
         catalog = await plugin.get_model_catalog(
-            config=load_config(config_path),
+            config=config,
             config_path=config_path,
         )
     except Exception:
@@ -203,13 +212,14 @@ async def _configured_catalog_worker_response(
 
 def _configured_catalog_worker_main() -> None:
     """Subprocess entry point for configured model catalog discovery."""
-    if len(sys.argv) != 5 or sys.argv[1] != "--configured-worker":
+    if len(sys.argv) not in {5, 6} or sys.argv[1] != "--configured-worker":
         raise SystemExit(2)
     result = asyncio.run(
         _configured_catalog_worker_response(
             sys.argv[2],
             sys.argv[3],
             sys.argv[4],
+            sys.argv[5] if len(sys.argv) == 6 else None,
         )
     )
     print(
@@ -224,10 +234,12 @@ async def _isolated_configured_catalog(
     *,
     config_path: str,
     timeout_seconds: float = _CONFIGURED_CATALOG_TIMEOUT_SECONDS,
+    credential_location: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> ModelCatalog:
     """Discover configured plugin metadata in a bounded process group."""
     try:
-        process = await asyncio.create_subprocess_exec(
+        command = [
             sys.executable,
             "-m",
             "src.model_catalog_bridge",
@@ -235,9 +247,19 @@ async def _isolated_configured_catalog(
             plugin_id,
             reference,
             config_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            start_new_session=True,
+        ]
+        if credential_location is not None:
+            command.append(credential_location)
+        spawn_kwargs: dict[str, Any] = {
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.DEVNULL,
+            "start_new_session": True,
+        }
+        if env is not None:
+            spawn_kwargs["env"] = dict(env)
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            **spawn_kwargs,
         )
     except OSError:
         raise ModelCatalogUnavailable(
@@ -606,14 +628,16 @@ async def handle_model_catalog_request(
                 assert config is not None
                 context_builder = getattr(
                     plugin,
-                    "build_credential_bound_run_kwargs",
+                    "build_credential_environment",
                     None,
                 )
                 if callable(context_builder):
-                    probe_environment = context_builder(
-                        config=config,
-                        credential_location=credential_location,
-                    ).get("environment")
+                    probe_environment = dict(
+                        context_builder(
+                            config=config,
+                            credential_location=credential_location,
+                        )
+                    )
             try:
                 auth = await isolated_auth_probe(
                     plugin_name,
@@ -652,6 +676,20 @@ async def handle_model_catalog_request(
                     {"ok": False, "error": "catalog unavailable"},
                 )
                 return
+        catalog_environment: dict[str, str] | None = None
+        if credential_location is not None:
+            context_builder = getattr(
+                plugin,
+                "build_credential_environment",
+                None,
+            )
+            if callable(context_builder):
+                catalog_environment = dict(
+                    context_builder(
+                        config=config,
+                        credential_location=credential_location,
+                    )
+                )
         try:
             if (
                 reference is not None
@@ -661,6 +699,8 @@ async def handle_model_catalog_request(
                     plugin_name,
                     reference,
                     config_path=config_path,
+                    credential_location=credential_location,
+                    env=catalog_environment,
                 )
             else:
                 catalog = await asyncio.wait_for(

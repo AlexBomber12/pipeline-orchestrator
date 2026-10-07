@@ -235,6 +235,36 @@ def test_codex_plugin_check_auth(
     )
 
 
+def test_codex_plugin_check_auth_uses_pinned_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reserved_environment = {
+        "HOME": "/reserved/home",
+        "CODEX_HOME": "/reserved/codex-home",
+    }
+    calls: list[dict[str, str] | None] = []
+
+    def fake_run_auth_command(
+        cmd: list[str], *, env: dict[str, str] | None = None
+    ) -> tuple[int, str, str]:
+        calls.append(env)
+        if cmd == ["codex", "--version"]:
+            return (0, "codex 0.160.0", "")
+        return (0, "Logged in using ChatGPT", "")
+
+    monkeypatch.setattr(codex_module, "_run_auth_command", fake_run_auth_command)
+    monkeypatch.setattr(
+        codex_module,
+        "load_config",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("must not reload")),
+    )
+
+    result = CodexPlugin().check_auth(environment=reserved_environment)
+
+    assert result["status"] == "ok"
+    assert calls == [reserved_environment, reserved_environment]
+
+
 @pytest.mark.parametrize(
     ("output", "expected_mode", "mode_label"),
     [

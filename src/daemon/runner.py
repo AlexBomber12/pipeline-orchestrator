@@ -30,6 +30,7 @@ import subprocess
 import uuid
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any, Coroutine
 
@@ -1044,6 +1045,7 @@ class PipelineRunner(
         now = datetime.now(timezone.utc)
         names = self._registry.coder_names()
         credential_locations: dict[str, str] = {}
+        credential_environments: dict[str, dict[str, str]] = {}
         invalid_locations: set[str] = set()
         credential_versions: dict[str, int] = {}
         login_blocked: set[str] = set()
@@ -1055,7 +1057,17 @@ class PipelineRunner(
                     invalid_locations.add(name)
                     continue
                 if location is not None:
+                    try:
+                        environment = self._credential_bound_coder_environment(
+                            name,
+                            location,
+                        )
+                    except Exception:
+                        invalid_locations.add(name)
+                        continue
                     credential_locations[name] = location
+                    if environment is not None:
+                        credential_environments[name] = environment
             credential_versions = {
                 name: self._credential_reservations.credential_version(location)
                 for name, location in credential_locations.items()
@@ -1095,17 +1107,27 @@ class PipelineRunner(
             try:
                 plugin = self._registry.get(name)
                 reference = self._registry.reference_for(name)
+                environment = credential_environments.get(name)
+                check_auth = plugin.check_auth
+                if environment is not None:
+                    check_auth = partial(
+                        check_auth,
+                        environment=dict(environment),
+                    )
 
                 async def _threaded_check_auth() -> dict[str, Any]:
                     if reserved:
                         return await self._run_reserved_sync_reader(
-                            plugin.check_auth
+                            check_auth
                         )
-                    return await asyncio.to_thread(plugin.check_auth)
+                    return await asyncio.to_thread(check_auth)
 
                 if reference != DEFAULT_CODER_PLUGINS.get(name):
                     if reference is None:
                         return await _threaded_check_auth()
+                    probe_kwargs: dict[str, Any] = {}
+                    if environment is not None:
+                        probe_kwargs["env"] = dict(environment)
                     return await isolated_auth_probe(
                         name,
                         reference,
@@ -1114,6 +1136,7 @@ class PipelineRunner(
                             "PO_CONFIG_PATH",
                             "config.yml",
                         ),
+                        **probe_kwargs,
                     )
                 return await _threaded_check_auth()
             except Exception:
@@ -2393,6 +2416,23 @@ class PipelineRunner(
             and active_location == credential_location
         )
 
+    def _credential_bound_coder_environment(
+        self,
+        coder_name: str,
+        credential_location: str,
+    ) -> dict[str, str] | None:
+        """Return optional plugin environment for reserved credentials."""
+        plugin = self._registry.get_optional(coder_name)
+        builder = getattr(plugin, "build_credential_environment", None)
+        if not callable(builder):
+            return None
+        return dict(
+            builder(
+                config=self.app_config,
+                credential_location=credential_location,
+            )
+        )
+
     def _bind_reserved_coder_run_kwargs(
         self,
         coder_name: str,
@@ -2400,16 +2440,13 @@ class PipelineRunner(
         invocation_kwargs: dict[str, Any],
     ) -> None:
         """Apply optional plugin context for the exact reserved credentials."""
-        plugin = self._registry.get_optional(coder_name)
-        binder = getattr(plugin, "build_credential_bound_run_kwargs", None)
-        if not callable(binder):
-            return
-        bound_kwargs = dict(
-            binder(
-                config=self.app_config,
-                credential_location=credential_location,
-            )
+        environment = self._credential_bound_coder_environment(
+            coder_name,
+            credential_location,
         )
+        if environment is None:
+            return
+        bound_kwargs = {"environment": environment}
         conflicts = invocation_kwargs.keys() & bound_kwargs.keys()
         if conflicts:
             raise ValueError(

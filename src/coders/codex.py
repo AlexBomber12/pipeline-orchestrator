@@ -438,11 +438,19 @@ class CodexPlugin:
             capabilities=self.auth_capabilities,
         )
 
-    def check_auth(self, *, config_path: str = CONFIG_PATH) -> dict[str, Any]:
+    def check_auth(
+        self,
+        *,
+        config_path: str = CONFIG_PATH,
+        environment: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         """Report saved Codex credentials without verifying service access."""
-        cfg = load_config(config_path)
-        env = codex_cli.build_codex_environment(
-            codex_home_dir=cfg.auth.codex_home_dir
+        env = (
+            dict(environment)
+            if environment is not None
+            else codex_cli.build_codex_environment(
+                codex_home_dir=load_config(config_path).auth.codex_home_dir
+            )
         )
         version_rc, version_stdout, version_stderr = _run_auth_command(
             ["codex", "--version"], env=env
@@ -633,15 +641,15 @@ class CodexPlugin:
             kwargs[_REASONING_EFFORT_SETTING] = reasoning_effort
         return kwargs
 
-    def build_credential_bound_run_kwargs(
+    def build_credential_environment(
         self,
         *,
         config: AppConfig,
         credential_location: str,
-    ) -> dict[str, Any]:
-        """Bind one invocation to the exact credential location it reserved."""
+    ) -> dict[str, str]:
+        """Return the environment bound to one reserved credential location."""
         environment = codex_cli.build_codex_environment(
             codex_home_dir=config.auth.codex_home_dir
         )
         environment["CODEX_HOME"] = credential_location
-        return {"environment": environment}
+        return environment

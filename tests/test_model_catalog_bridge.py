@@ -663,19 +663,39 @@ async def test_configured_catalog_worker_response_redacts_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Plugin:
+        calls = 0
+
+        def create_device_login(self, *, config_path: str) -> object:
+            del config_path
+            return object()
+
+        def device_login_credential_location(self, *, config: AppConfig) -> str:
+            return config.auth.codex_home_dir
+
         async def get_model_catalog(self, **_kwargs: object) -> ModelCatalog:
+            self.calls += 1
             return ModelCatalog(
                 (ModelMetadata("third", "Third"),),
                 "configured",
                 "Configured catalog.",
             )
 
-    monkeypatch.setattr("src.coders._load_plugin", lambda *_args: Plugin())
+    plugin = Plugin()
+    monkeypatch.setattr("src.coders._load_plugin", lambda *_args: plugin)
     monkeypatch.setattr(bridge, "load_config", lambda _path: AppConfig())
     response = await bridge._configured_catalog_worker_response(
         "third", "module:factory", "/cfg"
     )
     assert bridge._parse_catalog(response).models[0].invocation_id == "third"
+    assert plugin.calls == 1
+
+    assert await bridge._configured_catalog_worker_response(
+        "third",
+        "module:factory",
+        "/cfg",
+        "/reserved/credential/location",
+    ) == {"ok": False, "error": "catalog unavailable"}
+    assert plugin.calls == 1
 
     monkeypatch.setattr(
         "src.coders._load_plugin",
@@ -739,7 +759,11 @@ async def test_isolated_configured_catalog_parses_worker_result(
 
     monkeypatch.setattr(bridge.asyncio, "create_subprocess_exec", create)
     result = await bridge._isolated_configured_catalog(
-        "third", "module:factory", config_path="/cfg"
+        "third",
+        "module:factory",
+        config_path="/cfg",
+        credential_location="/reserved/credentials",
+        env={"CODEX_HOME": "/reserved/credentials"},
     )
 
     assert result == catalog
@@ -751,11 +775,13 @@ async def test_isolated_configured_catalog_parses_worker_result(
         "third",
         "module:factory",
         "/cfg",
+        "/reserved/credentials",
     )
     assert captured["kwargs"] == {
         "stdout": bridge.asyncio.subprocess.PIPE,
         "stderr": bridge.asyncio.subprocess.DEVNULL,
         "start_new_session": True,
+        "env": {"CODEX_HOME": "/reserved/credentials"},
     }
 
 
@@ -849,20 +875,39 @@ async def test_isolated_configured_catalog_handles_start_timeout_and_cancel(
 @pytest.mark.asyncio
 async def test_daemon_handler_isolates_configured_catalog(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     redis = _BridgeRedis()
     registry = CoderRegistry()
     plugin = CodexPlugin(discover=lambda **_kwargs: None)
     registry.register(plugin, reference="operator.plugin:factory")
-    calls: list[tuple[str, str, str]] = []
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    config_path = tmp_path / "config.yml"
+    codex_home = tmp_path / "codex-home"
+    config_path.write_text(
+        f"auth:\n  codex_home_dir: {codex_home}\n",
+        encoding="utf-8",
+    )
+    reservations = CoderCredentialReservations()
+    calls: list[tuple[str, str, str, str | None, str | None]] = []
 
     async def isolated(
         plugin_id: str,
         reference: str,
         *,
         config_path: str,
+        credential_location: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> ModelCatalog:
-        calls.append((plugin_id, reference, config_path))
+        calls.append(
+            (
+                plugin_id,
+                reference,
+                config_path,
+                credential_location,
+                None if env is None else env.get("CODEX_HOME"),
+            )
+        )
         return ModelCatalog((), "configured", "Isolated catalog.")
 
     monkeypatch.setattr(bridge, "_isolated_configured_catalog", isolated)
@@ -877,10 +922,20 @@ async def test_daemon_handler_isolates_configured_catalog(
                 "expires_at": time.time() + 10,
             }
         ),
-        config_path="/cfg",
+        config_path=str(config_path),
+        credential_reservations=reservations,
     )
 
-    assert calls == [("codex", "operator.plugin:factory", "/cfg")]
+    expected_location = str(codex_home / ".codex")
+    assert calls == [
+        (
+            "codex",
+            "operator.plugin:factory",
+            str(config_path),
+            expected_location,
+            expected_location,
+        )
+    ]
     response = json.loads(redis.values[bridge._response_key("c" * 32)])
     assert response["ok"] is True
     assert response["catalog"]["source"] == "configured"
@@ -896,9 +951,10 @@ async def test_daemon_handler_isolates_configured_catalog(
                 "expires_at": time.time() + 10,
             }
         ),
-        config_path="/cfg",
+        config_path=str(config_path),
+        credential_reservations=reservations,
     )
-    assert calls == [("codex", "operator.plugin:factory", "/cfg")]
+    assert len(calls) == 1
     assert json.loads(redis.values[bridge._response_key("d" * 32)]) == {
         "ok": False,
         "error": "plugin reference mismatch",

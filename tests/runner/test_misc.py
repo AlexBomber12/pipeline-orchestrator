@@ -159,7 +159,7 @@ def test_runner_credential_reservations_coordinate_with_device_login(
     runner._release_coder_credentials()
 
     with monkeypatch.context() as scoped:
-        scoped.setattr(codex, "build_credential_bound_run_kwargs", None)
+        scoped.setattr(codex, "build_credential_environment", None)
         unbound_kwargs: dict[str, Any] = {"model": "gpt-test"}
         assert runner._reserve_coder_credentials(
             "codex",
@@ -180,13 +180,13 @@ def test_runner_credential_reservations_coordinate_with_device_login(
     with monkeypatch.context() as scoped:
         scoped.setattr(
             codex,
-            "build_credential_bound_run_kwargs",
-            lambda **_kwargs: {"model": "must-not-overwrite"},
+            "build_credential_environment",
+            lambda **_kwargs: {"CODEX_HOME": location},
         )
         with pytest.raises(ValueError, match="conflict"):
             runner._reserve_coder_credentials(
                 "codex",
-                invocation_kwargs={"model": "gpt-test"},
+                invocation_kwargs={"environment": {}},
             )
         assert runner._coder_credential_reservation is None
         assert reservations.reserve_login(location) is True
@@ -518,6 +518,7 @@ def test_refresh_auth_status_cache_returns_early_when_cache_is_fresh(
 def test_auth_cache_defers_probe_during_login_and_refreshes_after_release(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     reservations = CoderCredentialReservations()
     runner = h._make_runner()
     runner._credential_reservations = reservations
@@ -528,10 +529,13 @@ def test_auth_cache_defers_probe_during_login_and_refreshes_after_release(
         "detail": "stale missing credentials",
     }
     runner._auth_status_cache_credential_versions = {"codex": 0}
-    calls: list[bool] = []
+    calls: list[dict[str, str]] = []
 
-    def check_auth() -> dict[str, str]:
-        calls.append(True)
+    def check_auth(
+        *, environment: dict[str, str] | None = None
+    ) -> dict[str, str]:
+        assert environment is not None
+        calls.append(environment)
         return {"status": "error", "detail": "login did not complete"}
 
     monkeypatch.setattr(codex, "check_auth", check_auth)
@@ -548,12 +552,29 @@ def test_auth_cache_defers_probe_during_login_and_refreshes_after_release(
     reservations.release_login(location)
     asyncio.run(runner._refresh_auth_status_cache())
 
-    assert calls == [True]
+    assert [environment["CODEX_HOME"] for environment in calls] == [location]
     assert runner._auth_status_cache["codex"] == {
         "status": "error",
         "detail": "login did not complete",
     }
     assert runner._auth_status_cache_credential_versions["codex"] == 1
+
+
+def test_auth_cache_fails_closed_when_credential_environment_is_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner(coder=CoderType.CODEX)
+    runner._credential_reservations = CoderCredentialReservations()
+    codex = runner._registry.get("codex")
+
+    def fail(**_kwargs: object) -> dict[str, str]:
+        raise RuntimeError("invalid environment")
+
+    monkeypatch.setattr(codex, "build_credential_environment", fail)
+
+    asyncio.run(runner._refresh_auth_status_cache())
+
+    assert runner._auth_status_cache["codex"] == {"status": "error"}
 
 
 @pytest.mark.asyncio
@@ -580,7 +601,8 @@ async def test_cancelled_auth_probe_holds_reservation_until_worker_settles(
     monkeypatch.setattr(reservations, "release_coder", release_coder)
 
     async def delayed_to_thread(function: Any, *args: object) -> Any:
-        if getattr(function, "__self__", None) is codex:
+        target = getattr(function, "func", function)
+        if getattr(target, "__self__", None) is codex:
             started.set()
             await release.wait()
             return function(*args)
@@ -725,6 +747,42 @@ def test_refresh_auth_status_cache_isolates_configured_runtime_override(
         "claude": {"status": "ok", "detail": "isolated"},
         "codex": {"status": "ok", "detail": "direct"},
         "third": {"status": "ok", "detail": "isolated"},
+    }
+
+
+def test_configured_auth_probe_uses_reserved_credential_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    runner = h._make_runner(coder=CoderType.CODEX)
+    reservations = CoderCredentialReservations()
+    runner._credential_reservations = reservations
+    codex = runner._registry.get("codex")
+    runner._registry.register(codex, reference="operator.codex:factory")
+    location = codex.device_login_credential_location(config=runner.app_config)
+    calls: list[str] = []
+
+    async def isolated(
+        plugin_id: str,
+        reference: str,
+        display_name: str,
+        *,
+        config_path: str,
+        env: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        del plugin_id, reference, display_name, config_path
+        assert env is not None
+        calls.append(env["CODEX_HOME"])
+        return {"status": "ok", "detail": "isolated"}
+
+    monkeypatch.setattr(runner_module, "isolated_auth_probe", isolated)
+
+    asyncio.run(runner._refresh_auth_status_cache())
+
+    assert calls == [location]
+    assert runner._auth_status_cache["codex"] == {
+        "status": "ok",
+        "detail": "isolated",
     }
 
 
