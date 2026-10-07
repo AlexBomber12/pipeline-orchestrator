@@ -43,8 +43,9 @@ reports source/output sizes, truncation, observation time, and remaining Redis
 TTL. Authorization headers, token, password, and passphrase assignments or
 long-option arguments,
 cookies, credential-bearing absolute or scheme-relative URL userinfo/query
-parameters (including percent-encoded parameter names), recognizable token
-shapes including JWTs, private-key blocks, and recognizable JSON credential
+parameters (including percent-encoded parameter names and Azure SAS signatures),
+recognizable token shapes including JWTs and Slack webhooks, private-key blocks,
+and recognizable JSON credential
 documents are not exported, including nested documents and documents serialized
 inside log strings and structured header name/value pairs in JSON-list or
 Python-tuple form. Complete and interrupted private-key blocks are both omitted
@@ -60,7 +61,8 @@ or interrupted quoting cannot expose a value suffix. Indented YAML/header
 continuations, backslash-continued shell values, and quoted values spanning
 physical lines are omitted with their key line through the close or source end.
 This includes leading blank lines and legal indentationless YAML sequence values
-under a credential key.
+under a credential key, plus shell heredoc bodies through their delimiter or
+source end.
 Terminal escape and control sequences, including C1 control strings, are
 normalized before credential inspection. The source suffix beginning with the
 first bare carriage return or stateful cursor/editing control is omitted

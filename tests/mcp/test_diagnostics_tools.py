@@ -455,6 +455,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     bare_jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.signatureValue"
     encoded_auth = "dXNlcjpTVVBFUlNFQ1JFVA=="
     standalone_basic = "dXNlcjpTVEFOREFMT05FLUJBU0lDLVNFQ1JFVA=="
+    slack_webhook = "https://hooks.slack.com/services/T123/B456/" + ("A" * 24)
     credential_log = "\n".join(
         (
             "curl -H 'Authorization: ApiKey inline-auth-secret' https://example.test",
@@ -465,6 +466,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "https://url-user:url-password@example.test/path?access_token=query-secret",
             "https://example.test/?access%5Ftoken=encoded-query-secret",
             "https://example.test/?password[]=bracket-query-secret",
+            "https://blob.example.test/c?sv=2024-01-01&sig=azure-sas-secret&se=2027-01-01",
             "https://single-url-credential@example.test/path",
             "//network-user:network-password@example.test/path",
             "ghp_" + ("A" * 36),
@@ -496,6 +498,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "tool --passphrase passphrase-option-secret",
             "jwt=jwt-assignment-secret",
             bare_jwt,
+            slack_webhook,
             f'{{"auths":{{"registry":{{"auth":"{encoded_auth}"}}}}}}',
             f"_auth={encoded_auth}",
             "Bearer standalone-bearer-secret",
@@ -532,6 +535,11 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "",
             "  yaml-leading-blank-secret",
             "safe-after-yaml-blank",
+            "PASSWORD=$(cat <<EOF)",
+            "heredoc-secret",
+            "EOF",
+            ")",
+            "safe-after-heredoc",
             "PASSWORD=" + "\\",
             "shell-multiline-secret",
             "safe-after-shell",
@@ -568,6 +576,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-yaml" in exported
     assert "safe-after-yaml-sequence" in exported
     assert "safe-after-yaml-blank" in exported
+    assert "safe-after-heredoc" in exported
     assert "safe-after-shell" in exported
     assert "safe-after-quote" in exported
     assert "visible-control" in exported
@@ -584,6 +593,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "hidden-camel-metadata" not in exported
     assert "serialized-metadata" not in exported
     assert bare_jwt not in exported
+    assert slack_webhook not in exported
     assert encoded_auth not in exported
     assert standalone_basic not in exported
     assert "safe-hyperlink-output" in exported
@@ -601,6 +611,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "query-secret",
         "encoded-query-secret",
         "bracket-query-secret",
+        "azure-sas-secret",
         "array-document-secret",
         "prefix-document-secret",
         "serialized-document-secret",
@@ -650,6 +661,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "yaml-multiline-secret",
         "indentationless-yaml-secret",
         "yaml-leading-blank-secret",
+        "heredoc-secret",
         "shell-multiline-secret",
         "quoted-multiline-secret",
         "malformed-private-secret",
@@ -745,6 +757,15 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     incomplete_inline = await diagnostics.get_latest_cli_log(SLUG)
     assert incomplete_inline["text"] == "safe-before\n[credential line omitted]"
     assert "unterminated-credential-secret" not in incomplete_inline["text"]
+
+    unterminated_heredoc_redis = FakeRedis()
+    unterminated_heredoc_redis.store[key] = (
+        "safe-before\nPASSWORD=$(cat <<'EOF')\nunterminated-heredoc-secret"
+    )
+    _patch_runtime(monkeypatch, unterminated_heredoc_redis)
+    unterminated_heredoc = await diagnostics.get_latest_cli_log(SLUG)
+    assert unterminated_heredoc["text"] == "safe-before\n[credential line omitted]\n"
+    assert "unterminated-heredoc-secret" not in unterminated_heredoc["text"]
 
 
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(

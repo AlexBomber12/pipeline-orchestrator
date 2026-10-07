@@ -109,10 +109,15 @@ _JSON_CONTAINER_START = re.compile(r"[\[{]")
 _JSON_UNICODE_ESCAPE = re.compile(r"\\u(?P<codepoint>[0-9a-fA-F]{4})")
 _JSON_SIMPLE_ESCAPE = re.compile(r'\\(?P<escape>["\\/bfnrt])')
 _URL_USERINFO = re.compile(r"(?i)(?P<scheme>(?:\b[a-z][a-z0-9+.-]*:)?//)[^/@\s]+@")
+_SENSITIVE_QUERY_VALUE = re.compile(r"(?i)(?P<prefix>[?&;](?:sig|signature)=)[^&#;\s]+")
 _AUTHORIZATION_VALUE = re.compile(
     r"(?i)\b(?P<scheme>Bearer|Basic|Digest|Negotiate|ApiKey|Token)[ \t]+\S+"
 )
 _DIGEST_AUTHORIZATION = re.compile(r"(?i)(?<![A-Za-z0-9])Digest[ \t]+")
+_HEREDOC_START = re.compile(
+    r"<<(?P<strip_tabs>-?)[ \t]*(?P<quote>['\"]?)"
+    r"(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)"
+)
 _SENSITIVE_MULTIWORD_LABEL = re.compile(
     r"(?i)(?<![A-Za-z0-9])(?:"
     r"(?:api|oauth|access|refresh|id|auth)\s+(?:key|token)|"
@@ -146,6 +151,8 @@ _RECOGNIZABLE_SECRET = tuple(
         r"\bxox[boaprs]-(?:[0-9]+-){2,}[A-Za-z0-9-]{24,}\b",
         r"\b(?:sk|rk)_(?:test|live)_[A-Za-z0-9]{24,}\b",
         r"\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b",
+        r"\bhttps://hooks\.slack(?:-gov)?\.com/(?:services/)?"
+        r"T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]{24}\b",
     )
 )
 
@@ -1256,10 +1263,19 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
         open_quote = _unterminated_quote(content)
         continued = content.rstrip().endswith("\\")
         yaml_block = content[value_start:].strip() in {"", "|", "|-", "|+", ">", ">-", ">+"}
+        heredoc = _HEREDOC_START.search(content[value_start:])
+        heredoc_delimiter = heredoc.group("delimiter") if heredoc is not None else None
+        heredoc_strips_tabs = heredoc is not None and heredoc.group("strip_tabs") == "-"
         indented_block = False
         index += 1
         while index < len(lines):
             continuation = lines[index].rstrip("\r\n")
+            if heredoc_delimiter is not None:
+                candidate = continuation.lstrip("\t") if heredoc_strips_tabs else continuation
+                index += 1
+                if candidate == heredoc_delimiter:
+                    heredoc_delimiter = None
+                continue
             indented = continuation.startswith((" ", "\t"))
             blank_in_block = (yaml_block or indented_block) and not continuation
             indentationless_sequence = yaml_block and (
@@ -1282,6 +1298,11 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     redactions = terminal_controls + pem_documents + json_documents + credential_lines
 
     text, count = _URL_USERINFO.subn(lambda match: f"{match.group('scheme')}{_REDACTED}@", text)
+    redactions += count
+    text, count = _SENSITIVE_QUERY_VALUE.subn(
+        lambda match: f"{match.group('prefix')}{_REDACTED}",
+        text,
+    )
     redactions += count
     text, count = _AUTHORIZATION_VALUE.subn(
         lambda match: f"{match.group('scheme')} {_REDACTED}",
