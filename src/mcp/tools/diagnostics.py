@@ -110,6 +110,9 @@ _JSON_CONTAINER_START = re.compile(r"[\[{]")
 _JSON_UNICODE_ESCAPE = re.compile(r"\\u(?P<codepoint>[0-9a-fA-F]{4})")
 _JSON_SIMPLE_ESCAPE = re.compile(r'\\(?P<escape>["\\/bfnrt])')
 _YAML_DOCUMENT_BOUNDARY = re.compile(r"(?m)^(?:---|\.\.\.)[ \t]*(?:#.*)?(?:\n|$)")
+_YAML_ALIAS = re.compile(r"(?<![A-Za-z0-9_.-])\*[^\s,\[\]{}#]+")
+_YAML_COMMENT = re.compile(r"(?<!\S)#")
+_YAML_BLOCK_VALUE_INDICATORS = frozenset({"", "|", "|-", "|+", ">", ">-", ">+"})
 _KUBERNETES_SECRET_KIND = re.compile(
     r"(?im)^[ \t]*kind[ \t]*:[ \t]*(?P<quote>['\"]?)Secret(?P=quote)"
     r"[ \t]*(?:#.*)?$"
@@ -1267,20 +1270,19 @@ def _omit_json_credential_documents(text: str) -> tuple[str, int]:
     return "".join(parts), len(ranges)
 
 
-def _omit_kubernetes_secret_documents(text: str) -> tuple[str, int]:
-    """Omit complete YAML documents recognizable as Kubernetes Secrets."""
+def _yaml_document_ranges(text: str) -> list[tuple[int, int]]:
     ranges: list[tuple[int, int]] = []
     document_start = 0
     for boundary in _YAML_DOCUMENT_BOUNDARY.finditer(text):
-        document_end = boundary.start()
-        if _KUBERNETES_SECRET_KIND.search(text, document_start, document_end):
-            ranges.append((document_start, document_end))
+        ranges.append((document_start, boundary.start()))
         document_start = boundary.end()
-    if _KUBERNETES_SECRET_KIND.search(text, document_start):
-        ranges.append((document_start, len(text)))
+    ranges.append((document_start, len(text)))
+    return ranges
+
+
+def _omit_document_ranges(text: str, ranges: list[tuple[int, int]]) -> tuple[str, int]:
     if not ranges:
         return text, 0
-
     parts: list[str] = []
     offset = 0
     for start, end in ranges:
@@ -1289,6 +1291,36 @@ def _omit_kubernetes_secret_documents(text: str) -> tuple[str, int]:
         offset = end
     parts.append(text[offset:])
     return "".join(parts), len(ranges)
+
+
+def _omit_ambiguous_yaml_credential_documents(text: str) -> tuple[str, int]:
+    """Fail closed for YAML credential values unsafe to redact line by line."""
+    ranges: list[tuple[int, int]] = []
+    for start, end in _yaml_document_ranges(text):
+        document_has_alias = _YAML_ALIAS.search(text, start, end) is not None
+        for line in text[start:end].splitlines():
+            value_start = _sensitive_value_start(line)
+            if value_start is None:
+                continue
+            value = line[value_start:].lstrip()
+            comment = _YAML_COMMENT.search(value)
+            unsafe_comment = comment is not None and (
+                value[: comment.start()].strip() in _YAML_BLOCK_VALUE_INDICATORS
+            )
+            if unsafe_comment or document_has_alias:
+                ranges.append((start, end))
+                break
+    return _omit_document_ranges(text, ranges)
+
+
+def _omit_kubernetes_secret_documents(text: str) -> tuple[str, int]:
+    """Omit complete YAML documents recognizable as Kubernetes Secrets."""
+    ranges = [
+        (start, end)
+        for start, end in _yaml_document_ranges(text)
+        if _KUBERNETES_SECRET_KIND.search(text, start, end)
+    ]
+    return _omit_document_ranges(text, ranges)
 
 
 def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
@@ -1310,7 +1342,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
         omitted += 1
         open_quote = _unterminated_quote(content)
         continued = content.rstrip().endswith("\\")
-        yaml_block = content[value_start:].strip() in {"", "|", "|-", "|+", ">", ">-", ">+"}
+        yaml_block = content[value_start:].strip() in _YAML_BLOCK_VALUE_INDICATORS
         sensitive_value = content[value_start:]
         heredoc = _HEREDOC_START.search(sensitive_value)
         heredoc_delimiter = heredoc.group("delimiter") if heredoc is not None else None
@@ -1345,12 +1377,14 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
 
 def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     text, terminal_controls = _normalize_terminal_text(text)
+    text, ambiguous_yaml_documents = _omit_ambiguous_yaml_credential_documents(text)
     text, kubernetes_documents = _omit_kubernetes_secret_documents(text)
     text, pem_documents = _omit_pem_credential_documents(text)
     text, json_documents = _omit_json_credential_documents(text)
     text, credential_lines = _omit_sensitive_context_lines(text)
     redactions = (
         terminal_controls
+        + ambiguous_yaml_documents
         + kubernetes_documents
         + pem_documents
         + json_documents
@@ -1372,7 +1406,11 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     for pattern in _RECOGNIZABLE_SECRET:
         text, count = pattern.subn(_REDACTED, text)
         redactions += count
-    return text, redactions, kubernetes_documents + pem_documents + json_documents
+    return (
+        text,
+        redactions,
+        ambiguous_yaml_documents + kubernetes_documents + pem_documents + json_documents,
+    )
 
 
 def _utf8_tail(text: str, maximum_bytes: int) -> tuple[str, int, int, bool]:

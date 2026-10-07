@@ -847,6 +847,80 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "still-sensitive-after-prefix" not in unsupported_heredoc["text"]
 
 
+async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    key = cli_log_latest(SLUG)
+    supplied_cases = (
+        "password: # explanation\n\n  SYNTHETIC_SECRET\nsafe: visible",
+        "defaults: &value SYNTHETIC_SECRET\npassword: *value\nsafe: visible",
+    )
+    for payload in supplied_cases:
+        supplied_redis = FakeRedis()
+        supplied_redis.store[key] = payload
+        _patch_runtime(monkeypatch, supplied_redis)
+        supplied = await diagnostics.get_latest_cli_log(SLUG)
+        assert supplied["text"] == "[credential document omitted]"
+        assert "SYNTHETIC_SECRET" not in supplied["text"]
+
+    redis = FakeRedis()
+    redis.store[key] = "\n".join(
+        (
+            "safe: before",
+            "---",
+            "password: # explanation",
+            "",
+            "  SYNTHETIC_COMMENT_SECRET",
+            "---",
+            "defaults: &before SYNTHETIC_BEFORE_ALIAS_SECRET",
+            "password: *before",
+            "---",
+            "password: *after",
+            "defaults: &after SYNTHETIC_AFTER_ALIAS_SECRET",
+            "---",
+            "defaults:",
+            "  nested: &nested SYNTHETIC_NESTED_ALIAS_SECRET",
+            "password:",
+            "  nested: *nested",
+            "---",
+            "safe: visible",
+        )
+    )
+    _patch_runtime(monkeypatch, redis)
+
+    result = await diagnostics.get_latest_cli_log(SLUG, diagnostics._MAX_CLI_LOG_TAIL_BYTES)
+
+    assert result["availability"]["status"] == "available"
+    assert result["text"].count("[credential document omitted]") == 4
+    assert "safe: before" in result["text"]
+    assert "safe: visible" in result["text"]
+    for secret in (
+        "SYNTHETIC_COMMENT_SECRET",
+        "SYNTHETIC_BEFORE_ALIAS_SECRET",
+        "SYNTHETIC_AFTER_ALIAS_SECRET",
+        "SYNTHETIC_NESTED_ALIAS_SECRET",
+    ):
+        assert secret not in result["text"]
+
+    ambiguous_redis = FakeRedis()
+    ambiguous_redis.store[key] = "\n".join(
+        (
+            "defaults: &value SYNTHETIC_AMBIGUOUS_SECRET",
+            "password: *value",
+            "safe: not-exported-without-boundary",
+        )
+    )
+    _patch_runtime(monkeypatch, ambiguous_redis)
+
+    ambiguous = await diagnostics.get_latest_cli_log(SLUG)
+
+    assert ambiguous["text"] == "[credential document omitted]"
+    assert "SYNTHETIC_AMBIGUOUS_SECRET" not in ambiguous["text"]
+    assert "safe: not-exported-without-boundary" not in ambiguous["text"]
+
+
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

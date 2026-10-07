@@ -69,6 +69,10 @@ This includes leading blank lines and legal indentationless YAML sequence values
 under a credential key, plus shell heredoc bodies through their delimiter or
 source end. Literal heredoc delimiters may start with digits; unsupported
 delimiter words fail closed by omitting the remainder of the bounded source.
+YAML documents containing a sensitive field with a comment-only value or an
+alias are omitted as a whole because line-level redaction cannot safely retain
+the referenced anchor value. Explicit document boundaries preserve neighboring
+documents; without one, the bounded source segment fails closed.
 Terminal escape and control sequences, including C1 control strings, are
 normalized before credential inspection. The source suffix beginning with the
 first bare carriage return or stateful cursor/editing control is omitted
