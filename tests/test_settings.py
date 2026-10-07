@@ -3188,6 +3188,24 @@ def test_device_login_api_degrades_when_daemon_is_unavailable(
     assert started.json()["replacement_requested"] is True
 
 
+def test_device_login_api_degrades_without_daemon_bridge(
+    empty_config: Path,
+) -> None:
+    with TestClient(app) as client:
+        del client.app.state.plugin_bridge
+        started = client.post("/api/coders/codex/device-login")
+        inspected = client.get(
+            f"/api/coders/codex/device-login/{'s' * 32}"
+        )
+        cancelled = client.delete(
+            f"/api/coders/codex/device-login/{'s' * 32}"
+        )
+
+    assert started.status_code == 503
+    assert inspected.status_code == 503
+    assert cancelled.status_code == 503
+
+
 def test_device_login_start_rejects_invalid_request_body(
     empty_config: Path,
 ) -> None:
