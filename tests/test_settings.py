@@ -3535,6 +3535,42 @@ class _FakeAuthProbeProcess:
         return self._stdout, b""
 
 
+def test_isolated_auth_probe_forwards_captured_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_subprocess(*_args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return _FakeAuthProbeProcess(
+            b'PIPELINE_AUTH_RESULT:{"status":"ok","detail":"ready"}\n',
+            0,
+        )
+
+    monkeypatch.setattr(
+        _coder_auth.asyncio,
+        "create_subprocess_exec",
+        fake_subprocess,
+    )
+    environment = {
+        "HOME": "/captured/home",
+        "CODEX_HOME": "/captured/home/.codex",
+    }
+
+    result = asyncio.run(
+        _coder_auth.isolated_auth_probe(
+            "third",
+            "module:factory",
+            "Worker",
+            config_path="/cfg",
+            env=environment,
+        )
+    )
+
+    assert captured["env"] == environment
+    _assert_legacy_auth_contract(result, status="ok", detail="ready")
+
+
 @pytest.mark.parametrize(
     ("stdout", "returncode", "expected_detail"),
     [

@@ -295,12 +295,18 @@ async def test_device_login_fake_process_reports_code_and_refreshes_auth(
     adapter = replace(
         _adapter(location=str(tmp_path / ".codex")),
         command=(sys.executable, "-c", fake_cli),
+        environment={
+            "HOME": str(tmp_path / "captured-home"),
+            "CODEX_HOME": str(tmp_path / ".codex"),
+        },
         working_directory=str(tmp_path),
     )
     manager, _ = _manager(adapter)
     probes = iter((_auth(False), _auth(True)))
+    probe_environments: list[dict[str, str]] = []
 
-    async def auth_probe(*_args: object, **_kwargs: object) -> dict[str, Any]:
+    async def auth_probe(*_args: object, **kwargs: object) -> dict[str, Any]:
+        probe_environments.append(kwargs["env"])  # type: ignore[arg-type]
         return next(probes)
 
     monkeypatch.setattr(coder_login, "isolated_auth_probe", auth_probe)
@@ -335,6 +341,7 @@ async def test_device_login_fake_process_reports_code_and_refreshes_auth(
     assert completed["auth_status"]["saved_credentials_present"] is True
     assert completed["auth_status"]["service_access_verified"] is None
     assert "raw-sensitive-diagnostic" not in json.dumps(completed)
+    assert probe_environments == [adapter.environment, adapter.environment]
     await manager.shutdown()
 
 
@@ -829,6 +836,16 @@ async def test_device_login_optional_plugin_and_identity_failures(
         )
     )["state"] == "unsupported"
 
+    invalid_warning_manager, _ = _manager(
+        adapter=replace(_adapter(), replacement_warning="unsafe\nwarning")
+    )
+    assert (
+        await invalid_warning_manager.start(
+            "codex", expected_reference=_REFERENCE, replace_existing=False
+        )
+    )["state"] == "unsupported"
+    assert invalid_warning_manager._sessions == {}
+
     mismatch_manager, mismatch_registry = _manager()
     monkeypatch.setattr(
         mismatch_registry.get("codex"),
@@ -1000,6 +1017,12 @@ def test_device_login_validates_adapter_and_prompt_contracts() -> None:
     )
     assert (
         CoderLoginSessionManager._valid_adapter(replace(good, replacement_warning=""))
+        is False
+    )
+    assert (
+        CoderLoginSessionManager._valid_adapter(
+            replace(good, replacement_warning="unsafe\nwarning")
+        )
         is False
     )
 

@@ -33,6 +33,7 @@ async def isolated_auth_probe(
     *,
     config_path: str,
     timeout: float = 5,
+    env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Probe trusted plugin code in a subprocess killed at ``timeout``."""
     try:
@@ -46,6 +47,7 @@ async def isolated_auth_probe(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             start_new_session=True,
+            env=env,
         )
     except OSError as exc:
         return coder_auth_payload(

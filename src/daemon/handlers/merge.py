@@ -194,11 +194,12 @@ class MergeMixin:
                             credential_reservation_held=True,
                         )
                         if auxiliary_result is None:
-                            git_ops._git(
-                                self.repo_path,
-                                "merge", "--abort",
-                                check=False,
-                            )
+                            if self.state.state == PipelineState.PAUSED:
+                                git_ops._git(
+                                    self.repo_path,
+                                    "merge", "--abort",
+                                    check=False,
+                                )
                             return
                         code, _stdout, _stderr = auxiliary_result
                         if code != 0:

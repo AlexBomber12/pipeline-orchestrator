@@ -53,6 +53,8 @@ ownership is released only after both are confirmed stopped.
 
 Session identifiers are opaque. A session is bound at creation to the plugin
 identity, effective environment, working directory, and credential location.
+Preflight and post-success auth probes run in that captured environment, so a
+later configuration edit cannot redirect them to a different credential store.
 Login-capable plugins must expose a side-effect-free credential locator, and its
 result must match the adapter's credential location; incomplete or inconsistent
 capabilities fail closed before a login or coder process can start.

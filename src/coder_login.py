@@ -382,6 +382,7 @@ class CoderLoginSessionManager:
                 self._registry.get(session.plugin).display_name,
                 config_path=self._config_path,
                 timeout=_AUTH_PROBE_TIMEOUT_SECONDS,
+                env=dict(session.adapter.environment),
             )
             auth = parse_coder_auth_payload(auth)
             if session.cancel_requested:
@@ -584,6 +585,7 @@ class CoderLoginSessionManager:
                 self._registry.get(session.plugin).display_name,
                 config_path=self._config_path,
                 timeout=_AUTH_PROBE_TIMEOUT_SECONDS,
+                env=dict(session.adapter.environment),
             )
             if session.cancel_requested:
                 self._finish(
@@ -895,6 +897,10 @@ class CoderLoginSessionManager:
                 and 0 < adapter.application_timeout_seconds <= 60 * 60
                 and isinstance(adapter.replacement_warning, str)
                 and 0 < len(adapter.replacement_warning) <= 512
+                and not any(
+                    ord(character) < 32
+                    for character in adapter.replacement_warning
+                )
             )
         except Exception:
             return False
