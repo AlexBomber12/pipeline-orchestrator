@@ -42,7 +42,8 @@ expansion, redacts the complete bounded source before selecting the tail, and
 reports source/output sizes, truncation, observation time, and remaining Redis
 TTL. Authorization headers, token and password assignments or long-option
 arguments,
-cookies, credential-bearing URL userinfo/query parameters, recognizable token
+cookies, credential-bearing URL userinfo/query parameters (including
+percent-encoded parameter names), recognizable token
 shapes, private-key blocks, and recognizable JSON credential documents are not
 exported, including nested documents and documents serialized inside log
 strings. Complete and interrupted private-key blocks are both omitted.
@@ -51,8 +52,11 @@ use assignment, structured-field, header, or long-option syntax, so malformed
 or interrupted quoting cannot expose a value suffix. Indented YAML/header
 continuations and backslash-continued shell values are omitted with their key
 line.
-Terminal escape and control sequences are normalized before credential
-inspection, preventing color or cursor controls from splitting sensitive keys.
+Terminal escape and control sequences, including C1 control strings, are
+normalized before credential inspection, preventing color, cursor, or terminal
+metadata controls from splitting sensitive keys. Credential-key inspection uses
+a bounded-source, single-pass line scanner so long non-credential lines do not
+cause regex backtracking stalls.
 Malformed or incomplete JSON containers with credential contexts are omitted
 through their closing boundary or, when unterminated, through the source end.
 Malformed JSON probing has a fixed failure budget; if that budget is

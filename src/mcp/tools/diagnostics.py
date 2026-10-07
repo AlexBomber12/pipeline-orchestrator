@@ -17,6 +17,7 @@ import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import unquote_plus
 
 import redis.asyncio as aioredis
 
@@ -95,27 +96,19 @@ _PEM_CREDENTIAL_END = re.compile(
     re.IGNORECASE,
 )
 _TERMINAL_ESCAPE = re.compile(
-    r"(?:\x1b\][^\x07]*(?:\x07|\x1b\\)|"
-    r"\x1bP.*?\x1b\\|"
+    r"(?:\x1b\][^\x07]*(?:\x07|\x1b\\|$)|"
+    r"\x1bP.*?(?:\x1b\\|$)|"
     r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|"
     r"\x1b[ -/]*[@-~])",
     re.DOTALL,
 )
+_C1_CONTROL_STRING = re.compile(r"[\x90\x98\x9d-\x9f].*?(?:\x9c|\x07|$)", re.DOTALL)
 _JSON_CONTAINER_START = re.compile(r"[\[{]")
 _URL_USERINFO = re.compile(r"(?i)(?P<scheme>\b[a-z][a-z0-9+.-]*://)[^/@\s]+@")
-_SENSITIVE_CONTEXT_LINE = re.compile(
-    r"(?im)^[^\r\n]*(?<![A-Za-z0-9-])(?:"
-    r"--(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|oauth[_-]?token|access[_-]?token|"
-    r"refresh[_-]?token|id[_-]?token|auth[_-]?token|client[_-]?secret|"
-    r"private[_-]?key(?:[_-]?id)?|secret(?:[_-]?access)?[_-]?key|secret|"
-    r"password|passwd|token|(?:proxy[_-]?)?authorization|(?:set[_-]?)?cookie)"
-    r"[\\'\"]*(?:[ \t]+|[=:])|"
-    r"(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|oauth[_-]?token|access[_-]?token|"
-    r"refresh[_-]?token|id[_-]?token|auth[_-]?token|client[_-]?secret|"
-    r"private[_-]?key(?:[_-]?id)?|secret(?:[_-]?access)?[_-]?key|secret|"
-    r"password|passwd|token|(?:proxy[_-]?)?authorization|(?:set[_-]?)?cookie)"
-    r"[\\'\"]*[ \t]*[=:])[^\r\n]*$"
+_SENSITIVE_KEY_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-%+"
 )
+_SENSITIVE_KEY_WRAPPERS = frozenset("\\\"'")
 _RECOGNIZABLE_SECRET = tuple(
     re.compile(pattern)
     for pattern in (
@@ -974,6 +967,8 @@ def _contains_credential_document_key(value: object) -> bool:
 
 def _normalize_terminal_text(text: str) -> tuple[str, int]:
     text, removed = _TERMINAL_ESCAPE.subn("", text)
+    text, c1_removed = _C1_CONTROL_STRING.subn("", text)
+    removed += c1_removed
     text = text.replace("\r\n", "\n")
     normalized: list[str] = []
     for character in text:
@@ -984,11 +979,63 @@ def _normalize_terminal_text(text: str) -> tuple[str, int]:
         elif character == "\r":
             removed += 1
             normalized.append("\n")
-        elif (ord(character) < 32 and character not in {"\n", "\t"}) or character == "\x7f":
+        elif (
+            (ord(character) < 32 and character not in {"\n", "\t"})
+            or "\x7f" <= character <= "\x9f"
+        ):
             removed += 1
         else:
             normalized.append(character)
     return "".join(normalized), removed
+
+
+def _is_sensitive_key(value: str) -> bool:
+    """Recognize credential keys without a backtracking expression."""
+    decoded = unquote_plus(value).lower()
+    normalized: list[str] = []
+    boundaries = {0}
+    for character in decoded:
+        if "a" <= character <= "z" or "0" <= character <= "9":
+            normalized.append(character)
+        else:
+            boundaries.add(len(normalized))
+    key = "".join(normalized)
+    return any(
+        key.endswith(sensitive)
+        and len(key) - len(sensitive) in boundaries
+        for sensitive in _CREDENTIAL_DOCUMENT_KEYS
+    )
+
+
+def _line_has_sensitive_context(line: str) -> bool:
+    """Scan one line for a sensitive assignment, field, header, or CLI option."""
+    index = 0
+    while index < len(line):
+        if line[index] not in _SENSITIVE_KEY_CHARACTERS:
+            index += 1
+            continue
+
+        start = index
+        while index < len(line) and line[index] in _SENSITIVE_KEY_CHARACTERS:
+            index += 1
+        candidate = line[start:index]
+
+        cursor = index
+        while cursor < len(line) and line[cursor] in _SENSITIVE_KEY_WRAPPERS:
+            cursor += 1
+        whitespace_start = cursor
+        while cursor < len(line) and line[cursor] in " \t":
+            cursor += 1
+
+        delimiter = line[cursor] if cursor < len(line) else ""
+        option_value = candidate.startswith("--") and (
+            cursor > whitespace_start or delimiter in {"=", ":"}
+        )
+        if _is_sensitive_key(candidate) and (delimiter in {"=", ":"} or option_value):
+            return True
+
+        index = max(index, cursor)
+    return False
 
 
 def _json_container_end(text: str, start: int) -> int:
@@ -1038,7 +1085,10 @@ def _omit_json_credential_documents(text: str) -> tuple[str, int]:
             if parse_failures >= _MAX_JSON_PARSE_FAILURES:
                 return _CREDENTIAL_DOCUMENT_OMITTED, 1
             end = _json_container_end(text, match.start())
-            if _SENSITIVE_CONTEXT_LINE.search(text[match.start() : end]):
+            if any(
+                _line_has_sensitive_context(line)
+                for line in text[match.start() : end].splitlines()
+            ):
                 ranges.append((match.start(), end))
                 covered_until = end
             continue
@@ -1064,7 +1114,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
     while index < len(lines):
         line = lines[index]
         content = line.rstrip("\r\n")
-        if _SENSITIVE_CONTEXT_LINE.search(content) is None:
+        if not _line_has_sensitive_context(content):
             sanitized.append(line)
             index += 1
             continue

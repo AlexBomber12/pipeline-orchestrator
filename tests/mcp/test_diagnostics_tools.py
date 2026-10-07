@@ -415,6 +415,14 @@ async def test_latest_cli_log_bounds_source_output_and_utf8(
     assert mismatched_json["availability"]["status"] == "available"
     assert mismatched_json["text"] == "{]"
 
+    linear_scan_redis = FakeRedis()
+    linear_scan_redis.store[key] = "a-" * (diagnostics._MAX_CLI_LOG_SOURCE_BYTES // 2)
+    _patch_runtime(monkeypatch, linear_scan_redis)
+    linear_scan = await diagnostics.get_latest_cli_log(SLUG, 32)
+    assert linear_scan["availability"]["status"] == "available"
+    assert linear_scan["text"] == "a-" * 16
+    assert linear_scan["returned_size_bytes"] == 32
+
 
 async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents(
     monkeypatch: pytest.MonkeyPatch,
@@ -442,6 +450,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             'API_KEY="api assignment secret"',
             "oauthToken=oauth-secret",
             "https://url-user:url-password@example.test/path?access_token=query-secret",
+            "https://example.test/?access%5Ftoken=encoded-query-secret",
             "https://single-url-credential@example.test/path",
             "ghp_" + ("A" * 36),
             '{"safe": "value"}',
@@ -460,9 +469,13 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "\x1b[31mpassword=ansi-secret\x1b[0m",
             "pass\x1b[34mword=embedded-ansi-secret",
             "\x1b]0;title\x07password=osc-secret",
+            "pass\x1bPterminal-data\x1b\\word=esc-dcs-secret",
+            "pass\x9d0;title\x9cword=c1-osc-secret",
+            "pass\x90terminal-data\x9cword=c1-dcs-secret",
             "passX\bword=backspace-secret",
             "safe-carriage\rpassword=carriage-secret",
             "visible\x00-control",
+            "visible\x81-control-c1",
             "matched-bad={private_key:matched-container-secret}",
             '{"private_key":"same-line-document-secret"} password=same-line-trailing-secret',
             "password: |",
@@ -501,8 +514,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-yaml" in exported
     assert "safe-after-shell" in exported
     assert "visible-control" in exported
+    assert "visible-control-c1" in exported
     assert "\x1b" not in exported
     assert "\x00" not in exported
+    assert not any("\x80" <= character <= "\x9f" for character in exported)
     assert "safe-output" in exported
     assert "private@example.test" not in exported
     assert "hidden-array-project" not in exported
@@ -518,6 +533,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "url-password",
         "single-url-credential",
         "query-secret",
+        "encoded-query-secret",
         "array-document-secret",
         "prefix-document-secret",
         "serialized-document-secret",
@@ -535,6 +551,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "ansi-secret",
         "embedded-ansi-secret",
         "osc-secret",
+        "esc-dcs-secret",
+        "c1-osc-secret",
+        "c1-dcs-secret",
         "backspace-secret",
         "carriage-secret",
         "matched-container-secret",
