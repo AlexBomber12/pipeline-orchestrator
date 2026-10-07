@@ -781,8 +781,17 @@ class WatchMixin:
         if not head_sha:
             return
         pending_max_seconds = self.app_config.daemon.ci_pending_max_min * 60
-        runs_payload, statuses_payload, fetch_ok = (
-            gh_checks._fetch_ci_status_rest(self.owner_repo, head_sha)
+        retrieval = gh_checks._retrieve_ci_status_evidence(
+            self.owner_repo, head_sha
+        )
+        statuses_payload = (
+            retrieval.status_payload
+            if retrieval.status_source.sha_matches
+            else {}
+        )
+        canonical_status = gh_checks._classify_ci_retrieval(
+            retrieval,
+            empty_is_success=self.repo_config.allow_merge_without_checks,
         )
         reclassified, reason = await gh_checks.classify_ci_status_with_age(
             self.owner_repo,
@@ -790,11 +799,11 @@ class WatchMixin:
             head_sha,
             self.redis,
             pending_max_seconds,
-            runs_payload,
+            retrieval.check_runs,
             statuses_payload,
             empty_is_success=self.repo_config.allow_merge_without_checks,
-            fetch_ok=fetch_ok,
-            canonical_status=found.ci_status,
+            fetch_ok=retrieval.evidence.sources_complete,
+            canonical_status=canonical_status,
         )
         if reason != "stuck_pending":
             return
