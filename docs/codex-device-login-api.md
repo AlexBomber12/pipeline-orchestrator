@@ -56,12 +56,13 @@ reservation is retained until process cleanup is confirmed; if cleanup cannot
 prove quiescence, both login replacement and new coder invocations remain
 blocked for that location.
 
-Auth probes take the same shared reservation before reading credentials. While
-login owns the location, selection treats that coder as provisionally available
-and dispatch defers at the reservation boundary instead of recording an auth or
-diagnosis failure. Releasing login ownership first advances the location's
-credential generation; runners reject cache entries from older generations and
-refresh auth before launching work.
+Auth probes and model discovery take the same shared reservation before reading
+credentials. While login owns the location, discovery is suppressed, selection
+treats that coder as provisionally available, and dispatch defers at the
+reservation boundary instead of recording an auth or diagnosis failure.
+Releasing login ownership first advances the location's credential generation;
+runners reject cache entries from older generations and refresh auth before
+launching work.
 
 Device login, auth probes, model discovery, and normal Codex coder invocations
 preserve the daemon's inherited `HOME` so its Git configuration remains

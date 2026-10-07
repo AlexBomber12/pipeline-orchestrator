@@ -622,23 +622,47 @@ async def handle_model_catalog_request(
                 {"ok": True, "auth": auth},
             )
             return
-        if (
-            reference is not None
-            and reference != DEFAULT_CODER_PLUGINS.get(plugin_name)
-        ):
-            catalog = await _isolated_configured_catalog(
-                plugin_name,
-                reference,
-                config_path=config_path,
-            )
-        else:
-            catalog = await asyncio.wait_for(
-                plugin.get_model_catalog(
-                    config=load_config(config_path),
+        credential_location = None
+        config = load_config(config_path)
+        resolver = getattr(plugin, "device_login_credential_location", None)
+        if callable(resolver) and credential_reservations is not None:
+            credential_location = resolver(config=config)
+            if (
+                not isinstance(credential_location, str)
+                or not credential_location
+            ):
+                raise ValueError("invalid coder credential location")
+            if not credential_reservations.reserve_coder(credential_location):
+                await _store_response(
+                    redis_client,
+                    request_id,
+                    {"ok": False, "error": "catalog unavailable"},
+                )
+                return
+        try:
+            if (
+                reference is not None
+                and reference != DEFAULT_CODER_PLUGINS.get(plugin_name)
+            ):
+                catalog = await _isolated_configured_catalog(
+                    plugin_name,
+                    reference,
                     config_path=config_path,
-                ),
-                timeout=_CONFIGURED_CATALOG_TIMEOUT_SECONDS,
-            )
+                )
+            else:
+                catalog = await asyncio.wait_for(
+                    plugin.get_model_catalog(
+                        config=config,
+                        config_path=config_path,
+                    ),
+                    timeout=_CONFIGURED_CATALOG_TIMEOUT_SECONDS,
+                )
+        finally:
+            if (
+                credential_location is not None
+                and credential_reservations is not None
+            ):
+                credential_reservations.release_coder(credential_location)
     except Exception:
         logger.warning("%s model discovery failed in daemon", plugin_name)
         payload = {"ok": False, "error": "catalog unavailable"}

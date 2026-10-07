@@ -85,8 +85,12 @@ async def test_loader_round_trips_catalog_through_daemon(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     redis = _BridgeRedis()
+    codex_home = tmp_path / "codex-home"
+    reservations = CoderCredentialReservations()
+    monkeypatch.delenv("CODEX_HOME", raising=False)
 
     async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
+        assert reservations.reserve_login(str(codex_home / ".codex")) is False
         return (
             CodexModel(
                 "invoke-me",
@@ -140,13 +144,11 @@ async def test_loader_round_trips_catalog_through_daemon(
 
     monkeypatch.setattr(bridge, "isolated_auth_probe", auth_probe)
     config_file = tmp_path / "config.yml"
-    codex_home = tmp_path / "codex-home"
     config_file.write_text(
         f"auth:\n  codex_home_dir: {codex_home}\n",
         encoding="utf-8",
     )
     config_path = str(config_file)
-    reservations = CoderCredentialReservations()
     server = asyncio.create_task(
         bridge.serve_model_catalog_requests(
             redis,
@@ -228,7 +230,10 @@ async def test_daemon_auth_probe_is_suppressed_during_device_login(
 ) -> None:
     redis = _BridgeRedis()
     registry = CoderRegistry()
-    plugin = CodexPlugin(discover=lambda **_kwargs: None)
+    async def must_not_discover(**_kwargs: object) -> object:
+        raise AssertionError("model discovery must wait for device login")
+
+    plugin = CodexPlugin(discover=must_not_discover)
     reference = "src.coders.codex:CodexPlugin"
     registry.register(plugin, reference=reference)
     config_path = tmp_path / "config.yml"
@@ -266,13 +271,35 @@ async def test_daemon_auth_probe_is_suppressed_during_device_login(
     assert response["ok"] is True
     assert response["auth"]["status"] == "error"
     assert response["auth"]["failure_reason"] == "probe_unavailable"
+
+    catalog_request_id = "d" * 32
+    await bridge.handle_model_catalog_request(
+        redis,
+        registry,
+        json.dumps(
+            {
+                "request_id": catalog_request_id,
+                "plugin": "codex",
+                "operation": "catalog",
+                "reference": reference,
+                "expires_at": time.time() + 10,
+            }
+        ),
+        config_path=str(config_path),
+        credential_reservations=reservations,
+    )
+    assert json.loads(
+        redis.values[bridge._response_key(catalog_request_id)]
+    ) == {"ok": False, "error": "catalog unavailable"}
     reservations.release_login(str(codex_home / ".codex"))
 
 
 @pytest.mark.asyncio
-async def test_daemon_auth_probe_rejects_invalid_credential_location(
+@pytest.mark.parametrize("operation", ["auth", "catalog"])
+async def test_daemon_reader_rejects_invalid_credential_location(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    operation: str,
 ) -> None:
     redis = _BridgeRedis()
     registry = CoderRegistry()
@@ -293,7 +320,7 @@ async def test_daemon_auth_probe_rejects_invalid_credential_location(
             {
                 "request_id": request_id,
                 "plugin": "codex",
-                "operation": "auth",
+                "operation": operation,
                 "reference": reference,
                 "expires_at": time.time() + 10,
             }
