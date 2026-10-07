@@ -48,7 +48,9 @@ exported, including nested documents and documents serialized inside log
 strings. Complete and interrupted private-key blocks are both omitted.
 Lines with recognizable credential keys are omitted conservatively when they
 use assignment, structured-field, header, or long-option syntax, so malformed
-or interrupted quoting cannot expose a value suffix.
+or interrupted quoting cannot expose a value suffix. Indented YAML/header
+continuations and backslash-continued shell values are omitted with their key
+line.
 Malformed or incomplete JSON containers with credential contexts are omitted
 through their closing boundary or, when unterminated, through the source end.
 Malformed JSON probing has a fixed failure budget; if that budget is

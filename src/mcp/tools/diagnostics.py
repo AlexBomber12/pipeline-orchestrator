@@ -97,8 +97,7 @@ _PEM_CREDENTIAL_END = re.compile(
 _JSON_CONTAINER_START = re.compile(r"[\[{]")
 _URL_USERINFO = re.compile(r"(?i)(?P<scheme>\b[a-z][a-z0-9+.-]*://)[^/@\s]+@")
 _SENSITIVE_CONTEXT_LINE = re.compile(
-    r"(?im)^(?![^\r\n]*\[credential document omitted\])"
-    r"[^\r\n]*(?<![A-Za-z0-9-])(?:"
+    r"(?im)^[^\r\n]*(?<![A-Za-z0-9-])(?:"
     r"--(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|oauth[_-]?token|access[_-]?token|"
     r"refresh[_-]?token|id[_-]?token|auth[_-]?token|client[_-]?secret|"
     r"private[_-]?key(?:[_-]?id)?|secret(?:[_-]?access)?[_-]?key|secret|"
@@ -1031,6 +1030,37 @@ def _omit_json_credential_documents(text: str) -> tuple[str, int]:
     return "".join(parts), len(ranges)
 
 
+def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
+    lines = text.splitlines(keepends=True)
+    sanitized: list[str] = []
+    omitted = 0
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        content = line.rstrip("\r\n")
+        if _SENSITIVE_CONTEXT_LINE.search(content) is None:
+            sanitized.append(line)
+            index += 1
+            continue
+
+        ending = line[len(content) :]
+        sanitized.append(f"[credential line omitted]{ending}")
+        omitted += 1
+        continued = content.rstrip().endswith("\\")
+        indented_block = False
+        index += 1
+        while index < len(lines):
+            continuation = lines[index].rstrip("\r\n")
+            indented = continuation.startswith((" ", "\t"))
+            blank_in_block = indented_block and not continuation
+            if not (continued or indented or blank_in_block):
+                break
+            indented_block = indented_block or indented
+            continued = continuation.rstrip().endswith("\\")
+            index += 1
+    return "".join(sanitized), omitted
+
+
 def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     text, pem_documents = _PEM_CREDENTIAL_DOCUMENT.subn(_CREDENTIAL_DOCUMENT_OMITTED, text)
     orphaned_begin = _PEM_CREDENTIAL_BEGIN.search(text)
@@ -1042,7 +1072,7 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
         text = f"{_CREDENTIAL_DOCUMENT_OMITTED}{text[orphaned_end.end() :]}"
         pem_documents += 1
     text, json_documents = _omit_json_credential_documents(text)
-    text, credential_lines = _SENSITIVE_CONTEXT_LINE.subn("[credential line omitted]", text)
+    text, credential_lines = _omit_sensitive_context_lines(text)
     redactions = pem_documents + json_documents + credential_lines
 
     text, count = _URL_USERINFO.subn(lambda match: f"{match.group('scheme')}{_REDACTED}@", text)

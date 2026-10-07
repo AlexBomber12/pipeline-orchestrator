@@ -458,6 +458,13 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "PASSWORD = spaced-assignment-secret",
             "Authorization : Bearer spaced-header-secret",
             "matched-bad={private_key:matched-container-secret}",
+            '{"private_key":"same-line-document-secret"} password=same-line-trailing-secret',
+            "password: |",
+            "  yaml-multiline-secret",
+            "safe-after-yaml",
+            "PASSWORD=" + "\\",
+            "shell-multiline-secret",
+            "safe-after-shell",
             "private_key=malformed-private-secret",
             "AWS_SECRET_ACCESS_KEY=aws-secret",
             "{",
@@ -484,8 +491,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert redacted["availability"]["status"] == "available"
     assert redacted["redaction"]["applied"] is True
     assert redacted["redaction"]["credential_documents_omitted"] >= 8
-    assert exported.count("[credential document omitted]") >= 7
     assert "[credential line omitted]" in exported
+    assert "safe-after-yaml" in exported
+    assert "safe-after-shell" in exported
     assert "safe-output" in exported
     assert "private@example.test" not in exported
     assert "hidden-array-project" not in exported
@@ -516,6 +524,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "spaced-assignment-secret",
         "spaced-header-secret",
         "matched-container-secret",
+        "same-line-document-secret",
+        "same-line-trailing-secret",
+        "yaml-multiline-secret",
+        "shell-multiline-secret",
         "malformed-private-secret",
         "aws-secret",
         "document-secret",
