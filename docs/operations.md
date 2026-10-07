@@ -46,7 +46,8 @@ cookies, credential-bearing URL userinfo/query parameters (including
 percent-encoded parameter names), recognizable token
 shapes, private-key blocks, and recognizable JSON credential documents are not
 exported, including nested documents and documents serialized inside log
-strings. Complete and interrupted private-key blocks are both omitted.
+strings and structured header name/value pairs. Complete and interrupted
+private-key blocks are both omitted using a bounded single-pass boundary scan.
 Lines with recognizable credential keys are omitted conservatively when they
 use assignment, structured-field, header, or long-option syntax, so malformed
 or interrupted quoting cannot expose a value suffix. Indented YAML/header

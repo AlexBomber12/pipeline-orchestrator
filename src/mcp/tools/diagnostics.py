@@ -83,17 +83,9 @@ _CREDENTIAL_DOCUMENT_KEYS = frozenset(
         "token",
     }
 )
-_PEM_CREDENTIAL_DOCUMENT = re.compile(
-    r"-----BEGIN (?P<label>(?:[A-Z0-9 ]*PRIVATE KEY|PGP PRIVATE KEY BLOCK))-----"
-    r".*?-----END (?P=label)-----",
-    re.IGNORECASE | re.DOTALL,
-)
-_PEM_CREDENTIAL_BEGIN = re.compile(
-    r"-----BEGIN (?:[A-Z0-9 ]*PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----",
-    re.IGNORECASE,
-)
-_PEM_CREDENTIAL_END = re.compile(
-    r"-----END (?:[A-Z0-9 ]*PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----",
+_PEM_CREDENTIAL_BOUNDARY = re.compile(
+    r"-----(?P<boundary>BEGIN|END) "
+    r"(?:[A-Z0-9 ]{0,64}PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----",
     re.IGNORECASE,
 )
 _TERMINAL_ESCAPE = re.compile(
@@ -956,6 +948,13 @@ def _contains_credential_document_key(value: object) -> bool:
                 if isinstance(child, (dict, list, str)):
                     pending.append(child)
         elif isinstance(current, list):
+            if (
+                len(current) >= 2
+                and isinstance(current[0], str)
+                and _is_sensitive_key(current[0])
+                and current[1] not in (None, "", False)
+            ):
+                return True
             pending.extend(child for child in current if isinstance(child, (dict, list, str)))
         elif isinstance(current, str):
             try:
@@ -1007,6 +1006,40 @@ def _normalize_terminal_text(text: str) -> tuple[str, int]:
         else:
             normalized.append(character)
     return "".join(normalized), removed
+
+
+def _omit_pem_credential_documents(text: str) -> tuple[str, int]:
+    ranges: list[tuple[int, int]] = []
+    open_start: int | None = None
+
+    def add_range(start: int, end: int) -> None:
+        if start == 0:
+            ranges.clear()
+            ranges.append((start, end))
+        else:
+            ranges.append((start, end))
+
+    for match in _PEM_CREDENTIAL_BOUNDARY.finditer(text):
+        if match.group("boundary").upper() == "BEGIN":
+            if open_start is None:
+                open_start = match.start()
+        elif open_start is None:
+            add_range(0, match.end())
+        else:
+            add_range(open_start, match.end())
+            open_start = None
+    if open_start is not None:
+        add_range(open_start, len(text))
+    if not ranges:
+        return text, 0
+
+    parts: list[str] = []
+    offset = 0
+    for start, end in ranges:
+        parts.extend((text[offset:start], _CREDENTIAL_DOCUMENT_OMITTED))
+        offset = end
+    parts.append(text[offset:])
+    return "".join(parts), len(ranges)
 
 
 def _is_sensitive_key(value: str) -> bool:
@@ -1169,15 +1202,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
 
 def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     text, terminal_controls = _normalize_terminal_text(text)
-    text, pem_documents = _PEM_CREDENTIAL_DOCUMENT.subn(_CREDENTIAL_DOCUMENT_OMITTED, text)
-    orphaned_begin = _PEM_CREDENTIAL_BEGIN.search(text)
-    if orphaned_begin is not None:
-        text = f"{text[: orphaned_begin.start()]}{_CREDENTIAL_DOCUMENT_OMITTED}"
-        pem_documents += 1
-    orphaned_end = _PEM_CREDENTIAL_END.search(text)
-    if orphaned_end is not None:
-        text = f"{_CREDENTIAL_DOCUMENT_OMITTED}{text[orphaned_end.end() :]}"
-        pem_documents += 1
+    text, pem_documents = _omit_pem_credential_documents(text)
     text, json_documents = _omit_json_credential_documents(text)
     text, credential_lines = _omit_sensitive_context_lines(text)
     redactions = terminal_controls + pem_documents + json_documents + credential_lines

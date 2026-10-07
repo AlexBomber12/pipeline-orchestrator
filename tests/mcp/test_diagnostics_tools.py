@@ -423,6 +423,16 @@ async def test_latest_cli_log_bounds_source_output_and_utf8(
     assert linear_scan["text"] == "a-" * 16
     assert linear_scan["returned_size_bytes"] == 32
 
+    pem_flood_redis = FakeRedis()
+    pem_marker = "-----BEGIN PRIVATE KEY-----"
+    pem_flood_redis.store[key] = (
+        pem_marker * (diagnostics._MAX_CLI_LOG_SOURCE_BYTES // len(pem_marker) + 1)
+    )[: diagnostics._MAX_CLI_LOG_SOURCE_BYTES]
+    _patch_runtime(monkeypatch, pem_flood_redis)
+    pem_flood = await diagnostics.get_latest_cli_log(SLUG)
+    assert pem_flood["availability"]["status"] == "available"
+    assert pem_flood["text"] == "[credential document omitted]"
+
 
 async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents(
     monkeypatch: pytest.MonkeyPatch,
@@ -461,6 +471,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             json.dumps(deeply_nested),
             'structured={"headers":{"Authorization":"Bearer structured-auth-secret"}}',
             'structured-cookie={"Cookie":"session=structured-cookie-secret"}',
+            '{"headers":[["Authorization","Bearer pair-auth-secret"],'
+            '["Cookie","session=pair-cookie-secret"],'
+            '["X-Safe","hidden-pair-metadata"]]}',
             '{"dbPassword":"camel-db-secret","safe":"hidden-camel-metadata"}',
             '{"githubToken":"camel-token-secret"}',
             'tool --password cli-option-secret --token "quoted cli token"',
@@ -527,6 +540,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "private@example.test" not in exported
     assert "hidden-array-project" not in exported
     assert "hidden-client" not in exported
+    assert "hidden-pair-metadata" not in exported
     assert "hidden-camel-metadata" not in exported
     assert "serialized-metadata" not in exported
     for secret in (
@@ -546,6 +560,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "deep-document-secret",
         "structured-auth-secret",
         "structured-cookie-secret",
+        "pair-auth-secret",
+        "pair-cookie-secret",
         "camel-db-secret",
         "camel-token-secret",
         "cli-option-secret",
