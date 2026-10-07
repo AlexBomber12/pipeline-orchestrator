@@ -967,37 +967,33 @@ def _contains_credential_document_key(value: object) -> bool:
 
 
 def _omit_stateful_terminal_lines(text: str) -> tuple[str, int]:
-    lines = text.splitlines(keepends=True)
     sanitized: list[str] = []
     omitted = 0
-    for line in lines:
-        content = line.rstrip("\r\n")
+    lines = text.split("\n")
+    for index, content in enumerate(lines):
+        ending = "\n" if index < len(lines) - 1 else ""
         stateful_csi = any(match.group("final") != "m" for match in _TERMINAL_CSI.finditer(content))
-        if stateful_csi or _TERMINAL_STATEFUL_ESCAPE.search(content):
-            ending = line[len(content) :]
+        if "\r" in content or stateful_csi or _TERMINAL_STATEFUL_ESCAPE.search(content):
             sanitized.append(f"{_TERMINAL_CONTROL_LINE_OMITTED}{ending}")
             omitted += 1
         else:
-            sanitized.append(line)
+            sanitized.append(f"{content}{ending}")
     return "".join(sanitized), omitted
 
 
 def _normalize_terminal_text(text: str) -> tuple[str, int]:
+    text = text.replace("\r\n", "\n")
     text, omitted_lines = _omit_stateful_terminal_lines(text)
     text, removed = _TERMINAL_ESCAPE.subn("", text)
     removed += omitted_lines
     text, c1_removed = _C1_CONTROL_STRING.subn("", text)
     removed += c1_removed
-    text = text.replace("\r\n", "\n")
     normalized: list[str] = []
     for character in text:
         if character == "\b":
             removed += 1
             if normalized and normalized[-1] != "\n":
                 normalized.pop()
-        elif character == "\r":
-            removed += 1
-            normalized.append("\n")
         elif (
             (ord(character) < 32 and character not in {"\n", "\t"})
             or "\x7f" <= character <= "\x9f"
@@ -1070,8 +1066,8 @@ def _is_sensitive_key(value: str) -> bool:
     )
 
 
-def _line_has_sensitive_context(line: str) -> bool:
-    """Scan one line for a sensitive assignment, field, header, or CLI option."""
+def _sensitive_value_start(line: str) -> int | None:
+    """Return the value position for a sensitive context found in one line."""
     index = 0
     while index < len(line):
         if line[index] not in _SENSITIVE_KEY_CHARACTERS:
@@ -1095,11 +1091,32 @@ def _line_has_sensitive_context(line: str) -> bool:
         option_value = candidate.startswith("--") and (
             cursor > whitespace_start or delimiter in {"=", ":"}
         )
-        if _is_sensitive_key(candidate) and (sensitive_delimiter or option_value):
-            return True
+        if _is_sensitive_key(candidate):
+            if sensitive_delimiter:
+                return cursor + 1
+            if option_value:
+                return cursor
 
         index = max(index, cursor)
-    return False
+    return None
+
+
+def _line_has_sensitive_context(line: str) -> bool:
+    return _sensitive_value_start(line) is not None
+
+
+def _unterminated_quote(value: str, quote: str | None = None) -> str | None:
+    escaped = False
+    for character in value:
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif quote is None and character in {"\"", "'"}:
+            quote = character
+        elif character == quote:
+            quote = None
+    return quote
 
 
 def _json_container_end(text: str, start: int) -> int:
@@ -1178,7 +1195,8 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
     while index < len(lines):
         line = lines[index]
         content = line.rstrip("\r\n")
-        if not _line_has_sensitive_context(content):
+        value_start = _sensitive_value_start(content)
+        if value_start is None:
             sanitized.append(line)
             index += 1
             continue
@@ -1186,6 +1204,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
         ending = line[len(content) :]
         sanitized.append(f"[credential line omitted]{ending}")
         omitted += 1
+        open_quote = _unterminated_quote(content)
         continued = content.rstrip().endswith("\\")
         indented_block = False
         index += 1
@@ -1193,9 +1212,10 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
             continuation = lines[index].rstrip("\r\n")
             indented = continuation.startswith((" ", "\t"))
             blank_in_block = indented_block and not continuation
-            if not (continued or indented or blank_in_block):
+            if not (open_quote or continued or indented or blank_in_block):
                 break
             indented_block = indented_block or indented
+            open_quote = _unterminated_quote(continuation, open_quote)
             continued = continuation.rstrip().endswith("\\")
             index += 1
     return "".join(sanitized), omitted

@@ -480,7 +480,6 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             '{"githubToken":"camel-token-secret"}',
             'tool --password cli-option-secret --token "quoted cli token"',
             r'tool --password "abc\"escaped-option-secret" token="abc\"escaped-assignment-secret"',
-            'password="alpha unterminated-credential-secret',
             "PASSWORD = spaced-assignment-secret",
             "Authorization : Bearer spaced-header-secret",
             "\x1b[31mpassword=ansi-secret\x1b[0m",
@@ -493,6 +492,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "passX\x9b1Dword=c1-cursor-secret",
             "passX\bword=backspace-secret",
             "safe-carriage\rpassword=carriage-secret",
+            "password=\rcarriage-value-secret",
+            "Authorization:\rBearer carriage-auth-secret",
             "visible\x00-control",
             "visible\x81-control-c1",
             "matched-bad={private_key:matched-container-secret}",
@@ -503,6 +504,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "PASSWORD=" + "\\",
             "shell-multiline-secret",
             "safe-after-shell",
+            'PASSWORD="alpha',
+            'quoted-multiline-secret"',
+            "safe-after-quote",
             "private_key=malformed-private-secret",
             "AWS_SECRET_ACCESS_KEY=aws-secret",
             "{",
@@ -533,6 +537,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "[terminal control line omitted]" in exported
     assert "safe-after-yaml" in exported
     assert "safe-after-shell" in exported
+    assert "safe-after-quote" in exported
     assert "visible-control" in exported
     assert "visible-control-c1" in exported
     assert "\x1b" not in exported
@@ -572,7 +577,6 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "quoted cli token",
         "escaped-option-secret",
         "escaped-assignment-secret",
-        "unterminated-credential-secret",
         "unwrapped-escaped-secret",
         "spaced-assignment-secret",
         "spaced-header-secret",
@@ -586,11 +590,14 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "c1-cursor-secret",
         "backspace-secret",
         "carriage-secret",
+        "carriage-value-secret",
+        "carriage-auth-secret",
         "matched-container-secret",
         "same-line-document-secret",
         "same-line-trailing-secret",
         "yaml-multiline-secret",
         "shell-multiline-secret",
+        "quoted-multiline-secret",
         "malformed-private-secret",
         "aws-secret",
         "document-secret",
@@ -623,6 +630,20 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     incomplete_json = await diagnostics.get_latest_cli_log(SLUG)
     assert incomplete_json["text"] == "[credential document omitted]"
     assert "incomplete-document-secret" not in incomplete_json["text"]
+
+    unterminated_quote_redis = FakeRedis()
+    unterminated_quote_redis.store[key] = 'safe-before\nPASSWORD="alpha\nunterminated-quote-secret'
+    _patch_runtime(monkeypatch, unterminated_quote_redis)
+    unterminated_quote = await diagnostics.get_latest_cli_log(SLUG)
+    assert unterminated_quote["text"] == "safe-before\n[credential line omitted]\n"
+    assert "unterminated-quote-secret" not in unterminated_quote["text"]
+
+    incomplete_inline_redis = FakeRedis()
+    incomplete_inline_redis.store[key] = 'safe-before\npassword="alpha unterminated-credential-secret'
+    _patch_runtime(monkeypatch, incomplete_inline_redis)
+    incomplete_inline = await diagnostics.get_latest_cli_log(SLUG)
+    assert incomplete_inline["text"] == "safe-before\n[credential line omitted]"
+    assert "unterminated-credential-secret" not in incomplete_inline["text"]
 
 
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(
