@@ -114,10 +114,14 @@ _AUTHORIZATION_VALUE = re.compile(
     r"(?i)\b(?P<scheme>Bearer|Basic|Digest|Negotiate|ApiKey|Token)[ \t]+\S+"
 )
 _DIGEST_AUTHORIZATION = re.compile(r"(?i)(?<![A-Za-z0-9])Digest[ \t]+")
+_CREDENTIAL_CLI_OPTION = re.compile(
+    r"(?i)(?<!\S)(?:-[uU]|--user|--proxy-user)(?:[ \t]+|=)"
+)
 _HEREDOC_START = re.compile(
     r"<<(?P<strip_tabs>-?)[ \t]*(?P<quote>['\"]?)"
-    r"(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)"
+    r"(?P<delimiter>[A-Za-z0-9_.+-]+)(?P=quote)(?=$|[ \t;|&()<>])"
 )
+_HEREDOC_OPERATOR = re.compile(r"(?<!<)<<-?(?!<)")
 _SENSITIVE_MULTIWORD_LABEL = re.compile(
     r"(?i)(?<![A-Za-z0-9])(?:"
     r"(?:api|oauth|access|refresh|id|auth)\s+(?:key|token)|"
@@ -151,6 +155,7 @@ _RECOGNIZABLE_SECRET = tuple(
         r"\bxox[boaprs]-(?:[0-9]+-){2,}[A-Za-z0-9-]{24,}\b",
         r"\b(?:sk|rk)_(?:test|live)_[A-Za-z0-9]{24,}\b",
         r"\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b",
+        r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA)[A-Z0-9]{16}\b",
         r"\bhttps://hooks\.slack(?:-gov)?\.com/(?:services/)?"
         r"T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]{24}\b",
     )
@@ -1111,6 +1116,10 @@ def _json_key_escape_length(value: str, index: int) -> int:
 
 def _sensitive_value_start(line: str) -> int | None:
     """Return the value position for a sensitive context found in one line."""
+    credential_option = _CREDENTIAL_CLI_OPTION.search(line)
+    if credential_option is not None:
+        return credential_option.end()
+
     digest = _DIGEST_AUTHORIZATION.search(line)
     if digest is not None:
         return digest.end()
@@ -1263,9 +1272,14 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
         open_quote = _unterminated_quote(content)
         continued = content.rstrip().endswith("\\")
         yaml_block = content[value_start:].strip() in {"", "|", "|-", "|+", ">", ">-", ">+"}
-        heredoc = _HEREDOC_START.search(content[value_start:])
+        sensitive_value = content[value_start:]
+        heredoc = _HEREDOC_START.search(sensitive_value)
         heredoc_delimiter = heredoc.group("delimiter") if heredoc is not None else None
         heredoc_strips_tabs = heredoc is not None and heredoc.group("strip_tabs") == "-"
+        if heredoc_delimiter is None and _HEREDOC_OPERATOR.search(sensitive_value):
+            # An unsupported shell word could expand to an unknown delimiter. Consume
+            # the remaining bounded source rather than risk exporting its body.
+            heredoc_delimiter = "\0"
         indented_block = False
         index += 1
         while index < len(lines):

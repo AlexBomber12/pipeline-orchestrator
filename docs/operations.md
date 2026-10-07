@@ -45,6 +45,7 @@ long-option arguments,
 cookies, credential-bearing absolute or scheme-relative URL userinfo/query
 parameters (including percent-encoded parameter names and Azure SAS signatures),
 recognizable token shapes including JWTs and Slack webhooks, private-key blocks,
+standalone AWS access-key identifiers, curl user/proxy-user credentials,
 and recognizable JSON credential
 documents are not exported, including nested documents and documents serialized
 inside log strings and structured header name/value pairs in JSON-list or
@@ -62,7 +63,8 @@ continuations, backslash-continued shell values, and quoted values spanning
 physical lines are omitted with their key line through the close or source end.
 This includes leading blank lines and legal indentationless YAML sequence values
 under a credential key, plus shell heredoc bodies through their delimiter or
-source end.
+source end. Literal heredoc delimiters may start with digits; unsupported
+delimiter words fail closed by omitting the remainder of the bounded source.
 Terminal escape and control sequences, including C1 control strings, are
 normalized before credential inspection. The source suffix beginning with the
 first bare carriage return or stateful cursor/editing control is omitted

@@ -456,6 +456,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     encoded_auth = "dXNlcjpTVVBFUlNFQ1JFVA=="
     standalone_basic = "dXNlcjpTVEFOREFMT05FLUJBU0lDLVNFQ1JFVA=="
     slack_webhook = "https://hooks.slack.com/services/T123/B456/" + ("A" * 24)
+    aws_access_key = "AKIAABCDEFGHIJKLMNOP"
     credential_log = "\n".join(
         (
             "curl -H 'Authorization: ApiKey inline-auth-secret' https://example.test",
@@ -506,6 +507,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             'Digest username="user", realm="realm", nonce="abc", uri="/", '
             'response="digest-response-secret"',
             'tool --password cli-option-secret --token "quoted cli token"',
+            "curl --user alice:curl-user-secret https://example.test",
+            "curl -u alice:curl-short-user-secret https://example.test",
+            "curl --proxy-user bob:curl-proxy-user-secret https://example.test",
+            "curl -U bob:curl-short-proxy-user-secret https://example.test",
             r'tool --password "abc\"escaped-option-secret" token="abc\"escaped-assignment-secret"',
             "PASSWORD = spaced-assignment-secret",
             "Authorization : Bearer spaced-header-secret",
@@ -540,6 +545,11 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "EOF",
             ")",
             "safe-after-heredoc",
+            "PASSWORD=$(cat <<123)",
+            "digit-heredoc-secret",
+            "123",
+            ")",
+            "safe-after-digit-heredoc",
             "PASSWORD=" + "\\",
             "shell-multiline-secret",
             "safe-after-shell",
@@ -548,6 +558,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "safe-after-quote",
             "private_key=malformed-private-secret",
             "AWS_SECRET_ACCESS_KEY=aws-secret",
+            aws_access_key,
             "{",
             '  "items": [',
             "    {",
@@ -577,6 +588,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-yaml-sequence" in exported
     assert "safe-after-yaml-blank" in exported
     assert "safe-after-heredoc" in exported
+    assert "safe-after-digit-heredoc" in exported
     assert "safe-after-shell" in exported
     assert "safe-after-quote" in exported
     assert "visible-control" in exported
@@ -594,6 +606,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "serialized-metadata" not in exported
     assert bare_jwt not in exported
     assert slack_webhook not in exported
+    assert aws_access_key not in exported
     assert encoded_auth not in exported
     assert standalone_basic not in exported
     assert "safe-hyperlink-output" in exported
@@ -639,6 +652,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "standalone-bearer-secret",
         "digest-response-secret",
         "cli-option-secret",
+        "curl-user-secret",
+        "curl-short-user-secret",
+        "curl-proxy-user-secret",
+        "curl-short-proxy-user-secret",
         "quoted cli token",
         "escaped-option-secret",
         "escaped-assignment-secret",
@@ -662,6 +679,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "indentationless-yaml-secret",
         "yaml-leading-blank-secret",
         "heredoc-secret",
+        "digit-heredoc-secret",
         "shell-multiline-secret",
         "quoted-multiline-secret",
         "malformed-private-secret",
@@ -766,6 +784,17 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     unterminated_heredoc = await diagnostics.get_latest_cli_log(SLUG)
     assert unterminated_heredoc["text"] == "safe-before\n[credential line omitted]\n"
     assert "unterminated-heredoc-secret" not in unterminated_heredoc["text"]
+
+    unsupported_heredoc_redis = FakeRedis()
+    unsupported_heredoc_redis.store[key] = (
+        "safe-before\nPASSWORD=$(cat <<EOF$SUFFIX)\nunsupported-heredoc-secret\n"
+        "EOF\nstill-sensitive-after-prefix"
+    )
+    _patch_runtime(monkeypatch, unsupported_heredoc_redis)
+    unsupported_heredoc = await diagnostics.get_latest_cli_log(SLUG)
+    assert unsupported_heredoc["text"] == "safe-before\n[credential line omitted]\n"
+    assert "unsupported-heredoc-secret" not in unsupported_heredoc["text"]
+    assert "still-sensitive-after-prefix" not in unsupported_heredoc["text"]
 
 
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(
