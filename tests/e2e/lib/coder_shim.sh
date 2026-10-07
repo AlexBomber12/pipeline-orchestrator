@@ -244,8 +244,9 @@ main() {
     local invoked
     invoked="$(basename "$0")"
 
-    # The web container mounts the same shim and probes `claude --version`,
-    # `codex --version`, and `codex login status` to populate the auth panel.
+    # The web and daemon containers mount the same shim and probe
+    # `claude --version`, `claude auth status`, `codex --version`, and
+    # `codex login status` to populate auth state and select eligible coders.
     # Without a short-circuit those read-only probes would race the daemon
     # by mutating branches and creating PRs in the testbed (Codex P1).
     local arg
@@ -257,6 +258,10 @@ main() {
                 ;;
         esac
     done
+    if [[ "${invoked}" == "claude" && "${1:-}" == "auth" && "${2:-}" == "status" ]]; then
+        printf '{"loggedIn":true,"authMethod":"claude.ai"}\n'
+        exit 0
+    fi
     if [[ "${invoked}" == "codex" && "${1:-}" == "login" ]]; then
         printf 'Logged in (shim)\n'
         exit 0

@@ -37,6 +37,24 @@ def _parse_doing_task(repo: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def test_claude_auth_status_reports_sanitized_authenticated_fixture(
+    tmp_path: Path,
+) -> None:
+    claude = tmp_path / "claude"
+    claude.symlink_to(SHIM)
+
+    result = subprocess.run(
+        [str(claude), "auth", "status"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == '{"loggedIn":true,"authMethod":"claude.ai"}\n'
+    assert result.stderr == ""
+
+
 def test_shim_reads_active_pr_from_runtime_file(tmp_path: Path) -> None:
     _write_task(tmp_path, "PR-004", branch="pr-004", status="TODO")
     _write_task(tmp_path, "PR-005", branch="pr-005", status=None)

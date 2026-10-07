@@ -15,6 +15,7 @@ NOT_CALLABLE = "not a factory"
 class ConfiguredTestPlugin(ClaudePlugin):
     name = "third"
     display_name = "Configured Test Coder"
+    auth_capabilities = None
     models = ["third-default", "third-invoke"]
     model_setting = ModelSetting(
         config_field=None,
@@ -90,6 +91,7 @@ class TelemetryTestPlugin(ConfiguredTestPlugin):
 class ClaudeOverridePlugin(ClaudePlugin):
     name = "claude"
     display_name = "Configured Claude"
+    auth_capabilities = None
 
     def check_auth(self, **_kwargs: object) -> dict[str, str]:
         return {"status": "ok", "detail": "configured plugin auth"}

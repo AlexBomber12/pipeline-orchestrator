@@ -458,6 +458,18 @@ def _patch_subprocess(
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         calls.append(cmd)
+        if cmd == ["claude", "--version"]:
+            return _FakeCompletedProcess(
+                args=cmd,
+                stdout="1.2.3 (Claude Code)\n",
+                returncode=0,
+            )
+        if cmd == ["claude", "auth", "status"]:
+            return _FakeCompletedProcess(
+                args=cmd,
+                stdout='{"loggedIn":true,"authMethod":"api_key"}\n',
+                returncode=0,
+            )
         if cmd[:2] == ["git", "rev-list"]:
             return _FakeCompletedProcess(args=cmd, stdout="0\n", returncode=0)
         if cmd[:3] == ["git", "cat-file", "-e"]:

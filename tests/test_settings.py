@@ -147,6 +147,11 @@ def _stub_auth_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
         cmd: list[str], *args: object, **kwargs: object
     ) -> _FakeCompleted:
         if cmd and cmd[0] == "claude":
+            if cmd[1:] == ["auth", "status"]:
+                return _FakeCompleted(
+                    0,
+                    stdout='{"loggedIn":true,"authMethod":"api_key"}\n',
+                )
             return _FakeCompleted(0, stdout="claude 1.2.3\n")
         if cmd and cmd[0] == "codex":
             if cmd[1:] == ["--version"]:
@@ -2959,9 +2964,15 @@ def _install_fake_subprocess(
         cmd: list[str], *args: object, **kwargs: object
     ) -> _FakeCompleted:
         if cmd and cmd[0] == "claude":
-            if isinstance(claude, Exception):
-                raise claude
-            return claude
+            result = claude
+            if cmd[1:] == ["auth", "status"]:
+                result = _FakeCompleted(
+                    0,
+                    stdout='{"loggedIn":true,"authMethod":"api_key"}\n',
+                )
+            if isinstance(result, Exception):
+                raise result
+            return result
         if cmd and cmd[0] == "codex":
             result = codex_version if cmd[1:] == ["--version"] else codex
             if isinstance(result, Exception):

@@ -1,12 +1,74 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 from src.coder_registry import ModelMetadata
 from src.coders import claude as claude_module
 from src.coders.claude import ClaudePlugin
 from src.config import AppConfig
+
+_CLAUDE_AUTH_CAPABILITIES = {
+    "can_check_cli": True,
+    "can_check_saved_credentials": True,
+    "can_report_authentication_mode": True,
+    "can_verify_service_access": False,
+    "interactive_login_methods": [],
+}
+
+
+def _assert_claude_auth_status(
+    result: dict[str, Any],
+    *,
+    status: str,
+    detail: str,
+    cli_available: bool | None = None,
+    cli_version: str | None = None,
+    saved_credentials_present: bool | None = None,
+    authentication_mode: str | None = None,
+    failure_reason: str | None = None,
+) -> None:
+    assert result == {
+        "status": status,
+        "detail": detail,
+        "cli_available": cli_available,
+        "cli_version": cli_version,
+        "saved_credentials_present": saved_credentials_present,
+        "authentication_mode": authentication_mode,
+        "service_access_verified": None,
+        "failure_reason": failure_reason,
+        "capabilities": _CLAUDE_AUTH_CAPABILITIES,
+    }
+
+
+def _check_auth_with_results(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    version_result: tuple[int, str, str],
+    status_result: tuple[int, str, str] | None,
+) -> tuple[dict[str, Any], list[tuple[list[str], dict[str, str] | None]]]:
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        "auth:\n"
+        f"  claude_config_dir: {tmp_path / 'claude-auth'}\n",
+        encoding="utf-8",
+    )
+    calls: list[tuple[list[str], dict[str, str] | None]] = []
+
+    def fake_run_auth_command(
+        cmd: list[str], *, env: dict[str, str] | None = None
+    ) -> tuple[int, str, str]:
+        calls.append((cmd, env))
+        if cmd == ["claude", "--version"]:
+            return version_result
+        if cmd == ["claude", "auth", "status"] and status_result is not None:
+            return status_result
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(claude_module, "_run_auth_command", fake_run_auth_command)
+    return ClaudePlugin().check_auth(config_path=str(config_path)), calls
 
 
 def test_claude_plugin_name() -> None:
@@ -159,63 +221,341 @@ async def test_claude_plugin_fix_review_delegates(
     }
 
 
-def test_claude_plugin_check_auth(
+def test_claude_plugin_reports_saved_subscription_authentication(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    cfg = tmp_path / "config.yml"
-    cfg.write_text(
-        "auth:\n"
-        f"  claude_config_dir: {tmp_path / 'claude-auth'}\n",
-        encoding="utf-8",
+    result, calls = _check_auth_with_results(
+        monkeypatch,
+        tmp_path,
+        version_result=(0, "2.1.47 (Claude Code)\n", ""),
+        status_result=(
+            0,
+            (
+                '{"loggedIn":true,"authMethod":"claude.ai",'
+                '"email":"synthetic-secret@example.test",'
+                '"organization":"synthetic-secret-org"}'
+            ),
+            "provider stderr synthetic-secret",
+        ),
     )
 
-    captured: dict[str, object] = {}
+    _assert_claude_auth_status(
+        result,
+        status="ok",
+        detail=(
+            "Claude Code CLI 2.1.47; saved Claude account credentials found; "
+            "service access not verified"
+        ),
+        cli_available=True,
+        cli_version="2.1.47",
+        saved_credentials_present=True,
+        authentication_mode="claude_ai",
+    )
+    assert [cmd for cmd, _env in calls] == [
+        ["claude", "--version"],
+        ["claude", "auth", "status"],
+    ]
+    assert all(
+        env is not None
+        and env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "claude-auth")
+        for _cmd, env in calls
+    )
+    assert "synthetic-secret" not in str(result)
 
-    def fake_run_auth_command(
-        cmd: list[str], *, env: dict[str, str] | None = None
-    ) -> tuple[int, str, str]:
-        captured["cmd"] = cmd
-        captured["env"] = env or {}
-        return (0, "claude 1.2.3\n", "")
 
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(
-        "src.coders.claude._run_auth_command",
-        fake_run_auth_command,
+@pytest.mark.parametrize(
+    ("provider_method", "authentication_mode", "evidence_detail"),
+    [
+        (
+            "oauth_token",
+            "oauth_token",
+            "configured OAuth-token authentication found",
+        ),
+        ("api_key", "api_key", "configured API-key authentication found"),
+        (
+            "api_key_helper",
+            "api_key_helper",
+            "configured API-key helper authentication found",
+        ),
+        (
+            "third_party",
+            "third_party",
+            "configured third-party authentication found",
+        ),
+    ],
+)
+def test_claude_plugin_reports_configured_auth_without_claiming_saved_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    provider_method: str,
+    authentication_mode: str,
+    evidence_detail: str,
+) -> None:
+    result, _calls = _check_auth_with_results(
+        monkeypatch,
+        tmp_path,
+        version_result=(0, "claude 2.1.47", ""),
+        status_result=(
+            0,
+            (
+                f'{{"loggedIn":true,"authMethod":"{provider_method}",'
+                '"token":"synthetic-secret"}'
+            ),
+            "",
+        ),
     )
 
-    result = ClaudePlugin().check_auth()
+    _assert_claude_auth_status(
+        result,
+        status="ok",
+        detail=(
+            f"Claude Code CLI 2.1.47; {evidence_detail}; "
+            "service access not verified"
+        ),
+        cli_available=True,
+        cli_version="2.1.47",
+        authentication_mode=authentication_mode,
+    )
+    assert "synthetic-secret" not in str(result)
 
-    assert result == {"status": "ok", "detail": "claude 1.2.3"}
-    assert captured["cmd"] == ["claude", "--version"]
-    assert captured["env"]["CLAUDE_CONFIG_DIR"] == str(tmp_path / "claude-auth")
 
-
-def test_claude_plugin_check_auth_returns_error_detail(
+def test_claude_plugin_reports_missing_authentication(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    cfg = tmp_path / "config.yml"
-    cfg.write_text(
-        "auth:\n"
-        f"  claude_config_dir: {tmp_path / 'claude-auth'}\n",
-        encoding="utf-8",
+    result, _calls = _check_auth_with_results(
+        monkeypatch,
+        tmp_path,
+        version_result=(0, "claude-code 2.1.47", ""),
+        status_result=(
+            1,
+            '{"loggedIn":false,"authMethod":"none","apiProvider":"none"}',
+            "",
+        ),
     )
 
-    def fake_run_auth_command(
-        cmd: list[str], *, env: dict[str, str] | None = None
-    ) -> tuple[int, str, str]:
-        del cmd, env
-        return (1, "", "broken auth")
-
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(
-        "src.coders.claude._run_auth_command",
-        fake_run_auth_command,
+    _assert_claude_auth_status(
+        result,
+        status="error",
+        detail=(
+            "Claude Code CLI 2.1.47; no active authentication reported; "
+            "service access not verified"
+        ),
+        cli_available=True,
+        cli_version="2.1.47",
+        failure_reason="credentials_missing",
     )
 
-    result = ClaudePlugin().check_auth()
 
-    assert result == {"status": "error", "detail": "broken auth"}
+def test_claude_plugin_rejects_unknown_authentication_method_without_disclosure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    result, _calls = _check_auth_with_results(
+        monkeypatch,
+        tmp_path,
+        version_result=(0, "2.1.47", ""),
+        status_result=(
+            0,
+            (
+                '{"loggedIn":true,"authMethod":"future_synthetic_secret",'
+                '"message":"arbitrary synthetic secret"}'
+            ),
+            "",
+        ),
+    )
+
+    _assert_claude_auth_status(
+        result,
+        status="error",
+        detail=(
+            "Claude Code CLI 2.1.47; authentication method was not recognized"
+        ),
+        cli_available=True,
+        cli_version="2.1.47",
+        failure_reason="unrecognized_output",
+    )
+    assert "synthetic" not in str(result)
+
+
+@pytest.mark.parametrize(
+    ("status_result", "detail", "failure_reason"),
+    [
+        (
+            (2, "", "error: unknown command 'auth' token=synthetic-secret"),
+            "Claude Code CLI 2.1.47; authentication status is unsupported",
+            "probe_unavailable",
+        ),
+        (
+            (124, "", "timeout token=synthetic-secret"),
+            "Claude Code CLI 2.1.47; authentication status check timed out",
+            "probe_timeout",
+        ),
+        (
+            (2, "", "failed token=synthetic-secret"),
+            "Claude Code CLI 2.1.47; authentication status check failed",
+            "probe_failed",
+        ),
+        (
+            (0, "not-json synthetic-secret", ""),
+            "Claude Code CLI 2.1.47; authentication status was not recognized",
+            "unrecognized_output",
+        ),
+    ],
+)
+def test_claude_plugin_sanitizes_auth_status_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    status_result: tuple[int, str, str],
+    detail: str,
+    failure_reason: str,
+) -> None:
+    result, _calls = _check_auth_with_results(
+        monkeypatch,
+        tmp_path,
+        version_result=(0, "2.1.47 (Claude Code)", ""),
+        status_result=status_result,
+    )
+
+    _assert_claude_auth_status(
+        result,
+        status="error",
+        detail=detail,
+        cli_available=True,
+        cli_version="2.1.47",
+        failure_reason=failure_reason,
+    )
+    assert "synthetic-secret" not in str(result)
+
+
+@pytest.mark.parametrize(
+    "status_result",
+    [
+        (0, '{"loggedIn":false,"authMethod":"none"}', ""),
+        (1, '{"loggedIn":true,"authMethod":"api_key"}', ""),
+        (0, '{"loggedIn":true,"authMethod":"none"}', ""),
+        (1, '{"loggedIn":false,"authMethod":"api_key"}', ""),
+    ],
+)
+def test_claude_plugin_rejects_inconsistent_auth_status(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    status_result: tuple[int, str, str],
+) -> None:
+    result, _calls = _check_auth_with_results(
+        monkeypatch,
+        tmp_path,
+        version_result=(0, "2.1.47", ""),
+        status_result=status_result,
+    )
+
+    _assert_claude_auth_status(
+        result,
+        status="error",
+        detail="Claude Code CLI 2.1.47; authentication status was inconsistent",
+        cli_available=True,
+        cli_version="2.1.47",
+        failure_reason="probe_failed",
+    )
+
+
+@pytest.mark.parametrize(
+    ("version_result", "detail", "cli_available", "failure_reason"),
+    [
+        (
+            (127, "", "claude not found"),
+            "Claude Code CLI was not found",
+            False,
+            "cli_missing",
+        ),
+        (
+            (124, "", "timeout synthetic-secret"),
+            "Claude Code CLI version check timed out",
+            None,
+            "probe_timeout",
+        ),
+        (
+            (2, "", "failure synthetic-secret"),
+            "Claude Code CLI version check failed",
+            None,
+            "probe_failed",
+        ),
+        (
+            (0, "unexpected-version synthetic-secret", ""),
+            "Claude Code CLI returned an unrecognized version",
+            True,
+            "unrecognized_output",
+        ),
+    ],
+)
+def test_claude_plugin_sanitizes_version_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    version_result: tuple[int, str, str],
+    detail: str,
+    cli_available: bool | None,
+    failure_reason: str,
+) -> None:
+    result, calls = _check_auth_with_results(
+        monkeypatch,
+        tmp_path,
+        version_result=version_result,
+        status_result=None,
+    )
+
+    _assert_claude_auth_status(
+        result,
+        status="error",
+        detail=detail,
+        cli_available=cli_available,
+        failure_reason=failure_reason,
+    )
+    assert [cmd for cmd, _env in calls] == [["claude", "--version"]]
+    assert "synthetic-secret" not in str(result)
+
+
+def test_claude_plugin_reports_executable_disappearing_during_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    result, _calls = _check_auth_with_results(
+        monkeypatch,
+        tmp_path,
+        version_result=(0, "2.1.47", ""),
+        status_result=(127, "", "claude not found"),
+    )
+
+    _assert_claude_auth_status(
+        result,
+        status="error",
+        detail="Claude Code CLI was not found",
+        cli_available=False,
+        cli_version="2.1.47",
+        failure_reason="cli_missing",
+    )
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "not JSON",
+        "[]",
+        '{"loggedIn":"yes","authMethod":"claude.ai"}',
+        '{"loggedIn":true,"authMethod":null}',
+    ],
+)
+def test_parse_auth_status_rejects_malformed_shapes(output: str) -> None:
+    assert claude_module._parse_auth_status(output) is None
+
+
+def test_probe_helpers_ignore_warnings_and_recognize_known_errors() -> None:
+    assert claude_module._claude_version(
+        "warning: npm notice\n2.1.47-beta.1 (Claude Code)"
+    ) == "2.1.47-beta.1"
+    assert claude_module._first_probe_line("warning: one\n\nwarning: two") == ""
+    assert claude_module._reports_missing_cli(
+        "claude: /missing: no such file or directory"
+    )
+    assert claude_module._auth_status_unsupported(
+        "status is not a supported subcommand"
+    )
 
 
 def test_run_auth_command_returns_completed_output(
