@@ -55,4 +55,145 @@
 
     {% include "components/settings_sandbox_backup.html" %}
 </div>
+
+<script>
+    (function () {
+        let leavingSettings = false;
+        const retryTimers = new Set();
+        const metadataRefreshes = new Set();
+
+        function loginRequestElement(event) {
+            return event.detail && event.detail.elt instanceof Element
+                ? event.detail.elt
+                : null;
+        }
+
+        function scheduleSessionRetry(state) {
+            if (
+                !state ||
+                !state.matches('[data-device-login-poll]') ||
+                state.dataset.deviceLoginRetryScheduled === 'true'
+            ) {
+                return;
+            }
+            state.dataset.deviceLoginRetryScheduled = 'true';
+            const timer = window.setTimeout(function () {
+                retryTimers.delete(timer);
+                delete state.dataset.deviceLoginRetryScheduled;
+                if (
+                    leavingSettings ||
+                    !state.isConnected ||
+                    window.location.pathname !== '/settings'
+                ) {
+                    return;
+                }
+                htmx.trigger(state, 'device-login-retry');
+            }, 3000);
+            retryTimers.add(timer);
+        }
+
+        function showTransportFailure(event) {
+            const requestElement = loginRequestElement(event);
+            const shell = requestElement
+                ? requestElement.closest('[data-device-login-shell]')
+                : null;
+            if (!shell) {
+                return;
+            }
+            const state = shell.querySelector('[data-device-login-state]');
+            const alert = state
+                ? state.querySelector('[data-device-login-transport-error]')
+                : null;
+            if (alert) {
+                const wasCancel = requestElement.closest(
+                    '[data-device-login-action="cancel"]'
+                );
+                alert.textContent = wasCancel
+                    ? 'The cancellation outcome is unknown. Settings will keep checking this session.'
+                    : state.matches('[data-device-login-poll]')
+                        ? 'The session status could not be reached. Settings will retry without starting a new login.'
+                        : 'The login request could not reach the daemon. Try again; Settings will not retry a start automatically.';
+                alert.classList.remove('hidden');
+            }
+            scheduleSessionRetry(state);
+        }
+
+        document.body.addEventListener('htmx:sendError', showTransportFailure);
+        document.body.addEventListener('htmx:timeout', showTransportFailure);
+
+        document.body.addEventListener('deviceLoginSucceeded', async function (event) {
+            const plugin = event.detail && event.detail.plugin;
+            if (
+                typeof plugin !== 'string' ||
+                !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(plugin) ||
+                metadataRefreshes.has(plugin)
+            ) {
+                return;
+            }
+            metadataRefreshes.add(plugin);
+            const shellId = 'coder-' + plugin + '-device-login';
+            try {
+                const controller = new AbortController();
+                const timeout = window.setTimeout(function () {
+                    controller.abort();
+                }, 10000);
+                let authResponse;
+                try {
+                    authResponse = await fetch('/api/auth-status', {
+                        cache: 'no-store',
+                        credentials: 'same-origin',
+                        headers: {'Accept': 'application/json'},
+                        signal: controller.signal,
+                    });
+                } finally {
+                    window.clearTimeout(timeout);
+                }
+                if (!authResponse.ok) {
+                    throw new Error('auth refresh failed');
+                }
+
+                const shell = document.getElementById(shellId);
+                const refreshable = shell &&
+                    shell.dataset.modelCatalogRefreshable === 'true';
+                const path = refreshable
+                    ? '/partials/settings/coders/' + plugin + '/models/refresh'
+                    : '/partials/settings/coders';
+                await htmx.ajax(refreshable ? 'POST' : 'GET', path, {
+                    target: '#settings-coders',
+                    swap: 'outerHTML',
+                });
+
+                const refreshedShell = document.getElementById(shellId);
+                const status = refreshedShell
+                    ? refreshedShell.querySelector('[data-device-login-refresh-status]')
+                    : null;
+                if (status) {
+                    status.textContent = 'Authentication status and model metadata refreshed.';
+                    status.classList.remove('text-gray-500', 'text-warn');
+                    status.classList.add('text-ok');
+                }
+            } catch (_error) {
+                const shell = document.getElementById(shellId);
+                const status = shell
+                    ? shell.querySelector('[data-device-login-refresh-status]')
+                    : null;
+                if (status) {
+                    status.textContent = 'Login succeeded, but Settings metadata could not be refreshed. Reload Settings to retry the read-only checks.';
+                    status.classList.remove('text-gray-500');
+                    status.classList.add('text-warn');
+                }
+            } finally {
+                metadataRefreshes.delete(plugin);
+            }
+        });
+
+        window.addEventListener('beforeunload', function () {
+            leavingSettings = true;
+            retryTimers.forEach(function (timer) {
+                window.clearTimeout(timer);
+            });
+            retryTimers.clear();
+        });
+    })();
+</script>
 {% endblock %}

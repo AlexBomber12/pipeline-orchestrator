@@ -3028,24 +3028,36 @@ def _device_login_payload(
     state: str = "waiting_for_user",
     failure_reason: str | None = None,
     session_id: str | None = "s" * 32,
+    cleanup_confirmed: bool | None = None,
+    replacement_requested: bool = False,
+    reused_session: bool = False,
+    replacement_warning: str | None = (
+        "Replacement can remove existing authentication."
+    ),
+    auth_status: dict[str, object] | None = None,
+    detail: str = "Device login status",
 ) -> dict[str, object]:
     waiting = state == "waiting_for_user"
     return {
         "plugin": "codex",
         "session_id": session_id,
         "state": state,
-        "detail": "Device login status",
+        "detail": detail,
         "failure_reason": failure_reason,
         "verification_url": (
             "https://auth.openai.com/codex/device" if waiting else None
         ),
         "user_code": "ABCD-EFGH" if waiting else None,
         "expires_at": 1_800_000_000.0 if waiting else None,
-        "cleanup_confirmed": True if state == "cancelled" else None,
-        "replacement_requested": False,
-        "reused_session": False,
-        "replacement_warning": "Replacement can remove existing authentication.",
-        "auth_status": None,
+        "cleanup_confirmed": (
+            True
+            if state == "cancelled" and cleanup_confirmed is None
+            else cleanup_confirmed
+        ),
+        "replacement_requested": replacement_requested,
+        "reused_session": reused_session,
+        "replacement_warning": replacement_warning,
+        "auth_status": auth_status,
     }
 
 
@@ -3244,9 +3256,374 @@ def test_device_login_start_rejects_invalid_request_body(
             "/api/coders/codex/device-login",
             json={"unexpected": True},
         )
+        invalid_htmx_form = client.post(
+            "/api/coders/codex/device-login",
+            data={"replace_existing": "yes"},
+            headers={"HX-Request": "true"},
+        )
 
     assert invalid_type.status_code == 422
     assert extra_field.status_code == 422
+    assert invalid_htmx_form.status_code == 422
+
+
+def test_settings_device_login_controls_follow_plugin_capabilities(
+    empty_config: Path,
+) -> None:
+    with TestClient(app) as client:
+        response = client.get("/settings")
+
+    assert response.status_code == 200
+    assert 'id="coder-codex-device-login"' in response.text
+    assert 'data-device-login-plugin="codex"' in response.text
+    assert 'hx-preserve="true"' in response.text
+    assert 'id="coder-claude-device-login"' not in response.text
+    assert 'hx-post="/api/coders/codex/device-login"' in (
+        response.text
+    )
+    assert "Starts only when you press this button" in response.text
+
+
+def test_device_login_waiting_partial_has_bounded_serial_poll_and_cancel(
+    empty_config: Path,
+) -> None:
+    calls: list[bool] = []
+
+    class Bridge:
+        async def start_device_login(
+            self,
+            _plugin: str,
+            *,
+            expected_reference: str,
+            replace_existing: bool,
+        ) -> dict[str, object]:
+            assert expected_reference == "src.coders.codex:CodexPlugin"
+            calls.append(replace_existing)
+            return _device_login_payload(reused_session=True)
+
+    with TestClient(app) as client:
+        client.app.state.plugin_bridge = Bridge()
+        response = client.post(
+            "/api/coders/codex/device-login",
+            data={},
+            headers={"HX-Request": "true"},
+        )
+        explicit_false = client.post(
+            "/api/coders/codex/device-login",
+            data={"replace_existing": "false"},
+            headers={"HX-Request": "true"},
+        )
+
+    assert response.status_code == 202
+    assert explicit_false.status_code == 202
+    assert calls == [False, False]
+    assert "Waiting for authorization" in response.text
+    assert "Continuing the daemon's existing login session" in response.text
+    assert "https://auth.openai.com/codex/device" in response.text
+    assert "ABCD-EFGH" in response.text
+    assert "2027-01-15 08:00:00 UTC" in response.text
+    assert (
+        f'hx-get="/api/coders/codex/device-login/{"s" * 32}"'
+        in response.text
+    )
+    assert 'hx-trigger="load delay:2s, device-login-retry"' in response.text
+    assert 'hx-request=\'{"timeout":10000}\'' in response.text
+    assert 'hx-sync="closest [data-device-login-shell]:replace"' in (
+        response.text
+    )
+    assert (
+        f'hx-delete="/api/coders/codex/device-login/{"s" * 32}"'
+        in response.text
+    )
+
+
+def test_device_login_waiting_partial_handles_unrepresentable_deadline(
+    empty_config: Path,
+) -> None:
+    payload = _device_login_payload()
+    payload["expires_at"] = 1e308
+
+    class Bridge:
+        async def inspect_device_login(
+            self, *_args: object, **_kwargs: object
+        ) -> dict[str, object]:
+            return payload
+
+    with TestClient(app) as client:
+        client.app.state.plugin_bridge = Bridge()
+        response = client.get(
+            f"/api/coders/codex/device-login/{'s' * 32}",
+            headers={"HX-Request": "true"},
+        )
+
+    assert response.status_code == 200
+    assert "Deadline" in response.text
+    assert "Unavailable" in response.text
+
+
+def test_device_login_replacement_requires_backend_warning_and_confirmation(
+    empty_config: Path,
+) -> None:
+    calls: list[bool] = []
+
+    class Bridge:
+        async def start_device_login(
+            self,
+            _plugin: str,
+            *,
+            expected_reference: str,
+            replace_existing: bool,
+        ) -> dict[str, object]:
+            assert expected_reference
+            calls.append(replace_existing)
+            if not replace_existing:
+                return _device_login_payload(
+                    state="failed",
+                    failure_reason="replacement_required",
+                    session_id=None,
+                    detail="Existing credentials require confirmation",
+                )
+            return _device_login_payload(replacement_requested=True)
+
+    with TestClient(app) as client:
+        client.app.state.plugin_bridge = Bridge()
+        warning = client.post(
+            "/api/coders/codex/device-login",
+            data={},
+            headers={"HX-Request": "true"},
+        )
+        confirmed = client.post(
+            "/api/coders/codex/device-login",
+            data={"replace_existing": "true"},
+            headers={"HX-Request": "true"},
+        )
+
+    assert warning.status_code == 409
+    assert "Confirm credential replacement" in warning.text
+    assert "Replacement can remove existing authentication." in warning.text
+    assert "authentication may remain unavailable" in warning.text
+    assert 'name="replace_existing" value="true"' in warning.text
+    assert "I understand — replace existing login" in warning.text
+    assert confirmed.status_code == 202
+    assert calls == [False, True]
+
+
+def test_device_login_replacement_is_blocked_without_backend_warning(
+    empty_config: Path,
+) -> None:
+    class Bridge:
+        async def start_device_login(
+            self, *_args: object, **_kwargs: object
+        ) -> dict[str, object]:
+            return _device_login_payload(
+                state="failed",
+                failure_reason="replacement_required",
+                session_id=None,
+                replacement_warning=None,
+            )
+
+    with TestClient(app) as client:
+        client.app.state.plugin_bridge = Bridge()
+        response = client.post(
+            "/api/coders/codex/device-login",
+            headers={"HX-Request": "true"},
+        )
+
+    assert response.status_code == 409
+    assert "did not provide the required replacement warning" in response.text
+    assert 'name="replace_existing"' not in response.text
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_status", "expected_text"),
+    [
+        (
+            _device_login_payload(
+                state="canceling",
+                cleanup_confirmed=False,
+                detail="Cancellation requested",
+            ),
+            200,
+            "Cancellation pending",
+        ),
+        (
+            _device_login_payload(
+                state="cleanup_failed",
+                failure_reason="cancellation_failed",
+                cleanup_confirmed=False,
+                detail="Owned process has not settled",
+            ),
+            200,
+            "Cleanup remains unresolved",
+        ),
+        (
+            _device_login_payload(
+                state="expired",
+                failure_reason="provider_expired",
+                detail="The device code expired",
+            ),
+            200,
+            "Device code expired",
+        ),
+        (
+            _device_login_payload(
+                state="not_found",
+                failure_reason="session_not_found",
+                session_id=None,
+                detail="Session not found",
+            ),
+            404,
+            "Login session is no longer available",
+        ),
+    ],
+)
+def test_device_login_inspection_renders_terminal_and_unresolved_states(
+    empty_config: Path,
+    payload: dict[str, object],
+    expected_status: int,
+    expected_text: str,
+) -> None:
+    class Bridge:
+        async def inspect_device_login(
+            self, *_args: object, **_kwargs: object
+        ) -> dict[str, object]:
+            return payload
+
+    with TestClient(app) as client:
+        client.app.state.plugin_bridge = Bridge()
+        response = client.get(
+            f"/api/coders/codex/device-login/{'s' * 32}",
+            headers={"HX-Request": "true"},
+        )
+
+    assert response.status_code == expected_status
+    assert expected_text in response.text
+    if payload["state"] == "canceling":
+        assert 'data-device-login-poll' in response.text
+    else:
+        assert 'data-device-login-poll' not in response.text
+    if payload["state"] == "cleanup_failed":
+        assert "do not assume the login process stopped" in response.text
+        assert "Retry cleanup check" in response.text
+    if payload["state"] == "not_found":
+        assert "No new login was started automatically" in response.text
+
+
+def test_device_login_cancel_waits_for_backend_outcome(
+    empty_config: Path,
+) -> None:
+    calls: list[str] = []
+
+    class Bridge:
+        async def cancel_device_login(
+            self,
+            _plugin: str,
+            session_id: str,
+            *,
+            expected_reference: str,
+        ) -> dict[str, object]:
+            assert expected_reference
+            calls.append(session_id)
+            return _device_login_payload(
+                state="canceling",
+                cleanup_confirmed=False,
+                detail="Cancellation requested",
+            )
+
+    with TestClient(app) as client:
+        client.app.state.plugin_bridge = Bridge()
+        response = client.delete(
+            f"/api/coders/codex/device-login/{'s' * 32}",
+            headers={"HX-Request": "true"},
+        )
+
+    assert response.status_code == 200
+    assert calls == ["s" * 32]
+    assert "Cancellation pending" in response.text
+    assert "Waiting for the daemon to report" in response.text
+    assert 'data-device-login-poll' in response.text
+
+
+def test_device_login_success_reports_unknown_access_and_triggers_refresh(
+    empty_config: Path,
+) -> None:
+    auth_status = {
+        "status": "ok",
+        "detail": "Saved ChatGPT credentials found; service access unknown",
+        "service_access_verified": None,
+    }
+
+    class Bridge:
+        async def inspect_device_login(
+            self, *_args: object, **_kwargs: object
+        ) -> dict[str, object]:
+            return _device_login_payload(
+                state="succeeded",
+                auth_status=auth_status,
+                detail="Codex login completed",
+            )
+
+    with TestClient(app) as client:
+        client.app.state.plugin_bridge = Bridge()
+        response = client.get(
+            f"/api/coders/codex/device-login/{'s' * 32}",
+            headers={"HX-Request": "true"},
+        )
+        settings = client.get("/settings")
+
+    assert response.status_code == 200
+    assert response.headers["hx-trigger-after-swap"] == (
+        '{"deviceLoginSucceeded":{"plugin":"codex"}}'
+    )
+    assert "Login completed" in response.text
+    assert "service access was not verified" in response.text
+    assert 'data-device-login-poll' not in response.text
+    assert "fetch('/api/auth-status'" in settings.text
+    assert "/partials/settings/coders/' + plugin + '/models/refresh" in (
+        settings.text
+    )
+
+
+def test_device_login_partial_reports_daemon_unavailable_without_leaking(
+    empty_config: Path,
+) -> None:
+    class Bridge:
+        async def start_device_login(
+            self, *_args: object, **_kwargs: object
+        ) -> dict[str, object]:
+            raise ModelCatalogUnavailable("provider-code-must-not-leak")
+
+    with TestClient(app) as client:
+        client.app.state.plugin_bridge = Bridge()
+        response = client.post(
+            "/api/coders/codex/device-login",
+            headers={"HX-Request": "true"},
+        )
+
+    assert response.status_code == 503
+    assert "daemon bridge is unavailable" in response.text
+    assert "No successful login was reported" in response.text
+    assert "provider-code-must-not-leak" not in response.text
+
+
+def test_settings_device_login_script_handles_rerenders_and_network_errors(
+    empty_config: Path,
+) -> None:
+    with TestClient(app) as client:
+        response = client.get("/settings")
+        rerender = client.get("/partials/settings/coders")
+
+    assert response.status_code == 200
+    assert rerender.status_code == 200
+    assert 'hx-preserve="true"' in rerender.text
+    assert 'hx-trigger="submit once"' in response.text
+    assert 'hx-sync="closest [data-device-login-shell]:drop"' in response.text
+    assert "htmx:sendError" in response.text
+    assert "htmx:timeout" in response.text
+    assert "will not retry a start automatically" in response.text
+    assert "Settings will retry without starting a new login" in response.text
+    assert "window.location.pathname !== '/settings'" in response.text
+    assert "beforeunload" in response.text
 
 
 def test_api_auth_status_uses_every_configured_plugin(
