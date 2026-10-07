@@ -26,8 +26,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from src.audit.webhook_log import write_webhook_audit
 from src.coder_registry import CoderPlugin, CoderRegistry
 from src.config import (
+    BUILTIN_CODER_IDS,
     AppConfig,
-    CoderType,
     DaemonConfig,
     load_config,
 )
@@ -293,8 +293,8 @@ def _build_coder_rows(
                         "detail": f"{plugin.display_name} unavailable",
                     },
                 ),
-                "is_default": config.daemon.coder.value == plugin.name,
-                "runtime_selectable": plugin.name in CoderType,
+                "is_default": config.daemon.coder == plugin.name,
+                "runtime_selectable": plugin.name in BUILTIN_CODER_IDS,
             }
         )
     return rows

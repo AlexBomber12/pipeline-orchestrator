@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import importlib
-import re
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from src.coder_ids import validate_coder_plugin_id
 from src.coder_registry import CoderPlugin, CoderRegistry, ModelSetting
 from src.config import DEFAULT_CODER_PLUGINS, AppConfig, DaemonConfig
 
-_PLUGIN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _RESERVED_PLUGIN_IDS = frozenset({"gh"})
 _RESERVED_MODEL_SETTING_KEYS = frozenset({"reasoning_effort"})
 _LEGACY_MODEL_FIELDS = {
@@ -214,14 +213,15 @@ def _validate_plugin_metadata(
 
 
 def _load_plugin(plugin_id: str, reference: object) -> CoderPlugin:
-    if not isinstance(plugin_id, str) or not _PLUGIN_ID_PATTERN.fullmatch(plugin_id):
+    try:
+        validate_coder_plugin_id(plugin_id)
+    except ValueError as exc:
         raise _configuration_error(
             str(plugin_id),
             reference,
             "plugin ID validation",
-            "expected an ASCII letter/digit slug using only letters, digits, "
-            "underscores, and hyphens",
-        )
+            str(exc),
+        ) from None
     if plugin_id in _RESERVED_PLUGIN_IDS:
         raise _configuration_error(
             plugin_id,

@@ -193,7 +193,7 @@
         </div>
         {% endif %}
         {% if repo.state.value == 'CODING' or repo.state.value == 'FIX' %}
-        {% set _coder_name = 'Codex' if repo.coder == 'codex' else 'Claude' %}
+        {% set _coder_name = 'Codex' if repo.coder == 'codex' else ('Claude' if repo.coder == 'claude' else (repo.coder or 'Coder')) %}
         <div class="text-xs text-accent/70 italic mt-1">{{ _coder_name }} is {{ 'coding' if repo.state.value == 'CODING' else 'fixing' }}...</div>
         {% endif %}
         {% endif %}

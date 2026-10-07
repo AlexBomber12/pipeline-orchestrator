@@ -97,8 +97,8 @@ choice; Claude normalizes an empty choice to its `opus` default.
 
 `coder_plugins` is a top-level mapping from a stable, route-safe plugin ID
 (ASCII letters/digits, underscores, and hyphens) to a trusted `module:factory`
-reference. The ID `gh` is reserved for the dashboard's GitHub CLI
-infrastructure status. The no-argument factory must already be importable
+reference. The IDs `gh` and `any` are reserved for infrastructure status and
+task-level inheritance respectively. The no-argument factory must be importable
 in both the web and daemon Python environments and must return a complete
 `CoderPlugin` whose `name` exactly matches the configured ID. Claude and Codex
 use the references shown above as compatibility defaults. An explicit entry
@@ -114,10 +114,18 @@ Plugin modules are operator-managed code: loading a reference does not install
 packages, download code, or sandbox the import. Definitions are loaded only at
 service startup, so deploy the module and restart both `web` and `daemon` after
 changing `coder_plugins`; config reload does not hot-swap implementations.
-Registration exposes shared metadata and generic model controls, but runtime
-repository/default selection is still limited to the existing `CoderType`
-values (`claude` and `codex`). Arbitrary registered IDs are therefore not yet
-complete support for executing additional providers. Legacy model-field
+Registration exposes shared metadata and generic model controls. Runtime
+dispatch is authorized by the registry that the daemon loaded successfully at
+startup. A loaded plugin ID can be selected as the global default with
+`daemon.coder`, as a repository override with `repositories[].coder`, or as a
+hard task pin with the task header `Coder: <plugin-id>`. `Coder: any` retains
+the inherited candidate and fallback behavior instead of hard-pinning a
+provider. Registered plugins participate in the same priority, exploration,
+disable, authentication, and rate-limit admission rules as the built-ins.
+Unknown, unloaded, or unavailable hard pins are rejected rather than falling
+back to another coder. The dashboard keeps its editable coder choices limited
+to Claude and Codex for now, but it renders configured custom selections as
+read-only values. Legacy model-field
 fallbacks are likewise owned by their built-ins (`claude_model` by `claude`
 and `codex_model` by `codex`); additional plugins must set their model
 metadata's `config_field` to `None` and use `coder_settings`. Configured model

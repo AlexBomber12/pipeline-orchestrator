@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from typing import Any
 
 from src.coder_registry import ModelSetting
 from src.coders.claude import ClaudePlugin
@@ -21,23 +22,69 @@ class ConfiguredTestPlugin(ClaudePlugin):
         default_label="Test default",
     )
 
+    def __init__(self) -> None:
+        self.run_auto_pr_calls: list[dict[str, Any]] = []
+        self.fix_review_calls: list[dict[str, Any]] = []
+
     def check_auth(self) -> dict[str, str]:
         return {"status": "ok", "detail": "configured test plugin auth"}
 
-    async def run_planned_pr(self, *_args: object, **_kwargs: object) -> object:
-        raise AssertionError("configured plugin inference must not start")
+    async def run_planned_pr(
+        self, *_args: object, **_kwargs: object
+    ) -> tuple[int, str, str]:
+        return (0, "configured planned", "")
 
-    async def run_auto_pr(self, *_args: object, **_kwargs: object) -> object:
-        raise AssertionError("configured plugin inference must not start")
+    async def run_auto_pr(
+        self, *_args: object, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        self.run_auto_pr_calls.append(dict(kwargs))
+        return (0, "configured coding", "")
 
-    async def fix_review(self, *_args: object, **_kwargs: object) -> object:
-        raise AssertionError("configured plugin inference must not start")
+    async def fix_review(
+        self, *_args: object, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        self.fix_review_calls.append(dict(kwargs))
+        return (0, "configured fix", "")
 
-    async def run_prompt(self, *_args: object, **_kwargs: object) -> object:
-        raise AssertionError("configured plugin inference must not start")
+    async def run_prompt(
+        self, *_args: object, **_kwargs: object
+    ) -> tuple[int, str, str]:
+        return (0, "configured prompt", "")
 
-    async def diagnose_error(self, *_args: object, **_kwargs: object) -> object:
-        raise AssertionError("configured plugin inference must not start")
+    async def diagnose_error(
+        self, *_args: object, **_kwargs: object
+    ) -> tuple[int, str, str]:
+        return (0, "FIX\nconfigured diagnosis", "")
+
+    def create_usage_provider(self, **_kwargs: object) -> None:
+        return None
+
+
+class TestUsageProvider:
+    def __init__(self) -> None:
+        self.snapshot: object | None = None
+        self.consecutive_failures = 0
+        self.fetch_count = 0
+        self.invalidated = False
+
+    def fetch(self) -> object | None:
+        self.fetch_count += 1
+        return self.snapshot
+
+    def invalidate_cache(self) -> None:
+        self.invalidated = True
+
+
+class TelemetryTestPlugin(ConfiguredTestPlugin):
+    name = "telemetry"
+    display_name = "Telemetry Test Coder"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.usage_provider = TestUsageProvider()
+
+    def create_usage_provider(self, **_kwargs: object) -> TestUsageProvider:
+        return self.usage_provider
 
 
 class ClaudeOverridePlugin(ClaudePlugin):
@@ -46,6 +93,9 @@ class ClaudeOverridePlugin(ClaudePlugin):
 
     def check_auth(self, **_kwargs: object) -> dict[str, str]:
         return {"status": "ok", "detail": "configured plugin auth"}
+
+    def create_usage_provider(self, **_kwargs: object) -> None:
+        return None
 
 
 class DigitLeadingTestPlugin(ConfiguredTestPlugin):
@@ -96,6 +146,10 @@ def build_test_plugin() -> ConfiguredTestPlugin:
     global FACTORY_CALLS
     FACTORY_CALLS += 1
     return ConfiguredTestPlugin()
+
+
+def build_telemetry_plugin() -> TelemetryTestPlugin:
+    return TelemetryTestPlugin()
 
 
 def build_claude_override() -> ClaudeOverridePlugin:

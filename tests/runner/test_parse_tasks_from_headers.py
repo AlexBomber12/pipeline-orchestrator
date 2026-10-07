@@ -273,7 +273,7 @@ def test_helper_raises_non_legacy_header_errors(
                 "pr_id": "PR-011",
                 "title": "Invalid coder",
                 "branch": "pr-011-invalid-coder",
-                "coder": "invalid",
+                "coder": "invalid/coder",
             }
         ]
     }

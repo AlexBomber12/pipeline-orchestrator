@@ -41,7 +41,7 @@ from src.cancellation.storage import (
     list_pending_guardrail_decisions,
 )
 from src.coders import build_coder_registry
-from src.config import AppConfig, CoderType, RepoConfig, load_config
+from src.config import BUILTIN_CODER_IDS, AppConfig, RepoConfig, load_config
 from src.daemon.github_rate_limit import (
     RateLimitBudget,
     read_graphql_budget,
@@ -194,14 +194,14 @@ def _page_rendered_at_iso() -> str:
 
 def _daemon_default_coder_name(config: AppConfig) -> str:
     """Return the daemon-level default coder name."""
-    return config.daemon.coder.value
+    return config.daemon.coder
 
 
 def _repo_coder_form_value(repo_config: RepoConfig | None) -> str:
     """Return the raw repo-level coder selection for the detail form."""
     if repo_config is None or repo_config.coder is None:
         return "any"
-    return repo_config.coder.value
+    return repo_config.coder
 
 
 def _repo_coder_label(coder: str | None) -> str:
@@ -687,7 +687,7 @@ async def _repo_template_context(
         "coders": [
             plugin
             for plugin in registry.list_coders()
-            if plugin.name in CoderType
+            if plugin.name in BUILTIN_CODER_IDS
         ],
         "effective_coder": effective_coder,
         "active_rate_limit_coder": active_rate_limit_coder,

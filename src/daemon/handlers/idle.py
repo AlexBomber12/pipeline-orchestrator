@@ -933,7 +933,7 @@ class IdleMixin:
             return
 
         pin = self._active_task_coder_pin()
-        if pin in ("claude", "codex"):
+        if pin and pin != "any":
             await self._refresh_auth_status_cache()
             if self._select_coder(allow_exploration=False) is None:
                 self.state.current_pr = None
@@ -1226,8 +1226,7 @@ class IdleMixin:
         )
         clearable = other_coder
         if clearable:
-            self._claude_usage_provider.invalidate_cache()
-            self._codex_usage_provider.invalidate_cache()
+            self._invalidate_usage_caches()
             label = (
                 f"{coder_name.capitalize()} active while {pause_coder} remains "
                 f"rate-limited until {self.state.rate_limited_until.isoformat()}"

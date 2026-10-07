@@ -8,6 +8,7 @@ import pytest
 import src.config as config_module
 from src.config import (
     AppConfig,
+    DaemonConfig,
     RepoConfig,
     TrustedReviewerIdentity,
     add_repository,
@@ -1188,11 +1189,29 @@ def test_repo_config_coder_override_codex() -> None:
     assert repo.coder == CoderType.CODEX
 
 
+def test_configured_plugin_ids_are_valid_coder_selections() -> None:
+    cfg = AppConfig(
+        repositories=[
+            RepoConfig(url="https://github.com/example/repo", coder="third")
+        ],
+        daemon=DaemonConfig(coder="third"),
+    )
+
+    assert cfg.daemon.coder == "third"
+    assert cfg.repositories[0].coder == "third"
+
+
+@pytest.mark.parametrize("coder", ["any", "bad/plugin", "", " space"])
+def test_config_coder_selection_rejects_non_plugin_ids(coder: str) -> None:
+    with pytest.raises(ValueError, match="coder"):
+        DaemonConfig(coder=coder)
+
+
 def test_update_daemon_config_coder(tmp_path: Path) -> None:
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text("daemon: {}\n", encoding="utf-8")
     updated = update_daemon_config(path=str(cfg_path), coder="codex")
-    assert updated.daemon.coder.value == "codex"
+    assert updated.daemon.coder == "codex"
 
 
 def test_update_daemon_config_codex_model(tmp_path: Path) -> None:
@@ -1288,7 +1307,7 @@ def test_update_repository_coder_override(tmp_path: Path) -> None:
         coder="codex",
     )
     assert cfg.repositories[0].coder is not None
-    assert cfg.repositories[0].coder.value == "codex"
+    assert cfg.repositories[0].coder == "codex"
 
 
 def test_update_repository_coder_clear(tmp_path: Path) -> None:

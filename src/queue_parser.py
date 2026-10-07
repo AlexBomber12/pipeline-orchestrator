@@ -11,6 +11,7 @@ from pathlib import Path
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 
+from src.coder_ids import validate_coder_plugin_id
 from src.models import QueueTask, TaskStatus
 from src.subsource_registry import SuppressionReason
 
@@ -74,7 +75,6 @@ COMPLEXITY_SYNONYMS: dict[str, str] = {
     "xl": "high",
 }
 _COMPLEXITY_VALUES: frozenset[str] = frozenset({"low", "medium", "high"})
-_CODER_VALUES = {"claude", "codex", "any"}
 
 
 def _normalize_frontmatter_status(value: str) -> str:
@@ -504,10 +504,12 @@ def _parse_task_header_lines(
                 )
 
     coder = fields.get("coder") or "any"
-    if coder not in _CODER_VALUES:
+    try:
+        validate_coder_plugin_id(coder, allow_any=True)
+    except ValueError:
         issues.append(
-            f"{task_path}: invalid Coder {coder!r}; expected one of "
-            f"{sorted(_CODER_VALUES)}"
+            f"{task_path}: invalid Coder {coder!r}; expected 'any' or a stable "
+            "plugin ID using only letters, digits, underscores, and hyphens"
         )
 
     if historical and "status" in fields:

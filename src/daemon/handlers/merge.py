@@ -111,6 +111,7 @@ class MergeMixin:
                     if "CONFLICT" in (
                         merge_result.stdout + merge_result.stderr
                     ):
+                        await self._refresh_auth_status_cache()
                         selected = self._get_auxiliary_coder()
                         if selected is None:
                             git_ops._git(
@@ -475,9 +476,12 @@ class MergeMixin:
         configured_coder = (
             self.repo_config.coder or self.app_config.daemon.coder
         )
-        coder_name = configured_coder.value
-        model = self._registry.get(coder_name).resolve_model(
-            self.app_config.daemon
+        coder_name = configured_coder
+        plugin = self._registry.get_optional(coder_name)
+        model = (
+            plugin.resolve_model(self.app_config.daemon)
+            if plugin is not None
+            else "unknown"
         )
         return coder_name, model
 

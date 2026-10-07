@@ -350,6 +350,20 @@ def test_build_registry_rejects_route_unsafe_plugin_id(plugin_id: str) -> None:
     assert "failed at plugin ID validation" in message
 
 
+def test_build_registry_rejects_task_inheritance_plugin_id() -> None:
+    reference = "tests.configured_coder_plugin:build_test_plugin"
+    config = AppConfig(coder_plugins={"any": reference})
+
+    with pytest.raises(CoderPluginConfigurationError) as caught:
+        build_coder_registry(config)
+
+    message = str(caught.value)
+    assert repr("any") in message
+    assert repr(reference) in message
+    assert "failed at plugin ID validation" in message
+    assert "reserved for task inheritance" in message
+
+
 def test_build_registry_rejects_reserved_infrastructure_plugin_id() -> None:
     reference = "tests.configured_coder_plugin:build_test_plugin"
     config = AppConfig(coder_plugins={"gh": reference})

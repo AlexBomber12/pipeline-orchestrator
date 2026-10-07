@@ -590,12 +590,28 @@ Branch: pr-084-task-header-parser
 - Type: feature
 - Complexity: medium
 - Depends on: none
-- Coder: cursor
+- Coder: invalid/coder
 """,
     )
 
     with pytest.raises(QueueValidationError, match="invalid Coder"):
         parse_task_header(task_path)
+
+
+def test_parse_task_header_accepts_configured_plugin_id(tmp_path: Path) -> None:
+    task_path = _write_task_file(
+        tmp_path,
+        """# PR-084: Task file header parser
+
+Branch: pr-084-task-header-parser
+- Type: feature
+- Complexity: medium
+- Depends on: none
+- Coder: cursor
+""",
+    )
+
+    assert parse_task_header(task_path).coder == "cursor"
 
 
 def test_parse_task_header_multiple_deps(tmp_path: Path) -> None:

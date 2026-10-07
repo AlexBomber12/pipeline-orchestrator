@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from src.config import DEFAULT_CODER_PLUGINS
 from src.daemon.notifications import send_spend_ceiling_warning
 from src.daemon.selector import resolve_pause_coder
 from src.models import PipelineState
@@ -99,11 +100,9 @@ class RateLimitMixin:
     """Rate-limit detection and proactive usage checks."""
 
     async def _fetch_usage_snapshot(self, coder_name: str) -> UsageSnapshot | None:
-        provider = (
-            self._claude_usage_provider
-            if coder_name == "claude"
-            else self._codex_usage_provider
-        )
+        provider = self._usage_provider_for(coder_name)
+        if provider is None:
+            return None
         return await asyncio.to_thread(provider.fetch)
 
     async def _check_spend_ceiling(self, coder_name: str) -> bool:
@@ -303,7 +302,7 @@ class RateLimitMixin:
         if proactive_coder is not None:
             return proactive_coder
         if self.repo_config.coder is not None:
-            return self.repo_config.coder.value
+            return self.repo_config.coder
         return self._get_coder()[0]
 
     def _legacy_pause_active(self, now: datetime) -> bool:
@@ -416,8 +415,19 @@ class RateLimitMixin:
         self.state.rate_limit_reactive_coder = None
 
     def _invalidate_usage_caches(self) -> None:
-        self._claude_usage_provider.invalidate_cache()
-        self._codex_usage_provider.invalidate_cache()
+        providers = {
+            id(provider): provider
+            for provider in (
+                *self._usage_providers.values(),
+                self._claude_usage_provider,
+                self._codex_usage_provider,
+            )
+            if provider is not None
+        }
+        for provider in providers.values():
+            invalidate = getattr(provider, "invalidate_cache", None)
+            if callable(invalidate):
+                invalidate()
 
     async def _proactive_usage_check(self, proactive_coder: str | None = None) -> bool:
         """Return True if CLI calls are allowed, False if usage threshold breached.
@@ -430,15 +440,14 @@ class RateLimitMixin:
         ``claude_cli``) check the correct provider's quota.
         """
         coder_name = proactive_coder or self._get_coder()[0]
-        provider = (
-            self._claude_usage_provider
-            if coder_name == "claude"
-            else self._codex_usage_provider
-        )
+        provider = self._usage_provider_for(coder_name)
+        if provider is None:
+            self._usage_degraded_logged = False
+            return True
         snapshot = await asyncio.to_thread(provider.fetch)
         if snapshot is None:
             if (
-                provider.consecutive_failures >= 10
+                getattr(provider, "consecutive_failures", 0) >= 10
                 and not self._usage_degraded_logged
             ):
                 self._usage_degraded_logged = True
@@ -572,6 +581,22 @@ class RateLimitMixin:
         triggered = False
         limit_type = "session"
         pause_min = 30
+
+        plugin = self._registry.get_optional(coder_name)
+        default_reference = DEFAULT_CODER_PLUGINS.get(coder_name)
+        uses_detailed_builtin_parser = (
+            plugin is not None
+            and default_reference is not None
+            and self._registry.reference_for(coder_name) == default_reference
+        )
+        if plugin is not None and not uses_detailed_builtin_parser:
+            try:
+                triggered = any(
+                    pattern.search(stderr)
+                    for pattern in plugin.rate_limit_patterns()
+                )
+            except Exception:
+                triggered = False
 
         if re.search(r"\b429\b", stderr):
             triggered = True

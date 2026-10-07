@@ -804,6 +804,7 @@ async def _pr190_no_breach_monitor_async(
     self: object,
     breach_dir: str,
     run_id: str,
+    coder_name: str,
     claude_task: asyncio.Task,  # type: ignore[type-arg]
     breach_flag: dict[str, bool],
 ) -> None:

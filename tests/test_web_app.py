@@ -3563,7 +3563,7 @@ def test_put_repo_detail_coder_succeeds_when_publish_wake_fails(
     assert response.status_code == 200
     reloaded = load_config(str(two_repo_config))
     assert reloaded.repositories[0].coder is not None
-    assert reloaded.repositories[0].coder.value == "codex"
+    assert reloaded.repositories[0].coder == "codex"
     assert any(
         "publish_wake failed for example__alpha" in rec.getMessage()
         and "settings" in rec.getMessage()

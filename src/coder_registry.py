@@ -243,6 +243,7 @@ class CoderRegistry:
     def __init__(self) -> None:
         self._plugins: dict[str, CoderPlugin] = {}
         self._references: dict[str, str] = {}
+        self._usage_providers: dict[str, UsageProvider | None] = {}
 
     def register(
         self,
@@ -261,6 +262,10 @@ class CoderRegistry:
             raise KeyError(f"Unknown coder: {name}")
         return self._plugins[name]
 
+    def get_optional(self, name: str) -> CoderPlugin | None:
+        """Return a loaded plugin, or ``None`` for an unavailable ID."""
+        return self._plugins.get(name)
+
     def list_coders(self) -> list[CoderPlugin]:
         return list(self._plugins.values())
 
@@ -271,3 +276,14 @@ class CoderRegistry:
         """Return the startup factory reference for a configured plugin."""
         self.get(name)
         return self._references.get(name)
+
+    def set_usage_providers(
+        self,
+        providers: dict[str, UsageProvider | None],
+    ) -> None:
+        """Replace the provider snapshot created for the active config."""
+        self._usage_providers = dict(providers)
+
+    def usage_providers(self) -> dict[str, UsageProvider | None]:
+        """Return a copy of the shared provider snapshot."""
+        return dict(self._usage_providers)
