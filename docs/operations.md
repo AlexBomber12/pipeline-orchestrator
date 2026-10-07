@@ -44,9 +44,9 @@ TTL. Authorization headers, token, password, and passphrase assignments or
 long-option arguments,
 cookies, credential-bearing absolute or scheme-relative URL userinfo/query
 parameters (including percent-encoded parameter names), recognizable token
-shapes, private-key blocks, and recognizable JSON credential documents are not
-exported, including nested documents and documents serialized inside log
-strings and structured header name/value pairs in JSON-list or Python-tuple
+shapes including JWTs, private-key blocks, and recognizable JSON credential
+documents are not exported, including nested documents and documents serialized
+inside log strings and structured header name/value pairs in JSON-list or Python-tuple
 form. Complete and interrupted private-key blocks are both omitted using a
 bounded single-pass boundary scan.
 Lines with recognizable credential keys are omitted conservatively when they

@@ -70,6 +70,7 @@ _CREDENTIAL_DOCUMENT_KEYS = frozenset(
         "credentials",
         "cookie",
         "idtoken",
+        "jwt",
         "oauthtoken",
         "passphrase",
         "password",
@@ -124,6 +125,7 @@ _RECOGNIZABLE_SECRET = tuple(
         r"\bAIza[A-Za-z0-9_-]{35}\b",
         r"\bxox[boaprs]-(?:[0-9]+-){2,}[A-Za-z0-9-]{24,}\b",
         r"\b(?:sk|rk)_(?:test|live)_[A-Za-z0-9]{24,}\b",
+        r"\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b",
     )
 )
 

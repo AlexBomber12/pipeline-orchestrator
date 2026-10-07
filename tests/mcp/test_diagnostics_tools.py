@@ -452,6 +452,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     deeply_nested: object = {"private_key": "deep-document-secret"}
     for _ in range(1_100):
         deeply_nested = {"nested": deeply_nested}
+    bare_jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.signatureValue"
     credential_log = "\n".join(
         (
             "curl -H 'Authorization: ApiKey inline-auth-secret' https://example.test",
@@ -487,6 +488,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "auth[password]=nested-bracket-secret",
             "SSH_KEY_PASSPHRASE=passphrase-assignment-secret",
             "tool --passphrase passphrase-option-secret",
+            "jwt=jwt-assignment-secret",
+            bare_jwt,
             'tool --password cli-option-secret --token "quoted cli token"',
             r'tool --password "abc\"escaped-option-secret" token="abc\"escaped-assignment-secret"',
             "PASSWORD = spaced-assignment-secret",
@@ -559,6 +562,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "hidden-pair-metadata" not in exported
     assert "hidden-camel-metadata" not in exported
     assert "serialized-metadata" not in exported
+    assert bare_jwt not in exported
     for secret in (
         "inline-auth-secret",
         "cookie-secret",
@@ -592,6 +596,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "nested-bracket-secret",
         "passphrase-assignment-secret",
         "passphrase-option-secret",
+        "jwt-assignment-secret",
         "cli-option-secret",
         "quoted cli token",
         "escaped-option-secret",
