@@ -24,19 +24,125 @@ Runtime diagnostics are available on the primary MCP service, whose published
 port remains bound to localhost. The same service container runs two
 streamable-HTTP listeners: the host port maps to the opted-in diagnostics
 listener on container port 5174, while the optional `cloudflared` profile keeps
-its existing `mcp:5173` target and reaches a restricted listener started with
-`MCP_RUNTIME_DIAGNOSTICS=0`. Existing non-diagnostic MCP tools remain available
-through the tunnel, but runtime status is not registered there.
+its existing `mcp:5173` target. With `MCP_REMOTE_DIAGNOSTICS=0` (the default),
+the tunnel listener has no Redis access and does not register runtime
+diagnostics, preserving its previous behavior.
 
 Runtime diagnostics are opt-in at server startup. The MCP service entrypoint
-sets `MCP_RUNTIME_DIAGNOSTICS=1` only for its localhost-published listener; an
-unset value defaults to disabled for direct and custom deployments. Operators
-starting `python -m src.mcp` outside Compose must explicitly set the variable
+sets `MCP_RUNTIME_DIAGNOSTICS=1` for the localhost-published listener. Operators
+starting `python -m src.mcp` outside Compose must explicitly set that variable
 and retain an equivalent loopback-only or authenticated access boundary.
 
 Raw CLI, CI, event, artifact, daemon-stdout, and live-stream retrieval is not
 exposed. Persistent capture and a separately reviewed safe log-export contract
 remain follow-up work.
+
+### Protected remote diagnostics with Cloudflare Access
+
+Port 5173 can expose the same structured diagnostics through the existing
+Cloudflare Tunnel target, `mcp:5173`. This mode is disabled by default. When it
+is enabled, the origin authenticates every MCP HTTP request before MCP session
+or tool dispatch. The local port 5174 listener remains loopback-only and does
+not require Cloudflare headers.
+
+Set all four variables in the Compose environment before enabling the mode:
+
+```dotenv
+MCP_REMOTE_DIAGNOSTICS=1
+MCP_PUBLIC_HOSTNAME=mcp.example.com
+MCP_CLOUDFLARE_ACCESS_ISSUER=https://example-team.cloudflareaccess.com
+MCP_CLOUDFLARE_ACCESS_AUDIENCE=<64-character-application-AUD-tag>
+```
+
+`MCP_CLOUDFLARE_ACCESS_ISSUER` is the Cloudflare One team domain shown under
+Zero Trust **Settings > Custom Pages > Team domain**. Use the exact HTTPS
+issuer, without a trailing slash, path, or port. Copy the immutable Application
+Audience (AUD) tag from **Access controls > Applications > Configure >
+Additional settings** into `MCP_CLOUDFLARE_ACCESS_AUDIENCE`.
+`MCP_PUBLIC_HOSTNAME` is the public DNS hostname routed by the existing tunnel
+to `http://mcp:5173`; it is also the explicit host/origin allowlist used by the
+MCP transport safeguards. Startup fails before binding port 5173 if protected
+mode is requested with missing or malformed values. Do not put these settings
+in the `cloudflared`-only `.cloudflared.env` unless they are also provided to
+the `mcp` service; Compose interpolation normally reads them from the shell or
+the project `.env` file.
+
+#### Cloudflare and ChatGPT setup
+
+1. Create or edit the Cloudflare Access application for the MCP public
+   hostname. Keep the tunnel service target as `http://mcp:5173`. Restrict its
+   Allow policy to the intended operator identity; do not use a broad email
+   domain, Everyone rule, service token, or bypass rule for this interactive
+   connection.
+2. Under the Access application's Advanced settings, enable **Managed OAuth**.
+   Cloudflare then owns OAuth discovery, authorization, code exchange, token
+   refresh, and policy enforcement. It publishes discovery below the public
+   application hostname and returns the appropriate `401` challenge at the
+   edge. This service does not publish a competing OAuth server or scopes.
+3. In Managed OAuth dynamic-client settings, allow the exact production
+   redirect URI displayed by ChatGPT when the MCP connection is created.
+   Current ChatGPT clients prefer Client ID Metadata Documents when the
+   authorization server supports them and otherwise use dynamic client
+   registration. The stable current client metadata URL is
+   `https://chatgpt.com/oauth/client.json`, and the stable redirect is
+   `https://chatgpt.com/connector_platform_oauth_redirect` only when the
+   authorization server advertises and returns RFC 9207 issuer identification.
+   Otherwise ChatGPT displays callback-specific URLs under
+   `https://chatgpt.com/oauth/{callback_id}/client.json` and
+   `https://chatgpt.com/connector/oauth/{callback_id}`. Treat the values shown
+   in the connection management page as authoritative and allowlist those exact
+   values; do not guess a callback ID or advertise invented scopes.
+4. Use a short Managed OAuth access-token lifetime (Cloudflare recommends
+   5–15 minutes for agents) and a longer grant session as appropriate. Save the
+   Access application, then deploy the MCP configuration and recreate the
+   `mcp` container. Do not change credentials in the repository.
+5. Add or refresh the MCP connection in ChatGPT using
+   `https://mcp.example.com/mcp`. If the connection predates the authentication
+   change, disconnect and reconnect it so discovery and client registration run
+   again. Complete the browser sign-in as the intended operator.
+
+The edge-to-origin flow has two distinct credentials. ChatGPT receives an
+opaque Managed OAuth access token and sends it to Cloudflare; it is not a JWT
+and this origin never decodes it. Cloudflare validates that token, reapplies the
+Access policy, and forwards a signed `Cf-Access-Jwt-Assertion` header. The MCP
+origin accepts only that header, verifies its RS256 signature against keys from
+`<issuer>/cdn-cgi/access/certs`, and checks the configured issuer, audience,
+expiration, and other supplied time claims on every request. Cookies, identity
+headers, bearer-token presence, decoded-but-unverified claims, and MCP session
+IDs never grant access.
+
+#### Verification and rollback
+
+After deployment, verify these separately:
+
+- Direct requests to the origin or public `/mcp` endpoint without a valid
+  Access login fail with a fixed authentication response and expose no tool
+  data. A previously issued MCP session ID must fail in the same way without a
+  fresh assertion.
+- An allowed operator can initialize the streamable-HTTP connection, discover
+  only the existing allowlisted tools, and call `get_orchestrator_status`.
+  Confirm that no log, artifact, event, credential, arbitrary-file, or mutation
+  tool appears.
+- A denied identity cannot complete the Access policy. Rotate the Access
+  signing key in a test application, reconnect, and confirm the origin accepts
+  the new key after its bounded refresh without accepting the old application
+  audience.
+
+Code deployment alone prepares the origin; it does not prove a live ChatGPT
+connection. Record live verification only after the browser authorization,
+connection initialization, tool discovery, and diagnostics call all succeed
+through the production hostname.
+
+To roll back, set `MCP_REMOTE_DIAGNOSTICS=0` and recreate the `mcp` container.
+This immediately returns port 5173 to the restricted, Redis-free tool set while
+leaving local diagnostics on port 5174 available. Then disable Managed OAuth or
+the Access application only if the public non-diagnostic MCP endpoint should no
+longer be reachable. Disconnect or refresh the ChatGPT connection after either
+change.
+
+Reference material: [Cloudflare Managed OAuth](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/),
+[Cloudflare Access JWT validation](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/),
+and [OpenAI plugin authentication](https://developers.openai.com/plugins/build/auth).
 
 ## Task format migration
 
