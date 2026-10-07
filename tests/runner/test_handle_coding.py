@@ -8,11 +8,80 @@ from pathlib import Path
 import pytest
 from src.cancellation import task_spec_content_hash, task_spec_hash_key
 from src.cancellation.storage import current_run_started_at_key
+from src.coder_login import CoderCredentialReservations
+from src.config import CoderType
 from src.daemon.handlers import coding as coding_module
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 from src.usage import UsageSnapshot
 
 from tests.runner import _helpers as h
+
+
+@pytest.mark.parametrize(
+    ("failure_site", "failure"),
+    [
+        ("checkpoint", RuntimeError("checkpoint failed")),
+        ("publish", asyncio.CancelledError()),
+    ],
+)
+def test_coding_prelaunch_failure_releases_reserved_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_site: str,
+    failure: BaseException,
+) -> None:
+    runner = h._make_runner(coder=CoderType.CODEX)
+    reservations = CoderCredentialReservations()
+    runner._credential_reservations = reservations
+    runner.state.current_task = QueueTask(
+        pr_id="PR-395",
+        title="Invocation settings",
+        status=TaskStatus.DOING,
+        branch="manual-20261008-coder-invocation-settings",
+    )
+    runner._start_current_run_record("codex", "")
+    plugin = runner._registry.get("codex")
+    coder_kwargs = asyncio.run(
+        runner._prepare_coder_invocation("codex", plugin)
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_branch_publications",
+        lambda *_args, **_kwargs: [],
+    )
+
+    async def fail_prelaunch() -> None:
+        raise failure
+
+    monkeypatch.setattr(
+        runner,
+        (
+            "_checkpoint_current_run_record"
+            if failure_site == "checkpoint"
+            else "publish_state"
+        ),
+        fail_prelaunch,
+    )
+
+    with pytest.raises(type(failure)):
+        asyncio.run(
+            runner._run_coder_with_supervision(
+                "codex",
+                plugin,
+                coder_kwargs,
+                target_branch="manual-20261008-coder-invocation-settings",
+                current_pr_id="PR-395",
+                pr_id="PR-395",
+                task_file="tasks/PR-395.md",
+                task_body="task",
+            )
+        )
+
+    location = plugin.device_login_credential_location(
+        config=runner.app_config
+    )
+    assert runner._coder_credential_reservation is None
+    assert runner._coder_invocation_active is False
+    assert reservations.reserve_login(location) is True
+    reservations.release_login(location)
 
 
 def test_handle_coding_skipped_when_spend_ceiling_exceeded(

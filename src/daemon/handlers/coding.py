@@ -484,15 +484,7 @@ class CodingMixin:
                 "owns its credential location."
             )
             return None
-        self._capture_invocation_snapshot(
-            coder_name,
-            coder_kwargs,
-            phase="coding",
-        )
-        await self._checkpoint_current_run_record()
-        await self.publish_state()
-        heartbeat = asyncio.create_task(self._publish_while_waiting("CODING"))
-        self._coder_invocation_active = True
+        heartbeat: asyncio.Task[None] | None = None
         invocation_supervised_process: SupervisedProcess | None = None
         configured_process_callback = coder_kwargs.get(
             "on_supervised_process_start"
@@ -505,6 +497,17 @@ class CodingMixin:
                 configured_process_callback(managed)
 
         try:
+            self._capture_invocation_snapshot(
+                coder_name,
+                coder_kwargs,
+                phase="coding",
+            )
+            await self._checkpoint_current_run_record()
+            await self.publish_state()
+            heartbeat = asyncio.create_task(
+                self._publish_while_waiting("CODING")
+            )
+            self._coder_invocation_active = True
             cli_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
                 plugin.run_auto_pr(
                     self.repo_path,
@@ -517,12 +520,14 @@ class CodingMixin:
                     },
                 )
             )
-        except Exception:
-            heartbeat.cancel()
-            await asyncio.gather(heartbeat, return_exceptions=True)
+        except BaseException:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
             self._coder_invocation_active = False
             self._release_coder_credentials()
             raise
+        assert heartbeat is not None
         publication_monitors: list[
             asyncio.Task[gh_prs.BranchPublication | None]
         ] = []
