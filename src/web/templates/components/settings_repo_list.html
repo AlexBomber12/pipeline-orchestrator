@@ -90,11 +90,12 @@
                         hx-trigger="change"
                         hx-target="#settings-repo-list"
                         hx-swap="innerHTML">
-                    <option value="" {% if repo.coder is none %}selected{% endif %}>Inherit</option>
-                    <option value="claude" {% if repo.coder == "claude" %}selected{% endif %}>Claude</option>
-                    <option value="codex" {% if repo.coder == "codex" %}selected{% endif %}>Codex</option>
-                    {% if repo.coder is not none and repo.coder not in ['claude', 'codex'] %}
-                    <option value="{{ repo.coder }}" selected disabled>{{ repo.coder }} (configured)</option>
+                    <option value="" {% if repo.coder is none %}selected{% endif %}>Automatic — preferred default: {{ default_coder_label }}</option>
+                    {% for coder in selectable_coders %}
+                    <option value="{{ coder.name }}" {% if repo.coder == coder.name %}selected{% endif %}>{{ coder.display_name }}</option>
+                    {% endfor %}
+                    {% if repo.coder is not none and repo.coder not in selectable_coder_ids %}
+                    <option value="{{ repo.coder }}" selected disabled>{{ repo.coder }} (unavailable)</option>
                     {% endif %}
                 </select>
             </td>

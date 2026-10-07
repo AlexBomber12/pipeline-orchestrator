@@ -157,14 +157,24 @@
                                hx-swap="innerHTML">
                         {% else %}
                         {% if coder.is_default %}
-                        <span class="text-xs font-medium text-accent">Configured default (read-only)</span>
+                        <span class="text-xs font-medium text-warn">Configured default (unavailable)</span>
                         {% else %}
-                        <span class="text-xs text-gray-500">Metadata only</span>
+                        <span class="text-xs text-gray-500">Unavailable</span>
                         {% endif %}
                         {% endif %}
                     </td>
                 </tr>
                 {% endfor %}
+                {% if unavailable_default_coder %}
+                <tr class="border-b border-white/5 last:border-0" data-unavailable-default-coder>
+                    <td class="py-3 pr-4">
+                        <div class="font-medium text-warn">{{ unavailable_default_coder }} (unavailable)</div>
+                    </td>
+                    <td class="py-3 pr-4 text-xs text-gray-500">Plugin is not loaded; saved model and effort settings are preserved.</td>
+                    <td class="py-3 pr-4 text-xs text-gray-500">Unavailable</td>
+                    <td class="py-3 align-top text-xs font-medium text-warn">Configured default (unavailable)</td>
+                </tr>
+                {% endif %}
             </tbody>
         </table>
     </div>

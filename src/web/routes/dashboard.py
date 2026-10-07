@@ -41,7 +41,7 @@ from src.cancellation.storage import (
     list_pending_guardrail_decisions,
 )
 from src.coders import build_coder_registry
-from src.config import BUILTIN_CODER_IDS, AppConfig, RepoConfig, load_config
+from src.config import AppConfig, RepoConfig, load_config
 from src.daemon.github_rate_limit import (
     RateLimitBudget,
     read_graphql_budget,
@@ -66,7 +66,11 @@ from src.sandbox.runtime_state import (
 from src.subsource_registry import all_subsources, group_for
 from src.subsource_registry import lookup as _subsource_lookup
 from src.utils import repo_slug_from_url
-from src.web.services.coder import _effective_coder_name
+from src.web.services.coder import (
+    _coder_display_name,
+    _effective_coder_name,
+    _selectable_coder_plugins,
+)
 from src.web.services.repo_state import (
     _find_repo_config_by_name,
     compute_repo_dependents_count,
@@ -204,15 +208,13 @@ def _repo_coder_form_value(repo_config: RepoConfig | None) -> str:
     return repo_config.coder
 
 
-def _repo_coder_label(coder: str | None) -> str:
+def _repo_coder_label(coder: str | None, registry: Any) -> str:
     """Return the repo-header display label for a coder selection."""
     if coder == "any":
-        return "Any (bandit)"
-    if coder == "claude":
-        return "Claude CLI"
-    if coder == "codex":
-        return "Codex"
-    return coder or ""
+        return "Automatic"
+    if coder:
+        return _coder_display_name(coder, registry)
+    return ""
 
 
 def _active_rate_limit_coder(
@@ -684,11 +686,7 @@ async def _repo_template_context(
         "guardrail_pending": guardrail_pending,
         "repo_config": repo_config,
         "daemon": config.daemon,
-        "coders": [
-            plugin
-            for plugin in registry.list_coders()
-            if plugin.name in BUILTIN_CODER_IDS
-        ],
+        "coders": _selectable_coder_plugins(registry),
         "effective_coder": effective_coder,
         "active_rate_limit_coder": active_rate_limit_coder,
         "active_rate_limit_coder_label": (
@@ -696,10 +694,17 @@ async def _repo_template_context(
         ),
         "show_rate_limit_badge": show_rate_limit_badge,
         "selected_repo_coder": selected_repo_coder,
-        "selected_repo_coder_label": _repo_coder_label(selected_repo_coder),
+        "selected_repo_coder_label": _repo_coder_label(
+            selected_repo_coder, registry
+        ),
         "active_repo_coder": active_repo_coder,
-        "active_repo_coder_label": _repo_coder_label(active_repo_coder),
+        "active_repo_coder_label": _repo_coder_label(
+            active_repo_coder, registry
+        ),
         "inherit_coder": _daemon_default_coder_name(config),
+        "inherit_coder_label": _coder_display_name(
+            _daemon_default_coder_name(config), registry
+        ),
         "coder_update_message": coder_update_message,
         "inhibitor_labels": INHIBITOR_LABELS,
         "metrics_records": (

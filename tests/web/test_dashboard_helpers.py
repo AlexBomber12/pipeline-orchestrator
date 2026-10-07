@@ -79,5 +79,7 @@ async def test_repo_template_context_uses_configured_runtime_coders(monkeypatch)
     assert [plugin.name for plugin in context["coders"]] == [
         "claude",
         "codex",
+        "third",
     ]
     assert context["coders"][0].display_name == "Configured Claude"
+    assert context["coders"][2].display_name == "Configured Test Coder"

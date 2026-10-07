@@ -32,20 +32,17 @@
          data-coder-display>
         <span class="font-mono text-gray-400">Coder</span>
         <span class="font-mono text-gray-300">
-            {% if selected_repo_coder == 'any' and active_repo_coder %}
-            {{ selected_repo_coder_label }} → {{ active_repo_coder_label }}
-            {% else %}
-            {{ selected_repo_coder_label }}
-            {% endif %}
+            Configured: {{ selected_repo_coder_label }}
         </span>
-        {% if active_repo_coder and selected_repo_coder != 'any' and active_repo_coder != selected_repo_coder %}
-        <span class="text-[11px] text-gray-500">
-            → Active: {{ active_repo_coder_label }} (via spec pin or bandit)
-        </span>
-        {% endif %}
         {% if selected_repo_coder == 'any' %}
         <span class="text-[11px] text-gray-500">
-            inherits {{ inherit_coder|capitalize }}
+            Preferred default: {{ inherit_coder_label }}
+        </span>
+        {% endif %}
+        {% set configured_effective_coder = inherit_coder if selected_repo_coder == 'any' else selected_repo_coder %}
+        {% if active_repo_coder and active_repo_coder != configured_effective_coder %}
+        <span class="text-[11px] text-gray-500">
+            Active: {{ active_repo_coder_label }} (via spec pin or bandit)
         </span>
         {% endif %}
         <a href="/settings" class="font-mono text-[11px] text-accent hover:text-accent/80">
