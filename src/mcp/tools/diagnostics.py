@@ -108,7 +108,7 @@ _SENSITIVE_CONTEXT_LINE = re.compile(
     r"refresh[_-]?token|id[_-]?token|auth[_-]?token|client[_-]?secret|"
     r"private[_-]?key(?:[_-]?id)?|secret(?:[_-]?access)?[_-]?key|secret|"
     r"password|passwd|token|(?:proxy[_-]?)?authorization|(?:set[_-]?)?cookie)"
-    r"[\\'\"]*[=:])[^\r\n]*$"
+    r"[\\'\"]*[ \t]*[=:])[^\r\n]*$"
 )
 _RECOGNIZABLE_SECRET = tuple(
     re.compile(pattern)
@@ -966,6 +966,34 @@ def _contains_credential_document_key(value: object) -> bool:
     return False
 
 
+def _json_container_end(text: str, start: int) -> int:
+    stack = [text[start]]
+    in_string = False
+    escaped = False
+    for index in range(start + 1, len(text)):
+        character = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            stack.append(character)
+        elif character in "]}":
+            expected = "[" if character == "]" else "{"
+            if stack[-1] != expected:
+                return index + 1
+            stack.pop()
+            if not stack:
+                return index + 1
+    return len(text)
+
+
 def _omit_json_credential_documents(text: str) -> tuple[str, int]:
     """Omit complete JSON objects that are recognizable credential records."""
     decoder = json.JSONDecoder()
@@ -984,6 +1012,10 @@ def _omit_json_credential_documents(text: str) -> tuple[str, int]:
             parse_failures += 1
             if parse_failures >= _MAX_JSON_PARSE_FAILURES:
                 return _CREDENTIAL_DOCUMENT_OMITTED, 1
+            end = _json_container_end(text, match.start())
+            if _SENSITIVE_CONTEXT_LINE.search(text[match.start() : end]):
+                ranges.append((match.start(), end))
+                covered_until = end
             continue
         covered_until = end
         if _contains_credential_document_key(value):

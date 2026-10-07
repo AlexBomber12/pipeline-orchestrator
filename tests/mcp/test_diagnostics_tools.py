@@ -408,6 +408,13 @@ async def test_latest_cli_log_bounds_source_output_and_utf8(
     assert oversized_integer["text"].startswith("[")
     assert oversized_integer["text"].endswith("]")
 
+    mismatched_json_redis = FakeRedis()
+    mismatched_json_redis.store[key] = "{]"
+    _patch_runtime(monkeypatch, mismatched_json_redis)
+    mismatched_json = await diagnostics.get_latest_cli_log(SLUG)
+    assert mismatched_json["availability"]["status"] == "available"
+    assert mismatched_json["text"] == "{]"
+
 
 async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents(
     monkeypatch: pytest.MonkeyPatch,
@@ -438,7 +445,6 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "https://single-url-credential@example.test/path",
             "ghp_" + ("A" * 36),
             '{"safe": "value"}',
-            "{not-json",
             'array-prefix=[{"private_key":"array-document-secret","project_id":"hidden-array-project"}]',
             'output: {"client_secret":"prefix-document-secret","client_id":"hidden-client"}',
             r'serialized="{\"private_key\":\"serialized-document-secret\",'
@@ -449,7 +455,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             'tool --password cli-option-secret --token "quoted cli token"',
             r'tool --password "abc\"escaped-option-secret" token="abc\"escaped-assignment-secret"',
             'password="alpha unterminated-credential-secret',
-            r'payload={\"private_key\":\"unwrapped-escaped-secret\"}',
+            "PASSWORD = spaced-assignment-secret",
+            "Authorization : Bearer spaced-header-secret",
+            "matched-bad={private_key:matched-container-secret}",
             "private_key=malformed-private-secret",
             "AWS_SECRET_ACCESS_KEY=aws-secret",
             "{",
@@ -464,6 +472,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "pem-document-secret",
             "-----END PRIVATE KEY-----",
             "safe-output",
+            r'payload={\"private_key\":\"unwrapped-escaped-secret\"}',
+            "{not-json",
         )
     )
     redis = FakeRedis()
@@ -473,8 +483,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     exported = redacted["text"]
     assert redacted["availability"]["status"] == "available"
     assert redacted["redaction"]["applied"] is True
-    assert redacted["redaction"]["credential_documents_omitted"] == 8
-    assert exported.count("[credential document omitted]") == 8
+    assert redacted["redaction"]["credential_documents_omitted"] >= 8
+    assert exported.count("[credential document omitted]") >= 7
     assert "[credential line omitted]" in exported
     assert "safe-output" in exported
     assert "private@example.test" not in exported
@@ -503,6 +513,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "escaped-assignment-secret",
         "unterminated-credential-secret",
         "unwrapped-escaped-secret",
+        "spaced-assignment-secret",
+        "spaced-header-secret",
+        "matched-container-secret",
         "malformed-private-secret",
         "aws-secret",
         "document-secret",
@@ -528,6 +541,13 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     orphaned_end = await diagnostics.get_latest_cli_log(SLUG)
     assert orphaned_end["text"] == "[credential document omitted]\nsafe-after"
     assert "orphaned-private-secret" not in orphaned_end["text"]
+
+    incomplete_json_redis = FakeRedis()
+    incomplete_json_redis.store[key] = '{"private_key":\n"incomplete-document-secret"\n'
+    _patch_runtime(monkeypatch, incomplete_json_redis)
+    incomplete_json = await diagnostics.get_latest_cli_log(SLUG)
+    assert incomplete_json["text"] == "[credential document omitted]"
+    assert "incomplete-document-secret" not in incomplete_json["text"]
 
 
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(

@@ -49,6 +49,8 @@ strings. Complete and interrupted private-key blocks are both omitted.
 Lines with recognizable credential keys are omitted conservatively when they
 use assignment, structured-field, header, or long-option syntax, so malformed
 or interrupted quoting cannot expose a value suffix.
+Malformed or incomplete JSON containers with credential contexts are omitted
+through their closing boundary or, when unterminated, through the source end.
 Malformed JSON probing has a fixed failure budget; if that budget is
 exhausted, export fails closed to a credential-document omission marker instead
 of blocking the MCP event loop or returning text that could not be inspected
