@@ -474,6 +474,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             '{"headers":[["Authorization","Bearer pair-auth-secret"],'
             '["Cookie","session=pair-cookie-secret"],'
             '["X-Safe","hidden-pair-metadata"]]}',
+            "headers=[('Authorization', 'Bearer tuple-auth-secret'), "
+            "('Cookie', 'session=tuple-cookie-secret')]",
             '{"dbPassword":"camel-db-secret","safe":"hidden-camel-metadata"}',
             '{"githubToken":"camel-token-secret"}',
             'tool --password cli-option-secret --token "quoted cli token"',
@@ -562,6 +564,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "structured-cookie-secret",
         "pair-auth-secret",
         "pair-cookie-secret",
+        "tuple-auth-secret",
+        "tuple-cookie-secret",
         "camel-db-secret",
         "camel-token-secret",
         "cli-option-secret",

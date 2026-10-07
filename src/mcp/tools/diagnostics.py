@@ -1091,10 +1091,11 @@ def _line_has_sensitive_context(line: str) -> bool:
             cursor += 1
 
         delimiter = line[cursor] if cursor < len(line) else ""
+        sensitive_delimiter = delimiter in {"=", ":", ","}
         option_value = candidate.startswith("--") and (
             cursor > whitespace_start or delimiter in {"=", ":"}
         )
-        if _is_sensitive_key(candidate) and (delimiter in {"=", ":"} or option_value):
+        if _is_sensitive_key(candidate) and (sensitive_delimiter or option_value):
             return True
 
         index = max(index, cursor)
