@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import tomllib
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from src import codex_cli as codex_cli_module
 from src.claude_cli import _CODER_EXECUTION_POLICY as _CLAUDE_EXECUTION_POLICY
 from src.codex_cli import (
     _CODER_EXECUTION_POLICY as _CODEX_EXECUTION_POLICY,
@@ -20,6 +22,7 @@ from src.codex_cli import (
     run_codex_async,
     run_planned_pr_async,
 )
+from src.config import AppConfig
 from src.process_supervisor import CleanupResult, CleanupStatus
 
 
@@ -83,10 +86,43 @@ def _block_until_cleanup(proc: MagicMock) -> None:
     proc.__dict__["_cleanup_returncode"] = 0
 
 
+def test_codex_environment_normalizes_explicit_and_default_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CODEX_HOME", "relative-explicit")
+
+    explicit = codex_cli_module.build_codex_environment(
+        codex_home_dir="relative-configured"
+    )
+
+    assert explicit["CODEX_HOME"] == str(tmp_path / "relative-explicit")
+
+    monkeypatch.delenv("CODEX_HOME")
+    default = codex_cli_module.build_codex_environment(
+        codex_home_dir="relative-configured"
+    )
+
+    assert default["CODEX_HOME"] == str(
+        tmp_path / "relative-configured" / ".codex"
+    )
+
+
 @pytest.mark.asyncio
 async def test_run_codex_async_success(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
     fake_proc = _make_fake_proc(stdout=b"done", stderr=b"info", returncode=0)
+    configured_home = "/tmp/configured-codex-home"
+    monkeypatch.setenv("HOME", "/tmp/daemon-home")
+    monkeypatch.setenv("CODEX_HOME", "/tmp/explicit-codex-home")
+    monkeypatch.setattr(
+        codex_cli_module,
+        "load_config",
+        lambda: AppConfig.model_validate(
+            {"auth": {"codex_home_dir": configured_home}}
+        ),
+    )
 
     async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
         captured["cmd"] = list(args)
@@ -115,6 +151,63 @@ async def test_run_codex_async_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "--config" not in cmd
     assert cmd[-1] == "do a thing"
     assert captured["kwargs"]["cwd"] == "/data/repos/demo"
+    assert captured["kwargs"]["env"]["HOME"] == "/tmp/daemon-home"
+    assert captured["kwargs"]["env"]["CODEX_HOME"] == (
+        "/tmp/explicit-codex-home"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_codex_async_keeps_reserved_credential_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    fake_proc = _make_fake_proc(returncode=0)
+    reserved_environment = {
+        "HOME": "/tmp/reserved-home",
+        "PATH": "/usr/bin",
+        "CODEX_HOME": "/tmp/reserved-codex-home",
+    }
+    monkeypatch.setattr(
+        codex_cli_module,
+        "load_config",
+        lambda: AppConfig.model_validate(
+            {
+                "auth": {
+                    "codex_home_dir": "/tmp/newly-configured-codex-home",
+                    "gh_config_dir": "/tmp/new-gh-home",
+                },
+                "daemon": {"coder_filesystem_isolation": True},
+            }
+        ),
+    )
+    monkeypatch.setattr(codex_cli_module, "is_bubblewrap_available", lambda: True)
+
+    def fake_bwrap(**kwargs: Any) -> list[str]:
+        captured["sandbox"] = kwargs
+        return kwargs["command"]
+
+    async def fake_create(*_args: Any, **kwargs: Any) -> MagicMock:
+        captured["process"] = kwargs
+        return fake_proc
+
+    monkeypatch.setattr(codex_cli_module, "build_bwrap_command", fake_bwrap)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    result = await run_codex_async(
+        "prompt",
+        "/tmp",
+        environment=reserved_environment,
+    )
+
+    assert result == (0, "", "")
+    assert captured["process"]["env"] == reserved_environment
+    assert captured["sandbox"]["coder_config_dir"] == (
+        "/tmp/reserved-codex-home"
+    )
+    assert captured["sandbox"]["additional_rw_dirs"] == [
+        "/tmp/reserved-home"
+    ]
 
 
 @pytest.mark.asyncio

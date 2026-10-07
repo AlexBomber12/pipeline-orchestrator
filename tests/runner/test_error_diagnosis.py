@@ -38,6 +38,7 @@ from typing import Any
 
 import pytest
 from src import codex_cli
+from src.coder_login import CoderCredentialReservations
 from src.coders import claude as claude_plugin_module
 from src.config import CoderType
 from src.daemon import git_ops as git_ops_module
@@ -576,6 +577,99 @@ def test_handle_error_dispatches_to_codex_plugin_when_codex_active(
         runner._track_current_coder_supervised_process
     )
     assert claude_calls == []
+
+
+def test_handle_error_device_login_deferral_preserves_diagnosis_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner()
+    runner._credential_reservations = reservations
+    codex_plugin = runner._registry.get("codex")
+    location = codex_plugin.device_login_credential_location(
+        config=runner.app_config
+    )
+    assert reservations.reserve_login(location) is True
+
+    async def must_not_run(*_args: object, **_kwargs: object) -> tuple[int, str, str]:
+        raise AssertionError("diagnosis must wait for device login")
+
+    monkeypatch.setattr(codex_plugin, "diagnose_error", must_not_run)
+    runner._get_auxiliary_coder = lambda: ("codex", codex_plugin)
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+    runner.state.current_task = QueueTask(
+        pr_id="PR-LOGIN",
+        title="Login reservation",
+        status=TaskStatus.DOING,
+        branch="pr-login",
+        task_file="tasks/PR-LOGIN.md",
+    )
+
+    asyncio.run(runner.handle_error())
+
+    assert runner._error_diagnose_count == 0
+    assert runner.state.state == PipelineState.ERROR
+    assert any("Diagnosis deferred" in item["event"] for item in runner.state.history)
+
+
+def test_handle_error_defers_usage_fetch_during_device_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner(coder=CoderType.CODEX)
+    runner._credential_reservations = reservations
+    codex_plugin = runner._registry.get("codex")
+    location = codex_plugin.device_login_credential_location(
+        config=runner.app_config
+    )
+    fetches: list[bool] = []
+    monkeypatch.setattr(
+        runner._codex_usage_provider,
+        "fetch",
+        lambda: fetches.append(True),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_get_auxiliary_coder",
+        lambda: ("codex", codex_plugin),
+    )
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+    assert reservations.reserve_login(location) is True
+
+    asyncio.run(runner.handle_error())
+
+    assert fetches == []
+    assert runner.state.state == PipelineState.ERROR
+    assert runner._error_diagnose_count == 0
+    reservations.release_login(location)
+
+
+def test_handle_error_releases_credential_reservation_on_preparation_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner()
+    runner._credential_reservations = reservations
+    codex_plugin = runner._registry.get("codex")
+    location = codex_plugin.device_login_credential_location(
+        config=runner.app_config
+    )
+
+    def fail(**_kwargs: object) -> dict[str, object]:
+        raise RuntimeError("cannot prepare")
+
+    monkeypatch.setattr(codex_plugin, "build_run_kwargs", fail)
+    runner._get_auxiliary_coder = lambda: ("codex", codex_plugin)
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+
+    with pytest.raises(RuntimeError, match="cannot prepare"):
+        asyncio.run(runner.handle_error())
+
+    assert reservations.reserve_login(location) is True
+    reservations.release_login(location)
 
 
 def test_handle_error_dispatches_to_third_coder_plugin_without_handler_edits(

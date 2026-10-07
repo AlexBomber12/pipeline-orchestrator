@@ -1,10 +1,9 @@
 """Auth status probes for the dashboard's coder/gh credential indicators.
 
-Each probe spawns a CLI subprocess (``claude --version``, ``codex login
-status``, ``gh auth status``) with a short timeout, so the dashboard can
-surface a green/red dot per coder without blocking the event loop. Probes
-read ``CONFIG_PATH`` lazily from :mod:`src.web.app` so test overrides
-``monkeypatch.setattr(web_app, "CONFIG_PATH", ...)`` continue to apply.
+Coder probes run through the Redis bridge under daemon process ownership;
+only the infrastructure ``gh auth status`` probe runs in the web service.
+Configuration is read lazily from :mod:`src.web.app` so test overrides of
+``CONFIG_PATH`` continue to apply.
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ from src.coder_registry import (
     coder_auth_payload,
 )
 from src.coders import build_coder_registry
-from src.config import DEFAULT_CODER_PLUGINS, load_config
+from src.config import load_config
 
 _AUTH_CHECK_TIMEOUT_SEC = 5
 
@@ -176,14 +175,11 @@ async def _bounded_coder_auth_probe(
             f"{plugin.display_name} auth check is unavailable",
             "probe_unavailable",
         )
-    if reference != DEFAULT_CODER_PLUGINS.get(plugin_id):
-        return await _daemon_coder_auth_probe(
-            plugin_id,
-            reference,
-            plugin.display_name,
-        )
-    probe = _check_claude_auth if plugin_id == "claude" else _check_codex_auth
-    return await asyncio.to_thread(probe, registry)
+    return await _daemon_coder_auth_probe(
+        plugin_id,
+        reference,
+        plugin.display_name,
+    )
 
 
 async def _daemon_coder_auth_probe(
@@ -191,7 +187,7 @@ async def _daemon_coder_auth_probe(
     reference: str,
     display_name: str,
 ) -> dict[str, Any]:
-    """Ask the daemon to own a configured plugin auth probe."""
+    """Ask the daemon to own a coder auth probe."""
     from src.web import app as _app
 
     bridge = getattr(_app.app.state, "plugin_bridge", None)
@@ -242,12 +238,9 @@ async def _collect_auth_status(
 ) -> dict[str, dict[str, Any]]:
     """Return auth status for every registered coder plus GitHub CLI.
 
-    Each probe invokes a blocking ``subprocess.run`` call with a 5s
-    timeout, so they would block the event loop if awaited directly from
-    an async handler. Dispatching them through ``asyncio.to_thread`` and
-    ``asyncio.gather`` moves the blocking work onto the default thread
-    pool and runs probes concurrently, so one slow or missing CLI does not
-    serially delay the remaining registered plugins and infrastructure probe.
+    Coder probes are concurrent daemon bridge requests. The local, blocking
+    GitHub CLI probe runs in the default thread pool alongside them, so one
+    slow or missing probe does not serially delay the others.
     """
     active_registry = registry or build_coder_registry()
     plugin_ids = active_registry.coder_names()

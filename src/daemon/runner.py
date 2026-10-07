@@ -30,6 +30,7 @@ import subprocess
 import uuid
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any, Coroutine
 
@@ -54,7 +55,12 @@ from src.cancellation.availability import (
     is_operator_available,
 )
 from src.coder_auth import isolated_auth_probe
-from src.coder_registry import CoderPlugin, CoderRegistry
+from src.coder_login import CoderCredentialReservations
+from src.coder_registry import (
+    CoderPlugin,
+    CoderRegistry,
+    resolve_device_login_credential_location,
+)
 from src.coders import build_coder_registry
 from src.config import (
     DEFAULT_CODER_PLUGINS,
@@ -333,6 +339,7 @@ class PipelineRunner(
         codex_usage_provider: UsageProvider | None,
         registry: CoderRegistry | None = None,
         usage_providers: Mapping[str, UsageProvider | None] | None = None,
+        credential_reservations: CoderCredentialReservations | None = None,
     ) -> None:
         self.repo_config = repo_config
         self._app_config = app_config
@@ -439,9 +446,13 @@ class PipelineRunner(
         self._selector_rng = random.Random()
         self._auth_status_cache: dict[str, dict[str, str]] = {}
         self._auth_status_cache_expires_at: datetime | None = None
+        self._auth_status_cache_credential_versions: dict[str, int] = {}
+        self._usage_credential_versions: dict[str, tuple[str, int]] = {}
         self._current_coder_process: asyncio.subprocess.Process | None = None
         self._current_coder_supervised_process: SupervisedProcess | None = None
         self._coder_invocation_active = False
+        self._credential_reservations = credential_reservations
+        self._coder_credential_reservation: str | None = None
         self._coder_cleanup_failure_detail: str | None = None
         self._coder_cleanup_error_reported = False
         self._retry_command_owner = f"{os.getpid()}:{uuid.uuid4()}"
@@ -1032,20 +1043,91 @@ class PipelineRunner(
     async def _refresh_auth_status_cache(self) -> None:
         """Refresh cached coder auth state off the event loop."""
         now = datetime.now(timezone.utc)
+        names = self._registry.coder_names()
+        credential_locations: dict[str, str] = {}
+        credential_environments: dict[str, dict[str, str]] = {}
+        invalid_locations: set[str] = set()
+        credential_versions: dict[str, int] = {}
+        login_blocked: set[str] = set()
+        if self._credential_reservations is not None:
+            for name in names:
+                try:
+                    location = self._device_login_credential_location(name)
+                except Exception:
+                    invalid_locations.add(name)
+                    continue
+                if location is not None:
+                    try:
+                        environment = self._credential_bound_coder_environment(
+                            name,
+                            location,
+                        )
+                    except Exception:
+                        invalid_locations.add(name)
+                        continue
+                    credential_locations[name] = location
+                    if environment is not None:
+                        credential_environments[name] = environment
+            credential_versions = {
+                name: self._credential_reservations.credential_version(location)
+                for name, location in credential_locations.items()
+            }
+            login_blocked = {
+                name
+                for name, location in credential_locations.items()
+                if self._credential_reservations.login_active(location)
+            }
         if (
             self._auth_status_cache
             and self._auth_status_cache_expires_at is not None
             and now < self._auth_status_cache_expires_at
+            and not invalid_locations
+            and credential_versions
+            == self._auth_status_cache_credential_versions
         ):
+            for name in login_blocked:
+                self._auth_status_cache[name] = {
+                    "status": "ok",
+                    "detail": "Device login in progress",
+                }
             return
 
         async def _probe(name: str) -> dict[str, str]:
+            if name in invalid_locations:
+                return {"status": "error"}
+            location = credential_locations.get(name)
+            reserved = False
+            if location is not None and self._credential_reservations is not None:
+                if not self._credential_reservations.reserve_coder(location):
+                    return {
+                        "status": "ok",
+                        "detail": "Device login in progress",
+                    }
+                reserved = True
             try:
                 plugin = self._registry.get(name)
                 reference = self._registry.reference_for(name)
+                environment = credential_environments.get(name)
+                check_auth = plugin.check_auth
+                if environment is not None:
+                    check_auth = partial(
+                        check_auth,
+                        environment=dict(environment),
+                    )
+
+                async def _threaded_check_auth() -> dict[str, Any]:
+                    if reserved:
+                        return await self._run_reserved_sync_reader(
+                            check_auth
+                        )
+                    return await asyncio.to_thread(check_auth)
+
                 if reference != DEFAULT_CODER_PLUGINS.get(name):
                     if reference is None:
-                        return await asyncio.to_thread(plugin.check_auth)
+                        return await _threaded_check_auth()
+                    probe_kwargs: dict[str, Any] = {}
+                    if environment is not None:
+                        probe_kwargs["env"] = dict(environment)
                     return await isolated_auth_probe(
                         name,
                         reference,
@@ -1054,18 +1136,33 @@ class PipelineRunner(
                             "PO_CONFIG_PATH",
                             "config.yml",
                         ),
+                        **probe_kwargs,
                     )
-                return await asyncio.to_thread(plugin.check_auth)
+                return await _threaded_check_auth()
             except Exception:
                 return {"status": "error"}
+            finally:
+                if reserved and self._credential_reservations is not None:
+                    self._credential_reservations.release_coder(location)
 
         # The startup-loaded registry is authoritative. Configured plugins use
         # the killable worker boundary; adding a definition during hot reload
         # cannot add it to this name set until the daemon restarts.
-        names = self._registry.coder_names()
         results = await asyncio.gather(*(_probe(name) for name in names))
+        for index, name in enumerate(names):
+            location = credential_locations.get(name)
+            if (
+                location is not None
+                and self._credential_reservations is not None
+                and self._credential_reservations.login_active(location)
+            ):
+                results[index] = {
+                    "status": "ok",
+                    "detail": "Device login in progress",
+                }
         self._auth_status_cache = dict(zip(names, results, strict=True))
         self._auth_status_cache_expires_at = now + timedelta(minutes=5)
+        self._auth_status_cache_credential_versions = credential_versions
 
     def _load_current_task_metadata(self) -> tuple[str, str]:
         """Return ``(task_type, complexity)`` for the active task if available."""
@@ -2298,6 +2395,130 @@ class PipelineRunner(
             raise RuntimeError("cannot replace an outstanding coder process")
         self._current_coder_process = proc
 
+    def coder_credential_location_in_use(
+        self, credential_location: str
+    ) -> bool:
+        """Return whether this runner owns a coder using that auth location."""
+        if not self._coder_invocation_active or not self.state.coder:
+            return False
+        plugin = self._registry.get_optional(self.state.coder)
+        if plugin is None:
+            return False
+        resolver = getattr(plugin, "device_login_credential_location", None)
+        if not callable(resolver):
+            return False
+        try:
+            active_location = resolver(config=self.app_config)
+        except Exception:
+            return False
+        return (
+            isinstance(active_location, str)
+            and active_location == credential_location
+        )
+
+    def _credential_bound_coder_environment(
+        self,
+        coder_name: str,
+        credential_location: str,
+    ) -> dict[str, str]:
+        """Return the plugin environment for reserved credentials."""
+        plugin = self._registry.get_optional(coder_name)
+        builder = getattr(plugin, "build_credential_environment", None)
+        return dict(
+            builder(
+                config=self.app_config,
+                credential_location=credential_location,
+            )
+        )
+
+    def _bind_reserved_coder_run_kwargs(
+        self,
+        coder_name: str,
+        credential_location: str,
+        invocation_kwargs: dict[str, Any],
+    ) -> None:
+        """Apply optional plugin context for the exact reserved credentials."""
+        environment = self._credential_bound_coder_environment(
+            coder_name,
+            credential_location,
+        )
+        bound_kwargs = {"environment": environment}
+        conflicts = invocation_kwargs.keys() & bound_kwargs.keys()
+        if conflicts:
+            raise ValueError(
+                "credential-bound coder kwargs conflict with invocation kwargs: "
+                + ", ".join(sorted(conflicts))
+            )
+        invocation_kwargs.update(bound_kwargs)
+
+    def _reserve_coder_credentials(
+        self,
+        coder_name: str,
+        *,
+        invocation_kwargs: dict[str, Any] | None = None,
+    ) -> bool:
+        """Reserve this coder's credential location against device login."""
+        if self._coder_credential_reservation is not None:
+            return False
+        if (
+            self._credential_reservations is None
+            and invocation_kwargs is None
+        ):
+            return True
+        try:
+            location = self._device_login_credential_location(coder_name)
+        except Exception:
+            return False
+        if location is None:
+            return True
+        if self._credential_reservations is None:
+            if invocation_kwargs is not None:
+                self._bind_reserved_coder_run_kwargs(
+                    coder_name, location, invocation_kwargs
+                )
+            return True
+        if not self._credential_reservations.reserve_coder(location):
+            return False
+        cached_version = self._auth_status_cache_credential_versions.get(
+            coder_name
+        )
+        current_version = self._credential_reservations.credential_version(
+            location
+        )
+        if cached_version is not None and cached_version != current_version:
+            self._credential_reservations.release_coder(location)
+            self._auth_status_cache_expires_at = None
+            return False
+        self._coder_credential_reservation = location
+        try:
+            if invocation_kwargs is not None:
+                self._bind_reserved_coder_run_kwargs(
+                    coder_name, location, invocation_kwargs
+                )
+        except BaseException:
+            self._credential_reservations.release_coder(location)
+            self._coder_credential_reservation = None
+            raise
+        return True
+
+    def _device_login_credential_location(
+        self, coder_name: str
+    ) -> str | None:
+        plugin = self._registry.get_optional(coder_name)
+        if plugin is None:
+            return None
+        return resolve_device_login_credential_location(
+            plugin,
+            config=self.app_config,
+        )
+
+    def _release_coder_credentials(self) -> None:
+        location = self._coder_credential_reservation
+        if location is None or self._credential_reservations is None:
+            return
+        self._credential_reservations.release_coder(location)
+        self._coder_credential_reservation = None
+
     def _track_current_coder_supervised_process(
         self, managed: SupervisedProcess
     ) -> None:
@@ -2452,6 +2673,8 @@ class PipelineRunner(
             confirmed = self._current_coder_supervised_process is None
         if not confirmed:
             await self._park_coder_cleanup_failure(context)
+        else:
+            self._release_coder_credentials()
         if cancellation is not None:
             raise cancellation
         return confirmed
@@ -2462,13 +2685,37 @@ class PipelineRunner(
         *,
         cleanup_context: str,
         log_prefix: str,
+        coder_name: str | None = None,
+        credential_reservation_held: bool = False,
     ) -> tuple[int, str, str] | None:
         """Await one plugin-owned helper invocation at an ownership boundary."""
+        if (
+            not credential_reservation_held
+            and not self._reserve_coder_credentials(
+                coder_name or self.state.coder or ""
+            )
+        ):
+            close = getattr(invocation, "close", None)
+            if callable(close):
+                close()
+            self.log_event(
+                f"{log_prefix} Coder invocation deferred while device login "
+                "owns its credential location."
+            )
+            return None
         self._stop_requested = False
         self._coder_invocation_active = True
-        coder_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
-            invocation
-        )
+        try:
+            coder_task: asyncio.Task[tuple[int, str, str]] = (
+                asyncio.create_task(invocation)
+            )
+        except Exception:
+            close = getattr(invocation, "close", None)
+            if callable(close):
+                close()
+            self._coder_invocation_active = False
+            self._release_coder_credentials()
+            raise
         stop_monitor = asyncio.create_task(self._monitor_stop_request(coder_task))
         result: tuple[int, str, str] | None = None
         cancellation: asyncio.CancelledError | None = None
@@ -2551,11 +2798,7 @@ class PipelineRunner(
         self.state.coder = active_coder
         if self.repo_config.active:
             provider = self._usage_provider_for(active_coder)
-            snap = (
-                await asyncio.to_thread(provider.fetch)
-                if provider is not None
-                else None
-            )
+            snap = await self._fetch_usage_snapshot(active_coder)
             if snap is not None:
                 self.state.usage_session_percent = snap.session_percent
                 self.state.usage_session_resets_at = snap.session_resets_at

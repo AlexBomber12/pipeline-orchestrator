@@ -88,6 +88,8 @@ async def test_codex_plugin_adapts_discovery_and_auth_context(
         )
 
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-used")
+    monkeypatch.setenv("HOME", str(tmp_path / "daemon-home"))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     config = AppConfig.model_validate(
         {"auth": {"codex_home_dir": str(tmp_path / "auth")}}
     )
@@ -109,7 +111,8 @@ async def test_codex_plugin_adapts_discovery_and_auth_context(
     assert captured["cwd"] == str(tmp_path)
     env = captured["env"]
     assert isinstance(env, dict)
-    assert env["HOME"] == str(tmp_path / "auth")
+    assert env["HOME"] == str(tmp_path / "daemon-home")
+    assert env["CODEX_HOME"] == str(tmp_path / "auth" / ".codex")
     assert "OPENAI_API_KEY" not in env
 
 
@@ -182,6 +185,8 @@ def test_codex_plugin_check_auth(
         f"  codex_home_dir: {tmp_path / 'codex-home'}\n",
         encoding="utf-8",
     )
+    monkeypatch.setenv("HOME", str(tmp_path / "daemon-home"))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
 
     calls: list[tuple[list[str], dict[str, str] | None]] = []
 
@@ -220,8 +225,44 @@ def test_codex_plugin_check_auth(
         ["codex", "login", "status"],
     ]
     assert all(env is not None for _cmd, env in calls)
-    assert calls[0][1]["HOME"] == str(tmp_path / "codex-home")
-    assert calls[1][1]["HOME"] == str(tmp_path / "codex-home")
+    assert calls[0][1]["HOME"] == str(tmp_path / "daemon-home")
+    assert calls[1][1]["HOME"] == str(tmp_path / "daemon-home")
+    assert calls[0][1]["CODEX_HOME"] == str(
+        tmp_path / "codex-home" / ".codex"
+    )
+    assert calls[1][1]["CODEX_HOME"] == str(
+        tmp_path / "codex-home" / ".codex"
+    )
+
+
+def test_codex_plugin_check_auth_uses_pinned_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reserved_environment = {
+        "HOME": "/reserved/home",
+        "CODEX_HOME": "/reserved/codex-home",
+    }
+    calls: list[dict[str, str] | None] = []
+
+    def fake_run_auth_command(
+        cmd: list[str], *, env: dict[str, str] | None = None
+    ) -> tuple[int, str, str]:
+        calls.append(env)
+        if cmd == ["codex", "--version"]:
+            return (0, "codex 0.160.0", "")
+        return (0, "Logged in using ChatGPT", "")
+
+    monkeypatch.setattr(codex_module, "_run_auth_command", fake_run_auth_command)
+    monkeypatch.setattr(
+        codex_module,
+        "load_config",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("must not reload")),
+    )
+
+    result = CodexPlugin().check_auth(environment=reserved_environment)
+
+    assert result["status"] == "ok"
+    assert calls == [reserved_environment, reserved_environment]
 
 
 @pytest.mark.parametrize(
@@ -455,12 +496,28 @@ def test_codex_plugin_create_usage_provider(
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
 
     provider = CodexPlugin().create_usage_provider()
 
     assert isinstance(provider, OpenAIUsageProvider)
     assert provider._credentials_path == tmp_path / "codex-home" / ".codex" / "auth.json"
     assert provider._cache_ttl == 123
+
+
+def test_codex_plugin_usage_provider_uses_effective_codex_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    configured_home = tmp_path / "configured-home"
+    explicit_codex_home = tmp_path / "explicit-codex-home"
+    config = AppConfig.model_validate(
+        {"auth": {"codex_home_dir": str(configured_home)}}
+    )
+    monkeypatch.setenv("CODEX_HOME", str(explicit_codex_home))
+
+    provider = CodexPlugin().create_usage_provider(config=config)
+
+    assert provider._credentials_path == explicit_codex_home / "auth.json"
 
 
 def test_auth_command_returns_126_on_permission_error(
@@ -884,3 +941,173 @@ def test_rate_limit_patterns_returns_both_codex_patterns() -> None:
         codex_module._CODEX_RETRY_PATTERN,
         codex_module._CODEX_USAGE_LIMIT_PATTERN,
     ]
+
+
+def test_codex_device_login_context_uses_effective_auth_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.yml"
+    configured_home = tmp_path / "configured-home"
+    explicit_codex_home = tmp_path / "explicit-codex-home"
+    config_path.write_text(
+        f"auth:\n  codex_home_dir: {configured_home}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "daemon-home"))
+    monkeypatch.setenv("CODEX_HOME", str(explicit_codex_home))
+
+    plugin = CodexPlugin()
+    adapter = plugin.create_device_login(config_path=str(config_path))
+
+    assert adapter.command == ("codex", "login", "--device-auth")
+    assert adapter.environment["HOME"] == str(tmp_path / "daemon-home")
+    assert adapter.environment["CODEX_HOME"] == str(explicit_codex_home)
+    assert adapter.working_directory == str(tmp_path)
+    assert adapter.credential_location == str(explicit_codex_home)
+    assert plugin.device_login_credential_location(
+        config=AppConfig.model_validate(
+            {"auth": {"codex_home_dir": str(configured_home)}}
+        )
+    ) == str(explicit_codex_home)
+    assert "unsuccessful or cancelled replacement" in adapter.replacement_warning
+
+    monkeypatch.delenv("CODEX_HOME")
+    default_adapter = plugin.create_device_login(config_path=str(config_path))
+    assert default_adapter.environment["HOME"] == str(tmp_path / "daemon-home")
+    assert default_adapter.environment["CODEX_HOME"] == str(
+        configured_home / ".codex"
+    )
+    assert default_adapter.credential_location == str(configured_home / ".codex")
+
+
+def test_codex_credential_location_canonicalizes_symlink_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    credential_parent = tmp_path / "credential-parent"
+    credential_parent.mkdir()
+    first_alias = tmp_path / "first-alias"
+    second_alias = tmp_path / "second-alias"
+    first_alias.symlink_to(credential_parent, target_is_directory=True)
+    second_alias.symlink_to(credential_parent, target_is_directory=True)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    plugin = CodexPlugin()
+
+    first = plugin.device_login_credential_location(
+        config=AppConfig.model_validate(
+            {"auth": {"codex_home_dir": str(first_alias)}}
+        )
+    )
+    second = plugin.device_login_credential_location(
+        config=AppConfig.model_validate(
+            {"auth": {"codex_home_dir": str(second_alias)}}
+        )
+    )
+
+    expected = str((credential_parent / ".codex").resolve(strict=False))
+    assert first == expected
+    assert second == expected
+
+
+def test_codex_device_login_parser_handles_ansi_and_incremental_output() -> None:
+    adapter = codex_module.CodexDeviceLoginAdapter(
+        command=("codex",),
+        environment={},
+        working_directory="/tmp",
+        credential_location="/tmp/.codex",
+    )
+    first = (
+        "Welcome to Codex\n"
+        "1. Open this link in your browser and sign in to your account\n"
+        "   \x1b[94mhttps://auth.openai.com/codex/de"
+    )
+    assert adapter.parse_progress(first, "") is None
+    complete = first + (
+        "vice\x1b[0m\n\n"
+        "2. Enter this one-time code \x1b[90m(expires in 15 minutes)\x1b[0m\n"
+        "   \x1b[94mABCD-EFGH\x1b[0m\n"
+    )
+
+    prompt = adapter.parse_progress(complete, "ignored")
+
+    assert prompt is not None
+    assert prompt.verification_url == "https://auth.openai.com/codex/device"
+    assert prompt.user_code == "ABCD-EFGH"
+    assert prompt.expires_in_seconds == 900
+
+    partial_code = complete.removesuffix("-EFGH\x1b[0m\n")
+    assert adapter.parse_progress(partial_code, "") is None
+    completed_code = partial_code + "-EFGH\x1b[0m\n"
+    assert adapter.parse_progress(completed_code, "") == prompt
+
+    assert (
+        codex_module._line_after_marker(
+            "marker with no following value\n", "marker with no following value"
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        (
+            "1. Open this link in your browser and sign in to your account\n"
+            "   http://auth.openai.com/codex/device\n"
+            "2. Enter this one-time code (expires in 15 minutes)\n"
+            "   ABCD-EFGH\n"
+        ),
+        (
+            "1. Open this link in your browser and sign in to your account\n"
+            "   https://auth.openai.com/codex/device\n"
+            "2. Enter this one-time code (expires in 15 minutes)\n"
+            "   bad code\n"
+        ),
+    ],
+)
+def test_codex_device_login_parser_rejects_untrusted_instructions(
+    output: str,
+) -> None:
+    adapter = codex_module.CodexDeviceLoginAdapter(
+        command=("codex",),
+        environment={},
+        working_directory="/tmp",
+        credential_location="/tmp/.codex",
+    )
+
+    with pytest.raises(ValueError, match="invalid Codex device"):
+        adapter.parse_progress(output, "")
+
+
+@pytest.mark.parametrize(
+    ("output", "reason"),
+    [
+        (
+            "Error logging in with device code: device auth timed out after 15 minutes",
+            "provider_expired",
+        ),
+        (
+            "device code login is not enabled for this Codex server",
+            "device_login_disabled",
+        ),
+        (
+            "ChatGPT login is disabled. Use API key login instead.",
+            "device_login_disabled",
+        ),
+        ("sensitive provider failure", "process_failed"),
+    ],
+)
+def test_codex_device_login_failure_classification_is_sanitized(
+    output: str, reason: str
+) -> None:
+    adapter = codex_module.CodexDeviceLoginAdapter(
+        command=("codex",),
+        environment={},
+        working_directory="/tmp",
+        credential_location="/tmp/.codex",
+    )
+
+    failure = adapter.classify_failure("", output, 1)
+
+    assert failure.reason == reason
+    assert "sensitive provider failure" not in failure.detail

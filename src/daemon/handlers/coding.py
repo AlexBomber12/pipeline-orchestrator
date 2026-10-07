@@ -475,6 +475,15 @@ class CodingMixin:
         else:
             publication_baseline = {item.number for item in baseline}
 
+        if not self._reserve_coder_credentials(
+            coder_name,
+            invocation_kwargs=coder_kwargs,
+        ):
+            self.log_event(
+                "[CODING] Coder invocation deferred while device login "
+                "owns its credential location."
+            )
+            return None
         heartbeat = asyncio.create_task(self._publish_while_waiting("CODING"))
         self._coder_invocation_active = True
         invocation_supervised_process: SupervisedProcess | None = None
@@ -488,18 +497,25 @@ class CodingMixin:
             if configured_process_callback is not None:
                 configured_process_callback(managed)
 
-        cli_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
-            plugin.run_auto_pr(
-                self.repo_path,
-                pr_id=pr_id,
-                task_file=task_file,
-                task_body=task_body,
-                **{
-                    **coder_kwargs,
-                    "on_supervised_process_start": retain_invocation_process,
-                },
+        try:
+            cli_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
+                plugin.run_auto_pr(
+                    self.repo_path,
+                    pr_id=pr_id,
+                    task_file=task_file,
+                    task_body=task_body,
+                    **{
+                        **coder_kwargs,
+                        "on_supervised_process_start": retain_invocation_process,
+                    },
+                )
             )
-        )
+        except Exception:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+            self._coder_invocation_active = False
+            self._release_coder_credentials()
+            raise
         publication_monitors: list[
             asyncio.Task[gh_prs.BranchPublication | None]
         ] = []

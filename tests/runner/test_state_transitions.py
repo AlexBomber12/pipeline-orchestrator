@@ -47,6 +47,7 @@ from typing import Any
 
 import pytest
 from src import codex_cli
+from src.coder_login import CoderCredentialReservations
 from src.coders import claude as claude_plugin_module
 from src.config import AppConfig, CoderType, DaemonConfig
 from src.daemon import git_ops as git_ops_module
@@ -1888,6 +1889,114 @@ def test_handle_merge_falls_back_to_codex_for_conflict_resolution(
     assert codex_calls, "Codex must be invoked on merge conflict fallback"
     assert codex_calls[0][2] == "generic-codex"
     assert any(cmd[:2] == ("push", "origin") for cmd in git_calls)
+
+
+def test_handle_merge_aborts_conflict_when_device_login_defers_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git_calls: list[tuple[str, ...]] = []
+
+    def fake_git(
+        repo_path: str,
+        *args: str,
+        **kwargs: Any,
+    ) -> h._FakeCompletedProcess:
+        git_calls.append(args)
+        if args[:2] == ("merge", "origin/main"):
+            return h._FakeCompletedProcess(
+                args=["git", *args],
+                returncode=1,
+                stdout="CONFLICT (content): merge conflict in foo",
+            )
+        return h._FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    runner = h._make_runner(coder=CoderType.CODEX)
+    reservations = CoderCredentialReservations()
+    runner._credential_reservations = reservations
+    plugin = runner._registry.get("codex")
+    location = plugin.device_login_credential_location(config=runner.app_config)
+    assert reservations.reserve_login(location) is True
+    monkeypatch.setattr(
+        runner,
+        "_get_auxiliary_coder",
+        lambda: ("codex", plugin),
+    )
+
+    async def allow_usage_gate(*_args: object, **_kwargs: object) -> bool:
+        return True
+
+    monkeypatch.setattr(runner, "usage_gate", allow_usage_gate)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.handle_merge())
+
+    assert ("merge", "--abort") in git_calls
+    assert runner.state.state == PipelineState.WATCH
+    assert any("device login" in item["event"] for item in runner.state.history)
+    reservations.release_login(location)
+
+
+@pytest.mark.parametrize(
+    ("terminal_state", "expects_abort"),
+    [
+        (PipelineState.ERROR, False),
+        (PipelineState.PAUSED, True),
+    ],
+)
+def test_handle_merge_aborts_after_auxiliary_stop_only_when_cleanup_confirmed(
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_state: PipelineState,
+    expects_abort: bool,
+) -> None:
+    git_calls: list[tuple[str, ...]] = []
+
+    def fake_git(
+        repo_path: str,
+        *args: str,
+        **kwargs: Any,
+    ) -> h._FakeCompletedProcess:
+        git_calls.append(args)
+        if args[:2] == ("merge", "origin/main"):
+            return h._FakeCompletedProcess(
+                args=["git", *args],
+                returncode=1,
+                stdout="CONFLICT (content): merge conflict in foo",
+            )
+        return h._FakeCompletedProcess(args=["git", *args], returncode=0)
+
+    async def allow_usage_gate(*_args: object, **_kwargs: object) -> bool:
+        return True
+
+    runner = h._make_runner(coder=CoderType.CODEX)
+    plugin = runner._registry.get("codex")
+
+    async def stop_auxiliary(invocation: Any, **_kwargs: object) -> None:
+        invocation.close()
+        runner.state.state = terminal_state
+        if terminal_state == PipelineState.PAUSED:
+            runner._release_coder_credentials()
+        return None
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(runner, "_refresh_auth_status_cache", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(runner, "_get_auxiliary_coder", lambda: ("codex", plugin))
+    monkeypatch.setattr(runner, "usage_gate", allow_usage_gate)
+    monkeypatch.setattr(runner, "_await_auxiliary_coder", stop_auxiliary)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.handle_merge())
+
+    assert (("merge", "--abort") in git_calls) is expects_abort
+    assert runner.state.state == terminal_state
 
 
 def test_handle_merge_sets_error_when_no_auxiliary_coder_is_eligible(

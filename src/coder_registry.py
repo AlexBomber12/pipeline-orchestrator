@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Hashable, Protocol, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Hashable,
+    Mapping,
+    Protocol,
+    runtime_checkable,
+)
 
 from src.process_supervisor import SupervisedProcess
 from src.usage import UsageProvider
@@ -25,6 +34,45 @@ AUTH_FAILURE_REASONS = frozenset(
         "unrecognized_output",
     }
 )
+
+DEVICE_LOGIN_STATES = frozenset(
+    {
+        "unsupported",
+        "starting",
+        "waiting_for_user",
+        "succeeded",
+        "failed",
+        "canceling",
+        "cancelled",
+        "expired",
+        "timed_out",
+        "cleanup_failed",
+        "not_found",
+    }
+)
+DEVICE_LOGIN_FAILURE_REASONS = frozenset(
+    {
+        "unsupported",
+        "session_not_found",
+        "session_plugin_mismatch",
+        "session_capacity",
+        "replacement_required",
+        "credential_in_use",
+        "auth_status_unavailable",
+        "cli_missing",
+        "device_login_disabled",
+        "startup_failed",
+        "malformed_output",
+        "provider_expired",
+        "application_timeout",
+        "process_failed",
+        "cancellation_failed",
+        "daemon_shutdown",
+        "daemon_unavailable",
+    }
+)
+_SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,128}")
+_DEVICE_CODE_PATTERN = re.compile(r"[A-Z0-9-]{4,64}")
 
 
 @dataclass(frozen=True)
@@ -60,6 +108,114 @@ class CoderAuthStatus:
     authentication_mode: str | None = None
     service_access_verified: bool | None = None
     failure_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class CoderDeviceLoginPrompt:
+    """Allowlisted operator instructions parsed from provider output."""
+
+    verification_url: str
+    user_code: str
+    expires_in_seconds: int
+
+
+@dataclass(frozen=True)
+class CoderDeviceLoginFailure:
+    """Sanitized provider-specific failure classification."""
+
+    reason: str
+    detail: str
+
+
+@runtime_checkable
+class CoderDeviceLoginAdapter(Protocol):
+    """Optional provider-owned device-login adapter.
+
+    This protocol is deliberately separate from :class:`CoderPlugin`: legacy,
+    Claude, and custom plugins remain valid without implementing login.
+    Environment and output values stay inside the daemon and are never wire
+    payloads.
+    """
+
+    @property
+    def command(self) -> tuple[str, ...]: ...
+
+    @property
+    def environment(self) -> Mapping[str, str]: ...
+
+    @property
+    def working_directory(self) -> str: ...
+
+    @property
+    def credential_location(self) -> str: ...
+
+    @property
+    def application_timeout_seconds(self) -> float: ...
+
+    @property
+    def replacement_warning(self) -> str: ...
+
+    def parse_progress(
+        self, stdout: str, stderr: str
+    ) -> CoderDeviceLoginPrompt | None: ...
+
+    def classify_failure(
+        self, stdout: str, stderr: str, returncode: int
+    ) -> CoderDeviceLoginFailure: ...
+
+
+@runtime_checkable
+class CoderDeviceLoginPlugin(Protocol):
+    """Complete optional capability for daemon-owned device login.
+
+    A login-capable plugin must expose the adapter factory, a side-effect-free
+    credential locator, and an environment pinned to that location. Daemon
+    readers reserve the locator and pass the environment to provider workers;
+    accepting a partial capability would make safe coordination impossible.
+    """
+
+    def create_device_login(
+        self, *, config_path: str
+    ) -> CoderDeviceLoginAdapter: ...
+
+    def device_login_credential_location(
+        self, *, config: "AppConfig"
+    ) -> str: ...
+
+    def build_credential_environment(
+        self,
+        *,
+        config: "AppConfig",
+        credential_location: str,
+    ) -> Mapping[str, str]: ...
+
+
+def resolve_device_login_credential_location(
+    plugin: object,
+    *,
+    config: "AppConfig",
+) -> str | None:
+    """Return a login-capable plugin's validated coordination location.
+
+    Plugins without a device-login factory do not participate. A plugin that
+    advertises login but omits or returns an invalid locator fails closed so
+    login and credential readers can never run without shared coordination.
+    """
+    factory = getattr(plugin, "create_device_login", None)
+    if not callable(factory):
+        return None
+    resolver = getattr(plugin, "device_login_credential_location", None)
+    if not callable(resolver):
+        raise ValueError("login-capable coder is missing a credential locator")
+    location = resolver(config=config)
+    if not isinstance(location, str) or not location:
+        raise ValueError("invalid coder credential location")
+    environment_builder = getattr(plugin, "build_credential_environment", None)
+    if not callable(environment_builder):
+        raise ValueError(
+            "login-capable coder is missing a credential environment builder"
+        )
+    return location
 
 
 def _optional_bool(value: object, field: str) -> bool | None:
@@ -226,6 +382,109 @@ def parse_coder_auth_payload(payload: object) -> dict[str, Any]:
         ),
     )
     return coder_auth_payload(payload, capabilities=capabilities)
+
+
+def parse_coder_device_login_payload(
+    payload: object,
+    *,
+    expected_plugin: str | None = None,
+) -> dict[str, Any]:
+    """Validate and select the device-login fields allowed across the bridge."""
+    if not isinstance(payload, dict):
+        raise TypeError("invalid device login payload")
+    plugin = payload.get("plugin")
+    session_id = payload.get("session_id")
+    state = payload.get("state")
+    detail = payload.get("detail")
+    failure_reason = payload.get("failure_reason")
+    verification_url = payload.get("verification_url")
+    user_code = payload.get("user_code")
+    expires_at = payload.get("expires_at")
+    cleanup_confirmed = payload.get("cleanup_confirmed")
+    replacement_requested = payload.get("replacement_requested")
+    reused_session = payload.get("reused_session")
+    replacement_warning = payload.get("replacement_warning")
+    raw_auth = payload.get("auth_status")
+    if (
+        not isinstance(plugin, str)
+        or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", plugin) is None
+        or (expected_plugin is not None and plugin != expected_plugin)
+    ):
+        raise TypeError("invalid device login plugin")
+    if session_id is not None and (
+        not isinstance(session_id, str)
+        or _SESSION_ID_PATTERN.fullmatch(session_id) is None
+    ):
+        raise TypeError("invalid device login session ID")
+    if state not in DEVICE_LOGIN_STATES:
+        raise TypeError("invalid device login state")
+    if (
+        not isinstance(detail, str)
+        or not detail
+        or len(detail) > 512
+        or any(ord(character) < 32 for character in detail)
+    ):
+        raise TypeError("invalid device login detail")
+    if (
+        failure_reason is not None
+        and failure_reason not in DEVICE_LOGIN_FAILURE_REASONS
+    ):
+        raise TypeError("invalid device login failure reason")
+    if verification_url is not None and (
+        not isinstance(verification_url, str)
+        or len(verification_url) > 256
+        or not verification_url.startswith("https://")
+    ):
+        raise TypeError("invalid device login verification URL")
+    if user_code is not None and (
+        not isinstance(user_code, str)
+        or _DEVICE_CODE_PATTERN.fullmatch(user_code) is None
+    ):
+        raise TypeError("invalid device login user code")
+    if expires_at is not None and (
+        isinstance(expires_at, bool)
+        or not isinstance(expires_at, (int, float))
+        or not math.isfinite(expires_at)
+        or expires_at <= 0
+    ):
+        raise TypeError("invalid device login expiry")
+    if cleanup_confirmed is not None and not isinstance(cleanup_confirmed, bool):
+        raise TypeError("invalid device login cleanup status")
+    if not isinstance(replacement_requested, bool) or not isinstance(
+        reused_session, bool
+    ):
+        raise TypeError("invalid device login flags")
+    if replacement_warning is not None and (
+        not isinstance(replacement_warning, str)
+        or not replacement_warning
+        or len(replacement_warning) > 512
+        or any(ord(character) < 32 for character in replacement_warning)
+    ):
+        raise TypeError("invalid device login replacement warning")
+    auth_status = (
+        parse_coder_auth_payload(raw_auth) if raw_auth is not None else None
+    )
+    if state != "waiting_for_user" and (
+        verification_url is not None or user_code is not None
+    ):
+        raise TypeError("device login instructions outlived waiting state")
+    if (verification_url is None) != (user_code is None):
+        raise TypeError("incomplete device login instructions")
+    return {
+        "plugin": plugin,
+        "session_id": session_id,
+        "state": state,
+        "detail": detail,
+        "failure_reason": failure_reason,
+        "verification_url": verification_url,
+        "user_code": user_code,
+        "expires_at": float(expires_at) if expires_at is not None else None,
+        "cleanup_confirmed": cleanup_confirmed,
+        "replacement_requested": replacement_requested,
+        "reused_session": reused_session,
+        "replacement_warning": replacement_warning,
+        "auth_status": auth_status,
+    }
 
 
 @dataclass(frozen=True)

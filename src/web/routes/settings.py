@@ -22,12 +22,14 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, ConfigDict, StrictBool
 
 from src.audit.webhook_log import write_webhook_audit
 from src.coder_registry import (
     CoderAuthStatus,
     CoderPlugin,
     CoderRegistry,
+    ModelCatalogUnavailable,
     coder_auth_payload,
 )
 from src.config import (
@@ -135,6 +137,14 @@ _HTTP_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 _BOOL_TRUE = {"true", "1", "yes", "on"}
 _BOOL_FALSE = {"false", "0", "no", "off"}
+
+
+class DeviceLoginStartRequest(BaseModel):
+    """Explicitly opt in to destructive credential replacement."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    replace_existing: StrictBool = False
 
 
 def _get_daemon_version() -> str:
@@ -1225,6 +1235,152 @@ async def put_settings_daemon(
 async def api_auth_status(request: Request) -> JSONResponse:
     return JSONResponse(
         await _collect_auth_status(request.app.state.coder_registry)
+    )
+
+
+def _device_login_unavailable(
+    coder_name: str,
+    *,
+    session_id: str | None = None,
+    replacement_requested: bool = False,
+) -> dict[str, object]:
+    return {
+        "plugin": coder_name,
+        "session_id": session_id,
+        "state": "failed",
+        "detail": "Daemon-owned device-code login is unavailable",
+        "failure_reason": "daemon_unavailable",
+        "verification_url": None,
+        "user_code": None,
+        "expires_at": None,
+        "cleanup_confirmed": None,
+        "replacement_requested": replacement_requested,
+        "reused_session": False,
+        "replacement_warning": None,
+        "auth_status": None,
+    }
+
+
+def _device_login_status_code(payload: dict[str, Any], *, started: bool) -> int:
+    if payload["state"] == "unsupported":
+        return 422
+    if payload["state"] == "not_found":
+        return 404
+    if payload.get("failure_reason") in {
+        "credential_in_use",
+        "replacement_required",
+        "session_capacity",
+        "session_plugin_mismatch",
+    }:
+        return 409
+    if payload.get("failure_reason") == "daemon_unavailable":
+        return 503
+    return (
+        202
+        if started and payload["state"] in {"starting", "waiting_for_user"}
+        else 200
+    )
+
+
+def _device_login_bridge_context(
+    request: Request, coder_name: str
+) -> tuple[Any, str] | None:
+    registry: CoderRegistry = request.app.state.coder_registry
+    if registry.get_optional(coder_name) is None:
+        return None
+    reference = registry.reference_for(coder_name)
+    bridge = getattr(request.app.state, "plugin_bridge", None)
+    if reference is None or bridge is None:
+        return None
+    return bridge, reference
+
+
+@router.post("/api/coders/{coder_name}/device-login")
+async def api_start_device_login(
+    request: Request,
+    coder_name: str,
+    body: DeviceLoginStartRequest | None = None,
+) -> JSONResponse:
+    """Start a daemon-owned login; user authorization continues in background."""
+    replace_existing = body.replace_existing if body is not None else False
+    context = _device_login_bridge_context(request, coder_name)
+    if context is None:
+        payload = _device_login_unavailable(
+            coder_name,
+            replacement_requested=replace_existing,
+        )
+    else:
+        bridge, reference = context
+        try:
+            payload = await bridge.start_device_login(
+                coder_name,
+                expected_reference=reference,
+                replace_existing=replace_existing,
+            )
+        except ModelCatalogUnavailable:
+            payload = _device_login_unavailable(
+                coder_name,
+                replacement_requested=replace_existing,
+            )
+    return JSONResponse(
+        payload,
+        status_code=_device_login_status_code(payload, started=True),
+    )
+
+
+@router.get("/api/coders/{coder_name}/device-login/{session_id}")
+async def api_inspect_device_login(
+    request: Request, coder_name: str, session_id: str
+) -> JSONResponse:
+    """Inspect one short-lived login session without exposing raw CLI output."""
+    context = _device_login_bridge_context(request, coder_name)
+    if context is None:
+        payload = _device_login_unavailable(
+            coder_name, session_id=session_id
+        )
+    else:
+        bridge, reference = context
+        try:
+            payload = await bridge.inspect_device_login(
+                coder_name,
+                session_id,
+                expected_reference=reference,
+            )
+        except ModelCatalogUnavailable:
+            payload = _device_login_unavailable(
+                coder_name, session_id=session_id
+            )
+    return JSONResponse(
+        payload,
+        status_code=_device_login_status_code(payload, started=False),
+    )
+
+
+@router.delete("/api/coders/{coder_name}/device-login/{session_id}")
+async def api_cancel_device_login(
+    request: Request, coder_name: str, session_id: str
+) -> JSONResponse:
+    """Cancel one daemon-owned login and report cleanup truthfully."""
+    context = _device_login_bridge_context(request, coder_name)
+    if context is None:
+        payload = _device_login_unavailable(
+            coder_name, session_id=session_id
+        )
+    else:
+        bridge, reference = context
+        try:
+            payload = await bridge.cancel_device_login(
+                coder_name,
+                session_id,
+                expected_reference=reference,
+            )
+        except ModelCatalogUnavailable:
+            payload = _device_login_unavailable(
+                coder_name, session_id=session_id
+            )
+    return JSONResponse(
+        payload,
+        status_code=_device_login_status_code(payload, started=False),
     )
 
 

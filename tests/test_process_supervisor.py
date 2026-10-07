@@ -24,6 +24,7 @@ from src.process_supervisor import (
     CleanupResult,
     CleanupStatus,
     ProcessIdentity,
+    ProcessLaunchCleanupError,
     ProcessSupervisionError,
     SupervisedProcess,
     _GroupMember,
@@ -355,6 +356,39 @@ async def test_run_supervised_process_reports_output_and_cleanup_failures() -> N
 
 
 @pytest.mark.asyncio
+async def test_run_supervised_process_streams_and_bounds_output() -> None:
+    chunks: list[bytes] = []
+    process = _ExecutionProcess(
+        stdout=_finished_reader(b"0123456789"),
+        stderr=_finished_reader(b"diagnostic"),
+    )
+
+    result = await run_supervised_process(  # type: ignore[arg-type]
+        _ExecutionManaged(
+            process,
+            CleanupResult(CleanupStatus.QUIESCENT, 0, False, False),
+        ),
+        timeout=1,
+        stdout_chunk_callback=chunks.append,
+        max_output_bytes=4,
+    )
+
+    assert chunks == [b"0123456789"]
+    assert result.stdout == b"6789"
+    assert result.stderr == b"stic"
+
+    with pytest.raises(ValueError, match="must be positive"):
+        await run_supervised_process(  # type: ignore[arg-type]
+            _ExecutionManaged(
+                _ExecutionProcess(),
+                CleanupResult(CleanupStatus.QUIESCENT, 0, False, False),
+            ),
+            timeout=1,
+            max_output_bytes=0,
+        )
+
+
+@pytest.mark.asyncio
 async def test_execution_wait_helpers_preserve_cancellation_and_are_bounded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -472,7 +506,11 @@ async def test_async_adapter_preserves_real_exit_and_output(
     monkeypatch.setenv("PATH", f"{fake_coder_bin}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_CODER_MODE", "success")
     monkeypatch.setenv("FAKE_CODER_EXIT", str(returncode))
-    monkeypatch.setattr(codex_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
+    monkeypatch.setattr(
+        codex_cli,
+        "_maybe_wrap_sandbox",
+        lambda cmd, _cwd, **_kwargs: cmd,
+    )
     monkeypatch.setattr(claude_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
     raw_processes: list[asyncio.subprocess.Process] = []
     managed_processes: list[SupervisedProcess] = []
@@ -502,7 +540,11 @@ async def test_async_adapter_leader_exit_does_not_wait_for_retained_pipe(
     monkeypatch.setenv("PATH", f"{fake_coder_bin}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_CODER_MODE", "retained-pipe")
     monkeypatch.setenv("FAKE_CODER_PIDS", str(pid_file))
-    monkeypatch.setattr(codex_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
+    monkeypatch.setattr(
+        codex_cli,
+        "_maybe_wrap_sandbox",
+        lambda cmd, _cwd, **_kwargs: cmd,
+    )
     monkeypatch.setattr(claude_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
 
     started = time.monotonic()
@@ -527,7 +569,11 @@ async def test_async_adapter_timeout_cleans_descendants(
     monkeypatch.setenv("PATH", f"{fake_coder_bin}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_CODER_MODE", "wait")
     monkeypatch.setenv("FAKE_CODER_PIDS", str(pid_file))
-    monkeypatch.setattr(codex_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
+    monkeypatch.setattr(
+        codex_cli,
+        "_maybe_wrap_sandbox",
+        lambda cmd, _cwd, **_kwargs: cmd,
+    )
     monkeypatch.setattr(claude_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
 
     result = await _run_fake_adapter(provider, tmp_path, timeout=0.05)
@@ -547,7 +593,11 @@ async def test_async_adapter_cancellation_and_callback_failure_clean_descendants
 ) -> None:
     monkeypatch.setenv("PATH", f"{fake_coder_bin}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_CODER_MODE", "wait")
-    monkeypatch.setattr(codex_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
+    monkeypatch.setattr(
+        codex_cli,
+        "_maybe_wrap_sandbox",
+        lambda cmd, _cwd, **_kwargs: cmd,
+    )
     monkeypatch.setattr(claude_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
 
     cancel_pids = tmp_path / f"{provider}-cancel.pids"
@@ -1119,6 +1169,59 @@ async def test_cleanup_failure_is_bounded(
     assert result.term_sent
     assert result.kill_sent
     assert elapsed < 0.5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "expected_status"),
+    (
+        (_GroupState.QUIESCENT, CleanupStatus.QUIESCENT),
+        (_GroupState.LIVE, CleanupStatus.FAILED),
+    ),
+)
+async def test_reconcile_cleanup_freshly_observes_without_replacing_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    state: _GroupState,
+    expected_status: CleanupStatus,
+) -> None:
+    process = type("ObservedProcess", (), {"returncode": 0})()
+    managed = SupervisedProcess(
+        process=process,  # type: ignore[arg-type]
+        identity=ProcessIdentity(101, 101, 101, 1),
+        _proof=process_supervisor._LAUNCH_PROOF,
+    )
+    cached_failure = asyncio.create_task(
+        asyncio.sleep(
+            0,
+            result=CleanupResult(
+                CleanupStatus.FAILED,
+                None,
+                True,
+                True,
+                "initial cleanup failed",
+            ),
+        )
+    )
+    await cached_failure
+    managed._cleanup_task = cached_failure
+
+    async def observe(
+        timeout: float,
+        *,
+        repeat_signal: signal.Signals | None = None,
+    ) -> tuple[_GroupObservation, bool]:
+        assert timeout == 0.25
+        assert repeat_signal is None
+        return _GroupObservation(state, "fresh observation"), False
+
+    monkeypatch.setattr(managed, "_wait_for_quiescence", observe)
+
+    reconciled = await managed.reconcile_cleanup(observation_grace=0.25)
+
+    assert reconciled.status is expected_status
+    assert reconciled.term_sent is False
+    assert reconciled.kill_sent is False
+    assert (await managed.cleanup()).status is CleanupStatus.FAILED
 
 
 @pytest.mark.asyncio
@@ -2009,15 +2112,50 @@ async def test_launch_deadline_helpers_bound_stubborn_tasks(
         patch.setattr(
             process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0
         )
-        await process_supervisor._finish_failed_launch(
-            fake_process,  # type: ignore[arg-type]
-            owned_process=None,
-            control_fd=control_read,
-            witness_pid=None,
-            witness_pidfd=None,
-        )
+        with pytest.raises(ProcessLaunchCleanupError) as unowned_error:
+            await process_supervisor._finish_failed_launch(
+                fake_process,  # type: ignore[arg-type]
+                owned_process=None,
+                control_fd=control_read,
+                witness_pid=None,
+                witness_pidfd=None,
+            )
     os.close(control_write)
     assert fake_process.kill_calls == 2
+    assert unowned_error.value.managed is None
+    assert unowned_error.value.cleanup_result is not None
+    assert unowned_error.value.cleanup_result.quiescent is False
+
+    class EventuallyReapedProcess:
+        pid = 987655
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self.kill_calls = 0
+            self.wait_calls = 0
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+        async def wait(self) -> int:
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise TimeoutError
+            self.returncode = -signal.SIGKILL
+            return self.returncode
+
+    eventually_reaped = EventuallyReapedProcess()
+    control_read, control_write = os.pipe()
+    await process_supervisor._finish_failed_launch(
+        eventually_reaped,  # type: ignore[arg-type]
+        owned_process=None,
+        control_fd=control_read,
+        witness_pid=None,
+        witness_pidfd=None,
+    )
+    os.close(control_write)
+    assert eventually_reaped.kill_calls == 2
+    assert eventually_reaped.wait_calls == 2
 
     class OwnedCleanup:
         def __init__(
@@ -2062,17 +2200,18 @@ async def test_launch_deadline_helpers_bound_stubborn_tasks(
             pytest.fail("unproven leader must not be awaited as successful cleanup")
 
     control_read, control_write = os.pipe()
+    failed_result = process_supervisor.CleanupResult(
+        CleanupStatus.FAILED,
+        None,
+        False,
+        False,
+        "ownership lost",
+    )
     failed_owner = OwnedCleanup(
         control_read,
-        process_supervisor.CleanupResult(
-            CleanupStatus.FAILED,
-            None,
-            False,
-            False,
-            "ownership lost",
-        ),
+        failed_result,
     )
-    with pytest.raises(RuntimeError, match="ownership lost"):
+    with pytest.raises(ProcessLaunchCleanupError, match="ownership lost") as owned_error:
         await process_supervisor._finish_failed_launch(
             UnprovenProcess(),  # type: ignore[arg-type]
             owned_process=failed_owner,  # type: ignore[arg-type]
@@ -2081,6 +2220,8 @@ async def test_launch_deadline_helpers_bound_stubborn_tasks(
             witness_pidfd=None,
         )
     os.close(control_write)
+    assert owned_error.value.managed is failed_owner
+    assert owned_error.value.cleanup_result is failed_result
 
     control_read, control_write = os.pipe()
     with monkeypatch.context() as patch:
@@ -2124,14 +2265,46 @@ async def test_launch_deadline_helpers_bound_stubborn_tasks(
             "pidfd_send_signal",
             lambda _pidfd, _sig: (_ for _ in ()).throw(ProcessLookupError()),
         )
-        await process_supervisor._finish_failed_launch(
-            None,
-            owned_process=None,
-            control_fd=control_read,
-            witness_pid=4321,
-            witness_pidfd=stable_pidfd,
-        )
+        with pytest.raises(ProcessLaunchCleanupError) as witness_error:
+            await process_supervisor._finish_failed_launch(
+                None,
+                owned_process=None,
+                control_fd=control_read,
+                witness_pid=4321,
+                witness_pidfd=stable_pidfd,
+            )
     os.close(control_write)
+    assert witness_error.value.managed is None
+    assert witness_error.value.cleanup_result is not None
+    assert witness_error.value.cleanup_result.quiescent is False
+
+
+@pytest.mark.asyncio
+async def test_launch_preserves_owned_handle_when_cleanup_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retained: SupervisedProcess | None = None
+
+    async def failed_cleanup(*_args: Any, **kwargs: Any) -> None:
+        nonlocal retained
+        retained = kwargs["owned_process"]
+        assert isinstance(retained, SupervisedProcess)
+        raise RuntimeError("structured-cleanup-test")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            process_supervisor,
+            "_finish_failed_launch",
+            failed_cleanup,
+        )
+        with pytest.raises(ProcessLaunchCleanupError) as exc_info:
+            await launch_process("/definitely/missing/process-supervisor-command")
+
+    assert exc_info.value.managed is retained
+    assert exc_info.value.cleanup_result is None
+    assert retained is not None
+    cleanup = await retained.cleanup(term_grace=0, kill_grace=0.1)
+    assert cleanup.quiescent is True
 
 
 @pytest.mark.asyncio
@@ -2224,8 +2397,11 @@ async def test_launch_rejects_conflicts_and_unverified_session(
             "kill",
             lambda _process: (_ for _ in ()).throw(ProcessLookupError()),
         )
-        with pytest.raises(RuntimeError, match="ownership witness"):
+        with pytest.raises(ProcessLaunchCleanupError) as cleanup_error:
             await launch_process(sys.executable, "-c", "pass")
+    assert cleanup_error.value.managed is None
+    assert cleanup_error.value.cleanup_result is not None
+    assert cleanup_error.value.cleanup_result.quiescent is False
 
     real_parse_proc_stat = process_supervisor._parse_proc_stat
     parse_calls = 0

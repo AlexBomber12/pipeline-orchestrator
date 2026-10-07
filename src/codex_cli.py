@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Callable
 
 from src.config import load_config
@@ -97,10 +98,25 @@ Completion boundary for this invocation:
 - If implementation or publication genuinely cannot complete under this policy,
   report the blocker and use the repository's ESCALATE protocol. Estimate or path
   deviation and a small incidental repair are not by themselves escalation
-  reasons. Never fabricate a push, gate, or approval."""
+reasons. Never fabricate a push, gate, or approval."""
 
 
-def _maybe_wrap_sandbox(cmd: list[str], cwd: str) -> list[str]:
+def build_codex_environment(*, codex_home_dir: str) -> dict[str, str]:
+    """Return the environment shared by Codex login and coder processes."""
+    env = dict(os.environ)
+    configured_home = env.get("CODEX_HOME")
+    if configured_home is None:
+        configured_home = str(Path(codex_home_dir) / ".codex")
+    env["CODEX_HOME"] = str(Path(configured_home).expanduser().absolute())
+    return env
+
+
+def _maybe_wrap_sandbox(
+    cmd: list[str],
+    cwd: str,
+    *,
+    environment: dict[str, str],
+) -> list[str]:
     """Wrap ``cmd`` with bwrap when ``coder_filesystem_isolation`` is on."""
     cfg = load_config()
     if not cfg.daemon.coder_filesystem_isolation:
@@ -114,12 +130,12 @@ def _maybe_wrap_sandbox(cmd: list[str], cwd: str) -> list[str]:
     # Bind the daemon HOME so files written outside of codex_home_dir
     # (notably ~/.gitconfig from ``gh auth setup-git``) remain visible to
     # the sandboxed coder; without it non-interactive git push fails.
-    home = os.environ.get("HOME")
+    home = environment.get("HOME")
     additional_rw_dirs = [home] if home else None
     return build_bwrap_command(
         command=cmd,
         repo_path=cwd,
-        coder_config_dir=cfg.auth.codex_home_dir,
+        coder_config_dir=environment["CODEX_HOME"],
         gh_config_dir=cfg.auth.gh_config_dir,
         additional_rw_dirs=additional_rw_dirs,
     )
@@ -131,6 +147,7 @@ async def run_codex_async(
     timeout: int | None = 600,
     model: str | None = None,
     reasoning_effort: str | None = None,
+    environment: dict[str, str] | None = None,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
     on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
 ) -> tuple[int, str, str]:
@@ -155,7 +172,14 @@ async def run_codex_async(
     cmd.append(prompt)
     logger.info("[codex] running codex exec with prompt: %s", prompt[:80])
 
-    cmd = _maybe_wrap_sandbox(cmd, cwd)
+    env = (
+        dict(environment)
+        if environment is not None
+        else build_codex_environment(
+            codex_home_dir=load_config().auth.codex_home_dir
+        )
+    )
+    cmd = _maybe_wrap_sandbox(cmd, cwd, environment=env)
     try:
         managed = await launch_process(
             *cmd,
@@ -163,6 +187,7 @@ async def run_codex_async(
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
             stdin=asyncio.subprocess.DEVNULL,
+            env=env,
         )
     except FileNotFoundError as exc:
         missing = getattr(exc, "filename", "")
@@ -207,6 +232,7 @@ async def run_planned_pr_async(
     repo_path: str,
     model: str | None = None,
     reasoning_effort: str | None = None,
+    environment: dict[str, str] | None = None,
     timeout: int = 900,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
     on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
@@ -217,6 +243,7 @@ async def run_planned_pr_async(
         "timeout": timeout,
         "model": model,
         "reasoning_effort": reasoning_effort,
+        "environment": environment,
     }
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
@@ -240,6 +267,7 @@ async def run_auto_pr_async(
     *,
     model: str | None = None,
     reasoning_effort: str | None = None,
+    environment: dict[str, str] | None = None,
     timeout: int = 900,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
     on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
@@ -250,6 +278,7 @@ async def run_auto_pr_async(
         "timeout": timeout,
         "model": model,
         "reasoning_effort": reasoning_effort,
+        "environment": environment,
     }
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
@@ -288,6 +317,7 @@ async def fix_review_async(
     repo_path: str,
     model: str | None = None,
     reasoning_effort: str | None = None,
+    environment: dict[str, str] | None = None,
     timeout: int | None = None,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
     on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
@@ -301,6 +331,7 @@ async def fix_review_async(
         "timeout": timeout,
         "model": model,
         "reasoning_effort": reasoning_effort,
+        "environment": environment,
     }
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
@@ -322,6 +353,7 @@ async def diagnose_error_async(
     context: str,
     model: str | None = None,
     reasoning_effort: str | None = None,
+    environment: dict[str, str] | None = None,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
     on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
 ) -> tuple[int, str, str]:
@@ -331,6 +363,7 @@ async def diagnose_error_async(
         timeout=120,
         model=model,
         reasoning_effort=reasoning_effort,
+        environment=environment,
         on_process_start=on_process_start,
         on_supervised_process_start=on_supervised_process_start,
     )

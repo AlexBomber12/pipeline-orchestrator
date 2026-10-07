@@ -18,6 +18,7 @@ from src.coder_registry import (
     ModelSetting,
     coder_auth_payload,
     parse_coder_auth_payload,
+    parse_coder_device_login_payload,
 )
 from src.coders import CoderPluginConfigurationError, build_coder_registry
 from src.coders.claude import ClaudePlugin
@@ -496,6 +497,94 @@ def test_auth_capabilities_are_optional_protocol_metadata() -> None:
     assert isinstance(plugin, CoderPlugin)
 
 
+def _device_login_payload() -> dict[str, Any]:
+    return {
+        "plugin": "codex",
+        "session_id": "A" * 43,
+        "state": "waiting_for_user",
+        "detail": "Authorize this login",
+        "failure_reason": None,
+        "verification_url": "https://auth.openai.com/codex/device",
+        "user_code": "ABCD-EFGH",
+        "expires_at": 1234,
+        "cleanup_confirmed": None,
+        "replacement_requested": True,
+        "reused_session": False,
+        "replacement_warning": "Existing credentials can be removed.",
+        "auth_status": None,
+        "raw_output": "must-not-cross",
+    }
+
+
+def test_device_login_contract_selects_allowlisted_fields() -> None:
+    payload = parse_coder_device_login_payload(
+        _device_login_payload(), expected_plugin="codex"
+    )
+
+    assert payload["expires_at"] == 1234.0
+    assert payload["user_code"] == "ABCD-EFGH"
+    assert "raw_output" not in payload
+
+    completed = _device_login_payload()
+    completed.update(
+        {
+            "state": "succeeded",
+            "verification_url": None,
+            "user_code": None,
+            "expires_at": None,
+            "cleanup_confirmed": True,
+            "auth_status": coder_auth_payload(
+                CoderAuthStatus(status="ok", detail="refreshed")
+            ),
+        }
+    )
+    assert (
+        parse_coder_device_login_payload(completed)["auth_status"][
+            "service_access_verified"
+        ]
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        None,
+        lambda payload: payload.update(plugin="Bad/Plugin"),
+        lambda payload: payload.update(plugin="other"),
+        lambda payload: payload.update(session_id="short"),
+        lambda payload: payload.update(state="unknown"),
+        lambda payload: payload.update(detail=""),
+        lambda payload: payload.update(failure_reason="secret_error"),
+        lambda payload: payload.update(verification_url="http://example.com"),
+        lambda payload: payload.update(user_code="bad code"),
+        lambda payload: payload.update(expires_at=True),
+        lambda payload: payload.update(expires_at=float("nan")),
+        lambda payload: payload.update(cleanup_confirmed="yes"),
+        lambda payload: payload.update(replacement_requested="yes"),
+        lambda payload: payload.update(replacement_warning=""),
+        lambda payload: payload.update(
+            state="failed", verification_url="https://example.com"
+        ),
+        lambda payload: payload.update(user_code=None),
+        lambda payload: payload.update(
+            auth_status={"status": "unknown", "detail": "bad"}
+        ),
+    ],
+)
+def test_device_login_contract_rejects_invalid_payloads(
+    mutate: Any,
+) -> None:
+    payload: object = _device_login_payload()
+    if mutate is None:
+        payload = []
+    else:
+        mutate(payload)
+
+    with pytest.raises(TypeError):
+        parse_coder_device_login_payload(payload, expected_plugin="codex")
+
+
 def test_auth_contract_adapts_legacy_result_and_drops_unknown_keys() -> None:
     payload = coder_auth_payload(
         {
@@ -708,6 +797,7 @@ def test_codex_plugin_diagnose_error_delegates(
         *,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        environment: dict[str, str] | None = None,
         on_process_start: object = None,
         on_supervised_process_start: object = None,
     ) -> tuple[int, str, str]:
@@ -715,6 +805,7 @@ def test_codex_plugin_diagnose_error_delegates(
         captured["context"] = context
         captured["model"] = model
         captured["reasoning_effort"] = reasoning_effort
+        captured["environment"] = environment
         captured["on_process_start"] = on_process_start
         captured["on_supervised_process_start"] = on_supervised_process_start
         return (0, "SKIP", "")
@@ -736,6 +827,7 @@ def test_codex_plugin_diagnose_error_delegates(
         "context": "ci red",
         "model": "gpt-5.4",
         "reasoning_effort": "high",
+        "environment": None,
         "on_process_start": None,
         "on_supervised_process_start": None,
     }

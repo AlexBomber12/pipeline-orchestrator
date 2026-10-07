@@ -12,8 +12,10 @@ import asyncio
 import math
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from src.config import DEFAULT_CODER_PLUGINS
 from src.daemon.notifications import send_spend_ceiling_warning
@@ -99,11 +101,61 @@ RATE_LIMIT_BRANCH_MAP = (
 class RateLimitMixin:
     """Rate-limit detection and proactive usage checks."""
 
+    @staticmethod
+    async def _run_reserved_sync_reader(reader: Callable[[], Any]) -> Any:
+        """Settle a non-cancellable worker before its reservation is released."""
+        task = asyncio.create_task(asyncio.to_thread(reader))
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+        if cancellation is not None:
+            task.exception()
+            raise cancellation
+        return task.result()
+
     async def _fetch_usage_snapshot(self, coder_name: str) -> UsageSnapshot | None:
         provider = self._usage_provider_for(coder_name)
         if provider is None:
             return None
-        return await asyncio.to_thread(provider.fetch)
+        reservations = self._credential_reservations
+        if reservations is None:
+            return await asyncio.to_thread(provider.fetch)
+        try:
+            credential_location = self._device_login_credential_location(
+                coder_name
+            )
+        except Exception:
+            return None
+        if credential_location is None:
+            return await asyncio.to_thread(provider.fetch)
+
+        credential_version = reservations.credential_version(
+            credential_location
+        )
+        credential_context = (credential_location, credential_version)
+        previous_context = self._usage_credential_versions.get(coder_name)
+        if previous_context != credential_context:
+            if previous_context is not None or credential_version > 0:
+                reset = getattr(
+                    provider,
+                    "reset_after_credential_change",
+                    None,
+                )
+                if not callable(reset):
+                    reset = getattr(provider, "invalidate_cache", None)
+                if callable(reset):
+                    reset()
+            self._usage_credential_versions[coder_name] = credential_context
+
+        if not reservations.reserve_coder(credential_location):
+            return None
+        try:
+            return await self._run_reserved_sync_reader(provider.fetch)
+        finally:
+            reservations.release_coder(credential_location)
 
     async def _check_spend_ceiling(self, coder_name: str) -> bool:
         """Compatibility wrapper for the spend predicate inside ``usage_gate``."""
@@ -444,7 +496,7 @@ class RateLimitMixin:
         if provider is None:
             self._usage_degraded_logged = False
             return True
-        snapshot = await asyncio.to_thread(provider.fetch)
+        snapshot = await self._fetch_usage_snapshot(coder_name)
         if snapshot is None:
             if (
                 getattr(provider, "consecutive_failures", 0) >= 10

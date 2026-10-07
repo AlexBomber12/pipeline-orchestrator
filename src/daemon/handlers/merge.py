@@ -170,6 +170,21 @@ class MergeMixin:
                                 self._track_current_coder_supervised_process
                             ),
                         }
+                        if not self._reserve_coder_credentials(
+                            coder_name,
+                            invocation_kwargs=auxiliary_kwargs,
+                        ):
+                            git_ops._git(
+                                self.repo_path,
+                                "merge", "--abort",
+                                check=False,
+                            )
+                            self.log_event(
+                                "[MERGE] Conflict resolution deferred while "
+                                "device login owns its credential location."
+                            )
+                            self.state.state = PipelineState.WATCH
+                            return
                         auxiliary_result = await self._await_auxiliary_coder(
                             plugin.run_prompt(
                                 prompt,
@@ -178,6 +193,8 @@ class MergeMixin:
                             ),
                             cleanup_context="MERGE conflict resolution",
                             log_prefix="[MERGE]",
+                            coder_name=coder_name,
+                            credential_reservation_held=True,
                         )
                         if auxiliary_result is None:
                             if self.state.state == PipelineState.PAUSED:

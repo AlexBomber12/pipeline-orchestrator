@@ -10,7 +10,6 @@ Module-level:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import subprocess
@@ -245,16 +244,12 @@ class ErrorMixin:
             )
             return
         coder_name, plugin = selected
-        provider = self._usage_provider_for(coder_name)
         # Soft-skip diagnosis rather than pausing the repo when the selected
         # diagnosis coder is already over its usage threshold.
-        if provider is None:
+        try:
+            snapshot = await self._fetch_usage_snapshot(coder_name)
+        except Exception:
             snapshot = None
-        else:
-            try:
-                snapshot = await asyncio.to_thread(provider.fetch)
-            except Exception:
-                snapshot = None
         if snapshot and (
             snapshot.session_percent
             >= self.app_config.daemon.rate_limit_session_pause_percent
@@ -301,48 +296,71 @@ class ErrorMixin:
         task_id = retry_task.pr_id if retry_task is not None else ""
         if task_id and await self._is_diagnose_exhausted(task_id):
             return
-        diagnose_count = 0
-        if task_id:
-            self._error_diagnose_policy.increment(self)
-            diagnose_count = self._error_diagnose_count
-            await self._set_suppression_detail_count(
-                task_id,
-                SuppressionReason.CRASH,
-                "diagnose_attempts",
-                diagnose_count,
+        credential_run_kwargs: dict[str, object] = {}
+        if not self._reserve_coder_credentials(
+            coder_name,
+            invocation_kwargs=credential_run_kwargs,
+        ):
+            self.log_event(
+                "[ERROR] Diagnosis deferred while device login owns "
+                "the coder credential location."
             )
-        else:
-            self._error_diagnose_policy.increment(self)
-            diagnose_count = self._error_diagnose_count
-        if diagnose_count >= self._error_diagnose_policy_max_attempts:
-            self._on_error_diagnose_threshold()
-            await self._mark_diagnose_exhausted(task_id)
             return
-        dirty_before = ""
         try:
-            dirty_before = git_ops._git(
-                self.repo_path, "status", "--porcelain"
-            ).stdout.strip()
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-            pass
-        plugin_run_kwargs = plugin.build_run_kwargs(
-            daemon_config=self.app_config.daemon
-        )
-        auxiliary_kwargs = {
-            **plugin_run_kwargs,
-            "on_process_start": self._track_current_coder_process,
-            "on_supervised_process_start": (
-                self._track_current_coder_supervised_process
-            ),
-        }
-        diagnosis_result = await self._await_auxiliary_coder(
-            plugin.diagnose_error(
+            diagnose_count = 0
+            if task_id:
+                self._error_diagnose_policy.increment(self)
+                diagnose_count = self._error_diagnose_count
+                await self._set_suppression_detail_count(
+                    task_id,
+                    SuppressionReason.CRASH,
+                    "diagnose_attempts",
+                    diagnose_count,
+                )
+            else:
+                self._error_diagnose_policy.increment(self)
+                diagnose_count = self._error_diagnose_count
+            if diagnose_count >= self._error_diagnose_policy_max_attempts:
+                self._release_coder_credentials()
+                self._on_error_diagnose_threshold()
+                await self._mark_diagnose_exhausted(task_id)
+                return
+            dirty_before = ""
+            try:
+                dirty_before = git_ops._git(
+                    self.repo_path, "status", "--porcelain"
+                ).stdout.strip()
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError,
+            ):
+                pass
+            plugin_run_kwargs = plugin.build_run_kwargs(
+                daemon_config=self.app_config.daemon
+            )
+            auxiliary_kwargs = {
+                **plugin_run_kwargs,
+                **credential_run_kwargs,
+                "on_process_start": self._track_current_coder_process,
+                "on_supervised_process_start": (
+                    self._track_current_coder_supervised_process
+                ),
+            }
+            invocation = plugin.diagnose_error(
                 self.repo_path,
                 context,
                 **auxiliary_kwargs,
-            ),
+            )
+        except BaseException:
+            self._release_coder_credentials()
+            raise
+        diagnosis_result = await self._await_auxiliary_coder(
+            invocation,
             cleanup_context="ERROR diagnosis",
             log_prefix="[ERROR]",
+            coder_name=coder_name,
+            credential_reservation_held=True,
         )
         if diagnosis_result is None:
             return

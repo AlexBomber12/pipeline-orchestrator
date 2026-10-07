@@ -15,9 +15,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
+from src.coder_login import CoderCredentialReservations
 from src.coder_registry import CoderRegistry
 from src.coders import claude as claude_plugin_module
-from src.config import AppConfig
+from src.config import AppConfig, CoderType
 from src.daemon import git_ops as git_ops_module
 from src.daemon import recovery_policy as recovery_policy_module
 from src.daemon import runner as runner_module
@@ -96,6 +97,130 @@ def test_runner_preserves_explicitly_injected_empty_registry(
     )
 
     assert runner._registry is injected
+
+
+def test_coder_credential_location_in_use_tracks_active_plugin_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    codex = runner._registry.get("codex")
+    location = codex.device_login_credential_location(config=runner.app_config)
+
+    assert runner._device_login_credential_location("missing") is None
+    assert runner.coder_credential_location_in_use(location) is False
+    runner._coder_invocation_active = True
+    assert runner.coder_credential_location_in_use(location) is False
+
+    runner.state.coder = "missing"
+    assert runner.coder_credential_location_in_use(location) is False
+    runner.state.coder = "claude"
+    assert runner.coder_credential_location_in_use(location) is False
+
+    runner.state.coder = "codex"
+    assert runner.coder_credential_location_in_use(location) is True
+    assert runner.coder_credential_location_in_use(location + "-other") is False
+
+    monkeypatch.setattr(
+        codex,
+        "device_login_credential_location",
+        lambda **_kwargs: 123,
+    )
+    assert runner.coder_credential_location_in_use(location) is False
+
+    def fail(**_kwargs: object) -> str:
+        raise RuntimeError("must-not-escape")
+
+    monkeypatch.setattr(codex, "device_login_credential_location", fail)
+    assert runner.coder_credential_location_in_use(location) is False
+
+
+def test_runner_credential_reservations_coordinate_with_device_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner()
+    runner._credential_reservations = reservations
+    codex = runner._registry.get("codex")
+    location = codex.device_login_credential_location(config=runner.app_config)
+
+    assert runner._reserve_coder_credentials("codex") is True
+    assert runner._reserve_coder_credentials("codex") is False
+    assert reservations.reserve_login(location) is False
+    runner._release_coder_credentials()
+    runner._release_coder_credentials()
+
+    invocation_kwargs: dict[str, Any] = {"model": "gpt-test"}
+    assert runner._reserve_coder_credentials(
+        "codex",
+        invocation_kwargs=invocation_kwargs,
+    ) is True
+    assert invocation_kwargs["environment"]["CODEX_HOME"] == location
+    runner._release_coder_credentials()
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(codex, "build_credential_environment", None)
+        unbound_kwargs: dict[str, Any] = {"model": "gpt-test"}
+        assert runner._reserve_coder_credentials(
+            "codex",
+            invocation_kwargs=unbound_kwargs,
+        ) is False
+        assert unbound_kwargs == {"model": "gpt-test"}
+
+    runner._credential_reservations = None
+    uncoordinated_kwargs: dict[str, Any] = {}
+    assert runner._reserve_coder_credentials(
+        "codex",
+        invocation_kwargs=uncoordinated_kwargs,
+    ) is True
+    assert uncoordinated_kwargs["environment"]["CODEX_HOME"] == location
+    runner._credential_reservations = reservations
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            codex,
+            "build_credential_environment",
+            lambda **_kwargs: {"CODEX_HOME": location},
+        )
+        with pytest.raises(ValueError, match="conflict"):
+            runner._reserve_coder_credentials(
+                "codex",
+                invocation_kwargs={"environment": {}},
+            )
+        assert runner._coder_credential_reservation is None
+        assert reservations.reserve_login(location) is True
+        reservations.release_login(location)
+
+    assert reservations.reserve_login(location) is True
+    assert runner._reserve_coder_credentials("codex") is False
+    reservations.release_login(location)
+    runner._auth_status_cache_credential_versions["codex"] = 0
+    assert runner._reserve_coder_credentials("codex") is False
+    assert runner._auth_status_cache_expires_at is None
+
+    assert runner._reserve_coder_credentials("claude") is True
+    assert runner._coder_credential_reservation is None
+
+    monkeypatch.setattr(
+        codex,
+        "device_login_credential_location",
+        lambda **_kwargs: "",
+    )
+    assert runner._reserve_coder_credentials("codex") is False
+
+    monkeypatch.setattr(codex, "device_login_credential_location", None)
+    assert runner._reserve_coder_credentials("codex") is False
+
+    def fail(**_kwargs: object) -> str:
+        raise RuntimeError("location unavailable")
+
+    monkeypatch.setattr(codex, "device_login_credential_location", fail)
+    assert runner._reserve_coder_credentials("codex") is False
+    asyncio.run(runner._refresh_auth_status_cache())
+    assert runner._auth_status_cache["codex"] == {"status": "error"}
+
+    runner._credential_reservations = None
+    assert runner._reserve_coder_credentials("codex") is True
 
 
 def test_preflight_returns_true_on_clean_repo(
@@ -389,6 +514,117 @@ def test_refresh_auth_status_cache_returns_early_when_cache_is_fresh(
     assert runner._auth_status_cache == {"claude": {"status": "ok"}}
 
 
+def test_auth_cache_defers_probe_during_login_and_refreshes_after_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner()
+    runner._credential_reservations = reservations
+    codex = runner._registry.get("codex")
+    location = codex.device_login_credential_location(config=runner.app_config)
+    runner._auth_status_cache["codex"] = {
+        "status": "error",
+        "detail": "stale missing credentials",
+    }
+    runner._auth_status_cache_credential_versions = {"codex": 0}
+    calls: list[dict[str, str]] = []
+
+    def check_auth(
+        *, environment: dict[str, str] | None = None
+    ) -> dict[str, str]:
+        assert environment is not None
+        calls.append(environment)
+        return {"status": "error", "detail": "login did not complete"}
+
+    monkeypatch.setattr(codex, "check_auth", check_auth)
+    assert reservations.reserve_login(location) is True
+
+    asyncio.run(runner._refresh_auth_status_cache())
+
+    assert calls == []
+    assert runner._auth_status_cache["codex"] == {
+        "status": "ok",
+        "detail": "Device login in progress",
+    }
+
+    reservations.release_login(location)
+    asyncio.run(runner._refresh_auth_status_cache())
+
+    assert [environment["CODEX_HOME"] for environment in calls] == [location]
+    assert runner._auth_status_cache["codex"] == {
+        "status": "error",
+        "detail": "login did not complete",
+    }
+    assert runner._auth_status_cache_credential_versions["codex"] == 1
+
+
+def test_auth_cache_fails_closed_when_credential_environment_is_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner(coder=CoderType.CODEX)
+    runner._credential_reservations = CoderCredentialReservations()
+    codex = runner._registry.get("codex")
+
+    def fail(**_kwargs: object) -> dict[str, str]:
+        raise RuntimeError("invalid environment")
+
+    monkeypatch.setattr(codex, "build_credential_environment", fail)
+
+    asyncio.run(runner._refresh_auth_status_cache())
+
+    assert runner._auth_status_cache["codex"] == {"status": "error"}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_auth_probe_holds_reservation_until_worker_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner(coder=CoderType.CODEX)
+    runner._credential_reservations = reservations
+    runner._auth_status_cache_expires_at = None
+    codex = runner._registry.get("codex")
+    location = codex.device_login_credential_location(config=runner.app_config)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    reservation_released = asyncio.Event()
+    real_to_thread = asyncio.to_thread
+    real_release_coder = reservations.release_coder
+
+    def release_coder(credential_location: str) -> None:
+        real_release_coder(credential_location)
+        if credential_location == location:
+            reservation_released.set()
+
+    monkeypatch.setattr(reservations, "release_coder", release_coder)
+
+    async def delayed_to_thread(function: Any, *args: object) -> Any:
+        target = getattr(function, "func", function)
+        if getattr(target, "__self__", None) is codex:
+            started.set()
+            await release.wait()
+            return function(*args)
+        return await real_to_thread(function, *args)
+
+    monkeypatch.setattr(runner_module.asyncio, "to_thread", delayed_to_thread)
+    refresh = asyncio.create_task(runner._refresh_auth_status_cache())
+    await started.wait()
+
+    refresh.cancel()
+    await asyncio.sleep(0)
+
+    assert refresh.done() is False
+    assert reservations.reserve_login(location) is False
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await refresh
+    await asyncio.wait_for(reservation_released.wait(), timeout=1)
+    assert reservations.reserve_login(location) is True
+    reservations.release_login(location)
+
+
 def test_refresh_auth_status_cache_marks_plugin_probe_errors() -> None:
     class _Plugin:
         display_name = "fake"
@@ -510,6 +746,42 @@ def test_refresh_auth_status_cache_isolates_configured_runtime_override(
         "claude": {"status": "ok", "detail": "isolated"},
         "codex": {"status": "ok", "detail": "direct"},
         "third": {"status": "ok", "detail": "isolated"},
+    }
+
+
+def test_configured_auth_probe_uses_reserved_credential_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    runner = h._make_runner(coder=CoderType.CODEX)
+    reservations = CoderCredentialReservations()
+    runner._credential_reservations = reservations
+    codex = runner._registry.get("codex")
+    runner._registry.register(codex, reference="operator.codex:factory")
+    location = codex.device_login_credential_location(config=runner.app_config)
+    calls: list[str] = []
+
+    async def isolated(
+        plugin_id: str,
+        reference: str,
+        display_name: str,
+        *,
+        config_path: str,
+        env: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        del plugin_id, reference, display_name, config_path
+        assert env is not None
+        calls.append(env["CODEX_HOME"])
+        return {"status": "ok", "detail": "isolated"}
+
+    monkeypatch.setattr(runner_module, "isolated_auth_probe", isolated)
+
+    asyncio.run(runner._refresh_auth_status_cache())
+
+    assert calls == [location]
+    assert runner._auth_status_cache["codex"] == {
+        "status": "ok",
+        "detail": "isolated",
     }
 
 
@@ -1157,6 +1429,67 @@ def test_auxiliary_awaiter_releases_confirmed_runner_handle() -> None:
     assert managed.cleanup_calls == 1
     assert runner._current_coder_process is None
     assert runner._current_coder_supervised_process is None
+
+
+def test_auxiliary_awaiter_defers_while_login_owns_credentials() -> None:
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner()
+    runner._credential_reservations = reservations
+    location = runner._registry.get("codex").device_login_credential_location(
+        config=runner.app_config
+    )
+    assert reservations.reserve_login(location) is True
+    invoked = False
+
+    async def invocation() -> tuple[int, str, str]:
+        nonlocal invoked
+        invoked = True
+        return (0, "", "")
+
+    result = asyncio.run(
+        runner._await_auxiliary_coder(
+            invocation(),
+            cleanup_context="test login conflict",
+            log_prefix="[TEST]",
+            coder_name="codex",
+        )
+    )
+
+    assert result is None
+    assert invoked is False
+    assert any("device login" in event["event"] for event in runner.state.history)
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_awaiter_releases_reservation_on_schedule_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner()
+    runner._credential_reservations = reservations
+    location = runner._registry.get("codex").device_login_credential_location(
+        config=runner.app_config
+    )
+
+    async def invocation() -> tuple[int, str, str]:
+        return (0, "", "")
+
+    real_create_task = asyncio.create_task
+    monkeypatch.setattr(
+        runner_module.asyncio,
+        "create_task",
+        lambda _awaitable: (_ for _ in ()).throw(RuntimeError("schedule failed")),
+    )
+    with pytest.raises(RuntimeError, match="schedule failed"):
+        await runner._await_auxiliary_coder(
+            invocation(),
+            cleanup_context="test schedule failure",
+            log_prefix="[TEST]",
+            coder_name="codex",
+        )
+    monkeypatch.setattr(runner_module.asyncio, "create_task", real_create_task)
+
+    assert reservations.reserve_login(location) is True
 
 
 @pytest.mark.parametrize(

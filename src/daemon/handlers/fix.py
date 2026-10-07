@@ -297,16 +297,6 @@ class FixMixin(BreachMixin):
             current_pr
         ):
             return
-        self.log_event(
-            f"[{coder_name}] entering FIX.",
-            tier="state",
-            kind="transition",
-        )
-        await self.publish_state()
-        if self._current_run_record is not None:
-            self._current_run_record.fix_iterations += 1
-            await self._checkpoint_current_run_record()
-
         if (
             self.state.current_pr is not None
             and not self.state.current_pr.is_cross_repository
@@ -367,7 +357,6 @@ class FixMixin(BreachMixin):
             breach_run_id=breach_run_id,
         )
 
-        heartbeat = asyncio.create_task(self._publish_while_waiting("FIX"))
         fix_kwargs: dict[str, object] = {
             **plugin_run_kwargs,
             "on_process_start": self._track_current_coder_process,
@@ -385,13 +374,44 @@ class FixMixin(BreachMixin):
             )
             if extra_context is not None:
                 fix_kwargs["extra_context"] = extra_context
-        self._coder_invocation_active = True
-        claude_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
-            plugin.fix_review(
-                self.repo_path,
-                **fix_kwargs,
+        if not self._reserve_coder_credentials(
+            coder_name,
+            invocation_kwargs=fix_kwargs,
+        ):
+            self.log_event(
+                "[FIX] Coder invocation deferred while device login owns "
+                "its credential location."
             )
-        )
+            return
+        heartbeat: asyncio.Task[None] | None = None
+        try:
+            self.log_event(
+                f"[{coder_name}] entering FIX.",
+                tier="state",
+                kind="transition",
+            )
+            await self.publish_state()
+            if self._current_run_record is not None:
+                self._current_run_record.fix_iterations += 1
+                await self._checkpoint_current_run_record()
+            heartbeat = asyncio.create_task(self._publish_while_waiting("FIX"))
+            self._coder_invocation_active = True
+            claude_task: asyncio.Task[tuple[int, str, str]] = (
+                asyncio.create_task(
+                    plugin.fix_review(
+                        self.repo_path,
+                        **fix_kwargs,
+                    )
+                )
+            )
+        except BaseException:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
+            self._coder_invocation_active = False
+            self._release_coder_credentials()
+            raise
+        assert heartbeat is not None
         stop_monitor = asyncio.create_task(self._monitor_stop_request(claude_task))
         idle_monitor = asyncio.create_task(
             self._monitor_fix_idle(pr_number, idle_limit, claude_task, idle_flag)

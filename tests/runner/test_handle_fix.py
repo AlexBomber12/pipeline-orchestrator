@@ -43,6 +43,59 @@ from tests.runner import _helpers as h
 claude_cli = claude_plugin_module.claude_cli
 
 
+def test_handle_fix_defers_for_device_login_without_counting_iteration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    called: list[str] = []
+
+    async def must_not_run(*_args: object, **_kwargs: object) -> tuple[int, str, str]:
+        called.append("fix")
+        return (0, "", "")
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", must_not_run)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-login-reservation")
+    monkeypatch.setattr(
+        runner,
+        "_reserve_coder_credentials",
+        lambda _name, **_kwargs: False,
+    )
+
+    asyncio.run(runner.handle_fix())
+
+    assert called == []
+    assert runner.state.current_pr.fix_iteration_count == 0
+    assert any("device login" in event["event"] for event in runner.state.history)
+
+
+def test_handle_fix_releases_reservation_on_schedule_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=77, branch="pr-login-schedule")
+    plugin = runner._registry.get("claude")
+    released: list[bool] = []
+    monkeypatch.setattr(plugin, "fix_review", lambda *_args, **_kwargs: (0, "", ""))
+    monkeypatch.setattr(
+        runner,
+        "_reserve_coder_credentials",
+        lambda _name, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        runner, "_release_coder_credentials", lambda: released.append(True)
+    )
+
+    with pytest.raises(TypeError, match="a coroutine was expected"):
+        asyncio.run(runner.handle_fix())
+
+    assert released == [True]
+    assert runner._coder_invocation_active is False
+
+
 def test_handle_fix_skipped_when_spend_ceiling_exceeded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

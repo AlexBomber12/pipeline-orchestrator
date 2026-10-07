@@ -26,13 +26,16 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import redis.asyncio as aioredis
 
+from src.coder_login import CoderCredentialReservations
 from src.coder_registry import CoderRegistry
 from src.coders import build_coder_registry
 from src.config import AppConfig, RepoConfig, load_config, normalize_repo_url
@@ -254,6 +257,7 @@ def _build_runner(
     claude_usage_provider: UsageProvider | None,
     codex_usage_provider: UsageProvider | None,
     registry: CoderRegistry,
+    credential_reservations: CoderCredentialReservations | None = None,
 ) -> PipelineRunner | None:
     """Construct a runner, logging and swallowing init failures."""
     try:
@@ -268,6 +272,10 @@ def _build_runner(
             kwargs["registry"] = registry
         if "usage_providers" in inspect.signature(PipelineRunner).parameters:
             kwargs["usage_providers"] = registry.usage_providers()
+        if "credential_reservations" in inspect.signature(
+            PipelineRunner
+        ).parameters:
+            kwargs["credential_reservations"] = credential_reservations
         return PipelineRunner(**kwargs)
     except Exception:
         logger.error(
@@ -307,6 +315,7 @@ def _sync_runners(
     codex_usage_provider: UsageProvider | None,
     registry: CoderRegistry,
     in_flight: dict[str, asyncio.Task[None]] | None = None,
+    credential_reservations: CoderCredentialReservations | None = None,
 ) -> None:
     """Reconcile ``runners`` with ``config.repositories`` in place.
 
@@ -400,6 +409,7 @@ def _sync_runners(
             claude_usage_provider,
             codex_usage_provider,
             registry,
+            credential_reservations,
         )
         if runner is not None:
             runners[key] = runner
@@ -713,7 +723,17 @@ async def _wait_or_wake(
     return healthy
 
 
-async def main() -> None:
+def _credential_location_in_use(
+    runners: dict[str, PipelineRunner], credential_location: str
+) -> bool:
+    """Check active runner ownership without exposing runner state to the bridge."""
+    return any(
+        runner.coder_credential_location_in_use(credential_location)
+        for runner in runners.values()
+    )
+
+
+async def _run_daemon(owned_tasks: set[asyncio.Task[None]]) -> None:
     """Initialize runners and drive the poll loop forever."""
     gh_dir = os.environ.get("GH_CONFIG_DIR")
     if gh_dir:
@@ -742,14 +762,20 @@ async def main() -> None:
 
     redis_url = os.environ.get("REDIS_URL", DEFAULT_REDIS_URL)
     redis_client = aioredis.from_url(redis_url, decode_responses=True)
+    runners: dict[str, PipelineRunner] = {}
+    credential_reservations = CoderCredentialReservations()
     # Publish configured metadata as soon as Redis is available so web startup
     # never needs to import or instantiate operator-provided plugin code.
-    _background_tasks: set[asyncio.Task[None]] = set()
+    _background_tasks = owned_tasks
     model_catalog_task = asyncio.create_task(
         serve_model_catalog_requests(
             redis_client,
             registry,
             config_path=os.environ.get("PO_CONFIG_PATH", "config.yml"),
+            credential_location_in_use=partial(
+                _credential_location_in_use, runners
+            ),
+            credential_reservations=credential_reservations,
         )
     )
     _background_tasks.add(model_catalog_task)
@@ -787,7 +813,6 @@ async def main() -> None:
             "No repositories configured; daemon will idle until config.yml is updated"
         )
 
-    runners: dict[str, PipelineRunner] = {}
     in_flight: dict[str, asyncio.Task[None]] = {}
     _sync_runners(
         runners,
@@ -797,6 +822,7 @@ async def main() -> None:
         codex_usage_provider,
         registry,
         in_flight,
+        credential_reservations,
     )
 
     # Keep strong references: the event loop only holds weak references to
@@ -868,6 +894,7 @@ async def main() -> None:
                         codex_usage_provider,
                         registry,
                         in_flight,
+                        credential_reservations,
                     )
                     removed_keys = prev_keys - set(runners.keys())
                     if removed_keys:
@@ -937,7 +964,10 @@ async def main() -> None:
                 # the moment it returns and the per-runner interval would be
                 # ignored on long jobs.
                 last_run[key] = now
-                in_flight[key] = asyncio.create_task(runner.run_cycle())
+                cycle_task = asyncio.create_task(runner.run_cycle())
+                in_flight[key] = cycle_task
+                _background_tasks.add(cycle_task)
+                cycle_task.add_done_callback(_background_tasks.discard)
 
             # Clean up last_run entries for removed runners.
             for key in list(last_run.keys()):
@@ -998,6 +1028,46 @@ async def main() -> None:
             await _close_pubsub(pubsub)
             pubsub = None
             subscribed_slugs = ()
+
+
+async def main() -> None:
+    """Run the daemon and await owned-task cleanup on process termination."""
+    loop = asyncio.get_running_loop()
+    owned_tasks: set[asyncio.Task[None]] = set()
+    daemon_task = asyncio.create_task(_run_daemon(owned_tasks))
+    sigterm_requested = False
+
+    def request_sigterm_shutdown() -> None:
+        nonlocal sigterm_requested
+        sigterm_requested = True
+        daemon_task.cancel()
+
+    def remove_sigterm_handler() -> None:
+        return None
+
+    try:
+        loop.add_signal_handler(signal.SIGTERM, request_sigterm_shutdown)
+    except (NotImplementedError, RuntimeError):  # pragma: no cover - non-Unix loop
+        logger.warning("SIGTERM handler unavailable; using platform defaults")
+    else:
+        remove_sigterm_handler = partial(
+            loop.remove_signal_handler,
+            signal.SIGTERM,
+        )
+
+    try:
+        await daemon_task
+    except asyncio.CancelledError:
+        if not sigterm_requested:
+            raise
+        logger.info("SIGTERM received; shutting down daemon")
+    finally:
+        remove_sigterm_handler()
+        tasks = tuple(owned_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":  # pragma: no cover  # entry point invoked via python -m
