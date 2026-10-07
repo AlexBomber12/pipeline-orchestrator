@@ -262,7 +262,7 @@ class CodexPlugin:
             if configured
             else Path(config.auth.codex_home_dir) / ".codex"
         )
-        return str(location.absolute())
+        return str(location.resolve(strict=False))
 
     def create_device_login(
         self, *, config_path: str = CONFIG_PATH

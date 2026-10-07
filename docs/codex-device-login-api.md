@@ -85,9 +85,12 @@ remains available. They receive the same effective `CODEX_HOME`: an explicitly
 inherited value when present, otherwise `<auth.codex_home_dir>/.codex`,
 normalized once to an absolute path before any child process starts. A
 successful login therefore updates the credential store used by subsequent
-work regardless of each child's working directory. Web auth-status requests
-reach coder probes through the daemon bridge, so they use the same credential
-reservation as coder dispatch and cannot race an active login.
+work regardless of each child's working directory. Credential-location
+identities also resolve filesystem aliases without requiring the directory to
+exist, so symlinked spellings of the same store share one reservation. Web
+auth-status requests reach coder probes through the daemon bridge, so they use
+the same credential reservation as coder dispatch and cannot race an active
+login.
 
 Terminal sessions are retained for five minutes. Sessions are daemon-memory
 state: after a daemon restart, every old identifier returns `not_found` and

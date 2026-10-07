@@ -950,6 +950,35 @@ def test_codex_device_login_context_uses_effective_auth_environment(
     assert default_adapter.credential_location == str(configured_home / ".codex")
 
 
+def test_codex_credential_location_canonicalizes_symlink_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    credential_parent = tmp_path / "credential-parent"
+    credential_parent.mkdir()
+    first_alias = tmp_path / "first-alias"
+    second_alias = tmp_path / "second-alias"
+    first_alias.symlink_to(credential_parent, target_is_directory=True)
+    second_alias.symlink_to(credential_parent, target_is_directory=True)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    plugin = CodexPlugin()
+
+    first = plugin.device_login_credential_location(
+        config=AppConfig.model_validate(
+            {"auth": {"codex_home_dir": str(first_alias)}}
+        )
+    )
+    second = plugin.device_login_credential_location(
+        config=AppConfig.model_validate(
+            {"auth": {"codex_home_dir": str(second_alias)}}
+        )
+    )
+
+    expected = str((credential_parent / ".codex").resolve(strict=False))
+    assert first == expected
+    assert second == expected
+
+
 def test_codex_device_login_parser_handles_ansi_and_incremental_output() -> None:
     adapter = codex_module.CodexDeviceLoginAdapter(
         command=("codex",),
