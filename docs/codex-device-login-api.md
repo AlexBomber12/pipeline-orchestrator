@@ -3,7 +3,8 @@
 The web control plane delegates device-code login to the daemon through the
 existing coder-plugin Redis bridge. The daemon owns the supervised Codex CLI
 process and retains login sessions only in memory. This contract is intended
-for a later Settings UI; this change does not add login controls.
+for the Settings Coders login controls; the web process only renders and polls
+daemon-owned session evidence.
 
 The adapter matches the `codex-cli 0.160.0` version pinned by the repository.
 OpenAI's [access-token documentation](https://learn.chatgpt.com/docs/enterprise/access-tokens)
@@ -22,7 +23,8 @@ cancellation return HTTP 200. Unsupported plugins return 422, missing or
 expired sessions return 404, ownership/replacement conflicts return 409, and
 an unavailable daemon bridge returns 503.
 
-Every response contains only these allowlisted fields:
+Every ordinary JSON API response contains only these allowlisted fields. The
+same-origin Settings HTMX representation renders only this validated payload:
 
 ```text
 plugin, session_id, state, detail, failure_reason,
@@ -121,3 +123,41 @@ Explicit replacement is destructive: an unsuccessful, expired, timed-out, or
 cancelled login can leave Codex authentication unavailable. The UI must show
 `replacement_warning` before requesting replacement and must not promise that
 the previous credentials will be preserved.
+
+## Settings operator flow
+
+Settings renders a login control only when the plugin auth capabilities include
+the `device_code` interactive method. Merely viewing or refreshing Settings is
+read-only: a session starts only after the operator presses the login button.
+The controls call the operations above directly; same-origin HTMX requests
+receive an escaped HTML state component while ordinary API clients continue to
+receive the allowlisted JSON object.
+When saved credentials cause `replacement_required`, Settings renders the
+backend `replacement_warning` and the risk of losing authentication before it
+offers a separate confirmation that sends `replace_existing=true`.
+
+An active component displays the allowlisted verification URL, temporary code,
+and UTC deadline, then polls only its opaque session identifier. HTMX request
+synchronization drops repeat starts, prevents overlapping polls, and aborts an
+older response when a cancel or newer request supersedes it. The component is
+preserved across ordinary Settings HTMX rerenders. Polling is one request at a
+time with a request timeout; it stops when the daemon returns a terminal state,
+the session is missing, or the operator leaves Settings. Transport failures are
+shown without automatically retrying a start; status inspection can retry the
+same known session.
+
+Cancellation stays pending while the backend reports `canceling`.
+`cleanup_failed` with `cleanup_confirmed=false` is rendered as unresolved and
+offers a fresh cleanup check; it is never presented as a stopped process. A
+missing session explains that the daemon may have restarted and does not start a
+replacement session.
+
+After `succeeded`, Settings uses the existing auth-status and model-catalog
+refresh paths. It renders the returned auth evidence exactly: saved credentials
+with `service_access_verified=null` are not described as verified service
+access.
+
+The UI keeps session state only in the live DOM. It never writes verification
+URLs or temporary codes to logs, analytics, event history, diagnostics,
+`localStorage`, or `sessionStorage`, and it never renders raw CLI output or
+credential contents.

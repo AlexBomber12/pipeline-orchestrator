@@ -1,0 +1,209 @@
+{% set login = device_login if device_login is defined else none %}
+{% set state = login.state if login else 'idle' %}
+{% set active = state in ('starting', 'waiting_for_user', 'canceling') %}
+<div id="coder-{{ coder_name }}-device-login-state"
+     data-device-login-state="{{ state }}"
+     {% if login and login.session_id %}data-device-login-session="{{ login.session_id }}"{% endif %}
+     {% if active and login.session_id %}
+     data-device-login-poll
+     hx-get="/api/coders/{{ coder_name }}/device-login/{{ login.session_id }}"
+     hx-trigger="load delay:2s, device-login-retry"
+     hx-target="this"
+     hx-swap="outerHTML"
+     hx-sync="closest [data-device-login-shell]:replace"
+     hx-request='{"timeout":10000}'
+     {% endif %}
+     class="mt-3 rounded border border-white/10 bg-surface-3/40 p-3 text-xs">
+    {% if not login %}
+    <form hx-post="/api/coders/{{ coder_name }}/device-login"
+          hx-target="#coder-{{ coder_name }}-device-login-state"
+          hx-swap="outerHTML"
+          hx-sync="closest [data-device-login-shell]:drop"
+          hx-disabled-elt="find button">
+        <button type="submit"
+                class="secondary-interactive rounded border border-accent/30 bg-accent/10 px-3 py-1.5 font-medium text-accent">
+            {% if device_login_auth.saved_credentials_present is sameas true %}Replace login{% else %}Start device login{% endif %}
+        </button>
+        <p class="mt-2 text-gray-500">
+            Starts only when you press this button. Device codes are temporary and should not be shared.
+        </p>
+        {% if device_login_auth.saved_credentials_present is sameas true %}
+        <p class="mt-1 text-warn">
+            Existing credentials are present. The daemon will return the provider replacement warning before replacement can be confirmed.
+        </p>
+        {% endif %}
+    </form>
+    {% elif state == 'replacement_required' or login.failure_reason == 'replacement_required' %}
+    <div role="alert" class="rounded border border-warn/30 bg-warn/10 p-3 text-warn">
+        <div class="font-semibold">Confirm credential replacement</div>
+        {% if login.replacement_warning %}
+        <p class="mt-2" data-device-login-replacement-warning>{{ login.replacement_warning }}</p>
+        <p class="mt-2 text-gray-300">
+            If replacement is unsuccessful, expires, times out, or is cancelled, authentication may remain unavailable.
+        </p>
+        <form class="mt-3"
+              hx-post="/api/coders/{{ coder_name }}/device-login"
+              hx-target="#coder-{{ coder_name }}-device-login-state"
+              hx-swap="outerHTML"
+              hx-sync="closest [data-device-login-shell]:drop"
+              hx-disabled-elt="find button">
+            <input type="hidden" name="replace_existing" value="true">
+            <button type="submit"
+                    class="secondary-interactive rounded border border-warn/30 bg-warn/10 px-3 py-1.5 font-medium text-warn">
+                I understand — replace existing login
+            </button>
+        </form>
+        {% else %}
+        <p class="mt-2">
+            The daemon did not provide the required replacement warning, so Settings will not offer credential replacement.
+        </p>
+        {% endif %}
+    </div>
+    {% elif state == 'waiting_for_user' %}
+    <div role="status" aria-live="polite">
+        <div class="font-semibold text-warn">Waiting for authorization</div>
+        <p class="mt-1 text-gray-300">{{ login.detail }}</p>
+        {% if login.reused_session %}
+        <p class="mt-1 text-gray-500">Continuing the daemon's existing login session.</p>
+        {% endif %}
+        <div class="mt-3 space-y-2">
+            <div>
+                <span class="text-gray-500">Verification page</span>
+                <a class="ml-2 break-all font-mono text-accent hover:text-accent"
+                   href="{{ login.verification_url }}"
+                   target="_blank"
+                   rel="noopener noreferrer">{{ login.verification_url }}</a>
+            </div>
+            <div>
+                <span class="text-gray-500">Temporary code</span>
+                <code class="ml-2 rounded bg-surface-2 px-2 py-1 text-base tracking-widest text-gray-100">{{ login.user_code }}</code>
+            </div>
+            <div>
+                <span class="text-gray-500">Deadline</span>
+                <time class="ml-2 font-mono text-gray-300">{{ device_login_deadline or 'Unavailable' }}</time>
+            </div>
+        </div>
+        <form class="mt-3"
+              hx-delete="/api/coders/{{ coder_name }}/device-login/{{ login.session_id }}"
+              hx-trigger="submit once"
+              hx-target="#coder-{{ coder_name }}-device-login-state"
+              hx-swap="outerHTML"
+              hx-sync="closest [data-device-login-shell]:replace"
+              hx-disabled-elt="find button"
+              data-device-login-action="cancel">
+            <button type="submit"
+                    class="secondary-interactive rounded border border-white/10 px-3 py-1.5 text-gray-300">
+                Cancel
+            </button>
+        </form>
+    </div>
+    {% elif state == 'starting' %}
+    <div role="status" aria-live="polite">
+        <div class="font-semibold text-warn">Starting device login…</div>
+        <p class="mt-1 text-gray-300">{{ login.detail }}</p>
+        <form class="mt-3"
+              hx-delete="/api/coders/{{ coder_name }}/device-login/{{ login.session_id }}"
+              hx-trigger="submit once"
+              hx-target="#coder-{{ coder_name }}-device-login-state"
+              hx-swap="outerHTML"
+              hx-sync="closest [data-device-login-shell]:replace"
+              hx-disabled-elt="find button"
+              data-device-login-action="cancel">
+            <button type="submit"
+                    class="secondary-interactive rounded border border-white/10 px-3 py-1.5 text-gray-300">
+                Cancel
+            </button>
+        </form>
+    </div>
+    {% elif state == 'canceling' %}
+    <div role="status" aria-live="polite">
+        <div class="font-semibold text-warn">Cancellation pending…</div>
+        <p class="mt-1 text-gray-300">{{ login.detail }}</p>
+        <p class="mt-1 text-gray-500">Waiting for the daemon to report the process cleanup outcome.</p>
+    </div>
+    {% elif state == 'cleanup_failed' and login.cleanup_confirmed is not sameas true %}
+    <div role="alert" class="text-fail">
+        <div class="font-semibold">Cleanup remains unresolved</div>
+        <p class="mt-1">{{ login.detail }}</p>
+        <p class="mt-1 text-gray-300">
+            Process cleanup is not confirmed. The daemon still retains login ownership; do not assume the login process stopped.
+        </p>
+        {% if login.session_id %}
+        <form class="mt-3"
+              hx-delete="/api/coders/{{ coder_name }}/device-login/{{ login.session_id }}"
+              hx-target="#coder-{{ coder_name }}-device-login-state"
+              hx-swap="outerHTML"
+              hx-sync="closest [data-device-login-shell]:drop"
+              hx-disabled-elt="find button"
+              data-device-login-action="cancel">
+            <button type="submit"
+                    class="secondary-interactive rounded border border-fail/30 bg-fail/10 px-3 py-1.5 font-medium text-fail">
+                Retry cleanup check
+            </button>
+        </form>
+        {% endif %}
+    </div>
+    {% elif state == 'succeeded' %}
+    <div role="status" aria-live="polite" class="text-ok">
+        <div class="font-semibold">Login completed</div>
+        <p class="mt-1 text-gray-300">{{ login.detail }}</p>
+        {% if login.auth_status %}
+        <p class="mt-1 text-gray-400">{{ login.auth_status.detail }}</p>
+        {% endif %}
+        {% if not login.auth_status or login.auth_status.service_access_verified is none %}
+        <p class="mt-1 text-warn">Credentials were saved; service access was not verified.</p>
+        {% elif login.auth_status.service_access_verified is sameas false %}
+        <p class="mt-1 text-fail">The backend reported that service access verification failed.</p>
+        {% else %}
+        <p class="mt-1">The backend verified service access.</p>
+        {% endif %}
+        <p class="mt-1 text-gray-500" data-device-login-refresh-status>
+            Refreshing authentication status and model metadata…
+        </p>
+    </div>
+    {% elif state == 'not_found' %}
+    <div role="alert" class="text-warn">
+        <div class="font-semibold">Login session is no longer available</div>
+        <p class="mt-1">{{ login.detail }}</p>
+        <p class="mt-1 text-gray-300">
+            The daemon may have restarted or the retained session may have expired. No new login was started automatically.
+        </p>
+    </div>
+    {% elif state == 'unsupported' %}
+    <div role="alert" class="text-warn">
+        <div class="font-semibold">Device login is unsupported</div>
+        <p class="mt-1">{{ login.detail }}</p>
+    </div>
+    {% else %}
+    <div role="alert" class="{% if state == 'cancelled' %}text-gray-300{% else %}text-fail{% endif %}">
+        <div class="font-semibold">
+            {% if state == 'cancelled' %}Login cancelled
+            {% elif state == 'expired' %}Device code expired
+            {% elif state == 'timed_out' %}Login timed out
+            {% else %}Login did not complete{% endif %}
+        </div>
+        <p class="mt-1">{{ login.detail }}</p>
+        {% if login.failure_reason == 'daemon_unavailable' %}
+        <p class="mt-1 text-gray-300">The daemon bridge is unavailable. No successful login was reported.</p>
+        {% endif %}
+    </div>
+    {% endif %}
+
+    {% if login and state in ('succeeded', 'failed', 'cancelled', 'expired', 'timed_out', 'not_found') and login.failure_reason != 'replacement_required' %}
+    <form class="mt-3"
+          hx-post="/api/coders/{{ coder_name }}/device-login"
+          hx-target="#coder-{{ coder_name }}-device-login-state"
+          hx-swap="outerHTML"
+          hx-sync="closest [data-device-login-shell]:drop"
+          hx-disabled-elt="find button">
+        <button type="submit"
+                class="secondary-interactive rounded border border-white/10 px-3 py-1.5 text-gray-300">
+            {% if state == 'succeeded' %}Start another device login{% else %}Try device login again{% endif %}
+        </button>
+    </form>
+    {% endif %}
+
+    <p data-device-login-transport-error
+       class="mt-2 hidden text-warn"
+       role="alert"></p>
+</div>

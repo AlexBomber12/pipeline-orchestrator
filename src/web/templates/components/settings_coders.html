@@ -145,6 +145,18 @@
                         <div class="mt-1 font-mono text-xs text-gray-400 break-all">
                             {{ auth_entry.detail }}
                         </div>
+                        {% if coder.device_login_supported %}
+                        <div id="coder-{{ coder.name }}-device-login"
+                             data-device-login-shell
+                             data-device-login-plugin="{{ coder.name }}"
+                             data-model-catalog-refreshable="{{ 'true' if coder.model_catalog.refreshable else 'false' }}"
+                             hx-preserve="true"
+                             hx-request='{"timeout":10000}'>
+                            {% with coder_name=coder.name, coder_display_name=coder.display_name, device_login=none, device_login_auth=auth_entry, device_login_deadline=none %}
+                                {% include "components/settings_device_login.html" %}
+                            {% endwith %}
+                        </div>
+                        {% endif %}
                     </td>
                     <td class="py-3 align-top">
                         {% if coder.runtime_selectable %}

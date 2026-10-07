@@ -20,12 +20,13 @@ from importlib import metadata
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict, StrictBool
+from fastapi import APIRouter, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, StrictBool, ValidationError
 
 from src.audit.webhook_log import write_webhook_audit
 from src.coder_registry import (
+    CoderAuthCapabilities,
     CoderAuthStatus,
     CoderPlugin,
     CoderRegistry,
@@ -318,11 +319,43 @@ def _build_coder_rows(
                 "metadata_available": metadata_available,
                 "auth": auth_entry,
                 "auth_view": auth_status_view(auth_entry),
+                "device_login_supported": _supports_device_login(
+                    plugin,
+                    auth_entry,
+                ),
                 "is_default": config.daemon.coder == plugin.name,
                 "runtime_selectable": metadata_available,
             }
         )
     return rows
+
+
+def _supports_device_login(
+    plugin: CoderPlugin,
+    auth_entry: dict[str, Any],
+) -> bool:
+    """Return whether plugin metadata advertises device-code login.
+
+    Auth results are the provider-neutral capability source for configured
+    plugins. Built-ins may retain their local capability metadata when the
+    daemon auth probe is temporarily unavailable, so an outage does not hide
+    the recovery control operators need to restore authentication.
+    """
+    capabilities = auth_entry.get("capabilities")
+    methods = (
+        capabilities.get("interactive_login_methods")
+        if isinstance(capabilities, dict)
+        else None
+    )
+    if isinstance(methods, list):
+        return "device_code" in methods
+    plugin_capabilities = getattr(plugin, "auth_capabilities", None)
+    return (
+        isinstance(plugin_capabilities, CoderAuthCapabilities)
+        and plugin_capabilities.interactive_login_methods is not None
+        and "device_code"
+        in plugin_capabilities.interactive_login_methods
+    )
 
 
 def _saved_reasoning_effort(daemon: DaemonConfig, plugin_id: str) -> str:
@@ -1282,6 +1315,48 @@ def _device_login_status_code(payload: dict[str, Any], *, started: bool) -> int:
     )
 
 
+async def _device_login_start_request(
+    request: Request,
+) -> DeviceLoginStartRequest:
+    """Validate JSON API bodies and the Settings HTMX form equivalently."""
+    try:
+        if request.headers.get("hx-request") == "true":
+            form = await request.form()
+            raw: dict[str, Any] = dict(form)
+            if isinstance(raw.get("replace_existing"), str):
+                value = raw["replace_existing"]
+                if value == "true":
+                    raw["replace_existing"] = True
+                elif value == "false":
+                    raw["replace_existing"] = False
+        else:
+            body = await request.body()
+            media_type = (
+                request.headers.get("content-type", "")
+                .partition(";")[0]
+                .strip()
+                .lower()
+            )
+            if body and media_type != "application/json":
+                raise HTTPException(
+                    status_code=415,
+                    detail="Device-login API requests must use application/json",
+                )
+            try:
+                raw = json.loads(body.decode("utf-8")) if body else {}
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid JSON device-login request body",
+                ) from None
+        return DeviceLoginStartRequest.model_validate(raw)
+    except ValidationError:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid device-login request body",
+        ) from None
+
+
 def _device_login_bridge_context(
     request: Request, coder_name: str
 ) -> tuple[Any, str] | None:
@@ -1295,33 +1370,157 @@ def _device_login_bridge_context(
     return bridge, reference
 
 
-@router.post("/api/coders/{coder_name}/device-login")
-async def api_start_device_login(
+async def _start_device_login(
     request: Request,
     coder_name: str,
-    body: DeviceLoginStartRequest | None = None,
-) -> JSONResponse:
-    """Start a daemon-owned login; user authorization continues in background."""
-    replace_existing = body.replace_existing if body is not None else False
+    *,
+    replace_existing: bool,
+) -> dict[str, Any]:
     context = _device_login_bridge_context(request, coder_name)
     if context is None:
-        payload = _device_login_unavailable(
+        return _device_login_unavailable(
             coder_name,
             replacement_requested=replace_existing,
         )
-    else:
-        bridge, reference = context
-        try:
-            payload = await bridge.start_device_login(
-                coder_name,
-                expected_reference=reference,
-                replace_existing=replace_existing,
-            )
-        except ModelCatalogUnavailable:
-            payload = _device_login_unavailable(
-                coder_name,
-                replacement_requested=replace_existing,
-            )
+    bridge, reference = context
+    try:
+        return await bridge.start_device_login(
+            coder_name,
+            expected_reference=reference,
+            replace_existing=replace_existing,
+        )
+    except ModelCatalogUnavailable:
+        return _device_login_unavailable(
+            coder_name,
+            replacement_requested=replace_existing,
+        )
+
+
+async def _inspect_device_login(
+    request: Request,
+    coder_name: str,
+    session_id: str,
+) -> dict[str, Any]:
+    context = _device_login_bridge_context(request, coder_name)
+    if context is None:
+        return _device_login_unavailable(
+            coder_name,
+            session_id=session_id,
+        )
+    bridge, reference = context
+    try:
+        return await bridge.inspect_device_login(
+            coder_name,
+            session_id,
+            expected_reference=reference,
+        )
+    except ModelCatalogUnavailable:
+        return _device_login_unavailable(
+            coder_name,
+            session_id=session_id,
+        )
+
+
+async def _cancel_device_login(
+    request: Request,
+    coder_name: str,
+    session_id: str,
+) -> dict[str, Any]:
+    context = _device_login_bridge_context(request, coder_name)
+    if context is None:
+        return _device_login_unavailable(
+            coder_name,
+            session_id=session_id,
+        )
+    bridge, reference = context
+    try:
+        return await bridge.cancel_device_login(
+            coder_name,
+            session_id,
+            expected_reference=reference,
+        )
+    except ModelCatalogUnavailable:
+        return _device_login_unavailable(
+            coder_name,
+            session_id=session_id,
+        )
+
+
+def _device_login_deadline(expires_at: object) -> str | None:
+    if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool):
+        return None
+    try:
+        deadline = datetime.fromtimestamp(expires_at, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return deadline.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _render_device_login(
+    request: Request,
+    coder_name: str,
+    payload: dict[str, Any],
+    *,
+    started: bool,
+) -> HTMLResponse:
+    """Render one session snapshot without persisting operator instructions."""
+    registry: CoderRegistry = request.app.state.coder_registry
+    plugin = registry.get_optional(coder_name)
+    headers: dict[str, str] = {}
+    if payload["state"] == "succeeded":
+        headers["HX-Trigger-After-Swap"] = json.dumps(
+            {"deviceLoginSucceeded": {"plugin": coder_name}},
+            separators=(",", ":"),
+        )
+    return _app.templates.TemplateResponse(
+        request,
+        "components/settings_device_login.html",
+        {
+            "coder_name": coder_name,
+            "coder_display_name": (
+                plugin.display_name if plugin is not None else coder_name
+            ),
+            "device_login": payload,
+            "device_login_deadline": _device_login_deadline(
+                payload.get("expires_at")
+            ),
+        },
+        status_code=_device_login_status_code(payload, started=started),
+        headers=headers,
+    )
+
+
+@router.post(
+    "/api/coders/{coder_name}/device-login",
+    openapi_extra={
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "schema": DeviceLoginStartRequest.model_json_schema()
+                }
+            }
+        }
+    },
+)
+async def api_start_device_login(
+    request: Request,
+    coder_name: str,
+) -> Response:
+    """Start a daemon-owned login; user authorization continues in background."""
+    body = await _device_login_start_request(request)
+    replace_existing = body.replace_existing
+    payload = await _start_device_login(
+        request,
+        coder_name,
+        replace_existing=replace_existing,
+    )
+    if request.headers.get("hx-request") == "true":
+        return _render_device_login(
+            request,
+            coder_name,
+            payload,
+            started=True,
+        )
     return JSONResponse(
         payload,
         status_code=_device_login_status_code(payload, started=True),
@@ -1331,25 +1530,16 @@ async def api_start_device_login(
 @router.get("/api/coders/{coder_name}/device-login/{session_id}")
 async def api_inspect_device_login(
     request: Request, coder_name: str, session_id: str
-) -> JSONResponse:
+) -> Response:
     """Inspect one short-lived login session without exposing raw CLI output."""
-    context = _device_login_bridge_context(request, coder_name)
-    if context is None:
-        payload = _device_login_unavailable(
-            coder_name, session_id=session_id
+    payload = await _inspect_device_login(request, coder_name, session_id)
+    if request.headers.get("hx-request") == "true":
+        return _render_device_login(
+            request,
+            coder_name,
+            payload,
+            started=False,
         )
-    else:
-        bridge, reference = context
-        try:
-            payload = await bridge.inspect_device_login(
-                coder_name,
-                session_id,
-                expected_reference=reference,
-            )
-        except ModelCatalogUnavailable:
-            payload = _device_login_unavailable(
-                coder_name, session_id=session_id
-            )
     return JSONResponse(
         payload,
         status_code=_device_login_status_code(payload, started=False),
@@ -1359,25 +1549,16 @@ async def api_inspect_device_login(
 @router.delete("/api/coders/{coder_name}/device-login/{session_id}")
 async def api_cancel_device_login(
     request: Request, coder_name: str, session_id: str
-) -> JSONResponse:
+) -> Response:
     """Cancel one daemon-owned login and report cleanup truthfully."""
-    context = _device_login_bridge_context(request, coder_name)
-    if context is None:
-        payload = _device_login_unavailable(
-            coder_name, session_id=session_id
+    payload = await _cancel_device_login(request, coder_name, session_id)
+    if request.headers.get("hx-request") == "true":
+        return _render_device_login(
+            request,
+            coder_name,
+            payload,
+            started=False,
         )
-    else:
-        bridge, reference = context
-        try:
-            payload = await bridge.cancel_device_login(
-                coder_name,
-                session_id,
-                expected_reference=reference,
-            )
-        except ModelCatalogUnavailable:
-            payload = _device_login_unavailable(
-                coder_name, session_id=session_id
-            )
     return JSONResponse(
         payload,
         status_code=_device_login_status_code(payload, started=False),
