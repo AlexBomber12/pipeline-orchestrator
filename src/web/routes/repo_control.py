@@ -1720,7 +1720,8 @@ async def post_repo_detail_coder(
         current_state.state in _DEFERRED_CODER_SWITCH_STATES
     )
     selected_label = (
-        f"Inherit ({_registry_coder_display_name(cfg.daemon.coder, registry)} default)"
+        "Automatic selection "
+        f"({_registry_coder_display_name(cfg.daemon.coder, registry)} preferred)"
         if updated_coder is None
         else _coder_display_name(updated_coder, registry)
     )

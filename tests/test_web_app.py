@@ -1793,8 +1793,8 @@ def test_repo_detail_route_renders_full_page(
     assert "Current PR" in body
     assert 'data-coder-display' in body
     assert 'href="/settings"' in body
-    assert "Configured: Inherit" in body
-    assert "Default: Claude Code" in body
+    assert "Configured: Automatic" in body
+    assert "Preferred default: Claude Code" in body
     assert "Recent PRs" not in body
     assert "Event log" in body
     # Pause/resume/stop publish history_updated; the SSE consumer must
@@ -4293,8 +4293,8 @@ def test_repo_header_coder_any_with_runtime_pick(
 ) -> None:
     coder_fragment = _render_repo_header_coder(two_repo_config, active="claude")
 
-    assert "Configured: Inherit" in coder_fragment
-    assert "Default: Claude Code" in coder_fragment
+    assert "Configured: Automatic" in coder_fragment
+    assert "Preferred default: Claude Code" in coder_fragment
     assert "Active:" not in coder_fragment
 
 
@@ -4307,9 +4307,9 @@ def test_repo_header_coder_ignores_persisted_idle_coder(
         state=PipelineState.IDLE,
     )
 
-    assert "Configured: Inherit" in coder_fragment
+    assert "Configured: Automatic" in coder_fragment
     assert "Active:" not in coder_fragment
-    assert "Default: Claude Code" in coder_fragment
+    assert "Preferred default: Claude Code" in coder_fragment
 
 
 def test_repo_header_coder_link_to_settings(

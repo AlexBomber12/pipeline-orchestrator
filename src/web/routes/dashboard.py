@@ -211,7 +211,7 @@ def _repo_coder_form_value(repo_config: RepoConfig | None) -> str:
 def _repo_coder_label(coder: str | None, registry: Any) -> str:
     """Return the repo-header display label for a coder selection."""
     if coder == "any":
-        return "Inherit"
+        return "Automatic"
     if coder:
         return _coder_display_name(coder, registry)
     return ""

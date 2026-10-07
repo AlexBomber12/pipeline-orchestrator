@@ -36,7 +36,7 @@
         </span>
         {% if selected_repo_coder == 'any' %}
         <span class="text-[11px] text-gray-500">
-            Default: {{ inherit_coder_label }}
+            Preferred default: {{ inherit_coder_label }}
         </span>
         {% endif %}
         {% set configured_effective_coder = inherit_coder if selected_repo_coder == 'any' else selected_repo_coder %}

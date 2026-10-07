@@ -1112,7 +1112,8 @@ def test_registered_plugin_round_trips_through_every_coder_mutation_endpoint(
     )
     assert 'option value="third" selected' in repo_update.text
     assert (
-        'option value="" selected>Inherit — Configured Test Coder'
+        'option value="" selected>Automatic — preferred default: '
+        "Configured Test Coder"
         in inherited.text
     )
     assert "Configured: Configured Test Coder" in detail_update.text
@@ -4239,8 +4240,8 @@ def test_repo_detail_coder_display_renders_readonly(
     assert 'data-coder-display' in body
     assert '<select name="coder"' not in body
     assert 'hx-post="/repos/example__alpha/coder"' not in body
-    assert "Configured: Inherit" in body
-    assert "Default: Claude Code" in body
+    assert "Configured: Automatic" in body
+    assert "Preferred default: Claude Code" in body
     assert 'href="/settings"' in body
 
 
