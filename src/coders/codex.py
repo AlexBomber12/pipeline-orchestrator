@@ -55,6 +55,14 @@ _AUTH_MODE_PATTERNS = (
     (re.compile(r"^Logged in (?:using|with) ChatGPT$"), "chatgpt"),
     (re.compile(r"^Logged in using an API key(?:\s+-\s+.*)?$"), "api_key"),
     (re.compile(r"^Logged in using (?:personal )?access token$"), "access_token"),
+    (
+        re.compile(r"^Logged in using Amazon Bedrock API key$"),
+        "bedrock_api_key",
+    ),
+    (
+        re.compile(r"^Logged in using Amazon Bedrock AWS access keys$"),
+        "bedrock_access_keys",
+    ),
     (re.compile(r"^Logged in using workload identity$"), "workload_identity"),
 )
 
@@ -350,6 +358,8 @@ class CodexPlugin:
                     "chatgpt": "ChatGPT",
                     "api_key": "API-key",
                     "access_token": "access-token",
+                    "bedrock_api_key": "Amazon Bedrock API-key",
+                    "bedrock_access_keys": "Amazon Bedrock AWS access-key",
                     "workload_identity": "workload-identity",
                 }[mode]
                 return self._auth_status(

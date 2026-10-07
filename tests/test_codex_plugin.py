@@ -235,6 +235,16 @@ def test_codex_plugin_check_auth(
             "access-token",
         ),
         (
+            "Logged in using Amazon Bedrock API key",
+            "bedrock_api_key",
+            "Amazon Bedrock API-key",
+        ),
+        (
+            "Logged in using Amazon Bedrock AWS access keys",
+            "bedrock_access_keys",
+            "Amazon Bedrock AWS access-key",
+        ),
+        (
             "Logged in using workload identity",
             "workload_identity",
             "workload-identity",

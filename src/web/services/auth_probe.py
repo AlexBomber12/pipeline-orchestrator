@@ -265,8 +265,8 @@ def auth_status_view(entry: dict[str, Any]) -> dict[str, str]:
     """Return generic presentation metadata for one auth contract."""
     if entry.get("service_access_verified") is True:
         return {"label": "Access verified", "tone": "ok"}
-    if entry.get("saved_credentials_present") is True:
-        return {"label": "Credentials saved", "tone": "warn"}
+    if entry.get("service_access_verified") is False:
+        return {"label": "Access failed", "tone": "fail"}
     if entry.get("saved_credentials_present") is False:
         return {"label": "Credentials missing", "tone": "fail"}
     if entry.get("cli_available") is False:
@@ -277,6 +277,10 @@ def auth_status_view(entry: dict[str, Any]) -> dict[str, str]:
         "probe_unavailable",
     }:
         return {"label": "Status unavailable", "tone": "warn"}
+    if entry.get("status") == "error":
+        return {"label": "Error", "tone": "fail"}
+    if entry.get("saved_credentials_present") is True:
+        return {"label": "Credentials saved", "tone": "warn"}
     if entry.get("status") == "ok":
         return {"label": "Available", "tone": "ok"}
     return {"label": "Error", "tone": "fail"}

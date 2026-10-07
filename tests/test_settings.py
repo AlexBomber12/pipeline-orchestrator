@@ -3508,6 +3508,14 @@ def test_default_auth_status_and_first_probe_line_helpers() -> None:
             {"label": "Access verified", "tone": "ok"},
         ),
         (
+            {
+                "status": "ok",
+                "saved_credentials_present": True,
+                "service_access_verified": False,
+            },
+            {"label": "Access failed", "tone": "fail"},
+        ),
+        (
             {"saved_credentials_present": True},
             {"label": "Credentials saved", "tone": "warn"},
         ),
@@ -3523,8 +3531,13 @@ def test_default_auth_status_and_first_probe_line_helpers() -> None:
             {"failure_reason": "probe_timeout"},
             {"label": "Status unavailable", "tone": "warn"},
         ),
+        (
+            {"status": "error", "saved_credentials_present": True},
+            {"label": "Error", "tone": "fail"},
+        ),
         ({"status": "ok"}, {"label": "Available", "tone": "ok"}),
         ({"status": "error"}, {"label": "Error", "tone": "fail"}),
+        ({}, {"label": "Error", "tone": "fail"}),
     ],
 )
 def test_auth_status_view_is_generic(
