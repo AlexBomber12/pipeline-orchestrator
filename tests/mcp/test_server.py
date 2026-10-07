@@ -159,12 +159,17 @@ def test_remote_listener_registers_diagnostics_and_transport_allowlist() -> None
 
 
 @pytest.mark.parametrize(
-    ("remote_enabled", "remote_redis"),
-    [("0", "unset"), ("1", "redis://redis:6379/0")],
+    ("remote_value", "remote_diagnostics", "remote_redis"),
+    [
+        ("0", "0", "unset"),
+        ("1", "1", "redis://redis:6379/0"),
+        (" true ", "1", "redis://redis:6379/0"),
+    ],
 )
 def test_mcp_entrypoint_preserves_local_diagnostics_and_gates_remote_redis(
     tmp_path: Path,
-    remote_enabled: str,
+    remote_value: str,
+    remote_diagnostics: str,
     remote_redis: str,
 ) -> None:
     fake_python = tmp_path / "python"
@@ -179,7 +184,7 @@ def test_mcp_entrypoint_preserves_local_diagnostics_and_gates_remote_redis(
     environment = {
         **os.environ,
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
-        "MCP_REMOTE_DIAGNOSTICS": remote_enabled,
+        "MCP_REMOTE_DIAGNOSTICS": remote_value,
         "REDIS_URL": "redis://redis:6379/0",
     }
     completed = subprocess.run(
@@ -191,7 +196,7 @@ def test_mcp_entrypoint_preserves_local_diagnostics_and_gates_remote_redis(
         timeout=5,
     )
     assert completed.returncode == 7
-    assert f"5173|{remote_enabled}|{remote_redis}" in completed.stdout
+    assert f"5173|{remote_diagnostics}|{remote_redis}" in completed.stdout
     assert "5174|1|redis://redis:6379/0" in completed.stdout
 
 
