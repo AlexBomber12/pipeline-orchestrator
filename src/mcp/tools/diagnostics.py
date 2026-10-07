@@ -16,6 +16,7 @@ import re
 import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
+from html import unescape
 from typing import Any
 from urllib.parse import unquote_plus
 
@@ -1375,7 +1376,7 @@ def _xml_tag_has_credential_context(name: str, attributes: list[tuple[str, str]]
         local_name = attribute_name.rsplit(":", 1)[-1]
         if _is_sensitive_key(local_name) or (
             local_name.lower() in _XML_CREDENTIAL_SELECTOR_ATTRIBUTES
-            and _is_sensitive_key(value)
+            and _is_sensitive_key(unescape(value))
         ):
             return True
     return False
@@ -1430,7 +1431,18 @@ def _omit_ambiguous_yaml_credential_documents(text: str) -> tuple[str, int]:
             unsafe_comment = comment is not None and (
                 value[: comment.start()].strip() in _YAML_BLOCK_VALUE_INDICATORS
             )
-            if unsafe_comment or document_has_alias:
+            yaml_key = line[: max(value_start - 1, 0)].strip().strip("'\"")
+            unsafe_flow_collection = (
+                value.startswith(("[", "{"))
+                and value_start > 0
+                and line[value_start - 1] == ":"
+                and bool(yaml_key)
+                and all(
+                    character in _SENSITIVE_KEY_CHARACTERS or character.isspace()
+                    for character in yaml_key
+                )
+            )
+            if unsafe_comment or unsafe_flow_collection or document_has_alias:
                 ranges.append((start, end))
                 break
     return _omit_document_ranges(text, ranges)

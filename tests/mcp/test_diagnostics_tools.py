@@ -885,6 +885,10 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
             "password:",
             "  nested: *nested",
             "---",
+            "password: [",
+            "SYNTHETIC_FLOW_COLLECTION_SECRET",
+            "]",
+            "---",
             "safe: visible",
         )
     )
@@ -893,7 +897,7 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
     result = await diagnostics.get_latest_cli_log(SLUG, diagnostics._MAX_CLI_LOG_TAIL_BYTES)
 
     assert result["availability"]["status"] == "available"
-    assert result["text"].count("[credential document omitted]") == 4
+    assert result["text"].count("[credential document omitted]") == 5
     assert "safe: before" in result["text"]
     assert "safe: visible" in result["text"]
     for secret in (
@@ -901,6 +905,7 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
         "SYNTHETIC_BEFORE_ALIAS_SECRET",
         "SYNTHETIC_AFTER_ALIAS_SECRET",
         "SYNTHETIC_NESTED_ALIAS_SECRET",
+        "SYNTHETIC_FLOW_COLLECTION_SECRET",
     ):
         assert secret not in result["text"]
 
@@ -933,6 +938,7 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
             "<password>SYNTHETIC_XML_ELEMENT_SECRET</password>",
             "safe-between: visible",
             '<add key="ClearTextPassword" value="SYNTHETIC_XML_PAIR_SECRET"/>',
+            '<add key="Pass&#x77;ord" value="SYNTHETIC_XML_ENTITY_SECRET"/>',
             "safe-after: visible",
             "<cfg:connection cfg:password='SYNTHETIC_XML_ATTRIBUTE_SECRET'/>",
             "<add value='SYNTHETIC_XML_ORDER_SECRET' name='apiToken'/>",
@@ -946,7 +952,7 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
     result = await diagnostics.get_latest_cli_log(SLUG)
 
     assert result["availability"]["status"] == "available"
-    assert result["text"].count("[credential document omitted]") == 5
+    assert result["text"].count("[credential document omitted]") == 6
     assert "safe-between: visible" in result["text"]
     assert "safe-after: visible" in result["text"]
     assert "<safe ignored attr='visible'>visible</safe>" in result["text"]
@@ -954,6 +960,7 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
     for secret in (
         "SYNTHETIC_XML_ELEMENT_SECRET",
         "SYNTHETIC_XML_PAIR_SECRET",
+        "SYNTHETIC_XML_ENTITY_SECRET",
         "SYNTHETIC_XML_ATTRIBUTE_SECRET",
         "SYNTHETIC_XML_ORDER_SECRET",
         "SYNTHETIC_XML_UNQUOTED_SECRET",

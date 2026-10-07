@@ -58,8 +58,9 @@ using a bounded single-pass boundary scan.
 Standard encoded `auth` fields used by registry and package-manager credential
 documents are treated as credential context rather than exported as base64 text.
 Recognizable XML credential elements, credential attributes, and `key`/`name`
-plus `value` configuration tags are omitted. Multiline or incomplete XML
-credential contexts fail closed through the bounded source end.
+plus `value` configuration tags are omitted. XML character references in
+credential selectors are decoded before classification. Multiline or incomplete
+XML credential contexts fail closed through the bounded source end.
 Standalone single-token authorization-scheme values such as `Bearer` and
 `Basic` credentials are redacted even when the header name is absent; a
 multi-parameter `Digest` value causes conservative line omission.
@@ -72,10 +73,11 @@ This includes leading blank lines and legal indentationless YAML sequence values
 under a credential key, plus shell heredoc bodies through their delimiter or
 source end. Literal heredoc delimiters may start with digits; unsupported
 delimiter words fail closed by omitting the remainder of the bounded source.
-YAML documents containing a sensitive field with a comment-only value or an
-alias are omitted as a whole because line-level redaction cannot safely retain
-the referenced anchor value. Explicit document boundaries preserve neighboring
-documents; without one, the bounded source segment fails closed.
+YAML documents containing a sensitive field with a comment-only value, alias,
+or flow-style collection are omitted as a whole because line-level redaction
+cannot safely retain the referenced or indentationless value. Explicit document
+boundaries preserve neighboring documents; without one, the bounded source
+segment fails closed.
 Terminal escape and control sequences, including C1 control strings, are
 normalized before credential inspection. The source suffix beginning with the
 first bare carriage return or stateful cursor/editing control is omitted
