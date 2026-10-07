@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import pytest
 from src import coder_login
-from src.coder_login import CoderLoginSessionManager
+from src.coder_login import CoderCredentialReservations, CoderLoginSessionManager
 from src.coder_registry import (
     CoderAuthStatus,
     CoderDeviceLoginFailure,
@@ -139,6 +139,7 @@ def _manager(
     *,
     plugin_name: str = "codex",
     active: Callable[[str], bool] | None = None,
+    reservations: CoderCredentialReservations | None = None,
     wall_time: Callable[[], float] = lambda: 1_000.0,
     monotonic: Callable[[], float] = lambda: 10.0,
 ) -> tuple[CoderLoginSessionManager, CoderRegistry]:
@@ -151,11 +152,68 @@ def _manager(
             registry,
             config_path="/cfg/config.yml",
             credential_location_in_use=active,
+            credential_reservations=reservations,
             wall_time=wall_time,
             monotonic=monotonic,
         ),
         registry,
     )
+
+
+def test_credential_reservations_allow_coder_sharing_but_exclude_login() -> None:
+    reservations = CoderCredentialReservations()
+    location = "/tmp/shared-codex-home"
+
+    assert reservations.reserve_coder(location) is True
+    assert reservations.reserve_coder(location) is True
+    assert reservations.reserve_login(location) is False
+    reservations.release_coder(location)
+    assert reservations.reserve_login(location) is False
+    reservations.release_coder(location)
+    assert reservations.reserve_login(location) is True
+    assert reservations.reserve_login(location) is False
+    assert reservations.reserve_coder(location) is False
+    reservations.release_login(location)
+    reservations.release_login(location)
+    reservations.release_coder(location)
+    assert reservations.reserve_coder(location) is True
+    reservations.release_coder(location)
+
+
+@pytest.mark.asyncio
+async def test_device_login_reserves_before_background_work_and_releases_on_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reservations = CoderCredentialReservations()
+    location = "/tmp/fake-codex-home"
+    manager, _ = _manager(reservations=reservations)
+
+    assert reservations.reserve_coder(location) is True
+    blocked = await manager.start(
+        "codex", expected_reference=_REFERENCE, replace_existing=False
+    )
+    assert blocked["failure_reason"] == "credential_in_use"
+    reservations.release_coder(location)
+
+    auth_release = asyncio.Event()
+
+    async def blocked_auth(*_args: object, **_kwargs: object) -> dict[str, Any]:
+        await auth_release.wait()
+        return _auth(False)
+
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", blocked_auth)
+    started = await manager.start(
+        "codex", expected_reference=_REFERENCE, replace_existing=False
+    )
+    assert started["state"] == "starting"
+    assert reservations.reserve_coder(location) is False
+
+    cancelled = await manager.cancel(
+        "codex", started["session_id"], expected_reference=_REFERENCE
+    )
+    assert cancelled["state"] == "cancelled"
+    assert reservations.reserve_coder(location) is True
+    reservations.release_coder(location)
 
 
 async def _wait_for_state(
@@ -704,7 +762,8 @@ async def test_device_login_process_supervision_failures_keep_cleanup_truthful(
 
     monkeypatch.setattr(coder_login, "isolated_auth_probe", auth_probe)
     for quiescent, expected in ((True, "failed"), (False, "cleanup_failed")):
-        manager, _ = _manager()
+        reservations = CoderCredentialReservations()
+        manager, _ = _manager(reservations=reservations)
         managed = _Managed(quiescent=quiescent)
 
         async def launch(*_args: object, **_kwargs: object) -> _Managed:
@@ -725,6 +784,9 @@ async def test_device_login_process_supervision_failures_keep_cleanup_truthful(
         final = await _wait_for_state(manager, started["session_id"], expected)
         assert "secret" not in json.dumps(final)
         assert final["cleanup_confirmed"] is quiescent
+        assert reservations.reserve_coder("/tmp/fake-codex-home") is quiescent
+        if quiescent:
+            reservations.release_coder("/tmp/fake-codex-home")
 
 
 def test_device_login_validates_adapter_and_prompt_contracts() -> None:

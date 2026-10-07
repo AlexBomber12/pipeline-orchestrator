@@ -49,7 +49,12 @@ identity, effective environment, working directory, and credential location.
 Repeating start for the same active plugin and credential location returns the
 same session with `reused_session: true`; it does not spawn another login.
 Another plugin or active coder invocation using that credential location is a
-conflict.
+conflict. The daemon reserves a credential location synchronously before it
+schedules either kind of process: coder invocations may share a read-only
+reservation, while device login requires exclusive ownership. A login
+reservation is retained until process cleanup is confirmed; if cleanup cannot
+prove quiescence, both login replacement and new coder invocations remain
+blocked for that location.
 
 Terminal sessions are retained for five minutes. Sessions are daemon-memory
 state: after a daemon restart, every old identifier returns `not_found` and

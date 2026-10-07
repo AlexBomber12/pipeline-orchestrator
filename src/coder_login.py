@@ -35,6 +35,47 @@ _TERMINAL_STATES = frozenset(
 )
 
 
+class CoderCredentialReservations:
+    """Coordinate credential mutation with concurrent read-only coder use.
+
+    Coders may share one credential location concurrently, but a device-login
+    process requires exclusive ownership because the pinned Codex CLI clears
+    saved authentication before polling. All methods are synchronous so a
+    check and reservation are atomic within the daemon event loop.
+    """
+
+    def __init__(self) -> None:
+        self._login_locations: set[str] = set()
+        self._coder_counts: dict[str, int] = {}
+
+    def reserve_login(self, credential_location: str) -> bool:
+        if (
+            credential_location in self._login_locations
+            or self._coder_counts.get(credential_location, 0) > 0
+        ):
+            return False
+        self._login_locations.add(credential_location)
+        return True
+
+    def release_login(self, credential_location: str) -> None:
+        self._login_locations.discard(credential_location)
+
+    def reserve_coder(self, credential_location: str) -> bool:
+        if credential_location in self._login_locations:
+            return False
+        self._coder_counts[credential_location] = (
+            self._coder_counts.get(credential_location, 0) + 1
+        )
+        return True
+
+    def release_coder(self, credential_location: str) -> None:
+        count = self._coder_counts.get(credential_location, 0)
+        if count <= 1:
+            self._coder_counts.pop(credential_location, None)
+        else:
+            self._coder_counts[credential_location] = count - 1
+
+
 @dataclass
 class _LoginSession:
     session_id: str
@@ -57,6 +98,7 @@ class _LoginSession:
     abort_task: asyncio.Task[None] | None = None
     cancel_requested: bool = False
     parse_failed: bool = False
+    reservation_held: bool = False
     stdout: bytearray = field(default_factory=bytearray)
     stderr: bytearray = field(default_factory=bytearray)
 
@@ -70,6 +112,7 @@ class CoderLoginSessionManager:
         *,
         config_path: str,
         credential_location_in_use: Callable[[str], bool] | None = None,
+        credential_reservations: CoderCredentialReservations | None = None,
         wall_time: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -77,6 +120,9 @@ class CoderLoginSessionManager:
         self._config_path = config_path
         self._credential_location_in_use = credential_location_in_use or (
             lambda _location: False
+        )
+        self._credential_reservations = (
+            credential_reservations or CoderCredentialReservations()
         )
         self._wall_time = wall_time
         self._monotonic = monotonic
@@ -157,6 +203,17 @@ class CoderLoginSessionManager:
                 replacement_requested=replace_existing,
                 replacement_warning=adapter.replacement_warning,
             )
+        if not self._credential_reservations.reserve_login(
+            adapter.credential_location
+        ):
+            return self._error_payload(
+                plugin_name,
+                "failed",
+                "A coder invocation or login is using this credential location",
+                "credential_in_use",
+                replacement_requested=replace_existing,
+                replacement_warning=adapter.replacement_warning,
+            )
         session_id = self._new_session_id()
         session = _LoginSession(
             session_id=session_id,
@@ -165,6 +222,7 @@ class CoderLoginSessionManager:
             adapter=adapter,
             replacement_requested=replace_existing,
             created_monotonic=self._monotonic(),
+            reservation_held=True,
         )
         self._sessions[session_id] = session
         session.task = asyncio.create_task(self._start_session(session))
@@ -615,6 +673,7 @@ class CoderLoginSessionManager:
         session.stderr.clear()
         session.terminal_monotonic = self._monotonic()
         if cleanup_confirmed:
+            self._release_reservation(session)
             session.managed = None
 
     def _cleanup_failed(self, session: _LoginSession) -> None:
@@ -629,6 +688,14 @@ class CoderLoginSessionManager:
         session.expires_at = None
         session.stdout.clear()
         session.stderr.clear()
+
+    def _release_reservation(self, session: _LoginSession) -> None:
+        if not session.reservation_held:
+            return
+        self._credential_reservations.release_login(
+            session.adapter.credential_location
+        )
+        session.reservation_held = False
 
     def _session_payload(
         self, session: _LoginSession, *, reused_session: bool = False

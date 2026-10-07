@@ -223,6 +223,78 @@ def test_prepare_coder_invocation_returns_kwargs_with_breach_env(
 # ---------- _run_coder_with_supervision ----------
 
 
+def test_run_coder_with_supervision_defers_for_device_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    coder_name, plugin = runner._get_coder()
+    calls: list[str] = []
+
+    async def must_not_run(*_args: Any, **_kwargs: Any) -> tuple[int, str, str]:
+        calls.append("run")
+        return (0, "", "")
+
+    monkeypatch.setattr(plugin, "run_auto_pr", must_not_run)
+    monkeypatch.setattr(
+        coding_module.gh_prs, "get_branch_publications", lambda *_args: []
+    )
+    monkeypatch.setattr(runner, "_reserve_coder_credentials", lambda _name: False)
+    runner._current_breach_dir = "/tmp/breach-login"
+    runner._current_breach_run_id = "run-login"
+
+    result = asyncio.run(
+        runner._run_coder_with_supervision(
+            coder_name,
+            plugin,
+            {},
+            target_branch="pr-001",
+            current_pr_id="PR-001",
+            pr_id="PR-001",
+            task_file="tasks/PR-001.md",
+            task_body="# PR-001\n",
+        )
+    )
+
+    assert result is None
+    assert calls == []
+    assert any("device login" in event["event"] for event in runner.state.history)
+
+
+def test_run_coder_with_supervision_releases_reservation_on_schedule_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    coder_name, plugin = runner._get_coder()
+    released: list[bool] = []
+    monkeypatch.setattr(plugin, "run_auto_pr", lambda *_args, **_kwargs: (0, "", ""))
+    monkeypatch.setattr(
+        coding_module.gh_prs, "get_branch_publications", lambda *_args: []
+    )
+    monkeypatch.setattr(runner, "_reserve_coder_credentials", lambda _name: True)
+    monkeypatch.setattr(
+        runner, "_release_coder_credentials", lambda: released.append(True)
+    )
+    runner._current_breach_dir = "/tmp/breach-schedule"
+    runner._current_breach_run_id = "run-schedule"
+
+    with pytest.raises(TypeError, match="a coroutine was expected"):
+        asyncio.run(
+            runner._run_coder_with_supervision(
+                coder_name,
+                plugin,
+                {},
+                target_branch="pr-001",
+                current_pr_id="PR-001",
+                pr_id="PR-001",
+                task_file="tasks/PR-001.md",
+                task_body="# PR-001\n",
+            )
+        )
+
+    assert released == [True]
+    assert runner._coder_invocation_active is False
+
+
 def test_run_coder_with_supervision_returns_none_on_stop_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

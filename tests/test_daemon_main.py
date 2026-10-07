@@ -1599,6 +1599,7 @@ def test_build_runner_passes_registry_when_supported(
             codex_usage_provider: Any,
             registry: Any,
             usage_providers: Any,
+            credential_reservations: Any,
         ) -> None:
             seen["repo"] = repo_config
             seen["config"] = app_config
@@ -1607,6 +1608,7 @@ def test_build_runner_passes_registry_when_supported(
             seen["codex"] = codex_usage_provider
             seen["registry"] = registry
             seen["usage_providers"] = usage_providers
+            seen["credential_reservations"] = credential_reservations
 
     class _Registry:
         def usage_providers(self) -> dict[str, str]:
@@ -1634,6 +1636,7 @@ def test_build_runner_passes_registry_when_supported(
         "codex": "codex-provider",
         "registry": registry,
         "usage_providers": {"third": "third-provider"},
+        "credential_reservations": None,
     }
 
 

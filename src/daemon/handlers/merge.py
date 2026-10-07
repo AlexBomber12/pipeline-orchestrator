@@ -178,6 +178,7 @@ class MergeMixin:
                             ),
                             cleanup_context="MERGE conflict resolution",
                             log_prefix="[MERGE]",
+                            coder_name=coder_name,
                         )
                         if auxiliary_result is None:
                             if self.state.state == PipelineState.PAUSED:

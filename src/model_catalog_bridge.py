@@ -12,7 +12,7 @@ from dataclasses import asdict
 from typing import Any, Callable
 
 from src.coder_auth import isolated_auth_probe, terminate_plugin_worker
-from src.coder_login import CoderLoginSessionManager
+from src.coder_login import CoderCredentialReservations, CoderLoginSessionManager
 from src.coder_registry import (
     CoderMetadataView,
     CoderPlugin,
@@ -615,6 +615,7 @@ async def serve_model_catalog_requests(
     *,
     config_path: str,
     credential_location_in_use: Callable[[str], bool] | None = None,
+    credential_reservations: CoderCredentialReservations | None = None,
 ) -> None:
     """Consume durable web requests for the lifetime of the daemon."""
     # Lightweight Redis doubles and alternate clients may not implement lists.
@@ -626,6 +627,7 @@ async def serve_model_catalog_requests(
         registry,
         config_path=config_path,
         credential_location_in_use=credential_location_in_use,
+        credential_reservations=credential_reservations,
     )
     pending: set[asyncio.Task[None]] = set()
 

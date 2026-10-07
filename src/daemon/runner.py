@@ -54,6 +54,7 @@ from src.cancellation.availability import (
     is_operator_available,
 )
 from src.coder_auth import isolated_auth_probe
+from src.coder_login import CoderCredentialReservations
 from src.coder_registry import CoderPlugin, CoderRegistry
 from src.coders import build_coder_registry
 from src.config import (
@@ -333,6 +334,7 @@ class PipelineRunner(
         codex_usage_provider: UsageProvider | None,
         registry: CoderRegistry | None = None,
         usage_providers: Mapping[str, UsageProvider | None] | None = None,
+        credential_reservations: CoderCredentialReservations | None = None,
     ) -> None:
         self.repo_config = repo_config
         self._app_config = app_config
@@ -442,6 +444,8 @@ class PipelineRunner(
         self._current_coder_process: asyncio.subprocess.Process | None = None
         self._current_coder_supervised_process: SupervisedProcess | None = None
         self._coder_invocation_active = False
+        self._credential_reservations = credential_reservations
+        self._coder_credential_reservation: str | None = None
         self._coder_cleanup_failure_detail: str | None = None
         self._coder_cleanup_error_reported = False
         self._retry_command_owner = f"{os.getpid()}:{uuid.uuid4()}"
@@ -2319,6 +2323,34 @@ class PipelineRunner(
             and active_location == credential_location
         )
 
+    def _reserve_coder_credentials(self, coder_name: str) -> bool:
+        """Reserve this coder's credential location against device login."""
+        if self._credential_reservations is None:
+            return True
+        if self._coder_credential_reservation is not None:
+            return False
+        plugin = self._registry.get_optional(coder_name)
+        resolver = getattr(plugin, "device_login_credential_location", None)
+        if not callable(resolver):
+            return True
+        try:
+            location = resolver(config=self.app_config)
+        except Exception:
+            return False
+        if not isinstance(location, str) or not location:
+            return False
+        if not self._credential_reservations.reserve_coder(location):
+            return False
+        self._coder_credential_reservation = location
+        return True
+
+    def _release_coder_credentials(self) -> None:
+        location = self._coder_credential_reservation
+        if location is None or self._credential_reservations is None:
+            return
+        self._credential_reservations.release_coder(location)
+        self._coder_credential_reservation = None
+
     def _track_current_coder_supervised_process(
         self, managed: SupervisedProcess
     ) -> None:
@@ -2473,6 +2505,8 @@ class PipelineRunner(
             confirmed = self._current_coder_supervised_process is None
         if not confirmed:
             await self._park_coder_cleanup_failure(context)
+        else:
+            self._release_coder_credentials()
         if cancellation is not None:
             raise cancellation
         return confirmed
@@ -2483,13 +2517,33 @@ class PipelineRunner(
         *,
         cleanup_context: str,
         log_prefix: str,
+        coder_name: str | None = None,
     ) -> tuple[int, str, str] | None:
         """Await one plugin-owned helper invocation at an ownership boundary."""
+        if not self._reserve_coder_credentials(
+            coder_name or self.state.coder or ""
+        ):
+            close = getattr(invocation, "close", None)
+            if callable(close):
+                close()
+            self.log_event(
+                f"{log_prefix} Coder invocation deferred while device login "
+                "owns its credential location."
+            )
+            return None
         self._stop_requested = False
         self._coder_invocation_active = True
-        coder_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
-            invocation
-        )
+        try:
+            coder_task: asyncio.Task[tuple[int, str, str]] = (
+                asyncio.create_task(invocation)
+            )
+        except Exception:
+            close = getattr(invocation, "close", None)
+            if callable(close):
+                close()
+            self._coder_invocation_active = False
+            self._release_coder_credentials()
+            raise
         stop_monitor = asyncio.create_task(self._monitor_stop_request(coder_task))
         result: tuple[int, str, str] | None = None
         cancellation: asyncio.CancelledError | None = None

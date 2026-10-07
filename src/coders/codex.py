@@ -144,9 +144,11 @@ def _line_after_marker(text: str, marker: str) -> str | None:
     _, separator, remainder = text.partition(marker)
     if not separator:
         return None
-    for line in remainder.splitlines()[1:]:
+    for line in remainder.splitlines(keepends=True)[1:]:
         candidate = line.strip()
         if candidate:
+            if not line.endswith("\n"):
+                return None
             return candidate
     return None
 

@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
+from src.coder_login import CoderCredentialReservations
 from src.coder_registry import CoderRegistry
 from src.coders import claude as claude_plugin_module
 from src.config import AppConfig
@@ -130,6 +131,45 @@ def test_coder_credential_location_in_use_tracks_active_plugin_context(
 
     monkeypatch.setattr(codex, "device_login_credential_location", fail)
     assert runner.coder_credential_location_in_use(location) is False
+
+
+def test_runner_credential_reservations_coordinate_with_device_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner()
+    runner._credential_reservations = reservations
+    codex = runner._registry.get("codex")
+    location = codex.device_login_credential_location(config=runner.app_config)
+
+    assert runner._reserve_coder_credentials("codex") is True
+    assert runner._reserve_coder_credentials("codex") is False
+    assert reservations.reserve_login(location) is False
+    runner._release_coder_credentials()
+    runner._release_coder_credentials()
+
+    assert reservations.reserve_login(location) is True
+    assert runner._reserve_coder_credentials("codex") is False
+    reservations.release_login(location)
+
+    assert runner._reserve_coder_credentials("claude") is True
+    assert runner._coder_credential_reservation is None
+
+    monkeypatch.setattr(
+        codex,
+        "device_login_credential_location",
+        lambda **_kwargs: "",
+    )
+    assert runner._reserve_coder_credentials("codex") is False
+
+    def fail(**_kwargs: object) -> str:
+        raise RuntimeError("location unavailable")
+
+    monkeypatch.setattr(codex, "device_login_credential_location", fail)
+    assert runner._reserve_coder_credentials("codex") is False
+
+    runner._credential_reservations = None
+    assert runner._reserve_coder_credentials("codex") is True
 
 
 def test_preflight_returns_true_on_clean_repo(
@@ -1191,6 +1231,67 @@ def test_auxiliary_awaiter_releases_confirmed_runner_handle() -> None:
     assert managed.cleanup_calls == 1
     assert runner._current_coder_process is None
     assert runner._current_coder_supervised_process is None
+
+
+def test_auxiliary_awaiter_defers_while_login_owns_credentials() -> None:
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner()
+    runner._credential_reservations = reservations
+    location = runner._registry.get("codex").device_login_credential_location(
+        config=runner.app_config
+    )
+    assert reservations.reserve_login(location) is True
+    invoked = False
+
+    async def invocation() -> tuple[int, str, str]:
+        nonlocal invoked
+        invoked = True
+        return (0, "", "")
+
+    result = asyncio.run(
+        runner._await_auxiliary_coder(
+            invocation(),
+            cleanup_context="test login conflict",
+            log_prefix="[TEST]",
+            coder_name="codex",
+        )
+    )
+
+    assert result is None
+    assert invoked is False
+    assert any("device login" in event["event"] for event in runner.state.history)
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_awaiter_releases_reservation_on_schedule_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner()
+    runner._credential_reservations = reservations
+    location = runner._registry.get("codex").device_login_credential_location(
+        config=runner.app_config
+    )
+
+    async def invocation() -> tuple[int, str, str]:
+        return (0, "", "")
+
+    real_create_task = asyncio.create_task
+    monkeypatch.setattr(
+        runner_module.asyncio,
+        "create_task",
+        lambda _awaitable: (_ for _ in ()).throw(RuntimeError("schedule failed")),
+    )
+    with pytest.raises(RuntimeError, match="schedule failed"):
+        await runner._await_auxiliary_coder(
+            invocation(),
+            cleanup_context="test schedule failure",
+            log_prefix="[TEST]",
+            coder_name="codex",
+        )
+    monkeypatch.setattr(runner_module.asyncio, "create_task", real_create_task)
+
+    assert reservations.reserve_login(location) is True
 
 
 @pytest.mark.parametrize(

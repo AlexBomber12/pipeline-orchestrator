@@ -945,6 +945,11 @@ def test_codex_device_login_parser_handles_ansi_and_incremental_output() -> None
     assert prompt.user_code == "ABCD-EFGH"
     assert prompt.expires_in_seconds == 900
 
+    partial_code = complete.removesuffix("-EFGH\x1b[0m\n")
+    assert adapter.parse_progress(partial_code, "") is None
+    completed_code = partial_code + "-EFGH\x1b[0m\n"
+    assert adapter.parse_progress(completed_code, "") == prompt
+
     assert (
         codex_module._line_after_marker(
             "marker with no following value\n", "marker with no following value"

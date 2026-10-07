@@ -34,6 +34,7 @@ from typing import Any
 
 import redis.asyncio as aioredis
 
+from src.coder_login import CoderCredentialReservations
 from src.coder_registry import CoderRegistry
 from src.coders import build_coder_registry
 from src.config import AppConfig, RepoConfig, load_config, normalize_repo_url
@@ -255,6 +256,7 @@ def _build_runner(
     claude_usage_provider: UsageProvider | None,
     codex_usage_provider: UsageProvider | None,
     registry: CoderRegistry,
+    credential_reservations: CoderCredentialReservations | None = None,
 ) -> PipelineRunner | None:
     """Construct a runner, logging and swallowing init failures."""
     try:
@@ -269,6 +271,10 @@ def _build_runner(
             kwargs["registry"] = registry
         if "usage_providers" in inspect.signature(PipelineRunner).parameters:
             kwargs["usage_providers"] = registry.usage_providers()
+        if "credential_reservations" in inspect.signature(
+            PipelineRunner
+        ).parameters:
+            kwargs["credential_reservations"] = credential_reservations
         return PipelineRunner(**kwargs)
     except Exception:
         logger.error(
@@ -308,6 +314,7 @@ def _sync_runners(
     codex_usage_provider: UsageProvider | None,
     registry: CoderRegistry,
     in_flight: dict[str, asyncio.Task[None]] | None = None,
+    credential_reservations: CoderCredentialReservations | None = None,
 ) -> None:
     """Reconcile ``runners`` with ``config.repositories`` in place.
 
@@ -401,6 +408,7 @@ def _sync_runners(
             claude_usage_provider,
             codex_usage_provider,
             registry,
+            credential_reservations,
         )
         if runner is not None:
             runners[key] = runner
@@ -754,6 +762,7 @@ async def main() -> None:
     redis_url = os.environ.get("REDIS_URL", DEFAULT_REDIS_URL)
     redis_client = aioredis.from_url(redis_url, decode_responses=True)
     runners: dict[str, PipelineRunner] = {}
+    credential_reservations = CoderCredentialReservations()
     # Publish configured metadata as soon as Redis is available so web startup
     # never needs to import or instantiate operator-provided plugin code.
     _background_tasks: set[asyncio.Task[None]] = set()
@@ -765,6 +774,7 @@ async def main() -> None:
             credential_location_in_use=partial(
                 _credential_location_in_use, runners
             ),
+            credential_reservations=credential_reservations,
         )
     )
     _background_tasks.add(model_catalog_task)
@@ -811,6 +821,7 @@ async def main() -> None:
         codex_usage_provider,
         registry,
         in_flight,
+        credential_reservations,
     )
 
     # Keep strong references: the event loop only holds weak references to
@@ -882,6 +893,7 @@ async def main() -> None:
                         codex_usage_provider,
                         registry,
                         in_flight,
+                        credential_reservations,
                     )
                     removed_keys = prev_keys - set(runners.keys())
                     if removed_keys:

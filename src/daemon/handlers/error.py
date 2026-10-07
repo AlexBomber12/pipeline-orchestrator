@@ -343,6 +343,7 @@ class ErrorMixin:
             ),
             cleanup_context="ERROR diagnosis",
             log_prefix="[ERROR]",
+            coder_name=coder_name,
         )
         if diagnosis_result is None:
             return
