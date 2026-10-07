@@ -353,6 +353,17 @@ class CodexPlugin:
         combined = f"{stdout}\n{stderr}".strip()
         if rc == 0:
             mode = _authentication_mode(combined)
+            if mode == "workload_identity":
+                return self._auth_status(
+                    status="ok",
+                    detail=(
+                        f"{installed_detail}; workload identity selected; "
+                        "service access not verified"
+                    ),
+                    cli_available=True,
+                    cli_version=version,
+                    authentication_mode=mode,
+                )
             if mode is not None:
                 mode_label = {
                     "chatgpt": "ChatGPT",
@@ -360,7 +371,6 @@ class CodexPlugin:
                     "access_token": "access-token",
                     "bedrock_api_key": "Amazon Bedrock API-key",
                     "bedrock_access_keys": "Amazon Bedrock AWS access-key",
-                    "workload_identity": "workload-identity",
                 }[mode]
                 return self._auth_status(
                     status="ok",

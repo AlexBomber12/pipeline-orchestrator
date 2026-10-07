@@ -244,11 +244,6 @@ def test_codex_plugin_check_auth(
             "bedrock_access_keys",
             "Amazon Bedrock AWS access-key",
         ),
-        (
-            "Logged in using workload identity",
-            "workload_identity",
-            "workload-identity",
-        ),
     ],
 )
 def test_codex_plugin_reports_known_saved_credential_modes_without_secrets(
@@ -285,6 +280,36 @@ def test_codex_plugin_reports_known_saved_credential_modes_without_secrets(
         authentication_mode=expected_mode,
     )
     assert "sk-secret" not in str(result)
+
+
+def test_codex_plugin_reports_workload_identity_without_saved_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run_auth_command(
+        cmd: list[str], *, env: dict[str, str] | None = None
+    ) -> tuple[int, str, str]:
+        assert env is not None
+        if cmd == ["codex", "--version"]:
+            return (0, "codex 0.160.0", "")
+        return (0, "Logged in using workload identity", "")
+
+    monkeypatch.setattr(codex_module, "_run_auth_command", fake_run_auth_command)
+
+    result = CodexPlugin().check_auth(
+        config_path=str(tmp_path / "missing-config.yml")
+    )
+
+    _assert_codex_auth_status(
+        result,
+        status="ok",
+        detail=(
+            "Codex CLI 0.160.0; workload identity selected; "
+            "service access not verified"
+        ),
+        cli_available=True,
+        cli_version="0.160.0",
+        authentication_mode="workload_identity",
+    )
 
 
 def test_codex_plugin_rejects_unrecognized_saved_credential_output(
