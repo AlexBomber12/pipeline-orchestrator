@@ -32,7 +32,7 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
-from typing import Any, Coroutine
+from typing import Any, Coroutine, Literal
 
 import redis.asyncio as aioredis
 from redis.exceptions import RedisError
@@ -138,7 +138,7 @@ from src.keyspace import (
     upload_pending,
 )
 from src.metrics import MetricsStore, RunRecord
-from src.models import PipelineState, RepoState, TaskStatus
+from src.models import InvocationSnapshot, PipelineState, RepoState, TaskStatus
 from src.process_supervisor import SupervisedProcess
 from src.queue_parser import (
     TYPE_SYNONYMS,
@@ -1223,6 +1223,41 @@ class PipelineRunner(
             repo_name=self.name,
             stage="coder",
         )
+
+    @staticmethod
+    def _invocation_override(value: object) -> str | None:
+        """Return one allowlisted override without retaining plugin kwargs."""
+        if not isinstance(value, str) or not value:
+            return None
+        return value
+
+    def _capture_invocation_snapshot(
+        self,
+        coder_name: str,
+        invocation_kwargs: Mapping[str, object],
+        *,
+        phase: Literal["coding", "fix"],
+        fix_iteration: int | None = None,
+    ) -> InvocationSnapshot:
+        """Capture the allowlisted settings passed to a primary invocation."""
+        record = self._current_run_record
+        snapshot = InvocationSnapshot(
+            plugin_id=coder_name,
+            model_override=self._invocation_override(
+                invocation_kwargs.get("model")
+            ),
+            reasoning_effort_override=self._invocation_override(
+                invocation_kwargs.get("reasoning_effort")
+            ),
+            run_id=record.run_id if record is not None else None,
+            attempt_index=record.attempt_index if record is not None else None,
+            phase=phase,
+            fix_iteration=fix_iteration,
+        )
+        self.state.active_invocation = snapshot
+        if record is not None:
+            record.invocations.append(snapshot)
+        return snapshot
 
     def _git_rev_parse(self, ref: str) -> str:
         try:

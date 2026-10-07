@@ -45,6 +45,16 @@
             Active: {{ active_repo_coder_label }} (via spec pin or bandit)
         </span>
         {% endif %}
+        {% if active_invocation %}
+        <span class="text-[11px] text-gray-400"
+              data-invocation-settings
+              title="Parameters passed to the coder plugin; provider execution values are unconfirmed.">
+            Invocation settings — Plugin ID: <span class="font-mono text-gray-300">{{ active_invocation.plugin_id }}</span>;
+            Model override: <span class="font-mono text-gray-300">{{ active_invocation.model_override_label }}</span>;
+            Reasoning effort override: <span class="font-mono text-gray-300">{{ active_invocation.reasoning_effort_override_label }}</span>;
+            {{ active_invocation.phase_label }}{% if active_invocation.attempt_index %}, attempt {{ active_invocation.attempt_index }}{% endif %}{% if active_invocation.fix_iteration %}, FIX iteration {{ active_invocation.fix_iteration }}{% endif %}{% if active_invocation.run_id %}, run {{ active_invocation.run_id }}{% endif %}.
+        </span>
+        {% endif %}
         <a href="/settings" class="font-mono text-[11px] text-accent hover:text-accent/80">
             Edit in Settings
         </a>

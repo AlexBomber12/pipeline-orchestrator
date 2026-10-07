@@ -484,6 +484,12 @@ class CodingMixin:
                 "owns its credential location."
             )
             return None
+        self._capture_invocation_snapshot(
+            coder_name,
+            coder_kwargs,
+            phase="coding",
+        )
+        await self.publish_state()
         heartbeat = asyncio.create_task(self._publish_while_waiting("CODING"))
         self._coder_invocation_active = True
         invocation_supervised_process: SupervisedProcess | None = None

@@ -390,9 +390,20 @@ class FixMixin(BreachMixin):
                 tier="state",
                 kind="transition",
             )
-            await self.publish_state()
+            fix_iteration: int | None = None
             if self._current_run_record is not None:
                 self._current_run_record.fix_iterations += 1
+                fix_iteration = self._current_run_record.fix_iterations
+            elif self.state.current_pr is not None:
+                fix_iteration = self.state.current_pr.fix_iteration_count + 1
+            self._capture_invocation_snapshot(
+                coder_name,
+                fix_kwargs,
+                phase="fix",
+                fix_iteration=fix_iteration,
+            )
+            await self.publish_state()
+            if self._current_run_record is not None:
                 await self._checkpoint_current_run_record()
             heartbeat = asyncio.create_task(self._publish_while_waiting("FIX"))
             self._coder_invocation_active = True

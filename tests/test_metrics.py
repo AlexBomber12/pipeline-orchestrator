@@ -4,8 +4,8 @@ import json
 from typing import Any
 
 import pytest
-
 from src.metrics import MetricsStore, RunRecord
+from src.models import InvocationSnapshot
 
 
 class _FakeRedis:
@@ -234,6 +234,7 @@ async def test_record_serialization() -> None:
         "files_touched_count": 0,
         "fix_iterations": 0,
         "had_merge_conflict": False,
+        "invocations": [],
         "languages_touched": [],
         "operator_intervention": False,
         "outcome": "merged",
@@ -252,6 +253,48 @@ async def test_record_serialization() -> None:
         "tokens_in": 1200,
         "tokens_out": 800,
     }
+
+
+async def test_invocation_snapshots_round_trip_and_legacy_records_default_empty() -> None:
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+    record = _record(
+        "run-invocations",
+        invocations=[
+            InvocationSnapshot(
+                plugin_id="codex",
+                model_override="gpt-5.4",
+                reasoning_effort_override="high",
+                run_id="run-invocations",
+                attempt_index=2,
+                phase="coding",
+            ),
+            InvocationSnapshot(
+                plugin_id="claude",
+                model_override="sonnet",
+                reasoning_effort_override=None,
+                run_id="run-invocations",
+                attempt_index=2,
+                phase="fix",
+                fix_iteration=1,
+            ),
+        ],
+    )
+    await store.save(record)
+
+    restored = await store.get("run-invocations")
+
+    assert restored == record
+    assert restored is not None
+    assert restored.invocations[1].plugin_id == "claude"
+    legacy_payload = json.loads(redis.store["metrics:run:run-invocations"])
+    legacy_payload.pop("invocations")
+    redis.store["metrics:run:legacy"] = json.dumps(
+        {**legacy_payload, "run_id": "legacy"}
+    )
+    legacy = await store.get("legacy")
+    assert legacy is not None
+    assert legacy.invocations == []
 
 
 async def test_runrecord_roundtrip_with_new_fields() -> None:

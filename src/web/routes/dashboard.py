@@ -58,7 +58,7 @@ from src.keyspace import (
     upload_pending_count,
 )
 from src.metrics import MetricsStore, RunRecord
-from src.models import PipelineState, RepoState
+from src.models import InvocationSnapshot, PipelineState, RepoState
 from src.sandbox.runtime_state import (
     REDIS_SANDBOX_STATE_KEY,
     SandboxState,
@@ -235,6 +235,20 @@ def _active_repo_coder(state: RepoState) -> str | None:
     if state.current_task is None or state.state not in _ACTIVE_RUN_STATES:
         return None
     return state.coder
+
+
+def _invocation_snapshot_view(
+    snapshot: InvocationSnapshot,
+) -> dict[str, Any]:
+    """Return display labels without implying provider-confirmed execution."""
+    return {
+        **asdict(snapshot),
+        "model_override_label": snapshot.model_override or "CLI default",
+        "reasoning_effort_override_label": (
+            snapshot.reasoning_effort_override or "Not specified"
+        ),
+        "phase_label": snapshot.phase.upper(),
+    }
 
 
 def _coder_rate_limit_supported(coder: str | None) -> bool:
@@ -676,6 +690,11 @@ async def _repo_template_context(
     )
     selected_repo_coder = _repo_coder_form_value(repo_config)
     active_repo_coder = _active_repo_coder(state)
+    active_invocation = (
+        _invocation_snapshot_view(state.active_invocation)
+        if active_repo_coder is not None and state.active_invocation is not None
+        else None
+    )
     registry = getattr(_app.app.state, "coder_registry", None)
     if registry is None:
         registry = build_coder_registry()
@@ -701,6 +720,7 @@ async def _repo_template_context(
         "active_repo_coder_label": _repo_coder_label(
             active_repo_coder, registry
         ),
+        "active_invocation": active_invocation,
         "inherit_coder": _daemon_default_coder_name(config),
         "inherit_coder_label": _coder_display_name(
             _daemon_default_coder_name(config), registry
@@ -790,6 +810,11 @@ def _serialize_run_record(record: RunRecord) -> dict[str, Any]:
             "duration_text": _format_duration_ms(record.duration_ms),
             "exit_reason_label": _exit_reason_label(record.exit_reason),
             "exit_reason_classes": _exit_reason_classes(record.exit_reason),
+            "invocations": [
+                _invocation_snapshot_view(snapshot)
+                for snapshot in record.invocations
+            ],
+            "legacy_profile": not record.invocations,
         }
     )
     return payload

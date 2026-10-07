@@ -2558,9 +2558,17 @@ def test_handle_coding_uses_codex_cli_when_coder_is_codex(
 
     h._patch_subprocess(monkeypatch)
     captured_module: list[str] = []
+    captured_kwargs: list[dict[str, object]] = []
 
     async def fake_run_planned_pr(path: str, *_args: object, **kwargs: object) -> tuple:
         captured_module.append("codex")
+        captured_kwargs.append(dict(kwargs))
+        runner.app_config.daemon.coder_settings = {
+            "codex": {
+                "model": "changed-after-dispatch",
+                "reasoning_effort": "low",
+            }
+        }
         return (0, "ok", "")
 
     monkeypatch.setattr(codex_cli, "run_auto_pr_async", fake_run_planned_pr)
@@ -2582,6 +2590,9 @@ def test_handle_coding_uses_codex_cli_when_coder_is_codex(
     )
 
     runner = h._make_runner(coder=CoderType.CODEX)
+    runner.app_config.daemon.coder_settings = {
+        "codex": {"model": "gpt-5.4", "reasoning_effort": "high"}
+    }
     runner.state.current_task = QueueTask(
         pr_id="PR-001",
         title="t",
@@ -2591,6 +2602,13 @@ def test_handle_coding_uses_codex_cli_when_coder_is_codex(
     asyncio.run(runner.handle_coding())
 
     assert captured_module == ["codex"]
+    assert captured_kwargs[0]["model"] == "gpt-5.4"
+    assert captured_kwargs[0]["reasoning_effort"] == "high"
+    assert runner.state.active_invocation is not None
+    assert runner.state.active_invocation.model_override == "gpt-5.4"
+    assert (
+        runner.state.active_invocation.reasoning_effort_override == "high"
+    )
     assert runner.state.state == PipelineState.WATCH
 
 

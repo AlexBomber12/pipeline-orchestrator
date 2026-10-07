@@ -219,6 +219,10 @@ def test_handle_coding_dispatches_to_fake_plugin(
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.number == 42
+    assert runner.state.active_invocation is not None
+    assert runner.state.active_invocation.plugin_id == "fake"
+    assert runner.state.active_invocation.model_override == "fake-1"
+    assert runner.state.active_invocation.reasoning_effort_override is None
 
 
 def test_handle_fix_dispatches_to_fake_plugin(
@@ -374,6 +378,9 @@ def test_configured_plugin_reaches_normal_coding_and_fix_dispatch(
     assert breach_attributions == ["third"]
     assert runner.state.coder == "third"
     assert runner.state.state == PipelineState.WATCH
+    coding_snapshot = runner.state.active_invocation
+    assert coding_snapshot is not None
+    assert coding_snapshot.model_override == "third-default"
 
     runner.state.current_pr = PRInfo(
         number=42,
@@ -381,12 +388,25 @@ def test_configured_plugin_reaches_normal_coding_and_fix_dispatch(
         ci_status=CIStatus.FAILURE,
         review_status=ReviewStatus.PENDING,
     )
+    runner.app_config.daemon.coder_settings = {
+        "third": {"model": "third-fix"}
+    }
     asyncio.run(runner.handle_fix())
 
     assert len(plugin.fix_review_calls) == 1
-    assert plugin.fix_review_calls[0]["model"] == "third-default"
+    assert plugin.fix_review_calls[0]["model"] == "third-fix"
     assert breach_attributions == ["third", "third"]
     assert runner.state.state == PipelineState.WATCH
+    fix_snapshot = runner.state.active_invocation
+    assert fix_snapshot is not None
+    assert fix_snapshot.phase == "fix"
+    assert fix_snapshot.model_override == "third-fix"
+    assert fix_snapshot.reasoning_effort_override is None
+    assert runner._current_run_record is not None
+    assert runner._current_run_record.invocations == [
+        coding_snapshot,
+        fix_snapshot,
+    ]
 
 
 @pytest.mark.parametrize(

@@ -29,8 +29,37 @@
                 {% for record in metrics_records %}
                 <tr class="align-top">
                     <td class="py-3 pr-4 font-mono text-gray-200">{{ record.task_id }}</td>
-                    <td class="py-3 pr-4 text-gray-300">{{ record.coder }}</td>
-                    <td class="py-3 pr-4 font-mono text-xs text-gray-400">{{ record.model }}</td>
+                    <td class="py-3 pr-4 text-gray-300">
+                        {% if record.invocations %}
+                            {% for invocation in record.invocations %}
+                            <div class="{% if not loop.first %}mt-2 border-t border-white/5 pt-2{% endif %}" data-run-invocation-settings>
+                                <div class="text-[11px] uppercase tracking-wide text-gray-500">
+                                    {{ invocation.phase_label }}{% if invocation.fix_iteration %} · FIX {{ invocation.fix_iteration }}{% endif %}
+                                </div>
+                                <div>Plugin ID: <span class="font-mono">{{ invocation.plugin_id }}</span></div>
+                                {% if invocation.attempt_index %}<div class="font-mono text-[11px] text-gray-500">Attempt {{ invocation.attempt_index }}</div>{% endif %}
+                                {% if invocation.run_id %}<div class="font-mono text-[11px] text-gray-500 break-all">Run {{ invocation.run_id }}</div>{% endif %}
+                            </div>
+                            {% endfor %}
+                        {% else %}
+                            <div>{{ record.coder }}</div>
+                            <div class="text-[11px] text-gray-500">Legacy profile; invocation settings unavailable</div>
+                        {% endif %}
+                    </td>
+                    <td class="py-3 pr-4 font-mono text-xs text-gray-400">
+                        {% if record.invocations %}
+                            {% for invocation in record.invocations %}
+                            <div class="{% if not loop.first %}mt-2 border-t border-white/5 pt-2{% endif %}">
+                                <div>Model override: {{ invocation.model_override_label }}</div>
+                                <div>Reasoning effort override: {{ invocation.reasoning_effort_override_label }}</div>
+                                <div class="mt-1 font-sans text-[11px] text-gray-500">Provider execution values unconfirmed</div>
+                            </div>
+                            {% endfor %}
+                        {% else %}
+                            <div>Legacy model: {{ record.model }}</div>
+                            <div>Reasoning effort override: Unknown</div>
+                        {% endif %}
+                    </td>
                     <td class="py-3 pr-4 font-mono text-gray-300">{{ record.duration_text }}</td>
                     <td class="py-3 pr-4 font-mono text-gray-300">{{ record.fix_iterations }}</td>
                     <td class="py-3">

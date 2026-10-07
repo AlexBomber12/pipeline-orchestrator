@@ -6,6 +6,8 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
+from src.models import InvocationSnapshot
+
 _TTL_SECONDS = 365 * 86400
 RUN_RECORD_TTL_SECONDS = _TTL_SECONDS
 _RECENT_INDEX_LIMIT = 200
@@ -73,8 +75,17 @@ class RunRecord:
     test_file_ratio: float = 0.0
     had_merge_conflict: bool = False
     base_branch: str = ""
+    invocations: list[InvocationSnapshot] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        self.invocations = [
+            (
+                snapshot
+                if isinstance(snapshot, InvocationSnapshot)
+                else InvocationSnapshot(**snapshot)
+            )
+            for snapshot in self.invocations
+        ]
         if not self.outcome:
             self.outcome, self.cause = _LEGACY_EXIT_REASON_MAP.get(
                 self.exit_reason,
