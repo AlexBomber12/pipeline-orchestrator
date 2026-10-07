@@ -96,6 +96,13 @@ def _make_runner(
         claude_provider or _FakeUsageProvider(),
         codex_provider or _FakeUsageProvider(),
     )
+    # Rate-limit tests are not authentication probes. Keep coder selection
+    # deterministic without relying on the generic subprocess stub's empty
+    # stdout being accepted as a successful CLI auth response.
+    runner._auth_status_cache = {
+        "claude": {"status": "ok", "detail": "test credentials"},
+        "codex": {"status": "ok", "detail": "test credentials"},
+    }
     runner._selector_rng.seed(0)
     return runner
 
