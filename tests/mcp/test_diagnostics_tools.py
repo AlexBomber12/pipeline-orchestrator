@@ -646,6 +646,13 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert incomplete_json["text"] == "[credential document omitted]"
     assert "incomplete-document-secret" not in incomplete_json["text"]
 
+    split_key_json_redis = FakeRedis()
+    split_key_json_redis.store[key] = '{"private_key"\n:\n"split-key-document-secret"\n'
+    _patch_runtime(monkeypatch, split_key_json_redis)
+    split_key_json = await diagnostics.get_latest_cli_log(SLUG)
+    assert split_key_json["text"] == "[credential document omitted]"
+    assert "split-key-document-secret" not in split_key_json["text"]
+
     unterminated_quote_redis = FakeRedis()
     unterminated_quote_redis.store[key] = 'safe-before\nPASSWORD="alpha\nunterminated-quote-secret'
     _patch_runtime(monkeypatch, unterminated_quote_redis)

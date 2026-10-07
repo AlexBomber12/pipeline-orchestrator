@@ -63,7 +63,8 @@ single-case compound, and bracketed parameter names, recognizes common
 multiword labels such as `API key`, and uses a bounded-source, single-pass line
 scanner so long non-credential lines do not cause regex backtracking stalls.
 Malformed or incomplete JSON containers with credential contexts are omitted
-through their closing boundary or, when unterminated, through the source end.
+through their closing boundary or, when unterminated, through the source end;
+legal whitespace may separate a credential key, delimiter, and value.
 Malformed JSON probing has a fixed failure budget; if that budget is
 exhausted, export fails closed to a credential-document omission marker instead
 of blocking the MCP event loop or returning text that could not be inspected

@@ -1161,10 +1161,8 @@ def _omit_json_credential_documents(text: str) -> tuple[str, int]:
             if parse_failures >= _MAX_JSON_PARSE_FAILURES:
                 return _CREDENTIAL_DOCUMENT_OMITTED, 1
             end = _json_container_end(text, match.start())
-            if any(
-                _line_has_sensitive_context(line)
-                for line in text[match.start() : end].splitlines()
-            ):
+            container = " ".join(text[match.start() : end].splitlines())
+            if _line_has_sensitive_context(container):
                 ranges.append((match.start(), end))
                 covered_until = end
             continue
