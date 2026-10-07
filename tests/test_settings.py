@@ -3261,10 +3261,19 @@ def test_device_login_start_rejects_invalid_request_body(
             data={"replace_existing": "yes"},
             headers={"HX-Request": "true"},
         )
+        invalid_encoding = client.post(
+            "/api/coders/codex/device-login",
+            content=b"\xff",
+            headers={"Content-Type": "application/json"},
+        )
 
     assert invalid_type.status_code == 422
     assert extra_field.status_code == 422
     assert invalid_htmx_form.status_code == 422
+    assert invalid_encoding.status_code == 400
+    assert invalid_encoding.json() == {
+        "detail": "Invalid JSON device-login request body"
+    }
 
 
 def test_settings_device_login_controls_follow_plugin_capabilities(
@@ -3404,6 +3413,7 @@ def test_device_login_replacement_requires_backend_warning_and_confirmation(
     assert "authentication may remain unavailable" in warning.text
     assert 'name="replace_existing" value="true"' in warning.text
     assert "I understand — replace existing login" in warning.text
+    assert 'hx-trigger="submit once"' not in warning.text
     assert confirmed.status_code == 202
     assert calls == [False, True]
 
@@ -3616,7 +3626,7 @@ def test_settings_device_login_script_handles_rerenders_and_network_errors(
     assert response.status_code == 200
     assert rerender.status_code == 200
     assert 'hx-preserve="true"' in rerender.text
-    assert 'hx-trigger="submit once"' in response.text
+    assert 'hx-trigger="submit once"' not in response.text
     assert 'hx-sync="closest [data-device-login-shell]:drop"' in response.text
     assert "htmx:sendError" in response.text
     assert "htmx:timeout" in response.text

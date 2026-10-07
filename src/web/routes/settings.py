@@ -20,8 +20,7 @@ from importlib import metadata
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Form, Request
-from fastapi.exceptions import RequestValidationError
+from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, StrictBool, ValidationError
 
@@ -1332,10 +1331,19 @@ async def _device_login_start_request(
                     raw["replace_existing"] = False
         else:
             body = await request.body()
-            return DeviceLoginStartRequest.model_validate_json(body or b"{}")
+            try:
+                raw = json.loads(body.decode("utf-8")) if body else {}
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid JSON device-login request body",
+                ) from None
         return DeviceLoginStartRequest.model_validate(raw)
-    except ValidationError as exc:
-        raise RequestValidationError(exc.errors()) from exc
+    except ValidationError:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid device-login request body",
+        ) from None
 
 
 def _device_login_bridge_context(
