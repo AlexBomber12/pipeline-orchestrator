@@ -40,13 +40,15 @@ is 8 KiB and callers may request at most 32 KiB. The service accepts the
 producer 64 KiB byte budget plus its bounded six-byte UTF-8 replacement
 expansion, redacts the complete bounded source before selecting the tail, and
 reports source/output sizes, truncation, observation time, and remaining Redis
-TTL. Authorization headers, token, password, and passphrase assignments or
-long-option arguments,
+TTL. A producer `[truncated]` marker means the stored tail may begin inside a
+credential value, so the service fails closed with
+`cli_log_producer_truncated` instead of exporting that record. Authorization
+headers, token, password, and passphrase assignments or long-option arguments,
 cookies, credential-bearing absolute or scheme-relative URL userinfo/query
 parameters (including percent-encoded parameter names and Azure SAS signatures),
 recognizable token shapes including JWTs and Slack webhooks, private-key blocks,
 standalone AWS access-key identifiers, curl user/proxy-user credentials,
-and recognizable JSON credential
+netrc whitespace-delimited passwords, and recognizable JSON credential
 documents are not exported, including nested documents and documents serialized
 inside log strings and structured header name/value pairs in JSON-list or
 Python-tuple form. Complete and interrupted private-key blocks are both omitted

@@ -54,6 +54,7 @@ _MAX_CLI_LOG_SOURCE_BYTES = (64 * 1024) + 6
 _DEFAULT_CLI_LOG_TAIL_BYTES = 8 * 1024
 _MAX_CLI_LOG_TAIL_BYTES = 32 * 1024
 _MAX_JSON_PARSE_FAILURES = 64
+_CLI_LOG_PRODUCER_TRUNCATION_MARKER = "[truncated]\n"
 
 _REDACTED = "[REDACTED]"
 _CREDENTIAL_DOCUMENT_OMITTED = "[credential document omitted]"
@@ -117,6 +118,7 @@ _DIGEST_AUTHORIZATION = re.compile(r"(?i)(?<![A-Za-z0-9])Digest[ \t]+")
 _CREDENTIAL_CLI_OPTION = re.compile(
     r"(?i)(?<!\S)(?:-[uU]|--user|--proxy-user)(?:[ \t]+|=)"
 )
+_NETRC_PASSWORD_VALUE = re.compile(r"(?i)(?<!\S)password[ \t]+")
 _HEREDOC_START = re.compile(
     r"<<(?P<strip_tabs>-?)[ \t]*(?P<quote>['\"]?)"
     r"(?P<delimiter>[A-Za-z0-9_.+-]+)(?P=quote)(?=$|[ \t;|&()<>])"
@@ -1116,6 +1118,10 @@ def _json_key_escape_length(value: str, index: int) -> int:
 
 def _sensitive_value_start(line: str) -> int | None:
     """Return the value position for a sensitive context found in one line."""
+    netrc_password = _NETRC_PASSWORD_VALUE.search(line)
+    if netrc_password is not None:
+        return netrc_password.end()
+
     credential_option = _CREDENTIAL_CLI_OPTION.search(line)
     if credential_option is not None:
         return credential_option.end()
@@ -1359,6 +1365,7 @@ def _cli_log_unavailable(
     code: str,
     source_size_bytes: int | None = None,
     ttl: int | None = None,
+    producer_truncated: bool | None = None,
 ) -> dict[str, Any]:
     ttl_fields = (
         _ttl_fields(ttl)
@@ -1384,6 +1391,7 @@ def _cli_log_unavailable(
         "truncation": {
             "tail_truncated": None,
             "source_oversized": status == "oversized",
+            "producer_truncated": producer_truncated,
             "omitted_prefix_bytes": None,
         },
         "redaction": {
@@ -1470,6 +1478,17 @@ async def get_latest_cli_log(
             )
 
         decoded = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+        if decoded.startswith(_CLI_LOG_PRODUCER_TRUNCATION_MARKER):
+            return _cli_log_unavailable(
+                repo_slug,
+                observed_at,
+                tail_bytes,
+                status="unavailable",
+                code="cli_log_producer_truncated",
+                source_size_bytes=source_size_bytes,
+                ttl=ttl,
+                producer_truncated=True,
+            )
         sanitized, replacement_count, documents_omitted = _sanitize_cli_log(decoded)
         sanitized_size_bytes = len(sanitized.encode("utf-8"))
         text, returned_size_bytes, omitted_prefix_bytes, tail_truncated = _utf8_tail(sanitized, tail_bytes)
@@ -1492,6 +1511,7 @@ async def get_latest_cli_log(
             "truncation": {
                 "tail_truncated": tail_truncated,
                 "source_oversized": False,
+                "producer_truncated": False,
                 "omitted_prefix_bytes": omitted_prefix_bytes,
             },
             "redaction": {

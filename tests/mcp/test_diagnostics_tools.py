@@ -256,6 +256,7 @@ async def test_latest_cli_log_available_empty_isolated_and_read_only(
     assert result["truncation"] == {
         "tail_truncated": False,
         "source_oversized": False,
+        "producer_truncated": False,
         "omitted_prefix_bytes": 0,
     }
     assert result["read_only"] is True
@@ -373,6 +374,23 @@ async def test_latest_cli_log_bounds_source_output_and_utf8(
     concurrently_oversized = await diagnostics.get_latest_cli_log(SLUG)
     assert concurrently_oversized["availability"]["status"] == "oversized"
     assert concurrently_oversized["source_size_bytes"] == diagnostics._MAX_CLI_LOG_SOURCE_BYTES + 1
+
+    producer_truncated_redis = FakeRedis()
+    producer_truncated_redis.store[key] = (
+        "[truncated]\nopaque-value-without-credential-context\nsafe-tail"
+    )
+    producer_truncated_redis.ttls[key] = 300
+    _patch_runtime(monkeypatch, producer_truncated_redis)
+    producer_truncated = await diagnostics.get_latest_cli_log(SLUG)
+    assert producer_truncated["availability"] == {
+        "status": "unavailable",
+        "code": "cli_log_producer_truncated",
+        "missing_may_mean_expired": False,
+    }
+    assert producer_truncated["text"] is None
+    assert producer_truncated["source_size_bytes"] == 61
+    assert producer_truncated["truncation"]["producer_truncated"] is True
+    assert producer_truncated["ttl_seconds_remaining"] == 300
 
     unicode_redis = FakeRedis()
     unicode_redis.store[key] = "prefix-" + ("🙂" * 10) + "-end"
@@ -511,6 +529,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "curl -u alice:curl-short-user-secret https://example.test",
             "curl --proxy-user bob:curl-proxy-user-secret https://example.test",
             "curl -U bob:curl-short-proxy-user-secret https://example.test",
+            "machine example.test login alice password netrc-password-secret",
             r'tool --password "abc\"escaped-option-secret" token="abc\"escaped-assignment-secret"',
             "PASSWORD = spaced-assignment-secret",
             "Authorization : Bearer spaced-header-secret",
@@ -656,6 +675,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "curl-short-user-secret",
         "curl-proxy-user-secret",
         "curl-short-proxy-user-secret",
+        "netrc-password-secret",
         "quoted cli token",
         "escaped-option-secret",
         "escaped-assignment-secret",
