@@ -51,8 +51,9 @@ Python-tuple form. Complete and interrupted private-key blocks are both omitted
 using a bounded single-pass boundary scan.
 Standard encoded `auth` fields used by registry and package-manager credential
 documents are treated as credential context rather than exported as base64 text.
-Standalone authorization-scheme values such as `Bearer` and `Basic` credentials
-are redacted even when the header name is absent.
+Standalone single-token authorization-scheme values such as `Bearer` and
+`Basic` credentials are redacted even when the header name is absent; a
+multi-parameter `Digest` value causes conservative line omission.
 Lines with recognizable credential keys are omitted conservatively when they
 use assignment, structured-field, header, or long-option syntax, so malformed
 or interrupted quoting cannot expose a value suffix. Indented YAML/header

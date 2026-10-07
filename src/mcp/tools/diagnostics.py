@@ -107,6 +107,7 @@ _URL_USERINFO = re.compile(r"(?i)(?P<scheme>(?:\b[a-z][a-z0-9+.-]*:)?//)[^/@\s]+
 _AUTHORIZATION_VALUE = re.compile(
     r"(?i)\b(?P<scheme>Bearer|Basic|Digest|Negotiate|ApiKey|Token)[ \t]+\S+"
 )
+_DIGEST_AUTHORIZATION = re.compile(r"(?i)(?<![A-Za-z0-9])Digest[ \t]+")
 _SENSITIVE_MULTIWORD_LABEL = re.compile(
     r"(?i)(?<![A-Za-z0-9])(?:"
     r"(?:api|oauth|access|refresh|id|auth)\s+(?:key|token)|"
@@ -1098,6 +1099,10 @@ def _json_key_escape_length(value: str, index: int) -> int:
 
 def _sensitive_value_start(line: str) -> int | None:
     """Return the value position for a sensitive context found in one line."""
+    digest = _DIGEST_AUTHORIZATION.search(line)
+    if digest is not None:
+        return digest.end()
+
     multiword = _SENSITIVE_MULTIWORD_LABEL.search(line)
     if multiword is not None:
         return multiword.end()

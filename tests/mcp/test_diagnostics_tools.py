@@ -496,6 +496,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             f"_auth={encoded_auth}",
             "Bearer standalone-bearer-secret",
             f"Basic {standalone_basic}",
+            'Digest username="user", realm="realm", nonce="abc", uri="/", '
+            'response="digest-response-secret"',
             'tool --password cli-option-secret --token "quoted cli token"',
             r'tool --password "abc\"escaped-option-secret" token="abc\"escaped-assignment-secret"',
             "PASSWORD = spaced-assignment-secret",
@@ -607,6 +609,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "passphrase-option-secret",
         "jwt-assignment-secret",
         "standalone-bearer-secret",
+        "digest-response-secret",
         "cli-option-secret",
         "quoted cli token",
         "escaped-option-secret",
