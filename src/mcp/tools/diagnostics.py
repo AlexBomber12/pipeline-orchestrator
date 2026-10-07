@@ -102,7 +102,11 @@ _TERMINAL_STATEFUL_ESCAPE = re.compile(r"\x1b[78DEHM]")
 _C1_CONTROL_STRING = re.compile(r"[\x90\x98\x9d-\x9f].*?(?:\x9c|\x07|$)", re.DOTALL)
 _JSON_CONTAINER_START = re.compile(r"[\[{]")
 _JSON_UNICODE_ESCAPE = re.compile(r"\\u(?P<codepoint>[0-9a-fA-F]{4})")
+_JSON_SIMPLE_ESCAPE = re.compile(r'\\(?P<escape>["\\/bfnrt])')
 _URL_USERINFO = re.compile(r"(?i)(?P<scheme>(?:\b[a-z][a-z0-9+.-]*:)?//)[^/@\s]+@")
+_AUTHORIZATION_VALUE = re.compile(
+    r"(?i)\b(?P<scheme>Bearer|Basic|Digest|Negotiate|ApiKey|Token)[ \t]+\S+"
+)
 _SENSITIVE_MULTIWORD_LABEL = re.compile(
     r"(?i)(?<![A-Za-z0-9])(?:"
     r"(?:api|oauth|access|refresh|id|auth)\s+(?:key|token)|"
@@ -112,9 +116,19 @@ _SENSITIVE_MULTIWORD_LABEL = re.compile(
     r")\s*[=:]"
 )
 _SENSITIVE_KEY_CHARACTERS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-%+[]\\"
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-%+[]"
 )
 _SENSITIVE_KEY_WRAPPERS = frozenset("\\\"'")
+_JSON_SIMPLE_ESCAPE_VALUES = {
+    '"': '"',
+    "\\": "\\",
+    "/": "/",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+}
 _RECOGNIZABLE_SECRET = tuple(
     re.compile(pattern)
     for pattern in (
@@ -1054,6 +1068,10 @@ def _is_sensitive_key(value: str) -> bool:
     decoded = _JSON_UNICODE_ESCAPE.sub(
         lambda match: chr(int(match.group("codepoint"), 16)),
         decoded,
+    )
+    decoded = _JSON_SIMPLE_ESCAPE.sub(
+        lambda match: _JSON_SIMPLE_ESCAPE_VALUES[match.group("escape")],
+        decoded,
     ).lower()
     key = "".join(
         character
@@ -1061,6 +1079,21 @@ def _is_sensitive_key(value: str) -> bool:
         if "a" <= character <= "z" or "0" <= character <= "9"
     )
     return any(sensitive in key for sensitive in _CREDENTIAL_DOCUMENT_KEYS)
+
+
+def _json_key_escape_length(value: str, index: int) -> int:
+    if index + 1 >= len(value) or value[index] != "\\":
+        return 0
+    escaped = value[index + 1]
+    if escaped in _JSON_SIMPLE_ESCAPE_VALUES:
+        return 2
+    if (
+        escaped == "u"
+        and index + 6 <= len(value)
+        and all(character in "0123456789abcdefABCDEF" for character in value[index + 2 : index + 6])
+    ):
+        return 6
+    return 0
 
 
 def _sensitive_value_start(line: str) -> int | None:
@@ -1071,13 +1104,20 @@ def _sensitive_value_start(line: str) -> int | None:
 
     index = 0
     while index < len(line):
-        if line[index] not in _SENSITIVE_KEY_CHARACTERS:
+        escape_length = _json_key_escape_length(line, index)
+        if line[index] not in _SENSITIVE_KEY_CHARACTERS and escape_length == 0:
             index += 1
             continue
 
         start = index
-        while index < len(line) and line[index] in _SENSITIVE_KEY_CHARACTERS:
-            index += 1
+        while index < len(line):
+            if line[index] in _SENSITIVE_KEY_CHARACTERS:
+                index += 1
+                continue
+            escape_length = _json_key_escape_length(line, index)
+            if escape_length == 0:
+                break
+            index += escape_length
         candidate = line[start:index]
 
         cursor = index
@@ -1228,6 +1268,11 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     redactions = terminal_controls + pem_documents + json_documents + credential_lines
 
     text, count = _URL_USERINFO.subn(lambda match: f"{match.group('scheme')}{_REDACTED}@", text)
+    redactions += count
+    text, count = _AUTHORIZATION_VALUE.subn(
+        lambda match: f"{match.group('scheme')} {_REDACTED}",
+        text,
+    )
     redactions += count
     for pattern in _RECOGNIZABLE_SECRET:
         text, count = pattern.subn(_REDACTED, text)

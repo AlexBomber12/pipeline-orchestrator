@@ -454,6 +454,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         deeply_nested = {"nested": deeply_nested}
     bare_jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.signatureValue"
     encoded_auth = "dXNlcjpTVVBFUlNFQ1JFVA=="
+    standalone_basic = "dXNlcjpTVEFOREFMT05FLUJBU0lDLVNFQ1JFVA=="
     credential_log = "\n".join(
         (
             "curl -H 'Authorization: ApiKey inline-auth-secret' https://example.test",
@@ -493,6 +494,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             bare_jwt,
             f'{{"auths":{{"registry":{{"auth":"{encoded_auth}"}}}}}}',
             f"_auth={encoded_auth}",
+            "Bearer standalone-bearer-secret",
+            f"Basic {standalone_basic}",
             'tool --password cli-option-secret --token "quoted cli token"',
             r'tool --password "abc\"escaped-option-secret" token="abc\"escaped-assignment-secret"',
             "PASSWORD = spaced-assignment-secret",
@@ -510,6 +513,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "passX\bword=backspace-secret",
             "visible\x00-control",
             "visible\x81-control-c1",
+            r"visible\q-invalid-json-escape",
             "matched-bad={private_key:matched-container-secret}",
             '{"private_key":"same-line-document-secret"} password=same-line-trailing-secret',
             "password: |",
@@ -553,6 +557,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-quote" in exported
     assert "visible-control" in exported
     assert "visible-control-c1" in exported
+    assert r"visible\q-invalid-json-escape" in exported
     assert "\x1b" not in exported
     assert "\x00" not in exported
     assert not any("\x80" <= character <= "\x9f" for character in exported)
@@ -565,6 +570,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "serialized-metadata" not in exported
     assert bare_jwt not in exported
     assert encoded_auth not in exported
+    assert standalone_basic not in exported
     assert "safe-hyperlink-output" in exported
     for secret in (
         "inline-auth-secret",
@@ -600,6 +606,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "passphrase-assignment-secret",
         "passphrase-option-secret",
         "jwt-assignment-secret",
+        "standalone-bearer-secret",
         "cli-option-secret",
         "quoted cli token",
         "escaped-option-secret",
@@ -689,6 +696,19 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     escaped_key_json = await diagnostics.get_latest_cli_log(SLUG)
     assert escaped_key_json["text"] == "[credential document omitted]"
     assert "escaped-key-document-secret" not in escaped_key_json["text"]
+
+    simple_escape_cases = (
+        ("private\\/key", "slash-escaped-key-secret"),
+        ("pass\\tword", "tab-escaped-key-secret"),
+        ("pass\\nword", "newline-escaped-key-secret"),
+    )
+    for escaped_key, secret in simple_escape_cases:
+        simple_escaped_key_redis = FakeRedis()
+        simple_escaped_key_redis.store[key] = f'{{"{escaped_key}":\n"{secret}"\n'
+        _patch_runtime(monkeypatch, simple_escaped_key_redis)
+        simple_escaped_key = await diagnostics.get_latest_cli_log(SLUG)
+        assert simple_escaped_key["text"] == "[credential document omitted]"
+        assert secret not in simple_escaped_key["text"]
 
     unterminated_quote_redis = FakeRedis()
     unterminated_quote_redis.store[key] = 'safe-before\nPASSWORD="alpha\nunterminated-quote-secret'

@@ -51,6 +51,8 @@ Python-tuple form. Complete and interrupted private-key blocks are both omitted
 using a bounded single-pass boundary scan.
 Standard encoded `auth` fields used by registry and package-manager credential
 documents are treated as credential context rather than exported as base64 text.
+Standalone authorization-scheme values such as `Bearer` and `Basic` credentials
+are redacted even when the header name is absent.
 Lines with recognizable credential keys are omitted conservatively when they
 use assignment, structured-field, header, or long-option syntax, so malformed
 or interrupted quoting cannot expose a value suffix. Indented YAML/header
@@ -68,7 +70,8 @@ backtracking stalls.
 Malformed or incomplete JSON containers with credential contexts are omitted
 through their closing boundary or, when unterminated, through the source end;
 legal whitespace may separate a credential key, delimiter, and value.
-JSON Unicode escapes in credential keys are decoded during fallback inspection.
+All legal JSON string escapes in credential keys are decoded during fallback
+inspection.
 Malformed JSON probing has a fixed failure budget; if that budget is
 exhausted, export fails closed to a credential-document omission marker instead
 of blocking the MCP event loop or returning text that could not be inspected
