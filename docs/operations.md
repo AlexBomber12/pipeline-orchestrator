@@ -40,7 +40,8 @@ is 8 KiB and callers may request at most 32 KiB. The service accepts the
 producer 64 KiB byte budget plus its bounded six-byte UTF-8 replacement
 expansion, redacts the complete bounded source before selecting the tail, and
 reports source/output sizes, truncation, observation time, and remaining Redis
-TTL. Authorization headers, token and password assignments,
+TTL. Authorization headers, token and password assignments or long-option
+arguments,
 cookies, credential-bearing URL userinfo/query parameters, recognizable token
 shapes, private-key blocks, and recognizable JSON credential documents are not
 exported, including nested documents and documents serialized inside log

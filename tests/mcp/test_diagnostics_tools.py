@@ -400,6 +400,14 @@ async def test_latest_cli_log_bounds_source_output_and_utf8(
     assert malformed_json["text"] == "[credential document omitted]"
     assert malformed_json["redaction"]["credential_documents_omitted"] == 1
 
+    oversized_integer_redis = FakeRedis()
+    oversized_integer_redis.store[key] = "[" + ("9" * 5_000) + "]"
+    _patch_runtime(monkeypatch, oversized_integer_redis)
+    oversized_integer = await diagnostics.get_latest_cli_log(SLUG)
+    assert oversized_integer["availability"]["status"] == "available"
+    assert oversized_integer["text"].startswith("[")
+    assert oversized_integer["text"].endswith("]")
+
 
 async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents(
     monkeypatch: pytest.MonkeyPatch,
@@ -438,6 +446,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             json.dumps(deeply_nested),
             'structured={"headers":{"Authorization":"Bearer structured-auth-secret"}}',
             'structured-cookie={"Cookie":"session=structured-cookie-secret"}',
+            'tool --password cli-option-secret --token "quoted cli token"',
             "private_key=malformed-private-secret",
             "AWS_SECRET_ACCESS_KEY=aws-secret",
             "{",
@@ -484,6 +493,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "deep-document-secret",
         "structured-auth-secret",
         "structured-cookie-secret",
+        "cli-option-secret",
+        "quoted cli token",
         "malformed-private-secret",
         "aws-secret",
         "document-secret",

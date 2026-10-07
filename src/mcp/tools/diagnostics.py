@@ -110,6 +110,13 @@ _CREDENTIAL_ASSIGNMENT = re.compile(
     r"(?!\[(?:REDACTED|credential document omitted)\])"
     r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;&#]+)"
 )
+_CREDENTIAL_OPTION = re.compile(
+    r"(?i)(?P<prefix>(?<![A-Za-z0-9-])--(?:api[_-]?key|oauth[_-]?token|"
+    r"access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|"
+    r"client[_-]?secret|private[_-]?key(?:[_-]?id)?|secret(?:[_-]?access)?[_-]?key|"
+    r"secret|password|passwd|token|(?:proxy[_-]?)?authorization|(?:set[_-]?)?cookie)"
+    r"[ \t]+)(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)"
+)
 _RECOGNIZABLE_SECRET = tuple(
     re.compile(pattern)
     for pattern in (
@@ -959,7 +966,7 @@ def _contains_credential_document_key(value: object) -> bool:
         elif isinstance(current, str):
             try:
                 decoded = json.loads(current)
-            except (json.JSONDecodeError, RecursionError):
+            except (json.JSONDecodeError, RecursionError, ValueError):
                 continue
             if isinstance(decoded, (dict, list, str)):
                 pending.append(decoded)
@@ -980,7 +987,7 @@ def _omit_json_credential_documents(text: str) -> tuple[str, int]:
             continue
         try:
             value, end = decoder.raw_decode(text, start)
-        except (json.JSONDecodeError, RecursionError):
+        except (json.JSONDecodeError, RecursionError, ValueError):
             parse_failures += 1
             if parse_failures >= _MAX_JSON_PARSE_FAILURES:
                 return _CREDENTIAL_DOCUMENT_OMITTED, 1
@@ -1022,6 +1029,8 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     )
     redactions += count
     text, count = _URL_USERINFO.subn(lambda match: f"{match.group('scheme')}{_REDACTED}@", text)
+    redactions += count
+    text, count = _CREDENTIAL_OPTION.subn(_redact_assignment, text)
     redactions += count
     text, count = _CREDENTIAL_ASSIGNMENT.subn(_redact_assignment, text)
     redactions += count
