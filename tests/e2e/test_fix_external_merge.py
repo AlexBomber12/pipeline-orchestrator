@@ -31,6 +31,7 @@ WATCH_GATE_CONTEXT = "e2e/watch-merge-gate"
 # silently keep timing out.
 FIX_POLL_INTERVAL_SEC = 5
 EXTERNAL_MERGE_DETECTION_MARGIN_SEC = 10
+STATUS_PROPAGATION_TIMEOUT_SEC = 10
 
 
 def _post_failed_status(head_sha: str) -> None:
@@ -101,6 +102,20 @@ def _watch_gate_state(head_sha: str) -> str:
     gate = next((item for item in statuses if item.get("context") == WATCH_GATE_CONTEXT), None)
     assert gate is not None, f"{WATCH_GATE_CONTEXT!r} missing on {head_sha}"
     return str(gate.get("state"))
+
+
+def _wait_for_watch_gate_state(head_sha: str, expected: str) -> None:
+    deadline = time.monotonic() + STATUS_PROPAGATION_TIMEOUT_SEC
+    last_state = None
+    while time.monotonic() < deadline:
+        last_state = _watch_gate_state(head_sha)
+        if last_state == expected:
+            return
+        time.sleep(0.5)
+    raise AssertionError(
+        f"{WATCH_GATE_CONTEXT!r} on {head_sha} remained {last_state!r}; "
+        f"expected {expected!r} within {STATUS_PROPAGATION_TIMEOUT_SEC}s"
+    )
 
 
 def _merge_pr(pr_number: int) -> None:
@@ -174,7 +189,7 @@ def test_external_merge_during_fix_returns_to_idle(
         assert _get_pr_head_sha(pr_number) == head_sha, (
             f"PR #{pr_number} HEAD changed while publishing the failure"
         )
-        assert _watch_gate_state(head_sha) == "failure"
+        _wait_for_watch_gate_state(head_sha, "failure")
 
         deadline = time.monotonic() + 30
         fix_entry = None
