@@ -980,17 +980,15 @@ def _contains_credential_document_key(value: object) -> bool:
 
 def _omit_stateful_terminal_lines(text: str) -> tuple[str, int]:
     sanitized: list[str] = []
-    omitted = 0
     lines = text.split("\n")
     for index, content in enumerate(lines):
         ending = "\n" if index < len(lines) - 1 else ""
         stateful_csi = any(match.group("final") != "m" for match in _TERMINAL_CSI.finditer(content))
         if "\r" in content or stateful_csi or _TERMINAL_STATEFUL_ESCAPE.search(content):
-            sanitized.append(f"{_TERMINAL_CONTROL_LINE_OMITTED}{ending}")
-            omitted += 1
-        else:
-            sanitized.append(f"{content}{ending}")
-    return "".join(sanitized), omitted
+            sanitized.append(_TERMINAL_CONTROL_LINE_OMITTED)
+            return "".join(sanitized), 1
+        sanitized.append(f"{content}{ending}")
+    return "".join(sanitized), 0
 
 
 def _normalize_terminal_text(text: str) -> tuple[str, int]:

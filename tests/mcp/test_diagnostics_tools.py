@@ -500,12 +500,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "pass\x1bPterminal-data\x1b\\word=esc-dcs-secret",
             "pass\x9d0;title\x9cword=c1-osc-secret",
             "pass\x90terminal-data\x9cword=c1-dcs-secret",
-            "passX\x1b[1Dword=cursor-secret",
-            "passX\x9b1Dword=c1-cursor-secret",
             "passX\bword=backspace-secret",
-            "safe-carriage\rpassword=carriage-secret",
-            "password=\rcarriage-value-secret",
-            "Authorization:\rBearer carriage-auth-secret",
             "visible\x00-control",
             "visible\x81-control-c1",
             "matched-bad={private_key:matched-container-secret}",
@@ -546,7 +541,6 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert redacted["redaction"]["applied"] is True
     assert redacted["redaction"]["credential_documents_omitted"] >= 8
     assert "[credential line omitted]" in exported
-    assert "[terminal control line omitted]" in exported
     assert "safe-after-yaml" in exported
     assert "safe-after-shell" in exported
     assert "safe-after-quote" in exported
@@ -610,12 +604,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "esc-dcs-secret",
         "c1-osc-secret",
         "c1-dcs-secret",
-        "cursor-secret",
-        "c1-cursor-secret",
         "backspace-secret",
-        "carriage-secret",
-        "carriage-value-secret",
-        "carriage-auth-secret",
         "matched-container-secret",
         "same-line-document-secret",
         "same-line-trailing-secret",
@@ -629,6 +618,24 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "ghp_" + ("A" * 36),
     ):
         assert secret not in exported
+
+    unsafe_terminal_cases = (
+        ("passX\x1b[1Dword=cursor-secret", "cursor-secret"),
+        ("passX\x9b1Dword=c1-cursor-secret", "c1-cursor-secret"),
+        ("safe-carriage\rpassword=carriage-secret", "carriage-secret"),
+        ("password=\rcarriage-value-secret", "carriage-value-secret"),
+        ("Authorization:\rBearer carriage-auth-secret", "carriage-auth-secret"),
+        ("-----BEGIN PRIVATE KEY-----\x1b[2K\npem-control-secret", "pem-control-secret"),
+        ('PASSWORD="\x1b[2K\nmultiline-control-secret"', "multiline-control-secret"),
+    )
+    for payload, secret in unsafe_terminal_cases:
+        unsafe_terminal_redis = FakeRedis()
+        unsafe_terminal_redis.store[key] = f"safe-before\n{payload}\nsafe-after"
+        _patch_runtime(monkeypatch, unsafe_terminal_redis)
+        unsafe_terminal = await diagnostics.get_latest_cli_log(SLUG)
+        assert unsafe_terminal["text"] == "safe-before\n[terminal control line omitted]"
+        assert secret not in unsafe_terminal["text"]
+        assert "safe-after" not in unsafe_terminal["text"]
 
     orphaned_begin_redis = FakeRedis()
     orphaned_begin_redis.store[key] = (
