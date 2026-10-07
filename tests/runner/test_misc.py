@@ -98,6 +98,40 @@ def test_runner_preserves_explicitly_injected_empty_registry(
     assert runner._registry is injected
 
 
+def test_coder_credential_location_in_use_tracks_active_plugin_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    codex = runner._registry.get("codex")
+    location = codex.device_login_credential_location(config=runner.app_config)
+
+    assert runner.coder_credential_location_in_use(location) is False
+    runner._coder_invocation_active = True
+    assert runner.coder_credential_location_in_use(location) is False
+
+    runner.state.coder = "missing"
+    assert runner.coder_credential_location_in_use(location) is False
+    runner.state.coder = "claude"
+    assert runner.coder_credential_location_in_use(location) is False
+
+    runner.state.coder = "codex"
+    assert runner.coder_credential_location_in_use(location) is True
+    assert runner.coder_credential_location_in_use(location + "-other") is False
+
+    monkeypatch.setattr(
+        codex,
+        "device_login_credential_location",
+        lambda **_kwargs: 123,
+    )
+    assert runner.coder_credential_location_in_use(location) is False
+
+    def fail(**_kwargs: object) -> str:
+        raise RuntimeError("must-not-escape")
+
+    monkeypatch.setattr(codex, "device_login_credential_location", fail)
+    assert runner.coder_credential_location_in_use(location) is False
+
+
 def test_preflight_returns_true_on_clean_repo(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

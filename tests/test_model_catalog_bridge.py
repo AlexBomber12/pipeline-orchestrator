@@ -343,6 +343,186 @@ def test_parse_auth_status_rejects_invalid_payloads(payload: object) -> None:
         bridge._parse_auth_status(payload)
 
 
+def _login_payload(
+    *, state: str = "starting", failure_reason: str | None = None
+) -> dict[str, object]:
+    return {
+        "plugin": "codex",
+        "session_id": "A" * 43,
+        "state": state,
+        "detail": "Device login status",
+        "failure_reason": failure_reason,
+        "verification_url": None,
+        "user_code": None,
+        "expires_at": None,
+        "cleanup_confirmed": None,
+        "replacement_requested": False,
+        "reused_session": False,
+        "replacement_warning": "Credentials can become unavailable.",
+        "auth_status": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {"ok": False},
+        {"ok": True, "login": {"state": "secret"}},
+    ],
+)
+def test_parse_device_login_rejects_invalid_payloads(payload: object) -> None:
+    with pytest.raises(ModelCatalogUnavailable):
+        bridge._parse_device_login(payload, expected_plugin="codex")
+
+
+@pytest.mark.asyncio
+async def test_loader_round_trips_device_login_operations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = _BridgeRedis()
+    registry = CoderRegistry()
+    reference = "src.coders.codex:CodexPlugin"
+    registry.register(CodexPlugin(discover=lambda **_kwargs: None), reference=reference)
+    calls: list[tuple[object, ...]] = []
+
+    class LoginManager:
+        async def start(
+            self,
+            plugin: str,
+            *,
+            expected_reference: str,
+            replace_existing: bool,
+        ) -> dict[str, object]:
+            calls.append(("start", plugin, expected_reference, replace_existing))
+            return _login_payload()
+
+        async def inspect(
+            self,
+            plugin: str,
+            session_id: str,
+            *,
+            expected_reference: str,
+        ) -> dict[str, object]:
+            calls.append(("inspect", plugin, session_id, expected_reference))
+            return _login_payload(state="waiting_for_user") | {
+                "verification_url": "https://auth.openai.com/codex/device",
+                "user_code": "ABCD-EFGH",
+                "expires_at": 1234.0,
+            }
+
+        async def cancel(
+            self,
+            plugin: str,
+            session_id: str,
+            *,
+            expected_reference: str,
+        ) -> dict[str, object]:
+            calls.append(("cancel", plugin, session_id, expected_reference))
+            return _login_payload(state="cancelled") | {"cleanup_confirmed": True}
+
+        async def shutdown(self) -> None:
+            calls.append(("shutdown",))
+
+    manager = LoginManager()
+    monkeypatch.setattr(
+        bridge,
+        "CoderLoginSessionManager",
+        lambda *_args, **_kwargs: manager,
+    )
+    server = asyncio.create_task(
+        bridge.serve_model_catalog_requests(
+            redis,
+            registry,
+            config_path="/cfg",
+            credential_location_in_use=lambda _location: False,
+        )
+    )
+    loader = bridge.DaemonModelCatalogLoader(
+        redis, timeout_seconds=1, poll_interval_seconds=0
+    )
+
+    started = await loader.start_device_login(
+        "codex",
+        expected_reference=reference,
+        replace_existing=False,
+    )
+    inspected = await loader.inspect_device_login(
+        "codex", "A" * 43, expected_reference=reference
+    )
+    cancelled = await loader.cancel_device_login(
+        "codex", "A" * 43, expected_reference=reference
+    )
+
+    assert started["state"] == "starting"
+    assert inspected["user_code"] == "ABCD-EFGH"
+    assert cancelled["cleanup_confirmed"] is True
+    assert calls[:3] == [
+        ("start", "codex", reference, False),
+        ("inspect", "codex", "A" * 43, reference),
+        ("cancel", "codex", "A" * 43, reference),
+    ]
+    server.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await server
+    assert calls[-1] == ("shutdown",)
+
+
+@pytest.mark.asyncio
+async def test_daemon_login_handler_rejects_unavailable_or_invalid_requests() -> None:
+    redis = _BridgeRedis()
+    registry = CoderRegistry()
+    reference = "src.coders.codex:CodexPlugin"
+    registry.register(CodexPlugin(discover=lambda **_kwargs: None), reference=reference)
+
+    await bridge.handle_model_catalog_request(
+        redis,
+        registry,
+        json.dumps(
+            {
+                "request_id": "a" * 32,
+                "plugin": "codex",
+                "operation": "device_login_start",
+                "reference": reference,
+                "replace_existing": False,
+                "expires_at": time.time() + 10,
+            }
+        ),
+        config_path="/cfg",
+    )
+    assert json.loads(redis.values[bridge._response_key("a" * 32)]) == {
+        "ok": False,
+        "error": "coder login unavailable",
+    }
+
+    for request_id, fields in (
+        ("b" * 32, {"operation": "device_login_start"}),
+        (
+            "c" * 32,
+            {
+                "operation": "device_login_inspect",
+                "session_id": "x" * 129,
+            },
+        ),
+    ):
+        await bridge.handle_model_catalog_request(
+            redis,
+            registry,
+            json.dumps(
+                {
+                    "request_id": request_id,
+                    "plugin": "codex",
+                    "reference": reference,
+                    "expires_at": time.time() + 10,
+                    **fields,
+                }
+            ),
+            config_path="/cfg",
+            login_manager=object(),  # type: ignore[arg-type]
+        )
+        assert bridge._response_key(request_id) not in redis.values
+
+
 @pytest.mark.asyncio
 async def test_configured_catalog_worker_response_redacts_failures(
     monkeypatch: pytest.MonkeyPatch,

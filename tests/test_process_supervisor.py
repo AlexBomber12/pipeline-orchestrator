@@ -355,6 +355,39 @@ async def test_run_supervised_process_reports_output_and_cleanup_failures() -> N
 
 
 @pytest.mark.asyncio
+async def test_run_supervised_process_streams_and_bounds_output() -> None:
+    chunks: list[bytes] = []
+    process = _ExecutionProcess(
+        stdout=_finished_reader(b"0123456789"),
+        stderr=_finished_reader(b"diagnostic"),
+    )
+
+    result = await run_supervised_process(  # type: ignore[arg-type]
+        _ExecutionManaged(
+            process,
+            CleanupResult(CleanupStatus.QUIESCENT, 0, False, False),
+        ),
+        timeout=1,
+        stdout_chunk_callback=chunks.append,
+        max_output_bytes=4,
+    )
+
+    assert chunks == [b"0123456789"]
+    assert result.stdout == b"6789"
+    assert result.stderr == b"stic"
+
+    with pytest.raises(ValueError, match="must be positive"):
+        await run_supervised_process(  # type: ignore[arg-type]
+            _ExecutionManaged(
+                _ExecutionProcess(),
+                CleanupResult(CleanupStatus.QUIESCENT, 0, False, False),
+            ),
+            timeout=1,
+            max_output_bytes=0,
+        )
+
+
+@pytest.mark.asyncio
 async def test_execution_wait_helpers_preserve_cancellation_and_are_bounded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1,4 +1,4 @@
-"""Redis request/response bridge for daemon-owned model discovery."""
+"""Redis request/response bridge for daemon-owned coder plugin operations."""
 
 from __future__ import annotations
 
@@ -9,9 +9,10 @@ import sys
 import time
 import uuid
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Callable
 
 from src.coder_auth import isolated_auth_probe, terminate_plugin_worker
+from src.coder_login import CoderLoginSessionManager
 from src.coder_registry import (
     CoderMetadataView,
     CoderPlugin,
@@ -22,6 +23,7 @@ from src.coder_registry import (
     ModelReasoningEffort,
     ModelSetting,
     parse_coder_auth_payload,
+    parse_coder_device_login_payload,
 )
 from src.config import DEFAULT_CODER_PLUGINS, AppConfig, load_config
 
@@ -74,6 +76,21 @@ def _parse_auth_status(payload: object) -> dict[str, Any]:
         return parse_coder_auth_payload(payload.get("auth"))
     except TypeError:
         raise ModelCatalogUnavailable("Daemon returned invalid coder auth status")
+
+
+def _parse_device_login(
+    payload: object, *, expected_plugin: str
+) -> dict[str, Any]:
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        raise ModelCatalogUnavailable("Daemon coder login is unavailable")
+    try:
+        return parse_coder_device_login_payload(
+            payload.get("login"), expected_plugin=expected_plugin
+        )
+    except TypeError:
+        raise ModelCatalogUnavailable(
+            "Daemon returned invalid coder login status"
+        ) from None
 
 
 def _parse_plugin_metadata(
@@ -254,7 +271,7 @@ async def _isolated_configured_catalog(
 
 
 class DaemonModelCatalogLoader:
-    """Load plugin metadata through Redis without executing it in the web app."""
+    """Call daemon-owned plugin operations without executing them in web."""
 
     def __init__(
         self,
@@ -320,12 +337,67 @@ class DaemonModelCatalogLoader:
             )
         )
 
+    async def start_device_login(
+        self,
+        plugin_id: str,
+        *,
+        expected_reference: str,
+        replace_existing: bool,
+    ) -> dict[str, Any]:
+        """Ask the daemon to start one background device-login session."""
+        return _parse_device_login(
+            await self._request(
+                plugin_id,
+                operation="device_login_start",
+                expected_reference=expected_reference,
+                extra_fields={"replace_existing": replace_existing},
+            ),
+            expected_plugin=plugin_id,
+        )
+
+    async def inspect_device_login(
+        self,
+        plugin_id: str,
+        session_id: str,
+        *,
+        expected_reference: str,
+    ) -> dict[str, Any]:
+        """Return one daemon-owned device-login session snapshot."""
+        return _parse_device_login(
+            await self._request(
+                plugin_id,
+                operation="device_login_inspect",
+                expected_reference=expected_reference,
+                extra_fields={"session_id": session_id},
+            ),
+            expected_plugin=plugin_id,
+        )
+
+    async def cancel_device_login(
+        self,
+        plugin_id: str,
+        session_id: str,
+        *,
+        expected_reference: str,
+    ) -> dict[str, Any]:
+        """Ask the daemon to cancel one owned device-login session."""
+        return _parse_device_login(
+            await self._request(
+                plugin_id,
+                operation="device_login_cancel",
+                expected_reference=expected_reference,
+                extra_fields={"session_id": session_id},
+            ),
+            expected_plugin=plugin_id,
+        )
+
     async def _request(
         self,
         plugin_id: str,
         *,
         operation: str,
         expected_reference: str | None = None,
+        extra_fields: dict[str, object] | None = None,
     ) -> object:
         """Round-trip one plugin metadata request through Redis."""
         request_id = uuid.uuid4().hex
@@ -338,6 +410,8 @@ class DaemonModelCatalogLoader:
         }
         if expected_reference is not None:
             request_payload["reference"] = expected_reference
+        if extra_fields is not None:
+            request_payload.update(extra_fields)
         request = json.dumps(request_payload, separators=(",", ":"))
         try:
             await self._redis.rpush(MODEL_CATALOG_REQUEST_QUEUE, request)
@@ -400,6 +474,7 @@ async def handle_model_catalog_request(
     raw_request: object,
     *,
     config_path: str,
+    login_manager: CoderLoginSessionManager | None = None,
 ) -> None:
     """Execute one validated request inside the daemon process."""
     if isinstance(raw_request, bytes):
@@ -420,7 +495,15 @@ async def handle_model_catalog_request(
         or len(request_id) != 32
         or not all(character in "0123456789abcdef" for character in request_id)
         or not isinstance(plugin_name, str)
-        or operation not in {"auth", "catalog", "metadata"}
+        or operation
+        not in {
+            "auth",
+            "catalog",
+            "metadata",
+            "device_login_start",
+            "device_login_inspect",
+            "device_login_cancel",
+        }
         or not isinstance(expected_reference, str)
         or not isinstance(expires_at, (int, float))
     ):
@@ -440,6 +523,43 @@ async def handle_model_catalog_request(
                 redis_client,
                 request_id,
                 {"ok": False, "error": "plugin reference mismatch"},
+            )
+            return
+        if operation.startswith("device_login_"):
+            if login_manager is None:
+                await _store_response(
+                    redis_client,
+                    request_id,
+                    {"ok": False, "error": "coder login unavailable"},
+                )
+                return
+            if operation == "device_login_start":
+                replace_existing = request.get("replace_existing")
+                if not isinstance(replace_existing, bool):
+                    return
+                login = await login_manager.start(
+                    plugin_name,
+                    expected_reference=expected_reference,
+                    replace_existing=replace_existing,
+                )
+            else:
+                session_id = request.get("session_id")
+                if not isinstance(session_id, str) or len(session_id) > 128:
+                    return
+                method = (
+                    login_manager.inspect
+                    if operation == "device_login_inspect"
+                    else login_manager.cancel
+                )
+                login = await method(
+                    plugin_name,
+                    session_id,
+                    expected_reference=expected_reference,
+                )
+            await _store_response(
+                redis_client,
+                request_id,
+                {"ok": True, "login": login},
             )
             return
         if operation == "metadata":
@@ -494,6 +614,7 @@ async def serve_model_catalog_requests(
     registry: CoderRegistry,
     *,
     config_path: str,
+    credential_location_in_use: Callable[[str], bool] | None = None,
 ) -> None:
     """Consume durable web requests for the lifetime of the daemon."""
     # Lightweight Redis doubles and alternate clients may not implement lists.
@@ -501,6 +622,11 @@ async def serve_model_catalog_requests(
     # bridge cannot be installed.
     if not callable(getattr(redis_client, "blpop", None)):
         return
+    login_manager = CoderLoginSessionManager(
+        registry,
+        config_path=config_path,
+        credential_location_in_use=credential_location_in_use,
+    )
     pending: set[asyncio.Task[None]] = set()
 
     def request_done(task: asyncio.Task[None]) -> None:
@@ -532,6 +658,7 @@ async def serve_model_catalog_requests(
                             registry,
                             queued[1],
                             config_path=config_path,
+                            login_manager=login_manager,
                         )
                     )
                     pending.add(task)
@@ -547,6 +674,7 @@ async def serve_model_catalog_requests(
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        await login_manager.shutdown()
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised in the isolated worker

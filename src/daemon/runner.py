@@ -2298,6 +2298,27 @@ class PipelineRunner(
             raise RuntimeError("cannot replace an outstanding coder process")
         self._current_coder_process = proc
 
+    def coder_credential_location_in_use(
+        self, credential_location: str
+    ) -> bool:
+        """Return whether this runner owns a coder using that auth location."""
+        if not self._coder_invocation_active or not self.state.coder:
+            return False
+        plugin = self._registry.get_optional(self.state.coder)
+        if plugin is None:
+            return False
+        resolver = getattr(plugin, "device_login_credential_location", None)
+        if not callable(resolver):
+            return False
+        try:
+            active_location = resolver(config=self.app_config)
+        except Exception:
+            return False
+        return (
+            isinstance(active_location, str)
+            and active_location == credential_location
+        )
+
     def _track_current_coder_supervised_process(
         self, managed: SupervisedProcess
     ) -> None:

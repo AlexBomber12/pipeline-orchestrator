@@ -175,6 +175,32 @@ def _repo(url: str, **kwargs: Any) -> RepoConfig:
     return RepoConfig(url=url, **kwargs)
 
 
+def test_credential_location_in_use_checks_active_runners() -> None:
+    class Runner:
+        def __init__(self, result: bool) -> None:
+            self.result = result
+            self.locations: list[str] = []
+
+        def coder_credential_location_in_use(self, location: str) -> bool:
+            self.locations.append(location)
+            return self.result
+
+    first = Runner(False)
+    second = Runner(True)
+    third = Runner(True)
+
+    assert main_module._credential_location_in_use({}, "/auth") is False
+    assert (
+        main_module._credential_location_in_use(
+            {"first": first, "second": second, "third": third}, "/auth"
+        )
+        is True
+    )
+    assert first.locations == ["/auth"]
+    assert second.locations == ["/auth"]
+    assert third.locations == []
+
+
 def test_main_creates_one_runner_per_repo(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

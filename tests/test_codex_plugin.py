@@ -884,3 +884,128 @@ def test_rate_limit_patterns_returns_both_codex_patterns() -> None:
         codex_module._CODEX_RETRY_PATTERN,
         codex_module._CODEX_USAGE_LIMIT_PATTERN,
     ]
+
+
+def test_codex_device_login_context_uses_effective_auth_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.yml"
+    configured_home = tmp_path / "configured-home"
+    explicit_codex_home = tmp_path / "explicit-codex-home"
+    config_path.write_text(
+        f"auth:\n  codex_home_dir: {configured_home}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(explicit_codex_home))
+
+    plugin = CodexPlugin()
+    adapter = plugin.create_device_login(config_path=str(config_path))
+
+    assert adapter.command == ("codex", "login", "--device-auth")
+    assert adapter.environment["HOME"] == str(configured_home)
+    assert adapter.environment["CODEX_HOME"] == str(explicit_codex_home)
+    assert adapter.working_directory == str(tmp_path)
+    assert adapter.credential_location == str(explicit_codex_home)
+    assert plugin.device_login_credential_location(
+        config=AppConfig.model_validate(
+            {"auth": {"codex_home_dir": str(configured_home)}}
+        )
+    ) == str(explicit_codex_home)
+    assert "unsuccessful or cancelled replacement" in adapter.replacement_warning
+
+    monkeypatch.delenv("CODEX_HOME")
+    assert plugin.create_device_login(
+        config_path=str(config_path)
+    ).credential_location == str(configured_home / ".codex")
+
+
+def test_codex_device_login_parser_handles_ansi_and_incremental_output() -> None:
+    adapter = codex_module.CodexDeviceLoginAdapter(
+        command=("codex",),
+        environment={},
+        working_directory="/tmp",
+        credential_location="/tmp/.codex",
+    )
+    first = (
+        "Welcome to Codex\n"
+        "1. Open this link in your browser and sign in to your account\n"
+        "   \x1b[94mhttps://auth.openai.com/codex/de"
+    )
+    assert adapter.parse_progress(first, "") is None
+    complete = first + (
+        "vice\x1b[0m\n\n"
+        "2. Enter this one-time code \x1b[90m(expires in 15 minutes)\x1b[0m\n"
+        "   \x1b[94mABCD-EFGH\x1b[0m\n"
+    )
+
+    prompt = adapter.parse_progress(complete, "ignored")
+
+    assert prompt is not None
+    assert prompt.verification_url == "https://auth.openai.com/codex/device"
+    assert prompt.user_code == "ABCD-EFGH"
+    assert prompt.expires_in_seconds == 900
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        (
+            "1. Open this link in your browser and sign in to your account\n"
+            "   http://auth.openai.com/codex/device\n"
+            "2. Enter this one-time code (expires in 15 minutes)\n"
+            "   ABCD-EFGH\n"
+        ),
+        (
+            "1. Open this link in your browser and sign in to your account\n"
+            "   https://auth.openai.com/codex/device\n"
+            "2. Enter this one-time code (expires in 15 minutes)\n"
+            "   bad code\n"
+        ),
+    ],
+)
+def test_codex_device_login_parser_rejects_untrusted_instructions(
+    output: str,
+) -> None:
+    adapter = codex_module.CodexDeviceLoginAdapter(
+        command=("codex",),
+        environment={},
+        working_directory="/tmp",
+        credential_location="/tmp/.codex",
+    )
+
+    with pytest.raises(ValueError, match="invalid Codex device"):
+        adapter.parse_progress(output, "")
+
+
+@pytest.mark.parametrize(
+    ("output", "reason"),
+    [
+        (
+            "Error logging in with device code: device auth timed out after 15 minutes",
+            "provider_expired",
+        ),
+        (
+            "device code login is not enabled for this Codex server",
+            "device_login_disabled",
+        ),
+        (
+            "ChatGPT login is disabled. Use API key login instead.",
+            "device_login_disabled",
+        ),
+        ("sensitive provider failure", "process_failed"),
+    ],
+)
+def test_codex_device_login_failure_classification_is_sanitized(
+    output: str, reason: str
+) -> None:
+    adapter = codex_module.CodexDeviceLoginAdapter(
+        command=("codex",),
+        environment={},
+        working_directory="/tmp",
+        credential_location="/tmp/.codex",
+    )
+
+    failure = adapter.classify_failure("", output, 1)
+
+    assert failure.reason == reason
+    assert "sensitive provider failure" not in failure.detail

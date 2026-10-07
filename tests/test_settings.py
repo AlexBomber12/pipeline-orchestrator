@@ -17,6 +17,7 @@ from src import config as src_config
 from src.coder_registry import (
     CoderRegistry,
     ModelCatalog,
+    ModelCatalogUnavailable,
     ModelMetadata,
     ModelReasoningEffort,
     ModelSetting,
@@ -2994,6 +2995,214 @@ def test_api_auth_status_returns_ok_for_both(
     assert payload["gh"]["status"] == "ok"
     assert "Logged in" in payload["gh"]["detail"]
     assert "octocat" in payload["gh"]["detail"]
+
+
+def _device_login_payload(
+    *,
+    state: str = "waiting_for_user",
+    failure_reason: str | None = None,
+    session_id: str | None = "s" * 32,
+) -> dict[str, object]:
+    waiting = state == "waiting_for_user"
+    return {
+        "plugin": "codex",
+        "session_id": session_id,
+        "state": state,
+        "detail": "Device login status",
+        "failure_reason": failure_reason,
+        "verification_url": (
+            "https://auth.openai.com/codex/device" if waiting else None
+        ),
+        "user_code": "ABCD-EFGH" if waiting else None,
+        "expires_at": 1_800_000_000.0 if waiting else None,
+        "cleanup_confirmed": True if state == "cancelled" else None,
+        "replacement_requested": False,
+        "reused_session": False,
+        "replacement_warning": "Replacement can remove existing authentication.",
+        "auth_status": None,
+    }
+
+
+def test_device_login_api_delegates_start_inspect_and_cancel(
+    empty_config: Path,
+) -> None:
+    calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    class Bridge:
+        async def start_device_login(
+            self, *args: object, **kwargs: object
+        ) -> dict[str, object]:
+            calls.append(("start", args, kwargs))
+            return _device_login_payload()
+
+        async def inspect_device_login(
+            self, *args: object, **kwargs: object
+        ) -> dict[str, object]:
+            calls.append(("inspect", args, kwargs))
+            return _device_login_payload(state="succeeded")
+
+        async def cancel_device_login(
+            self, *args: object, **kwargs: object
+        ) -> dict[str, object]:
+            calls.append(("cancel", args, kwargs))
+            return _device_login_payload(state="cancelled")
+
+    with TestClient(app) as client:
+        client.app.state.plugin_bridge = Bridge()
+        started = client.post(
+            "/api/coders/codex/device-login",
+            json={"replace_existing": True},
+        )
+        inspected = client.get(
+            f"/api/coders/codex/device-login/{'s' * 32}"
+        )
+        cancelled = client.delete(
+            f"/api/coders/codex/device-login/{'s' * 32}"
+        )
+
+    assert started.status_code == 202
+    assert started.json()["user_code"] == "ABCD-EFGH"
+    assert inspected.status_code == 200
+    assert inspected.json()["state"] == "succeeded"
+    assert cancelled.status_code == 200
+    assert cancelled.json()["cleanup_confirmed"] is True
+    assert [call[0] for call in calls] == ["start", "inspect", "cancel"]
+    assert calls[0][1] == ("codex",)
+    assert calls[0][2]["replace_existing"] is True
+    assert calls[0][2]["expected_reference"] == "src.coders.codex:CodexPlugin"
+    assert calls[1][1] == ("codex", "s" * 32)
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_status"),
+    [
+        (
+            _device_login_payload(
+                state="unsupported",
+                failure_reason="unsupported",
+                session_id=None,
+            ),
+            422,
+        ),
+        (
+            _device_login_payload(
+                state="not_found",
+                failure_reason="session_not_found",
+                session_id=None,
+            ),
+            404,
+        ),
+        (
+            _device_login_payload(
+                state="failed",
+                failure_reason="replacement_required",
+                session_id=None,
+            ),
+            409,
+        ),
+        (
+            _device_login_payload(
+                state="failed",
+                failure_reason="credential_in_use",
+                session_id=None,
+            ),
+            409,
+        ),
+        (
+            _device_login_payload(
+                state="failed",
+                failure_reason="session_capacity",
+                session_id=None,
+            ),
+            409,
+        ),
+        (
+            _device_login_payload(
+                state="failed",
+                failure_reason="session_plugin_mismatch",
+                session_id=None,
+            ),
+            409,
+        ),
+    ],
+)
+def test_device_login_api_maps_structured_states(
+    empty_config: Path,
+    payload: dict[str, object],
+    expected_status: int,
+) -> None:
+    class Bridge:
+        async def start_device_login(
+            self, *_args: object, **_kwargs: object
+        ) -> dict[str, object]:
+            return payload
+
+    with TestClient(app) as client:
+        client.app.state.plugin_bridge = Bridge()
+        response = client.post("/api/coders/codex/device-login")
+
+    assert response.status_code == expected_status
+    assert response.json()["failure_reason"] == payload["failure_reason"]
+
+
+def test_device_login_api_degrades_when_daemon_is_unavailable(
+    empty_config: Path,
+) -> None:
+    class Bridge:
+        async def start_device_login(
+            self, *_args: object, **_kwargs: object
+        ) -> dict[str, object]:
+            raise ModelCatalogUnavailable("must-not-leak")
+
+        async def inspect_device_login(
+            self, *_args: object, **_kwargs: object
+        ) -> dict[str, object]:
+            raise ModelCatalogUnavailable("must-not-leak")
+
+        async def cancel_device_login(
+            self, *_args: object, **_kwargs: object
+        ) -> dict[str, object]:
+            raise ModelCatalogUnavailable("must-not-leak")
+
+    with TestClient(app) as client:
+        client.app.state.plugin_bridge = Bridge()
+        started = client.post(
+            "/api/coders/codex/device-login",
+            json={"replace_existing": True},
+        )
+        inspected = client.get(
+            f"/api/coders/codex/device-login/{'s' * 32}"
+        )
+        cancelled = client.delete(
+            f"/api/coders/codex/device-login/{'s' * 32}"
+        )
+        missing = client.post("/api/coders/missing/device-login", json={})
+
+    for response in (started, inspected, cancelled, missing):
+        assert response.status_code == 503
+        assert response.json()["failure_reason"] == "daemon_unavailable"
+        assert "must-not-leak" not in response.text
+    assert inspected.json()["session_id"] == "s" * 32
+    assert cancelled.json()["session_id"] == "s" * 32
+    assert missing.json()["session_id"] is None
+    assert started.json()["replacement_requested"] is True
+
+
+def test_device_login_start_rejects_invalid_request_body(
+    empty_config: Path,
+) -> None:
+    with TestClient(app) as client:
+        invalid_type = client.post(
+            "/api/coders/codex/device-login",
+            json={"replace_existing": "yes"},
+        )
+        extra_field = client.post(
+            "/api/coders/codex/device-login",
+            json={"unexpected": True},
+        )
+
+    assert invalid_type.status_code == 422
+    assert extra_field.status_code == 422
 
 
 def test_api_auth_status_uses_every_configured_plugin(

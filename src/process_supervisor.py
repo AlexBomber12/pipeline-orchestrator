@@ -1222,11 +1222,19 @@ async def _wait_without_cancelling(task: asyncio.Task[None]) -> None:
 
 
 async def _capture_output(
-    stream: asyncio.StreamReader, buffer: bytearray
+    stream: asyncio.StreamReader,
+    buffer: bytearray,
+    *,
+    max_bytes: int | None = None,
+    on_chunk: Callable[[bytes], None] | None = None,
 ) -> None:
     """Read one subprocess pipe incrementally so cancellation keeps diagnostics."""
     while chunk := await stream.read(64 * 1024):
+        if on_chunk is not None:
+            on_chunk(chunk)
         buffer.extend(chunk)
+        if max_bytes is not None and len(buffer) > max_bytes:
+            del buffer[: len(buffer) - max_bytes]
 
 
 async def _wait_for_leader_exit(process: asyncio.subprocess.Process) -> int:
@@ -1320,6 +1328,9 @@ async def run_supervised_process(
     timeout: float | None,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
     on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
+    stdout_chunk_callback: Callable[[bytes], None] | None = None,
+    stderr_chunk_callback: Callable[[bytes], None] | None = None,
+    max_output_bytes: int | None = None,
 ) -> ProcessRunResult:
     """Run callbacks, wait for the leader, clean its group, and drain output.
 
@@ -1331,6 +1342,8 @@ async def run_supervised_process(
     bounded by its TERM/KILL, leader-reap, adopted-child, and lifecycle-witness
     grace periods.
     """
+    if max_output_bytes is not None and max_output_bytes <= 0:
+        raise ValueError("max_output_bytes must be positive or null")
     process = managed.process
     stdout_buffer = bytearray()
     stderr_buffer = bytearray()
@@ -1339,11 +1352,21 @@ async def run_supervised_process(
     }
     if process.stdout is not None:
         execution_tasks["stdout reader"] = asyncio.create_task(
-            _capture_output(process.stdout, stdout_buffer)
+            _capture_output(
+                process.stdout,
+                stdout_buffer,
+                max_bytes=max_output_bytes,
+                on_chunk=stdout_chunk_callback,
+            )
         )
     if process.stderr is not None:
         execution_tasks["stderr reader"] = asyncio.create_task(
-            _capture_output(process.stderr, stderr_buffer)
+            _capture_output(
+                process.stderr,
+                stderr_buffer,
+                max_bytes=max_output_bytes,
+                on_chunk=stderr_chunk_callback,
+            )
         )
 
     primary_error: BaseException | None = None

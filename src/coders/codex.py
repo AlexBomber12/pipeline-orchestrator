@@ -6,13 +6,17 @@ import asyncio
 import os
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
+from urllib.parse import urlsplit
 
 from src import codex_cli
 from src.coder_registry import (
     CoderAuthCapabilities,
     CoderAuthStatus,
+    CoderDeviceLoginFailure,
+    CoderDeviceLoginPrompt,
     ModelCatalog,
     ModelCatalogUnavailable,
     ModelMetadata,
@@ -34,6 +38,15 @@ if TYPE_CHECKING:
 
 CONFIG_PATH = os.environ.get("PO_CONFIG_PATH", "config.yml")
 _AUTH_CHECK_TIMEOUT_SEC = 5
+_DEVICE_LOGIN_TIMEOUT_SECONDS = 16 * 60
+_DEVICE_CODE_EXPIRES_IN_SECONDS = 15 * 60
+_DEVICE_VERIFICATION_URL = "https://auth.openai.com/codex/device"
+_DEVICE_LOGIN_REPLACEMENT_WARNING = (
+    "Codex clears existing saved authentication before device login; an "
+    "unsuccessful or cancelled replacement can leave authentication unavailable."
+)
+_ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_DEVICE_CODE_PATTERN = re.compile(r"[A-Z0-9-]{4,64}")
 _REASONING_EFFORT_SETTING = "reasoning_effort"
 _CODEX_RETRY_PATTERN = re.compile(
     r"try again in\s+"
@@ -123,6 +136,92 @@ def _reports_missing_cli(text: str) -> bool:
     )
 
 
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE_PATTERN.sub("", text).replace("\r", "")
+
+
+def _line_after_marker(text: str, marker: str) -> str | None:
+    _, separator, remainder = text.partition(marker)
+    if not separator:
+        return None
+    for line in remainder.splitlines()[1:]:
+        candidate = line.strip()
+        if candidate:
+            return candidate
+    return None
+
+
+@dataclass(frozen=True)
+class CodexDeviceLoginAdapter:
+    """Pinned Codex CLI 0.160.0 device-login command and parser."""
+
+    command: tuple[str, ...]
+    environment: dict[str, str]
+    working_directory: str
+    credential_location: str
+    application_timeout_seconds: float = _DEVICE_LOGIN_TIMEOUT_SECONDS
+    replacement_warning: str = _DEVICE_LOGIN_REPLACEMENT_WARNING
+
+    def parse_progress(
+        self, stdout: str, stderr: str
+    ) -> CoderDeviceLoginPrompt | None:
+        del stderr
+        text = _strip_ansi(stdout)
+        url = _line_after_marker(
+            text,
+            "1. Open this link in your browser and sign in to your account",
+        )
+        code = _line_after_marker(
+            text,
+            "2. Enter this one-time code (expires in 15 minutes)",
+        )
+        if url is None or code is None:
+            return None
+        parsed = urlsplit(url)
+        if (
+            url != _DEVICE_VERIFICATION_URL
+            or parsed.scheme != "https"
+            or parsed.hostname != "auth.openai.com"
+            or parsed.port is not None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path != "/codex/device"
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("invalid Codex device verification URL")
+        if _DEVICE_CODE_PATTERN.fullmatch(code) is None:
+            raise ValueError("invalid Codex device code")
+        return CoderDeviceLoginPrompt(
+            verification_url=url,
+            user_code=code,
+            expires_in_seconds=_DEVICE_CODE_EXPIRES_IN_SECONDS,
+        )
+
+    def classify_failure(
+        self, stdout: str, stderr: str, returncode: int
+    ) -> CoderDeviceLoginFailure:
+        del returncode
+        output = _strip_ansi(f"{stdout}\n{stderr}").lower()
+        if "device auth timed out after 15 minutes" in output:
+            return CoderDeviceLoginFailure(
+                "provider_expired",
+                "The Codex device code expired before authorization completed",
+            )
+        if (
+            "device code login is not enabled" in output
+            or "chatgpt login is disabled" in output
+        ):
+            return CoderDeviceLoginFailure(
+                "device_login_disabled",
+                "Codex device-code login is disabled for this account or configuration",
+            )
+        return CoderDeviceLoginFailure(
+            "process_failed",
+            "Codex device-code login failed",
+        )
+
+
 class CodexPlugin:
     name = "codex"
     display_name = "Codex CLI"
@@ -155,6 +254,32 @@ class CodexPlugin:
 
     def __init__(self, *, discover: Any | None = None) -> None:
         self._discover = discover or discover_codex_models
+
+    def device_login_credential_location(self, *, config: AppConfig) -> str:
+        """Return the effective Codex auth directory for conflict checks."""
+        env = _auth_probe_env(HOME=config.auth.codex_home_dir)
+        configured = env.get("CODEX_HOME")
+        location = (
+            Path(configured)
+            if configured
+            else Path(config.auth.codex_home_dir) / ".codex"
+        )
+        return str(location.absolute())
+
+    def create_device_login(
+        self, *, config_path: str = CONFIG_PATH
+    ) -> CodexDeviceLoginAdapter:
+        """Resolve one immutable CLI device-login context."""
+        config = load_config(config_path)
+        environment = _auth_probe_env(HOME=config.auth.codex_home_dir)
+        return CodexDeviceLoginAdapter(
+            command=("codex", "login", "--device-auth"),
+            environment=environment,
+            working_directory=str(Path(config_path).absolute().parent),
+            credential_location=self.device_login_credential_location(
+                config=config
+            ),
+        )
 
     def resolve_model(self, daemon_config: "DaemonConfig") -> str:
         """Prefer the plugin-ID setting, including an explicit empty value."""

@@ -28,6 +28,7 @@ import os
 import shutil
 import subprocess
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -713,6 +714,16 @@ async def _wait_or_wake(
     return healthy
 
 
+def _credential_location_in_use(
+    runners: dict[str, PipelineRunner], credential_location: str
+) -> bool:
+    """Check active runner ownership without exposing runner state to the bridge."""
+    return any(
+        runner.coder_credential_location_in_use(credential_location)
+        for runner in runners.values()
+    )
+
+
 async def main() -> None:
     """Initialize runners and drive the poll loop forever."""
     gh_dir = os.environ.get("GH_CONFIG_DIR")
@@ -742,6 +753,7 @@ async def main() -> None:
 
     redis_url = os.environ.get("REDIS_URL", DEFAULT_REDIS_URL)
     redis_client = aioredis.from_url(redis_url, decode_responses=True)
+    runners: dict[str, PipelineRunner] = {}
     # Publish configured metadata as soon as Redis is available so web startup
     # never needs to import or instantiate operator-provided plugin code.
     _background_tasks: set[asyncio.Task[None]] = set()
@@ -750,6 +762,9 @@ async def main() -> None:
             redis_client,
             registry,
             config_path=os.environ.get("PO_CONFIG_PATH", "config.yml"),
+            credential_location_in_use=partial(
+                _credential_location_in_use, runners
+            ),
         )
     )
     _background_tasks.add(model_catalog_task)
@@ -787,7 +802,6 @@ async def main() -> None:
             "No repositories configured; daemon will idle until config.yml is updated"
         )
 
-    runners: dict[str, PipelineRunner] = {}
     in_flight: dict[str, asyncio.Task[None]] = {}
     _sync_runners(
         runners,
