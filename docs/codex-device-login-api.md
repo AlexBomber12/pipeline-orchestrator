@@ -61,7 +61,7 @@ reservation is retained until process cleanup is confirmed; if cleanup cannot
 prove quiescence, both login replacement and new coder invocations remain
 blocked for that location.
 
-Auth probes, model discovery, and proactive usage checks take the same shared
+Auth probes, model discovery, and all daemon usage reads take the same shared
 reservation before reading credentials. While login owns the location,
 discovery and usage reads are suppressed, selection treats that coder as
 provisionally available, and dispatch defers at the reservation boundary instead
@@ -70,13 +70,14 @@ first advances the location's credential generation; runners reject auth cache
 entries from older generations, clear usage cache and failure-backoff state, and
 refresh against the new credentials before launching work.
 
-Device login, auth probes, model discovery, and normal Codex coder invocations
-preserve the daemon's inherited `HOME` so its Git configuration remains
-available. They receive the same effective `CODEX_HOME`: an explicitly inherited
-value when present, otherwise `<auth.codex_home_dir>/.codex`. A successful login
-therefore updates the credential store used by subsequent work. Web auth-status
-requests reach coder probes through the daemon bridge, so they use the same
-credential reservation as coder dispatch and cannot race an active login.
+Device login, auth probes, model discovery, usage reads, and normal Codex coder
+invocations preserve the daemon's inherited `HOME` so its Git configuration
+remains available. They receive the same effective `CODEX_HOME`: an explicitly
+inherited value when present, otherwise `<auth.codex_home_dir>/.codex`. A
+successful login therefore updates the credential store used by subsequent
+work. Web auth-status requests reach coder probes through the daemon bridge, so
+they use the same credential reservation as coder dispatch and cannot race an
+active login.
 
 Terminal sessions are retained for five minutes. Sessions are daemon-memory
 state: after a daemon restart, every old identifier returns `not_found` and

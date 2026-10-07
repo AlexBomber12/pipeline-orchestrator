@@ -613,6 +613,39 @@ def test_handle_error_device_login_deferral_preserves_diagnosis_attempts(
     assert any("Diagnosis deferred" in item["event"] for item in runner.state.history)
 
 
+def test_handle_error_defers_usage_fetch_during_device_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner(coder=CoderType.CODEX)
+    runner._credential_reservations = reservations
+    codex_plugin = runner._registry.get("codex")
+    location = codex_plugin.device_login_credential_location(
+        config=runner.app_config
+    )
+    fetches: list[bool] = []
+    monkeypatch.setattr(
+        runner._codex_usage_provider,
+        "fetch",
+        lambda: fetches.append(True),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_get_auxiliary_coder",
+        lambda: ("codex", codex_plugin),
+    )
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "boom"
+    assert reservations.reserve_login(location) is True
+
+    asyncio.run(runner.handle_error())
+
+    assert fetches == []
+    assert runner.state.state == PipelineState.ERROR
+    assert runner._error_diagnose_count == 0
+    reservations.release_login(location)
+
+
 def test_handle_error_releases_credential_reservation_on_preparation_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

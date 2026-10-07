@@ -2709,11 +2709,7 @@ class PipelineRunner(
         self.state.coder = active_coder
         if self.repo_config.active:
             provider = self._usage_provider_for(active_coder)
-            snap = (
-                await asyncio.to_thread(provider.fetch)
-                if provider is not None
-                else None
-            )
+            snap = await self._fetch_usage_snapshot(active_coder)
             if snap is not None:
                 self.state.usage_session_percent = snap.session_percent
                 self.state.usage_session_resets_at = snap.session_resets_at

@@ -10,7 +10,6 @@ Module-level:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import subprocess
@@ -245,16 +244,12 @@ class ErrorMixin:
             )
             return
         coder_name, plugin = selected
-        provider = self._usage_provider_for(coder_name)
         # Soft-skip diagnosis rather than pausing the repo when the selected
         # diagnosis coder is already over its usage threshold.
-        if provider is None:
+        try:
+            snapshot = await self._fetch_usage_snapshot(coder_name)
+        except Exception:
             snapshot = None
-        else:
-            try:
-                snapshot = await asyncio.to_thread(provider.fetch)
-            except Exception:
-                snapshot = None
         if snapshot and (
             snapshot.session_percent
             >= self.app_config.daemon.rate_limit_session_pause_percent

@@ -466,12 +466,28 @@ def test_codex_plugin_create_usage_provider(
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
 
     provider = CodexPlugin().create_usage_provider()
 
     assert isinstance(provider, OpenAIUsageProvider)
     assert provider._credentials_path == tmp_path / "codex-home" / ".codex" / "auth.json"
     assert provider._cache_ttl == 123
+
+
+def test_codex_plugin_usage_provider_uses_effective_codex_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    configured_home = tmp_path / "configured-home"
+    explicit_codex_home = tmp_path / "explicit-codex-home"
+    config = AppConfig.model_validate(
+        {"auth": {"codex_home_dir": str(configured_home)}}
+    )
+    monkeypatch.setenv("CODEX_HOME", str(explicit_codex_home))
+
+    provider = CodexPlugin().create_usage_provider(config=config)
+
+    assert provider._credentials_path == explicit_codex_home / "auth.json"
 
 
 def test_auth_command_returns_126_on_permission_error(

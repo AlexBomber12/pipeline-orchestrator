@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 from src import codex_cli
+from src.coder_login import CoderCredentialReservations
 from src.coders import claude as claude_plugin_module
 from src.config import CoderType, FeatureFlags
 from src.daemon import fix_supervision as fix_supervision_module
@@ -536,6 +537,29 @@ def test_publish_state_copies_usage_snapshot_to_state() -> None:
     assert runner.state.usage_session_resets_at == 123
     assert runner.state.usage_weekly_percent == 10
     assert runner.state.usage_weekly_resets_at == 456
+
+
+def test_publish_state_defers_usage_fetch_during_device_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner(coder=CoderType.CODEX)
+    runner._credential_reservations = reservations
+    plugin = runner._registry.get("codex")
+    location = plugin.device_login_credential_location(config=runner.app_config)
+    fetches: list[bool] = []
+    monkeypatch.setattr(
+        runner._codex_usage_provider,
+        "fetch",
+        lambda: fetches.append(True),
+    )
+    assert reservations.reserve_login(location) is True
+
+    asyncio.run(runner.publish_state())
+
+    assert fetches == []
+    assert runner.state.usage_session_percent is None
+    reservations.release_login(location)
 
 
 def test_github_api_budget_paused_handles_no_cache() -> None:

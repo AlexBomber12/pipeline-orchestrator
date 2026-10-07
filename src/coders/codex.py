@@ -564,7 +564,10 @@ class CodexPlugin:
         assert isinstance(cfg, AppConfig)
         credentials_path = kwargs.pop(
             "credentials_path",
-            str(Path(cfg.auth.codex_home_dir) / ".codex" / "auth.json"),
+            str(
+                Path(self.device_login_credential_location(config=cfg))
+                / "auth.json"
+            ),
         )
         cache_ttl_sec = kwargs.pop(
             "cache_ttl_sec", cfg.daemon.usage_api_cache_ttl_sec
