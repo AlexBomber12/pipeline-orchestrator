@@ -123,9 +123,12 @@ the inherited candidate and fallback behavior instead of hard-pinning a
 provider. Registered plugins participate in the same priority, exploration,
 disable, authentication, and rate-limit admission rules as the built-ins.
 Unknown, unloaded, or unavailable hard pins are rejected rather than falling
-back to another coder. The dashboard keeps its editable coder choices limited
-to Claude and Codex for now, but it renders configured custom selections as
-read-only values. Legacy model-field
+back to another coder. The dashboard offers every successfully loaded registry
+plugin as an editable global default and repository override, labels choices
+with plugin display names, and persists their stable IDs. A saved selection
+that is no longer available remains visible as unavailable and read-only until
+the operator chooses another loaded plugin or restores repository-level
+automatic selection. Legacy model-field
 fallbacks are likewise owned by their built-ins (`claude_model` by `claude`
 and `codex_model` by `codex`); additional plugins must set their model
 metadata's `config_field` to `None` and use `coder_settings`. Configured model
