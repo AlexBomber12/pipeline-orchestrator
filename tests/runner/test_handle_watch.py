@@ -32,6 +32,24 @@ from tests.runner import _helpers as h
 claude_cli = claude_plugin_module.claude_cli
 
 
+def _ci_retrieval(
+    repo: str,
+    sha: str,
+    check_runs: list[dict],
+) -> Any:
+    source = watch_module.gh_checks._CiSourceResult(True, not check_runs)
+    status_source = watch_module.gh_checks._CiSourceResult(True, True)
+    return watch_module.gh_checks._make_ci_retrieval(
+        repo,
+        sha,
+        0.0,
+        check_runs,
+        {"state": "success", "statuses": []},
+        source,
+        status_source,
+    )
+
+
 def test_observe_watch_event_signature_resets_retrigger_count() -> None:
     runner = h._make_runner()
     runner.state.current_pr = PRInfo(
@@ -644,7 +662,9 @@ def test_handle_watch_reclassified_pending_routes_to_fix(
 ) -> None:
     """PR-250: stuck-PENDING reclassification routes WATCH through handle_fix.
 
-    The PR's raw CI status is PENDING, but the Redis tracker shows the
+    The PR's canonical CI status is PENDING even though its raw runs look
+    successful (for example, because producer identity is missing), and the
+    Redis tracker shows the
     same head_sha has been PENDING longer than ``ci_pending_max_min``
     minutes. ``classify_ci_status_with_age`` reclassifies as FAILURE,
     a ``stuck_pending`` event is logged, and ``handle_fix`` is invoked.
@@ -657,12 +677,23 @@ def test_handle_watch_reclassified_pending_routes_to_fix(
         branch="pr-042",
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.PENDING,
-        head_sha="cafef00d",
+        head_sha="c" * 40,
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
     monkeypatch.setattr(
-        "src.github.checks._fetch_ci_status_rest",
-        lambda repo, sha: ([{"status": "in_progress"}], {}, True),
+        "src.github.checks._retrieve_ci_status_evidence",
+        lambda repo, sha: _ci_retrieval(
+            repo,
+            sha,
+            [
+                {
+                    "id": 1,
+                    "name": "unit",
+                    "conclusion": "success",
+                    "head_sha": sha,
+                }
+            ],
+        ),
     )
 
     fix_calls: list[None] = []
@@ -679,7 +710,7 @@ def test_handle_watch_reclassified_pending_routes_to_fix(
     runner = h._make_runner()
     runner.app_config.daemon.ci_pending_max_min = 30
     fixed_first_seen = 1_700_000_000.0
-    key = gh_checks._pending_tracker_key(runner.owner_repo, 42, "cafef00d")
+    key = gh_checks._pending_tracker_key(runner.owner_repo, 42, "c" * 40)
     asyncio.run(runner.redis.set(key, str(fixed_first_seen)))
     monkeypatch.setattr(
         gh_checks.time, "time", lambda: fixed_first_seen + 60 * 60
@@ -709,18 +740,30 @@ def test_handle_watch_pending_within_threshold_does_not_reclassify(
         branch="pr-043",
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.PENDING,
-        head_sha="deadbeef",
+        head_sha="d" * 40,
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
     monkeypatch.setattr(
-        "src.github.checks._fetch_ci_status_rest",
-        lambda repo, sha: ([{"status": "in_progress"}], {}, True),
+        "src.github.checks._retrieve_ci_status_evidence",
+        lambda repo, sha: _ci_retrieval(
+            repo,
+            sha,
+            [
+                {
+                    "id": 1,
+                    "name": "unit",
+                    "status": "in_progress",
+                    "head_sha": sha,
+                    "app": {"id": 1},
+                }
+            ],
+        ),
     )
 
     runner = h._make_runner()
     runner.app_config.daemon.ci_pending_max_min = 30
     fixed_first_seen = 1_700_000_000.0
-    key = gh_checks._pending_tracker_key(runner.owner_repo, 43, "deadbeef")
+    key = gh_checks._pending_tracker_key(runner.owner_repo, 43, "d" * 40)
     asyncio.run(runner.redis.set(key, str(fixed_first_seen)))
     # 5 min elapsed, threshold is 30 — wrapper returns PENDING with no reason.
     monkeypatch.setattr(
@@ -736,6 +779,46 @@ def test_handle_watch_pending_within_threshold_does_not_reclassify(
     history_events = " ".join(entry.get("event", "") for entry in runner.state.history)
     assert "stuck_pending" not in history_events
     assert "reclassified" not in history_events
+
+
+def test_fresh_success_clears_stale_pending_age(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh canonical SUCCESS must not age a stale hydrated PENDING."""
+    from src.github import checks as gh_checks
+
+    head_sha = "e" * 40
+    found = PRInfo(number=44, branch="pr-044", head_sha=head_sha)
+    monkeypatch.setattr(
+        gh_checks,
+        "_retrieve_ci_status_evidence",
+        lambda repo, sha: _ci_retrieval(
+            repo,
+            sha,
+            [
+                {
+                    "id": 1,
+                    "name": "unit",
+                    "conclusion": "success",
+                    "head_sha": sha,
+                    "app": {"id": 1},
+                }
+            ],
+        ),
+    )
+
+    runner = h._make_runner()
+    runner.app_config.daemon.ci_pending_max_min = 30
+    key = gh_checks._pending_tracker_key(runner.owner_repo, found.number, head_sha)
+    asyncio.run(runner.redis.set(key, "1700000000.0"))
+    monkeypatch.setattr(gh_checks.time, "time", lambda: 1_700_003_600.0)
+
+    asyncio.run(runner._maybe_reclassify_stuck_pending(found))
+
+    assert found.ci_status == CIStatus.PENDING
+    assert asyncio.run(runner.redis.get(key)) is None
+    history = " ".join(entry.get("event", "") for entry in runner.state.history)
+    assert "stuck_pending" not in history
 
 
 def test_handle_watch_timeout_transitions_to_error_with_cause(

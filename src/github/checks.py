@@ -8,11 +8,12 @@ WATCH gate's CI status read. Reuses ``cache._etag_get`` and
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable
 from datetime import datetime
 from typing import Any, NamedTuple
 
 from src.github import cache, gh_runner
-from src.github.ci_evidence import CIEvidence, evaluate_ci_evidence
+from src.github.ci_evidence import CIEvidence, _latest, evaluate_ci_evidence
 from src.models import CIStatus
 from src.retry import retry_transient
 
@@ -504,6 +505,72 @@ def _fetch_ci_status_rest(repo: str, sha: str) -> tuple[list[dict], dict, bool]:
     )
 
 
+def _classify_ci_retrieval(
+    retrieval: _CiRetrieval,
+    *,
+    empty_is_success: bool = False,
+    required_contexts: Iterable[str] | None = None,
+) -> CIStatus:
+    """Classify a complete REST retrieval without discarding provenance policy."""
+
+    statuses = retrieval.status_payload.get("statuses", [])
+    evidence = evaluate_ci_evidence(
+        repo=retrieval.evidence.repo,
+        pr_number=None,
+        sha=retrieval.evidence.sha,
+        check_runs=retrieval.check_runs,
+        statuses=(
+            [status for status in statuses if isinstance(status, dict)]
+            if retrieval.status_source.sha_matches and isinstance(statuses, list)
+            else []
+        ),
+        check_runs_complete=retrieval.check_runs_source.complete,
+        statuses_complete=retrieval.status_source.complete,
+        required_contexts=required_contexts,
+        observed_at=retrieval.evidence.observed_at,
+        empty_is_success=empty_is_success,
+    )
+    # ``_make_ci_retrieval`` preserves this aggregate because GitHub can
+    # report a known commit-status failure while omitting or malforming the
+    # embedded status history. Keep it authoritative here too; the rebuilt
+    # evidence above cannot recover a context that the response omitted.
+    combined_state = _commit_status_state(retrieval.status_payload.get("state"))
+    if (
+        retrieval.status_source.sha_matches
+        and combined_state in _REST_CI_FAILURE_STATES
+    ):
+        return CIStatus.FAILURE
+
+    # Classify infrastructure failures from the canonical current attempts.
+    # The compatibility mapper intentionally sees the complete historical
+    # payload, where an older logic failure would otherwise override a newer
+    # infra-class rerun for the same check and producer.
+    if evidence.policy_result == CIStatus.FAILURE:
+        latest_failures = [
+            context
+            for producers in _latest(evidence.contexts).values()
+            for context in producers.values()
+            if context.state == "failure"
+        ]
+        current_runs = []
+        for context in latest_failures:
+            if not context.run_id or context.run_id[0] != "check":
+                return CIStatus.FAILURE
+            matches = [
+                run
+                for run in retrieval.check_runs
+                if isinstance(run, dict) and run.get("id") == context.run_id[1]
+            ]
+            if len(matches) != 1:
+                return CIStatus.FAILURE
+            current_runs.append(matches[0])
+        if current_runs and all(_is_infra_failure(run) for run in current_runs):
+            return CIStatus.INFRA_FAILURE
+        return CIStatus.FAILURE
+
+    return evidence.policy_result
+
+
 def _map_rest_ci_status_to_enum(
     check_runs: list[dict],
     status_payload: dict,
@@ -719,26 +786,33 @@ async def classify_ci_status_with_age(
     *,
     empty_is_success: bool = False,
     fetch_ok: bool = True,
+    canonical_status: CIStatus | None = None,
 ) -> tuple[CIStatus, str | None]:
     """Augment :func:`_map_rest_ci_status_to_enum` with stuck-PENDING reclassification.
 
-    Returns ``(status, reclassification_reason)``. When the raw status is
+    Returns ``(status, reclassification_reason)``. When the canonical status is
     PENDING for longer than ``pending_max_seconds`` on the same
     ``head_sha``, returns ``(CIStatus.FAILURE, "stuck_pending")``;
-    otherwise returns the raw status with reason ``None``. The
+    otherwise returns the selected status with reason ``None``. The
     first-seen-PENDING timestamp is tracked per ``head_sha`` in Redis so
     a fresh push naturally resets the clock, and the tracker is cleared
-    whenever the raw status leaves PENDING so a transient regression
+    whenever the canonical status leaves PENDING so a transient regression
     back into PENDING starts a new window.
+
+    ``canonical_status`` lets callers retain provenance and required-context
+    policy already applied while hydrating the PR. When omitted, the legacy
+    REST payload mapper remains the source of the status.
 
     PR-250.
     """
-    raw_status = _map_rest_ci_status_to_enum(
-        runs_payload,
-        statuses_payload,
-        empty_is_success=empty_is_success,
-        fetch_ok=fetch_ok,
-    )
+    raw_status = canonical_status
+    if raw_status is None:
+        raw_status = _map_rest_ci_status_to_enum(
+            runs_payload,
+            statuses_payload,
+            empty_is_success=empty_is_success,
+            fetch_ok=fetch_ok,
+        )
     if raw_status != CIStatus.PENDING:
         await _clear_pending_tracker(redis_client, repo, pr_number, head_sha)
         return raw_status, None

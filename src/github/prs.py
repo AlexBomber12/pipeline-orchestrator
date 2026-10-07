@@ -28,7 +28,7 @@ from src.github.gh_runner import (
 )
 from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_config
 from src.github.reviews import _begin_review_cache_cycle
-from src.models import CIStatus, PRInfo
+from src.models import PRInfo
 
 logger = logging.getLogger(__name__)
 
@@ -267,11 +267,15 @@ def get_open_prs(
     repo: str,
     allow_merge_without_checks: bool = False,
     reviewer_policy: ReviewerPolicy | None = None,
+    required_checks: Iterable[str] | None = None,
 ) -> list[PRInfo]:
     """Return open PRs for ``repo`` (``owner/repo``) with CI and review status."""
 
     _begin_review_cache_cycle()
     reviewer_policy = reviewer_policy or reviewer_policy_from_config(load_config())
+    required_checks = (
+        tuple(required_checks) if required_checks is not None else None
+    )
     try:
         raw = gh_runner.run_gh(
             [
@@ -294,6 +298,7 @@ def get_open_prs(
             repo,
             allow_merge_without_checks=allow_merge_without_checks,
             reviewer_policy=reviewer_policy,
+            required_checks=required_checks,
         )
     if not isinstance(raw, list):
         return []
@@ -306,9 +311,7 @@ def get_open_prs(
         commits = entry.get("commits") or []
         head_sha = entry.get("headRefOid", "")
         title = entry.get("title", "")
-        check_runs, status_payload, fetch_ok = checks._fetch_ci_status_rest(
-            repo, head_sha
-        )
+        ci_retrieval = checks._retrieve_ci_status_evidence(repo, head_sha)
         labels = entry.get("labels") or []
         quarantine_labels = {
             label.get("name", "")
@@ -322,11 +325,10 @@ def get_open_prs(
                 branch=entry.get("headRefName", ""),
                 title=title,
                 pr_id=extract_queue_pr_id(title),
-                ci_status=checks._map_rest_ci_status_to_enum(
-                    check_runs,
-                    status_payload,
+                ci_status=checks._classify_ci_retrieval(
+                    ci_retrieval,
                     empty_is_success=allow_merge_without_checks,
-                    fetch_ok=fetch_ok,
+                    required_contexts=required_checks,
                 ),
                 review_status=reviews.get_pr_review_status(
                     repo,
@@ -358,9 +360,13 @@ def _get_open_prs_rest(
     *,
     allow_merge_without_checks: bool,
     reviewer_policy: ReviewerPolicy | None = None,
+    required_checks: Iterable[str] | None = None,
 ) -> list[PRInfo]:
     """Return open PRs via REST when GraphQL status rollup is unavailable."""
 
+    required_checks = (
+        tuple(required_checks) if required_checks is not None else None
+    )
     raw = cache._gh_api_paginated(f"repos/{repo}/pulls?state=open&per_page=100")
     if raw is None:
         return []
@@ -374,6 +380,7 @@ def _get_open_prs_rest(
         user = entry.get("user") or {}
         title = entry.get("title", "")
         head_sha = head.get("sha", "")
+        ci_retrieval = checks._retrieve_ci_status_evidence(repo, head_sha)
         labels = entry.get("labels") or []
         quarantine_labels = {
             label.get("name", "")
@@ -387,10 +394,10 @@ def _get_open_prs_rest(
                 branch=head.get("ref", ""),
                 title=title,
                 pr_id=extract_queue_pr_id(title),
-                ci_status=(
-                    CIStatus.SUCCESS
-                    if allow_merge_without_checks
-                    else CIStatus.PENDING
+                ci_status=checks._classify_ci_retrieval(
+                    ci_retrieval,
+                    empty_is_success=allow_merge_without_checks,
+                    required_contexts=required_checks,
                 ),
                 review_status=reviews.get_pr_review_status(
                     repo,

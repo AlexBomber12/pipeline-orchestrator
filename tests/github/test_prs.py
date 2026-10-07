@@ -195,8 +195,13 @@ def test_get_open_prs_preserves_quarantine_labels(
     )
     monkeypatch.setattr(
         gh_prs.checks,
-        "_fetch_ci_status_rest",
-        lambda repo, sha: ([], [], True),
+        "_retrieve_ci_status_evidence",
+        lambda repo, sha: object(),
+    )
+    monkeypatch.setattr(
+        gh_prs.checks,
+        "_classify_ci_retrieval",
+        lambda *args, **kwargs: gh_prs.checks.CIStatus.PENDING,
     )
     monkeypatch.setattr(
         gh_prs.reviews,
@@ -260,8 +265,13 @@ def test_get_open_prs_snapshots_reviewer_policy_once_per_poll(
     )
     monkeypatch.setattr(
         gh_prs.checks,
-        "_fetch_ci_status_rest",
-        lambda repo, sha: ([], [], True),
+        "_retrieve_ci_status_evidence",
+        lambda repo, sha: object(),
+    )
+    monkeypatch.setattr(
+        gh_prs.checks,
+        "_classify_ci_retrieval",
+        lambda *args, **kwargs: gh_prs.checks.CIStatus.PENDING,
     )
 
     def fake_review_status(
