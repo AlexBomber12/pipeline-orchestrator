@@ -12,8 +12,10 @@ import asyncio
 import math
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from src.config import DEFAULT_CODER_PLUGINS
 from src.daemon.notifications import send_spend_ceiling_warning
@@ -99,6 +101,21 @@ RATE_LIMIT_BRANCH_MAP = (
 class RateLimitMixin:
     """Rate-limit detection and proactive usage checks."""
 
+    @staticmethod
+    async def _run_reserved_sync_reader(reader: Callable[[], Any]) -> Any:
+        """Settle a non-cancellable worker before its reservation is released."""
+        task = asyncio.create_task(asyncio.to_thread(reader))
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+        if cancellation is not None:
+            task.exception()
+            raise cancellation
+        return task.result()
+
     async def _fetch_usage_snapshot(self, coder_name: str) -> UsageSnapshot | None:
         provider = self._usage_provider_for(coder_name)
         if provider is None:
@@ -136,7 +153,7 @@ class RateLimitMixin:
         if not reservations.reserve_coder(credential_location):
             return None
         try:
-            return await asyncio.to_thread(provider.fetch)
+            return await self._run_reserved_sync_reader(provider.fetch)
         finally:
             reservations.release_coder(credential_location)
 

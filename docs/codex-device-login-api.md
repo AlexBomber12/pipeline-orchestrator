@@ -73,7 +73,9 @@ provisionally available, and dispatch defers at the reservation boundary instead
 of recording an auth, usage, or diagnosis failure. Releasing login ownership
 first advances the location's credential generation; runners reject auth cache
 entries from older generations, clear usage cache and failure-backoff state, and
-refresh against the new credentials before launching work.
+refresh against the new credentials before launching work. Cancellation of a
+thread-backed auth or usage read is propagated only after its worker settles,
+so login cannot acquire the location while that read is still running.
 
 Device login, auth probes, model discovery, usage reads, and normal Codex coder
 invocations preserve the daemon's inherited `HOME` so its Git configuration

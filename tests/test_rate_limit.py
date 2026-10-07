@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -222,6 +223,45 @@ def test_usage_fetch_coordinates_with_device_login_credentials(
     assert asyncio.run(
         missing_locator_runner._fetch_usage_snapshot("codex")
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_usage_fetch_holds_reservation_until_worker_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = UsageSnapshot(10, 100, 20, 200, 1.0)
+    runner = _make_runner(
+        monkeypatch,
+        coder=CoderType.CODEX,
+        codex_provider=_FakeUsageProvider(snapshot=snapshot),
+    )
+    reservations = CoderCredentialReservations()
+    runner._credential_reservations = reservations
+    location = runner._device_login_credential_location("codex")
+    assert location is not None
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_to_thread(function: Callable[[], Any]) -> Any:
+        started.set()
+        await release.wait()
+        return function()
+
+    monkeypatch.setattr(asyncio, "to_thread", delayed_to_thread)
+    fetch = asyncio.create_task(runner._fetch_usage_snapshot("codex"))
+    await started.wait()
+
+    fetch.cancel()
+    await asyncio.sleep(0)
+
+    assert fetch.done() is False
+    assert reservations.reserve_login(location) is False
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await fetch
+    assert reservations.reserve_login(location) is True
+    reservations.release_login(location)
 
 
 def test_legacy_pause_predicate(monkeypatch: pytest.MonkeyPatch) -> None:

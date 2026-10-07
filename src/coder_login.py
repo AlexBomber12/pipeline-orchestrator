@@ -335,6 +335,7 @@ class CoderLoginSessionManager:
             for session in self._sessions.values()
             if self._retains_credential_ownership(session)
         ]
+        cleanup_confirmed_session_ids: set[str] = set()
         for session in active:
             session.cancel_requested = True
             session.state = "canceling"
@@ -346,9 +347,12 @@ class CoderLoginSessionManager:
                 session.task.cancel()
         for session in active:
             if session.managed is None:
+                cleanup_confirmed_session_ids.add(session.session_id)
                 continue
             if not await self._cleanup(session):
                 self._cleanup_failed(session)
+                continue
+            cleanup_confirmed_session_ids.add(session.session_id)
         tasks = [
             session.task
             for session in active
@@ -357,7 +361,10 @@ class CoderLoginSessionManager:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         for session in active:
-            if session.state in _TERMINAL_STATES or session.state == "cleanup_failed":
+            if (
+                session.state in _TERMINAL_STATES
+                or session.session_id not in cleanup_confirmed_session_ids
+            ):
                 continue
             self._finish(
                 session,

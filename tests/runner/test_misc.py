@@ -18,7 +18,7 @@ import pytest
 from src.coder_login import CoderCredentialReservations
 from src.coder_registry import CoderRegistry
 from src.coders import claude as claude_plugin_module
-from src.config import AppConfig
+from src.config import AppConfig, CoderType
 from src.daemon import git_ops as git_ops_module
 from src.daemon import recovery_policy as recovery_policy_module
 from src.daemon import runner as runner_module
@@ -511,6 +511,54 @@ def test_auth_cache_defers_probe_during_login_and_refreshes_after_release(
         "detail": "login did not complete",
     }
     assert runner._auth_status_cache_credential_versions["codex"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_auth_probe_holds_reservation_until_worker_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner(coder=CoderType.CODEX)
+    runner._credential_reservations = reservations
+    runner._auth_status_cache_expires_at = None
+    codex = runner._registry.get("codex")
+    location = codex.device_login_credential_location(config=runner.app_config)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    reservation_released = asyncio.Event()
+    real_to_thread = asyncio.to_thread
+    real_release_coder = reservations.release_coder
+
+    def release_coder(credential_location: str) -> None:
+        real_release_coder(credential_location)
+        if credential_location == location:
+            reservation_released.set()
+
+    monkeypatch.setattr(reservations, "release_coder", release_coder)
+
+    async def delayed_to_thread(function: Any, *args: object) -> Any:
+        if getattr(function, "__self__", None) is codex:
+            started.set()
+            await release.wait()
+            return function(*args)
+        return await real_to_thread(function, *args)
+
+    monkeypatch.setattr(runner_module.asyncio, "to_thread", delayed_to_thread)
+    refresh = asyncio.create_task(runner._refresh_auth_status_cache())
+    await started.wait()
+
+    refresh.cancel()
+    await asyncio.sleep(0)
+
+    assert refresh.done() is False
+    assert reservations.reserve_login(location) is False
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await refresh
+    await asyncio.wait_for(reservation_released.wait(), timeout=1)
+    assert reservations.reserve_login(location) is True
+    reservations.release_login(location)
 
 
 def test_refresh_auth_status_cache_marks_plugin_probe_errors() -> None:

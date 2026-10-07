@@ -1095,9 +1095,17 @@ class PipelineRunner(
             try:
                 plugin = self._registry.get(name)
                 reference = self._registry.reference_for(name)
+
+                async def _threaded_check_auth() -> dict[str, Any]:
+                    if reserved:
+                        return await self._run_reserved_sync_reader(
+                            plugin.check_auth
+                        )
+                    return await asyncio.to_thread(plugin.check_auth)
+
                 if reference != DEFAULT_CODER_PLUGINS.get(name):
                     if reference is None:
-                        return await asyncio.to_thread(plugin.check_auth)
+                        return await _threaded_check_auth()
                     return await isolated_auth_probe(
                         name,
                         reference,
@@ -1107,7 +1115,7 @@ class PipelineRunner(
                             "config.yml",
                         ),
                     )
-                return await asyncio.to_thread(plugin.check_auth)
+                return await _threaded_check_auth()
             except Exception:
                 return {"status": "error"}
             finally:
