@@ -575,11 +575,13 @@ async def handle_model_catalog_request(
             return
         if operation == "auth":
             assert reference is not None
+            config: AppConfig | None = None
             credential_location: str | None = None
             if credential_reservations is not None:
+                config = load_config(config_path)
                 credential_location = resolve_device_login_credential_location(
                     plugin,
-                    config=load_config(config_path),
+                    config=config,
                 )
             if credential_location is not None:
                 if not credential_reservations.reserve_coder(
@@ -599,6 +601,19 @@ async def handle_model_catalog_request(
                         {"ok": True, "auth": auth},
                     )
                     return
+            probe_environment: dict[str, str] | None = None
+            if credential_location is not None:
+                assert config is not None
+                context_builder = getattr(
+                    plugin,
+                    "build_credential_bound_run_kwargs",
+                    None,
+                )
+                if callable(context_builder):
+                    probe_environment = context_builder(
+                        config=config,
+                        credential_location=credential_location,
+                    ).get("environment")
             try:
                 auth = await isolated_auth_probe(
                     plugin_name,
@@ -606,6 +621,7 @@ async def handle_model_catalog_request(
                     plugin.display_name,
                     config_path=config_path,
                     timeout=_CONFIGURED_CATALOG_TIMEOUT_SECONDS,
+                    env=probe_environment,
                 )
             finally:
                 if (

@@ -86,6 +86,7 @@ async def test_loader_round_trips_catalog_through_daemon(
 ) -> None:
     redis = _BridgeRedis()
     codex_home = tmp_path / "codex-home"
+    replacement_codex_home = tmp_path / "replacement-codex-home"
     reservations = CoderCredentialReservations()
     monkeypatch.delenv("CODEX_HOME", raising=False)
 
@@ -105,7 +106,7 @@ async def test_loader_round_trips_catalog_through_daemon(
     registry = CoderRegistry()
     reference = "src.coders.codex:CodexPlugin"
     registry.register(plugin, reference=reference)
-    auth_calls: list[tuple[str, str, str, str, float]] = []
+    auth_calls: list[tuple[str, str, str, str, float, str]] = []
 
     async def auth_probe(
         plugin_id: str,
@@ -114,7 +115,16 @@ async def test_loader_round_trips_catalog_through_daemon(
         *,
         config_path: str,
         timeout: float,
+        env: dict[str, str] | None,
     ) -> dict[str, object]:
+        assert env is not None
+        config_file.write_text(
+            f"auth:\n  codex_home_dir: {replacement_codex_home}\n",
+            encoding="utf-8",
+        )
+        replacement_location = str(replacement_codex_home / ".codex")
+        assert reservations.reserve_login(replacement_location) is True
+        reservations.release_login(replacement_location)
         auth_calls.append(
             (
                 plugin_id,
@@ -122,6 +132,7 @@ async def test_loader_round_trips_catalog_through_daemon(
                 display_name,
                 config_path,
                 timeout,
+                env["CODEX_HOME"],
             )
         )
         return coder_auth_payload(
@@ -201,6 +212,7 @@ async def test_loader_round_trips_catalog_through_daemon(
             "Codex CLI",
             config_path,
             bridge._CONFIGURED_CATALOG_TIMEOUT_SECONDS,
+            str(codex_home / ".codex"),
         )
     ]
     assert redis.trimmed == [
