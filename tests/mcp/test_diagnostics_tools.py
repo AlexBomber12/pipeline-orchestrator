@@ -488,6 +488,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "API key: whitespace-label-secret",
             "secret key = whitespace-secret-key",
             "auth[password]=nested-bracket-secret",
+            "AZURE_STORAGE_KEY=azure-storage-secret",
+            "DefaultEndpointsProtocol=https;AccountName=demo;AccountKey=azure-account-secret",
             "SSH_KEY_PASSPHRASE=passphrase-assignment-secret",
             "tool --passphrase passphrase-option-secret",
             "jwt=jwt-assignment-secret",
@@ -521,6 +523,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "password: |",
             "  yaml-multiline-secret",
             "safe-after-yaml",
+            "password:",
+            "- indentationless-yaml-secret",
+            "safe-after-yaml-sequence",
             "PASSWORD=" + "\\",
             "shell-multiline-secret",
             "safe-after-shell",
@@ -555,6 +560,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert redacted["redaction"]["credential_documents_omitted"] >= 8
     assert "[credential line omitted]" in exported
     assert "safe-after-yaml" in exported
+    assert "safe-after-yaml-sequence" in exported
     assert "safe-after-shell" in exported
     assert "safe-after-quote" in exported
     assert "visible-control" in exported
@@ -605,6 +611,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "whitespace-label-secret",
         "whitespace-secret-key",
         "nested-bracket-secret",
+        "azure-storage-secret",
+        "azure-account-secret",
         "passphrase-assignment-secret",
         "passphrase-option-secret",
         "jwt-assignment-secret",
@@ -631,6 +639,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "same-line-document-secret",
         "same-line-trailing-secret",
         "yaml-multiline-secret",
+        "indentationless-yaml-secret",
         "shell-multiline-secret",
         "quoted-multiline-secret",
         "malformed-private-secret",

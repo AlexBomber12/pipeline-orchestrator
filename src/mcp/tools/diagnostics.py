@@ -61,12 +61,15 @@ _TERMINAL_CONTROL_LINE_OMITTED = "[terminal control line omitted]"
 _CREDENTIAL_DOCUMENT_KEYS = frozenset(
     {
         "accesstoken",
+        "accountkey",
+        "accesskey",
         "apikey",
         "auth",
         "authorization",
         "authtoken",
         "awssecretaccesskey",
         "clientsecret",
+        "connectionstring",
         "credential",
         "credentials",
         "cookie",
@@ -83,6 +86,8 @@ _CREDENTIAL_DOCUMENT_KEYS = frozenset(
         "secret",
         "secretaccesskey",
         "setcookie",
+        "sharedaccesssignature",
+        "storagekey",
         "token",
     }
 )
@@ -1250,13 +1255,17 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
         omitted += 1
         open_quote = _unterminated_quote(content)
         continued = content.rstrip().endswith("\\")
+        yaml_block = content[value_start:].strip() in {"", "|", "|-", "|+", ">", ">-", ">+"}
         indented_block = False
         index += 1
         while index < len(lines):
             continuation = lines[index].rstrip("\r\n")
             indented = continuation.startswith((" ", "\t"))
             blank_in_block = indented_block and not continuation
-            if not (open_quote or continued or indented or blank_in_block):
+            indentationless_sequence = yaml_block and (
+                continuation == "-" or continuation.startswith("- ")
+            )
+            if not (open_quote or continued or indented or blank_in_block or indentationless_sequence):
                 break
             indented_block = indented_block or indented
             open_quote = _unterminated_quote(continuation, open_quote)

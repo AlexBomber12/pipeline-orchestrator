@@ -59,6 +59,7 @@ use assignment, structured-field, header, or long-option syntax, so malformed
 or interrupted quoting cannot expose a value suffix. Indented YAML/header
 continuations, backslash-continued shell values, and quoted values spanning
 physical lines are omitted with their key line through the close or source end.
+This includes legal indentationless YAML sequence values under a credential key.
 Terminal escape and control sequences, including C1 control strings, are
 normalized before credential inspection. The source suffix beginning with the
 first bare carriage return or stateful cursor/editing control is omitted
