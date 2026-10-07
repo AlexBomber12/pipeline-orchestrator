@@ -97,7 +97,14 @@ Completion boundary for this invocation:
 - If implementation or publication genuinely cannot complete under this policy,
   report the blocker and use the repository's ESCALATE protocol. Estimate or path
   deviation and a small incidental repair are not by themselves escalation
-  reasons. Never fabricate a push, gate, or approval."""
+reasons. Never fabricate a push, gate, or approval."""
+
+
+def build_codex_environment(*, codex_home_dir: str) -> dict[str, str]:
+    """Return the environment shared by Codex login and coder processes."""
+    env = dict(os.environ)
+    env["HOME"] = codex_home_dir
+    return env
 
 
 def _maybe_wrap_sandbox(cmd: list[str], cwd: str) -> list[str]:
@@ -155,6 +162,9 @@ async def run_codex_async(
     cmd.append(prompt)
     logger.info("[codex] running codex exec with prompt: %s", prompt[:80])
 
+    env = build_codex_environment(
+        codex_home_dir=load_config().auth.codex_home_dir
+    )
     cmd = _maybe_wrap_sandbox(cmd, cwd)
     try:
         managed = await launch_process(
@@ -163,6 +173,7 @@ async def run_codex_async(
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
             stdin=asyncio.subprocess.DEVNULL,
+            env=env,
         )
     except FileNotFoundError as exc:
         missing = getattr(exc, "filename", "")

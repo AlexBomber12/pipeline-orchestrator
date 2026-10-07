@@ -56,6 +56,10 @@ reservation is retained until process cleanup is confirmed; if cleanup cannot
 prove quiescence, both login replacement and new coder invocations remain
 blocked for that location.
 
+Device login and normal Codex coder invocations receive the same effective
+`HOME` and inherited `CODEX_HOME`, so a successful login updates the credential
+store used by subsequent work.
+
 Terminal sessions are retained for five minutes. Sessions are daemon-memory
 state: after a daemon restart, every old identifier returns `not_found` and
 must not be presented as a live login. The Codex provider code expires after

@@ -259,7 +259,9 @@ class CodexPlugin:
 
     def device_login_credential_location(self, *, config: AppConfig) -> str:
         """Return the effective Codex auth directory for conflict checks."""
-        env = _auth_probe_env(HOME=config.auth.codex_home_dir)
+        env = codex_cli.build_codex_environment(
+            codex_home_dir=config.auth.codex_home_dir
+        )
         configured = env.get("CODEX_HOME")
         location = (
             Path(configured)
@@ -273,7 +275,9 @@ class CodexPlugin:
     ) -> CodexDeviceLoginAdapter:
         """Resolve one immutable CLI device-login context."""
         config = load_config(config_path)
-        environment = _auth_probe_env(HOME=config.auth.codex_home_dir)
+        environment = codex_cli.build_codex_environment(
+            codex_home_dir=config.auth.codex_home_dir
+        )
         return CodexDeviceLoginAdapter(
             command=("codex", "login", "--device-auth"),
             environment=environment,

@@ -2518,10 +2518,14 @@ class PipelineRunner(
         cleanup_context: str,
         log_prefix: str,
         coder_name: str | None = None,
+        credential_reservation_held: bool = False,
     ) -> tuple[int, str, str] | None:
         """Await one plugin-owned helper invocation at an ownership boundary."""
-        if not self._reserve_coder_credentials(
-            coder_name or self.state.coder or ""
+        if (
+            not credential_reservation_held
+            and not self._reserve_coder_credentials(
+                coder_name or self.state.coder or ""
+            )
         ):
             close = getattr(invocation, "close", None)
             if callable(close):

@@ -8,6 +8,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from src import codex_cli as codex_cli_module
 from src.claude_cli import _CODER_EXECUTION_POLICY as _CLAUDE_EXECUTION_POLICY
 from src.codex_cli import (
     _CODER_EXECUTION_POLICY as _CODEX_EXECUTION_POLICY,
@@ -20,6 +21,7 @@ from src.codex_cli import (
     run_codex_async,
     run_planned_pr_async,
 )
+from src.config import AppConfig
 from src.process_supervisor import CleanupResult, CleanupStatus
 
 
@@ -87,6 +89,16 @@ def _block_until_cleanup(proc: MagicMock) -> None:
 async def test_run_codex_async_success(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
     fake_proc = _make_fake_proc(stdout=b"done", stderr=b"info", returncode=0)
+    configured_home = "/tmp/configured-codex-home"
+    monkeypatch.setenv("HOME", "/tmp/daemon-home")
+    monkeypatch.setenv("CODEX_HOME", "/tmp/explicit-codex-home")
+    monkeypatch.setattr(
+        codex_cli_module,
+        "load_config",
+        lambda: AppConfig.model_validate(
+            {"auth": {"codex_home_dir": configured_home}}
+        ),
+    )
 
     async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
         captured["cmd"] = list(args)
@@ -115,6 +127,10 @@ async def test_run_codex_async_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "--config" not in cmd
     assert cmd[-1] == "do a thing"
     assert captured["kwargs"]["cwd"] == "/data/repos/demo"
+    assert captured["kwargs"]["env"]["HOME"] == configured_home
+    assert captured["kwargs"]["env"]["CODEX_HOME"] == (
+        "/tmp/explicit-codex-home"
+    )
 
 
 @pytest.mark.asyncio
