@@ -26,7 +26,6 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from src.audit.webhook_log import write_webhook_audit
 from src.coder_registry import CoderPlugin, CoderRegistry
 from src.config import (
-    BUILTIN_CODER_IDS,
     AppConfig,
     DaemonConfig,
     load_config,
@@ -36,6 +35,11 @@ from src.utils import repo_slug_from_url
 from src.web.services.auth_probe import (
     _collect_auth_status,
     _get_cached_auth_status,
+)
+from src.web.services.coder import (
+    _coder_display_name,
+    _selectable_coder_plugins,
+    _validate_coder_selection,
 )
 from src.web.services.config_writer import (
     delete_daemon_fields,
@@ -294,7 +298,7 @@ def _build_coder_rows(
                     },
                 ),
                 "is_default": config.daemon.coder == plugin.name,
-                "runtime_selectable": plugin.name in BUILTIN_CODER_IDS,
+                "runtime_selectable": metadata_available,
             }
         )
     return rows
@@ -578,10 +582,22 @@ def _render_settings_repo_list(request: Request) -> HTMLResponse:
     override.
     """
     cfg = load_config(_app.CONFIG_PATH)
+    registry: CoderRegistry = request.app.state.coder_registry
+    selectable_coders = _selectable_coder_plugins(registry)
     return _app.templates.TemplateResponse(
         request,
         "components/settings_repo_list_response.html",
-        {"repos": cfg.repositories, "daemon": cfg.daemon},
+        {
+            "repos": cfg.repositories,
+            "daemon": cfg.daemon,
+            "selectable_coders": selectable_coders,
+            "selectable_coder_ids": {
+                plugin.name for plugin in selectable_coders
+            },
+            "default_coder_label": _coder_display_name(
+                cfg.daemon.coder, registry
+            ),
+        },
     )
 
 
@@ -589,6 +605,8 @@ def _render_settings_error(
     request: Request, message: str, status_code: int
 ) -> HTMLResponse:
     cfg = load_config(_app.CONFIG_PATH)
+    registry: CoderRegistry = request.app.state.coder_registry
+    selectable_coders = _selectable_coder_plugins(registry)
     return _app.templates.TemplateResponse(
         request,
         "components/settings_error.html",
@@ -596,6 +614,13 @@ def _render_settings_error(
             "message": message,
             "repos": cfg.repositories,
             "daemon": cfg.daemon,
+            "selectable_coders": selectable_coders,
+            "selectable_coder_ids": {
+                plugin.name for plugin in selectable_coders
+            },
+            "default_coder_label": _coder_display_name(
+                cfg.daemon.coder, registry
+            ),
         },
         status_code=status_code,
     )
@@ -662,6 +687,11 @@ async def _settings_daemon_template_context(
             coder_messages=coder_messages,
         ),
         "auth": auth,
+        "unavailable_default_coder": (
+            cfg.daemon.coder
+            if registry.get_optional(cfg.daemon.coder) is None
+            else None
+        ),
     }
 
 
@@ -720,6 +750,7 @@ async def settings_page(request: Request) -> HTMLResponse:
         catalogs,
         registry,
     )
+    selectable_coders = _selectable_coder_plugins(registry)
     return _app.templates.TemplateResponse(
         request,
         "settings.html",
@@ -729,6 +760,18 @@ async def settings_page(request: Request) -> HTMLResponse:
             "daemon": cfg.daemon,
             "coders": coder_rows,
             "auth": auth,
+            "selectable_coders": selectable_coders,
+            "selectable_coder_ids": {
+                plugin.name for plugin in selectable_coders
+            },
+            "default_coder_label": _coder_display_name(
+                cfg.daemon.coder, registry
+            ),
+            "unavailable_default_coder": (
+                cfg.daemon.coder
+                if registry.get_optional(cfg.daemon.coder) is None
+                else None
+            ),
             "sandbox_actual_state": _sandbox_actual_state(cfg.daemon),
         },
     )
@@ -956,11 +999,9 @@ async def put_settings_daemon(
                 min_value=0,
                 max_value=100,
             )
-        if coder is not None and coder != "":
-            if coder not in ("claude", "codex"):
-                raise ValueError("coder must be 'claude' or 'codex'")
-            updates["coder"] = coder
         registry: CoderRegistry = request.app.state.coder_registry
+        if coder is not None and coder != "":
+            updates["coder"] = _validate_coder_selection(coder, registry)
         cache = request.app.state.model_catalog
         submitted_models, submitted_efforts = _submitted_coder_settings(
             await request.form(), registry
@@ -1292,12 +1333,11 @@ async def put_settings_repo(
                     review_timeout_min, "review_timeout_min", min_value=1
                 )
         if coder is not None:
-            if coder == "":
-                updates["coder"] = None
-            elif coder in ("claude", "codex"):
-                updates["coder"] = coder
-            else:
-                raise ValueError("coder must be 'claude', 'codex', or empty")
+            updates["coder"] = _validate_coder_selection(
+                coder,
+                request.app.state.coder_registry,
+                inherit_values=("", "any"),
+            )
     except ValueError as exc:
         return _render_settings_error(request, str(exc), 422)
 
@@ -1545,15 +1585,14 @@ async def put_repo_detail_coder(
 
     updates: dict[str, object | None] = {}
     if coder is not None:
-        if coder == "":
-            updates["coder"] = None
-        elif coder in ("claude", "codex"):
-            updates["coder"] = coder
-        else:
-            return HTMLResponse(
-                "coder must be 'claude', 'codex', or empty",
-                status_code=422,
+        try:
+            updates["coder"] = _validate_coder_selection(
+                coder,
+                request.app.state.coder_registry,
+                inherit_values=("", "any"),
             )
+        except ValueError as exc:
+            return HTMLResponse(str(exc), status_code=422)
 
     try:
         _app.update_repository(repo.url, path=_app.CONFIG_PATH, **updates)

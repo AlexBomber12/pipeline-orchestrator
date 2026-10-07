@@ -987,8 +987,7 @@ def test_arbitrary_plugin_model_round_trips_without_core_field(
     assert rendered.status_code == 200
     assert saved.status_code == 200
     assert "Configured Test Coder" in rendered.text
-    assert "Metadata only" in rendered.text
-    assert not re.search(
+    assert re.search(
         r'<input type="radio"[^>]*value="third"',
         rendered.text,
         re.DOTALL,
@@ -1004,7 +1003,7 @@ def test_arbitrary_plugin_model_round_trips_without_core_field(
     }
 
 
-def test_configured_custom_daemon_coder_renders_as_read_only_default(
+def test_configured_custom_daemon_coder_renders_as_selectable_default(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1024,12 +1023,255 @@ def test_configured_custom_daemon_coder_renders_as_read_only_default(
 
     assert rendered.status_code == 200
     assert "Configured Test Coder" in rendered.text
-    assert "Configured default (read-only)" in rendered.text
-    assert not re.search(
-        r'<input type="radio"[^>]*value="third"',
+    assert re.search(
+        r'<input type="radio"[^>]*value="third"[^>]*checked',
         rendered.text,
         re.DOTALL,
     )
+
+
+def test_registered_plugin_round_trips_through_every_coder_mutation_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "coder_plugins:\n"
+        "  third: tests.configured_coder_plugin:build_test_plugin\n"
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    claude:\n"
+        "      model: sonnet\n"
+        "      reasoning_effort: high\n"
+        "    codex:\n"
+        "      model: gpt-5.4\n"
+        "      reasoning_effort: medium\n"
+        "    third:\n"
+        "      model: third-invoke\n"
+        "      reasoning_effort: deliberate\n"
+        "repositories:\n"
+        "  - url: https://github.com/example/alpha.git\n"
+        "    branch: main\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    fake_redis = _FakeRedis()
+    fake_redis.store["pipeline:example__alpha"] = RepoState(
+        url="https://github.com/example/alpha.git",
+        name="example__alpha",
+        state=PipelineState.WATCH,
+        coder="claude",
+    ).model_dump_json()
+
+    async def fake_publish(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(web_app, "publish_repo_event", fake_publish)
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake_redis
+        settings = client.get("/settings")
+        daemon_update = client.put(
+            "/settings/daemon", data={"coder": "third"}
+        )
+        repo_update = client.put(
+            "/settings/repos",
+            params={"url": "https://github.com/example/alpha.git"},
+            data={"coder": "third"},
+        )
+        inherited = client.put(
+            "/settings/repos",
+            params={"url": "https://github.com/example/alpha.git"},
+            data={"coder": ""},
+        )
+        detail_update = client.put(
+            "/settings/repo/example__alpha", data={"coder": "third"}
+        )
+        control_update = client.post(
+            "/repos/example__alpha/coder", data={"coder": "third"}
+        )
+
+    for response in (
+        settings,
+        daemon_update,
+        repo_update,
+        inherited,
+        detail_update,
+        control_update,
+    ):
+        assert response.status_code == 200
+    assert "Configured Test Coder" in settings.text
+    assert re.search(
+        r'<input type="radio"[^>]*value="third"', settings.text, re.DOTALL
+    )
+    assert re.search(
+        r'<input type="radio"[^>]*value="third"[^>]*checked',
+        daemon_update.text,
+        re.DOTALL,
+    )
+    assert 'option value="third" selected' in repo_update.text
+    assert (
+        'option value="" selected>Inherit — Configured Test Coder'
+        in inherited.text
+    )
+    assert "Configured: Configured Test Coder" in detail_update.text
+    assert "Switching to Configured Test Coder - applies after current PR" in (
+        control_update.text
+    )
+
+    cfg = load_config(str(cfg_path))
+    assert cfg.daemon.coder == "third"
+    assert cfg.repositories[0].coder == "third"
+    assert cfg.daemon.coder_settings == {
+        "claude": {"model": "sonnet", "reasoning_effort": "high"},
+        "codex": {"model": "gpt-5.4", "reasoning_effort": "medium"},
+        "third": {
+            "model": "third-invoke",
+            "reasoning_effort": "deliberate",
+        },
+    }
+    active_state = RepoState.model_validate_json(
+        fake_redis.store["pipeline:example__alpha"]
+    )
+    assert active_state.coder == "claude"
+
+    with TestClient(app) as client:
+        reloaded_global = client.get("/partials/settings/coders")
+        reloaded_repos = client.get("/partials/settings/repo-list")
+
+    assert re.search(
+        r'<input type="radio"[^>]*value="third"[^>]*checked',
+        reloaded_global.text,
+        re.DOTALL,
+    )
+    assert 'option value="third" selected' in reloaded_repos.text
+    assert "Configured Test Coder" in reloaded_repos.text
+
+
+def test_unavailable_configured_coders_remain_visible_and_preserved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder: missing-default\n"
+        "  coder_settings:\n"
+        "    missing-default:\n"
+        "      model: keep-model\n"
+        "      reasoning_effort: keep-effort\n"
+        "repositories:\n"
+        "  - url: https://github.com/example/alpha.git\n"
+        "    branch: main\n"
+        "    coder: missing-repo\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        initial = client.get("/settings")
+        daemon_update = client.put(
+            "/settings/daemon", data={"poll_interval_sec": "45"}
+        )
+        repo_update = client.put(
+            "/settings/repos",
+            params={"url": "https://github.com/example/alpha.git"},
+            data={"branch": "develop"},
+        )
+        detail = client.get("/repo/example__alpha")
+
+    assert initial.status_code == 200
+    assert "missing-default (unavailable)" in initial.text
+    assert 'option value="missing-repo" selected disabled' in initial.text
+    assert "missing-repo (unavailable)" in initial.text
+    assert "missing-default (unavailable)" in daemon_update.text
+    assert "missing-repo (unavailable)" in repo_update.text
+    assert "Configured: missing-repo (unavailable)" in detail.text
+
+    cfg = load_config(str(cfg_path))
+    assert cfg.daemon.coder == "missing-default"
+    assert cfg.daemon.coder_settings == {
+        "missing-default": {
+            "model": "keep-model",
+            "reasoning_effort": "keep-effort",
+        }
+    }
+    assert cfg.repositories[0].branch == "develop"
+    assert cfg.repositories[0].coder == "missing-repo"
+
+
+def test_invalid_coder_selections_have_no_config_or_notification_side_effects(
+    one_repo_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(one_repo_config))
+    before = one_repo_config.read_text(encoding="utf-8")
+    mutation_events: list[str] = []
+
+    async def fake_mutation(**_kwargs: object) -> None:
+        mutation_events.append("mutation")
+
+    async def fake_publish(*_args: object, **_kwargs: object) -> None:
+        mutation_events.append("event")
+
+    monkeypatch.setattr(web_app, "apply_config_mutation", fake_mutation)
+    monkeypatch.setattr(web_app, "publish_repo_event", fake_publish)
+
+    with TestClient(app) as client:
+        client.app.state.redis = _FakeRedis()
+        responses = (
+            client.put("/settings/daemon", data={"coder": "bad value"}),
+            client.put(
+                "/settings/repos",
+                params={"url": "https://github.com/example/alpha.git"},
+                data={"coder": "unregistered"},
+            ),
+            client.put(
+                "/settings/repo/example__alpha",
+                data={"coder": "unregistered"},
+            ),
+            client.post(
+                "/repos/example__alpha/coder",
+                data={"coder": "unregistered"},
+            ),
+        )
+
+    assert all(response.status_code == 422 for response in responses)
+    assert "stable plugin ID" in responses[0].text
+    assert all(
+        "not registered: unregistered" in response.text
+        for response in responses[1:]
+    )
+    assert one_repo_config.read_text(encoding="utf-8") == before
+    assert mutation_events == []
+
+
+def test_unavailable_registry_metadata_cannot_be_selected() -> None:
+    from src.coder_registry import CoderMetadataView
+    from src.web.services.coder import (
+        _coder_display_name,
+        _selectable_coder_plugins,
+        _validate_coder_selection,
+    )
+
+    registry = CoderRegistry()
+    registry.register(
+        CoderMetadataView(
+            name="third",
+            display_name="Third metadata placeholder",
+            models=[],
+            model_setting=ModelSetting(None, "", "Unavailable"),
+            model_catalog_refreshable=False,
+            metadata_available=False,
+        )
+    )
+
+    assert _selectable_coder_plugins(registry) == []
+    assert _coder_display_name("third", registry) == "third (unavailable)"
+    with pytest.raises(ValueError, match="coder plugin is unavailable: third"):
+        _validate_coder_selection("third", registry)
 
 
 def test_reasoning_effort_choices_render_from_selected_model_and_match_api(
@@ -3460,7 +3702,7 @@ def test_put_repo_rejects_invalid_coder_value(one_repo_config: Path) -> None:
         )
 
     assert response.status_code == 422
-    assert "coder must be" in response.text
+    assert "coder plugin is not registered: other" in response.text
 
 
 # ---------------------------------------------------------------------------
@@ -3596,7 +3838,7 @@ def test_settings_repo_list_shows_custom_coder_override_as_read_only(
 
     assert response.status_code == 200
     assert 'option value="third" selected disabled' in response.text
-    assert "third (configured)" in response.text
+    assert "third (unavailable)" in response.text
 
 
 def test_update_daemon_rate_limit_session(
@@ -3997,8 +4239,8 @@ def test_repo_detail_coder_display_renders_readonly(
     assert 'data-coder-display' in body
     assert '<select name="coder"' not in body
     assert 'hx-post="/repos/example__alpha/coder"' not in body
-    assert "Any (bandit)" in body
-    assert "inherits Claude" in body
+    assert "Configured: Inherit" in body
+    assert "Default: Claude Code" in body
     assert 'href="/settings"' in body
 
 
@@ -4165,7 +4407,7 @@ def test_post_repo_detail_coder_handles_missing_invalid_and_write_error(
             data={"coder": "other"},
         )
         assert invalid.status_code == 422
-        assert "coder must be one of: any, claude, codex" in invalid.text
+        assert "coder plugin is not registered: other" in invalid.text
 
         cleared = client.post("/repos/example__alpha/coder", data={"coder": "any"})
         assert cleared.status_code == 200
@@ -4274,7 +4516,7 @@ def test_put_repo_detail_coder_handles_missing_invalid_clear_and_write_error(
             data={"coder": "other"},
         )
         assert invalid.status_code == 422
-        assert "coder must be 'claude', 'codex', or empty" in invalid.text
+        assert "coder plugin is not registered: other" in invalid.text
 
         cleared = client.put("/settings/repo/example__alpha", data={"coder": ""})
         assert cleared.status_code == 200
@@ -4304,3 +4546,4 @@ def test_settings_helpers_resolve_via_module_getattr() -> None:
     """
     assert web_app._coerce_int("3", "field", min_value=1) == 3
     assert callable(web_app._render_settings_repo_list)
+    assert web_app._coder_display_name("codex") == "Codex CLI"

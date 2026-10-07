@@ -1793,7 +1793,8 @@ def test_repo_detail_route_renders_full_page(
     assert "Current PR" in body
     assert 'data-coder-display' in body
     assert 'href="/settings"' in body
-    assert "Any (bandit)" in body
+    assert "Configured: Inherit" in body
+    assert "Default: Claude Code" in body
     assert "Recent PRs" not in body
     assert "Event log" in body
     # Pause/resume/stop publish history_updated; the SSE consumer must
@@ -4269,7 +4270,7 @@ def test_repo_header_coder_renders_readonly_when_configured_claude(
 
     assert "<select" not in coder_fragment
     assert "<form" not in coder_fragment
-    assert "Claude CLI" in coder_fragment
+    assert "Configured: Claude Code" in coder_fragment
     assert "Active:" not in coder_fragment
 
 
@@ -4282,8 +4283,8 @@ def test_repo_header_coder_shows_runtime_override_when_divergent(
         active="codex",
     )
 
-    assert "Claude CLI" in coder_fragment
-    assert "Active: Codex" in coder_fragment
+    assert "Configured: Claude Code" in coder_fragment
+    assert "Active: Codex CLI" in coder_fragment
     assert "via spec pin or bandit" in coder_fragment
 
 
@@ -4292,8 +4293,8 @@ def test_repo_header_coder_any_with_runtime_pick(
 ) -> None:
     coder_fragment = _render_repo_header_coder(two_repo_config, active="claude")
 
-    assert "Any (bandit) → Claude CLI" in coder_fragment
-    assert "inherits Claude" in coder_fragment
+    assert "Configured: Inherit" in coder_fragment
+    assert "Default: Claude Code" in coder_fragment
     assert "Active:" not in coder_fragment
 
 
@@ -4306,10 +4307,9 @@ def test_repo_header_coder_ignores_persisted_idle_coder(
         state=PipelineState.IDLE,
     )
 
-    assert "Any (bandit) →" not in coder_fragment
+    assert "Configured: Inherit" in coder_fragment
     assert "Active:" not in coder_fragment
-    assert "Any (bandit)" in coder_fragment
-    assert "inherits Claude" in coder_fragment
+    assert "Default: Claude Code" in coder_fragment
 
 
 def test_repo_header_coder_link_to_settings(

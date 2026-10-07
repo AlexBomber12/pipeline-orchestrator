@@ -69,7 +69,13 @@ from src.retry_commands import (
 )
 from src.subsource_registry import SuppressionReason
 from src.suppression.redis_store import RedisSuppressionStore
-from src.web.services.coder import _effective_coder_name
+from src.web.services.coder import (
+    _coder_display_name as _registry_coder_display_name,
+)
+from src.web.services.coder import (
+    _effective_coder_name,
+    _validate_coder_selection,
+)
 from src.web.services.repo_state import (
     _default_repo_state,
     _find_repo_config_by_name,
@@ -182,8 +188,10 @@ _OPERATOR_CLEARABLE_INHIBITORS = frozenset({"user_pause", "user_stop"})
 _QueueSource = Literal["snapshot"]
 
 
-def _coder_display_name(coder: str) -> str:
+def _coder_display_name(coder: str, registry: Any | None = None) -> str:
     """Return the UI label for a coder selection."""
+    if registry is not None and coder != "any":
+        return _registry_coder_display_name(coder, registry)
     return _CODER_LABELS.get(coder, coder)
 
 
@@ -1633,13 +1641,16 @@ async def post_repo_detail_coder(
     if repo is None:
         return HTMLResponse("Repository not found", status_code=404)
 
-    if coder == "any":
-        updated_coder: str | None = None
-    elif coder in ("claude", "codex"):
-        updated_coder = coder
-    else:
+    registry = request.app.state.coder_registry
+    try:
+        updated_coder = _validate_coder_selection(
+            coder,
+            registry,
+            inherit_values=("", "any"),
+        )
+    except ValueError as exc:
         return HTMLResponse(
-            "coder must be one of: any, claude, codex",
+            str(exc),
             status_code=422,
         )
 
@@ -1708,7 +1719,12 @@ async def post_repo_detail_coder(
     applies_after_current_pr = (
         current_state.state in _DEFERRED_CODER_SWITCH_STATES
     )
-    message = f"Switching to {_coder_display_name(coder)}"
+    selected_label = (
+        f"Inherit ({_registry_coder_display_name(cfg.daemon.coder, registry)} default)"
+        if updated_coder is None
+        else _coder_display_name(updated_coder, registry)
+    )
+    message = f"Switching to {selected_label}"
     if applies_after_current_pr:
         message += " - applies after current PR completes."
     else:
