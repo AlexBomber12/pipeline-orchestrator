@@ -33,9 +33,29 @@ sets `MCP_RUNTIME_DIAGNOSTICS=1` for the localhost-published listener. Operators
 starting `python -m src.mcp` outside Compose must explicitly set that variable
 and retain an equivalent loopback-only or authenticated access boundary.
 
-Raw CLI, CI, event, artifact, daemon-stdout, and live-stream retrieval is not
-exposed. Persistent capture and a separately reviewed safe log-export contract
-remain follow-up work.
+The opted-in diagnostics service also exposes `get_latest_cli_log`. It accepts
+one configured `owner__repo` slug and returns a sanitized tail of the fixed
+latest-log record written by completed coder CLI invocations. The default tail
+is 8 KiB and callers may request at most 32 KiB. The service refuses to read a
+source larger than 64 KiB, redacts the complete bounded source before selecting
+the tail, and reports source/output sizes, truncation, observation time, and
+remaining Redis TTL. Authorization headers, token and password assignments,
+cookies, credential-bearing URL userinfo/query parameters, recognizable token
+shapes, private-key blocks, and recognizable JSON credential documents are not
+exported.
+
+This legacy latest-only record has no trustworthy task, invocation, commit SHA,
+or producer timestamp. Those associations are returned as unavailable and are
+never inferred from the current pipeline snapshot or TTL. `observed_at` is only
+the retrieval time. A missing Redis value can mean either never written or
+expired; the response reports that ambiguity. An existing zero-length value is
+reported as available with empty text. Reads use `STRLEN`, bounded `GETRANGE`,
+`EXISTS`, and `TTL`; they do not refresh expiry, mutate state, access credential
+files or caller-selected Redis keys, trigger Retry, or launch a process.
+
+Historical CLI-log discovery, CI/event/artifact logs, process observations,
+daemon stdout, and live output remain unavailable and require separate reviewed
+contracts.
 
 ### Protected remote diagnostics with Cloudflare Access
 
@@ -120,9 +140,10 @@ After deployment, verify these separately:
   data. A previously issued MCP session ID must fail in the same way without a
   fresh assertion.
 - An allowed operator can initialize the streamable-HTTP connection, discover
-  only the existing allowlisted tools, and call `get_orchestrator_status`.
-  Confirm that no log, artifact, event, credential, arbitrary-file, or mutation
-  tool appears.
+  the allowlisted diagnostics tools, and call `get_orchestrator_status` and
+  `get_latest_cli_log`. Confirm the latter returns only its bounded, sanitized
+  latest-log tail and that no historical-log, artifact, event, credential-file,
+  arbitrary-file, arbitrary-key, or mutation tool appears.
 - A denied identity cannot complete the Access policy. Rotate the Access
   signing key in a test application, reconnect, and confirm the origin accepts
   the new key after its bounded refresh without accepting the old application

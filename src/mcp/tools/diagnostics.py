@@ -24,7 +24,7 @@ from src.cancellation import SUBSOURCE_VOCABULARY
 from src.cancellation.storage import CATEGORIES, cause_key
 from src.coder_ids import validate_coder_plugin_id
 from src.config import AppConfig, RepoConfig, load_config
-from src.keyspace import pipeline_state, retry_command, retry_command_pending
+from src.keyspace import cli_log_latest, pipeline_state, retry_command, retry_command_pending
 from src.mcp.server import mcp
 from src.metrics import MetricsStore, RunRecord
 from src.models import RepoState
@@ -47,6 +47,67 @@ _MAX_RETRY_BYTES = 64 * 1024
 _MAX_CANCELLATION_BYTES = 64 * 1024
 _MAX_RUN_BYTES = 64 * 1024
 _MAX_INDEX_MEMBER_BYTES = 512
+_MAX_CLI_LOG_SOURCE_BYTES = 64 * 1024
+_DEFAULT_CLI_LOG_TAIL_BYTES = 8 * 1024
+_MAX_CLI_LOG_TAIL_BYTES = 32 * 1024
+
+_REDACTED = "[REDACTED]"
+_CREDENTIAL_DOCUMENT_OMITTED = "[credential document omitted]"
+_CREDENTIAL_DOCUMENT_KEYS = frozenset(
+    {
+        "accesstoken",
+        "apikey",
+        "authtoken",
+        "clientsecret",
+        "credential",
+        "credentials",
+        "idtoken",
+        "oauthtoken",
+        "password",
+        "passwd",
+        "privatekey",
+        "refreshtoken",
+        "token",
+    }
+)
+_PEM_CREDENTIAL_DOCUMENT = re.compile(
+    r"-----BEGIN (?P<label>(?:[A-Z0-9 ]*PRIVATE KEY|PGP PRIVATE KEY BLOCK))-----"
+    r".*?-----END (?P=label)-----",
+    re.IGNORECASE | re.DOTALL,
+)
+_JSON_OBJECT_LINE_START = re.compile(r"(?m)^[ \t]*(?P<object>\{)")
+_SENSITIVE_HEADER_LINE = re.compile(
+    r"(?im)^(?P<prefix>[ \t]*(?:proxy-)?authorization[ \t]*:[ \t]*|"
+    r"[ \t]*(?:set-)?cookie[ \t]*:[ \t]*).*$"
+)
+_INLINE_AUTHORIZATION = re.compile(
+    r"(?i)(?P<prefix>\b(?:proxy-)?authorization\s*:)(?![ \t]*\[REDACTED\])"
+    r"(?P<spacing>[ \t]*)[^'\"\r\n]+"
+)
+_INLINE_COOKIE = re.compile(
+    r"(?i)(?P<prefix>\b(?:set-)?cookie\s*:)(?![ \t]*\[REDACTED\])"
+    r"(?P<spacing>[ \t]*)[^'\"\r\n]+"
+)
+_URL_USERINFO = re.compile(r"(?i)(?P<scheme>\b[a-z][a-z0-9+.-]*://)[^/@\s]+@")
+_CREDENTIAL_ASSIGNMENT = re.compile(
+    r"(?i)(?P<prefix>(?<![A-Za-z0-9])['\"]?(?:[A-Za-z0-9]+[_-])*"
+    r"(?:api[_-]?key|oauth[_-]?token|access[_-]?token|refresh[_-]?token|"
+    r"id[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|token)"
+    r"['\"]?[ \t]*(?:=|:)[ \t]*)"
+    r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;&#]+)"
+)
+_RECOGNIZABLE_SECRET = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\bgh[pousr]_[A-Za-z0-9]{36}\b",
+        r"\bgithub_pat_[A-Za-z0-9_]{82}\b",
+        r"\bsk-ant-[A-Za-z0-9_-]{30,}\b",
+        r"\bsk-(?!ant-)[A-Za-z0-9_-]{48,}\b",
+        r"\bAIza[A-Za-z0-9_-]{35}\b",
+        r"\bxox[boaprs]-(?:[0-9]+-){2,}[A-Za-z0-9-]{24,}\b",
+        r"\b(?:sk|rk)_(?:test|live)_[A-Za-z0-9]{24,}\b",
+    )
+)
 
 _KNOWN_CATEGORIES = frozenset(CATEGORIES)
 _KNOWN_SUBSOURCES = frozenset(SUBSOURCE_VOCABULARY)
@@ -187,6 +248,14 @@ def _configured_repositories() -> tuple[AppConfig, dict[str, RepoConfig]]:
             raise ValueError("configured repository identity is invalid")
         repositories[slug] = repo
     return config, repositories
+
+
+def _validate_repo_slug(repo_slug: object, repositories: dict[str, RepoConfig]) -> str:
+    if not isinstance(repo_slug, str) or not _REPO_SLUG.fullmatch(repo_slug):
+        raise ValueError("repo_slug must be a canonical owner__repo slug")
+    if repo_slug not in repositories:
+        raise ValueError("repo_slug is not configured")
+    return repo_slug
 
 
 async def _read_bounded_string(
@@ -860,6 +929,255 @@ def _source_summary(statuses: list[str]) -> str:
     return "partially_available"
 
 
+def _contains_credential_document_key(value: object) -> bool:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            if normalized in _CREDENTIAL_DOCUMENT_KEYS and child not in (None, "", False):
+                return True
+            if _contains_credential_document_key(child):
+                return True
+    elif isinstance(value, list):
+        return any(_contains_credential_document_key(child) for child in value)
+    return False
+
+
+def _omit_json_credential_documents(text: str) -> tuple[str, int]:
+    """Omit complete JSON objects that are recognizable credential records."""
+    decoder = json.JSONDecoder()
+    ranges: list[tuple[int, int]] = []
+    covered_until = 0
+    for match in _JSON_OBJECT_LINE_START.finditer(text):
+        start = match.start("object")
+        if start < covered_until:
+            continue
+        try:
+            value, end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and _contains_credential_document_key(value):
+            ranges.append((start, end))
+            covered_until = end
+    if not ranges:
+        return text, 0
+    parts: list[str] = []
+    offset = 0
+    for start, end in ranges:
+        parts.extend((text[offset:start], _CREDENTIAL_DOCUMENT_OMITTED))
+        offset = end
+    parts.append(text[offset:])
+    return "".join(parts), len(ranges)
+
+
+def _redact_assignment(match: re.Match[str]) -> str:
+    value = match.group("value")
+    quote = value[0] if len(value) >= 2 and value[0] in {'"', "'"} and value[-1] == value[0] else ""
+    replacement = f"{quote}{_REDACTED}{quote}" if quote else _REDACTED
+    return f"{match.group('prefix')}{replacement}"
+
+
+def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
+    text, pem_documents = _PEM_CREDENTIAL_DOCUMENT.subn(_CREDENTIAL_DOCUMENT_OMITTED, text)
+    text, json_documents = _omit_json_credential_documents(text)
+    redactions = pem_documents + json_documents
+
+    text, count = _SENSITIVE_HEADER_LINE.subn(lambda match: f"{match.group('prefix')}{_REDACTED}", text)
+    redactions += count
+    text, count = _INLINE_AUTHORIZATION.subn(
+        lambda match: f"{match.group('prefix')}{match.group('spacing')}{_REDACTED}", text
+    )
+    redactions += count
+    text, count = _INLINE_COOKIE.subn(
+        lambda match: f"{match.group('prefix')}{match.group('spacing')}{_REDACTED}", text
+    )
+    redactions += count
+    text, count = _URL_USERINFO.subn(lambda match: f"{match.group('scheme')}{_REDACTED}@", text)
+    redactions += count
+    text, count = _CREDENTIAL_ASSIGNMENT.subn(_redact_assignment, text)
+    redactions += count
+    for pattern in _RECOGNIZABLE_SECRET:
+        text, count = pattern.subn(_REDACTED, text)
+        redactions += count
+    return text, redactions, pem_documents + json_documents
+
+
+def _utf8_tail(text: str, maximum_bytes: int) -> tuple[str, int, int, bool]:
+    raw = text.encode("utf-8")
+    if len(raw) <= maximum_bytes:
+        return text, len(raw), 0, False
+    tail = raw[-maximum_bytes:].decode("utf-8", errors="ignore")
+    returned_bytes = len(tail.encode("utf-8"))
+    return tail, returned_bytes, len(raw) - returned_bytes, True
+
+
+def _cli_log_source(repo_slug: str) -> dict[str, Any]:
+    return {
+        "kind": "latest_cli_log",
+        "repo_slug": repo_slug,
+        "task_id": None,
+        "invocation_id": None,
+        "head_sha": None,
+        "producer_timestamp": None,
+        "association_status": "unavailable_legacy_record",
+    }
+
+
+def _cli_log_unavailable(
+    repo_slug: str,
+    observed_at: datetime,
+    tail_bytes: int,
+    *,
+    status: str,
+    code: str,
+    source_size_bytes: int | None = None,
+    ttl: int | None = None,
+) -> dict[str, Any]:
+    ttl_fields = (
+        _ttl_fields(ttl)
+        if ttl is not None
+        else {"ttl_seconds_remaining": None, "expiry_status": "unknown"}
+    )
+    return {
+        "schema_version": 1,
+        "observed_at": _iso_z(observed_at),
+        "repo_slug": repo_slug,
+        "source": _cli_log_source(repo_slug),
+        "availability": {
+            "status": status,
+            "code": code,
+            "missing_may_mean_expired": status == "missing",
+        },
+        "text": None,
+        "source_size_bytes": source_size_bytes,
+        "sanitized_size_bytes": None,
+        "read_bound_bytes": _MAX_CLI_LOG_SOURCE_BYTES,
+        "requested_tail_bytes": tail_bytes,
+        "returned_size_bytes": 0,
+        "truncation": {
+            "tail_truncated": None,
+            "source_oversized": status == "oversized",
+            "omitted_prefix_bytes": None,
+        },
+        "redaction": {
+            "applied": None,
+            "replacement_count": None,
+            "credential_documents_omitted": None,
+        },
+        **ttl_fields,
+        "read_only": True,
+    }
+
+
+@mcp.tool()
+async def get_latest_cli_log(
+    repo_slug: str,
+    tail_bytes: int = _DEFAULT_CLI_LOG_TAIL_BYTES,
+) -> dict[str, Any]:
+    """Return a bounded, sanitized tail of one configured repository's latest CLI log.
+
+    The legacy record has no trustworthy task, invocation, commit, or producer
+    timestamp. ``observed_at`` is the read time, not the time the log was made.
+    This fixed-key read never refreshes the record's TTL or accesses log files.
+    """
+    tail_bytes = _validate_limit(tail_bytes, name="tail_bytes", maximum=_MAX_CLI_LOG_TAIL_BYTES)
+    observed_at = _utc_now()
+    try:
+        _, repositories = _configured_repositories()
+    except Exception:
+        return _cli_log_unavailable(
+            repo_slug,
+            observed_at,
+            tail_bytes,
+            status="unavailable",
+            code="configuration_invalid",
+        )
+    repo_slug = _validate_repo_slug(repo_slug, repositories)
+
+    client: Any | None = None
+    try:
+        try:
+            client = _new_redis_client()
+        except Exception:
+            return _cli_log_unavailable(
+                repo_slug,
+                observed_at,
+                tail_bytes,
+                status="unavailable",
+                code="redis_connection_failed",
+            )
+        try:
+            async with asyncio.timeout(_REDIS_TIMEOUT_SECONDS):
+                raw, source_size_bytes, oversized = await _read_bounded_string(
+                    client,
+                    cli_log_latest(repo_slug),
+                    _MAX_CLI_LOG_SOURCE_BYTES,
+                )
+                ttl = int(await client.ttl(cli_log_latest(repo_slug)))
+        except Exception:
+            return _cli_log_unavailable(
+                repo_slug,
+                observed_at,
+                tail_bytes,
+                status="unavailable",
+                code="cli_log_read_failed",
+            )
+        if oversized:
+            return _cli_log_unavailable(
+                repo_slug,
+                observed_at,
+                tail_bytes,
+                status="oversized",
+                code="cli_log_source_size_limit",
+                source_size_bytes=source_size_bytes,
+                ttl=ttl,
+            )
+        if raw is None:
+            return _cli_log_unavailable(
+                repo_slug,
+                observed_at,
+                tail_bytes,
+                status="missing",
+                code="cli_log_missing_or_expired",
+                ttl=ttl,
+            )
+
+        decoded = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+        sanitized, replacement_count, documents_omitted = _sanitize_cli_log(decoded)
+        sanitized_size_bytes = len(sanitized.encode("utf-8"))
+        text, returned_size_bytes, omitted_prefix_bytes, tail_truncated = _utf8_tail(sanitized, tail_bytes)
+        return {
+            "schema_version": 1,
+            "observed_at": _iso_z(observed_at),
+            "repo_slug": repo_slug,
+            "source": _cli_log_source(repo_slug),
+            "availability": {
+                "status": "available",
+                "code": None,
+                "missing_may_mean_expired": False,
+            },
+            "text": text,
+            "source_size_bytes": source_size_bytes,
+            "sanitized_size_bytes": sanitized_size_bytes,
+            "read_bound_bytes": _MAX_CLI_LOG_SOURCE_BYTES,
+            "requested_tail_bytes": tail_bytes,
+            "returned_size_bytes": returned_size_bytes,
+            "truncation": {
+                "tail_truncated": tail_truncated,
+                "source_oversized": False,
+                "omitted_prefix_bytes": omitted_prefix_bytes,
+            },
+            "redaction": {
+                "applied": replacement_count > 0,
+                "replacement_count": replacement_count,
+                "credential_documents_omitted": documents_omitted,
+            },
+            **_ttl_fields(ttl),
+            "read_only": True,
+        }
+    finally:
+        await _close_redis(client)
+
+
 @mcp.tool()
 async def get_orchestrator_status(
     repo_slug: str | None = None,
@@ -887,10 +1205,7 @@ async def get_orchestrator_status(
             "detail": None,
         }
     if repo_slug is not None:
-        if not isinstance(repo_slug, str) or not _REPO_SLUG.fullmatch(repo_slug):
-            raise ValueError("repo_slug must be a canonical owner__repo slug")
-        if repo_slug not in repositories:
-            raise ValueError("repo_slug is not configured")
+        repo_slug = _validate_repo_slug(repo_slug, repositories)
 
     client: Any | None = None
     try:

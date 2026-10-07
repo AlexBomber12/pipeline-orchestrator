@@ -13,7 +13,7 @@ import pytest
 from src.cancellation.storage import cause_key
 from src.config import AppConfig, CoderType, RepoConfig
 from src.inhibitor import InhibitorType, WorkInhibitor
-from src.keyspace import pipeline_state, retry_command, retry_command_pending
+from src.keyspace import cli_log_latest, pipeline_state, retry_command, retry_command_pending
 from src.metrics import MetricsStore, RunRecord
 from src.models import CIStatus, PRInfo, QueueTask, RepoState, ReviewStatus, TaskStatus
 from src.retry_commands import new_retry_command
@@ -212,6 +212,246 @@ def _run(*, run_id: str | None = None, task_id: str = "PR-9", ended: bool = Fals
         head_sha=HEAD_SHA,
         task_spec_hash="secret-task-hash",
     )
+
+
+async def test_latest_cli_log_available_empty_isolated_and_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(
+        monkeypatch,
+        redis,
+        _config(_repo(), _repo("https://github.com/octo/other.git")),
+    )
+    key = cli_log_latest(SLUG)
+    other_key = cli_log_latest(OTHER_SLUG)
+    redis.store[key] = b""
+    redis.store[other_key] = "other-repository-secret"
+    redis.ttls[key] = 1_800
+
+    result = await diagnostics.get_latest_cli_log(SLUG)
+
+    assert result["observed_at"] == "2026-10-05T12:00:00Z"
+    assert result["availability"] == {
+        "status": "available",
+        "code": None,
+        "missing_may_mean_expired": False,
+    }
+    assert result["text"] == ""
+    assert result["source_size_bytes"] == 0
+    assert result["returned_size_bytes"] == 0
+    assert result["ttl_seconds_remaining"] == 1_800
+    assert result["expiry_status"] == "expires"
+    assert result["source"] == {
+        "kind": "latest_cli_log",
+        "repo_slug": SLUG,
+        "task_id": None,
+        "invocation_id": None,
+        "head_sha": None,
+        "producer_timestamp": None,
+        "association_status": "unavailable_legacy_record",
+    }
+    assert result["truncation"] == {
+        "tail_truncated": False,
+        "source_oversized": False,
+        "omitted_prefix_bytes": 0,
+    }
+    assert result["read_only"] is True
+    assert other_key not in [call_key for _, call_key in redis.calls]
+    assert {operation for operation, _ in redis.calls} == {"strlen", "getrange", "exists", "ttl", "aclose"}
+    assert redis.closed is True
+
+
+async def test_latest_cli_log_validates_repo_tail_and_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis)
+    with pytest.raises(ValueError, match="canonical"):
+        await diagnostics.get_latest_cli_log("../secret")
+    with pytest.raises(ValueError, match="not configured"):
+        await diagnostics.get_latest_cli_log(OTHER_SLUG)
+    with pytest.raises(ValueError, match="tail_bytes"):
+        await diagnostics.get_latest_cli_log(SLUG, 0)
+    with pytest.raises(ValueError, match="tail_bytes"):
+        await diagnostics.get_latest_cli_log(SLUG, diagnostics._MAX_CLI_LOG_TAIL_BYTES + 1)
+    with pytest.raises(ValueError, match="tail_bytes"):
+        await diagnostics.get_latest_cli_log(SLUG, True)
+    assert redis.calls == []
+
+    monkeypatch.setattr(
+        diagnostics,
+        "_configured_repositories",
+        lambda: (_ for _ in ()).throw(ValueError("api_key=config-secret")),
+    )
+    invalid_config = await diagnostics.get_latest_cli_log(SLUG)
+    assert invalid_config["availability"]["code"] == "configuration_invalid"
+    assert "config-secret" not in json.dumps(invalid_config)
+
+    _patch_runtime(monkeypatch, redis)
+    monkeypatch.setattr(
+        diagnostics,
+        "_new_redis_client",
+        lambda: (_ for _ in ()).throw(ConnectionError("Authorization: Bearer connection-secret")),
+    )
+    unavailable = await diagnostics.get_latest_cli_log(SLUG)
+    assert unavailable["availability"]["code"] == "redis_connection_failed"
+    assert unavailable["ttl_seconds_remaining"] is None
+    assert unavailable["expiry_status"] == "unknown"
+    assert "connection-secret" not in json.dumps(unavailable)
+
+
+async def test_latest_cli_log_missing_and_redis_read_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    missing_redis = FakeRedis()
+    _patch_runtime(monkeypatch, missing_redis)
+    missing = await diagnostics.get_latest_cli_log(SLUG)
+    assert missing["availability"] == {
+        "status": "missing",
+        "code": "cli_log_missing_or_expired",
+        "missing_may_mean_expired": True,
+    }
+    assert missing["text"] is None
+    assert missing["expiry_status"] == "missing"
+    assert missing["ttl_seconds_remaining"] is None
+
+    read_failure_redis = FakeRedis()
+    read_failure_redis.fail.add(("strlen", cli_log_latest(SLUG)))
+    _patch_runtime(monkeypatch, read_failure_redis)
+    failed = await diagnostics.get_latest_cli_log(SLUG)
+    assert failed["availability"] == {
+        "status": "unavailable",
+        "code": "cli_log_read_failed",
+        "missing_may_mean_expired": False,
+    }
+    assert "should-never-be-returned" not in json.dumps(failed)
+
+    ttl_failure_redis = FakeRedis()
+    ttl_failure_redis.store[cli_log_latest(SLUG)] = "available content"
+    ttl_failure_redis.fail.add(("ttl", cli_log_latest(SLUG)))
+    _patch_runtime(monkeypatch, ttl_failure_redis)
+    ttl_failed = await diagnostics.get_latest_cli_log(SLUG)
+    assert ttl_failed["availability"]["code"] == "cli_log_read_failed"
+    assert ttl_failed["text"] is None
+
+
+async def test_latest_cli_log_bounds_source_output_and_utf8(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis)
+    key = cli_log_latest(SLUG)
+    redis.store[key] = b"x" * (diagnostics._MAX_CLI_LOG_SOURCE_BYTES + 1)
+    redis.ttls[key] = 300
+    oversized = await diagnostics.get_latest_cli_log(SLUG)
+    assert oversized["availability"]["status"] == "oversized"
+    assert oversized["availability"]["code"] == "cli_log_source_size_limit"
+    assert oversized["source_size_bytes"] == diagnostics._MAX_CLI_LOG_SOURCE_BYTES + 1
+    assert oversized["truncation"]["source_oversized"] is True
+    assert oversized["text"] is None
+    assert ("getrange", key) not in redis.calls
+
+    growing = GrowingRedis()
+    _patch_runtime(monkeypatch, growing)
+    concurrently_oversized = await diagnostics.get_latest_cli_log(SLUG)
+    assert concurrently_oversized["availability"]["status"] == "oversized"
+    assert concurrently_oversized["source_size_bytes"] == diagnostics._MAX_CLI_LOG_SOURCE_BYTES + 1
+
+    unicode_redis = FakeRedis()
+    unicode_redis.store[key] = "prefix-" + ("🙂" * 10) + "-end"
+    unicode_redis.ttls[key] = -1
+    _patch_runtime(monkeypatch, unicode_redis)
+    unicode_tail = await diagnostics.get_latest_cli_log(SLUG, 13)
+    assert unicode_tail["text"].endswith("-end")
+    assert "�" not in unicode_tail["text"]
+    assert unicode_tail["returned_size_bytes"] <= 13
+    assert unicode_tail["truncation"]["tail_truncated"] is True
+    assert unicode_tail["truncation"]["omitted_prefix_bytes"] > 0
+    assert unicode_tail["expiry_status"] == "persistent"
+
+    invalid_utf8_redis = FakeRedis()
+    invalid_utf8_redis.store[key] = b"before\xffafter"
+    _patch_runtime(monkeypatch, invalid_utf8_redis)
+    invalid_utf8 = await diagnostics.get_latest_cli_log(SLUG, 32)
+    assert invalid_utf8["text"] == "before�after"
+
+
+async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis)
+    key = cli_log_latest(SLUG)
+    long_secret = "tail-fragment-" * 20
+    redis.store[key] = f"Authorization: Bearer {long_secret}\nsafe-tail"
+    before_tail = await diagnostics.get_latest_cli_log(SLUG, 64)
+    assert before_tail["text"] == "Authorization: [REDACTED]\nsafe-tail"
+    assert "tail-fragment" not in before_tail["text"]
+    assert before_tail["truncation"]["tail_truncated"] is False
+
+    credential_log = "\n".join(
+        (
+            "curl -H 'Authorization: ApiKey inline-auth-secret' https://example.test",
+            "Cookie: session=cookie-secret; other=value",
+            "curl -H 'Set-Cookie: session=inline-cookie-secret' https://example.test",
+            'API_KEY="api assignment secret"',
+            "oauthToken=oauth-secret",
+            "https://url-user:url-password@example.test/path?access_token=query-secret",
+            "https://single-url-credential@example.test/path",
+            "ghp_" + ("A" * 36),
+            '{"safe": "value"}',
+            "{not-json",
+            "{",
+            '  "items": [',
+            "    {",
+            '      "refresh_token": "document-secret"',
+            "    }",
+            "  ],",
+            '  "client_email": "private@example.test"',
+            "}",
+            "-----BEGIN PRIVATE KEY-----",
+            "pem-document-secret",
+            "-----END PRIVATE KEY-----",
+            "safe-output",
+        )
+    )
+    redis = FakeRedis()
+    redis.store[key] = credential_log
+    _patch_runtime(monkeypatch, redis)
+    redacted = await diagnostics.get_latest_cli_log(SLUG, diagnostics._MAX_CLI_LOG_TAIL_BYTES)
+    exported = redacted["text"]
+    assert redacted["availability"]["status"] == "available"
+    assert redacted["redaction"]["applied"] is True
+    assert redacted["redaction"]["credential_documents_omitted"] == 2
+    assert exported.count("[credential document omitted]") == 2
+    assert "safe-output" in exported
+    assert "private@example.test" not in exported
+    for secret in (
+        "inline-auth-secret",
+        "cookie-secret",
+        "inline-cookie-secret",
+        "api assignment secret",
+        "oauth-secret",
+        "url-user",
+        "url-password",
+        "single-url-credential",
+        "query-secret",
+        "document-secret",
+        "pem-document-secret",
+        "ghp_" + ("A" * 36),
+    ):
+        assert secret not in exported
 
 
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(
