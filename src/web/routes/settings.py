@@ -677,8 +677,10 @@ async def _settings_daemon_template_context(
     # refresh response cannot re-render an older model selection over a save
     # that completed while the subprocess was running.
     cfg = load_config(_app.CONFIG_PATH)
+    selectable_coders = _selectable_coder_plugins(registry)
     return {
         "daemon": cfg.daemon,
+        "repos": cfg.repositories,
         "coders": _build_coder_rows(
             cfg,
             auth,
@@ -687,6 +689,13 @@ async def _settings_daemon_template_context(
             coder_messages=coder_messages,
         ),
         "auth": auth,
+        "selectable_coders": selectable_coders,
+        "selectable_coder_ids": {
+            plugin.name for plugin in selectable_coders
+        },
+        "default_coder_label": _coder_display_name(
+            cfg.daemon.coder, registry
+        ),
         "unavailable_default_coder": (
             cfg.daemon.coder
             if registry.get_optional(cfg.daemon.coder) is None

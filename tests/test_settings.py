@@ -1110,6 +1110,12 @@ def test_registered_plugin_round_trips_through_every_coder_mutation_endpoint(
         daemon_update.text,
         re.DOTALL,
     )
+    assert 'id="settings-repo-list" hx-swap-oob="innerHTML"' in (
+        daemon_update.text
+    )
+    assert "Automatic — preferred default: Configured Test Coder" in (
+        daemon_update.text
+    )
     assert 'option value="third" selected' in repo_update.text
     assert (
         'option value="" selected>Automatic — preferred default: '
