@@ -447,6 +447,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             'structured={"headers":{"Authorization":"Bearer structured-auth-secret"}}',
             'structured-cookie={"Cookie":"session=structured-cookie-secret"}',
             'tool --password cli-option-secret --token "quoted cli token"',
+            r'tool --password "abc\"escaped-option-secret" token="abc\"escaped-assignment-secret"',
             "private_key=malformed-private-secret",
             "AWS_SECRET_ACCESS_KEY=aws-secret",
             "{",
@@ -495,6 +496,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "structured-cookie-secret",
         "cli-option-secret",
         "quoted cli token",
+        "escaped-option-secret",
+        "escaped-assignment-secret",
         "malformed-private-secret",
         "aws-secret",
         "document-secret",
@@ -502,6 +505,24 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "ghp_" + ("A" * 36),
     ):
         assert secret not in exported
+
+    orphaned_begin_redis = FakeRedis()
+    orphaned_begin_redis.store[key] = (
+        "safe-before\n-----BEGIN PRIVATE KEY-----\norphaned-private-secret"
+    )
+    _patch_runtime(monkeypatch, orphaned_begin_redis)
+    orphaned_begin = await diagnostics.get_latest_cli_log(SLUG)
+    assert orphaned_begin["text"] == "safe-before\n[credential document omitted]"
+    assert "orphaned-private-secret" not in orphaned_begin["text"]
+
+    orphaned_end_redis = FakeRedis()
+    orphaned_end_redis.store[key] = (
+        "orphaned-private-secret\n-----END PRIVATE KEY-----\nsafe-after"
+    )
+    _patch_runtime(monkeypatch, orphaned_end_redis)
+    orphaned_end = await diagnostics.get_latest_cli_log(SLUG)
+    assert orphaned_end["text"] == "[credential document omitted]\nsafe-after"
+    assert "orphaned-private-secret" not in orphaned_end["text"]
 
 
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(

@@ -86,6 +86,14 @@ _PEM_CREDENTIAL_DOCUMENT = re.compile(
     r".*?-----END (?P=label)-----",
     re.IGNORECASE | re.DOTALL,
 )
+_PEM_CREDENTIAL_BEGIN = re.compile(
+    r"-----BEGIN (?:[A-Z0-9 ]*PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----",
+    re.IGNORECASE,
+)
+_PEM_CREDENTIAL_END = re.compile(
+    r"-----END (?:[A-Z0-9 ]*PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----",
+    re.IGNORECASE,
+)
 _JSON_CONTAINER_START = re.compile(r"[\[{]")
 _SENSITIVE_HEADER_LINE = re.compile(
     r"(?im)^(?P<prefix>[ \t]*(?:proxy-)?authorization[ \t]*:[ \t]*|"
@@ -108,14 +116,14 @@ _CREDENTIAL_ASSIGNMENT = re.compile(
     r"(?:proxy[_-]?)?authorization|(?:set[_-]?)?cookie)"
     r"['\"]?[ \t]*(?:=|:)[ \t]*)"
     r"(?!\[(?:REDACTED|credential document omitted)\])"
-    r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;&#]+)"
+    r"(?P<value>\"(?:\\.|[^\"\\\r\n])*\"|'(?:\\.|[^'\\\r\n])*'|[^\s,;&#]+)"
 )
 _CREDENTIAL_OPTION = re.compile(
     r"(?i)(?P<prefix>(?<![A-Za-z0-9-])--(?:api[_-]?key|oauth[_-]?token|"
     r"access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|"
     r"client[_-]?secret|private[_-]?key(?:[_-]?id)?|secret(?:[_-]?access)?[_-]?key|"
     r"secret|password|passwd|token|(?:proxy[_-]?)?authorization|(?:set[_-]?)?cookie)"
-    r"[ \t]+)(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)"
+    r"[ \t]+)(?P<value>\"(?:\\.|[^\"\\\r\n])*\"|'(?:\\.|[^'\\\r\n])*'|[^\s,;]+)"
 )
 _RECOGNIZABLE_SECRET = tuple(
     re.compile(pattern)
@@ -1015,6 +1023,14 @@ def _redact_assignment(match: re.Match[str]) -> str:
 
 def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     text, pem_documents = _PEM_CREDENTIAL_DOCUMENT.subn(_CREDENTIAL_DOCUMENT_OMITTED, text)
+    orphaned_begin = _PEM_CREDENTIAL_BEGIN.search(text)
+    if orphaned_begin is not None:
+        text = f"{text[: orphaned_begin.start()]}{_CREDENTIAL_DOCUMENT_OMITTED}"
+        pem_documents += 1
+    orphaned_end = _PEM_CREDENTIAL_END.search(text)
+    if orphaned_end is not None:
+        text = f"{_CREDENTIAL_DOCUMENT_OMITTED}{text[orphaned_end.end() :]}"
+        pem_documents += 1
     text, json_documents = _omit_json_credential_documents(text)
     redactions = pem_documents + json_documents
 

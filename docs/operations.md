@@ -45,7 +45,8 @@ arguments,
 cookies, credential-bearing URL userinfo/query parameters, recognizable token
 shapes, private-key blocks, and recognizable JSON credential documents are not
 exported, including nested documents and documents serialized inside log
-strings. Malformed JSON probing has a fixed failure budget; if that budget is
+strings. Complete and interrupted private-key blocks are both omitted.
+Malformed JSON probing has a fixed failure budget; if that budget is
 exhausted, export fails closed to a credential-document omission marker instead
 of blocking the MCP event loop or returning text that could not be inspected
 safely.
