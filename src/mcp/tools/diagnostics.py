@@ -118,19 +118,21 @@ _XML_NAME_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-"
 )
 _XML_CREDENTIAL_SELECTOR_ATTRIBUTES = frozenset({"key", "name"})
+_KUBERNETES_KIND_KEY = r'''(?:kind|'kind'|"kind")'''
 _KUBERNETES_SECRET_KIND = re.compile(
-    r"(?im)^[ \t]*kind[ \t]*:[ \t]*"
+    rf"(?im)^[ \t]*{_KUBERNETES_KIND_KEY}[ \t]*:[ \t]*"
     r"(?:(?:&|!)[^\s,\[\]{}]+[ \t]+)*"
     r"(?P<quote>['\"]?)Secret(?P=quote)"
     r"[ \t]*(?:#.*)?$"
 )
 # YAML double-quoted scalars can resolve escapes; omit instead of partially decoding.
 _KUBERNETES_ESCAPED_QUOTED_KIND = re.compile(
-    r'(?im)^[ \t]*kind[ \t]*:[ \t]*'
+    rf'(?im)^[ \t]*{_KUBERNETES_KIND_KEY}[ \t]*:[ \t]*'
     r'(?:(?:&|!)[^\s,\[\]{}]+[ \t]+)*"(?=[^\r\n]*\\)'
 )
 _KUBERNETES_SECRET_BLOCK_KIND = re.compile(
-    r"(?im)^[ \t]*kind[ \t]*:[ \t]*[|>][0-9+-]{0,2}[ \t]*(?:#.*)?\n"
+    rf"(?im)^[ \t]*{_KUBERNETES_KIND_KEY}[ \t]*:[ \t]*"
+    r"[|>][0-9+-]{0,2}[ \t]*(?:#.*)?\n"
     r"(?:[ \t]*\n)*[ \t]+Secret[ \t]*(?:\n|$)"
 )
 _URL_USERINFO = re.compile(r"(?i)(?P<scheme>(?:\b[a-z][a-z0-9+.-]*:)?//)[^/@\s]+@")
