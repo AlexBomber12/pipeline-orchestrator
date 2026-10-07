@@ -5,6 +5,39 @@ Pipeline-orchestrator reads runtime connection settings such as
 longer has rollout flags: daemon startup always reconstructs queue state
 from structured `tasks/PR-*.md` headers.
 
+## Read-only MCP diagnostics
+
+The localhost-scoped Orchestrator MCP exposes `get_orchestrator_status` for a
+compact overview of configured repositories. Pass a validated `owner__repo`
+slug for structured pipeline, inhibitor, cancellation, pending Retry-command,
+and run-record metadata. Results use explicit field allowlists and fixed status
+codes: task text, error messages, exception text, arbitrary payload fields, and
+other free-form producer content are not returned.
+
+Redis values and indexes are read with fixed size and count bounds. Missing,
+malformed, oversized, and unavailable sources are reported independently.
+These reads do not refresh TTLs, prune stale index members, or mutate daemon
+state. Snapshot age describes only the persisted `RepoState` observation; even
+a fresh snapshot is not evidence that a coder process is alive or progressing.
+
+Runtime diagnostics are available on the primary MCP service, whose published
+port remains bound to localhost. The same service container runs two
+streamable-HTTP listeners: the host port maps to the opted-in diagnostics
+listener on container port 5174, while the optional `cloudflared` profile keeps
+its existing `mcp:5173` target and reaches a restricted listener started with
+`MCP_RUNTIME_DIAGNOSTICS=0`. Existing non-diagnostic MCP tools remain available
+through the tunnel, but runtime status is not registered there.
+
+Runtime diagnostics are opt-in at server startup. The MCP service entrypoint
+sets `MCP_RUNTIME_DIAGNOSTICS=1` only for its localhost-published listener; an
+unset value defaults to disabled for direct and custom deployments. Operators
+starting `python -m src.mcp` outside Compose must explicitly set the variable
+and retain an equivalent loopback-only or authenticated access boundary.
+
+Raw CLI, CI, event, artifact, daemon-stdout, and live-stream retrieval is not
+exposed. Persistent capture and a separately reviewed safe log-export contract
+remain follow-up work.
+
 ## Task format migration
 
 Task files are migrating from legacy status headers to explicit YAML

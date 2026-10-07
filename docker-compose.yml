@@ -40,17 +40,20 @@ services:
 
   mcp:
     build: .
-    command: python -m src.mcp
+    entrypoint: ["bash", "scripts/mcp-entrypoint.sh"]
     user: "1000:1000"
     mem_limit: 1g
     ports:
-      - "127.0.0.1:${MCP_PORT:-5173}:5173"
+      - "127.0.0.1:${MCP_PORT:-5173}:5174"
     volumes:
       - .:/app:ro
       - ./data/repos:/data/repos:ro
     environment:
       PYTHONUNBUFFERED: "1"
+      REDIS_URL: redis://redis:6379/0
     restart: unless-stopped
+    depends_on:
+      - redis
 
   cloudflared:
     image: cloudflare/cloudflared:latest

@@ -186,7 +186,7 @@ def _pid_is_live(pid: int) -> bool:
     try:
         with open(f"/proc/{pid}/stat", encoding="utf-8") as stat_file:
             stat = stat_file.read()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return False
     state, _, _, _ = _parse_proc_stat(stat)
     return state != "Z"
@@ -196,6 +196,23 @@ async def _wait_not_live(*pids: int) -> None:
     async with asyncio.timeout(2):
         while any(_pid_is_live(pid) for pid in pids):
             await asyncio.sleep(0.01)
+
+
+def test_pid_is_live_treats_a_vanished_proc_entry_as_not_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class VanishedStat:
+        def __enter__(self) -> "VanishedStat":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> str:
+            raise ProcessLookupError("process exited")
+
+    monkeypatch.setattr("builtins.open", lambda *_args, **_kwargs: VanishedStat())
+    assert _pid_is_live(12345) is False
 
 
 @pytest.fixture
