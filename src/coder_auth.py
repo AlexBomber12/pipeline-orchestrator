@@ -7,8 +7,14 @@ import json
 import os
 import signal
 import sys
+from typing import Any
 
 from src.coder_auth_worker import RESULT_PREFIX
+from src.coder_registry import (
+    CoderAuthStatus,
+    coder_auth_payload,
+    parse_coder_auth_payload,
+)
 
 
 async def terminate_plugin_worker(process: asyncio.subprocess.Process) -> None:
@@ -27,7 +33,7 @@ async def isolated_auth_probe(
     *,
     config_path: str,
     timeout: float = 5,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Probe trusted plugin code in a subprocess killed at ``timeout``."""
     try:
         process = await asyncio.create_subprocess_exec(
@@ -42,12 +48,15 @@ async def isolated_auth_probe(
             start_new_session=True,
         )
     except OSError as exc:
-        return {
-            "status": "error",
-            "detail": (
-                f"{display_name} auth check failed ({type(exc).__name__})"
-            ),
-        }
+        return coder_auth_payload(
+            CoderAuthStatus(
+                status="error",
+                detail=(
+                    f"{display_name} auth check failed ({type(exc).__name__})"
+                ),
+                failure_reason="probe_failed",
+            )
+        )
     try:
         stdout, _ = await asyncio.wait_for(
             process.communicate(),
@@ -58,15 +67,21 @@ async def isolated_auth_probe(
         raise
     except asyncio.TimeoutError:
         await terminate_plugin_worker(process)
-        return {
-            "status": "error",
-            "detail": f"{display_name} auth check timed out after {timeout:g}s",
-        }
+        return coder_auth_payload(
+            CoderAuthStatus(
+                status="error",
+                detail=f"{display_name} auth check timed out after {timeout:g}s",
+                failure_reason="probe_timeout",
+            )
+        )
     if process.returncode != 0:
-        return {
-            "status": "error",
-            "detail": f"{display_name} auth check worker failed",
-        }
+        return coder_auth_payload(
+            CoderAuthStatus(
+                status="error",
+                detail=f"{display_name} auth check worker failed",
+                failure_reason="probe_failed",
+            )
+        )
     for raw_line in reversed(stdout.decode("utf-8", errors="replace").splitlines()):
         if not raw_line.startswith(RESULT_PREFIX):
             continue
@@ -74,18 +89,15 @@ async def isolated_auth_probe(
             result = json.loads(raw_line.removeprefix(RESULT_PREFIX))
         except (json.JSONDecodeError, TypeError):
             break
-        if (
-            isinstance(result, dict)
-            and result.get("status") in {"ok", "error"}
-            and isinstance(result.get("detail"), str)
-            and all(
-                isinstance(key, str) and isinstance(value, str)
-                for key, value in result.items()
-            )
-        ):
-            return result
+        try:
+            return parse_coder_auth_payload(result)
+        except TypeError:
+            pass
         break
-    return {
-        "status": "error",
-        "detail": f"{display_name} auth check returned an invalid result",
-    }
+    return coder_auth_payload(
+        CoderAuthStatus(
+            status="error",
+            detail=f"{display_name} auth check returned an invalid result",
+            failure_reason="unrecognized_output",
+        )
+    )

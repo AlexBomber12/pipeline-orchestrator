@@ -11,11 +11,14 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from src import codex_cli
 from src.coder_registry import (
+    CoderAuthCapabilities,
+    CoderAuthStatus,
     ModelCatalog,
     ModelCatalogUnavailable,
     ModelMetadata,
     ModelReasoningEffort,
     ModelSetting,
+    coder_auth_payload,
 )
 from src.coders.codex_models import (
     CodexModelDiscoveryInvalid,
@@ -43,6 +46,16 @@ _CODEX_RETRY_PATTERN = re.compile(
 _CODEX_USAGE_LIMIT_PATTERN = re.compile(
     r"(you've hit your usage limit|usage limit|rate limit exceeded|try again later|retry later)",
     re.IGNORECASE,
+)
+_CODEX_VERSION_PATTERN = re.compile(
+    r"^(?:codex|codex-cli)\s+"
+    r"(?P<version>[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?)$"
+)
+_AUTH_MODE_PATTERNS = (
+    (re.compile(r"^Logged in (?:using|with) ChatGPT$"), "chatgpt"),
+    (re.compile(r"^Logged in using an API key(?:\s+-\s+.*)?$"), "api_key"),
+    (re.compile(r"^Logged in using (?:personal )?access token$"), "access_token"),
+    (re.compile(r"^Logged in using workload identity$"), "workload_identity"),
 )
 
 
@@ -81,6 +94,27 @@ def _first_probe_line(text: str) -> str:
     return ""
 
 
+def _codex_version(text: str) -> str | None:
+    line = _first_probe_line(text)
+    match = _CODEX_VERSION_PATTERN.fullmatch(line)
+    return match.group("version") if match is not None else None
+
+
+def _authentication_mode(text: str) -> str | None:
+    line = _first_probe_line(text)
+    for pattern, mode in _AUTH_MODE_PATTERNS:
+        if pattern.fullmatch(line) is not None:
+            return mode
+    return None
+
+
+def _reports_missing_cli(text: str) -> bool:
+    line = _first_probe_line(text).lower()
+    return line in {"codex: not found", "codex not found"} or line.endswith(
+        ": no such file or directory"
+    )
+
+
 class CodexPlugin:
     name = "codex"
     display_name = "Codex CLI"
@@ -103,6 +137,13 @@ class CodexPlugin:
         default_label="CLI default",
     )
     model_catalog_refreshable = True
+    auth_capabilities = CoderAuthCapabilities(
+        can_check_cli=True,
+        can_check_saved_credentials=True,
+        can_report_authentication_mode=True,
+        can_verify_service_access=False,
+        interactive_login_methods=("browser_oauth", "device_code"),
+    )
 
     def __init__(self, *, discover: Any | None = None) -> None:
         self._discover = discover or discover_codex_models
@@ -255,42 +296,118 @@ class CodexPlugin:
             on_supervised_process_start=on_supervised_process_start,
         )
 
-    def check_auth(self, *, config_path: str = CONFIG_PATH) -> dict[str, str]:
+    def _auth_status(self, **kwargs: Any) -> dict[str, Any]:
+        return coder_auth_payload(
+            CoderAuthStatus(**kwargs),
+            capabilities=self.auth_capabilities,
+        )
+
+    def check_auth(self, *, config_path: str = CONFIG_PATH) -> dict[str, Any]:
+        """Report saved Codex credentials without verifying service access."""
         cfg = load_config(config_path)
         env = _auth_probe_env(HOME=cfg.auth.codex_home_dir)
         version_rc, version_stdout, version_stderr = _run_auth_command(
             ["codex", "--version"], env=env
         )
         version_combined = f"{version_stdout}\n{version_stderr}".strip()
-        version_line = _first_probe_line(version_combined)
+        version = _codex_version(version_combined)
         if version_rc != 0:
-            if (
-                "not found" in version_combined.lower()
-                or "no such file" in version_combined.lower()
-            ):
-                return {"status": "error", "detail": "codex CLI not installed"}
-            detail = version_line or "codex CLI not installed"
-            return {"status": "error", "detail": detail}
+            if version_rc == 127 or _reports_missing_cli(version_combined):
+                return self._auth_status(
+                    status="error",
+                    detail="Codex CLI is not installed",
+                    cli_available=False,
+                    failure_reason="cli_missing",
+                )
+            if version_rc == 124:
+                return self._auth_status(
+                    status="error",
+                    detail="Codex CLI version check timed out",
+                    failure_reason="probe_timeout",
+                )
+            return self._auth_status(
+                status="error",
+                detail="Codex CLI version check failed",
+                failure_reason="probe_failed",
+            )
+        if version is None:
+            return self._auth_status(
+                status="error",
+                detail="Codex CLI returned an unrecognized version",
+                cli_available=True,
+                failure_reason="unrecognized_output",
+            )
 
-        installed_detail = (
-            f"{version_line} (installed)"
-            if version_line
-            else "codex CLI installed"
-        )
+        installed_detail = f"Codex CLI {version}"
         rc, stdout, stderr = _run_auth_command(
             ["codex", "login", "status"], env=env
         )
         combined = f"{stdout}\n{stderr}".strip()
         if rc == 0:
-            detail = _first_probe_line(combined) or "codex authenticated"
-            return {"status": "ok", "detail": f"{installed_detail}; {detail}"}
-        if "not found" in combined.lower() or "no such file" in combined.lower():
-            return {"status": "error", "detail": "codex CLI not installed"}
-        api_key = env.get("OPENAI_API_KEY", "")
-        base_detail = _first_probe_line(combined) or "codex not authenticated"
-        if api_key:
-            base_detail = f"{base_detail} (OPENAI_API_KEY set but unverified)"
-        return {"status": "error", "detail": f"{installed_detail}; {base_detail}"}
+            mode = _authentication_mode(combined)
+            if mode is not None:
+                mode_label = {
+                    "chatgpt": "ChatGPT",
+                    "api_key": "API-key",
+                    "access_token": "access-token",
+                    "workload_identity": "workload-identity",
+                }[mode]
+                return self._auth_status(
+                    status="ok",
+                    detail=(
+                        f"{installed_detail}; saved {mode_label} credentials "
+                        "found; service access not verified"
+                    ),
+                    cli_available=True,
+                    cli_version=version,
+                    saved_credentials_present=True,
+                    authentication_mode=mode,
+                )
+            return self._auth_status(
+                status="error",
+                detail=(
+                    f"{installed_detail}; saved credential status could not "
+                    "be recognized"
+                ),
+                cli_available=True,
+                cli_version=version,
+                failure_reason="unrecognized_output",
+            )
+        if rc == 124:
+            return self._auth_status(
+                status="error",
+                detail=f"{installed_detail}; saved credential check timed out",
+                cli_available=True,
+                cli_version=version,
+                failure_reason="probe_timeout",
+            )
+        if rc == 127 or _reports_missing_cli(combined):
+            return self._auth_status(
+                status="error",
+                detail="Codex CLI is not installed",
+                cli_available=False,
+                cli_version=version,
+                failure_reason="cli_missing",
+            )
+        if _first_probe_line(combined).lower() == "not logged in":
+            return self._auth_status(
+                status="error",
+                detail=(
+                    f"{installed_detail}; no saved credentials found; "
+                    "service access not verified"
+                ),
+                cli_available=True,
+                cli_version=version,
+                saved_credentials_present=False,
+                failure_reason="credentials_missing",
+            )
+        return self._auth_status(
+            status="error",
+            detail=f"{installed_detail}; saved credential check failed",
+            cli_available=True,
+            cli_version=version,
+            failure_reason="probe_failed",
+        )
 
     def create_usage_provider(self, **kwargs: Any) -> UsageProvider:
         cfg = kwargs.pop("config", None)

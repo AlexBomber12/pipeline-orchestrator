@@ -14,6 +14,220 @@ if TYPE_CHECKING:
     from src.config import AppConfig, DaemonConfig
 
 
+AUTH_FAILURE_REASONS = frozenset(
+    {
+        "cli_missing",
+        "credentials_missing",
+        "daemon_unavailable",
+        "probe_failed",
+        "probe_timeout",
+        "probe_unavailable",
+        "unrecognized_output",
+    }
+)
+
+
+@dataclass(frozen=True)
+class CoderAuthCapabilities:
+    """Optional plugin-owned authentication capabilities.
+
+    ``None`` means a legacy plugin did not advertise whether the capability is
+    supported. Login method identifiers describe provider-neutral workflows;
+    they are metadata only and never execute an authentication action.
+    """
+
+    can_check_cli: bool | None = None
+    can_check_saved_credentials: bool | None = None
+    can_report_authentication_mode: bool | None = None
+    can_verify_service_access: bool | None = None
+    interactive_login_methods: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True)
+class CoderAuthStatus:
+    """Provider-neutral result of one read-only authentication probe.
+
+    Every evidence field is tri-state. ``None`` means the probe did not learn
+    that fact; in particular, saved credentials do not imply verified service
+    access.
+    """
+
+    status: str
+    detail: str
+    cli_available: bool | None = None
+    cli_version: str | None = None
+    saved_credentials_present: bool | None = None
+    authentication_mode: str | None = None
+    service_access_verified: bool | None = None
+    failure_reason: str | None = None
+
+
+def _optional_bool(value: object, field: str) -> bool | None:
+    if value is None or isinstance(value, bool):
+        return value
+    raise TypeError(f"{field} must be a boolean or null")
+
+
+def _optional_identifier(value: object, field: str) -> str | None:
+    if value is None:
+        return None
+    if (
+        isinstance(value, str)
+        and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value) is not None
+    ):
+        return value
+    raise TypeError(f"{field} must be a bounded identifier or null")
+
+
+def _auth_status_from_result(result: object) -> CoderAuthStatus:
+    """Select and validate contract fields from a plugin result.
+
+    Existing plugins may continue returning only ``status`` and ``detail``.
+    Unknown keys are deliberately not forwarded across process boundaries.
+    """
+    if isinstance(result, CoderAuthStatus):
+        raw: dict[str, object] = {
+            "status": result.status,
+            "detail": result.detail,
+            "cli_available": result.cli_available,
+            "cli_version": result.cli_version,
+            "saved_credentials_present": result.saved_credentials_present,
+            "authentication_mode": result.authentication_mode,
+            "service_access_verified": result.service_access_verified,
+            "failure_reason": result.failure_reason,
+        }
+    elif isinstance(result, dict):
+        raw = result
+    else:
+        raise TypeError("invalid auth status")
+    legacy_status = raw.get("status")
+    detail = raw.get("detail")
+    if legacy_status not in {"ok", "error"} or not isinstance(detail, str):
+        raise TypeError("invalid auth status")
+    cli_version = raw.get("cli_version")
+    if cli_version is not None and (
+        not isinstance(cli_version, str) or len(cli_version) > 64
+    ):
+        raise TypeError("cli_version must be a bounded string or null")
+    failure_reason = raw.get("failure_reason")
+    if failure_reason is not None and failure_reason not in AUTH_FAILURE_REASONS:
+        raise TypeError("invalid auth failure reason")
+    return CoderAuthStatus(
+        status=legacy_status,
+        detail=detail,
+        cli_available=_optional_bool(
+            raw.get("cli_available"), "cli_available"
+        ),
+        cli_version=cli_version,
+        saved_credentials_present=_optional_bool(
+            raw.get("saved_credentials_present"),
+            "saved_credentials_present",
+        ),
+        authentication_mode=_optional_identifier(
+            raw.get("authentication_mode"), "authentication_mode"
+        ),
+        service_access_verified=_optional_bool(
+            raw.get("service_access_verified"),
+            "service_access_verified",
+        ),
+        failure_reason=failure_reason,
+    )
+
+
+def _auth_capabilities_payload(
+    capabilities: CoderAuthCapabilities | None,
+) -> dict[str, Any]:
+    selected = capabilities or CoderAuthCapabilities()
+    methods = selected.interactive_login_methods
+    if methods is not None:
+        if not isinstance(methods, tuple):
+            raise TypeError("interactive_login_methods must be a tuple or null")
+        methods = tuple(
+            _optional_identifier(method, "interactive_login_methods")
+            for method in methods
+        )
+        if any(method is None for method in methods):
+            raise TypeError("interactive_login_methods cannot contain null")
+    return {
+        "can_check_cli": _optional_bool(
+            selected.can_check_cli, "can_check_cli"
+        ),
+        "can_check_saved_credentials": _optional_bool(
+            selected.can_check_saved_credentials,
+            "can_check_saved_credentials",
+        ),
+        "can_report_authentication_mode": _optional_bool(
+            selected.can_report_authentication_mode,
+            "can_report_authentication_mode",
+        ),
+        "can_verify_service_access": _optional_bool(
+            selected.can_verify_service_access,
+            "can_verify_service_access",
+        ),
+        "interactive_login_methods": (
+            list(methods) if methods is not None else None
+        ),
+    }
+
+
+def coder_auth_payload(
+    result: object,
+    *,
+    capabilities: CoderAuthCapabilities | None = None,
+) -> dict[str, Any]:
+    """Return the explicit wire contract for a plugin auth result."""
+    status = _auth_status_from_result(result)
+    return {
+        "status": status.status,
+        "detail": status.detail,
+        "cli_available": status.cli_available,
+        "cli_version": status.cli_version,
+        "saved_credentials_present": status.saved_credentials_present,
+        "authentication_mode": status.authentication_mode,
+        "service_access_verified": status.service_access_verified,
+        "failure_reason": status.failure_reason,
+        "capabilities": _auth_capabilities_payload(capabilities),
+    }
+
+
+def parse_coder_auth_payload(payload: object) -> dict[str, Any]:
+    """Validate an auth result received from an isolated process."""
+    if not isinstance(payload, dict):
+        raise TypeError("invalid auth payload")
+    raw_capabilities = payload.get("capabilities")
+    if raw_capabilities is None:
+        raw_capabilities = {}
+    elif not isinstance(raw_capabilities, dict):
+        raise TypeError("invalid auth capabilities")
+    raw_methods = raw_capabilities.get("interactive_login_methods")
+    if raw_methods is not None and (
+        not isinstance(raw_methods, list)
+        or not all(isinstance(method, str) for method in raw_methods)
+    ):
+        raise TypeError("invalid interactive login methods")
+    capabilities = CoderAuthCapabilities(
+        can_check_cli=_optional_bool(
+            raw_capabilities.get("can_check_cli"), "can_check_cli"
+        ),
+        can_check_saved_credentials=_optional_bool(
+            raw_capabilities.get("can_check_saved_credentials"),
+            "can_check_saved_credentials",
+        ),
+        can_report_authentication_mode=_optional_bool(
+            raw_capabilities.get("can_report_authentication_mode"),
+            "can_report_authentication_mode",
+        ),
+        can_verify_service_access=_optional_bool(
+            raw_capabilities.get("can_verify_service_access"),
+            "can_verify_service_access",
+        ),
+        interactive_login_methods=(
+            tuple(raw_methods) if raw_methods is not None else None
+        ),
+    )
+    return coder_auth_payload(payload, capabilities=capabilities)
+
+
 @dataclass(frozen=True)
 class ModelReasoningEffort:
     """Reasoning-effort metadata advertised for one model."""

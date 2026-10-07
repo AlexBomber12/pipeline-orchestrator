@@ -10,10 +10,13 @@ from pathlib import Path
 import pytest
 from src import model_catalog_bridge as bridge
 from src.coder_registry import (
+    CoderAuthCapabilities,
+    CoderAuthStatus,
     CoderRegistry,
     ModelCatalog,
     ModelCatalogUnavailable,
     ModelMetadata,
+    coder_auth_payload,
 )
 from src.coders.codex import CodexPlugin
 from src.coders.codex_models import CodexModel, CodexReasoningEffort
@@ -106,7 +109,7 @@ async def test_loader_round_trips_catalog_through_daemon(
         *,
         config_path: str,
         timeout: float,
-    ) -> dict[str, str]:
+    ) -> dict[str, object]:
         auth_calls.append(
             (
                 plugin_id,
@@ -116,7 +119,23 @@ async def test_loader_round_trips_catalog_through_daemon(
                 timeout,
             )
         )
-        return {"status": "ok", "detail": "daemon-owned"}
+        return coder_auth_payload(
+            CoderAuthStatus(
+                status="ok",
+                detail="daemon-owned",
+                cli_available=True,
+                cli_version="1.2.3",
+                saved_credentials_present=True,
+                authentication_mode="browser_oauth",
+            ),
+            capabilities=CoderAuthCapabilities(
+                can_check_cli=True,
+                can_check_saved_credentials=True,
+                can_report_authentication_mode=True,
+                can_verify_service_access=False,
+                interactive_login_methods=("browser_oauth",),
+            ),
+        )
 
     monkeypatch.setattr(bridge, "isolated_auth_probe", auth_probe)
     config_path = str(tmp_path / "config.yml")
@@ -155,7 +174,13 @@ async def test_loader_round_trips_catalog_through_daemon(
     assert metadata.display_name == "Codex CLI"
     assert metadata.model_setting.setting_key == "model"
     assert metadata.model_catalog_refreshable is True
-    assert auth == {"status": "ok", "detail": "daemon-owned"}
+    assert auth["status"] == "ok"
+    assert auth["detail"] == "daemon-owned"
+    assert auth["cli_available"] is True
+    assert auth["saved_credentials_present"] is True
+    assert auth["authentication_mode"] == "browser_oauth"
+    assert auth["service_access_verified"] is None
+    assert auth["capabilities"]["can_verify_service_access"] is False
     assert auth_calls == [
         (
             "codex",

@@ -17,7 +17,9 @@
             <tbody>
                 {% for coder in coders %}
                 {% set auth_entry = coder.auth %}
-                {% set ok = auth_entry.status == "ok" %}
+                {% set auth_view = coder.auth_view %}
+                {% set auth_ok = auth_view.tone == "ok" %}
+                {% set auth_warn = auth_view.tone == "warn" %}
                 <tr class="border-b border-white/5 last:border-0">
                     <td class="py-3 pr-4">
                         <div class="font-medium text-gray-200">{{ coder.display_name }}</div>
@@ -134,10 +136,10 @@
                     </td>
                     <td class="py-3 pr-4">
                         <div class="flex items-center gap-2">
-                            <span class="w-2.5 h-2.5 rounded-full {% if ok %}bg-ok{% else %}bg-fail{% endif %}"
+                            <span class="w-2.5 h-2.5 rounded-full {% if auth_ok %}bg-ok{% elif auth_warn %}bg-warn{% else %}bg-fail{% endif %}"
                                   aria-hidden="true"></span>
-                            <span class="{% if ok %}text-ok{% else %}text-fail{% endif %}">
-                                {% if ok %}Authorized{% else %}Error{% endif %}
+                            <span class="{% if auth_ok %}text-ok{% elif auth_warn %}text-warn{% else %}text-fail{% endif %}">
+                                {{ auth_view.label }}
                             </span>
                         </div>
                         <div class="mt-1 font-mono text-xs text-gray-400 break-all">

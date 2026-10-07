@@ -9,11 +9,15 @@ import pytest
 from src import claude_cli, codex_cli
 from src import coders as coders_module
 from src.coder_registry import (
+    CoderAuthCapabilities,
+    CoderAuthStatus,
     CoderPlugin,
     CoderRegistry,
     ModelCatalog,
     ModelMetadata,
     ModelSetting,
+    coder_auth_payload,
+    parse_coder_auth_payload,
 )
 from src.coders import CoderPluginConfigurationError, build_coder_registry
 from src.coders.claude import ClaudePlugin
@@ -482,6 +486,135 @@ def test_protocol_includes_run_prompt() -> None:
     assert isinstance(DummyCoderPlugin("dummy", "Dummy"), CoderPlugin)
     assert isinstance(ClaudePlugin(), CoderPlugin)
     assert isinstance(CodexPlugin(), CoderPlugin)
+
+
+def test_auth_capabilities_are_optional_protocol_metadata() -> None:
+    plugin = DummyCoderPlugin("dummy", "Dummy")
+
+    assert "auth_capabilities" not in dir(CoderPlugin)
+    assert not hasattr(plugin, "auth_capabilities")
+    assert isinstance(plugin, CoderPlugin)
+
+
+def test_auth_contract_adapts_legacy_result_and_drops_unknown_keys() -> None:
+    payload = coder_auth_payload(
+        {
+            "status": "ok",
+            "detail": "Legacy probe succeeded",
+            "raw_secret": "must-not-cross-the-boundary",
+        }
+    )
+
+    assert payload == {
+        "status": "ok",
+        "detail": "Legacy probe succeeded",
+        "cli_available": None,
+        "cli_version": None,
+        "saved_credentials_present": None,
+        "authentication_mode": None,
+        "service_access_verified": None,
+        "failure_reason": None,
+        "capabilities": {
+            "can_check_cli": None,
+            "can_check_saved_credentials": None,
+            "can_report_authentication_mode": None,
+            "can_verify_service_access": None,
+            "interactive_login_methods": None,
+        },
+    }
+    assert "must-not-cross-the-boundary" not in str(payload)
+
+
+def test_auth_contract_round_trips_explicit_status_and_capabilities() -> None:
+    payload = coder_auth_payload(
+        CoderAuthStatus(
+            status="ok",
+            detail="Credentials saved; service access not verified",
+            cli_available=True,
+            cli_version="1.2.3",
+            saved_credentials_present=True,
+            authentication_mode="browser_oauth",
+            service_access_verified=None,
+        ),
+        capabilities=CoderAuthCapabilities(
+            can_check_cli=True,
+            can_check_saved_credentials=True,
+            can_report_authentication_mode=True,
+            can_verify_service_access=False,
+            interactive_login_methods=("browser_oauth", "device_code"),
+        ),
+    )
+
+    assert parse_coder_auth_payload(payload) == payload
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        None,
+        {"status": "unknown", "detail": "bad"},
+        {"status": "ok", "detail": None},
+        {"status": "ok", "detail": "bad", "cli_available": "yes"},
+        {"status": "ok", "detail": "bad", "cli_version": 7},
+        {"status": "ok", "detail": "bad", "cli_version": "x" * 65},
+        {"status": "error", "detail": "bad", "failure_reason": "secret"},
+        {"status": "ok", "detail": "bad", "authentication_mode": "BAD"},
+        CoderAuthStatus(
+            status="ok",
+            detail="bad",
+            service_access_verified="yes",  # type: ignore[arg-type]
+        ),
+    ],
+)
+def test_auth_contract_rejects_invalid_status_fields(result: object) -> None:
+    with pytest.raises(TypeError):
+        coder_auth_payload(result)
+
+
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        CoderAuthCapabilities(
+            interactive_login_methods=["browser_oauth"]  # type: ignore[arg-type]
+        ),
+        CoderAuthCapabilities(
+            interactive_login_methods=(None,)  # type: ignore[arg-type]
+        ),
+        CoderAuthCapabilities(
+            can_check_cli="yes"  # type: ignore[arg-type]
+        ),
+    ],
+)
+def test_auth_contract_rejects_invalid_plugin_capabilities(
+    capabilities: CoderAuthCapabilities,
+) -> None:
+    with pytest.raises(TypeError):
+        coder_auth_payload(
+            {"status": "ok", "detail": "ok"},
+            capabilities=capabilities,
+        )
+
+
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        "not-a-mapping",
+        {"interactive_login_methods": "browser_oauth"},
+        {"interactive_login_methods": [1]},
+        {"interactive_login_methods": ["BAD"]},
+    ],
+)
+def test_auth_contract_rejects_invalid_wire_capabilities(
+    capabilities: object,
+) -> None:
+    with pytest.raises(TypeError):
+        parse_coder_auth_payload(
+            {
+                "status": "ok",
+                "detail": "ok",
+                "capabilities": capabilities,
+            }
+        )
 
 
 def test_protocol_includes_supports_breach_lifecycle() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -20,6 +21,38 @@ from src.coders.codex_models import (
 )
 from src.config import AppConfig, DaemonConfig
 from src.usage import OpenAIUsageProvider
+
+_CODEX_AUTH_CAPABILITIES = {
+    "can_check_cli": True,
+    "can_check_saved_credentials": True,
+    "can_report_authentication_mode": True,
+    "can_verify_service_access": False,
+    "interactive_login_methods": ["browser_oauth", "device_code"],
+}
+
+
+def _assert_codex_auth_status(
+    result: dict[str, Any],
+    *,
+    status: str,
+    detail: str,
+    cli_available: bool | None = None,
+    cli_version: str | None = None,
+    saved_credentials_present: bool | None = None,
+    authentication_mode: str | None = None,
+    failure_reason: str | None = None,
+) -> None:
+    assert result == {
+        "status": status,
+        "detail": detail,
+        "cli_available": cli_available,
+        "cli_version": cli_version,
+        "saved_credentials_present": saved_credentials_present,
+        "authentication_mode": authentication_mode,
+        "service_access_verified": None,
+        "failure_reason": failure_reason,
+        "capabilities": _CODEX_AUTH_CAPABILITIES,
+    }
 
 
 def test_codex_plugin_name() -> None:
@@ -159,7 +192,7 @@ def test_codex_plugin_check_auth(
         if cmd == ["codex", "--version"]:
             return (0, "codex 0.99.0\n", "")
         if cmd == ["codex", "login", "status"]:
-            return (0, "Logged in as test-user\n", "")
+            return (0, "Logged in using ChatGPT\n", "")
         raise AssertionError(f"unexpected command: {cmd}")
 
     monkeypatch.chdir(tmp_path)
@@ -170,10 +203,18 @@ def test_codex_plugin_check_auth(
 
     result = CodexPlugin().check_auth()
 
-    assert result == {
-        "status": "ok",
-        "detail": "codex 0.99.0 (installed); Logged in as test-user",
-    }
+    _assert_codex_auth_status(
+        result,
+        status="ok",
+        detail=(
+            "Codex CLI 0.99.0; saved ChatGPT credentials found; "
+            "service access not verified"
+        ),
+        cli_available=True,
+        cli_version="0.99.0",
+        saved_credentials_present=True,
+        authentication_mode="chatgpt",
+    )
     assert [cmd for cmd, _env in calls] == [
         ["codex", "--version"],
         ["codex", "login", "status"],
@@ -181,6 +222,190 @@ def test_codex_plugin_check_auth(
     assert all(env is not None for _cmd, env in calls)
     assert calls[0][1]["HOME"] == str(tmp_path / "codex-home")
     assert calls[1][1]["HOME"] == str(tmp_path / "codex-home")
+
+
+@pytest.mark.parametrize(
+    ("output", "expected_mode", "mode_label"),
+    [
+        ("Logged in using an API key - sk-secret", "api_key", "API-key"),
+        ("Logged in using access token", "access_token", "access-token"),
+        (
+            "Logged in using personal access token",
+            "access_token",
+            "access-token",
+        ),
+        (
+            "Logged in using workload identity",
+            "workload_identity",
+            "workload-identity",
+        ),
+    ],
+)
+def test_codex_plugin_reports_known_saved_credential_modes_without_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    output: str,
+    expected_mode: str,
+    mode_label: str,
+) -> None:
+    def fake_run_auth_command(
+        cmd: list[str], *, env: dict[str, str] | None = None
+    ) -> tuple[int, str, str]:
+        assert env is not None
+        if cmd == ["codex", "--version"]:
+            return (0, "codex-cli 0.160.0\n", "")
+        return (0, output, "")
+
+    monkeypatch.setattr(codex_module, "_run_auth_command", fake_run_auth_command)
+
+    result = CodexPlugin().check_auth(
+        config_path=str(tmp_path / "missing-config.yml")
+    )
+
+    _assert_codex_auth_status(
+        result,
+        status="ok",
+        detail=(
+            f"Codex CLI 0.160.0; saved {mode_label} credentials found; "
+            "service access not verified"
+        ),
+        cli_available=True,
+        cli_version="0.160.0",
+        saved_credentials_present=True,
+        authentication_mode=expected_mode,
+    )
+    assert "sk-secret" not in str(result)
+
+
+def test_codex_plugin_rejects_unrecognized_saved_credential_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run_auth_command(
+        cmd: list[str], *, env: dict[str, str] | None = None
+    ) -> tuple[int, str, str]:
+        assert env is not None
+        if cmd == ["codex", "--version"]:
+            return (0, "codex 0.160.0", "")
+        return (0, "Logged in with token=must-not-leak", "")
+
+    monkeypatch.setattr(codex_module, "_run_auth_command", fake_run_auth_command)
+
+    result = CodexPlugin().check_auth(
+        config_path=str(tmp_path / "missing-config.yml")
+    )
+
+    _assert_codex_auth_status(
+        result,
+        status="error",
+        detail=(
+            "Codex CLI 0.160.0; saved credential status could not be recognized"
+        ),
+        cli_available=True,
+        cli_version="0.160.0",
+        failure_reason="unrecognized_output",
+    )
+    assert "must-not-leak" not in str(result)
+
+
+def test_codex_plugin_bounds_saved_credential_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run_auth_command(
+        cmd: list[str], *, env: dict[str, str] | None = None
+    ) -> tuple[int, str, str]:
+        assert env is not None
+        if cmd == ["codex", "--version"]:
+            return (0, "codex 0.160.0", "")
+        return (124, "", "secret timeout details")
+
+    monkeypatch.setattr(codex_module, "_run_auth_command", fake_run_auth_command)
+
+    result = CodexPlugin().check_auth(
+        config_path=str(tmp_path / "missing-config.yml")
+    )
+
+    _assert_codex_auth_status(
+        result,
+        status="error",
+        detail="Codex CLI 0.160.0; saved credential check timed out",
+        cli_available=True,
+        cli_version="0.160.0",
+        failure_reason="probe_timeout",
+    )
+    assert "secret timeout details" not in str(result)
+
+
+@pytest.mark.parametrize(
+    ("version_result", "detail", "cli_available", "failure_reason"),
+    [
+        (
+            (124, "", "secret timeout details"),
+            "Codex CLI version check timed out",
+            None,
+            "probe_timeout",
+        ),
+        (
+            (0, "unexpected version token=secret", ""),
+            "Codex CLI returned an unrecognized version",
+            True,
+            "unrecognized_output",
+        ),
+    ],
+)
+def test_codex_plugin_bounds_version_probe_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    version_result: tuple[int, str, str],
+    detail: str,
+    cli_available: bool | None,
+    failure_reason: str,
+) -> None:
+    monkeypatch.setattr(
+        codex_module,
+        "_run_auth_command",
+        lambda _cmd, *, env=None: version_result,
+    )
+
+    result = CodexPlugin().check_auth(
+        config_path=str(tmp_path / "missing-config.yml")
+    )
+
+    _assert_codex_auth_status(
+        result,
+        status="error",
+        detail=detail,
+        cli_available=cli_available,
+        failure_reason=failure_reason,
+    )
+    assert "secret" not in str(result)
+
+
+def test_codex_plugin_bounds_generic_saved_credential_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run_auth_command(
+        cmd: list[str], *, env: dict[str, str] | None = None
+    ) -> tuple[int, str, str]:
+        assert env is not None
+        if cmd == ["codex", "--version"]:
+            return (0, "codex 0.160.0", "")
+        return (2, "", "provider response token=secret")
+
+    monkeypatch.setattr(codex_module, "_run_auth_command", fake_run_auth_command)
+
+    result = CodexPlugin().check_auth(
+        config_path=str(tmp_path / "missing-config.yml")
+    )
+
+    _assert_codex_auth_status(
+        result,
+        status="error",
+        detail="Codex CLI 0.160.0; saved credential check failed",
+        cli_available=True,
+        cli_version="0.160.0",
+        failure_reason="probe_failed",
+    )
+    assert "secret" not in str(result)
 
 
 def test_codex_plugin_create_usage_provider(
@@ -298,10 +523,15 @@ def test_check_auth_detail_fallback_for_unknown_version_stderr(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(codex_module, "_run_auth_command", fake_run_auth_command)
 
-    assert CodexPlugin().check_auth() == {
-        "status": "error",
-        "detail": "mysterious failure",
-    }
+    result = CodexPlugin().check_auth()
+
+    _assert_codex_auth_status(
+        result,
+        status="error",
+        detail="Codex CLI version check failed",
+        failure_reason="probe_failed",
+    )
+    assert "mysterious failure" not in str(result)
 
 
 def test_check_auth_version_not_found_returns_cli_not_installed(
@@ -325,10 +555,13 @@ def test_check_auth_version_not_found_returns_cli_not_installed(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(codex_module, "_run_auth_command", fake_run_auth_command)
 
-    assert CodexPlugin().check_auth() == {
-        "status": "error",
-        "detail": "codex CLI not installed",
-    }
+    _assert_codex_auth_status(
+        CodexPlugin().check_auth(),
+        status="error",
+        detail="Codex CLI is not installed",
+        cli_available=False,
+        failure_reason="cli_missing",
+    )
 
 
 def test_check_auth_login_status_not_found_returns_cli_not_installed(
@@ -354,10 +587,14 @@ def test_check_auth_login_status_not_found_returns_cli_not_installed(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(codex_module, "_run_auth_command", fake_run_auth_command)
 
-    assert CodexPlugin().check_auth() == {
-        "status": "error",
-        "detail": "codex CLI not installed",
-    }
+    _assert_codex_auth_status(
+        CodexPlugin().check_auth(),
+        status="error",
+        detail="Codex CLI is not installed",
+        cli_available=False,
+        cli_version="0.99.0",
+        failure_reason="cli_missing",
+    )
 
 
 @pytest.mark.asyncio
@@ -569,7 +806,7 @@ async def test_codex_plugin_forwards_auxiliary_reasoning_effort(
         assert kwargs["on_supervised_process_start"] is supervised_callback
 
 
-def test_check_auth_detail_mentions_api_key_when_set_but_unverified(
+def test_api_key_environment_does_not_manufacture_saved_authentication(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     cfg = tmp_path / "config.yml"
@@ -586,20 +823,25 @@ def test_check_auth_detail_mentions_api_key_when_set_but_unverified(
         if cmd == ["codex", "--version"]:
             return (0, "codex 0.99.0\n", "")
         if cmd == ["codex", "login", "status"]:
-            return (1, "", "login required")
+            return (1, "", "Not logged in")
         raise AssertionError(f"unexpected command: {cmd}")
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setattr(codex_module, "_run_auth_command", fake_run_auth_command)
 
-    assert CodexPlugin().check_auth() == {
-        "status": "error",
-        "detail": (
-            "codex 0.99.0 (installed); "
-            "login required (OPENAI_API_KEY set but unverified)"
+    _assert_codex_auth_status(
+        CodexPlugin().check_auth(),
+        status="error",
+        detail=(
+            "Codex CLI 0.99.0; no saved credentials found; "
+            "service access not verified"
         ),
-    }
+        cli_available=True,
+        cli_version="0.99.0",
+        saved_credentials_present=False,
+        failure_reason="credentials_missing",
+    )
 
 
 def test_rate_limit_patterns_returns_both_codex_patterns() -> None:
