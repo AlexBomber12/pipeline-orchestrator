@@ -3266,6 +3266,11 @@ def test_device_login_start_rejects_invalid_request_body(
             content=b"\xff",
             headers={"Content-Type": "application/json"},
         )
+        invalid_media_type = client.post(
+            "/api/coders/codex/device-login",
+            content=b'{"replace_existing":true}',
+            headers={"Content-Type": "text/plain"},
+        )
 
     assert invalid_type.status_code == 422
     assert extra_field.status_code == 422
@@ -3273,6 +3278,10 @@ def test_device_login_start_rejects_invalid_request_body(
     assert invalid_encoding.status_code == 400
     assert invalid_encoding.json() == {
         "detail": "Invalid JSON device-login request body"
+    }
+    assert invalid_media_type.status_code == 415
+    assert invalid_media_type.json() == {
+        "detail": "Device-login API requests must use application/json"
     }
 
 
@@ -3515,6 +3524,10 @@ def test_device_login_inspection_renders_terminal_and_unresolved_states(
     if payload["state"] == "cleanup_failed":
         assert "do not assume the login process stopped" in response.text
         assert "Retry cleanup check" in response.text
+        assert 'hx-trigger="submit once"' not in response.text
+        assert 'hx-sync="closest [data-device-login-shell]:drop"' in (
+            response.text
+        )
     if payload["state"] == "not_found":
         assert "No new login was started automatically" in response.text
 

@@ -1331,6 +1331,17 @@ async def _device_login_start_request(
                     raw["replace_existing"] = False
         else:
             body = await request.body()
+            media_type = (
+                request.headers.get("content-type", "")
+                .partition(";")[0]
+                .strip()
+                .lower()
+            )
+            if body and media_type != "application/json":
+                raise HTTPException(
+                    status_code=415,
+                    detail="Device-login API requests must use application/json",
+                )
             try:
                 raw = json.loads(body.decode("utf-8")) if body else {}
             except (UnicodeDecodeError, json.JSONDecodeError):
