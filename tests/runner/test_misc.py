@@ -1045,6 +1045,61 @@ def test_restore_current_run_record_logs_metrics_lookup_failure() -> None:
     )
 
 
+def test_restore_current_run_record_rehydrates_latest_invocation() -> None:
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner._start_current_run_record("codex", "gpt-5.4")
+    runner._capture_invocation_snapshot(
+        "codex",
+        {"model": "gpt-5.4", "reasoning_effort": "high"},
+        phase="coding",
+    )
+    latest = runner._capture_invocation_snapshot(
+        "claude",
+        {"model": "sonnet"},
+        phase="fix",
+        fix_iteration=1,
+    )
+    asyncio.run(runner._checkpoint_current_run_record())
+    runner._current_run_record = None
+    runner.state.active_invocation = None
+
+    asyncio.run(runner._restore_current_run_record())
+
+    assert runner._current_run_record is not None
+    assert runner.state.active_invocation == latest
+
+
+def test_restore_current_run_record_preserves_newer_state_snapshot() -> None:
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner._start_current_run_record("codex", "gpt-5.4")
+    runner._capture_invocation_snapshot(
+        "codex", {"model": "gpt-5.4"}, phase="coding"
+    )
+    asyncio.run(runner._checkpoint_current_run_record())
+    newer = runner._capture_invocation_snapshot(
+        "third", {"model": "third-fix"}, phase="fix", fix_iteration=1
+    )
+    runner._current_run_record = None
+
+    asyncio.run(runner._restore_current_run_record())
+
+    assert runner.state.active_invocation == newer
+
+
 def test_save_current_run_record_sets_duration_none_for_invalid_started_at() -> None:
     runner = h._make_runner()
     runner.state.current_task = QueueTask(

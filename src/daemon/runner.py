@@ -1634,6 +1634,12 @@ class PipelineRunner(
             (record for record in recent if record.task_id == task.pr_id),
             None,
         )
+        if (
+            self.state.active_invocation is None
+            and self._current_run_record is not None
+            and self._current_run_record.invocations
+        ):
+            self.state.active_invocation = self._current_run_record.invocations[-1]
 
     async def _save_current_run_record(
         self,

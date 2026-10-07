@@ -489,6 +489,7 @@ class CodingMixin:
             coder_kwargs,
             phase="coding",
         )
+        await self._checkpoint_current_run_record()
         await self.publish_state()
         heartbeat = asyncio.create_task(self._publish_while_waiting("CODING"))
         self._coder_invocation_active = True

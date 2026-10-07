@@ -2563,6 +2563,12 @@ def test_handle_coding_uses_codex_cli_when_coder_is_codex(
     async def fake_run_planned_pr(path: str, *_args: object, **kwargs: object) -> tuple:
         captured_module.append("codex")
         captured_kwargs.append(dict(kwargs))
+        assert runner._current_run_record is not None
+        checkpointed = await runner._metrics_store.get(
+            runner._current_run_record.run_id
+        )
+        assert checkpointed is not None
+        assert checkpointed.invocations == [runner.state.active_invocation]
         runner.app_config.daemon.coder_settings = {
             "codex": {
                 "model": "changed-after-dispatch",
