@@ -254,6 +254,13 @@ def _snapshot_result(
             or not isinstance(decoded.get("last_updated"), str)
         ):
             raise ValueError
+        current_pr = decoded.get("current_pr")
+        if current_pr is not None:
+            if not isinstance(current_pr, dict):
+                raise ValueError
+            pr_number = current_pr.get("number")
+            if isinstance(pr_number, bool) or not isinstance(pr_number, int):
+                raise ValueError
         source_timestamp = _timestamp(decoded["last_updated"])
         if source_timestamp is None:
             raise ValueError
@@ -492,6 +499,21 @@ def _retry_metadata(command: RetryCommand, ttl: int) -> dict[str, Any] | None:
 
 
 async def _pending_retries(client: Any, slug: str, limit: int) -> dict[str, Any]:
+    try:
+        async with asyncio.timeout(_REDIS_TIMEOUT_SECONDS):
+            return await _pending_retries_before_timeout(client, slug, limit)
+    except TimeoutError:
+        return {
+            "status": "unavailable",
+            "code": "retry_record_read_failed",
+            "records": [],
+            "record_count": None,
+            "scanned_index_entries": 0,
+            "truncated": False,
+        }
+
+
+async def _pending_retries_before_timeout(client: Any, slug: str, limit: int) -> dict[str, Any]:
     index_key = retry_command_pending(slug)
     try:
         page = await client.eval_ro(

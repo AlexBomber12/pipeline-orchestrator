@@ -738,6 +738,49 @@ def test_snapshot_requires_producer_state_and_control_flags(
     assert state is None
 
 
+@pytest.mark.parametrize("pr_number", [True, "7", 7.0])
+def test_snapshot_rejects_coerced_current_pr_number(pr_number: object) -> None:
+    from src.mcp.tools import diagnostics
+
+    payload = json.loads(_state(updated=NOW).model_dump_json())
+    payload["current_pr"]["number"] = pr_number
+
+    result, state = diagnostics._snapshot_result(
+        json.dumps(payload),
+        size_bytes=100,
+        oversized=False,
+        slug=SLUG,
+        repo=_repo(),
+        config=_config(_repo()),
+        observed_at=NOW,
+    )
+
+    assert result["status"] == "malformed"
+    assert result["code"] == "snapshot_invalid"
+    assert state is None
+
+
+def test_snapshot_rejects_non_object_current_pr() -> None:
+    from src.mcp.tools import diagnostics
+
+    payload = json.loads(_state(updated=NOW).model_dump_json())
+    payload["current_pr"] = []
+
+    result, state = diagnostics._snapshot_result(
+        json.dumps(payload),
+        size_bytes=100,
+        oversized=False,
+        slug=SLUG,
+        repo=_repo(),
+        config=_config(_repo()),
+        observed_at=NOW,
+    )
+
+    assert result["status"] == "malformed"
+    assert result["code"] == "snapshot_invalid"
+    assert state is None
+
+
 def test_pipeline_and_inhibitor_allowlists() -> None:
     from src.mcp.tools import diagnostics
 
@@ -902,6 +945,45 @@ async def test_retry_source_bounds_and_malformed_records() -> None:
     command.command_id = str(uuid.uuid4())
     command.task_id = "secret"
     assert diagnostics._retry_metadata(command, 1) is None
+
+
+async def test_retry_source_has_whole_scan_deadline_and_propagates_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    class BlockingRetryRedis(FakeRedis):
+        def __init__(self) -> None:
+            super().__init__()
+            self.read_started = asyncio.Event()
+
+        async def getrange(self, key: str, start: int, end: int) -> object:
+            self._check("getrange", key)
+            self.read_started.set()
+            await asyncio.Event().wait()
+
+    redis = BlockingRetryRedis()
+    index = retry_command_pending(SLUG)
+    redis.zsets[index] = [(str(uuid.uuid4()), 1.0)]
+    monkeypatch.setattr(diagnostics, "_REDIS_TIMEOUT_SECONDS", 0.01)
+
+    result = await diagnostics._pending_retries(redis, SLUG, 5)
+    assert result == {
+        "status": "unavailable",
+        "code": "retry_record_read_failed",
+        "records": [],
+        "record_count": None,
+        "scanned_index_entries": 0,
+        "truncated": False,
+    }
+
+    monkeypatch.setattr(diagnostics, "_REDIS_TIMEOUT_SECONDS", 30.0)
+    redis.read_started.clear()
+    task = asyncio.create_task(diagnostics._pending_retries(redis, SLUG, 5))
+    await redis.read_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 def test_run_metadata_allowlist_and_validation() -> None:
