@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import subprocess
 import types
 from typing import Any
@@ -199,6 +200,113 @@ def test_credential_location_in_use_checks_active_runners() -> None:
     assert first.locations == ["/auth"]
     assert second.locations == ["/auth"]
     assert third.locations == []
+
+
+def test_main_sigterm_awaits_owned_task_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callbacks: dict[signal.Signals, Any] = {}
+    removed: list[signal.Signals] = []
+    child_started = asyncio.Event()
+    child_cleaned = asyncio.Event()
+
+    async def owned_child() -> None:
+        child_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            child_cleaned.set()
+
+    async def fake_run_daemon(
+        owned_tasks: set[asyncio.Task[None]],
+    ) -> None:
+        child = asyncio.create_task(owned_child())
+        owned_tasks.add(child)
+        await child_started.wait()
+        await asyncio.Event().wait()
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(
+            loop,
+            "add_signal_handler",
+            lambda sig, callback: callbacks.__setitem__(sig, callback),
+        )
+        monkeypatch.setattr(
+            loop,
+            "remove_signal_handler",
+            lambda sig: removed.append(sig) or True,
+        )
+        monkeypatch.setattr(main_module, "_run_daemon", fake_run_daemon)
+
+        main_task = asyncio.create_task(main_module.main())
+        await child_started.wait()
+        callbacks[signal.SIGTERM]()
+        await main_task
+
+        assert child_cleaned.is_set()
+
+    asyncio.run(scenario())
+
+    assert removed == [signal.SIGTERM]
+
+
+def test_main_external_cancellation_propagates_after_owned_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child_started = asyncio.Event()
+    child_cleaned = asyncio.Event()
+
+    async def owned_child() -> None:
+        child_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            child_cleaned.set()
+
+    async def fake_run_daemon(
+        owned_tasks: set[asyncio.Task[None]],
+    ) -> None:
+        child = asyncio.create_task(owned_child())
+        owned_tasks.add(child)
+        await child_started.wait()
+        await asyncio.Event().wait()
+
+    async def scenario() -> None:
+        monkeypatch.setattr(main_module, "_run_daemon", fake_run_daemon)
+        main_task = asyncio.create_task(main_module.main())
+        await child_started.wait()
+        main_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await main_task
+        assert child_cleaned.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_main_degrades_when_signal_handlers_are_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def fake_run_daemon(
+        _owned_tasks: set[asyncio.Task[None]],
+    ) -> None:
+        return None
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(
+            loop,
+            "add_signal_handler",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("unsupported")),
+        )
+        monkeypatch.setattr(main_module, "_run_daemon", fake_run_daemon)
+        await main_module.main()
+
+    with caplog.at_level(logging.WARNING, logger=main_module.logger.name):
+        asyncio.run(scenario())
+
+    assert "SIGTERM handler unavailable" in caplog.text
 
 
 def test_main_creates_one_runner_per_repo(

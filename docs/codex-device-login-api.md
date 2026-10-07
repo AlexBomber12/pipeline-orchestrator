@@ -48,6 +48,8 @@ the daemon still retains ownership because the complete login lifecycle is not
 proven quiescent. A later cancel or shutdown request performs a fresh
 observation-only process reconciliation and settles the session task;
 ownership is released only after both are confirmed stopped.
+The daemon's SIGTERM path cancels and awaits its owned bridge task before the
+process exits, so service shutdown runs this same session cleanup contract.
 
 ## Lifecycle and identity
 

@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import time
 from functools import partial
@@ -732,7 +733,7 @@ def _credential_location_in_use(
     )
 
 
-async def main() -> None:
+async def _run_daemon(owned_tasks: set[asyncio.Task[None]]) -> None:
     """Initialize runners and drive the poll loop forever."""
     gh_dir = os.environ.get("GH_CONFIG_DIR")
     if gh_dir:
@@ -765,7 +766,7 @@ async def main() -> None:
     credential_reservations = CoderCredentialReservations()
     # Publish configured metadata as soon as Redis is available so web startup
     # never needs to import or instantiate operator-provided plugin code.
-    _background_tasks: set[asyncio.Task[None]] = set()
+    _background_tasks = owned_tasks
     model_catalog_task = asyncio.create_task(
         serve_model_catalog_requests(
             redis_client,
@@ -963,7 +964,10 @@ async def main() -> None:
                 # the moment it returns and the per-runner interval would be
                 # ignored on long jobs.
                 last_run[key] = now
-                in_flight[key] = asyncio.create_task(runner.run_cycle())
+                cycle_task = asyncio.create_task(runner.run_cycle())
+                in_flight[key] = cycle_task
+                _background_tasks.add(cycle_task)
+                cycle_task.add_done_callback(_background_tasks.discard)
 
             # Clean up last_run entries for removed runners.
             for key in list(last_run.keys()):
@@ -1024,6 +1028,46 @@ async def main() -> None:
             await _close_pubsub(pubsub)
             pubsub = None
             subscribed_slugs = ()
+
+
+async def main() -> None:
+    """Run the daemon and await owned-task cleanup on process termination."""
+    loop = asyncio.get_running_loop()
+    owned_tasks: set[asyncio.Task[None]] = set()
+    daemon_task = asyncio.create_task(_run_daemon(owned_tasks))
+    sigterm_requested = False
+
+    def request_sigterm_shutdown() -> None:
+        nonlocal sigterm_requested
+        sigterm_requested = True
+        daemon_task.cancel()
+
+    def remove_sigterm_handler() -> None:
+        return None
+
+    try:
+        loop.add_signal_handler(signal.SIGTERM, request_sigterm_shutdown)
+    except (NotImplementedError, RuntimeError):  # pragma: no cover - non-Unix loop
+        logger.warning("SIGTERM handler unavailable; using platform defaults")
+    else:
+        remove_sigterm_handler = partial(
+            loop.remove_signal_handler,
+            signal.SIGTERM,
+        )
+
+    try:
+        await daemon_task
+    except asyncio.CancelledError:
+        if not sigterm_requested:
+            raise
+        logger.info("SIGTERM received; shutting down daemon")
+    finally:
+        remove_sigterm_handler()
+        tasks = tuple(owned_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":  # pragma: no cover  # entry point invoked via python -m
