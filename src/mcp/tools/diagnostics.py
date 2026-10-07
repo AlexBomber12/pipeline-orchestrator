@@ -94,6 +94,13 @@ _PEM_CREDENTIAL_END = re.compile(
     r"-----END (?:[A-Z0-9 ]*PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----",
     re.IGNORECASE,
 )
+_TERMINAL_ESCAPE = re.compile(
+    r"(?:\x1b\][^\x07]*(?:\x07|\x1b\\)|"
+    r"\x1bP.*?\x1b\\|"
+    r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|"
+    r"\x1b[ -/]*[@-~])",
+    re.DOTALL,
+)
 _JSON_CONTAINER_START = re.compile(r"[\[{]")
 _URL_USERINFO = re.compile(r"(?i)(?P<scheme>\b[a-z][a-z0-9+.-]*://)[^/@\s]+@")
 _SENSITIVE_CONTEXT_LINE = re.compile(
@@ -965,6 +972,25 @@ def _contains_credential_document_key(value: object) -> bool:
     return False
 
 
+def _normalize_terminal_text(text: str) -> tuple[str, int]:
+    text, removed = _TERMINAL_ESCAPE.subn("", text)
+    text = text.replace("\r\n", "\n")
+    normalized: list[str] = []
+    for character in text:
+        if character == "\b":
+            removed += 1
+            if normalized and normalized[-1] != "\n":
+                normalized.pop()
+        elif character == "\r":
+            removed += 1
+            normalized.append("\n")
+        elif (ord(character) < 32 and character not in {"\n", "\t"}) or character == "\x7f":
+            removed += 1
+        else:
+            normalized.append(character)
+    return "".join(normalized), removed
+
+
 def _json_container_end(text: str, start: int) -> int:
     stack = [text[start]]
     in_string = False
@@ -1062,6 +1088,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
 
 
 def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
+    text, terminal_controls = _normalize_terminal_text(text)
     text, pem_documents = _PEM_CREDENTIAL_DOCUMENT.subn(_CREDENTIAL_DOCUMENT_OMITTED, text)
     orphaned_begin = _PEM_CREDENTIAL_BEGIN.search(text)
     if orphaned_begin is not None:
@@ -1073,7 +1100,7 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
         pem_documents += 1
     text, json_documents = _omit_json_credential_documents(text)
     text, credential_lines = _omit_sensitive_context_lines(text)
-    redactions = pem_documents + json_documents + credential_lines
+    redactions = terminal_controls + pem_documents + json_documents + credential_lines
 
     text, count = _URL_USERINFO.subn(lambda match: f"{match.group('scheme')}{_REDACTED}@", text)
     redactions += count

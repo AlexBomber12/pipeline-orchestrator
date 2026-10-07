@@ -457,6 +457,12 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             'password="alpha unterminated-credential-secret',
             "PASSWORD = spaced-assignment-secret",
             "Authorization : Bearer spaced-header-secret",
+            "\x1b[31mpassword=ansi-secret\x1b[0m",
+            "pass\x1b[34mword=embedded-ansi-secret",
+            "\x1b]0;title\x07password=osc-secret",
+            "passX\bword=backspace-secret",
+            "safe-carriage\rpassword=carriage-secret",
+            "visible\x00-control",
             "matched-bad={private_key:matched-container-secret}",
             '{"private_key":"same-line-document-secret"} password=same-line-trailing-secret',
             "password: |",
@@ -494,6 +500,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "[credential line omitted]" in exported
     assert "safe-after-yaml" in exported
     assert "safe-after-shell" in exported
+    assert "visible-control" in exported
+    assert "\x1b" not in exported
+    assert "\x00" not in exported
     assert "safe-output" in exported
     assert "private@example.test" not in exported
     assert "hidden-array-project" not in exported
@@ -523,6 +532,11 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "unwrapped-escaped-secret",
         "spaced-assignment-secret",
         "spaced-header-secret",
+        "ansi-secret",
+        "embedded-ansi-secret",
+        "osc-secret",
+        "backspace-secret",
+        "carriage-secret",
         "matched-container-secret",
         "same-line-document-secret",
         "same-line-trailing-secret",
