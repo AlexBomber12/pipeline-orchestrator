@@ -48,6 +48,11 @@ the daemon still retains ownership because the complete login lifecycle is not
 proven quiescent. A later cancel or shutdown request performs a fresh
 observation-only process reconciliation and settles the session task;
 ownership is released only after both are confirmed stopped.
+The same rule applies when CLI startup fails after a process may have been
+created: structured launcher cleanup evidence determines the result, and any
+retained supervision handle is used for later reconciliation. If no safe
+ownership handle exists, the session and reservation remain unconfirmed rather
+than inferring cleanup from an exception string.
 The daemon's SIGTERM path cancels and awaits its owned bridge task before the
 process exits, so service shutdown runs this same session cleanup contract.
 

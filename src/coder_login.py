@@ -22,6 +22,7 @@ from src.coder_registry import (
 )
 from src.config import load_config
 from src.process_supervisor import (
+    ProcessLaunchCleanupError,
     ProcessSupervisionError,
     SupervisedProcess,
     launch_process,
@@ -291,6 +292,9 @@ class CoderLoginSessionManager:
         session.user_code = None
         session.expires_at = None
         if session.managed is None:
+            if session.cleanup_confirmed is False:
+                self._cleanup_failed(session)
+                return self._session_payload(session)
             if session.task is not None:
                 session.task.cancel()
                 await asyncio.gather(session.task, return_exceptions=True)
@@ -347,6 +351,9 @@ class CoderLoginSessionManager:
                 session.task.cancel()
         for session in active:
             if session.managed is None:
+                if session.cleanup_confirmed is False:
+                    self._cleanup_failed(session)
+                    continue
                 cleanup_confirmed_session_ids.add(session.session_id)
                 continue
             if not await self._cleanup(session):
@@ -448,6 +455,16 @@ class CoderLoginSessionManager:
                     cwd=session.adapter.working_directory,
                     env=dict(session.adapter.environment),
                 )
+            except ProcessLaunchCleanupError as exc:
+                session.managed = exc.managed
+                self._cleanup_failed(
+                    session,
+                    detail=(
+                        "Device-code login startup cleanup could not confirm "
+                        "process termination"
+                    ),
+                )
+                return
             except FileNotFoundError:
                 self._finish(
                     session,
@@ -687,7 +704,7 @@ class CoderLoginSessionManager:
     async def _cleanup(self, session: _LoginSession) -> bool:
         managed = session.managed
         if managed is None:
-            return True
+            return session.cleanup_confirmed is not False
         try:
             if session.cleanup_confirmed is False:
                 result = await managed.reconcile_cleanup(

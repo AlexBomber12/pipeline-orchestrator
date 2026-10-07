@@ -22,6 +22,7 @@ from src.config import AppConfig
 from src.process_supervisor import (
     CleanupResult,
     CleanupStatus,
+    ProcessLaunchCleanupError,
     ProcessRunResult,
     ProcessSupervisionError,
 )
@@ -437,7 +438,8 @@ async def test_device_login_reports_missing_cli_before_launch(
 async def test_device_login_sanitizes_startup_failure(
     monkeypatch: pytest.MonkeyPatch, error: Exception, reason: str
 ) -> None:
-    manager, _ = _manager()
+    reservations = CoderCredentialReservations()
+    manager, _ = _manager(reservations=reservations)
 
     async def auth_probe(*_args: object, **_kwargs: object) -> dict[str, Any]:
         return _auth(False)
@@ -453,7 +455,123 @@ async def test_device_login_sanitizes_startup_failure(
     result = await _wait_for_state(manager, started["session_id"], "failed")
 
     assert result["failure_reason"] == reason
+    assert result["cleanup_confirmed"] is True
     assert "launch-secret" not in json.dumps(result)
+    assert reservations.reserve_coder("/tmp/fake-codex-home") is True
+    reservations.release_coder("/tmp/fake-codex-home")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["cancel", "shutdown"])
+async def test_device_login_failed_launch_retains_until_reconciled(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    reservations = CoderCredentialReservations()
+    manager, _ = _manager(reservations=reservations)
+    managed = _Managed(quiescent=False, reconcile_quiescent=False)
+
+    async def auth_probe(*_args: object, **_kwargs: object) -> dict[str, Any]:
+        return _auth(False)
+
+    async def launch(*_args: object, **_kwargs: object) -> object:
+        raise ProcessLaunchCleanupError(
+            "launch-cleanup-secret",
+            managed=managed,  # type: ignore[arg-type]
+            cleanup_result=CleanupResult(
+                CleanupStatus.FAILED,
+                None,
+                True,
+                True,
+                "ownership-secret",
+            ),
+        )
+
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", auth_probe)
+    monkeypatch.setattr(coder_login, "launch_process", launch)
+    started = await manager.start(
+        "codex", expected_reference=_REFERENCE, replace_existing=False
+    )
+    failed = await _wait_for_state(
+        manager, started["session_id"], "cleanup_failed"
+    )
+
+    assert failed["cleanup_confirmed"] is False
+    assert "secret" not in json.dumps(failed)
+    assert reservations.reserve_coder("/tmp/fake-codex-home") is False
+    inspected = await manager.inspect(
+        "codex", started["session_id"], expected_reference=_REFERENCE
+    )
+    assert inspected["cleanup_confirmed"] is False
+
+    if operation == "cancel":
+        still_unconfirmed = await manager.cancel(
+            "codex", started["session_id"], expected_reference=_REFERENCE
+        )
+    else:
+        await manager.shutdown()
+        still_unconfirmed = await manager.inspect(
+            "codex", started["session_id"], expected_reference=_REFERENCE
+        )
+    assert still_unconfirmed["cleanup_confirmed"] is False
+    assert reservations.reserve_coder("/tmp/fake-codex-home") is False
+
+    managed.reconcile_quiescent = True
+    if operation == "cancel":
+        reconciled = await manager.cancel(
+            "codex", started["session_id"], expected_reference=_REFERENCE
+        )
+    else:
+        await manager.shutdown()
+        reconciled = await manager.inspect(
+            "codex", started["session_id"], expected_reference=_REFERENCE
+        )
+    assert reconciled["state"] == "cancelled"
+    assert reconciled["cleanup_confirmed"] is True
+    assert managed.cleanup_calls == 0
+    assert managed.reconcile_calls == 2
+    assert reservations.reserve_coder("/tmp/fake-codex-home") is True
+    reservations.release_coder("/tmp/fake-codex-home")
+
+
+@pytest.mark.asyncio
+async def test_device_login_failed_launch_without_handle_stays_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reservations = CoderCredentialReservations()
+    manager, _ = _manager(reservations=reservations)
+
+    async def auth_probe(*_args: object, **_kwargs: object) -> dict[str, Any]:
+        return _auth(False)
+
+    async def launch(*_args: object, **_kwargs: object) -> object:
+        raise ProcessLaunchCleanupError(
+            "launch-cleanup-secret",
+            managed=None,
+            cleanup_result=None,
+        )
+
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", auth_probe)
+    monkeypatch.setattr(coder_login, "launch_process", launch)
+    started = await manager.start(
+        "codex", expected_reference=_REFERENCE, replace_existing=False
+    )
+    failed = await _wait_for_state(
+        manager, started["session_id"], "cleanup_failed"
+    )
+
+    assert failed["cleanup_confirmed"] is False
+    assert reservations.reserve_coder("/tmp/fake-codex-home") is False
+    cancelled = await manager.cancel(
+        "codex", started["session_id"], expected_reference=_REFERENCE
+    )
+    assert cancelled["cleanup_confirmed"] is False
+    await manager.shutdown()
+    after_shutdown = await manager.inspect(
+        "codex", started["session_id"], expected_reference=_REFERENCE
+    )
+    assert after_shutdown["cleanup_confirmed"] is False
+    assert reservations.reserve_coder("/tmp/fake-codex-home") is False
 
 
 @pytest.mark.asyncio

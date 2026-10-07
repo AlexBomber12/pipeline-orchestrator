@@ -197,6 +197,21 @@ class ProcessSupervisionError(RuntimeError):
         self.stderr = stderr
 
 
+class ProcessLaunchCleanupError(RuntimeError):
+    """A failed launch whose cleanup did not prove process quiescence."""
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        managed: SupervisedProcess | None,
+        cleanup_result: CleanupResult | None,
+    ) -> None:
+        super().__init__(detail)
+        self.managed = managed
+        self.cleanup_result = cleanup_result
+
+
 class _GroupState(Enum):
     LIVE = "live"
     QUIESCENT = "quiescent"
@@ -1163,15 +1178,21 @@ async def _finish_failed_launch(
         )
         if result.quiescent:
             return
-        raise RuntimeError(
+        raise ProcessLaunchCleanupError(
             "failed launch cleanup could not confirm quiescence: "
-            f"{result.detail or 'unknown cleanup failure'}"
+            f"{result.detail or 'unknown cleanup failure'}",
+            managed=owned_process,
+            cleanup_result=result,
         )
 
+    leader_quiescent = process is None
+    witness_quiescent = witness_pid is None
+    kill_sent = False
     try:
         if process is not None:
             try:
                 process.kill()
+                kill_sent = True
             except OSError:
                 pass
         os.close(control_fd)
@@ -1180,15 +1201,18 @@ async def _finish_failed_launch(
                 await asyncio.wait_for(
                     process.wait(), _LAUNCH_CLEANUP_TIMEOUT_SECONDS
                 )
+                leader_quiescent = True
             except TimeoutError:
                 try:
                     process.kill()
+                    kill_sent = True
                 except OSError:
                     pass
                 try:
                     await asyncio.wait_for(
                         process.wait(), _LAUNCH_CLEANUP_TIMEOUT_SECONDS
                     )
+                    leader_quiescent = True
                 except TimeoutError:
                     pass
         if witness_pid is not None:
@@ -1199,8 +1223,10 @@ async def _finish_failed_launch(
                 try:
                     reaped_pid, _ = os.waitpid(witness_pid, os.WNOHANG)
                 except ChildProcessError:
+                    witness_quiescent = True
                     break
                 if reaped_pid == witness_pid:
+                    witness_quiescent = True
                     break
                 if loop.time() >= deadline:
                     if force_sent:
@@ -1218,6 +1244,26 @@ async def _finish_failed_launch(
     finally:
         if witness_pidfd is not None:
             os.close(witness_pidfd)
+    if leader_quiescent and witness_quiescent:
+        return
+    unconfirmed = []
+    if not leader_quiescent:
+        unconfirmed.append("process leader")
+    if not witness_quiescent:
+        unconfirmed.append("lifecycle witness")
+    detail = f"failed launch cleanup could not confirm {' and '.join(unconfirmed)} exit"
+    result = CleanupResult(
+        CleanupStatus.FAILED,
+        getattr(process, "returncode", None),
+        False,
+        kill_sent,
+        detail,
+    )
+    raise ProcessLaunchCleanupError(
+        detail,
+        managed=None,
+        cleanup_result=result,
+    )
 
 
 async def _wait_without_cancelling(task: asyncio.Task[None]) -> None:
@@ -1489,7 +1535,12 @@ async def run_supervised_process(
 
 
 async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
-    """Launch ``program`` in a new Linux session and retain its group identity."""
+    """Launch ``program`` in a new Linux session and retain its group identity.
+
+    Startup errors are raised unchanged only after failed-launch cleanup is
+    confirmed. ``ProcessLaunchCleanupError`` instead carries structured cleanup
+    evidence and any proven ownership handle when quiescence is unconfirmed.
+    """
     conflicts = {"start_new_session", "process_group", "preexec_fn"} & kwargs.keys()
     if conflicts:
         names = ", ".join(sorted(conflicts))
@@ -1710,7 +1761,16 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
         )
         control_write = -1
         witness_pidfd = None
-        await _wait_without_cancelling(cleanup_task)
+        try:
+            await _wait_without_cancelling(cleanup_task)
+        except ProcessLaunchCleanupError:
+            raise
+        except BaseException as cleanup_error:
+            raise ProcessLaunchCleanupError(
+                "failed launch cleanup did not complete safely",
+                managed=owned_process,
+                cleanup_result=None,
+            ) from cleanup_error
         raise
     finally:
         if control_read >= 0:

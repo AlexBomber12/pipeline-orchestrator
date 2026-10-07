@@ -24,6 +24,7 @@ from src.process_supervisor import (
     CleanupResult,
     CleanupStatus,
     ProcessIdentity,
+    ProcessLaunchCleanupError,
     ProcessSupervisionError,
     SupervisedProcess,
     _GroupMember,
@@ -2095,15 +2096,50 @@ async def test_launch_deadline_helpers_bound_stubborn_tasks(
         patch.setattr(
             process_supervisor, "_LAUNCH_CLEANUP_TIMEOUT_SECONDS", 0
         )
-        await process_supervisor._finish_failed_launch(
-            fake_process,  # type: ignore[arg-type]
-            owned_process=None,
-            control_fd=control_read,
-            witness_pid=None,
-            witness_pidfd=None,
-        )
+        with pytest.raises(ProcessLaunchCleanupError) as unowned_error:
+            await process_supervisor._finish_failed_launch(
+                fake_process,  # type: ignore[arg-type]
+                owned_process=None,
+                control_fd=control_read,
+                witness_pid=None,
+                witness_pidfd=None,
+            )
     os.close(control_write)
     assert fake_process.kill_calls == 2
+    assert unowned_error.value.managed is None
+    assert unowned_error.value.cleanup_result is not None
+    assert unowned_error.value.cleanup_result.quiescent is False
+
+    class EventuallyReapedProcess:
+        pid = 987655
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self.kill_calls = 0
+            self.wait_calls = 0
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+        async def wait(self) -> int:
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise TimeoutError
+            self.returncode = -signal.SIGKILL
+            return self.returncode
+
+    eventually_reaped = EventuallyReapedProcess()
+    control_read, control_write = os.pipe()
+    await process_supervisor._finish_failed_launch(
+        eventually_reaped,  # type: ignore[arg-type]
+        owned_process=None,
+        control_fd=control_read,
+        witness_pid=None,
+        witness_pidfd=None,
+    )
+    os.close(control_write)
+    assert eventually_reaped.kill_calls == 2
+    assert eventually_reaped.wait_calls == 2
 
     class OwnedCleanup:
         def __init__(
@@ -2148,17 +2184,18 @@ async def test_launch_deadline_helpers_bound_stubborn_tasks(
             pytest.fail("unproven leader must not be awaited as successful cleanup")
 
     control_read, control_write = os.pipe()
+    failed_result = process_supervisor.CleanupResult(
+        CleanupStatus.FAILED,
+        None,
+        False,
+        False,
+        "ownership lost",
+    )
     failed_owner = OwnedCleanup(
         control_read,
-        process_supervisor.CleanupResult(
-            CleanupStatus.FAILED,
-            None,
-            False,
-            False,
-            "ownership lost",
-        ),
+        failed_result,
     )
-    with pytest.raises(RuntimeError, match="ownership lost"):
+    with pytest.raises(ProcessLaunchCleanupError, match="ownership lost") as owned_error:
         await process_supervisor._finish_failed_launch(
             UnprovenProcess(),  # type: ignore[arg-type]
             owned_process=failed_owner,  # type: ignore[arg-type]
@@ -2167,6 +2204,8 @@ async def test_launch_deadline_helpers_bound_stubborn_tasks(
             witness_pidfd=None,
         )
     os.close(control_write)
+    assert owned_error.value.managed is failed_owner
+    assert owned_error.value.cleanup_result is failed_result
 
     control_read, control_write = os.pipe()
     with monkeypatch.context() as patch:
@@ -2210,14 +2249,46 @@ async def test_launch_deadline_helpers_bound_stubborn_tasks(
             "pidfd_send_signal",
             lambda _pidfd, _sig: (_ for _ in ()).throw(ProcessLookupError()),
         )
-        await process_supervisor._finish_failed_launch(
-            None,
-            owned_process=None,
-            control_fd=control_read,
-            witness_pid=4321,
-            witness_pidfd=stable_pidfd,
-        )
+        with pytest.raises(ProcessLaunchCleanupError) as witness_error:
+            await process_supervisor._finish_failed_launch(
+                None,
+                owned_process=None,
+                control_fd=control_read,
+                witness_pid=4321,
+                witness_pidfd=stable_pidfd,
+            )
     os.close(control_write)
+    assert witness_error.value.managed is None
+    assert witness_error.value.cleanup_result is not None
+    assert witness_error.value.cleanup_result.quiescent is False
+
+
+@pytest.mark.asyncio
+async def test_launch_preserves_owned_handle_when_cleanup_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retained: SupervisedProcess | None = None
+
+    async def failed_cleanup(*_args: Any, **kwargs: Any) -> None:
+        nonlocal retained
+        retained = kwargs["owned_process"]
+        assert isinstance(retained, SupervisedProcess)
+        raise RuntimeError("structured-cleanup-test")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            process_supervisor,
+            "_finish_failed_launch",
+            failed_cleanup,
+        )
+        with pytest.raises(ProcessLaunchCleanupError) as exc_info:
+            await launch_process("/definitely/missing/process-supervisor-command")
+
+    assert exc_info.value.managed is retained
+    assert exc_info.value.cleanup_result is None
+    assert retained is not None
+    cleanup = await retained.cleanup(term_grace=0, kill_grace=0.1)
+    assert cleanup.quiescent is True
 
 
 @pytest.mark.asyncio
@@ -2310,8 +2381,11 @@ async def test_launch_rejects_conflicts_and_unverified_session(
             "kill",
             lambda _process: (_ for _ in ()).throw(ProcessLookupError()),
         )
-        with pytest.raises(RuntimeError, match="ownership witness"):
+        with pytest.raises(ProcessLaunchCleanupError) as cleanup_error:
             await launch_process(sys.executable, "-c", "pass")
+    assert cleanup_error.value.managed is None
+    assert cleanup_error.value.cleanup_result is not None
+    assert cleanup_error.value.cleanup_result.quiescent is False
 
     real_parse_proc_stat = process_supervisor._parse_proc_stat
     parse_calls = 0
