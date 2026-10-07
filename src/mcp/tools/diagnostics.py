@@ -122,6 +122,10 @@ _KUBERNETES_SECRET_KIND = re.compile(
     r"(?im)^[ \t]*kind[ \t]*:[ \t]*(?P<quote>['\"]?)Secret(?P=quote)"
     r"[ \t]*(?:#.*)?$"
 )
+_KUBERNETES_SECRET_BLOCK_KIND = re.compile(
+    r"(?im)^[ \t]*kind[ \t]*:[ \t]*[|>][0-9+-]{0,2}[ \t]*(?:#.*)?\n"
+    r"(?:[ \t]*\n)*[ \t]+Secret[ \t]*(?:\n|$)"
+)
 _URL_USERINFO = re.compile(r"(?i)(?P<scheme>(?:\b[a-z][a-z0-9+.-]*:)?//)[^/@\s]+@")
 _SENSITIVE_QUERY_VALUE = re.compile(r"(?i)(?P<prefix>[?&;](?:sig|signature)=)[^&#;\s]+")
 _AUTHORIZATION_VALUE = re.compile(
@@ -1454,6 +1458,7 @@ def _omit_kubernetes_secret_documents(text: str) -> tuple[str, int]:
         (start, end)
         for start, end in _yaml_document_ranges(text)
         if _KUBERNETES_SECRET_KIND.search(text, start, end)
+        or _KUBERNETES_SECRET_BLOCK_KIND.search(text, start, end)
     ]
     return _omit_document_ranges(text, ranges)
 
