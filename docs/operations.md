@@ -43,7 +43,8 @@ reports source/output sizes, truncation, observation time, and remaining Redis
 TTL. Authorization headers, token and password assignments,
 cookies, credential-bearing URL userinfo/query parameters, recognizable token
 shapes, private-key blocks, and recognizable JSON credential documents are not
-exported.
+exported, including nested documents and documents serialized inside log
+strings.
 
 This legacy latest-only record has no trustworthy task, invocation, commit SHA,
 or producer timestamp. Those associations are returned as unavailable and are

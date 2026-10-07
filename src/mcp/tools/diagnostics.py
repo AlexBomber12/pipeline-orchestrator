@@ -81,7 +81,7 @@ _PEM_CREDENTIAL_DOCUMENT = re.compile(
     r".*?-----END (?P=label)-----",
     re.IGNORECASE | re.DOTALL,
 )
-_JSON_OBJECT_START = re.compile(r"\{")
+_JSON_VALUE_START = re.compile(r"[\[{\"]")
 _SENSITIVE_HEADER_LINE = re.compile(
     r"(?im)^(?P<prefix>[ \t]*(?:proxy-)?authorization[ \t]*:[ \t]*|"
     r"[ \t]*(?:set-)?cookie[ \t]*:[ \t]*).*$"
@@ -937,15 +937,25 @@ def _source_summary(statuses: list[str]) -> str:
 
 
 def _contains_credential_document_key(value: object) -> bool:
-    if isinstance(value, dict):
-        for key, child in value.items():
-            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
-            if normalized in _CREDENTIAL_DOCUMENT_KEYS and child not in (None, "", False):
-                return True
-            if _contains_credential_document_key(child):
-                return True
-    elif isinstance(value, list):
-        return any(_contains_credential_document_key(child) for child in value)
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            for key, child in current.items():
+                normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+                if normalized in _CREDENTIAL_DOCUMENT_KEYS and child not in (None, "", False):
+                    return True
+                if isinstance(child, (dict, list, str)):
+                    pending.append(child)
+        elif isinstance(current, list):
+            pending.extend(child for child in current if isinstance(child, (dict, list, str)))
+        elif isinstance(current, str):
+            try:
+                decoded = json.loads(current)
+            except (json.JSONDecodeError, RecursionError):
+                continue
+            if isinstance(decoded, (dict, list, str)):
+                pending.append(decoded)
     return False
 
 
@@ -954,7 +964,7 @@ def _omit_json_credential_documents(text: str) -> tuple[str, int]:
     decoder = json.JSONDecoder()
     ranges: list[tuple[int, int]] = []
     covered_until = 0
-    for match in _JSON_OBJECT_START.finditer(text):
+    for match in _JSON_VALUE_START.finditer(text):
         start = match.start()
         if start < covered_until:
             continue
@@ -962,9 +972,9 @@ def _omit_json_credential_documents(text: str) -> tuple[str, int]:
             value, end = decoder.raw_decode(text, start)
         except (json.JSONDecodeError, RecursionError):
             continue
-        if isinstance(value, dict) and _contains_credential_document_key(value):
+        covered_until = end
+        if _contains_credential_document_key(value):
             ranges.append((start, end))
-            covered_until = end
     if not ranges:
         return text, 0
     parts: list[str] = []

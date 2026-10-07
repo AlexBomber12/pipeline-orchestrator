@@ -408,6 +408,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "tail-fragment" not in before_tail["text"]
     assert before_tail["truncation"]["tail_truncated"] is False
 
+    deeply_nested: object = {"private_key": "deep-document-secret"}
+    for _ in range(1_100):
+        deeply_nested = {"nested": deeply_nested}
     credential_log = "\n".join(
         (
             "curl -H 'Authorization: ApiKey inline-auth-secret' https://example.test",
@@ -422,6 +425,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "{not-json",
             'array-prefix=[{"private_key":"array-document-secret","project_id":"hidden-array-project"}]',
             'output: {"client_secret":"prefix-document-secret","client_id":"hidden-client"}',
+            r'serialized="{\"private_key\":\"serialized-document-secret\",'
+            r'\"project_id\":\"serialized-metadata\"}"',
+            json.dumps(deeply_nested),
             "private_key=malformed-private-secret",
             "AWS_SECRET_ACCESS_KEY=aws-secret",
             "{",
@@ -445,12 +451,13 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     exported = redacted["text"]
     assert redacted["availability"]["status"] == "available"
     assert redacted["redaction"]["applied"] is True
-    assert redacted["redaction"]["credential_documents_omitted"] == 4
-    assert exported.count("[credential document omitted]") == 4
+    assert redacted["redaction"]["credential_documents_omitted"] == 6
+    assert exported.count("[credential document omitted]") == 6
     assert "safe-output" in exported
     assert "private@example.test" not in exported
     assert "hidden-array-project" not in exported
     assert "hidden-client" not in exported
+    assert "serialized-metadata" not in exported
     for secret in (
         "inline-auth-secret",
         "cookie-secret",
@@ -463,6 +470,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "query-secret",
         "array-document-secret",
         "prefix-document-secret",
+        "serialized-document-secret",
+        "deep-document-secret",
         "malformed-private-secret",
         "aws-secret",
         "document-secret",
