@@ -124,6 +124,11 @@ _KUBERNETES_SECRET_KIND = re.compile(
     r"(?P<quote>['\"]?)Secret(?P=quote)"
     r"[ \t]*(?:#.*)?$"
 )
+# YAML double-quoted scalars can resolve escapes; omit instead of partially decoding.
+_KUBERNETES_ESCAPED_QUOTED_KIND = re.compile(
+    r'(?im)^[ \t]*kind[ \t]*:[ \t]*'
+    r'(?:(?:&|!)[^\s,\[\]{}]+[ \t]+)*"(?=[^\r\n]*\\)'
+)
 _KUBERNETES_SECRET_BLOCK_KIND = re.compile(
     r"(?im)^[ \t]*kind[ \t]*:[ \t]*[|>][0-9+-]{0,2}[ \t]*(?:#.*)?\n"
     r"(?:[ \t]*\n)*[ \t]+Secret[ \t]*(?:\n|$)"
@@ -1455,11 +1460,12 @@ def _omit_ambiguous_yaml_credential_documents(text: str) -> tuple[str, int]:
 
 
 def _omit_kubernetes_secret_documents(text: str) -> tuple[str, int]:
-    """Omit complete YAML documents recognizable as Kubernetes Secrets."""
+    """Omit complete YAML documents recognizable or ambiguous as Secrets."""
     ranges = [
         (start, end)
         for start, end in _yaml_document_ranges(text)
         if _KUBERNETES_SECRET_KIND.search(text, start, end)
+        or _KUBERNETES_ESCAPED_QUOTED_KIND.search(text, start, end)
         or _KUBERNETES_SECRET_BLOCK_KIND.search(text, start, end)
     ]
     return _omit_document_ranges(text, ranges)
