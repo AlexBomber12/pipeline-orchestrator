@@ -26,6 +26,7 @@ from src.coder_registry import (
     coder_auth_payload,
     parse_coder_auth_payload,
     parse_coder_device_login_payload,
+    resolve_device_login_credential_location,
 )
 from src.config import DEFAULT_CODER_PLUGINS, AppConfig, load_config
 
@@ -575,14 +576,12 @@ async def handle_model_catalog_request(
         if operation == "auth":
             assert reference is not None
             credential_location: str | None = None
-            resolver = getattr(plugin, "device_login_credential_location", None)
-            if callable(resolver) and credential_reservations is not None:
-                credential_location = resolver(config=load_config(config_path))
-                if (
-                    not isinstance(credential_location, str)
-                    or not credential_location
-                ):
-                    raise ValueError("invalid coder credential location")
+            if credential_reservations is not None:
+                credential_location = resolve_device_login_credential_location(
+                    plugin,
+                    config=load_config(config_path),
+                )
+            if credential_location is not None:
                 if not credential_reservations.reserve_coder(
                     credential_location
                 ):
@@ -624,14 +623,12 @@ async def handle_model_catalog_request(
             return
         credential_location = None
         config = load_config(config_path)
-        resolver = getattr(plugin, "device_login_credential_location", None)
-        if callable(resolver) and credential_reservations is not None:
-            credential_location = resolver(config=config)
-            if (
-                not isinstance(credential_location, str)
-                or not credential_location
-            ):
-                raise ValueError("invalid coder credential location")
+        if credential_reservations is not None:
+            credential_location = resolve_device_login_credential_location(
+                plugin,
+                config=config,
+            )
+        if credential_location is not None:
             if not credential_reservations.reserve_coder(credential_location):
                 await _store_response(
                     redis_client,

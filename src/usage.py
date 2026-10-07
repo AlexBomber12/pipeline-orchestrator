@@ -309,6 +309,13 @@ class OpenAIUsageProvider:
         with self._lock:
             self._cached = None
 
+    def reset_after_credential_change(self) -> None:
+        """Discard cached state and retry immediately with new credentials."""
+        with self._lock:
+            self._cached = None
+            self._consecutive_failures = 0
+            self._last_failure_at = 0.0
+
     def _read_credentials(self) -> tuple[str | None, str | None]:
         """Return ``(access_token, account_id)`` from Codex auth file."""
         if not self._credentials_path.is_file():

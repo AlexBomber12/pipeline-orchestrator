@@ -55,7 +55,11 @@ from src.cancellation.availability import (
 )
 from src.coder_auth import isolated_auth_probe
 from src.coder_login import CoderCredentialReservations
-from src.coder_registry import CoderPlugin, CoderRegistry
+from src.coder_registry import (
+    CoderPlugin,
+    CoderRegistry,
+    resolve_device_login_credential_location,
+)
 from src.coders import build_coder_registry
 from src.config import (
     DEFAULT_CODER_PLUGINS,
@@ -442,6 +446,7 @@ class PipelineRunner(
         self._auth_status_cache: dict[str, dict[str, str]] = {}
         self._auth_status_cache_expires_at: datetime | None = None
         self._auth_status_cache_credential_versions: dict[str, int] = {}
+        self._usage_credential_versions: dict[str, tuple[str, int]] = {}
         self._current_coder_process: asyncio.subprocess.Process | None = None
         self._current_coder_supervised_process: SupervisedProcess | None = None
         self._coder_invocation_active = False
@@ -2411,13 +2416,12 @@ class PipelineRunner(
         self, coder_name: str
     ) -> str | None:
         plugin = self._registry.get_optional(coder_name)
-        resolver = getattr(plugin, "device_login_credential_location", None)
-        if not callable(resolver):
+        if plugin is None:
             return None
-        location = resolver(config=self.app_config)
-        if not isinstance(location, str) or not location:
-            raise ValueError("invalid coder credential location")
-        return location
+        return resolve_device_login_credential_location(
+            plugin,
+            config=self.app_config,
+        )
 
     def _release_coder_credentials(self) -> None:
         location = self._coder_credential_reservation

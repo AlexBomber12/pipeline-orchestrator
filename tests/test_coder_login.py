@@ -18,6 +18,7 @@ from src.coder_registry import (
     coder_auth_payload,
 )
 from src.coders.codex import CodexDeviceLoginAdapter
+from src.config import AppConfig
 from src.process_supervisor import (
     CleanupResult,
     CleanupStatus,
@@ -38,6 +39,22 @@ _PROMPT = (
 class _Plugin:
     name = "codex"
     display_name = "Codex CLI"
+
+    def __init__(self, adapter: object) -> None:
+        self.adapter = adapter
+
+    def create_device_login(self, *, config_path: str) -> object:
+        assert config_path == "/cfg/config.yml"
+        return self.adapter
+
+    def device_login_credential_location(self, *, config: AppConfig) -> str:
+        del config
+        return getattr(self.adapter, "credential_location", "/tmp/invalid-adapter")
+
+
+class _MissingLocatorPlugin:
+    name = "missing-locator"
+    display_name = "Missing Locator"
 
     def __init__(self, adapter: object) -> None:
         self.adapter = adapter
@@ -79,6 +96,11 @@ class _Managed:
             not self.quiescent,
             None if self.quiescent else "ownership uncertain",
         )
+
+
+@pytest.fixture(autouse=True)
+def _stub_login_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(coder_login, "load_config", lambda _path: AppConfig())
 
 
 def _adapter(
@@ -509,6 +531,46 @@ async def test_device_login_malformed_prompt_requests_owned_cleanup(
 
 
 @pytest.mark.asyncio
+async def test_device_login_rejects_prompt_outside_wire_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _ = _manager()
+    managed = _Managed()
+
+    async def auth_probe(*_args: object, **_kwargs: object) -> dict[str, Any]:
+        return _auth(False)
+
+    async def launch(*_args: object, **_kwargs: object) -> _Managed:
+        return managed
+
+    async def run(*_args: object, **kwargs: object) -> ProcessRunResult:
+        kwargs["stdout_chunk_callback"](b"provider prompt\n")
+        await asyncio.sleep(0)
+        return ProcessRunResult(1, b"", b"")
+
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", auth_probe)
+    monkeypatch.setattr(coder_login, "launch_process", launch)
+    monkeypatch.setattr(coder_login, "run_supervised_process", run)
+    monkeypatch.setattr(
+        CodexDeviceLoginAdapter,
+        "parse_progress",
+        lambda *_args: CoderDeviceLoginPrompt(
+            "https://example.com/device",
+            "lowercase",
+            60,
+        ),
+    )
+
+    started = await manager.start(
+        "codex", expected_reference=_REFERENCE, replace_existing=False
+    )
+    final = await _wait_for_state(manager, started["session_id"], "failed")
+
+    assert final["failure_reason"] == "malformed_output"
+    assert managed.cleanup_calls >= 1
+
+
+@pytest.mark.asyncio
 async def test_device_login_cancel_confirms_or_retains_process_ownership(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -631,6 +693,10 @@ async def test_device_login_optional_plugin_and_identity_failures(
         _FactoryFailurePlugin(_adapter()),
         reference=_REFERENCE,
     )
+    registry.register(
+        _MissingLocatorPlugin(_adapter()),  # type: ignore[arg-type]
+        reference="missing:locator",
+    )
     manager = CoderLoginSessionManager(registry, config_path="/cfg/config.yml")
 
     assert (
@@ -648,6 +714,12 @@ async def test_device_login_optional_plugin_and_identity_failures(
     )
     assert factory_failure["failure_reason"] == "startup_failed"
     assert "must-not-leak" not in json.dumps(factory_failure)
+    missing_locator = await manager.start(
+        "missing-locator",
+        expected_reference="missing:locator",
+        replace_existing=False,
+    )
+    assert missing_locator["failure_reason"] == "startup_failed"
     assert (
         await manager.start(
             "claude", expected_reference="changed:factory", replace_existing=False
@@ -657,6 +729,18 @@ async def test_device_login_optional_plugin_and_identity_failures(
     invalid_manager, _ = _manager(adapter=object())
     assert (
         await invalid_manager.start(
+            "codex", expected_reference=_REFERENCE, replace_existing=False
+        )
+    )["state"] == "unsupported"
+
+    mismatch_manager, mismatch_registry = _manager()
+    monkeypatch.setattr(
+        mismatch_registry.get("codex"),
+        "device_login_credential_location",
+        lambda **_kwargs: "/tmp/different-credential-home",
+    )
+    assert (
+        await mismatch_manager.start(
             "codex", expected_reference=_REFERENCE, replace_existing=False
         )
     )["state"] == "unsupported"
@@ -833,7 +917,19 @@ def test_device_login_validates_adapter_and_prompt_contracts() -> None:
         is False
     )
     assert (
+        CoderLoginSessionManager._valid_prompt(
+            replace(prompt, verification_url="https://" + "x" * 249)
+        )
+        is False
+    )
+    assert (
         CoderLoginSessionManager._valid_prompt(replace(prompt, user_code="")) is False
+    )
+    assert (
+        CoderLoginSessionManager._valid_prompt(
+            replace(prompt, user_code="lowercase")
+        )
+        is False
     )
     assert (
         CoderLoginSessionManager._valid_prompt(replace(prompt, expires_in_seconds=True))

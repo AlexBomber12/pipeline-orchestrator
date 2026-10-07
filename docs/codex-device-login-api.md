@@ -33,7 +33,9 @@ replacement_requested, reused_session, replacement_warning, auth_status
 `verification_url`, `user_code`, and `expires_at` are present only while the
 state is `waiting_for_user`. They are short-lived operator instructions and
 must not be logged or copied into event history or diagnostics. Raw CLI output,
-tokens, and credential contents are never returned.
+tokens, and credential contents are never returned. Provider prompts are checked
+against these wire bounds before the session enters `waiting_for_user`; malformed
+URLs or codes abort the owned process and return `malformed_output`.
 
 The possible states are `unsupported`, `starting`, `waiting_for_user`,
 `succeeded`, `failed`, `canceling`, `cancelled`, `expired`, `timed_out`,
@@ -46,6 +48,9 @@ the daemon still retains ownership because process termination was not proven.
 
 Session identifiers are opaque. A session is bound at creation to the plugin
 identity, effective environment, working directory, and credential location.
+Login-capable plugins must expose a side-effect-free credential locator, and its
+result must match the adapter's credential location; incomplete or inconsistent
+capabilities fail closed before a login or coder process can start.
 Repeating start for the same active plugin and credential location returns the
 same session with `reused_session: true`; it does not spawn another login.
 Another plugin or active coder invocation using that credential location is a
@@ -56,13 +61,14 @@ reservation is retained until process cleanup is confirmed; if cleanup cannot
 prove quiescence, both login replacement and new coder invocations remain
 blocked for that location.
 
-Auth probes and model discovery take the same shared reservation before reading
-credentials. While login owns the location, discovery is suppressed, selection
-treats that coder as provisionally available, and dispatch defers at the
-reservation boundary instead of recording an auth or diagnosis failure.
-Releasing login ownership first advances the location's credential generation;
-runners reject cache entries from older generations and refresh auth before
-launching work.
+Auth probes, model discovery, and proactive usage checks take the same shared
+reservation before reading credentials. While login owns the location,
+discovery and usage reads are suppressed, selection treats that coder as
+provisionally available, and dispatch defers at the reservation boundary instead
+of recording an auth, usage, or diagnosis failure. Releasing login ownership
+first advances the location's credential generation; runners reject auth cache
+entries from older generations, clear usage cache and failure-backoff state, and
+refresh against the new credentials before launching work.
 
 Device login, auth probes, model discovery, and normal Codex coder invocations
 preserve the daemon's inherited `HOME` so its Git configuration remains

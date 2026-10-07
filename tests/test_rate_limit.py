@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
+from src.coder_login import CoderCredentialReservations
 from src.config import AppConfig, CoderType, DaemonConfig, RepoConfig
 from src.daemon import runner as runner_module
 from src.daemon.rate_limit import RATE_LIMIT_BRANCH_MAP
@@ -137,6 +138,90 @@ def test_branch_map_complete() -> None:
     assert len(RATE_LIMIT_BRANCH_MAP) >= 37
     for concern in expected_concerns:
         assert any(entry.startswith(f"{concern}:") for entry in RATE_LIMIT_BRANCH_MAP)
+
+
+def test_usage_fetch_coordinates_with_device_login_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = UsageSnapshot(10, 100, 20, 200, 1.0)
+
+    class CredentialAwareProvider(_FakeUsageProvider):
+        def __init__(self) -> None:
+            super().__init__(snapshot=snapshot, failures=3)
+            self.fetches = 0
+            self.credential_resets = 0
+
+        def fetch(self) -> UsageSnapshot | None:
+            self.fetches += 1
+            return super().fetch()
+
+        def reset_after_credential_change(self) -> None:
+            self.credential_resets += 1
+            self._consecutive_failures = 0
+
+    provider = CredentialAwareProvider()
+    runner = _make_runner(
+        monkeypatch,
+        coder=CoderType.CODEX,
+        codex_provider=provider,
+    )
+    reservations = CoderCredentialReservations()
+    runner._credential_reservations = reservations
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    location = runner._device_login_credential_location("codex")
+    assert location is not None
+    assert reservations.reserve_login(location) is True
+
+    assert asyncio.run(runner._fetch_usage_snapshot("codex")) is None
+    assert provider.fetches == 0
+    assert provider.consecutive_failures == 3
+
+    reservations.release_login(location)
+    assert asyncio.run(runner._fetch_usage_snapshot("codex")) == snapshot
+    assert provider.fetches == 1
+    assert provider.credential_resets == 1
+    assert provider.consecutive_failures == 0
+    assert reservations.reserve_login(location) is True
+    reservations.release_login(location)
+
+    fallback_provider = _FakeUsageProvider(snapshot=snapshot)
+    fallback_runner = _make_runner(
+        monkeypatch,
+        coder=CoderType.CODEX,
+        codex_provider=fallback_provider,
+    )
+    fallback_runner._credential_reservations = reservations
+    assert asyncio.run(
+        fallback_runner._fetch_usage_snapshot("codex")
+    ) == snapshot
+    assert fallback_provider.invalidated == 1
+
+    claude_provider = _FakeUsageProvider(snapshot=snapshot)
+    claude_runner = _make_runner(
+        monkeypatch,
+        coder=CoderType.CLAUDE,
+        claude_provider=claude_provider,
+    )
+    claude_runner._credential_reservations = reservations
+    assert asyncio.run(
+        claude_runner._fetch_usage_snapshot("claude")
+    ) == snapshot
+
+    missing_locator_provider = _FakeUsageProvider(snapshot=snapshot)
+    missing_locator_runner = _make_runner(
+        monkeypatch,
+        coder=CoderType.CODEX,
+        codex_provider=missing_locator_provider,
+    )
+    missing_locator_runner._credential_reservations = reservations
+    monkeypatch.setattr(
+        missing_locator_runner._registry.get("codex"),
+        "device_login_credential_location",
+        None,
+    )
+    assert asyncio.run(
+        missing_locator_runner._fetch_usage_snapshot("codex")
+    ) is None
 
 
 def test_legacy_pause_predicate(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -164,6 +164,48 @@ class CoderDeviceLoginAdapter(Protocol):
     ) -> CoderDeviceLoginFailure: ...
 
 
+@runtime_checkable
+class CoderDeviceLoginPlugin(Protocol):
+    """Complete optional capability for daemon-owned device login.
+
+    A login-capable plugin must expose both the adapter factory and a
+    side-effect-free credential locator. Daemon readers use the locator before
+    launching any provider work, so accepting only one half of the capability
+    would make safe coordination impossible.
+    """
+
+    def create_device_login(
+        self, *, config_path: str
+    ) -> CoderDeviceLoginAdapter: ...
+
+    def device_login_credential_location(
+        self, *, config: "AppConfig"
+    ) -> str: ...
+
+
+def resolve_device_login_credential_location(
+    plugin: object,
+    *,
+    config: "AppConfig",
+) -> str | None:
+    """Return a login-capable plugin's validated coordination location.
+
+    Plugins without a device-login factory do not participate. A plugin that
+    advertises login but omits or returns an invalid locator fails closed so
+    login and credential readers can never run without shared coordination.
+    """
+    factory = getattr(plugin, "create_device_login", None)
+    if not callable(factory):
+        return None
+    resolver = getattr(plugin, "device_login_credential_location", None)
+    if not callable(resolver):
+        raise ValueError("login-capable coder is missing a credential locator")
+    location = resolver(config=config)
+    if not isinstance(location, str) or not location:
+        raise ValueError("invalid coder credential location")
+    return location
+
+
 def _optional_bool(value: object, field: str) -> bool | None:
     if value is None or isinstance(value, bool):
         return value

@@ -448,6 +448,31 @@ class TestOpenAIProviderCache:
             provider.fetch()
         assert call_count == 2
 
+    def test_credential_change_clears_cache_and_failure_backoff(
+        self, tmp_path: Path
+    ) -> None:
+        provider = _make_openai_provider(
+            tmp_path,
+            creds={"tokens": {"access_token": "new-token"}},
+            cache_ttl_sec=300,
+        )
+        provider._cached = object()  # type: ignore[assignment]
+        provider._consecutive_failures = 3
+        provider._last_failure_at = time.time()
+
+        provider.reset_after_credential_change()
+
+        assert provider._cached is None
+        assert provider.consecutive_failures == 0
+        assert provider._last_failure_at == 0.0
+        with patch.object(
+            httpx,
+            "get",
+            return_value=_mock_openai_response(),
+        ) as mock_get:
+            assert provider.fetch() is not None
+        mock_get.assert_called_once()
+
 
 class TestOpenAIProviderConsecutiveFailures:
     def test_increment(self, tmp_path: Path) -> None:

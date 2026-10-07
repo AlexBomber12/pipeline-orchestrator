@@ -106,6 +106,7 @@ def test_coder_credential_location_in_use_tracks_active_plugin_context(
     codex = runner._registry.get("codex")
     location = codex.device_login_credential_location(config=runner.app_config)
 
+    assert runner._device_login_credential_location("missing") is None
     assert runner.coder_credential_location_in_use(location) is False
     runner._coder_invocation_active = True
     assert runner.coder_credential_location_in_use(location) is False
@@ -163,6 +164,9 @@ def test_runner_credential_reservations_coordinate_with_device_login(
         "device_login_credential_location",
         lambda **_kwargs: "",
     )
+    assert runner._reserve_coder_credentials("codex") is False
+
+    monkeypatch.setattr(codex, "device_login_credential_location", None)
     assert runner._reserve_coder_credentials("codex") is False
 
     def fail(**_kwargs: object) -> str:

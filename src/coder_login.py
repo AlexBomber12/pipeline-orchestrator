@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -17,7 +18,9 @@ from src.coder_registry import (
     CoderRegistry,
     parse_coder_auth_payload,
     parse_coder_device_login_payload,
+    resolve_device_login_credential_location,
 )
+from src.config import load_config
 from src.process_supervisor import (
     ProcessSupervisionError,
     SupervisedProcess,
@@ -30,6 +33,7 @@ _TERMINAL_RETENTION_SECONDS = 5 * 60
 _MAX_SESSIONS = 64
 _AUTH_PROBE_TIMEOUT_SECONDS = 5.0
 _CLEANUP_GRACE_SECONDS = 1.0
+_DEVICE_CODE_PATTERN = re.compile(r"[A-Z0-9-]{4,64}")
 _TERMINAL_STATES = frozenset(
     {"unsupported", "succeeded", "failed", "cancelled", "expired", "timed_out"}
 )
@@ -175,6 +179,10 @@ class CoderLoginSessionManager:
         if not callable(factory):
             return self._unsupported_payload(plugin_name, replace_existing)
         try:
+            credential_location = resolve_device_login_credential_location(
+                plugin,
+                config=load_config(self._config_path),
+            )
             adapter = factory(config_path=self._config_path)
         except Exception:
             return self._error_payload(
@@ -184,7 +192,10 @@ class CoderLoginSessionManager:
                 "startup_failed",
                 replacement_requested=replace_existing,
             )
-        if not self._valid_adapter(adapter):
+        if (
+            not self._valid_adapter(adapter)
+            or adapter.credential_location != credential_location
+        ):
             return self._unsupported_payload(plugin_name, replace_existing)
 
         for existing in self._sessions.values():
@@ -816,9 +827,10 @@ class CoderLoginSessionManager:
         return (
             isinstance(prompt, CoderDeviceLoginPrompt)
             and isinstance(prompt.verification_url, str)
+            and len(prompt.verification_url) <= 256
             and prompt.verification_url.startswith("https://")
             and isinstance(prompt.user_code, str)
-            and bool(prompt.user_code)
+            and _DEVICE_CODE_PATTERN.fullmatch(prompt.user_code) is not None
             and isinstance(prompt.expires_in_seconds, int)
             and not isinstance(prompt.expires_in_seconds, bool)
             and 0 < prompt.expires_in_seconds <= 60 * 60
