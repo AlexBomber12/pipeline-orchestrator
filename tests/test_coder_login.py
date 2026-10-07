@@ -1446,10 +1446,45 @@ async def test_device_login_shutdown_retains_unconfirmed_cleanup() -> None:
 
 
 @pytest.mark.asyncio
-async def test_device_login_cancel_bounds_task_settlement(
+async def test_device_login_cancellation_wins_during_success_auth_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, _ = _manager()
+    session = coder_login._LoginSession(
+        "P" * 43,
+        "codex",
+        _REFERENCE,
+        _adapter(),
+        False,
+        1,
+        state="waiting_for_user",
+        verification_url="https://auth.openai.com/codex/device",
+        user_code="ABCD-EFGH",
+        managed=_Managed(),  # type: ignore[arg-type]
+    )
+
+    async def successful_run(*_args: object, **_kwargs: object) -> ProcessRunResult:
+        return ProcessRunResult(0, b"", b"")
+
+    async def auth_probe(*_args: object, **_kwargs: object) -> dict[str, Any]:
+        session.cancel_requested = True
+        return _auth(True)
+
+    monkeypatch.setattr(coder_login, "run_supervised_process", successful_run)
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", auth_probe)
+
+    await manager._run_owned_session(session)
+
+    assert session.state == "cancelled"
+    assert session.auth_status is None
+
+
+@pytest.mark.asyncio
+async def test_device_login_cancel_bounds_task_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reservations = CoderCredentialReservations()
+    manager, _ = _manager(reservations=reservations)
     pending = asyncio.create_task(asyncio.Event().wait())
     session = coder_login._LoginSession(
         "B" * 43,
@@ -1460,17 +1495,25 @@ async def test_device_login_cancel_bounds_task_settlement(
         1,
         managed=_Managed(),  # type: ignore[arg-type]
         task=pending,  # type: ignore[arg-type]
+        reservation_held=True,
     )
     manager._sessions[session.session_id] = session
+    assert reservations.reserve_login(session.adapter.credential_location)
 
-    async def timeout(*_args: object, **_kwargs: object) -> object:
-        raise TimeoutError
+    async def timeout(
+        tasks: set[asyncio.Task[None]], *, timeout: float
+    ) -> tuple[set[asyncio.Task[None]], set[asyncio.Task[None]]]:
+        assert tasks == {pending}
+        assert timeout == 3
+        return set(), tasks
 
-    monkeypatch.setattr(coder_login.asyncio, "wait_for", timeout)
+    monkeypatch.setattr(coder_login.asyncio, "wait", timeout)
     result = await manager.cancel(
         "codex", session.session_id, expected_reference=_REFERENCE
     )
 
-    assert result["state"] == "cancelled"
-    pending.cancel()
+    assert result["state"] == "cleanup_failed"
+    assert result["cleanup_confirmed"] is False
+    assert "session task did not stop" in result["detail"]
+    assert reservations.reserve_coder(session.adapter.credential_location) is False
     await asyncio.gather(pending, return_exceptions=True)

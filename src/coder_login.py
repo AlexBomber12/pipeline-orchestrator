@@ -307,15 +307,17 @@ class CoderLoginSessionManager:
             self._cleanup_failed(session)
             return self._session_payload(session)
         if session.task is not None and not session.task.done():
-            try:
-                await asyncio.wait_for(asyncio.shield(session.task), timeout=3)
-            except TimeoutError:
-                self._finish(
+            session.task.cancel()
+            done, _pending = await asyncio.wait({session.task}, timeout=3)
+            if not done:
+                self._cleanup_failed(
                     session,
-                    state="cancelled",
-                    detail="Device-code login was cancelled",
-                    cleanup_confirmed=True,
+                    detail=(
+                        "Device-code login session task did not stop after "
+                        "cancellation"
+                    ),
                 )
+                return self._session_payload(session)
         if session.state not in _TERMINAL_STATES:
             self._finish(
                 session,
@@ -576,6 +578,14 @@ class CoderLoginSessionManager:
                 config_path=self._config_path,
                 timeout=_AUTH_PROBE_TIMEOUT_SECONDS,
             )
+            if session.cancel_requested:
+                self._finish(
+                    session,
+                    state="cancelled",
+                    detail="Device-code login was cancelled",
+                    cleanup_confirmed=True,
+                )
+                return
             session.auth_status = parse_coder_auth_payload(auth)
             self._finish(
                 session,
@@ -704,11 +714,16 @@ class CoderLoginSessionManager:
             self._release_reservation(session)
             session.managed = None
 
-    def _cleanup_failed(self, session: _LoginSession) -> None:
-        session.state = "cleanup_failed"
-        session.detail = (
+    def _cleanup_failed(
+        self,
+        session: _LoginSession,
+        *,
+        detail: str = (
             "Device-code login cleanup could not confirm process termination"
-        )
+        ),
+    ) -> None:
+        session.state = "cleanup_failed"
+        session.detail = detail
         session.failure_reason = "cancellation_failed"
         session.cleanup_confirmed = False
         session.verification_url = None
