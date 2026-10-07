@@ -58,10 +58,9 @@ Terminal escape and control sequences, including C1 control strings, are
 normalized before credential inspection. Lines containing bare carriage
 returns or stateful cursor/editing controls are omitted conservatively,
 preventing terminal overwrite semantics from constructing an otherwise hidden
-sensitive key. Credential-key
-inspection preserves compound camel-case boundaries and uses a bounded-source,
-single-pass line scanner so long non-credential lines do not cause regex
-backtracking stalls.
+sensitive key. Credential-key inspection normalizes separated, camel-case, and
+single-case compound names and uses a bounded-source, single-pass line scanner
+so long non-credential lines do not cause regex backtracking stalls.
 Malformed or incomplete JSON containers with credential contexts are omitted
 through their closing boundary or, when unterminated, through the source end.
 Malformed JSON probing has a fixed failure budget; if that budget is

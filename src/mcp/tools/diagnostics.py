@@ -1040,30 +1040,13 @@ def _omit_pem_credential_documents(text: str) -> tuple[str, int]:
 
 def _is_sensitive_key(value: str) -> bool:
     """Recognize credential keys without a backtracking expression."""
-    decoded = unquote_plus(value)
-    normalized: list[str] = []
-    boundaries = {0}
-    for index, character in enumerate(decoded):
-        if "a" <= character <= "z" or "0" <= character <= "9":
-            normalized.append(character)
-        elif "A" <= character <= "Z":
-            previous = decoded[index - 1] if index else ""
-            following = decoded[index + 1] if index + 1 < len(decoded) else ""
-            if normalized and (
-                "a" <= previous <= "z"
-                or "0" <= previous <= "9"
-                or ("A" <= previous <= "Z" and "a" <= following <= "z")
-            ):
-                boundaries.add(len(normalized))
-            normalized.append(character.lower())
-        else:
-            boundaries.add(len(normalized))
-    key = "".join(normalized)
-    return any(
-        key.endswith(sensitive)
-        and len(key) - len(sensitive) in boundaries
-        for sensitive in _CREDENTIAL_DOCUMENT_KEYS
+    decoded = unquote_plus(value).lower()
+    key = "".join(
+        character
+        for character in decoded
+        if "a" <= character <= "z" or "0" <= character <= "9"
     )
+    return any(sensitive in key for sensitive in _CREDENTIAL_DOCUMENT_KEYS)
 
 
 def _sensitive_value_start(line: str) -> int | None:
