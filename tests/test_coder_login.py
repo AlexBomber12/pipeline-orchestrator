@@ -52,6 +52,17 @@ class _Plugin:
         del config
         return getattr(self.adapter, "credential_location", "/tmp/invalid-adapter")
 
+    def build_credential_environment(
+        self,
+        *,
+        config: AppConfig,
+        credential_location: str,
+    ) -> dict[str, str]:
+        del config
+        environment = dict(getattr(self.adapter, "environment", {}))
+        environment["CODEX_HOME"] = credential_location
+        return environment
+
 
 class _MissingLocatorPlugin:
     name = "missing-locator"

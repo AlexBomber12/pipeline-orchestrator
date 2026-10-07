@@ -2420,12 +2420,10 @@ class PipelineRunner(
         self,
         coder_name: str,
         credential_location: str,
-    ) -> dict[str, str] | None:
-        """Return optional plugin environment for reserved credentials."""
+    ) -> dict[str, str]:
+        """Return the plugin environment for reserved credentials."""
         plugin = self._registry.get_optional(coder_name)
         builder = getattr(plugin, "build_credential_environment", None)
-        if not callable(builder):
-            return None
         return dict(
             builder(
                 config=self.app_config,
@@ -2444,8 +2442,6 @@ class PipelineRunner(
             coder_name,
             credential_location,
         )
-        if environment is None:
-            return
         bound_kwargs = {"environment": environment}
         conflicts = invocation_kwargs.keys() & bound_kwargs.keys()
         if conflicts:

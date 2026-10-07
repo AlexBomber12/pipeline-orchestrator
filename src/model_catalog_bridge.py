@@ -72,6 +72,26 @@ def _plugin_metadata_payload(plugin: CoderPlugin) -> dict[str, Any]:
     }
 
 
+def _credential_environment(
+    plugin: object,
+    *,
+    config: AppConfig,
+    credential_location: str | None,
+) -> dict[str, str] | None:
+    """Return the immutable environment required by a reserved reader."""
+    if credential_location is None:
+        return None
+    builder = getattr(plugin, "build_credential_environment", None)
+    if not callable(builder):
+        raise ValueError("credential environment builder unavailable")
+    return dict(
+        builder(
+            config=config,
+            credential_location=credential_location,
+        )
+    )
+
+
 def _parse_auth_status(payload: object) -> dict[str, Any]:
     if not isinstance(payload, dict) or payload.get("ok") is not True:
         raise ModelCatalogUnavailable("Daemon coder auth status is unavailable")
@@ -623,22 +643,15 @@ async def handle_model_catalog_request(
                         {"ok": True, "auth": auth},
                     )
                     return
-            probe_environment: dict[str, str] | None = None
-            if credential_location is not None:
-                assert config is not None
-                context_builder = getattr(
-                    plugin,
-                    "build_credential_environment",
-                    None,
-                )
-                if callable(context_builder):
-                    probe_environment = dict(
-                        context_builder(
-                            config=config,
-                            credential_location=credential_location,
-                        )
-                    )
             try:
+                probe_environment = None
+                if credential_location is not None:
+                    assert config is not None
+                    probe_environment = _credential_environment(
+                        plugin,
+                        config=config,
+                        credential_location=credential_location,
+                    )
                 auth = await isolated_auth_probe(
                     plugin_name,
                     reference,
@@ -676,21 +689,12 @@ async def handle_model_catalog_request(
                     {"ok": False, "error": "catalog unavailable"},
                 )
                 return
-        catalog_environment: dict[str, str] | None = None
-        if credential_location is not None:
-            context_builder = getattr(
-                plugin,
-                "build_credential_environment",
-                None,
-            )
-            if callable(context_builder):
-                catalog_environment = dict(
-                    context_builder(
-                        config=config,
-                        credential_location=credential_location,
-                    )
-                )
         try:
+            catalog_environment = _credential_environment(
+                plugin,
+                config=config,
+                credential_location=credential_location,
+            )
             if (
                 reference is not None
                 and reference != DEFAULT_CODER_PLUGINS.get(plugin_name)

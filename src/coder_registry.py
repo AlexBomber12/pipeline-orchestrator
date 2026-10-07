@@ -168,10 +168,10 @@ class CoderDeviceLoginAdapter(Protocol):
 class CoderDeviceLoginPlugin(Protocol):
     """Complete optional capability for daemon-owned device login.
 
-    A login-capable plugin must expose both the adapter factory and a
-    side-effect-free credential locator. Daemon readers use the locator before
-    launching any provider work, so accepting only one half of the capability
-    would make safe coordination impossible.
+    A login-capable plugin must expose the adapter factory, a side-effect-free
+    credential locator, and an environment pinned to that location. Daemon
+    readers reserve the locator and pass the environment to provider workers;
+    accepting a partial capability would make safe coordination impossible.
     """
 
     def create_device_login(
@@ -181,6 +181,13 @@ class CoderDeviceLoginPlugin(Protocol):
     def device_login_credential_location(
         self, *, config: "AppConfig"
     ) -> str: ...
+
+    def build_credential_environment(
+        self,
+        *,
+        config: "AppConfig",
+        credential_location: str,
+    ) -> Mapping[str, str]: ...
 
 
 def resolve_device_login_credential_location(
@@ -203,6 +210,11 @@ def resolve_device_login_credential_location(
     location = resolver(config=config)
     if not isinstance(location, str) or not location:
         raise ValueError("invalid coder credential location")
+    environment_builder = getattr(plugin, "build_credential_environment", None)
+    if not callable(environment_builder):
+        raise ValueError(
+            "login-capable coder is missing a credential environment builder"
+        )
     return location
 
 

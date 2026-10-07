@@ -164,9 +164,8 @@ def test_runner_credential_reservations_coordinate_with_device_login(
         assert runner._reserve_coder_credentials(
             "codex",
             invocation_kwargs=unbound_kwargs,
-        ) is True
+        ) is False
         assert unbound_kwargs == {"model": "gpt-test"}
-        runner._release_coder_credentials()
 
     runner._credential_reservations = None
     uncoordinated_kwargs: dict[str, Any] = {}

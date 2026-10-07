@@ -346,6 +346,123 @@ async def test_daemon_reader_rejects_invalid_credential_location(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["auth", "catalog"])
+@pytest.mark.parametrize("builder_failure", ["raises", "invalid"])
+async def test_daemon_reader_releases_reservation_after_context_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    builder_failure: str,
+) -> None:
+    redis = _BridgeRedis()
+    registry = CoderRegistry()
+    plugin = CodexPlugin(discover=lambda **_kwargs: None)
+    reference = "src.coders.codex:CodexPlugin"
+    registry.register(plugin, reference=reference)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    codex_home = tmp_path / "codex-home"
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        f"auth:\n  codex_home_dir: {codex_home}\n",
+        encoding="utf-8",
+    )
+    reservations = CoderCredentialReservations()
+    location = str(codex_home / ".codex")
+
+    def fail(**_kwargs: object) -> object:
+        if builder_failure == "raises":
+            raise RuntimeError("must-not-leak")
+        return 1
+
+    monkeypatch.setattr(plugin, "build_credential_environment", fail)
+    request_id = "b" * 32
+
+    await bridge.handle_model_catalog_request(
+        redis,
+        registry,
+        json.dumps(
+            {
+                "request_id": request_id,
+                "plugin": "codex",
+                "operation": operation,
+                "reference": reference,
+                "expires_at": time.time() + 10,
+            }
+        ),
+        config_path=str(config_path),
+        credential_reservations=reservations,
+    )
+
+    assert json.loads(redis.values[bridge._response_key(request_id)]) == {
+        "ok": False,
+        "error": "catalog unavailable",
+    }
+    assert reservations.reserve_login(location) is True
+    reservations.release_login(location)
+
+
+@pytest.mark.asyncio
+async def test_daemon_auth_reader_requires_credential_environment_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = _BridgeRedis()
+    registry = CoderRegistry()
+    plugin = CodexPlugin(discover=lambda **_kwargs: None)
+    reference = "src.coders.codex:CodexPlugin"
+    registry.register(plugin, reference=reference)
+    monkeypatch.setattr(plugin, "build_credential_environment", None)
+    config_path = tmp_path / "config.yml"
+    config_path.write_text("auth:\n  codex_home_dir: /reserved\n", encoding="utf-8")
+
+    async def must_not_probe(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("probe must fail closed before worker startup")
+
+    monkeypatch.setattr(bridge, "isolated_auth_probe", must_not_probe)
+    request_id = "a" * 32
+    await bridge.handle_model_catalog_request(
+        redis,
+        registry,
+        json.dumps(
+            {
+                "request_id": request_id,
+                "plugin": "codex",
+                "operation": "auth",
+                "reference": reference,
+                "expires_at": time.time() + 10,
+            }
+        ),
+        config_path=str(config_path),
+        credential_reservations=CoderCredentialReservations(),
+    )
+
+    assert json.loads(redis.values[bridge._response_key(request_id)]) == {
+        "ok": False,
+        "error": "catalog unavailable",
+    }
+
+
+def test_credential_environment_handles_unreserved_and_missing_contract() -> None:
+    plugin = object()
+    config = AppConfig()
+
+    assert (
+        bridge._credential_environment(
+            plugin,
+            config=config,
+            credential_location=None,
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="credential environment builder unavailable"):
+        bridge._credential_environment(
+            plugin,
+            config=config,
+            credential_location="/reserved",
+        )
+
+
+@pytest.mark.asyncio
 async def test_loader_reports_queue_read_payload_timeout_and_cleanup_failures(
 ) -> None:
     plugin = CodexPlugin(discover=lambda **_kwargs: None)
@@ -671,6 +788,15 @@ async def test_configured_catalog_worker_response_redacts_failures(
 
         def device_login_credential_location(self, *, config: AppConfig) -> str:
             return config.auth.codex_home_dir
+
+        def build_credential_environment(
+            self,
+            *,
+            config: AppConfig,
+            credential_location: str,
+        ) -> dict[str, str]:
+            del config
+            return {"CODEX_HOME": credential_location}
 
         async def get_model_catalog(self, **_kwargs: object) -> ModelCatalog:
             self.calls += 1
