@@ -315,6 +315,23 @@ async def _read_snapshot(
     )
 
 
+async def _read_snapshots(
+    client: Any,
+    repositories: dict[str, RepoConfig],
+    config: AppConfig,
+    observed_at: datetime,
+) -> dict[str, tuple[dict[str, Any], RepoState | None]]:
+    snapshots: dict[str, tuple[dict[str, Any], RepoState | None]] = {}
+    try:
+        async with asyncio.timeout(_REDIS_TIMEOUT_SECONDS):
+            for slug, repo in repositories.items():
+                snapshots[slug] = await _read_snapshot(client, slug, repo, config, observed_at)
+    except TimeoutError:
+        for slug in repositories:
+            snapshots.setdefault(slug, (_snapshot_unavailable("unavailable", "snapshot_read_failed"), None))
+    return snapshots
+
+
 def _pipeline_view(state: RepoState | None) -> dict[str, Any] | None:
     if state is None:
         return None
@@ -477,14 +494,16 @@ async def _current_cancellation(
 def _retry_metadata(command: RetryCommand, ttl: int) -> dict[str, Any] | None:
     command_id = _uuid(command.command_id)
     task_id = _task_id(command.task_id)
-    if command_id is None or task_id is None:
+    requested_at = _timestamp_text(command.requested_at)
+    updated_at = _timestamp_text(command.updated_at)
+    if command_id is None or task_id is None or requested_at is None or updated_at is None:
         return None
     return {
         "command_id": command_id,
         "task_id": task_id,
         "status": command.status.value,
-        "requested_at": _timestamp_text(command.requested_at),
-        "updated_at": _timestamp_text(command.updated_at),
+        "requested_at": requested_at,
+        "updated_at": updated_at,
         "failure_subsource": _subsource(command.failure_subsource)
         or ("unclassified" if command.failure_subsource is not None else None),
         "bound_pr_number": _positive_number(command.bound_pr_number),
@@ -590,7 +609,16 @@ async def _pending_retries_before_timeout(client: Any, slug: str, limit: int) ->
             records.append({"status": "missing", "code": "retry_record_missing", "command_id": command_id})
             continue
         try:
-            command = RetryCommand.model_validate_json(_decode(raw))
+            decoded = json.loads(_decode(raw))
+            if not isinstance(decoded, dict):
+                raise ValueError
+            for field in ("bound_pr_number", "retry_count", "retry_cap", "processing_attempts"):
+                value = decoded.get(field)
+                if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+                    raise ValueError
+            if _timestamp(decoded.get("requested_at")) is None or _timestamp(decoded.get("updated_at")) is None:
+                raise ValueError
+            command = RetryCommand.model_validate(decoded)
         except Exception:
             records.append(
                 {
@@ -860,9 +888,7 @@ async def get_orchestrator_status(
             redis_status = "unavailable"
             redis_code = "redis_connection_failed"
         else:
-            snapshots = {}
-            for slug, repo in repositories.items():
-                snapshots[slug] = await _read_snapshot(client, slug, repo, config, observed_at)
+            snapshots = await _read_snapshots(client, repositories, config, observed_at)
             snapshot_statuses = [snapshot[0]["status"] for snapshot in snapshots.values()]
             redis_status = _source_summary(snapshot_statuses) if snapshot_statuses else "available"
             redis_code = "redis_read_failed" if redis_status != "available" else None

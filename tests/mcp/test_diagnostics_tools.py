@@ -344,6 +344,37 @@ async def test_status_overview_reports_missing_malformed_oversized_and_partial_s
     assert result["detail"]["pending_retries"]["status"] == "available"
 
 
+async def test_snapshot_reads_share_one_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.mcp.tools import diagnostics
+
+    second_url = "https://github.com/octo/other.git"
+
+    class BlockingSecondSnapshotRedis(FakeRedis):
+        async def getrange(self, key: str, start: int, end: int) -> object:
+            if key == pipeline_state(OTHER_SLUG):
+                await asyncio.Event().wait()
+            return await super().getrange(key, start, end)
+
+    redis = BlockingSecondSnapshotRedis()
+    first = _state(updated=NOW)
+    second = _state(updated=NOW)
+    second.name = OTHER_SLUG
+    second.url = second_url
+    redis.store[pipeline_state(SLUG)] = first.model_dump_json()
+    redis.store[pipeline_state(OTHER_SLUG)] = second.model_dump_json()
+    _patch_runtime(monkeypatch, redis, _config(_repo(), _repo(second_url)))
+    monkeypatch.setattr(diagnostics, "_REDIS_TIMEOUT_SECONDS", 0.01)
+
+    result = await diagnostics.get_orchestrator_status()
+
+    assert result["repositories"][0]["snapshot"]["status"] == "fresh"
+    assert result["repositories"][1]["snapshot"] == diagnostics._snapshot_unavailable(
+        "unavailable", "snapshot_read_failed"
+    )
+    assert result["redis"] == {"status": "partially_available", "code": "redis_read_failed"}
+    assert redis.closed is True
+
+
 async def test_sparse_snapshot_cannot_default_to_fresh_idle_and_other_reads_continue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -984,6 +1015,42 @@ async def test_retry_source_has_whole_scan_deadline_and_propagates_cancellation(
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+async def test_retry_source_rejects_coerced_numbers_and_invalid_timestamps() -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    command = _command()
+    index = retry_command_pending(SLUG)
+    redis.zsets[index] = [(command.command_id, 1.0)]
+    key = retry_command(SLUG, command.command_id)
+    payload = json.loads(command.model_dump_json())
+
+    redis.store[key] = "[]"
+    result = await diagnostics._pending_retries(redis, SLUG, 5)
+    assert result["records"][0]["status"] == "malformed"
+    assert result["records"][0]["code"] == "retry_record_invalid"
+
+    for field in ("bound_pr_number", "retry_count", "retry_cap", "processing_attempts"):
+        for invalid in (True, "1", 1.0):
+            candidate = dict(payload)
+            candidate[field] = invalid
+            redis.store[key] = json.dumps(candidate)
+            result = await diagnostics._pending_retries(redis, SLUG, 5)
+            assert result["records"][0]["status"] == "malformed"
+            assert result["records"][0]["code"] == "retry_record_invalid"
+
+    for field in ("requested_at", "updated_at"):
+        candidate = dict(payload)
+        candidate[field] = "0001-01-01T00:00:00+23:59"
+        redis.store[key] = json.dumps(candidate)
+        result = await diagnostics._pending_retries(redis, SLUG, 5)
+        assert result["records"][0]["status"] == "malformed"
+        assert result["records"][0]["code"] == "retry_record_invalid"
+
+    command.requested_at = datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=23, minutes=59)))
+    assert diagnostics._retry_metadata(command, 1) is None
 
 
 def test_run_metadata_allowlist_and_validation() -> None:
