@@ -453,6 +453,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     for _ in range(1_100):
         deeply_nested = {"nested": deeply_nested}
     bare_jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.signatureValue"
+    encoded_auth = "dXNlcjpTVVBFUlNFQ1JFVA=="
     credential_log = "\n".join(
         (
             "curl -H 'Authorization: ApiKey inline-auth-secret' https://example.test",
@@ -490,6 +491,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "tool --passphrase passphrase-option-secret",
             "jwt=jwt-assignment-secret",
             bare_jwt,
+            f'{{"auths":{{"registry":{{"auth":"{encoded_auth}"}}}}}}',
+            f"_auth={encoded_auth}",
             'tool --password cli-option-secret --token "quoted cli token"',
             r'tool --password "abc\"escaped-option-secret" token="abc\"escaped-assignment-secret"',
             "PASSWORD = spaced-assignment-secret",
@@ -498,6 +501,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "pass\x1b[34mword=embedded-ansi-secret",
             "\x1b]0;title\x07password=osc-secret",
             "pass\x1bPterminal-data\x1b\\word=esc-dcs-secret",
+            "pass\x1b_hidden\x1b\\word=apc-secret",
+            "pass\x1b^hidden\x1b\\word=pm-secret",
+            "pass\x1bXhidden\x1b\\word=sos-secret",
+            "safe-\x1b]8;;https://example.test\x1b\\hyperlink\x1b]8;;\x1b\\-output",
             "pass\x9d0;title\x9cword=c1-osc-secret",
             "pass\x90terminal-data\x9cword=c1-dcs-secret",
             "passX\bword=backspace-secret",
@@ -557,6 +564,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "hidden-camel-metadata" not in exported
     assert "serialized-metadata" not in exported
     assert bare_jwt not in exported
+    assert encoded_auth not in exported
+    assert "safe-hyperlink-output" in exported
     for secret in (
         "inline-auth-secret",
         "cookie-secret",
@@ -602,6 +611,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "embedded-ansi-secret",
         "osc-secret",
         "esc-dcs-secret",
+        "apc-secret",
+        "pm-secret",
+        "sos-secret",
         "c1-osc-secret",
         "c1-dcs-secret",
         "backspace-secret",

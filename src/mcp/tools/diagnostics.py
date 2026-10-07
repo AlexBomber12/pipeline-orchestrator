@@ -62,6 +62,7 @@ _CREDENTIAL_DOCUMENT_KEYS = frozenset(
     {
         "accesstoken",
         "apikey",
+        "auth",
         "authorization",
         "authtoken",
         "awssecretaccesskey",
@@ -91,8 +92,7 @@ _PEM_CREDENTIAL_BOUNDARY = re.compile(
     re.IGNORECASE,
 )
 _TERMINAL_ESCAPE = re.compile(
-    r"(?:\x1b\][^\x07]*(?:\x07|\x1b\\|$)|"
-    r"\x1bP.*?(?:\x1b\\|$)|"
+    r"(?:\x1b(?:\]|P|X|\^|_).*?(?:\x07|\x1b\\|$)|"
     r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|"
     r"\x1b[ -/]*[@-~])",
     re.DOTALL,

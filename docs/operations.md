@@ -46,9 +46,11 @@ cookies, credential-bearing absolute or scheme-relative URL userinfo/query
 parameters (including percent-encoded parameter names), recognizable token
 shapes including JWTs, private-key blocks, and recognizable JSON credential
 documents are not exported, including nested documents and documents serialized
-inside log strings and structured header name/value pairs in JSON-list or Python-tuple
-form. Complete and interrupted private-key blocks are both omitted using a
-bounded single-pass boundary scan.
+inside log strings and structured header name/value pairs in JSON-list or
+Python-tuple form. Complete and interrupted private-key blocks are both omitted
+using a bounded single-pass boundary scan.
+Standard encoded `auth` fields used by registry and package-manager credential
+documents are treated as credential context rather than exported as base64 text.
 Lines with recognizable credential keys are omitted conservatively when they
 use assignment, structured-field, header, or long-option syntax, so malformed
 or interrupted quoting cannot expose a value suffix. Indented YAML/header
