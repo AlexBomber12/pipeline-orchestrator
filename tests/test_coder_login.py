@@ -1388,6 +1388,39 @@ async def test_device_login_parser_defenses_and_abort_failure() -> None:
     assert classifier_session.failure_reason == "process_failed"
 
 
+def test_device_login_repeated_prompt_preserves_original_expiration() -> None:
+    now = [1_000.0]
+    adapter = type(
+        "RepeatedPromptAdapter",
+        (),
+        {
+            "parse_progress": lambda *_args: CoderDeviceLoginPrompt(
+                "https://example.com/device",
+                "ABCD-EFGH",
+                900,
+            )
+        },
+    )()
+    manager, _ = _manager(adapter, wall_time=lambda: now[0])
+    session = coder_login._LoginSession(
+        "E" * 43,
+        "codex",
+        _REFERENCE,
+        adapter,  # type: ignore[arg-type]
+        False,
+        1,
+    )
+
+    manager._observe_chunk(session, session.stdout, b"prompt")
+    assert session.expires_at == 1_900.0
+
+    now[0] = 1_600.0
+    manager._observe_chunk(session, session.stderr, b"polling")
+
+    assert session.state == "waiting_for_user"
+    assert session.expires_at == 1_900.0
+
+
 @pytest.mark.asyncio
 async def test_device_login_invalid_classifier_result_is_normalized(
     monkeypatch: pytest.MonkeyPatch,

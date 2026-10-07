@@ -648,7 +648,8 @@ class CoderLoginSessionManager:
                 return
             if not self._valid_prompt(prompt):
                 raise ValueError("invalid device-login prompt")
-            if session.verification_url is not None and (
+            first_prompt = session.verification_url is None
+            if not first_prompt and (
                 session.verification_url != prompt.verification_url
                 or session.user_code != prompt.user_code
             ):
@@ -666,7 +667,8 @@ class CoderLoginSessionManager:
         session.detail = "Open the verification URL and enter the one-time code"
         session.verification_url = prompt.verification_url
         session.user_code = prompt.user_code
-        session.expires_at = self._wall_time() + prompt.expires_in_seconds
+        if first_prompt:
+            session.expires_at = self._wall_time() + prompt.expires_in_seconds
 
     async def _abort_malformed_session(self, session: _LoginSession) -> None:
         assert session.managed is not None

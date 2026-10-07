@@ -104,7 +104,10 @@ reasons. Never fabricate a push, gate, or approval."""
 def build_codex_environment(*, codex_home_dir: str) -> dict[str, str]:
     """Return the environment shared by Codex login and coder processes."""
     env = dict(os.environ)
-    env.setdefault("CODEX_HOME", str(Path(codex_home_dir) / ".codex"))
+    configured_home = env.get("CODEX_HOME")
+    if configured_home is None:
+        configured_home = str(Path(codex_home_dir) / ".codex")
+    env["CODEX_HOME"] = str(Path(configured_home).expanduser().absolute())
     return env
 
 

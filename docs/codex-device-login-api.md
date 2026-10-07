@@ -35,7 +35,9 @@ state is `waiting_for_user`. They are short-lived operator instructions and
 must not be logged or copied into event history or diagnostics. Raw CLI output,
 tokens, and credential contents are never returned. Provider prompts are checked
 against these wire bounds before the session enters `waiting_for_user`; malformed
-URLs or codes abort the owned process and return `malformed_output`.
+URLs or codes abort the owned process and return `malformed_output`. The
+`expires_at` deadline is fixed when the prompt is first observed; later progress
+output cannot extend it.
 
 The possible states are `unsupported`, `starting`, `waiting_for_user`,
 `succeeded`, `failed`, `canceling`, `cancelled`, `expired`, `timed_out`,
@@ -76,11 +78,12 @@ refresh against the new credentials before launching work.
 Device login, auth probes, model discovery, usage reads, and normal Codex coder
 invocations preserve the daemon's inherited `HOME` so its Git configuration
 remains available. They receive the same effective `CODEX_HOME`: an explicitly
-inherited value when present, otherwise `<auth.codex_home_dir>/.codex`. A
+inherited value when present, otherwise `<auth.codex_home_dir>/.codex`,
+normalized once to an absolute path before any child process starts. A
 successful login therefore updates the credential store used by subsequent
-work. Web auth-status requests reach coder probes through the daemon bridge, so
-they use the same credential reservation as coder dispatch and cannot race an
-active login.
+work regardless of each child's working directory. Web auth-status requests
+reach coder probes through the daemon bridge, so they use the same credential
+reservation as coder dispatch and cannot race an active login.
 
 Terminal sessions are retained for five minutes. Sessions are daemon-memory
 state: after a daemon restart, every old identifier returns `not_found` and

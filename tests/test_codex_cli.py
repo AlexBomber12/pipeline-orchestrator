@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import tomllib
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -83,6 +84,29 @@ def _make_fake_proc(
 def _block_until_cleanup(proc: MagicMock) -> None:
     proc.returncode = None
     proc.__dict__["_cleanup_returncode"] = 0
+
+
+def test_codex_environment_normalizes_explicit_and_default_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CODEX_HOME", "relative-explicit")
+
+    explicit = codex_cli_module.build_codex_environment(
+        codex_home_dir="relative-configured"
+    )
+
+    assert explicit["CODEX_HOME"] == str(tmp_path / "relative-explicit")
+
+    monkeypatch.delenv("CODEX_HOME")
+    default = codex_cli_module.build_codex_environment(
+        codex_home_dir="relative-configured"
+    )
+
+    assert default["CODEX_HOME"] == str(
+        tmp_path / "relative-configured" / ".codex"
+    )
 
 
 @pytest.mark.asyncio
