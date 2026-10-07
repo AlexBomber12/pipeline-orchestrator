@@ -109,6 +109,11 @@ _C1_CONTROL_STRING = re.compile(r"[\x90\x98\x9d-\x9f].*?(?:\x9c|\x07|$)", re.DOT
 _JSON_CONTAINER_START = re.compile(r"[\[{]")
 _JSON_UNICODE_ESCAPE = re.compile(r"\\u(?P<codepoint>[0-9a-fA-F]{4})")
 _JSON_SIMPLE_ESCAPE = re.compile(r'\\(?P<escape>["\\/bfnrt])')
+_YAML_DOCUMENT_BOUNDARY = re.compile(r"(?m)^(?:---|\.\.\.)[ \t]*(?:#.*)?(?:\n|$)")
+_KUBERNETES_SECRET_KIND = re.compile(
+    r"(?im)^[ \t]*kind[ \t]*:[ \t]*(?P<quote>['\"]?)Secret(?P=quote)"
+    r"[ \t]*(?:#.*)?$"
+)
 _URL_USERINFO = re.compile(r"(?i)(?P<scheme>(?:\b[a-z][a-z0-9+.-]*:)?//)[^/@\s]+@")
 _SENSITIVE_QUERY_VALUE = re.compile(r"(?i)(?P<prefix>[?&;](?:sig|signature)=)[^&#;\s]+")
 _AUTHORIZATION_VALUE = re.compile(
@@ -988,6 +993,10 @@ def _contains_credential_document_key(value: object) -> bool:
     while pending:
         current = pending.pop()
         if isinstance(current, dict):
+            if current.get("kind") == "Secret" and (
+                "data" in current or "stringData" in current
+            ):
+                return True
             for key, child in current.items():
                 if _is_sensitive_key(str(key)) and child not in (None, "", False):
                     return True
@@ -1258,6 +1267,30 @@ def _omit_json_credential_documents(text: str) -> tuple[str, int]:
     return "".join(parts), len(ranges)
 
 
+def _omit_kubernetes_secret_documents(text: str) -> tuple[str, int]:
+    """Omit complete YAML documents recognizable as Kubernetes Secrets."""
+    ranges: list[tuple[int, int]] = []
+    document_start = 0
+    for boundary in _YAML_DOCUMENT_BOUNDARY.finditer(text):
+        document_end = boundary.start()
+        if _KUBERNETES_SECRET_KIND.search(text, document_start, document_end):
+            ranges.append((document_start, document_end))
+        document_start = boundary.end()
+    if _KUBERNETES_SECRET_KIND.search(text, document_start):
+        ranges.append((document_start, len(text)))
+    if not ranges:
+        return text, 0
+
+    parts: list[str] = []
+    offset = 0
+    for start, end in ranges:
+        ending = "\n" if text[start:end].endswith("\n") else ""
+        parts.extend((text[offset:start], f"{_CREDENTIAL_DOCUMENT_OMITTED}{ending}"))
+        offset = end
+    parts.append(text[offset:])
+    return "".join(parts), len(ranges)
+
+
 def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
     lines = text.splitlines(keepends=True)
     sanitized: list[str] = []
@@ -1312,10 +1345,17 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
 
 def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     text, terminal_controls = _normalize_terminal_text(text)
+    text, kubernetes_documents = _omit_kubernetes_secret_documents(text)
     text, pem_documents = _omit_pem_credential_documents(text)
     text, json_documents = _omit_json_credential_documents(text)
     text, credential_lines = _omit_sensitive_context_lines(text)
-    redactions = terminal_controls + pem_documents + json_documents + credential_lines
+    redactions = (
+        terminal_controls
+        + kubernetes_documents
+        + pem_documents
+        + json_documents
+        + credential_lines
+    )
 
     text, count = _URL_USERINFO.subn(lambda match: f"{match.group('scheme')}{_REDACTED}@", text)
     redactions += count
@@ -1332,7 +1372,7 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     for pattern in _RECOGNIZABLE_SECRET:
         text, count = pattern.subn(_REDACTED, text)
         redactions += count
-    return text, redactions, pem_documents + json_documents
+    return text, redactions, kubernetes_documents + pem_documents + json_documents
 
 
 def _utf8_tail(text: str, maximum_bytes: int) -> tuple[str, int, int, bool]:

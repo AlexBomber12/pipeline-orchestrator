@@ -530,6 +530,28 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "curl --proxy-user bob:curl-proxy-user-secret https://example.test",
             "curl -U bob:curl-short-proxy-user-secret https://example.test",
             "machine example.test login alice password netrc-password-secret",
+            "safe-before-kubernetes-secret",
+            "---",
+            "apiVersion: v1",
+            "data:",
+            "  .dockerconfigjson: kubernetes-dockerconfig-secret",
+            "stringData:",
+            "  arbitrary-name: kubernetes-stringdata-secret",
+            "kind: Secret",
+            "metadata:",
+            "  name: credentials",
+            "---",
+            "apiVersion: v1",
+            "kind: ConfigMap",
+            "data:",
+            "  public: safe-after-kubernetes-secret",
+            json.dumps(
+                {
+                    "apiVersion": "v1",
+                    "kind": "Secret",
+                    "data": {"arbitrary-name": "kubernetes-json-secret"},
+                }
+            ),
             r'tool --password "abc\"escaped-option-secret" token="abc\"escaped-assignment-secret"',
             "PASSWORD = spaced-assignment-secret",
             "Authorization : Bearer spaced-header-secret",
@@ -601,13 +623,15 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     exported = redacted["text"]
     assert redacted["availability"]["status"] == "available"
     assert redacted["redaction"]["applied"] is True
-    assert redacted["redaction"]["credential_documents_omitted"] >= 8
+    assert redacted["redaction"]["credential_documents_omitted"] >= 10
     assert "[credential line omitted]" in exported
     assert "safe-after-yaml" in exported
     assert "safe-after-yaml-sequence" in exported
     assert "safe-after-yaml-blank" in exported
     assert "safe-after-heredoc" in exported
     assert "safe-after-digit-heredoc" in exported
+    assert "safe-before-kubernetes-secret" in exported
+    assert "safe-after-kubernetes-secret" in exported
     assert "safe-after-shell" in exported
     assert "safe-after-quote" in exported
     assert "visible-control" in exported
@@ -629,6 +653,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert encoded_auth not in exported
     assert standalone_basic not in exported
     assert "safe-hyperlink-output" in exported
+    assert diagnostics._omit_kubernetes_secret_documents(
+        "apiVersion: v1\nkind: Secret\ndata:\n  tls.key: source-end-secret"
+    ) == ("[credential document omitted]", 1)
     for secret in (
         "inline-auth-secret",
         "cookie-secret",
@@ -676,6 +703,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "curl-proxy-user-secret",
         "curl-short-proxy-user-secret",
         "netrc-password-secret",
+        "kubernetes-dockerconfig-secret",
+        "kubernetes-stringdata-secret",
+        "kubernetes-json-secret",
         "quoted cli token",
         "escaped-option-secret",
         "escaped-assignment-secret",
