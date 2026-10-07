@@ -668,10 +668,15 @@ class CoderLoginSessionManager:
         if managed is None:
             return True
         try:
-            result = await managed.cleanup(
-                term_grace=_CLEANUP_GRACE_SECONDS,
-                kill_grace=_CLEANUP_GRACE_SECONDS,
-            )
+            if session.cleanup_confirmed is False:
+                result = await managed.reconcile_cleanup(
+                    observation_grace=_CLEANUP_GRACE_SECONDS,
+                )
+            else:
+                result = await managed.cleanup(
+                    term_grace=_CLEANUP_GRACE_SECONDS,
+                    kill_grace=_CLEANUP_GRACE_SECONDS,
+                )
         except Exception:
             return False
         return result.quiescent

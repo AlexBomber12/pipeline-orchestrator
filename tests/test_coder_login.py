@@ -79,11 +79,14 @@ class _Managed:
         self,
         *,
         quiescent: bool = True,
+        reconcile_quiescent: bool | None = None,
         cleanup_error: Exception | None = None,
     ) -> None:
         self.quiescent = quiescent
+        self.reconcile_quiescent = reconcile_quiescent
         self.cleanup_error = cleanup_error
         self.cleanup_calls = 0
+        self.reconcile_calls = 0
 
     async def cleanup(self, **_kwargs: object) -> CleanupResult:
         self.cleanup_calls += 1
@@ -95,6 +98,23 @@ class _Managed:
             True,
             not self.quiescent,
             None if self.quiescent else "ownership uncertain",
+        )
+
+    async def reconcile_cleanup(self, **_kwargs: object) -> CleanupResult:
+        self.reconcile_calls += 1
+        if self.cleanup_error is not None:
+            raise self.cleanup_error
+        quiescent = (
+            self.quiescent
+            if self.reconcile_quiescent is None
+            else self.reconcile_quiescent
+        )
+        return CleanupResult(
+            CleanupStatus.QUIESCENT if quiescent else CleanupStatus.FAILED,
+            0 if quiescent else None,
+            False,
+            False,
+            None if quiescent else "ownership still uncertain",
         )
 
 
@@ -614,6 +634,82 @@ async def test_device_login_cancel_confirms_or_retains_process_ownership(
                 manager._sessions[started["session_id"]].task,
                 return_exceptions=True,
             )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reconcile_quiescent", "expected_state"),
+    ((True, "cancelled"), (False, "cleanup_failed")),
+)
+async def test_device_login_cancel_reconciles_prior_cleanup_failure(
+    reconcile_quiescent: bool,
+    expected_state: str,
+) -> None:
+    reservations = CoderCredentialReservations()
+    manager, _ = _manager(reservations=reservations)
+    managed = _Managed(
+        quiescent=False,
+        reconcile_quiescent=reconcile_quiescent,
+    )
+    session = coder_login._LoginSession(
+        "R" * 43,
+        "codex",
+        _REFERENCE,
+        _adapter(),
+        False,
+        1,
+        state="cleanup_failed",
+        cleanup_confirmed=False,
+        managed=managed,  # type: ignore[arg-type]
+        reservation_held=True,
+    )
+    manager._sessions[session.session_id] = session
+    assert reservations.reserve_login(session.adapter.credential_location)
+
+    result = await manager.cancel(
+        "codex", session.session_id, expected_reference=_REFERENCE
+    )
+
+    assert result["state"] == expected_state
+    assert result["cleanup_confirmed"] is (
+        True if reconcile_quiescent else False
+    )
+    assert managed.cleanup_calls == 0
+    assert managed.reconcile_calls == 1
+    assert reservations.reserve_coder(
+        session.adapter.credential_location
+    ) is reconcile_quiescent
+    if reconcile_quiescent:
+        reservations.release_coder(session.adapter.credential_location)
+
+
+@pytest.mark.asyncio
+async def test_device_login_shutdown_reconciles_prior_cleanup_failure() -> None:
+    reservations = CoderCredentialReservations()
+    manager, _ = _manager(reservations=reservations)
+    managed = _Managed(quiescent=False, reconcile_quiescent=True)
+    session = coder_login._LoginSession(
+        "W" * 43,
+        "codex",
+        _REFERENCE,
+        _adapter(),
+        False,
+        1,
+        state="cleanup_failed",
+        cleanup_confirmed=False,
+        managed=managed,  # type: ignore[arg-type]
+        reservation_held=True,
+    )
+    manager._sessions[session.session_id] = session
+    assert reservations.reserve_login(session.adapter.credential_location)
+
+    await manager.shutdown()
+
+    assert session.state == "cancelled"
+    assert session.cleanup_confirmed is True
+    assert managed.reconcile_calls == 1
+    assert reservations.reserve_coder(session.adapter.credential_location)
+    reservations.release_coder(session.adapter.credential_location)
 
 
 @pytest.mark.asyncio

@@ -151,7 +151,7 @@ class ProcessIdentity:
 
 @dataclass(frozen=True)
 class CleanupResult:
-    """Outcome cached by :meth:`SupervisedProcess.cleanup`."""
+    """Process-group cleanup or observation-only reconciliation outcome."""
 
     status: CleanupStatus
     leader_returncode: int | None
@@ -323,6 +323,24 @@ class SupervisedProcess:
         if cancellation is not None:
             raise cancellation
         return result
+
+    async def reconcile_cleanup(
+        self,
+        *,
+        observation_grace: float = 0.0,
+    ) -> CleanupResult:
+        """Freshly observe quiescence after a cached cleanup failure.
+
+        This path never signals the process group and does not replace the
+        first cleanup result. It only permits an owner that retained control
+        after an unconfirmed cleanup to prove that the group later exited.
+        """
+        observation, _ = await self._wait_for_quiescence(observation_grace)
+        term_sent = bool(self._signaled_members.get(signal.SIGTERM))
+        kill_sent = bool(self._signaled_members.get(signal.SIGKILL))
+        if observation.state is _GroupState.QUIESCENT:
+            return await self._success(term_sent, kill_sent)
+        return self._failure(term_sent, kill_sent, observation.detail)
 
     async def _cleanup_impl(
         self, term_grace: float, kill_grace: float

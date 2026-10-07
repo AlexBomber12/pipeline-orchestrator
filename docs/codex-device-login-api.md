@@ -43,6 +43,9 @@ The possible states are `unsupported`, `starting`, `waiting_for_user`,
 `state` or `failure_reason`; they must not infer process termination from a
 cancellation request. `cleanup_failed` with `cleanup_confirmed: false` means
 the daemon still retains ownership because process termination was not proven.
+A later cancel or shutdown request performs a fresh observation-only
+reconciliation; ownership is released only if that observation proves the
+process group is quiescent.
 
 ## Lifecycle and identity
 

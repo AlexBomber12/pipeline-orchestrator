@@ -1155,6 +1155,59 @@ async def test_cleanup_failure_is_bounded(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "expected_status"),
+    (
+        (_GroupState.QUIESCENT, CleanupStatus.QUIESCENT),
+        (_GroupState.LIVE, CleanupStatus.FAILED),
+    ),
+)
+async def test_reconcile_cleanup_freshly_observes_without_replacing_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    state: _GroupState,
+    expected_status: CleanupStatus,
+) -> None:
+    process = type("ObservedProcess", (), {"returncode": 0})()
+    managed = SupervisedProcess(
+        process=process,  # type: ignore[arg-type]
+        identity=ProcessIdentity(101, 101, 101, 1),
+        _proof=process_supervisor._LAUNCH_PROOF,
+    )
+    cached_failure = asyncio.create_task(
+        asyncio.sleep(
+            0,
+            result=CleanupResult(
+                CleanupStatus.FAILED,
+                None,
+                True,
+                True,
+                "initial cleanup failed",
+            ),
+        )
+    )
+    await cached_failure
+    managed._cleanup_task = cached_failure
+
+    async def observe(
+        timeout: float,
+        *,
+        repeat_signal: signal.Signals | None = None,
+    ) -> tuple[_GroupObservation, bool]:
+        assert timeout == 0.25
+        assert repeat_signal is None
+        return _GroupObservation(state, "fresh observation"), False
+
+    monkeypatch.setattr(managed, "_wait_for_quiescence", observe)
+
+    reconciled = await managed.reconcile_cleanup(observation_grace=0.25)
+
+    assert reconciled.status is expected_status
+    assert reconciled.term_sent is False
+    assert reconciled.kill_sent is False
+    assert (await managed.cleanup()).status is CleanupStatus.FAILED
+
+
+@pytest.mark.asyncio
 async def test_cleanup_reports_control_and_observation_failures(
     process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
