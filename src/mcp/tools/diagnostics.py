@@ -109,7 +109,7 @@ _SENSITIVE_MULTIWORD_LABEL = re.compile(
     r")\s*[=:]"
 )
 _SENSITIVE_KEY_CHARACTERS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-%+"
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-%+[]"
 )
 _SENSITIVE_KEY_WRAPPERS = frozenset("\\\"'")
 _RECOGNIZABLE_SECRET = tuple(
