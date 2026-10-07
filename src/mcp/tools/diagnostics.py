@@ -22,7 +22,8 @@ import redis.asyncio as aioredis
 
 from src.cancellation import SUBSOURCE_VOCABULARY
 from src.cancellation.storage import CATEGORIES, cause_key
-from src.config import AppConfig, CoderType, RepoConfig, load_config
+from src.coder_ids import validate_coder_plugin_id
+from src.config import AppConfig, RepoConfig, load_config
 from src.keyspace import pipeline_state, retry_command, retry_command_pending
 from src.mcp.server import mcp
 from src.metrics import MetricsStore, RunRecord
@@ -47,7 +48,6 @@ _MAX_CANCELLATION_BYTES = 64 * 1024
 _MAX_RUN_BYTES = 64 * 1024
 _MAX_INDEX_MEMBER_BYTES = 512
 
-_KNOWN_CODERS = frozenset(item.value for item in CoderType)
 _KNOWN_CATEGORIES = frozenset(CATEGORIES)
 _KNOWN_SUBSOURCES = frozenset(SUBSOURCE_VOCABULARY)
 
@@ -137,7 +137,10 @@ def _uuid(value: object) -> str | None:
 
 
 def _coder(value: object) -> str | None:
-    return value if isinstance(value, str) and value in _KNOWN_CODERS else None
+    try:
+        return validate_coder_plugin_id(value)
+    except ValueError:
+        return None
 
 
 def _subsource(value: object) -> str | None:
@@ -387,7 +390,7 @@ def _overview(
         "repo_slug": slug,
         "configured": {
             "active": repo.active,
-            "coder": (repo.coder or config.daemon.coder).value,
+            "coder": repo.coder or config.daemon.coder,
         },
         "snapshot": snapshot,
         "pipeline": _pipeline_view(state),
@@ -438,6 +441,18 @@ async def _current_cancellation(
 ) -> dict[str, Any]:
     if task_id is None:
         return {"status": "not_applicable", "classification": None}
+    try:
+        async with asyncio.timeout(_REDIS_TIMEOUT_SECONDS):
+            return await _current_cancellation_before_timeout(client, slug, task_id)
+    except TimeoutError:
+        return {"status": "unavailable", "code": "cancellation_read_failed", "classification": None}
+
+
+async def _current_cancellation_before_timeout(
+    client: Any,
+    slug: str,
+    task_id: str,
+) -> dict[str, Any]:
     key = cause_key(slug, task_id)
     try:
         raw, size_bytes, oversized = await _read_bounded_string(client, key, _MAX_CANCELLATION_BYTES)

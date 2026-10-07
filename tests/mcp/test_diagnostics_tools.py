@@ -256,6 +256,7 @@ async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_o
     assert result["schema_version"] == 1
     assert result["redis"] == {"status": "available", "code": None}
     overview = result["repositories"][0]
+    assert overview["configured"]["coder"] == "codex"
     assert overview["snapshot"]["status"] == "stale"
     assert overview["snapshot"]["freshness_is_coder_activity"] is False
     assert overview["pipeline"] == {
@@ -564,7 +565,8 @@ def test_scalar_validation_and_configured_repo_guards(monkeypatch: pytest.Monkey
     identifier = str(uuid.uuid4())
     assert diagnostics._uuid(identifier.upper()) == identifier
     assert diagnostics._coder("codex") == "codex"
-    assert diagnostics._coder("secret") is None
+    assert diagnostics._coder("custom-coder") == "custom-coder"
+    assert diagnostics._coder("../secret") is None
     assert diagnostics._subsource("guardrail") == "guardrail"
     assert diagnostics._subsource("secret") is None
     assert diagnostics._decode(b"ok") == "ok"
@@ -816,7 +818,7 @@ def test_pipeline_and_inhibitor_allowlists() -> None:
     from src.mcp.tools import diagnostics
 
     state = _state()
-    state.coder = "secret-coder"
+    state.coder = "../secret"
     state.current_task.pr_id = "secret-task"
     state.current_pr.number = 0
     state.current_pr.head_sha = "short"
@@ -836,7 +838,7 @@ def test_pipeline_and_inhibitor_allowlists() -> None:
     state.active_inhibitors = [
         WorkInhibitor(
             inhibitor_type=InhibitorType.RATE_LIMIT,
-            coder_affected="secret-coder",
+            coder_affected="../secret",
             expires_at=NOW - timedelta(seconds=1),
             reason_text="secret",
             source_key="secret",
@@ -904,6 +906,41 @@ async def test_cancellation_source_statuses() -> None:
     assert result["classification"]["subsource"] == "unclassified"
     assert "future-category-secret" not in json.dumps(result)
     assert "secret-invalid-payload" not in json.dumps(result)
+
+
+async def test_cancellation_read_has_one_deadline_and_propagates_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    class BlockingCancellationRedis(FakeRedis):
+        def __init__(self) -> None:
+            super().__init__()
+            self.read_started = asyncio.Event()
+
+        async def getrange(self, key: str, start: int, end: int) -> object:
+            self._check("getrange", key)
+            self.read_started.set()
+            await asyncio.Event().wait()
+
+    redis = BlockingCancellationRedis()
+    redis.store[cause_key(SLUG, "PR-9")] = "{}"
+    monkeypatch.setattr(diagnostics, "_REDIS_TIMEOUT_SECONDS", 0.01)
+
+    result = await diagnostics._current_cancellation(redis, SLUG, "PR-9")
+    assert result == {
+        "status": "unavailable",
+        "code": "cancellation_read_failed",
+        "classification": None,
+    }
+
+    monkeypatch.setattr(diagnostics, "_REDIS_TIMEOUT_SECONDS", 30.0)
+    redis.read_started.clear()
+    task = asyncio.create_task(diagnostics._current_cancellation(redis, SLUG, "PR-9"))
+    await redis.read_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 async def test_retry_source_bounds_and_malformed_records() -> None:
