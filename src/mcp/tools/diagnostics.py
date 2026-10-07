@@ -99,7 +99,15 @@ _TERMINAL_CSI = re.compile(r"(?:\x1b\[|\x9b)[0-?]*[ -/]*(?P<final>[@-~])")
 _TERMINAL_STATEFUL_ESCAPE = re.compile(r"\x1b[78DEHM]")
 _C1_CONTROL_STRING = re.compile(r"[\x90\x98\x9d-\x9f].*?(?:\x9c|\x07|$)", re.DOTALL)
 _JSON_CONTAINER_START = re.compile(r"[\[{]")
-_URL_USERINFO = re.compile(r"(?i)(?P<scheme>\b[a-z][a-z0-9+.-]*://)[^/@\s]+@")
+_URL_USERINFO = re.compile(r"(?i)(?P<scheme>(?:\b[a-z][a-z0-9+.-]*:)?//)[^/@\s]+@")
+_SENSITIVE_MULTIWORD_LABEL = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:"
+    r"(?:api|oauth|access|refresh|id|auth)\s+(?:key|token)|"
+    r"(?:client|private)\s+(?:key|secret)|"
+    r"secret(?:\s+access)?\s+key|"
+    r"proxy\s+authorization|set\s+cookie"
+    r")\s*[=:]"
+)
 _SENSITIVE_KEY_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-%+"
 )
@@ -1051,6 +1059,10 @@ def _is_sensitive_key(value: str) -> bool:
 
 def _sensitive_value_start(line: str) -> int | None:
     """Return the value position for a sensitive context found in one line."""
+    multiword = _SENSITIVE_MULTIWORD_LABEL.search(line)
+    if multiword is not None:
+        return multiword.end()
+
     index = 0
     while index < len(line):
         if line[index] not in _SENSITIVE_KEY_CHARACTERS:
