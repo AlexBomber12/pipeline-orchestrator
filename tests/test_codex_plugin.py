@@ -88,6 +88,8 @@ async def test_codex_plugin_adapts_discovery_and_auth_context(
         )
 
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-used")
+    monkeypatch.setenv("HOME", str(tmp_path / "daemon-home"))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     config = AppConfig.model_validate(
         {"auth": {"codex_home_dir": str(tmp_path / "auth")}}
     )
@@ -109,7 +111,8 @@ async def test_codex_plugin_adapts_discovery_and_auth_context(
     assert captured["cwd"] == str(tmp_path)
     env = captured["env"]
     assert isinstance(env, dict)
-    assert env["HOME"] == str(tmp_path / "auth")
+    assert env["HOME"] == str(tmp_path / "daemon-home")
+    assert env["CODEX_HOME"] == str(tmp_path / "auth" / ".codex")
     assert "OPENAI_API_KEY" not in env
 
 
@@ -182,6 +185,8 @@ def test_codex_plugin_check_auth(
         f"  codex_home_dir: {tmp_path / 'codex-home'}\n",
         encoding="utf-8",
     )
+    monkeypatch.setenv("HOME", str(tmp_path / "daemon-home"))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
 
     calls: list[tuple[list[str], dict[str, str] | None]] = []
 
@@ -220,8 +225,14 @@ def test_codex_plugin_check_auth(
         ["codex", "login", "status"],
     ]
     assert all(env is not None for _cmd, env in calls)
-    assert calls[0][1]["HOME"] == str(tmp_path / "codex-home")
-    assert calls[1][1]["HOME"] == str(tmp_path / "codex-home")
+    assert calls[0][1]["HOME"] == str(tmp_path / "daemon-home")
+    assert calls[1][1]["HOME"] == str(tmp_path / "daemon-home")
+    assert calls[0][1]["CODEX_HOME"] == str(
+        tmp_path / "codex-home" / ".codex"
+    )
+    assert calls[1][1]["CODEX_HOME"] == str(
+        tmp_path / "codex-home" / ".codex"
+    )
 
 
 @pytest.mark.parametrize(
@@ -896,13 +907,14 @@ def test_codex_device_login_context_uses_effective_auth_environment(
         f"auth:\n  codex_home_dir: {configured_home}\n",
         encoding="utf-8",
     )
+    monkeypatch.setenv("HOME", str(tmp_path / "daemon-home"))
     monkeypatch.setenv("CODEX_HOME", str(explicit_codex_home))
 
     plugin = CodexPlugin()
     adapter = plugin.create_device_login(config_path=str(config_path))
 
     assert adapter.command == ("codex", "login", "--device-auth")
-    assert adapter.environment["HOME"] == str(configured_home)
+    assert adapter.environment["HOME"] == str(tmp_path / "daemon-home")
     assert adapter.environment["CODEX_HOME"] == str(explicit_codex_home)
     assert adapter.working_directory == str(tmp_path)
     assert adapter.credential_location == str(explicit_codex_home)
@@ -914,9 +926,12 @@ def test_codex_device_login_context_uses_effective_auth_environment(
     assert "unsuccessful or cancelled replacement" in adapter.replacement_warning
 
     monkeypatch.delenv("CODEX_HOME")
-    assert plugin.create_device_login(
-        config_path=str(config_path)
-    ).credential_location == str(configured_home / ".codex")
+    default_adapter = plugin.create_device_login(config_path=str(config_path))
+    assert default_adapter.environment["HOME"] == str(tmp_path / "daemon-home")
+    assert default_adapter.environment["CODEX_HOME"] == str(
+        configured_home / ".codex"
+    )
+    assert default_adapter.credential_location == str(configured_home / ".codex")
 
 
 def test_codex_device_login_parser_handles_ansi_and_incremental_output() -> None:

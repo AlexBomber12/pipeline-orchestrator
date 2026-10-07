@@ -2192,6 +2192,9 @@ def test_codex_discovery_uses_configured_session_context_without_api_key(
     monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
     monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-used")
+    daemon_home = tmp_path / "daemon-home"
+    monkeypatch.setenv("HOME", str(daemon_home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     captured: dict[str, object] = {}
 
     async def discover(**kwargs: object) -> tuple[CodexModel, ...]:
@@ -2206,7 +2209,8 @@ def test_codex_discovery_uses_configured_session_context_without_api_key(
     assert captured["cwd"] == str(tmp_path)
     env = captured["env"]
     assert isinstance(env, dict)
-    assert env["HOME"] == str(codex_home)
+    assert env["HOME"] == str(daemon_home)
+    assert env["CODEX_HOME"] == str(codex_home / ".codex")
     assert "OPENAI_API_KEY" not in env
 
 
@@ -2945,7 +2949,7 @@ def _install_fake_subprocess(
     codex: _FakeCompleted | Exception | None = None,
     codex_version: _FakeCompleted | Exception | None = None,
 ) -> None:
-    """Patch ``subprocess.run`` inside src.web.app with canned auth probes."""
+    """Install canned daemon-owned coder probes and a local gh probe."""
     if codex is None:
         codex = _FakeCompleted(127, stderr="codex not found")
     if codex_version is None:
@@ -2970,6 +2974,28 @@ def _install_fake_subprocess(
         raise AssertionError(f"unexpected command: {cmd}")
 
     monkeypatch.setattr(web_app.subprocess, "run", fake_run)
+
+    async def fake_daemon_auth(
+        _self: object,
+        plugin_id: str,
+        *,
+        expected_reference: str,
+    ) -> dict[str, Any]:
+        assert expected_reference
+        if plugin_id == "claude":
+            return _auth_probe._check_claude_auth()
+        if plugin_id == "codex":
+            return _auth_probe._check_codex_auth()
+        raise AssertionError(f"unexpected coder auth probe: {plugin_id}")
+
+    loader_factory = web_app.DaemonModelCatalogLoader
+
+    def fake_loader_factory(redis_client: object) -> object:
+        loader = loader_factory(redis_client)
+        monkeypatch.setattr(loader, "load_auth_status", fake_daemon_auth.__get__(loader))
+        return loader
+
+    monkeypatch.setattr(web_app, "DaemonModelCatalogLoader", fake_loader_factory)
 
 
 def test_api_auth_status_returns_ok_for_both(
@@ -3836,7 +3862,7 @@ def test_api_coders_returns_rows(empty_config: Path) -> None:
 def test_auth_probes_inject_config_auth_dirs_into_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Auth CLI probes must inject ``CLAUDE_CONFIG_DIR`` / ``GH_CONFIG_DIR``.
+    """Direct auth helpers inject configured CLI credential directories.
 
     Regression for a P1 Codex finding on PR-016: ``docker-compose.yml``
     only wires those env vars on the ``daemon`` service, so the ``web``
@@ -3846,8 +3872,8 @@ def test_auth_probes_inject_config_auth_dirs_into_env(
     then report "not authorized" even when the daemon was correctly
     logged in. The probes now read ``auth.claude_config_dir`` and
     ``auth.gh_config_dir`` from ``config.yml`` and inject them into the
-    subprocess environment, so the Auth Status panel reflects the real
-    auth context operators actually care about.
+    subprocess environment. Coder helpers execute within the daemon in
+    production; GitHub remains an infrastructure probe in the web service.
     """
     cfg = tmp_path / "config.yml"
     cfg.write_text(
@@ -3885,10 +3911,8 @@ def test_auth_probes_inject_config_auth_dirs_into_env(
 
     monkeypatch.setattr(web_app.subprocess, "run", fake_run)
 
-    with TestClient(app) as client:
-        response = client.get("/api/auth-status")
-
-    assert response.status_code == 200
+    _auth_probe._check_claude_auth()
+    _auth_probe._check_gh_auth()
     assert captured["claude"].get("CLAUDE_CONFIG_DIR") == "/custom/claude-home"
     assert captured["gh"].get("GH_CONFIG_DIR") == "/custom/gh-home"
 
@@ -3896,7 +3920,7 @@ def test_auth_probes_inject_config_auth_dirs_into_env(
 def test_api_auth_status_uses_overridden_config_path_for_claude_probe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Claude auth probe must honor the web app's overridden ``CONFIG_PATH``.
+    """Direct auth helpers honor the web app's overridden ``CONFIG_PATH``.
 
     Regression for a P2 Codex finding on PR-074: `_check_claude_auth()`
     delegated to `ClaudePlugin.check_auth()` without passing
@@ -3947,59 +3971,50 @@ def test_api_auth_status_uses_overridden_config_path_for_claude_probe(
 
     monkeypatch.setattr(web_app.subprocess, "run", fake_run)
 
-    with TestClient(app) as client:
-        response = client.get("/api/auth-status")
-
-    assert response.status_code == 200
+    _auth_probe._check_claude_auth()
+    _auth_probe._check_gh_auth()
     assert captured["claude"].get("CLAUDE_CONFIG_DIR") == "/override/claude-home"
     assert captured["gh"].get("GH_CONFIG_DIR") == "/override/gh-home"
 
 
-def test_auth_status_probes_run_concurrently_off_loop(
+def test_auth_status_routes_coder_probes_through_daemon_bridge(
     empty_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Both probes must dispatch to the threadpool in parallel.
-
-    Regression for a P1 Codex finding: the original implementation ran
-    `_check_claude_auth` and `_check_gh_auth` serially from the async
-    handler, blocking the event loop for up to ~10s (two 5s timeouts)
-    whenever a CLI was missing. The fix uses `asyncio.gather` +
-    `asyncio.to_thread` so both probes run concurrently in the threadpool.
-
-    This test proves the fix by installing a `threading.Barrier(parties=2)`
-    that both probes must rendez-vous on before `subprocess.run` returns.
-    If the probes still run serially, the first one blocks forever waiting
-    for the second to show up and the test times out; if they run
-    concurrently, both reach the barrier and the request completes.
-    """
-    barrier = threading.Barrier(parties=3, timeout=5)
+    """Coder probes use the daemon bridge while only gh runs in web."""
+    coder_calls: list[str] = []
+    subprocess_calls: list[str] = []
 
     def fake_run(
         cmd: list[str], *args: object, **kwargs: object
     ) -> _FakeCompleted:
-        # Block until all sibling probes also reach the barrier. With a
-        # serial implementation this wait times out because the later
-        # probes are never dispatched.
-        barrier.wait()
-        if cmd and cmd[0] == "claude":
-            return _FakeCompleted(0, stdout="claude 1.2.3\n")
-        if cmd and cmd[0] == "codex":
-            return _FakeCompleted(127, stderr="codex not found")
+        subprocess_calls.append(cmd[0])
         if cmd and cmd[0] == "gh":
             return _FakeCompleted(
                 0, stderr="  ✓ Logged in to github.com as octocat\n"
             )
         raise AssertionError(f"unexpected command: {cmd}")
 
+    class Bridge:
+        async def load_auth_status(
+            self, plugin_id: str, *, expected_reference: str
+        ) -> dict[str, object]:
+            assert expected_reference
+            coder_calls.append(plugin_id)
+            return {"status": "ok", "detail": "daemon-owned"}
+
     monkeypatch.setattr(web_app.subprocess, "run", fake_run)
 
     with TestClient(app) as client:
+        client.app.state.plugin_bridge = Bridge()
         response = client.get("/api/auth-status")
 
     assert response.status_code == 200
     payload = response.json()
     assert payload["claude"]["status"] == "ok"
+    assert payload["codex"]["status"] == "ok"
     assert payload["gh"]["status"] == "ok"
+    assert sorted(coder_calls) == ["claude", "codex"]
+    assert subprocess_calls == ["gh"]
 
 
 def test_partial_auth_status_renders_status_dots(

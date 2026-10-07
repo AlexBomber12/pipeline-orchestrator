@@ -174,6 +174,7 @@ async def test_codex_async_spawn_uses_bwrap_when_isolation_enabled_and_available
     captured: dict[str, Any] = {}
     fake_proc = _make_fake_proc()
 
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.setattr(codex_cli, "load_config", lambda: _config(isolation=True))
     _patch_bwrap(monkeypatch, available=True)
     _patch_supervised_launch(monkeypatch, codex_cli, captured, fake_proc)
@@ -184,7 +185,7 @@ async def test_codex_async_spawn_uses_bwrap_when_isolation_enabled_and_available
     assert captured["cmd"][0] == "bwrap"
     assert "codex" in captured["cmd"]
     assert "/data/repos/demo" in captured["cmd"]
-    assert "/data/auth" in captured["cmd"]
+    assert "/data/auth/.codex" in captured["cmd"]
 
 
 @pytest.mark.asyncio

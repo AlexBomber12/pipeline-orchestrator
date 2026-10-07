@@ -101,12 +101,6 @@ def _run_auth_command(
     return completed.returncode, completed.stdout or "", completed.stderr or ""
 
 
-def _auth_probe_env(**overrides: str) -> dict[str, str]:
-    env = dict(os.environ)
-    env.update(overrides)
-    return env
-
-
 def _first_probe_line(text: str) -> str:
     for line in text.splitlines():
         stripped = line.strip()
@@ -312,7 +306,7 @@ class CodexPlugin:
         self, *, config: AppConfig, config_path: str
     ) -> tuple[str, str]:
         return (
-            config.auth.codex_home_dir,
+            self.device_login_credential_location(config=config),
             str(Path(config_path).absolute().parent),
         )
 
@@ -320,12 +314,13 @@ class CodexPlugin:
         self, *, config: AppConfig, config_path: str
     ) -> ModelCatalog:
         """Discover Codex metadata in the configured CLI auth context."""
-        home_dir, working_directory = self.model_catalog_cache_key(
+        _credential_location, working_directory = self.model_catalog_cache_key(
             config=config,
             config_path=config_path,
         )
-        env = dict(os.environ)
-        env["HOME"] = home_dir
+        env = codex_cli.build_codex_environment(
+            codex_home_dir=config.auth.codex_home_dir
+        )
         # The configured CLI session is the supported discovery context. Do
         # not accidentally switch the metadata probe to API billing.
         env.pop("OPENAI_API_KEY", None)
@@ -444,7 +439,9 @@ class CodexPlugin:
     def check_auth(self, *, config_path: str = CONFIG_PATH) -> dict[str, Any]:
         """Report saved Codex credentials without verifying service access."""
         cfg = load_config(config_path)
-        env = _auth_probe_env(HOME=cfg.auth.codex_home_dir)
+        env = codex_cli.build_codex_environment(
+            codex_home_dir=cfg.auth.codex_home_dir
+        )
         version_rc, version_stdout, version_stderr = _run_auth_command(
             ["codex", "--version"], env=env
         )

@@ -127,7 +127,7 @@ async def test_run_codex_async_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "--config" not in cmd
     assert cmd[-1] == "do a thing"
     assert captured["kwargs"]["cwd"] == "/data/repos/demo"
-    assert captured["kwargs"]["env"]["HOME"] == configured_home
+    assert captured["kwargs"]["env"]["HOME"] == "/tmp/daemon-home"
     assert captured["kwargs"]["env"]["CODEX_HOME"] == (
         "/tmp/explicit-codex-home"
     )

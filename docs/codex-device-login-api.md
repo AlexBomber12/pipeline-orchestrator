@@ -63,9 +63,13 @@ diagnosis failure. Releasing login ownership first advances the location's
 credential generation; runners reject cache entries from older generations and
 refresh auth before launching work.
 
-Device login and normal Codex coder invocations receive the same effective
-`HOME` and inherited `CODEX_HOME`, so a successful login updates the credential
-store used by subsequent work.
+Device login, auth probes, model discovery, and normal Codex coder invocations
+preserve the daemon's inherited `HOME` so its Git configuration remains
+available. They receive the same effective `CODEX_HOME`: an explicitly inherited
+value when present, otherwise `<auth.codex_home_dir>/.codex`. A successful login
+therefore updates the credential store used by subsequent work. Web auth-status
+requests reach coder probes through the daemon bridge, so they use the same
+credential reservation as coder dispatch and cannot race an active login.
 
 Terminal sessions are retained for five minutes. Sessions are daemon-memory
 state: after a daemon restart, every old identifier returns `not_found` and

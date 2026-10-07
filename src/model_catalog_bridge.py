@@ -14,6 +14,7 @@ from typing import Any, Callable
 from src.coder_auth import isolated_auth_probe, terminate_plugin_worker
 from src.coder_login import CoderCredentialReservations, CoderLoginSessionManager
 from src.coder_registry import (
+    CoderAuthStatus,
     CoderMetadataView,
     CoderPlugin,
     CoderRegistry,
@@ -22,6 +23,7 @@ from src.coder_registry import (
     ModelMetadata,
     ModelReasoningEffort,
     ModelSetting,
+    coder_auth_payload,
     parse_coder_auth_payload,
     parse_coder_device_login_payload,
 )
@@ -475,6 +477,7 @@ async def handle_model_catalog_request(
     *,
     config_path: str,
     login_manager: CoderLoginSessionManager | None = None,
+    credential_reservations: CoderCredentialReservations | None = None,
 ) -> None:
     """Execute one validated request inside the daemon process."""
     if isinstance(raw_request, bytes):
@@ -571,13 +574,48 @@ async def handle_model_catalog_request(
             return
         if operation == "auth":
             assert reference is not None
-            auth = await isolated_auth_probe(
-                plugin_name,
-                reference,
-                plugin.display_name,
-                config_path=config_path,
-                timeout=_CONFIGURED_CATALOG_TIMEOUT_SECONDS,
-            )
+            credential_location: str | None = None
+            resolver = getattr(plugin, "device_login_credential_location", None)
+            if callable(resolver) and credential_reservations is not None:
+                credential_location = resolver(config=load_config(config_path))
+                if (
+                    not isinstance(credential_location, str)
+                    or not credential_location
+                ):
+                    raise ValueError("invalid coder credential location")
+                if not credential_reservations.reserve_coder(
+                    credential_location
+                ):
+                    auth = coder_auth_payload(
+                        CoderAuthStatus(
+                            status="error",
+                            detail="Device login is in progress",
+                            failure_reason="probe_unavailable",
+                        ),
+                        capabilities=plugin.auth_capabilities,
+                    )
+                    await _store_response(
+                        redis_client,
+                        request_id,
+                        {"ok": True, "auth": auth},
+                    )
+                    return
+            try:
+                auth = await isolated_auth_probe(
+                    plugin_name,
+                    reference,
+                    plugin.display_name,
+                    config_path=config_path,
+                    timeout=_CONFIGURED_CATALOG_TIMEOUT_SECONDS,
+                )
+            finally:
+                if (
+                    credential_location is not None
+                    and credential_reservations is not None
+                ):
+                    credential_reservations.release_coder(
+                        credential_location
+                    )
             await _store_response(
                 redis_client,
                 request_id,
@@ -661,6 +699,7 @@ async def serve_model_catalog_requests(
                             queued[1],
                             config_path=config_path,
                             login_manager=login_manager,
+                            credential_reservations=credential_reservations,
                         )
                     )
                     pending.add(task)

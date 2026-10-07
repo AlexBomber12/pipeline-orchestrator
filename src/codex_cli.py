@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Callable
 
 from src.config import load_config
@@ -103,7 +104,7 @@ reasons. Never fabricate a push, gate, or approval."""
 def build_codex_environment(*, codex_home_dir: str) -> dict[str, str]:
     """Return the environment shared by Codex login and coder processes."""
     env = dict(os.environ)
-    env["HOME"] = codex_home_dir
+    env.setdefault("CODEX_HOME", str(Path(codex_home_dir) / ".codex"))
     return env
 
 
@@ -123,10 +124,13 @@ def _maybe_wrap_sandbox(cmd: list[str], cwd: str) -> list[str]:
     # the sandboxed coder; without it non-interactive git push fails.
     home = os.environ.get("HOME")
     additional_rw_dirs = [home] if home else None
+    codex_environment = build_codex_environment(
+        codex_home_dir=cfg.auth.codex_home_dir
+    )
     return build_bwrap_command(
         command=cmd,
         repo_path=cwd,
-        coder_config_dir=cfg.auth.codex_home_dir,
+        coder_config_dir=codex_environment["CODEX_HOME"],
         gh_config_dir=cfg.auth.gh_config_dir,
         additional_rw_dirs=additional_rw_dirs,
     )
