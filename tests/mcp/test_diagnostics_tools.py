@@ -569,6 +569,11 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "  arbitrary-name: kubernetes-quoted-key-secret",
             "---",
             "apiVersion: v1",
+            r'"k\u0069nd": Secret',
+            "data:",
+            "  arbitrary-name: kubernetes-escaped-key-secret",
+            "---",
+            "apiVersion: v1",
             "kind: ConfigMap",
             "data:",
             "  public: safe-after-kubernetes-secret",
@@ -624,6 +629,19 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             'PASSWORD="alpha',
             'quoted-multiline-secret"',
             "safe-after-quote",
+            "PASSWORD=(",
+            "shell-array-secret",
+            ")",
+            "safe-after-shell-array",
+            "PASSWORD=$( # unmatched comment close )",
+            "printf '%s)' shell-command-secret",
+            r"printf \) escaped-shell-secret",
+            "printf $(",
+            "nested-shell-group-secret",
+            ")",
+            "outer-shell-group-secret",
+            ")",
+            "safe-after-shell-command",
             "private_key=malformed-private-secret",
             "AWS_SECRET_ACCESS_KEY=aws-secret",
             aws_access_key,
@@ -661,6 +679,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-kubernetes-secret" in exported
     assert "safe-after-shell" in exported
     assert "safe-after-quote" in exported
+    assert "safe-after-shell-array" in exported
+    assert "safe-after-shell-command" in exported
     assert "visible-control" in exported
     assert "visible-control-c1" in exported
     assert r"visible\q-invalid-json-escape" in exported
@@ -738,6 +758,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "kubernetes-tagged-kind-secret",
         "kubernetes-escaped-kind-secret",
         "kubernetes-quoted-key-secret",
+        "kubernetes-escaped-key-secret",
         "quoted cli token",
         "escaped-option-secret",
         "escaped-assignment-secret",
@@ -764,6 +785,11 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "digit-heredoc-secret",
         "shell-multiline-secret",
         "quoted-multiline-secret",
+        "shell-array-secret",
+        "shell-command-secret",
+        "escaped-shell-secret",
+        "nested-shell-group-secret",
+        "outer-shell-group-secret",
         "malformed-private-secret",
         "aws-secret",
         "document-secret",
@@ -789,6 +815,17 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         assert unsafe_terminal["text"] == "safe-before\n[terminal control line omitted]"
         assert secret not in unsafe_terminal["text"]
         assert "safe-after" not in unsafe_terminal["text"]
+
+    for payload, secret in (
+        ("PASSWORD=(\nunterminated-array-secret", "unterminated-array-secret"),
+        ("PASSWORD=$(\nunterminated-command-secret", "unterminated-command-secret"),
+    ):
+        incomplete_group_redis = FakeRedis()
+        incomplete_group_redis.store[key] = f"safe-before\n{payload}"
+        _patch_runtime(monkeypatch, incomplete_group_redis)
+        incomplete_group = await diagnostics.get_latest_cli_log(SLUG)
+        assert incomplete_group["text"] == "safe-before\n[credential line omitted]\n"
+        assert secret not in incomplete_group["text"]
 
     orphaned_begin_redis = FakeRedis()
     orphaned_begin_redis.store[key] = (

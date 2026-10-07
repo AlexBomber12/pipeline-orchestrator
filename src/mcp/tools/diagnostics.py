@@ -118,7 +118,10 @@ _XML_NAME_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-"
 )
 _XML_CREDENTIAL_SELECTOR_ATTRIBUTES = frozenset({"key", "name"})
-_KUBERNETES_KIND_KEY = r'''(?:kind|'kind'|"kind")'''
+_KUBERNETES_KIND_KEY = (
+    r'''(?:kind|'kind'|"kind"|'''
+    r'''"(?=[^"\r\n]*\\)(?:[^"\\\r\n]|\\[^\r\n])*")'''
+)
 _KUBERNETES_SECRET_KIND = re.compile(
     rf"(?im)^[ \t]*{_KUBERNETES_KIND_KEY}[ \t]*:[ \t]*"
     r"(?:(?:&|!)[^\s,\[\]{}]+[ \t]+)*"
@@ -1222,6 +1225,35 @@ def _unterminated_quote(value: str, quote: str | None = None) -> str | None:
     return quote
 
 
+def _shell_parenthesis_state(
+    value: str,
+    depth: int = 0,
+    quote: str | None = None,
+) -> tuple[int, str | None]:
+    """Track bounded shell grouping without interpreting commands or expansions."""
+    escaped = False
+    for index, character in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            continue
+        if character in {"\"", "'"}:
+            quote = character
+        elif character == "#" and (index == 0 or value[index - 1].isspace()):
+            break
+        elif character == "(":
+            depth += 1
+        elif character == ")" and depth:
+            depth -= 1
+    return depth, quote
+
+
 def _json_container_end(text: str, start: int) -> int:
     stack = [text[start]]
     in_string = False
@@ -1494,6 +1526,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
         continued = content.rstrip().endswith("\\")
         yaml_block = content[value_start:].strip() in _YAML_BLOCK_VALUE_INDICATORS
         sensitive_value = content[value_start:]
+        shell_group_depth, shell_group_quote = _shell_parenthesis_state(sensitive_value)
         heredoc = _HEREDOC_START.search(sensitive_value)
         heredoc_delimiter = heredoc.group("delimiter") if heredoc is not None else None
         heredoc_strips_tabs = heredoc is not None and heredoc.group("strip_tabs") == "-"
@@ -1510,6 +1543,14 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
                 index += 1
                 if candidate == heredoc_delimiter:
                     heredoc_delimiter = None
+                continue
+            if shell_group_depth:
+                shell_group_depth, shell_group_quote = _shell_parenthesis_state(
+                    continuation,
+                    shell_group_depth,
+                    shell_group_quote,
+                )
+                index += 1
                 continue
             indented = continuation.startswith((" ", "\t"))
             blank_in_block = (yaml_block or indented_block) and not continuation
