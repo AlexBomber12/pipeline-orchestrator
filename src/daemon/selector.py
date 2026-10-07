@@ -13,10 +13,8 @@ from datetime import datetime, timezone
 from enum import Enum
 
 from src.coder_registry import CoderPlugin, CoderRegistry
-from src.config import AppConfig, CoderType, RepoConfig
+from src.config import AppConfig, RepoConfig
 from src.models import RepoState
-
-_RUNTIME_SUPPORTED_CODERS = {coder.value for coder in CoderType}
 
 
 @dataclass
@@ -28,9 +26,9 @@ class SelectionContext:
     rng: random.Random
     auth_statuses: dict[str, dict[str, str]] | None = None
     # Hard pin from the active task header (`Coder:` field).
-    # ``"claude"`` / ``"codex"`` short-circuit selection; ``"any"`` and
-    # ``None`` defer to repo / global defaults so unpinned tasks keep
-    # the legacy auto_fallback behavior.
+    # Any loaded plugin ID other than ``"any"`` is a hard pin. ``"any"``
+    # and ``None`` defer to repo / global defaults so unpinned tasks keep
+    # the existing auto_fallback behavior.
     task_coder_pin: str | None = None
 
 
@@ -38,6 +36,10 @@ class CoderPurpose(str, Enum):
     DISPATCH = "dispatch"
     AUXILIARY = "auxiliary"
     DISPLAY = "display"
+
+
+class CoderSelectionUnavailable(RuntimeError):
+    """The configured or hard-pinned coder cannot be dispatched."""
 
 
 @dataclass(frozen=True)
@@ -50,7 +52,7 @@ class CoderResolution:
 def eligible_coders(ctx: SelectionContext) -> list[str]:
     """Return the currently runnable coder names in preference order."""
     task_pin = ctx.task_coder_pin
-    if task_pin in ("claude", "codex"):
+    if _is_hard_task_pin(task_pin):
         if _coder_runtime_ok(task_pin, ctx):
             return [task_pin]
         return []
@@ -58,7 +60,7 @@ def eligible_coders(ctx: SelectionContext) -> list[str]:
     pinned = ctx.repo_config.coder
     preferred = pinned or ctx.app_config.daemon.coder
     if not ctx.app_config.daemon.auto_fallback:
-        return [preferred.value]
+        return [preferred] if _coder_runtime_ok(preferred, ctx) else []
 
     result = [
         name
@@ -66,8 +68,8 @@ def eligible_coders(ctx: SelectionContext) -> list[str]:
         if _coder_runtime_ok(name, ctx)
     ]
 
-    if pinned is not None and pinned.value in result:
-        return [pinned.value] + [name for name in result if name != pinned.value]
+    if pinned is not None and pinned in result:
+        return [pinned] + [name for name in result if name != pinned]
     return result
 
 
@@ -84,25 +86,35 @@ def candidate_coders(ctx: SelectionContext) -> list[str]:
     ``is_work_inhibited`` per returned coder.
     """
     task_pin = ctx.task_coder_pin
-    if task_pin in ("claude", "codex"):
-        return [task_pin]
+    if _is_hard_task_pin(task_pin):
+        return (
+            [task_pin]
+            if ctx.registry.get_optional(task_pin) is not None
+            and not _is_disabled_for_repo(task_pin, ctx.repo_config)
+            else []
+        )
 
     pinned = ctx.repo_config.coder
     preferred = pinned or ctx.app_config.daemon.coder
     if not ctx.app_config.daemon.auto_fallback:
-        return [preferred.value]
+        return (
+            [preferred]
+            if ctx.registry.get_optional(preferred) is not None
+            and not _is_disabled_for_repo(preferred, ctx.repo_config)
+            else []
+        )
 
     return [
         name
         for name in ctx.registry.coder_names()
-        if _supports_runtime(name) and not _is_disabled_for_repo(name, ctx.repo_config)
+        if not _is_disabled_for_repo(name, ctx.repo_config)
     ]
 
 
 def _coder_runtime_ok(name: str, ctx: SelectionContext) -> bool:
     """Return True when *name* passes every per-coder runtime gate."""
     return (
-        _supports_runtime(name)
+        ctx.registry.get_optional(name) is not None
         and not _is_rate_limited(name, ctx.state)
         and not _auth_failed(name, ctx.registry, ctx.auth_statuses)
         and not _is_disabled_for_repo(name, ctx.repo_config)
@@ -175,7 +187,7 @@ def resolve_active_coder(
     """Resolve the active coder for the requested daemon purpose."""
     if (
         purpose is CoderPurpose.DISPLAY
-        and ctx.task_coder_pin not in ("claude", "codex")
+        and not _is_hard_task_pin(ctx.task_coder_pin)
         and ctx.state.coder
     ):
         name = ctx.state.coder
@@ -242,7 +254,7 @@ def _resolution_reason(
     ctx: SelectionContext,
 ) -> str:
     explicit_pin = ctx.task_coder_pin
-    if explicit_pin in ("claude", "codex"):
+    if _is_hard_task_pin(explicit_pin):
         return "pinned" if name == explicit_pin else "fallback"
 
     repo_pin = _pinned_coder_name(ctx)
@@ -257,7 +269,7 @@ def _resolution_reason(
 
 def _non_exploring_resolution_reason(name: str, ctx: SelectionContext) -> str:
     explicit_pin = ctx.task_coder_pin
-    if explicit_pin in ("claude", "codex"):
+    if _is_hard_task_pin(explicit_pin):
         return "pinned" if name == explicit_pin else "fallback"
 
     repo_pin = _pinned_coder_name(ctx)
@@ -267,10 +279,7 @@ def _non_exploring_resolution_reason(name: str, ctx: SelectionContext) -> str:
 
 
 def _plugin_or_none(registry: CoderRegistry, name: str) -> CoderPlugin | None:
-    try:
-        return registry.get(name)
-    except KeyError:
-        return None
+    return registry.get_optional(name)
 
 
 def _sort_by_priority(eligible: list[str], ctx: SelectionContext) -> list[str]:
@@ -293,15 +302,19 @@ def _greedy_order(eligible: list[str], ctx: SelectionContext) -> list[str]:
 def _preferred_coder_name(ctx: SelectionContext) -> str:
     preferred = ctx.repo_config.coder
     if preferred is not None:
-        return preferred.value
-    return ctx.app_config.daemon.coder.value
+        return preferred
+    return ctx.app_config.daemon.coder
 
 
 def _pinned_coder_name(ctx: SelectionContext) -> str | None:
     pinned = ctx.repo_config.coder
     if pinned is None:
         return None
-    return pinned.value
+    return pinned
+
+
+def _is_hard_task_pin(value: str | None) -> bool:
+    return bool(value and value != "any")
 
 
 def _is_rate_limited(name: str, state: RepoState) -> bool:
@@ -336,7 +349,3 @@ def _auth_failed(
 def _is_disabled_for_repo(name: str, repo_config: RepoConfig) -> bool:
     disabled = repo_config.disabled_coders or []
     return name in disabled
-
-
-def _supports_runtime(name: str) -> bool:
-    return name in _RUNTIME_SUPPORTED_CODERS

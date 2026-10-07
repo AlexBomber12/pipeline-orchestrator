@@ -289,6 +289,9 @@ def test_build_outcome_record_handles_no_run_record_or_pr(
     )
 
     runner = _make_runner()
+    runner.app_config.daemon.coder_settings = {
+        "claude": {"model": "generic-claude"}
+    }
     # Leave current_pr / current_task / current_run_record as None.
 
     from datetime import datetime, timezone
@@ -302,6 +305,7 @@ def test_build_outcome_record_handles_no_run_record_or_pr(
     assert record["codex_review_iterations"] is None
     # Coder string still falls back to the daemon default (claude).
     assert record["coder"] == "claude"
+    assert record["coder_model_string"] == "generic-claude"
 
 
 def test_build_outcome_record_falls_back_to_pr_pr_id_when_task_missing(

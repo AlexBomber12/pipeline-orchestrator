@@ -698,10 +698,10 @@ def _patch_eyes_reaction_present(
     """Stub the EYES-skip pre-push gate to fire (fresh EYES after push)."""
     monkeypatch.setattr(
         "src.github.reactions._get_codex_issue_reactions",
-        lambda repo, number: [
+        lambda repo, number, policy=None: [
             {
                 "content": "eyes",
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
                 "created_at": "2026-04-30T12:30:00Z",
             }
         ],
@@ -718,10 +718,10 @@ def _patch_eyes_reaction_stale(
     """Stub a stale EYES reaction (predates push) — gate must NOT skip."""
     monkeypatch.setattr(
         "src.github.reactions._get_codex_issue_reactions",
-        lambda repo, number: [
+        lambda repo, number, policy=None: [
             {
                 "content": "eyes",
-                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
                 "created_at": "2026-04-30T11:00:00Z",
             }
         ],
@@ -768,11 +768,17 @@ def _codex_bot_pr(review: ReviewStatus = ReviewStatus.EYES) -> PRInfo:
 def _codex_bot_error_comment(
     body: str = "Something went wrong while reviewing this PR. Please try again.",
     *,
-    user: str = "chatgpt-codex-connector[bot]",
+    user: str | dict[str, Any] = "chatgpt-codex-connector[bot]",
     created_at: str | None = None,
 ) -> dict[str, Any]:
+    if isinstance(user, dict):
+        payload_user = user
+    elif user == "chatgpt-codex-connector[bot]":
+        payload_user = {"id": 199175422, "login": user}
+    else:
+        payload_user = {"login": user}
     return {
-        "user": {"login": user},
+        "user": payload_user,
         "body": body,
         "created_at": created_at or "2026-04-30T12:00:00Z",
     }
@@ -798,6 +804,7 @@ async def _pr190_no_breach_monitor_async(
     self: object,
     breach_dir: str,
     run_id: str,
+    coder_name: str,
     claude_task: asyncio.Task,  # type: ignore[type-arg]
     breach_flag: dict[str, bool],
 ) -> None:

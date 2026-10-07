@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from src import claude_cli
+from src.coder_registry import ModelCatalog, ModelMetadata, ModelSetting
 from src.config import AppConfig, load_config
+from src.process_supervisor import SupervisedProcess
 from src.usage import OAuthUsageProvider, UsageProvider
 
 if TYPE_CHECKING:
@@ -49,6 +52,41 @@ class ClaudePlugin:
     name = "claude"
     display_name = "Claude Code"
     models = ["opus", "sonnet"]
+    model_setting = ModelSetting(
+        config_field="claude_model",
+        default_value="opus",
+        default_label="(default)",
+    )
+    model_catalog_refreshable = False
+
+    def resolve_model(self, daemon_config: "DaemonConfig") -> str:
+        """Prefer the plugin-ID setting, then legacy ``claude_model``."""
+        return (
+            self.model_setting.resolve(self.name, daemon_config)
+            or self.model_setting.default_value
+        )
+
+    def model_catalog_cache_key(
+        self, *, config: AppConfig, config_path: str
+    ) -> tuple[str, tuple[str, ...]]:
+        del config, config_path
+        return ("static-compatibility", tuple(self.models))
+
+    async def get_model_catalog(
+        self, *, config: AppConfig, config_path: str
+    ) -> ModelCatalog:
+        """Expose legacy Claude choices without implying live discovery."""
+        del config, config_path
+        return ModelCatalog(
+            models=tuple(
+                ModelMetadata(model, model, is_default=model == "opus")
+                for model in self.models
+            ),
+            source="static_compatibility",
+            description=(
+                "Static compatibility choices; not live or account-verified."
+            ),
+        )
 
     async def run_planned_pr(
         self,
@@ -102,6 +140,27 @@ class ClaudePlugin:
             pr_id=pr_id,
             task_file=task_file,
             **kwargs,
+        )
+
+    async def run_prompt(
+        self,
+        prompt: str,
+        repo_path: str,
+        model: str | None,
+        timeout: int | None,
+        on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+        on_supervised_process_start: Callable[[SupervisedProcess], None]
+        | None = None,
+        **_kwargs: Any,
+    ) -> tuple[int, str, str]:
+        return await claude_cli.run_claude_async(
+            prompt,
+            repo_path,
+            model=model,
+            timeout=timeout,
+            on_process_start=on_process_start,
+            on_supervised_process_start=on_supervised_process_start,
+            system_prompt_file=None,
         )
 
     def check_auth(self, *, config_path: str = CONFIG_PATH) -> dict[str, str]:
@@ -159,12 +218,18 @@ class ClaudePlugin:
         self,
         repo_path: str,
         context: str,
-        model: str,
+        model: str | None,
+        on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+        on_supervised_process_start: Callable[[SupervisedProcess], None]
+        | None = None,
+        **_kwargs: Any,
     ) -> tuple[int, str, str]:
         return await claude_cli.diagnose_error_async(
             repo_path,
             context,
             model=model,
+            on_process_start=on_process_start,
+            on_supervised_process_start=on_supervised_process_start,
         )
 
     def build_run_kwargs(
@@ -174,7 +239,7 @@ class ClaudePlugin:
         breach_dir: str | None = None,
         breach_run_id: str | None = None,
     ) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {"model": daemon_config.claude_model}
+        kwargs: dict[str, Any] = {"model": self.resolve_model(daemon_config)}
         if breach_dir is not None and breach_run_id is not None:
             kwargs["breach_dir"] = breach_dir
             kwargs["breach_run_id"] = breach_run_id

@@ -1697,7 +1697,7 @@ async def post_repo_detail_coder(
             "config_reloaded",
             {
                 "coder": coder,
-                "effective_coder": updated_coder or cfg.daemon.coder.value,
+                "effective_coder": updated_coder or cfg.daemon.coder,
             },
             redis_client,
         )

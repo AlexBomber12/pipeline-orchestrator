@@ -2,14 +2,28 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from src import codex_cli
+from src.coder_registry import (
+    ModelCatalog,
+    ModelCatalogUnavailable,
+    ModelMetadata,
+    ModelReasoningEffort,
+    ModelSetting,
+)
+from src.coders.codex_models import (
+    CodexModelDiscoveryInvalid,
+    CodexModelDiscoveryUnavailable,
+    discover_codex_models,
+)
 from src.config import AppConfig, load_config
+from src.process_supervisor import SupervisedProcess
 from src.usage import OpenAIUsageProvider, UsageProvider
 
 if TYPE_CHECKING:
@@ -17,6 +31,7 @@ if TYPE_CHECKING:
 
 CONFIG_PATH = os.environ.get("PO_CONFIG_PATH", "config.yml")
 _AUTH_CHECK_TIMEOUT_SEC = 5
+_REASONING_EFFORT_SETTING = "reasoning_effort"
 _CODEX_RETRY_PATTERN = re.compile(
     r"try again in\s+"
     r"(?:(\d+)\s*days?)?\s*"
@@ -69,6 +84,8 @@ def _first_probe_line(text: str) -> str:
 class CodexPlugin:
     name = "codex"
     display_name = "Codex CLI"
+    # Compatibility metadata for existing /api/coders consumers. Discovery,
+    # not this legacy list, is authoritative for new model selections.
     models = [
         "",
         "gpt-5.4",
@@ -80,6 +97,87 @@ class CodexPlugin:
         "gpt-5.1-codex-mini",
         "gpt-5.2",
     ]
+    model_setting = ModelSetting(
+        config_field="codex_model",
+        default_value="",
+        default_label="CLI default",
+    )
+    model_catalog_refreshable = True
+
+    def __init__(self, *, discover: Any | None = None) -> None:
+        self._discover = discover or discover_codex_models
+
+    def resolve_model(self, daemon_config: "DaemonConfig") -> str:
+        """Prefer the plugin-ID setting, including an explicit empty value."""
+        return self.model_setting.resolve(self.name, daemon_config)
+
+    def _resolve_reasoning_effort(
+        self, daemon_config: "DaemonConfig"
+    ) -> str | None:
+        """Return the configured override without validating provider choices."""
+        plugin_settings = daemon_config.coder_settings.get(self.name)
+        if (
+            plugin_settings is None
+            or _REASONING_EFFORT_SETTING not in plugin_settings
+        ):
+            return None
+        value = plugin_settings[_REASONING_EFFORT_SETTING]
+        if not isinstance(value, str):
+            raise ValueError(
+                "daemon.coder_settings.codex.reasoning_effort must be a string"
+            )
+        return value or None
+
+    def model_catalog_cache_key(
+        self, *, config: AppConfig, config_path: str
+    ) -> tuple[str, str]:
+        return (
+            config.auth.codex_home_dir,
+            str(Path(config_path).absolute().parent),
+        )
+
+    async def get_model_catalog(
+        self, *, config: AppConfig, config_path: str
+    ) -> ModelCatalog:
+        """Discover Codex metadata in the configured CLI auth context."""
+        home_dir, working_directory = self.model_catalog_cache_key(
+            config=config,
+            config_path=config_path,
+        )
+        env = dict(os.environ)
+        env["HOME"] = home_dir
+        # The configured CLI session is the supported discovery context. Do
+        # not accidentally switch the metadata probe to API billing.
+        env.pop("OPENAI_API_KEY", None)
+        try:
+            discovered = await self._discover(env=env, cwd=working_directory)
+        except (CodexModelDiscoveryInvalid, CodexModelDiscoveryUnavailable) as exc:
+            raise ModelCatalogUnavailable(
+                "Codex CLI model discovery is unavailable"
+            ) from exc
+        models = tuple(
+            ModelMetadata(
+                invocation_id=model.identifier,
+                display_name=model.display_name,
+                is_default=model.is_default,
+                default_reasoning_effort=model.default_reasoning_effort,
+                reasoning_efforts=tuple(
+                    ModelReasoningEffort(effort.name, effort.description)
+                    for effort in model.reasoning_efforts
+                ),
+            )
+            for model in discovered
+        )
+        return ModelCatalog(
+            models=models,
+            source="discovered",
+            description=(
+                f"{len(models)} model{'s' if len(models) != 1 else ''} "
+                "advertised by Codex CLI."
+                if models
+                else "Codex CLI advertised no usable models."
+            ),
+        )
 
     async def run_planned_pr(
         self,
@@ -133,6 +231,28 @@ class CodexPlugin:
             pr_id=pr_id,
             task_file=task_file,
             **kwargs,
+        )
+
+    async def run_prompt(
+        self,
+        prompt: str,
+        repo_path: str,
+        model: str | None,
+        timeout: int | None,
+        on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+        on_supervised_process_start: Callable[[SupervisedProcess], None]
+        | None = None,
+        reasoning_effort: str | None = None,
+        **_kwargs: Any,
+    ) -> tuple[int, str, str]:
+        return await codex_cli.run_codex_async(
+            prompt,
+            repo_path,
+            model=model or None,
+            reasoning_effort=reasoning_effort,
+            timeout=timeout,
+            on_process_start=on_process_start,
+            on_supervised_process_start=on_supervised_process_start,
         )
 
     def check_auth(self, *, config_path: str = CONFIG_PATH) -> dict[str, str]:
@@ -209,12 +329,20 @@ class CodexPlugin:
         self,
         repo_path: str,
         context: str,
-        model: str,
+        model: str | None,
+        on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+        on_supervised_process_start: Callable[[SupervisedProcess], None]
+        | None = None,
+        reasoning_effort: str | None = None,
+        **_kwargs: Any,
     ) -> tuple[int, str, str]:
         return await codex_cli.diagnose_error_async(
             repo_path,
             context,
-            model=model,
+            model=model or None,
+            reasoning_effort=reasoning_effort,
+            on_process_start=on_process_start,
+            on_supervised_process_start=on_supervised_process_start,
         )
 
     def build_run_kwargs(
@@ -227,4 +355,8 @@ class CodexPlugin:
         # breach inputs are accepted for Protocol uniformity but ignored —
         # supports_breach_lifecycle is False, so the plugin emits no
         # breach kwargs even when callers pass them unconditionally.
-        return {"model": daemon_config.codex_model}
+        kwargs: dict[str, Any] = {"model": self.resolve_model(daemon_config)}
+        reasoning_effort = self._resolve_reasoning_effort(daemon_config)
+        if reasoning_effort is not None:
+            kwargs[_REASONING_EFFORT_SETTING] = reasoning_effort
+        return kwargs

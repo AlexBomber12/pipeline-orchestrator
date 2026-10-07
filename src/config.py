@@ -17,12 +17,22 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field, field_validator
 
+from src.coder_ids import validate_coder_plugin_id
+
 OVERLAY_FILENAME = "config.production.yml"
+
+DEFAULT_CODER_PLUGINS = {
+    "claude": "src.coders.claude:ClaudePlugin",
+    "codex": "src.coders.codex:CodexPlugin",
+}
 
 
 class CoderType(str, Enum):
     CLAUDE = "claude"
     CODEX = "codex"
+
+
+BUILTIN_CODER_IDS = frozenset(coder.value for coder in CoderType)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +83,7 @@ _DAEMON_FIELDS = {
     "exploration_epsilon",
     "coder",
     "codex_model",
+    "coder_settings",
     "github_api_pause_threshold_percent",
     "github_api_slowdown_threshold_percent",
     "github_api_slowdown_multiplier",
@@ -109,6 +120,7 @@ _DAEMON_FIELDS = {
     "git_bundle_backup_daily_retention",
     "git_bundle_backup_weekly_retention",
     "coder_filesystem_isolation",
+    "trusted_reviewer_identities",
 }
 
 _DAEMON_ENV_OVERRIDES = {
@@ -170,10 +182,17 @@ class RepoConfig(BaseModel):
     allow_merge_without_checks: bool = False
     required_checks: list[str] | None = None
     allow_merge_without_review: bool = False
-    coder: CoderType | None = None
+    coder: str | None = None
     disabled_coders: list[str] | None = None
     governance_scan_enabled: bool | None = None
     feature_flags: FeatureFlags = Field(default_factory=FeatureFlags)
+
+    @field_validator("coder", mode="before")
+    @classmethod
+    def _coder_is_plugin_id(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        return validate_coder_plugin_id(value)
 
     @field_validator("poll_interval_sec", mode="before")
     @classmethod
@@ -249,8 +268,11 @@ class DaemonConfig(BaseModel):
         }
     )
     exploration_epsilon: float = Field(default=0.15, ge=0.0, le=0.5)
-    coder: CoderType = CoderType.CLAUDE
+    coder: str = CoderType.CLAUDE.value
     codex_model: str = ""
+    # Plugin-local configuration keyed by stable registry ID. Values stay
+    # implementation-agnostic so parsing config never imports coder plugins.
+    coder_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
     github_api_pause_threshold_percent: int = Field(default=5, ge=0, le=100)
     github_api_slowdown_threshold_percent: int = Field(default=20, ge=0, le=100)
     github_api_slowdown_multiplier: int = Field(default=5, ge=1, le=60)
@@ -287,6 +309,42 @@ class DaemonConfig(BaseModel):
     git_bundle_backup_daily_retention: int = Field(default=7, ge=1)
     git_bundle_backup_weekly_retention: int = Field(default=4, ge=0)
     coder_filesystem_isolation: bool = Field(default=False)
+    trusted_reviewer_identities: list["TrustedReviewerIdentity"] = Field(
+        default_factory=lambda: [
+            TrustedReviewerIdentity(
+                user_id=199175422,
+                login="chatgpt-codex-connector[bot]",
+            )
+        ]
+    )
+
+    @field_validator("coder", mode="before")
+    @classmethod
+    def _coder_is_plugin_id(cls, value: Any) -> str:
+        return validate_coder_plugin_id(value)
+
+    @field_validator("coder_settings", mode="before")
+    @classmethod
+    def _coder_settings_are_plugin_mappings(
+        cls, value: Any
+    ) -> dict[str, dict[str, Any]]:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("coder_settings must be a mapping")
+        for plugin_id, settings in value.items():
+            if not isinstance(plugin_id, str) or not plugin_id:
+                raise ValueError("coder_settings plugin IDs must be non-empty strings")
+            if not isinstance(settings, dict):
+                raise ValueError(
+                    f"coder_settings.{plugin_id} must be a mapping"
+                )
+            for setting_key, setting_value in settings.items():
+                if not isinstance(setting_value, str):
+                    raise ValueError(
+                        f"coder_settings.{plugin_id}.{setting_key} must be a string"
+                    )
+        return value
 
     @property
     def usage_gate_rate_limit_session_pause_percent(self) -> int:
@@ -310,6 +368,28 @@ class WebConfig(BaseModel):
     port: int = Field(default=8000, ge=1, le=65535)
 
 
+class TrustedReviewerIdentity(BaseModel, frozen=True):
+    user_id: int = Field(gt=0)
+    login: str | None = None
+
+    @field_validator("user_id", mode="before")
+    @classmethod
+    def _user_id_must_be_positive_int(cls, v: Any) -> int:
+        if not isinstance(v, int) or isinstance(v, bool):
+            raise ValueError("trusted reviewer user_id must be a positive integer")
+        if v <= 0:
+            raise ValueError("trusted reviewer user_id must be positive")
+        return v
+
+    @field_validator("login")
+    @classmethod
+    def _blank_login_is_missing(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        cleaned = v.strip()
+        return cleaned or None
+
+
 class AuthConfig(BaseModel):
     claude_config_dir: str = "/data/auth/claude"
     gh_config_dir: str = "/data/auth/gh"
@@ -321,6 +401,34 @@ class AppConfig(BaseModel):
     daemon: DaemonConfig = Field(default_factory=DaemonConfig)
     web: WebConfig = Field(default_factory=WebConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
+    # Trusted, operator-managed Python entry points. Explicit YAML entries
+    # replace the matching built-in definition or add another stable ID.
+    # Importing and instantiation are deliberately deferred to registry
+    # construction so config reads, overlays, validation, and saves stay inert.
+    coder_plugins: dict[str, str] = Field(
+        default_factory=lambda: dict(DEFAULT_CODER_PLUGINS)
+    )
+
+    @field_validator("coder_plugins", mode="before")
+    @classmethod
+    def _merge_coder_plugin_defaults(cls, value: Any) -> dict[str, str]:
+        if value is None:
+            return dict(DEFAULT_CODER_PLUGINS)
+        if not isinstance(value, dict):
+            raise ValueError("coder_plugins must be a mapping")
+
+        configured: dict[str, str] = {}
+        for plugin_id, reference in value.items():
+            if not isinstance(plugin_id, str) or not plugin_id:
+                raise ValueError(
+                    "coder_plugins plugin IDs must be non-empty strings"
+                )
+            if not isinstance(reference, str):
+                raise ValueError(
+                    f"coder_plugins.{plugin_id} must be a module:factory string"
+                )
+            configured[plugin_id] = reference
+        return {**DEFAULT_CODER_PLUGINS, **configured}
 
 
 def _load_config_raw(path: str = "config.yml") -> dict[str, Any]:
@@ -756,10 +864,19 @@ def update_daemon_config(
         raise ValueError(f"Unknown daemon fields: {sorted(unknown)}")
 
     config = AppConfig.model_validate(_load_config_raw(path))
+    normalized_updates = dict(updates)
+    if "coder_settings" in normalized_updates:
+        coder_settings_patch = normalized_updates["coder_settings"]
+        if not isinstance(coder_settings_patch, dict):
+            raise ValueError("coder_settings must be a mapping")
+        normalized_updates["coder_settings"] = _deep_merge(
+            config.daemon.coder_settings,
+            coder_settings_patch,
+        )
     # Same reasoning as update_repository: go through model_validate so a
     # malformed patch raises instead of corrupting the on-disk config.
     config.daemon = DaemonConfig.model_validate(
-        {**config.daemon.model_dump(), **updates}
+        {**config.daemon.model_dump(), **normalized_updates}
     )
     save_config(config, path)
     return config

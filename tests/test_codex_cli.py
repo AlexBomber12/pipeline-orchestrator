@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import tomllib
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -94,7 +95,12 @@ async def test_run_codex_async_success(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
-    result = await run_codex_async("do a thing", "/data/repos/demo", timeout=42)
+    result = await run_codex_async(
+        "do a thing",
+        "/data/repos/demo",
+        timeout=42,
+        reasoning_effort="",
+    )
 
     assert result == (0, "done", "info")
     cmd = captured["cmd"]
@@ -106,8 +112,42 @@ async def test_run_codex_async_success(monkeypatch: pytest.MonkeyPatch) -> None:
         "--sandbox",
         "danger-full-access",
     ]
+    assert "--config" not in cmd
     assert cmd[-1] == "do a thing"
     assert captured["kwargs"]["cwd"] == "/data/repos/demo"
+
+
+@pytest.mark.asyncio
+async def test_run_codex_async_passes_toml_encoded_reasoning_effort_and_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    fake_proc = _make_fake_proc(
+        stderr=b"unsupported reasoning effort",
+        returncode=2,
+    )
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        captured["cmd"] = list(args)
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    requested_effort = 'provider "preview"\\level\n'
+
+    result = await run_codex_async(
+        "prompt",
+        "/tmp",
+        model="gpt-test",
+        reasoning_effort=requested_effort,
+    )
+
+    assert result == (2, "", "unsupported reasoning effort")
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--model") + 1] == "gpt-test"
+    override = cmd[cmd.index("--config") + 1]
+    assert tomllib.loads(override) == {
+        "model_reasoning_effort": requested_effort
+    }
 
 
 @pytest.mark.asyncio
@@ -243,7 +283,11 @@ async def test_run_planned_pr_async_calls_exec_with_docker_sandbox(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
-    await run_planned_pr_async("/data/repos/demo", model="o3")
+    await run_planned_pr_async(
+        "/data/repos/demo",
+        model="o3",
+        reasoning_effort="high",
+    )
 
     cmd = captured["cmd"]
     assert cmd[:6] == [
@@ -256,6 +300,9 @@ async def test_run_planned_pr_async_calls_exec_with_docker_sandbox(
     ]
     assert "--model" in cmd
     assert cmd[cmd.index("--model") + 1] == "o3"
+    assert cmd[cmd.index("--config") + 1] == (
+        'model_reasoning_effort="high"'
+    )
     assert cmd[-1] == "PLANNED PR"
     assert "DAEMON INVOCATION" not in cmd[-1]
 
@@ -298,6 +345,7 @@ async def test_fix_review_async_passes_prompt(
 
     await fix_review_async(
         "/data/repos/demo",
+        reasoning_effort="low",
         extra_context="Latest review feedback:\nP1: fix this",
         pr_id="PR-270",
         task_file="tasks/PR-270.md",
@@ -312,6 +360,9 @@ async def test_fix_review_async_passes_prompt(
         "--sandbox",
         "danger-full-access",
     ]
+    assert cmd[cmd.index("--config") + 1] == (
+        'model_reasoning_effort="low"'
+    )
     prompt = cmd[-1]
     assert prompt.startswith("Task: PR-270\n\nFile: tasks/PR-270.md\n\n")
     assert "\n\nFIX FEEDBACK\n\nDAEMON INVOCATION" in prompt
@@ -420,6 +471,8 @@ async def test_diagnose_error_async_uses_expected_prompt_and_timeout(
 ) -> None:
     captured: dict[str, Any] = {}
     fake_proc = _make_fake_proc(returncode=0)
+    started: list[MagicMock] = []
+    supervised: list[_FakeSupervisedProcess] = []
 
     async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
         captured["cmd"] = list(args)
@@ -428,7 +481,14 @@ async def test_diagnose_error_async_uses_expected_prompt_and_timeout(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
-    await diagnose_error_async("/data/repos/demo", "broken CI", model="gpt-5.4")
+    await diagnose_error_async(
+        "/data/repos/demo",
+        "broken CI",
+        model="gpt-5.4",
+        reasoning_effort="medium",
+        on_process_start=started.append,
+        on_supervised_process_start=supervised.append,
+    )
 
     cmd = captured["cmd"]
     assert cmd[:6] == [
@@ -441,9 +501,15 @@ async def test_diagnose_error_async_uses_expected_prompt_and_timeout(
     ]
     assert "--model" in cmd
     assert cmd[cmd.index("--model") + 1] == "gpt-5.4"
+    assert cmd[cmd.index("--config") + 1] == (
+        'model_reasoning_effort="medium"'
+    )
     assert "Error context: broken CI" in cmd[-1]
     assert "FIX, SKIP, or ESCALATE" in cmd[-1]
     assert "DAEMON INVOCATION" not in cmd[-1]
+    assert started == [fake_proc]
+    assert len(supervised) == 1
+    assert supervised[0].process is fake_proc
 
 
 @pytest.mark.asyncio
@@ -535,6 +601,7 @@ async def test_run_auto_pr_async_formats_prompt_with_headers(
         "tasks/PR-270.md",
         "<body>",
         model="gpt-5.4",
+        reasoning_effort="xhigh",
         timeout=321,
     )
 
@@ -549,6 +616,9 @@ async def test_run_auto_pr_async_formats_prompt_with_headers(
     ]
     assert "--model" in cmd
     assert cmd[cmd.index("--model") + 1] == "gpt-5.4"
+    assert cmd[cmd.index("--config") + 1] == (
+        'model_reasoning_effort="xhigh"'
+    )
     assert cmd[-1].startswith(
         "AUTO PR\nTask: PR-270\nFile: tasks/PR-270.md\n\n<body>\n\n"
     )

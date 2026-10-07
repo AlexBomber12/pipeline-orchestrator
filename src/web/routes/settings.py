@@ -24,9 +24,9 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from src.audit.webhook_log import write_webhook_audit
-from src.coder_registry import CoderPlugin
-from src.coders import build_coder_registry
+from src.coder_registry import CoderPlugin, CoderRegistry
 from src.config import (
+    BUILTIN_CODER_IDS,
     AppConfig,
     DaemonConfig,
     load_config,
@@ -41,9 +41,12 @@ from src.web.services.config_writer import (
     delete_daemon_fields,
     write_daemon_field,
 )
+from src.web.services.model_catalog import ModelCatalogSnapshot
 from src.web.services.repo_state import _find_repo_config_by_name
 
 router = APIRouter()
+
+_REASONING_EFFORT_SETTING_KEY = "reasoning_effort"
 
 SPEND_CEILING_FIELDS = (
     "spend_ceiling_session_percent",
@@ -191,23 +194,98 @@ def _coerce_int(
 
 
 def _build_coder_rows(
-    config: AppConfig, auth: dict[str, dict[str, str]]
+    config: AppConfig,
+    auth: dict[str, dict[str, str]],
+    catalogs: dict[str, ModelCatalogSnapshot],
+    registry: CoderRegistry,
+    *,
+    coder_messages: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Return coder rows for the settings table and JSON API."""
+    coder_messages = coder_messages or {}
     rows: list[dict[str, Any]] = []
-    for plugin in build_coder_registry().list_coders():
-        selected_model = (
-            config.daemon.claude_model
-            if plugin.name == "claude"
-            else config.daemon.codex_model
+    for plugin in registry.list_coders():
+        setting = plugin.model_setting
+        metadata_available = getattr(plugin, "metadata_available", True)
+        selected_model = plugin.resolve_model(config.daemon)
+        catalog = catalogs.get(
+            plugin.name,
+            ModelCatalogSnapshot(
+                refreshable=plugin.model_catalog_refreshable
+            ),
         )
-        model_options = [model for model in plugin.models if model != ""]
+        invocation_ids = [model.invocation_id for model in catalog.models]
+        model_options = [
+            {
+                "value": model.invocation_id,
+                "label": model.display_name,
+                "is_advertised_default": model.is_default,
+                "is_missing": False,
+            }
+            for model in catalog.models
+        ]
+        if selected_model and selected_model not in invocation_ids:
+            model_options.insert(
+                0,
+                {
+                    "value": selected_model,
+                    "label": selected_model,
+                    "is_advertised_default": False,
+                    "is_missing": True,
+                },
+            )
+        reasoning_effort = _reasoning_effort_view(
+            config.daemon,
+            plugin=plugin,
+            selected_model=selected_model,
+            catalog=catalog,
+            update_message=coder_messages.get(plugin.name),
+        )
         rows.append(
             {
                 "name": plugin.name,
                 "display_name": plugin.display_name,
-                "models": model_options,
+                # Preserve the existing static field for /api/coders clients;
+                # model_catalog is the authoritative normalized metadata.
+                "models": [model for model in plugin.models if model != ""],
+                "model_options": model_options,
+                "model_setting": {
+                    "config_field": setting.config_field,
+                    "setting_key": setting.setting_key,
+                    "control_name": setting.control_name(plugin.name),
+                    "default_value": setting.default_value,
+                    "default_label": setting.default_label,
+                },
+                "model_catalog": {
+                    "status": catalog.status,
+                    "message": catalog.message,
+                    "source": catalog.source,
+                    "refreshable": catalog.refreshable,
+                    "refreshed_at": catalog.refreshed_at,
+                    "attempted_at": catalog.attempted_at,
+                    "has_usable_models": catalog.has_usable_models,
+                    "choices": [
+                        {
+                            "invocation_id": model.invocation_id,
+                            "display_name": model.display_name,
+                            "is_default": model.is_default,
+                            "default_reasoning_effort": (
+                                model.default_reasoning_effort
+                            ),
+                            "reasoning_efforts": [
+                                {
+                                    "name": effort.name,
+                                    "description": effort.description,
+                                }
+                                for effort in model.reasoning_efforts
+                            ],
+                        }
+                        for model in catalog.models
+                    ],
+                },
                 "selected_model": selected_model,
+                "reasoning_effort": reasoning_effort,
+                "metadata_available": metadata_available,
                 "auth": auth.get(
                     plugin.name,
                     {
@@ -215,28 +293,276 @@ def _build_coder_rows(
                         "detail": f"{plugin.display_name} unavailable",
                     },
                 ),
-                "is_default": config.daemon.coder.value == plugin.name,
+                "is_default": config.daemon.coder == plugin.name,
+                "runtime_selectable": plugin.name in BUILTIN_CODER_IDS,
             }
         )
     return rows
 
 
+def _saved_reasoning_effort(daemon: DaemonConfig, plugin_id: str) -> str:
+    """Return one plugin's application-supplied effort override."""
+    plugin_settings = daemon.coder_settings.get(plugin_id, {})
+    value = plugin_settings.get(_REASONING_EFFORT_SETTING_KEY, "")
+    if not isinstance(value, str):
+        raise ValueError(
+            f"daemon.coder_settings.{plugin_id}.reasoning_effort "
+            "must be a string"
+        )
+    return value
+
+
+def _reasoning_effort_view(
+    daemon: DaemonConfig,
+    *,
+    plugin: CoderPlugin,
+    selected_model: str,
+    catalog: ModelCatalogSnapshot,
+    update_message: str | None,
+) -> dict[str, Any]:
+    """Build provider-neutral effort state for HTML and JSON consumers."""
+    selected_effort = _saved_reasoning_effort(daemon, plugin.name)
+    model_metadata = next(
+        (
+            model
+            for model in catalog.models
+            if model.invocation_id == selected_model
+        ),
+        None,
+    )
+    choices = (
+        [
+            {"value": effort.name, "description": effort.description}
+            for effort in model_metadata.reasoning_efforts
+        ]
+        if model_metadata is not None
+        else []
+    )
+    advertised_values = {choice["value"] for choice in choices}
+    can_select = bool(selected_model and model_metadata and choices)
+    support_confirmed = catalog.status == "available" and can_select
+
+    if not selected_model:
+        status = "explicit_model_required"
+        message = (
+            "Select an explicit model to choose one of its supported efforts; "
+            "the CLI default model remains controlled by the CLI."
+        )
+    elif model_metadata is None:
+        status = "metadata_unavailable"
+        message = (
+            "Effort support cannot be confirmed because metadata for the "
+            "selected model is unavailable."
+        )
+    elif not choices:
+        status = "not_advertised"
+        message = "The selected model advertises no reasoning-effort overrides."
+    elif catalog.status != "available":
+        status = "stale"
+        message = (
+            "Showing last-known effort choices; current support is unconfirmed."
+        )
+    else:
+        status = "available"
+        message = "Choose an application override or keep the CLI default."
+
+    if selected_effort and selected_effort not in advertised_values:
+        message = (
+            f"{message} Saved override “{selected_effort}” remains configured, "
+            "but its support is unconfirmed."
+        )
+
+    return {
+        "control_name": (
+            f"coder_settings.{plugin.name}.{_REASONING_EFFORT_SETTING_KEY}"
+        ),
+        "selected_value": selected_effort,
+        "choices": choices,
+        "can_select": can_select,
+        "support_confirmed": support_confirmed,
+        "saved_is_advertised": (
+            not selected_effort or selected_effort in advertised_values
+        ),
+        "default_reasoning_effort": (
+            model_metadata.default_reasoning_effort
+            if model_metadata is not None
+            else None
+        ),
+        "status": status,
+        "message": message,
+        "update_message": update_message,
+    }
+
+
 def _validate_coder_model(
     model: str,
     *,
-    field_name: str,
+    current_model: str,
     plugin: CoderPlugin,
-    default_model: str | None = None,
+    catalog: ModelCatalogSnapshot,
+    field_name: str | None = None,
 ) -> str:
-    """Return a supported model value for ``plugin``."""
+    """Validate a changed selection against plugin-owned metadata."""
+    setting = plugin.model_setting
+    display_field = field_name or setting.control_name(plugin.name)
     if model == "":
-        return default_model if default_model is not None else model
-    allowed_models = {candidate for candidate in plugin.models if candidate != ""}
+        return setting.default_value
+    if model in {current_model, setting.default_value}:
+        return model
+    if not catalog.has_usable_models:
+        raise ValueError(
+            f"{display_field} cannot be changed because no usable "
+            f"{plugin.display_name} model catalog is available; keep the "
+            "saved value or choose the default"
+        )
+    allowed_models = {candidate.invocation_id for candidate in catalog.models}
     if model not in allowed_models:
         raise ValueError(
-            f"{field_name} must be one of: {', '.join(sorted(allowed_models))}"
+            f"{display_field} is not advertised by "
+            f"{plugin.display_name}"
         )
     return model
+
+
+def _validate_reasoning_effort(
+    effort: str,
+    *,
+    current_effort: str,
+    current_model: str,
+    selected_model: str,
+    model_changed: bool,
+    catalog: ModelCatalogSnapshot,
+    field_name: str,
+) -> str:
+    """Validate a submitted override against the selected model metadata."""
+    if effort == "":
+        return ""
+    if not selected_model:
+        if effort == current_effort and not model_changed:
+            return effort
+        raise ValueError(
+            f"{field_name} requires an explicitly selected model"
+        )
+
+    model_metadata = next(
+        (
+            model
+            for model in catalog.models
+            if model.invocation_id == selected_model
+        ),
+        None,
+    )
+    if model_metadata is None:
+        if (
+            effort == current_effort
+            and selected_model == current_model
+            and not model_changed
+        ):
+            return effort
+        raise ValueError(
+            f"{field_name} cannot be changed because reasoning-effort "
+            f"metadata for model {selected_model} is unavailable"
+        )
+    advertised = {candidate.name for candidate in model_metadata.reasoning_efforts}
+    if effort not in advertised:
+        if effort == current_effort and not model_changed:
+            return effort
+        raise ValueError(
+            f"{field_name} is not advertised for model {selected_model}"
+        )
+    return effort
+
+
+def _submitted_coder_settings(
+    form: Any,
+    registry: CoderRegistry,
+) -> tuple[
+    dict[str, tuple[str, str, bool]],
+    dict[str, tuple[str, str]],
+]:
+    """Return generic model and reasoning-effort form submissions."""
+    plugins = {plugin.name: plugin for plugin in registry.list_coders()}
+    models: dict[str, tuple[str, str, bool]] = {}
+    efforts: dict[str, tuple[str, str]] = {}
+    prefix = "coder_settings."
+    for field_name, raw_value in form.multi_items():
+        if not field_name.startswith(prefix):
+            continue
+        remainder = field_name[len(prefix) :]
+        plugin_id, separator, setting_key = remainder.rpartition(".")
+        if not separator or plugin_id not in plugins:
+            raise ValueError(
+                f"Unknown coder settings plugin ID: {plugin_id or remainder}"
+            )
+        plugin = plugins[plugin_id]
+        if not getattr(plugin, "metadata_available", True):
+            raise ValueError(f"Coder metadata is unavailable: {plugin_id}")
+        if not isinstance(raw_value, str):
+            raise ValueError(f"{field_name} must be a string")
+        if setting_key == plugin.model_setting.setting_key:
+            models[plugin_id] = (raw_value, field_name, False)
+        elif setting_key == _REASONING_EFFORT_SETTING_KEY:
+            efforts[plugin_id] = (raw_value, field_name)
+        else:
+            raise ValueError(f"Unknown coder setting: {field_name}")
+
+    for plugin in plugins.values():
+        legacy_field = plugin.model_setting.config_field
+        if plugin.name in models or legacy_field is None:
+            continue
+        if legacy_field in form:
+            if not getattr(plugin, "metadata_available", True):
+                raise ValueError(
+                    f"Coder metadata is unavailable: {plugin.name}"
+                )
+            raw_value = form[legacy_field]
+            if not isinstance(raw_value, str):
+                raise ValueError(f"{legacy_field} must be a string")
+            models[plugin.name] = (raw_value, legacy_field, True)
+    return models, efforts
+
+
+def _submitted_coder_models(
+    form: Any,
+    registry: CoderRegistry,
+) -> dict[str, tuple[str, str, bool]]:
+    """Return plugin-ID submissions as value, field name, legacy flag.
+
+    Generic controls win if a compatibility client submits both forms. Any
+    generic plugin ID or setting key must match registered plugin metadata.
+    """
+    submitted, _efforts = _submitted_coder_settings(form, registry)
+    return submitted
+
+
+async def _model_catalog_snapshots(
+    request: Request,
+    config: AppConfig,
+    *,
+    load: bool,
+    refresh_coder: str | None = None,
+) -> dict[str, ModelCatalogSnapshot]:
+    cache = request.app.state.model_catalog
+    registry: CoderRegistry = request.app.state.coder_registry
+
+    async def snapshot(plugin: CoderPlugin) -> ModelCatalogSnapshot:
+        refresh = plugin.name == refresh_coder
+        if load or refresh or not plugin.model_catalog_refreshable:
+            return await cache.get(
+                plugin,
+                config=config,
+                config_path=_app.CONFIG_PATH,
+                refresh=refresh,
+            )
+        return cache.peek(
+            plugin,
+            config=config,
+            config_path=_app.CONFIG_PATH,
+        )
+
+    plugins = registry.list_coders()
+    snapshots = await asyncio.gather(*(snapshot(plugin) for plugin in plugins))
+    return dict(zip((plugin.name for plugin in plugins), snapshots, strict=True))
 
 
 def _render_settings_repo_list(request: Request) -> HTMLResponse:
@@ -298,21 +624,52 @@ async def _settings_daemon_template_context(
     request: Request,
     *,
     use_cached_auth: bool = False,
+    load_model_catalogs: bool = True,
+    refresh_coder: str | None = None,
+    coder_messages: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     cfg = load_config(_app.CONFIG_PATH)
-    auth = (
-        _get_cached_auth_status()
-        if use_cached_auth
-        else await _collect_auth_status()
-    )
+    registry: CoderRegistry = request.app.state.coder_registry
+    if use_cached_auth:
+        auth = _get_cached_auth_status()
+        catalogs = await _model_catalog_snapshots(
+            request,
+            cfg,
+            load=load_model_catalogs,
+            refresh_coder=refresh_coder,
+        )
+    else:
+        auth, catalogs = await asyncio.gather(
+            _collect_auth_status(registry),
+            _model_catalog_snapshots(
+                request,
+                cfg,
+                load=load_model_catalogs,
+                refresh_coder=refresh_coder,
+            ),
+        )
+    # Discovery may take several seconds. Reload after it completes so a slow
+    # refresh response cannot re-render an older model selection over a save
+    # that completed while the subprocess was running.
+    cfg = load_config(_app.CONFIG_PATH)
     return {
         "daemon": cfg.daemon,
-        "coders": _build_coder_rows(cfg, auth),
+        "coders": _build_coder_rows(
+            cfg,
+            auth,
+            catalogs,
+            registry,
+            coder_messages=coder_messages,
+        ),
         "auth": auth,
     }
 
 
-async def _render_settings_daemon_response(request: Request) -> HTMLResponse:
+async def _render_settings_daemon_response(
+    request: Request,
+    *,
+    coder_messages: dict[str, str] | None = None,
+) -> HTMLResponse:
     """Render the daemon settings form for a successful mutation response.
 
     Successful PUTs re-render both the daemon form and the coder controls.
@@ -323,7 +680,12 @@ async def _render_settings_daemon_response(request: Request) -> HTMLResponse:
     return _app.templates.TemplateResponse(
         request,
         "components/settings_daemon_response.html",
-        await _settings_daemon_template_context(request, use_cached_auth=True),
+        await _settings_daemon_template_context(
+            request,
+            use_cached_auth=True,
+            load_model_catalogs=False,
+            coder_messages=coder_messages,
+        ),
     )
 
 
@@ -331,7 +693,9 @@ async def _render_settings_daemon_error(
     request: Request, message: str, status_code: int
 ) -> HTMLResponse:
     context = await _settings_daemon_template_context(
-        request, use_cached_auth=True
+        request,
+        use_cached_auth=True,
+        load_model_catalogs=False,
     )
     return _app.templates.TemplateResponse(
         request,
@@ -344,8 +708,18 @@ async def _render_settings_daemon_error(
 @router.get("/settings", response_class=HTMLResponse)
 async def settings_page(request: Request) -> HTMLResponse:
     cfg = load_config(_app.CONFIG_PATH)
-    auth = await _collect_auth_status()
-    coder_rows = _build_coder_rows(cfg, auth)
+    registry: CoderRegistry = request.app.state.coder_registry
+    auth, catalogs = await asyncio.gather(
+        _collect_auth_status(registry),
+        _model_catalog_snapshots(request, cfg, load=True),
+    )
+    cfg = load_config(_app.CONFIG_PATH)
+    coder_rows = _build_coder_rows(
+        cfg,
+        auth,
+        catalogs,
+        registry,
+    )
     return _app.templates.TemplateResponse(
         request,
         "settings.html",
@@ -373,6 +747,34 @@ async def partial_settings_daemon(request: Request) -> HTMLResponse:
 @router.get("/partials/settings/coders", response_class=HTMLResponse)
 async def partial_settings_coders(request: Request) -> HTMLResponse:
     context = await _settings_daemon_template_context(request)
+    return _app.templates.TemplateResponse(
+        request,
+        "components/settings_coders_wrapper.html",
+        context,
+    )
+
+
+@router.post(
+    "/partials/settings/coders/{coder_name}/models/refresh",
+    response_class=HTMLResponse,
+)
+async def refresh_coder_models(
+    request: Request, coder_name: str
+) -> HTMLResponse:
+    """Refresh one plugin catalog without mutating configuration."""
+    registry: CoderRegistry = request.app.state.coder_registry
+    try:
+        plugin = registry.get(coder_name)
+    except KeyError:
+        return HTMLResponse("Unknown coder", status_code=404)
+    if not plugin.model_catalog_refreshable:
+        return HTMLResponse("Model catalog is static", status_code=422)
+    context = await _settings_daemon_template_context(
+        request,
+        use_cached_auth=True,
+        load_model_catalogs=False,
+        refresh_coder=coder_name,
+    )
     return _app.templates.TemplateResponse(
         request,
         "components/settings_coders_wrapper.html",
@@ -470,8 +872,6 @@ async def put_settings_daemon(
     rate_limit_session_pause_percent: str | None = Form(None),
     rate_limit_weekly_pause_percent: str | None = Form(None),
     coder: str | None = Form(None),
-    claude_model: str | None = Form(None),
-    codex_model: str | None = Form(None),
 ) -> HTMLResponse:
     """Update daemon settings.
 
@@ -483,6 +883,7 @@ async def put_settings_daemon(
     would flag every in-flight PR as hung the moment it is created.
     """
     updates: dict[str, Any] = {}
+    current_cfg = load_config(_app.CONFIG_PATH)
     try:
         if poll_interval_sec is not None and poll_interval_sec != "":
             updates["poll_interval_sec"] = _coerce_int(
@@ -559,21 +960,176 @@ async def put_settings_daemon(
             if coder not in ("claude", "codex"):
                 raise ValueError("coder must be 'claude' or 'codex'")
             updates["coder"] = coder
-        if claude_model is not None or codex_model is not None:
-            registry = build_coder_registry()
-            if claude_model is not None:
-                updates["claude_model"] = _validate_coder_model(
-                    claude_model,
-                    field_name="claude_model",
-                    plugin=registry.get("claude"),
-                    default_model=DaemonConfig().claude_model,
+        registry: CoderRegistry = request.app.state.coder_registry
+        cache = request.app.state.model_catalog
+        submitted_models, submitted_efforts = _submitted_coder_settings(
+            await request.form(), registry
+        )
+        submitted_plugin_ids = tuple(
+            sorted(set(submitted_models) | set(submitted_efforts))
+        )
+        initial_states = {
+            plugin_id: (
+                registry.get(plugin_id).resolve_model(current_cfg.daemon),
+                _saved_reasoning_effort(current_cfg.daemon, plugin_id),
+            )
+            for plugin_id in submitted_plugin_ids
+        }
+
+        async def validation_catalog(plugin_id: str) -> ModelCatalogSnapshot:
+            plugin = registry.get(plugin_id)
+            current_model, current_effort = initial_states[plugin_id]
+            submitted_model = submitted_models.get(plugin_id)
+            submitted_effort = submitted_efforts.get(plugin_id)
+            target_model = (
+                plugin.model_setting.default_value
+                if submitted_model is not None and submitted_model[0] == ""
+                else submitted_model[0]
+                if submitted_model is not None
+                else current_model
+            )
+            should_load = bool(
+                (
+                    submitted_model is not None
+                    and submitted_model[0] != ""
+                    and submitted_model[0]
+                    not in {current_model, plugin.model_setting.default_value}
                 )
-            if codex_model is not None:
-                updates["codex_model"] = _validate_coder_model(
-                    codex_model,
-                    field_name="codex_model",
-                    plugin=registry.get("codex"),
+                or (
+                    submitted_effort is not None
+                    and submitted_effort[0] != ""
+                    and submitted_effort[0] != current_effort
                 )
+                or (
+                    submitted_model is not None
+                    and target_model != current_model
+                    and target_model != ""
+                    and current_effort != ""
+                )
+            )
+            if should_load:
+                return await cache.get(
+                    plugin,
+                    config=current_cfg,
+                    config_path=_app.CONFIG_PATH,
+                )
+            return cache.peek(
+                plugin,
+                config=current_cfg,
+                config_path=_app.CONFIG_PATH,
+            )
+
+        catalog_values = await asyncio.gather(
+            *(validation_catalog(plugin_id) for plugin_id in submitted_plugin_ids)
+        )
+        validation_catalogs = dict(
+            zip(submitted_plugin_ids, catalog_values, strict=True)
+        )
+
+        # A model-catalogue lookup can outlive a later save. Re-read the
+        # configuration before validation and refuse to let the older request
+        # overwrite a newer model/effort choice.
+        latest_cfg = load_config(_app.CONFIG_PATH)
+        stale_plugins = {
+            plugin_id
+            for plugin_id, initial_state in initial_states.items()
+            if (
+                registry.get(plugin_id).resolve_model(latest_cfg.daemon),
+                _saved_reasoning_effort(latest_cfg.daemon, plugin_id),
+            )
+            != initial_state
+        }
+        if stale_plugins:
+            stale_message = (
+                "A newer model or effort selection was saved while metadata "
+                "loaded; no submitted settings were saved. The newer saved "
+                "settings were kept."
+            )
+            return await _render_settings_daemon_error(
+                request, stale_message, 409
+            )
+
+        coder_settings_updates: dict[str, dict[str, str]] = {}
+        coder_messages: dict[str, str] = {}
+        for plugin_id in submitted_plugin_ids:
+            plugin = registry.get(plugin_id)
+            catalog = validation_catalogs[plugin_id]
+            current_model = plugin.resolve_model(latest_cfg.daemon)
+            current_effort = _saved_reasoning_effort(
+                latest_cfg.daemon, plugin_id
+            )
+            plugin_updates: dict[str, str] = {}
+            submitted_model = submitted_models.get(plugin_id)
+            if submitted_model is not None:
+                model_value, model_field, is_legacy = submitted_model
+                selected_model = _validate_coder_model(
+                    model_value,
+                    current_model=current_model,
+                    plugin=plugin,
+                    catalog=catalog,
+                    field_name=model_field,
+                )
+                plugin_updates[plugin.model_setting.setting_key] = selected_model
+                legacy_field = plugin.model_setting.config_field
+                if is_legacy and legacy_field is not None:
+                    # Compatibility submissions update both representations so
+                    # old readers and the effective generic value cannot diverge.
+                    updates[legacy_field] = selected_model
+            else:
+                selected_model = current_model
+            model_changed = selected_model != current_model
+
+            submitted_effort = submitted_efforts.get(plugin_id)
+            if submitted_effort is not None:
+                effort_value, effort_field = submitted_effort
+                plugin_updates[_REASONING_EFFORT_SETTING_KEY] = (
+                    _validate_reasoning_effort(
+                        effort_value,
+                        current_effort=current_effort,
+                        current_model=current_model,
+                        selected_model=selected_model,
+                        model_changed=model_changed,
+                        catalog=catalog,
+                        field_name=effort_field,
+                    )
+                )
+            elif model_changed and current_effort:
+                selected_metadata = next(
+                    (
+                        model
+                        for model in catalog.models
+                        if model.invocation_id == selected_model
+                    ),
+                    None,
+                )
+                advertised_efforts = (
+                    {
+                        effort.name
+                        for effort in selected_metadata.reasoning_efforts
+                    }
+                    if selected_metadata is not None
+                    else None
+                )
+                if not selected_model or (
+                    advertised_efforts is not None
+                    and current_effort not in advertised_efforts
+                ):
+                    plugin_updates[_REASONING_EFFORT_SETTING_KEY] = ""
+                    if selected_model:
+                        reason = (
+                            f"it is not advertised for model {selected_model}"
+                        )
+                    else:
+                        reason = "an explicit model is required"
+                    coder_messages[plugin_id] = (
+                        "Reasoning effort reset to CLI default because "
+                        f"{reason}."
+                    )
+
+            if plugin_updates:
+                coder_settings_updates[plugin_id] = plugin_updates
+        if coder_settings_updates:
+            updates["coder_settings"] = coder_settings_updates
     except ValueError as exc:
         return await _render_settings_daemon_error(request, str(exc), 422)
 
@@ -598,24 +1154,42 @@ async def put_settings_daemon(
             affected_repo_names=repo_names,
             event_type="settings",
         )
-    return await _render_settings_daemon_response(request)
+    return await _render_settings_daemon_response(
+        request,
+        coder_messages=coder_messages,
+    )
 
 
 @router.get("/api/auth-status")
-async def api_auth_status() -> JSONResponse:
-    return JSONResponse(await _collect_auth_status())
+async def api_auth_status(request: Request) -> JSONResponse:
+    return JSONResponse(
+        await _collect_auth_status(request.app.state.coder_registry)
+    )
 
 
 @router.get("/api/coders")
-async def api_coders() -> JSONResponse:
+async def api_coders(request: Request) -> JSONResponse:
     cfg = load_config(_app.CONFIG_PATH)
-    auth = await _collect_auth_status()
-    return JSONResponse({"coders": _build_coder_rows(cfg, auth)})
+    auth, catalogs = await asyncio.gather(
+        _collect_auth_status(request.app.state.coder_registry),
+        _model_catalog_snapshots(request, cfg, load=True),
+    )
+    cfg = load_config(_app.CONFIG_PATH)
+    return JSONResponse(
+        {
+            "coders": _build_coder_rows(
+                cfg,
+                auth,
+                catalogs,
+                request.app.state.coder_registry,
+            )
+        }
+    )
 
 
 @router.get("/partials/settings/auth-status", response_class=HTMLResponse)
 async def partial_settings_auth_status(request: Request) -> HTMLResponse:
-    auth = await _collect_auth_status()
+    auth = await _collect_auth_status(request.app.state.coder_registry)
     return _app.templates.TemplateResponse(
         request,
         "components/settings_auth.html",

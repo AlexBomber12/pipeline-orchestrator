@@ -4,8 +4,21 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
+from src.coder_registry import (
+    ModelCatalogUnavailable,
+    ModelMetadata,
+    ModelReasoningEffort,
+)
 from src.coders import codex as codex_module
 from src.coders.codex import CodexPlugin
+from src.coders.codex_models import (
+    CodexModel,
+    CodexModelDiscoveryInvalid,
+    CodexModelDiscoveryUnavailable,
+    CodexReasoningEffort,
+)
+from src.config import AppConfig, DaemonConfig
 from src.usage import OpenAIUsageProvider
 
 
@@ -16,20 +29,76 @@ def test_codex_plugin_name() -> None:
     assert plugin.display_name == "Codex CLI"
 
 
-def test_codex_plugin_models_includes_default() -> None:
+def test_codex_plugin_models_remains_legacy_compatibility_metadata() -> None:
     plugin = CodexPlugin()
 
-    assert plugin.models == [
-        "",
-        "gpt-5.4",
-        "gpt-5.3-codex",
-        "gpt-5.3-codex-spark",
-        "gpt-5.2-codex",
-        "gpt-5.4-mini",
-        "gpt-5.1-codex-max",
-        "gpt-5.1-codex-mini",
-        "gpt-5.2",
-    ]
+    assert plugin.models[0] == ""
+    assert "gpt-5.4" in plugin.models
+
+
+@pytest.mark.asyncio
+async def test_codex_plugin_adapts_discovery_and_auth_context(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def discover(**kwargs: object) -> tuple[CodexModel, ...]:
+        captured.update(kwargs)
+        return (
+            CodexModel(
+                "invoke-new",
+                "Provider Name",
+                True,
+                "medium",
+                (CodexReasoningEffort("low", "Fast"),),
+            ),
+        )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-used")
+    config = AppConfig.model_validate(
+        {"auth": {"codex_home_dir": str(tmp_path / "auth")}}
+    )
+    catalog = await CodexPlugin(discover=discover).get_model_catalog(
+        config=config,
+        config_path=str(tmp_path / "config.yml"),
+    )
+
+    assert catalog.source == "discovered"
+    assert catalog.models == (
+        ModelMetadata(
+            "invoke-new",
+            "Provider Name",
+            True,
+            "medium",
+            (ModelReasoningEffort("low", "Fast"),),
+        ),
+    )
+    assert captured["cwd"] == str(tmp_path)
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["HOME"] == str(tmp_path / "auth")
+    assert "OPENAI_API_KEY" not in env
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        CodexModelDiscoveryUnavailable("offline"),
+        CodexModelDiscoveryInvalid("malformed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_codex_plugin_normalizes_discovery_failures(
+    error: Exception,
+) -> None:
+    async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
+        raise error
+
+    with pytest.raises(ModelCatalogUnavailable, match="unavailable"):
+        await CodexPlugin(discover=discover).get_model_catalog(
+            config=AppConfig(),
+            config_path="config.yml",
+        )
 
 
 @pytest.mark.asyncio
@@ -42,11 +111,12 @@ async def test_codex_plugin_run_planned_pr_delegates(
         repo_path: str,
         model: str | None = None,
         timeout: int = 900,
-        **_: object,
+        **kwargs: object,
     ) -> tuple[int, str, str]:
         captured["repo_path"] = repo_path
         captured["model"] = model
         captured["timeout"] = timeout
+        captured["kwargs"] = kwargs
         return (0, "ok", "")
 
     monkeypatch.setattr(
@@ -58,6 +128,7 @@ async def test_codex_plugin_run_planned_pr_delegates(
         "/data/repos/demo",
         model="",
         timeout=321,
+        reasoning_effort="high",
     )
 
     assert result == (0, "ok", "")
@@ -65,6 +136,7 @@ async def test_codex_plugin_run_planned_pr_delegates(
         "repo_path": "/data/repos/demo",
         "model": None,
         "timeout": 321,
+        "kwargs": {"reasoning_effort": "high"},
     }
 
 
@@ -322,6 +394,7 @@ async def test_codex_plugin_run_auto_pr_delegates(
         task_body="<body>",
         model="",
         timeout=321,
+        reasoning_effort="xhigh",
     )
 
     assert result == (0, "ok", "")
@@ -333,6 +406,7 @@ async def test_codex_plugin_run_auto_pr_delegates(
     )
     assert captured["model"] is None
     assert captured["timeout"] == 321
+    assert captured["kwargs"] == {"reasoning_effort": "xhigh"}
 
 
 @pytest.mark.asyncio
@@ -345,11 +419,12 @@ async def test_codex_plugin_fix_review_delegates(
         repo_path: str,
         model: str | None = None,
         timeout: int | None = None,
-        **_: object,
+        **kwargs: object,
     ) -> tuple[int, str, str]:
         captured["repo_path"] = repo_path
         captured["model"] = model
         captured["timeout"] = timeout
+        captured["kwargs"] = kwargs
         return (0, "fixed", "")
 
     monkeypatch.setattr(
@@ -361,6 +436,7 @@ async def test_codex_plugin_fix_review_delegates(
         "/data/repos/demo",
         model="",
         timeout=654,
+        reasoning_effort="low",
     )
 
     assert result == (0, "fixed", "")
@@ -368,7 +444,129 @@ async def test_codex_plugin_fix_review_delegates(
         "repo_path": "/data/repos/demo",
         "model": None,
         "timeout": 654,
+        "kwargs": {
+            "pr_id": None,
+            "task_file": None,
+            "reasoning_effort": "low",
+        },
     }
+
+
+@pytest.mark.parametrize(
+    ("coder_settings", "expected"),
+    [
+        ({}, {"model": "legacy-codex"}),
+        (
+            {"codex": {"reasoning_effort": ""}},
+            {"model": "legacy-codex"},
+        ),
+        (
+            {"codex": {"reasoning_effort": "ultra"}},
+            {"model": "legacy-codex", "reasoning_effort": "ultra"},
+        ),
+    ],
+)
+def test_codex_plugin_build_run_kwargs_resolves_reasoning_effort(
+    coder_settings: dict[str, dict[str, object]],
+    expected: dict[str, str],
+) -> None:
+    config = DaemonConfig(
+        codex_model="legacy-codex",
+        coder_settings=coder_settings,
+    )
+
+    assert CodexPlugin().build_run_kwargs(daemon_config=config) == expected
+
+
+@pytest.mark.parametrize("malformed", [None, 7, False, ["high"]])
+def test_daemon_config_rejects_malformed_reasoning_effort(
+    malformed: object,
+) -> None:
+    with pytest.raises(
+        ValidationError,
+        match=r"coder_settings\.codex\.reasoning_effort must be a string",
+    ):
+        DaemonConfig(coder_settings={"codex": {"reasoning_effort": malformed}})
+
+
+@pytest.mark.parametrize("malformed", [None, 7, False, ["high"]])
+def test_codex_plugin_rejects_malformed_reasoning_effort(
+    malformed: object,
+) -> None:
+    config = DaemonConfig.model_construct(
+        coder_settings={"codex": {"reasoning_effort": malformed}}
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"daemon\.coder_settings\.codex\.reasoning_effort must be a string",
+    ):
+        CodexPlugin().build_run_kwargs(daemon_config=config)
+
+
+@pytest.mark.asyncio
+async def test_codex_plugin_forwards_auxiliary_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def process_callback(_process: object) -> None:
+        pass
+
+    def supervised_callback(_managed: object) -> None:
+        pass
+
+    async def fake_run_codex_async(
+        prompt: str, repo_path: str, **kwargs: object
+    ) -> tuple[int, str, str]:
+        calls.append((f"prompt:{prompt}:{repo_path}", kwargs))
+        return (0, "ok", "")
+
+    async def fake_diagnose_error_async(
+        repo_path: str, context: str, **kwargs: object
+    ) -> tuple[int, str, str]:
+        calls.append((f"diagnose:{context}:{repo_path}", kwargs))
+        return (0, "ok", "")
+
+    monkeypatch.setattr(
+        codex_module.codex_cli,
+        "run_codex_async",
+        fake_run_codex_async,
+    )
+    monkeypatch.setattr(
+        codex_module.codex_cli,
+        "diagnose_error_async",
+        fake_diagnose_error_async,
+    )
+    plugin = CodexPlugin()
+
+    await plugin.run_prompt(
+        "merge",
+        "/repo",
+        model="",
+        timeout=300,
+        reasoning_effort="high",
+        on_process_start=process_callback,
+        on_supervised_process_start=supervised_callback,
+    )
+    await plugin.diagnose_error(
+        "/repo",
+        "boom",
+        model="",
+        reasoning_effort="high",
+        on_process_start=process_callback,
+        on_supervised_process_start=supervised_callback,
+    )
+
+    assert [call[0] for call in calls] == [
+        "prompt:merge:/repo",
+        "diagnose:boom:/repo",
+    ]
+    for _kind, kwargs in calls:
+        assert kwargs["model"] is None
+        assert kwargs["reasoning_effort"] == "high"
+        assert kwargs["on_process_start"] is process_callback
+        assert kwargs["on_supervised_process_start"] is supervised_callback
 
 
 def test_check_auth_detail_mentions_api_key_when_set_but_unverified(

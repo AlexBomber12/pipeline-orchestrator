@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import subprocess
 import threading
@@ -9,14 +10,26 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from src import coder_auth as _coder_auth
+from src import coder_auth_worker as _auth_worker
 from src import config as src_config
+from src.coder_registry import (
+    CoderRegistry,
+    ModelCatalog,
+    ModelMetadata,
+    ModelReasoningEffort,
+    ModelSetting,
+)
 from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
-from src.config import load_config
+from src.coders.codex_models import CodexModel, CodexReasoningEffort
+from src.config import AppConfig, DaemonConfig, load_config
 from src.models import PipelineState, RepoState
 from src.web import app as web_app
 from src.web.app import app
 from src.web.services import auth_probe as _auth_probe
+from src.web.services import model_catalog as _model_catalog
+from src.web.services.model_catalog import ModelCatalogCache
 
 
 class _StubAioredisClient:
@@ -763,23 +776,37 @@ def test_put_daemon_updates_optional_timeout_fields(empty_config: Path) -> None:
     assert cfg.daemon.rate_limit_weekly_pause_percent == 90
 
 
-def test_model_save_rejects_unknown_model(empty_config: Path) -> None:
+def test_model_save_rejects_unknown_codex_model_atomically(
+    empty_config: Path,
+) -> None:
     with TestClient(app) as client:
         response = client.put(
             "/settings/daemon",
             data={
-                "claude_model": "o3",
+                "claude_model": "sonnet",
                 "codex_model": "not-a-real-model",
             },
         )
 
     assert response.status_code == 422
     assert "text/html" in response.headers["content-type"]
-    assert "claude_model" in response.text or "codex_model" in response.text
+    assert "codex_model is not advertised by Codex CLI" in response.text
 
     cfg = load_config(str(empty_config))
     assert cfg.daemon.claude_model == "opus"
     assert cfg.daemon.codex_model == ""
+
+
+def test_model_save_rejects_unknown_claude_model(empty_config: Path) -> None:
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"claude_model": "not-a-real-model"},
+        )
+
+    assert response.status_code == 422
+    assert "claude_model is not advertised by Claude Code" in response.text
+    assert load_config(str(empty_config)).daemon.claude_model == "opus"
 
 
 def test_model_save_accepts_valid_model(empty_config: Path) -> None:
@@ -788,14 +815,14 @@ def test_model_save_accepts_valid_model(empty_config: Path) -> None:
             "/settings/daemon",
             data={
                 "claude_model": ClaudePlugin.models[-1],
-                "codex_model": CodexPlugin.models[-1],
+                "codex_model": "gpt-5.4",
             },
         )
 
     assert response.status_code == 200
     cfg = load_config(str(empty_config))
     assert cfg.daemon.claude_model == ClaudePlugin.models[-1]
-    assert cfg.daemon.codex_model == CodexPlugin.models[-1]
+    assert cfg.daemon.codex_model == "gpt-5.4"
 
 
 def test_model_dropdown_includes_default_option(empty_config: Path) -> None:
@@ -806,12 +833,1571 @@ def test_model_dropdown_includes_default_option(empty_config: Path) -> None:
     body = response.text
     assert '<option value=""' in body
     assert "(default)" in body
+    assert "CLI default" in body
+    assert 'name="coder_settings.claude.model"' in body
+    assert 'name="coder_settings.codex.model"' in body
+    assert 'name="claude_model"' not in body
+    assert 'name="codex_model"' not in body
     for model in ClaudePlugin.models:
         if model != "":
             assert f'value="{model}"' in body
-    for model in CodexPlugin.models:
-        if model != "":
-            assert f'value="{model}"' in body
+    assert 'value="gpt-5.4"' in body
+
+
+class _ThirdCatalogPlugin:
+    name = "third"
+    display_name = "Third Coder"
+    models = ["legacy-third"]
+    model_setting = ModelSetting(None, "third-default", "Default")
+    model_catalog_refreshable = False
+
+    def model_catalog_cache_key(
+        self, *, config: AppConfig, config_path: str
+    ) -> str:
+        del config, config_path
+        return "third-static"
+
+    async def get_model_catalog(
+        self, *, config: AppConfig, config_path: str
+    ) -> ModelCatalog:
+        del config, config_path
+        return ModelCatalog(
+            (ModelMetadata("third-invoke", "Third Display"),),
+            "static_compatibility",
+            "Third-party static catalog.",
+        )
+
+    def resolve_model(self, daemon_config: object) -> str:
+        return self.model_setting.resolve(self.name, daemon_config)
+
+    def build_run_kwargs(
+        self, *, daemon_config: object, **_kwargs: object
+    ) -> dict[str, str]:
+        return {"model": self.resolve_model(daemon_config)}
+
+    def check_auth(self) -> dict[str, str]:
+        return {"status": "ok", "detail": "third authenticated"}
+
+
+class _EffortCatalogPlugin:
+    name = "vendor-test"
+    display_name = "Vendor Test"
+    models: list[str] = []
+    model_setting = ModelSetting(None, "", "CLI default")
+    model_catalog_refreshable = False
+
+    def model_catalog_cache_key(
+        self, *, config: AppConfig, config_path: str
+    ) -> str:
+        del config, config_path
+        return "vendor-test-static"
+
+    async def get_model_catalog(
+        self, *, config: AppConfig, config_path: str
+    ) -> ModelCatalog:
+        del config, config_path
+        return ModelCatalog(
+            (
+                ModelMetadata(
+                    "vendor-model",
+                    "Vendor Model",
+                    default_reasoning_effort="balanced",
+                    reasoning_efforts=(
+                        ModelReasoningEffort("quick", "Short deliberation"),
+                        ModelReasoningEffort("balanced", "Balanced"),
+                    ),
+                ),
+            ),
+            "plugin_metadata",
+            "Vendor-owned catalog.",
+        )
+
+    def resolve_model(self, daemon_config: object) -> str:
+        return self.model_setting.resolve(self.name, daemon_config)
+
+    def build_run_kwargs(
+        self, *, daemon_config: object, **_kwargs: object
+    ) -> dict[str, str]:
+        return {"model": self.resolve_model(daemon_config)}
+
+
+def test_shared_catalog_rendering_supports_third_plugin_without_branches(
+    empty_config: Path,
+) -> None:
+    with TestClient(app) as client:
+        client.app.state.coder_registry.register(_ThirdCatalogPlugin())
+        response = client.get("/partials/settings/coders")
+
+    assert response.status_code == 200
+    assert "Third Coder" in response.text
+    assert 'value="third-invoke"' in response.text
+    assert "Third Display" in response.text
+    assert "Third-party static catalog." in response.text
+    assert 'name="coder_settings.third.model"' in response.text
+    assert "/partials/settings/coders/third/models/refresh" not in response.text
+
+
+def test_refresh_indicator_is_css_safe_for_digit_leading_plugin_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "coder_plugins:\n"
+        "  3rd: tests.configured_coder_plugin:build_digit_leading_plugin\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/settings/coders")
+
+    assert response.status_code == 200
+    assert 'hx-indicator="#coder-3rd-model-refreshing"' in response.text
+    assert 'id="coder-3rd-model-refreshing"' in response.text
+
+
+def test_arbitrary_plugin_model_round_trips_without_core_field(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "coder_plugins:\n"
+        "  third: tests.configured_coder_plugin:build_test_plugin\n"
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    unrelated:\n"
+        "      model: keep-me\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        plugin = client.app.state.coder_registry.get("third")
+        rendered = client.get("/partials/settings/coders")
+        saved = client.put(
+            "/settings/daemon",
+            data={"coder_settings.third.model": "third-invoke"},
+        )
+
+    cfg = load_config(str(cfg_path))
+    assert rendered.status_code == 200
+    assert saved.status_code == 200
+    assert "Configured Test Coder" in rendered.text
+    assert "Metadata only" in rendered.text
+    assert not re.search(
+        r'<input type="radio"[^>]*value="third"',
+        rendered.text,
+        re.DOTALL,
+    )
+    assert "third_model" not in type(cfg.daemon).model_fields
+    assert cfg.daemon.coder_settings == {
+        "unrelated": {"model": "keep-me"},
+        "third": {"model": "third-invoke"},
+    }
+    assert plugin.resolve_model(cfg.daemon) == "third-invoke"
+    assert plugin.build_run_kwargs(daemon_config=cfg.daemon) == {
+        "model": "third-invoke"
+    }
+
+
+def test_configured_custom_daemon_coder_renders_as_read_only_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "coder_plugins:\n"
+        "  third: tests.configured_coder_plugin:build_test_plugin\n"
+        "daemon:\n"
+        "  coder: third\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        rendered = client.get("/partials/settings/coders")
+
+    assert rendered.status_code == 200
+    assert "Configured Test Coder" in rendered.text
+    assert "Configured default (read-only)" in rendered.text
+    assert not re.search(
+        r'<input type="radio"[^>]*value="third"',
+        rendered.text,
+        re.DOTALL,
+    )
+
+
+def test_reasoning_effort_choices_render_from_selected_model_and_match_api(
+    empty_config: Path,
+) -> None:
+    catalog = (
+        CodexModel(
+            "reasoning-model",
+            "Reasoning Model",
+            True,
+            "balanced",
+            (
+                CodexReasoningEffort("quick", "Short deliberation"),
+                CodexReasoningEffort("balanced", "Balanced response"),
+            ),
+        ),
+    )
+
+    async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
+        return catalog
+
+    with TestClient(app) as client:
+        plugin = client.app.state.coder_registry.get("codex")
+        plugin._discover = discover
+        client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.model": "reasoning-model"},
+        )
+        rendered = client.get("/partials/settings/coders")
+        api_response = client.get("/api/coders")
+
+    assert rendered.status_code == 200
+    assert 'name="coder_settings.codex.reasoning_effort"' in rendered.text
+    assert "CLI default (no application override)" in rendered.text
+    assert "quick" in rendered.text
+    assert "Short deliberation" in rendered.text
+    assert "Catalogue metadata advertises" in rendered.text
+    assert "does not confirm the effective CLI setting" in rendered.text
+    assert "subsequent coder launches" in rendered.text
+    codex_row = next(
+        row for row in api_response.json()["coders"] if row["name"] == "codex"
+    )
+    assert codex_row["reasoning_effort"] == {
+        "control_name": "coder_settings.codex.reasoning_effort",
+        "selected_value": "",
+        "choices": [
+            {"value": "quick", "description": "Short deliberation"},
+            {"value": "balanced", "description": "Balanced response"},
+        ],
+        "can_select": True,
+        "support_confirmed": True,
+        "saved_is_advertised": True,
+        "default_reasoning_effort": "balanced",
+        "status": "available",
+        "message": "Choose an application override or keep the CLI default.",
+        "update_message": None,
+    }
+
+
+def test_saved_model_and_effort_feed_codex_execution_kwargs(
+    empty_config: Path,
+) -> None:
+    async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
+        return (
+            CodexModel(
+                "execution-model",
+                "Execution Model",
+                True,
+                "medium",
+                (
+                    CodexReasoningEffort("medium", "Balanced"),
+                    CodexReasoningEffort("high", "Thorough"),
+                ),
+            ),
+        )
+
+    with TestClient(app) as client:
+        plugin = client.app.state.coder_registry.get("codex")
+        plugin._discover = discover
+        selected_model = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.model": "execution-model"},
+        )
+        saved_effort = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.reasoning_effort": "high"},
+        )
+        reloaded = client.get("/partials/settings/coders")
+        persisted = load_config(str(empty_config))
+        run_kwargs = plugin.build_run_kwargs(daemon_config=persisted.daemon)
+
+    assert selected_model.status_code == 200
+    assert saved_effort.status_code == 200
+    assert reloaded.status_code == 200
+    assert 'value="execution-model" selected' in reloaded.text
+    assert 'value="high" selected' in reloaded.text
+    assert persisted.daemon.coder_settings["codex"] == {
+        "model": "execution-model",
+        "reasoning_effort": "high",
+    }
+    assert run_kwargs == {
+        "model": "execution-model",
+        "reasoning_effort": "high",
+    }
+
+
+def test_reasoning_effort_requires_explicit_model_and_can_clear_saved_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: ''\n"
+        "      reasoning_effort: legacy-saved\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        rendered = client.get("/partials/settings/coders")
+        rejected = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.reasoning_effort": "high"},
+        )
+        cleared = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.reasoning_effort": ""},
+        )
+
+    assert 'data-reasoning-effort-status="explicit_model_required"' in (
+        rendered.text
+    )
+    assert "Select an explicit model" in rendered.text
+    assert "legacy-saved" in rendered.text
+    assert "Use CLI default" in rendered.text
+    assert rejected.status_code == 422
+    assert "requires an explicitly selected model" in rejected.text
+    assert cleared.status_code == 200
+    cfg = load_config(str(cfg_path))
+    assert cfg.daemon.coder_settings["codex"]["reasoning_effort"] == ""
+
+
+def test_reasoning_effort_persists_and_preserves_unrelated_plugin_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: model-a\n"
+        "      custom_option: keep-codex\n"
+        "    unrelated:\n"
+        "      token: keep-other\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
+        return (
+            CodexModel(
+                "model-a",
+                "Model A",
+                True,
+                "medium",
+                (
+                    CodexReasoningEffort("low", "Fast"),
+                    CodexReasoningEffort("medium", "Balanced"),
+                ),
+            ),
+        )
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.get("codex")._discover = discover
+        saved = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.reasoning_effort": "low"},
+        )
+        reloaded = client.get("/partials/settings/coders")
+        persisted = load_config(str(cfg_path))
+        cleared = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.reasoning_effort": ""},
+        )
+
+    assert saved.status_code == 200
+    assert 'value="low" selected' in reloaded.text
+    assert persisted.daemon.coder_settings == {
+        "codex": {
+            "model": "model-a",
+            "custom_option": "keep-codex",
+            "reasoning_effort": "low",
+        },
+        "unrelated": {"token": "keep-other"},
+    }
+    assert cleared.status_code == 200
+    cfg = load_config(str(cfg_path))
+    assert cfg.daemon.coder_settings["codex"] == {
+        "model": "model-a",
+        "custom_option": "keep-codex",
+        "reasoning_effort": "",
+    }
+    assert cfg.daemon.coder_settings["unrelated"] == {"token": "keep-other"}
+
+
+def test_model_change_preserves_compatible_effort_and_clears_incompatible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: model-a\n"
+        "      reasoning_effort: medium\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
+        return (
+            CodexModel(
+                "model-a",
+                "Model A",
+                False,
+                "medium",
+                (
+                    CodexReasoningEffort("low", None),
+                    CodexReasoningEffort("medium", None),
+                ),
+            ),
+            CodexModel(
+                "model-b",
+                "Model B",
+                True,
+                "medium",
+                (
+                    CodexReasoningEffort("medium", None),
+                    CodexReasoningEffort("high", None),
+                ),
+            ),
+        )
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.get("codex")._discover = discover
+        compatible = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.model": "model-b"},
+        )
+        after_compatible = load_config(str(cfg_path))
+        selected_high = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.reasoning_effort": "high"},
+        )
+        incompatible = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.model": "model-a"},
+        )
+
+    assert compatible.status_code == 200
+    assert after_compatible.daemon.coder_settings["codex"] == {
+        "model": "model-b",
+        "reasoning_effort": "medium",
+    }
+    assert selected_high.status_code == 200
+    assert incompatible.status_code == 200
+    assert "Reasoning effort reset to CLI default" in incompatible.text
+    assert "not advertised for model model-a" in incompatible.text
+    cfg = load_config(str(cfg_path))
+    assert cfg.daemon.coder_settings["codex"] == {
+        "model": "model-a",
+        "reasoning_effort": "",
+    }
+
+
+def test_model_change_to_cli_default_clears_saved_effort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: model-a\n"
+        "      reasoning_effort: low\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.model": ""},
+        )
+
+    assert response.status_code == 200
+    assert "an explicit model is required" in response.text
+    assert load_config(str(cfg_path)).daemon.coder_settings["codex"] == {
+        "model": "",
+        "reasoning_effort": "",
+    }
+
+
+def test_invalid_combined_model_effort_submission_is_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  poll_interval_sec: 60\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: model-a\n"
+        "      reasoning_effort: low\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
+        return (
+            CodexModel(
+                "model-a",
+                "Model A",
+                False,
+                "low",
+                (CodexReasoningEffort("low", None),),
+            ),
+            CodexModel(
+                "model-b",
+                "Model B",
+                True,
+                "high",
+                (CodexReasoningEffort("high", None),),
+            ),
+        )
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.get("codex")._discover = discover
+        response = client.put(
+            "/settings/daemon",
+            data={
+                "poll_interval_sec": "99",
+                "coder_settings.codex.model": "model-b",
+                "coder_settings.codex.reasoning_effort": "unsupported",
+            },
+        )
+
+    assert response.status_code == 422
+    assert "is not advertised for model model-b" in response.text
+    cfg = load_config(str(cfg_path))
+    assert cfg.daemon.poll_interval_sec == 60
+    assert cfg.daemon.coder_settings["codex"] == {
+        "model": "model-a",
+        "reasoning_effort": "low",
+    }
+
+
+def test_saved_effort_survives_catalog_failure_and_refresh_then_can_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: saved-model\n"
+        "      reasoning_effort: saved-effort\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    async def fail(**_kwargs: object) -> tuple[CodexModel, ...]:
+        raise RuntimeError("private failure detail")
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.get("codex")._discover = fail
+        failed = client.get("/partials/settings/coders")
+        refreshed = client.post(
+            "/partials/settings/coders/codex/models/refresh"
+        )
+        retained = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.reasoning_effort": "saved-effort"},
+        )
+        rejected = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.reasoning_effort": "new-effort"},
+        )
+        before_clear = load_config(str(cfg_path))
+        cleared = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.reasoning_effort": ""},
+        )
+
+    for response in (failed, refreshed):
+        assert response.status_code == 200
+        assert "saved-effort" in response.text
+        assert "support" in response.text
+        assert "private failure detail" not in response.text
+    assert (
+        before_clear.daemon.coder_settings["codex"]["reasoning_effort"]
+        == "saved-effort"
+    )
+    assert retained.status_code == 200
+    assert rejected.status_code == 422
+    assert "metadata for model saved-model is unavailable" in rejected.text
+    assert cleared.status_code == 200
+    assert (
+        load_config(str(cfg_path)).daemon.coder_settings["codex"][
+            "reasoning_effort"
+        ]
+        == ""
+    )
+
+
+def test_stale_catalog_keeps_saved_effort_visible_without_claiming_support(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: known-model\n"
+        "      reasoning_effort: low\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    async def available(**_kwargs: object) -> tuple[CodexModel, ...]:
+        return (
+            CodexModel(
+                "known-model",
+                "Known Model",
+                True,
+                "low",
+                (CodexReasoningEffort("low", "Fast"),),
+            ),
+        )
+
+    async def fail(**_kwargs: object) -> tuple[CodexModel, ...]:
+        raise RuntimeError("offline")
+
+    with TestClient(app) as client:
+        plugin = client.app.state.coder_registry.get("codex")
+        plugin._discover = available
+        ready = client.get("/partials/settings/coders")
+        plugin._discover = fail
+        stale = client.post(
+            "/partials/settings/coders/codex/models/refresh"
+        )
+
+    assert 'data-reasoning-effort-status="available"' in ready.text
+    assert 'data-reasoning-effort-status="stale"' in stale.text
+    assert 'value="low" selected' in stale.text
+    assert "current support is unconfirmed" in stale.text
+    assert (
+        load_config(str(cfg_path)).daemon.coder_settings["codex"][
+            "reasoning_effort"
+        ]
+        == "low"
+    )
+
+
+def test_arbitrary_plugin_effort_uses_generic_storage_and_no_provider_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    vendor-test:\n"
+        "      model: vendor-model\n"
+        "    unrelated:\n"
+        "      keep: value\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.register(_EffortCatalogPlugin())
+        rendered = client.get("/partials/settings/coders")
+        saved = client.put(
+            "/settings/daemon",
+            data={"coder_settings.vendor-test.reasoning_effort": "quick"},
+        )
+
+    assert rendered.status_code == 200
+    assert "Vendor Test" in rendered.text
+    assert 'name="coder_settings.vendor-test.reasoning_effort"' in rendered.text
+    assert "Short deliberation" in rendered.text
+    assert saved.status_code == 200
+    assert load_config(str(cfg_path)).daemon.coder_settings == {
+        "vendor-test": {
+            "model": "vendor-model",
+            "reasoning_effort": "quick",
+        },
+        "unrelated": {"keep": "value"},
+    }
+
+
+def test_model_without_effort_metadata_has_no_selectable_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    third:\n"
+        "      model: third-invoke\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.register(_ThirdCatalogPlugin())
+        response = client.get("/partials/settings/coders")
+
+    assert response.status_code == 200
+    assert 'data-reasoning-effort-status="not_advertised"' in response.text
+    assert "advertises no reasoning-effort overrides" in response.text
+    assert 'name="coder_settings.third.reasoning_effort"' not in response.text
+
+
+def test_slow_effort_validation_does_not_overwrite_newer_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: old-model\n"
+        "      reasoning_effort: low\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    started = threading.Event()
+    release = threading.Event()
+    result: dict[str, object] = {}
+
+    async def slow_discovery(**_kwargs: object) -> tuple[CodexModel, ...]:
+        started.set()
+        await asyncio.to_thread(release.wait)
+        return (
+            CodexModel(
+                "new-model",
+                "New Model",
+                True,
+                "high",
+                (CodexReasoningEffort("high", None),),
+            ),
+        )
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.get("codex")._discover = slow_discovery
+
+        def save_old_request() -> None:
+            result["response"] = client.put(
+                "/settings/daemon",
+                data={
+                    "poll_interval_sec": "99",
+                    "coder_settings.codex.model": "new-model",
+                },
+            )
+
+        thread = threading.Thread(target=save_old_request)
+        thread.start()
+        assert started.wait(timeout=2)
+        src_config.update_daemon_config(
+            path=str(cfg_path),
+            coder_settings={
+                "codex": {
+                    "model": "newer-saved-model",
+                    "reasoning_effort": "newer-effort",
+                }
+            },
+        )
+        release.set()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    response = result["response"]
+    assert hasattr(response, "status_code")
+    assert response.status_code == 409
+    assert "no submitted settings were saved" in response.text
+    assert "newer saved settings were kept" in response.text
+    cfg = load_config(str(cfg_path))
+    assert cfg.daemon.coder_settings["codex"] == {
+        "model": "newer-saved-model",
+        "reasoning_effort": "newer-effort",
+    }
+    assert cfg.daemon.poll_interval_sec == 60
+
+
+def test_generic_model_submission_rejects_unregistered_plugin(
+    empty_config: Path,
+) -> None:
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"coder_settings.not-registered.model": "anything"},
+        )
+
+    assert response.status_code == 422
+    assert "Unknown coder settings plugin ID" in response.text
+    assert load_config(str(empty_config)).daemon.coder_settings == {}
+
+
+def test_generic_model_submission_rejects_unknown_setting_key(
+    empty_config: Path,
+) -> None:
+    with TestClient(app) as client:
+        response = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.not-model": "anything"},
+        )
+
+    assert response.status_code == 422
+    assert "Unknown coder setting" in response.text
+
+
+class _NonStringForm(dict[str, object]):
+    def multi_items(self) -> list[tuple[str, object]]:
+        return list(self.items())
+
+
+@pytest.mark.parametrize(
+    ("form", "message"),
+    [
+        (
+            _NonStringForm({"coder_settings.codex.model": object()}),
+            "coder_settings.codex.model must be a string",
+        ),
+        (
+            _NonStringForm({"codex_model": object()}),
+            "codex_model must be a string",
+        ),
+        (
+            _NonStringForm(
+                {"coder_settings.codex.reasoning_effort": object()}
+            ),
+            "coder_settings.codex.reasoning_effort must be a string",
+        ),
+    ],
+)
+def test_model_submission_parser_rejects_non_string_values(
+    form: _NonStringForm,
+    message: str,
+) -> None:
+    from src.coders import build_coder_registry
+    from src.web.routes.settings import _submitted_coder_models
+
+    with pytest.raises(ValueError, match=message):
+        _submitted_coder_models(form, build_coder_registry())
+
+
+def test_reasoning_effort_helpers_preserve_existing_unconfirmed_values() -> None:
+    from src.coders import build_coder_registry
+    from src.web.routes.settings import (
+        _saved_reasoning_effort,
+        _submitted_coder_models,
+        _validate_reasoning_effort,
+    )
+    from src.web.services.model_catalog import ModelCatalogSnapshot
+
+    unavailable = ModelCatalogSnapshot(status="unavailable")
+    assert (
+        _validate_reasoning_effort(
+            "saved",
+            current_effort="saved",
+            current_model="",
+            selected_model="",
+            model_changed=False,
+            catalog=unavailable,
+            field_name="effort",
+        )
+        == "saved"
+    )
+    assert (
+        _validate_reasoning_effort(
+            "saved",
+            current_effort="saved",
+            current_model="known",
+            selected_model="known",
+            model_changed=False,
+            catalog=unavailable,
+            field_name="effort",
+        )
+        == "saved"
+    )
+    no_efforts = ModelCatalogSnapshot(
+        models=(ModelMetadata("known", "Known"),),
+        status="available",
+    )
+    assert (
+        _validate_reasoning_effort(
+            "saved",
+            current_effort="saved",
+            current_model="known",
+            selected_model="known",
+            model_changed=False,
+            catalog=no_efforts,
+            field_name="effort",
+        )
+        == "saved"
+    )
+    submitted = _submitted_coder_models(
+        _NonStringForm({"coder_settings.codex.model": "gpt-5.4"}),
+        build_coder_registry(),
+    )
+    assert submitted["codex"] == (
+        "gpt-5.4",
+        "coder_settings.codex.model",
+        False,
+    )
+    malformed = DaemonConfig.model_construct(
+        coder_settings={"codex": {"reasoning_effort": 3}}
+    )
+    with pytest.raises(ValueError, match="reasoning_effort must be a string"):
+        _saved_reasoning_effort(malformed, "codex")
+
+
+def test_model_submission_parser_rejects_unavailable_legacy_metadata() -> None:
+    from src.coder_registry import CoderMetadataView
+    from src.web.routes.settings import _submitted_coder_models
+
+    registry = CoderRegistry()
+    registry.register(
+        CoderMetadataView(
+            name="codex",
+            display_name="codex (metadata unavailable)",
+            models=[],
+            model_setting=ModelSetting(
+                "codex_model",
+                "",
+                "Metadata unavailable",
+            ),
+            model_catalog_refreshable=False,
+            metadata_available=False,
+        )
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Coder metadata is unavailable: codex",
+    ):
+        _submitted_coder_models(
+            _NonStringForm({"codex_model": "gpt-test"}),
+            registry,
+        )
+
+
+def test_dynamic_codex_choice_persists_invocation_slug_and_api_metadata(
+    empty_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = (
+        CodexModel("invoke-future", "GPT Future", False, None, ()),
+        CodexModel("invoke-default", "GPT Provider Default", True, None, ()),
+    )
+
+    async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
+        return catalog
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.get("codex")._discover = discover
+        fragment = client.get("/partials/settings/coders")
+        response = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.model": "invoke-future"},
+        )
+        reloaded = client.get("/partials/settings/coders")
+        api_response = client.get("/api/coders")
+
+    assert fragment.status_code == 200
+    assert re.search(
+        r'<option value="invoke-future" >\s+GPT Future', fragment.text
+    )
+    assert "GPT Provider Default (advertised default)" in fragment.text
+    assert fragment.text.index("invoke-future") < fragment.text.index("invoke-default")
+    assert response.status_code == 200
+    assert 'value="invoke-future" selected' in reloaded.text
+    cfg = load_config(str(empty_config))
+    assert cfg.daemon.codex_model == ""
+    assert cfg.daemon.coder_settings["codex"]["model"] == "invoke-future"
+    run_kwargs = CodexPlugin().build_run_kwargs(daemon_config=cfg.daemon)
+    assert run_kwargs == {
+        "model": "invoke-future"
+    }
+    captured: dict[str, object] = {}
+
+    async def run_cli(
+        repo_path: str,
+        *,
+        model: str | None,
+        timeout: int,
+        **_kwargs: object,
+    ) -> tuple[int, str, str]:
+        captured.update(repo_path=repo_path, model=model, timeout=timeout)
+        return (0, "ok", "")
+
+    monkeypatch.setattr(
+        "src.coders.codex.codex_cli.run_planned_pr_async",
+        run_cli,
+    )
+    assert asyncio.run(
+        CodexPlugin().run_planned_pr(
+            "/repo",
+            timeout=60,
+            **run_kwargs,
+        )
+    ) == (0, "ok", "")
+    assert captured == {
+        "repo_path": "/repo",
+        "model": "invoke-future",
+        "timeout": 60,
+    }
+
+    codex_row = next(
+        row for row in api_response.json()["coders"] if row["name"] == "codex"
+    )
+    assert "gpt-5.4" in codex_row["models"]
+    assert codex_row["model_catalog"]["choices"] == [
+        {
+            "invocation_id": "invoke-future",
+            "display_name": "GPT Future",
+            "is_default": False,
+            "default_reasoning_effort": None,
+            "reasoning_efforts": [],
+        },
+        {
+            "invocation_id": "invoke-default",
+            "display_name": "GPT Provider Default",
+            "is_default": True,
+            "default_reasoning_effort": None,
+            "reasoning_efforts": [],
+        },
+    ]
+    claude_row = next(
+        row for row in api_response.json()["coders"] if row["name"] == "claude"
+    )
+    assert claude_row["models"] == ["opus", "sonnet"]
+    assert claude_row["model_catalog"]["source"] == "static_compatibility"
+    assert "not live or account-verified" in claude_row["model_catalog"]["message"]
+
+
+def test_codex_discovery_uses_configured_session_context_without_api_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    codex_home = tmp_path / "codex-home"
+    cfg_path.write_text(
+        "repositories: []\nauth:\n"
+        f"  codex_home_dir: {codex_home}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-used")
+    captured: dict[str, object] = {}
+
+    async def discover(**kwargs: object) -> tuple[CodexModel, ...]:
+        captured.update(kwargs)
+        return (CodexModel("session-model", "Session Model", False, None, ()),)
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.get("codex")._discover = discover
+        response = client.get("/api/coders")
+
+    assert response.status_code == 200
+    assert captured["cwd"] == str(tmp_path)
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["HOME"] == str(codex_home)
+    assert "OPENAI_API_KEY" not in env
+
+
+def test_codex_empty_catalog_rejects_new_slug_but_unrelated_save_works(
+    empty_config: Path,
+) -> None:
+    calls = 0
+
+    async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
+        nonlocal calls
+        calls += 1
+        return ()
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.get("codex")._discover = discover
+        settings_response = client.get("/settings")
+        invalid_response = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.model": "unadvertised"},
+        )
+        unrelated_response = client.put(
+            "/settings/daemon",
+            data={"poll_interval_sec": "41"},
+        )
+
+    assert settings_response.status_code == 200
+    assert 'data-model-catalog-status="empty"' in settings_response.text
+    assert invalid_response.status_code == 422
+    assert "no usable Codex CLI model catalog" in invalid_response.text
+    assert unrelated_response.status_code == 200
+    assert calls == 1
+    cfg = load_config(str(empty_config))
+    assert cfg.daemon.codex_model == ""
+    assert cfg.daemon.poll_interval_sec == 41
+
+
+def test_codex_discovery_failure_retains_saved_value_and_refresh_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: saved-custom\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    async def fail(**_kwargs: object) -> tuple[CodexModel, ...]:
+        raise RuntimeError("raw protocol secret")
+
+    async def recover(**_kwargs: object) -> tuple[CodexModel, ...]:
+        return (CodexModel("recovered", "Recovered Model", True, None, ()),)
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.get("codex")._discover = fail
+        failed = client.get("/settings")
+        retained = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.model": "saved-custom"},
+        )
+        client.app.state.coder_registry.get("codex")._discover = recover
+        refreshed = client.post(
+            "/partials/settings/coders/codex/models/refresh"
+        )
+
+    assert failed.status_code == 200
+    assert 'data-model-catalog-status="unavailable"' in failed.text
+    assert "raw protocol secret" not in failed.text
+    assert "saved-custom (saved; not advertised)" in failed.text
+    assert retained.status_code == 200
+    assert refreshed.status_code == 200
+    assert 'value="recovered"' in refreshed.text
+    assert "saved-custom (saved; not advertised)" in refreshed.text
+    assert (
+        load_config(str(cfg_path)).daemon.coder_settings["codex"]["model"]
+        == "saved-custom"
+    )
+
+
+def test_codex_default_can_be_saved_while_discovery_is_offline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: saved-custom\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    async def fail(**_kwargs: object) -> tuple[CodexModel, ...]:
+        raise RuntimeError("offline")
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.get("codex")._discover = fail
+        failed = client.get("/settings")
+        defaulted = client.put(
+            "/settings/daemon",
+            data={"coder_settings.codex.model": ""},
+        )
+
+    assert failed.status_code == 200
+    assert defaulted.status_code == 200
+    cfg = load_config(str(cfg_path))
+    assert cfg.daemon.coder_settings["codex"]["model"] == ""
+    assert CodexPlugin().resolve_model(cfg.daemon) == ""
+
+
+def test_codex_refresh_updates_choices_without_changing_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n  codex_model: original-slug\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    async def initial(**_kwargs: object) -> tuple[CodexModel, ...]:
+        return (CodexModel("original-slug", "Original", True, None, ()),)
+
+    async def updated(**_kwargs: object) -> tuple[CodexModel, ...]:
+        return (CodexModel("new-slug", "New Model", True, None, ()),)
+
+    with TestClient(app) as client:
+        plugin = client.app.state.coder_registry.get("codex")
+        plugin._discover = initial
+        first = client.get("/partials/settings/coders")
+        plugin._discover = updated
+        refreshed = client.post(
+            "/partials/settings/coders/codex/models/refresh"
+        )
+
+    assert 'value="original-slug" selected' in first.text
+    assert 'value="new-slug"' in refreshed.text
+    assert "original-slug (saved; not advertised)" in refreshed.text
+    assert 'hx-indicator="#coder-codex-model-refreshing"' in refreshed.text
+    assert "Refreshing…" in refreshed.text
+    assert load_config(str(cfg_path)).daemon.codex_model == "original-slug"
+
+
+def test_model_refresh_rejects_unknown_and_static_plugins(
+    empty_config: Path,
+) -> None:
+    with TestClient(app) as client:
+        unknown = client.post(
+            "/partials/settings/coders/missing/models/refresh"
+        )
+        static = client.post(
+            "/partials/settings/coders/claude/models/refresh"
+        )
+
+    assert unknown.status_code == 404
+    assert unknown.text == "Unknown coder"
+    assert static.status_code == 422
+    assert static.text == "Model catalog is static"
+
+
+@pytest.mark.asyncio
+async def test_codex_catalog_cache_coalesces_concurrent_refreshes() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+    models = (
+        CodexModel("first", "First", True, None, ()),
+        CodexModel("second", "Second", False, None, ()),
+    )
+
+    async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return models
+
+    plugin = CodexPlugin(discover=discover)
+    config = AppConfig.model_validate(
+        {"auth": {"codex_home_dir": "/auth"}}
+    )
+    cache = ModelCatalogCache()
+    first = asyncio.create_task(
+        cache.get(plugin, config=config, config_path="/workspace/config.yml")
+    )
+    await started.wait()
+    second = asyncio.create_task(
+        cache.get(
+            plugin,
+            config=config,
+            config_path="/workspace/config.yml",
+            refresh=True,
+        )
+    )
+    await asyncio.sleep(0)
+    release.set()
+
+    first_snapshot, second_snapshot = await asyncio.gather(first, second)
+    cached_snapshot = await cache.get(
+        plugin,
+        config=config,
+        config_path="/workspace/config.yml",
+    )
+
+    assert calls == 1
+    assert first_snapshot == second_snapshot == cached_snapshot
+    assert [model.invocation_id for model in cached_snapshot.models] == [
+        "first",
+        "second",
+    ]
+    assert cached_snapshot.status == "available"
+    assert cached_snapshot.message == "2 models advertised by Codex CLI."
+    assert (
+        cache.peek(
+            plugin,
+            config=config,
+            config_path="/workspace/config.yml",
+        )
+        == cached_snapshot
+    )
+    other_config = AppConfig.model_validate(
+        {"auth": {"codex_home_dir": "/other-auth"}}
+    )
+    await cache.get(
+        plugin,
+        config=other_config,
+        config_path="/workspace/config.yml",
+    )
+    assert calls == 2
+    await cache.close()
+
+
+@pytest.mark.asyncio
+async def test_static_catalog_bypasses_daemon_loader() -> None:
+    async def unavailable_loader(*_args: object, **_kwargs: object) -> ModelCatalog:
+        raise AssertionError("static catalog must not use daemon loader")
+
+    cache = ModelCatalogCache(loader=unavailable_loader)
+    config = AppConfig()
+    snapshot = await cache.get(
+        ClaudePlugin(),
+        config=config,
+        config_path="/workspace/config.yml",
+    )
+
+    assert snapshot.status == "available"
+    assert [model.invocation_id for model in snapshot.models] == [
+        "opus",
+        "sonnet",
+    ]
+    assert snapshot.source == "static_compatibility"
+
+
+@pytest.mark.asyncio
+async def test_configured_static_catalog_uses_daemon_loader() -> None:
+    calls: list[str] = []
+
+    class UnsafeConfiguredCatalog(_ThirdCatalogPlugin):
+        def model_catalog_cache_key(self, **_kwargs: object) -> str:
+            raise AssertionError("configured cache key must stay out of web")
+
+    async def daemon_loader(
+        plugin: object, **_kwargs: object
+    ) -> ModelCatalog:
+        calls.append(plugin.name)
+        return ModelCatalog(
+            (ModelMetadata("isolated", "Daemon-owned"),),
+            "daemon",
+            "Loaded outside the web process.",
+        )
+
+    cache = ModelCatalogCache(
+        loader=daemon_loader,
+        daemon_owned_plugins={"third"},
+    )
+    snapshot = await cache.get(
+        UnsafeConfiguredCatalog(),
+        config=AppConfig(),
+        config_path="/workspace/config.yml",
+    )
+    changed = await cache.get(
+        UnsafeConfiguredCatalog(),
+        config=AppConfig(
+            daemon={"coder_settings": {"third": {"variant": "preview"}}}
+        ),
+        config_path="/workspace/config.yml",
+    )
+
+    assert calls == ["third", "third"]
+    assert len(cache._entries) == 1
+    assert snapshot.source == "daemon"
+    assert [model.invocation_id for model in snapshot.models] == ["isolated"]
+    assert changed.source == "daemon"
+
+
+@pytest.mark.asyncio
+async def test_codex_catalog_cache_expires_retains_last_known_and_handles_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr(_model_catalog.time, "monotonic", lambda: clock[0])
+    model = CodexModel("known", "Known", False, None, ())
+    should_fail = False
+
+    async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
+        if should_fail:
+            raise RuntimeError("unsafe provider detail")
+        return (model,)
+
+    config = AppConfig.model_validate(
+        {"auth": {"codex_home_dir": "/auth"}}
+    )
+    plugin = CodexPlugin(discover=discover)
+    cache = ModelCatalogCache(ttl_seconds=10)
+    ready = await cache.get(
+        plugin, config=config, config_path="/workspace/config.yml"
+    )
+    clock[0] = 11
+    expired = cache.peek(
+        plugin, config=config, config_path="/workspace/config.yml"
+    )
+    should_fail = True
+    stale = await cache.get(
+        plugin, config=config, config_path="/workspace/config.yml"
+    )
+
+    assert ready.status == "available"
+    assert expired.status == "stale"
+    assert "refresh is due" in expired.message
+    assert stale.status == "stale"
+    assert [candidate.invocation_id for candidate in stale.models] == ["known"]
+    assert "unsafe provider detail" not in stale.message
+
+    async def empty(**_kwargs: object) -> tuple[CodexModel, ...]:
+        return ()
+
+    empty_plugin = CodexPlugin(discover=empty)
+    empty_cache = ModelCatalogCache(ttl_seconds=10)
+    empty_snapshot = await empty_cache.get(
+        empty_plugin, config=config, config_path="/workspace/config.yml"
+    )
+    clock[0] = 22
+    expired_empty = empty_cache.peek(
+        empty_plugin, config=config, config_path="/workspace/config.yml"
+    )
+    assert empty_snapshot.status == "empty"
+    assert expired_empty.status == "empty"
+    assert not expired_empty.has_usable_models
+
+    async def unavailable(**_kwargs: object) -> tuple[CodexModel, ...]:
+        raise RuntimeError("provider failed")
+
+    unavailable_plugin = CodexPlugin(discover=unavailable)
+    unavailable_cache = ModelCatalogCache()
+    unavailable_snapshot = await unavailable_cache.get(
+        unavailable_plugin,
+        config=config,
+        config_path="/workspace/config.yml",
+    )
+    assert unavailable_snapshot.status == "unavailable"
+    assert (
+        unavailable_cache.peek(
+            unavailable_plugin,
+            config=config,
+            config_path="/workspace/config.yml",
+        )
+        == unavailable_snapshot
+    )
+    other_config = AppConfig.model_validate(
+        {"auth": {"codex_home_dir": "/other"}}
+    )
+    assert (
+        cache.peek(
+            plugin,
+            config=other_config,
+            config_path="/workspace/config.yml",
+        ).status
+        == "not_loaded"
+    )
+
+    with pytest.raises(ValueError, match="TTL must be positive"):
+        ModelCatalogCache(ttl_seconds=0)
+
+
+@pytest.mark.asyncio
+async def test_codex_catalog_cache_cancels_owned_discovery_on_close() -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    plugin = CodexPlugin(discover=discover)
+    config = AppConfig.model_validate(
+        {"auth": {"codex_home_dir": "/auth"}}
+    )
+    cache = ModelCatalogCache()
+    pending = asyncio.create_task(
+        cache.get(
+            plugin,
+            config=config,
+            config_path="/workspace/config.yml",
+        )
+    )
+    await started.wait()
+    await cache.close()
+
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert cancelled.is_set()
+
+
+def test_slow_codex_refresh_renders_selection_saved_during_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n  codex_model: old-selection\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    started = threading.Event()
+    release = threading.Event()
+    refresh_result: dict[str, object] = {}
+
+    async def slow_discovery(**_kwargs: object) -> tuple[CodexModel, ...]:
+        started.set()
+        await asyncio.to_thread(release.wait)
+        return (CodexModel("new-choice", "New Choice", True, None, ()),)
+
+    with TestClient(app) as client:
+        client.app.state.coder_registry.get("codex")._discover = slow_discovery
+
+        def refresh() -> None:
+            refresh_result["response"] = client.post(
+                "/partials/settings/coders/codex/models/refresh"
+            )
+
+        thread = threading.Thread(target=refresh)
+        thread.start()
+        assert started.wait(timeout=2)
+        saved = client.put(
+            "/settings/daemon",
+            data={"codex_model": ""},
+        )
+        release.set()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert saved.status_code == 200
+    refreshed = refresh_result["response"]
+    assert hasattr(refreshed, "text")
+    assert '<option value="" selected>' in refreshed.text
+    assert 'value="old-selection"' not in refreshed.text
+    assert load_config(str(cfg_path)).daemon.codex_model == ""
 
 
 def test_put_daemon_empty_numeric_inputs_are_no_ops(empty_config: Path) -> None:
@@ -1130,6 +2716,384 @@ def test_api_auth_status_returns_ok_for_both(
     assert payload["gh"]["status"] == "ok"
     assert "Logged in" in payload["gh"]["detail"]
     assert "octocat" in payload["gh"]["detail"]
+
+
+def test_api_auth_status_uses_every_configured_plugin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories: []\n"
+        "coder_plugins:\n"
+        "  claude: tests.configured_coder_plugin:build_claude_override\n"
+        "  third: tests.configured_coder_plugin:build_test_plugin\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/api/auth-status")
+
+    assert response.status_code == 200
+    assert response.json()["claude"] == {
+        "status": "ok",
+        "detail": "configured plugin auth",
+    }
+    assert response.json()["third"] == {
+        "status": "ok",
+        "detail": "configured test plugin auth",
+    }
+
+
+def test_configured_plugin_auth_failure_is_isolated_and_redacted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories: []\n"
+        "coder_plugins:\n"
+        "  third: tests.configured_coder_plugin:build_raising_auth_plugin\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        api_response = client.get("/api/auth-status")
+        settings_response = client.get("/settings")
+
+    assert api_response.status_code == 200
+    assert settings_response.status_code == 200
+    assert api_response.json()["third"] == {
+        "status": "error",
+        "detail": "Configured Test Coder auth check failed (RuntimeError)",
+    }
+    assert "must-not-leak" not in api_response.text
+    assert "must-not-leak" not in settings_response.text
+
+
+def test_configured_plugin_auth_probe_has_response_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories: []\n"
+        "coder_plugins:\n"
+        "  third: tests.configured_coder_plugin:build_slow_auth_plugin\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    monkeypatch.setattr(_auth_probe, "_AUTH_CHECK_TIMEOUT_SEC", 0.01)
+
+    with TestClient(app) as client:
+        response = client.get("/api/auth-status")
+
+    assert response.status_code == 200
+    assert response.json()["third"] == {
+        "status": "error",
+        "detail": "Configured Test Coder auth check timed out after 0.01s",
+    }
+
+
+def test_direct_coder_auth_probe_redacts_plugin_exception() -> None:
+    from tests.configured_coder_plugin import RaisingAuthTestPlugin
+
+    registry = CoderRegistry()
+    registry.register(RaisingAuthTestPlugin())
+
+    assert _auth_probe._check_coder_auth(registry, "third") == {
+        "status": "error",
+        "detail": "Configured Test Coder auth check failed (RuntimeError)",
+    }
+
+
+def test_configured_auth_probe_degrades_without_daemon_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.coder_registry import CoderMetadataView
+
+    registry = CoderRegistry()
+    registry.register(
+        CoderMetadataView(
+            name="third",
+            display_name="Third Coder",
+            models=[],
+            model_setting=ModelSetting(None, "", "Default"),
+            model_catalog_refreshable=False,
+        ),
+        reference="operator.plugin:factory",
+    )
+    monkeypatch.delattr(web_app.app.state, "plugin_bridge", raising=False)
+
+    result = asyncio.run(
+        _auth_probe._bounded_coder_auth_probe(registry, "third")
+    )
+
+    assert result == {
+        "status": "error",
+        "detail": "Third Coder auth check is unavailable",
+    }
+
+
+def test_auth_probe_worker_normalizes_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[str] = []
+
+    class _WithConfigPath:
+        display_name = "Worker Coder"
+
+        def check_auth(self, *, config_path: str) -> dict[str, str]:
+            seen.append(config_path)
+            return {"status": "ok", "detail": "ready"}
+
+    monkeypatch.setattr(
+        _auth_worker,
+        "_load_plugin",
+        lambda _plugin_id, _reference: _WithConfigPath(),
+    )
+    assert _auth_worker.run_probe("third", "module:factory", "/cfg") == {
+        "status": "ok",
+        "detail": "ready",
+    }
+    assert seen == ["/cfg"]
+
+    class _InvalidResult:
+        display_name = "Invalid Coder"
+
+        def check_auth(self) -> object:
+            return {"status": object()}
+
+    monkeypatch.setattr(
+        _auth_worker,
+        "_load_plugin",
+        lambda _plugin_id, _reference: _InvalidResult(),
+    )
+    assert _auth_worker.run_probe("third", "module:factory", "/cfg") == {
+        "status": "error",
+        "detail": "Invalid Coder auth check failed (TypeError)",
+    }
+
+    monkeypatch.setattr(
+        _auth_worker,
+        "_load_plugin",
+        lambda _plugin_id, _reference: (_ for _ in ()).throw(
+            RuntimeError("must-not-leak")
+        ),
+    )
+    assert _auth_worker.run_probe("third", "module:factory", "/cfg") == {
+        "status": "error",
+        "detail": "third auth check failed (RuntimeError)",
+    }
+
+
+def test_auth_probe_worker_main_validates_arguments_and_prints_result(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(_auth_worker.sys, "argv", ["auth-probe-worker"])
+    with pytest.raises(SystemExit, match="2"):
+        _auth_worker.main()
+
+    monkeypatch.setattr(
+        _auth_worker,
+        "run_probe",
+        lambda *_args: {"status": "ok", "detail": "ready"},
+    )
+    monkeypatch.setattr(
+        _auth_worker.sys,
+        "argv",
+        ["auth-probe-worker", "third", "module:factory", "/cfg"],
+    )
+    _auth_worker.main()
+
+    assert capsys.readouterr().out.strip() == (
+        _auth_worker.RESULT_PREFIX + '{"status":"ok","detail":"ready"}'
+    )
+
+
+class _FakeAuthProbeProcess:
+    def __init__(self, stdout: bytes, returncode: int) -> None:
+        self.pid = 12345
+        self.returncode = returncode
+        self._stdout = stdout
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return self._stdout, b""
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode", "expected_detail"),
+    [
+        (b"", 1, "Worker auth check worker failed"),
+        (
+            b"PIPELINE_AUTH_RESULT:{bad json}\nnoise\n",
+            0,
+            "Worker auth check returned an invalid result",
+        ),
+        (
+            b"PIPELINE_AUTH_RESULT:[]\n",
+            0,
+            "Worker auth check returned an invalid result",
+        ),
+    ],
+)
+def test_isolated_auth_probe_rejects_worker_failures_and_invalid_output(
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: bytes,
+    returncode: int,
+    expected_detail: str,
+) -> None:
+    async def fake_subprocess(*_args: object, **_kwargs: object) -> object:
+        return _FakeAuthProbeProcess(stdout, returncode)
+
+    monkeypatch.setattr(
+        _coder_auth.asyncio,
+        "create_subprocess_exec",
+        fake_subprocess,
+    )
+
+    result = asyncio.run(
+        _coder_auth.isolated_auth_probe(
+            "third",
+            "module:factory",
+            "Worker",
+            config_path="/cfg",
+        )
+    )
+
+    assert result == {"status": "error", "detail": expected_detail}
+
+
+def test_isolated_auth_probe_redacts_worker_start_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def failing_subprocess(*_args: object, **_kwargs: object) -> object:
+        raise OSError("must-not-leak")
+
+    monkeypatch.setattr(
+        _coder_auth.asyncio,
+        "create_subprocess_exec",
+        failing_subprocess,
+    )
+
+    result = asyncio.run(
+        _coder_auth.isolated_auth_probe(
+            "third",
+            "module:factory",
+            "Worker",
+            config_path="/cfg",
+        )
+    )
+
+    assert result == {
+        "status": "error",
+        "detail": "Worker auth check failed (OSError)",
+    }
+
+
+def test_isolated_auth_probe_handles_worker_exit_during_timeout_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _SlowProcess:
+        pid = 12345
+        returncode: int | None = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def wait(self) -> int:
+            self.returncode = 0
+            return 0
+
+    async def fake_subprocess(*_args: object, **_kwargs: object) -> object:
+        return _SlowProcess()
+
+    def exited_process_group(_pid: int, _signal: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(
+        _coder_auth.asyncio,
+        "create_subprocess_exec",
+        fake_subprocess,
+    )
+    monkeypatch.setattr(_coder_auth.os, "killpg", exited_process_group)
+
+    result = asyncio.run(
+        _coder_auth.isolated_auth_probe(
+            "third",
+            "module:factory",
+            "Worker",
+            config_path="/cfg",
+            timeout=0.001,
+        )
+    )
+
+    assert result == {
+        "status": "error",
+        "detail": "Worker auth check timed out after 0.001s",
+    }
+
+
+def test_isolated_auth_probe_terminates_worker_when_caller_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _BlockedProcess:
+        pid = 12345
+        returncode: int | None = None
+        reaped = False
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def wait(self) -> int:
+            self.reaped = True
+            self.returncode = -9
+            return -9
+
+    process = _BlockedProcess()
+    killed: list[tuple[int, int]] = []
+
+    async def fake_subprocess(*_args: object, **_kwargs: object) -> object:
+        return process
+
+    monkeypatch.setattr(
+        _coder_auth.asyncio,
+        "create_subprocess_exec",
+        fake_subprocess,
+    )
+    monkeypatch.setattr(
+        _coder_auth.os,
+        "killpg",
+        lambda pid, sig: killed.append((pid, sig)),
+    )
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            _coder_auth.isolated_auth_probe(
+                "third",
+                "module:factory",
+                "Worker",
+                config_path="/cfg",
+                timeout=60,
+            )
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    assert killed == [(process.pid, _coder_auth.signal.SIGKILL)]
+    assert process.reaped is True
 
 
 def test_api_auth_status_reports_errors(
@@ -1590,6 +3554,51 @@ def test_settings_repo_list_shows_value_when_override_set(
     assert 'value="60"' in body
 
 
+def test_settings_repo_list_marks_builtin_coder_override_selected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/codex-repo.git\n"
+        "    branch: main\n"
+        "    coder: codex\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/settings/repo-list")
+
+    assert response.status_code == 200
+    assert 'option value="codex" selected' in response.text
+
+
+def test_settings_repo_list_shows_custom_coder_override_as_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "repositories:\n"
+        "  - url: https://github.com/example/custom-repo.git\n"
+        "    branch: main\n"
+        "    coder: third\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+
+    with TestClient(app) as client:
+        response = client.get("/partials/settings/repo-list")
+
+    assert response.status_code == 200
+    assert 'option value="third" selected disabled' in response.text
+    assert "third (configured)" in response.text
+
+
 def test_update_daemon_rate_limit_session(
     empty_config: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1790,7 +3799,7 @@ def test_coder_setting_saves_and_reloads(
 
     assert response.status_code == 200
     cfg = load_config(str(empty_config))
-    assert cfg.daemon.coder.value == "codex"
+    assert cfg.daemon.coder == "codex"
 
 
 def test_codex_model_setting_saves(
@@ -1808,6 +3817,8 @@ def test_codex_model_setting_saves(
     assert response.status_code == 200
     cfg = load_config(str(empty_config))
     assert cfg.daemon.codex_model == "gpt-5.4"
+    assert cfg.daemon.coder_settings["codex"]["model"] == "gpt-5.4"
+    assert CodexPlugin().resolve_model(cfg.daemon) == "gpt-5.4"
 
 
 def test_codex_model_setting_clears_to_default(
@@ -1827,6 +3838,8 @@ def test_codex_model_setting_clears_to_default(
     assert response.status_code == 200
     cfg = load_config(str(cfg_path))
     assert cfg.daemon.codex_model == ""
+    assert cfg.daemon.coder_settings["codex"]["model"] == ""
+    assert CodexPlugin().resolve_model(cfg.daemon) == ""
 
 
 def test_claude_model_setting_saves(
@@ -1844,6 +3857,8 @@ def test_claude_model_setting_saves(
     assert response.status_code == 200
     cfg = load_config(str(empty_config))
     assert cfg.daemon.claude_model == "sonnet"
+    assert cfg.daemon.coder_settings["claude"]["model"] == "sonnet"
+    assert ClaudePlugin().resolve_model(cfg.daemon) == "sonnet"
 
 
 def test_claude_model_setting_empty_uses_default(
@@ -1863,6 +3878,8 @@ def test_claude_model_setting_empty_uses_default(
     assert response.status_code == 200
     cfg = load_config(str(cfg_path))
     assert cfg.daemon.claude_model == "opus"
+    assert cfg.daemon.coder_settings["claude"]["model"] == "opus"
+    assert ClaudePlugin().resolve_model(cfg.daemon) == "opus"
 
 
 def test_repo_coder_override_saves(
@@ -1880,7 +3897,7 @@ def test_repo_coder_override_saves(
     assert response.status_code == 200
     cfg = load_config(str(one_repo_config))
     assert cfg.repositories[0].coder is not None
-    assert cfg.repositories[0].coder.value == "codex"
+    assert cfg.repositories[0].coder == "codex"
 
 
 def test_repo_coder_override_clear(
@@ -1960,9 +3977,10 @@ def test_coders_table_omits_unknown_selected_model(
 
     assert response.status_code == 200
     body = response.text
-    assert 'value="custom-model"' not in body
+    assert '<option value="custom-model" selected>' in body
+    assert "custom-model (saved; not advertised)" in body
     assert 'value=""' in body
-    assert "(default)" in body
+    assert "CLI default" in body
 
 
 def test_repo_detail_coder_display_renders_readonly(
@@ -2040,7 +4058,7 @@ def test_repo_coder_change_posts_selector_updates_config_and_sets_dirty_flag(
     assert "Switching to Codex CLI." in response.text
     cfg = load_config(str(one_repo_config))
     assert cfg.repositories[0].coder is not None
-    assert cfg.repositories[0].coder.value == "codex"
+    assert cfg.repositories[0].coder == "codex"
     assert fake_redis.store["control:example__alpha:config_dirty"] == "1"
     assert published == [
         (
@@ -2235,7 +4253,7 @@ def test_put_repo_detail_coder_still_updates_summary_fragment(
     assert 'hx-post="/repos/example__alpha/coder"' not in response.text
     cfg = load_config(str(one_repo_config))
     assert cfg.repositories[0].coder is not None
-    assert cfg.repositories[0].coder.value == "codex"
+    assert cfg.repositories[0].coder == "codex"
 
 
 def test_put_repo_detail_coder_handles_missing_invalid_clear_and_write_error(

@@ -8,7 +8,9 @@ import pytest
 import src.config as config_module
 from src.config import (
     AppConfig,
+    DaemonConfig,
     RepoConfig,
+    TrustedReviewerIdentity,
     add_repository,
     load_config,
     normalize_repo_url,
@@ -33,6 +35,7 @@ def test_load_config_missing_file_returns_defaults(tmp_path: Path) -> None:
     assert cfg.web.port == 8000
     assert cfg.auth.claude_config_dir == "/data/auth/claude"
     assert cfg.auth.gh_config_dir == "/data/auth/gh"
+    assert cfg.coder_plugins == config_module.DEFAULT_CODER_PLUGINS
 
 
 def test_load_config_missing_file_applies_env_overrides(
@@ -129,6 +132,66 @@ def test_daemon_config_claude_model_default() -> None:
     from src.config import DaemonConfig
 
     assert DaemonConfig().claude_model == "opus"
+    assert DaemonConfig().coder_settings == {}
+
+
+def test_daemon_config_accepts_null_coder_settings_as_empty() -> None:
+    from src.config import DaemonConfig
+
+    assert DaemonConfig(coder_settings=None).coder_settings == {}  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("coder_settings", "message"),
+    [
+        ("not-a-mapping", "coder_settings must be a mapping"),
+        ({"": {}}, "plugin IDs must be non-empty strings"),
+        ({"codex": "not-a-mapping"}, "coder_settings.codex must be a mapping"),
+        ({"codex": {"model": 123}}, "coder_settings.codex.model must be a string"),
+        (
+            {"codex": {"reasoning_effort": 123}},
+            "coder_settings.codex.reasoning_effort must be a string",
+        ),
+        (
+            {"third": {"variant": 123}},
+            "coder_settings.third.variant must be a string",
+        ),
+    ],
+)
+def test_daemon_config_rejects_malformed_coder_settings(
+    coder_settings: object,
+    message: str,
+) -> None:
+    from pydantic import ValidationError
+    from src.config import DaemonConfig
+
+    with pytest.raises(ValidationError, match=message):
+        DaemonConfig(coder_settings=coder_settings)  # type: ignore[arg-type]
+
+
+def test_load_config_rejects_non_string_custom_setting_on_reload(
+    tmp_path: Path,
+) -> None:
+    from pydantic import ValidationError
+
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        "daemon:\n  coder_settings:\n    third:\n      variant: safe\n",
+        encoding="utf-8",
+    )
+    assert load_config(str(config_path)).daemon.coder_settings["third"] == {
+        "variant": "safe"
+    }
+
+    config_path.write_text(
+        "daemon:\n  coder_settings:\n    third:\n      variant: 123\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        ValidationError,
+        match=r"coder_settings\.third\.variant must be a string",
+    ):
+        load_config(str(config_path))
 
 
 def test_daemon_config_selector_defaults() -> None:
@@ -139,6 +202,42 @@ def test_daemon_config_selector_defaults() -> None:
     assert cfg.auto_fallback is True
     assert cfg.coder_priority == {"codex": 81, "claude": 76}
     assert cfg.exploration_epsilon == 0.15
+
+
+def test_daemon_config_default_trusted_reviewer_identity() -> None:
+    from src.config import DaemonConfig
+
+    cfg = DaemonConfig()
+
+    assert cfg.trusted_reviewer_identities == [
+        TrustedReviewerIdentity(
+            user_id=199175422,
+            login="chatgpt-codex-connector[bot]",
+        )
+    ]
+
+
+def test_daemon_config_rejects_malformed_reviewer_ids() -> None:
+    from pydantic import ValidationError
+    from src.config import DaemonConfig
+
+    for user_id in (None, 0, -1, True, "199175422"):
+        with pytest.raises(ValidationError):
+            DaemonConfig(
+                trusted_reviewer_identities=[{"user_id": user_id}]
+            )
+
+
+def test_trusted_reviewer_identity_blank_login_normalizes_to_none() -> None:
+    identity = TrustedReviewerIdentity(user_id=199175422, login="  ")
+
+    assert identity.login is None
+
+
+def test_trusted_reviewer_identity_missing_login_stays_none() -> None:
+    identity = TrustedReviewerIdentity(user_id=199175422, login=None)
+
+    assert identity.login is None
 
 
 def test_load_config_valid_yaml(tmp_path: Path) -> None:
@@ -237,6 +336,9 @@ def test_save_config_round_trip(tmp_path: Path) -> None:
     )
     config.daemon.poll_interval_sec = 90
     config.daemon.error_handler_use_ai = False
+    config.daemon.trusted_reviewer_identities.append(
+        TrustedReviewerIdentity(user_id=200, login="second-reviewer")
+    )
     config.web.port = 9000
     config.auth.claude_config_dir = "/tmp/claude"
 
@@ -246,6 +348,111 @@ def test_save_config_round_trip(tmp_path: Path) -> None:
     assert path.is_file()
     loaded = load_config(str(path))
     assert loaded.model_dump() == config.model_dump()
+
+
+def test_coder_plugins_overlay_save_and_parse_do_not_invoke_factories(
+    tmp_path: Path,
+) -> None:
+    from src.coders import build_coder_registry
+
+    from tests import configured_coder_plugin as fixture
+
+    fixture.reset_factory_calls()
+    path = tmp_path / "config.yml"
+    path.write_text(
+        "coder_plugins:\n"
+        "  third: tests.configured_coder_plugin:build_test_plugin\n"
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    third:\n"
+        "      model: third-default\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "config.production.yml").write_text(
+        "coder_plugins:\n"
+        "  claude: tests.configured_coder_plugin:build_claude_override\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(str(path))
+    assert fixture.FACTORY_CALLS == 0
+    assert config.coder_plugins == {
+        "claude": "tests.configured_coder_plugin:build_claude_override",
+        "codex": "src.coders.codex:CodexPlugin",
+        "third": "tests.configured_coder_plugin:build_test_plugin",
+    }
+
+    save_config(config, str(path))
+    update_daemon_config(
+        path=str(path),
+        coder_settings={"third": {"model": "third-invoke"}},
+    )
+    reloaded = load_config(str(path))
+    assert fixture.FACTORY_CALLS == 0
+    assert reloaded.coder_plugins == config.coder_plugins
+    assert reloaded.daemon.coder_settings["third"]["model"] == "third-invoke"
+
+    registry = build_coder_registry(reloaded)
+    assert registry.get("third").display_name == "Configured Test Coder"
+    assert fixture.FACTORY_CALLS == 1
+
+
+@pytest.mark.parametrize(
+    ("coder_plugins", "message"),
+    [
+        ("not-a-mapping", "coder_plugins must be a mapping"),
+        ({"": "some.module:factory"}, "plugin IDs must be non-empty strings"),
+        ({"third": 3}, "coder_plugins.third must be a module:factory string"),
+    ],
+)
+def test_app_config_rejects_malformed_coder_plugin_mapping(
+    coder_plugins: object,
+    message: str,
+) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match=message):
+        AppConfig(coder_plugins=coder_plugins)  # type: ignore[arg-type]
+
+
+def test_app_config_accepts_null_coder_plugins_as_defaults() -> None:
+    config = AppConfig(coder_plugins=None)  # type: ignore[arg-type]
+
+    assert config.coder_plugins == config_module.DEFAULT_CODER_PLUGINS
+
+
+def test_load_config_reloads_trusted_reviewer_policy_snapshot(
+    tmp_path: Path,
+) -> None:
+    from src.github.reviewer_policy import reviewer_policy_from_config
+
+    path = tmp_path / "config.yml"
+    path.write_text(
+        """
+daemon:
+  trusted_reviewer_identities:
+    - user_id: 199175422
+      login: chatgpt-codex-connector[bot]
+""",
+        encoding="utf-8",
+    )
+    first = reviewer_policy_from_config(load_config(str(path)))
+
+    path.write_text(
+        """
+daemon:
+  trusted_reviewer_identities:
+    - user_id: 200
+      login: second-reviewer
+""",
+        encoding="utf-8",
+    )
+    second = reviewer_policy_from_config(load_config(str(path)))
+
+    assert first.is_trusted_user({"id": 199175422, "login": "renamed"})
+    assert not first.is_trusted_user({"id": 200, "login": "second-reviewer"})
+    assert second.is_trusted_user({"id": 200, "login": "second-reviewer"})
+    assert not second.is_trusted_user({"id": 199175422, "login": "renamed"})
 
 
 def test_save_config_omits_unset_required_checks(tmp_path: Path) -> None:
@@ -982,11 +1189,29 @@ def test_repo_config_coder_override_codex() -> None:
     assert repo.coder == CoderType.CODEX
 
 
+def test_configured_plugin_ids_are_valid_coder_selections() -> None:
+    cfg = AppConfig(
+        repositories=[
+            RepoConfig(url="https://github.com/example/repo", coder="third")
+        ],
+        daemon=DaemonConfig(coder="third"),
+    )
+
+    assert cfg.daemon.coder == "third"
+    assert cfg.repositories[0].coder == "third"
+
+
+@pytest.mark.parametrize("coder", ["any", "bad/plugin", "", " space"])
+def test_config_coder_selection_rejects_non_plugin_ids(coder: str) -> None:
+    with pytest.raises(ValueError, match="coder"):
+        DaemonConfig(coder=coder)
+
+
 def test_update_daemon_config_coder(tmp_path: Path) -> None:
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text("daemon: {}\n", encoding="utf-8")
     updated = update_daemon_config(path=str(cfg_path), coder="codex")
-    assert updated.daemon.coder.value == "codex"
+    assert updated.daemon.coder == "codex"
 
 
 def test_update_daemon_config_codex_model(tmp_path: Path) -> None:
@@ -994,6 +1219,81 @@ def test_update_daemon_config_codex_model(tmp_path: Path) -> None:
     cfg_path.write_text("daemon: {}\n", encoding="utf-8")
     updated = update_daemon_config(path=str(cfg_path), codex_model="o4-mini")
     assert updated.daemon.codex_model == "o4-mini"
+
+
+def test_update_daemon_config_merges_plugin_settings(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    other:\n"
+        "      model: keep-me\n"
+        "      token: preserved\n"
+        "    codex:\n"
+        "      extra: also-preserved\n",
+        encoding="utf-8",
+    )
+
+    updated = update_daemon_config(
+        path=str(cfg_path),
+        coder_settings={"codex": {"model": "new-model"}},
+    )
+
+    assert updated.daemon.coder_settings == {
+        "other": {"model": "keep-me", "token": "preserved"},
+        "codex": {"extra": "also-preserved", "model": "new-model"},
+    }
+
+
+def test_update_daemon_config_rejects_non_mapping_plugin_patch(
+    tmp_path: Path,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text("daemon: {}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="coder_settings must be a mapping"):
+        update_daemon_config(
+            path=str(cfg_path),
+            coder_settings="not-a-mapping",
+        )
+
+    assert cfg_path.read_text(encoding="utf-8") == "daemon: {}\n"
+
+
+def test_coder_settings_deep_merge_through_production_overlay(
+    tmp_path: Path,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: base-model\n"
+        "      retained: base-value\n"
+        "    arbitrary:\n"
+        "      model: arbitrary-model\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "config.production.yml").write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    codex:\n"
+        "      model: production-model\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(str(cfg_path))
+
+    assert cfg.daemon.coder_settings == {
+        "codex": {
+            "model": "production-model",
+            "retained": "base-value",
+        },
+        "arbitrary": {"model": "arbitrary-model"},
+    }
+    from src.coders.codex import CodexPlugin
+
+    assert CodexPlugin().resolve_model(cfg.daemon) == "production-model"
 
 
 def test_update_repository_coder_override(tmp_path: Path) -> None:
@@ -1007,7 +1307,7 @@ def test_update_repository_coder_override(tmp_path: Path) -> None:
         coder="codex",
     )
     assert cfg.repositories[0].coder is not None
-    assert cfg.repositories[0].coder.value == "codex"
+    assert cfg.repositories[0].coder == "codex"
 
 
 def test_update_repository_coder_clear(tmp_path: Path) -> None:

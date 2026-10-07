@@ -19,12 +19,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import quote
 
+from src.config import load_config
 from src.github import cache, checks, gh_runner, reviews
 from src.github.gh_runner import (
     _extract_commit_date,
     _extract_head_sha,
     _parse_iso,
 )
+from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_config
 from src.github.reviews import _begin_review_cache_cycle
 from src.models import CIStatus, PRInfo
 
@@ -264,10 +266,12 @@ def _is_valid_branch_name(branch: str) -> bool:
 def get_open_prs(
     repo: str,
     allow_merge_without_checks: bool = False,
+    reviewer_policy: ReviewerPolicy | None = None,
 ) -> list[PRInfo]:
     """Return open PRs for ``repo`` (``owner/repo``) with CI and review status."""
 
     _begin_review_cache_cycle()
+    reviewer_policy = reviewer_policy or reviewer_policy_from_config(load_config())
     try:
         raw = gh_runner.run_gh(
             [
@@ -289,6 +293,7 @@ def get_open_prs(
         return _get_open_prs_rest(
             repo,
             allow_merge_without_checks=allow_merge_without_checks,
+            reviewer_policy=reviewer_policy,
         )
     if not isinstance(raw, list):
         return []
@@ -328,6 +333,7 @@ def get_open_prs(
                     number,
                     pr_author=(entry.get("author") or {}).get("login", ""),
                     head_sha=head_sha,
+                    policy=reviewer_policy,
                 ),
                 commits_count=len(commits),
                 push_count=1 if head_sha else 0,
@@ -351,6 +357,7 @@ def _get_open_prs_rest(
     repo: str,
     *,
     allow_merge_without_checks: bool,
+    reviewer_policy: ReviewerPolicy | None = None,
 ) -> list[PRInfo]:
     """Return open PRs via REST when GraphQL status rollup is unavailable."""
 
@@ -390,6 +397,7 @@ def _get_open_prs_rest(
                     number,
                     pr_author=user.get("login", ""),
                     head_sha=head_sha,
+                    policy=reviewer_policy,
                 ),
                 commits_count=1 if head_sha else 0,
                 push_count=1 if head_sha else 0,
@@ -769,39 +777,50 @@ def get_pr_last_push_time(repo: str, pr_number: int) -> datetime | None:
     Anywhere we want "did X happen after this branch's latest push?",
     push time is the correct anchor.
 
-    Returns ``None`` on any API or parse failure (callers must fail
-    open).
+    Resolves activity against the PR head repository so fork-origin
+    branches use the fork's push feed rather than the base repository's.
+    Returns ``None`` on any API or parse failure; callers choose whether
+    missing freshness evidence should fail open or closed.
     """
 
     try:
-        branch_raw = gh_runner.run_gh([
+        head_raw = gh_runner.run_gh([
             "api",
             f"repos/{repo}/pulls/{pr_number}",
             "--jq",
-            ".head.ref",
+            '{branch: .head.ref, repo: .head.repo.full_name}',
         ])
-        branch = branch_raw.strip() if isinstance(branch_raw, str) else ""
-        if not branch:
+        branch = ""
+        head_repo = ""
+        if isinstance(head_raw, dict):
+            branch_value = head_raw.get("branch")
+            repo_value = head_raw.get("repo")
+            branch = branch_value.strip() if isinstance(branch_value, str) else ""
+            head_repo = repo_value.strip() if isinstance(repo_value, str) else ""
+        elif isinstance(head_raw, str):
+            # Preserve compatibility with simple test doubles and old gh output.
+            branch = head_raw.strip()
+            head_repo = repo
+        if not branch or not head_repo:
             return None
         ref = quote(f"refs/heads/{branch}", safe="")
-        date_raw = gh_runner.run_gh([
-            "api",
-            f"repos/{repo}/activity?ref={ref}&activity_type=push&per_page=1&direction=desc",
-            "--jq",
-            ".[0].timestamp // .[0].pushed_at",
-        ])
-        date_str = date_raw.strip() if isinstance(date_raw, str) else ""
-        if not date_str:
+        push_times: list[datetime] = []
+        for activity_type in ("push", "force_push"):
             date_raw = gh_runner.run_gh([
                 "api",
-                f"repos/{repo}/activity?ref={ref}&per_page=1&direction=desc",
+                (
+                    f"repos/{head_repo}/activity?ref={ref}"
+                    f"&activity_type={activity_type}&per_page=1&direction=desc"
+                ),
                 "--jq",
-                ".[0].timestamp // .[0].pushed_at",
+                ".[0].timestamp",
             ])
             date_str = date_raw.strip() if isinstance(date_raw, str) else ""
-        if not date_str:
-            return None
-        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            if date_str:
+                push_times.append(
+                    datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                )
+        return max(push_times, default=None)
     except Exception:
         return None
 

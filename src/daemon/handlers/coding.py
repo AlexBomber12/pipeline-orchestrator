@@ -29,6 +29,7 @@ from src.daemon import git_ops
 from src.daemon.guardrails import scan_stdout
 from src.daemon.handlers import CoderUnavailable
 from src.daemon.quarantine import apply_quarantine_label_for_violation
+from src.daemon.selector import CoderSelectionUnavailable
 from src.github import cache as gh_cache
 from src.github import gh_runner
 from src.github import prs as gh_prs
@@ -217,7 +218,15 @@ class CodingMixin:
         # statuses; selecting first would let a stale/empty auth cache
         # pick an ineligible coder that no later refresh can undo.
         await self._refresh_auth_status_cache()
-        coder_name, plugin = self._get_coder()
+        try:
+            coder_name, plugin = self._get_coder()
+        except CoderSelectionUnavailable as exc:
+            await self._transition_to_error(
+                str(exc),
+                publish=False,
+                log_prefix="[CODING]",
+            )
+            return
 
         # Start the run record before the branch guard so a malformed
         # task (no Branch:) still produces error telemetry — otherwise
@@ -558,7 +567,11 @@ class CodingMixin:
         if plugin.supports_breach_lifecycle:
             breach_monitor = asyncio.create_task(
                 self._monitor_inflight_breach(
-                    breach_dir, breach_run_id, cli_task, breach_flag,
+                    breach_dir,
+                    breach_run_id,
+                    plugin.name,
+                    cli_task,
+                    breach_flag,
                 )
             )
         stop_monitor = asyncio.create_task(self._monitor_stop_request(cli_task))
@@ -676,7 +689,12 @@ class CodingMixin:
             if result is not None:
                 self._record_unconfirmed_launch_cleanup(result)
             if plugin.supports_breach_lifecycle:
-                self._check_late_breach(breach_dir, breach_run_id, breach_flag)
+                self._check_late_breach(
+                    breach_dir,
+                    breach_run_id,
+                    plugin.name,
+                    breach_flag,
+                )
                 self._cleanup_breach_marker(breach_dir, breach_run_id)
             cleanup_confirmed = await self._confirm_current_coder_cleanup(
                 "CODING completion"

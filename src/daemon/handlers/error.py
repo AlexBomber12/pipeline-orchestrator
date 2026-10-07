@@ -236,6 +236,7 @@ class ErrorMixin:
             )
             await self.publish_state()
             return
+        await self._refresh_auth_status_cache()
         selected = self._get_auxiliary_coder()
         if selected is None:
             self.log_event(
@@ -244,17 +245,16 @@ class ErrorMixin:
             )
             return
         coder_name, plugin = selected
-        provider = (
-            self._claude_usage_provider
-            if coder_name == "claude"
-            else self._codex_usage_provider
-        )
+        provider = self._usage_provider_for(coder_name)
         # Soft-skip diagnosis rather than pausing the repo when the selected
         # diagnosis coder is already over its usage threshold.
-        try:
-            snapshot = await asyncio.to_thread(provider.fetch)
-        except Exception:
+        if provider is None:
             snapshot = None
+        else:
+            try:
+                snapshot = await asyncio.to_thread(provider.fetch)
+            except Exception:
+                snapshot = None
         if snapshot and (
             snapshot.session_percent
             >= self.app_config.daemon.rate_limit_session_pause_percent
@@ -325,14 +325,28 @@ class ErrorMixin:
             ).stdout.strip()
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             pass
-        model = (
-            self.app_config.daemon.claude_model
-            if coder_name == "claude"
-            else self.app_config.daemon.codex_model
+        plugin_run_kwargs = plugin.build_run_kwargs(
+            daemon_config=self.app_config.daemon
         )
-        code, stdout, stderr = await plugin.diagnose_error(
-            self.repo_path, context, model=model
+        auxiliary_kwargs = {
+            **plugin_run_kwargs,
+            "on_process_start": self._track_current_coder_process,
+            "on_supervised_process_start": (
+                self._track_current_coder_supervised_process
+            ),
+        }
+        diagnosis_result = await self._await_auxiliary_coder(
+            plugin.diagnose_error(
+                self.repo_path,
+                context,
+                **auxiliary_kwargs,
+            ),
+            cleanup_context="ERROR diagnosis",
+            log_prefix="[ERROR]",
         )
+        if diagnosis_result is None:
+            return
+        code, stdout, stderr = diagnosis_result
         self._detect_rate_limit(stderr, coder_name=coder_name)
         if self.state.rate_limited_until is not None:
             self.state.state = PipelineState.PAUSED

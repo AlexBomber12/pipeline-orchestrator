@@ -14,16 +14,26 @@ import asyncio
 import random
 import re
 import time
+import types
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 from src import codex_cli
-from src.coder_registry import CoderPlugin, CoderRegistry
-from src.config import DaemonConfig
+from src.coder_registry import (
+    CoderPlugin,
+    CoderRegistry,
+    ModelCatalog,
+    ModelMetadata,
+    ModelSetting,
+)
+from src.coders import build_coder_registry
+from src.config import AppConfig, DaemonConfig, load_config
+from src.daemon import main as main_module
 from src.daemon import runner as runner_module
 from src.daemon.runner import PipelineRunner
-from src.daemon.selector import CoderResolution
+from src.daemon.selector import CoderResolution, CoderSelectionUnavailable
 from src.models import (
     CIStatus,
     PipelineState,
@@ -48,12 +58,31 @@ class FakeCoderPlugin:
     name = "fake"
     display_name = "Fake Coder"
     models = ["fake-1", "fake-2"]
+    model_setting = ModelSetting(None, "fake-1", "(default)")
+    model_catalog_refreshable = False
 
     def __init__(self) -> None:
         self.run_planned_pr_calls: list[dict[str, Any]] = []
         self.run_auto_pr_calls: list[dict[str, Any]] = []
         self.fix_review_calls: list[dict[str, Any]] = []
-        self.diagnose_calls: list[tuple[str, str, str]] = []
+        self.run_prompt_calls: list[dict[str, Any]] = []
+        self.diagnose_calls: list[dict[str, Any]] = []
+
+    def model_catalog_cache_key(
+        self, *, config: AppConfig, config_path: str
+    ) -> str:
+        del config, config_path
+        return "static"
+
+    async def get_model_catalog(
+        self, *, config: AppConfig, config_path: str
+    ) -> ModelCatalog:
+        del config, config_path
+        return ModelCatalog(
+            tuple(ModelMetadata(model, model) for model in self.models),
+            "static_compatibility",
+            "Static test catalog.",
+        )
 
     async def run_planned_pr(self, repo_path: str, **kwargs: Any) -> tuple[int, str, str]:
         self.run_planned_pr_calls.append({"repo_path": repo_path, **kwargs})
@@ -65,6 +94,14 @@ class FakeCoderPlugin:
 
     async def fix_review(self, repo_path: str, **kwargs: Any) -> tuple[int, str, str]:
         self.fix_review_calls.append({"repo_path": repo_path, **kwargs})
+        return (0, "fake stdout", "")
+
+    async def run_prompt(
+        self, prompt: str, repo_path: str, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        self.run_prompt_calls.append(
+            {"prompt": prompt, "repo_path": repo_path, **kwargs}
+        )
         return (0, "fake stdout", "")
 
     def check_auth(self) -> dict[str, str]:
@@ -88,9 +125,21 @@ class FakeCoderPlugin:
     def default_weekly_pause_percent(self) -> int:
         return 100
 
-    async def diagnose_error(self, repo_path: str, context: str, model: str) -> tuple[int, str, str]:
-        self.diagnose_calls.append((repo_path, context, model))
+    async def diagnose_error(
+        self, repo_path: str, context: str, model: str, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        self.diagnose_calls.append(
+            {
+                "repo_path": repo_path,
+                "context": context,
+                "model": model,
+                **kwargs,
+            }
+        )
         return (0, "FIX\nfake diagnose", "")
+
+    def resolve_model(self, daemon_config: DaemonConfig) -> str:
+        return self.model_setting.resolve(self.name, daemon_config)
 
     def build_run_kwargs(
         self,
@@ -99,12 +148,9 @@ class FakeCoderPlugin:
         breach_dir: str | None = None,
         breach_run_id: str | None = None,
     ) -> dict[str, Any]:
-        # Third coder uses ``claude_model`` config slot for its model;
-        # the test doesn't add a fake_model attribute to DaemonConfig.
-        # The point is the handler doesn't care which slot — the plugin
-        # decides. supports_breach_lifecycle is False so breach inputs
-        # are ignored.
-        return {"model": "fake-1"}
+        # No ``fake_model`` field exists on DaemonConfig; the plugin resolves
+        # its stable-ID namespace through the shared setting contract.
+        return {"model": self.resolve_model(daemon_config)}
 
 
 def test_fake_plugin_satisfies_protocol() -> None:
@@ -228,6 +274,418 @@ def test_handle_fix_dispatches_to_fake_plugin(
     assert runner.state.state == PipelineState.WATCH
 
 
+def test_configured_plugin_reaches_normal_coding_and_fix_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A module:factory plugin is selected without patching runner selection."""
+    h._patch_subprocess(monkeypatch)
+    opened_pr = PRInfo(
+        number=42,
+        branch="pr-901",
+        ci_status=CIStatus.PENDING,
+        review_status=ReviewStatus.PENDING,
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kwargs: [opened_pr],
+    )
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda repo, number, body: None,
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_branch_last_push_time",
+        lambda repo, number: None,
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_last_push_age_seconds",
+        lambda repo, number: None,
+    )
+
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        "coder_plugins:\n"
+        "  third: tests.configured_coder_plugin:build_test_plugin\n"
+        "daemon:\n"
+        "  coder: third\n"
+        "  exploration_epsilon: 0\n"
+        "repositories:\n"
+        "  - url: https://github.com/example/repo.git\n"
+        "    branch: main\n",
+        encoding="utf-8",
+    )
+    config = load_config(str(config_path))
+    registry = build_coder_registry(config)
+    claude_provider, codex_provider = h._usage_providers()
+    runner = PipelineRunner(
+        config.repositories[0],
+        config,
+        h._FakeRedis(),
+        claude_provider,
+        codex_provider,
+        registry=registry,
+    )
+    breach_attributions: list[str] = []
+
+    def capture_late_breach(
+        breach_dir: str,
+        run_id: str,
+        coder_name: str,
+        breach_flag: dict[str, bool],
+    ) -> None:
+        del breach_dir, run_id, breach_flag
+        breach_attributions.append(coder_name)
+
+    monkeypatch.setattr(runner, "_check_late_breach", capture_late_breach)
+    runner.repo_path = str(tmp_path)
+    (tmp_path / ".git" / "info").mkdir(parents=True)
+    (tmp_path / "tasks").mkdir()
+    task_body = (
+        "---\n---\n"
+        "# PR-901: Configured dispatch\n\n"
+        "Branch: pr-901\n"
+        "- Type: feature\n"
+        "- Complexity: low\n"
+        "- Depends on: none\n"
+        "- Priority: 1\n"
+        "- Coder: third\n"
+    )
+    (tmp_path / "tasks" / "PR-901.md").write_text(task_body, encoding="utf-8")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-901",
+        title="Configured dispatch",
+        status=TaskStatus.DOING,
+        branch="pr-901",
+        task_file="tasks/PR-901.md",
+    )
+    runner._auth_status_cache = {
+        name: {"status": "ok"} for name in registry.coder_names()
+    }
+    runner._auth_status_cache_expires_at = datetime.now(timezone.utc) + timedelta(
+        minutes=5
+    )
+
+    asyncio.run(runner.handle_coding())
+
+    plugin = registry.get("third")
+    assert len(plugin.run_auto_pr_calls) == 1
+    assert plugin.run_auto_pr_calls[0]["model"] == "third-default"
+    assert breach_attributions == ["third"]
+    assert runner.state.coder == "third"
+    assert runner.state.state == PipelineState.WATCH
+
+    runner.state.current_pr = PRInfo(
+        number=42,
+        branch="pr-901",
+        ci_status=CIStatus.FAILURE,
+        review_status=ReviewStatus.PENDING,
+    )
+    asyncio.run(runner.handle_fix())
+
+    assert len(plugin.fix_review_calls) == 1
+    assert plugin.fix_review_calls[0]["model"] == "third-default"
+    assert breach_attributions == ["third", "third"]
+    assert runner.state.state == PipelineState.WATCH
+
+
+@pytest.mark.parametrize(
+    ("handler_name", "log_prefix"),
+    [("handle_coding", "[CODING]"), ("handle_fix", "[FIX]")],
+)
+def test_dispatch_handler_reports_unavailable_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    handler_name: str,
+    log_prefix: str,
+) -> None:
+    runner = h._make_runner()
+    transitions: list[tuple[str, dict[str, Any]]] = []
+
+    async def refresh_auth() -> None:
+        return None
+
+    def unavailable(*_args: object, **_kwargs: object) -> None:
+        raise CoderSelectionUnavailable("configured coder unavailable")
+
+    async def transition(message: str, **kwargs: Any) -> None:
+        transitions.append((message, kwargs))
+
+    monkeypatch.setattr(runner, "_refresh_auth_status_cache", refresh_auth)
+    monkeypatch.setattr(runner, "_get_coder", unavailable)
+    monkeypatch.setattr(runner, "_transition_to_error", transition)
+
+    asyncio.run(getattr(runner, handler_name)())
+
+    assert transitions == [
+        (
+            "configured coder unavailable",
+            {"publish": False, "log_prefix": log_prefix},
+        )
+    ]
+
+
+def test_usage_provider_identity_follows_selected_plugin() -> None:
+    config = AppConfig(
+        repositories=[h._repo_cfg()],
+        daemon=DaemonConfig(coder="telemetry"),
+        coder_plugins={
+            "telemetry": (
+                "tests.configured_coder_plugin:build_telemetry_plugin"
+            )
+        },
+    )
+    registry = build_coder_registry(config)
+    claude_provider, codex_provider = main_module._create_usage_providers(
+        config, registry
+    )
+    plugin = registry.get("telemetry")
+    plugin.usage_provider.snapshot = UsageSnapshot(
+        session_percent=17,
+        session_resets_at=18,
+        weekly_percent=19,
+        weekly_resets_at=20,
+        fetched_at=time.time(),
+    )
+    runner = PipelineRunner(
+        config.repositories[0],
+        config,
+        h._FakeRedis(),
+        claude_provider,
+        codex_provider,
+        registry=registry,
+        usage_providers=registry.usage_providers(),
+    )
+    runner.state.coder = "telemetry"
+
+    asyncio.run(runner.publish_state())
+
+    assert plugin.usage_provider.fetch_count == 1
+    assert runner.state.usage_session_percent == 17
+    assert runner.state.usage_weekly_percent == 19
+
+
+def test_plugin_without_usage_provider_does_not_inherit_builtin_quota() -> None:
+    config = AppConfig(
+        repositories=[h._repo_cfg()],
+        daemon=DaemonConfig(coder="third"),
+        coder_plugins={
+            "third": "tests.configured_coder_plugin:build_test_plugin"
+        },
+    )
+    registry = build_coder_registry(config)
+    claude_provider, codex_provider = main_module._create_usage_providers(
+        config, registry
+    )
+    claude_provider._cached = UsageSnapshot(
+        session_percent=100,
+        session_resets_at=18,
+        weekly_percent=100,
+        weekly_resets_at=20,
+        fetched_at=time.time(),
+    )
+    codex_provider._cached = claude_provider._cached
+    runner = PipelineRunner(
+        config.repositories[0],
+        config,
+        h._FakeRedis(),
+        claude_provider,
+        codex_provider,
+        registry=registry,
+        usage_providers=registry.usage_providers(),
+    )
+    runner.state.coder = "third"
+    runner.state.usage_session_percent = 55
+    runner.state.usage_weekly_percent = 66
+
+    assert asyncio.run(runner._fetch_usage_snapshot("third")) is None
+    assert asyncio.run(runner.usage_gate(proactive_coder="third")) is True
+    asyncio.run(runner.publish_state())
+
+    assert runner.state.state != PipelineState.PAUSED
+    assert runner.state.usage_session_percent is None
+    assert runner.state.usage_weekly_percent is None
+    assert runner.state.usage_api_degraded is False
+
+
+def test_telemetryless_builtin_override_starts_without_quota_substitution() -> None:
+    config = AppConfig(
+        repositories=[h._repo_cfg()],
+        daemon=DaemonConfig(coder="claude"),
+        coder_plugins={
+            "claude": (
+                "tests.configured_coder_plugin:build_claude_override"
+            )
+        },
+    )
+    registry = build_coder_registry(config)
+
+    claude_provider, codex_provider = main_module._create_usage_providers(
+        config, registry
+    )
+
+    assert claude_provider is None
+    assert codex_provider is not None
+    assert registry.usage_providers()["claude"] is None
+
+    runner = PipelineRunner(
+        config.repositories[0],
+        config,
+        h._FakeRedis(),
+        claude_provider,
+        codex_provider,
+        registry=registry,
+        usage_providers=registry.usage_providers(),
+    )
+    runner.state.coder = "claude"
+    runner._claude_usage_provider = h._FakeUsageProvider(
+        snapshot=UsageSnapshot(
+            session_percent=100,
+            session_resets_at=18,
+            weekly_percent=100,
+            weekly_resets_at=20,
+            fetched_at=time.time(),
+        )
+    )
+
+    rebuilt = runner._build_usage_provider_map_for_app_config(config)
+
+    assert rebuilt["claude"] is None
+    runner.set_usage_providers(
+        None,
+        codex_provider,
+        usage_providers=rebuilt,
+    )
+    assert asyncio.run(runner._fetch_usage_snapshot("claude")) is None
+    assert asyncio.run(runner.usage_gate(proactive_coder="claude")) is True
+
+
+def test_overridden_builtin_uses_registered_rate_limit_patterns() -> None:
+    class _ClaudeOverride(FakeCoderPlugin):
+        name = "claude"
+
+        def rate_limit_patterns(self) -> list[re.Pattern[str]]:
+            return [re.compile("override throttle sentinel")]
+
+    runner = h._make_runner()
+    runner._registry.register(
+        _ClaudeOverride(),
+        reference="tests.example:build_claude_override",
+    )
+
+    runner._detect_rate_limit(
+        "override throttle sentinel",
+        coder_name="claude",
+    )
+
+    assert runner.state.rate_limit_reactive_coder == "claude"
+    assert runner.state.rate_limited_until is not None
+
+
+def test_handle_merge_dispatches_auxiliary_prompt_to_fake_plugin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Merge-conflict execution is plugin-owned for an arbitrary name."""
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
+            return h._FakeCompletedProcess(
+                args=cmd,
+                returncode=1,
+                stdout="CONFLICT (content): merge conflict in foo",
+            )
+        return h._FakeCompletedProcess(args=cmd, returncode=0)
+
+    fake = _OverridingPlugin()
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        "src.github.comments.post_comment",
+        lambda repo, number, body: None,
+    )
+
+    runner = h._make_runner()
+    runner._registry.register(fake)  # type: ignore[arg-type]
+    runner._get_auxiliary_coder = lambda: ("fake", fake)  # type: ignore[method-assign]
+    runner.state.current_pr = PRInfo(number=42, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.handle_merge())
+
+    assert len(fake.run_prompt_calls) == 1
+    call = fake.run_prompt_calls[0]
+    assert call["prompt"] == (
+        "Resolve all merge conflicts in the working tree. Keep both sides "
+        "where possible. Run scripts/ci.sh to verify."
+    )
+    assert call["repo_path"] == runner.repo_path
+    assert call["model"] == "fake-1"
+    assert call["timeout"] == 300
+    assert call["on_process_start"] == runner._track_current_coder_process
+    assert call["on_supervised_process_start"] == (
+        runner._track_current_coder_supervised_process
+    )
+    assert call["provider_option"] == "configured"
+    assert call["timeout"] != _OverridingPlugin.SENTINEL_TIMEOUT
+    assert call["on_process_start"] is not _OverridingPlugin.SENTINEL_HOOK
+    assert runner.state.state == PipelineState.WATCH
+
+
+def test_handle_merge_stop_cleans_auxiliary_process_and_aborts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git_calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
+        git_calls.append(cmd)
+        if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
+            return h._FakeCompletedProcess(
+                args=cmd,
+                returncode=1,
+                stdout="CONFLICT (content): merge conflict in foo",
+            )
+        return h._FakeCompletedProcess(args=cmd, returncode=0)
+
+    class _Managed:
+        process = types.SimpleNamespace(returncode=0)
+
+        async def cleanup(self, **kwargs: object) -> object:
+            del kwargs
+            return types.SimpleNamespace(quiescent=True, detail=None)
+
+    managed = _Managed()
+    fake = FakeCoderPlugin()
+
+    async def wait_for_stop(
+        prompt: str, repo_path: str, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        del prompt, repo_path
+        kwargs["on_process_start"](managed.process)
+        kwargs["on_supervised_process_start"](managed)
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+    fake.run_prompt = wait_for_stop  # type: ignore[method-assign]
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    runner = h._make_runner()
+    runner._get_auxiliary_coder = lambda: ("fake", fake)  # type: ignore[method-assign]
+    runner.redis.store[f"control:{runner.name}:stop"] = "1"
+    runner.state.current_pr = PRInfo(number=42, branch="pr-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING
+    )
+
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.user_paused is True
+    assert runner._current_coder_process is None
+    assert runner._current_coder_supervised_process is None
+    assert any(cmd[:3] == ["git", "merge", "--abort"] for cmd in git_calls)
+    assert not any(cmd[:2] == ["git", "push"] for cmd in git_calls)
+
+
 class _OverridingPlugin(FakeCoderPlugin):
     """Plugin whose ``build_run_kwargs`` returns handler-owned keys.
 
@@ -247,6 +705,7 @@ class _OverridingPlugin(FakeCoderPlugin):
     ) -> dict[str, Any]:
         return {
             "model": "fake-1",
+            "provider_option": "configured",
             "timeout": self.SENTINEL_TIMEOUT,
             "on_process_start": self.SENTINEL_HOOK,
         }
@@ -438,7 +897,7 @@ def test_select_auxiliary_coder_returns_none_when_resolver_has_no_plugin(
     assert runner._select_auxiliary_coder() is None
 
 
-def test_get_coder_falls_through_to_default_when_selector_returns_none(
+def test_get_coder_does_not_bypass_selector_when_no_coder_is_eligible(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._allow_all_coder_auth(monkeypatch)
@@ -449,13 +908,11 @@ def test_get_coder_falls_through_to_default_when_selector_returns_none(
         lambda ctx, *, purpose: None,
     )
 
-    name, plugin = runner._get_coder()
-
-    assert name == "claude"
-    assert plugin.name == "claude"
+    with pytest.raises(CoderSelectionUnavailable, match="claude is unavailable"):
+        runner._get_coder()
 
 
-def test_get_coder_ignores_stale_reactive_coder_when_selector_returns_none(
+def test_get_coder_does_not_use_stale_reactive_coder_as_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._allow_all_coder_auth(monkeypatch)
@@ -467,13 +924,11 @@ def test_get_coder_ignores_stale_reactive_coder_when_selector_returns_none(
         lambda ctx, *, purpose: None,
     )
 
-    name, plugin = runner._get_coder()
-
-    assert name == "claude"
-    assert plugin.name == "claude"
+    with pytest.raises(CoderSelectionUnavailable, match="claude is unavailable"):
+        runner._get_coder()
 
 
-def test_get_coder_hard_pin_overrides_default_when_selector_returns_none(
+def test_get_coder_hard_pin_never_falls_back_when_selector_returns_none(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -511,10 +966,8 @@ def test_get_coder_hard_pin_overrides_default_when_selector_returns_none(
         lambda ctx, *, purpose: None,
     )
 
-    name, plugin = runner._get_coder()
-
-    assert name == "codex"
-    assert plugin.name == "codex"
+    with pytest.raises(CoderSelectionUnavailable, match="pinned to codex"):
+        runner._get_coder()
 
 
 def test_get_coder_repo_override_uses_selector_for_fallback(

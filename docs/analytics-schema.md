@@ -44,7 +44,7 @@ All 21 fields are present on every row. Missing data is written as JSON
 | `repo_slug` | str | runner `repo_slug_from_url(url)` | stable |
 | `merged_at` | str | `datetime.now(UTC)` at merge | stable |
 | `coder` | str | `repo.coder` or `daemon.coder` | stable |
-| `coder_model_string` | str | `daemon.claude_model` / `daemon.codex_model` | stable; **critical for safe aggregation** |
+| `coder_model_string` | str | effective plugin model (`daemon.coder_settings.<plugin_id>.model`, then legacy fallback) | stable; **critical for safe aggregation** |
 | `coder_extension_version` \| `null` | str | `npm list -g --json <package>` | stable; `null` when detection fails |
 | `task_type` | str | task header `Type:` field | stable; values from `_TASK_TYPE_VALUES` |
 | `task_complexity` | str | task header `Complexity:` field | stable; one of `low`/`medium`/`high` |

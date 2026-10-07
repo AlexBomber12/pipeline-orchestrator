@@ -37,6 +37,9 @@ def _disable_config_watcher(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         main_module, "watch_config_changes", _noop_watcher
     )
+    monkeypatch.setattr(
+        main_module, "serve_model_catalog_requests", _noop_watcher
+    )
 
 
 class _FakeRedisClient:
@@ -430,6 +433,7 @@ def test_main_reload_drops_removed_repository(
 
 def test_main_reload_recreates_shared_usage_providers(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Reloading config must refresh the shared providers for all runners."""
     first = AppConfig(
@@ -442,6 +446,9 @@ def test_main_reload_recreates_shared_usage_providers(
             _repo("https://github.com/octo/beta.git"),
         ],
         daemon=DaemonConfig(poll_interval_sec=1),
+        coder_plugins={
+            "third": "tests.configured_coder_plugin:build_test_plugin"
+        },
     )
 
     _reset_fake_runner()
@@ -463,6 +470,15 @@ def test_main_reload_recreates_shared_usage_providers(
     claude_factory = _PluginFactory("claude")
     codex_factory = _PluginFactory("codex")
 
+    class _Registry:
+        def get(self, name: str) -> _PluginFactory:
+            return {
+                "claude": claude_factory,
+                "codex": codex_factory,
+            }[name]
+
+    registry = _Registry()
+
     monkeypatch.setattr(main_module, "load_config", fake_load_config)
     monkeypatch.setattr(
         main_module.aioredis,
@@ -475,8 +491,11 @@ def test_main_reload_recreates_shared_usage_providers(
         main_module, "_validate_auth", lambda: {"claude": True, "gh": True}
     )
     monkeypatch.setattr(main_module, "CONFIG_RELOAD_CYCLES", 3)
-    monkeypatch.setattr(main_module, "ClaudePlugin", lambda: claude_factory)
-    monkeypatch.setattr(main_module, "CodexPlugin", lambda: codex_factory)
+    monkeypatch.setattr(
+        main_module,
+        "build_coder_registry",
+        lambda _config: registry,
+    )
 
     clock = [0.0]
     monkeypatch.setattr(main_module.time, "monotonic", lambda: clock[0])
@@ -502,6 +521,7 @@ def test_main_reload_recreates_shared_usage_providers(
     assert alpha.codex_usage_provider == f"codex-2-{id(second)}"
     assert beta.claude_usage_provider == f"claude-2-{id(second)}"
     assert beta.codex_usage_provider == f"codex-2-{id(second)}"
+    assert "plugin definitions are startup-only" in caplog.text
 
 
 def test_hot_reload_updates_repo_config_coder(
@@ -557,7 +577,7 @@ def test_hot_reload_updates_repo_config_coder(
 
     alpha = next(r for r in _FakeRunner.instances if r.name == "octo__alpha")
     assert alpha.repo_config.coder is not None
-    assert alpha.repo_config.coder.value == "codex"
+    assert alpha.repo_config.coder == "codex"
 
 
 def test_sync_runners_stages_config_reload_when_runner_supports_it() -> None:
@@ -585,13 +605,20 @@ def test_sync_runners_stages_config_reload_when_runner_supports_it() -> None:
             app_config: AppConfig,
             claude_usage_provider: Any,
             codex_usage_provider: Any,
+            *,
+            usage_providers: Any,
         ) -> None:
             self.staged = (
                 repo_config,
                 app_config,
                 claude_usage_provider,
                 codex_usage_provider,
+                usage_providers,
             )
+
+    class _Registry:
+        def usage_providers(self) -> dict[str, str]:
+            return {"third": "third-provider"}
 
     daemon_config = DaemonConfig(poll_interval_sec=1)
     config = AppConfig(
@@ -616,16 +643,17 @@ def test_sync_runners_stages_config_reload_when_runner_supports_it() -> None:
         _FakeRedisClient(),
         "claude-provider",
         "codex-provider",
-        registry=None,  # type: ignore[arg-type]
+        registry=_Registry(),  # type: ignore[arg-type]
     )
 
     assert runner.staged is not None
-    staged_repo, staged_app, staged_claude, staged_codex = runner.staged
+    staged_repo, staged_app, staged_claude, staged_codex, staged_usage = runner.staged
     assert staged_repo.coder is not None
-    assert staged_repo.coder.value == "codex"
+    assert staged_repo.coder == "codex"
     assert staged_app is config
     assert staged_claude == "claude-provider"
     assert staged_codex == "codex-provider"
+    assert staged_usage == {"third": "third-provider"}
 
 
 def test_sync_runners_applies_active_flag_change_immediately() -> None:
@@ -664,6 +692,23 @@ def test_sync_runners_applies_active_flag_change_immediately() -> None:
         def clear_staged_config_reload(self) -> None:
             self.staged = None
 
+        def set_usage_providers(
+            self,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+            *,
+            usage_providers: Any,
+        ) -> None:
+            super().set_usage_providers(
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+            self.usage_providers = usage_providers
+
+    class _Registry:
+        def usage_providers(self) -> dict[str, str]:
+            return {"third": "third-provider"}
+
     config = AppConfig(
         repositories=[_repo("https://github.com/octo/alpha.git", active=True, coder="codex")],
         daemon=DaemonConfig(poll_interval_sec=1),
@@ -684,16 +729,17 @@ def test_sync_runners_applies_active_flag_change_immediately() -> None:
         _FakeRedisClient(),
         "claude-provider",
         "codex-provider",
-        registry=None,  # type: ignore[arg-type]
+        registry=_Registry(),  # type: ignore[arg-type]
     )
 
     assert runner.staged is None
     assert runner.repo_config.active is True
     assert runner.repo_config.coder is not None
-    assert runner.repo_config.coder.value == "codex"
+    assert runner.repo_config.coder == "codex"
     assert runner.app_config is config
     assert runner.claude_usage_provider == "claude-provider"
     assert runner.codex_usage_provider == "codex-provider"
+    assert runner.usage_providers == {"third": "third-provider"}
 
 
 def test_sync_runners_clears_staged_reload_after_immediate_active_update() -> None:
@@ -757,7 +803,7 @@ def test_sync_runners_clears_staged_reload_after_immediate_active_update() -> No
 
     assert runner.repo_config.active is False
     assert runner.repo_config.coder is not None
-    assert runner.repo_config.coder.value == "codex"
+    assert runner.repo_config.coder == "codex"
     assert runner.staged is None
 
 
@@ -820,7 +866,7 @@ def test_sync_runners_applies_config_immediately_when_runner_is_in_error() -> No
 
     assert runner.staged is None
     assert runner.repo_config.coder is not None
-    assert runner.repo_config.coder.value == "codex"
+    assert runner.repo_config.coder == "codex"
     assert runner.app_config is config
 
 
@@ -894,7 +940,7 @@ def test_sync_runners_applies_non_coder_repo_changes_immediately() -> None:
 
     assert runner.staged is None
     assert runner.repo_config.coder is not None
-    assert runner.repo_config.coder.value == "codex"
+    assert runner.repo_config.coder == "codex"
     assert runner.repo_config.auto_merge is False
     assert runner.app_config is config
     assert runner.claude_usage_provider == "claude-provider"
@@ -1035,7 +1081,7 @@ def test_sync_runners_updates_watching_runner_without_staging_support() -> None:
     )
 
     assert runner.repo_config.coder is not None
-    assert runner.repo_config.coder.value == "codex"
+    assert runner.repo_config.coder == "codex"
     assert runner.app_config is config
     assert runner.claude_usage_provider == "claude-provider"
     assert runner.codex_usage_provider == "codex-provider"
@@ -1429,6 +1475,71 @@ def test_clean_breach_dir_removes_stale_markers(tmp_path: Any) -> None:
         main_module._BREACH_DIR = original
 
 
+def test_main_builds_and_injects_configured_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig(
+        repositories=[_repo("https://github.com/octo/alpha.git")],
+        daemon=DaemonConfig(poll_interval_sec=1),
+        coder_plugins={
+            "third": "tests.configured_coder_plugin:build_test_plugin"
+        },
+    )
+
+    class _RunnerWithRegistry(_FakeRunner):
+        def __init__(
+            self,
+            repo_config: RepoConfig,
+            app_config: AppConfig,
+            redis_client: Any,
+            claude_usage_provider: Any,
+            codex_usage_provider: Any,
+            registry: Any,
+        ) -> None:
+            self.registry = registry
+            super().__init__(
+                repo_config,
+                app_config,
+                redis_client,
+                claude_usage_provider,
+                codex_usage_provider,
+            )
+
+    _patch_main(monkeypatch, config, runner_cls=_RunnerWithRegistry)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(main_module.main())
+
+    runner = _RunnerWithRegistry.instances[0]
+    assert runner.registry.coder_names() == ["claude", "codex", "third"]
+    assert runner.registry.get("third").display_name == "Configured Test Coder"
+
+
+def test_main_registry_failure_precedes_redis_client_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig()
+    _patch_main(monkeypatch, config)
+    opened = False
+
+    def from_url(*_args: Any, **_kwargs: Any) -> _FakeRedisClient:
+        nonlocal opened
+        opened = True
+        return _FakeRedisClient()
+
+    monkeypatch.setattr(main_module.aioredis, "from_url", from_url)
+    monkeypatch.setattr(
+        main_module,
+        "build_coder_registry",
+        lambda _config: (_ for _ in ()).throw(ValueError("bad plugin")),
+    )
+
+    with pytest.raises(ValueError, match="bad plugin"):
+        asyncio.run(main_module.main())
+
+    assert opened is False
+
+
 def test_clean_breach_dir_unlinks_file_marker(tmp_path: Any) -> None:
     breach_file = tmp_path / "breach-file"
     breach_file.write_text("stale")
@@ -1461,6 +1572,7 @@ def test_build_runner_passes_registry_when_supported(
             claude_usage_provider: Any,
             codex_usage_provider: Any,
             registry: Any,
+            usage_providers: Any,
         ) -> None:
             seen["repo"] = repo_config
             seen["config"] = app_config
@@ -1468,9 +1580,14 @@ def test_build_runner_passes_registry_when_supported(
             seen["claude"] = claude_usage_provider
             seen["codex"] = codex_usage_provider
             seen["registry"] = registry
+            seen["usage_providers"] = usage_providers
+
+    class _Registry:
+        def usage_providers(self) -> dict[str, str]:
+            return {"third": "third-provider"}
 
     monkeypatch.setattr(main_module, "PipelineRunner", _RunnerWithRegistry)
-    registry = object()
+    registry = _Registry()
     redis_client = object()
 
     runner = main_module._build_runner(
@@ -1490,7 +1607,44 @@ def test_build_runner_passes_registry_when_supported(
         "claude": "claude-provider",
         "codex": "codex-provider",
         "registry": registry,
+        "usage_providers": {"third": "third-provider"},
     }
+
+
+def test_create_usage_providers_allows_missing_builtin_provider() -> None:
+    class _Plugin:
+        def __init__(self, provider: object | None) -> None:
+            self.provider = provider
+
+        def create_usage_provider(self, *, config: AppConfig) -> object | None:
+            del config
+            return self.provider
+
+    class _Registry:
+        def __init__(self) -> None:
+            self.providers: dict[str, object | None] = {}
+
+        def get(self, name: str) -> _Plugin:
+            return {
+                "claude": _Plugin(None),
+                "codex": _Plugin(object()),
+            }[name]
+
+        def set_usage_providers(
+            self, providers: dict[str, object | None]
+        ) -> None:
+            self.providers = dict(providers)
+
+    registry = _Registry()
+
+    claude, codex = main_module._create_usage_providers(
+        AppConfig(),
+        registry,  # type: ignore[arg-type]
+    )
+
+    assert claude is None
+    assert codex is not None
+    assert registry.providers == {"claude": None, "codex": codex}
 
 
 def test_main_logs_error_when_no_auth_is_configured(

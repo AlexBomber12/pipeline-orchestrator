@@ -51,8 +51,8 @@ class _Plugin:
 def _ctx(
     *,
     auto_fallback: bool = True,
-    repo_coder: CoderType | None = None,
-    daemon_coder: CoderType = CoderType.CLAUDE,
+    repo_coder: str | CoderType | None = None,
+    daemon_coder: str | CoderType = CoderType.CLAUDE,
     disabled_coders: list[str] | None = None,
     priorities: dict[str, int] | None = None,
     epsilon: float = 0.15,
@@ -158,26 +158,26 @@ def test_cached_auth_statuses_avoid_hot_path_probes() -> None:
     assert "codex" not in eligible_coders(ctx)
 
 
-def test_pinned_without_fallback_returns_only_pinned() -> None:
+def test_pinned_without_fallback_returns_empty_when_pinned_unavailable() -> None:
     ctx = _ctx(auto_fallback=False, repo_coder=CoderType.CODEX, limited={"codex"})
 
-    assert eligible_coders(ctx) == ["codex"]
+    assert eligible_coders(ctx) == []
 
 
-def test_unpinned_without_fallback_returns_only_daemon_default() -> None:
+def test_unpinned_without_fallback_returns_empty_when_default_unavailable() -> None:
     ctx = _ctx(
         auto_fallback=False,
         daemon_coder=CoderType.CODEX,
         limited={"codex"},
     )
 
-    assert eligible_coders(ctx) == ["codex"]
+    assert eligible_coders(ctx) == []
 
 
 def test_pinned_with_fallback_returns_pinned_first_then_others() -> None:
     ctx = _ctx(auto_fallback=True, repo_coder=CoderType.CODEX)
 
-    assert eligible_coders(ctx) == ["codex", "claude"]
+    assert eligible_coders(ctx) == ["codex", "claude", "gemini"]
 
 
 def test_priority_ranks_higher_first_when_no_exploration() -> None:
@@ -228,12 +228,12 @@ def test_select_coder_returns_top_ranked_plugin() -> None:
     assert plugin is ctx.registry.get("codex")
 
 
-def test_selector_ignores_plugins_without_runtime_support() -> None:
+def test_selector_includes_every_loaded_plugin_without_core_allowlist() -> None:
     ctx = _ctx()
     ctx.registry.register(_Plugin("qwen"))
     ctx.app_config.daemon.coder_priority["qwen"] = 75
 
-    assert "qwen" not in eligible_coders(ctx)
+    assert "qwen" in eligible_coders(ctx)
 
 
 def test_epsilon_zero_always_greedy() -> None:
@@ -417,13 +417,61 @@ def test_candidate_coders_skips_rate_limit_and_auth_probes() -> None:
 
     result = candidate_coders(ctx)
 
-    assert set(result) == {"claude", "codex"}
+    assert set(result) == {"claude", "codex", "gemini"}
 
 
 def test_candidate_coders_filters_disabled_coders() -> None:
     ctx = _ctx(disabled_coders=["codex"])
 
-    assert candidate_coders(ctx) == ["claude"]
+    assert candidate_coders(ctx) == ["claude", "gemini"]
+
+
+def test_configured_plugin_can_be_global_default() -> None:
+    ctx = _ctx(daemon_coder="gemini", epsilon=0.0)
+
+    selected = select_coder(ctx)
+
+    assert selected is not None
+    assert selected[0] == "gemini"
+
+
+def test_configured_plugin_can_be_repo_override() -> None:
+    ctx = _ctx(repo_coder="gemini", epsilon=0.0)
+
+    assert eligible_coders(ctx)[0] == "gemini"
+
+
+def test_configured_plugin_can_be_hard_task_pin() -> None:
+    ctx = _ctx(task_coder_pin="gemini")
+
+    assert eligible_coders(ctx) == ["gemini"]
+
+
+def test_unknown_hard_task_pin_has_no_candidate_or_fallback() -> None:
+    ctx = _ctx(task_coder_pin="not-loaded")
+
+    assert candidate_coders(ctx) == []
+    assert select_coder(ctx) is None
+
+
+def test_hot_added_definition_is_unavailable_until_registry_loads_it() -> None:
+    ctx = _ctx(auto_fallback=False, daemon_coder="new-plugin")
+    ctx.app_config.coder_plugins["new-plugin"] = "example.module:factory"
+
+    assert candidate_coders(ctx) == []
+    assert select_coder(ctx) is None
+
+    ctx.registry.register(_Plugin("new-plugin"))
+
+    assert select_coder(ctx)[0] == "new-plugin"  # type: ignore[index]
+
+
+def test_configured_plugin_respects_disabled_and_auth_gates() -> None:
+    disabled = _ctx(repo_coder="gemini", disabled_coders=["gemini"])
+    unauthenticated = _ctx(repo_coder="gemini", auth={"gemini": "error"})
+
+    assert eligible_coders(disabled)[0] != "gemini"
+    assert eligible_coders(unauthenticated)[0] != "gemini"
 
 
 def test_candidate_coders_auto_fallback_off_returns_preferred() -> None:

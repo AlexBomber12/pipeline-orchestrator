@@ -117,6 +117,16 @@ def test_paused_badge_consistent_across_components() -> None:
         assert WARN_BADGE in html
 
 
+def test_repo_card_uses_registered_coder_id_for_active_custom_plugin() -> None:
+    repo = _repo(PipelineState.CODING)
+    repo.coder = "third"
+
+    html = _render_repo_cards(repo)
+
+    assert "third is coding..." in html
+    assert "Claude is coding..." not in html
+
+
 def test_each_component_imports_canonical() -> None:
     for path in CHANGED_COMPONENTS:
         assert 'import "components/_repo_state_styles.html"' in _source(path)

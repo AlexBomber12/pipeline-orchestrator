@@ -79,6 +79,17 @@ jobs:
 
       - run: pip install -r requirements.txt -r requirements-test.txt
 
+      - name: Prepare integration reviewer config
+        id: prepare-test-reviewer
+        env:
+          GH_TOKEN: ${{ steps.testbed-reviewer-token.outputs.token }}
+          TESTBED_REVIEWER_APP_SLUG: ${{ steps.testbed-reviewer-token.outputs.app-slug }}
+        run: |
+          python scripts/prepare_test_reviewer_config.py \
+            --app-slug "$TESTBED_REVIEWER_APP_SLUG" \
+            --config config.test.yml \
+            --github-output "$GITHUB_OUTPUT"
+
       - run: playwright install --with-deps chromium
 
       - name: Build test stack image
@@ -119,6 +130,32 @@ jobs:
             exit 1
           fi
           echo "OK: shim mounted at $actual"
+
+      - name: Verify prepared reviewer config in test services
+        env:
+          EXPECTED_REVIEWER_ID: ${{ steps.prepare-test-reviewer.outputs.user-id }}
+          EXPECTED_REVIEWER_LOGIN: ${{ steps.prepare-test-reviewer.outputs.login }}
+        run: |
+          for service in web-test daemon-test; do
+            docker compose -f docker-compose.test.yml exec -T \
+              -e "EXPECTED_REVIEWER_ID=$EXPECTED_REVIEWER_ID" \
+              -e "EXPECTED_REVIEWER_LOGIN=$EXPECTED_REVIEWER_LOGIN" \
+              "$service" python -c '
+          import os
+          from src.config import load_config
+
+          expected_id = int(os.environ["EXPECTED_REVIEWER_ID"])
+          expected_login = os.environ["EXPECTED_REVIEWER_LOGIN"].casefold()
+          identities = load_config().daemon.trusted_reviewer_identities
+          if not any(
+              identity.user_id == expected_id
+              and identity.login.casefold() == expected_login
+              for identity in identities
+          ):
+              raise SystemExit("prepared reviewer identity is missing")
+          '
+            echo "OK: $service loaded the prepared reviewer identity"
+          done
 
       - name: Run e2e tests
         env:

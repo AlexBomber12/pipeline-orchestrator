@@ -11,13 +11,14 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
+from src.config import load_config
 from src.github import cache
 from src.github import reactions as _reactions
 from src.github.gh_runner import (
-    _extract_commit_date,
     _is_http_404_error,
     _parse_iso,
 )
+from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_config
 from src.models import ReviewStatus
 
 logger = logging.getLogger(__name__)
@@ -26,8 +27,10 @@ _review_status_cache: dict[str, "ReviewStatus"] = {}
 _review_status_cache_cycle: int | None = None
 
 
-def _cache_key(repo: str, pr_number: int, head_sha: str) -> str:
-    return f"{repo}#{pr_number}#{head_sha}"
+def _cache_key(
+    repo: str, pr_number: int, head_sha: str, policy: ReviewerPolicy
+) -> str:
+    return f"{repo}#{pr_number}#{head_sha}#{policy.fingerprint!r}"
 
 
 def clear_review_status_cache() -> None:
@@ -46,13 +49,11 @@ def _begin_review_cache_cycle() -> None:
     _review_status_cache_cycle += 1
 
 
-def _get_commit_time(repo: str, sha: str) -> datetime | None:
-    """Return the committer date of a commit, or None on failure."""
-    try:
-        payload = cache._etag_get(f"repos/{repo}/commits/{sha}")
-    except RuntimeError:
-        return None
-    return _parse_iso(_extract_commit_date(payload))
+def _get_pr_push_time(repo: str, pr_number: int) -> datetime | None:
+    """Return the actual latest push time without creating an import cycle."""
+    from src.github import prs
+
+    return prs.get_pr_last_push_time(repo, pr_number)
 
 
 def get_pr_review_status(
@@ -60,6 +61,7 @@ def get_pr_review_status(
     pr_number: int,
     pr_author: str = "",
     head_sha: str = "",
+    policy: ReviewerPolicy | None = None,
 ) -> ReviewStatus:
     """Derive a Codex review status from PR issue comments, review comments, and reactions.
 
@@ -70,16 +72,22 @@ def get_pr_review_status(
        the anchor for P1/P2 → CHANGES_REQUESTED.
     4. Otherwise → PENDING.
     """
+    reviewer_policy = (
+        policy if policy is not None else reviewer_policy_from_config(load_config())
+    )
+
     if head_sha:
-        ck = _cache_key(repo, pr_number, head_sha)
+        ck = _cache_key(repo, pr_number, head_sha, reviewer_policy)
         cached = _review_status_cache.get(ck)
         if cached is not None:
             return cached
 
-    result = _compute_review_status(repo, pr_number, pr_author, head_sha)
+    result = _compute_review_status(
+        repo, pr_number, pr_author, head_sha, reviewer_policy
+    )
 
     if head_sha:
-        _review_status_cache[_cache_key(repo, pr_number, head_sha)] = result
+        _review_status_cache[_cache_key(repo, pr_number, head_sha, reviewer_policy)] = result
     return result
 
 
@@ -88,20 +96,34 @@ def _compute_review_status(
     pr_number: int,
     pr_author: str,
     head_sha: str,
+    policy: ReviewerPolicy | None = None,
 ) -> ReviewStatus:
     """Core review status logic, separated for caching."""
     body_eyes = False
     body_approved = False
-    head_commit_time: datetime | None = None
+    last_push_time: datetime | None = None
+    last_push_time_loaded = False
+    reviewer_policy = (
+        policy if policy is not None else reviewer_policy_from_config(load_config())
+    )
 
     try:
-        codex_reactions = _reactions._get_codex_issue_reactions(repo, pr_number)
+        codex_reactions = _reactions._get_codex_issue_reactions(
+            repo, pr_number, policy=reviewer_policy
+        )
         if codex_reactions:
-            plus_one = _reactions._find_codex_plus_one_reaction(codex_reactions)
+            plus_one = _reactions._find_codex_plus_one_reaction(
+                codex_reactions, policy=reviewer_policy
+            )
             if plus_one is not None:
                 if head_sha:
                     try:
-                        review_info = _get_codex_review_signals(repo, pr_number)
+                        review_info = _get_codex_review_signals(
+                            repo,
+                            pr_number,
+                            policy=reviewer_policy,
+                            actor=plus_one.get("user"),
+                        )
                     except RuntimeError:
                         review_info = {
                             "latest_sha": "",
@@ -111,31 +133,24 @@ def _compute_review_status(
                     latest_review_time = review_info["latest_time"]
                     latest_review_sha = review_info["latest_sha"]
                     reaction_time = _parse_iso(plus_one.get("created_at"))
-                    if latest_review_sha and latest_review_sha == head_sha:
-                        body_approved = True
-                    else:
-                        head_commit_time = _get_commit_time(repo, head_sha)
-                        threshold = head_commit_time
-                        if (
+                    last_push_time = _get_pr_push_time(repo, pr_number)
+                    last_push_time_loaded = True
+                    if last_push_time is not None:
+                        threshold = last_push_time
+                        if latest_review_sha != head_sha and (
                             latest_review_time is not None
-                            and (
-                                threshold is None
-                                or latest_review_time > threshold
-                            )
+                            and latest_review_time > threshold
                         ):
                             threshold = latest_review_time
                         if (
                             reaction_time
-                            and threshold
                             and reaction_time >= threshold
                         ):
                             body_approved = True
-                        elif not threshold:
-                            body_approved = True
-                else:
-                    body_approved = True
             if not body_approved and any(
-                _reactions._is_reaction_content(reaction, "eyes")
+                _reactions._is_reaction_content(
+                    reaction, "eyes", policy=reviewer_policy
+                )
                 for reaction in codex_reactions
             ):
                 body_eyes = True
@@ -176,10 +191,27 @@ def _compute_review_status(
                     f"repos/{repo}/issues/comments/{cid}/reactions"
                 )
                 if anchor_reactions:
-                    if any(_reactions._is_plus_one(reaction) for reaction in anchor_reactions):
-                        anchor_approved = True
-                    elif any(
-                        _reactions._is_reaction_content(reaction, "eyes")
+                    anchor_plus_one = _reactions._find_codex_plus_one_reaction(
+                        anchor_reactions,
+                        policy=reviewer_policy,
+                    )
+                    if anchor_plus_one is not None:
+                        if head_sha:
+                            if not last_push_time_loaded:
+                                last_push_time = _get_pr_push_time(repo, pr_number)
+                                last_push_time_loaded = True
+                            reaction_time = _parse_iso(
+                                anchor_plus_one.get("created_at")
+                            )
+                            anchor_approved = bool(
+                                reaction_time
+                                and last_push_time
+                                and reaction_time >= last_push_time
+                            )
+                    if not anchor_approved and any(
+                        _reactions._is_reaction_content(
+                            reaction, "eyes", policy=reviewer_policy
+                        )
                         for reaction in anchor_reactions
                     ):
                         anchor_eyes = True
@@ -205,7 +237,9 @@ def _compute_review_status(
 
     anchor_ts = (anchor.get("created_at") or "") if anchor else ""
     for comment in issue_comments + review_comments:
-        if not _reactions._is_codex_user(comment.get("user")):
+        if not _reactions._is_codex_user(
+            comment.get("user"), policy=reviewer_policy
+        ):
             continue
         if _reactions._is_codex_onboarding_comment(comment):
             continue
@@ -217,7 +251,10 @@ def _compute_review_status(
 
 
 def _get_codex_review_signals(
-    repo: str, pr_number: int
+    repo: str,
+    pr_number: int,
+    policy: _reactions.ReviewerPolicy | None = None,
+    actor: dict | None = None,
 ) -> dict[str, str | datetime | None]:
     """Return the latest Codex review timestamp, sha, and state."""
     try:
@@ -241,8 +278,14 @@ def _get_codex_review_signals(
     best_time: datetime | None = None
     best_raw = ""
     best_state = ""
+    actor_id = actor.get("id") if isinstance(actor, dict) else None
     for review in reviews:
-        if not _reactions._is_codex_user(review.get("user")):
+        user = review.get("user")
+        if not _reactions._is_codex_user(user, policy=policy):
+            continue
+        if actor_id is not None and (
+            not isinstance(user, dict) or user.get("id") != actor_id
+        ):
             continue
         submitted_raw = review.get("submitted_at") or ""
         parsed = _parse_iso(submitted_raw)
@@ -264,7 +307,10 @@ def _get_latest_codex_review_info(
     repo: str, pr_number: int
 ) -> tuple[str, datetime | None]:
     """Return ``(commit_id, submitted_at)`` of the most recent Codex review."""
-    signals = _get_codex_review_signals(repo, pr_number)
+    reviewer_policy = reviewer_policy_from_config(load_config())
+    signals = _get_codex_review_signals(
+        repo, pr_number, policy=reviewer_policy
+    )
     latest_sha = signals["latest_sha"]
     latest_time = signals["latest_time"]
     return str(latest_sha or ""), latest_time if isinstance(latest_time, datetime) else None

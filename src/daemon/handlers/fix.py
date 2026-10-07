@@ -23,8 +23,10 @@ from src.daemon.guardrails import scan_stdout
 from src.daemon.handlers.breach import BreachMixin
 from src.daemon.quarantine import apply_quarantine_label_for_violation
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
+from src.daemon.selector import CoderSelectionUnavailable
 from src.github import comments as gh_comments
 from src.github import gh_runner
+from src.github.reviewer_policy import ReviewerPolicy
 from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus
 from src.retry import retry_transient
 from src.subsource_registry import SuppressionReason
@@ -188,7 +190,9 @@ class FixMixin(BreachMixin):
         )
 
     async def _build_fix_feedback_context(
-        self, current_pr: PRInfo
+        self,
+        current_pr: PRInfo,
+        reviewer_policy: ReviewerPolicy | None = None,
     ) -> str | None:
         """Compose CI failure logs + latest review feedback for the FIX prompt.
 
@@ -210,6 +214,7 @@ class FixMixin(BreachMixin):
             feedback = await asyncio.to_thread(
                 gh_comments.get_latest_codex_feedback,
                 self.owner_repo, current_pr.number,
+                reviewer_policy,
             )
             if feedback:
                 sections.append("Latest review feedback:\n" + feedback)
@@ -220,6 +225,8 @@ class FixMixin(BreachMixin):
     async def handle_fix(self) -> None:
         """Run ``FIX FEEDBACK`` via the active coder CLI and return to WATCH."""
         self._stop_requested = False
+        fix_feedback_reviewer_policy = self._fix_feedback_reviewer_policy
+        self._fix_feedback_reviewer_policy = None
         # PR-358: a FIX entry begins a new review iteration; clear the
         # single-shot review_timeout repost flag so the next WATCH
         # iteration after this FIX can post one repost again if Codex
@@ -234,7 +241,15 @@ class FixMixin(BreachMixin):
             BranchContext.from_runner(self).log_summary(),
         )
         await self._refresh_auth_status_cache()
-        coder_name, plugin = self._get_coder(allow_exploration=False)
+        try:
+            coder_name, plugin = self._get_coder(allow_exploration=False)
+        except CoderSelectionUnavailable as exc:
+            await self._transition_to_error(
+                str(exc),
+                publish=False,
+                log_prefix="[FIX]",
+            )
+            return
         if not await self.usage_gate(proactive_coder=coder_name):
             return
 
@@ -365,7 +380,8 @@ class FixMixin(BreachMixin):
             fix_kwargs["task_file"] = self.state.current_task.task_file
         if self.state.current_pr is not None:
             extra_context = await self._build_fix_feedback_context(
-                self.state.current_pr
+                self.state.current_pr,
+                reviewer_policy=fix_feedback_reviewer_policy,
             )
             if extra_context is not None:
                 fix_kwargs["extra_context"] = extra_context
@@ -384,7 +400,11 @@ class FixMixin(BreachMixin):
         if plugin.supports_breach_lifecycle:
             breach_monitor = asyncio.create_task(
                 self._monitor_inflight_breach(
-                    breach_dir, breach_run_id, claude_task, breach_flag,
+                    breach_dir,
+                    breach_run_id,
+                    plugin.name,
+                    claude_task,
+                    breach_flag,
                 )
             )
         external_state_monitor = self._run_coder_with_polling(
@@ -436,7 +456,12 @@ class FixMixin(BreachMixin):
             if coder_result is not None:
                 self._record_unconfirmed_launch_cleanup(coder_result)
             if plugin.supports_breach_lifecycle:
-                self._check_late_breach(breach_dir, breach_run_id, breach_flag)
+                self._check_late_breach(
+                    breach_dir,
+                    breach_run_id,
+                    plugin.name,
+                    breach_flag,
+                )
                 self._cleanup_breach_marker(breach_dir, breach_run_id)
             cleanup_confirmed = await self._confirm_current_coder_cleanup(
                 "FIX completion"

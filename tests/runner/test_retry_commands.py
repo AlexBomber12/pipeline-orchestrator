@@ -1181,7 +1181,10 @@ async def test_deferred_retry_allows_active_watch_and_later_resumes_once(
         lambda path: (
             [
                 {
-                    "user": {"login": "chatgpt-codex-connector"},
+                    "user": {
+                        "id": 199175422,
+                        "login": "chatgpt-codex-connector[bot]",
+                    },
                     "body": "P1: fresh review finding",
                     "created_at": recent,
                 }

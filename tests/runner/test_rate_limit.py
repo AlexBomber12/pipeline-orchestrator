@@ -227,9 +227,11 @@ def test_handle_fix_breach_cancel_resets_no_push_counter(
         self: PipelineRunner,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,  # type: ignore[type-arg]
         breach_flag: dict[str, bool],
     ) -> None:
+        assert coder_name == "claude"
         self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
         breach_flag["breached"] = True
         await asyncio.sleep(0)
@@ -281,17 +283,21 @@ def test_handle_fix_late_breach_resets_no_push_counter(
         self: object,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,  # type: ignore[type-arg]
         breach_flag: dict[str, bool],
     ) -> None:
+        assert coder_name == "claude"
         await asyncio.sleep(0)
 
     def fake_late_breach(
         self: PipelineRunner,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         breach_flag: dict[str, bool],
     ) -> None:
+        assert coder_name == "claude"
         self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
         breach_flag["breached"] = True
 
@@ -943,9 +949,11 @@ def test_handle_fix_sets_error_when_breach_cancel_review_post_fails(
         self: PipelineRunner,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,  # type: ignore[type-arg]
         breach_flag: dict[str, bool],
     ) -> None:
+        assert coder_name == "claude"
         self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
         breach_flag["breached"] = True
         await asyncio.sleep(0)
@@ -1001,9 +1009,11 @@ def test_handle_fix_pauses_when_breach_cancel_rev_parse_fails(
         self: PipelineRunner,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,  # type: ignore[type-arg]
         breach_flag: dict[str, bool],
     ) -> None:
+        assert coder_name == "claude"
         self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
         breach_flag["breached"] = True
         await asyncio.sleep(0)
@@ -1059,17 +1069,21 @@ def test_handle_fix_sets_error_when_late_breach_review_post_fails(
         self: object,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,  # type: ignore[type-arg]
         breach_flag: dict[str, bool],
     ) -> None:
+        assert coder_name == "claude"
         await asyncio.sleep(0)
 
     def fake_late_breach(
         self: PipelineRunner,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         breach_flag: dict[str, bool],
     ) -> None:
+        assert coder_name == "claude"
         self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
         breach_flag["breached"] = True
 
@@ -1120,17 +1134,21 @@ def test_handle_fix_pauses_when_late_breach_rev_parse_fails(
         self: object,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,  # type: ignore[type-arg]
         breach_flag: dict[str, bool],
     ) -> None:
+        assert coder_name == "claude"
         await asyncio.sleep(0)
 
     def fake_late_breach(
         self: PipelineRunner,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         breach_flag: dict[str, bool],
     ) -> None:
+        assert coder_name == "claude"
         self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
         breach_flag["breached"] = True
 
@@ -1188,9 +1206,11 @@ def test_handle_fix_breach_cancel_skips_codex_review_when_eyes_already_reacted(
         self: PipelineRunner,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,  # type: ignore[type-arg]
         breach_flag: dict[str, bool],
     ) -> None:
+        assert coder_name == "claude"
         self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
         breach_flag["breached"] = True
         await asyncio.sleep(0)
@@ -1246,17 +1266,21 @@ def test_handle_fix_late_breach_skips_codex_review_when_eyes_already_reacted(
         self: object,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,  # type: ignore[type-arg]
         breach_flag: dict[str, bool],
     ) -> None:
+        assert coder_name == "claude"
         await asyncio.sleep(0)
 
     def fake_late_breach(
         self: PipelineRunner,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         breach_flag: dict[str, bool],
     ) -> None:
+        assert coder_name == "claude"
         self.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
         breach_flag["breached"] = True
 
@@ -1306,9 +1330,11 @@ def test_handle_fix_sets_error_on_non_rate_limit_cli_failure(
         self: object,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         claude_task: asyncio.Task,  # type: ignore[type-arg]
         breach_flag: dict[str, bool],
     ) -> None:
+        assert coder_name == "claude"
         await asyncio.sleep(0)
 
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
@@ -2081,7 +2107,7 @@ def test_rate_limited_until_uses_resets_at_timestamp(
     assert int(runner.state.rate_limited_until.timestamp()) == resets_at
 
 
-def test_monitor_inflight_breach_cancels_claude_task_on_marker(
+def test_monitor_inflight_breach_attributes_custom_coder_on_marker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -2112,6 +2138,7 @@ def test_monitor_inflight_breach_cancels_claude_task_on_marker(
             runner._monitor_inflight_breach(
                 str(tmp_path),
                 breach_run_id,
+                "third",
                 task,
                 breach_flag,
             )
@@ -2137,7 +2164,8 @@ def test_monitor_inflight_breach_cancels_claude_task_on_marker(
         assert breach_flag["breached"] is True
         assert cancelled.is_set()
         assert runner.state.rate_limited_until is not None
-        assert runner.state.rate_limit_reactive_coder == "claude"
+        assert runner.state.rate_limit_reactive_coder == "third"
+        assert "third" in runner.state.rate_limited_coders
 
         monitor.cancel()
 
@@ -2169,6 +2197,7 @@ def test_monitor_inflight_breach_sets_paused_state_with_resets_at(
             runner._monitor_inflight_breach(
                 str(tmp_path),
                 breach_run_id,
+                "claude",
                 task,
                 breach_flag,
             )
@@ -2221,6 +2250,7 @@ def test_monitor_inflight_breach_exits_when_claude_task_completes(
             runner._monitor_inflight_breach(
                 str(tmp_path),
                 breach_run_id,
+                "claude",
                 task,
                 breach_flag,
             )
@@ -2456,8 +2486,10 @@ def test_handle_coding_records_pr_before_late_breach_pause(
     def fake_check_late_breach(
         breach_dir: str,
         breach_run_id: str,
+        coder_name: str,
         breach_flag: dict[str, bool],
     ) -> None:
+        assert coder_name == "claude"
         breach_flag["breached"] = True
         runner.state.rate_limited_until = datetime.fromtimestamp(
             1700000000,
@@ -2937,6 +2969,7 @@ def test_monitor_inflight_breach_retries_bad_marker_then_uses_default_reset(
             runner._monitor_inflight_breach(
                 str(tmp_path),
                 breach_run_id,
+                "claude",
                 task,
                 breach_flag,
             )
@@ -2982,7 +3015,9 @@ def test_check_late_breach_returns_after_retry_exhaustion(
     marker = tmp_path / "retry-exhausted.breach"
     marker.write_text("{not-json")
 
-    runner._check_late_breach(str(tmp_path), "retry-exhausted", breach_flag)
+    runner._check_late_breach(
+        str(tmp_path), "retry-exhausted", "claude", breach_flag
+    )
 
     assert breach_flag["breached"] is False
     assert runner.state.rate_limited_until is None
@@ -3009,9 +3044,11 @@ def test_check_late_breach_uses_resets_at_timestamp(
         )
     )
 
-    runner._check_late_breach(str(tmp_path), "late-reset", breach_flag)
+    runner._check_late_breach(str(tmp_path), "late-reset", "third", breach_flag)
 
     assert breach_flag["breached"] is True
+    assert runner.state.rate_limit_reactive_coder == "third"
+    assert "third" in runner.state.rate_limited_coders
     assert runner.state.rate_limited_until is not None
     assert int(runner.state.rate_limited_until.timestamp()) == resets_at
 

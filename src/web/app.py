@@ -24,6 +24,7 @@ split (``X`` is loaded on demand from whichever submodule now owns it).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import subprocess  # noqa: F401 — re-exported via web_app.subprocess for tests
@@ -37,7 +38,10 @@ import redis.asyncio as aioredis
 from fastapi import FastAPI
 from fastapi.templating import Jinja2Templates
 
+from src.coder_registry import CoderMetadataView, CoderRegistry, ModelSetting
+from src.coders import build_coder_registry
 from src.config import (
+    DEFAULT_CODER_PLUGINS,
     add_repository,  # noqa: F401 — accessed by routes via _app.add_repository
     load_config,  # noqa: F401 — accessed by routes via _app.load_config
     remove_repository,  # noqa: F401 — accessed by routes via _app.remove_repository
@@ -52,12 +56,14 @@ from src.events.sse import (
     RepoEventsUnavailableError,  # noqa: F401 — accessed by routes via _app.RepoEventsUnavailableError
     stream_repo_events,  # noqa: F401 — accessed by routes via _app.stream_repo_events
 )
+from src.model_catalog_bridge import DaemonModelCatalogLoader
 from src.web.services import (
     upload_validation as _upload_validation_service,
 )
 from src.web.services.config_updates import (
     apply_config_mutation,  # noqa: F401 — accessed by routes via _app.apply_config_mutation
 )
+from src.web.services.model_catalog import ModelCatalogCache
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 CONFIG_PATH = os.environ.get("PO_CONFIG_PATH", "config.yml")
@@ -65,6 +71,7 @@ REPOS_DIR = "/data/repos"
 UPLOADS_DIR = "/data/uploads"
 _UPLOAD_MAX_TOTAL_BYTES = 1_000_000  # 1 MB
 logger = logging.getLogger(__name__)
+_METADATA_RETRY_INTERVAL_SECONDS = 1.0
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
@@ -292,14 +299,134 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _unavailable_coder_metadata(plugin_id: str) -> CoderMetadataView:
+    """Return a safe placeholder while daemon-owned metadata is unavailable."""
+    legacy_field = {
+        "claude": "claude_model",
+        "codex": "codex_model",
+    }.get(plugin_id)
+    return CoderMetadataView(
+        name=plugin_id,
+        display_name=f"{plugin_id} (metadata unavailable)",
+        models=[],
+        model_setting=ModelSetting(
+            config_field=legacy_field,
+            default_value="",
+            default_label="Metadata unavailable",
+        ),
+        model_catalog_refreshable=False,
+        metadata_available=False,
+    )
+
+
+async def _retry_unavailable_coder_metadata(
+    loader: DaemonModelCatalogLoader,
+    registry: CoderRegistry,
+    references: dict[str, str],
+) -> None:
+    """Replace startup placeholders after the daemon bridge recovers."""
+    pending = dict(references)
+    while pending:
+        await asyncio.sleep(_METADATA_RETRY_INTERVAL_SECONDS)
+        plugin_ids = tuple(pending)
+        results = await asyncio.gather(
+            *(
+                loader.load_plugin_metadata(
+                    plugin_id,
+                    expected_reference=pending[plugin_id],
+                )
+                for plugin_id in plugin_ids
+            ),
+            return_exceptions=True,
+        )
+        for plugin_id, result in zip(plugin_ids, results, strict=True):
+            if isinstance(result, Exception):
+                continue
+            reference = pending.pop(plugin_id)
+            registry.register(result, reference=reference)
+            logger.info("%s plugin metadata recovered from daemon", plugin_id)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # Configuration parsing is inert, and only known built-ins are constructed
+    # in web. Configured factories and metadata stay daemon-owned.
+    config = load_config(CONFIG_PATH)
+    default_registry = build_coder_registry()
     redis_url = os.environ.get("REDIS_URL", DEFAULT_REDIS_URL)
     client = aioredis.from_url(redis_url, decode_responses=True)
     app.state.redis = client
+    catalog_cache: ModelCatalogCache | None = None
+    metadata_retry_task: asyncio.Task[None] | None = None
     try:
+        catalog_loader = DaemonModelCatalogLoader(client)
+        app.state.plugin_bridge = catalog_loader
+        configured_ids = [
+            plugin_id
+            for plugin_id, reference in config.coder_plugins.items()
+            if reference != DEFAULT_CODER_PLUGINS.get(plugin_id)
+        ]
+        metadata = await asyncio.gather(
+            *(
+                catalog_loader.load_plugin_metadata(
+                    plugin_id,
+                    expected_reference=config.coder_plugins[plugin_id],
+                )
+                for plugin_id in configured_ids
+            ),
+            return_exceptions=True,
+        )
+        configured_metadata: dict[str, CoderMetadataView] = {}
+        for plugin_id, result in zip(configured_ids, metadata, strict=True):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "%s plugin metadata is unavailable from daemon",
+                    plugin_id,
+                )
+                configured_metadata[plugin_id] = _unavailable_coder_metadata(
+                    plugin_id
+                )
+            else:
+                configured_metadata[plugin_id] = result
+        registry = CoderRegistry()
+        for plugin_id, reference in config.coder_plugins.items():
+            plugin = (
+                default_registry.get(plugin_id)
+                if reference == DEFAULT_CODER_PLUGINS.get(plugin_id)
+                else configured_metadata[plugin_id]
+            )
+            registry.register(plugin, reference=reference)
+        unavailable_references = {
+            plugin_id: config.coder_plugins[plugin_id]
+            for plugin_id in configured_ids
+            if not configured_metadata[plugin_id].metadata_available
+        }
+        if unavailable_references:
+            metadata_retry_task = asyncio.create_task(
+                _retry_unavailable_coder_metadata(
+                    catalog_loader,
+                    registry,
+                    unavailable_references,
+                )
+            )
+        app.state.coder_registry = registry
+        daemon_owned_catalogs = {
+            name
+            for name in registry.coder_names()
+            if registry.reference_for(name) != DEFAULT_CODER_PLUGINS.get(name)
+        }
+        catalog_cache = ModelCatalogCache(
+            loader=catalog_loader,
+            daemon_owned_plugins=daemon_owned_catalogs,
+        )
+        app.state.model_catalog = catalog_cache
         yield
     finally:
+        if metadata_retry_task is not None:
+            metadata_retry_task.cancel()
+            await asyncio.gather(metadata_retry_task, return_exceptions=True)
+        if catalog_cache is not None:
+            await catalog_cache.close()
         try:
             await client.aclose()
         except Exception:

@@ -59,12 +59,20 @@ repositories:
     branch: main
     auto_merge: true
 
+coder_plugins:
+  claude: src.coders.claude:ClaudePlugin
+  codex: src.coders.codex:CodexPlugin
+
 daemon:
   poll_interval_sec: 60
   review_timeout_min: 20
   hung_fallback_codex_review: true
   error_handler_use_ai: true
-  claude_model: opus
+  coder_settings:
+    claude:
+      model: opus
+    codex:
+      reasoning_effort: high
   fix_idle_timeout_sec: 1800
   fix_iteration_cap: 15
   planned_pr_timeout_sec: 3600
@@ -79,6 +87,64 @@ auth:
 ```
 
 `PO_FIX_ITERATION_CAP` overrides `daemon.fix_iteration_cap` for daemon runs.
+
+Coder model choices are stored by stable plugin ID under
+`daemon.coder_settings`. Legacy `daemon.claude_model` and
+`daemon.codex_model` values remain supported as fallbacks when a plugin does
+not have an explicit generic `model` setting. An explicit generic value wins
+over its legacy fallback. Codex preserves `model: ""` as the CLI-default
+choice; Claude normalizes an empty choice to its `opus` default.
+
+`coder_plugins` is a top-level mapping from a stable, route-safe plugin ID
+(ASCII letters/digits, underscores, and hyphens) to a trusted `module:factory`
+reference. The IDs `gh` and `any` are reserved for infrastructure status and
+task-level inheritance respectively. The no-argument factory must be importable
+in both the web and daemon Python environments and must return a complete
+`CoderPlugin` whose `name` exactly matches the configured ID. Claude and Codex
+use the references shown above as compatibility defaults. An explicit entry
+with either ID replaces that default; any other ID adds a registry entry.
+Plugin options remain separate under `daemon.coder_settings.<plugin-id>`.
+Those persisted option values are strings, which keeps configured model keys
+safe across both startup and config-file reload validation without importing
+plugin modules during configuration parsing. A plugin model binding cannot use
+`reasoning_effort` as its `setting_key`; that key is reserved for the plugin's
+execution option.
+
+Plugin modules are operator-managed code: loading a reference does not install
+packages, download code, or sandbox the import. Definitions are loaded only at
+service startup, so deploy the module and restart both `web` and `daemon` after
+changing `coder_plugins`; config reload does not hot-swap implementations.
+Registration exposes shared metadata and generic model controls. Runtime
+dispatch is authorized by the registry that the daemon loaded successfully at
+startup. A loaded plugin ID can be selected as the global default with
+`daemon.coder`, as a repository override with `repositories[].coder`, or as a
+hard task pin with the task header `Coder: <plugin-id>`. `Coder: any` retains
+the inherited candidate and fallback behavior instead of hard-pinning a
+provider. Registered plugins participate in the same priority, exploration,
+disable, authentication, and rate-limit admission rules as the built-ins.
+Unknown, unloaded, or unavailable hard pins are rejected rather than falling
+back to another coder. The dashboard keeps its editable coder choices limited
+to Claude and Codex for now, but it renders configured custom selections as
+read-only values. Legacy model-field
+fallbacks are likewise owned by their built-ins (`claude_model` by `claude`
+and `codex_model` by `codex`); additional plugins must set their model
+metadata's `config_field` to `None` and use `coder_settings`. Configured model
+catalog methods run through the daemon in bounded worker processes, while the
+web cache key is derived from validated configuration; configured catalog code
+does not execute inside the web control plane. The daemon also supplies
+validated plugin metadata to web over Redis, so configured modules and
+factories are never imported or instantiated by FastAPI. If daemon metadata is
+temporarily unavailable, the dashboard still starts with that plugin marked
+unavailable and its model-setting control disabled, then retries the daemon
+metadata until the control can recover without a web restart. Configured
+authentication checks also cross the daemon bridge and remain bounded by its
+worker deadline; independent metadata, authentication, and catalog requests
+run concurrently under a fixed daemon-side limit.
+
+Codex reasoning effort can be overridden for each new invocation with
+`daemon.coder_settings.codex.reasoning_effort`. Omit the key or set it to an
+empty string to let the Codex CLI use its configured/default effort. A nonempty
+value is forwarded unchanged; supported values depend on the selected model.
 
 ## Local development
 

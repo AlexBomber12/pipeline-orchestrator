@@ -8,6 +8,7 @@ to dispatch PLANNED PR and FIX FEEDBACK workflows through Codex.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from typing import Callable
@@ -129,6 +130,7 @@ async def run_codex_async(
     cwd: str,
     timeout: int | None = 600,
     model: str | None = None,
+    reasoning_effort: str | None = None,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
     on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
 ) -> tuple[int, str, str]:
@@ -147,6 +149,9 @@ async def run_codex_async(
     ]
     if model:
         cmd.extend(["--model", model])
+    if reasoning_effort:
+        encoded_effort = json.dumps(reasoning_effort, ensure_ascii=False)
+        cmd.extend(["--config", f"model_reasoning_effort={encoded_effort}"])
     cmd.append(prompt)
     logger.info("[codex] running codex exec with prompt: %s", prompt[:80])
 
@@ -201,13 +206,18 @@ async def run_codex_async(
 async def run_planned_pr_async(
     repo_path: str,
     model: str | None = None,
+    reasoning_effort: str | None = None,
     timeout: int = 900,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
     on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
     **_kwargs: object,
 ) -> tuple[int, str, str]:
     """Trigger a ``PLANNED PR`` run in ``repo_path`` via Codex CLI."""
-    kwargs: dict[str, object] = {"timeout": timeout, "model": model}
+    kwargs: dict[str, object] = {
+        "timeout": timeout,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+    }
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
     if on_supervised_process_start is not None:
@@ -229,13 +239,18 @@ async def run_auto_pr_async(
     task_body: str,
     *,
     model: str | None = None,
+    reasoning_effort: str | None = None,
     timeout: int = 900,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
     on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
     **_kwargs: object,
 ) -> tuple[int, str, str]:
     """Trigger an ``AUTO PR`` run in ``repo_path`` via Codex CLI."""
-    kwargs: dict[str, object] = {"timeout": timeout, "model": model}
+    kwargs: dict[str, object] = {
+        "timeout": timeout,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+    }
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
     if on_supervised_process_start is not None:
@@ -272,6 +287,7 @@ def _build_fix_feedback_prompt(
 async def fix_review_async(
     repo_path: str,
     model: str | None = None,
+    reasoning_effort: str | None = None,
     timeout: int | None = None,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
     on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
@@ -281,7 +297,11 @@ async def fix_review_async(
     **_kwargs: object,
 ) -> tuple[int, str, str]:
     """Trigger a ``FIX FEEDBACK`` run in ``repo_path`` via Codex CLI."""
-    kwargs: dict[str, object] = {"timeout": timeout, "model": model}
+    kwargs: dict[str, object] = {
+        "timeout": timeout,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+    }
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
     if on_supervised_process_start is not None:
@@ -298,11 +318,19 @@ async def fix_review_async(
 
 
 async def diagnose_error_async(
-    repo_path: str, context: str, model: str | None = None
+    repo_path: str,
+    context: str,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+    on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
 ) -> tuple[int, str, str]:
     return await run_codex_async(
         build_diagnosis_prompt(repo_path, context),
         repo_path,
         timeout=120,
         model=model,
+        reasoning_effort=reasoning_effort,
+        on_process_start=on_process_start,
+        on_supervised_process_start=on_supervised_process_start,
     )

@@ -277,7 +277,10 @@ def test_run_coder_with_supervision_returns_none_on_breach(
         await asyncio.sleep(0)
         raise asyncio.CancelledError
 
-    async def fake_breach_monitor(self, breach_dir, run_id, task, flag):
+    async def fake_breach_monitor(
+        self, breach_dir, run_id, coder_name, task, flag
+    ):
+        assert coder_name == "claude"
         flag["breached"] = True
         task.cancel()
 
@@ -1208,9 +1211,11 @@ def test_stop_and_breach_win_publication_race(
         async def breach_monitor(
             breach_dir: str,
             run_id: str,
+            coder_name: str,
             cli_task: asyncio.Task[tuple[int, str, str]],
             breach_flag: dict[str, bool],
         ) -> None:
+            assert coder_name == "claude"
             await publication_ready.wait()
             breach_flag["breached"] = True
             cli_task.cancel()
@@ -1497,9 +1502,11 @@ def test_run_coder_breach_cleanup_failure_wins_over_pause(
         self: object,
         breach_dir: str,
         run_id: str,
+        coder_name: str,
         task: asyncio.Task,  # type: ignore[type-arg]
         flag: dict[str, bool],
     ) -> None:
+        assert coder_name == "claude"
         await asyncio.sleep(0)
         flag["breached"] = True
         task.cancel()

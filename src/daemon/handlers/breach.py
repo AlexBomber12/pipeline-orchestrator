@@ -30,12 +30,13 @@ class BreachMixin:
         self,
         breach_dir: str,
         run_id: str,
-        claude_task: asyncio.Task,  # type: ignore[type-arg]
+        coder_name: str,
+        coder_task: asyncio.Task,  # type: ignore[type-arg]
         breach_flag: dict[str, bool],
     ) -> None:
-        """Cancel *claude_task* if the statusline hook writes a breach marker."""
+        """Cancel *coder_task* if the statusline hook writes a breach marker."""
         marker = Path(breach_dir) / f"{run_id}.breach"
-        while not claude_task.done():
+        while not coder_task.done():
             if marker.is_file():
                 try:
                     data = json.loads(marker.read_text())
@@ -47,16 +48,16 @@ class BreachMixin:
                     until = datetime.fromtimestamp(resets_at, tz=timezone.utc)
                 else:
                     until = datetime.now(timezone.utc) + timedelta(minutes=30)
-                self._record_rate_limit("claude", until, reactive=True)
+                self._record_rate_limit(coder_name, until, reactive=True)
                 breach_type = data.get("type", "session")
                 pct_key = "session_pct" if breach_type == "session" else "weekly_pct"
                 pct_val = data.get(pct_key, "?")
                 self.log_event(
                     f"[RATE-LIMIT] In-flight breach: {breach_type} at "
-                    f"{pct_val}%, killing Claude CLI."
+                    f"{pct_val}%, killing {coder_name} coder."
                 )
                 breach_flag["breached"] = True
-                claude_task.cancel()
+                coder_task.cancel()
                 return
             await asyncio.sleep(_BREACH_POLL_SEC)
 
@@ -68,7 +69,11 @@ class BreachMixin:
         return breach_dir, run_id
 
     def _check_late_breach(
-        self, breach_dir: str, run_id: str, breach_flag: dict[str, bool],
+        self,
+        breach_dir: str,
+        run_id: str,
+        coder_name: str,
+        breach_flag: dict[str, bool],
     ) -> None:
         """Final synchronous check for a breach marker the poll loop missed."""
         if breach_flag["breached"]:
@@ -90,7 +95,7 @@ class BreachMixin:
             until = datetime.fromtimestamp(resets_at, tz=timezone.utc)
         else:
             until = datetime.now(timezone.utc) + timedelta(minutes=30)
-        self._record_rate_limit("claude", until, reactive=True)
+        self._record_rate_limit(coder_name, until, reactive=True)
         breach_type = data.get("type", "session")
         pct_key = "session_pct" if breach_type == "session" else "weekly_pct"
         pct_val = data.get(pct_key, "?")
