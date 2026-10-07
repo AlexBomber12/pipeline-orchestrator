@@ -461,6 +461,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             json.dumps(deeply_nested),
             'structured={"headers":{"Authorization":"Bearer structured-auth-secret"}}',
             'structured-cookie={"Cookie":"session=structured-cookie-secret"}',
+            '{"dbPassword":"camel-db-secret","safe":"hidden-camel-metadata"}',
+            '{"githubToken":"camel-token-secret"}',
             'tool --password cli-option-secret --token "quoted cli token"',
             r'tool --password "abc\"escaped-option-secret" token="abc\"escaped-assignment-secret"',
             'password="alpha unterminated-credential-secret',
@@ -472,6 +474,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "pass\x1bPterminal-data\x1b\\word=esc-dcs-secret",
             "pass\x9d0;title\x9cword=c1-osc-secret",
             "pass\x90terminal-data\x9cword=c1-dcs-secret",
+            "passX\x1b[1Dword=cursor-secret",
+            "passX\x9b1Dword=c1-cursor-secret",
             "passX\bword=backspace-secret",
             "safe-carriage\rpassword=carriage-secret",
             "visible\x00-control",
@@ -511,6 +515,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert redacted["redaction"]["applied"] is True
     assert redacted["redaction"]["credential_documents_omitted"] >= 8
     assert "[credential line omitted]" in exported
+    assert "[terminal control line omitted]" in exported
     assert "safe-after-yaml" in exported
     assert "safe-after-shell" in exported
     assert "visible-control" in exported
@@ -522,6 +527,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "private@example.test" not in exported
     assert "hidden-array-project" not in exported
     assert "hidden-client" not in exported
+    assert "hidden-camel-metadata" not in exported
     assert "serialized-metadata" not in exported
     for secret in (
         "inline-auth-secret",
@@ -540,6 +546,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "deep-document-secret",
         "structured-auth-secret",
         "structured-cookie-secret",
+        "camel-db-secret",
+        "camel-token-secret",
         "cli-option-secret",
         "quoted cli token",
         "escaped-option-secret",
@@ -554,6 +562,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "esc-dcs-secret",
         "c1-osc-secret",
         "c1-dcs-secret",
+        "cursor-secret",
+        "c1-cursor-secret",
         "backspace-secret",
         "carriage-secret",
         "matched-container-secret",

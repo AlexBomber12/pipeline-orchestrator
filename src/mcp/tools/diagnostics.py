@@ -57,6 +57,7 @@ _MAX_JSON_PARSE_FAILURES = 64
 
 _REDACTED = "[REDACTED]"
 _CREDENTIAL_DOCUMENT_OMITTED = "[credential document omitted]"
+_TERMINAL_CONTROL_LINE_OMITTED = "[terminal control line omitted]"
 _CREDENTIAL_DOCUMENT_KEYS = frozenset(
     {
         "accesstoken",
@@ -102,6 +103,8 @@ _TERMINAL_ESCAPE = re.compile(
     r"\x1b[ -/]*[@-~])",
     re.DOTALL,
 )
+_TERMINAL_CSI = re.compile(r"(?:\x1b\[|\x9b)[0-?]*[ -/]*(?P<final>[@-~])")
+_TERMINAL_STATEFUL_ESCAPE = re.compile(r"\x1b[78DEHM]")
 _C1_CONTROL_STRING = re.compile(r"[\x90\x98\x9d-\x9f].*?(?:\x9c|\x07|$)", re.DOTALL)
 _JSON_CONTAINER_START = re.compile(r"[\[{]")
 _URL_USERINFO = re.compile(r"(?i)(?P<scheme>\b[a-z][a-z0-9+.-]*://)[^/@\s]+@")
@@ -948,8 +951,7 @@ def _contains_credential_document_key(value: object) -> bool:
         current = pending.pop()
         if isinstance(current, dict):
             for key, child in current.items():
-                normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
-                if normalized in _CREDENTIAL_DOCUMENT_KEYS and child not in (None, "", False):
+                if _is_sensitive_key(str(key)) and child not in (None, "", False):
                     return True
                 if isinstance(child, (dict, list, str)):
                     pending.append(child)
@@ -965,8 +967,26 @@ def _contains_credential_document_key(value: object) -> bool:
     return False
 
 
+def _omit_stateful_terminal_lines(text: str) -> tuple[str, int]:
+    lines = text.splitlines(keepends=True)
+    sanitized: list[str] = []
+    omitted = 0
+    for line in lines:
+        content = line.rstrip("\r\n")
+        stateful_csi = any(match.group("final") != "m" for match in _TERMINAL_CSI.finditer(content))
+        if stateful_csi or _TERMINAL_STATEFUL_ESCAPE.search(content):
+            ending = line[len(content) :]
+            sanitized.append(f"{_TERMINAL_CONTROL_LINE_OMITTED}{ending}")
+            omitted += 1
+        else:
+            sanitized.append(line)
+    return "".join(sanitized), omitted
+
+
 def _normalize_terminal_text(text: str) -> tuple[str, int]:
+    text, omitted_lines = _omit_stateful_terminal_lines(text)
     text, removed = _TERMINAL_ESCAPE.subn("", text)
+    removed += omitted_lines
     text, c1_removed = _C1_CONTROL_STRING.subn("", text)
     removed += c1_removed
     text = text.replace("\r\n", "\n")
@@ -991,12 +1011,22 @@ def _normalize_terminal_text(text: str) -> tuple[str, int]:
 
 def _is_sensitive_key(value: str) -> bool:
     """Recognize credential keys without a backtracking expression."""
-    decoded = unquote_plus(value).lower()
+    decoded = unquote_plus(value)
     normalized: list[str] = []
     boundaries = {0}
-    for character in decoded:
+    for index, character in enumerate(decoded):
         if "a" <= character <= "z" or "0" <= character <= "9":
             normalized.append(character)
+        elif "A" <= character <= "Z":
+            previous = decoded[index - 1] if index else ""
+            following = decoded[index + 1] if index + 1 < len(decoded) else ""
+            if normalized and (
+                "a" <= previous <= "z"
+                or "0" <= previous <= "9"
+                or ("A" <= previous <= "Z" and "a" <= following <= "z")
+            ):
+                boundaries.add(len(normalized))
+            normalized.append(character.lower())
         else:
             boundaries.add(len(normalized))
     key = "".join(normalized)
