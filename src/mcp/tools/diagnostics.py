@@ -8,6 +8,7 @@ producer text and arbitrary payload mappings are never returned.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -652,6 +653,27 @@ def _run_metadata(raw: object, expected_id: str, slug: str) -> dict[str, Any] | 
 
 
 async def _run_records(
+    client: Any,
+    slug: str,
+    task_filter: str | None,
+    limit: int,
+) -> dict[str, Any]:
+    try:
+        async with asyncio.timeout(_REDIS_TIMEOUT_SECONDS):
+            return await _run_records_before_timeout(client, slug, task_filter, limit)
+    except TimeoutError:
+        return {
+            "status": "unavailable",
+            "code": "run_record_read_failed",
+            "task_filter": task_filter,
+            "records": [],
+            "record_count": None,
+            "scanned_index_entries": 0,
+            "truncated": False,
+        }
+
+
+async def _run_records_before_timeout(
     client: Any,
     slug: str,
     task_filter: str | None,

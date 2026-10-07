@@ -1006,3 +1006,43 @@ async def test_run_source_bounds_filtering_and_malformed_records() -> None:
 
     limited = await diagnostics._run_records(redis, SLUG, "PR-9", 1)
     assert limited["truncated"] is True
+
+
+async def test_run_source_has_whole_scan_deadline_and_propagates_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    class BlockingRunRedis(FakeRedis):
+        def __init__(self) -> None:
+            super().__init__()
+            self.read_started = asyncio.Event()
+
+        async def getrange(self, key: str, start: int, end: int) -> object:
+            self._check("getrange", key)
+            self.read_started.set()
+            await asyncio.Event().wait()
+
+    redis = BlockingRunRedis()
+    index = MetricsStore._recent_key("PR-9", SLUG)
+    redis.lists[index] = [str(uuid.uuid4())]
+    monkeypatch.setattr(diagnostics, "_REDIS_TIMEOUT_SECONDS", 0.01)
+
+    result = await diagnostics._run_records(redis, SLUG, "PR-9", 5)
+    assert result == {
+        "status": "unavailable",
+        "code": "run_record_read_failed",
+        "task_filter": "PR-9",
+        "records": [],
+        "record_count": None,
+        "scanned_index_entries": 0,
+        "truncated": False,
+    }
+
+    monkeypatch.setattr(diagnostics, "_REDIS_TIMEOUT_SECONDS", 30.0)
+    redis.read_started.clear()
+    task = asyncio.create_task(diagnostics._run_records(redis, SLUG, "PR-9", 5))
+    await redis.read_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
