@@ -95,35 +95,20 @@ _PEM_CREDENTIAL_END = re.compile(
     re.IGNORECASE,
 )
 _JSON_CONTAINER_START = re.compile(r"[\[{]")
-_SENSITIVE_HEADER_LINE = re.compile(
-    r"(?im)^(?P<prefix>[ \t]*(?:proxy-)?authorization[ \t]*:[ \t]*|"
-    r"[ \t]*(?:set-)?cookie[ \t]*:[ \t]*).*$"
-)
-_INLINE_AUTHORIZATION = re.compile(
-    r"(?i)(?P<prefix>\b(?:proxy-)?authorization\s*:)(?![ \t]*\[REDACTED\])"
-    r"(?P<spacing>[ \t]*)[^'\"\r\n]+"
-)
-_INLINE_COOKIE = re.compile(
-    r"(?i)(?P<prefix>\b(?:set-)?cookie\s*:)(?![ \t]*\[REDACTED\])"
-    r"(?P<spacing>[ \t]*)[^'\"\r\n]+"
-)
 _URL_USERINFO = re.compile(r"(?i)(?P<scheme>\b[a-z][a-z0-9+.-]*://)[^/@\s]+@")
-_CREDENTIAL_ASSIGNMENT = re.compile(
-    r"(?i)(?P<prefix>(?<![A-Za-z0-9])['\"]?(?:[A-Za-z0-9]+[_-])*"
-    r"(?:api[_-]?key|oauth[_-]?token|access[_-]?token|refresh[_-]?token|"
-    r"id[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key(?:[_-]?id)?|"
-    r"secret(?:[_-]?access)?[_-]?key|secret|password|passwd|token|"
-    r"(?:proxy[_-]?)?authorization|(?:set[_-]?)?cookie)"
-    r"['\"]?[ \t]*(?:=|:)[ \t]*)"
-    r"(?!\[(?:REDACTED|credential document omitted)\])"
-    r"(?P<value>\"(?:\\.|[^\"\\\r\n])*\"|'(?:\\.|[^'\\\r\n])*'|[^\s,;&#]+)"
-)
-_CREDENTIAL_OPTION = re.compile(
-    r"(?i)(?P<prefix>(?<![A-Za-z0-9-])--(?:api[_-]?key|oauth[_-]?token|"
-    r"access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|"
-    r"client[_-]?secret|private[_-]?key(?:[_-]?id)?|secret(?:[_-]?access)?[_-]?key|"
-    r"secret|password|passwd|token|(?:proxy[_-]?)?authorization|(?:set[_-]?)?cookie)"
-    r"[ \t]+)(?P<value>\"(?:\\.|[^\"\\\r\n])*\"|'(?:\\.|[^'\\\r\n])*'|[^\s,;]+)"
+_SENSITIVE_CONTEXT_LINE = re.compile(
+    r"(?im)^(?![^\r\n]*\[credential document omitted\])"
+    r"[^\r\n]*(?<![A-Za-z0-9-])(?:"
+    r"--(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|oauth[_-]?token|access[_-]?token|"
+    r"refresh[_-]?token|id[_-]?token|auth[_-]?token|client[_-]?secret|"
+    r"private[_-]?key(?:[_-]?id)?|secret(?:[_-]?access)?[_-]?key|secret|"
+    r"password|passwd|token|(?:proxy[_-]?)?authorization|(?:set[_-]?)?cookie)"
+    r"[\\'\"]*(?:[ \t]+|[=:])|"
+    r"(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|oauth[_-]?token|access[_-]?token|"
+    r"refresh[_-]?token|id[_-]?token|auth[_-]?token|client[_-]?secret|"
+    r"private[_-]?key(?:[_-]?id)?|secret(?:[_-]?access)?[_-]?key|secret|"
+    r"password|passwd|token|(?:proxy[_-]?)?authorization|(?:set[_-]?)?cookie)"
+    r"[\\'\"]*[=:])[^\r\n]*$"
 )
 _RECOGNIZABLE_SECRET = tuple(
     re.compile(pattern)
@@ -1014,13 +999,6 @@ def _omit_json_credential_documents(text: str) -> tuple[str, int]:
     return "".join(parts), len(ranges)
 
 
-def _redact_assignment(match: re.Match[str]) -> str:
-    value = match.group("value")
-    quote = value[0] if len(value) >= 2 and value[0] in {'"', "'"} and value[-1] == value[0] else ""
-    replacement = f"{quote}{_REDACTED}{quote}" if quote else _REDACTED
-    return f"{match.group('prefix')}{replacement}"
-
-
 def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     text, pem_documents = _PEM_CREDENTIAL_DOCUMENT.subn(_CREDENTIAL_DOCUMENT_OMITTED, text)
     orphaned_begin = _PEM_CREDENTIAL_BEGIN.search(text)
@@ -1032,23 +1010,10 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
         text = f"{_CREDENTIAL_DOCUMENT_OMITTED}{text[orphaned_end.end() :]}"
         pem_documents += 1
     text, json_documents = _omit_json_credential_documents(text)
-    redactions = pem_documents + json_documents
+    text, credential_lines = _SENSITIVE_CONTEXT_LINE.subn("[credential line omitted]", text)
+    redactions = pem_documents + json_documents + credential_lines
 
-    text, count = _SENSITIVE_HEADER_LINE.subn(lambda match: f"{match.group('prefix')}{_REDACTED}", text)
-    redactions += count
-    text, count = _INLINE_AUTHORIZATION.subn(
-        lambda match: f"{match.group('prefix')}{match.group('spacing')}{_REDACTED}", text
-    )
-    redactions += count
-    text, count = _INLINE_COOKIE.subn(
-        lambda match: f"{match.group('prefix')}{match.group('spacing')}{_REDACTED}", text
-    )
-    redactions += count
     text, count = _URL_USERINFO.subn(lambda match: f"{match.group('scheme')}{_REDACTED}@", text)
-    redactions += count
-    text, count = _CREDENTIAL_OPTION.subn(_redact_assignment, text)
-    redactions += count
-    text, count = _CREDENTIAL_ASSIGNMENT.subn(_redact_assignment, text)
     redactions += count
     for pattern in _RECOGNIZABLE_SECRET:
         text, count = pattern.subn(_REDACTED, text)

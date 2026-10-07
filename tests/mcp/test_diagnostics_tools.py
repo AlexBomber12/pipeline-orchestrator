@@ -420,7 +420,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     long_secret = "tail-fragment-" * 20
     redis.store[key] = f"Authorization: Bearer {long_secret}\nsafe-tail"
     before_tail = await diagnostics.get_latest_cli_log(SLUG, 64)
-    assert before_tail["text"] == "Authorization: [REDACTED]\nsafe-tail"
+    assert before_tail["text"] == "[credential line omitted]\nsafe-tail"
     assert "tail-fragment" not in before_tail["text"]
     assert before_tail["truncation"]["tail_truncated"] is False
 
@@ -448,6 +448,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             'structured-cookie={"Cookie":"session=structured-cookie-secret"}',
             'tool --password cli-option-secret --token "quoted cli token"',
             r'tool --password "abc\"escaped-option-secret" token="abc\"escaped-assignment-secret"',
+            'password="alpha unterminated-credential-secret',
+            r'payload={\"private_key\":\"unwrapped-escaped-secret\"}',
             "private_key=malformed-private-secret",
             "AWS_SECRET_ACCESS_KEY=aws-secret",
             "{",
@@ -473,6 +475,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert redacted["redaction"]["applied"] is True
     assert redacted["redaction"]["credential_documents_omitted"] == 8
     assert exported.count("[credential document omitted]") == 8
+    assert "[credential line omitted]" in exported
     assert "safe-output" in exported
     assert "private@example.test" not in exported
     assert "hidden-array-project" not in exported
@@ -498,6 +501,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "quoted cli token",
         "escaped-option-secret",
         "escaped-assignment-secret",
+        "unterminated-credential-secret",
+        "unwrapped-escaped-secret",
         "malformed-private-secret",
         "aws-secret",
         "document-secret",
