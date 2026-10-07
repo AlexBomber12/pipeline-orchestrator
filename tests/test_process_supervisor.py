@@ -506,7 +506,11 @@ async def test_async_adapter_preserves_real_exit_and_output(
     monkeypatch.setenv("PATH", f"{fake_coder_bin}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_CODER_MODE", "success")
     monkeypatch.setenv("FAKE_CODER_EXIT", str(returncode))
-    monkeypatch.setattr(codex_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
+    monkeypatch.setattr(
+        codex_cli,
+        "_maybe_wrap_sandbox",
+        lambda cmd, _cwd, **_kwargs: cmd,
+    )
     monkeypatch.setattr(claude_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
     raw_processes: list[asyncio.subprocess.Process] = []
     managed_processes: list[SupervisedProcess] = []
@@ -536,7 +540,11 @@ async def test_async_adapter_leader_exit_does_not_wait_for_retained_pipe(
     monkeypatch.setenv("PATH", f"{fake_coder_bin}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_CODER_MODE", "retained-pipe")
     monkeypatch.setenv("FAKE_CODER_PIDS", str(pid_file))
-    monkeypatch.setattr(codex_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
+    monkeypatch.setattr(
+        codex_cli,
+        "_maybe_wrap_sandbox",
+        lambda cmd, _cwd, **_kwargs: cmd,
+    )
     monkeypatch.setattr(claude_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
 
     started = time.monotonic()
@@ -561,7 +569,11 @@ async def test_async_adapter_timeout_cleans_descendants(
     monkeypatch.setenv("PATH", f"{fake_coder_bin}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_CODER_MODE", "wait")
     monkeypatch.setenv("FAKE_CODER_PIDS", str(pid_file))
-    monkeypatch.setattr(codex_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
+    monkeypatch.setattr(
+        codex_cli,
+        "_maybe_wrap_sandbox",
+        lambda cmd, _cwd, **_kwargs: cmd,
+    )
     monkeypatch.setattr(claude_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
 
     result = await _run_fake_adapter(provider, tmp_path, timeout=0.05)
@@ -581,7 +593,11 @@ async def test_async_adapter_cancellation_and_callback_failure_clean_descendants
 ) -> None:
     monkeypatch.setenv("PATH", f"{fake_coder_bin}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_CODER_MODE", "wait")
-    monkeypatch.setattr(codex_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
+    monkeypatch.setattr(
+        codex_cli,
+        "_maybe_wrap_sandbox",
+        lambda cmd, _cwd, **_kwargs: cmd,
+    )
     monkeypatch.setattr(claude_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
 
     cancel_pids = tmp_path / f"{provider}-cancel.pids"

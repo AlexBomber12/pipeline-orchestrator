@@ -158,6 +158,59 @@ async def test_run_codex_async_success(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_codex_async_keeps_reserved_credential_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    fake_proc = _make_fake_proc(returncode=0)
+    reserved_environment = {
+        "HOME": "/tmp/reserved-home",
+        "PATH": "/usr/bin",
+        "CODEX_HOME": "/tmp/reserved-codex-home",
+    }
+    monkeypatch.setattr(
+        codex_cli_module,
+        "load_config",
+        lambda: AppConfig.model_validate(
+            {
+                "auth": {
+                    "codex_home_dir": "/tmp/newly-configured-codex-home",
+                    "gh_config_dir": "/tmp/new-gh-home",
+                },
+                "daemon": {"coder_filesystem_isolation": True},
+            }
+        ),
+    )
+    monkeypatch.setattr(codex_cli_module, "is_bubblewrap_available", lambda: True)
+
+    def fake_bwrap(**kwargs: Any) -> list[str]:
+        captured["sandbox"] = kwargs
+        return kwargs["command"]
+
+    async def fake_create(*_args: Any, **kwargs: Any) -> MagicMock:
+        captured["process"] = kwargs
+        return fake_proc
+
+    monkeypatch.setattr(codex_cli_module, "build_bwrap_command", fake_bwrap)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    result = await run_codex_async(
+        "prompt",
+        "/tmp",
+        environment=reserved_environment,
+    )
+
+    assert result == (0, "", "")
+    assert captured["process"]["env"] == reserved_environment
+    assert captured["sandbox"]["coder_config_dir"] == (
+        "/tmp/reserved-codex-home"
+    )
+    assert captured["sandbox"]["additional_rw_dirs"] == [
+        "/tmp/reserved-home"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_run_codex_async_passes_toml_encoded_reasoning_effort_and_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

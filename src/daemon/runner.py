@@ -2393,17 +2393,56 @@ class PipelineRunner(
             and active_location == credential_location
         )
 
-    def _reserve_coder_credentials(self, coder_name: str) -> bool:
+    def _bind_reserved_coder_run_kwargs(
+        self,
+        coder_name: str,
+        credential_location: str,
+        invocation_kwargs: dict[str, Any],
+    ) -> None:
+        """Apply optional plugin context for the exact reserved credentials."""
+        plugin = self._registry.get_optional(coder_name)
+        binder = getattr(plugin, "build_credential_bound_run_kwargs", None)
+        if not callable(binder):
+            return
+        bound_kwargs = dict(
+            binder(
+                config=self.app_config,
+                credential_location=credential_location,
+            )
+        )
+        conflicts = invocation_kwargs.keys() & bound_kwargs.keys()
+        if conflicts:
+            raise ValueError(
+                "credential-bound coder kwargs conflict with invocation kwargs: "
+                + ", ".join(sorted(conflicts))
+            )
+        invocation_kwargs.update(bound_kwargs)
+
+    def _reserve_coder_credentials(
+        self,
+        coder_name: str,
+        *,
+        invocation_kwargs: dict[str, Any] | None = None,
+    ) -> bool:
         """Reserve this coder's credential location against device login."""
-        if self._credential_reservations is None:
-            return True
         if self._coder_credential_reservation is not None:
             return False
+        if (
+            self._credential_reservations is None
+            and invocation_kwargs is None
+        ):
+            return True
         try:
             location = self._device_login_credential_location(coder_name)
         except Exception:
             return False
         if location is None:
+            return True
+        if self._credential_reservations is None:
+            if invocation_kwargs is not None:
+                self._bind_reserved_coder_run_kwargs(
+                    coder_name, location, invocation_kwargs
+                )
             return True
         if not self._credential_reservations.reserve_coder(location):
             return False
@@ -2418,6 +2457,15 @@ class PipelineRunner(
             self._auth_status_cache_expires_at = None
             return False
         self._coder_credential_reservation = location
+        try:
+            if invocation_kwargs is not None:
+                self._bind_reserved_coder_run_kwargs(
+                    coder_name, location, invocation_kwargs
+                )
+        except BaseException:
+            self._credential_reservations.release_coder(location)
+            self._coder_credential_reservation = None
+            raise
         return True
 
     def _device_login_credential_location(

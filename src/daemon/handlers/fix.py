@@ -374,7 +374,10 @@ class FixMixin(BreachMixin):
             )
             if extra_context is not None:
                 fix_kwargs["extra_context"] = extra_context
-        if not self._reserve_coder_credentials(coder_name):
+        if not self._reserve_coder_credentials(
+            coder_name,
+            invocation_kwargs=fix_kwargs,
+        ):
             self.log_event(
                 "[FIX] Coder invocation deferred while device login owns "
                 "its credential location."

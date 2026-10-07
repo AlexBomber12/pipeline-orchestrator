@@ -613,6 +613,18 @@ class CoderLoginSessionManager:
                 )
                 return
             session.auth_status = parse_coder_auth_payload(auth)
+            if session.auth_status["saved_credentials_present"] is not True:
+                self._finish(
+                    session,
+                    state="failed",
+                    detail=(
+                        "Device-code login completed, but saved credentials "
+                        "could not be confirmed"
+                    ),
+                    failure_reason="auth_status_unavailable",
+                    cleanup_confirmed=True,
+                )
+                return
             self._finish(
                 session,
                 state="succeeded",

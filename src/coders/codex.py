@@ -418,6 +418,7 @@ class CodexPlugin:
         on_supervised_process_start: Callable[[SupervisedProcess], None]
         | None = None,
         reasoning_effort: str | None = None,
+        environment: dict[str, str] | None = None,
         **_kwargs: Any,
     ) -> tuple[int, str, str]:
         return await codex_cli.run_codex_async(
@@ -425,6 +426,7 @@ class CodexPlugin:
             repo_path,
             model=model or None,
             reasoning_effort=reasoning_effort,
+            environment=environment,
             timeout=timeout,
             on_process_start=on_process_start,
             on_supervised_process_start=on_supervised_process_start,
@@ -602,6 +604,7 @@ class CodexPlugin:
         on_supervised_process_start: Callable[[SupervisedProcess], None]
         | None = None,
         reasoning_effort: str | None = None,
+        environment: dict[str, str] | None = None,
         **_kwargs: Any,
     ) -> tuple[int, str, str]:
         return await codex_cli.diagnose_error_async(
@@ -609,6 +612,7 @@ class CodexPlugin:
             context,
             model=model or None,
             reasoning_effort=reasoning_effort,
+            environment=environment,
             on_process_start=on_process_start,
             on_supervised_process_start=on_supervised_process_start,
         )
@@ -628,3 +632,16 @@ class CodexPlugin:
         if reasoning_effort is not None:
             kwargs[_REASONING_EFFORT_SETTING] = reasoning_effort
         return kwargs
+
+    def build_credential_bound_run_kwargs(
+        self,
+        *,
+        config: AppConfig,
+        credential_location: str,
+    ) -> dict[str, Any]:
+        """Bind one invocation to the exact credential location it reserved."""
+        environment = codex_cli.build_codex_environment(
+            codex_home_dir=config.auth.codex_home_dir
+        )
+        environment["CODEX_HOME"] = credential_location
+        return {"environment": environment}

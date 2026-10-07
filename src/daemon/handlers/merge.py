@@ -170,7 +170,10 @@ class MergeMixin:
                                 self._track_current_coder_supervised_process
                             ),
                         }
-                        if not self._reserve_coder_credentials(coder_name):
+                        if not self._reserve_coder_credentials(
+                            coder_name,
+                            invocation_kwargs=auxiliary_kwargs,
+                        ):
                             git_ops._git(
                                 self.repo_path,
                                 "merge", "--abort",

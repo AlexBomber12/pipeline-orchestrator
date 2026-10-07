@@ -1654,6 +1654,45 @@ async def test_device_login_cancellation_wins_during_success_auth_probe(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("saved_credentials", [False, None])
+async def test_device_login_requires_confirmed_saved_credentials_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+    saved_credentials: bool | None,
+) -> None:
+    manager, _ = _manager()
+    session = coder_login._LoginSession(
+        "V" * 43,
+        "codex",
+        _REFERENCE,
+        _adapter(),
+        False,
+        1,
+        state="waiting_for_user",
+        verification_url="https://auth.openai.com/codex/device",
+        user_code="ABCD-EFGH",
+        managed=_Managed(),  # type: ignore[arg-type]
+    )
+
+    async def successful_run(*_args: object, **_kwargs: object) -> ProcessRunResult:
+        return ProcessRunResult(0, b"", b"")
+
+    async def auth_probe(*_args: object, **_kwargs: object) -> dict[str, Any]:
+        return _auth(saved_credentials)
+
+    monkeypatch.setattr(coder_login, "run_supervised_process", successful_run)
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", auth_probe)
+
+    await manager._run_owned_session(session)
+
+    assert session.state == "failed"
+    assert session.failure_reason == "auth_status_unavailable"
+    assert session.cleanup_confirmed is True
+    assert session.auth_status is not None
+    assert session.auth_status["saved_credentials_present"] is saved_credentials
+    assert "Saved credentials found" not in session.detail
+
+
+@pytest.mark.asyncio
 async def test_device_login_cancel_bounds_task_settlement(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

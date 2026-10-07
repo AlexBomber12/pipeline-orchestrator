@@ -137,6 +137,7 @@ def test_coder_credential_location_in_use_tracks_active_plugin_context(
 def test_runner_credential_reservations_coordinate_with_device_login(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     reservations = CoderCredentialReservations()
     runner = h._make_runner()
     runner._credential_reservations = reservations
@@ -148,6 +149,48 @@ def test_runner_credential_reservations_coordinate_with_device_login(
     assert reservations.reserve_login(location) is False
     runner._release_coder_credentials()
     runner._release_coder_credentials()
+
+    invocation_kwargs: dict[str, Any] = {"model": "gpt-test"}
+    assert runner._reserve_coder_credentials(
+        "codex",
+        invocation_kwargs=invocation_kwargs,
+    ) is True
+    assert invocation_kwargs["environment"]["CODEX_HOME"] == location
+    runner._release_coder_credentials()
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(codex, "build_credential_bound_run_kwargs", None)
+        unbound_kwargs: dict[str, Any] = {"model": "gpt-test"}
+        assert runner._reserve_coder_credentials(
+            "codex",
+            invocation_kwargs=unbound_kwargs,
+        ) is True
+        assert unbound_kwargs == {"model": "gpt-test"}
+        runner._release_coder_credentials()
+
+    runner._credential_reservations = None
+    uncoordinated_kwargs: dict[str, Any] = {}
+    assert runner._reserve_coder_credentials(
+        "codex",
+        invocation_kwargs=uncoordinated_kwargs,
+    ) is True
+    assert uncoordinated_kwargs["environment"]["CODEX_HOME"] == location
+    runner._credential_reservations = reservations
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            codex,
+            "build_credential_bound_run_kwargs",
+            lambda **_kwargs: {"model": "must-not-overwrite"},
+        )
+        with pytest.raises(ValueError, match="conflict"):
+            runner._reserve_coder_credentials(
+                "codex",
+                invocation_kwargs={"model": "gpt-test"},
+            )
+        assert runner._coder_credential_reservation is None
+        assert reservations.reserve_login(location) is True
+        reservations.release_login(location)
 
     assert reservations.reserve_login(location) is True
     assert runner._reserve_coder_credentials("codex") is False

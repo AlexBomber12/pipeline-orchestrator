@@ -238,7 +238,11 @@ def test_run_coder_with_supervision_defers_for_device_login(
     monkeypatch.setattr(
         coding_module.gh_prs, "get_branch_publications", lambda *_args: []
     )
-    monkeypatch.setattr(runner, "_reserve_coder_credentials", lambda _name: False)
+    monkeypatch.setattr(
+        runner,
+        "_reserve_coder_credentials",
+        lambda _name, **_kwargs: False,
+    )
     runner._current_breach_dir = "/tmp/breach-login"
     runner._current_breach_run_id = "run-login"
 
@@ -270,7 +274,11 @@ def test_run_coder_with_supervision_releases_reservation_on_schedule_failure(
     monkeypatch.setattr(
         coding_module.gh_prs, "get_branch_publications", lambda *_args: []
     )
-    monkeypatch.setattr(runner, "_reserve_coder_credentials", lambda _name: True)
+    monkeypatch.setattr(
+        runner,
+        "_reserve_coder_credentials",
+        lambda _name, **_kwargs: True,
+    )
     monkeypatch.setattr(
         runner, "_release_coder_credentials", lambda: released.append(True)
     )
@@ -986,7 +994,11 @@ def test_adapter_supervision_failure_blocks_publication_handoff(
     monkeypatch.setattr(runner, "_get_coder", lambda: ("codex", plugin))
     monkeypatch.setattr(runner, "_monitor_coding_publication", monitor)
     monkeypatch.setattr(codex_cli, "launch_process", launch)
-    monkeypatch.setattr(codex_cli, "_maybe_wrap_sandbox", lambda cmd, cwd: cmd)
+    monkeypatch.setattr(
+        codex_cli,
+        "_maybe_wrap_sandbox",
+        lambda cmd, cwd, **_kwargs: cmd,
+    )
 
     asyncio.run(runner.handle_coding())
 
@@ -1057,7 +1069,11 @@ def test_publication_cleanup_keeps_invocation_supervision_failure(
     monkeypatch.setattr(runner, "_monitor_coding_publication", monitor)
     monkeypatch.setattr(plugin, "run_auto_pr", run_auto_pr)
     monkeypatch.setattr(codex_cli, "launch_process", launch)
-    monkeypatch.setattr(codex_cli, "_maybe_wrap_sandbox", lambda cmd, cwd: cmd)
+    monkeypatch.setattr(
+        codex_cli,
+        "_maybe_wrap_sandbox",
+        lambda cmd, cwd, **_kwargs: cmd,
+    )
     monkeypatch.setattr(coding_module.gh_prs, "get_branch_publications", fetch)
     monkeypatch.setattr(
         coding_module,

@@ -797,6 +797,7 @@ def test_codex_plugin_diagnose_error_delegates(
         *,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        environment: dict[str, str] | None = None,
         on_process_start: object = None,
         on_supervised_process_start: object = None,
     ) -> tuple[int, str, str]:
@@ -804,6 +805,7 @@ def test_codex_plugin_diagnose_error_delegates(
         captured["context"] = context
         captured["model"] = model
         captured["reasoning_effort"] = reasoning_effort
+        captured["environment"] = environment
         captured["on_process_start"] = on_process_start
         captured["on_supervised_process_start"] = on_supervised_process_start
         return (0, "SKIP", "")
@@ -825,6 +827,7 @@ def test_codex_plugin_diagnose_error_delegates(
         "context": "ci red",
         "model": "gpt-5.4",
         "reasoning_effort": "high",
+        "environment": None,
         "on_process_start": None,
         "on_supervised_process_start": None,
     }

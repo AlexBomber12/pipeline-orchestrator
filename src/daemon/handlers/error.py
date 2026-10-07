@@ -296,7 +296,11 @@ class ErrorMixin:
         task_id = retry_task.pr_id if retry_task is not None else ""
         if task_id and await self._is_diagnose_exhausted(task_id):
             return
-        if not self._reserve_coder_credentials(coder_name):
+        credential_run_kwargs: dict[str, object] = {}
+        if not self._reserve_coder_credentials(
+            coder_name,
+            invocation_kwargs=credential_run_kwargs,
+        ):
             self.log_event(
                 "[ERROR] Diagnosis deferred while device login owns "
                 "the coder credential location."
@@ -337,6 +341,7 @@ class ErrorMixin:
             )
             auxiliary_kwargs = {
                 **plugin_run_kwargs,
+                **credential_run_kwargs,
                 "on_process_start": self._track_current_coder_process,
                 "on_supervised_process_start": (
                     self._track_current_coder_supervised_process

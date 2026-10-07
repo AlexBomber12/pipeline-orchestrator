@@ -57,7 +57,11 @@ def test_handle_fix_defers_for_device_login_without_counting_iteration(
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=77, branch="pr-login-reservation")
-    monkeypatch.setattr(runner, "_reserve_coder_credentials", lambda _name: False)
+    monkeypatch.setattr(
+        runner,
+        "_reserve_coder_credentials",
+        lambda _name, **_kwargs: False,
+    )
 
     asyncio.run(runner.handle_fix())
 
@@ -76,7 +80,11 @@ def test_handle_fix_releases_reservation_on_schedule_failure(
     plugin = runner._registry.get("claude")
     released: list[bool] = []
     monkeypatch.setattr(plugin, "fix_review", lambda *_args, **_kwargs: (0, "", ""))
-    monkeypatch.setattr(runner, "_reserve_coder_credentials", lambda _name: True)
+    monkeypatch.setattr(
+        runner,
+        "_reserve_coder_credentials",
+        lambda _name, **_kwargs: True,
+    )
     monkeypatch.setattr(
         runner, "_release_coder_credentials", lambda: released.append(True)
     )

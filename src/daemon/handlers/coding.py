@@ -475,7 +475,10 @@ class CodingMixin:
         else:
             publication_baseline = {item.number for item in baseline}
 
-        if not self._reserve_coder_credentials(coder_name):
+        if not self._reserve_coder_credentials(
+            coder_name,
+            invocation_kwargs=coder_kwargs,
+        ):
             self.log_event(
                 "[CODING] Coder invocation deferred while device login "
                 "owns its credential location."
