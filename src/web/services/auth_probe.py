@@ -1,6 +1,6 @@
 """Auth status probes for the dashboard's coder/gh credential indicators.
 
-Each probe spawns a CLI subprocess (``claude --version``, ``codex auth
+Each probe spawns a CLI subprocess (``claude --version``, ``codex login
 status``, ``gh auth status``) with a short timeout, so the dashboard can
 surface a green/red dot per coder without blocking the event loop. Probes
 read ``CONFIG_PATH`` lazily from :mod:`src.web.app` so test overrides
@@ -13,19 +13,35 @@ import asyncio
 import inspect
 import os
 import subprocess
+from typing import Any
 
-from src.coder_registry import CoderRegistry
+from src.coder_registry import (
+    CoderAuthCapabilities,
+    CoderAuthStatus,
+    CoderRegistry,
+    coder_auth_payload,
+)
 from src.coders import build_coder_registry
 from src.config import DEFAULT_CODER_PLUGINS, load_config
 
 _AUTH_CHECK_TIMEOUT_SEC = 5
 
-_AUTH_STATUS_CACHE: dict[str, dict[str, str]] | None = None
+_AUTH_STATUS_CACHE: dict[str, dict[str, Any]] | None = None
 
 
-def _default_auth_status() -> dict[str, dict[str, str]]:
+def _auth_error(detail: str, failure_reason: str) -> dict[str, Any]:
+    return coder_auth_payload(
+        CoderAuthStatus(
+            status="error",
+            detail=detail,
+            failure_reason=failure_reason,
+        )
+    )
+
+
+def _default_auth_status() -> dict[str, dict[str, Any]]:
     """Return placeholder auth status entries when no cached probe exists."""
-    unavailable = {"status": "error", "detail": "Status unavailable"}
+    unavailable = _auth_error("Status unavailable", "probe_unavailable")
     return {
         "claude": dict(unavailable),
         "codex": dict(unavailable),
@@ -33,7 +49,7 @@ def _default_auth_status() -> dict[str, dict[str, str]]:
     }
 
 
-def _get_cached_auth_status() -> dict[str, dict[str, str]]:
+def _get_cached_auth_status() -> dict[str, dict[str, Any]]:
     """Return the last collected auth status, if available."""
     source = _AUTH_STATUS_CACHE or _default_auth_status()
     return {key: dict(value) for key, value in source.items()}
@@ -107,7 +123,7 @@ def _config_path() -> str:
 def _check_coder_auth(
     registry: CoderRegistry,
     plugin_id: str,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Probe one startup-registered coder in the active config context."""
     plugin = registry.get(plugin_id)
     try:
@@ -117,27 +133,33 @@ def _check_coder_auth(
             if "config_path" in inspect.signature(check_auth).parameters
             else {}
         )
-        return check_auth(**kwargs)
+        result = check_auth(**kwargs)
+        capabilities = getattr(plugin, "auth_capabilities", None)
+        if capabilities is not None and not isinstance(
+            capabilities, CoderAuthCapabilities
+        ):
+            raise TypeError("invalid auth capabilities")
+        return coder_auth_payload(result, capabilities=capabilities)
     except Exception as exc:
-        return {
-            "status": "error",
-            "detail": (
+        return _auth_error(
+            (
                 f"{plugin.display_name} auth check failed "
                 f"({type(exc).__name__})"
             ),
-        }
+            "probe_failed",
+        )
 
 
 def _check_claude_auth(
     registry: CoderRegistry | None = None,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Probe the ``claude`` CLI and report its authorization status."""
     return _check_coder_auth(registry or build_coder_registry(), "claude")
 
 
 def _check_codex_auth(
     registry: CoderRegistry | None = None,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Probe the ``codex`` CLI and report its authorization status."""
     return _check_coder_auth(registry or build_coder_registry(), "codex")
 
@@ -145,15 +167,15 @@ def _check_codex_auth(
 async def _bounded_coder_auth_probe(
     registry: CoderRegistry,
     plugin_id: str,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Run one plugin probe with a deadline that also ends its worker."""
     plugin = registry.get(plugin_id)
     reference = registry.reference_for(plugin_id)
     if reference is None:
-        return {
-            "status": "error",
-            "detail": f"{plugin.display_name} auth check is unavailable",
-        }
+        return _auth_error(
+            f"{plugin.display_name} auth check is unavailable",
+            "probe_unavailable",
+        )
     if reference != DEFAULT_CODER_PLUGINS.get(plugin_id):
         return await _daemon_coder_auth_probe(
             plugin_id,
@@ -168,26 +190,26 @@ async def _daemon_coder_auth_probe(
     plugin_id: str,
     reference: str,
     display_name: str,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Ask the daemon to own a configured plugin auth probe."""
     from src.web import app as _app
 
     bridge = getattr(_app.app.state, "plugin_bridge", None)
     if bridge is None:
-        return {
-            "status": "error",
-            "detail": f"{display_name} auth check is unavailable",
-        }
+        return _auth_error(
+            f"{display_name} auth check is unavailable",
+            "daemon_unavailable",
+        )
     try:
         return await bridge.load_auth_status(
             plugin_id,
             expected_reference=reference,
         )
     except Exception:
-        return {
-            "status": "error",
-            "detail": f"{display_name} auth check is unavailable from daemon",
-        }
+        return _auth_error(
+            f"{display_name} auth check is unavailable from daemon",
+            "daemon_unavailable",
+        )
 
 
 def _check_gh_auth() -> dict[str, str]:
@@ -217,7 +239,7 @@ def _check_gh_auth() -> dict[str, str]:
 
 async def _collect_auth_status(
     registry: CoderRegistry | None = None,
-) -> dict[str, dict[str, str]]:
+) -> dict[str, dict[str, Any]]:
     """Return auth status for every registered coder plus GitHub CLI.
 
     Each probe invokes a blocking ``subprocess.run`` call with a 5s
@@ -237,3 +259,28 @@ async def _collect_auth_status(
     global _AUTH_STATUS_CACHE
     _AUTH_STATUS_CACHE = dict(zip((*plugin_ids, "gh"), results, strict=True))
     return _get_cached_auth_status()
+
+
+def auth_status_view(entry: dict[str, Any]) -> dict[str, str]:
+    """Return generic presentation metadata for one auth contract."""
+    if entry.get("service_access_verified") is True:
+        return {"label": "Access verified", "tone": "ok"}
+    if entry.get("service_access_verified") is False:
+        return {"label": "Access failed", "tone": "fail"}
+    if entry.get("saved_credentials_present") is False:
+        return {"label": "Credentials missing", "tone": "fail"}
+    if entry.get("cli_available") is False:
+        return {"label": "CLI unavailable", "tone": "fail"}
+    if entry.get("failure_reason") in {
+        "daemon_unavailable",
+        "probe_timeout",
+        "probe_unavailable",
+    }:
+        return {"label": "Status unavailable", "tone": "warn"}
+    if entry.get("status") == "error":
+        return {"label": "Error", "tone": "fail"}
+    if entry.get("saved_credentials_present") is True:
+        return {"label": "Credentials saved", "tone": "warn"}
+    if entry.get("status") == "ok":
+        return {"label": "Available", "tone": "ok"}
+    return {"label": "Error", "tone": "fail"}

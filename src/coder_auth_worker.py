@@ -7,6 +7,11 @@ import json
 import sys
 from typing import Any
 
+from src.coder_registry import (
+    CoderAuthCapabilities,
+    CoderAuthStatus,
+    coder_auth_payload,
+)
 from src.coders import _load_plugin
 
 RESULT_PREFIX = "PIPELINE_AUTH_RESULT:"
@@ -16,7 +21,7 @@ def run_probe(
     plugin_id: str,
     reference: str,
     config_path: str,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Load one startup reference and return a redacted auth status."""
     display_name = plugin_id
     try:
@@ -29,22 +34,22 @@ def run_probe(
             else {}
         )
         result: Any = check_auth(**kwargs)
-        if (
-            not isinstance(result, dict)
-            or result.get("status") not in {"ok", "error"}
-            or not isinstance(result.get("detail"), str)
-            or not all(
-                isinstance(key, str) and isinstance(value, str)
-                for key, value in result.items()
-            )
+        capabilities = getattr(plugin, "auth_capabilities", None)
+        if capabilities is not None and not isinstance(
+            capabilities, CoderAuthCapabilities
         ):
-            raise TypeError("invalid auth status")
-        return result
+            raise TypeError("invalid auth capabilities")
+        return coder_auth_payload(result, capabilities=capabilities)
     except Exception as exc:
-        return {
-            "status": "error",
-            "detail": f"{display_name} auth check failed ({type(exc).__name__})",
-        }
+        return coder_auth_payload(
+            CoderAuthStatus(
+                status="error",
+                detail=(
+                    f"{display_name} auth check failed ({type(exc).__name__})"
+                ),
+                failure_reason="probe_failed",
+            )
+        )
 
 
 def main() -> None:

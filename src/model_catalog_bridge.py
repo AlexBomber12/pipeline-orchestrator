@@ -21,6 +21,7 @@ from src.coder_registry import (
     ModelMetadata,
     ModelReasoningEffort,
     ModelSetting,
+    parse_coder_auth_payload,
 )
 from src.config import DEFAULT_CODER_PLUGINS, AppConfig, load_config
 
@@ -66,21 +67,13 @@ def _plugin_metadata_payload(plugin: CoderPlugin) -> dict[str, Any]:
     }
 
 
-def _parse_auth_status(payload: object) -> dict[str, str]:
+def _parse_auth_status(payload: object) -> dict[str, Any]:
     if not isinstance(payload, dict) or payload.get("ok") is not True:
         raise ModelCatalogUnavailable("Daemon coder auth status is unavailable")
-    status = payload.get("auth")
-    if (
-        not isinstance(status, dict)
-        or status.get("status") not in {"ok", "error"}
-        or not isinstance(status.get("detail"), str)
-        or not all(
-            isinstance(key, str) and isinstance(value, str)
-            for key, value in status.items()
-        )
-    ):
+    try:
+        return parse_coder_auth_payload(payload.get("auth"))
+    except TypeError:
         raise ModelCatalogUnavailable("Daemon returned invalid coder auth status")
-    return status
 
 
 def _parse_plugin_metadata(
@@ -317,7 +310,7 @@ class DaemonModelCatalogLoader:
         plugin_id: str,
         *,
         expected_reference: str,
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """Run one configured auth probe inside the daemon boundary."""
         return _parse_auth_status(
             await self._request(

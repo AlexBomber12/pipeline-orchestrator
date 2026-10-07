@@ -24,7 +24,12 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from src.audit.webhook_log import write_webhook_audit
-from src.coder_registry import CoderPlugin, CoderRegistry
+from src.coder_registry import (
+    CoderAuthStatus,
+    CoderPlugin,
+    CoderRegistry,
+    coder_auth_payload,
+)
 from src.config import (
     AppConfig,
     DaemonConfig,
@@ -35,6 +40,7 @@ from src.utils import repo_slug_from_url
 from src.web.services.auth_probe import (
     _collect_auth_status,
     _get_cached_auth_status,
+    auth_status_view,
 )
 from src.web.services.coder import (
     _coder_display_name,
@@ -199,7 +205,7 @@ def _coerce_int(
 
 def _build_coder_rows(
     config: AppConfig,
-    auth: dict[str, dict[str, str]],
+    auth: dict[str, dict[str, Any]],
     catalogs: dict[str, ModelCatalogSnapshot],
     registry: CoderRegistry,
     *,
@@ -209,6 +215,16 @@ def _build_coder_rows(
     coder_messages = coder_messages or {}
     rows: list[dict[str, Any]] = []
     for plugin in registry.list_coders():
+        auth_entry = auth.get(
+            plugin.name,
+            coder_auth_payload(
+                CoderAuthStatus(
+                    status="error",
+                    detail=f"{plugin.display_name} unavailable",
+                    failure_reason="probe_unavailable",
+                )
+            ),
+        )
         setting = plugin.model_setting
         metadata_available = getattr(plugin, "metadata_available", True)
         selected_model = plugin.resolve_model(config.daemon)
@@ -290,13 +306,8 @@ def _build_coder_rows(
                 "selected_model": selected_model,
                 "reasoning_effort": reasoning_effort,
                 "metadata_available": metadata_available,
-                "auth": auth.get(
-                    plugin.name,
-                    {
-                        "status": "error",
-                        "detail": f"{plugin.display_name} unavailable",
-                    },
-                ),
+                "auth": auth_entry,
+                "auth_view": auth_status_view(auth_entry),
                 "is_default": config.daemon.coder == plugin.name,
                 "runtime_selectable": metadata_available,
             }
@@ -1243,7 +1254,12 @@ async def partial_settings_auth_status(request: Request) -> HTMLResponse:
     return _app.templates.TemplateResponse(
         request,
         "components/settings_auth.html",
-        {"auth": auth},
+        {
+            "auth": auth,
+            "auth_views": {
+                key: auth_status_view(entry) for key, entry in auth.items()
+            },
+        },
     )
 
 

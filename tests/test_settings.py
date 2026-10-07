@@ -7,6 +7,7 @@ import re
 import subprocess
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -30,6 +31,34 @@ from src.web.app import app
 from src.web.services import auth_probe as _auth_probe
 from src.web.services import model_catalog as _model_catalog
 from src.web.services.model_catalog import ModelCatalogCache
+
+_UNKNOWN_AUTH_CAPABILITIES = {
+    "can_check_cli": None,
+    "can_check_saved_credentials": None,
+    "can_report_authentication_mode": None,
+    "can_verify_service_access": None,
+    "interactive_login_methods": None,
+}
+
+
+def _assert_legacy_auth_contract(
+    result: dict[str, Any],
+    *,
+    status: str,
+    detail: str,
+    failure_reason: str | None = None,
+) -> None:
+    assert result == {
+        "status": status,
+        "detail": detail,
+        "cli_available": None,
+        "cli_version": None,
+        "saved_credentials_present": None,
+        "authentication_mode": None,
+        "service_access_verified": None,
+        "failure_reason": failure_reason,
+        "capabilities": _UNKNOWN_AUTH_CAPABILITIES,
+    }
 
 
 class _StubAioredisClient:
@@ -2986,14 +3015,16 @@ def test_api_auth_status_uses_every_configured_plugin(
         response = client.get("/api/auth-status")
 
     assert response.status_code == 200
-    assert response.json()["claude"] == {
-        "status": "ok",
-        "detail": "configured plugin auth",
-    }
-    assert response.json()["third"] == {
-        "status": "ok",
-        "detail": "configured test plugin auth",
-    }
+    _assert_legacy_auth_contract(
+        response.json()["claude"],
+        status="ok",
+        detail="configured plugin auth",
+    )
+    _assert_legacy_auth_contract(
+        response.json()["third"],
+        status="ok",
+        detail="configured test plugin auth",
+    )
 
 
 def test_configured_plugin_auth_failure_is_isolated_and_redacted(
@@ -3016,10 +3047,12 @@ def test_configured_plugin_auth_failure_is_isolated_and_redacted(
 
     assert api_response.status_code == 200
     assert settings_response.status_code == 200
-    assert api_response.json()["third"] == {
-        "status": "error",
-        "detail": "Configured Test Coder auth check failed (RuntimeError)",
-    }
+    _assert_legacy_auth_contract(
+        api_response.json()["third"],
+        status="error",
+        detail="Configured Test Coder auth check failed (RuntimeError)",
+        failure_reason="probe_failed",
+    )
     assert "must-not-leak" not in api_response.text
     assert "must-not-leak" not in settings_response.text
 
@@ -3043,10 +3076,12 @@ def test_configured_plugin_auth_probe_has_response_timeout(
         response = client.get("/api/auth-status")
 
     assert response.status_code == 200
-    assert response.json()["third"] == {
-        "status": "error",
-        "detail": "Configured Test Coder auth check timed out after 0.01s",
-    }
+    _assert_legacy_auth_contract(
+        response.json()["third"],
+        status="error",
+        detail="Configured Test Coder auth check timed out after 0.01s",
+        failure_reason="probe_timeout",
+    )
 
 
 def test_direct_coder_auth_probe_redacts_plugin_exception() -> None:
@@ -3055,10 +3090,55 @@ def test_direct_coder_auth_probe_redacts_plugin_exception() -> None:
     registry = CoderRegistry()
     registry.register(RaisingAuthTestPlugin())
 
-    assert _auth_probe._check_coder_auth(registry, "third") == {
-        "status": "error",
-        "detail": "Configured Test Coder auth check failed (RuntimeError)",
-    }
+    _assert_legacy_auth_contract(
+        _auth_probe._check_coder_auth(registry, "third"),
+        status="error",
+        detail="Configured Test Coder auth check failed (RuntimeError)",
+        failure_reason="probe_failed",
+    )
+
+
+def test_direct_coder_auth_probe_rejects_invalid_capabilities() -> None:
+    class _InvalidCapabilitiesPlugin:
+        name = "third"
+        display_name = "Third Coder"
+        auth_capabilities = {"can_check_cli": True}
+
+        def check_auth(self) -> dict[str, str]:
+            return {"status": "ok", "detail": "must-not-pass"}
+
+    registry = CoderRegistry()
+    registry.register(_InvalidCapabilitiesPlugin())  # type: ignore[arg-type]
+
+    _assert_legacy_auth_contract(
+        _auth_probe._check_coder_auth(registry, "third"),
+        status="error",
+        detail="Third Coder auth check failed (TypeError)",
+        failure_reason="probe_failed",
+    )
+
+
+def test_daemon_coder_auth_probe_classifies_bridge_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FailingBridge:
+        async def load_auth_status(self, *_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("must-not-leak")
+
+    monkeypatch.setattr(web_app.app.state, "plugin_bridge", _FailingBridge())
+
+    result = asyncio.run(
+        _auth_probe._daemon_coder_auth_probe(
+            "third", "module:factory", "Third Coder"
+        )
+    )
+
+    _assert_legacy_auth_contract(
+        result,
+        status="error",
+        detail="Third Coder auth check is unavailable from daemon",
+        failure_reason="daemon_unavailable",
+    )
 
 
 def test_configured_auth_probe_degrades_without_daemon_bridge(
@@ -3083,10 +3163,12 @@ def test_configured_auth_probe_degrades_without_daemon_bridge(
         _auth_probe._bounded_coder_auth_probe(registry, "third")
     )
 
-    assert result == {
-        "status": "error",
-        "detail": "Third Coder auth check is unavailable",
-    }
+    _assert_legacy_auth_contract(
+        result,
+        status="error",
+        detail="Third Coder auth check is unavailable",
+        failure_reason="daemon_unavailable",
+    )
 
 
 def test_auth_probe_worker_normalizes_results(
@@ -3106,10 +3188,11 @@ def test_auth_probe_worker_normalizes_results(
         "_load_plugin",
         lambda _plugin_id, _reference: _WithConfigPath(),
     )
-    assert _auth_worker.run_probe("third", "module:factory", "/cfg") == {
-        "status": "ok",
-        "detail": "ready",
-    }
+    _assert_legacy_auth_contract(
+        _auth_worker.run_probe("third", "module:factory", "/cfg"),
+        status="ok",
+        detail="ready",
+    )
     assert seen == ["/cfg"]
 
     class _InvalidResult:
@@ -3123,10 +3206,31 @@ def test_auth_probe_worker_normalizes_results(
         "_load_plugin",
         lambda _plugin_id, _reference: _InvalidResult(),
     )
-    assert _auth_worker.run_probe("third", "module:factory", "/cfg") == {
-        "status": "error",
-        "detail": "Invalid Coder auth check failed (TypeError)",
-    }
+    _assert_legacy_auth_contract(
+        _auth_worker.run_probe("third", "module:factory", "/cfg"),
+        status="error",
+        detail="Invalid Coder auth check failed (TypeError)",
+        failure_reason="probe_failed",
+    )
+
+    class _InvalidCapabilities:
+        display_name = "Invalid Capabilities"
+        auth_capabilities = {"can_check_cli": True}
+
+        def check_auth(self) -> dict[str, str]:
+            return {"status": "ok", "detail": "must-not-pass"}
+
+    monkeypatch.setattr(
+        _auth_worker,
+        "_load_plugin",
+        lambda _plugin_id, _reference: _InvalidCapabilities(),
+    )
+    _assert_legacy_auth_contract(
+        _auth_worker.run_probe("third", "module:factory", "/cfg"),
+        status="error",
+        detail="Invalid Capabilities auth check failed (TypeError)",
+        failure_reason="probe_failed",
+    )
 
     monkeypatch.setattr(
         _auth_worker,
@@ -3135,10 +3239,12 @@ def test_auth_probe_worker_normalizes_results(
             RuntimeError("must-not-leak")
         ),
     )
-    assert _auth_worker.run_probe("third", "module:factory", "/cfg") == {
-        "status": "error",
-        "detail": "third auth check failed (RuntimeError)",
-    }
+    _assert_legacy_auth_contract(
+        _auth_worker.run_probe("third", "module:factory", "/cfg"),
+        status="error",
+        detail="third auth check failed (RuntimeError)",
+        failure_reason="probe_failed",
+    )
 
 
 def test_auth_probe_worker_main_validates_arguments_and_prints_result(
@@ -3216,7 +3322,14 @@ def test_isolated_auth_probe_rejects_worker_failures_and_invalid_output(
         )
     )
 
-    assert result == {"status": "error", "detail": expected_detail}
+    _assert_legacy_auth_contract(
+        result,
+        status="error",
+        detail=expected_detail,
+        failure_reason=(
+            "probe_failed" if returncode != 0 else "unrecognized_output"
+        ),
+    )
 
 
 def test_isolated_auth_probe_redacts_worker_start_failure(
@@ -3240,10 +3353,12 @@ def test_isolated_auth_probe_redacts_worker_start_failure(
         )
     )
 
-    assert result == {
-        "status": "error",
-        "detail": "Worker auth check failed (OSError)",
-    }
+    _assert_legacy_auth_contract(
+        result,
+        status="error",
+        detail="Worker auth check failed (OSError)",
+        failure_reason="probe_failed",
+    )
 
 
 def test_isolated_auth_probe_handles_worker_exit_during_timeout_cleanup(
@@ -3284,10 +3399,12 @@ def test_isolated_auth_probe_handles_worker_exit_during_timeout_cleanup(
         )
     )
 
-    assert result == {
-        "status": "error",
-        "detail": "Worker auth check timed out after 0.001s",
-    }
+    _assert_legacy_auth_contract(
+        result,
+        status="error",
+        detail="Worker auth check timed out after 0.001s",
+        failure_reason="probe_timeout",
+    )
 
 
 def test_isolated_auth_probe_terminates_worker_when_caller_is_cancelled(
@@ -3369,23 +3486,64 @@ def test_api_auth_status_reports_errors(
 
 def test_default_auth_status_and_first_probe_line_helpers() -> None:
     default = web_app._default_auth_status()
-    assert default["claude"] == {
-        "status": "error",
-        "detail": "Status unavailable",
-    }
-    assert default["codex"] == {
-        "status": "error",
-        "detail": "Status unavailable",
-    }
-    assert default["gh"] == {
-        "status": "error",
-        "detail": "Status unavailable",
-    }
+    for entry in default.values():
+        _assert_legacy_auth_contract(
+            entry,
+            status="error",
+            detail="Status unavailable",
+            failure_reason="probe_unavailable",
+        )
     assert web_app._first_probe_line("") == ""
     assert (
         web_app._first_probe_line("warning: noisy\n\nready\nnext")
         == "ready"
     )
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        (
+            {"service_access_verified": True},
+            {"label": "Access verified", "tone": "ok"},
+        ),
+        (
+            {
+                "status": "ok",
+                "saved_credentials_present": True,
+                "service_access_verified": False,
+            },
+            {"label": "Access failed", "tone": "fail"},
+        ),
+        (
+            {"saved_credentials_present": True},
+            {"label": "Credentials saved", "tone": "warn"},
+        ),
+        (
+            {"saved_credentials_present": False},
+            {"label": "Credentials missing", "tone": "fail"},
+        ),
+        (
+            {"cli_available": False},
+            {"label": "CLI unavailable", "tone": "fail"},
+        ),
+        (
+            {"failure_reason": "probe_timeout"},
+            {"label": "Status unavailable", "tone": "warn"},
+        ),
+        (
+            {"status": "error", "saved_credentials_present": True},
+            {"label": "Error", "tone": "fail"},
+        ),
+        ({"status": "ok"}, {"label": "Available", "tone": "ok"}),
+        ({"status": "error"}, {"label": "Error", "tone": "fail"}),
+        ({}, {"label": "Error", "tone": "fail"}),
+    ],
+)
+def test_auth_status_view_is_generic(
+    entry: dict[str, Any], expected: dict[str, str]
+) -> None:
+    assert _auth_probe.auth_status_view(entry) == expected
 
 
 def test_run_auth_command_reports_missing_binary_and_permission_error(
@@ -3666,9 +3824,42 @@ def test_api_auth_status_reports_codex_version_and_installation(
     assert response.status_code == 200
     payload = response.json()
     assert payload["codex"]["status"] == "ok"
-    assert "codex-cli 0.121.0" in payload["codex"]["detail"]
-    assert "installed" in payload["codex"]["detail"]
-    assert "Logged in with ChatGPT" in payload["codex"]["detail"]
+    assert payload["codex"]["cli_available"] is True
+    assert payload["codex"]["cli_version"] == "0.121.0"
+    assert payload["codex"]["saved_credentials_present"] is True
+    assert payload["codex"]["authentication_mode"] == "chatgpt"
+    assert payload["codex"]["service_access_verified"] is None
+    assert payload["codex"]["capabilities"] == {
+        "can_check_cli": True,
+        "can_check_saved_credentials": True,
+        "can_report_authentication_mode": True,
+        "can_verify_service_access": False,
+        "interactive_login_methods": ["browser_oauth", "device_code"],
+    }
+    assert "service access not verified" in payload["codex"]["detail"]
+
+
+def test_settings_and_api_agree_saved_credentials_are_not_verified_access(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_fake_subprocess(
+        monkeypatch,
+        claude=_FakeCompleted(0, stdout="claude 1.2.3\n"),
+        gh=_FakeCompleted(1, stderr="Not logged in\n"),
+        codex=_FakeCompleted(0, stdout="Logged in using ChatGPT\n"),
+        codex_version=_FakeCompleted(0, stdout="codex 0.160.0\n"),
+    )
+
+    with TestClient(app) as client:
+        api_response = client.get("/api/auth-status")
+        settings_response = client.get("/settings")
+
+    codex = api_response.json()["codex"]
+    assert codex["saved_credentials_present"] is True
+    assert codex["service_access_verified"] is None
+    assert "Credentials saved" in settings_response.text
+    assert "service access not verified" in settings_response.text
+    assert "Authorized" not in settings_response.text
 
 
 def test_settings_repo_list_shows_no_ci_merge_checkbox(
@@ -4181,18 +4372,24 @@ def test_coders_table_shows_auth_status(
         gh=_FakeCompleted(
             0, stderr="github.com\n  ✓ Logged in to github.com as octocat\n"
         ),
-        codex=_FakeCompleted(1, stderr="codex not authenticated"),
+        codex=_FakeCompleted(1, stderr="Not logged in"),
         codex_version=_FakeCompleted(0, stdout="codex-cli 0.121.0\n"),
     )
 
     with TestClient(app) as client:
         response = client.get("/settings")
+        api_response = client.get("/api/auth-status")
 
     assert response.status_code == 200
     body = response.text
-    assert "Authorized" in body
-    assert "codex not authenticated" in body
+    assert "Credentials missing" in body
+    assert "no saved credentials found" in body
     assert "GitHub CLI" in body
+    codex = api_response.json()["codex"]
+    assert codex["cli_available"] is True
+    assert codex["saved_credentials_present"] is False
+    assert codex["service_access_verified"] is None
+    assert codex["failure_reason"] == "credentials_missing"
 
 
 def test_coders_table_renders_without_polling_after_sse_migration(
