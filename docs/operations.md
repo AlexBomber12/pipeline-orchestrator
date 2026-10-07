@@ -59,16 +59,17 @@ use assignment, structured-field, header, or long-option syntax, so malformed
 or interrupted quoting cannot expose a value suffix. Indented YAML/header
 continuations, backslash-continued shell values, and quoted values spanning
 physical lines are omitted with their key line through the close or source end.
-This includes legal indentationless YAML sequence values under a credential key.
+This includes leading blank lines and legal indentationless YAML sequence values
+under a credential key.
 Terminal escape and control sequences, including C1 control strings, are
 normalized before credential inspection. The source suffix beginning with the
 first bare carriage return or stateful cursor/editing control is omitted
 conservatively, preventing terminal overwrite semantics or lost multiline
 context from exposing a hidden credential. Credential-key inspection normalizes
 separated, camel-case, single-case compound, and bracketed parameter names,
-recognizes common multiword labels such as `API key`, and uses a bounded-source,
-single-pass line scanner so long non-credential lines do not cause regex
-backtracking stalls.
+quoted mapping subscripts, and common multiword labels such as `API key`; it uses
+a bounded-source, single-pass line scanner so long non-credential lines do not
+cause regex backtracking stalls.
 Malformed or incomplete JSON containers with credential contexts are omitted
 through their closing boundary or, when unterminated, through the source end;
 legal whitespace may separate a credential key, delimiter, and value.

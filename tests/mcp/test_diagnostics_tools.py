@@ -490,6 +490,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "auth[password]=nested-bracket-secret",
             "AZURE_STORAGE_KEY=azure-storage-secret",
             "DefaultEndpointsProtocol=https;AccountName=demo;AccountKey=azure-account-secret",
+            'config["password"] = subscript-password-secret',
+            "env['API_TOKEN']=subscript-token-secret",
             "SSH_KEY_PASSPHRASE=passphrase-assignment-secret",
             "tool --passphrase passphrase-option-secret",
             "jwt=jwt-assignment-secret",
@@ -526,6 +528,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "password:",
             "- indentationless-yaml-secret",
             "safe-after-yaml-sequence",
+            "password:",
+            "",
+            "  yaml-leading-blank-secret",
+            "safe-after-yaml-blank",
             "PASSWORD=" + "\\",
             "shell-multiline-secret",
             "safe-after-shell",
@@ -561,6 +567,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "[credential line omitted]" in exported
     assert "safe-after-yaml" in exported
     assert "safe-after-yaml-sequence" in exported
+    assert "safe-after-yaml-blank" in exported
     assert "safe-after-shell" in exported
     assert "safe-after-quote" in exported
     assert "visible-control" in exported
@@ -613,6 +620,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "nested-bracket-secret",
         "azure-storage-secret",
         "azure-account-secret",
+        "subscript-password-secret",
+        "subscript-token-secret",
         "passphrase-assignment-secret",
         "passphrase-option-secret",
         "jwt-assignment-secret",
@@ -640,6 +649,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "same-line-trailing-secret",
         "yaml-multiline-secret",
         "indentationless-yaml-secret",
+        "yaml-leading-blank-secret",
         "shell-multiline-secret",
         "quoted-multiline-secret",
         "malformed-private-secret",

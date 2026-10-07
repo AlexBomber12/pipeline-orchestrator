@@ -124,7 +124,7 @@ _SENSITIVE_MULTIWORD_LABEL = re.compile(
 _SENSITIVE_KEY_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-%+[]"
 )
-_SENSITIVE_KEY_WRAPPERS = frozenset("\\\"'")
+_SENSITIVE_KEY_WRAPPERS = frozenset("\\\"']")
 _JSON_SIMPLE_ESCAPE_VALUES = {
     '"': '"',
     "\\": "\\",
@@ -1261,7 +1261,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
         while index < len(lines):
             continuation = lines[index].rstrip("\r\n")
             indented = continuation.startswith((" ", "\t"))
-            blank_in_block = indented_block and not continuation
+            blank_in_block = (yaml_block or indented_block) and not continuation
             indentationless_sequence = yaml_block and (
                 continuation == "-" or continuation.startswith("- ")
             )
