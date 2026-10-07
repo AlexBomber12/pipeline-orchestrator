@@ -485,6 +485,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "API key: whitespace-label-secret",
             "secret key = whitespace-secret-key",
             "auth[password]=nested-bracket-secret",
+            "SSH_KEY_PASSPHRASE=passphrase-assignment-secret",
+            "tool --passphrase passphrase-option-secret",
             'tool --password cli-option-secret --token "quoted cli token"',
             r'tool --password "abc\"escaped-option-secret" token="abc\"escaped-assignment-secret"',
             "PASSWORD = spaced-assignment-secret",
@@ -588,6 +590,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "whitespace-label-secret",
         "whitespace-secret-key",
         "nested-bracket-secret",
+        "passphrase-assignment-secret",
+        "passphrase-option-secret",
         "cli-option-secret",
         "quoted cli token",
         "escaped-option-secret",
@@ -652,6 +656,15 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     split_key_json = await diagnostics.get_latest_cli_log(SLUG)
     assert split_key_json["text"] == "[credential document omitted]"
     assert "split-key-document-secret" not in split_key_json["text"]
+
+    escaped_key_json_redis = FakeRedis()
+    escaped_key_json_redis.store[key] = (
+        '{"pass\\u0077ord":\n"escaped-key-document-secret"\n'
+    )
+    _patch_runtime(monkeypatch, escaped_key_json_redis)
+    escaped_key_json = await diagnostics.get_latest_cli_log(SLUG)
+    assert escaped_key_json["text"] == "[credential document omitted]"
+    assert "escaped-key-document-secret" not in escaped_key_json["text"]
 
     unterminated_quote_redis = FakeRedis()
     unterminated_quote_redis.store[key] = 'safe-before\nPASSWORD="alpha\nunterminated-quote-secret'

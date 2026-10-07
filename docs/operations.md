@@ -40,8 +40,8 @@ is 8 KiB and callers may request at most 32 KiB. The service accepts the
 producer 64 KiB byte budget plus its bounded six-byte UTF-8 replacement
 expansion, redacts the complete bounded source before selecting the tail, and
 reports source/output sizes, truncation, observation time, and remaining Redis
-TTL. Authorization headers, token and password assignments or long-option
-arguments,
+TTL. Authorization headers, token, password, and passphrase assignments or
+long-option arguments,
 cookies, credential-bearing absolute or scheme-relative URL userinfo/query
 parameters (including percent-encoded parameter names), recognizable token
 shapes, private-key blocks, and recognizable JSON credential documents are not
@@ -65,6 +65,7 @@ scanner so long non-credential lines do not cause regex backtracking stalls.
 Malformed or incomplete JSON containers with credential contexts are omitted
 through their closing boundary or, when unterminated, through the source end;
 legal whitespace may separate a credential key, delimiter, and value.
+JSON Unicode escapes in credential keys are decoded during fallback inspection.
 Malformed JSON probing has a fixed failure budget; if that budget is
 exhausted, export fails closed to a credential-document omission marker instead
 of blocking the MCP event loop or returning text that could not be inspected

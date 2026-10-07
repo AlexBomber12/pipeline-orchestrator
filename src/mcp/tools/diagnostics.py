@@ -71,6 +71,7 @@ _CREDENTIAL_DOCUMENT_KEYS = frozenset(
         "cookie",
         "idtoken",
         "oauthtoken",
+        "passphrase",
         "password",
         "passwd",
         "privatekey",
@@ -99,6 +100,7 @@ _TERMINAL_CSI = re.compile(r"(?:\x1b\[|\x9b)[0-?]*[ -/]*(?P<final>[@-~])")
 _TERMINAL_STATEFUL_ESCAPE = re.compile(r"\x1b[78DEHM]")
 _C1_CONTROL_STRING = re.compile(r"[\x90\x98\x9d-\x9f].*?(?:\x9c|\x07|$)", re.DOTALL)
 _JSON_CONTAINER_START = re.compile(r"[\[{]")
+_JSON_UNICODE_ESCAPE = re.compile(r"\\u(?P<codepoint>[0-9a-fA-F]{4})")
 _URL_USERINFO = re.compile(r"(?i)(?P<scheme>(?:\b[a-z][a-z0-9+.-]*:)?//)[^/@\s]+@")
 _SENSITIVE_MULTIWORD_LABEL = re.compile(
     r"(?i)(?<![A-Za-z0-9])(?:"
@@ -109,7 +111,7 @@ _SENSITIVE_MULTIWORD_LABEL = re.compile(
     r")\s*[=:]"
 )
 _SENSITIVE_KEY_CHARACTERS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-%+[]"
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-%+[]\\"
 )
 _SENSITIVE_KEY_WRAPPERS = frozenset("\\\"'")
 _RECOGNIZABLE_SECRET = tuple(
@@ -1048,7 +1050,11 @@ def _omit_pem_credential_documents(text: str) -> tuple[str, int]:
 
 def _is_sensitive_key(value: str) -> bool:
     """Recognize credential keys without a backtracking expression."""
-    decoded = unquote_plus(value).lower()
+    decoded = unquote_plus(value)
+    decoded = _JSON_UNICODE_ESCAPE.sub(
+        lambda match: chr(int(match.group("codepoint"), 16)),
+        decoded,
+    ).lower()
     key = "".join(
         character
         for character in decoded
