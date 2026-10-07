@@ -3648,6 +3648,120 @@ def test_get_open_prs_rest_fallback_rejects_untrusted_required_check_provenance(
     assert prs[0].ci_status == CIStatus.PENDING
 
 
+@pytest.mark.parametrize(
+    ("required_checks_kind", "expected_statuses"),
+    [
+        pytest.param("none", [CIStatus.SUCCESS, CIStatus.SUCCESS], id="none"),
+        pytest.param("list", [CIStatus.SUCCESS, CIStatus.PENDING], id="list"),
+        pytest.param("tuple", [CIStatus.SUCCESS, CIStatus.PENDING], id="tuple"),
+        pytest.param(
+            "generator",
+            [CIStatus.SUCCESS, CIStatus.PENDING],
+            id="generator",
+        ),
+    ],
+)
+@pytest.mark.parametrize("hydration_path", ["primary", "fallback", "direct-rest"])
+def test_get_open_prs_reuses_required_checks_for_every_pr(
+    monkeypatch: pytest.MonkeyPatch,
+    hydration_path: str,
+    required_checks_kind: str,
+    expected_statuses: list[CIStatus],
+) -> None:
+    """Every PR sees the same required contexts, including generator inputs."""
+    first_sha = "a" * 40
+    second_sha = "b" * 40
+    primary_entries = [
+        {
+            "number": number,
+            "title": f"PR-{number}: test",
+            "headRefName": f"pr-{number}",
+            "headRefOid": sha,
+            "url": f"https://example.test/pr/{number}",
+            "updatedAt": "2026-04-18T11:22:33Z",
+            "commits": [{}],
+            "author": {"login": "alice"},
+            "labels": [],
+            "isCrossRepository": False,
+        }
+        for number, sha in ((1, first_sha), (2, second_sha))
+    ]
+    rest_entries = [
+        {
+            "number": number,
+            "title": f"PR-{number}: test",
+            "head": {"ref": f"pr-{number}", "sha": sha, "repo": {"fork": False}},
+            "html_url": f"https://example.test/pr/{number}",
+            "updated_at": "2026-04-18T11:22:33Z",
+            "user": {"login": "alice"},
+            "labels": [],
+        }
+        for number, sha in ((1, first_sha), (2, second_sha))
+    ]
+
+    def retrieve(repo: str, sha: str) -> checks._CiRetrieval:
+        names = ["unit", "integration"] if sha == first_sha else ["unit"]
+        return _ci_retrieval(
+            repo,
+            sha,
+            [
+                {
+                    "id": index,
+                    "name": name,
+                    "conclusion": "success",
+                    "head_sha": sha,
+                    "app": {"id": 1},
+                }
+                for index, name in enumerate(names, start=1)
+            ],
+            {"state": "success", "statuses": []},
+        )
+
+    if hydration_path == "primary":
+        monkeypatch.setattr(
+            "src.github.gh_runner.run_gh",
+            lambda *args, **kwargs: primary_entries,
+        )
+    else:
+        if hydration_path == "fallback":
+
+            def fail_graphql(*args: Any, **kwargs: Any) -> None:
+                raise RuntimeError("GraphQL: API rate limit exceeded")
+
+            monkeypatch.setattr("src.github.gh_runner.run_gh", fail_graphql)
+        monkeypatch.setattr(cache, "_gh_api_paginated", lambda path: rest_entries)
+    monkeypatch.setattr(checks, "_retrieve_ci_status_evidence", retrieve)
+    monkeypatch.setattr(
+        reviews,
+        "get_pr_review_status",
+        lambda *args, **kwargs: ReviewStatus.PENDING,
+    )
+
+    values = ["unit", "integration"]
+    if required_checks_kind == "none":
+        required_checks = None
+    elif required_checks_kind == "list":
+        required_checks = values
+    elif required_checks_kind == "tuple":
+        required_checks = tuple(values)
+    else:
+        required_checks = (name for name in values)
+
+    if hydration_path == "direct-rest":
+        hydrated = prs._get_open_prs_rest(
+            "owner/name",
+            allow_merge_without_checks=False,
+            required_checks=required_checks,
+        )
+    else:
+        hydrated = get_open_prs(
+            "owner/name",
+            required_checks=required_checks,
+        )
+
+    assert [pr.ci_status for pr in hydrated] == expected_statuses
+
+
 def test_get_open_prs_propagates_non_rate_limit_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

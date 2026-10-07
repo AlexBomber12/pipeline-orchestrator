@@ -273,6 +273,9 @@ def get_open_prs(
 
     _begin_review_cache_cycle()
     reviewer_policy = reviewer_policy or reviewer_policy_from_config(load_config())
+    required_checks = (
+        tuple(required_checks) if required_checks is not None else None
+    )
     try:
         raw = gh_runner.run_gh(
             [
@@ -361,6 +364,9 @@ def _get_open_prs_rest(
 ) -> list[PRInfo]:
     """Return open PRs via REST when GraphQL status rollup is unavailable."""
 
+    required_checks = (
+        tuple(required_checks) if required_checks is not None else None
+    )
     raw = cache._gh_api_paginated(f"repos/{repo}/pulls?state=open&per_page=100")
     if raw is None:
         return []
