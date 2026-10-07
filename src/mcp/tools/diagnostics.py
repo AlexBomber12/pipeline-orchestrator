@@ -47,7 +47,9 @@ _MAX_RETRY_BYTES = 64 * 1024
 _MAX_CANCELLATION_BYTES = 64 * 1024
 _MAX_RUN_BYTES = 64 * 1024
 _MAX_INDEX_MEMBER_BYTES = 512
-_MAX_CLI_LOG_SOURCE_BYTES = 64 * 1024
+# The producer budgets 64 KiB before decoding a byte tail with replacement.
+# Up to three split continuation bytes can expand from one to three bytes each.
+_MAX_CLI_LOG_SOURCE_BYTES = (64 * 1024) + 6
 _DEFAULT_CLI_LOG_TAIL_BYTES = 8 * 1024
 _MAX_CLI_LOG_TAIL_BYTES = 32 * 1024
 
@@ -58,6 +60,7 @@ _CREDENTIAL_DOCUMENT_KEYS = frozenset(
         "accesstoken",
         "apikey",
         "authtoken",
+        "awssecretaccesskey",
         "clientsecret",
         "credential",
         "credentials",
@@ -66,7 +69,10 @@ _CREDENTIAL_DOCUMENT_KEYS = frozenset(
         "password",
         "passwd",
         "privatekey",
+        "privatekeyid",
         "refreshtoken",
+        "secret",
+        "secretaccesskey",
         "token",
     }
 )
@@ -75,7 +81,7 @@ _PEM_CREDENTIAL_DOCUMENT = re.compile(
     r".*?-----END (?P=label)-----",
     re.IGNORECASE | re.DOTALL,
 )
-_JSON_OBJECT_LINE_START = re.compile(r"(?m)^[ \t]*(?P<object>\{)")
+_JSON_OBJECT_START = re.compile(r"\{")
 _SENSITIVE_HEADER_LINE = re.compile(
     r"(?im)^(?P<prefix>[ \t]*(?:proxy-)?authorization[ \t]*:[ \t]*|"
     r"[ \t]*(?:set-)?cookie[ \t]*:[ \t]*).*$"
@@ -92,7 +98,8 @@ _URL_USERINFO = re.compile(r"(?i)(?P<scheme>\b[a-z][a-z0-9+.-]*://)[^/@\s]+@")
 _CREDENTIAL_ASSIGNMENT = re.compile(
     r"(?i)(?P<prefix>(?<![A-Za-z0-9])['\"]?(?:[A-Za-z0-9]+[_-])*"
     r"(?:api[_-]?key|oauth[_-]?token|access[_-]?token|refresh[_-]?token|"
-    r"id[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|token)"
+    r"id[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key(?:[_-]?id)?|"
+    r"secret(?:[_-]?access)?[_-]?key|secret|password|passwd|token)"
     r"['\"]?[ \t]*(?:=|:)[ \t]*)"
     r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;&#]+)"
 )
@@ -947,13 +954,13 @@ def _omit_json_credential_documents(text: str) -> tuple[str, int]:
     decoder = json.JSONDecoder()
     ranges: list[tuple[int, int]] = []
     covered_until = 0
-    for match in _JSON_OBJECT_LINE_START.finditer(text):
-        start = match.start("object")
+    for match in _JSON_OBJECT_START.finditer(text):
+        start = match.start()
         if start < covered_until:
             continue
         try:
             value, end = decoder.raw_decode(text, start)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             continue
         if isinstance(value, dict) and _contains_credential_document_key(value):
             ranges.append((start, end))

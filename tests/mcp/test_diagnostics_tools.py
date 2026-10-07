@@ -347,9 +347,17 @@ async def test_latest_cli_log_bounds_source_output_and_utf8(
 ) -> None:
     from src.mcp.tools import diagnostics
 
+    key = cli_log_latest(SLUG)
+    maximum_redis = FakeRedis()
+    maximum_redis.store[key] = ("�" * 3) + ("x" * (diagnostics._MAX_CLI_LOG_SOURCE_BYTES - 9))
+    _patch_runtime(monkeypatch, maximum_redis)
+    maximum = await diagnostics.get_latest_cli_log(SLUG)
+    assert maximum["availability"]["status"] == "available"
+    assert maximum["source_size_bytes"] == (64 * 1024) + 6
+    assert maximum["truncation"]["tail_truncated"] is True
+
     redis = FakeRedis()
     _patch_runtime(monkeypatch, redis)
-    key = cli_log_latest(SLUG)
     redis.store[key] = b"x" * (diagnostics._MAX_CLI_LOG_SOURCE_BYTES + 1)
     redis.ttls[key] = 300
     oversized = await diagnostics.get_latest_cli_log(SLUG)
@@ -412,6 +420,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "ghp_" + ("A" * 36),
             '{"safe": "value"}',
             "{not-json",
+            'array-prefix=[{"private_key":"array-document-secret","project_id":"hidden-array-project"}]',
+            'output: {"client_secret":"prefix-document-secret","client_id":"hidden-client"}',
+            "private_key=malformed-private-secret",
+            "AWS_SECRET_ACCESS_KEY=aws-secret",
             "{",
             '  "items": [',
             "    {",
@@ -433,10 +445,12 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     exported = redacted["text"]
     assert redacted["availability"]["status"] == "available"
     assert redacted["redaction"]["applied"] is True
-    assert redacted["redaction"]["credential_documents_omitted"] == 2
-    assert exported.count("[credential document omitted]") == 2
+    assert redacted["redaction"]["credential_documents_omitted"] == 4
+    assert exported.count("[credential document omitted]") == 4
     assert "safe-output" in exported
     assert "private@example.test" not in exported
+    assert "hidden-array-project" not in exported
+    assert "hidden-client" not in exported
     for secret in (
         "inline-auth-secret",
         "cookie-secret",
@@ -447,6 +461,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "url-password",
         "single-url-credential",
         "query-secret",
+        "array-document-secret",
+        "prefix-document-secret",
+        "malformed-private-secret",
+        "aws-secret",
         "document-secret",
         "pem-document-secret",
         "ghp_" + ("A" * 36),

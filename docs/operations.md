@@ -36,10 +36,11 @@ and retain an equivalent loopback-only or authenticated access boundary.
 The opted-in diagnostics service also exposes `get_latest_cli_log`. It accepts
 one configured `owner__repo` slug and returns a sanitized tail of the fixed
 latest-log record written by completed coder CLI invocations. The default tail
-is 8 KiB and callers may request at most 32 KiB. The service refuses to read a
-source larger than 64 KiB, redacts the complete bounded source before selecting
-the tail, and reports source/output sizes, truncation, observation time, and
-remaining Redis TTL. Authorization headers, token and password assignments,
+is 8 KiB and callers may request at most 32 KiB. The service accepts the
+producer 64 KiB byte budget plus its bounded six-byte UTF-8 replacement
+expansion, redacts the complete bounded source before selecting the tail, and
+reports source/output sizes, truncation, observation time, and remaining Redis
+TTL. Authorization headers, token and password assignments,
 cookies, credential-bearing URL userinfo/query parameters, recognizable token
 shapes, private-key blocks, and recognizable JSON credential documents are not
 exported.
