@@ -119,7 +119,9 @@ _XML_NAME_CHARACTERS = frozenset(
 )
 _XML_CREDENTIAL_SELECTOR_ATTRIBUTES = frozenset({"key", "name"})
 _KUBERNETES_SECRET_KIND = re.compile(
-    r"(?im)^[ \t]*kind[ \t]*:[ \t]*(?P<quote>['\"]?)Secret(?P=quote)"
+    r"(?im)^[ \t]*kind[ \t]*:[ \t]*"
+    r"(?:(?:&|!)[^\s,\[\]{}]+[ \t]+)*"
+    r"(?P<quote>['\"]?)Secret(?P=quote)"
     r"[ \t]*(?:#.*)?$"
 )
 _KUBERNETES_SECRET_BLOCK_KIND = re.compile(
