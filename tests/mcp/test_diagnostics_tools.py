@@ -392,6 +392,14 @@ async def test_latest_cli_log_bounds_source_output_and_utf8(
     invalid_utf8 = await diagnostics.get_latest_cli_log(SLUG, 32)
     assert invalid_utf8["text"] == "before�after"
 
+    malformed_json_redis = FakeRedis()
+    malformed_json_redis.store[key] = b"[" * diagnostics._MAX_CLI_LOG_SOURCE_BYTES
+    _patch_runtime(monkeypatch, malformed_json_redis)
+    malformed_json = await diagnostics.get_latest_cli_log(SLUG)
+    assert malformed_json["availability"]["status"] == "available"
+    assert malformed_json["text"] == "[credential document omitted]"
+    assert malformed_json["redaction"]["credential_documents_omitted"] == 1
+
 
 async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents(
     monkeypatch: pytest.MonkeyPatch,
@@ -428,6 +436,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             r'serialized="{\"private_key\":\"serialized-document-secret\",'
             r'\"project_id\":\"serialized-metadata\"}"',
             json.dumps(deeply_nested),
+            'structured={"headers":{"Authorization":"Bearer structured-auth-secret"}}',
+            'structured-cookie={"Cookie":"session=structured-cookie-secret"}',
             "private_key=malformed-private-secret",
             "AWS_SECRET_ACCESS_KEY=aws-secret",
             "{",
@@ -451,8 +461,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     exported = redacted["text"]
     assert redacted["availability"]["status"] == "available"
     assert redacted["redaction"]["applied"] is True
-    assert redacted["redaction"]["credential_documents_omitted"] == 6
-    assert exported.count("[credential document omitted]") == 6
+    assert redacted["redaction"]["credential_documents_omitted"] == 8
+    assert exported.count("[credential document omitted]") == 8
     assert "safe-output" in exported
     assert "private@example.test" not in exported
     assert "hidden-array-project" not in exported
@@ -472,6 +482,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "prefix-document-secret",
         "serialized-document-secret",
         "deep-document-secret",
+        "structured-auth-secret",
+        "structured-cookie-secret",
         "malformed-private-secret",
         "aws-secret",
         "document-secret",

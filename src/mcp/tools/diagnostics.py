@@ -52,6 +52,7 @@ _MAX_INDEX_MEMBER_BYTES = 512
 _MAX_CLI_LOG_SOURCE_BYTES = (64 * 1024) + 6
 _DEFAULT_CLI_LOG_TAIL_BYTES = 8 * 1024
 _MAX_CLI_LOG_TAIL_BYTES = 32 * 1024
+_MAX_JSON_PARSE_FAILURES = 64
 
 _REDACTED = "[REDACTED]"
 _CREDENTIAL_DOCUMENT_OMITTED = "[credential document omitted]"
@@ -59,20 +60,24 @@ _CREDENTIAL_DOCUMENT_KEYS = frozenset(
     {
         "accesstoken",
         "apikey",
+        "authorization",
         "authtoken",
         "awssecretaccesskey",
         "clientsecret",
         "credential",
         "credentials",
+        "cookie",
         "idtoken",
         "oauthtoken",
         "password",
         "passwd",
         "privatekey",
         "privatekeyid",
+        "proxyauthorization",
         "refreshtoken",
         "secret",
         "secretaccesskey",
+        "setcookie",
         "token",
     }
 )
@@ -81,7 +86,7 @@ _PEM_CREDENTIAL_DOCUMENT = re.compile(
     r".*?-----END (?P=label)-----",
     re.IGNORECASE | re.DOTALL,
 )
-_JSON_VALUE_START = re.compile(r"[\[{\"]")
+_JSON_CONTAINER_START = re.compile(r"[\[{]")
 _SENSITIVE_HEADER_LINE = re.compile(
     r"(?im)^(?P<prefix>[ \t]*(?:proxy-)?authorization[ \t]*:[ \t]*|"
     r"[ \t]*(?:set-)?cookie[ \t]*:[ \t]*).*$"
@@ -99,8 +104,10 @@ _CREDENTIAL_ASSIGNMENT = re.compile(
     r"(?i)(?P<prefix>(?<![A-Za-z0-9])['\"]?(?:[A-Za-z0-9]+[_-])*"
     r"(?:api[_-]?key|oauth[_-]?token|access[_-]?token|refresh[_-]?token|"
     r"id[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key(?:[_-]?id)?|"
-    r"secret(?:[_-]?access)?[_-]?key|secret|password|passwd|token)"
+    r"secret(?:[_-]?access)?[_-]?key|secret|password|passwd|token|"
+    r"(?:proxy[_-]?)?authorization|(?:set[_-]?)?cookie)"
     r"['\"]?[ \t]*(?:=|:)[ \t]*)"
+    r"(?!\[(?:REDACTED|credential document omitted)\])"
     r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;&#]+)"
 )
 _RECOGNIZABLE_SECRET = tuple(
@@ -964,13 +971,19 @@ def _omit_json_credential_documents(text: str) -> tuple[str, int]:
     decoder = json.JSONDecoder()
     ranges: list[tuple[int, int]] = []
     covered_until = 0
-    for match in _JSON_VALUE_START.finditer(text):
+    parse_failures = 0
+    for match in _JSON_CONTAINER_START.finditer(text):
         start = match.start()
+        if start > 0 and text[start - 1] == '"':
+            start -= 1
         if start < covered_until:
             continue
         try:
             value, end = decoder.raw_decode(text, start)
         except (json.JSONDecodeError, RecursionError):
+            parse_failures += 1
+            if parse_failures >= _MAX_JSON_PARSE_FAILURES:
+                return _CREDENTIAL_DOCUMENT_OMITTED, 1
             continue
         covered_until = end
         if _contains_credential_document_key(value):
