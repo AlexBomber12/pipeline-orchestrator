@@ -113,6 +113,10 @@ _YAML_DOCUMENT_BOUNDARY = re.compile(r"(?m)^(?:---|\.\.\.)[ \t]*(?:#.*)?(?:\n|$)
 _YAML_ALIAS = re.compile(r"(?<![A-Za-z0-9_.-])\*[^\s,\[\]{}#]+")
 _YAML_COMMENT = re.compile(r"(?<!\S)#")
 _YAML_BLOCK_VALUE_INDICATORS = frozenset({"", "|", "|-", "|+", ">", ">-", ">+"})
+_XML_NAME_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-"
+)
+_XML_CREDENTIAL_SELECTOR_ATTRIBUTES = frozenset({"key", "name"})
 _KUBERNETES_SECRET_KIND = re.compile(
     r"(?im)^[ \t]*kind[ \t]*:[ \t]*(?P<quote>['\"]?)Secret(?P=quote)"
     r"[ \t]*(?:#.*)?$"
@@ -1293,6 +1297,125 @@ def _omit_document_ranges(text: str, ranges: list[tuple[int, int]]) -> tuple[str
     return "".join(parts), len(ranges)
 
 
+def _xml_tag_details(
+    text: str,
+    start: int,
+) -> tuple[bool, str, int, int, bool] | None:
+    cursor = start + 1
+    closing = cursor < len(text) and text[cursor] == "/"
+    if closing:
+        cursor += 1
+    name_start = cursor
+    while cursor < len(text) and text[cursor] in _XML_NAME_CHARACTERS:
+        cursor += 1
+    if cursor == name_start:
+        return None
+    if cursor < len(text) and not text[cursor].isspace() and text[cursor] not in "/>":
+        return None
+    name = text[name_start:cursor]
+    name_end = cursor
+    quote: str | None = None
+    while cursor < len(text):
+        character = text[cursor]
+        cursor += 1
+        if quote is not None:
+            if character == quote:
+                quote = None
+        elif character in {"'", '"'}:
+            quote = character
+        elif character == ">":
+            break
+    complete = cursor > start and text[cursor - 1] == ">"
+    self_closing = complete and text[start : cursor - 1].rstrip().endswith("/")
+    return closing, name, name_end, cursor, self_closing
+
+
+def _xml_attributes(text: str, start: int, end: int) -> list[tuple[str, str]]:
+    limit = end - 1 if end > start and text[end - 1] == ">" else end
+    attributes: list[tuple[str, str]] = []
+    cursor = start
+    while cursor < limit:
+        while cursor < limit and (text[cursor].isspace() or text[cursor] == "/"):
+            cursor += 1
+        name_start = cursor
+        while cursor < limit and text[cursor] in _XML_NAME_CHARACTERS:
+            cursor += 1
+        if cursor == name_start:
+            cursor += 1
+            continue
+        name = text[name_start:cursor]
+        while cursor < limit and text[cursor].isspace():
+            cursor += 1
+        if cursor >= limit or text[cursor] != "=":
+            continue
+        cursor += 1
+        while cursor < limit and text[cursor].isspace():
+            cursor += 1
+        quote = text[cursor] if cursor < limit and text[cursor] in {"'", '"'} else None
+        if quote is not None:
+            cursor += 1
+            value_start = cursor
+            while cursor < limit and text[cursor] != quote:
+                cursor += 1
+            value = text[value_start:cursor]
+            cursor += cursor < limit
+        else:
+            value_start = cursor
+            while cursor < limit and not text[cursor].isspace() and text[cursor] not in "/>":
+                cursor += 1
+            value = text[value_start:cursor]
+        attributes.append((name, value))
+    return attributes
+
+
+def _xml_tag_has_credential_context(name: str, attributes: list[tuple[str, str]]) -> bool:
+    if _is_sensitive_key(name.rsplit(":", 1)[-1]):
+        return True
+    for attribute_name, value in attributes:
+        local_name = attribute_name.rsplit(":", 1)[-1]
+        if _is_sensitive_key(local_name) or (
+            local_name.lower() in _XML_CREDENTIAL_SELECTOR_ATTRIBUTES
+            and _is_sensitive_key(value)
+        ):
+            return True
+    return False
+
+
+def _omit_xml_credential_contexts(text: str) -> tuple[str, int]:
+    """Omit XML credential tags without interpreting arbitrary XML documents."""
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    while True:
+        start = text.find("<", cursor)
+        if start < 0:
+            break
+        if start > 0 and text[start - 1] == "<":
+            cursor = start + 1
+            continue
+        details = _xml_tag_details(text, start)
+        if details is None:
+            cursor = start + 1
+            continue
+        closing, name, name_end, tag_end, self_closing = details
+        if closing or not _xml_tag_has_credential_context(
+            name,
+            _xml_attributes(text, name_end, tag_end),
+        ):
+            cursor = max(tag_end, start + 1)
+            continue
+
+        range_start = text.rfind("\n", 0, start) + 1
+        line_end = text.find("\n", tag_end)
+        range_end = len(text) if line_end < 0 else line_end + 1
+        same_line = text[tag_end:range_end]
+        closing_tag = f"</{name}>"
+        if not self_closing and closing_tag.lower() not in same_line.lower():
+            range_end = len(text)
+        ranges.append((range_start, range_end))
+        cursor = range_end
+    return _omit_document_ranges(text, ranges)
+
+
 def _omit_ambiguous_yaml_credential_documents(text: str) -> tuple[str, int]:
     """Fail closed for YAML credential values unsafe to redact line by line."""
     ranges: list[tuple[int, int]] = []
@@ -1377,6 +1500,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
 
 def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     text, terminal_controls = _normalize_terminal_text(text)
+    text, xml_contexts = _omit_xml_credential_contexts(text)
     text, ambiguous_yaml_documents = _omit_ambiguous_yaml_credential_documents(text)
     text, kubernetes_documents = _omit_kubernetes_secret_documents(text)
     text, pem_documents = _omit_pem_credential_documents(text)
@@ -1384,6 +1508,7 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     text, credential_lines = _omit_sensitive_context_lines(text)
     redactions = (
         terminal_controls
+        + xml_contexts
         + ambiguous_yaml_documents
         + kubernetes_documents
         + pem_documents
@@ -1409,7 +1534,11 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     return (
         text,
         redactions,
-        ambiguous_yaml_documents + kubernetes_documents + pem_documents + json_documents,
+        xml_contexts
+        + ambiguous_yaml_documents
+        + kubernetes_documents
+        + pem_documents
+        + json_documents,
     )
 
 

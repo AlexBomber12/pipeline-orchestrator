@@ -57,6 +57,9 @@ whole in YAML or JSON form, including arbitrary keys under `data` or
 using a bounded single-pass boundary scan.
 Standard encoded `auth` fields used by registry and package-manager credential
 documents are treated as credential context rather than exported as base64 text.
+Recognizable XML credential elements, credential attributes, and `key`/`name`
+plus `value` configuration tags are omitted. Multiline or incomplete XML
+credential contexts fail closed through the bounded source end.
 Standalone single-token authorization-scheme values such as `Bearer` and
 `Basic` credentials are redacted even when the header name is absent; a
 multi-parameter `Digest` value causes conservative line omission.

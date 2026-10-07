@@ -921,6 +921,59 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
     assert "safe: not-exported-without-boundary" not in ambiguous["text"]
 
 
+async def test_latest_cli_log_omits_xml_credential_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    key = cli_log_latest(SLUG)
+    redis = FakeRedis()
+    redis.store[key] = "\n".join(
+        (
+            "<password>SYNTHETIC_XML_ELEMENT_SECRET</password>",
+            "safe-between: visible",
+            '<add key="ClearTextPassword" value="SYNTHETIC_XML_PAIR_SECRET"/>',
+            "safe-after: visible",
+            "<cfg:connection cfg:password='SYNTHETIC_XML_ATTRIBUTE_SECRET'/>",
+            "<add value='SYNTHETIC_XML_ORDER_SECRET' name='apiToken'/>",
+            "<add key = password value = SYNTHETIC_XML_UNQUOTED_SECRET/>",
+            "<safe ignored attr='visible'>visible</safe>",
+            "not xml <broken! visible",
+        )
+    )
+    _patch_runtime(monkeypatch, redis)
+
+    result = await diagnostics.get_latest_cli_log(SLUG)
+
+    assert result["availability"]["status"] == "available"
+    assert result["text"].count("[credential document omitted]") == 5
+    assert "safe-between: visible" in result["text"]
+    assert "safe-after: visible" in result["text"]
+    assert "<safe ignored attr='visible'>visible</safe>" in result["text"]
+    assert "not xml <broken! visible" in result["text"]
+    for secret in (
+        "SYNTHETIC_XML_ELEMENT_SECRET",
+        "SYNTHETIC_XML_PAIR_SECRET",
+        "SYNTHETIC_XML_ATTRIBUTE_SECRET",
+        "SYNTHETIC_XML_ORDER_SECRET",
+        "SYNTHETIC_XML_UNQUOTED_SECRET",
+    ):
+        assert secret not in result["text"]
+
+    fail_closed_cases = (
+        "safe-before\n<password>\nSYNTHETIC_XML_MULTILINE_SECRET\n</password>\nsafe-after",
+        'safe-before\n<add key="password"\n value="SYNTHETIC_XML_INCOMPLETE_SECRET"',
+    )
+    for payload in fail_closed_cases:
+        fail_closed_redis = FakeRedis()
+        fail_closed_redis.store[key] = payload
+        _patch_runtime(monkeypatch, fail_closed_redis)
+        fail_closed = await diagnostics.get_latest_cli_log(SLUG)
+        assert fail_closed["text"] == "safe-before\n[credential document omitted]"
+        assert "SYNTHETIC_XML_" not in fail_closed["text"]
+        assert "safe-after" not in fail_closed["text"]
+
+
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
