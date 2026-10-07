@@ -56,6 +56,13 @@ reservation is retained until process cleanup is confirmed; if cleanup cannot
 prove quiescence, both login replacement and new coder invocations remain
 blocked for that location.
 
+Auth probes take the same shared reservation before reading credentials. While
+login owns the location, selection treats that coder as provisionally available
+and dispatch defers at the reservation boundary instead of recording an auth or
+diagnosis failure. Releasing login ownership first advances the location's
+credential generation; runners reject cache entries from older generations and
+refresh auth before launching work.
+
 Device login and normal Codex coder invocations receive the same effective
 `HOME` and inherited `CODEX_HOME`, so a successful login updates the credential
 store used by subsequent work.

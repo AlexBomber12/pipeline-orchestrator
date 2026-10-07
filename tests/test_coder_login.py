@@ -164,6 +164,8 @@ def test_credential_reservations_allow_coder_sharing_but_exclude_login() -> None
     reservations = CoderCredentialReservations()
     location = "/tmp/shared-codex-home"
 
+    assert reservations.credential_version(location) == 0
+    assert reservations.login_active(location) is False
     assert reservations.reserve_coder(location) is True
     assert reservations.reserve_coder(location) is True
     assert reservations.reserve_login(location) is False
@@ -171,10 +173,14 @@ def test_credential_reservations_allow_coder_sharing_but_exclude_login() -> None
     assert reservations.reserve_login(location) is False
     reservations.release_coder(location)
     assert reservations.reserve_login(location) is True
+    assert reservations.login_active(location) is True
     assert reservations.reserve_login(location) is False
     assert reservations.reserve_coder(location) is False
     reservations.release_login(location)
+    assert reservations.credential_version(location) == 1
+    assert reservations.login_active(location) is False
     reservations.release_login(location)
+    assert reservations.credential_version(location) == 1
     reservations.release_coder(location)
     assert reservations.reserve_coder(location) is True
     reservations.release_coder(location)

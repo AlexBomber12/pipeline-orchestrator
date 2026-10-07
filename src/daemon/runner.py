@@ -441,6 +441,7 @@ class PipelineRunner(
         self._selector_rng = random.Random()
         self._auth_status_cache: dict[str, dict[str, str]] = {}
         self._auth_status_cache_expires_at: datetime | None = None
+        self._auth_status_cache_credential_versions: dict[str, int] = {}
         self._current_coder_process: asyncio.subprocess.Process | None = None
         self._current_coder_supervised_process: SupervisedProcess | None = None
         self._coder_invocation_active = False
@@ -1036,14 +1037,56 @@ class PipelineRunner(
     async def _refresh_auth_status_cache(self) -> None:
         """Refresh cached coder auth state off the event loop."""
         now = datetime.now(timezone.utc)
+        names = self._registry.coder_names()
+        credential_locations: dict[str, str] = {}
+        invalid_locations: set[str] = set()
+        credential_versions: dict[str, int] = {}
+        login_blocked: set[str] = set()
+        if self._credential_reservations is not None:
+            for name in names:
+                try:
+                    location = self._device_login_credential_location(name)
+                except Exception:
+                    invalid_locations.add(name)
+                    continue
+                if location is not None:
+                    credential_locations[name] = location
+            credential_versions = {
+                name: self._credential_reservations.credential_version(location)
+                for name, location in credential_locations.items()
+            }
+            login_blocked = {
+                name
+                for name, location in credential_locations.items()
+                if self._credential_reservations.login_active(location)
+            }
         if (
             self._auth_status_cache
             and self._auth_status_cache_expires_at is not None
             and now < self._auth_status_cache_expires_at
+            and not invalid_locations
+            and credential_versions
+            == self._auth_status_cache_credential_versions
         ):
+            for name in login_blocked:
+                self._auth_status_cache[name] = {
+                    "status": "ok",
+                    "detail": "Device login in progress",
+                }
             return
 
         async def _probe(name: str) -> dict[str, str]:
+            if name in invalid_locations:
+                return {"status": "error"}
+            location = credential_locations.get(name)
+            reserved = False
+            if location is not None and self._credential_reservations is not None:
+                if not self._credential_reservations.reserve_coder(location):
+                    return {
+                        "status": "ok",
+                        "detail": "Device login in progress",
+                    }
+                reserved = True
             try:
                 plugin = self._registry.get(name)
                 reference = self._registry.reference_for(name)
@@ -1062,14 +1105,28 @@ class PipelineRunner(
                 return await asyncio.to_thread(plugin.check_auth)
             except Exception:
                 return {"status": "error"}
+            finally:
+                if reserved and self._credential_reservations is not None:
+                    self._credential_reservations.release_coder(location)
 
         # The startup-loaded registry is authoritative. Configured plugins use
         # the killable worker boundary; adding a definition during hot reload
         # cannot add it to this name set until the daemon restarts.
-        names = self._registry.coder_names()
         results = await asyncio.gather(*(_probe(name) for name in names))
+        for index, name in enumerate(names):
+            location = credential_locations.get(name)
+            if (
+                location is not None
+                and self._credential_reservations is not None
+                and self._credential_reservations.login_active(location)
+            ):
+                results[index] = {
+                    "status": "ok",
+                    "detail": "Device login in progress",
+                }
         self._auth_status_cache = dict(zip(names, results, strict=True))
         self._auth_status_cache_expires_at = now + timedelta(minutes=5)
+        self._auth_status_cache_credential_versions = credential_versions
 
     def _load_current_task_metadata(self) -> tuple[str, str]:
         """Return ``(task_type, complexity)`` for the active task if available."""
@@ -2329,20 +2386,38 @@ class PipelineRunner(
             return True
         if self._coder_credential_reservation is not None:
             return False
-        plugin = self._registry.get_optional(coder_name)
-        resolver = getattr(plugin, "device_login_credential_location", None)
-        if not callable(resolver):
-            return True
         try:
-            location = resolver(config=self.app_config)
+            location = self._device_login_credential_location(coder_name)
         except Exception:
             return False
-        if not isinstance(location, str) or not location:
-            return False
+        if location is None:
+            return True
         if not self._credential_reservations.reserve_coder(location):
+            return False
+        cached_version = self._auth_status_cache_credential_versions.get(
+            coder_name
+        )
+        current_version = self._credential_reservations.credential_version(
+            location
+        )
+        if cached_version is not None and cached_version != current_version:
+            self._credential_reservations.release_coder(location)
+            self._auth_status_cache_expires_at = None
             return False
         self._coder_credential_reservation = location
         return True
+
+    def _device_login_credential_location(
+        self, coder_name: str
+    ) -> str | None:
+        plugin = self._registry.get_optional(coder_name)
+        resolver = getattr(plugin, "device_login_credential_location", None)
+        if not callable(resolver):
+            return None
+        location = resolver(config=self.app_config)
+        if not isinstance(location, str) or not location:
+            raise ValueError("invalid coder credential location")
+        return location
 
     def _release_coder_credentials(self) -> None:
         location = self._coder_credential_reservation

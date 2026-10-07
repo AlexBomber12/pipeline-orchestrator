@@ -47,6 +47,7 @@ class CoderCredentialReservations:
     def __init__(self) -> None:
         self._login_locations: set[str] = set()
         self._coder_counts: dict[str, int] = {}
+        self._credential_versions: dict[str, int] = {}
 
     def reserve_login(self, credential_location: str) -> bool:
         if (
@@ -58,7 +59,18 @@ class CoderCredentialReservations:
         return True
 
     def release_login(self, credential_location: str) -> None:
+        if credential_location not in self._login_locations:
+            return
+        self._credential_versions[credential_location] = (
+            self._credential_versions.get(credential_location, 0) + 1
+        )
         self._login_locations.discard(credential_location)
+
+    def login_active(self, credential_location: str) -> bool:
+        return credential_location in self._login_locations
+
+    def credential_version(self, credential_location: str) -> int:
+        return self._credential_versions.get(credential_location, 0)
 
     def reserve_coder(self, credential_location: str) -> bool:
         if credential_location in self._login_locations:

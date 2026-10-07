@@ -151,6 +151,9 @@ def test_runner_credential_reservations_coordinate_with_device_login(
     assert reservations.reserve_login(location) is True
     assert runner._reserve_coder_credentials("codex") is False
     reservations.release_login(location)
+    runner._auth_status_cache_credential_versions["codex"] = 0
+    assert runner._reserve_coder_credentials("codex") is False
+    assert runner._auth_status_cache_expires_at is None
 
     assert runner._reserve_coder_credentials("claude") is True
     assert runner._coder_credential_reservation is None
@@ -167,6 +170,8 @@ def test_runner_credential_reservations_coordinate_with_device_login(
 
     monkeypatch.setattr(codex, "device_login_credential_location", fail)
     assert runner._reserve_coder_credentials("codex") is False
+    asyncio.run(runner._refresh_auth_status_cache())
+    assert runner._auth_status_cache["codex"] == {"status": "error"}
 
     runner._credential_reservations = None
     assert runner._reserve_coder_credentials("codex") is True
@@ -461,6 +466,47 @@ def test_refresh_auth_status_cache_returns_early_when_cache_is_fresh(
     asyncio.run(runner._refresh_auth_status_cache())
 
     assert runner._auth_status_cache == {"claude": {"status": "ok"}}
+
+
+def test_auth_cache_defers_probe_during_login_and_refreshes_after_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner()
+    runner._credential_reservations = reservations
+    codex = runner._registry.get("codex")
+    location = codex.device_login_credential_location(config=runner.app_config)
+    runner._auth_status_cache["codex"] = {
+        "status": "error",
+        "detail": "stale missing credentials",
+    }
+    runner._auth_status_cache_credential_versions = {"codex": 0}
+    calls: list[bool] = []
+
+    def check_auth() -> dict[str, str]:
+        calls.append(True)
+        return {"status": "error", "detail": "login did not complete"}
+
+    monkeypatch.setattr(codex, "check_auth", check_auth)
+    assert reservations.reserve_login(location) is True
+
+    asyncio.run(runner._refresh_auth_status_cache())
+
+    assert calls == []
+    assert runner._auth_status_cache["codex"] == {
+        "status": "ok",
+        "detail": "Device login in progress",
+    }
+
+    reservations.release_login(location)
+    asyncio.run(runner._refresh_auth_status_cache())
+
+    assert calls == [True]
+    assert runner._auth_status_cache["codex"] == {
+        "status": "error",
+        "detail": "login did not complete",
+    }
+    assert runner._auth_status_cache_credential_versions["codex"] == 1
 
 
 def test_refresh_auth_status_cache_marks_plugin_probe_errors() -> None:
