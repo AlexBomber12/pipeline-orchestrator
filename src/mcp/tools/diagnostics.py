@@ -80,6 +80,7 @@ _CREDENTIAL_DOCUMENT_KEYS = frozenset(
         "cookie",
         "idtoken",
         "jwt",
+        "mysqlpwd",
         "oauthtoken",
         "passphrase",
         "password",
@@ -267,6 +268,11 @@ _DIGEST_AUTHORIZATION = re.compile(r"(?i)(?<![A-Za-z0-9])Digest[ \t]+")
 _CREDENTIAL_CLI_OPTION = re.compile(
     r"(?i)(?<!\S)(?:\$?['\"])?(?:(?:--user|--proxy-user)(?:['\"]?[ \t]+|=)|"
     r"-[#0-9:A-Za-z]*?[uU](?:[ \t]+|=|(?=[^ \t;&|<>()])))"
+)
+_MYSQL_ATTACHED_PASSWORD_OPTION = re.compile(
+    r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?"
+    r"(?:mysql|mysqladmin|mysqlcheck|mysqldump|mysqlimport|mysqlshow)(?:\.exe)?"
+    r"(?=[ \t]|$)[^;&|<>\r\n]*?(?<!\S)-p[^ \t;&|<>()]+"
 )
 _SHELL_IFS_VALUE_BOUNDARY_PATTERN = r"\$(?:IFS\b|\{IFS[^}\r\n]{0,64}\})"
 _SHELL_IFS_VALUE_BOUNDARY = re.compile(_SHELL_IFS_VALUE_BOUNDARY_PATTERN)
@@ -1597,6 +1603,9 @@ def _sensitive_value_start(line: str) -> int | None:
     ansi_c_option = _ansi_c_option_value_start(line)
     if ansi_c_option is not None:
         return ansi_c_option
+    mysql_password = _MYSQL_ATTACHED_PASSWORD_OPTION.search(line)
+    if mysql_password is not None:
+        return mysql_password.end()
     line = _normalize_shell_credential_names(line)
     netrc_password = _NETRC_PASSWORD_VALUE.search(line)
     if netrc_password is not None:

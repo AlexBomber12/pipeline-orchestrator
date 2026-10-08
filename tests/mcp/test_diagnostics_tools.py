@@ -603,6 +603,13 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "safe-after-cmd-variable-option",
             "tool --pass!EMPTY!word cmd-delayed-variable-option-secret",
             "safe-after-cmd-delayed-variable-option",
+            "MYSQL_PWD=mysql-pwd-assignment-secret",
+            "safe-after-mysql-pwd",
+            "mysql -pmysql-attached-option-secret synthetic_db",
+            "safe-after-mysql-attached-option",
+            'mysqldump --host example.test -p"mysql-quoted-option-secret" synthetic_db',
+            "safe-after-mysql-quoted-option",
+            "tool -pvisible-unrelated-option",
             "curl --user alice:curl-user-secret https://example.test",
             "curl -u alice:curl-short-user-secret https://example.test",
             "curl -ualice:curl-attached-user-secret https://example.test",
@@ -978,6 +985,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-parameter-substitution-option" in exported
     assert "safe-after-cmd-variable-option" in exported
     assert "safe-after-cmd-delayed-variable-option" in exported
+    assert "safe-after-mysql-pwd" in exported
+    assert "safe-after-mysql-attached-option" in exported
+    assert "safe-after-mysql-quoted-option" in exported
+    assert "tool -pvisible-unrelated-option" in exported
     assert "safe-after-toml-array" in exported
     assert "safe-after-toml-triple-quote" in exported
     assert "safe-after-split-assignment-name" in exported
@@ -1086,6 +1097,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "ambiguous-parameter-option-secret",
         "cmd-variable-option-secret",
         "cmd-delayed-variable-option-secret",
+        "mysql-pwd-assignment-secret",
+        "mysql-attached-option-secret",
+        "mysql-quoted-option-secret",
         "curl-user-secret",
         "curl-short-user-secret",
         "curl-attached-user-secret",
