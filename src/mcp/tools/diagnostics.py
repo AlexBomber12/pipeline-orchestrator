@@ -138,6 +138,18 @@ _KUBERNETES_SECRET_BLOCK_KIND = re.compile(
     r"[|>][0-9+-]{0,2}[ \t]*(?:#.*)?\n"
     r"(?:[ \t]*\n)*[ \t]+Secret[ \t]*(?:\n|$)"
 )
+_KUBERNETES_FLOW_KIND_PREFIX = (
+    rf"(?im)(?:^|[{{,])[ \t\r\n]*{_KUBERNETES_KIND_KEY}"
+    r"[ \t\r\n]*:[ \t\r\n]*(?:(?:&|!)[^\s,\[\]{}]+[ \t\r\n]+)*"
+)
+_KUBERNETES_FLOW_SECRET_KIND = re.compile(
+    _KUBERNETES_FLOW_KIND_PREFIX
+    + r"(?P<flow_quote>['\"]?)Secret(?P=flow_quote)"
+    + r"[ \t\r\n]*(?:#[^\r\n]*)?[ \t\r\n]*(?=[,}])"
+)
+_KUBERNETES_FLOW_ESCAPED_QUOTED_KIND = re.compile(
+    _KUBERNETES_FLOW_KIND_PREFIX + r'"(?=[^\r\n]*\\)'
+)
 _URL_USERINFO = re.compile(r"(?i)(?P<scheme>(?:\b[a-z][a-z0-9+.-]*:)?//)[^/@\s]+@")
 _SENSITIVE_QUERY_VALUE = re.compile(r"(?i)(?P<prefix>[?&;](?:sig|signature)=)[^&#;\s]+")
 _AUTHORIZATION_VALUE = re.compile(
@@ -1501,6 +1513,8 @@ def _omit_kubernetes_secret_documents(text: str) -> tuple[str, int]:
         if _KUBERNETES_SECRET_KIND.search(text, start, end)
         or _KUBERNETES_ESCAPED_QUOTED_KIND.search(text, start, end)
         or _KUBERNETES_SECRET_BLOCK_KIND.search(text, start, end)
+        or _KUBERNETES_FLOW_SECRET_KIND.search(text, start, end)
+        or _KUBERNETES_FLOW_ESCAPED_QUOTED_KIND.search(text, start, end)
     ]
     return _omit_document_ranges(text, ranges)
 
@@ -1569,10 +1583,10 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
 def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     text, terminal_controls = _normalize_terminal_text(text)
     text, xml_contexts = _omit_xml_credential_contexts(text)
+    text, json_documents = _omit_json_credential_documents(text)
     text, ambiguous_yaml_documents = _omit_ambiguous_yaml_credential_documents(text)
     text, kubernetes_documents = _omit_kubernetes_secret_documents(text)
     text, pem_documents = _omit_pem_credential_documents(text)
-    text, json_documents = _omit_json_credential_documents(text)
     text, credential_lines = _omit_sensitive_context_lines(text)
     redactions = (
         terminal_controls
