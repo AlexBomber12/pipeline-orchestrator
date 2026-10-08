@@ -1358,8 +1358,36 @@ def _json_key_escape_length(value: str, index: int) -> int:
     return 0
 
 
+def _normalize_quoted_credential_names(line: str) -> str:
+    """Join simple adjacent shell quote fragments without changing offsets."""
+    normalized = list(line)
+    index = 0
+    while index < len(line):
+        quote = line[index]
+        if quote not in {"'", '"'}:
+            index += 1
+            continue
+        closing = line.find(quote, index + 1)
+        if closing < 0:
+            break
+        fragment = line[index + 1 : closing]
+        joins_left = index > 0 and normalized[index - 1] in _SENSITIVE_KEY_CHARACTERS
+        joins_right = (
+            closing + 1 < len(line)
+            and line[closing + 1] in _SENSITIVE_KEY_CHARACTERS
+        )
+        if (joins_left or joins_right) and all(
+            character in _SENSITIVE_KEY_CHARACTERS for character in fragment
+        ):
+            normalized[index] = "_" if joins_left else " "
+            normalized[closing] = "_"
+        index = closing + 1
+    return "".join(normalized)
+
+
 def _sensitive_value_start(line: str) -> int | None:
     """Return the value position for a sensitive context found in one line."""
+    line = _normalize_quoted_credential_names(line)
     netrc_password = _NETRC_PASSWORD_VALUE.search(line)
     if netrc_password is not None:
         return netrc_password.end()
@@ -1441,9 +1469,10 @@ def _shell_group_state(
     value: str,
     parenthesis_depth: int = 0,
     parameter_brace_depth: int = 0,
+    square_bracket_depth: int = 0,
     backtick_open: bool = False,
     quote: str | None = None,
-) -> tuple[int, int, bool, str | None]:
+) -> tuple[int, int, int, bool, str | None]:
     """Track bounded shell grouping without interpreting commands or expansions."""
     escaped = False
     for index, character in enumerate(value):
@@ -1480,7 +1509,17 @@ def _shell_group_state(
             parameter_brace_depth += 1
         elif character == "}" and parameter_brace_depth:
             parameter_brace_depth -= 1
-    return parenthesis_depth, parameter_brace_depth, backtick_open, quote
+        elif character == "[":
+            square_bracket_depth += 1
+        elif character == "]" and square_bracket_depth:
+            square_bracket_depth -= 1
+    return (
+        parenthesis_depth,
+        parameter_brace_depth,
+        square_bracket_depth,
+        backtick_open,
+        quote,
+    )
 
 
 def _omit_json_string_credential_documents(text: str) -> tuple[str, int]:
@@ -1941,6 +1980,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
         (
             shell_parenthesis_depth,
             shell_brace_depth,
+            shell_bracket_depth,
             shell_backtick_open,
             shell_group_quote,
         ) = _shell_group_state(sensitive_value)
@@ -1967,16 +2007,23 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
                 if candidate == heredoc_delimiter:
                     heredoc_delimiter = None
                 continue
-            if shell_parenthesis_depth or shell_brace_depth or shell_backtick_open:
+            if (
+                shell_parenthesis_depth
+                or shell_brace_depth
+                or shell_bracket_depth
+                or shell_backtick_open
+            ):
                 (
                     shell_parenthesis_depth,
                     shell_brace_depth,
+                    shell_bracket_depth,
                     shell_backtick_open,
                     shell_group_quote,
                 ) = _shell_group_state(
                     continuation,
                     shell_parenthesis_depth,
                     shell_brace_depth,
+                    shell_bracket_depth,
                     shell_backtick_open,
                     shell_group_quote,
                 )

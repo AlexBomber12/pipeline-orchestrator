@@ -561,6 +561,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             'Digest username="user", realm="realm", nonce="abc", uri="/", '
             'response="digest-response-secret"',
             'tool --password cli-option-secret --token "quoted cli token"',
+            'tool --pass"word" quoted-fragment-option-secret',
+            "safe-after-quoted-option-name",
+            'tool "--pass"word leading-quoted-fragment-option-secret',
+            "safe-after-leading-quoted-option-name",
             "curl --user alice:curl-user-secret https://example.test",
             "curl -u alice:curl-short-user-secret https://example.test",
             "curl -ualice:curl-attached-user-secret https://example.test",
@@ -746,6 +750,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "",
             "  reversed-numeric-yaml-block-secret",
             "safe-after-reversed-numeric-yaml-block",
+            "tokens = [",
+            '"toml-array-secret"',
+            "]",
+            "safe-after-toml-array",
             "password:",
             "# explanation",
             "",
@@ -894,6 +902,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-before-bom-aws-csv" in exported
     assert "safe-after-bom-aws-csv" in exported
     assert "safe-after-shell" in exported
+    assert "safe-after-quoted-option-name" in exported
+    assert "safe-after-leading-quoted-option-name" in exported
+    assert "safe-after-toml-array" in exported
     assert "safe-after-split-assignment-name" in exported
     assert "safe-after-split-option-name" in exported
     assert "safe-after-quote" in exported
@@ -978,6 +989,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "standalone-bearer-secret",
         "digest-response-secret",
         "cli-option-secret",
+        "quoted-fragment-option-secret",
+        "leading-quoted-fragment-option-secret",
         "curl-user-secret",
         "curl-short-user-secret",
         "curl-attached-user-secret",
@@ -1038,6 +1051,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "yaml-leading-blank-secret",
         "numeric-yaml-block-secret",
         "reversed-numeric-yaml-block-secret",
+        "toml-array-secret",
         "yaml-comment-line-secret",
         "yaml-anchor-property-secret",
         "yaml-tag-property-secret",
@@ -1095,6 +1109,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
 
     for payload, secret in (
         ("PASSWORD=(\nunterminated-array-secret", "unterminated-array-secret"),
+        ("TOKENS=[\nunterminated-bracket-secret", "unterminated-bracket-secret"),
         ("PASSWORD=$(\nunterminated-command-secret", "unterminated-command-secret"),
         ("PASSWORD=${UNSET:-\nunterminated-brace-secret", "unterminated-brace-secret"),
         ("PASSWORD=`\nunterminated-backtick-secret", "unterminated-backtick-secret"),
