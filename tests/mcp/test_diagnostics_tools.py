@@ -576,6 +576,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "safe-after-ansi-c-hex-option-name",
             r"tool --pass$'\u0077ord' ansi-c-unicode-option-secret",
             "safe-after-ansi-c-unicode-option-name",
+            r"tool $'--pass\x77ord' whole-ansi-c-option-secret",
+            "safe-after-whole-ansi-c-option-name",
             r"tool --pass\word same-line-escaped-option-secret",
             "safe-after-same-line-escaped-option-name",
             "curl --user alice:curl-user-secret https://example.test",
@@ -940,6 +942,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-dollar-double-quoted-option-name" in exported
     assert "safe-after-ansi-c-hex-option-name" in exported
     assert "safe-after-ansi-c-unicode-option-name" in exported
+    assert "safe-after-whole-ansi-c-option-name" in exported
     assert "safe-after-same-line-escaped-option-name" in exported
     assert "safe-after-toml-array" in exported
     assert "safe-after-toml-triple-quote" in exported
@@ -1036,6 +1039,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "dollar-double-quoted-option-secret",
         "ansi-c-hex-option-secret",
         "ansi-c-unicode-option-secret",
+        "whole-ansi-c-option-secret",
         "same-line-escaped-option-secret",
         "curl-user-secret",
         "curl-short-user-secret",
@@ -1223,6 +1227,31 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "unclosed-before-secret" not in unclosed_mismatched_pem["text"]
     assert "unclosed-after-secret" not in unclosed_mismatched_pem["text"]
     assert "safe-after" not in unclosed_mismatched_pem["text"]
+
+    nested_pem_redis = FakeRedis()
+    nested_pem_redis.store[key] = (
+        "safe-before\n-----BEGIN PRIVATE KEY-----\n"
+        "outer-private-secret\n-----BEGIN RSA PRIVATE KEY-----\n"
+        "-----END PRIVATE KEY-----\ninner-private-secret"
+    )
+    _patch_runtime(monkeypatch, nested_pem_redis)
+    nested_pem = await diagnostics.get_latest_cli_log(SLUG)
+    assert nested_pem["text"] == "safe-before\n[credential document omitted]"
+    assert "outer-private-secret" not in nested_pem["text"]
+    assert "inner-private-secret" not in nested_pem["text"]
+
+    closed_nested_pem_redis = FakeRedis()
+    closed_nested_pem_redis.store[key] = (
+        "safe-before\n-----BEGIN PRIVATE KEY-----\n"
+        "-----BEGIN RSA PRIVATE KEY-----\nnested-private-secret\n"
+        "-----END RSA PRIVATE KEY-----\n-----END PRIVATE KEY-----\nsafe-after"
+    )
+    _patch_runtime(monkeypatch, closed_nested_pem_redis)
+    closed_nested_pem = await diagnostics.get_latest_cli_log(SLUG)
+    assert closed_nested_pem["text"] == (
+        "safe-before\n[credential document omitted]\nsafe-after"
+    )
+    assert "nested-private-secret" not in closed_nested_pem["text"]
 
     orphaned_ssh2_redis = FakeRedis()
     orphaned_ssh2_redis.store[key] = (

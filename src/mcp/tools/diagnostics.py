@@ -1262,8 +1262,7 @@ def _omit_putty_private_key_documents(text: str) -> tuple[str, int]:
 
 def _omit_pem_credential_documents(text: str) -> tuple[str, int]:
     ranges: list[tuple[int, int]] = []
-    open_start: int | None = None
-    open_marker: tuple[str, str] | None = None
+    open_boundaries: list[tuple[tuple[str, str], int]] = []
 
     def add_range(start: int, end: int) -> None:
         if start == 0:
@@ -1282,17 +1281,15 @@ def _omit_pem_credential_documents(text: str) -> tuple[str, int]:
     for match, marker_format in boundaries:
         marker = (marker_format, " ".join(match.group("label").upper().split()))
         if match.group("boundary").upper() == "BEGIN":
-            if open_start is None:
-                open_start = match.start()
-                open_marker = marker
-        elif open_start is None:
+            open_boundaries.append((marker, match.start()))
+        elif not open_boundaries:
             add_range(0, match.end())
-        elif marker == open_marker:
-            add_range(open_start, match.end())
-            open_start = None
-            open_marker = None
-    if open_start is not None:
-        add_range(open_start, len(text))
+        elif marker == open_boundaries[-1][0]:
+            _closed_marker, block_start = open_boundaries.pop()
+            if not open_boundaries:
+                add_range(block_start, match.end())
+    if open_boundaries:
+        add_range(open_boundaries[0][1], len(text))
     if not ranges:
         return text, 0
 
@@ -1475,7 +1472,8 @@ def _ansi_c_option_value_start(line: str) -> int | None:
             word_end += 1
         word = line[word_start:word_end].lstrip("'\"")
         marker = word.find("$'")
-        if word.startswith("--") and marker >= 0 and "\\" in word[marker + 2 :]:
+        possible_long_option = word.startswith("--") or word.startswith("$'--")
+        if possible_long_option and marker >= 0 and "\\" in word[marker + 2 :]:
             value_start = word_end
             while value_start < len(line) and line[value_start] in " \t":
                 value_start += 1
