@@ -311,6 +311,11 @@ _INLINE_POWERSHELL_BACKTICK = re.compile(
 _EMBEDDED_SHELL_SUBSTITUTION = re.compile(
     r"(?<![ \t;&|<>])\$(?:\(|\{|[A-Za-z_][A-Za-z0-9_]*|[0-9*@$#?!-])"
 )
+_SHELL_BRACE_EXPANSION = re.compile(
+    r"(?:(?<=[^ \t;&|<>])\{[^{}\s;&|<>]{0,64}(?:,|\.\.)"
+    r"[^{}\s;&|<>]{0,64}\}|\{[^{}\s;&|<>]{0,64}(?:,|\.\.)"
+    r"[^{}\s;&|<>]{0,64}\}(?=[^ \t;&|<>]))"
+)
 _EMBEDDED_CMD_VARIABLE = re.compile(
     r"(?<![ \t;&|<>])(?:%[A-Za-z_][A-Za-z0-9_]*(?::[^%\r\n]{0,64})?%|"
     r"![A-Za-z_][A-Za-z0-9_]*!)"
@@ -363,6 +368,7 @@ _RECOGNIZABLE_SECRET = tuple(
         r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA)[A-Z0-9]{16}\b",
         r"\b(?:glpat|gloas|gldt|glrt|glrtr|glcbt|glptt|glft|glimt|"
         r"glagent|glwt|glsoat|glffct)-[A-Za-z0-9_-]{20,}\b",
+        r"\bpypi-[A-Za-z0-9_-]{85,}\b",
         r"\bhttps://hooks\.slack(?:-gov)?\.com/(?:services/)?"
         r"T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]{24}\b",
     )
@@ -2397,6 +2403,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
         ) or _has_backslash_ansi_c_word(logical_content)
         ambiguous_shell_substitution = (
             _EMBEDDED_SHELL_SUBSTITUTION.search(logical_content) is not None
+            or _SHELL_BRACE_EXPANSION.search(logical_content) is not None
             or _EMBEDDED_CMD_VARIABLE.search(logical_content) is not None
         )
         if (

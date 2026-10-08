@@ -49,8 +49,8 @@ option arguments and their multiline shell groups, cookies,
 credential-bearing absolute or
 scheme-relative URL userinfo/query parameters (including percent-encoded
 parameter names, Azure SAS signatures, and AWS/Google presigned signatures),
-recognizable token shapes including JWTs, standard GitLab token prefixes, and
-Slack webhooks, private-key blocks,
+recognizable token shapes including JWTs, standard GitLab token prefixes, PyPI
+API tokens, and Slack webhooks, private-key blocks,
 PuTTY private-key documents, standalone AWS access-key identifiers and AWS
 credential CSVs with quoted or unquoted fields and an optional leading UTF-8
 BOM, curl user/proxy-user credentials using separated or attached short-option
@@ -80,6 +80,8 @@ names or recognizable token shapes are detected using the same inline token,
 URL, and query rules; the contributing line is omitted before tail selection.
 Bare named, positional, or special shell-parameter expansions embedded in a
 word are treated as ambiguous credential context rather than evaluated.
+Bounded Bash brace-list or brace-sequence expansions embedded in a word use the
+same fail-closed treatment.
 The established `MYSQL_PWD` assignment and attached `-pPASSWORD` forms for
 MySQL client commands are treated as credential context; unrelated `-p` options
 remain visible. Docker login's separated, equals, and attached short-password

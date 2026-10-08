@@ -610,6 +610,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "safe-after-positional-parameter-option",
             "tool --pass$?word special-parameter-option-secret",
             "safe-after-special-parameter-option",
+            "tool --pass{w..w}ord brace-sequence-option-secret",
+            "safe-after-brace-sequence-option",
+            "tool --pass{w,w}ord brace-list-option-secret",
+            "safe-after-brace-list-option",
             "set EMPTY=",
             "tool --pass%EMPTY%word cmd-variable-option-secret",
             "safe-after-cmd-variable-option",
@@ -660,6 +664,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "tool -avisible-unrelated-option",
             "tool -'p' visible-fragmented-unrelated-option",
             "az storage -p visible-unrelated-azure-option",
+            "tool {alpha,beta} visible-standalone-brace-word",
             "curl --user alice:curl-user-secret https://example.test",
             "curl -u alice:curl-short-user-secret https://example.test",
             "curl -ualice:curl-attached-user-secret https://example.test",
@@ -1041,6 +1046,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-bare-parameter-option" in exported
     assert "safe-after-positional-parameter-option" in exported
     assert "safe-after-special-parameter-option" in exported
+    assert "safe-after-brace-sequence-option" in exported
+    assert "safe-after-brace-list-option" in exported
     assert "safe-after-cmd-variable-option" in exported
     assert "safe-after-cmd-delayed-variable-option" in exported
     assert "safe-after-mysql-pwd" in exported
@@ -1067,6 +1074,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "tool -avisible-unrelated-option" in exported
     assert "tool -'p' visible-fragmented-unrelated-option" in exported
     assert "az storage -p visible-unrelated-azure-option" in exported
+    assert "tool {alpha,beta} visible-standalone-brace-word" in exported
     assert "safe-after-toml-array" in exported
     assert "safe-after-toml-triple-quote" in exported
     assert "safe-after-split-assignment-name" in exported
@@ -1177,6 +1185,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "bare-parameter-option-secret",
         "positional-parameter-option-secret",
         "special-parameter-option-secret",
+        "brace-sequence-option-secret",
+        "brace-list-option-secret",
         "cmd-variable-option-secret",
         "cmd-delayed-variable-option-secret",
         "mysql-pwd-assignment-secret",
@@ -2000,6 +2010,24 @@ async def test_latest_cli_log_redacts_standard_gitlab_token_prefixes(
         ("safe-before", *("[REDACTED]" for _token in synthetic_tokens), "safe-after")
     )
     assert all(token not in result["text"] for token in synthetic_tokens)
+
+
+async def test_latest_cli_log_redacts_recognizable_pypi_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    synthetic_token = "pypi-" + ("A" * 85)
+    redis = FakeRedis()
+    redis.store[cli_log_latest(SLUG)] = (
+        f"safe-before\n{synthetic_token}\nsafe-after"
+    )
+    _patch_runtime(monkeypatch, redis)
+
+    result = await diagnostics.get_latest_cli_log(SLUG)
+
+    assert result["text"] == "safe-before\n[REDACTED]\nsafe-after"
+    assert synthetic_token not in result["text"]
 
 
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(
