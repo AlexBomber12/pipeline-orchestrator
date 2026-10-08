@@ -146,6 +146,8 @@ and `-passout` arguments using the inline `pass:password` source are omitted by
 the same command-scoped scan; indirect password sources such as files remain
 visible. Mongosh short `-p` password arguments are likewise omitted only in
 their command span, preserving unrelated short options.
+Credential commands launched through `sudo`, `env`, `command`, or `exec` are
+omitted conservatively rather than interpreting wrapper-specific options.
 Shell-fragmented curl
 long options and bounded unquoted IFS expansions at recognized credential-option
 value boundaries fail closed without evaluating the expansion. PowerShell credential

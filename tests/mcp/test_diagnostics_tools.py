@@ -2373,6 +2373,45 @@ async def test_latest_cli_log_omits_curl_certificate_passwords(
         assert secret not in result["text"]
 
 
+async def test_latest_cli_log_fails_closed_for_execution_wrappers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    cases = (
+        ("sudo curl -u alice:wrapped-curl-secret https://example.test", "safe-sudo"),
+        ("env docker login -p wrapped-docker-secret registry.test", "safe-env"),
+        ("command sshpass -p wrapped-sshpass-secret ssh host", "safe-command"),
+        ("exec redis-cli -a wrapped-redis-secret ping", "safe-exec"),
+        (
+            "sudo -u mysql curl -u alice:wrapped-option-value-secret "
+            "https://example.test",
+            "safe-wrapper-option",
+        ),
+    )
+    redis = FakeRedis()
+    redis.store[cli_log_latest(SLUG)] = "\n".join(
+        (
+            *(line for payload, marker in cases for line in (payload, marker)),
+            "sudo echo visible-wrapper-command",
+        )
+    )
+    _patch_runtime(monkeypatch, redis)
+
+    result = await diagnostics.get_latest_cli_log(SLUG)
+
+    assert all(marker in result["text"] for _payload, marker in cases)
+    assert "sudo echo visible-wrapper-command" in result["text"]
+    for secret in (
+        "wrapped-curl-secret",
+        "wrapped-docker-secret",
+        "wrapped-sshpass-secret",
+        "wrapped-redis-secret",
+        "wrapped-option-value-secret",
+    ):
+        assert secret not in result["text"]
+
+
 async def test_latest_cli_log_omits_cloud_secret_response_shapes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

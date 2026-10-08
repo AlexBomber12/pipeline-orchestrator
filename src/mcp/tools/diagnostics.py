@@ -267,6 +267,24 @@ _CREDENTIAL_CLI_OPTION = re.compile(
 )
 _SHELL_COMMAND_WORD = re.compile(r"[^ \t;&|<>()]+|[;&|<>()]")
 _SHELL_ASSIGNMENT_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_CREDENTIAL_COMMANDS = frozenset(
+    {
+        "az",
+        "curl",
+        "docker",
+        "mongosh",
+        "mysql",
+        "mysqladmin",
+        "mysqlcheck",
+        "mysqldump",
+        "mysqlimport",
+        "mysqlshow",
+        "openssl",
+        "redis-cli",
+        "sshpass",
+    }
+)
+_EXECUTION_WRAPPERS = frozenset({"command", "env", "exec", "sudo"})
 _AWS_CONFIGURE_SET_CREDENTIAL = re.compile(
     r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?aws(?:\.exe)?[ \t]+"
     r"(?:[^ \t;&|<>()]+[ \t]+){0,16}?"
@@ -1730,30 +1748,24 @@ def _command_specific_credential_value_start(line: str) -> int | None:
             executable = compact.replace("\\", "/").rsplit("/", 1)[-1]
             if executable.endswith(".exe"):
                 executable = executable[:-4]
-            if executable in {
-                "az",
-                "curl",
-                "docker",
-                "mongosh",
-                "mysql",
-                "mysqladmin",
-                "mysqlcheck",
-                "mysqldump",
-                "mysqlimport",
-                "mysqlshow",
-                "openssl",
-                "redis-cli",
-                "sshpass",
-            }:
+            if executable in _CREDENTIAL_COMMANDS:
                 command = executable
                 pending_option = None
+                at_command_start = False
+                continue
+            if executable in _EXECUTION_WRAPPERS:
+                command = "execution-wrapper"
                 at_command_start = False
                 continue
             if _SHELL_ASSIGNMENT_WORD.match(compact_case) is not None:
                 continue
             at_command_start = False
 
-        if command == "curl":
+        if command == "execution-wrapper":
+            wrapped = compact.replace("\\", "/").rsplit("/", 1)[-1]
+            if wrapped.removesuffix(".exe") in _CREDENTIAL_COMMANDS:
+                return match.start()
+        elif command == "curl":
             if compact in {"-b", "--cookie"}:
                 pending_option = "curl-cookie"
             elif compact == "--pass":
