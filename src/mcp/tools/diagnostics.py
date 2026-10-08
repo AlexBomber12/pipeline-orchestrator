@@ -113,7 +113,9 @@ _JSON_SIMPLE_ESCAPE = re.compile(r'\\(?P<escape>["\\/bfnrt])')
 _YAML_DOCUMENT_BOUNDARY = re.compile(r"(?m)^(?:---|\.\.\.)[ \t]*(?:#.*)?(?:\n|$)")
 _YAML_ALIAS = re.compile(r"(?<![A-Za-z0-9_.-])\*[^\s,\[\]{}#]+")
 _YAML_COMMENT = re.compile(r"(?<!\S)#")
-_YAML_BLOCK_VALUE_INDICATORS = frozenset({"", "|", "|-", "|+", ">", ">-", ">+"})
+_YAML_BLOCK_VALUE_INDICATOR = re.compile(
+    r"^(?:[|>](?:[1-9][+-]?|[+-][1-9]?)?)?$"
+)
 _XML_NAME_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-"
 )
@@ -150,8 +152,14 @@ _KUBERNETES_FLOW_SECRET_KIND = re.compile(
 _KUBERNETES_FLOW_ESCAPED_QUOTED_KIND = re.compile(
     _KUBERNETES_FLOW_KIND_PREFIX + r'"(?=[^\r\n]*\\)'
 )
+_KUBERNETES_ALIAS_KIND = re.compile(
+    rf"(?im)(?:^|[{{,])[ \t\r\n]*{_KUBERNETES_KIND_KEY}"
+    r"[ \t\r\n]*:[ \t\r\n]*\*[^\s,\[\]{}#]+"
+)
 _URL_USERINFO = re.compile(r"(?i)(?P<scheme>(?:\b[a-z][a-z0-9+.-]*:)?//)[^/@\s]+@")
-_SENSITIVE_QUERY_VALUE = re.compile(r"(?i)(?P<prefix>[?&;](?:sig|signature)=)[^&#;\s]+")
+_QUERY_PARAMETER_VALUE = re.compile(
+    r"(?P<separator>[?&;])(?P<name>[^=&#;\s]+)=(?P<value>[^&#;\s]+)"
+)
 _AUTHORIZATION_VALUE = re.compile(
     r"(?i)\b(?P<scheme>Bearer|Basic|Digest|Negotiate|ApiKey|Token)[ \t]+\S+"
 )
@@ -1146,6 +1154,19 @@ def _is_sensitive_key(value: str) -> bool:
     return any(sensitive in key for sensitive in _CREDENTIAL_DOCUMENT_KEYS)
 
 
+def _redact_sensitive_query_values(text: str) -> tuple[str, int]:
+    redactions = 0
+
+    def redact(match: re.Match[str]) -> str:
+        nonlocal redactions
+        if unquote_plus(match.group("name")).lower() not in {"sig", "signature"}:
+            return match.group(0)
+        redactions += 1
+        return f"{match.group('separator')}{match.group('name')}={_REDACTED}"
+
+    return _QUERY_PARAMETER_VALUE.sub(redact, text), redactions
+
+
 def _json_key_escape_length(value: str, index: int) -> int:
     if index + 1 >= len(value) or value[index] != "\\":
         return 0
@@ -1486,7 +1507,10 @@ def _omit_ambiguous_yaml_credential_documents(text: str) -> tuple[str, int]:
             value = line[value_start:].lstrip()
             comment = _YAML_COMMENT.search(value)
             unsafe_comment = comment is not None and (
-                value[: comment.start()].strip() in _YAML_BLOCK_VALUE_INDICATORS
+                _YAML_BLOCK_VALUE_INDICATOR.fullmatch(
+                    value[: comment.start()].strip()
+                )
+                is not None
             )
             yaml_key = line[: max(value_start - 1, 0)].strip().strip("'\"")
             unsafe_flow_collection = (
@@ -1515,6 +1539,7 @@ def _omit_kubernetes_secret_documents(text: str) -> tuple[str, int]:
         or _KUBERNETES_SECRET_BLOCK_KIND.search(text, start, end)
         or _KUBERNETES_FLOW_SECRET_KIND.search(text, start, end)
         or _KUBERNETES_FLOW_ESCAPED_QUOTED_KIND.search(text, start, end)
+        or _KUBERNETES_ALIAS_KIND.search(text, start, end)
     ]
     return _omit_document_ranges(text, ranges)
 
@@ -1538,7 +1563,10 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
         omitted += 1
         open_quote = _unterminated_quote(content)
         continued = content.rstrip().endswith("\\")
-        yaml_block = content[value_start:].strip() in _YAML_BLOCK_VALUE_INDICATORS
+        yaml_block = (
+            _YAML_BLOCK_VALUE_INDICATOR.fullmatch(content[value_start:].strip())
+            is not None
+        )
         sensitive_value = content[value_start:]
         shell_group_depth, shell_group_quote = _shell_parenthesis_state(sensitive_value)
         heredoc = _HEREDOC_START.search(sensitive_value)
@@ -1600,10 +1628,7 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
 
     text, count = _URL_USERINFO.subn(lambda match: f"{match.group('scheme')}{_REDACTED}@", text)
     redactions += count
-    text, count = _SENSITIVE_QUERY_VALUE.subn(
-        lambda match: f"{match.group('prefix')}{_REDACTED}",
-        text,
-    )
+    text, count = _redact_sensitive_query_values(text)
     redactions += count
     text, count = _AUTHORIZATION_VALUE.subn(
         lambda match: f"{match.group('scheme')} {_REDACTED}",

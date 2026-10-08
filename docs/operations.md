@@ -54,10 +54,10 @@ documents are not exported, including nested documents and documents serialized
 inside log strings and structured header name/value pairs in JSON-list or
 Python-tuple form. Recognizable Kubernetes Secret documents are omitted as a
 whole in YAML or JSON form, including arbitrary keys under `data` or
-`stringData`, quoted or escaped `kind` keys, and anchored, tagged, escaped
-double-quoted, block-scalar, or flow-mapping `kind` values. Complete and
-interrupted private-key blocks are both omitted
-using a bounded single-pass boundary scan.
+`stringData`, quoted or escaped `kind` keys, and anchored, aliased, tagged,
+escaped double-quoted, block-scalar (including indentation indicators), or
+flow-mapping `kind` values. Complete and interrupted private-key blocks are both
+omitted using a bounded single-pass boundary scan.
 Standard encoded `auth` fields used by registry and package-manager credential
 documents are treated as credential context rather than exported as base64 text.
 Recognizable XML credential elements, credential attributes, and `key`/`name`

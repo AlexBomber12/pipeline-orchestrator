@@ -486,6 +486,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "https://example.test/?access%5Ftoken=encoded-query-secret",
             "https://example.test/?password[]=bracket-query-secret",
             "https://blob.example.test/c?sv=2024-01-01&sig=azure-sas-secret&se=2027-01-01",
+            "https://blob.example.test/c?sv=2024-01-01&%73ig=encoded-azure-sas-secret",
             "https://single-url-credential@example.test/path",
             "//network-user:network-password@example.test/path",
             "ghp_" + ("A" * 36),
@@ -573,6 +574,14 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "data:",
             "  arbitrary-name: kubernetes-escaped-key-secret",
             "---",
+            "apiVersion: v1",
+            "metadata:",
+            "  annotations:",
+            "    selected-kind: &resourceKindAlias Secret",
+            "kind: *resourceKindAlias",
+            "data:",
+            "  arbitrary-name: kubernetes-aliased-kind-secret",
+            "---",
             "{data: {arbitrary: kubernetes-flow-secret}, kind: Secret}",
             "---",
             r'{"k\u0069nd": "Sec\u0072et", data: {arbitrary: kubernetes-flow-escaped-secret}}',
@@ -617,6 +626,14 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "",
             "  yaml-leading-blank-secret",
             "safe-after-yaml-blank",
+            "password: |2-",
+            "",
+            "  numeric-yaml-block-secret",
+            "safe-after-numeric-yaml-block",
+            "password: >-2",
+            "",
+            "  reversed-numeric-yaml-block-secret",
+            "safe-after-reversed-numeric-yaml-block",
             "PASSWORD=$(cat <<EOF)",
             "heredoc-secret",
             "EOF",
@@ -677,6 +694,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-yaml" in exported
     assert "safe-after-yaml-sequence" in exported
     assert "safe-after-yaml-blank" in exported
+    assert "safe-after-numeric-yaml-block" in exported
+    assert "safe-after-reversed-numeric-yaml-block" in exported
     assert "safe-after-heredoc" in exported
     assert "safe-after-digit-heredoc" in exported
     assert "safe-before-kubernetes-secret" in exported
@@ -722,6 +741,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "encoded-query-secret",
         "bracket-query-secret",
         "azure-sas-secret",
+        "encoded-azure-sas-secret",
         "array-document-secret",
         "prefix-document-secret",
         "serialized-document-secret",
@@ -763,6 +783,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "kubernetes-escaped-kind-secret",
         "kubernetes-quoted-key-secret",
         "kubernetes-escaped-key-secret",
+        "kubernetes-aliased-kind-secret",
         "kubernetes-flow-secret",
         "kubernetes-flow-escaped-secret",
         "quoted cli token",
@@ -787,6 +808,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "yaml-multiline-secret",
         "indentationless-yaml-secret",
         "yaml-leading-blank-secret",
+        "numeric-yaml-block-secret",
+        "reversed-numeric-yaml-block-secret",
         "heredoc-secret",
         "digit-heredoc-secret",
         "shell-multiline-secret",
