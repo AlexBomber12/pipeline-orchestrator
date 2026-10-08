@@ -737,6 +737,12 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "PASSWORD=" + "\\",
             "shell-multiline-secret",
             "safe-after-shell",
+            "PASS" + "\\",
+            "WORD=split-assignment-name-secret",
+            "safe-after-split-assignment-name",
+            "--pass" + "\\",
+            "word split-option-name-secret",
+            "safe-after-split-option-name",
             'PASSWORD="alpha',
             'quoted-multiline-secret"',
             "safe-after-quote",
@@ -845,6 +851,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-before-bom-aws-csv" in exported
     assert "safe-after-bom-aws-csv" in exported
     assert "safe-after-shell" in exported
+    assert "safe-after-split-assignment-name" in exported
+    assert "safe-after-split-option-name" in exported
     assert "safe-after-quote" in exported
     assert "safe-after-shell-array" in exported
     assert "safe-after-shell-command" in exported
@@ -988,6 +996,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "heredoc-secret",
         "digit-heredoc-secret",
         "shell-multiline-secret",
+        "split-assignment-name-secret",
+        "split-option-name-secret",
         "quoted-multiline-secret",
         "shell-array-secret",
         "shell-command-secret",

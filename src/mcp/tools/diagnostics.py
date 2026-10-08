@@ -1809,20 +1809,28 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
     while index < len(lines):
         line = lines[index]
         content = line.rstrip("\r\n")
-        value_start = _sensitive_value_start(content)
+        logical_content = content
+        logical_end = index + 1
+        while logical_content.rstrip().endswith("\\") and logical_end < len(lines):
+            logical_content = (
+                logical_content.rstrip()[:-1] + lines[logical_end].rstrip("\r\n")
+            )
+            logical_end += 1
+        value_start = _sensitive_value_start(logical_content)
         if value_start is None:
-            sanitized.append(line)
-            index += 1
+            sanitized.extend(lines[index:logical_end])
+            index = logical_end
             continue
 
-        ending = line[len(content) :]
+        final_content = lines[logical_end - 1].rstrip("\r\n")
+        ending = lines[logical_end - 1][len(final_content) :]
         sanitized.append(f"[credential line omitted]{ending}")
         omitted += 1
-        open_quote = _unterminated_quote(content)
-        continued = content.rstrip().endswith("\\")
-        yaml_block = _is_pending_yaml_value(content[value_start:].strip())
-        pending_netrc_value = _NETRC_PENDING_PASSWORD_VALUE.search(content) is not None
-        sensitive_value = content[value_start:]
+        open_quote = _unterminated_quote(logical_content)
+        continued = logical_content.rstrip().endswith("\\")
+        yaml_block = _is_pending_yaml_value(logical_content[value_start:].strip())
+        pending_netrc_value = _NETRC_PENDING_PASSWORD_VALUE.search(logical_content) is not None
+        sensitive_value = logical_content[value_start:]
         (
             shell_parenthesis_depth,
             shell_brace_depth,
@@ -1837,7 +1845,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
             # the remaining bounded source rather than risk exporting its body.
             heredoc_delimiter = "\0"
         indented_block = False
-        index += 1
+        index = logical_end
         while index < len(lines):
             continuation = lines[index].rstrip("\r\n")
             if pending_netrc_value:
