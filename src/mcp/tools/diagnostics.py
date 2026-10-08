@@ -145,6 +145,11 @@ _YAML_MULTILINE_EXPLICIT_SINGLE_QUOTED_KEY = re.compile(
     r"(?:[^']|'')*'[ \t]*"
     r"(?::|(?:#.*)?\r?\n(?:[ \t]*(?:#.*)?\r?\n)*[ \t]*:)"
 )
+_YAML_MULTILINE_EXPLICIT_PLAIN_KEY = re.compile(
+    r"(?m)(?:^[ \t]*(?:-[ \t]+)?|[,{][ \t]*)\?[ \t]+"
+    r"(?!['\"\[{|>])[^\r\n#]+\r?\n"
+    r"(?:[ \t]+(?!:)[^\r\n]*(?:\r?\n))+[ \t]*:"
+)
 _YAML_ALIAS_MAPPING_KEY = re.compile(
     r"(?im)(?:^[ \t]*(?:-[ \t]+)?|[,{][ \t]*)"
     r"\*[^\s,\[\]{}#]+[ \t]*:"
@@ -261,7 +266,7 @@ _AUTHORIZATION_VALUE = re.compile(
 )
 _DIGEST_AUTHORIZATION = re.compile(r"(?i)(?<![A-Za-z0-9])Digest[ \t]+")
 _CREDENTIAL_CLI_OPTION = re.compile(
-    r"(?i)(?<!\S)(?:(?:--user|--proxy-user)(?:[ \t]+|=)|"
+    r"(?i)(?<!\S)(?:\$?['\"])?(?:(?:--user|--proxy-user)(?:[ \t]+|=)|"
     r"-[#0-9:A-Za-z]*?[uU](?:[ \t]+|=|(?=[^ \t;&|<>()])))"
 )
 _NETRC_PASSWORD_VALUE = re.compile(r"(?i)(?<!\S)password[ \t]+")
@@ -1564,7 +1569,21 @@ def _sensitive_value_start(line: str) -> int | None:
         option_value = candidate.startswith("-") and (
             cursor > whitespace_start or delimiter in {"=", ":"}
         )
-        if _is_sensitive_key(candidate):
+        powershell_parameter = "".join(
+            character
+            for character in candidate[1:].lower()
+            if "a" <= character <= "z" or "0" <= character <= "9"
+        )
+        powershell_credential_prefix = (
+            candidate.startswith("-")
+            and not candidate.startswith("--")
+            and len(powershell_parameter) >= 4
+            and any(
+                sensitive.startswith(powershell_parameter)
+                for sensitive in _CREDENTIAL_DOCUMENT_KEYS
+            )
+        )
+        if _is_sensitive_key(candidate) or powershell_credential_prefix:
             if sensitive_delimiter:
                 return cursor + 1
             if option_value:
@@ -2087,6 +2106,7 @@ def _omit_ambiguous_yaml_credential_documents(text: str) -> tuple[str, int]:
             or _YAML_BLOCK_EXPLICIT_MAPPING_KEY.search(text, start, end)
             or _YAML_MULTILINE_EXPLICIT_QUOTED_KEY.search(text, start, end)
             or _YAML_MULTILINE_EXPLICIT_SINGLE_QUOTED_KEY.search(text, start, end)
+            or _YAML_MULTILINE_EXPLICIT_PLAIN_KEY.search(text, start, end)
             or _YAML_ALIAS_MAPPING_KEY.search(text, start, end)
             or explicit_credential_key
         ):

@@ -1373,6 +1373,10 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
             "safe-after-numeric-bundled-user",
             "curl -#Uproxy:SYNTHETIC_SYMBOL_BUNDLED_SECRET https://example.test",
             "safe-after-symbol-bundled-proxy",
+            "curl '-uuser:SYNTHETIC_QUOTED_CURL_SECRET' https://example.test",
+            "safe-after-quoted-curl",
+            "curl $'-uuser:SYNTHETIC_ANSI_QUOTED_CURL_SECRET' https://example.test",
+            "safe-after-ansi-quoted-curl",
             "https://user:SYNTHETIC_URL_FIRST@SYNTHETIC_URL_SECOND@example.test/path",
             "safe-after-url",
             "('X-Api-Key',",
@@ -1390,6 +1394,8 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
     assert "safe-after-bundled-proxy" in result["text"]
     assert "safe-after-numeric-bundled-user" in result["text"]
     assert "safe-after-symbol-bundled-proxy" in result["text"]
+    assert "safe-after-quoted-curl" in result["text"]
+    assert "safe-after-ansi-quoted-curl" in result["text"]
     assert "safe-after-url" in result["text"]
     assert "safe-after-pair" in result["text"]
     for secret in (
@@ -1397,6 +1403,8 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
         "SYNTHETIC_BUNDLED_PROXY_SECRET",
         "SYNTHETIC_NUMERIC_BUNDLED_SECRET",
         "SYNTHETIC_SYMBOL_BUNDLED_SECRET",
+        "SYNTHETIC_QUOTED_CURL_SECRET",
+        "SYNTHETIC_ANSI_QUOTED_CURL_SECRET",
         "SYNTHETIC_URL_FIRST",
         "SYNTHETIC_URL_SECOND",
         "SYNTHETIC_STRUCTURED_PAIR_SECRET",
@@ -1422,6 +1430,10 @@ async def test_latest_cli_log_omits_embedded_json_and_powershell_credentials(
             "Connect-Service -ClientSec`",
             "ret SYNTHETIC_SPLIT_POWERSHELL_SECRET",
             "safe-after-split-powershell",
+            "Connect-Service -Pass SYNTHETIC_ABBREVIATED_PASS_SECRET",
+            "safe-after-abbreviated-pass",
+            "Connect-Service -ClientSec SYNTHETIC_ABBREVIATED_CLIENT_SECRET",
+            "safe-after-abbreviated-client",
         )
     )
     _patch_runtime(monkeypatch, redis)
@@ -1433,11 +1445,15 @@ async def test_latest_cli_log_omits_embedded_json_and_powershell_credentials(
         'safe-before-json\n{"message":[credential document omitted]}\n'
         "safe-after-json\n"
         "[credential line omitted]\nsafe-after-powershell\n"
-        "[credential line omitted]\nsafe-after-split-powershell"
+        "[credential line omitted]\nsafe-after-split-powershell\n"
+        "[credential line omitted]\nsafe-after-abbreviated-pass\n"
+        "[credential line omitted]\nsafe-after-abbreviated-client"
     )
     assert "SYNTHETIC_EMBEDDED_UNICODE_SECRET" not in result["text"]
     assert "SYNTHETIC_POWERSHELL_SECRET" not in result["text"]
     assert "SYNTHETIC_SPLIT_POWERSHELL_SECRET" not in result["text"]
+    assert "SYNTHETIC_ABBREVIATED_PASS_SECRET" not in result["text"]
+    assert "SYNTHETIC_ABBREVIATED_CLIENT_SECRET" not in result["text"]
     assert diagnostics._contains_credential_document_key(
         "{" + ("x" * diagnostics._MAX_CLI_LOG_SOURCE_BYTES)
     )
@@ -1456,6 +1472,7 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
         '? "pass\\\n  word"\n: SYNTHETIC_SECRET\nsafe: visible',
         '{? "pass\\\n  word": SYNTHETIC_SECRET}\nsafe: visible',
         "? 'pass\n  word'\n: SYNTHETIC_SECRET\nsafe: visible",
+        "? pass\n  word\n: SYNTHETIC_SECRET\nsafe: visible",
         "? |-\n  password\n: SYNTHETIC_SECRET\nsafe: visible",
     )
     for payload in supplied_cases:
@@ -1498,6 +1515,10 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
             "  word'",
             ": SYNTHETIC_SINGLE_QUOTED_EXPLICIT_KEY_SECRET",
             "---",
+            "? pass",
+            "  word",
+            ": SYNTHETIC_PLAIN_MULTILINE_EXPLICIT_KEY_SECRET",
+            "---",
             '{? "pass\\',
             '  word": SYNTHETIC_FLOW_MULTILINE_EXPLICIT_KEY_SECRET}',
             "---",
@@ -1518,7 +1539,7 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
     result = await diagnostics.get_latest_cli_log(SLUG, diagnostics._MAX_CLI_LOG_TAIL_BYTES)
 
     assert result["availability"]["status"] == "available"
-    assert result["text"].count("[credential document omitted]") == 9
+    assert result["text"].count("[credential document omitted]") == 10
     assert "safe: before" in result["text"]
     assert "safe: visible" in result["text"]
     assert "safe-explicit-visible" in result["text"]
@@ -1531,6 +1552,7 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
         "SYNTHETIC_FLOW_COLLECTION_SECRET",
         "SYNTHETIC_MULTILINE_EXPLICIT_KEY_SECRET",
         "SYNTHETIC_SINGLE_QUOTED_EXPLICIT_KEY_SECRET",
+        "SYNTHETIC_PLAIN_MULTILINE_EXPLICIT_KEY_SECRET",
         "SYNTHETIC_FLOW_MULTILINE_EXPLICIT_KEY_SECRET",
         "SYNTHETIC_BLOCK_EXPLICIT_KEY_SECRET",
     ):

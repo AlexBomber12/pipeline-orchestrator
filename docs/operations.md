@@ -72,7 +72,9 @@ Logical command reconstruction recognizes trailing shell backslashes and
 PowerShell backticks before classifying split credential parameter names.
 URL userinfo redaction consumes through the final `@` in the bounded authority,
 and curl user/proxy-user short options are recognized when attached inside an
-option cluster. Multiline structured credential pairs retain grouping that
+option cluster or quoted as a complete shell argument. PowerShell credential
+parameter prefixes of four or more characters fail closed when they prefix a
+recognized sensitive name. Multiline structured credential pairs retain grouping that
 starts before the sensitive field so unindented values cannot escape omission.
 Standard encoded `auth` fields used by registry and package-manager credential
 documents are treated as credential context rather than exported as base64 text.
@@ -81,9 +83,9 @@ keys that use recognized YAML-only escape forms are omitted conservatively
 rather than partially decoded. Node-property-only credential values retain their
 context across blank and comment lines. Single-quoted YAML mapping keys decode
 doubled single-quote escapes before credential classification. Documents
-containing multiline explicit single- or double-quoted mapping keys, in block or
-flow mappings, are omitted because folded keys cannot be classified safely
-without interpreting YAML.
+containing multiline explicit plain mapping keys, or multiline explicit single-
+or double-quoted keys in block or flow mappings, are omitted because folded keys
+cannot be classified safely without interpreting YAML.
 Explicit block-scalar mapping keys
 are omitted for the same reason.
 Recognizable XML credential elements, credential attributes, and `key`/`name`
