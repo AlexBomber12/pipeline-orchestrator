@@ -418,6 +418,34 @@ async def test_latest_cli_log_bounds_source_output_and_utf8(
     assert malformed_json["text"] == "[credential document omitted]"
     assert malformed_json["redaction"]["credential_documents_omitted"] == 1
 
+    parse_failure_flood = "{]" * diagnostics._MAX_JSON_PARSE_FAILURES
+    assert diagnostics._omit_json_credential_documents(parse_failure_flood) == (
+        "[credential document omitted]",
+        1,
+    )
+
+    fallback_classifications: list[int] = []
+
+    def record_fallback_classification(container: str) -> bool:
+        fallback_classifications.append(len(container))
+        return False
+
+    repeated_malformed = ("{a" * diagnostics._MAX_CLI_LOG_SOURCE_BYTES)[
+        : diagnostics._MAX_CLI_LOG_SOURCE_BYTES
+    ]
+    with monkeypatch.context() as fallback_context:
+        fallback_context.setattr(
+            diagnostics,
+            "_line_has_sensitive_context",
+            record_fallback_classification,
+        )
+        bounded_json, bounded_omissions = diagnostics._omit_json_credential_documents(
+            repeated_malformed
+        )
+    assert (bounded_json, bounded_omissions) == ("[credential document omitted]", 1)
+    assert fallback_classifications == [diagnostics._MAX_CLI_LOG_SOURCE_BYTES]
+    assert diagnostics._json_container_end("{", 0, 0) is None
+
     oversized_integer_redis = FakeRedis()
     oversized_integer_redis.store[key] = "[" + ("9" * 5_000) + "]"
     _patch_runtime(monkeypatch, oversized_integer_redis)
@@ -660,6 +688,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "*credentialKey: alias-key-credential-secret",
             "---",
             "{data: {arbitrary: kubernetes-flow-secret}, kind: Secret}",
+            "---",
+            "{data: {arbitrary: kubernetes-flow-explicit-secret}, ? kind : Secret}",
             "---",
             r'{"k\u0069nd": "Sec\u0072et", data: {arbitrary: kubernetes-flow-escaped-secret}}',
             "---",
@@ -965,6 +995,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "explicit-yaml-credential-secret",
         "alias-key-credential-secret",
         "kubernetes-flow-secret",
+        "kubernetes-flow-explicit-secret",
         "kubernetes-flow-escaped-secret",
         "quoted cli token",
         "escaped-option-secret",

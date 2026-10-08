@@ -55,6 +55,9 @@ _MAX_CLI_LOG_SOURCE_BYTES = (64 * 1024) + 6
 _DEFAULT_CLI_LOG_TAIL_BYTES = 8 * 1024
 _MAX_CLI_LOG_TAIL_BYTES = 32 * 1024
 _MAX_JSON_PARSE_FAILURES = 64
+# Malformed JSON fallback performs one boundary pass and one credential-context
+# pass. Bound their cumulative character work to two producer-sized passes.
+_MAX_JSON_FALLBACK_SCAN_CHARACTERS = 2 * _MAX_CLI_LOG_SOURCE_BYTES
 _CLI_LOG_PRODUCER_TRUNCATION_MARKER = "[truncated]\n"
 
 _REDACTED = "[REDACTED]"
@@ -214,7 +217,7 @@ _KUBERNETES_MULTILINE_SECRET_KIND = re.compile(
     + r"[ \t]*(?:#.*)?(?:\n|$)"
 )
 _KUBERNETES_FLOW_KIND_PREFIX = (
-    rf"(?im)(?:^|[{{,])[ \t\r\n]*{_KUBERNETES_KIND_KEY}"
+    rf"(?im)(?:^|[{{,])[ \t\r\n]*(?:\?[ \t\r\n]+)?{_KUBERNETES_KIND_KEY}"
     r"[ \t\r\n]*:[ \t\r\n]*"
     + _YAML_FLOW_NODE_PROPERTIES
 )
@@ -1486,11 +1489,23 @@ def _shell_group_state(
     return parenthesis_depth, parameter_brace_depth, backtick_open, quote
 
 
-def _json_container_end(text: str, start: int) -> int:
+def _json_container_end(
+    text: str,
+    start: int,
+    work_limit: int,
+) -> tuple[int, int] | None:
+    # Charge the start once for later classification, then twice per following
+    # character for boundary scanning plus classification of the same span.
+    work = 1
+    if work > work_limit:
+        return None
     stack = [text[start]]
     in_string = False
     escaped = False
     for index in range(start + 1, len(text)):
+        if work + 2 > work_limit:
+            return None
+        work += 2
         character = text[index]
         if in_string:
             if escaped:
@@ -1507,11 +1522,11 @@ def _json_container_end(text: str, start: int) -> int:
         elif character in "]}":
             expected = "[" if character == "]" else "{"
             if stack[-1] != expected:
-                return index + 1
+                return index + 1, work
             stack.pop()
             if not stack:
-                return index + 1
-    return len(text)
+                return index + 1, work
+    return len(text), work
 
 
 def _omit_json_credential_documents(text: str) -> tuple[str, int]:
@@ -1519,6 +1534,7 @@ def _omit_json_credential_documents(text: str) -> tuple[str, int]:
     ranges: list[tuple[int, int]] = []
     covered_until = 0
     parse_failures = 0
+    fallback_scan_characters = 0
     for match in _JSON_CONTAINER_START.finditer(text):
         start = match.start()
         if start > 0 and text[start - 1] == '"':
@@ -1531,7 +1547,14 @@ def _omit_json_credential_documents(text: str) -> tuple[str, int]:
             parse_failures += 1
             if parse_failures >= _MAX_JSON_PARSE_FAILURES:
                 return _CREDENTIAL_DOCUMENT_OMITTED, 1
-            end = _json_container_end(text, match.start())
+            remaining_work = (
+                _MAX_JSON_FALLBACK_SCAN_CHARACTERS - fallback_scan_characters
+            )
+            boundary = _json_container_end(text, match.start(), remaining_work)
+            if boundary is None:
+                return _CREDENTIAL_DOCUMENT_OMITTED, 1
+            end, work = boundary
+            fallback_scan_characters += work
             container = " ".join(text[match.start() : end].splitlines())
             if _line_has_sensitive_context(container):
                 ranges.append((match.start(), end))

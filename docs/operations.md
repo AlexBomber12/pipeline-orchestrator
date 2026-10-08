@@ -62,8 +62,9 @@ values that are anchored, aliased, tagged using non-specific, shorthand, or
 verbatim forms, escaped double-quoted, node-property-decorated multiline, or
 block-scalar
 (including indentation indicators), multiline plain-scalar, block-sequence, or
-flow-mapping `kind` values. Complete and interrupted private-key blocks are both
-omitted using bounded boundary scans.
+flow-mapping `kind` values. Explicit `kind` keys inside flow mappings are also
+recognized regardless of member order. Complete and interrupted private-key
+blocks are both omitted using bounded boundary scans.
 Standard encoded `auth` fields used by registry and package-manager credential
 documents are treated as credential context rather than exported as base64 text.
 YAML documents with explicit credential keys, alias mapping keys, or mapping
@@ -123,6 +124,9 @@ cause regex backtracking stalls.
 Malformed or incomplete JSON containers with credential contexts are omitted
 through their closing boundary or, when unterminated, through the source end;
 legal whitespace may separate a credential key, delimiter, and value.
+Fallback inspection of malformed JSON has both a parse-failure limit and a
+fixed cumulative character-work budget, so overlapping container candidates
+cannot repeatedly rescan a producer-sized source.
 All legal JSON string escapes in credential keys are decoded during fallback
 inspection.
 Malformed JSON probing has a fixed failure budget; if that budget is
