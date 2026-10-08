@@ -109,6 +109,8 @@ one-line scalar output are omitted conservatively.
 An exact AWS Secrets Manager `get-secret-value` command selecting
 `SecretString` or `SecretBinary` with text output receives the same scalar
 handling.
+The documented `kubectl get secret` JSONPath pipeline into `base64 --decode`
+also omits its following decoded scalar.
 The `sshpass -p` separated, attached, and shell-fragmented password forms are
 also recognized only in their command-specific context. Its exact `SSHPASS`
 environment password assignment is credential context for `-e` mode.
@@ -138,7 +140,8 @@ arguments containing explicit cookie data are likewise omitted in their
 command-specific context using a monotonic bounded word scan. Curl certificate
 and proxy-certificate arguments with embedded `certificate:password` suffixes
 are omitted by that curl-scoped scan while passwordless certificate arguments
-remain visible. OpenSSL `-passin`
+remain visible. URLs do not replace the active curl scope, and curl `--pass`
+private-key passphrases are omitted in separated or equals forms. OpenSSL `-passin`
 and `-passout` arguments using the inline `pass:password` source are omitted by
 the same command-scoped scan; indirect password sources such as files remain
 visible. Mongosh short `-p` password arguments are likewise omitted only in

@@ -266,6 +266,7 @@ _CREDENTIAL_CLI_OPTION = re.compile(
     r"(?i)(?<!\S)(?:\$?['\"])?(?:--user|--proxy-user)(?:['\"]?[ \t]+|=)"
 )
 _SHELL_COMMAND_WORD = re.compile(r"[^ \t;&|<>()]+|[;&|<>()]")
+_SHELL_ASSIGNMENT_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _AWS_CONFIGURE_SET_CREDENTIAL = re.compile(
     r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?aws(?:\.exe)?[ \t]+"
     r"(?:[^ \t;&|<>()]+[ \t]+){0,16}?"
@@ -1682,11 +1683,13 @@ def _command_specific_credential_value_start(line: str) -> int | None:
     """Scan command words once for options whose meaning depends on the executable."""
     command: str | None = None
     pending_option: str | None = None
+    at_command_start = True
     for match in _SHELL_COMMAND_WORD.finditer(line):
         word = match.group(0)
         if word in ";&|<>()":
             command = None
             pending_option = None
+            at_command_start = True
             continue
 
         compact_case = word.strip("'\"").replace("_", "")
@@ -1699,6 +1702,7 @@ def _command_specific_credential_value_start(line: str) -> int | None:
             pending_option = None
             if selected_option in {
                 "az-password",
+                "curl-passphrase",
                 "curl-user",
                 "docker-password",
                 "mongosh-password",
@@ -1722,31 +1726,40 @@ def _command_specific_credential_value_start(line: str) -> int | None:
                 return match.start()
             continue
 
-        executable = compact.replace("\\", "/").rsplit("/", 1)[-1]
-        if executable.endswith(".exe"):
-            executable = executable[:-4]
-        if executable in {
-            "az",
-            "curl",
-            "docker",
-            "mongosh",
-            "mysql",
-            "mysqladmin",
-            "mysqlcheck",
-            "mysqldump",
-            "mysqlimport",
-            "mysqlshow",
-            "openssl",
-            "redis-cli",
-            "sshpass",
-        }:
-            command = executable
-            pending_option = None
-            continue
+        if at_command_start:
+            executable = compact.replace("\\", "/").rsplit("/", 1)[-1]
+            if executable.endswith(".exe"):
+                executable = executable[:-4]
+            if executable in {
+                "az",
+                "curl",
+                "docker",
+                "mongosh",
+                "mysql",
+                "mysqladmin",
+                "mysqlcheck",
+                "mysqldump",
+                "mysqlimport",
+                "mysqlshow",
+                "openssl",
+                "redis-cli",
+                "sshpass",
+            }:
+                command = executable
+                pending_option = None
+                at_command_start = False
+                continue
+            if _SHELL_ASSIGNMENT_WORD.match(compact_case) is not None:
+                continue
+            at_command_start = False
 
         if command == "curl":
             if compact in {"-b", "--cookie"}:
                 pending_option = "curl-cookie"
+            elif compact == "--pass":
+                pending_option = "curl-passphrase"
+            elif compact.startswith("--pass=") and len(compact) > len("--pass="):
+                return match.start()
             elif compact_case == "-E" or compact in {"--cert", "--proxy-cert"}:
                 pending_option = "curl-certificate"
             elif (
@@ -2645,6 +2658,35 @@ def _is_aws_secrets_manager_value_command(line: str) -> bool:
     return False
 
 
+def _is_kubectl_decoded_secret_command(line: str) -> bool:
+    """Recognize the documented kubectl Secret JSONPath decode pipeline."""
+    segments = _normalize_shell_credential_names(line).split("|")
+    if len(segments) < 2:
+        return False
+
+    command_words: list[list[str]] = []
+    for segment in segments[:2]:
+        words = [
+            match.group(0).strip("'\"").replace("_", "").lower()
+            for match in _SHELL_COMMAND_WORD.finditer(segment)
+            if match.group(0) not in ";&|<>()"
+        ]
+        command_words.append(words)
+    kubectl_words, base64_words = command_words
+    if not kubectl_words or not base64_words:
+        return False
+    kubectl = kubectl_words[0].replace("\\", "/").rsplit("/", 1)[-1]
+    decoder = base64_words[0].replace("\\", "/").rsplit("/", 1)[-1]
+    return (
+        kubectl.removesuffix(".exe") == "kubectl"
+        and len(kubectl_words) >= 3
+        and kubectl_words[1:3] in (["get", "secret"], ["get", "secrets"])
+        and any("jsonpath" in word and ".data." in word for word in kubectl_words[3:])
+        and decoder.removesuffix(".exe") == "base64"
+        and any(word in {"--decode", "-d"} for word in base64_words[1:])
+    )
+
+
 def _omit_secret_scalar_command_output(text: str) -> tuple[str, int]:
     """Omit one-line scalars emitted by exact secret-value CLI queries."""
     lines = text.splitlines(keepends=True)
@@ -2656,6 +2698,7 @@ def _omit_secret_scalar_command_output(text: str) -> tuple[str, int]:
         if not (
             _is_azure_key_vault_secret_value_command(content)
             or _is_aws_secrets_manager_value_command(content)
+            or _is_kubectl_decoded_secret_command(content)
         ):
             sanitized.append(lines[index])
             index += 1

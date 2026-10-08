@@ -2332,6 +2332,19 @@ async def test_latest_cli_log_omits_curl_certificate_passwords(
             "https://example.test",
             "safe-after-curl-proxy-cert-password",
         ),
+        (
+            "curl https://example.test/mysql -u user:curl-user-after-url-secret",
+            "safe-after-curl-user-after-url",
+        ),
+        (
+            "curl --pass curl-key-passphrase-secret --key id_rsa sftp://host/file",
+            "safe-after-curl-key-passphrase",
+        ),
+        (
+            "curl --pass=curl-attached-key-passphrase-secret --key id_rsa "
+            "sftp://host/file",
+            "safe-after-curl-attached-key-passphrase",
+        ),
     )
     redis = FakeRedis()
     redis.store[cli_log_latest(SLUG)] = "\n".join(
@@ -2353,6 +2366,9 @@ async def test_latest_cli_log_omits_curl_certificate_passwords(
         "curl-cert-password-secret",
         "curl-short-cert-password-secret",
         "curl-proxy-cert-password-secret",
+        "curl-user-after-url-secret",
+        "curl-key-passphrase-secret",
+        "curl-attached-key-passphrase-secret",
     ):
         assert secret not in result["text"]
 
@@ -2393,6 +2409,11 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
             "",
             "aws-secret-manager-plain-value",
             "safe-after-aws-secret-manager-scalar",
+            "kubectl get secret db-user-pass -o "
+            "jsonpath='{.data.password}' | base64 --decode",
+            "",
+            "kubectl-decoded-secret-value",
+            "safe-after-kubectl-decoded-secret",
             '{"name":"ordinary","value":"visible-generic-value"}',
             '{"id":"https://example.test/items/name","value":"visible-id-value"}',
             '{"keyName":"key1","value":""}',
@@ -2413,6 +2434,7 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
         "kubeconfig-client-key-data-value",
         "exec-credential-client-key-data-value",
         "aws-secret-manager-plain-value",
+        "kubectl-decoded-secret-value",
     ):
         assert secret not in result["text"]
     for marker in (
@@ -2426,6 +2448,7 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
         "safe-after-kubeconfig-client-key-data",
         "safe-after-exec-credential-client-key-data",
         "safe-after-aws-secret-manager-scalar",
+        "safe-after-kubectl-decoded-secret",
     ):
         assert marker in result["text"]
     assert '"value":"visible-generic-value"' in result["text"]
@@ -2439,6 +2462,10 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
     assert diagnostics._is_aws_secrets_manager_value_command(
         "noop; /usr/bin/aws.exe secretsmanager get-secret-value "
         "--output=text --query=SecretBinary"
+    )
+    assert diagnostics._is_kubectl_decoded_secret_command(
+        "/usr/bin/kubectl.exe get secrets demo -o "
+        "jsonpath='{.data.token}' | /usr/bin/base64.exe -d"
     )
 
 
