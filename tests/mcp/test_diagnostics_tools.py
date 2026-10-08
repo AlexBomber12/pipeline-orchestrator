@@ -590,6 +590,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "safe-after-same-line-caret-option-name",
             "tool --pass`word same-line-backtick-option-secret",
             "safe-after-same-line-backtick-option-name",
+            "tool --password${IFS}generic-ifs-option-secret",
+            "safe-after-generic-ifs-option",
+            "tool --client-secret$IFS client-ifs-option-secret",
+            "safe-after-client-ifs-option",
             "curl --user alice:curl-user-secret https://example.test",
             "curl -u alice:curl-short-user-secret https://example.test",
             "curl -ualice:curl-attached-user-secret https://example.test",
@@ -959,6 +963,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-empty-backtick-option-name" in exported
     assert "safe-after-same-line-caret-option-name" in exported
     assert "safe-after-same-line-backtick-option-name" in exported
+    assert "safe-after-generic-ifs-option" in exported
+    assert "safe-after-client-ifs-option" in exported
     assert "safe-after-toml-array" in exported
     assert "safe-after-toml-triple-quote" in exported
     assert "safe-after-split-assignment-name" in exported
@@ -1061,6 +1067,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "empty-backtick-option-secret",
         "same-line-caret-option-secret",
         "same-line-backtick-option-secret",
+        "generic-ifs-option-secret",
+        "client-ifs-option-secret",
         "curl-user-secret",
         "curl-short-user-secret",
         "curl-attached-user-secret",

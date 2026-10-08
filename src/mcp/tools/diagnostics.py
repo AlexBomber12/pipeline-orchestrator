@@ -268,10 +268,12 @@ _CREDENTIAL_CLI_OPTION = re.compile(
     r"(?i)(?<!\S)(?:\$?['\"])?(?:(?:--user|--proxy-user)(?:['\"]?[ \t]+|=)|"
     r"-[#0-9:A-Za-z]*?[uU](?:[ \t]+|=|(?=[^ \t;&|<>()])))"
 )
+_SHELL_IFS_VALUE_BOUNDARY_PATTERN = r"\$(?:IFS\b|\{IFS[^}\r\n]{0,64}\})"
+_SHELL_IFS_VALUE_BOUNDARY = re.compile(_SHELL_IFS_VALUE_BOUNDARY_PATTERN)
 _SHELL_NORMALIZED_CURL_CREDENTIAL_OPTION = re.compile(
     r"(?i)(?<!\S)(?:\$?['\"])?"
     r"(?:--_*u_*s_*e_*r_*|--_*p_*r_*o_*x_*y_*-_*u_*s_*e_*r_*)"
-    r"(?:['\"]?[ \t]+|=|\$(?:IFS\b|\{IFS[^}\r\n]{0,64}\}))"
+    rf"(?:['\"]?[ \t]+|=|{_SHELL_IFS_VALUE_BOUNDARY_PATTERN})"
 )
 _NETRC_PASSWORD_VALUE = re.compile(r"(?i)(?<!\S)password[ \t]+")
 _NETRC_PENDING_PASSWORD_VALUE = re.compile(r"(?i)(?<!\S)password[ \t]*$")
@@ -1662,6 +1664,9 @@ def _sensitive_value_start(line: str) -> int | None:
                 return cursor + 1
             if option_value:
                 return cursor
+            ifs_boundary = _SHELL_IFS_VALUE_BOUNDARY.match(line, cursor)
+            if ifs_boundary is not None:
+                return ifs_boundary.end()
 
         index = max(index, cursor)
     return None

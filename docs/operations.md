@@ -84,8 +84,8 @@ classification.
 URL userinfo redaction consumes through the final `@` in the bounded authority,
 and curl user/proxy-user short options are recognized when attached inside an
 option cluster or quoted as a complete shell argument. Shell-fragmented curl
-long options and bounded unquoted IFS expansions at their value boundary fail
-closed without evaluating the expansion. PowerShell credential
+long options and bounded unquoted IFS expansions at recognized credential-option
+value boundaries fail closed without evaluating the expansion. PowerShell credential
 parameter prefixes of four or more characters fail closed when they prefix a
 recognized sensitive name. Multiline structured credential pairs retain grouping that
 starts before the sensitive field so unindented values cannot escape omission.
