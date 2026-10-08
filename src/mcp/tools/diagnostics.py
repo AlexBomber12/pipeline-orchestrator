@@ -88,7 +88,6 @@ _CREDENTIAL_DOCUMENT_KEYS = frozenset(
         "privatekey",
         "privatekeyid",
         "proxyauthorization",
-        "pwd",
         "refreshtoken",
         "secret",
         "secretaccesskey",
@@ -96,6 +95,7 @@ _CREDENTIAL_DOCUMENT_KEYS = frozenset(
         "sharedaccesssignature",
         "storagekey",
         "token",
+        "tokens",
     }
 )
 _JWK_ASYMMETRIC_KEY_TYPES = frozenset({"ec", "okp", "rsa"})
@@ -282,11 +282,13 @@ _DOCKER_LOGIN_PASSWORD_OPTION = re.compile(
 )
 _AWS_CONFIGURE_SET_CREDENTIAL = re.compile(
     r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?aws(?:\.exe)?[ \t]+"
+    r"(?:[^ \t;&|<>()]+[ \t]+){0,16}?"
     r"configure[ \t]+set[ \t]+"
     r"(?:profile\.[A-Za-z0-9_.-]+\.)?"
     r"(?:aws_access_key_id|aws_secret_access_key|aws_session_token)"
     r"[ \t]+[^ \t;&|<>()]+"
 )
+_CONNECTION_STRING_PWD_VALUE = re.compile(r"(?i);[ \t]*Pwd[ \t]*=")
 _REDIS_CLI_PASSWORD_OPTION = re.compile(
     r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?redis-cli(?:\.exe)?(?=[ \t])"
     r"[^;&|<>\r\n]*?(?<!\S)(?:-a(?:[ \t]+|=)?|--pass(?:[ \t]+|=))"
@@ -1394,7 +1396,10 @@ def _is_sensitive_key(value: str) -> bool:
         for character in decoded
         if "a" <= character <= "z" or "0" <= character <= "9"
     )
-    return any(sensitive in key for sensitive in _CREDENTIAL_DOCUMENT_KEYS)
+    return any(
+        key == sensitive or key.endswith(sensitive)
+        for sensitive in _CREDENTIAL_DOCUMENT_KEYS
+    )
 
 
 def _is_pending_yaml_value(value: str) -> bool:
@@ -1633,6 +1638,9 @@ def _sensitive_value_start(line: str) -> int | None:
     redis_password = _REDIS_CLI_PASSWORD_OPTION.search(line)
     if redis_password is not None:
         return redis_password.end()
+    connection_pwd = _CONNECTION_STRING_PWD_VALUE.search(line)
+    if connection_pwd is not None:
+        return connection_pwd.end()
     line = _normalize_shell_credential_names(line)
     netrc_password = _NETRC_PASSWORD_VALUE.search(line)
     if netrc_password is not None:

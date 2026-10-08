@@ -511,6 +511,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "curl -H 'Set-Cookie: session=inline-cookie-secret' https://example.test",
             'API_KEY="api assignment secret"',
             "oauthToken=oauth-secret",
+            "Author: Synthetic User",
+            "tokenizer: ready",
+            "passwordless: enabled",
+            "PWD=/synthetic/workspace",
             "https://url-user:url-password@example.test/path?access_token=query-secret",
             "curl https://user:split-url-first-secret-" + "\\",
             "split-url-second-secret@example.test/path",
@@ -621,6 +625,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "safe-after-aws-config-credential",
             "aws configure set aws_session_token aws-session-token-secret",
             "safe-after-aws-session-token",
+            "aws --profile production configure set aws_secret_access_key aws-profile-secret",
+            "safe-after-aws-profile-credential",
             "/usr/bin/aws configure set profile.synthetic.aws_access_key_id aws-access-id-secret",
             "safe-after-aws-access-id",
             "redis-cli -a redis-short-password-secret",
@@ -980,6 +986,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-kubernetes-secret" in exported
     assert "safe-after-reconstructed-url" in exported
     assert "safe-after-connection-pwd" in exported
+    assert "Author: Synthetic User" in exported
+    assert "tokenizer: ready" in exported
+    assert "passwordless: enabled" in exported
+    assert "PWD=/synthetic/workspace" in exported
     assert "safe-after-yaml-doubled-quote-key" in exported
     assert "safe-yaml-doubled-quote-visible" in exported
     assert "safe-before-aws-csv" in exported
@@ -1017,6 +1027,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-docker-attached-password-option" in exported
     assert "safe-after-aws-config-credential" in exported
     assert "safe-after-aws-session-token" in exported
+    assert "safe-after-aws-profile-credential" in exported
     assert "safe-after-aws-access-id" in exported
     assert "safe-after-redis-short-password" in exported
     assert "safe-after-redis-attached-password" in exported
@@ -1141,6 +1152,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "docker-attached-password-secret",
         "aws-config-secret",
         "aws-session-token-secret",
+        "aws-profile-secret",
         "aws-access-id-secret",
         "redis-short-password-secret",
         "redis-attached-password-secret",

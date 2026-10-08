@@ -82,8 +82,12 @@ MySQL client commands are treated as credential context; unrelated `-p` options
 remain visible. Docker login's separated, equals, and attached short-password
 forms are likewise recognized only in their command-specific context.
 Positional access-key, secret-key, and session-token values passed through
-`aws configure set`, plus `redis-cli`'s `-a` and `--pass` password flags, are
-also omitted only in their command-specific contexts.
+`aws configure set` (including after up to 16 global-option words), plus
+`redis-cli`'s `-a` and `--pass` password flags, are also omitted only in their
+command-specific contexts.
+Structured credential names use established exact names or compound-name
+suffixes; unrelated fields such as `Author`, `tokenizer`, and `passwordless`
+remain visible.
 Backslash-bearing Bash ANSI-C words are omitted with a bounded scan instead of
 being decoded or exported.
 Command or parameter substitutions embedded after a literal shell-word fragment
