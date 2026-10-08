@@ -271,7 +271,7 @@ _MYSQL_ATTACHED_PASSWORD_OPTION = re.compile(
 _DOCKER_LOGIN_PASSWORD_OPTION = re.compile(
     r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?docker(?:\.exe)?(?=[ \t])"
     r"[^;&|<>\r\n]*?(?<!\S)login(?=[ \t]|$)"
-    r"[^;&|<>\r\n]*?(?<!\S)-p(?:[ \t]+|=)?[^ \t;&|<>()]+"
+    r"[^;&|<>\r\n]*?(?<!\S)-_*p_*(?:[ \t]+|=)?[^ \t;&|<>()]+"
 )
 _AWS_CONFIGURE_SET_CREDENTIAL = re.compile(
     r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?aws(?:\.exe)?[ \t]+"
@@ -284,7 +284,8 @@ _AWS_CONFIGURE_SET_CREDENTIAL = re.compile(
 _CONNECTION_STRING_PWD_VALUE = re.compile(r"(?i);[ \t]*Pwd[ \t]*=")
 _REDIS_CLI_PASSWORD_OPTION = re.compile(
     r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?redis-cli(?:\.exe)?(?=[ \t])"
-    r"[^;&|<>\r\n]*?(?<!\S)(?:-a(?:[ \t]+|=)?|--pass(?:[ \t]+|=))"
+    r"[^;&|<>\r\n]*?(?<!\S)(?:-_*a_*(?:[ \t]+|=)?|"
+    r"--_*p_*a_*s_*s_*(?:[ \t]+|=))"
     r"[^ \t;&|<>()]+"
 )
 _SHELL_IFS_VALUE_BOUNDARY_PATTERN = r"\$(?:IFS\b|\{IFS[^}\r\n]{0,64}\})"
@@ -302,7 +303,9 @@ _EMPTY_SHELL_NAME_FRAGMENT = re.compile(
 _INLINE_POWERSHELL_BACKTICK = re.compile(
     r"(?<=[A-Za-z0-9_.%+\[\]])`(?=[A-Za-z0-9_.%+\[\]])"
 )
-_EMBEDDED_SHELL_SUBSTITUTION = re.compile(r"(?<![ \t;&|<>])\$(?:\(|\{)")
+_EMBEDDED_SHELL_SUBSTITUTION = re.compile(
+    r"(?<![ \t;&|<>])\$(?:\(|\{|[A-Za-z_][A-Za-z0-9_]*|[0-9*@$#?!-])"
+)
 _EMBEDDED_CMD_VARIABLE = re.compile(
     r"(?<![ \t;&|<>])(?:%[A-Za-z_][A-Za-z0-9_]*(?::[^%\r\n]{0,64})?%|"
     r"![A-Za-z_][A-Za-z0-9_]*!)"
@@ -1531,7 +1534,15 @@ def _normalize_shell_credential_names(line: str) -> str:
             closing + 1 < len(line)
             and line[closing + 1] in _SENSITIVE_KEY_CHARACTERS
         )
-        if (joins_left or joins_right) and all(
+        isolated_option = (
+            fragment.startswith("-")
+            and (index == 0 or line[index - 1] in " \t;&|<>()")
+            and (
+                closing + 1 == len(line)
+                or line[closing + 1] in " \t;&|<>()"
+            )
+        )
+        if (joins_left or joins_right or isolated_option) and all(
             character in _SENSITIVE_KEY_CHARACTERS for character in fragment
         ):
             normalized[index] = "_" if joins_left else " "
@@ -1621,22 +1632,23 @@ def _sensitive_value_start(line: str) -> int | None:
     ansi_c_option = _ansi_c_option_value_start(line)
     if ansi_c_option is not None:
         return ansi_c_option
+    normalized_line = _normalize_shell_credential_names(line)
     mysql_password = _MYSQL_ATTACHED_PASSWORD_OPTION.search(line)
     if mysql_password is not None:
         return mysql_password.end()
-    docker_password = _DOCKER_LOGIN_PASSWORD_OPTION.search(line)
+    docker_password = _DOCKER_LOGIN_PASSWORD_OPTION.search(normalized_line)
     if docker_password is not None:
         return docker_password.end()
     aws_credential = _AWS_CONFIGURE_SET_CREDENTIAL.search(line)
     if aws_credential is not None:
         return aws_credential.end()
-    redis_password = _REDIS_CLI_PASSWORD_OPTION.search(line)
+    redis_password = _REDIS_CLI_PASSWORD_OPTION.search(normalized_line)
     if redis_password is not None:
         return redis_password.end()
     connection_pwd = _CONNECTION_STRING_PWD_VALUE.search(line)
     if connection_pwd is not None:
         return connection_pwd.end()
-    line = _normalize_shell_credential_names(line)
+    line = normalized_line
     netrc_password = _NETRC_PASSWORD_VALUE.search(line)
     if netrc_password is not None:
         return netrc_password.end()

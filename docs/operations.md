@@ -78,10 +78,14 @@ Credentials joined by adjacent simple shell fragments, unquoted backslash
 escapes, `cmd` caret escapes, or PowerShell backtick escapes within credential
 names or recognizable token shapes are detected using the same inline token,
 URL, and query rules; the contributing line is omitted before tail selection.
+Bare named, positional, or special shell-parameter expansions embedded in a
+word are treated as ambiguous credential context rather than evaluated.
 The established `MYSQL_PWD` assignment and attached `-pPASSWORD` forms for
 MySQL client commands are treated as credential context; unrelated `-p` options
 remain visible. Docker login's separated, equals, and attached short-password
-forms are likewise recognized only in their command-specific context.
+forms are likewise recognized only in their command-specific context, including
+shell-fragmented or quoted short flags. Redis CLI password flags use the same
+bounded shell-fragment normalization before command-specific matching.
 Positional access-key, secret-key, and session-token values passed through
 `aws configure set` (including after up to 16 global-option words), plus
 `redis-cli`'s `-a` and `--pass` password flags, are also omitted only in their

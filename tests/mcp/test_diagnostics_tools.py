@@ -604,6 +604,12 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "safe-after-command-substitution-option",
             "tool --pass${UNSET}word ambiguous-parameter-option-secret",
             "safe-after-parameter-substitution-option",
+            'EMPTY=; docker login --pass$EMPTY"word" bare-parameter-option-secret registry.example',
+            "safe-after-bare-parameter-option",
+            "tool --pass$1word positional-parameter-option-secret",
+            "safe-after-positional-parameter-option",
+            "tool --pass$?word special-parameter-option-secret",
+            "safe-after-special-parameter-option",
             "set EMPTY=",
             "tool --pass%EMPTY%word cmd-variable-option-secret",
             "safe-after-cmd-variable-option",
@@ -621,6 +627,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "safe-after-docker-equals-password-option",
             "docker login -pdocker-attached-password-secret registry.example.test",
             "safe-after-docker-attached-password-option",
+            "docker login -'p' docker-fragmented-password-secret registry.example.test",
+            "safe-after-docker-fragmented-password-option",
+            "docker login '-p' docker-quoted-password-secret registry.example.test",
+            "safe-after-docker-quoted-password-option",
             "aws configure set aws_secret_access_key aws-config-secret",
             "safe-after-aws-config-credential",
             "aws configure set aws_session_token aws-session-token-secret",
@@ -633,12 +643,17 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "safe-after-redis-short-password",
             "redis-cli -aredis-attached-password-secret",
             "safe-after-redis-attached-password",
+            "redis-cli -'a' redis-fragmented-password-secret",
+            "safe-after-redis-fragmented-password",
+            "redis-cli '-a' redis-quoted-password-secret",
+            "safe-after-redis-quoted-password",
             "redis-cli --pass redis-separated-password-secret ping",
             "safe-after-redis-separated-password",
             "/usr/bin/redis-cli --pass=redis-long-password-secret ping",
             "safe-after-redis-long-password",
             "tool -pvisible-unrelated-option",
             "tool -avisible-unrelated-option",
+            "tool -'p' visible-fragmented-unrelated-option",
             "curl --user alice:curl-user-secret https://example.test",
             "curl -u alice:curl-short-user-secret https://example.test",
             "curl -ualice:curl-attached-user-secret https://example.test",
@@ -1017,6 +1032,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-client-ifs-option" in exported
     assert "safe-after-command-substitution-option" in exported
     assert "safe-after-parameter-substitution-option" in exported
+    assert "safe-after-bare-parameter-option" in exported
+    assert "safe-after-positional-parameter-option" in exported
+    assert "safe-after-special-parameter-option" in exported
     assert "safe-after-cmd-variable-option" in exported
     assert "safe-after-cmd-delayed-variable-option" in exported
     assert "safe-after-mysql-pwd" in exported
@@ -1025,16 +1043,21 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-docker-password-option" in exported
     assert "safe-after-docker-equals-password-option" in exported
     assert "safe-after-docker-attached-password-option" in exported
+    assert "safe-after-docker-fragmented-password-option" in exported
+    assert "safe-after-docker-quoted-password-option" in exported
     assert "safe-after-aws-config-credential" in exported
     assert "safe-after-aws-session-token" in exported
     assert "safe-after-aws-profile-credential" in exported
     assert "safe-after-aws-access-id" in exported
     assert "safe-after-redis-short-password" in exported
     assert "safe-after-redis-attached-password" in exported
+    assert "safe-after-redis-fragmented-password" in exported
+    assert "safe-after-redis-quoted-password" in exported
     assert "safe-after-redis-separated-password" in exported
     assert "safe-after-redis-long-password" in exported
     assert "tool -pvisible-unrelated-option" in exported
     assert "tool -avisible-unrelated-option" in exported
+    assert "tool -'p' visible-fragmented-unrelated-option" in exported
     assert "safe-after-toml-array" in exported
     assert "safe-after-toml-triple-quote" in exported
     assert "safe-after-split-assignment-name" in exported
@@ -1142,6 +1165,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "client-ifs-option-secret",
         "output-empty-command-option-secret",
         "ambiguous-parameter-option-secret",
+        "bare-parameter-option-secret",
+        "positional-parameter-option-secret",
+        "special-parameter-option-secret",
         "cmd-variable-option-secret",
         "cmd-delayed-variable-option-secret",
         "mysql-pwd-assignment-secret",
@@ -1150,12 +1176,16 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "docker-password-option-secret",
         "docker-equals-password-secret",
         "docker-attached-password-secret",
+        "docker-fragmented-password-secret",
+        "docker-quoted-password-secret",
         "aws-config-secret",
         "aws-session-token-secret",
         "aws-profile-secret",
         "aws-access-id-secret",
         "redis-short-password-secret",
         "redis-attached-password-secret",
+        "redis-fragmented-password-secret",
+        "redis-quoted-password-secret",
         "redis-separated-password-secret",
         "redis-long-password-secret",
         "curl-user-secret",
