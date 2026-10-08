@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
-from src.models import PipelineState, PRInfo, RepoState
+from src.models import InvocationSnapshot, PipelineState, PRInfo, RepoState
 
 from tests.runner._helpers import (
     _allow_all_coder_auth,
@@ -42,6 +43,7 @@ def test_publish_state_skips_progress_update_when_value_was_already_published(
         runner.state.state.value,
         (),
         (None, None, False),
+        None,
         None,
     )
     runner._set_queue_progress(1, 2)
@@ -194,6 +196,7 @@ def test_publish_state_emits_state_change_on_first_publish(
         runner.state.state.value,
         (),
         (None, None, False),
+        None,
         None,
     )
 
@@ -393,6 +396,45 @@ def test_publish_state_emits_state_change_on_usage_field_change(
     assert all(event[2] == {"state": "WATCH"} for event in state_events)
 
 
+def test_publish_state_emits_state_change_on_invocation_snapshot_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    published: list[tuple[str, str, dict[str, object], object | None]] = []
+
+    async def _fake_publish_repo_event(
+        repo_name: str,
+        event_type: str,
+        payload: dict[str, object],
+        redis_client: object | None = None,
+    ) -> None:
+        published.append((repo_name, event_type, payload, redis_client))
+
+    monkeypatch.setattr(runner_module, "publish_repo_event", _fake_publish_repo_event)
+
+    runner = _make_runner()
+    runner.state.state = PipelineState.CODING
+    asyncio.run(runner.publish_state())
+    asyncio.run(runner.publish_state())
+
+    snapshot = InvocationSnapshot(
+        plugin_id="codex",
+        model_override="gpt-5.4",
+        reasoning_effort_override="high",
+        run_id="run-1",
+        attempt_index=1,
+        phase="coding",
+    )
+    runner.state.active_invocation = snapshot
+    asyncio.run(runner.publish_state())
+
+    runner.state.active_invocation = replace(snapshot, model_override="gpt-5.5")
+    asyncio.run(runner.publish_state())
+
+    state_events = [event for event in published if event[1] == "state_change"]
+    assert len(state_events) == 3
+    assert all(event[2] == {"state": "CODING"} for event in state_events)
+
+
 def test_publish_state_change_for_inactive_repo_emits_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -425,6 +467,7 @@ def test_publish_state_change_for_inactive_repo_emits_idle(
         PipelineState.IDLE.value,
         (),
         (None, None, False),
+        None,
         None,
     )
 
@@ -505,6 +548,7 @@ def test_publish_state_change_swallows_publish_failure(
         (),
         (None, None, False),
         None,
+        None,
     )
 
 
@@ -528,6 +572,7 @@ def test_publish_state_drains_pending_event_log_entries(
         runner.state.state.value,
         (),
         (None, None, False),
+        None,
         None,
     )
     runner.log_event("first event")
@@ -575,6 +620,7 @@ def test_publish_pending_event_log_entries_requeues_on_failure(
         runner.state.state.value,
         (),
         (None, None, False),
+        None,
         None,
     )
     monkeypatch.setattr(
@@ -627,6 +673,7 @@ def test_publish_pending_event_log_entries_retry_drains_remainder(
         runner.state.state.value,
         (),
         (None, None, False),
+        None,
         None,
     )
     runner.log_event("first event")

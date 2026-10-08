@@ -1428,6 +1428,9 @@ class PipelineRunner(
         refreshes them every cycle, so without inclusion here the
         badges would stay stale through long WATCH/IDLE stretches with
         an unchanged PR signature until an unrelated transition fired.
+        The active invocation snapshot is also visible in the summary;
+        tracking the immutable snapshot makes CODING/FIX launches and
+        any changed override values refresh immediately.
 
         The published payload mirrors what ``_serialize_latest_state``
         writes to Redis: inactive repos surface as ``IDLE`` regardless
@@ -1455,6 +1458,7 @@ class PipelineRunner(
             self._summary_pr_signature(),
             usage_signature,
             self.state.merge_phase,
+            self.state.active_invocation,
         )
         if signature == self._last_published_state_signature:
             return
