@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from src.inhibitor import InhibitorType, WorkInhibitor
 from src.models import (
     CIStatus,
+    InvocationSnapshot,
     PipelineState,
     PRInfo,
     QueueTask,
@@ -96,6 +97,14 @@ def test_repo_state_json_round_trip() -> None:
         history=[{"event": "started", "at": now.isoformat()}],
         rate_limited_coders={"claude", "codex"},
         last_stale_retrigger_at=now,
+        active_invocation=InvocationSnapshot(
+            plugin_id="codex",
+            model_override="gpt-5.4",
+            reasoning_effort_override="high",
+            run_id="run-1",
+            attempt_index=2,
+            phase="coding",
+        ),
     )
 
     payload = state.model_dump_json()
@@ -218,6 +227,28 @@ def test_repo_state_clearing_current_task_clears_error_message() -> None:
 
     assert state.current_task is None
     assert state.error_message is None
+
+
+def test_repo_state_clearing_current_task_clears_active_invocation() -> None:
+    state = RepoState(
+        url="https://github.com/example/repo.git",
+        name="repo",
+        current_task=QueueTask(
+            pr_id="PR-001", title="t", status=TaskStatus.DOING,
+        ),
+        active_invocation=InvocationSnapshot(
+            plugin_id="codex",
+            model_override=None,
+            reasoning_effort_override=None,
+            run_id="run-1",
+            attempt_index=1,
+            phase="coding",
+        ),
+    )
+
+    state.current_task = None
+
+    assert state.active_invocation is None
 
 
 def test_repo_state_assigning_current_task_does_not_clear_current_pr() -> None:

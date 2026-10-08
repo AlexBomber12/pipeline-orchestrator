@@ -484,8 +484,7 @@ class CodingMixin:
                 "owns its credential location."
             )
             return None
-        heartbeat = asyncio.create_task(self._publish_while_waiting("CODING"))
-        self._coder_invocation_active = True
+        heartbeat: asyncio.Task[None] | None = None
         invocation_supervised_process: SupervisedProcess | None = None
         configured_process_callback = coder_kwargs.get(
             "on_supervised_process_start"
@@ -497,7 +496,26 @@ class CodingMixin:
             if configured_process_callback is not None:
                 configured_process_callback(managed)
 
+        run_record = self._current_run_record
+        previous_active_invocation = self.state.active_invocation
+        captured_snapshot = None
         try:
+            captured_snapshot = self._capture_invocation_snapshot(
+                coder_name,
+                coder_kwargs,
+                phase="coding",
+            )
+            # Persist the snapshot identity before creating an unfinished
+            # metrics checkpoint. Recovery requires the snapshot run_id to
+            # finalize that exact record after a crash; the reverse order
+            # leaves an unidentifiable checkpoint if the daemon dies between
+            # these writes.
+            await self.publish_state()
+            await self._checkpoint_current_run_record()
+            heartbeat = asyncio.create_task(
+                self._publish_while_waiting("CODING")
+            )
+            self._coder_invocation_active = True
             cli_task: asyncio.Task[tuple[int, str, str]] = asyncio.create_task(
                 plugin.run_auto_pr(
                     self.repo_path,
@@ -510,12 +528,26 @@ class CodingMixin:
                     },
                 )
             )
-        except Exception:
-            heartbeat.cancel()
-            await asyncio.gather(heartbeat, return_exceptions=True)
+        except BaseException:
+            if captured_snapshot is not None:
+                self.state.active_invocation = previous_active_invocation
+                if (
+                    run_record is not None
+                    and run_record.invocations
+                    and run_record.invocations[-1] == captured_snapshot
+                ):
+                    run_record.invocations.pop()
+                rollback_writes = [self.publish_state()]
+                if run_record is not None:
+                    rollback_writes.append(self._checkpoint_current_run_record())
+                await asyncio.gather(*rollback_writes, return_exceptions=True)
+            if heartbeat is not None:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
             self._coder_invocation_active = False
             self._release_coder_credentials()
             raise
+        assert heartbeat is not None
         publication_monitors: list[
             asyncio.Task[gh_prs.BranchPublication | None]
         ] = []

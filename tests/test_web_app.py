@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from src.config import load_config
 from src.models import (
     CIStatus,
+    InvocationSnapshot,
     PipelineState,
     PRInfo,
     QueueTask,
@@ -2001,25 +2002,27 @@ def _metrics_record(
     fix_iterations: int,
     exit_reason: str,
     profile_id: str = "claude:opus:container",
+    invocations: list[dict[str, object]] | None = None,
 ) -> str:
-    return json.dumps(
-        {
-            "run_id": run_id,
-            "task_id": task_id,
-            "repo_name": "example__alpha",
-            "profile_id": profile_id,
-            "task_type": "feature",
-            "complexity": "medium",
-            "started_at": started_at,
-            "ended_at": ended_at,
-            "duration_ms": duration_ms,
-            "fix_iterations": fix_iterations,
-            "tokens_in": 1200,
-            "tokens_out": 800,
-            "exit_reason": exit_reason,
-            "operator_intervention": False,
-        }
-    )
+    payload: dict[str, object] = {
+        "run_id": run_id,
+        "task_id": task_id,
+        "repo_name": "example__alpha",
+        "profile_id": profile_id,
+        "task_type": "feature",
+        "complexity": "medium",
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_ms": duration_ms,
+        "fix_iterations": fix_iterations,
+        "tokens_in": 1200,
+        "tokens_out": 800,
+        "exit_reason": exit_reason,
+        "operator_intervention": False,
+    }
+    if invocations is not None:
+        payload["invocations"] = invocations
+    return json.dumps(payload)
 
 
 def test_metrics_endpoint_returns_records(
@@ -2088,6 +2091,74 @@ def test_metrics_endpoint_returns_records(
     assert payload[1]["coder"] == "claude"
     assert payload[1]["model"] == "opus"
     assert payload[1]["exit_reason_label"] == "merged"
+
+
+def test_metrics_history_labels_snapshots_and_legacy_evidence(
+    two_repo_config: Path,
+) -> None:
+    fake = _FakeRedis(
+        store={
+            "metrics:run:snapshot": _metrics_record(
+                "snapshot",
+                task_id="PR-395",
+                started_at="2026-10-08T09:00:00+00:00",
+                ended_at="2026-10-08T09:05:00+00:00",
+                duration_ms=300000,
+                fix_iterations=1,
+                exit_reason="success_merged",
+                invocations=[
+                    {
+                        "plugin_id": "codex",
+                        "model_override": "<gpt-model>",
+                        "reasoning_effort_override": "high & careful",
+                        "run_id": "snapshot",
+                        "attempt_index": 2,
+                        "phase": "coding",
+                        "fix_iteration": None,
+                    },
+                    {
+                        "plugin_id": "third",
+                        "model_override": None,
+                        "reasoning_effort_override": None,
+                        "run_id": "snapshot",
+                        "attempt_index": 2,
+                        "phase": "fix",
+                        "fix_iteration": 1,
+                    },
+                ],
+            ),
+            "metrics:run:legacy": _metrics_record(
+                "legacy",
+                task_id="PR-394",
+                started_at="2026-10-08T08:00:00+00:00",
+                ended_at="2026-10-08T08:05:00+00:00",
+                duration_ms=300000,
+                fix_iterations=0,
+                exit_reason="success_merged",
+                profile_id="claude:opus:container",
+            ),
+        },
+        lists={
+            "metrics:repo:example__alpha:PR": ["snapshot", "legacy"]
+        },
+    )
+
+    with TestClient(app) as client:
+        client.app.state.redis = fake
+        response = client.get("/partials/repo/example__alpha/metrics")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "Plugin ID:" in body
+    assert "&lt;gpt-model&gt;" in body
+    assert "<gpt-model>" not in body
+    assert "high &amp; careful" in body
+    assert "Model override: CLI default" in body
+    assert "Reasoning effort override: Not specified" in body
+    assert "Provider execution values unconfirmed" in body
+    assert "Legacy profile; invocation settings unavailable" in body
+    assert "Legacy model: opus" in body
+    assert "Reasoning effort override: Unknown" in body
 
 
 def test_recent_repo_metrics_payload_returns_empty_without_redis() -> None:
@@ -4221,6 +4292,7 @@ def _render_repo_header_coder(
     selected: str = "any",
     active: str | None = None,
     state: PipelineState | None = None,
+    active_invocation: InvocationSnapshot | None = None,
 ) -> str:
     if selected != "any":
         config_path.write_text(
@@ -4238,6 +4310,7 @@ def _render_repo_header_coder(
         state=state or (PipelineState.CODING if active else PipelineState.IDLE),
         last_updated=datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc),
         coder=active,
+        active_invocation=active_invocation,
     )
     active_run_states = {
         PipelineState.CODING,
@@ -4319,6 +4392,34 @@ def test_repo_header_coder_link_to_settings(
 
     assert 'href="/settings"' in coder_fragment
     assert "Edit in Settings" in coder_fragment
+
+
+def test_repo_header_coder_renders_captured_invocation_defaults_and_escapes(
+    two_repo_config: Path,
+) -> None:
+    coder_fragment = _render_repo_header_coder(
+        two_repo_config,
+        active="codex",
+        active_invocation=InvocationSnapshot(
+            plugin_id="codex",
+            model_override=None,
+            reasoning_effort_override="<high & careful>",
+            run_id="run-395",
+            attempt_index=4,
+            phase="fix",
+            fix_iteration=2,
+        ),
+    )
+
+    assert "Invocation settings" in coder_fragment
+    assert "Plugin ID:" in coder_fragment
+    assert "Model override:" in coder_fragment
+    assert "CLI default" in coder_fragment
+    assert "Reasoning effort override:" in coder_fragment
+    assert "&lt;high &amp; careful&gt;" in coder_fragment
+    assert "<high & careful>" not in coder_fragment
+    assert "FIX, attempt 4, FIX iteration 2, run run-395" in coder_fragment
+    assert "provider execution values are unconfirmed" in coder_fragment
 
 
 @pytest.mark.parametrize(

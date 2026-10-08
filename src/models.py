@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import NotRequired, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -169,6 +170,19 @@ class EventEntry(TypedDict, total=False):
     last_seen_at: NotRequired[str]
 
 
+@dataclass(frozen=True)
+class InvocationSnapshot:
+    """Allowlisted settings captured for one primary coder invocation."""
+
+    plugin_id: str
+    model_override: str | None
+    reasoning_effort_override: str | None
+    run_id: str | None
+    attempt_index: int | None
+    phase: Literal["coding", "fix"]
+    fix_iteration: int | None = None
+
+
 class RepoState(BaseModel):
     url: str
     name: str
@@ -199,6 +213,7 @@ class RepoState(BaseModel):
     usage_weekly_resets_at: int | None = None
     usage_api_degraded: bool = False
     coder: str | None = None
+    active_invocation: InvocationSnapshot | None = None
     last_stale_retrigger_at: datetime | None = None
     last_codex_retrigger_at: datetime | None = None
     # PR-358: set True after WATCH posts the single ``@codex review`` repost
@@ -295,6 +310,7 @@ class RepoState(BaseModel):
         if name == "current_task" and value is None:
             super().__setattr__("current_pr", None)
             super().__setattr__("error_message", None)
+            super().__setattr__("active_invocation", None)
             super().__setattr__("review_timeout_repost_attempted", False)
             super().__setattr__("review_timeout_repost_at", None)
         if name == "state":

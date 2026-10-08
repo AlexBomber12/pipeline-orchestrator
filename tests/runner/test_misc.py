@@ -497,6 +497,72 @@ def test_start_current_run_record_clears_record_without_task() -> None:
     assert runner._current_run_record is None
 
 
+def test_capture_invocation_snapshot_is_allowlisted_and_immutable() -> None:
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner._start_current_run_record("codex", "gpt-5.4")
+    assert runner._current_run_record is not None
+    runner._current_run_record.attempt_index = 3
+    kwargs: dict[str, object] = {
+        "model": "gpt-5.4",
+        "reasoning_effort": "high",
+        "environment": {"SECRET": "must-not-be-snapshotted"},
+        "extra_context": "must-not-be-snapshotted",
+    }
+
+    coding = runner._capture_invocation_snapshot(
+        "codex", kwargs, phase="coding"
+    )
+    kwargs["model"] = "changed-after-dispatch"
+    runner.app_config.daemon.coder_settings = {
+        "codex": {"model": "changed-in-settings", "reasoning_effort": "low"}
+    }
+
+    assert coding.model_override == "gpt-5.4"
+    assert coding.reasoning_effort_override == "high"
+    assert coding.run_id == runner._current_run_record.run_id
+    assert coding.attempt_index == 3
+    assert set(coding.__dict__) == {
+        "plugin_id",
+        "model_override",
+        "reasoning_effort_override",
+        "run_id",
+        "attempt_index",
+        "phase",
+        "fix_iteration",
+    }
+
+    fix = runner._capture_invocation_snapshot(
+        "third",
+        {"model": "third-fix"},
+        phase="fix",
+        fix_iteration=1,
+    )
+
+    assert runner.state.active_invocation == fix
+    assert fix.reasoning_effort_override is None
+    assert runner._current_run_record.invocations == [coding, fix]
+
+
+def test_capture_invocation_snapshot_records_cli_defaults() -> None:
+    runner = h._make_runner()
+
+    snapshot = runner._capture_invocation_snapshot(
+        "codex", {"model": ""}, phase="coding"
+    )
+
+    assert snapshot.model_override is None
+    assert snapshot.reasoning_effort_override is None
+    assert snapshot.run_id is None
+    assert snapshot.attempt_index is None
+
+
 def test_refresh_auth_status_cache_returns_early_when_cache_is_fresh(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -977,6 +1043,61 @@ def test_restore_current_run_record_logs_metrics_lookup_failure() -> None:
         "restore_current_run_record failed for PR-001: metrics unavailable" in entry["event"]
         for entry in runner.state.history
     )
+
+
+def test_restore_current_run_record_rehydrates_latest_invocation() -> None:
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner._start_current_run_record("codex", "gpt-5.4")
+    runner._capture_invocation_snapshot(
+        "codex",
+        {"model": "gpt-5.4", "reasoning_effort": "high"},
+        phase="coding",
+    )
+    latest = runner._capture_invocation_snapshot(
+        "claude",
+        {"model": "sonnet"},
+        phase="fix",
+        fix_iteration=1,
+    )
+    asyncio.run(runner._checkpoint_current_run_record())
+    runner._current_run_record = None
+    runner.state.active_invocation = None
+
+    asyncio.run(runner._restore_current_run_record())
+
+    assert runner._current_run_record is not None
+    assert runner.state.active_invocation == latest
+
+
+def test_restore_current_run_record_preserves_newer_state_snapshot() -> None:
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-001",
+        task_file="tasks/PR-001.md",
+    )
+    runner._start_current_run_record("codex", "gpt-5.4")
+    runner._capture_invocation_snapshot(
+        "codex", {"model": "gpt-5.4"}, phase="coding"
+    )
+    asyncio.run(runner._checkpoint_current_run_record())
+    newer = runner._capture_invocation_snapshot(
+        "third", {"model": "third-fix"}, phase="fix", fix_iteration=1
+    )
+    runner._current_run_record = None
+
+    asyncio.run(runner._restore_current_run_record())
+
+    assert runner.state.active_invocation == newer
 
 
 def test_save_current_run_record_sets_duration_none_for_invalid_started_at() -> None:

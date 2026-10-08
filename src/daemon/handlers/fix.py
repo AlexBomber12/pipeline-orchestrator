@@ -384,16 +384,33 @@ class FixMixin(BreachMixin):
             )
             return
         heartbeat: asyncio.Task[None] | None = None
+        run_record = self._current_run_record
+        previous_active_invocation = self.state.active_invocation
+        previous_fix_iterations = (
+            run_record.fix_iterations if run_record is not None else None
+        )
+        captured_snapshot = None
         try:
             self.log_event(
                 f"[{coder_name}] entering FIX.",
                 tier="state",
                 kind="transition",
             )
-            await self.publish_state()
+            fix_iteration: int | None = None
             if self._current_run_record is not None:
                 self._current_run_record.fix_iterations += 1
+                fix_iteration = self._current_run_record.fix_iterations
+            elif self.state.current_pr is not None:
+                fix_iteration = self.state.current_pr.fix_iteration_count + 1
+            captured_snapshot = self._capture_invocation_snapshot(
+                coder_name,
+                fix_kwargs,
+                phase="fix",
+                fix_iteration=fix_iteration,
+            )
+            if run_record is not None:
                 await self._checkpoint_current_run_record()
+            await self.publish_state()
             heartbeat = asyncio.create_task(self._publish_while_waiting("FIX"))
             self._coder_invocation_active = True
             claude_task: asyncio.Task[tuple[int, str, str]] = (
@@ -405,6 +422,20 @@ class FixMixin(BreachMixin):
                 )
             )
         except BaseException:
+            if captured_snapshot is not None:
+                self.state.active_invocation = previous_active_invocation
+                if (
+                    run_record is not None
+                    and run_record.invocations
+                    and run_record.invocations[-1] == captured_snapshot
+                ):
+                    run_record.invocations.pop()
+                    assert previous_fix_iterations is not None
+                    run_record.fix_iterations = previous_fix_iterations
+                rollback_writes = [self.publish_state()]
+                if run_record is not None:
+                    rollback_writes.append(self._checkpoint_current_run_record())
+                await asyncio.gather(*rollback_writes, return_exceptions=True)
             if heartbeat is not None:
                 heartbeat.cancel()
                 await asyncio.gather(heartbeat, return_exceptions=True)

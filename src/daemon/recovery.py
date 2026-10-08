@@ -226,7 +226,7 @@ class RecoveryMixin:
         return await self._recover_state_headers()
 
     async def _hydrate_current_task_from_persisted_state(self) -> None:
-        """Restore ``state.current_task`` from the published Redis snapshot.
+        """Restore active CODING identity from the published Redis snapshot.
 
         ``publish_state`` writes the live ``RepoState`` to
         ``pipeline_state(self.name)`` at the end of every cycle, so the
@@ -251,18 +251,16 @@ class RecoveryMixin:
         and ``_apply_recovery_decisions`` would mark the task
         ``ERROR`` and force manual re-upload.
 
+        The allowlisted ``active_invocation`` snapshot is hydrated alongside
+        the task when both identify that same CODING dispatch. Its ``run_id``
+        lets crash recovery distinguish the current unfinished checkpoint
+        from completed records belonging to an earlier retry of the task.
+
         Best-effort: Redis read errors, missing snapshots, and corrupt
-        payloads all leave ``state.current_task`` untouched. This is
-        deliberately narrow — we only hydrate ``current_task`` because
-        ``_apply_recovery_decisions`` overwrites it from the parsed task
-        list afterwards, so a stale value cannot leak past recovery
-        even when the snapshot lags reality (e.g. the task was merged
-        externally between crash and restart, in which case
-        ``derive_task_status`` returns ``DONE`` first via the merged-
-        state probe and the hydrated value is irrelevant).
+        payloads leave both fields untouched. ``_apply_recovery_decisions``
+        still overwrites ``current_task`` from parsed headers, and the
+        invocation is used only when its task and unfinished run record match.
         """
-        if self.state.current_task is not None:
-            return
         try:
             raw = await self.redis.get(pipeline_state(self.name))
         except Exception:
@@ -275,8 +273,43 @@ class RecoveryMixin:
             return
         if persisted.state != PipelineState.CODING:
             return
-        if persisted.current_task is not None:
+        if self.state.current_task is None and persisted.current_task is not None:
             self.state.current_task = persisted.current_task
+        current = self.state.current_task
+        if (
+            self.state.active_invocation is None
+            and current is not None
+            and persisted.current_task is not None
+            and persisted.current_task.pr_id == current.pr_id
+            and persisted.active_invocation is not None
+        ):
+            self.state.active_invocation = persisted.active_invocation
+
+    async def _finalize_interrupted_coding_invocation(self) -> None:
+        """Finalize only the exact unfinished CODING checkpoint on recovery."""
+        task = self.state.current_task
+        snapshot = self.state.active_invocation
+        if (
+            task is None
+            or snapshot is None
+            or snapshot.phase != "coding"
+            or snapshot.run_id is None
+        ):
+            return
+        await self._restore_current_run_record()
+        record = self._current_run_record
+        if (
+            record is None
+            or record.run_id != snapshot.run_id
+            or record.task_id != task.pr_id
+            or record.ended_at is not None
+        ):
+            return
+        await self._save_current_run_record(
+            "error",
+            run_phase="recovery",
+            cause="CRASH",
+        )
 
     async def _recover_state_headers(self) -> bool:
         """Apply state using the headers-derived task list.
@@ -487,6 +520,7 @@ class RecoveryMixin:
                 doing = None
 
         if doing is not None:
+            await self._finalize_interrupted_coding_invocation()
             if self.state.user_paused:
                 if doing.branch and not self._preserve_crashed_run_commits(
                     doing.branch

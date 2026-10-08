@@ -40,6 +40,7 @@ import re  # noqa: F401
 import subprocess
 import time  # noqa: F401
 import types  # noqa: F401
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,7 @@ from src.models import (
     PipelineState,  # noqa: F811
     PRInfo,  # noqa: F811
     QueueTask,  # noqa: F811
+    RepoState,
     TaskStatus,  # noqa: F811
 )
 from src.task_status import MergedState
@@ -152,6 +154,233 @@ def test_dirty_tree_recovery_composes_with_crashed_task_marker(
     assert any(cmd[:2] == ["git", "reset"] and "--hard" in cmd for cmd in reset_commands)
     assert any("Auto-recovered from dirty tree" in e["event"] for e in runner.state.history)
     assert any("PR-100 crashed, marking ERROR" in e["event"] for e in runner.state.history)
+
+
+def test_recovery_finalizes_checkpointed_coding_invocation_without_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = QueueTask(
+        pr_id="PR-395",
+        title="Invocation settings",
+        status=TaskStatus.DOING,
+        branch="manual-20261008-coder-invocation-settings",
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kwargs: [],
+    )
+    runner = h._make_runner()
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
+    runner._preserve_crashed_run_commits = (  # type: ignore[method-assign]
+        lambda branch: True
+    )
+    runner.state.state = PipelineState.CODING
+    runner.state.current_task = task
+    runner._start_current_run_record("codex", "gpt-5.4")
+    snapshot = runner._capture_invocation_snapshot(
+        "codex",
+        {"model": "gpt-5.4", "reasoning_effort": "high"},
+        phase="coding",
+    )
+    asyncio.run(runner._checkpoint_current_run_record())
+    asyncio.run(runner.publish_state())
+    runner._current_run_record = None
+    runner.state = RepoState(url=runner.state.url, name=runner.state.name)
+
+    asyncio.run(runner.recover_state())
+
+    records = asyncio.run(
+        runner._metrics_store.recent(
+            task_id=task.pr_id,
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+    assert len(records) == 1
+    record = records[0]
+    assert record.ended_at is not None
+    assert record.exit_reason == "error"
+    assert record.outcome == "failed"
+    assert record.cause == "CRASH"
+    assert record.run_phase == "recovery"
+    assert record.invocations == [snapshot]
+    assert runner.state.current_task is None
+    assert runner.state.active_invocation is None
+
+
+def test_recovery_does_not_rewrite_completed_run_without_current_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = QueueTask(
+        pr_id="PR-395",
+        title="Invocation settings retry",
+        status=TaskStatus.DOING,
+        branch="manual-20261008-coder-invocation-settings",
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kwargs: [],
+    )
+    runner = h._make_runner()
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
+    runner._preserve_crashed_run_commits = (  # type: ignore[method-assign]
+        lambda branch: True
+    )
+    runner.state.current_task = task
+    runner._start_current_run_record("codex", "gpt-5.4")
+    runner._capture_invocation_snapshot(
+        "codex", {"model": "gpt-5.4"}, phase="coding"
+    )
+    assert runner._current_run_record is not None
+    completed_run_id = runner._current_run_record.run_id
+    asyncio.run(
+        runner._save_current_run_record(
+            "success_merged",
+            diff_stats={},
+            base_branch="main",
+        )
+    )
+    runner.state.current_task = None
+    runner.state.state = PipelineState.CODING
+    runner.state.current_task = task
+    asyncio.run(runner.publish_state())
+    runner._current_run_record = None
+    runner.state = RepoState(url=runner.state.url, name=runner.state.name)
+
+    asyncio.run(runner.recover_state())
+
+    record = asyncio.run(runner._metrics_store.get(completed_run_id))
+    assert record is not None
+    assert record.exit_reason == "success_merged"
+    assert record.outcome == "merged"
+    assert record.cause is None
+    assert record.run_phase == "merge"
+
+
+def test_recovery_does_not_finalize_checkpoint_for_different_run() -> None:
+    task = QueueTask(
+        pr_id="PR-395",
+        title="Invocation settings retry",
+        status=TaskStatus.DOING,
+        branch="manual-20261008-coder-invocation-settings",
+    )
+    runner = h._make_runner()
+    runner.state.current_task = task
+    runner._start_current_run_record("codex", "gpt-5.4")
+    snapshot = runner._capture_invocation_snapshot(
+        "codex", {"model": "gpt-5.4"}, phase="coding"
+    )
+    asyncio.run(runner._checkpoint_current_run_record())
+    assert snapshot.run_id is not None
+    runner.state.active_invocation = replace(snapshot, run_id=f"retry-{snapshot.run_id}")
+    runner._current_run_record = None
+
+    asyncio.run(runner._finalize_interrupted_coding_invocation())
+
+    record = asyncio.run(runner._metrics_store.get(snapshot.run_id))
+    assert record is not None
+    assert record.ended_at is None
+    assert record.exit_reason == ""
+
+
+def test_recovery_finalizes_checkpoint_while_user_paused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = QueueTask(
+        pr_id="PR-396",
+        title="Paused invocation settings",
+        status=TaskStatus.DOING,
+        branch="manual-20261008-paused-invocation-settings",
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kwargs: [],
+    )
+    runner = h._make_runner()
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
+    runner._preserve_crashed_run_commits = (  # type: ignore[method-assign]
+        lambda branch: True
+    )
+    runner.state.state = PipelineState.CODING
+    runner.state.user_paused = True
+    runner.state.current_task = task
+    runner._start_current_run_record("codex", "")
+    snapshot = runner._capture_invocation_snapshot(
+        "codex", {"model": ""}, phase="coding"
+    )
+    asyncio.run(runner._checkpoint_current_run_record())
+    asyncio.run(runner.publish_state())
+    runner._current_run_record = None
+    runner.state = RepoState(
+        url=runner.state.url,
+        name=runner.state.name,
+        user_paused=True,
+    )
+
+    asyncio.run(runner.recover_state())
+
+    records = asyncio.run(
+        runner._metrics_store.recent(
+            task_id=task.pr_id,
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+    assert len(records) == 1
+    record = records[0]
+    assert record.ended_at is not None
+    assert record.exit_reason == "error"
+    assert record.cause == "CRASH"
+    assert record.invocations == [snapshot]
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task == task
+    assert runner.state.active_invocation == snapshot
+
+
+def test_recovery_restores_checkpointed_fix_snapshot_before_state_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = QueueTask(
+        pr_id="PR-397",
+        title="Interrupted FIX snapshot",
+        status=TaskStatus.DOING,
+        branch="manual-20261008-fix-snapshot",
+    )
+    matching_pr = PRInfo(number=397, branch=task.branch)
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kwargs: [matching_pr],
+    )
+    runner = h._make_runner()
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
+    runner.state.current_task = task
+    runner._start_current_run_record("codex", "gpt-5.4")
+    coding_snapshot = runner._capture_invocation_snapshot(
+        "codex", {"model": "gpt-5.4"}, phase="coding"
+    )
+    assert runner._current_run_record is not None
+    runner._current_run_record.fix_iterations = 1
+    fix_snapshot = runner._capture_invocation_snapshot(
+        "codex",
+        {"model": "gpt-5.5", "reasoning_effort": "high"},
+        phase="fix",
+        fix_iteration=1,
+    )
+    asyncio.run(runner._checkpoint_current_run_record())
+    runner._current_run_record = None
+    runner.state = RepoState(url=runner.state.url, name=runner.state.name)
+
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_task == task
+    assert runner.state.current_pr == matching_pr
+    assert runner.state.active_invocation == fix_snapshot
+    assert runner._current_run_record is not None
+    assert runner._current_run_record.invocations == [
+        coding_snapshot,
+        fix_snapshot,
+    ]
 
 
 # ---------------------------------------------------------------------------
