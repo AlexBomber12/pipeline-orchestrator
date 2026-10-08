@@ -337,6 +337,52 @@ def test_recovery_finalizes_checkpoint_while_user_paused(
     assert runner.state.active_invocation == snapshot
 
 
+def test_recovery_restores_checkpointed_fix_snapshot_before_state_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = QueueTask(
+        pr_id="PR-397",
+        title="Interrupted FIX snapshot",
+        status=TaskStatus.DOING,
+        branch="manual-20261008-fix-snapshot",
+    )
+    matching_pr = PRInfo(number=397, branch=task.branch)
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kwargs: [matching_pr],
+    )
+    runner = h._make_runner()
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
+    runner.state.current_task = task
+    runner._start_current_run_record("codex", "gpt-5.4")
+    coding_snapshot = runner._capture_invocation_snapshot(
+        "codex", {"model": "gpt-5.4"}, phase="coding"
+    )
+    assert runner._current_run_record is not None
+    runner._current_run_record.fix_iterations = 1
+    fix_snapshot = runner._capture_invocation_snapshot(
+        "codex",
+        {"model": "gpt-5.5", "reasoning_effort": "high"},
+        phase="fix",
+        fix_iteration=1,
+    )
+    asyncio.run(runner._checkpoint_current_run_record())
+    runner._current_run_record = None
+    runner.state = RepoState(url=runner.state.url, name=runner.state.name)
+
+    asyncio.run(runner.recover_state())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_task == task
+    assert runner.state.current_pr == matching_pr
+    assert runner.state.active_invocation == fix_snapshot
+    assert runner._current_run_record is not None
+    assert runner._current_run_record.invocations == [
+        coding_snapshot,
+        fix_snapshot,
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Test 2 — no-push deadlock cancels the task and returns to IDLE (PR-258)
 # ---------------------------------------------------------------------------

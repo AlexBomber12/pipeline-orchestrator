@@ -77,6 +77,18 @@ def test_handle_fix_releases_reservation_on_schedule_failure(
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=77, branch="pr-login-schedule")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-395",
+        title="Invocation settings",
+        status=TaskStatus.DOING,
+        branch="pr-login-schedule",
+    )
+    runner._start_current_run_record("claude", "")
+    coding_snapshot = runner._capture_invocation_snapshot(
+        "claude", {}, phase="coding"
+    )
+    assert runner._current_run_record is not None
+    run_id = runner._current_run_record.run_id
     plugin = runner._registry.get("claude")
     released: list[bool] = []
     monkeypatch.setattr(plugin, "fix_review", lambda *_args, **_kwargs: (0, "", ""))
@@ -94,6 +106,13 @@ def test_handle_fix_releases_reservation_on_schedule_failure(
 
     assert released == [True]
     assert runner._coder_invocation_active is False
+    assert runner.state.active_invocation == coding_snapshot
+    assert runner._current_run_record.invocations == [coding_snapshot]
+    assert runner._current_run_record.fix_iterations == 0
+    checkpointed = asyncio.run(runner._metrics_store.get(run_id))
+    assert checkpointed is not None
+    assert checkpointed.invocations == [coding_snapshot]
+    assert checkpointed.fix_iterations == 0
 
 
 def test_handle_fix_skipped_when_spend_ceiling_exceeded(
