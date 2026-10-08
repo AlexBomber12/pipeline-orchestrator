@@ -156,6 +156,23 @@ _KUBERNETES_ALIAS_KIND = re.compile(
     rf"(?im)(?:^|[{{,])[ \t\r\n]*{_KUBERNETES_KIND_KEY}"
     r"[ \t\r\n]*:[ \t\r\n]*\*[^\s,\[\]{}#]+"
 )
+_KUBERNETES_EXPLICIT_SECRET_KIND = re.compile(
+    rf"(?im)^[ \t]*\?[ \t]+{_KUBERNETES_KIND_KEY}[ \t]*(?:#.*)?\n"
+    r"(?:[ \t]*\n)*[ \t]*:[ \t]*"
+    r"(?:(?:&|!)[^\s,\[\]{}]+[ \t]+)*"
+    r"(?P<explicit_quote>['\"]?)Secret(?P=explicit_quote)"
+    r"[ \t]*(?:#.*)?$"
+)
+_AWS_CREDENTIAL_CSV_HEADER = re.compile(
+    r"(?i)(?:^|,)[ \t]*access key id[ \t]*,[ \t]*"
+    r"secret access key[ \t]*(?:,|$)"
+)
+_PUTTY_PRIVATE_KEY_START = re.compile(
+    r"(?im)^PuTTY-User-Key-File-[23]:[^\r\n]*(?:\r?\n|$)"
+)
+_PUTTY_PRIVATE_KEY_END = re.compile(
+    r"(?im)^Private-MAC:[^\r\n]*(?:\r?\n|$)"
+)
 _URL_USERINFO = re.compile(r"(?i)(?P<scheme>(?:\b[a-z][a-z0-9+.-]*:)?//)[^/@\s]+@")
 _QUERY_PARAMETER_VALUE = re.compile(
     r"(?P<separator>[?&;])(?P<name>[^=&#;\s]+)=(?P<value>[^&#;\s]+)"
@@ -1101,6 +1118,45 @@ def _normalize_terminal_text(text: str) -> tuple[str, int]:
     return "".join(normalized), removed
 
 
+def _omit_aws_credential_csv_documents(text: str) -> tuple[str, int]:
+    lines = text.splitlines(keepends=True)
+    sanitized: list[str] = []
+    omitted = 0
+    index = 0
+    while index < len(lines):
+        content = lines[index].rstrip("\r\n")
+        if _AWS_CREDENTIAL_CSV_HEADER.search(content) is None:
+            sanitized.append(lines[index])
+            index += 1
+            continue
+        ending = lines[index][len(content) :]
+        sanitized.append(f"{_CREDENTIAL_DOCUMENT_OMITTED}{ending}")
+        omitted += 1
+        index += 1
+        while index < len(lines):
+            row = lines[index].rstrip("\r\n")
+            if not row.strip() or "," not in row:
+                break
+            index += 1
+    return "".join(sanitized), omitted
+
+
+def _omit_putty_private_key_documents(text: str) -> tuple[str, int]:
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    while True:
+        start = _PUTTY_PRIVATE_KEY_START.search(text, cursor)
+        if start is None:
+            break
+        end = _PUTTY_PRIVATE_KEY_END.search(text, start.end())
+        if end is None:
+            ranges.append((start.start(), len(text)))
+            break
+        ranges.append((start.start(), end.end()))
+        cursor = end.end()
+    return _omit_document_ranges(text, ranges)
+
+
 def _omit_pem_credential_documents(text: str) -> tuple[str, int]:
     ranges: list[tuple[int, int]] = []
     open_start: int | None = None
@@ -1540,6 +1596,7 @@ def _omit_kubernetes_secret_documents(text: str) -> tuple[str, int]:
         or _KUBERNETES_FLOW_SECRET_KIND.search(text, start, end)
         or _KUBERNETES_FLOW_ESCAPED_QUOTED_KIND.search(text, start, end)
         or _KUBERNETES_ALIAS_KIND.search(text, start, end)
+        or _KUBERNETES_EXPLICIT_SECRET_KIND.search(text, start, end)
     ]
     return _omit_document_ranges(text, ranges)
 
@@ -1610,6 +1667,8 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
 
 def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     text, terminal_controls = _normalize_terminal_text(text)
+    text, aws_csv_documents = _omit_aws_credential_csv_documents(text)
+    text, putty_documents = _omit_putty_private_key_documents(text)
     text, xml_contexts = _omit_xml_credential_contexts(text)
     text, json_documents = _omit_json_credential_documents(text)
     text, ambiguous_yaml_documents = _omit_ambiguous_yaml_credential_documents(text)
@@ -1618,6 +1677,8 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     text, credential_lines = _omit_sensitive_context_lines(text)
     redactions = (
         terminal_controls
+        + aws_csv_documents
+        + putty_documents
         + xml_contexts
         + ambiguous_yaml_documents
         + kubernetes_documents
@@ -1641,7 +1702,9 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     return (
         text,
         redactions,
-        xml_contexts
+        aws_csv_documents
+        + putty_documents
+        + xml_contexts
         + ambiguous_yaml_documents
         + kubernetes_documents
         + pem_documents

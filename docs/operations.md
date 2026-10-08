@@ -48,16 +48,17 @@ and their multiline shell groups, cookies, credential-bearing absolute or
 scheme-relative URL userinfo/query
 parameters (including percent-encoded parameter names and Azure SAS signatures),
 recognizable token shapes including JWTs and Slack webhooks, private-key blocks,
-standalone AWS access-key identifiers, curl user/proxy-user credentials,
-netrc whitespace-delimited passwords, and recognizable JSON credential
-documents are not exported, including nested documents and documents serialized
+PuTTY private-key documents, standalone AWS access-key identifiers and AWS
+credential CSVs, curl user/proxy-user credentials, netrc whitespace-delimited
+passwords, and recognizable JSON credential documents are not exported,
+including nested documents and documents serialized
 inside log strings and structured header name/value pairs in JSON-list or
 Python-tuple form. Recognizable Kubernetes Secret documents are omitted as a
 whole in YAML or JSON form, including arbitrary keys under `data` or
-`stringData`, quoted or escaped `kind` keys, and anchored, aliased, tagged,
-escaped double-quoted, block-scalar (including indentation indicators), or
-flow-mapping `kind` values. Complete and interrupted private-key blocks are both
-omitted using a bounded single-pass boundary scan.
+`stringData`, explicit, quoted, or escaped `kind` keys, and anchored, aliased,
+tagged, escaped double-quoted, block-scalar (including indentation indicators),
+or flow-mapping `kind` values. Complete and interrupted private-key blocks are
+both omitted using bounded boundary scans.
 Standard encoded `auth` fields used by registry and package-manager credential
 documents are treated as credential context rather than exported as base64 text.
 Recognizable XML credential elements, credential attributes, and `key`/`name`

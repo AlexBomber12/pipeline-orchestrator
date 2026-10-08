@@ -531,6 +531,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "curl --proxy-user bob:curl-proxy-user-secret https://example.test",
             "curl -U bob:curl-short-proxy-user-secret https://example.test",
             "machine example.test login alice password netrc-password-secret",
+            "safe-before-aws-csv",
+            "Access key ID,Secret access key",
+            "ASIAABCDEFGHIJKLMNOP,aws-csv-secret-key",
+            "safe-after-aws-csv",
             "safe-before-kubernetes-secret",
             "---",
             "apiVersion: v1",
@@ -581,6 +585,12 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "kind: *resourceKindAlias",
             "data:",
             "  arbitrary-name: kubernetes-aliased-kind-secret",
+            "---",
+            "apiVersion: v1",
+            "? kind",
+            ": Secret",
+            "data:",
+            "  arbitrary-name: kubernetes-explicit-kind-secret",
             "---",
             "{data: {arbitrary: kubernetes-flow-secret}, kind: Secret}",
             "---",
@@ -677,6 +687,14 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "-----BEGIN PRIVATE KEY-----",
             "pem-document-secret",
             "-----END PRIVATE KEY-----",
+            "PuTTY-User-Key-File-3: ssh-rsa",
+            "Encryption: none",
+            "Public-Lines: 1",
+            "cHVibGljLWtleQ==",
+            "Private-Lines: 1",
+            "putty-private-secret",
+            "Private-MAC: putty-private-mac-secret",
+            "safe-after-putty",
             "safe-output",
             r'payload={\"private_key\":\"unwrapped-escaped-secret\"}',
             "{not-json",
@@ -700,6 +718,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-digit-heredoc" in exported
     assert "safe-before-kubernetes-secret" in exported
     assert "safe-after-kubernetes-secret" in exported
+    assert "safe-before-aws-csv" in exported
+    assert "safe-after-aws-csv" in exported
     assert "safe-after-shell" in exported
     assert "safe-after-quote" in exported
     assert "safe-after-shell-array" in exported
@@ -723,6 +743,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert encoded_auth not in exported
     assert standalone_basic not in exported
     assert "safe-hyperlink-output" in exported
+    assert "safe-after-putty" in exported
     assert diagnostics._omit_kubernetes_secret_documents(
         "apiVersion: v1\nkind: Secret\ndata:\n  tls.key: source-end-secret"
     ) == ("[credential document omitted]", 1)
@@ -774,6 +795,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "curl-proxy-user-secret",
         "curl-short-proxy-user-secret",
         "netrc-password-secret",
+        "aws-csv-secret-key",
         "kubernetes-dockerconfig-secret",
         "kubernetes-stringdata-secret",
         "kubernetes-json-secret",
@@ -784,6 +806,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "kubernetes-quoted-key-secret",
         "kubernetes-escaped-key-secret",
         "kubernetes-aliased-kind-secret",
+        "kubernetes-explicit-kind-secret",
         "kubernetes-flow-secret",
         "kubernetes-flow-escaped-secret",
         "quoted cli token",
@@ -823,6 +846,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "aws-secret",
         "document-secret",
         "pem-document-secret",
+        "putty-private-secret",
+        "putty-private-mac-secret",
         "ghp_" + ("A" * 36),
     ):
         assert secret not in exported
@@ -873,6 +898,16 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     orphaned_end = await diagnostics.get_latest_cli_log(SLUG)
     assert orphaned_end["text"] == "[credential document omitted]\nsafe-after"
     assert "orphaned-private-secret" not in orphaned_end["text"]
+
+    incomplete_putty_redis = FakeRedis()
+    incomplete_putty_redis.store[key] = (
+        "safe-before\nPuTTY-User-Key-File-2: ssh-rsa\n"
+        "Private-Lines: 1\nincomplete-putty-secret"
+    )
+    _patch_runtime(monkeypatch, incomplete_putty_redis)
+    incomplete_putty = await diagnostics.get_latest_cli_log(SLUG)
+    assert incomplete_putty["text"] == "safe-before\n[credential document omitted]"
+    assert "incomplete-putty-secret" not in incomplete_putty["text"]
 
     incomplete_json_redis = FakeRedis()
     incomplete_json_redis.store[key] = '{"private_key":\n"incomplete-document-secret"\n'
