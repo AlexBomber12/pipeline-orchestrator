@@ -57,9 +57,9 @@ Python-tuple form. Recognizable Kubernetes Secret documents are omitted as a
 whole in YAML or JSON form, including arbitrary keys under `data` or
 `stringData`, decorated, explicit, quoted, or escaped `kind` keys, and anchored,
 aliased, shorthand- or verbatim-tagged, escaped double-quoted, block-scalar
-(including indentation indicators), block-sequence, or flow-mapping `kind`
-values. Complete and interrupted private-key blocks are both omitted using
-bounded boundary scans.
+(including indentation indicators), multiline plain-scalar, block-sequence, or
+flow-mapping `kind` values. Complete and interrupted private-key blocks are both
+omitted using bounded boundary scans.
 Standard encoded `auth` fields used by registry and package-manager credential
 documents are treated as credential context rather than exported as base64 text.
 YAML documents with explicit credential keys, alias mapping keys, or mapping

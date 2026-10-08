@@ -162,6 +162,13 @@ _KUBERNETES_SECRET_BLOCK_KIND = re.compile(
     + r"[|>][0-9+-]{0,2}[ \t]*(?:#.*)?\n"
     r"(?:[ \t]*\n)*[ \t]+Secret[ \t]*(?:\n|$)"
 )
+_KUBERNETES_MULTILINE_SECRET_KIND = re.compile(
+    _KUBERNETES_BLOCK_KIND_PREFIX
+    + r"(?:#.*)?\n(?:[ \t]*(?:#.*)?\n)*[ \t]+"
+    + _YAML_NODE_PROPERTIES
+    + r"(?P<multiline_quote>['\"]?)Secret(?P=multiline_quote)"
+    + r"[ \t]*(?:#.*)?(?:\n|$)"
+)
 _KUBERNETES_FLOW_KIND_PREFIX = (
     rf"(?im)(?:^|[{{,])[ \t\r\n]*{_KUBERNETES_KIND_KEY}"
     r"[ \t\r\n]*:[ \t\r\n]*"
@@ -1645,6 +1652,7 @@ def _omit_kubernetes_secret_documents(text: str) -> tuple[str, int]:
         if _KUBERNETES_SECRET_KIND.search(text, start, end)
         or _KUBERNETES_ESCAPED_QUOTED_KIND.search(text, start, end)
         or _KUBERNETES_SECRET_BLOCK_KIND.search(text, start, end)
+        or _KUBERNETES_MULTILINE_SECRET_KIND.search(text, start, end)
         or _KUBERNETES_FLOW_SECRET_KIND.search(text, start, end)
         or _KUBERNETES_FLOW_ESCAPED_QUOTED_KIND.search(text, start, end)
         or _KUBERNETES_ALIAS_KIND.search(text, start, end)
