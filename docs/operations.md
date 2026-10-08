@@ -50,8 +50,8 @@ parameter names, Azure SAS signatures, and AWS/Google presigned signatures),
 recognizable token shapes including JWTs and Slack webhooks, private-key blocks,
 PuTTY private-key documents, standalone AWS access-key identifiers and AWS
 credential CSVs with quoted or unquoted fields and an optional leading UTF-8
-BOM, curl user/proxy-user
-credentials, netrc passwords delimited by horizontal whitespace or a newline,
+BOM, curl user/proxy-user credentials using separated or attached short-option
+arguments, netrc passwords delimited by horizontal whitespace or a newline,
 and recognizable JSON
 credential documents are not exported, including nested documents and documents
 serialized inside log strings, documents whose container and field syntax is

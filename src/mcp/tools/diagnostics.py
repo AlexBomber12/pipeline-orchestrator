@@ -257,7 +257,8 @@ _AUTHORIZATION_VALUE = re.compile(
 )
 _DIGEST_AUTHORIZATION = re.compile(r"(?i)(?<![A-Za-z0-9])Digest[ \t]+")
 _CREDENTIAL_CLI_OPTION = re.compile(
-    r"(?i)(?<!\S)(?:-[uU]|--user|--proxy-user)(?:[ \t]+|=)"
+    r"(?i)(?<!\S)(?:(?:--user|--proxy-user)(?:[ \t]+|=)|"
+    r"-[uU](?:[ \t]+|=|(?=[^ \t;&|<>()])))"
 )
 _NETRC_PASSWORD_VALUE = re.compile(r"(?i)(?<!\S)password[ \t]+")
 _NETRC_PENDING_PASSWORD_VALUE = re.compile(r"(?i)(?<!\S)password[ \t]*$")
