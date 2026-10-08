@@ -1464,11 +1464,34 @@ def _yaml_single_quoted_sensitive_value_start(line: str) -> int | None:
             break
 
 
+def _ansi_c_option_value_start(line: str) -> int | None:
+    """Fail closed for backslash-bearing ANSI-C fragments in long options."""
+    word_start = 0
+    while word_start < len(line):
+        while word_start < len(line) and line[word_start] in " \t;&|<>()":
+            word_start += 1
+        word_end = word_start
+        while word_end < len(line) and line[word_end] not in " \t;&|<>()":
+            word_end += 1
+        word = line[word_start:word_end].lstrip("'\"")
+        marker = word.find("$'")
+        if word.startswith("--") and marker >= 0 and "\\" in word[marker + 2 :]:
+            value_start = word_end
+            while value_start < len(line) and line[value_start] in " \t":
+                value_start += 1
+            return value_start
+        word_start = word_end
+    return None
+
+
 def _sensitive_value_start(line: str) -> int | None:
     """Return the value position for a sensitive context found in one line."""
     yaml_single_quoted = _yaml_single_quoted_sensitive_value_start(line)
     if yaml_single_quoted is not None:
         return yaml_single_quoted
+    ansi_c_option = _ansi_c_option_value_start(line)
+    if ansi_c_option is not None:
+        return ansi_c_option
     line = _normalize_shell_credential_names(line)
     netrc_password = _NETRC_PASSWORD_VALUE.search(line)
     if netrc_password is not None:

@@ -107,7 +107,8 @@ quotes around recognized multiword credential labels are supported, so
 malformed or interrupted quoting cannot expose a value suffix. Adjacent simple
 shell quote fragments, including Bash dollar-prefixed ANSI/locale quotes, and
 same-line backslash-escaped characters in long-option names are reassembled for
-classification.
+classification. Backslash-bearing ANSI-C fragments inside long-option names
+fail closed rather than requiring shell escape evaluation.
 Indented YAML/header continuations, backslash-continued shell values, and quoted
 or square-bracketed values spanning physical lines are omitted with their key
 line through the close or source end. TOML triple-quoted values retain the full

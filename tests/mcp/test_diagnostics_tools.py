@@ -572,6 +572,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "safe-after-dollar-single-quoted-option-name",
             'tool --pass$"word" dollar-double-quoted-option-secret',
             "safe-after-dollar-double-quoted-option-name",
+            r"tool --pass$'\x77ord' ansi-c-hex-option-secret",
+            "safe-after-ansi-c-hex-option-name",
+            r"tool --pass$'\u0077ord' ansi-c-unicode-option-secret",
+            "safe-after-ansi-c-unicode-option-name",
             r"tool --pass\word same-line-escaped-option-secret",
             "safe-after-same-line-escaped-option-name",
             "curl --user alice:curl-user-secret https://example.test",
@@ -934,6 +938,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-leading-quoted-option-name" in exported
     assert "safe-after-dollar-single-quoted-option-name" in exported
     assert "safe-after-dollar-double-quoted-option-name" in exported
+    assert "safe-after-ansi-c-hex-option-name" in exported
+    assert "safe-after-ansi-c-unicode-option-name" in exported
     assert "safe-after-same-line-escaped-option-name" in exported
     assert "safe-after-toml-array" in exported
     assert "safe-after-toml-triple-quote" in exported
@@ -1028,6 +1034,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "leading-quoted-fragment-option-secret",
         "dollar-single-quoted-option-secret",
         "dollar-double-quoted-option-secret",
+        "ansi-c-hex-option-secret",
+        "ansi-c-unicode-option-secret",
         "same-line-escaped-option-secret",
         "curl-user-secret",
         "curl-short-user-secret",
