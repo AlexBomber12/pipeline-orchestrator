@@ -598,6 +598,11 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "safe-after-command-substitution-option",
             "tool --pass${UNSET}word ambiguous-parameter-option-secret",
             "safe-after-parameter-substitution-option",
+            "set EMPTY=",
+            "tool --pass%EMPTY%word cmd-variable-option-secret",
+            "safe-after-cmd-variable-option",
+            "tool --pass!EMPTY!word cmd-delayed-variable-option-secret",
+            "safe-after-cmd-delayed-variable-option",
             "curl --user alice:curl-user-secret https://example.test",
             "curl -u alice:curl-short-user-secret https://example.test",
             "curl -ualice:curl-attached-user-secret https://example.test",
@@ -971,6 +976,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-client-ifs-option" in exported
     assert "safe-after-command-substitution-option" in exported
     assert "safe-after-parameter-substitution-option" in exported
+    assert "safe-after-cmd-variable-option" in exported
+    assert "safe-after-cmd-delayed-variable-option" in exported
     assert "safe-after-toml-array" in exported
     assert "safe-after-toml-triple-quote" in exported
     assert "safe-after-split-assignment-name" in exported
@@ -1077,6 +1084,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "client-ifs-option-secret",
         "output-empty-command-option-secret",
         "ambiguous-parameter-option-secret",
+        "cmd-variable-option-secret",
+        "cmd-delayed-variable-option-secret",
         "curl-user-secret",
         "curl-short-user-secret",
         "curl-attached-user-secret",
@@ -1455,6 +1464,8 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
             "safe-after-ansi-c-token",
             "echo ghp_ABCDEFGHIJ$(true)KLMNOPQRSTUVWXYZ0123456789",
             "safe-after-command-substitution-token",
+            "echo ghp_ABCDEFGHIJ%EMPTY%KLMNOPQRSTUVWXYZ0123456789",
+            "safe-after-cmd-variable-token",
             'curl https://blob.test/?sv=1\'&\'si"g"=SYNTHETIC_QUOTED_QUERY_SECRET',
             "safe-after-quoted-query",
             "https://user:SYNTHETIC_URL_FIRST@SYNTHETIC_URL_SECOND@example.test/path",
@@ -1490,6 +1501,7 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
     assert "safe-after-backtick-token" in result["text"]
     assert "safe-after-ansi-c-token" in result["text"]
     assert "safe-after-command-substitution-token" in result["text"]
+    assert "safe-after-cmd-variable-token" in result["text"]
     assert r"\x4b" not in result["text"]
     assert "safe-after-quoted-query" in result["text"]
     assert "safe-after-url" in result["text"]
@@ -1590,6 +1602,7 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
         '{? "pass\\\n  word": SYNTHETIC_SECRET}\nsafe: visible',
         "? 'pass\n  word'\n: SYNTHETIC_SECRET\nsafe: visible",
         "? pass\n  word\n: SYNTHETIC_SECRET\nsafe: visible",
+        "{? pass\n  word: SYNTHETIC_SECRET}\nsafe: visible",
         "? |-\n  password\n: SYNTHETIC_SECRET\nsafe: visible",
     )
     for payload in supplied_cases:
@@ -1639,6 +1652,9 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
             '{? "pass\\',
             '  word": SYNTHETIC_FLOW_MULTILINE_EXPLICIT_KEY_SECRET}',
             "---",
+            "{? pass",
+            "  word: SYNTHETIC_FLOW_PLAIN_CONTINUATION_SECRET}",
+            "---",
             "? >-2",
             "  pass",
             "  word",
@@ -1656,7 +1672,7 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
     result = await diagnostics.get_latest_cli_log(SLUG, diagnostics._MAX_CLI_LOG_TAIL_BYTES)
 
     assert result["availability"]["status"] == "available"
-    assert result["text"].count("[credential document omitted]") == 10
+    assert result["text"].count("[credential document omitted]") == 11
     assert "safe: before" in result["text"]
     assert "safe: visible" in result["text"]
     assert "safe-explicit-visible" in result["text"]
@@ -1671,6 +1687,7 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
         "SYNTHETIC_SINGLE_QUOTED_EXPLICIT_KEY_SECRET",
         "SYNTHETIC_PLAIN_MULTILINE_EXPLICIT_KEY_SECRET",
         "SYNTHETIC_FLOW_MULTILINE_EXPLICIT_KEY_SECRET",
+        "SYNTHETIC_FLOW_PLAIN_CONTINUATION_SECRET",
         "SYNTHETIC_BLOCK_EXPLICIT_KEY_SECRET",
     ):
         assert secret not in result["text"]

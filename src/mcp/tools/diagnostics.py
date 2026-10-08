@@ -284,6 +284,10 @@ _INLINE_POWERSHELL_BACKTICK = re.compile(
     r"(?<=[A-Za-z0-9_.%+\[\]])`(?=[A-Za-z0-9_.%+\[\]])"
 )
 _EMBEDDED_SHELL_SUBSTITUTION = re.compile(r"(?<![ \t;&|<>])\$(?:\(|\{)")
+_EMBEDDED_CMD_VARIABLE = re.compile(
+    r"(?<![ \t;&|<>])(?:%[A-Za-z_][A-Za-z0-9_]*(?::[^%\r\n]{0,64})?%|"
+    r"![A-Za-z_][A-Za-z0-9_]*!)"
+)
 _HEREDOC_START = re.compile(
     r"<<(?P<strip_tabs>-?)[ \t]*(?P<quote>['\"]?)"
     r"(?P<delimiter>[A-Za-z0-9_.+-]+)(?P=quote)(?=$|[ \t;|&()<>])"
@@ -1912,6 +1916,15 @@ def _has_multiline_explicit_plain_yaml_key(text: str, start: int, end: int) -> b
             elif not stripped or stripped.startswith("#"):
                 continue
             elif line.startswith((" ", "\t")):
+                if any(
+                    character == ":"
+                    and (
+                        delimiter + 1 == len(stripped)
+                        or stripped[delimiter + 1] in " \t]},"
+                    )
+                    for delimiter, character in enumerate(stripped)
+                ):
+                    return True
                 saw_continuation = True
                 continue
             else:
@@ -2289,6 +2302,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
         ) or _has_backslash_ansi_c_word(logical_content)
         ambiguous_shell_substitution = (
             _EMBEDDED_SHELL_SUBSTITUTION.search(logical_content) is not None
+            or _EMBEDDED_CMD_VARIABLE.search(logical_content) is not None
         )
         if (
             value_start is None

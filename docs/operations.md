@@ -81,6 +81,8 @@ being decoded or exported.
 Command or parameter substitutions embedded after a literal shell-word fragment
 are treated as ambiguous credential context and omitted with balanced-group
 tracking rather than evaluated.
+Percent-delimited and delayed-expansion `cmd` variables embedded in a word are
+handled by the same fail-closed rule.
 Provably empty `${name:+}`, `${name+}`, `$()`, and backtick substitutions inside
 credential option names or recognizable token text are normalized before
 classification.
@@ -102,7 +104,8 @@ doubled single-quote escapes before credential classification. Documents
 containing multiline explicit plain mapping keys, or multiline explicit single-
 or double-quoted keys in block or flow mappings, are omitted because folded keys
 cannot be classified safely without interpreting YAML. Plain-key discovery uses
-a monotonic bounded line scan.
+a monotonic bounded line scan, including flow-form delimiters on continuation
+lines.
 Explicit block-scalar mapping keys
 are omitted for the same reason.
 Recognizable XML credential elements, credential attributes, and `key`/`name`
