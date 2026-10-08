@@ -1119,6 +1119,7 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
         "password: # explanation\n\n  SYNTHETIC_SECRET\nsafe: visible",
         "defaults: &value SYNTHETIC_SECRET\npassword: *value\nsafe: visible",
         '? "pass\\\n  word"\n: SYNTHETIC_SECRET\nsafe: visible',
+        "? 'pass\n  word'\n: SYNTHETIC_SECRET\nsafe: visible",
     )
     for payload in supplied_cases:
         supplied_redis = FakeRedis()
@@ -1156,7 +1157,13 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
             '  word"',
             ": SYNTHETIC_MULTILINE_EXPLICIT_KEY_SECRET",
             "---",
+            "? 'pa''ss",
+            "  word'",
+            ": SYNTHETIC_SINGLE_QUOTED_EXPLICIT_KEY_SECRET",
+            "---",
             "safe: visible",
+            "? 'public label'",
+            ": safe-explicit-visible",
         )
     )
     _patch_runtime(monkeypatch, redis)
@@ -1164,9 +1171,10 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
     result = await diagnostics.get_latest_cli_log(SLUG, diagnostics._MAX_CLI_LOG_TAIL_BYTES)
 
     assert result["availability"]["status"] == "available"
-    assert result["text"].count("[credential document omitted]") == 6
+    assert result["text"].count("[credential document omitted]") == 7
     assert "safe: before" in result["text"]
     assert "safe: visible" in result["text"]
+    assert "safe-explicit-visible" in result["text"]
     for secret in (
         "SYNTHETIC_COMMENT_SECRET",
         "SYNTHETIC_BEFORE_ALIAS_SECRET",
@@ -1174,6 +1182,7 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
         "SYNTHETIC_NESTED_ALIAS_SECRET",
         "SYNTHETIC_FLOW_COLLECTION_SECRET",
         "SYNTHETIC_MULTILINE_EXPLICIT_KEY_SECRET",
+        "SYNTHETIC_SINGLE_QUOTED_EXPLICIT_KEY_SECRET",
     ):
         assert secret not in result["text"]
 

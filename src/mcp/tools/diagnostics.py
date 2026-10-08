@@ -136,6 +136,12 @@ _YAML_MULTILINE_EXPLICIT_QUOTED_KEY = re.compile(
     r'(?:[^"\\]|\\(?:\r\n|[\s\S]))*"[ \t]*(?:#.*)?\r?\n'
     r'(?:[ \t]*(?:#.*)?\r?\n)*[ \t]*:'
 )
+_YAML_MULTILINE_EXPLICIT_SINGLE_QUOTED_KEY = re.compile(
+    r"(?m)^[ \t]*(?:-[ \t]+)?\?[ \t]+'"
+    r"(?=(?:[^'\r\n]|'')*(?:\r?\n))"
+    r"(?:[^']|'')*'[ \t]*(?:#.*)?\r?\n"
+    r"(?:[ \t]*(?:#.*)?\r?\n)*[ \t]*:"
+)
 _YAML_ALIAS_MAPPING_KEY = re.compile(
     r"(?im)(?:^[ \t]*(?:-[ \t]+)?|[,{][ \t]*)"
     r"\*[^\s,\[\]{}#]+[ \t]*:"
@@ -1673,6 +1679,7 @@ def _omit_ambiguous_yaml_credential_documents(text: str) -> tuple[str, int]:
         if (
             _YAML_ONLY_ESCAPED_MAPPING_KEY.search(text, start, end)
             or _YAML_MULTILINE_EXPLICIT_QUOTED_KEY.search(text, start, end)
+            or _YAML_MULTILINE_EXPLICIT_SINGLE_QUOTED_KEY.search(text, start, end)
             or _YAML_ALIAS_MAPPING_KEY.search(text, start, end)
             or explicit_credential_key
         ):
