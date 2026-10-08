@@ -1264,7 +1264,11 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
             "<string>SYNTHETIC_XML_CDATA_PLIST_SECRET</string>",
             "<key>Pass<!-- synthetic note -->word</key>"
             "<string>SYNTHETIC_XML_COMMENT_PLIST_SECRET</string>",
+            '<name type="setting">Password</name>'
+            '<value format="text">SYNTHETIC_XML_ATTRIBUTE_PLIST_SECRET</value>',
             "<key>Visible</key><string>safe-plist-visible</string>",
+            '<name type="set>ting">Visible</name>'
+            '<value format="text">safe-attributed-plist-visible</value>',
             "safe-after: visible",
             "<cfg:connection cfg:password='SYNTHETIC_XML_ATTRIBUTE_SECRET'/>",
             "<add value='SYNTHETIC_XML_ORDER_SECRET' name='apiToken'/>",
@@ -1278,11 +1282,12 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
     result = await diagnostics.get_latest_cli_log(SLUG)
 
     assert result["availability"]["status"] == "available"
-    assert result["text"].count("[credential document omitted]") == 10
+    assert result["text"].count("[credential document omitted]") == 11
     assert "safe-between: visible" in result["text"]
     assert "safe-after: visible" in result["text"]
     assert "<safe ignored attr='visible'>visible</safe>" in result["text"]
     assert "safe-plist-visible" in result["text"]
+    assert "safe-attributed-plist-visible" in result["text"]
     assert "not xml <broken! visible" in result["text"]
     for secret in (
         "SYNTHETIC_XML_ELEMENT_SECRET",
@@ -1292,6 +1297,7 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
         "SYNTHETIC_XML_PLIST_SECRET",
         "SYNTHETIC_XML_CDATA_PLIST_SECRET",
         "SYNTHETIC_XML_COMMENT_PLIST_SECRET",
+        "SYNTHETIC_XML_ATTRIBUTE_PLIST_SECRET",
         "SYNTHETIC_XML_ATTRIBUTE_SECRET",
         "SYNTHETIC_XML_ORDER_SECRET",
         "SYNTHETIC_XML_UNQUOTED_SECRET",

@@ -75,8 +75,9 @@ are omitted for the same reason.
 Recognizable XML credential elements, credential attributes, and `key`/`name`
 plus `value` configuration tags are omitted. XML character references in
 credential selectors are decoded before classification. Plist-style sensitive
-`key`/`name` element text is normalized across comments and CDATA before its
-following scalar value is omitted. Other or incomplete selector markup fails
+`key`/`name` element text is normalized across bounded attributed start tags,
+comments, and CDATA before its following scalar value is omitted. Other or
+incomplete selector markup fails
 closed through the bounded source end. Multiline or incomplete XML credential
 contexts fail closed through the bounded source end, and
 unresolved named entities in credential selectors are treated as ambiguous

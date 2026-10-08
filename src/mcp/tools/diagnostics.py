@@ -155,13 +155,18 @@ _XML_NAME_CHARACTERS = frozenset(
 _XML_CREDENTIAL_SELECTOR_ATTRIBUTES = frozenset({"key", "name"})
 _XML_DOCTYPE = re.compile(r"(?i)<!DOCTYPE(?:\s|>)")
 _XML_UNRESOLVED_NAMED_ENTITY = re.compile(r"&[A-Za-z_:][A-Za-z0-9_.:-]*;")
+_XML_OPTIONAL_ATTRIBUTES = r'''(?:[ \t\r\n]+(?:[^"'<>]|"[^"]*"|'[^']*')*)?'''
 _XML_SELECTOR_ELEMENT = re.compile(
-    r"(?is)<(?P<tag>(?:[A-Za-z_][A-Za-z0-9_.-]*:)?(?:key|name))[ \t\r\n]*>"
+    r"(?is)<(?P<tag>(?:[A-Za-z_][A-Za-z0-9_.-]*:)?(?:key|name))"
+    + _XML_OPTIONAL_ATTRIBUTES
+    + r">"
     r"(?P<selector>.*?)</(?P=tag)[ \t\r\n]*>"
 )
 _XML_SELECTOR_MARKUP = re.compile(r"(?s)<!--.*?-->|<!\[CDATA\[(?P<cdata>.*?)\]\]>|<")
 _XML_SCALAR_VALUE_ELEMENT = re.compile(
-    r"(?is)[ \t\r\n]*<(?P<tag>[A-Za-z_:][A-Za-z0-9_.:-]*)[ \t\r\n]*>"
+    r"(?is)[ \t\r\n]*<(?P<tag>[A-Za-z_:][A-Za-z0-9_.:-]*)"
+    + _XML_OPTIONAL_ATTRIBUTES
+    + r">"
     r"[^<]*</(?P=tag)[ \t\r\n]*>"
 )
 _YAML_NODE_PROPERTY = r"(?:&[^\s,\[\]{}]+|!<[^>\r\n]+>|![^\s,\[\]{}]*)"
