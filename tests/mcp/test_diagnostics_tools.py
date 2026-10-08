@@ -1435,6 +1435,8 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
             "safe-after-empty-expansion-token",
             "echo ghp_ABCDEFGHIJ`KLMNOPQRSTUVWXYZ0123456789",
             "safe-after-backtick-token",
+            r"echo $'ghp_ABCDEFGHIJ\x4bLMNOPQRSTUVWXYZ0123456789'",
+            "safe-after-ansi-c-token",
             'curl https://blob.test/?sv=1\'&\'si"g"=SYNTHETIC_QUOTED_QUERY_SECRET',
             "safe-after-quoted-query",
             "https://user:SYNTHETIC_URL_FIRST@SYNTHETIC_URL_SECOND@example.test/path",
@@ -1468,6 +1470,8 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
     assert "safe-after-caret-token" in result["text"]
     assert "safe-after-empty-expansion-token" in result["text"]
     assert "safe-after-backtick-token" in result["text"]
+    assert "safe-after-ansi-c-token" in result["text"]
+    assert r"\x4b" not in result["text"]
     assert "safe-after-quoted-query" in result["text"]
     assert "safe-after-url" in result["text"]
     assert "safe-after-pair" in result["text"]
@@ -1493,6 +1497,12 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
         "SYNTHETIC_STRUCTURED_PAIR_SECRET",
     ):
         assert secret not in result["text"]
+
+    incomplete_ansi_c_redis = FakeRedis()
+    incomplete_ansi_c_redis.store[key] = r"echo $'ghp_ABCDEFGHIJ\x4bLMNOPQRSTUVWXYZ0123456789"
+    _patch_runtime(monkeypatch, incomplete_ansi_c_redis)
+    incomplete_ansi_c = await diagnostics.get_latest_cli_log(SLUG)
+    assert incomplete_ansi_c["text"] == "[credential line omitted]"
 
 
 async def test_latest_cli_log_omits_embedded_json_and_powershell_credentials(

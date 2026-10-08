@@ -1430,6 +1430,31 @@ def _has_shell_normalized_credential(text: str) -> bool:
     return _has_recognizable_inline_credential(joined)
 
 
+def _has_backslash_ansi_c_word(text: str) -> bool:
+    """Fail closed for bounded ANSI-C shell words that require decoding."""
+    cursor = 0
+    while True:
+        opening = text.find("$'", cursor)
+        if opening < 0:
+            return False
+        escaped = False
+        index = opening + 2
+        while index < len(text):
+            character = text[index]
+            if character == "\\":
+                escaped = True
+                index += 2
+                continue
+            if character == "'":
+                if escaped:
+                    return True
+                cursor = index + 1
+                break
+            index += 1
+        else:
+            return escaped
+
+
 def _json_key_escape_length(value: str, index: int) -> int:
     if index + 1 >= len(value) or value[index] != "\\":
         return 0
@@ -2253,7 +2278,9 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
             logical_end > index + 1
             and _has_recognizable_inline_credential(logical_content)
         )
-        shell_normalized_credential = _has_shell_normalized_credential(logical_content)
+        shell_normalized_credential = _has_shell_normalized_credential(
+            logical_content
+        ) or _has_backslash_ansi_c_word(logical_content)
         if (
             value_start is None
             and not reconstructed_credential
