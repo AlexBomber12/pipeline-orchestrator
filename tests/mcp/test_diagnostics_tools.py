@@ -2249,6 +2249,38 @@ def test_mysql_attached_password_scan_is_command_scoped_and_bounded() -> None:
     assert diagnostics._command_specific_credential_value_start(repeated_mysql) is None
 
 
+async def test_latest_cli_log_normalizes_unicode_yaml_line_separators(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    redis.store[cli_log_latest(SLUG)] = (
+        "---\npassword:\u2028- unicode-line-separator-secret\n"
+        "---\nsafe-after-line-separator\n"
+        "---\npassword:\u2029- unicode-paragraph-separator-secret\n"
+        "---\nsafe-after-paragraph-separator"
+    )
+    _patch_runtime(monkeypatch, redis)
+
+    result = await diagnostics.get_latest_cli_log(SLUG)
+
+    assert "unicode-line-separator-secret" not in result["text"]
+    assert "unicode-paragraph-separator-secret" not in result["text"]
+    assert "safe-after-line-separator" in result["text"]
+    assert "safe-after-paragraph-separator" in result["text"]
+
+
+def test_command_password_scans_are_monotonic_at_source_bound() -> None:
+    from src.mcp.tools import diagnostics
+
+    for executable in ("az", "docker", "redis-cli", "sshpass"):
+        repeated = (f"{executable} x " * diagnostics._MAX_CLI_LOG_SOURCE_BYTES)[
+            : diagnostics._MAX_CLI_LOG_SOURCE_BYTES
+        ]
+        assert diagnostics._command_specific_credential_value_start(repeated) is None
+
+
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

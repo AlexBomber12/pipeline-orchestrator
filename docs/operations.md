@@ -38,7 +38,8 @@ one configured `owner__repo` slug and returns a sanitized tail of the fixed
 latest-log record written by completed coder CLI invocations. The default tail
 is 8 KiB and callers may request at most 32 KiB. The service accepts the
 producer 64 KiB byte budget plus its bounded six-byte UTF-8 replacement
-expansion, redacts the complete bounded source before selecting the tail, and
+expansion, normalizes Unicode YAML line and paragraph separators, redacts the
+complete bounded source before selecting the tail, and
 reports source/output sizes, truncation, observation time, and remaining Redis
 TTL. A producer `[truncated]` marker means the stored tail may begin inside a
 credential value, so the service fails closed with
@@ -90,11 +91,12 @@ The established `MYSQL_PWD` assignment and attached `-pPASSWORD` forms for
 MySQL client commands are treated as credential context using the monotonic
 command-word scan; unrelated `-p` and MySQL `-P` port options remain visible.
 Docker login's separated, equals, and attached short-password
-forms are likewise recognized only in their command-specific context, including
-shell-fragmented or quoted short flags. Redis CLI password flags use the same
-bounded shell-fragment normalization before command-specific matching.
+forms are likewise recognized only in their command-specific context by that
+monotonic scan, including shell-fragmented or quoted short flags. Redis CLI and
+sshpass password flags use the same bounded command scan and shell-fragment
+normalization.
 Azure CLI `az login` recognizes its `-p` password or service-principal-secret
-alias in the same command-specific context; unrelated `-p` options remain visible.
+alias in the same monotonic command-specific context; unrelated `-p` options remain visible.
 The `sshpass -p` separated, attached, and shell-fragmented password forms are
 also recognized only in their command-specific context.
 Positional access-key, secret-key, and session-token values passed through

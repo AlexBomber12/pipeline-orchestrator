@@ -262,20 +262,6 @@ _DIGEST_AUTHORIZATION = re.compile(r"(?i)(?<![A-Za-z0-9])Digest[ \t]+")
 _CREDENTIAL_CLI_OPTION = re.compile(
     r"(?i)(?<!\S)(?:\$?['\"])?(?:--user|--proxy-user)(?:['\"]?[ \t]+|=)"
 )
-_DOCKER_LOGIN_PASSWORD_OPTION = re.compile(
-    r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?docker(?:\.exe)?(?=[ \t])"
-    r"[^;&|<>\r\n]*?(?<!\S)login(?=[ \t]|$)"
-    r"[^;&|<>\r\n]*?(?<!\S)-_*p_*(?:[ \t]+|=)?[^ \t;&|<>()]+"
-)
-_AZ_LOGIN_PASSWORD_OPTION = re.compile(
-    r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?az(?:\.exe)?(?=[ \t])"
-    r"[^;&|<>\r\n]*?(?<!\S)login(?=[ \t]|$)"
-    r"[^;&|<>\r\n]*?(?<!\S)-_*p_*(?:[ \t]+|=)?[^ \t;&|<>()]+"
-)
-_SSHPASS_PASSWORD_OPTION = re.compile(
-    r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?sshpass(?:\.exe)?(?=[ \t])"
-    r"[^;&|<>\r\n]*?(?<!\S)-_*p_*(?:[ \t]+|=)?[^ \t;&|<>()]+"
-)
 _SHELL_COMMAND_WORD = re.compile(r"[^ \t;&|<>()]+|[;&|<>()]")
 _AWS_CONFIGURE_SET_CREDENTIAL = re.compile(
     r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?aws(?:\.exe)?[ \t]+"
@@ -291,12 +277,6 @@ _CONNECTION_STRING_LEADING_PWD_VALUE = re.compile(
     r"(?=[^;\r\n]*;[ \t]*(?i:Server|Data[ \t]+Source|Address|Addr|"
     r"Network[ \t]+Address|Host|Database|Initial[ \t]+Catalog|User[ \t]+ID|"
     r"UID|Port|Driver|Provider)[ \t]*=)"
-)
-_REDIS_CLI_PASSWORD_OPTION = re.compile(
-    r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?redis-cli(?:\.exe)?(?=[ \t])"
-    r"[^;&|<>\r\n]*?(?<!\S)(?:-_*a_*(?:[ \t]+|=)?|"
-    r"--_*p_*a_*s_*s_*(?:[ \t]+|=))"
-    r"[^ \t;&|<>()]+"
 )
 _SHELL_IFS_VALUE_BOUNDARY_PATTERN = r"\$(?:IFS\b|\{IFS[^}\r\n]{0,64}\})"
 _SHELL_IFS_VALUE_BOUNDARY = re.compile(_SHELL_IFS_VALUE_BOUNDARY_PATTERN)
@@ -1292,6 +1272,7 @@ def _omit_stateful_terminal_lines(text: str) -> tuple[str, int]:
 
 def _normalize_terminal_text(text: str) -> tuple[str, int]:
     text = text.replace("\r\n", "\n")
+    text = text.replace("\u2028", "\n").replace("\u2029", "\n")
     text, omitted_lines = _omit_stateful_terminal_lines(text)
     text, removed = _TERMINAL_ESCAPE.subn("", text)
     removed += omitted_lines
@@ -1679,9 +1660,14 @@ def _command_specific_credential_value_start(line: str) -> int | None:
         if pending_option is not None:
             selected_option = pending_option
             pending_option = None
-            if selected_option == "curl-user":
-                return match.start()
-            if selected_option == "mongosh-password":
+            if selected_option in {
+                "az-password",
+                "curl-user",
+                "docker-password",
+                "mongosh-password",
+                "redis-password",
+                "sshpass-password",
+            }:
                 return match.start()
             if selected_option == "curl-cookie" and "=" in compact:
                 return match.start()
@@ -1697,7 +1683,9 @@ def _command_specific_credential_value_start(line: str) -> int | None:
         if executable.endswith(".exe"):
             executable = executable[:-4]
         if executable in {
+            "az",
             "curl",
+            "docker",
             "mongosh",
             "mysql",
             "mysqladmin",
@@ -1706,6 +1694,8 @@ def _command_specific_credential_value_start(line: str) -> int | None:
             "mysqlimport",
             "mysqlshow",
             "openssl",
+            "redis-cli",
+            "sshpass",
         }:
             command = executable
             pending_option = None
@@ -1747,6 +1737,34 @@ def _command_specific_credential_value_start(line: str) -> int | None:
         elif command is not None and command.startswith("mysql"):
             if compact_case.startswith("-p") and len(compact_case) > len("-p"):
                 return match.start()
+        elif command in {"az", "docker"}:
+            if compact == "login":
+                command = f"{command}-login"
+        elif command in {"az-login", "docker-login"}:
+            if compact in {"-p", "--password"}:
+                pending_option = f"{command.removesuffix('-login')}-password"
+            elif (
+                compact.startswith("-p")
+                and len(compact) > len("-p")
+                or compact.startswith("--password=")
+                and len(compact) > len("--password=")
+            ):
+                return match.start()
+        elif command == "sshpass":
+            if compact == "-p":
+                pending_option = "sshpass-password"
+            elif compact.startswith("-p") and len(compact) > len("-p"):
+                return match.start()
+        elif command == "redis-cli":
+            if compact in {"-a", "--pass"}:
+                pending_option = "redis-password"
+            elif (
+                compact.startswith("-a")
+                and len(compact) > len("-a")
+                or compact.startswith("--pass=")
+                and len(compact) > len("--pass=")
+            ):
+                return match.start()
     return None
 
 
@@ -1762,21 +1780,9 @@ def _sensitive_value_start(line: str) -> int | None:
     command_credential = _command_specific_credential_value_start(normalized_line)
     if command_credential is not None:
         return command_credential
-    docker_password = _DOCKER_LOGIN_PASSWORD_OPTION.search(normalized_line)
-    if docker_password is not None:
-        return docker_password.end()
-    azure_password = _AZ_LOGIN_PASSWORD_OPTION.search(normalized_line)
-    if azure_password is not None:
-        return azure_password.end()
-    sshpass_password = _SSHPASS_PASSWORD_OPTION.search(normalized_line)
-    if sshpass_password is not None:
-        return sshpass_password.end()
     aws_credential = _AWS_CONFIGURE_SET_CREDENTIAL.search(line)
     if aws_credential is not None:
         return aws_credential.end()
-    redis_password = _REDIS_CLI_PASSWORD_OPTION.search(normalized_line)
-    if redis_password is not None:
-        return redis_password.end()
     connection_pwd = _CONNECTION_STRING_PWD_VALUE.search(line)
     if connection_pwd is not None:
         return connection_pwd.end()
