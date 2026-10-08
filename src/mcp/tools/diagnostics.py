@@ -126,9 +126,12 @@ _XML_NAME_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-"
 )
 _XML_CREDENTIAL_SELECTOR_ATTRIBUTES = frozenset({"key", "name"})
-_KUBERNETES_KIND_KEY = (
+_KUBERNETES_KIND_KEY_SCALAR = (
     r'''(?:kind|'kind'|"kind"|'''
     r'''"(?=[^"\r\n]*\\)(?:[^"\\\r\n]|\\[^\r\n])*")'''
+)
+_KUBERNETES_KIND_KEY = (
+    r"(?:(?:&|!)[^\s,\[\]{}]+[ \t]+)*" + _KUBERNETES_KIND_KEY_SCALAR
 )
 _KUBERNETES_BLOCK_KIND_PREFIX = (
     rf"(?im)^[ \t]*(?:-[ \t]+)?{_KUBERNETES_KIND_KEY}[ \t]*:[ \t]*"
@@ -1333,11 +1336,12 @@ def _unterminated_quote(value: str, quote: str | None = None) -> str | None:
     return quote
 
 
-def _shell_parenthesis_state(
+def _shell_group_state(
     value: str,
-    depth: int = 0,
+    parenthesis_depth: int = 0,
+    parameter_brace_depth: int = 0,
     quote: str | None = None,
-) -> tuple[int, str | None]:
+) -> tuple[int, int, str | None]:
     """Track bounded shell grouping without interpreting commands or expansions."""
     escaped = False
     for index, character in enumerate(value):
@@ -1356,10 +1360,14 @@ def _shell_parenthesis_state(
         elif character == "#" and (index == 0 or value[index - 1].isspace()):
             break
         elif character == "(":
-            depth += 1
-        elif character == ")" and depth:
-            depth -= 1
-    return depth, quote
+            parenthesis_depth += 1
+        elif character == ")" and parenthesis_depth:
+            parenthesis_depth -= 1
+        elif character == "{" and index > 0 and value[index - 1] == "$":
+            parameter_brace_depth += 1
+        elif character == "}" and parameter_brace_depth:
+            parameter_brace_depth -= 1
+    return parenthesis_depth, parameter_brace_depth, quote
 
 
 def _json_container_end(text: str, start: int) -> int:
@@ -1647,7 +1655,11 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
             is not None
         )
         sensitive_value = content[value_start:]
-        shell_group_depth, shell_group_quote = _shell_parenthesis_state(sensitive_value)
+        (
+            shell_parenthesis_depth,
+            shell_brace_depth,
+            shell_group_quote,
+        ) = _shell_group_state(sensitive_value)
         heredoc = _HEREDOC_START.search(sensitive_value)
         heredoc_delimiter = heredoc.group("delimiter") if heredoc is not None else None
         heredoc_strips_tabs = heredoc is not None and heredoc.group("strip_tabs") == "-"
@@ -1665,10 +1677,15 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
                 if candidate == heredoc_delimiter:
                     heredoc_delimiter = None
                 continue
-            if shell_group_depth:
-                shell_group_depth, shell_group_quote = _shell_parenthesis_state(
+            if shell_parenthesis_depth or shell_brace_depth:
+                (
+                    shell_parenthesis_depth,
+                    shell_brace_depth,
+                    shell_group_quote,
+                ) = _shell_group_state(
                     continuation,
-                    shell_group_depth,
+                    shell_parenthesis_depth,
+                    shell_brace_depth,
                     shell_group_quote,
                 )
                 index += 1

@@ -589,6 +589,16 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "  arbitrary-name: kubernetes-aliased-kind-secret",
             "---",
             "apiVersion: v1",
+            "&field kind: Secret",
+            "data:",
+            "  arbitrary-name: kubernetes-anchored-key-secret",
+            "---",
+            "apiVersion: v1",
+            "!!str kind: Secret",
+            "data:",
+            "  arbitrary-name: kubernetes-tagged-key-secret",
+            "---",
+            "apiVersion: v1",
             "? kind",
             ": Secret",
             "data:",
@@ -691,6 +701,13 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "outer-shell-group-secret",
             ")",
             "safe-after-shell-command",
+            "PASSWORD=${UNSET:-",
+            "${OTHER:-",
+            "nested-shell-brace-secret",
+            "}",
+            "outer-shell-brace-secret",
+            "}",
+            "safe-after-shell-brace",
             "private_key=malformed-private-secret",
             "AWS_SECRET_ACCESS_KEY=aws-secret",
             aws_access_key,
@@ -743,6 +760,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-quote" in exported
     assert "safe-after-shell-array" in exported
     assert "safe-after-shell-command" in exported
+    assert "safe-after-shell-brace" in exported
     assert "visible-control" in exported
     assert "visible-control-c1" in exported
     assert r"visible\q-invalid-json-escape" in exported
@@ -827,6 +845,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "kubernetes-quoted-key-secret",
         "kubernetes-escaped-key-secret",
         "kubernetes-aliased-kind-secret",
+        "kubernetes-anchored-key-secret",
+        "kubernetes-tagged-key-secret",
         "kubernetes-explicit-kind-secret",
         "kubernetes-sequence-kind-secret",
         "yaml-x-escape-secret",
@@ -867,6 +887,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "escaped-shell-secret",
         "nested-shell-group-secret",
         "outer-shell-group-secret",
+        "nested-shell-brace-secret",
+        "outer-shell-brace-secret",
         "malformed-private-secret",
         "aws-secret",
         "document-secret",
@@ -898,6 +920,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     for payload, secret in (
         ("PASSWORD=(\nunterminated-array-secret", "unterminated-array-secret"),
         ("PASSWORD=$(\nunterminated-command-secret", "unterminated-command-secret"),
+        ("PASSWORD=${UNSET:-\nunterminated-brace-secret", "unterminated-brace-secret"),
     ):
         incomplete_group_redis = FakeRedis()
         incomplete_group_redis.store[key] = f"safe-before\n{payload}"
