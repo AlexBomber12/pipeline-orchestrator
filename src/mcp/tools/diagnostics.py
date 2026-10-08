@@ -134,9 +134,14 @@ _XML_NAME_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-"
 )
 _XML_CREDENTIAL_SELECTOR_ATTRIBUTES = frozenset({"key", "name"})
+_XML_DOCTYPE = re.compile(r"(?i)<!DOCTYPE(?:\s|>)")
+_XML_UNRESOLVED_NAMED_ENTITY = re.compile(r"&[A-Za-z_:][A-Za-z0-9_.:-]*;")
 _YAML_NODE_PROPERTY = r"(?:&[^\s,\[\]{}]+|!<[^>\r\n]+>|![^\s,\[\]{}]+)"
 _YAML_NODE_PROPERTIES = rf"(?:{_YAML_NODE_PROPERTY}[ \t]+)*"
 _YAML_FLOW_NODE_PROPERTIES = rf"(?:{_YAML_NODE_PROPERTY}[ \t\r\n]+)*"
+_YAML_NODE_PROPERTIES_ONLY = re.compile(
+    rf"^{_YAML_NODE_PROPERTY}(?:[ \t]+{_YAML_NODE_PROPERTY})*$"
+)
 _KUBERNETES_KIND_KEY_SCALAR = (
     r'''(?:kind|'kind'|"kind"|'''
     r'''"(?=[^"\r\n]*\\)(?:[^"\\\r\n]|\\[^\r\n])*")'''
@@ -1245,6 +1250,13 @@ def _is_sensitive_key(value: str) -> bool:
     return any(sensitive in key for sensitive in _CREDENTIAL_DOCUMENT_KEYS)
 
 
+def _is_pending_yaml_value(value: str) -> bool:
+    return (
+        _YAML_BLOCK_VALUE_INDICATOR.fullmatch(value) is not None
+        or _YAML_NODE_PROPERTIES_ONLY.fullmatch(value) is not None
+    )
+
+
 def _redact_sensitive_query_values(text: str) -> tuple[str, int]:
     redactions = 0
 
@@ -1556,9 +1568,13 @@ def _xml_tag_has_credential_context(name: str, attributes: list[tuple[str, str]]
         return True
     for attribute_name, value in attributes:
         local_name = attribute_name.rsplit(":", 1)[-1]
+        decoded_value = unescape(value)
         if _is_sensitive_key(local_name) or (
             local_name.lower() in _XML_CREDENTIAL_SELECTOR_ATTRIBUTES
-            and _is_sensitive_key(unescape(value))
+            and (
+                _is_sensitive_key(decoded_value)
+                or _XML_UNRESOLVED_NAMED_ENTITY.search(decoded_value) is not None
+            )
         ):
             return True
     return False
@@ -1566,6 +1582,10 @@ def _xml_tag_has_credential_context(name: str, attributes: list[tuple[str, str]]
 
 def _omit_xml_credential_contexts(text: str) -> tuple[str, int]:
     """Omit XML credential tags without interpreting arbitrary XML documents."""
+    doctype = _XML_DOCTYPE.search(text)
+    if doctype is not None:
+        return _omit_document_ranges(text, [(doctype.start(), len(text))])
+
     ranges: list[tuple[int, int]] = []
     cursor = 0
     while True:
@@ -1622,10 +1642,7 @@ def _omit_ambiguous_yaml_credential_documents(text: str) -> tuple[str, int]:
             value = line[value_start:].lstrip()
             comment = _YAML_COMMENT.search(value)
             unsafe_comment = comment is not None and (
-                _YAML_BLOCK_VALUE_INDICATOR.fullmatch(
-                    value[: comment.start()].strip()
-                )
-                is not None
+                _is_pending_yaml_value(value[: comment.start()].strip())
             )
             yaml_key = line[: max(value_start - 1, 0)].strip().strip("'\"")
             unsafe_flow_collection = (
@@ -1680,10 +1697,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
         omitted += 1
         open_quote = _unterminated_quote(content)
         continued = content.rstrip().endswith("\\")
-        yaml_block = (
-            _YAML_BLOCK_VALUE_INDICATOR.fullmatch(content[value_start:].strip())
-            is not None
-        )
+        yaml_block = _is_pending_yaml_value(content[value_start:].strip())
         sensitive_value = content[value_start:]
         (
             shell_parenthesis_depth,

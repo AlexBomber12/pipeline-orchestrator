@@ -689,6 +689,14 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "",
             "  yaml-comment-line-secret",
             "safe-after-yaml-comment",
+            "password: &credentialValue",
+            "",
+            "  yaml-anchor-property-secret",
+            "safe-after-yaml-anchor-property",
+            "password: !!str",
+            "",
+            "  yaml-tag-property-secret",
+            "safe-after-yaml-tag-property",
             "PASSWORD=$(cat <<EOF)",
             "heredoc-secret",
             "EOF",
@@ -771,6 +779,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-numeric-yaml-block" in exported
     assert "safe-after-reversed-numeric-yaml-block" in exported
     assert "safe-after-yaml-comment" in exported
+    assert "safe-after-yaml-anchor-property" in exported
+    assert "safe-after-yaml-tag-property" in exported
     assert "safe-after-heredoc" in exported
     assert "safe-after-digit-heredoc" in exported
     assert "safe-before-kubernetes-secret" in exported
@@ -904,6 +914,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "numeric-yaml-block-secret",
         "reversed-numeric-yaml-block-secret",
         "yaml-comment-line-secret",
+        "yaml-anchor-property-secret",
+        "yaml-tag-property-secret",
         "heredoc-secret",
         "digit-heredoc-secret",
         "shell-multiline-secret",
@@ -1148,6 +1160,7 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
             "safe-between: visible",
             '<add key="ClearTextPassword" value="SYNTHETIC_XML_PAIR_SECRET"/>',
             '<add key="Pass&#x77;ord" value="SYNTHETIC_XML_ENTITY_SECRET"/>',
+            '<add key="&pw;" value="SYNTHETIC_XML_INTERNAL_ENTITY_SECRET"/>',
             "safe-after: visible",
             "<cfg:connection cfg:password='SYNTHETIC_XML_ATTRIBUTE_SECRET'/>",
             "<add value='SYNTHETIC_XML_ORDER_SECRET' name='apiToken'/>",
@@ -1161,7 +1174,7 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
     result = await diagnostics.get_latest_cli_log(SLUG)
 
     assert result["availability"]["status"] == "available"
-    assert result["text"].count("[credential document omitted]") == 6
+    assert result["text"].count("[credential document omitted]") == 7
     assert "safe-between: visible" in result["text"]
     assert "safe-after: visible" in result["text"]
     assert "<safe ignored attr='visible'>visible</safe>" in result["text"]
@@ -1170,6 +1183,7 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
         "SYNTHETIC_XML_ELEMENT_SECRET",
         "SYNTHETIC_XML_PAIR_SECRET",
         "SYNTHETIC_XML_ENTITY_SECRET",
+        "SYNTHETIC_XML_INTERNAL_ENTITY_SECRET",
         "SYNTHETIC_XML_ATTRIBUTE_SECRET",
         "SYNTHETIC_XML_ORDER_SECRET",
         "SYNTHETIC_XML_UNQUOTED_SECRET",
@@ -1179,6 +1193,9 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
     fail_closed_cases = (
         "safe-before\n<password>\nSYNTHETIC_XML_MULTILINE_SECRET\n</password>\nsafe-after",
         'safe-before\n<add key="password"\n value="SYNTHETIC_XML_INCOMPLETE_SECRET"',
+        'safe-before\n<!DOCTYPE settings [<!ENTITY pw "Password">]>\n'
+        '<settings><add key="&pw;" value="SYNTHETIC_XML_DTD_SECRET"/></settings>\n'
+        "safe-after",
     )
     for payload in fail_closed_cases:
         fail_closed_redis = FakeRedis()
