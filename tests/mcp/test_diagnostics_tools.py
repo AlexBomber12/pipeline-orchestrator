@@ -512,6 +512,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             'API_KEY="api assignment secret"',
             "oauthToken=oauth-secret",
             "https://url-user:url-password@example.test/path?access_token=query-secret",
+            "curl https://user:split-url-first-secret-" + "\\",
+            "split-url-second-secret@example.test/path",
+            "safe-after-reconstructed-url",
             "https://example.test/?access%5Ftoken=encoded-query-secret",
             "https://example.test/?password[]=bracket-query-secret",
             "https://blob.example.test/c?sv=2024-01-01&sig=azure-sas-secret&se=2027-01-01",
@@ -916,6 +919,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-digit-heredoc" in exported
     assert "safe-before-kubernetes-secret" in exported
     assert "safe-after-kubernetes-secret" in exported
+    assert "safe-after-reconstructed-url" in exported
     assert "safe-after-yaml-doubled-quote-key" in exported
     assert "safe-yaml-doubled-quote-visible" in exported
     assert "safe-before-aws-csv" in exported
@@ -978,6 +982,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "oauth-secret",
         "url-user",
         "url-password",
+        "split-url-first-secret-",
+        "split-url-second-secret",
         "single-url-credential",
         "network-user",
         "network-password",
@@ -1155,6 +1161,17 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         incomplete_group = await diagnostics.get_latest_cli_log(SLUG)
         assert incomplete_group["text"] == "safe-before\n[credential line omitted]\n"
         assert secret not in incomplete_group["text"]
+
+    multiple_heredoc_redis = FakeRedis()
+    multiple_heredoc_redis.store[key] = (
+        "safe-before\nPASSWORD=$(cat <<FIRST <<SECOND)\n"
+        "ignored-first-body\nFIRST\nmultiple-heredoc-secret\nSECOND\n)\nsafe-after"
+    )
+    _patch_runtime(monkeypatch, multiple_heredoc_redis)
+    multiple_heredoc = await diagnostics.get_latest_cli_log(SLUG)
+    assert multiple_heredoc["text"] == "safe-before\n[credential line omitted]\n"
+    assert "multiple-heredoc-secret" not in multiple_heredoc["text"]
+    assert "safe-after" not in multiple_heredoc["text"]
 
     orphaned_begin_redis = FakeRedis()
     orphaned_begin_redis.store[key] = (
@@ -1466,6 +1483,18 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
 
     fail_closed_cases = (
         "safe-before\n<password>\nSYNTHETIC_XML_MULTILINE_SECRET\n</password>\nsafe-after",
+        "safe-before\n<password><!-- </password> -->\n"
+        "SYNTHETIC_XML_COMMENT_CLOSE_SECRET\n</password>\nsafe-after",
+        "safe-before\n<password><![CDATA[</password>]]>\n"
+        "SYNTHETIC_XML_CDATA_CLOSE_SECRET\n</password>\nsafe-after",
+        "safe-before\n<password><!-- incomplete\n"
+        "SYNTHETIC_XML_INCOMPLETE_COMMENT_SECRET\n</password>\nsafe-after",
+        "safe-before\n<password><![CDATA[incomplete\n"
+        "SYNTHETIC_XML_INCOMPLETE_CDATA_SECRET\n</password>\nsafe-after",
+        "safe-before\n<password><!UNKNOWN></password>\n"
+        "SYNTHETIC_XML_UNKNOWN_MARKUP_SECRET\nsafe-after",
+        "safe-before\n<password><value\n format='text'>"
+        "SYNTHETIC_XML_CROSS_LINE_TAG_SECRET</value></password>\nsafe-after",
         'safe-before\n<add key="password"\n value="SYNTHETIC_XML_INCOMPLETE_SECRET"',
         "safe-before\n<key>Password</key>\n<string>SYNTHETIC_XML_PLIST_INCOMPLETE_SECRET",
         "safe-before\n<key>Pass<em>word</em></key>"
@@ -1482,6 +1511,16 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
         assert fail_closed["text"] == "safe-before\n[credential document omitted]"
         assert "SYNTHETIC_XML_" not in fail_closed["text"]
         assert "safe-after" not in fail_closed["text"]
+
+    nested_redis = FakeRedis()
+    nested_redis.store[key] = (
+        "safe-before\n<password><password>nested-xml-secret</password>"
+        "</password>\nsafe-after"
+    )
+    _patch_runtime(monkeypatch, nested_redis)
+    nested = await diagnostics.get_latest_cli_log(SLUG)
+    assert nested["text"] == "safe-before\n[credential document omitted]\nsafe-after"
+    assert "nested-xml-secret" not in nested["text"]
 
     for incomplete_markup in ("Pass<!-- incomplete", "<![CDATA[Password"):
         markup_redis = FakeRedis()

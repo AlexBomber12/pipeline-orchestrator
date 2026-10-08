@@ -1349,6 +1349,19 @@ def _redact_sensitive_query_values(text: str) -> tuple[str, int]:
     return _QUERY_PARAMETER_VALUE.sub(redact, text), redactions
 
 
+def _has_recognizable_inline_credential(text: str) -> bool:
+    """Recognize post-line redactions on a reconstructed logical shell line."""
+    if (
+        _URL_USERINFO.search(text) is not None
+        or _PROVIDER_SIGNATURE_VALUE.search(text) is not None
+        or _AUTHORIZATION_VALUE.search(text) is not None
+        or any(pattern.search(text) is not None for pattern in _RECOGNIZABLE_SECRET)
+    ):
+        return True
+    _sanitized, redactions = _redact_sensitive_query_values(text)
+    return redactions > 0
+
+
 def _json_key_escape_length(value: str, index: int) -> int:
     if index + 1 >= len(value) or value[index] != "\\":
         return 0
@@ -1825,6 +1838,46 @@ def _xml_attributes(text: str, start: int, end: int) -> list[tuple[str, str]]:
     return attributes
 
 
+def _xml_matching_close_end(
+    text: str,
+    cursor: int,
+    limit: int,
+    name: str,
+) -> int | None:
+    """Find a real same-line close tag while skipping comments and CDATA."""
+    depth = 0
+    while True:
+        start = text.find("<", cursor, limit)
+        if start < 0:
+            return None
+        if text.startswith("<!--", start):
+            comment_end = text.find("-->", start + 4, limit)
+            if comment_end < 0:
+                return None
+            cursor = comment_end + 3
+            continue
+        if text.startswith("<![CDATA[", start):
+            cdata_end = text.find("]]>", start + 9, limit)
+            if cdata_end < 0:
+                return None
+            cursor = cdata_end + 3
+            continue
+        details = _xml_tag_details(text, start)
+        if details is None:
+            return None
+        closing, candidate_name, _name_end, tag_end, self_closing = details
+        if tag_end > limit or text[tag_end - 1 : tag_end] != ">":
+            return None
+        if candidate_name.lower() == name.lower():
+            if closing:
+                if depth == 0:
+                    return tag_end
+                depth -= 1
+            elif not self_closing:
+                depth += 1
+        cursor = tag_end
+
+
 def _xml_tag_has_credential_context(name: str, attributes: list[tuple[str, str]]) -> bool:
     if _is_sensitive_key(name.rsplit(":", 1)[-1]):
         return True
@@ -1964,9 +2017,12 @@ def _omit_xml_credential_contexts(text: str) -> tuple[str, int]:
         range_start = text.rfind("\n", 0, start) + 1
         line_end = text.find("\n", tag_end)
         range_end = len(text) if line_end < 0 else line_end + 1
-        same_line = text[tag_end:range_end]
-        closing_tag = f"</{name}>"
-        if not self_closing and closing_tag.lower() not in same_line.lower():
+        if not self_closing and _xml_matching_close_end(
+            text,
+            tag_end,
+            range_end,
+            name,
+        ) is None:
             range_end = len(text)
         ranges.append((range_start, range_end))
         cursor = range_end
@@ -2051,10 +2107,16 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
             )
             logical_end += 1
         value_start = _sensitive_value_start(logical_content)
-        if value_start is None:
+        reconstructed_credential = (
+            logical_end > index + 1
+            and _has_recognizable_inline_credential(logical_content)
+        )
+        if value_start is None and not reconstructed_credential:
             sanitized.extend(lines[index:logical_end])
             index = logical_end
             continue
+        if value_start is None:
+            value_start = 0
 
         final_content = lines[logical_end - 1].rstrip("\r\n")
         ending = lines[logical_end - 1][len(final_content) :]
@@ -2072,12 +2134,16 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
             shell_backtick_open,
             shell_group_quote,
         ) = _shell_group_state(sensitive_value)
-        heredoc = _HEREDOC_START.search(sensitive_value)
+        heredocs = list(_HEREDOC_START.finditer(sensitive_value))
+        heredoc = heredocs[0] if len(heredocs) == 1 else None
         heredoc_delimiter = heredoc.group("delimiter") if heredoc is not None else None
         heredoc_strips_tabs = heredoc is not None and heredoc.group("strip_tabs") == "-"
-        if heredoc_delimiter is None and _HEREDOC_OPERATOR.search(sensitive_value):
+        if len(heredocs) > 1 or (
+            heredoc_delimiter is None and _HEREDOC_OPERATOR.search(sensitive_value)
+        ):
             # An unsupported shell word could expand to an unknown delimiter. Consume
-            # the remaining bounded source rather than risk exporting its body.
+            # the remaining bounded source rather than risk exporting its body. The
+            # same fail-closed rule applies to multiple ordered heredoc bodies.
             heredoc_delimiter = "\0"
         indented_block = False
         index = logical_end

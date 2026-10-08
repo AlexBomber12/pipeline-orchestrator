@@ -86,7 +86,8 @@ credential selectors are decoded before classification. Plist-style sensitive
 comments, and CDATA before its following scalar value is omitted. Other or
 incomplete selector markup fails
 closed through the bounded source end. Multiline or incomplete XML credential
-contexts fail closed through the bounded source end, and
+contexts fail closed through the bounded source end; closing-tag text inside a
+comment or CDATA section is not treated as a real element close. In addition,
 unresolved named entities in credential selectors are treated as ambiguous
 credential context. DTD-bearing XML fails closed from the declaration boundary
 without parsing or expanding internal or external entities.
@@ -112,13 +113,15 @@ or square-bracketed values spanning physical lines are omitted with their key
 line through the close or source end. TOML triple-quoted values retain the full
 three-character delimiter across content lines.
 Backslash-continued shell lines are reconstructed before credential-name
-classification, so split assignments and options cannot evade detection.
+classification, so split assignments, options, URLs, and recognizable token
+shapes cannot evade detection.
 Command, parameter, and backtick substitutions remain tracked inside
 double-quoted credential values.
 This includes leading blank lines and legal indentationless YAML sequence values
 under a credential key, plus shell heredoc bodies through their delimiter or
 source end. Literal heredoc delimiters may start with digits; unsupported
-delimiter words fail closed by omitting the remainder of the bounded source.
+delimiter words and assignments with multiple ordered heredocs fail closed by
+omitting the remainder of the bounded source.
 YAML documents containing a sensitive field with a comment-only value, alias,
 or flow-style collection are omitted as a whole because line-level redaction
 cannot safely retain the referenced or indentationless value. Explicit document
