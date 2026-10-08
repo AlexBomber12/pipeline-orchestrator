@@ -73,8 +73,10 @@ classified safely without interpreting YAML. Explicit block-scalar mapping keys
 are omitted for the same reason.
 Recognizable XML credential elements, credential attributes, and `key`/`name`
 plus `value` configuration tags are omitted. XML character references in
-credential selectors are decoded before classification. Multiline or incomplete
-XML credential contexts fail closed through the bounded source end, and
+credential selectors are decoded before classification. Plist-style sensitive
+`key`/`name` element text causes its following scalar value element to be
+omitted. Multiline or incomplete XML credential contexts fail closed through
+the bounded source end, and
 unresolved named entities in credential selectors are treated as ambiguous
 credential context. DTD-bearing XML fails closed from the declaration boundary
 without parsing or expanding internal or external entities.
@@ -87,8 +89,9 @@ private JWK objects are omitted while public JWKs remain exportable. PEM, SSH2,
 and PuTTY private-key documents are omitted through their recognized boundaries;
 incomplete blocks fail closed.
 Lines with recognizable credential keys are omitted conservatively when they
-use assignment, structured-field, header, or long-option syntax, so malformed
-or interrupted quoting cannot expose a value suffix. Indented YAML/header
+use assignment, structured-field, header, or long-option syntax. Balanced
+quotes around recognized multiword credential labels are supported, so
+malformed or interrupted quoting cannot expose a value suffix. Indented YAML/header
 continuations, backslash-continued shell values, and quoted values spanning
 physical lines are omitted with their key line through the close or source end.
 This includes leading blank lines and legal indentationless YAML sequence values

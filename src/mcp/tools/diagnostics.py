@@ -155,6 +155,14 @@ _XML_NAME_CHARACTERS = frozenset(
 _XML_CREDENTIAL_SELECTOR_ATTRIBUTES = frozenset({"key", "name"})
 _XML_DOCTYPE = re.compile(r"(?i)<!DOCTYPE(?:\s|>)")
 _XML_UNRESOLVED_NAMED_ENTITY = re.compile(r"&[A-Za-z_:][A-Za-z0-9_.:-]*;")
+_XML_SELECTOR_ELEMENT = re.compile(
+    r"(?is)<(?P<tag>(?:[A-Za-z_][A-Za-z0-9_.-]*:)?(?:key|name))[ \t\r\n]*>"
+    r"(?P<selector>[^<]*)</(?P=tag)[ \t\r\n]*>"
+)
+_XML_SCALAR_VALUE_ELEMENT = re.compile(
+    r"(?is)[ \t\r\n]*<(?P<tag>[A-Za-z_:][A-Za-z0-9_.:-]*)[ \t\r\n]*>"
+    r"[^<]*</(?P=tag)[ \t\r\n]*>"
+)
 _YAML_NODE_PROPERTY = r"(?:&[^\s,\[\]{}]+|!<[^>\r\n]+>|![^\s,\[\]{}]*)"
 _YAML_NODE_PROPERTIES = rf"(?:{_YAML_NODE_PROPERTY}[ \t]+)*"
 _YAML_FLOW_NODE_PROPERTIES = rf"(?:{_YAML_NODE_PROPERTY}[ \t\r\n]+)*"
@@ -255,12 +263,12 @@ _HEREDOC_START = re.compile(
 )
 _HEREDOC_OPERATOR = re.compile(r"(?<!<)<<-?(?!<)")
 _SENSITIVE_MULTIWORD_LABEL = re.compile(
-    r"(?i)(?<![A-Za-z0-9])(?:"
+    r"(?i)(?<![A-Za-z0-9])(?P<quote>['\"]?)(?:"
     r"(?:api|oauth|access|refresh|id|auth)\s+(?:key|token)|"
     r"(?:client|private)\s+(?:key|secret)|"
     r"secret(?:\s+access)?\s+key|"
     r"proxy\s+authorization|set\s+cookie"
-    r")\s*[=:]"
+    r")(?P=quote)\s*[=:]"
 )
 _SENSITIVE_KEY_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-%+[]"
@@ -1637,6 +1645,24 @@ def _xml_tag_has_credential_context(name: str, attributes: list[tuple[str, str]]
     return False
 
 
+def _omit_xml_selector_credential_contexts(text: str) -> tuple[str, int]:
+    """Omit plist-style XML values selected by credential key/name elements."""
+    ranges: list[tuple[int, int]] = []
+    for selector in _XML_SELECTOR_ELEMENT.finditer(text):
+        decoded_selector = unescape(selector.group("selector"))
+        if not (
+            _is_sensitive_key(decoded_selector)
+            or _XML_UNRESOLVED_NAMED_ENTITY.search(decoded_selector) is not None
+        ):
+            continue
+        value = _XML_SCALAR_VALUE_ELEMENT.match(text, selector.end())
+        if value is None:
+            ranges.append((selector.start(), len(text)))
+            break
+        ranges.append((selector.start(), value.end()))
+    return _omit_document_ranges(text, ranges)
+
+
 def _omit_xml_credential_contexts(text: str) -> tuple[str, int]:
     """Omit XML credential tags without interpreting arbitrary XML documents."""
     doctype = _XML_DOCTYPE.search(text)
@@ -1832,6 +1858,7 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     text, terminal_controls = _normalize_terminal_text(text)
     text, aws_csv_documents = _omit_aws_credential_csv_documents(text)
     text, putty_documents = _omit_putty_private_key_documents(text)
+    text, xml_selector_contexts = _omit_xml_selector_credential_contexts(text)
     text, xml_contexts = _omit_xml_credential_contexts(text)
     text, json_documents = _omit_json_credential_documents(text)
     text, ambiguous_yaml_documents = _omit_ambiguous_yaml_credential_documents(text)
@@ -1842,6 +1869,7 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
         terminal_controls
         + aws_csv_documents
         + putty_documents
+        + xml_selector_contexts
         + xml_contexts
         + ambiguous_yaml_documents
         + kubernetes_documents
@@ -1872,6 +1900,7 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
         redactions,
         aws_csv_documents
         + putty_documents
+        + xml_selector_contexts
         + xml_contexts
         + ambiguous_yaml_documents
         + kubernetes_documents

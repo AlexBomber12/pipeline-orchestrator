@@ -511,6 +511,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "dbpassword=lowercase-compound-secret",
             "API key: whitespace-label-secret",
             "secret key = whitespace-secret-key",
+            '"Secret access key": quoted-multiword-secret-key',
+            "'api key': single-quoted-multiword-secret",
             "auth[password]=nested-bracket-secret",
             "AZURE_STORAGE_KEY=azure-storage-secret",
             "DefaultEndpointsProtocol=https;AccountName=demo;AccountKey=azure-account-secret",
@@ -883,6 +885,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "lowercase-compound-secret",
         "whitespace-label-secret",
         "whitespace-secret-key",
+        "quoted-multiword-secret-key",
+        "single-quoted-multiword-secret",
         "nested-bracket-secret",
         "azure-storage-secret",
         "azure-account-secret",
@@ -1248,6 +1252,8 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
             '<add key="ClearTextPassword" value="SYNTHETIC_XML_PAIR_SECRET"/>',
             '<add key="Pass&#x77;ord" value="SYNTHETIC_XML_ENTITY_SECRET"/>',
             '<add key="&pw;" value="SYNTHETIC_XML_INTERNAL_ENTITY_SECRET"/>',
+            "<key>Password</key><string>SYNTHETIC_XML_PLIST_SECRET</string>",
+            "<key>Visible</key><string>safe-plist-visible</string>",
             "safe-after: visible",
             "<cfg:connection cfg:password='SYNTHETIC_XML_ATTRIBUTE_SECRET'/>",
             "<add value='SYNTHETIC_XML_ORDER_SECRET' name='apiToken'/>",
@@ -1261,16 +1267,18 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
     result = await diagnostics.get_latest_cli_log(SLUG)
 
     assert result["availability"]["status"] == "available"
-    assert result["text"].count("[credential document omitted]") == 7
+    assert result["text"].count("[credential document omitted]") == 8
     assert "safe-between: visible" in result["text"]
     assert "safe-after: visible" in result["text"]
     assert "<safe ignored attr='visible'>visible</safe>" in result["text"]
+    assert "safe-plist-visible" in result["text"]
     assert "not xml <broken! visible" in result["text"]
     for secret in (
         "SYNTHETIC_XML_ELEMENT_SECRET",
         "SYNTHETIC_XML_PAIR_SECRET",
         "SYNTHETIC_XML_ENTITY_SECRET",
         "SYNTHETIC_XML_INTERNAL_ENTITY_SECRET",
+        "SYNTHETIC_XML_PLIST_SECRET",
         "SYNTHETIC_XML_ATTRIBUTE_SECRET",
         "SYNTHETIC_XML_ORDER_SECRET",
         "SYNTHETIC_XML_UNQUOTED_SECRET",
@@ -1280,6 +1288,7 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
     fail_closed_cases = (
         "safe-before\n<password>\nSYNTHETIC_XML_MULTILINE_SECRET\n</password>\nsafe-after",
         'safe-before\n<add key="password"\n value="SYNTHETIC_XML_INCOMPLETE_SECRET"',
+        "safe-before\n<key>Password</key>\n<string>SYNTHETIC_XML_PLIST_INCOMPLETE_SECRET",
         'safe-before\n<!DOCTYPE settings [<!ENTITY pw "Password">]>\n'
         '<settings><add key="&pw;" value="SYNTHETIC_XML_DTD_SECRET"/></settings>\n'
         "safe-after",
