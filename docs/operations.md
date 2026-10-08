@@ -44,7 +44,8 @@ TTL. A producer `[truncated]` marker means the stored tail may begin inside a
 credential value, so the service fails closed with
 `cli_log_producer_truncated` instead of exporting that record. Authorization
 headers, token, password, and passphrase assignments (including the standard
-`Pwd` connection-string alias) or long- and PowerShell-style single-hyphen
+`Pwd` connection-string alias, whether leading or following another property)
+or long- and PowerShell-style single-hyphen
 option arguments and their multiline shell groups, cookies,
 credential-bearing absolute or
 scheme-relative URL userinfo/query parameters (including percent-encoded
@@ -54,7 +55,8 @@ and npm API tokens, and Slack webhooks, private-key blocks,
 PuTTY private-key documents, standalone AWS access-key identifiers and AWS
 credential CSVs with quoted or unquoted fields and an optional leading UTF-8
 BOM, curl user/proxy-user credentials using separated or attached short-option
-arguments, netrc passwords delimited by horizontal whitespace or a newline,
+arguments recognized only inside a curl command span, netrc passwords delimited
+by horizontal whitespace or a newline,
 and recognizable JSON
 credential documents are not exported, including nested documents and documents
 serialized inside log strings, documents whose container and field syntax is

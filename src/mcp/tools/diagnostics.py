@@ -260,8 +260,7 @@ _AUTHORIZATION_VALUE = re.compile(
 )
 _DIGEST_AUTHORIZATION = re.compile(r"(?i)(?<![A-Za-z0-9])Digest[ \t]+")
 _CREDENTIAL_CLI_OPTION = re.compile(
-    r"(?i)(?<!\S)(?:\$?['\"])?(?:(?:--user|--proxy-user)(?:['\"]?[ \t]+|=)|"
-    r"-[#0-9:A-Za-z]*?[uU](?:[ \t]+|=|(?=[^ \t;&|<>()])))"
+    r"(?i)(?<!\S)(?:\$?['\"])?(?:--user|--proxy-user)(?:['\"]?[ \t]+|=)"
 )
 _MYSQL_ATTACHED_PASSWORD_OPTION = re.compile(
     r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?"
@@ -292,6 +291,12 @@ _AWS_CONFIGURE_SET_CREDENTIAL = re.compile(
     r"[ \t]+[^ \t;&|<>()]+"
 )
 _CONNECTION_STRING_PWD_VALUE = re.compile(r"(?i);[ \t]*Pwd[ \t]*=")
+_CONNECTION_STRING_LEADING_PWD_VALUE = re.compile(
+    r"^[ \t]*(?!PWD[ \t]*=)(?P<prefix>(?i:Pwd)[ \t]*=)"
+    r"(?=[^;\r\n]*;[ \t]*(?i:Server|Data[ \t]+Source|Address|Addr|"
+    r"Network[ \t]+Address|Host|Database|Initial[ \t]+Catalog|User[ \t]+ID|"
+    r"UID|Port|Driver|Provider)[ \t]*=)"
+)
 _REDIS_CLI_PASSWORD_OPTION = re.compile(
     r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?redis-cli(?:\.exe)?(?=[ \t])"
     r"[^;&|<>\r\n]*?(?<!\S)(?:-_*a_*(?:[ \t]+|=)?|"
@@ -1654,6 +1659,24 @@ def _command_specific_credential_value_start(line: str) -> int | None:
             continue
 
         compact = word.strip("'\"").replace("_", "").lower()
+        if compact.startswith(("$'", '$"')):
+            compact = compact[2:]
+
+        if pending_option is not None:
+            selected_option = pending_option
+            pending_option = None
+            if selected_option == "curl-user":
+                return match.start()
+            if selected_option == "curl-cookie" and "=" in compact:
+                return match.start()
+            if (
+                selected_option == "openssl-passin"
+                and compact.startswith("pass:")
+                and len(compact) > len("pass:")
+            ):
+                return match.start()
+            continue
+
         executable = compact.replace("\\", "/").rsplit("/", 1)[-1]
         if executable.endswith(".exe"):
             executable = executable[:-4]
@@ -1662,18 +1685,19 @@ def _command_specific_credential_value_start(line: str) -> int | None:
             pending_option = None
             continue
 
-        if pending_option == "curl-cookie":
-            pending_option = None
-            if "=" in compact:
-                return match.start()
-        elif pending_option == "openssl-passin":
-            pending_option = None
-            if compact.startswith("pass:") and len(compact) > len("pass:"):
-                return match.start()
-
         if command == "curl":
             if compact in {"-b", "--cookie"}:
                 pending_option = "curl-cookie"
+            elif compact.startswith("-") and not compact.startswith("--"):
+                short_options = compact[1:]
+                user_index = short_options.find("u")
+                if user_index >= 0 and all(
+                    character in "#0123456789:abcdefghijklmnopqrstuvwxyz"
+                    for character in short_options[:user_index]
+                ):
+                    if short_options[user_index + 1 :]:
+                        return match.start()
+                    pending_option = "curl-user"
             elif (
                 compact.startswith("-b")
                 and "=" in compact[2:]
@@ -1724,6 +1748,9 @@ def _sensitive_value_start(line: str) -> int | None:
     connection_pwd = _CONNECTION_STRING_PWD_VALUE.search(line)
     if connection_pwd is not None:
         return connection_pwd.end()
+    leading_connection_pwd = _CONNECTION_STRING_LEADING_PWD_VALUE.search(line)
+    if leading_connection_pwd is not None:
+        return leading_connection_pwd.end("prefix")
     line = normalized_line
     netrc_password = _NETRC_PASSWORD_VALUE.search(line)
     if netrc_password is not None:

@@ -2140,6 +2140,38 @@ async def test_latest_cli_log_omits_openssl_passin_with_bounded_command_scan(
     assert diagnostics._command_specific_credential_value_start(repeated_curl) is None
 
 
+async def test_latest_cli_log_scopes_curl_short_user_and_leading_connection_pwd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    redis.store[cli_log_latest(SLUG)] = "\n".join(
+        (
+            "Pwd=leading-connection-password;Server=db.example.test",
+            "safe-after-leading-pwd",
+            "curl -u user:curl-scoped-user-secret https://example.test",
+            "safe-after-curl-scoped-user",
+            "python -u worker.py",
+            "git status -uno",
+            "PWD=/synthetic/workspace;Server=ordinary-shell-command",
+            "Pwd=visible-nonconnection-value;MODE=test",
+        )
+    )
+    _patch_runtime(monkeypatch, redis)
+
+    result = await diagnostics.get_latest_cli_log(SLUG)
+
+    assert "leading-connection-password" not in result["text"]
+    assert "curl-scoped-user-secret" not in result["text"]
+    assert "safe-after-leading-pwd" in result["text"]
+    assert "safe-after-curl-scoped-user" in result["text"]
+    assert "python -u worker.py" in result["text"]
+    assert "git status -uno" in result["text"]
+    assert "PWD=/synthetic/workspace;Server=ordinary-shell-command" in result["text"]
+    assert "Pwd=visible-nonconnection-value;MODE=test" in result["text"]
+
+
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
