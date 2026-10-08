@@ -2113,6 +2113,14 @@ async def test_latest_cli_log_omits_openssl_passin_with_bounded_command_scan(
             "openssl rsa -'passin' pass:openssl-fragmented-passin-secret",
             "safe-openssl-fragmented-passin",
         ),
+        (
+            "openssl genpkey -passout pass:openssl-passout-secret -out key.pem",
+            "safe-openssl-passout",
+        ),
+        (
+            "openssl genpkey -passout=pass:openssl-attached-passout-secret",
+            "safe-openssl-attached-passout",
+        ),
     )
     redis = FakeRedis()
     redis.store[cli_log_latest(SLUG)] = "\n".join(
@@ -2133,6 +2141,8 @@ async def test_latest_cli_log_omits_openssl_passin_with_bounded_command_scan(
     assert "openssl-passin-secret" not in result["text"]
     assert "openssl-attached-passin-secret" not in result["text"]
     assert "openssl-fragmented-passin-secret" not in result["text"]
+    assert "openssl-passout-secret" not in result["text"]
+    assert "openssl-attached-passout-secret" not in result["text"]
 
     repeated_curl = ("curl x " * diagnostics._MAX_CLI_LOG_SOURCE_BYTES)[
         : diagnostics._MAX_CLI_LOG_SOURCE_BYTES
@@ -2170,6 +2180,32 @@ async def test_latest_cli_log_scopes_curl_short_user_and_leading_connection_pwd(
     assert "git status -uno" in result["text"]
     assert "PWD=/synthetic/workspace;Server=ordinary-shell-command" in result["text"]
     assert "Pwd=visible-nonconnection-value;MODE=test" in result["text"]
+
+
+async def test_latest_cli_log_scopes_mongosh_short_password(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    redis.store[cli_log_latest(SLUG)] = "\n".join(
+        (
+            "mongosh --username alice -p mongosh-separated-password-secret",
+            "safe-after-mongosh-separated-password",
+            "/usr/bin/mongosh -p=mongosh-attached-password-secret",
+            "safe-after-mongosh-attached-password",
+            "tool -p visible-unrelated-short-option",
+        )
+    )
+    _patch_runtime(monkeypatch, redis)
+
+    result = await diagnostics.get_latest_cli_log(SLUG)
+
+    assert "mongosh-separated-password-secret" not in result["text"]
+    assert "mongosh-attached-password-secret" not in result["text"]
+    assert "safe-after-mongosh-separated-password" in result["text"]
+    assert "safe-after-mongosh-attached-password" in result["text"]
+    assert "tool -p visible-unrelated-short-option" in result["text"]
 
 
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(

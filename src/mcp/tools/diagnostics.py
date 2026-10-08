@@ -1667,10 +1667,12 @@ def _command_specific_credential_value_start(line: str) -> int | None:
             pending_option = None
             if selected_option == "curl-user":
                 return match.start()
+            if selected_option == "mongosh-password":
+                return match.start()
             if selected_option == "curl-cookie" and "=" in compact:
                 return match.start()
             if (
-                selected_option == "openssl-passin"
+                selected_option == "openssl-password"
                 and compact.startswith("pass:")
                 and len(compact) > len("pass:")
             ):
@@ -1680,7 +1682,7 @@ def _command_specific_credential_value_start(line: str) -> int | None:
         executable = compact.replace("\\", "/").rsplit("/", 1)[-1]
         if executable.endswith(".exe"):
             executable = executable[:-4]
-        if executable in {"curl", "openssl"}:
+        if executable in {"curl", "mongosh", "openssl"}:
             command = executable
             pending_option = None
             continue
@@ -1706,11 +1708,17 @@ def _command_specific_credential_value_start(line: str) -> int | None:
             ):
                 return match.start()
         elif command == "openssl":
-            if compact == "-passin":
-                pending_option = "openssl-passin"
-            elif compact.startswith("-passin=pass:") and len(compact) > len(
-                "-passin=pass:"
+            if compact in {"-passin", "-passout"}:
+                pending_option = "openssl-password"
+            elif any(
+                compact.startswith(prefix) and len(compact) > len(prefix)
+                for prefix in ("-passin=pass:", "-passout=pass:")
             ):
+                return match.start()
+        elif command == "mongosh":
+            if compact in {"-p", "--password"}:
+                pending_option = "mongosh-password"
+            elif compact.startswith("-p") and len(compact) > len("-p"):
                 return match.start()
     return None
 
