@@ -1385,8 +1385,42 @@ def _normalize_quoted_credential_names(line: str) -> str:
     return "".join(normalized)
 
 
+def _yaml_single_quoted_sensitive_value_start(line: str) -> int | None:
+    """Return the value offset for a sensitive YAML key with doubled quotes."""
+    search_start = 0
+    while True:
+        opening = line.find("'", search_start)
+        if opening < 0:
+            return None
+        parts: list[str] = []
+        cursor = opening + 1
+        while True:
+            closing = line.find("'", cursor)
+            if closing < 0:
+                return None
+            parts.append(line[cursor:closing])
+            if closing + 1 < len(line) and line[closing + 1] == "'":
+                parts.append("'")
+                cursor = closing + 2
+                continue
+            delimiter = closing + 1
+            while delimiter < len(line) and line[delimiter] in " \t":
+                delimiter += 1
+            if (
+                delimiter < len(line)
+                and line[delimiter] == ":"
+                and _is_sensitive_key("".join(parts))
+            ):
+                return delimiter + 1
+            search_start = closing + 1
+            break
+
+
 def _sensitive_value_start(line: str) -> int | None:
     """Return the value position for a sensitive context found in one line."""
+    yaml_single_quoted = _yaml_single_quoted_sensitive_value_start(line)
+    if yaml_single_quoted is not None:
+        return yaml_single_quoted
     line = _normalize_quoted_credential_names(line)
     netrc_password = _NETRC_PASSWORD_VALUE.search(line)
     if netrc_password is not None:

@@ -690,6 +690,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "---",
             r'{safe: visible, "pass\U00000077ord": yaml-u-escape-secret}',
             "---",
+            "'pass''word': yaml-doubled-quote-key-secret",
+            "safe-after-yaml-doubled-quote-key",
+            "'public''label': safe-yaml-doubled-quote-visible",
+            "---",
             "? password",
             ": explicit-yaml-credential-secret",
             "---",
@@ -894,6 +898,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-digit-heredoc" in exported
     assert "safe-before-kubernetes-secret" in exported
     assert "safe-after-kubernetes-secret" in exported
+    assert "safe-after-yaml-doubled-quote-key" in exported
+    assert "safe-yaml-doubled-quote-visible" in exported
     assert "safe-before-aws-csv" in exported
     assert "safe-after-aws-csv" in exported
     assert "safe-after-netrc-newline" in exported
@@ -941,6 +947,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert diagnostics._omit_kubernetes_secret_documents(
         "apiVersion: v1\nkind: Secret\ndata:\n  tls.key: source-end-secret"
     ) == ("[credential document omitted]", 1)
+    assert diagnostics._yaml_single_quoted_sensitive_value_start("'unterminated") is None
     for secret in (
         "inline-auth-secret",
         "cookie-secret",
@@ -1022,6 +1029,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "kubernetes-sequence-kind-secret",
         "yaml-x-escape-secret",
         "yaml-u-escape-secret",
+        "yaml-doubled-quote-key-secret",
         "explicit-yaml-credential-secret",
         "alias-key-credential-secret",
         "kubernetes-flow-secret",
