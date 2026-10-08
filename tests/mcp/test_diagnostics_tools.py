@@ -1368,6 +1368,10 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
             "safe-after-bundled-user",
             "curl -vUproxy:SYNTHETIC_BUNDLED_PROXY_SECRET https://example.test",
             "safe-after-bundled-proxy",
+            "curl -0uuser:SYNTHETIC_NUMERIC_BUNDLED_SECRET https://example.test",
+            "safe-after-numeric-bundled-user",
+            "curl -#Uproxy:SYNTHETIC_SYMBOL_BUNDLED_SECRET https://example.test",
+            "safe-after-symbol-bundled-proxy",
             "https://user:SYNTHETIC_URL_FIRST@SYNTHETIC_URL_SECOND@example.test/path",
             "safe-after-url",
             "('X-Api-Key',",
@@ -1383,11 +1387,15 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
     assert "https://[REDACTED]@example.test/path" in result["text"]
     assert "safe-after-bundled-user" in result["text"]
     assert "safe-after-bundled-proxy" in result["text"]
+    assert "safe-after-numeric-bundled-user" in result["text"]
+    assert "safe-after-symbol-bundled-proxy" in result["text"]
     assert "safe-after-url" in result["text"]
     assert "safe-after-pair" in result["text"]
     for secret in (
         "SYNTHETIC_BUNDLED_USER_SECRET",
         "SYNTHETIC_BUNDLED_PROXY_SECRET",
+        "SYNTHETIC_NUMERIC_BUNDLED_SECRET",
+        "SYNTHETIC_SYMBOL_BUNDLED_SECRET",
         "SYNTHETIC_URL_FIRST",
         "SYNTHETIC_URL_SECOND",
         "SYNTHETIC_STRUCTURED_PAIR_SECRET",
