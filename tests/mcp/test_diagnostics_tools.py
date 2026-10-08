@@ -609,6 +609,12 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "safe-after-mysql-attached-option",
             'mysqldump --host example.test -p"mysql-quoted-option-secret" synthetic_db',
             "safe-after-mysql-quoted-option",
+            "docker login -p docker-password-option-secret registry.example.test",
+            "safe-after-docker-password-option",
+            "/usr/bin/docker login -p=docker-equals-password-secret registry.example.test",
+            "safe-after-docker-equals-password-option",
+            "docker login -pdocker-attached-password-secret registry.example.test",
+            "safe-after-docker-attached-password-option",
             "tool -pvisible-unrelated-option",
             "curl --user alice:curl-user-secret https://example.test",
             "curl -u alice:curl-short-user-secret https://example.test",
@@ -988,6 +994,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-mysql-pwd" in exported
     assert "safe-after-mysql-attached-option" in exported
     assert "safe-after-mysql-quoted-option" in exported
+    assert "safe-after-docker-password-option" in exported
+    assert "safe-after-docker-equals-password-option" in exported
+    assert "safe-after-docker-attached-password-option" in exported
     assert "tool -pvisible-unrelated-option" in exported
     assert "safe-after-toml-array" in exported
     assert "safe-after-toml-triple-quote" in exported
@@ -1100,6 +1109,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "mysql-pwd-assignment-secret",
         "mysql-attached-option-secret",
         "mysql-quoted-option-secret",
+        "docker-password-option-secret",
+        "docker-equals-password-secret",
+        "docker-attached-password-secret",
         "curl-user-secret",
         "curl-short-user-secret",
         "curl-attached-user-secret",

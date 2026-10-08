@@ -274,6 +274,11 @@ _MYSQL_ATTACHED_PASSWORD_OPTION = re.compile(
     r"(?:mysql|mysqladmin|mysqlcheck|mysqldump|mysqlimport|mysqlshow)(?:\.exe)?"
     r"(?=[ \t]|$)[^;&|<>\r\n]*?(?<!\S)-p[^ \t;&|<>()]+"
 )
+_DOCKER_LOGIN_PASSWORD_OPTION = re.compile(
+    r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?docker(?:\.exe)?(?=[ \t])"
+    r"[^;&|<>\r\n]*?(?<!\S)login(?=[ \t]|$)"
+    r"[^;&|<>\r\n]*?(?<!\S)-p(?:[ \t]+|=)?[^ \t;&|<>()]+"
+)
 _SHELL_IFS_VALUE_BOUNDARY_PATTERN = r"\$(?:IFS\b|\{IFS[^}\r\n]{0,64}\})"
 _SHELL_IFS_VALUE_BOUNDARY = re.compile(_SHELL_IFS_VALUE_BOUNDARY_PATTERN)
 _SHELL_NORMALIZED_CURL_CREDENTIAL_OPTION = re.compile(
@@ -1606,6 +1611,9 @@ def _sensitive_value_start(line: str) -> int | None:
     mysql_password = _MYSQL_ATTACHED_PASSWORD_OPTION.search(line)
     if mysql_password is not None:
         return mysql_password.end()
+    docker_password = _DOCKER_LOGIN_PASSWORD_OPTION.search(line)
+    if docker_password is not None:
+        return docker_password.end()
     line = _normalize_shell_credential_names(line)
     netrc_password = _NETRC_PASSWORD_VALUE.search(line)
     if netrc_password is not None:

@@ -78,7 +78,8 @@ names or recognizable token shapes are detected using the same inline token,
 URL, and query rules; the contributing line is omitted before tail selection.
 The established `MYSQL_PWD` assignment and attached `-pPASSWORD` forms for
 MySQL client commands are treated as credential context; unrelated `-p` options
-remain visible.
+remain visible. Docker login's separated, equals, and attached short-password
+forms are likewise recognized only in their command-specific context.
 Backslash-bearing Bash ANSI-C words are omitted with a bounded scan instead of
 being decoded or exported.
 Command or parameter substitutions embedded after a literal shell-word fragment
