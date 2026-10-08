@@ -1253,6 +1253,8 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
             '<add key="Pass&#x77;ord" value="SYNTHETIC_XML_ENTITY_SECRET"/>',
             '<add key="&pw;" value="SYNTHETIC_XML_INTERNAL_ENTITY_SECRET"/>',
             "<key>Password</key><string>SYNTHETIC_XML_PLIST_SECRET</string>",
+            "<key><![CDATA[Password]]></key>"
+            "<string>SYNTHETIC_XML_CDATA_PLIST_SECRET</string>",
             "<key>Visible</key><string>safe-plist-visible</string>",
             "safe-after: visible",
             "<cfg:connection cfg:password='SYNTHETIC_XML_ATTRIBUTE_SECRET'/>",
@@ -1267,7 +1269,7 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
     result = await diagnostics.get_latest_cli_log(SLUG)
 
     assert result["availability"]["status"] == "available"
-    assert result["text"].count("[credential document omitted]") == 8
+    assert result["text"].count("[credential document omitted]") == 9
     assert "safe-between: visible" in result["text"]
     assert "safe-after: visible" in result["text"]
     assert "<safe ignored attr='visible'>visible</safe>" in result["text"]
@@ -1279,6 +1281,7 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
         "SYNTHETIC_XML_ENTITY_SECRET",
         "SYNTHETIC_XML_INTERNAL_ENTITY_SECRET",
         "SYNTHETIC_XML_PLIST_SECRET",
+        "SYNTHETIC_XML_CDATA_PLIST_SECRET",
         "SYNTHETIC_XML_ATTRIBUTE_SECRET",
         "SYNTHETIC_XML_ORDER_SECRET",
         "SYNTHETIC_XML_UNQUOTED_SECRET",

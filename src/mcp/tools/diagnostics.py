@@ -157,7 +157,9 @@ _XML_DOCTYPE = re.compile(r"(?i)<!DOCTYPE(?:\s|>)")
 _XML_UNRESOLVED_NAMED_ENTITY = re.compile(r"&[A-Za-z_:][A-Za-z0-9_.:-]*;")
 _XML_SELECTOR_ELEMENT = re.compile(
     r"(?is)<(?P<tag>(?:[A-Za-z_][A-Za-z0-9_.-]*:)?(?:key|name))[ \t\r\n]*>"
-    r"(?P<selector>[^<]*)</(?P=tag)[ \t\r\n]*>"
+    r"(?:"
+    r"(?P<selector>[^<]*)|<!\[CDATA\[(?P<cdata>.*?)\]\]>"
+    r")</(?P=tag)[ \t\r\n]*>"
 )
 _XML_SCALAR_VALUE_ELEMENT = re.compile(
     r"(?is)[ \t\r\n]*<(?P<tag>[A-Za-z_:][A-Za-z0-9_.:-]*)[ \t\r\n]*>"
@@ -1649,7 +1651,10 @@ def _omit_xml_selector_credential_contexts(text: str) -> tuple[str, int]:
     """Omit plist-style XML values selected by credential key/name elements."""
     ranges: list[tuple[int, int]] = []
     for selector in _XML_SELECTOR_ELEMENT.finditer(text):
-        decoded_selector = unescape(selector.group("selector"))
+        selector_text = selector.group("selector")
+        if selector_text is None:
+            selector_text = selector.group("cdata")
+        decoded_selector = unescape(selector_text)
         if not (
             _is_sensitive_key(decoded_selector)
             or _XML_UNRESOLVED_NAMED_ENTITY.search(decoded_selector) is not None
