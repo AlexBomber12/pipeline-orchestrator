@@ -1355,6 +1355,46 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "still-sensitive-after-prefix" not in unsupported_heredoc["text"]
 
 
+async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    key = cli_log_latest(SLUG)
+    redis = FakeRedis()
+    redis.store[key] = "\n".join(
+        (
+            "curl -suuser:SYNTHETIC_BUNDLED_USER_SECRET https://example.test",
+            "safe-after-bundled-user",
+            "curl -vUproxy:SYNTHETIC_BUNDLED_PROXY_SECRET https://example.test",
+            "safe-after-bundled-proxy",
+            "https://user:SYNTHETIC_URL_FIRST@SYNTHETIC_URL_SECOND@example.test/path",
+            "safe-after-url",
+            "('X-Api-Key',",
+            "'SYNTHETIC_STRUCTURED_PAIR_SECRET')",
+            "safe-after-pair",
+        )
+    )
+    _patch_runtime(monkeypatch, redis)
+
+    result = await diagnostics.get_latest_cli_log(SLUG)
+
+    assert result["availability"]["status"] == "available"
+    assert "https://[REDACTED]@example.test/path" in result["text"]
+    assert "safe-after-bundled-user" in result["text"]
+    assert "safe-after-bundled-proxy" in result["text"]
+    assert "safe-after-url" in result["text"]
+    assert "safe-after-pair" in result["text"]
+    for secret in (
+        "SYNTHETIC_BUNDLED_USER_SECRET",
+        "SYNTHETIC_BUNDLED_PROXY_SECRET",
+        "SYNTHETIC_URL_FIRST",
+        "SYNTHETIC_URL_SECOND",
+        "SYNTHETIC_STRUCTURED_PAIR_SECRET",
+    ):
+        assert secret not in result["text"]
+
+
 async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

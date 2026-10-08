@@ -246,7 +246,9 @@ _PUTTY_PRIVATE_KEY_START = re.compile(
 _PUTTY_PRIVATE_KEY_END = re.compile(
     r"(?im)^Private-(?:MAC|Hash):[^\r\n]*(?:\r?\n|$)"
 )
-_URL_USERINFO = re.compile(r"(?i)(?P<scheme>(?:\b[a-z][a-z0-9+.-]*:)?//)[^/@\s]+@")
+_URL_USERINFO = re.compile(
+    r"(?i)(?P<scheme>(?:\b[a-z][a-z0-9+.-]*:)?//)[^/?#\s]+@"
+)
 _QUERY_PARAMETER_VALUE = re.compile(
     r"(?P<separator>[?&;])(?P<name>[^=&#;\s]+)=(?P<value>[^&#;\s]+)"
 )
@@ -260,7 +262,7 @@ _AUTHORIZATION_VALUE = re.compile(
 _DIGEST_AUTHORIZATION = re.compile(r"(?i)(?<![A-Za-z0-9])Digest[ \t]+")
 _CREDENTIAL_CLI_OPTION = re.compile(
     r"(?i)(?<!\S)(?:(?:--user|--proxy-user)(?:[ \t]+|=)|"
-    r"-[uU](?:[ \t]+|=|(?=[^ \t;&|<>()])))"
+    r"-[A-Za-z]*?[uU](?:[ \t]+|=|(?=[^ \t;&|<>()])))"
 )
 _NETRC_PASSWORD_VALUE = re.compile(r"(?i)(?<!\S)password[ \t]+")
 _NETRC_PENDING_PASSWORD_VALUE = re.compile(r"(?i)(?<!\S)password[ \t]*$")
@@ -2154,7 +2156,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
             shell_bracket_depth,
             shell_backtick_open,
             shell_group_quote,
-        ) = _shell_group_state(sensitive_value)
+        ) = _shell_group_state(logical_content)
         heredocs = list(_HEREDOC_START.finditer(sensitive_value))
         heredoc = heredocs[0] if len(heredocs) == 1 else None
         heredoc_delimiter = heredoc.group("delimiter") if heredoc is not None else None

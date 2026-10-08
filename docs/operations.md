@@ -66,6 +66,10 @@ property lines, or block-scalar
 flow-mapping `kind` values. Explicit `kind` keys inside flow mappings are also
 recognized regardless of member order. Complete and interrupted private-key
 blocks are both omitted using bounded boundary scans.
+URL userinfo redaction consumes through the final `@` in the bounded authority,
+and curl user/proxy-user short options are recognized when attached inside an
+option cluster. Multiline structured credential pairs retain grouping that
+starts before the sensitive field so unindented values cannot escape omission.
 Standard encoded `auth` fields used by registry and package-manager credential
 documents are treated as credential context rather than exported as base64 text.
 YAML documents with explicit credential keys, alias mapping keys, or mapping
