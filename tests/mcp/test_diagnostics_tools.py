@@ -594,6 +594,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "safe-after-generic-ifs-option",
             "tool --client-secret$IFS client-ifs-option-secret",
             "safe-after-client-ifs-option",
+            "tool --pass$(true)word output-empty-command-option-secret",
+            "safe-after-command-substitution-option",
+            "tool --pass${UNSET}word ambiguous-parameter-option-secret",
+            "safe-after-parameter-substitution-option",
             "curl --user alice:curl-user-secret https://example.test",
             "curl -u alice:curl-short-user-secret https://example.test",
             "curl -ualice:curl-attached-user-secret https://example.test",
@@ -965,6 +969,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-same-line-backtick-option-name" in exported
     assert "safe-after-generic-ifs-option" in exported
     assert "safe-after-client-ifs-option" in exported
+    assert "safe-after-command-substitution-option" in exported
+    assert "safe-after-parameter-substitution-option" in exported
     assert "safe-after-toml-array" in exported
     assert "safe-after-toml-triple-quote" in exported
     assert "safe-after-split-assignment-name" in exported
@@ -1069,6 +1075,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "same-line-backtick-option-secret",
         "generic-ifs-option-secret",
         "client-ifs-option-secret",
+        "output-empty-command-option-secret",
+        "ambiguous-parameter-option-secret",
         "curl-user-secret",
         "curl-short-user-secret",
         "curl-attached-user-secret",
@@ -1445,6 +1453,8 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
             "safe-after-backtick-token",
             r"echo $'ghp_ABCDEFGHIJ\x4bLMNOPQRSTUVWXYZ0123456789'",
             "safe-after-ansi-c-token",
+            "echo ghp_ABCDEFGHIJ$(true)KLMNOPQRSTUVWXYZ0123456789",
+            "safe-after-command-substitution-token",
             'curl https://blob.test/?sv=1\'&\'si"g"=SYNTHETIC_QUOTED_QUERY_SECRET',
             "safe-after-quoted-query",
             "https://user:SYNTHETIC_URL_FIRST@SYNTHETIC_URL_SECOND@example.test/path",
@@ -1479,6 +1489,7 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
     assert "safe-after-empty-expansion-token" in result["text"]
     assert "safe-after-backtick-token" in result["text"]
     assert "safe-after-ansi-c-token" in result["text"]
+    assert "safe-after-command-substitution-token" in result["text"]
     assert r"\x4b" not in result["text"]
     assert "safe-after-quoted-query" in result["text"]
     assert "safe-after-url" in result["text"]

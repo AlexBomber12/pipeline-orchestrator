@@ -283,6 +283,7 @@ _EMPTY_SHELL_NAME_FRAGMENT = re.compile(
 _INLINE_POWERSHELL_BACKTICK = re.compile(
     r"(?<=[A-Za-z0-9_.%+\[\]])`(?=[A-Za-z0-9_.%+\[\]])"
 )
+_EMBEDDED_SHELL_SUBSTITUTION = re.compile(r"(?<![ \t;&|<>])\$(?:\(|\{)")
 _HEREDOC_START = re.compile(
     r"<<(?P<strip_tabs>-?)[ \t]*(?P<quote>['\"]?)"
     r"(?P<delimiter>[A-Za-z0-9_.+-]+)(?P=quote)(?=$|[ \t;|&()<>])"
@@ -2286,10 +2287,14 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
         shell_normalized_credential = _has_shell_normalized_credential(
             logical_content
         ) or _has_backslash_ansi_c_word(logical_content)
+        ambiguous_shell_substitution = (
+            _EMBEDDED_SHELL_SUBSTITUTION.search(logical_content) is not None
+        )
         if (
             value_start is None
             and not reconstructed_credential
             and not shell_normalized_credential
+            and not ambiguous_shell_substitution
         ):
             sanitized.extend(lines[index:logical_end])
             index = logical_end

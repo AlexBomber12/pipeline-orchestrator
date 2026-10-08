@@ -78,6 +78,9 @@ names or recognizable token shapes are detected using the same inline token,
 URL, and query rules; the contributing line is omitted before tail selection.
 Backslash-bearing Bash ANSI-C words are omitted with a bounded scan instead of
 being decoded or exported.
+Command or parameter substitutions embedded after a literal shell-word fragment
+are treated as ambiguous credential context and omitted with balanced-group
+tracking rather than evaluated.
 Provably empty `${name:+}`, `${name+}`, `$()`, and backtick substitutions inside
 credential option names or recognizable token text are normalized before
 classification.
