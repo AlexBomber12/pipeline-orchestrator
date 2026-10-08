@@ -232,7 +232,7 @@ _KUBERNETES_EXPLICIT_SECRET_KIND = re.compile(
     r"[ \t]*(?:#.*)?$"
 )
 _AWS_CREDENTIAL_CSV_HEADER = re.compile(
-    r'(?i)(?:^|,)[ \t]*"?access key id"?[ \t]*,[ \t]*'
+    r'(?i)(?:^\ufeff?|,)[ \t]*"?access key id"?[ \t]*,[ \t]*'
     r'"?secret access key"?[ \t]*(?:,|$)'
 )
 _PUTTY_PRIVATE_KEY_START = re.compile(

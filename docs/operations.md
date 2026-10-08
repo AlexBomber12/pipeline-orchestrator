@@ -49,7 +49,8 @@ scheme-relative URL userinfo/query parameters (including percent-encoded
 parameter names, Azure SAS signatures, and AWS/Google presigned signatures),
 recognizable token shapes including JWTs and Slack webhooks, private-key blocks,
 PuTTY private-key documents, standalone AWS access-key identifiers and AWS
-credential CSVs with quoted or unquoted fields, curl user/proxy-user
+credential CSVs with quoted or unquoted fields and an optional leading UTF-8
+BOM, curl user/proxy-user
 credentials, netrc passwords delimited by horizontal whitespace or a newline,
 and recognizable JSON
 credential documents are not exported, including nested documents and documents

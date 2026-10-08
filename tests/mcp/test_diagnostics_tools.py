@@ -549,6 +549,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             '"Access key ID","Secret access key"',
             '"AKIAABCDEFGHIJKLMNOP","quoted-aws-csv-secret-key"',
             "safe-after-quoted-aws-csv",
+            "safe-before-bom-aws-csv",
+            "\ufeffAccess key ID,Secret access key",
+            "AKIAQRSTUVWXYZABCDEF,bom-aws-csv-secret-key",
+            "safe-after-bom-aws-csv",
             "safe-before-kubernetes-secret",
             "---",
             "apiVersion: v1",
@@ -820,6 +824,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-netrc-newline" in exported
     assert "safe-before-quoted-aws-csv" in exported
     assert "safe-after-quoted-aws-csv" in exported
+    assert "safe-before-bom-aws-csv" in exported
+    assert "safe-after-bom-aws-csv" in exported
     assert "safe-after-shell" in exported
     assert "safe-after-quote" in exported
     assert "safe-after-shell-array" in exported
@@ -906,6 +912,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "netrc-newline-password-secret",
         "aws-csv-secret-key",
         "quoted-aws-csv-secret-key",
+        "bom-aws-csv-secret-key",
         "kubernetes-dockerconfig-secret",
         "kubernetes-stringdata-secret",
         "kubernetes-json-secret",
