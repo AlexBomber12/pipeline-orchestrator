@@ -93,6 +93,8 @@ _CREDENTIAL_DOCUMENT_KEYS = frozenset(
         "token",
     }
 )
+_JWK_ASYMMETRIC_KEY_TYPES = frozenset({"ec", "okp", "rsa"})
+_JWK_PRIVATE_PARAMETERS = frozenset({"d", "dp", "dq", "oth", "p", "q", "qi"})
 _PEM_CREDENTIAL_BOUNDARY = re.compile(
     r"-----(?P<boundary>BEGIN|END) "
     r"(?:[A-Z0-9 ]{0,64}PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----",
@@ -1115,6 +1117,22 @@ def _contains_credential_document_key(value: object) -> bool:
             items = list(current if isinstance(current, _JSONObjectPairs) else current.items())
             if any(key == "kind" and child == "Secret" for key, child in items) and any(
                 key in {"data", "stringData"} for key, _child in items
+            ):
+                return True
+            jwk_key_types = {
+                child.lower()
+                for key, child in items
+                if key == "kty" and isinstance(child, str)
+            }
+            if (
+                jwk_key_types & _JWK_ASYMMETRIC_KEY_TYPES
+                and any(
+                    key in _JWK_PRIVATE_PARAMETERS and child not in (None, "", False)
+                    for key, child in items
+                )
+            ) or (
+                "oct" in jwk_key_types
+                and any(key == "k" and child not in (None, "", False) for key, child in items)
             ):
                 return True
             for key, child in items:

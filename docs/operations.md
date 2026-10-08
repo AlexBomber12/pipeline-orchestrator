@@ -79,8 +79,10 @@ Standalone single-token authorization-scheme values such as `Bearer` and
 `Basic` credentials are redacted even when the header name is absent; a
 multi-parameter `Digest` value causes conservative line omission.
 JSON inspection preserves duplicate object members so a later empty value cannot
-hide an earlier credential value. PEM, SSH2, and PuTTY private-key documents are
-omitted through their recognized boundaries; incomplete blocks fail closed.
+hide an earlier credential value. Recognizable RSA, EC, OKP, and symmetric
+private JWK objects are omitted while public JWKs remain exportable. PEM, SSH2,
+and PuTTY private-key documents are omitted through their recognized boundaries;
+incomplete blocks fail closed.
 Lines with recognizable credential keys are omitted conservatively when they
 use assignment, structured-field, header, or long-option syntax, so malformed
 or interrupted quoting cannot expose a value suffix. Indented YAML/header

@@ -748,6 +748,14 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "  ],",
             '  "client_email": "private@example.test"',
             "}",
+            '{"kty":"RSA","n":"public-modulus","e":"AQAB",'
+            '"d":"jwk-rsa-private-secret"}',
+            '{"kty":"EC","crv":"P-256","x":"public-x","y":"public-y",'
+            '"d":"jwk-ec-private-secret"}',
+            '{"kty":"OKP","crv":"Ed25519","x":"public-okp",'
+            '"d":"jwk-okp-private-secret"}',
+            '{"kty":"oct","k":"jwk-symmetric-private-secret"}',
+            '{"kty":"RSA","n":"safe-public-jwk-modulus","e":"AQAB"}',
             "-----BEGIN PRIVATE KEY-----",
             "pem-document-secret",
             "-----END PRIVATE KEY-----",
@@ -806,6 +814,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert not any("\x80" <= character <= "\x9f" for character in exported)
     assert "safe-output" in exported
     assert "private@example.test" not in exported
+    assert "safe-public-jwk-modulus" in exported
     assert "hidden-array-project" not in exported
     assert "hidden-client" not in exported
     assert "hidden-pair-metadata" not in exported
@@ -937,6 +946,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "malformed-private-secret",
         "aws-secret",
         "document-secret",
+        "jwk-rsa-private-secret",
+        "jwk-ec-private-secret",
+        "jwk-okp-private-secret",
+        "jwk-symmetric-private-secret",
         "pem-document-secret",
         "ssh2-private-secret",
         "putty-private-secret",
