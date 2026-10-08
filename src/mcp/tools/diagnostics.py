@@ -172,6 +172,7 @@ _XML_SCALAR_VALUE_ELEMENT = re.compile(
 _YAML_NODE_PROPERTY = r"(?:&[^\s,\[\]{}]+|!<[^>\r\n]+>|![^\s,\[\]{}]*)"
 _YAML_NODE_PROPERTIES = rf"(?:{_YAML_NODE_PROPERTY}[ \t]+)*"
 _YAML_FLOW_NODE_PROPERTIES = rf"(?:{_YAML_NODE_PROPERTY}[ \t\r\n]+)*"
+_YAML_NODE_PROPERTIES_LINE = rf"{_YAML_NODE_PROPERTIES}(?:{_YAML_NODE_PROPERTY})?[ \t]*"
 _YAML_NODE_PROPERTIES_ONLY = re.compile(
     rf"^{_YAML_NODE_PROPERTY}(?:[ \t]+{_YAML_NODE_PROPERTY})*$"
 )
@@ -206,6 +207,7 @@ _KUBERNETES_SECRET_BLOCK_KIND = re.compile(
 )
 _KUBERNETES_MULTILINE_SECRET_KIND = re.compile(
     _KUBERNETES_BLOCK_KIND_PREFIX
+    + _YAML_NODE_PROPERTIES_LINE
     + r"(?:#.*)?\n(?:[ \t]*(?:#.*)?\n)*[ \t]+"
     + _YAML_NODE_PROPERTIES
     + r"(?P<multiline_quote>['\"]?)Secret(?P=multiline_quote)"
