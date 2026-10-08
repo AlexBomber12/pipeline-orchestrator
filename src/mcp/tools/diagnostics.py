@@ -164,13 +164,6 @@ _XML_NAME_CHARACTERS = frozenset(
 _XML_CREDENTIAL_SELECTOR_ATTRIBUTES = frozenset({"key", "name"})
 _XML_DOCTYPE = re.compile(r"(?i)<!DOCTYPE(?:\s|>)")
 _XML_UNRESOLVED_NAMED_ENTITY = re.compile(r"&[A-Za-z_:][A-Za-z0-9_.:-]*;")
-_XML_OPTIONAL_ATTRIBUTES = r'''(?:[ \t\r\n]+(?:[^"'<>]|"[^"]*"|'[^']*')*)?'''
-_XML_SCALAR_VALUE_ELEMENT = re.compile(
-    r"(?is)[ \t\r\n]*<(?P<tag>[A-Za-z_:][A-Za-z0-9_.:-]*)"
-    + _XML_OPTIONAL_ATTRIBUTES
-    + r">"
-    r"[^<]*</(?P=tag)[ \t\r\n]*>"
-)
 _YAML_NODE_PROPERTY = r"(?:&[^\s,\[\]{}]+|!<[^>\r\n]+>|![^\s,\[\]{}]*)"
 _YAML_NODE_PROPERTIES = rf"(?:{_YAML_NODE_PROPERTY}[ \t]+)*"
 _YAML_FLOW_NODE_PROPERTIES = rf"(?:{_YAML_NODE_PROPERTY}[ \t\r\n]+)*"
@@ -360,6 +353,8 @@ _RECOGNIZABLE_SECRET = tuple(
         r"\b(?:sk|rk)_(?:test|live)_[A-Za-z0-9]{24,}\b",
         r"\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b",
         r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA)[A-Z0-9]{16}\b",
+        r"\b(?:glpat|gloas|gldt|glrt|glrtr|glcbt|glptt|glft|glimt|"
+        r"glagent|glwt|glsoat|glffct)-[A-Za-z0-9_-]{20,}\b",
         r"\bhttps://hooks\.slack(?:-gov)?\.com/(?:services/)?"
         r"T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]{24}\b",
     )
@@ -2148,6 +2143,42 @@ def _xml_selector_text(value: str) -> str | None:
     return "".join(parts)
 
 
+def _xml_scalar_value_end(text: str, start: int) -> int | None:
+    """Find a simple scalar value element with one monotonic tag scan."""
+    cursor = start
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+    if cursor >= len(text) or text[cursor] != "<":
+        return None
+    details = _xml_tag_details(text, cursor)
+    if details is None:
+        return None
+    closing, name, _name_end, tag_end, self_closing = details
+    if (
+        closing
+        or self_closing
+        or tag_end > len(text)
+        or text[tag_end - 1 : tag_end] != ">"
+    ):
+        return None
+
+    closing_start = text.find("<", tag_end)
+    if closing_start < 0:
+        return None
+    closing_details = _xml_tag_details(text, closing_start)
+    if closing_details is None:
+        return None
+    is_closing, closing_name, name_end, closing_end, _self_closing = closing_details
+    if (
+        not is_closing
+        or closing_name != name
+        or text[closing_end - 1 : closing_end] != ">"
+        or text[name_end : closing_end - 1].strip()
+    ):
+        return None
+    return closing_end
+
+
 def _omit_xml_selector_credential_contexts(text: str) -> tuple[str, int]:
     """Omit plist-style XML values selected by credential key/name elements."""
     ranges: list[tuple[int, int]] = []
@@ -2205,12 +2236,12 @@ def _omit_xml_selector_credential_contexts(text: str) -> tuple[str, int]:
         ):
             cursor = selector_end
             continue
-        value = _XML_SCALAR_VALUE_ELEMENT.match(text, selector_end)
-        if value is None:
+        value_end = _xml_scalar_value_end(text, selector_end)
+        if value_end is None:
             ranges.append((start, len(text)))
             break
-        ranges.append((start, value.end()))
-        cursor = value.end()
+        ranges.append((start, value_end))
+        cursor = value_end
     return _omit_document_ranges(text, ranges)
 
 

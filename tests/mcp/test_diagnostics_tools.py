@@ -1912,6 +1912,53 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
         "[credential document omitted]",
         1,
     )
+    malformed_scalar_prefix = "<key>Password</key><string "
+    malformed_scalar = malformed_scalar_prefix + (
+        " " * (diagnostics._MAX_CLI_LOG_SOURCE_BYTES - len(malformed_scalar_prefix))
+    )
+    assert diagnostics._omit_xml_selector_credential_contexts(malformed_scalar) == (
+        "[credential document omitted]",
+        1,
+    )
+    assert diagnostics._xml_scalar_value_end("", 0) is None
+    assert diagnostics._xml_scalar_value_end("<!", 0) is None
+    assert diagnostics._xml_scalar_value_end("<string>value<!", 0) is None
+    assert diagnostics._xml_scalar_value_end("<string>value</value>", 0) is None
+
+
+async def test_latest_cli_log_redacts_standard_gitlab_token_prefixes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    prefixes = (
+        "glpat",
+        "gloas",
+        "gldt",
+        "glrt",
+        "glrtr",
+        "glcbt",
+        "glptt",
+        "glft",
+        "glimt",
+        "glagent",
+        "glwt",
+        "glsoat",
+        "glffct",
+    )
+    synthetic_tokens = tuple(f"{prefix}-{'A' * 20}" for prefix in prefixes)
+    redis = FakeRedis()
+    redis.store[cli_log_latest(SLUG)] = "\n".join(
+        ("safe-before", *synthetic_tokens, "safe-after")
+    )
+    _patch_runtime(monkeypatch, redis)
+
+    result = await diagnostics.get_latest_cli_log(SLUG)
+
+    assert result["text"] == "\n".join(
+        ("safe-before", *("[REDACTED]" for _token in synthetic_tokens), "safe-after")
+    )
+    assert all(token not in result["text"] for token in synthetic_tokens)
 
 
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(

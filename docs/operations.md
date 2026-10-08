@@ -49,7 +49,8 @@ option arguments and their multiline shell groups, cookies,
 credential-bearing absolute or
 scheme-relative URL userinfo/query parameters (including percent-encoded
 parameter names, Azure SAS signatures, and AWS/Google presigned signatures),
-recognizable token shapes including JWTs and Slack webhooks, private-key blocks,
+recognizable token shapes including JWTs, standard GitLab token prefixes, and
+Slack webhooks, private-key blocks,
 PuTTY private-key documents, standalone AWS access-key identifiers and AWS
 credential CSVs with quoted or unquoted fields and an optional leading UTF-8
 BOM, curl user/proxy-user credentials using separated or attached short-option
@@ -106,6 +107,8 @@ value boundaries fail closed without evaluating the expansion. PowerShell creden
 parameter prefixes of four or more characters fail closed when they prefix a
 recognized sensitive name. Multiline structured credential pairs retain grouping that
 starts before the sensitive field so unindented values cannot escape omission.
+Plist-style XML selector/scalar pairs use monotonic tag scans, including when a
+producer-sized scalar start is malformed or unterminated.
 Standard encoded `auth` fields used by registry and package-manager credential
 documents are treated as credential context rather than exported as base64 text.
 YAML documents with explicit credential keys, alias mapping keys, or mapping
