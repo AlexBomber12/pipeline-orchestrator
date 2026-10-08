@@ -86,6 +86,8 @@ remain visible. Docker login's separated, equals, and attached short-password
 forms are likewise recognized only in their command-specific context, including
 shell-fragmented or quoted short flags. Redis CLI password flags use the same
 bounded shell-fragment normalization before command-specific matching.
+Azure CLI `az login` recognizes its `-p` password or service-principal-secret
+alias in the same command-specific context; unrelated `-p` options remain visible.
 Positional access-key, secret-key, and session-token values passed through
 `aws configure set` (including after up to 16 global-option words), plus
 `redis-cli`'s `-a` and `--pass` password flags, are also omitted only in their

@@ -631,6 +631,11 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "safe-after-docker-fragmented-password-option",
             "docker login '-p' docker-quoted-password-secret registry.example.test",
             "safe-after-docker-quoted-password-option",
+            "az login --service-principal --username synthetic-app "
+            "-p azure-login-password-secret --tenant synthetic-tenant",
+            "safe-after-azure-login-password-option",
+            "az login -'p' azure-fragmented-password-secret",
+            "safe-after-azure-fragmented-password-option",
             "aws configure set aws_secret_access_key aws-config-secret",
             "safe-after-aws-config-credential",
             "aws configure set aws_session_token aws-session-token-secret",
@@ -654,6 +659,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "tool -pvisible-unrelated-option",
             "tool -avisible-unrelated-option",
             "tool -'p' visible-fragmented-unrelated-option",
+            "az storage -p visible-unrelated-azure-option",
             "curl --user alice:curl-user-secret https://example.test",
             "curl -u alice:curl-short-user-secret https://example.test",
             "curl -ualice:curl-attached-user-secret https://example.test",
@@ -1045,6 +1051,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-docker-attached-password-option" in exported
     assert "safe-after-docker-fragmented-password-option" in exported
     assert "safe-after-docker-quoted-password-option" in exported
+    assert "safe-after-azure-login-password-option" in exported
+    assert "safe-after-azure-fragmented-password-option" in exported
     assert "safe-after-aws-config-credential" in exported
     assert "safe-after-aws-session-token" in exported
     assert "safe-after-aws-profile-credential" in exported
@@ -1058,6 +1066,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "tool -pvisible-unrelated-option" in exported
     assert "tool -avisible-unrelated-option" in exported
     assert "tool -'p' visible-fragmented-unrelated-option" in exported
+    assert "az storage -p visible-unrelated-azure-option" in exported
     assert "safe-after-toml-array" in exported
     assert "safe-after-toml-triple-quote" in exported
     assert "safe-after-split-assignment-name" in exported
@@ -1178,6 +1187,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "docker-attached-password-secret",
         "docker-fragmented-password-secret",
         "docker-quoted-password-secret",
+        "azure-login-password-secret",
+        "azure-fragmented-password-secret",
         "aws-config-secret",
         "aws-session-token-secret",
         "aws-profile-secret",

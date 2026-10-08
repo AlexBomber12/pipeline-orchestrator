@@ -273,6 +273,11 @@ _DOCKER_LOGIN_PASSWORD_OPTION = re.compile(
     r"[^;&|<>\r\n]*?(?<!\S)login(?=[ \t]|$)"
     r"[^;&|<>\r\n]*?(?<!\S)-_*p_*(?:[ \t]+|=)?[^ \t;&|<>()]+"
 )
+_AZ_LOGIN_PASSWORD_OPTION = re.compile(
+    r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?az(?:\.exe)?(?=[ \t])"
+    r"[^;&|<>\r\n]*?(?<!\S)login(?=[ \t]|$)"
+    r"[^;&|<>\r\n]*?(?<!\S)-_*p_*(?:[ \t]+|=)?[^ \t;&|<>()]+"
+)
 _AWS_CONFIGURE_SET_CREDENTIAL = re.compile(
     r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?aws(?:\.exe)?[ \t]+"
     r"(?:[^ \t;&|<>()]+[ \t]+){0,16}?"
@@ -1639,6 +1644,9 @@ def _sensitive_value_start(line: str) -> int | None:
     docker_password = _DOCKER_LOGIN_PASSWORD_OPTION.search(normalized_line)
     if docker_password is not None:
         return docker_password.end()
+    azure_password = _AZ_LOGIN_PASSWORD_OPTION.search(normalized_line)
+    if azure_password is not None:
+        return azure_password.end()
     aws_credential = _AWS_CONFIGURE_SET_CREDENTIAL.search(line)
     if aws_credential is not None:
         return aws_credential.end()
