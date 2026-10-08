@@ -73,8 +73,9 @@ Logical command reconstruction recognizes trailing shell backslashes and
 PowerShell backticks, plus Windows `cmd` carets, before classifying split
 credential parameter names.
 Credentials joined by adjacent simple shell fragments, unquoted backslash
-escapes, or `cmd` caret escapes are detected using the same inline token, URL,
-and query rules; the contributing line is omitted before tail selection.
+escapes, `cmd` caret escapes, or PowerShell backtick escapes within credential
+names or recognizable token shapes are detected using the same inline token,
+URL, and query rules; the contributing line is omitted before tail selection.
 Provably empty `${name:+}`, `${name+}`, `$()`, and backtick substitutions inside
 credential option names or recognizable token text are normalized before
 classification.

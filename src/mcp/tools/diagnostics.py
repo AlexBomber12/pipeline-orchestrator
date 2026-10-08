@@ -273,6 +273,9 @@ _NETRC_PENDING_PASSWORD_VALUE = re.compile(r"(?i)(?<!\S)password[ \t]*$")
 _EMPTY_SHELL_NAME_FRAGMENT = re.compile(
     r"\$\{[A-Za-z_][A-Za-z0-9_]*:?\+\}|\$\([ \t]*\)|``"
 )
+_INLINE_POWERSHELL_BACKTICK = re.compile(
+    r"(?<=[A-Za-z0-9_.%+\[\]])`(?=[A-Za-z0-9_.%+\[\]])"
+)
 _HEREDOC_START = re.compile(
     r"<<(?P<strip_tabs>-?)[ \t]*(?P<quote>['\"]?)"
     r"(?P<delimiter>[A-Za-z0-9_.+-]+)(?P=quote)(?=$|[ \t;|&()<>])"
@@ -1405,9 +1408,12 @@ def _has_shell_normalized_credential(text: str) -> bool:
         and '"' not in text
         and "\\" not in text
         and "^" not in text
+        and "`" not in text
     ):
         return False
-    joined = _EMPTY_SHELL_NAME_FRAGMENT.sub("", text).translate(
+    joined = _INLINE_POWERSHELL_BACKTICK.sub(
+        "", _EMPTY_SHELL_NAME_FRAGMENT.sub("", text)
+    ).translate(
         {
             ord("'"): None,
             ord('"'): None,
@@ -1486,7 +1492,7 @@ def _normalize_shell_credential_names(line: str) -> str:
         if normalized[prefix_start : prefix_start + 2] == ["-", "-"]:
             for cursor in range(prefix_start + 2, word_end - 1):
                 if (
-                    line[cursor] in {"\\", "^"}
+                    line[cursor] in {"\\", "^", "`"}
                     and line[cursor + 1] in _SENSITIVE_KEY_CHARACTERS
                 ):
                     normalized[cursor] = "_"
@@ -2266,7 +2272,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
             shell_bracket_depth,
             shell_backtick_open,
             shell_group_quote,
-        ) = _shell_group_state(logical_content)
+        ) = _shell_group_state(_INLINE_POWERSHELL_BACKTICK.sub("", logical_content))
         heredocs = list(_HEREDOC_START.finditer(sensitive_value))
         heredoc = heredocs[0] if len(heredocs) == 1 else None
         heredoc_delimiter = heredoc.group("delimiter") if heredoc is not None else None
