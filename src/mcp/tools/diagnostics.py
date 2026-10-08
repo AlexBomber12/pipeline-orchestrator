@@ -1457,7 +1457,16 @@ def _shell_group_state(
             escaped = True
             continue
         if quote is not None:
-            if character == quote:
+            if quote == '"' and character == "(" and index > 0 and value[index - 1] == "$":
+                parenthesis_depth += 1
+                quote = None
+            elif quote == '"' and character == "{" and index > 0 and value[index - 1] == "$":
+                parameter_brace_depth += 1
+                quote = None
+            elif quote == '"' and character == "`":
+                backtick_open = not backtick_open
+                quote = None
+            elif character == quote:
                 quote = None
             continue
         if character in {"\"", "'"}:

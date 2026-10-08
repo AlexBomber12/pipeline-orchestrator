@@ -98,6 +98,8 @@ quotes around recognized multiword credential labels are supported, so
 malformed or interrupted quoting cannot expose a value suffix. Indented YAML/header
 continuations, backslash-continued shell values, and quoted values spanning
 physical lines are omitted with their key line through the close or source end.
+Command, parameter, and backtick substitutions remain tracked inside
+double-quoted credential values.
 This includes leading blank lines and legal indentationless YAML sequence values
 under a credential key, plus shell heredoc bodies through their delimiter or
 source end. Literal heredoc delimiters may start with digits; unsupported

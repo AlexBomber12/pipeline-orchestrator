@@ -753,6 +753,18 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "outer-shell-group-secret",
             ")",
             "safe-after-shell-command",
+            'PASSWORD="$(echo foo"',
+            "quoted-command-group-secret",
+            '")"',
+            "safe-after-quoted-command-group",
+            'PASSWORD="${UNSET:-"',
+            "quoted-parameter-group-secret",
+            '"}"',
+            "safe-after-quoted-parameter-group",
+            'PASSWORD="`echo foo"',
+            "quoted-backtick-group-secret",
+            '"`"',
+            "safe-after-quoted-backtick-group",
             "PASSWORD=${UNSET:-",
             "${OTHER:-",
             "nested-shell-brace-secret",
@@ -836,6 +848,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-quote" in exported
     assert "safe-after-shell-array" in exported
     assert "safe-after-shell-command" in exported
+    assert "safe-after-quoted-command-group" in exported
+    assert "safe-after-quoted-parameter-group" in exported
+    assert "safe-after-quoted-backtick-group" in exported
     assert "safe-after-shell-brace" in exported
     assert "safe-after-shell-backtick" in exported
     assert "visible-control" in exported
@@ -979,6 +994,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "escaped-shell-secret",
         "nested-shell-group-secret",
         "outer-shell-group-secret",
+        "quoted-command-group-secret",
+        "quoted-parameter-group-secret",
+        "quoted-backtick-group-secret",
         "nested-shell-brace-secret",
         "outer-shell-brace-secret",
         "backtick-shell-secret",
