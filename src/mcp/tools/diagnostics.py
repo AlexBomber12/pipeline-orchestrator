@@ -1394,6 +1394,14 @@ def _has_recognizable_inline_credential(text: str) -> bool:
     return redactions > 0
 
 
+def _has_fragmented_recognizable_secret(text: str) -> bool:
+    """Detect token shapes joined from adjacent simple shell fragments."""
+    if "'" not in text and '"' not in text:
+        return False
+    joined = text.translate({ord("'"): None, ord('"'): None, ord("$"): None})
+    return any(pattern.search(joined) is not None for pattern in _RECOGNIZABLE_SECRET)
+
+
 def _json_key_escape_length(value: str, index: int) -> int:
     if index + 1 >= len(value) or value[index] != "\\":
         return 0
@@ -2184,7 +2192,8 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
             logical_end > index + 1
             and _has_recognizable_inline_credential(logical_content)
         )
-        if value_start is None and not reconstructed_credential:
+        fragmented_credential = _has_fragmented_recognizable_secret(logical_content)
+        if value_start is None and not reconstructed_credential and not fragmented_credential:
             sanitized.extend(lines[index:logical_end])
             index = logical_end
             continue

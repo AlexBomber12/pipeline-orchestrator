@@ -1395,6 +1395,8 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
             "safe-after-quoted-long-curl",
             "curl $'--proxy-user' proxy:SYNTHETIC_ANSI_LONG_CURL_SECRET https://example.test",
             "safe-after-ansi-long-curl",
+            'echo ghp_ABCDEFGHIJ"KLMNOPQRSTUVWXYZ0123456789"',
+            "safe-after-fragmented-token",
             "https://user:SYNTHETIC_URL_FIRST@SYNTHETIC_URL_SECOND@example.test/path",
             "safe-after-url",
             "('X-Api-Key',",
@@ -1416,8 +1418,11 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
     assert "safe-after-ansi-quoted-curl" in result["text"]
     assert "safe-after-quoted-long-curl" in result["text"]
     assert "safe-after-ansi-long-curl" in result["text"]
+    assert "safe-after-fragmented-token" in result["text"]
     assert "safe-after-url" in result["text"]
     assert "safe-after-pair" in result["text"]
+    assert "ghp_ABCDEFGHIJ" not in result["text"]
+    assert "KLMNOPQRSTUVWXYZ0123456789" not in result["text"]
     for secret in (
         "SYNTHETIC_BUNDLED_USER_SECRET",
         "SYNTHETIC_BUNDLED_PROXY_SECRET",
