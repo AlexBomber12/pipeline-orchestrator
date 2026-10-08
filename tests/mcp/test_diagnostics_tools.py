@@ -1399,6 +1399,8 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
             "safe-after-fragmented-token",
             r"echo ghp_ABCDEFGHIJ\KLMNOPQRSTUVWXYZ0123456789",
             "safe-after-escaped-token",
+            "echo ghp_ABCDEFGHIJ^KLMNOPQRSTUVWXYZ0123456789",
+            "safe-after-caret-token",
             'curl https://blob.test/?sv=1\'&\'si"g"=SYNTHETIC_QUOTED_QUERY_SECRET',
             "safe-after-quoted-query",
             "https://user:SYNTHETIC_URL_FIRST@SYNTHETIC_URL_SECOND@example.test/path",
@@ -1424,6 +1426,7 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
     assert "safe-after-ansi-long-curl" in result["text"]
     assert "safe-after-fragmented-token" in result["text"]
     assert "safe-after-escaped-token" in result["text"]
+    assert "safe-after-caret-token" in result["text"]
     assert "safe-after-quoted-query" in result["text"]
     assert "safe-after-url" in result["text"]
     assert "safe-after-pair" in result["text"]
@@ -1468,6 +1471,9 @@ async def test_latest_cli_log_omits_embedded_json_and_powershell_credentials(
             "safe-after-abbreviated-pass",
             "Connect-Service -ClientSec SYNTHETIC_ABBREVIATED_CLIENT_SECRET",
             "safe-after-abbreviated-client",
+            "cmd /c tool --pass^",
+            "word SYNTHETIC_CMD_CONTINUATION_SECRET",
+            "safe-after-cmd-continuation",
         )
     )
     _patch_runtime(monkeypatch, redis)
@@ -1481,13 +1487,15 @@ async def test_latest_cli_log_omits_embedded_json_and_powershell_credentials(
         "[credential line omitted]\nsafe-after-powershell\n"
         "[credential line omitted]\nsafe-after-split-powershell\n"
         "[credential line omitted]\nsafe-after-abbreviated-pass\n"
-        "[credential line omitted]\nsafe-after-abbreviated-client"
+        "[credential line omitted]\nsafe-after-abbreviated-client\n"
+        "[credential line omitted]\nsafe-after-cmd-continuation"
     )
     assert "SYNTHETIC_EMBEDDED_UNICODE_SECRET" not in result["text"]
     assert "SYNTHETIC_POWERSHELL_SECRET" not in result["text"]
     assert "SYNTHETIC_SPLIT_POWERSHELL_SECRET" not in result["text"]
     assert "SYNTHETIC_ABBREVIATED_PASS_SECRET" not in result["text"]
     assert "SYNTHETIC_ABBREVIATED_CLIENT_SECRET" not in result["text"]
+    assert "SYNTHETIC_CMD_CONTINUATION_SECRET" not in result["text"]
     assert diagnostics._contains_credential_document_key(
         "{" + ("x" * diagnostics._MAX_CLI_LOG_SOURCE_BYTES)
     )
