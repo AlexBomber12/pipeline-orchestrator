@@ -55,8 +55,9 @@ including nested documents and documents serialized
 inside log strings and structured header name/value pairs in JSON-list or
 Python-tuple form. Recognizable Kubernetes Secret documents are omitted as a
 whole in YAML or JSON form, including arbitrary keys under `data` or
-`stringData`, decorated, explicit, quoted, or escaped `kind` keys, and anchored,
-aliased, shorthand- or verbatim-tagged, escaped double-quoted, block-scalar
+`stringData`, decorated, explicit, quoted, or escaped `kind` keys, and `kind`
+values that are anchored, aliased, tagged using non-specific, shorthand, or
+verbatim forms, escaped double-quoted, or block-scalar
 (including indentation indicators), multiline plain-scalar, block-sequence, or
 flow-mapping `kind` values. Complete and interrupted private-key blocks are both
 omitted using bounded boundary scans.
