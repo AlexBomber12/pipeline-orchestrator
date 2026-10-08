@@ -1415,6 +1415,16 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
             "safe-after-quoted-long-curl",
             "curl $'--proxy-user' proxy:SYNTHETIC_ANSI_LONG_CURL_SECRET https://example.test",
             "safe-after-ansi-long-curl",
+            'curl --u"ser" user:SYNTHETIC_FRAGMENTED_LONG_CURL_SECRET https://example.test',
+            "safe-after-fragmented-long-curl",
+            "curl --proxy-'user' proxy:SYNTHETIC_FRAGMENTED_PROXY_CURL_SECRET https://example.test",
+            "safe-after-fragmented-proxy-curl",
+            "curl --user${IFS}user:SYNTHETIC_IFS_CURL_SECRET https://example.test",
+            "safe-after-ifs-curl",
+            "curl --user$IFS user:SYNTHETIC_BARE_IFS_CURL_SECRET https://example.test",
+            "safe-after-bare-ifs-curl",
+            "curl --proxy-user${IFS:0:1}proxy:SYNTHETIC_IFS_PROXY_CURL_SECRET https://example.test",
+            "safe-after-ifs-proxy-curl",
             'echo ghp_ABCDEFGHIJ"KLMNOPQRSTUVWXYZ0123456789"',
             "safe-after-fragmented-token",
             r"echo ghp_ABCDEFGHIJ\KLMNOPQRSTUVWXYZ0123456789",
@@ -1448,6 +1458,11 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
     assert "safe-after-ansi-quoted-curl" in result["text"]
     assert "safe-after-quoted-long-curl" in result["text"]
     assert "safe-after-ansi-long-curl" in result["text"]
+    assert "safe-after-fragmented-long-curl" in result["text"]
+    assert "safe-after-fragmented-proxy-curl" in result["text"]
+    assert "safe-after-ifs-curl" in result["text"]
+    assert "safe-after-bare-ifs-curl" in result["text"]
+    assert "safe-after-ifs-proxy-curl" in result["text"]
     assert "safe-after-fragmented-token" in result["text"]
     assert "safe-after-escaped-token" in result["text"]
     assert "safe-after-caret-token" in result["text"]
@@ -1468,6 +1483,11 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
         "SYNTHETIC_ANSI_QUOTED_CURL_SECRET",
         "SYNTHETIC_QUOTED_LONG_CURL_SECRET",
         "SYNTHETIC_ANSI_LONG_CURL_SECRET",
+        "SYNTHETIC_FRAGMENTED_LONG_CURL_SECRET",
+        "SYNTHETIC_FRAGMENTED_PROXY_CURL_SECRET",
+        "SYNTHETIC_IFS_CURL_SECRET",
+        "SYNTHETIC_BARE_IFS_CURL_SECRET",
+        "SYNTHETIC_IFS_PROXY_CURL_SECRET",
         "SYNTHETIC_URL_FIRST",
         "SYNTHETIC_URL_SECOND",
         "SYNTHETIC_STRUCTURED_PAIR_SECRET",

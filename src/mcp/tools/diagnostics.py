@@ -268,6 +268,11 @@ _CREDENTIAL_CLI_OPTION = re.compile(
     r"(?i)(?<!\S)(?:\$?['\"])?(?:(?:--user|--proxy-user)(?:['\"]?[ \t]+|=)|"
     r"-[#0-9:A-Za-z]*?[uU](?:[ \t]+|=|(?=[^ \t;&|<>()])))"
 )
+_SHELL_NORMALIZED_CURL_CREDENTIAL_OPTION = re.compile(
+    r"(?i)(?<!\S)(?:\$?['\"])?"
+    r"(?:--_*u_*s_*e_*r_*|--_*p_*r_*o_*x_*y_*-_*u_*s_*e_*r_*)"
+    r"(?:['\"]?[ \t]+|=|\$(?:IFS\b|\{IFS[^}\r\n]{0,64}\}))"
+)
 _NETRC_PASSWORD_VALUE = re.compile(r"(?i)(?<!\S)password[ \t]+")
 _NETRC_PENDING_PASSWORD_VALUE = re.compile(r"(?i)(?<!\S)password[ \t]*$")
 _EMPTY_SHELL_NAME_FRAGMENT = re.compile(
@@ -1571,6 +1576,9 @@ def _sensitive_value_start(line: str) -> int | None:
     credential_option = _CREDENTIAL_CLI_OPTION.search(line)
     if credential_option is not None:
         return credential_option.end()
+    normalized_curl_option = _SHELL_NORMALIZED_CURL_CREDENTIAL_OPTION.search(line)
+    if normalized_curl_option is not None:
+        return normalized_curl_option.end()
 
     digest = _DIGEST_AUTHORIZATION.search(line)
     if digest is not None:
