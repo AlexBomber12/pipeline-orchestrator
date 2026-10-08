@@ -2384,6 +2384,15 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
             "safe-after-key-vault-object",
             "ya29." + ("A" * 40),
             "safe-after-google-oauth-token",
+            "client-key-data: kubeconfig-client-key-data-value",
+            "safe-after-kubeconfig-client-key-data",
+            '{"clientKeyData":"exec-credential-client-key-data-value"}',
+            "safe-after-exec-credential-client-key-data",
+            "aws secretsmanager get-secret-value --secret-id synthetic "
+            "--query SecretString --output text",
+            "",
+            "aws-secret-manager-plain-value",
+            "safe-after-aws-secret-manager-scalar",
             '{"name":"ordinary","value":"visible-generic-value"}',
             '{"id":"https://example.test/items/name","value":"visible-id-value"}',
             '{"keyName":"key1","value":""}',
@@ -2401,6 +2410,9 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
         "azure-key-vault-plain-value",
         "azure-key-vault-json-value",
         "ya29." + ("A" * 40),
+        "kubeconfig-client-key-data-value",
+        "exec-credential-client-key-data-value",
+        "aws-secret-manager-plain-value",
     ):
         assert secret not in result["text"]
     for marker in (
@@ -2411,6 +2423,9 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
         "safe-after-key-vault-scalar",
         "safe-after-key-vault-object",
         "safe-after-google-oauth-token",
+        "safe-after-kubeconfig-client-key-data",
+        "safe-after-exec-credential-client-key-data",
+        "safe-after-aws-secret-manager-scalar",
     ):
         assert marker in result["text"]
     assert '"value":"visible-generic-value"' in result["text"]
@@ -2420,6 +2435,10 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
     assert not diagnostics._is_sensitive_key("notsshpass")
     assert diagnostics._is_azure_key_vault_secret_value_command(
         "noop; /usr/bin/az.exe keyvault secret show --query=value"
+    )
+    assert diagnostics._is_aws_secrets_manager_value_command(
+        "noop; /usr/bin/aws.exe secretsmanager get-secret-value "
+        "--output=text --query=SecretBinary"
     )
 
 

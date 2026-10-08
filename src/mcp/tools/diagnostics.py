@@ -99,7 +99,7 @@ _CREDENTIAL_DOCUMENT_KEYS = frozenset(
     }
 )
 _EXACT_CREDENTIAL_DOCUMENT_KEYS = frozenset(
-    {"secretbinary", "secretstring", "sshpass"}
+    {"clientkeydata", "secretbinary", "secretstring", "sshpass"}
 )
 _JWK_ASYMMETRIC_KEY_TYPES = frozenset({"ec", "okp", "rsa"})
 _JWK_PRIVATE_PARAMETERS = frozenset({"d", "dp", "dq", "oth", "p", "q", "qi"})
@@ -2594,15 +2594,69 @@ def _is_azure_key_vault_secret_value_command(line: str) -> bool:
     return False
 
 
-def _omit_azure_key_vault_secret_value_output(text: str) -> tuple[str, int]:
-    """Omit the one-line scalar emitted by an exact Key Vault value query."""
+def _is_aws_secrets_manager_value_command(line: str) -> bool:
+    expected = ("secretsmanager", "get-secret-value")
+    stage = 0
+    active = False
+    query_selected = False
+    text_output = False
+    pending_option: str | None = None
+    for match in _SHELL_COMMAND_WORD.finditer(_normalize_shell_credential_names(line)):
+        word = match.group(0)
+        if word in ";&|<>()":
+            active = False
+            stage = 0
+            query_selected = False
+            text_output = False
+            pending_option = None
+            continue
+        compact = word.strip("'\"").replace("_", "").lower()
+        executable = compact.replace("\\", "/").rsplit("/", 1)[-1]
+        if executable.removesuffix(".exe") == "aws":
+            active = True
+            stage = 0
+            query_selected = False
+            text_output = False
+            pending_option = None
+            continue
+        if not active:
+            continue
+        if stage < len(expected):
+            if compact == expected[stage]:
+                stage += 1
+            continue
+        if pending_option is not None:
+            if pending_option == "query":
+                query_selected = compact in {"secretbinary", "secretstring"}
+            else:
+                text_output = compact == "text"
+            pending_option = None
+        elif compact in {"--query", "--output"}:
+            pending_option = compact[2:]
+        elif compact.startswith("--query="):
+            query_selected = compact[len("--query=") :] in {
+                "secretbinary",
+                "secretstring",
+            }
+        elif compact.startswith("--output="):
+            text_output = compact[len("--output=") :] == "text"
+        if query_selected and text_output:
+            return True
+    return False
+
+
+def _omit_secret_scalar_command_output(text: str) -> tuple[str, int]:
+    """Omit one-line scalars emitted by exact secret-value CLI queries."""
     lines = text.splitlines(keepends=True)
     sanitized: list[str] = []
     omitted = 0
     index = 0
     while index < len(lines):
         content = lines[index].rstrip("\r\n")
-        if not _is_azure_key_vault_secret_value_command(content):
+        if not (
+            _is_azure_key_vault_secret_value_command(content)
+            or _is_aws_secrets_manager_value_command(content)
+        ):
             sanitized.append(lines[index])
             index += 1
             continue
@@ -2761,7 +2815,7 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     text, xml_selector_contexts = _omit_xml_selector_credential_contexts(text)
     text, xml_contexts = _omit_xml_credential_contexts(text)
     text, json_documents = _omit_json_credential_documents(text)
-    text, azure_key_vault_values = _omit_azure_key_vault_secret_value_output(text)
+    text, secret_scalar_values = _omit_secret_scalar_command_output(text)
     text, ambiguous_yaml_documents = _omit_ambiguous_yaml_credential_documents(text)
     text, kubernetes_documents = _omit_kubernetes_secret_documents(text)
     text, pem_documents = _omit_pem_credential_documents(text)
@@ -2776,7 +2830,7 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
         + kubernetes_documents
         + pem_documents
         + json_documents
-        + azure_key_vault_values
+        + secret_scalar_values
         + credential_lines
     )
 

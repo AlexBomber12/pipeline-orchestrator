@@ -65,6 +65,7 @@ with AWS Secrets Manager `SecretString`/`SecretBinary` fields or Azure storage
 access-key response objects containing nonempty `keyName` and `value` members,
 and Azure Key Vault secret objects containing a secret-resource `id` plus a
 nonempty `value`,
+and exact kubeconfig `client-key-data`/`clientKeyData` private-key fields,
 serialized inside log strings, documents whose container and field syntax is
 Unicode-escaped inside a JSON string (including after ordinary decoded message
 text), and structured header name/value pairs in
@@ -105,6 +106,9 @@ Azure CLI `az login` recognizes its `-p` password or service-principal-secret
 alias in the same monotonic command-specific context; unrelated `-p` options remain visible.
 An exact `az keyvault secret show --query value` command and its following
 one-line scalar output are omitted conservatively.
+An exact AWS Secrets Manager `get-secret-value` command selecting
+`SecretString` or `SecretBinary` with text output receives the same scalar
+handling.
 The `sshpass -p` separated, attached, and shell-fragmented password forms are
 also recognized only in their command-specific context. Its exact `SSHPASS`
 environment password assignment is credential context for `-e` mode.
