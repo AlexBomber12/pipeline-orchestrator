@@ -75,6 +75,8 @@ credential parameter names.
 Credentials joined by adjacent simple shell fragments, unquoted backslash
 escapes, or `cmd` caret escapes are detected using the same inline token, URL,
 and query rules; the contributing line is omitted before tail selection.
+Provably empty `${name:+}`, `${name+}`, `$()`, and backtick substitutions inside
+credential option names are normalized with same-length placeholders.
 URL userinfo redaction consumes through the final `@` in the bounded authority,
 and curl user/proxy-user short options are recognized when attached inside an
 option cluster or quoted as a complete shell argument. PowerShell credential

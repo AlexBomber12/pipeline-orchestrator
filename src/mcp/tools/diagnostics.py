@@ -270,6 +270,9 @@ _CREDENTIAL_CLI_OPTION = re.compile(
 )
 _NETRC_PASSWORD_VALUE = re.compile(r"(?i)(?<!\S)password[ \t]+")
 _NETRC_PENDING_PASSWORD_VALUE = re.compile(r"(?i)(?<!\S)password[ \t]*$")
+_EMPTY_SHELL_NAME_FRAGMENT = re.compile(
+    r"\$\{[A-Za-z_][A-Za-z0-9_]*:?\+\}|\$\([ \t]*\)|``"
+)
 _HEREDOC_START = re.compile(
     r"<<(?P<strip_tabs>-?)[ \t]*(?P<quote>['\"]?)"
     r"(?P<delimiter>[A-Za-z0-9_.+-]+)(?P=quote)(?=$|[ \t;|&()<>])"
@@ -1427,6 +1430,10 @@ def _json_key_escape_length(value: str, index: int) -> int:
 def _normalize_shell_credential_names(line: str) -> str:
     """Join simple shell word fragments without changing source offsets."""
     normalized = list(line)
+    for empty_fragment in _EMPTY_SHELL_NAME_FRAGMENT.finditer(line):
+        normalized[empty_fragment.start() : empty_fragment.end()] = "_" * len(
+            empty_fragment.group(0)
+        )
     index = 0
     while index < len(line):
         quote = line[index]
