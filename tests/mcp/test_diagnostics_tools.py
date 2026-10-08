@@ -1365,6 +1365,7 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
         "password: # explanation\n\n  SYNTHETIC_SECRET\nsafe: visible",
         "defaults: &value SYNTHETIC_SECRET\npassword: *value\nsafe: visible",
         '? "pass\\\n  word"\n: SYNTHETIC_SECRET\nsafe: visible',
+        '{? "pass\\\n  word": SYNTHETIC_SECRET}\nsafe: visible',
         "? 'pass\n  word'\n: SYNTHETIC_SECRET\nsafe: visible",
         "? |-\n  password\n: SYNTHETIC_SECRET\nsafe: visible",
     )
@@ -1408,6 +1409,9 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
             "  word'",
             ": SYNTHETIC_SINGLE_QUOTED_EXPLICIT_KEY_SECRET",
             "---",
+            '{? "pass\\',
+            '  word": SYNTHETIC_FLOW_MULTILINE_EXPLICIT_KEY_SECRET}',
+            "---",
             "? >-2",
             "  pass",
             "  word",
@@ -1425,7 +1429,7 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
     result = await diagnostics.get_latest_cli_log(SLUG, diagnostics._MAX_CLI_LOG_TAIL_BYTES)
 
     assert result["availability"]["status"] == "available"
-    assert result["text"].count("[credential document omitted]") == 8
+    assert result["text"].count("[credential document omitted]") == 9
     assert "safe: before" in result["text"]
     assert "safe: visible" in result["text"]
     assert "safe-explicit-visible" in result["text"]
@@ -1438,6 +1442,7 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
         "SYNTHETIC_FLOW_COLLECTION_SECRET",
         "SYNTHETIC_MULTILINE_EXPLICIT_KEY_SECRET",
         "SYNTHETIC_SINGLE_QUOTED_EXPLICIT_KEY_SECRET",
+        "SYNTHETIC_FLOW_MULTILINE_EXPLICIT_KEY_SECRET",
         "SYNTHETIC_BLOCK_EXPLICIT_KEY_SECRET",
     ):
         assert secret not in result["text"]

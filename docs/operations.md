@@ -73,8 +73,9 @@ keys that use recognized YAML-only escape forms are omitted conservatively
 rather than partially decoded. Node-property-only credential values retain their
 context across blank and comment lines. Single-quoted YAML mapping keys decode
 doubled single-quote escapes before credential classification. Documents
-containing multiline explicit single- or double-quoted mapping keys are omitted
-because folded keys cannot be classified safely without interpreting YAML.
+containing multiline explicit single- or double-quoted mapping keys, in block or
+flow mappings, are omitted because folded keys cannot be classified safely
+without interpreting YAML.
 Explicit block-scalar mapping keys
 are omitted for the same reason.
 Recognizable XML credential elements, credential attributes, and `key`/`name`
