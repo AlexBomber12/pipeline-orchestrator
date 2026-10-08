@@ -47,18 +47,30 @@ def test_coding_prelaunch_failure_releases_reserved_credentials(
         "src.github.prs.get_branch_publications",
         lambda *_args, **_kwargs: [],
     )
+    assert runner._current_run_record is not None
+    run_id = runner._current_run_record.run_id
     prelaunch_calls: list[str] = []
+    failure_raised = False
+    original_checkpoint = runner._checkpoint_current_run_record
+    original_publish = runner.publish_state
 
     async def checkpoint() -> None:
+        nonlocal failure_raised
         prelaunch_calls.append("checkpoint")
-        if failure_site == "checkpoint":
+        if failure_site == "checkpoint" and not failure_raised:
+            failure_raised = True
             raise failure
+        await original_checkpoint()
 
     async def publish() -> None:
-        assert runner.state.active_invocation is not None
+        nonlocal failure_raised
+        if not prelaunch_calls:
+            assert runner.state.active_invocation is not None
         prelaunch_calls.append("publish")
-        if failure_site == "publish":
+        if failure_site == "publish" and not failure_raised:
+            failure_raised = True
             raise failure
+        await original_publish()
 
     monkeypatch.setattr(runner, "_checkpoint_current_run_record", checkpoint)
     monkeypatch.setattr(runner, "publish_state", publish)
@@ -82,11 +94,18 @@ def test_coding_prelaunch_failure_releases_reserved_credentials(
     )
     assert runner._coder_credential_reservation is None
     assert runner._coder_invocation_active is False
-    assert prelaunch_calls == (
-        ["publish", "checkpoint"]
-        if failure_site == "checkpoint"
-        else ["publish"]
-    )
+    if failure_site == "checkpoint":
+        assert prelaunch_calls[:2] == ["publish", "checkpoint"]
+    else:
+        assert prelaunch_calls[0] == "publish"
+        assert prelaunch_calls.count("publish") == 2
+        assert "checkpoint" in prelaunch_calls
+    assert runner.state.active_invocation is None
+    assert runner._current_run_record is not None
+    assert runner._current_run_record.invocations == []
+    checkpointed = asyncio.run(runner._metrics_store.get(run_id))
+    assert checkpointed is not None
+    assert checkpointed.invocations == []
     assert reservations.reserve_login(location) is True
     reservations.release_login(location)
 

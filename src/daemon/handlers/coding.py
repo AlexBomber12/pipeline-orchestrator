@@ -496,8 +496,11 @@ class CodingMixin:
             if configured_process_callback is not None:
                 configured_process_callback(managed)
 
+        run_record = self._current_run_record
+        previous_active_invocation = self.state.active_invocation
+        captured_snapshot = None
         try:
-            self._capture_invocation_snapshot(
+            captured_snapshot = self._capture_invocation_snapshot(
                 coder_name,
                 coder_kwargs,
                 phase="coding",
@@ -526,6 +529,18 @@ class CodingMixin:
                 )
             )
         except BaseException:
+            if captured_snapshot is not None:
+                self.state.active_invocation = previous_active_invocation
+                if (
+                    run_record is not None
+                    and run_record.invocations
+                    and run_record.invocations[-1] == captured_snapshot
+                ):
+                    run_record.invocations.pop()
+                rollback_writes = [self.publish_state()]
+                if run_record is not None:
+                    rollback_writes.append(self._checkpoint_current_run_record())
+                await asyncio.gather(*rollback_writes, return_exceptions=True)
             if heartbeat is not None:
                 heartbeat.cancel()
                 await asyncio.gather(heartbeat, return_exceptions=True)
