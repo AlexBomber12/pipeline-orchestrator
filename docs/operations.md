@@ -104,14 +104,15 @@ sshpass password flags use the same bounded command scan and shell-fragment
 normalization.
 Azure CLI `az login` recognizes its `-p` password or service-principal-secret
 alias in the same monotonic command-specific context; unrelated `-p` options remain visible.
-An exact `az keyvault secret show --query value` command and its following
-one-line scalar output are omitted conservatively.
+An exact `az keyvault secret show --query value` command and the remaining
+bounded log record are omitted conservatively because legacy CLI output has no
+trustworthy boundary after a potentially multiline secret result.
 An exact AWS Secrets Manager `get-secret-value` command selecting
 `SecretString` or `SecretBinary` with text output receives the same scalar
 handling, including when those global output or query options precede the
 service name.
 The documented `kubectl get secret` JSONPath pipeline into `base64 --decode`
-also omits its following decoded scalar.
+also receives the same fail-closed remainder handling.
 The `sshpass -p` separated, attached, and shell-fragmented password forms are
 also recognized only in their command-specific context. Its exact `SSHPASS`
 environment password assignment is credential context for `-e` mode.
@@ -150,6 +151,8 @@ their command span, preserving unrelated short options.
 Credential commands launched through `sudo`, `env`, `command`, `exec`, or
 `nohup` are omitted conservatively rather than interpreting wrapper-specific
 options.
+Shell redirections do not terminate an already recognized credential-command
+scope, so later password options on the same simple command remain protected.
 Shell-fragmented curl
 long options and bounded unquoted IFS expansions at recognized credential-option
 value boundaries fail closed without evaluating the expansion. PowerShell credential

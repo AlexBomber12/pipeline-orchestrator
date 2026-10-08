@@ -2385,6 +2385,22 @@ async def test_latest_cli_log_fails_closed_for_execution_wrappers(
         ("exec redis-cli -a wrapped-redis-secret ping", "safe-exec"),
         ("nohup curl -u alice:wrapped-nohup-secret https://example.test", "safe-nohup"),
         (
+            "curl < /dev/null -u alice:redirection-curl-secret https://example.test",
+            "safe-curl-redirection",
+        ),
+        (
+            "docker login > /dev/null -p redirection-docker-secret registry.test",
+            "safe-docker-redirection",
+        ),
+        (
+            "redis-cli 2>/dev/null -a redirection-redis-secret ping",
+            "safe-redis-redirection",
+        ),
+        (
+            "curl 2>&1 -u alice:redirection-fd-secret https://example.test",
+            "safe-fd-redirection",
+        ),
+        (
             "sudo -u mysql curl -u alice:wrapped-option-value-secret "
             "https://example.test",
             "safe-wrapper-option",
@@ -2409,6 +2425,10 @@ async def test_latest_cli_log_fails_closed_for_execution_wrappers(
         "wrapped-sshpass-secret",
         "wrapped-redis-secret",
         "wrapped-nohup-secret",
+        "redirection-curl-secret",
+        "redirection-docker-secret",
+        "redirection-redis-secret",
+        "redirection-fd-secret",
         "wrapped-option-value-secret",
     ):
         assert secret not in result["text"]
@@ -2431,11 +2451,6 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
             "safe-after-azure-storage-keys",
             "SSHPASS=sshpass-environment-password sshpass -e ssh synthetic@host",
             "safe-after-sshpass-environment",
-            "az keyvault secret show --name ApiEndpoint --vault-name synthetic "
-            "--query value",
-            "",
-            "azure-key-vault-plain-value",
-            "safe-after-key-vault-scalar",
             '{"id":"https://synthetic.vault.azure.net/secrets/name/version",'
             '"value":"azure-key-vault-json-value","name":"name"}',
             "safe-after-key-vault-object",
@@ -2445,21 +2460,6 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
             "safe-after-kubeconfig-client-key-data",
             '{"clientKeyData":"exec-credential-client-key-data-value"}',
             "safe-after-exec-credential-client-key-data",
-            "aws secretsmanager get-secret-value --secret-id synthetic "
-            "--query SecretString --output text",
-            "",
-            "aws-secret-manager-plain-value",
-            "safe-after-aws-secret-manager-scalar",
-            "aws --output text secretsmanager get-secret-value "
-            "--secret-id synthetic --query SecretString",
-            "",
-            "aws-global-output-secret-manager-plain-value",
-            "safe-after-aws-global-output-scalar",
-            "kubectl get secret db-user-pass -o "
-            "jsonpath='{.data.password}' | base64 --decode",
-            "",
-            "kubectl-decoded-secret-value",
-            "safe-after-kubectl-decoded-secret",
             '{"name":"ordinary","value":"visible-generic-value"}',
             '{"id":"https://example.test/items/name","value":"visible-id-value"}',
             '{"keyName":"key1","value":""}',
@@ -2474,14 +2474,10 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
         "aws-secret-binary-value",
         "azure-storage-access-key-value",
         "sshpass-environment-password",
-        "azure-key-vault-plain-value",
         "azure-key-vault-json-value",
         "ya29." + ("A" * 40),
         "kubeconfig-client-key-data-value",
         "exec-credential-client-key-data-value",
-        "aws-secret-manager-plain-value",
-        "aws-global-output-secret-manager-plain-value",
-        "kubectl-decoded-secret-value",
     ):
         assert secret not in result["text"]
     for marker in (
@@ -2489,14 +2485,10 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
         "safe-after-aws-secret-binary",
         "safe-after-azure-storage-keys",
         "safe-after-sshpass-environment",
-        "safe-after-key-vault-scalar",
         "safe-after-key-vault-object",
         "safe-after-google-oauth-token",
         "safe-after-kubeconfig-client-key-data",
         "safe-after-exec-credential-client-key-data",
-        "safe-after-aws-secret-manager-scalar",
-        "safe-after-aws-global-output-scalar",
-        "safe-after-kubectl-decoded-secret",
     ):
         assert marker in result["text"]
     assert '"value":"visible-generic-value"' in result["text"]
@@ -2518,6 +2510,42 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
         "/usr/bin/kubectl.exe get secrets demo -o "
         "jsonpath='{.data.token}' | /usr/bin/base64.exe -d"
     )
+
+
+async def test_latest_cli_log_omits_remainder_after_secret_scalar_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    commands = (
+        "az keyvault secret show --name demo --vault-name synthetic --query value",
+        "aws secretsmanager get-secret-value --secret-id synthetic "
+        "--query SecretString --output text",
+        "aws --output text secretsmanager get-secret-value "
+        "--secret-id synthetic --query SecretString",
+        "kubectl get secret demo -o jsonpath='{.data.password}' | base64 --decode",
+    )
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis)
+
+    for index, command in enumerate(commands):
+        secret = f"multiline-secret-{index}"
+        redis.store[cli_log_latest(SLUG)] = "\n".join(
+            (
+                "safe-before-secret-command",
+                command,
+                f"FIRST-{secret}",
+                f"SECOND-{secret}",
+                "unsafe-unbounded-neighbor",
+            )
+        )
+
+        result = await diagnostics.get_latest_cli_log(SLUG)
+
+        assert "safe-before-secret-command" in result["text"]
+        assert "[credential document omitted]" in result["text"]
+        assert secret not in result["text"]
+        assert "unsafe-unbounded-neighbor" not in result["text"]
 
 
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(

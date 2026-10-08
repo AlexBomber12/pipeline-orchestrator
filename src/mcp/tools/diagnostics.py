@@ -1702,12 +1702,26 @@ def _command_specific_credential_value_start(line: str) -> int | None:
     command: str | None = None
     pending_option: str | None = None
     at_command_start = True
+    redirection_target = False
     for match in _SHELL_COMMAND_WORD.finditer(line):
         word = match.group(0)
-        if word in ";&|<>()":
+        if word in "<>":
+            redirection_target = True
+            continue
+        if word == "&" and (
+            redirection_target
+            or match.end() < len(line)
+            and line[match.end()] in "<>"
+        ):
+            continue
+        if word in ";&|()":
             command = None
             pending_option = None
             at_command_start = True
+            redirection_target = False
+            continue
+        if redirection_target:
+            redirection_target = False
             continue
 
         compact_case = word.strip("'\"").replace("_", "")
@@ -2699,7 +2713,7 @@ def _is_kubectl_decoded_secret_command(line: str) -> bool:
 
 
 def _omit_secret_scalar_command_output(text: str) -> tuple[str, int]:
-    """Omit one-line scalars emitted by exact secret-value CLI queries."""
+    """Omit the bounded remainder after an exact secret-value CLI query."""
     lines = text.splitlines(keepends=True)
     sanitized: list[str] = []
     omitted = 0
@@ -2718,15 +2732,12 @@ def _omit_secret_scalar_command_output(text: str) -> tuple[str, int]:
         sanitized.append(f"[credential line omitted]{ending}")
         omitted += 1
         index += 1
-        while index < len(lines) and not lines[index].strip():
-            sanitized.append(lines[index])
-            index += 1
         if index < len(lines):
-            output = lines[index].rstrip("\r\n")
-            output_ending = lines[index][len(output) :]
-            sanitized.append(f"[credential line omitted]{output_ending}")
+            remainder = "".join(lines[index:])
+            remainder_ending = remainder[len(remainder.rstrip("\r\n")) :]
+            sanitized.append(f"{_CREDENTIAL_DOCUMENT_OMITTED}{remainder_ending}")
             omitted += 1
-            index += 1
+            break
     return "".join(sanitized), omitted
 
 
