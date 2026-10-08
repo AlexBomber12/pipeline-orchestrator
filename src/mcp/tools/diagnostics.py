@@ -279,6 +279,18 @@ _DOCKER_LOGIN_PASSWORD_OPTION = re.compile(
     r"[^;&|<>\r\n]*?(?<!\S)login(?=[ \t]|$)"
     r"[^;&|<>\r\n]*?(?<!\S)-p(?:[ \t]+|=)?[^ \t;&|<>()]+"
 )
+_AWS_CONFIGURE_SET_CREDENTIAL = re.compile(
+    r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?aws(?:\.exe)?[ \t]+"
+    r"configure[ \t]+set[ \t]+"
+    r"(?:profile\.[A-Za-z0-9_.-]+\.)?"
+    r"(?:aws_access_key_id|aws_secret_access_key|aws_session_token)"
+    r"[ \t]+[^ \t;&|<>()]+"
+)
+_REDIS_CLI_PASSWORD_OPTION = re.compile(
+    r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?redis-cli(?:\.exe)?(?=[ \t])"
+    r"[^;&|<>\r\n]*?(?<!\S)(?:-a(?:[ \t]+|=)?|--pass(?:[ \t]+|=))"
+    r"[^ \t;&|<>()]+"
+)
 _SHELL_IFS_VALUE_BOUNDARY_PATTERN = r"\$(?:IFS\b|\{IFS[^}\r\n]{0,64}\})"
 _SHELL_IFS_VALUE_BOUNDARY = re.compile(_SHELL_IFS_VALUE_BOUNDARY_PATTERN)
 _SHELL_NORMALIZED_CURL_CREDENTIAL_OPTION = re.compile(
@@ -1614,6 +1626,12 @@ def _sensitive_value_start(line: str) -> int | None:
     docker_password = _DOCKER_LOGIN_PASSWORD_OPTION.search(line)
     if docker_password is not None:
         return docker_password.end()
+    aws_credential = _AWS_CONFIGURE_SET_CREDENTIAL.search(line)
+    if aws_credential is not None:
+        return aws_credential.end()
+    redis_password = _REDIS_CLI_PASSWORD_OPTION.search(line)
+    if redis_password is not None:
+        return redis_password.end()
     line = _normalize_shell_credential_names(line)
     netrc_password = _NETRC_PASSWORD_VALUE.search(line)
     if netrc_password is not None:

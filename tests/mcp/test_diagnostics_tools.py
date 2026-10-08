@@ -615,7 +615,22 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "safe-after-docker-equals-password-option",
             "docker login -pdocker-attached-password-secret registry.example.test",
             "safe-after-docker-attached-password-option",
+            "aws configure set aws_secret_access_key aws-config-secret",
+            "safe-after-aws-config-credential",
+            "aws configure set aws_session_token aws-session-token-secret",
+            "safe-after-aws-session-token",
+            "/usr/bin/aws configure set profile.synthetic.aws_access_key_id aws-access-id-secret",
+            "safe-after-aws-access-id",
+            "redis-cli -a redis-short-password-secret",
+            "safe-after-redis-short-password",
+            "redis-cli -aredis-attached-password-secret",
+            "safe-after-redis-attached-password",
+            "redis-cli --pass redis-separated-password-secret ping",
+            "safe-after-redis-separated-password",
+            "/usr/bin/redis-cli --pass=redis-long-password-secret ping",
+            "safe-after-redis-long-password",
             "tool -pvisible-unrelated-option",
+            "tool -avisible-unrelated-option",
             "curl --user alice:curl-user-secret https://example.test",
             "curl -u alice:curl-short-user-secret https://example.test",
             "curl -ualice:curl-attached-user-secret https://example.test",
@@ -997,7 +1012,15 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-docker-password-option" in exported
     assert "safe-after-docker-equals-password-option" in exported
     assert "safe-after-docker-attached-password-option" in exported
+    assert "safe-after-aws-config-credential" in exported
+    assert "safe-after-aws-session-token" in exported
+    assert "safe-after-aws-access-id" in exported
+    assert "safe-after-redis-short-password" in exported
+    assert "safe-after-redis-attached-password" in exported
+    assert "safe-after-redis-separated-password" in exported
+    assert "safe-after-redis-long-password" in exported
     assert "tool -pvisible-unrelated-option" in exported
+    assert "tool -avisible-unrelated-option" in exported
     assert "safe-after-toml-array" in exported
     assert "safe-after-toml-triple-quote" in exported
     assert "safe-after-split-assignment-name" in exported
@@ -1112,6 +1135,13 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "docker-password-option-secret",
         "docker-equals-password-secret",
         "docker-attached-password-secret",
+        "aws-config-secret",
+        "aws-session-token-secret",
+        "aws-access-id-secret",
+        "redis-short-password-secret",
+        "redis-attached-password-secret",
+        "redis-separated-password-secret",
+        "redis-long-password-secret",
         "curl-user-secret",
         "curl-short-user-secret",
         "curl-attached-user-secret",
