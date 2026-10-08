@@ -40,6 +40,7 @@ import re  # noqa: F401
 import subprocess
 import time  # noqa: F401
 import types  # noqa: F401
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -254,6 +255,32 @@ def test_recovery_does_not_rewrite_completed_run_without_current_snapshot(
     assert record.outcome == "merged"
     assert record.cause is None
     assert record.run_phase == "merge"
+
+
+def test_recovery_does_not_finalize_checkpoint_for_different_run() -> None:
+    task = QueueTask(
+        pr_id="PR-395",
+        title="Invocation settings retry",
+        status=TaskStatus.DOING,
+        branch="manual-20261008-coder-invocation-settings",
+    )
+    runner = h._make_runner()
+    runner.state.current_task = task
+    runner._start_current_run_record("codex", "gpt-5.4")
+    snapshot = runner._capture_invocation_snapshot(
+        "codex", {"model": "gpt-5.4"}, phase="coding"
+    )
+    asyncio.run(runner._checkpoint_current_run_record())
+    assert snapshot.run_id is not None
+    runner.state.active_invocation = replace(snapshot, run_id=f"retry-{snapshot.run_id}")
+    runner._current_run_record = None
+
+    asyncio.run(runner._finalize_interrupted_coding_invocation())
+
+    record = asyncio.run(runner._metrics_store.get(snapshot.run_id))
+    assert record is not None
+    assert record.ended_at is None
+    assert record.exit_reason == ""
 
 
 def test_recovery_finalizes_checkpoint_while_user_paused(
