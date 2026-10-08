@@ -282,11 +282,7 @@ _SSHPASS_PASSWORD_OPTION = re.compile(
     r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?sshpass(?:\.exe)?(?=[ \t])"
     r"[^;&|<>\r\n]*?(?<!\S)-_*p_*(?:[ \t]+|=)?[^ \t;&|<>()]+"
 )
-_CURL_COOKIE_OPTION = re.compile(
-    r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?curl(?:\.exe)?(?=[ \t])"
-    r"[^;&|<>\r\n]*?(?<!\S)(?:-_*b_*|--_*c_*o_*o_*k_*i_*e_*)"
-    r"(?:[ \t]+|=)?[^ \t;&|<>()]*=[^ \t;&|<>()]+"
-)
+_SHELL_COMMAND_WORD = re.compile(r"[^ \t;&|<>()]+|[;&|<>()]")
 _AWS_CONFIGURE_SET_CREDENTIAL = re.compile(
     r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?aws(?:\.exe)?[ \t]+"
     r"(?:[^ \t;&|<>()]+[ \t]+){0,16}?"
@@ -1646,6 +1642,55 @@ def _ansi_c_option_value_start(line: str) -> int | None:
     return None
 
 
+def _command_specific_credential_value_start(line: str) -> int | None:
+    """Scan command words once for options whose meaning depends on the executable."""
+    command: str | None = None
+    pending_option: str | None = None
+    for match in _SHELL_COMMAND_WORD.finditer(line):
+        word = match.group(0)
+        if word in ";&|<>()":
+            command = None
+            pending_option = None
+            continue
+
+        compact = word.strip("'\"").replace("_", "").lower()
+        executable = compact.replace("\\", "/").rsplit("/", 1)[-1]
+        if executable.endswith(".exe"):
+            executable = executable[:-4]
+        if executable in {"curl", "openssl"}:
+            command = executable
+            pending_option = None
+            continue
+
+        if pending_option == "curl-cookie":
+            pending_option = None
+            if "=" in compact:
+                return match.start()
+        elif pending_option == "openssl-passin":
+            pending_option = None
+            if compact.startswith("pass:") and len(compact) > len("pass:"):
+                return match.start()
+
+        if command == "curl":
+            if compact in {"-b", "--cookie"}:
+                pending_option = "curl-cookie"
+            elif (
+                compact.startswith("-b")
+                and "=" in compact[2:]
+                or compact.startswith("--cookie=")
+                and "=" in compact[len("--cookie=") :]
+            ):
+                return match.start()
+        elif command == "openssl":
+            if compact == "-passin":
+                pending_option = "openssl-passin"
+            elif compact.startswith("-passin=pass:") and len(compact) > len(
+                "-passin=pass:"
+            ):
+                return match.start()
+    return None
+
+
 def _sensitive_value_start(line: str) -> int | None:
     """Return the value position for a sensitive context found in one line."""
     yaml_single_quoted = _yaml_single_quoted_sensitive_value_start(line)
@@ -1655,6 +1700,9 @@ def _sensitive_value_start(line: str) -> int | None:
     if ansi_c_option is not None:
         return ansi_c_option
     normalized_line = _normalize_shell_credential_names(line)
+    command_credential = _command_specific_credential_value_start(normalized_line)
+    if command_credential is not None:
+        return command_credential
     mysql_password = _MYSQL_ATTACHED_PASSWORD_OPTION.search(line)
     if mysql_password is not None:
         return mysql_password.end()
@@ -1667,9 +1715,6 @@ def _sensitive_value_start(line: str) -> int | None:
     sshpass_password = _SSHPASS_PASSWORD_OPTION.search(normalized_line)
     if sshpass_password is not None:
         return sshpass_password.end()
-    curl_cookie = _CURL_COOKIE_OPTION.search(normalized_line)
-    if curl_cookie is not None:
-        return curl_cookie.end()
     aws_credential = _AWS_CONFIGURE_SET_CREDENTIAL.search(line)
     if aws_credential is not None:
         return aws_credential.end()

@@ -115,7 +115,10 @@ URL userinfo redaction consumes through the final `@` in the bounded authority,
 and curl user/proxy-user short options are recognized when attached inside an
 option cluster or quoted as a complete shell argument. Curl `-b`/`--cookie`
 arguments containing explicit cookie data are likewise omitted in their
-command-specific context. Shell-fragmented curl
+command-specific context using a monotonic bounded word scan. OpenSSL `-passin`
+arguments using the inline `pass:password` source are omitted by the same
+command-scoped scan; indirect password sources such as files remain visible.
+Shell-fragmented curl
 long options and bounded unquoted IFS expansions at recognized credential-option
 value boundaries fail closed without evaluating the expansion. PowerShell credential
 parameter prefixes of four or more characters fail closed when they prefix a

@@ -2095,6 +2095,51 @@ async def test_latest_cli_log_omits_curl_cookies_and_cmd_batch_fragments(
         assert secret not in result["text"]
 
 
+async def test_latest_cli_log_omits_openssl_passin_with_bounded_command_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    cases = (
+        (
+            "openssl rsa -passin pass:openssl-passin-secret -in encrypted.pem",
+            "safe-openssl-passin",
+        ),
+        (
+            r"C:\OpenSSL.exe rsa -passin=pass:openssl-attached-passin-secret",
+            "safe-openssl-attached-passin",
+        ),
+        (
+            "openssl rsa -'passin' pass:openssl-fragmented-passin-secret",
+            "safe-openssl-fragmented-passin",
+        ),
+    )
+    redis = FakeRedis()
+    redis.store[cli_log_latest(SLUG)] = "\n".join(
+        (
+            *(line for payload, marker in cases for line in (payload, "---", marker, "---")),
+            "openssl rsa -passin file:/safe/password-source",
+            "curl x ; tool -b session=visible-unrelated-command",
+        )
+    )
+    _patch_runtime(monkeypatch, redis)
+
+    result = await diagnostics.get_latest_cli_log(SLUG)
+
+    assert all(marker in result["text"] for _payload, marker in cases)
+    assert "openssl rsa -passin file:/safe/password-source" in result["text"]
+    assert "tool -b session=visible-unrelated-command" in result["text"]
+    assert all(payload not in result["text"] for payload, _marker in cases)
+    assert "openssl-passin-secret" not in result["text"]
+    assert "openssl-attached-passin-secret" not in result["text"]
+    assert "openssl-fragmented-passin-secret" not in result["text"]
+
+    repeated_curl = ("curl x " * diagnostics._MAX_CLI_LOG_SOURCE_BYTES)[
+        : diagnostics._MAX_CLI_LOG_SOURCE_BYTES
+    ]
+    assert diagnostics._command_specific_credential_value_start(repeated_curl) is None
+
+
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
