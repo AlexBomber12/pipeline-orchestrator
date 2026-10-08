@@ -71,8 +71,9 @@ blocks are both omitted using bounded boundary scans. A nested PuTTY key header
 before the current document terminator fails closed from the outer boundary.
 Logical command reconstruction recognizes trailing shell backslashes and
 PowerShell backticks before classifying split credential parameter names.
-Recognizable token shapes joined from adjacent simple shell fragments cause the
-contributing line to be omitted before tail selection.
+Credentials joined by adjacent simple shell fragments or unquoted backslash
+escapes are detected using the same inline token, URL, and query rules; the
+contributing line is omitted before tail selection.
 URL userinfo redaction consumes through the final `@` in the bounded authority,
 and curl user/proxy-user short options are recognized when attached inside an
 option cluster or quoted as a complete shell argument. PowerShell credential

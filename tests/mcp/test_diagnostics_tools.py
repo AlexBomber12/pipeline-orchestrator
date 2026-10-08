@@ -1397,6 +1397,10 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
             "safe-after-ansi-long-curl",
             'echo ghp_ABCDEFGHIJ"KLMNOPQRSTUVWXYZ0123456789"',
             "safe-after-fragmented-token",
+            r"echo ghp_ABCDEFGHIJ\KLMNOPQRSTUVWXYZ0123456789",
+            "safe-after-escaped-token",
+            'curl https://blob.test/?sv=1\'&\'si"g"=SYNTHETIC_QUOTED_QUERY_SECRET',
+            "safe-after-quoted-query",
             "https://user:SYNTHETIC_URL_FIRST@SYNTHETIC_URL_SECOND@example.test/path",
             "safe-after-url",
             "('X-Api-Key',",
@@ -1419,10 +1423,13 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
     assert "safe-after-quoted-long-curl" in result["text"]
     assert "safe-after-ansi-long-curl" in result["text"]
     assert "safe-after-fragmented-token" in result["text"]
+    assert "safe-after-escaped-token" in result["text"]
+    assert "safe-after-quoted-query" in result["text"]
     assert "safe-after-url" in result["text"]
     assert "safe-after-pair" in result["text"]
     assert "ghp_ABCDEFGHIJ" not in result["text"]
     assert "KLMNOPQRSTUVWXYZ0123456789" not in result["text"]
+    assert "SYNTHETIC_QUOTED_QUERY_SECRET" not in result["text"]
     for secret in (
         "SYNTHETIC_BUNDLED_USER_SECRET",
         "SYNTHETIC_BUNDLED_PROXY_SECRET",
