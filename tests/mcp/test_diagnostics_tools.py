@@ -2042,6 +2042,59 @@ async def test_latest_cli_log_redacts_recognizable_package_tokens(
     assert all(token not in result["text"] for token in synthetic_tokens)
 
 
+async def test_latest_cli_log_omits_curl_cookies_and_cmd_batch_fragments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    cases = (
+        ("cmd /c tool --pass%1ord cmd-positional-option-secret", "safe-cmd-1"),
+        (
+            "cmd /c tool --pass%~1ord cmd-modified-positional-option-secret",
+            "safe-cmd-modified",
+        ),
+        ("cmd /c tool --pass%*word cmd-all-arguments-option-secret", "safe-cmd-all"),
+        (
+            "curl -b session=curl-cookie-secret https://example.test",
+            "safe-curl-cookie",
+        ),
+        (
+            "curl -'b' session=curl-fragmented-cookie-secret https://example.test",
+            "safe-curl-fragmented-cookie",
+        ),
+        (
+            "curl --cookie=session=curl-long-cookie-secret https://example.test",
+            "safe-curl-long-cookie",
+        ),
+    )
+    redis = FakeRedis()
+    redis.store[cli_log_latest(SLUG)] = "\n".join(
+        (
+            *(
+                line
+                for payload, marker in cases
+                for line in (payload, "---", marker, "---")
+            ),
+            "tool -b visible-unrelated-cookie-option",
+        )
+    )
+    _patch_runtime(monkeypatch, redis)
+
+    result = await diagnostics.get_latest_cli_log(SLUG)
+
+    assert all(marker in result["text"] for _payload, marker in cases)
+    assert "tool -b visible-unrelated-cookie-option" in result["text"]
+    for secret in (
+        "cmd-positional-option-secret",
+        "cmd-modified-positional-option-secret",
+        "cmd-all-arguments-option-secret",
+        "curl-cookie-secret",
+        "curl-fragmented-cookie-secret",
+        "curl-long-cookie-secret",
+    ):
+        assert secret not in result["text"]
+
+
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

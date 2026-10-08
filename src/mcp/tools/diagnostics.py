@@ -282,6 +282,11 @@ _SSHPASS_PASSWORD_OPTION = re.compile(
     r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?sshpass(?:\.exe)?(?=[ \t])"
     r"[^;&|<>\r\n]*?(?<!\S)-_*p_*(?:[ \t]+|=)?[^ \t;&|<>()]+"
 )
+_CURL_COOKIE_OPTION = re.compile(
+    r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?curl(?:\.exe)?(?=[ \t])"
+    r"[^;&|<>\r\n]*?(?<!\S)(?:-_*b_*|--_*c_*o_*o_*k_*i_*e_*)"
+    r"(?:[ \t]+|=)?[^ \t;&|<>()]*=[^ \t;&|<>()]+"
+)
 _AWS_CONFIGURE_SET_CREDENTIAL = re.compile(
     r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?aws(?:\.exe)?[ \t]+"
     r"(?:[^ \t;&|<>()]+[ \t]+){0,16}?"
@@ -322,7 +327,8 @@ _SHELL_BRACE_EXPANSION = re.compile(
 )
 _EMBEDDED_CMD_VARIABLE = re.compile(
     r"(?<![ \t;&|<>])(?:%[A-Za-z_][A-Za-z0-9_]*(?::[^%\r\n]{0,64})?%|"
-    r"![A-Za-z_][A-Za-z0-9_]*!)"
+    r"![A-Za-z_][A-Za-z0-9_]*!|%[0-9*]|"
+    r"%~[A-Za-z]*(?:\$[A-Za-z_][A-Za-z0-9_]*:)?[0-9])"
 )
 _HEREDOC_START = re.compile(
     r"<<(?P<strip_tabs>-?)[ \t]*(?P<quote>['\"]?)"
@@ -1661,6 +1667,9 @@ def _sensitive_value_start(line: str) -> int | None:
     sshpass_password = _SSHPASS_PASSWORD_OPTION.search(normalized_line)
     if sshpass_password is not None:
         return sshpass_password.end()
+    curl_cookie = _CURL_COOKIE_OPTION.search(normalized_line)
+    if curl_cookie is not None:
+        return curl_cookie.end()
     aws_credential = _AWS_CONFIGURE_SET_CREDENTIAL.search(line)
     if aws_credential is not None:
         return aws_credential.end()

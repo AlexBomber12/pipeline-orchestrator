@@ -106,12 +106,16 @@ are treated as ambiguous credential context and omitted with balanced-group
 tracking rather than evaluated.
 Percent-delimited and delayed-expansion `cmd` variables embedded in a word are
 handled by the same fail-closed rule.
+Embedded `%0` through `%9`, `%*`, and bounded `%~` batch-parameter forms are
+also treated as ambiguous fragments rather than expanded.
 Provably empty `${name:+}`, `${name+}`, `$()`, and backtick substitutions inside
 credential option names or recognizable token text are normalized before
 classification.
 URL userinfo redaction consumes through the final `@` in the bounded authority,
 and curl user/proxy-user short options are recognized when attached inside an
-option cluster or quoted as a complete shell argument. Shell-fragmented curl
+option cluster or quoted as a complete shell argument. Curl `-b`/`--cookie`
+arguments containing explicit cookie data are likewise omitted in their
+command-specific context. Shell-fragmented curl
 long options and bounded unquoted IFS expansions at recognized credential-option
 value boundaries fail closed without evaluating the expansion. PowerShell credential
 parameter prefixes of four or more characters fail closed when they prefix a
