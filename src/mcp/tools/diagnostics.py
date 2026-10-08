@@ -1398,9 +1398,16 @@ def _has_recognizable_inline_credential(text: str) -> bool:
 
 def _has_shell_normalized_credential(text: str) -> bool:
     """Detect credentials joined by simple shell quote or escape removal."""
-    if "'" not in text and '"' not in text and "\\" not in text and "^" not in text:
+    empty_fragment = _EMPTY_SHELL_NAME_FRAGMENT.search(text)
+    if (
+        empty_fragment is None
+        and "'" not in text
+        and '"' not in text
+        and "\\" not in text
+        and "^" not in text
+    ):
         return False
-    joined = text.translate(
+    joined = _EMPTY_SHELL_NAME_FRAGMENT.sub("", text).translate(
         {
             ord("'"): None,
             ord('"'): None,
@@ -1479,7 +1486,7 @@ def _normalize_shell_credential_names(line: str) -> str:
         if normalized[prefix_start : prefix_start + 2] == ["-", "-"]:
             for cursor in range(prefix_start + 2, word_end - 1):
                 if (
-                    line[cursor] == "\\"
+                    line[cursor] in {"\\", "^"}
                     and line[cursor + 1] in _SENSITIVE_KEY_CHARACTERS
                 ):
                     normalized[cursor] = "_"

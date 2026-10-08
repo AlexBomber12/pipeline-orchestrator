@@ -586,6 +586,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "safe-after-empty-command-option-name",
             "tool --pass``word empty-backtick-option-secret",
             "safe-after-empty-backtick-option-name",
+            "cmd /c tool --pass^word same-line-caret-option-secret",
+            "safe-after-same-line-caret-option-name",
             "curl --user alice:curl-user-secret https://example.test",
             "curl -u alice:curl-short-user-secret https://example.test",
             "curl -ualice:curl-attached-user-secret https://example.test",
@@ -953,6 +955,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-empty-parameter-option-name" in exported
     assert "safe-after-empty-command-option-name" in exported
     assert "safe-after-empty-backtick-option-name" in exported
+    assert "safe-after-same-line-caret-option-name" in exported
     assert "safe-after-toml-array" in exported
     assert "safe-after-toml-triple-quote" in exported
     assert "safe-after-split-assignment-name" in exported
@@ -1053,6 +1056,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "empty-parameter-option-secret",
         "empty-command-option-secret",
         "empty-backtick-option-secret",
+        "same-line-caret-option-secret",
         "curl-user-secret",
         "curl-short-user-secret",
         "curl-attached-user-secret",
@@ -1413,6 +1417,8 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
             "safe-after-escaped-token",
             "echo ghp_ABCDEFGHIJ^KLMNOPQRSTUVWXYZ0123456789",
             "safe-after-caret-token",
+            "echo ghp_ABCDEFGHIJ${ANY:+}KLMNOPQRSTUVWXYZ0123456789",
+            "safe-after-empty-expansion-token",
             'curl https://blob.test/?sv=1\'&\'si"g"=SYNTHETIC_QUOTED_QUERY_SECRET',
             "safe-after-quoted-query",
             "https://user:SYNTHETIC_URL_FIRST@SYNTHETIC_URL_SECOND@example.test/path",
@@ -1439,6 +1445,7 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
     assert "safe-after-fragmented-token" in result["text"]
     assert "safe-after-escaped-token" in result["text"]
     assert "safe-after-caret-token" in result["text"]
+    assert "safe-after-empty-expansion-token" in result["text"]
     assert "safe-after-quoted-query" in result["text"]
     assert "safe-after-url" in result["text"]
     assert "safe-after-pair" in result["text"]
