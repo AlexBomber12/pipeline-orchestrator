@@ -1273,6 +1273,20 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert incomplete_putty["text"] == "safe-before\n[credential document omitted]"
     assert "incomplete-putty-secret" not in incomplete_putty["text"]
 
+    nested_putty_redis = FakeRedis()
+    nested_putty_redis.store[key] = (
+        "safe-before\nPuTTY-User-Key-File-3: ssh-rsa\nouter-putty-secret\n"
+        "PuTTY-User-Key-File-2: ssh-rsa\ninner-putty-secret\n"
+        "Private-MAC: synthetic-inner-mac\nouter-putty-after-secret\nsafe-after"
+    )
+    _patch_runtime(monkeypatch, nested_putty_redis)
+    nested_putty = await diagnostics.get_latest_cli_log(SLUG)
+    assert nested_putty["text"] == "safe-before\n[credential document omitted]"
+    assert "outer-putty-secret" not in nested_putty["text"]
+    assert "inner-putty-secret" not in nested_putty["text"]
+    assert "outer-putty-after-secret" not in nested_putty["text"]
+    assert "safe-after" not in nested_putty["text"]
+
     incomplete_json_redis = FakeRedis()
     incomplete_json_redis.store[key] = '{"private_key":\n"incomplete-document-secret"\n'
     _patch_runtime(monkeypatch, incomplete_json_redis)
@@ -1377,6 +1391,10 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
             "safe-after-quoted-curl",
             "curl $'-uuser:SYNTHETIC_ANSI_QUOTED_CURL_SECRET' https://example.test",
             "safe-after-ansi-quoted-curl",
+            "curl '--user' user:SYNTHETIC_QUOTED_LONG_CURL_SECRET https://example.test",
+            "safe-after-quoted-long-curl",
+            "curl $'--proxy-user' proxy:SYNTHETIC_ANSI_LONG_CURL_SECRET https://example.test",
+            "safe-after-ansi-long-curl",
             "https://user:SYNTHETIC_URL_FIRST@SYNTHETIC_URL_SECOND@example.test/path",
             "safe-after-url",
             "('X-Api-Key',",
@@ -1396,6 +1414,8 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
     assert "safe-after-symbol-bundled-proxy" in result["text"]
     assert "safe-after-quoted-curl" in result["text"]
     assert "safe-after-ansi-quoted-curl" in result["text"]
+    assert "safe-after-quoted-long-curl" in result["text"]
+    assert "safe-after-ansi-long-curl" in result["text"]
     assert "safe-after-url" in result["text"]
     assert "safe-after-pair" in result["text"]
     for secret in (
@@ -1405,6 +1425,8 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
         "SYNTHETIC_SYMBOL_BUNDLED_SECRET",
         "SYNTHETIC_QUOTED_CURL_SECRET",
         "SYNTHETIC_ANSI_QUOTED_CURL_SECRET",
+        "SYNTHETIC_QUOTED_LONG_CURL_SECRET",
+        "SYNTHETIC_ANSI_LONG_CURL_SECRET",
         "SYNTHETIC_URL_FIRST",
         "SYNTHETIC_URL_SECOND",
         "SYNTHETIC_STRUCTURED_PAIR_SECRET",

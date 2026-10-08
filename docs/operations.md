@@ -67,7 +67,8 @@ property lines, or block-scalar
 (including indentation indicators), multiline plain-scalar, block-sequence, or
 flow-mapping `kind` values. Explicit `kind` keys inside flow mappings are also
 recognized regardless of member order. Complete and interrupted private-key
-blocks are both omitted using bounded boundary scans.
+blocks are both omitted using bounded boundary scans. A nested PuTTY key header
+before the current document terminator fails closed from the outer boundary.
 Logical command reconstruction recognizes trailing shell backslashes and
 PowerShell backticks before classifying split credential parameter names.
 URL userinfo redaction consumes through the final `@` in the bounded authority,

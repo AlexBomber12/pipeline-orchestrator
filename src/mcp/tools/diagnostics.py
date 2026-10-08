@@ -266,7 +266,7 @@ _AUTHORIZATION_VALUE = re.compile(
 )
 _DIGEST_AUTHORIZATION = re.compile(r"(?i)(?<![A-Za-z0-9])Digest[ \t]+")
 _CREDENTIAL_CLI_OPTION = re.compile(
-    r"(?i)(?<!\S)(?:\$?['\"])?(?:(?:--user|--proxy-user)(?:[ \t]+|=)|"
+    r"(?i)(?<!\S)(?:\$?['\"])?(?:(?:--user|--proxy-user)(?:['\"]?[ \t]+|=)|"
     r"-[#0-9:A-Za-z]*?[uU](?:[ \t]+|=|(?=[^ \t;&|<>()])))"
 )
 _NETRC_PASSWORD_VALUE = re.compile(r"(?i)(?<!\S)password[ \t]+")
@@ -1281,6 +1281,12 @@ def _omit_putty_private_key_documents(text: str) -> tuple[str, int]:
         if start is None:
             break
         end = _PUTTY_PRIVATE_KEY_END.search(text, start.end())
+        nested_start = _PUTTY_PRIVATE_KEY_START.search(text, start.end())
+        if nested_start is not None and (
+            end is None or nested_start.start() < end.start()
+        ):
+            ranges.append((start.start(), len(text)))
+            break
         if end is None:
             ranges.append((start.start(), len(text)))
             break
