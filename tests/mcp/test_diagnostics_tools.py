@@ -550,6 +550,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "auth[password]=nested-bracket-secret",
             "AZURE_STORAGE_KEY=azure-storage-secret",
             "DefaultEndpointsProtocol=https;AccountName=demo;AccountKey=azure-account-secret",
+            "Server=db.example.test;User ID=synthetic;Pwd=connection-pwd-secret",
+            "safe-after-connection-pwd",
             'config["password"] = subscript-password-secret',
             "env['API_TOKEN']=subscript-token-secret",
             "SSH_KEY_PASSPHRASE=passphrase-assignment-secret",
@@ -977,6 +979,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-before-kubernetes-secret" in exported
     assert "safe-after-kubernetes-secret" in exported
     assert "safe-after-reconstructed-url" in exported
+    assert "safe-after-connection-pwd" in exported
     assert "safe-after-yaml-doubled-quote-key" in exported
     assert "safe-yaml-doubled-quote-visible" in exported
     assert "safe-before-aws-csv" in exported
@@ -1102,6 +1105,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "nested-bracket-secret",
         "azure-storage-secret",
         "azure-account-secret",
+        "connection-pwd-secret",
         "subscript-password-secret",
         "subscript-token-secret",
         "passphrase-assignment-secret",

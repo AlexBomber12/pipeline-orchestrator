@@ -88,6 +88,7 @@ _CREDENTIAL_DOCUMENT_KEYS = frozenset(
         "privatekey",
         "privatekeyid",
         "proxyauthorization",
+        "pwd",
         "refreshtoken",
         "secret",
         "secretaccesskey",

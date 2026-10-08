@@ -43,8 +43,9 @@ reports source/output sizes, truncation, observation time, and remaining Redis
 TTL. A producer `[truncated]` marker means the stored tail may begin inside a
 credential value, so the service fails closed with
 `cli_log_producer_truncated` instead of exporting that record. Authorization
-headers, token, password, and passphrase assignments or long- and PowerShell-style
-single-hyphen option arguments and their multiline shell groups, cookies,
+headers, token, password, and passphrase assignments (including the standard
+`Pwd` connection-string alias) or long- and PowerShell-style single-hyphen
+option arguments and their multiline shell groups, cookies,
 credential-bearing absolute or
 scheme-relative URL userinfo/query parameters (including percent-encoded
 parameter names, Azure SAS signatures, and AWS/Google presigned signatures),
