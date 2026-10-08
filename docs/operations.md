@@ -108,7 +108,8 @@ An exact `az keyvault secret show --query value` command and its following
 one-line scalar output are omitted conservatively.
 An exact AWS Secrets Manager `get-secret-value` command selecting
 `SecretString` or `SecretBinary` with text output receives the same scalar
-handling.
+handling, including when those global output or query options precede the
+service name.
 The documented `kubectl get secret` JSONPath pipeline into `base64 --decode`
 also omits its following decoded scalar.
 The `sshpass -p` separated, attached, and shell-fragmented password forms are
@@ -146,8 +147,9 @@ and `-passout` arguments using the inline `pass:password` source are omitted by
 the same command-scoped scan; indirect password sources such as files remain
 visible. Mongosh short `-p` password arguments are likewise omitted only in
 their command span, preserving unrelated short options.
-Credential commands launched through `sudo`, `env`, `command`, or `exec` are
-omitted conservatively rather than interpreting wrapper-specific options.
+Credential commands launched through `sudo`, `env`, `command`, `exec`, or
+`nohup` are omitted conservatively rather than interpreting wrapper-specific
+options.
 Shell-fragmented curl
 long options and bounded unquoted IFS expansions at recognized credential-option
 value boundaries fail closed without evaluating the expansion. PowerShell credential

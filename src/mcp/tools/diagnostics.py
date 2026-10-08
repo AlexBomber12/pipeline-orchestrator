@@ -284,7 +284,7 @@ _CREDENTIAL_COMMANDS = frozenset(
         "sshpass",
     }
 )
-_EXECUTION_WRAPPERS = frozenset({"command", "env", "exec", "sudo"})
+_EXECUTION_WRAPPERS = frozenset({"command", "env", "exec", "nohup", "sudo"})
 _AWS_CONFIGURE_SET_CREDENTIAL = re.compile(
     r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?aws(?:\.exe)?[ \t]+"
     r"(?:[^ \t;&|<>()]+[ \t]+){0,16}?"
@@ -2646,10 +2646,6 @@ def _is_aws_secrets_manager_value_command(line: str) -> bool:
             continue
         if not active:
             continue
-        if stage < len(expected):
-            if compact == expected[stage]:
-                stage += 1
-            continue
         if pending_option is not None:
             if pending_option == "query":
                 query_selected = compact in {"secretbinary", "secretstring"}
@@ -2665,7 +2661,10 @@ def _is_aws_secrets_manager_value_command(line: str) -> bool:
             }
         elif compact.startswith("--output="):
             text_output = compact[len("--output=") :] == "text"
-        if query_selected and text_output:
+        elif stage < len(expected):
+            if compact == expected[stage]:
+                stage += 1
+        if query_selected and text_output and stage == len(expected):
             return True
     return False
 

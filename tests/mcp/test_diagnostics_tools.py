@@ -2383,6 +2383,7 @@ async def test_latest_cli_log_fails_closed_for_execution_wrappers(
         ("env docker login -p wrapped-docker-secret registry.test", "safe-env"),
         ("command sshpass -p wrapped-sshpass-secret ssh host", "safe-command"),
         ("exec redis-cli -a wrapped-redis-secret ping", "safe-exec"),
+        ("nohup curl -u alice:wrapped-nohup-secret https://example.test", "safe-nohup"),
         (
             "sudo -u mysql curl -u alice:wrapped-option-value-secret "
             "https://example.test",
@@ -2407,6 +2408,7 @@ async def test_latest_cli_log_fails_closed_for_execution_wrappers(
         "wrapped-docker-secret",
         "wrapped-sshpass-secret",
         "wrapped-redis-secret",
+        "wrapped-nohup-secret",
         "wrapped-option-value-secret",
     ):
         assert secret not in result["text"]
@@ -2448,6 +2450,11 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
             "",
             "aws-secret-manager-plain-value",
             "safe-after-aws-secret-manager-scalar",
+            "aws --output text secretsmanager get-secret-value "
+            "--secret-id synthetic --query SecretString",
+            "",
+            "aws-global-output-secret-manager-plain-value",
+            "safe-after-aws-global-output-scalar",
             "kubectl get secret db-user-pass -o "
             "jsonpath='{.data.password}' | base64 --decode",
             "",
@@ -2473,6 +2480,7 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
         "kubeconfig-client-key-data-value",
         "exec-credential-client-key-data-value",
         "aws-secret-manager-plain-value",
+        "aws-global-output-secret-manager-plain-value",
         "kubectl-decoded-secret-value",
     ):
         assert secret not in result["text"]
@@ -2487,6 +2495,7 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
         "safe-after-kubeconfig-client-key-data",
         "safe-after-exec-credential-client-key-data",
         "safe-after-aws-secret-manager-scalar",
+        "safe-after-aws-global-output-scalar",
         "safe-after-kubectl-decoded-secret",
     ):
         assert marker in result["text"]
@@ -2501,6 +2510,9 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
     assert diagnostics._is_aws_secrets_manager_value_command(
         "noop; /usr/bin/aws.exe secretsmanager get-secret-value "
         "--output=text --query=SecretBinary"
+    )
+    assert diagnostics._is_aws_secrets_manager_value_command(
+        "aws --query SecretBinary --output=text secretsmanager get-secret-value"
     )
     assert diagnostics._is_kubectl_decoded_secret_command(
         "/usr/bin/kubectl.exe get secrets demo -o "
