@@ -751,6 +751,11 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "-----BEGIN PRIVATE KEY-----",
             "pem-document-secret",
             "-----END PRIVATE KEY-----",
+            "---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----",
+            "Comment: synthetic fixture",
+            "ssh2-private-secret",
+            "---- END SSH2 ENCRYPTED PRIVATE KEY ----",
+            "safe-after-ssh2",
             "PuTTY-User-Key-File-3: ssh-rsa",
             "Encryption: none",
             "Public-Lines: 1",
@@ -812,6 +817,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert encoded_auth not in exported
     assert standalone_basic not in exported
     assert "safe-hyperlink-output" in exported
+    assert "safe-after-ssh2" in exported
     assert "safe-after-putty" in exported
     assert diagnostics._omit_kubernetes_secret_documents(
         "apiVersion: v1\nkind: Secret\ndata:\n  tls.key: source-end-secret"
@@ -932,6 +938,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "aws-secret",
         "document-secret",
         "pem-document-secret",
+        "ssh2-private-secret",
         "putty-private-secret",
         "putty-private-mac-secret",
         "ghp_" + ("A" * 36),
@@ -987,6 +994,15 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert orphaned_end["text"] == "[credential document omitted]\nsafe-after"
     assert "orphaned-private-secret" not in orphaned_end["text"]
 
+    orphaned_ssh2_redis = FakeRedis()
+    orphaned_ssh2_redis.store[key] = (
+        "safe-before\n---- BEGIN SSH2 PRIVATE KEY ----\norphaned-ssh2-secret"
+    )
+    _patch_runtime(monkeypatch, orphaned_ssh2_redis)
+    orphaned_ssh2 = await diagnostics.get_latest_cli_log(SLUG)
+    assert orphaned_ssh2["text"] == "safe-before\n[credential document omitted]"
+    assert "orphaned-ssh2-secret" not in orphaned_ssh2["text"]
+
     incomplete_putty_redis = FakeRedis()
     incomplete_putty_redis.store[key] = (
         "safe-before\nPuTTY-User-Key-File-2: ssh-rsa\n"
@@ -1010,6 +1026,18 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     split_key_json = await diagnostics.get_latest_cli_log(SLUG)
     assert split_key_json["text"] == "[credential document omitted]"
     assert "split-key-document-secret" not in split_key_json["text"]
+
+    duplicate_key_json_redis = FakeRedis()
+    duplicate_key_json_redis.store[key] = (
+        'safe-before\n{\n  "password": "duplicate-key-document-secret",\n'
+        '  "password": null\n}\nsafe-after'
+    )
+    _patch_runtime(monkeypatch, duplicate_key_json_redis)
+    duplicate_key_json = await diagnostics.get_latest_cli_log(SLUG)
+    assert duplicate_key_json["text"] == (
+        "safe-before\n[credential document omitted]\nsafe-after"
+    )
+    assert "duplicate-key-document-secret" not in duplicate_key_json["text"]
 
     escaped_key_json_redis = FakeRedis()
     escaped_key_json_redis.store[key] = (
@@ -1077,6 +1105,7 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
     supplied_cases = (
         "password: # explanation\n\n  SYNTHETIC_SECRET\nsafe: visible",
         "defaults: &value SYNTHETIC_SECRET\npassword: *value\nsafe: visible",
+        '? "pass\\\n  word"\n: SYNTHETIC_SECRET\nsafe: visible',
     )
     for payload in supplied_cases:
         supplied_redis = FakeRedis()
@@ -1110,6 +1139,10 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
             "SYNTHETIC_FLOW_COLLECTION_SECRET",
             "]",
             "---",
+            '? "pass\\',
+            '  word"',
+            ": SYNTHETIC_MULTILINE_EXPLICIT_KEY_SECRET",
+            "---",
             "safe: visible",
         )
     )
@@ -1118,7 +1151,7 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
     result = await diagnostics.get_latest_cli_log(SLUG, diagnostics._MAX_CLI_LOG_TAIL_BYTES)
 
     assert result["availability"]["status"] == "available"
-    assert result["text"].count("[credential document omitted]") == 5
+    assert result["text"].count("[credential document omitted]") == 6
     assert "safe: before" in result["text"]
     assert "safe: visible" in result["text"]
     for secret in (
@@ -1127,6 +1160,7 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
         "SYNTHETIC_AFTER_ALIAS_SECRET",
         "SYNTHETIC_NESTED_ALIAS_SECRET",
         "SYNTHETIC_FLOW_COLLECTION_SECRET",
+        "SYNTHETIC_MULTILINE_EXPLICIT_KEY_SECRET",
     ):
         assert secret not in result["text"]
 

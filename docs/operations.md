@@ -65,7 +65,9 @@ documents are treated as credential context rather than exported as base64 text.
 YAML documents with explicit credential keys, alias mapping keys, or mapping
 keys that use recognized YAML-only escape forms are omitted conservatively
 rather than partially decoded. Node-property-only credential values retain their
-context across blank and comment lines.
+context across blank and comment lines. Documents containing multiline explicit
+quoted mapping keys are omitted because folded keys cannot be classified safely
+without interpreting YAML.
 Recognizable XML credential elements, credential attributes, and `key`/`name`
 plus `value` configuration tags are omitted. XML character references in
 credential selectors are decoded before classification. Multiline or incomplete
@@ -76,6 +78,9 @@ without parsing or expanding internal or external entities.
 Standalone single-token authorization-scheme values such as `Bearer` and
 `Basic` credentials are redacted even when the header name is absent; a
 multi-parameter `Digest` value causes conservative line omission.
+JSON inspection preserves duplicate object members so a later empty value cannot
+hide an earlier credential value. PEM, SSH2, and PuTTY private-key documents are
+omitted through their recognized boundaries; incomplete blocks fail closed.
 Lines with recognizable credential keys are omitted conservatively when they
 use assignment, structured-field, header, or long-option syntax, so malformed
 or interrupted quoting cannot expose a value suffix. Indented YAML/header

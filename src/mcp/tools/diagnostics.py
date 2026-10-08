@@ -98,6 +98,11 @@ _PEM_CREDENTIAL_BOUNDARY = re.compile(
     r"(?:[A-Z0-9 ]{0,64}PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----",
     re.IGNORECASE,
 )
+_SSH2_PRIVATE_KEY_BOUNDARY = re.compile(
+    r"----[ \t]+(?P<boundary>BEGIN|END)[ \t]+SSH2"
+    r"(?:[ \t]+ENCRYPTED)?[ \t]+PRIVATE[ \t]+KEY[ \t]+----",
+    re.IGNORECASE,
+)
 _TERMINAL_ESCAPE = re.compile(
     r"(?:\x1b(?:\]|P|X|\^|_).*?(?:\x07|\x1b\\|$)|"
     r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|"
@@ -122,6 +127,12 @@ _YAML_ONLY_ESCAPED_MAPPING_KEY = re.compile(
 _YAML_EXPLICIT_MAPPING_KEY = re.compile(
     r"(?im)^[ \t]*(?:-[ \t]+)?\?[ \t]+(?P<key>[^\r\n#]+?)"
     r"[ \t]*(?:#.*)?\n(?:[ \t]*(?:#.*)?\n)*[ \t]*:"
+)
+_YAML_MULTILINE_EXPLICIT_QUOTED_KEY = re.compile(
+    r'(?m)^[ \t]*(?:-[ \t]+)?\?[ \t]+"'
+    r'(?=(?:[^"\\\r\n]|\\[^\r\n])*(?:\\?\r?\n))'
+    r'(?:[^"\\]|\\(?:\r\n|[\s\S]))*"[ \t]*(?:#.*)?\r?\n'
+    r'(?:[ \t]*(?:#.*)?\r?\n)*[ \t]*:'
 )
 _YAML_ALIAS_MAPPING_KEY = re.compile(
     r"(?im)(?:^[ \t]*(?:-[ \t]+)?|[,{][ \t]*)"
@@ -252,6 +263,13 @@ _JSON_SIMPLE_ESCAPE_VALUES = {
     "r": "\r",
     "t": "\t",
 }
+
+
+class _JSONObjectPairs(list[tuple[str, object]]):
+    """JSON object members retained in source order, including duplicates."""
+
+
+_JSON_DECODER = json.JSONDecoder(object_pairs_hook=_JSONObjectPairs)
 _RECOGNIZABLE_SECRET = tuple(
     re.compile(pattern)
     for pattern in (
@@ -1093,12 +1111,13 @@ def _contains_credential_document_key(value: object) -> bool:
     pending = [value]
     while pending:
         current = pending.pop()
-        if isinstance(current, dict):
-            if current.get("kind") == "Secret" and (
-                "data" in current or "stringData" in current
+        if isinstance(current, (_JSONObjectPairs, dict)):
+            items = list(current if isinstance(current, _JSONObjectPairs) else current.items())
+            if any(key == "kind" and child == "Secret" for key, child in items) and any(
+                key in {"data", "stringData"} for key, _child in items
             ):
                 return True
-            for key, child in current.items():
+            for key, child in items:
                 if _is_sensitive_key(str(key)) and child not in (None, "", False):
                     return True
                 if isinstance(child, (dict, list, str)):
@@ -1114,7 +1133,7 @@ def _contains_credential_document_key(value: object) -> bool:
             pending.extend(child for child in current if isinstance(child, (dict, list, str)))
         elif isinstance(current, str):
             try:
-                decoded = json.loads(current)
+                decoded = _JSON_DECODER.decode(current)
             except (json.JSONDecodeError, RecursionError, ValueError):
                 continue
             if isinstance(decoded, (dict, list, str)):
@@ -1208,7 +1227,14 @@ def _omit_pem_credential_documents(text: str) -> tuple[str, int]:
         else:
             ranges.append((start, end))
 
-    for match in _PEM_CREDENTIAL_BOUNDARY.finditer(text):
+    boundaries = sorted(
+        (
+            *_PEM_CREDENTIAL_BOUNDARY.finditer(text),
+            *_SSH2_PRIVATE_KEY_BOUNDARY.finditer(text),
+        ),
+        key=lambda match: match.start(),
+    )
+    for match in boundaries:
         if match.group("boundary").upper() == "BEGIN":
             if open_start is None:
                 open_start = match.start()
@@ -1433,7 +1459,6 @@ def _json_container_end(text: str, start: int) -> int:
 
 def _omit_json_credential_documents(text: str) -> tuple[str, int]:
     """Omit complete JSON objects that are recognizable credential records."""
-    decoder = json.JSONDecoder()
     ranges: list[tuple[int, int]] = []
     covered_until = 0
     parse_failures = 0
@@ -1444,7 +1469,7 @@ def _omit_json_credential_documents(text: str) -> tuple[str, int]:
         if start < covered_until:
             continue
         try:
-            value, end = decoder.raw_decode(text, start)
+            value, end = _JSON_DECODER.raw_decode(text, start)
         except (json.JSONDecodeError, RecursionError, ValueError):
             parse_failures += 1
             if parse_failures >= _MAX_JSON_PARSE_FAILURES:
@@ -1629,6 +1654,7 @@ def _omit_ambiguous_yaml_credential_documents(text: str) -> tuple[str, int]:
         )
         if (
             _YAML_ONLY_ESCAPED_MAPPING_KEY.search(text, start, end)
+            or _YAML_MULTILINE_EXPLICIT_QUOTED_KEY.search(text, start, end)
             or _YAML_ALIAS_MAPPING_KEY.search(text, start, end)
             or explicit_credential_key
         ):
