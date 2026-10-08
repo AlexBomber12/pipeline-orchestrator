@@ -1740,6 +1740,7 @@ def _command_specific_credential_value_start(line: str) -> int | None:
                 "curl-user",
                 "docker-password",
                 "mongosh-password",
+                "openssl-enc-secret",
                 "redis-password",
                 "sshpass-password",
             }:
@@ -1787,9 +1788,12 @@ def _command_specific_credential_value_start(line: str) -> int | None:
         elif command == "curl":
             if compact in {"-b", "--cookie"}:
                 pending_option = "curl-cookie"
-            elif compact == "--pass":
+            elif compact in {"--pass", "--proxy-pass"}:
                 pending_option = "curl-passphrase"
-            elif compact.startswith("--pass=") and len(compact) > len("--pass="):
+            elif any(
+                compact.startswith(prefix) and len(compact) > len(prefix)
+                for prefix in ("--pass=", "--proxy-pass=")
+            ):
                 return match.start()
             elif compact_case == "-E" or compact in {"--cert", "--proxy-cert"}:
                 pending_option = "curl-certificate"
@@ -1822,8 +1826,12 @@ def _command_specific_credential_value_start(line: str) -> int | None:
                 and "=" in compact[len("--cookie=") :]
             ):
                 return match.start()
-        elif command == "openssl":
-            if compact in {"-passin", "-passout"}:
+        elif command in {"openssl", "openssl-enc"}:
+            if command == "openssl" and compact == "enc":
+                command = "openssl-enc"
+            elif command == "openssl-enc" and compact_case in {"-k", "-K"}:
+                pending_option = "openssl-enc-secret"
+            elif compact in {"-passin", "-passout"}:
                 pending_option = "openssl-password"
             elif any(
                 compact.startswith(prefix) and len(compact) > len(prefix)
@@ -2694,6 +2702,36 @@ def _is_aws_secrets_manager_value_command(line: str) -> bool:
     return False
 
 
+def _is_gcloud_secret_manager_access_command(line: str) -> bool:
+    expected = ("secrets", "versions", "access")
+    stage = 0
+    active = False
+    has_out_file = False
+    for match in _SHELL_COMMAND_WORD.finditer(_normalize_shell_credential_names(line)):
+        word = match.group(0)
+        if word in ";&|<>()":
+            if active and stage == len(expected) and not has_out_file:
+                return True
+            active = False
+            stage = 0
+            has_out_file = False
+            continue
+        compact = word.strip("'\"").replace("_", "").lower()
+        executable = compact.replace("\\", "/").rsplit("/", 1)[-1]
+        if executable.removesuffix(".exe") == "gcloud":
+            active = True
+            stage = 0
+            has_out_file = False
+            continue
+        if not active:
+            continue
+        if compact == "--out-file" or compact.startswith("--out-file="):
+            has_out_file = True
+        elif stage < len(expected) and compact == expected[stage]:
+            stage += 1
+    return active and stage == len(expected) and not has_out_file
+
+
 def _is_kubectl_decoded_secret_command(line: str) -> bool:
     """Recognize the documented kubectl Secret JSONPath decode pipeline."""
     segments = _normalize_shell_credential_names(line).split("|")
@@ -2745,6 +2783,7 @@ def _omit_secret_scalar_command_output(text: str) -> tuple[str, int]:
         if not (
             _is_azure_key_vault_secret_value_command(content)
             or _is_aws_secrets_manager_value_command(content)
+            or _is_gcloud_secret_manager_access_command(content)
             or _is_kubectl_decoded_secret_command(content)
         ):
             sanitized.append(lines[index])

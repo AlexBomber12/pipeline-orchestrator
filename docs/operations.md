@@ -111,6 +111,9 @@ An exact AWS Secrets Manager `get-secret-value` command selecting
 `SecretString` or `SecretBinary` with text output receives the same scalar
 handling, including when those global output or query options precede the
 service name.
+An exact `gcloud secrets versions access` command without `--out-file` also
+receives fail-closed remainder handling because it writes secret data to
+standard output.
 The documented `kubectl get secret` JSONPath pipeline into `base64 --decode`
 also receives the same fail-closed remainder handling, including when inherited
 global options precede the `get secret` subcommand.
@@ -145,11 +148,13 @@ command-specific context using a monotonic bounded word scan. Curl certificate
 and proxy-certificate arguments with embedded `certificate:password` suffixes
 are omitted by that curl-scoped scan while passwordless certificate arguments
 remain visible. URLs do not replace the active curl scope, and curl `--pass`
-private-key passphrases are omitted in separated or equals forms. OpenSSL `-passin`
-and `-passout` arguments using the inline `pass:password` source are omitted by
-the same command-scoped scan; indirect password sources such as files remain
-visible. Mongosh short `-p` password arguments are likewise omitted only in
-their command span, preserving unrelated short options.
+and `--proxy-pass` private-key passphrases are omitted in separated or equals
+forms. OpenSSL `-passin` and `-passout` arguments using the inline
+`pass:password` source are omitted by the same command-scoped scan; indirect
+password sources such as files remain visible. OpenSSL `enc` passphrases and
+raw keys supplied through `-k` and uppercase `-K` are omitted in that
+subcommand scope. Mongosh short `-p` password arguments are likewise omitted
+only in their command span, preserving unrelated short options.
 Credential commands launched through `sudo`, `env`, `command`, `exec`, or
 `nohup` are omitted conservatively rather than interpreting wrapper-specific
 options.

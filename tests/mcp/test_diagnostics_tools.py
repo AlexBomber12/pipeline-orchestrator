@@ -2121,6 +2121,14 @@ async def test_latest_cli_log_omits_openssl_passin_with_bounded_command_scan(
             "openssl genpkey -passout=pass:openssl-attached-passout-secret",
             "safe-openssl-attached-passout",
         ),
+        (
+            "openssl enc -aes-256-cbc -k openssl-enc-passphrase-secret",
+            "safe-openssl-enc-passphrase",
+        ),
+        (
+            "openssl enc -aes-256-cbc -K A1B2C3D4E5F60718",
+            "safe-openssl-enc-raw-key",
+        ),
     )
     redis = FakeRedis()
     redis.store[cli_log_latest(SLUG)] = "\n".join(
@@ -2143,6 +2151,8 @@ async def test_latest_cli_log_omits_openssl_passin_with_bounded_command_scan(
     assert "openssl-fragmented-passin-secret" not in result["text"]
     assert "openssl-passout-secret" not in result["text"]
     assert "openssl-attached-passout-secret" not in result["text"]
+    assert "openssl-enc-passphrase-secret" not in result["text"]
+    assert "A1B2C3D4E5F60718" not in result["text"]
 
     repeated_curl = ("curl x " * diagnostics._MAX_CLI_LOG_SOURCE_BYTES)[
         : diagnostics._MAX_CLI_LOG_SOURCE_BYTES
@@ -2345,6 +2355,10 @@ async def test_latest_cli_log_omits_curl_certificate_passwords(
             "sftp://host/file",
             "safe-after-curl-attached-key-passphrase",
         ),
+        (
+            "curl --proxy-pass curl-proxy-passphrase-secret https://example.test",
+            "safe-after-curl-proxy-passphrase",
+        ),
     )
     redis = FakeRedis()
     redis.store[cli_log_latest(SLUG)] = "\n".join(
@@ -2369,6 +2383,7 @@ async def test_latest_cli_log_omits_curl_certificate_passwords(
         "curl-user-after-url-secret",
         "curl-key-passphrase-secret",
         "curl-attached-key-passphrase-secret",
+        "curl-proxy-passphrase-secret",
     ):
         assert secret not in result["text"]
 
@@ -2511,6 +2526,15 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
     assert diagnostics._is_aws_secrets_manager_value_command(
         "aws --query SecretBinary --output=text secretsmanager get-secret-value"
     )
+    assert diagnostics._is_gcloud_secret_manager_access_command(
+        "gcloud secrets versions access latest --secret=demo"
+    )
+    assert diagnostics._is_gcloud_secret_manager_access_command(
+        "gcloud secrets versions access latest --secret=demo; echo safe"
+    )
+    assert not diagnostics._is_gcloud_secret_manager_access_command(
+        "gcloud secrets versions access latest --secret=demo --out-file=secret.bin"
+    )
     assert diagnostics._is_kubectl_decoded_secret_command(
         "/usr/bin/kubectl.exe get secrets demo -o "
         "jsonpath='{.data.token}' | /usr/bin/base64.exe -d"
@@ -2532,6 +2556,7 @@ async def test_latest_cli_log_omits_remainder_after_secret_scalar_commands(
         "--query SecretString --output text",
         "aws --output text secretsmanager get-secret-value "
         "--secret-id synthetic --query SecretString",
+        "gcloud secrets versions access latest --secret=demo",
         "kubectl get secret demo -o jsonpath='{.data.password}' | base64 --decode",
         "kubectl --context demo --namespace synthetic get secret demo "
         "-o jsonpath='{.data.password}' | base64 --decode",
