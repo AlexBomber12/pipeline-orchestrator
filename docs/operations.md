@@ -50,7 +50,7 @@ credential-bearing absolute or
 scheme-relative URL userinfo/query parameters (including percent-encoded
 parameter names, Azure SAS signatures, and AWS/Google presigned signatures),
 recognizable token shapes including JWTs, standard GitLab token prefixes, PyPI
-API tokens, and Slack webhooks, private-key blocks,
+and npm API tokens, and Slack webhooks, private-key blocks,
 PuTTY private-key documents, standalone AWS access-key identifiers and AWS
 credential CSVs with quoted or unquoted fields and an optional leading UTF-8
 BOM, curl user/proxy-user credentials using separated or attached short-option
@@ -90,6 +90,8 @@ shell-fragmented or quoted short flags. Redis CLI password flags use the same
 bounded shell-fragment normalization before command-specific matching.
 Azure CLI `az login` recognizes its `-p` password or service-principal-secret
 alias in the same command-specific context; unrelated `-p` options remain visible.
+The `sshpass -p` separated, attached, and shell-fragmented password forms are
+also recognized only in their command-specific context.
 Positional access-key, secret-key, and session-token values passed through
 `aws configure set` (including after up to 16 global-option words), plus
 `redis-cli`'s `-a` and `--pass` password flags, are also omitted only in their

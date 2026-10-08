@@ -640,6 +640,12 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "safe-after-azure-login-password-option",
             "az login -'p' azure-fragmented-password-secret",
             "safe-after-azure-fragmented-password-option",
+            "sshpass -p sshpass-separated-password-secret ssh synthetic@example.test",
+            "safe-after-sshpass-separated-password-option",
+            "/usr/bin/sshpass -psshpass-attached-password-secret ssh synthetic@example.test",
+            "safe-after-sshpass-attached-password-option",
+            "sshpass -'p' sshpass-fragmented-password-secret ssh synthetic@example.test",
+            "safe-after-sshpass-fragmented-password-option",
             "aws configure set aws_secret_access_key aws-config-secret",
             "safe-after-aws-config-credential",
             "aws configure set aws_session_token aws-session-token-secret",
@@ -1060,6 +1066,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-docker-quoted-password-option" in exported
     assert "safe-after-azure-login-password-option" in exported
     assert "safe-after-azure-fragmented-password-option" in exported
+    assert "safe-after-sshpass-separated-password-option" in exported
+    assert "safe-after-sshpass-attached-password-option" in exported
+    assert "safe-after-sshpass-fragmented-password-option" in exported
     assert "safe-after-aws-config-credential" in exported
     assert "safe-after-aws-session-token" in exported
     assert "safe-after-aws-profile-credential" in exported
@@ -1199,6 +1208,9 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "docker-quoted-password-secret",
         "azure-login-password-secret",
         "azure-fragmented-password-secret",
+        "sshpass-separated-password-secret",
+        "sshpass-attached-password-secret",
+        "sshpass-fragmented-password-secret",
         "aws-config-secret",
         "aws-session-token-secret",
         "aws-profile-secret",
@@ -2012,22 +2024,22 @@ async def test_latest_cli_log_redacts_standard_gitlab_token_prefixes(
     assert all(token not in result["text"] for token in synthetic_tokens)
 
 
-async def test_latest_cli_log_redacts_recognizable_pypi_token(
+async def test_latest_cli_log_redacts_recognizable_package_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from src.mcp.tools import diagnostics
 
-    synthetic_token = "pypi-" + ("A" * 85)
+    synthetic_tokens = ("pypi-" + ("A" * 85), "npm_" + ("a" * 36))
     redis = FakeRedis()
-    redis.store[cli_log_latest(SLUG)] = (
-        f"safe-before\n{synthetic_token}\nsafe-after"
+    redis.store[cli_log_latest(SLUG)] = "\n".join(
+        ("safe-before", *synthetic_tokens, "safe-after")
     )
     _patch_runtime(monkeypatch, redis)
 
     result = await diagnostics.get_latest_cli_log(SLUG)
 
-    assert result["text"] == "safe-before\n[REDACTED]\nsafe-after"
-    assert synthetic_token not in result["text"]
+    assert result["text"] == "safe-before\n[REDACTED]\n[REDACTED]\nsafe-after"
+    assert all(token not in result["text"] for token in synthetic_tokens)
 
 
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(

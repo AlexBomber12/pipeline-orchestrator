@@ -278,6 +278,10 @@ _AZ_LOGIN_PASSWORD_OPTION = re.compile(
     r"[^;&|<>\r\n]*?(?<!\S)login(?=[ \t]|$)"
     r"[^;&|<>\r\n]*?(?<!\S)-_*p_*(?:[ \t]+|=)?[^ \t;&|<>()]+"
 )
+_SSHPASS_PASSWORD_OPTION = re.compile(
+    r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?sshpass(?:\.exe)?(?=[ \t])"
+    r"[^;&|<>\r\n]*?(?<!\S)-_*p_*(?:[ \t]+|=)?[^ \t;&|<>()]+"
+)
 _AWS_CONFIGURE_SET_CREDENTIAL = re.compile(
     r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?aws(?:\.exe)?[ \t]+"
     r"(?:[^ \t;&|<>()]+[ \t]+){0,16}?"
@@ -369,6 +373,7 @@ _RECOGNIZABLE_SECRET = tuple(
         r"\b(?:glpat|gloas|gldt|glrt|glrtr|glcbt|glptt|glft|glimt|"
         r"glagent|glwt|glsoat|glffct)-[A-Za-z0-9_-]{20,}\b",
         r"\bpypi-[A-Za-z0-9_-]{85,}\b",
+        r"\bnpm_[A-Za-z0-9]{36}\b",
         r"\bhttps://hooks\.slack(?:-gov)?\.com/(?:services/)?"
         r"T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]{24}\b",
     )
@@ -1653,6 +1658,9 @@ def _sensitive_value_start(line: str) -> int | None:
     azure_password = _AZ_LOGIN_PASSWORD_OPTION.search(normalized_line)
     if azure_password is not None:
         return azure_password.end()
+    sshpass_password = _SSHPASS_PASSWORD_OPTION.search(normalized_line)
+    if sshpass_password is not None:
+        return sshpass_password.end()
     aws_credential = _AWS_CONFIGURE_SET_CREDENTIAL.search(line)
     if aws_credential is not None:
         return aws_credential.end()
