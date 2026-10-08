@@ -45,8 +45,8 @@ credential value, so the service fails closed with
 `cli_log_producer_truncated` instead of exporting that record. Authorization
 headers, token, password, and passphrase assignments or long-option arguments
 and their multiline shell groups, cookies, credential-bearing absolute or
-scheme-relative URL userinfo/query
-parameters (including percent-encoded parameter names and Azure SAS signatures),
+scheme-relative URL userinfo/query parameters (including percent-encoded
+parameter names, Azure SAS signatures, and AWS/Google presigned signatures),
 recognizable token shapes including JWTs and Slack webhooks, private-key blocks,
 PuTTY private-key documents, standalone AWS access-key identifiers and AWS
 credential CSVs, curl user/proxy-user credentials, netrc whitespace-delimited
@@ -61,6 +61,8 @@ block-sequence, or flow-mapping `kind` values. Complete and interrupted
 private-key blocks are both omitted using bounded boundary scans.
 Standard encoded `auth` fields used by registry and package-manager credential
 documents are treated as credential context rather than exported as base64 text.
+YAML documents with mapping keys that use recognized YAML-only escape forms are
+omitted conservatively rather than partially decoded.
 Recognizable XML credential elements, credential attributes, and `key`/`name`
 plus `value` configuration tags are omitted. XML character references in
 credential selectors are decoded before classification. Multiline or incomplete

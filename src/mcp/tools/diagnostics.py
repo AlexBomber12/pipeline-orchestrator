@@ -113,6 +113,12 @@ _JSON_SIMPLE_ESCAPE = re.compile(r'\\(?P<escape>["\\/bfnrt])')
 _YAML_DOCUMENT_BOUNDARY = re.compile(r"(?m)^(?:---|\.\.\.)[ \t]*(?:#.*)?(?:\n|$)")
 _YAML_ALIAS = re.compile(r"(?<![A-Za-z0-9_.-])\*[^\s,\[\]{}#]+")
 _YAML_COMMENT = re.compile(r"(?<!\S)#")
+_YAML_ONLY_ESCAPED_MAPPING_KEY = re.compile(
+    r'(?m)(?:^[ \t]*(?:-[ \t]+)?|[,{][ \t]*)"'
+    r'(?:[^"\\\r\n]|\\[^\r\n]|\\(?:\r\n|\n)[ \t]*)*'
+    r"\\(?:[0ave _NLP]|x[0-9a-fA-F]{2}|U[0-9a-fA-F]{8})"
+    r'(?:[^"\\\r\n]|\\[^\r\n]|\\(?:\r\n|\n)[ \t]*)*"[ \t]*:'
+)
 _YAML_BLOCK_VALUE_INDICATOR = re.compile(
     r"^(?:[|>](?:[1-9][+-]?|[+-][1-9]?)?)?$"
 )
@@ -180,6 +186,10 @@ _PUTTY_PRIVATE_KEY_END = re.compile(
 _URL_USERINFO = re.compile(r"(?i)(?P<scheme>(?:\b[a-z][a-z0-9+.-]*:)?//)[^/@\s]+@")
 _QUERY_PARAMETER_VALUE = re.compile(
     r"(?P<separator>[?&;])(?P<name>[^=&#;\s]+)=(?P<value>[^&#;\s]+)"
+)
+_PROVIDER_SIGNATURE_VALUE = re.compile(
+    r"(?i)(?P<prefix>(?<![A-Za-z0-9])X-(?:Amz|Goog)-Signature"
+    r"[ \t]*=[ \t]*)[^&#;\s]+"
 )
 _AUTHORIZATION_VALUE = re.compile(
     r"(?i)\b(?P<scheme>Bearer|Basic|Digest|Negotiate|ApiKey|Token)[ \t]+\S+"
@@ -1219,7 +1229,12 @@ def _redact_sensitive_query_values(text: str) -> tuple[str, int]:
 
     def redact(match: re.Match[str]) -> str:
         nonlocal redactions
-        if unquote_plus(match.group("name")).lower() not in {"sig", "signature"}:
+        if unquote_plus(match.group("name")).lower() not in {
+            "sig",
+            "signature",
+            "x-amz-signature",
+            "x-goog-signature",
+        }:
             return match.group(0)
         redactions += 1
         return f"{match.group('separator')}{match.group('name')}={_REDACTED}"
@@ -1559,6 +1574,9 @@ def _omit_ambiguous_yaml_credential_documents(text: str) -> tuple[str, int]:
     """Fail closed for YAML credential values unsafe to redact line by line."""
     ranges: list[tuple[int, int]] = []
     for start, end in _yaml_document_ranges(text):
+        if _YAML_ONLY_ESCAPED_MAPPING_KEY.search(text, start, end):
+            ranges.append((start, end))
+            continue
         document_has_alias = _YAML_ALIAS.search(text, start, end) is not None
         for line in text[start:end].splitlines():
             value_start = _sensitive_value_start(line)
@@ -1704,6 +1722,11 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     text, count = _URL_USERINFO.subn(lambda match: f"{match.group('scheme')}{_REDACTED}@", text)
     redactions += count
     text, count = _redact_sensitive_query_values(text)
+    redactions += count
+    text, count = _PROVIDER_SIGNATURE_VALUE.subn(
+        lambda match: f"{match.group('prefix')}{_REDACTED}",
+        text,
+    )
     redactions += count
     text, count = _AUTHORIZATION_VALUE.subn(
         lambda match: f"{match.group('scheme')} {_REDACTED}",
