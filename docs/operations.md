@@ -60,8 +60,8 @@ JSON-list or Python-tuple form. Recognizable Kubernetes Secret documents are
 omitted as a whole in YAML or JSON form, including arbitrary keys under `data` or
 `stringData`, decorated, explicit, quoted, or escaped `kind` keys, and `kind`
 values that are anchored, aliased, tagged using non-specific, shorthand, or
-verbatim forms, escaped double-quoted, node-property-decorated multiline, or
-block-scalar
+verbatim forms, escaped double-quoted, decorated by one or more multiline node
+property lines, or block-scalar
 (including indentation indicators), multiline plain-scalar, block-sequence, or
 flow-mapping `kind` values. Explicit `kind` keys inside flow mappings are also
 recognized regardless of member order. Complete and interrupted private-key
@@ -98,7 +98,8 @@ hide an earlier credential value. Recognizable RSA, EC, OKP, and symmetric
 private JWK objects are omitted while public JWKs remain exportable. PEM, SSH2,
 and PuTTY version 1 through 3 private-key documents are omitted through their
 recognized boundaries, including the version 1 `Private-Hash` terminator;
-incomplete blocks fail closed.
+PEM and SSH2 end labels must match their opening label, and incomplete or
+mismatched blocks fail closed.
 Lines with recognizable credential keys are omitted conservatively when they
 use assignment, structured-field, header, or long-option syntax. Balanced
 quotes around recognized multiword credential labels are supported, so

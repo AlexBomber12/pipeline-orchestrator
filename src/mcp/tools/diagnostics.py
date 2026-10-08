@@ -100,12 +100,12 @@ _JWK_ASYMMETRIC_KEY_TYPES = frozenset({"ec", "okp", "rsa"})
 _JWK_PRIVATE_PARAMETERS = frozenset({"d", "dp", "dq", "oth", "p", "q", "qi"})
 _PEM_CREDENTIAL_BOUNDARY = re.compile(
     r"-----(?P<boundary>BEGIN|END) "
-    r"(?:[A-Z0-9 ]{0,64}PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----",
+    r"(?P<label>[A-Z0-9 ]{0,64}PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----",
     re.IGNORECASE,
 )
 _SSH2_PRIVATE_KEY_BOUNDARY = re.compile(
     r"----[ \t]+(?P<boundary>BEGIN|END)[ \t]+SSH2"
-    r"(?:[ \t]+ENCRYPTED)?[ \t]+PRIVATE[ \t]+KEY[ \t]+----",
+    r"(?P<label>(?:[ \t]+ENCRYPTED)?[ \t]+PRIVATE[ \t]+KEY)[ \t]+----",
     re.IGNORECASE,
 )
 _TERMINAL_ESCAPE = re.compile(
@@ -204,7 +204,9 @@ _KUBERNETES_SECRET_BLOCK_KIND = re.compile(
 _KUBERNETES_MULTILINE_SECRET_KIND = re.compile(
     _KUBERNETES_BLOCK_KIND_PREFIX
     + _YAML_NODE_PROPERTIES_LINE
-    + r"(?:#.*)?\n(?:[ \t]*(?:#.*)?\n)*[ \t]+"
+    + r"(?:#.*)?\n(?:[ \t]*(?:#.*)?\n|[ \t]+"
+    + _YAML_NODE_PROPERTY
+    + rf"(?:[ \t]+{_YAML_NODE_PROPERTY})*[ \t]*(?:#.*)?\n)*[ \t]+"
     + _YAML_NODE_PROPERTIES
     + r"(?P<multiline_quote>['\"]?)Secret(?P=multiline_quote)"
     + r"[ \t]*(?:#.*)?(?:\n|$)"
@@ -1261,6 +1263,7 @@ def _omit_putty_private_key_documents(text: str) -> tuple[str, int]:
 def _omit_pem_credential_documents(text: str) -> tuple[str, int]:
     ranges: list[tuple[int, int]] = []
     open_start: int | None = None
+    open_marker: tuple[str, str] | None = None
 
     def add_range(start: int, end: int) -> None:
         if start == 0:
@@ -1270,21 +1273,24 @@ def _omit_pem_credential_documents(text: str) -> tuple[str, int]:
             ranges.append((start, end))
 
     boundaries = sorted(
-        (
-            *_PEM_CREDENTIAL_BOUNDARY.finditer(text),
-            *_SSH2_PRIVATE_KEY_BOUNDARY.finditer(text),
-        ),
-        key=lambda match: match.start(),
+        [
+            *((match, "pem") for match in _PEM_CREDENTIAL_BOUNDARY.finditer(text)),
+            *((match, "ssh2") for match in _SSH2_PRIVATE_KEY_BOUNDARY.finditer(text)),
+        ],
+        key=lambda item: item[0].start(),
     )
-    for match in boundaries:
+    for match, marker_format in boundaries:
+        marker = (marker_format, " ".join(match.group("label").upper().split()))
         if match.group("boundary").upper() == "BEGIN":
             if open_start is None:
                 open_start = match.start()
+                open_marker = marker
         elif open_start is None:
             add_range(0, match.end())
-        else:
+        elif marker == open_marker:
             add_range(open_start, match.end())
             open_start = None
+            open_marker = None
     if open_start is not None:
         add_range(open_start, len(text))
     if not ranges:

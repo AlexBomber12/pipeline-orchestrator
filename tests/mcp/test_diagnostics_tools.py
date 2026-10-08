@@ -643,6 +643,13 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "  arbitrary-name: kubernetes-property-multiline-kind-secret",
             "---",
             "apiVersion: v1",
+            "kind: &resourceKindMulti",
+            "  !!str",
+            "  Secret",
+            "data:",
+            "  arbitrary-name: kubernetes-multiple-property-lines-secret",
+            "---",
+            "apiVersion: v1",
             r'kind: "Sec\u0072et"',
             "data:",
             "  arbitrary-name: kubernetes-escaped-kind-secret",
@@ -1023,6 +1030,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "kubernetes-verbatim-tag-secret",
         "kubernetes-multiline-kind-secret",
         "kubernetes-property-multiline-kind-secret",
+        "kubernetes-multiple-property-lines-secret",
         "kubernetes-escaped-kind-secret",
         "kubernetes-quoted-key-secret",
         "kubernetes-escaped-key-secret",
@@ -1150,6 +1158,31 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     orphaned_end = await diagnostics.get_latest_cli_log(SLUG)
     assert orphaned_end["text"] == "[credential document omitted]\nsafe-after"
     assert "orphaned-private-secret" not in orphaned_end["text"]
+
+    mismatched_pem_redis = FakeRedis()
+    mismatched_pem_redis.store[key] = (
+        "safe-before\n-----BEGIN PRIVATE KEY-----\n"
+        "mismatched-before-secret\n-----END PGP PRIVATE KEY BLOCK-----\n"
+        "mismatched-after-secret\n-----END PRIVATE KEY-----\nsafe-after"
+    )
+    _patch_runtime(monkeypatch, mismatched_pem_redis)
+    mismatched_pem = await diagnostics.get_latest_cli_log(SLUG)
+    assert mismatched_pem["text"] == "safe-before\n[credential document omitted]\nsafe-after"
+    assert "mismatched-before-secret" not in mismatched_pem["text"]
+    assert "mismatched-after-secret" not in mismatched_pem["text"]
+
+    unclosed_mismatched_pem_redis = FakeRedis()
+    unclosed_mismatched_pem_redis.store[key] = (
+        "safe-before\n-----BEGIN PRIVATE KEY-----\n"
+        "unclosed-before-secret\n-----END PGP PRIVATE KEY BLOCK-----\n"
+        "unclosed-after-secret\nsafe-after"
+    )
+    _patch_runtime(monkeypatch, unclosed_mismatched_pem_redis)
+    unclosed_mismatched_pem = await diagnostics.get_latest_cli_log(SLUG)
+    assert unclosed_mismatched_pem["text"] == "safe-before\n[credential document omitted]"
+    assert "unclosed-before-secret" not in unclosed_mismatched_pem["text"]
+    assert "unclosed-after-secret" not in unclosed_mismatched_pem["text"]
+    assert "safe-after" not in unclosed_mismatched_pem["text"]
 
     orphaned_ssh2_redis = FakeRedis()
     orphaned_ssh2_redis.store[key] = (
