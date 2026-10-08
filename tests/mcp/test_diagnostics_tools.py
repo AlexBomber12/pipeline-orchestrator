@@ -1403,6 +1403,41 @@ async def test_latest_cli_log_redacts_bundled_curl_urls_and_structured_pairs(
         assert secret not in result["text"]
 
 
+async def test_latest_cli_log_omits_embedded_json_and_powershell_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    key = cli_log_latest(SLUG)
+    redis = FakeRedis()
+    redis.store[key] = "\n".join(
+        (
+            "safe-before-json",
+            r'{"message":"response: \u007b\u0022password\u0022\u003a'
+            r'\u0022SYNTHETIC_EMBEDDED_UNICODE_SECRET\u0022\u007d"}',
+            "safe-after-json",
+            "Connect-Service -ClientSecret SYNTHETIC_POWERSHELL_SECRET",
+            "safe-after-powershell",
+        )
+    )
+    _patch_runtime(monkeypatch, redis)
+
+    result = await diagnostics.get_latest_cli_log(SLUG)
+
+    assert result["availability"]["status"] == "available"
+    assert result["text"] == (
+        'safe-before-json\n{"message":[credential document omitted]}\n'
+        "safe-after-json\n"
+        "[credential line omitted]\nsafe-after-powershell"
+    )
+    assert "SYNTHETIC_EMBEDDED_UNICODE_SECRET" not in result["text"]
+    assert "SYNTHETIC_POWERSHELL_SECRET" not in result["text"]
+    assert diagnostics._contains_credential_document_key(
+        "{" + ("x" * diagnostics._MAX_CLI_LOG_SOURCE_BYTES)
+    )
+    assert not diagnostics._contains_credential_document_key("message: {not-json}")
+
+
 async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

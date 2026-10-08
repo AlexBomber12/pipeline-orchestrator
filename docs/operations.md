@@ -43,8 +43,9 @@ reports source/output sizes, truncation, observation time, and remaining Redis
 TTL. A producer `[truncated]` marker means the stored tail may begin inside a
 credential value, so the service fails closed with
 `cli_log_producer_truncated` instead of exporting that record. Authorization
-headers, token, password, and passphrase assignments or long-option arguments
-and their multiline shell groups, cookies, credential-bearing absolute or
+headers, token, password, and passphrase assignments or long- and PowerShell-style
+single-hyphen option arguments and their multiline shell groups, cookies,
+credential-bearing absolute or
 scheme-relative URL userinfo/query parameters (including percent-encoded
 parameter names, Azure SAS signatures, and AWS/Google presigned signatures),
 recognizable token shapes including JWTs and Slack webhooks, private-key blocks,
@@ -55,7 +56,8 @@ arguments, netrc passwords delimited by horizontal whitespace or a newline,
 and recognizable JSON
 credential documents are not exported, including nested documents and documents
 serialized inside log strings, documents whose container and field syntax is
-Unicode-escaped inside a JSON string, and structured header name/value pairs in
+Unicode-escaped inside a JSON string (including after ordinary decoded message
+text), and structured header name/value pairs in
 JSON-list or Python-tuple form. Recognizable Kubernetes Secret documents are
 omitted as a whole in YAML or JSON form, including arbitrary keys under `data` or
 `stringData`, decorated, explicit, quoted, or escaped `kind` keys, and `kind`

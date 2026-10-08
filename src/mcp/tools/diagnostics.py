@@ -1139,6 +1139,7 @@ def _source_summary(statuses: list[str]) -> str:
 
 def _contains_credential_document_key(value: object) -> bool:
     pending = [value]
+    embedded_json_work = 0
     while pending:
         current = pending.pop()
         if isinstance(current, (_JSONObjectPairs, dict)):
@@ -1181,9 +1182,30 @@ def _contains_credential_document_key(value: object) -> bool:
             try:
                 decoded = _JSON_DECODER.decode(current)
             except (json.JSONDecodeError, RecursionError, ValueError):
-                continue
-            if isinstance(decoded, (dict, list, str)):
-                pending.append(decoded)
+                pass
+            else:
+                if isinstance(decoded, (dict, list, str)):
+                    pending.append(decoded)
+                    continue
+
+            cursor = 0
+            while match := _JSON_CONTAINER_START.search(current, cursor):
+                remaining_work = (
+                    _MAX_JSON_FALLBACK_SCAN_CHARACTERS - embedded_json_work
+                )
+                boundary = _json_container_end(current, match.start(), remaining_work)
+                if boundary is None:
+                    return True
+                end, work = boundary
+                embedded_json_work += work
+                try:
+                    embedded = _JSON_DECODER.decode(current[match.start() : end])
+                except (json.JSONDecodeError, RecursionError, ValueError):
+                    cursor = max(end, match.end())
+                    continue
+                if isinstance(embedded, (dict, list, str)):
+                    pending.append(embedded)
+                cursor = max(end, match.end())
     return False
 
 
@@ -1539,7 +1561,7 @@ def _sensitive_value_start(line: str) -> int | None:
 
         delimiter = line[cursor] if cursor < len(line) else ""
         sensitive_delimiter = delimiter in {"=", ":", ","}
-        option_value = candidate.startswith("--") and (
+        option_value = candidate.startswith("-") and (
             cursor > whitespace_start or delimiter in {"=", ":"}
         )
         if _is_sensitive_key(candidate):
