@@ -592,6 +592,13 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "data:",
             "  arbitrary-name: kubernetes-explicit-kind-secret",
             "---",
+            "apiVersion: v1",
+            "kind: List",
+            "items:",
+            "  - kind: Secret",
+            "    data:",
+            "      arbitrary-name: kubernetes-sequence-kind-secret",
+            "---",
             "{data: {arbitrary: kubernetes-flow-secret}, kind: Secret}",
             "---",
             r'{"k\u0069nd": "Sec\u0072et", data: {arbitrary: kubernetes-flow-escaped-secret}}',
@@ -644,6 +651,11 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "",
             "  reversed-numeric-yaml-block-secret",
             "safe-after-reversed-numeric-yaml-block",
+            "password:",
+            "# explanation",
+            "",
+            "  yaml-comment-line-secret",
+            "safe-after-yaml-comment",
             "PASSWORD=$(cat <<EOF)",
             "heredoc-secret",
             "EOF",
@@ -714,6 +726,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-yaml-blank" in exported
     assert "safe-after-numeric-yaml-block" in exported
     assert "safe-after-reversed-numeric-yaml-block" in exported
+    assert "safe-after-yaml-comment" in exported
     assert "safe-after-heredoc" in exported
     assert "safe-after-digit-heredoc" in exported
     assert "safe-before-kubernetes-secret" in exported
@@ -807,6 +820,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "kubernetes-escaped-key-secret",
         "kubernetes-aliased-kind-secret",
         "kubernetes-explicit-kind-secret",
+        "kubernetes-sequence-kind-secret",
         "kubernetes-flow-secret",
         "kubernetes-flow-escaped-secret",
         "quoted cli token",
@@ -833,6 +847,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "yaml-leading-blank-secret",
         "numeric-yaml-block-secret",
         "reversed-numeric-yaml-block-secret",
+        "yaml-comment-line-secret",
         "heredoc-secret",
         "digit-heredoc-secret",
         "shell-multiline-secret",

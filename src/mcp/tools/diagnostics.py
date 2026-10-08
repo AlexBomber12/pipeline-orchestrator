@@ -124,20 +124,23 @@ _KUBERNETES_KIND_KEY = (
     r'''(?:kind|'kind'|"kind"|'''
     r'''"(?=[^"\r\n]*\\)(?:[^"\\\r\n]|\\[^\r\n])*")'''
 )
+_KUBERNETES_BLOCK_KIND_PREFIX = (
+    rf"(?im)^[ \t]*(?:-[ \t]+)?{_KUBERNETES_KIND_KEY}[ \t]*:[ \t]*"
+)
 _KUBERNETES_SECRET_KIND = re.compile(
-    rf"(?im)^[ \t]*{_KUBERNETES_KIND_KEY}[ \t]*:[ \t]*"
-    r"(?:(?:&|!)[^\s,\[\]{}]+[ \t]+)*"
+    _KUBERNETES_BLOCK_KIND_PREFIX
+    + r"(?:(?:&|!)[^\s,\[\]{}]+[ \t]+)*"
     r"(?P<quote>['\"]?)Secret(?P=quote)"
     r"[ \t]*(?:#.*)?$"
 )
 # YAML double-quoted scalars can resolve escapes; omit instead of partially decoding.
 _KUBERNETES_ESCAPED_QUOTED_KIND = re.compile(
-    rf'(?im)^[ \t]*{_KUBERNETES_KIND_KEY}[ \t]*:[ \t]*'
-    r'(?:(?:&|!)[^\s,\[\]{}]+[ \t]+)*"(?=[^\r\n]*\\)'
+    _KUBERNETES_BLOCK_KIND_PREFIX
+    + r'(?:(?:&|!)[^\s,\[\]{}]+[ \t]+)*"(?=[^\r\n]*\\)'
 )
 _KUBERNETES_SECRET_BLOCK_KIND = re.compile(
-    rf"(?im)^[ \t]*{_KUBERNETES_KIND_KEY}[ \t]*:[ \t]*"
-    r"[|>][0-9+-]{0,2}[ \t]*(?:#.*)?\n"
+    _KUBERNETES_BLOCK_KIND_PREFIX
+    + r"[|>][0-9+-]{0,2}[ \t]*(?:#.*)?\n"
     r"(?:[ \t]*\n)*[ \t]+Secret[ \t]*(?:\n|$)"
 )
 _KUBERNETES_FLOW_KIND_PREFIX = (
@@ -153,11 +156,12 @@ _KUBERNETES_FLOW_ESCAPED_QUOTED_KIND = re.compile(
     _KUBERNETES_FLOW_KIND_PREFIX + r'"(?=[^\r\n]*\\)'
 )
 _KUBERNETES_ALIAS_KIND = re.compile(
-    rf"(?im)(?:^|[{{,])[ \t\r\n]*{_KUBERNETES_KIND_KEY}"
+    rf"(?im)(?:^[ \t]*(?:-[ \t]+)?|[{{,][ \t\r\n]*){_KUBERNETES_KIND_KEY}"
     r"[ \t\r\n]*:[ \t\r\n]*\*[^\s,\[\]{}#]+"
 )
 _KUBERNETES_EXPLICIT_SECRET_KIND = re.compile(
-    rf"(?im)^[ \t]*\?[ \t]+{_KUBERNETES_KIND_KEY}[ \t]*(?:#.*)?\n"
+    rf"(?im)^[ \t]*(?:-[ \t]+)?\?[ \t]+{_KUBERNETES_KIND_KEY}"
+    r"[ \t]*(?:#.*)?\n"
     r"(?:[ \t]*\n)*[ \t]*:[ \t]*"
     r"(?:(?:&|!)[^\s,\[\]{}]+[ \t]+)*"
     r"(?P<explicit_quote>['\"]?)Secret(?P=explicit_quote)"
@@ -1653,10 +1657,20 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
                 continue
             indented = continuation.startswith((" ", "\t"))
             blank_in_block = (yaml_block or indented_block) and not continuation
+            comment_in_block = (yaml_block or indented_block) and (
+                continuation.lstrip().startswith("#")
+            )
             indentationless_sequence = yaml_block and (
                 continuation == "-" or continuation.startswith("- ")
             )
-            if not (open_quote or continued or indented or blank_in_block or indentationless_sequence):
+            if not (
+                open_quote
+                or continued
+                or indented
+                or blank_in_block
+                or comment_in_block
+                or indentationless_sequence
+            ):
                 break
             indented_block = indented_block or indented
             open_quote = _unterminated_quote(continuation, open_quote)
