@@ -2313,6 +2313,50 @@ def test_command_password_scans_are_monotonic_at_source_bound() -> None:
         assert diagnostics._command_specific_credential_value_start(repeated) is None
 
 
+async def test_latest_cli_log_omits_curl_certificate_passwords(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    cases = (
+        (
+            "curl --cert client.pem:curl-cert-password-secret https://example.test",
+            "safe-after-curl-cert-password",
+        ),
+        (
+            "curl -Eclient.pem:curl-short-cert-password-secret https://example.test",
+            "safe-after-curl-short-cert-password",
+        ),
+        (
+            "curl --proxy-cert=proxy.pem:curl-proxy-cert-password-secret "
+            "https://example.test",
+            "safe-after-curl-proxy-cert-password",
+        ),
+    )
+    redis = FakeRedis()
+    redis.store[cli_log_latest(SLUG)] = "\n".join(
+        (
+            *(line for payload, marker in cases for line in (payload, "---", marker, "---")),
+            "curl --cert client.pem https://example.test",
+            "tool -Eclient.pem:visible-unrelated-cert-argument",
+        )
+    )
+    _patch_runtime(monkeypatch, redis)
+
+    result = await diagnostics.get_latest_cli_log(SLUG)
+
+    assert all(marker in result["text"] for _payload, marker in cases)
+    assert "curl --cert client.pem https://example.test" in result["text"]
+    assert "tool -Eclient.pem:visible-unrelated-cert-argument" in result["text"]
+    assert all(payload not in result["text"] for payload, _marker in cases)
+    for secret in (
+        "curl-cert-password-secret",
+        "curl-short-cert-password-secret",
+        "curl-proxy-cert-password-secret",
+    ):
+        assert secret not in result["text"]
+
+
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

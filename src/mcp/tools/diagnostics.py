@@ -1689,6 +1689,12 @@ def _command_specific_credential_value_start(line: str) -> int | None:
             if selected_option == "curl-cookie" and "=" in compact:
                 return match.start()
             if (
+                selected_option == "curl-certificate"
+                and ":" in compact
+                and compact.rsplit(":", 1)[-1]
+            ):
+                return match.start()
+            if (
                 selected_option == "openssl-password"
                 and compact.startswith("pass:")
                 and len(compact) > len("pass:")
@@ -1721,6 +1727,20 @@ def _command_specific_credential_value_start(line: str) -> int | None:
         if command == "curl":
             if compact in {"-b", "--cookie"}:
                 pending_option = "curl-cookie"
+            elif compact_case == "-E" or compact in {"--cert", "--proxy-cert"}:
+                pending_option = "curl-certificate"
+            elif (
+                compact_case.startswith("-E")
+                and ":" in compact_case[len("-E") :]
+                and compact_case.rsplit(":", 1)[-1]
+                or any(
+                    compact.startswith(prefix)
+                    and ":" in compact[len(prefix) :]
+                    and compact.rsplit(":", 1)[-1]
+                    for prefix in ("--cert=", "--proxy-cert=")
+                )
+            ):
+                return match.start()
             elif compact.startswith("-") and not compact.startswith("--"):
                 short_options = compact[1:]
                 user_index = short_options.find("u")

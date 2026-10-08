@@ -123,7 +123,10 @@ URL userinfo redaction consumes through the final `@` in the bounded authority,
 and curl user/proxy-user short options are recognized when attached inside an
 option cluster or quoted as a complete shell argument. Curl `-b`/`--cookie`
 arguments containing explicit cookie data are likewise omitted in their
-command-specific context using a monotonic bounded word scan. OpenSSL `-passin`
+command-specific context using a monotonic bounded word scan. Curl certificate
+and proxy-certificate arguments with embedded `certificate:password` suffixes
+are omitted by that curl-scoped scan while passwordless certificate arguments
+remain visible. OpenSSL `-passin`
 and `-passout` arguments using the inline `pass:password` source are omitted by
 the same command-scoped scan; indirect password sources such as files remain
 visible. Mongosh short `-p` password arguments are likewise omitted only in
