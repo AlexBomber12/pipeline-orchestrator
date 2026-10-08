@@ -68,6 +68,8 @@ property lines, or block-scalar
 flow-mapping `kind` values. Explicit `kind` keys inside flow mappings are also
 recognized regardless of member order. Complete and interrupted private-key
 blocks are both omitted using bounded boundary scans.
+Logical command reconstruction recognizes trailing shell backslashes and
+PowerShell backticks before classifying split credential parameter names.
 URL userinfo redaction consumes through the final `@` in the bounded authority,
 and curl user/proxy-user short options are recognized when attached inside an
 option cluster. Multiline structured credential pairs retain grouping that

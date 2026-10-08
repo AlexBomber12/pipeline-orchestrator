@@ -1171,7 +1171,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         incomplete_group_redis.store[key] = f"safe-before\n{payload}"
         _patch_runtime(monkeypatch, incomplete_group_redis)
         incomplete_group = await diagnostics.get_latest_cli_log(SLUG)
-        assert incomplete_group["text"] == "safe-before\n[credential line omitted]\n"
+        ending = "" if payload.startswith("PASSWORD=`") else "\n"
+        assert incomplete_group["text"] == f"safe-before\n[credential line omitted]{ending}"
         assert secret not in incomplete_group["text"]
 
     multiple_heredoc_redis = FakeRedis()
@@ -1418,6 +1419,9 @@ async def test_latest_cli_log_omits_embedded_json_and_powershell_credentials(
             "safe-after-json",
             "Connect-Service -ClientSecret SYNTHETIC_POWERSHELL_SECRET",
             "safe-after-powershell",
+            "Connect-Service -ClientSec`",
+            "ret SYNTHETIC_SPLIT_POWERSHELL_SECRET",
+            "safe-after-split-powershell",
         )
     )
     _patch_runtime(monkeypatch, redis)
@@ -1428,10 +1432,12 @@ async def test_latest_cli_log_omits_embedded_json_and_powershell_credentials(
     assert result["text"] == (
         'safe-before-json\n{"message":[credential document omitted]}\n'
         "safe-after-json\n"
-        "[credential line omitted]\nsafe-after-powershell"
+        "[credential line omitted]\nsafe-after-powershell\n"
+        "[credential line omitted]\nsafe-after-split-powershell"
     )
     assert "SYNTHETIC_EMBEDDED_UNICODE_SECRET" not in result["text"]
     assert "SYNTHETIC_POWERSHELL_SECRET" not in result["text"]
+    assert "SYNTHETIC_SPLIT_POWERSHELL_SECRET" not in result["text"]
     assert diagnostics._contains_credential_document_key(
         "{" + ("x" * diagnostics._MAX_CLI_LOG_SOURCE_BYTES)
     )

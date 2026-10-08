@@ -2146,7 +2146,9 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
         content = line.rstrip("\r\n")
         logical_content = content
         logical_end = index + 1
-        while logical_content.rstrip().endswith("\\") and logical_end < len(lines):
+        while logical_content.rstrip().endswith(("\\", "`")) and logical_end < len(
+            lines
+        ):
             logical_content = (
                 logical_content.rstrip()[:-1] + lines[logical_end].rstrip("\r\n")
             )
@@ -2168,7 +2170,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
         sanitized.append(f"[credential line omitted]{ending}")
         omitted += 1
         open_quote = _unterminated_quote(logical_content)
-        continued = logical_content.rstrip().endswith("\\")
+        continued = logical_content.rstrip().endswith(("\\", "`"))
         yaml_block = _is_pending_yaml_value(logical_content[value_start:].strip())
         pending_netrc_value = _NETRC_PENDING_PASSWORD_VALUE.search(logical_content) is not None
         sensitive_value = logical_content[value_start:]
@@ -2247,7 +2249,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
                 break
             indented_block = indented_block or indented
             open_quote = _unterminated_quote(continuation, open_quote)
-            continued = continuation.rstrip().endswith("\\")
+            continued = continuation.rstrip().endswith(("\\", "`"))
             index += 1
     return "".join(sanitized), omitted
 
