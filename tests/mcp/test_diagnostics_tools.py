@@ -2208,6 +2208,47 @@ async def test_latest_cli_log_scopes_mongosh_short_password(
     assert "tool -p visible-unrelated-short-option" in result["text"]
 
 
+async def test_latest_cli_log_omits_word_leading_expansion_credential_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    redis.store[cli_log_latest(SLUG)] = "\n".join(
+        (
+            "EMPTY=; tool $EMPTY--password word-leading-password-secret",
+            "safe-after-word-leading-password",
+            "EMPTY=; tool ${EMPTY}--client-secret word-leading-client-secret",
+            "safe-after-leading-client-option",
+            "echo $HOME/bin/tool --help",
+            "echo $EMPTY--author visible-noncredential-expansion",
+        )
+    )
+    _patch_runtime(monkeypatch, redis)
+
+    result = await diagnostics.get_latest_cli_log(SLUG)
+
+    assert "word-leading-password-secret" not in result["text"]
+    assert "word-leading-client-secret" not in result["text"]
+    assert "safe-after-word-leading-password" in result["text"]
+    assert "safe-after-leading-client-option" in result["text"]
+    assert "echo $HOME/bin/tool --help" in result["text"]
+    assert "echo $EMPTY--author visible-noncredential-expansion" in result["text"]
+
+
+def test_mysql_attached_password_scan_is_command_scoped_and_bounded() -> None:
+    from src.mcp.tools import diagnostics
+
+    assert diagnostics._sensitive_value_start("mysql -pattached-password") is not None
+    assert diagnostics._sensitive_value_start("mysql -P3306") is None
+    assert diagnostics._sensitive_value_start("tool -pvisible") is None
+
+    repeated_mysql = ("mysql x " * diagnostics._MAX_CLI_LOG_SOURCE_BYTES)[
+        : diagnostics._MAX_CLI_LOG_SOURCE_BYTES
+    ]
+    assert diagnostics._command_specific_credential_value_start(repeated_mysql) is None
+
+
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

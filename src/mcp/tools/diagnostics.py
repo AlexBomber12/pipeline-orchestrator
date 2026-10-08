@@ -262,11 +262,6 @@ _DIGEST_AUTHORIZATION = re.compile(r"(?i)(?<![A-Za-z0-9])Digest[ \t]+")
 _CREDENTIAL_CLI_OPTION = re.compile(
     r"(?i)(?<!\S)(?:\$?['\"])?(?:--user|--proxy-user)(?:['\"]?[ \t]+|=)"
 )
-_MYSQL_ATTACHED_PASSWORD_OPTION = re.compile(
-    r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?"
-    r"(?:mysql|mysqladmin|mysqlcheck|mysqldump|mysqlimport|mysqlshow)(?:\.exe)?"
-    r"(?=[ \t]|$)[^;&|<>\r\n]*?(?<!\S)-p[^ \t;&|<>()]+"
-)
 _DOCKER_LOGIN_PASSWORD_OPTION = re.compile(
     r"(?i)(?<!\S)(?:[^ \t;&|<>]*[\\/])?docker(?:\.exe)?(?=[ \t])"
     r"[^;&|<>\r\n]*?(?<!\S)login(?=[ \t]|$)"
@@ -320,6 +315,10 @@ _INLINE_POWERSHELL_BACKTICK = re.compile(
 )
 _EMBEDDED_SHELL_SUBSTITUTION = re.compile(
     r"(?<![ \t;&|<>])\$(?:\(|\{|[A-Za-z_][A-Za-z0-9_]*|[0-9*@$#?!-])"
+)
+_WORD_LEADING_SHELL_EXPANSION = re.compile(
+    r"(?<![^ \t;&|<>()])\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|"
+    r"[A-Za-z_][A-Za-z0-9_]*|[0-9*@$#?!-])"
 )
 _SHELL_BRACE_EXPANSION = re.compile(
     r"(?:(?<=[^ \t;&|<>])\{[^{}\s;&|<>]{0,64}(?:,|\.\.)"
@@ -1512,6 +1511,20 @@ def _has_backslash_ansi_c_word(text: str) -> bool:
             return escaped
 
 
+def _has_word_leading_shell_credential_option(line: str) -> bool:
+    """Recognize an expansion that may disappear before a credential option."""
+    for expansion in _WORD_LEADING_SHELL_EXPANSION.finditer(line):
+        option_start = expansion.end()
+        if option_start >= len(line) or line[option_start] != "-":
+            continue
+        option_end = option_start
+        while option_end < len(line) and line[option_end] in _SENSITIVE_KEY_CHARACTERS:
+            option_end += 1
+        if _is_sensitive_key(line[option_start:option_end]):
+            return True
+    return False
+
+
 def _json_key_escape_length(value: str, index: int) -> int:
     if index + 1 >= len(value) or value[index] != "\\":
         return 0
@@ -1658,9 +1671,10 @@ def _command_specific_credential_value_start(line: str) -> int | None:
             pending_option = None
             continue
 
-        compact = word.strip("'\"").replace("_", "").lower()
-        if compact.startswith(("$'", '$"')):
-            compact = compact[2:]
+        compact_case = word.strip("'\"").replace("_", "")
+        if compact_case.startswith(("$'", '$"')):
+            compact_case = compact_case[2:]
+        compact = compact_case.lower()
 
         if pending_option is not None:
             selected_option = pending_option
@@ -1682,7 +1696,17 @@ def _command_specific_credential_value_start(line: str) -> int | None:
         executable = compact.replace("\\", "/").rsplit("/", 1)[-1]
         if executable.endswith(".exe"):
             executable = executable[:-4]
-        if executable in {"curl", "mongosh", "openssl"}:
+        if executable in {
+            "curl",
+            "mongosh",
+            "mysql",
+            "mysqladmin",
+            "mysqlcheck",
+            "mysqldump",
+            "mysqlimport",
+            "mysqlshow",
+            "openssl",
+        }:
             command = executable
             pending_option = None
             continue
@@ -1720,6 +1744,9 @@ def _command_specific_credential_value_start(line: str) -> int | None:
                 pending_option = "mongosh-password"
             elif compact.startswith("-p") and len(compact) > len("-p"):
                 return match.start()
+        elif command is not None and command.startswith("mysql"):
+            if compact_case.startswith("-p") and len(compact_case) > len("-p"):
+                return match.start()
     return None
 
 
@@ -1735,9 +1762,6 @@ def _sensitive_value_start(line: str) -> int | None:
     command_credential = _command_specific_credential_value_start(normalized_line)
     if command_credential is not None:
         return command_credential
-    mysql_password = _MYSQL_ATTACHED_PASSWORD_OPTION.search(line)
-    if mysql_password is not None:
-        return mysql_password.end()
     docker_password = _DOCKER_LOGIN_PASSWORD_OPTION.search(normalized_line)
     if docker_password is not None:
         return docker_password.end()
@@ -2502,6 +2526,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
             _EMBEDDED_SHELL_SUBSTITUTION.search(logical_content) is not None
             or _SHELL_BRACE_EXPANSION.search(logical_content) is not None
             or _EMBEDDED_CMD_VARIABLE.search(logical_content) is not None
+            or _has_word_leading_shell_credential_option(logical_content)
         )
         if (
             value_start is None
