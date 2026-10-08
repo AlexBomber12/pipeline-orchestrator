@@ -83,8 +83,9 @@ names or recognizable token shapes are detected using the same inline token,
 URL, and query rules; the contributing line is omitted before tail selection.
 Bare named, positional, or special shell-parameter expansions embedded in a
 word are treated as ambiguous credential context rather than evaluated. An
-expansion at the start of a shell word also fails closed when its removal could
-expose a recognized credential option.
+shell or cmd expansion at the start of a word also fails closed when its removal
+could expose a recognized generic or command-specific credential option. This
+normalization is detection-only and does not evaluate the variable.
 Bounded Bash brace-list or brace-sequence expansions embedded in a word use the
 same fail-closed treatment.
 The established `MYSQL_PWD` assignment and attached `-pPASSWORD` forms for

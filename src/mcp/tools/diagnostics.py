@@ -300,6 +300,11 @@ _WORD_LEADING_SHELL_EXPANSION = re.compile(
     r"(?<![^ \t;&|<>()])\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|"
     r"[A-Za-z_][A-Za-z0-9_]*|[0-9*@$#?!-])"
 )
+_WORD_LEADING_CMD_EXPANSION = re.compile(
+    r"(?<![^ \t;&|<>()])(?:%[A-Za-z_][A-Za-z0-9_]*(?::[^%\r\n]{0,64})?%|"
+    r"![A-Za-z_][A-Za-z0-9_]*!|%[0-9*]|"
+    r"%~[A-Za-z]*(?:\$[A-Za-z_][A-Za-z0-9_]*:)?[0-9])"
+)
 _SHELL_BRACE_EXPANSION = re.compile(
     r"(?:(?<=[^ \t;&|<>])\{[^{}\s;&|<>]{0,64}(?:,|\.\.)"
     r"[^{}\s;&|<>]{0,64}\}|\{[^{}\s;&|<>]{0,64}(?:,|\.\.)"
@@ -1492,18 +1497,30 @@ def _has_backslash_ansi_c_word(text: str) -> bool:
             return escaped
 
 
-def _has_word_leading_shell_credential_option(line: str) -> bool:
+def _has_word_leading_expansion_credential_option(line: str) -> bool:
     """Recognize an expansion that may disappear before a credential option."""
-    for expansion in _WORD_LEADING_SHELL_EXPANSION.finditer(line):
-        option_start = expansion.end()
-        if option_start >= len(line) or line[option_start] != "-":
-            continue
-        option_end = option_start
-        while option_end < len(line) and line[option_end] in _SENSITIVE_KEY_CHARACTERS:
-            option_end += 1
-        if _is_sensitive_key(line[option_start:option_end]):
-            return True
-    return False
+    normalized = list(line)
+    reconstructed = False
+    for pattern in (_WORD_LEADING_SHELL_EXPANSION, _WORD_LEADING_CMD_EXPANSION):
+        for expansion in pattern.finditer(line):
+            option_start = expansion.end()
+            if option_start >= len(line) or line[option_start] != "-":
+                continue
+            option_end = option_start
+            while (
+                option_end < len(line)
+                and line[option_end] in _SENSITIVE_KEY_CHARACTERS
+            ):
+                option_end += 1
+            if _is_sensitive_key(line[option_start:option_end]):
+                return True
+            normalized[expansion.start() : expansion.end()] = " " * len(
+                expansion.group(0)
+            )
+            reconstructed = True
+    return reconstructed and _command_specific_credential_value_start(
+        "".join(normalized)
+    ) is not None
 
 
 def _json_key_escape_length(value: str, index: int) -> int:
@@ -2532,7 +2549,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
             _EMBEDDED_SHELL_SUBSTITUTION.search(logical_content) is not None
             or _SHELL_BRACE_EXPANSION.search(logical_content) is not None
             or _EMBEDDED_CMD_VARIABLE.search(logical_content) is not None
-            or _has_word_leading_shell_credential_option(logical_content)
+            or _has_word_leading_expansion_credential_option(logical_content)
         )
         if (
             value_start is None

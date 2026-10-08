@@ -2222,6 +2222,19 @@ async def test_latest_cli_log_omits_word_leading_expansion_credential_options(
             "safe-after-leading-client-option",
             "echo $HOME/bin/tool --help",
             "echo $EMPTY--author visible-noncredential-expansion",
+            "EMPTY=; docker login ${EMPTY}-p shell-docker-password-secret",
+            "safe-after-shell-docker-option",
+            "set EMPTY= & docker login %EMPTY%-p cmd-docker-password-secret",
+            "safe-after-cmd-docker-option",
+            "EMPTY=; az login $EMPTY-p shell-azure-password-secret",
+            "safe-after-shell-azure-option",
+            "EMPTY=; mongosh $EMPTY-p shell-mongosh-password-secret",
+            "safe-after-shell-mongosh-option",
+            "EMPTY=; sshpass $EMPTY-p shell-sshpass-password-secret ssh host",
+            "safe-after-shell-sshpass-option",
+            "EMPTY=; redis-cli $EMPTY-a shell-redis-password-secret ping",
+            "safe-after-shell-redis-option",
+            "echo %EMPTY%-x visible-cmd-noncredential-expansion",
         )
     )
     _patch_runtime(monkeypatch, redis)
@@ -2234,6 +2247,25 @@ async def test_latest_cli_log_omits_word_leading_expansion_credential_options(
     assert "safe-after-leading-client-option" in result["text"]
     assert "echo $HOME/bin/tool --help" in result["text"]
     assert "echo $EMPTY--author visible-noncredential-expansion" in result["text"]
+    for secret in (
+        "shell-docker-password-secret",
+        "cmd-docker-password-secret",
+        "shell-azure-password-secret",
+        "shell-mongosh-password-secret",
+        "shell-sshpass-password-secret",
+        "shell-redis-password-secret",
+    ):
+        assert secret not in result["text"]
+    for marker in (
+        "safe-after-shell-docker-option",
+        "safe-after-cmd-docker-option",
+        "safe-after-shell-azure-option",
+        "safe-after-shell-mongosh-option",
+        "safe-after-shell-sshpass-option",
+        "safe-after-shell-redis-option",
+    ):
+        assert marker in result["text"]
+    assert "echo %EMPTY%-x visible-cmd-noncredential-expansion" in result["text"]
 
 
 def test_mysql_attached_password_scan_is_command_scoped_and_bounded() -> None:
