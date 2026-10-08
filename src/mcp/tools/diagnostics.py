@@ -134,26 +134,28 @@ _XML_NAME_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-"
 )
 _XML_CREDENTIAL_SELECTOR_ATTRIBUTES = frozenset({"key", "name"})
+_YAML_NODE_PROPERTY = r"(?:&[^\s,\[\]{}]+|!<[^>\r\n]+>|![^\s,\[\]{}]+)"
+_YAML_NODE_PROPERTIES = rf"(?:{_YAML_NODE_PROPERTY}[ \t]+)*"
+_YAML_FLOW_NODE_PROPERTIES = rf"(?:{_YAML_NODE_PROPERTY}[ \t\r\n]+)*"
 _KUBERNETES_KIND_KEY_SCALAR = (
     r'''(?:kind|'kind'|"kind"|'''
     r'''"(?=[^"\r\n]*\\)(?:[^"\\\r\n]|\\[^\r\n])*")'''
 )
-_KUBERNETES_KIND_KEY = (
-    r"(?:(?:&|!)[^\s,\[\]{}]+[ \t]+)*" + _KUBERNETES_KIND_KEY_SCALAR
-)
+_KUBERNETES_KIND_KEY = _YAML_NODE_PROPERTIES + _KUBERNETES_KIND_KEY_SCALAR
 _KUBERNETES_BLOCK_KIND_PREFIX = (
     rf"(?im)^[ \t]*(?:-[ \t]+)?{_KUBERNETES_KIND_KEY}[ \t]*:[ \t]*"
 )
 _KUBERNETES_SECRET_KIND = re.compile(
     _KUBERNETES_BLOCK_KIND_PREFIX
-    + r"(?:(?:&|!)[^\s,\[\]{}]+[ \t]+)*"
-    r"(?P<quote>['\"]?)Secret(?P=quote)"
+    + _YAML_NODE_PROPERTIES
+    + r"(?P<quote>['\"]?)Secret(?P=quote)"
     r"[ \t]*(?:#.*)?$"
 )
 # YAML double-quoted scalars can resolve escapes; omit instead of partially decoding.
 _KUBERNETES_ESCAPED_QUOTED_KIND = re.compile(
     _KUBERNETES_BLOCK_KIND_PREFIX
-    + r'(?:(?:&|!)[^\s,\[\]{}]+[ \t]+)*"(?=[^\r\n]*\\)'
+    + _YAML_NODE_PROPERTIES
+    + r'"(?=[^\r\n]*\\)'
 )
 _KUBERNETES_SECRET_BLOCK_KIND = re.compile(
     _KUBERNETES_BLOCK_KIND_PREFIX
@@ -162,7 +164,8 @@ _KUBERNETES_SECRET_BLOCK_KIND = re.compile(
 )
 _KUBERNETES_FLOW_KIND_PREFIX = (
     rf"(?im)(?:^|[{{,])[ \t\r\n]*{_KUBERNETES_KIND_KEY}"
-    r"[ \t\r\n]*:[ \t\r\n]*(?:(?:&|!)[^\s,\[\]{}]+[ \t\r\n]+)*"
+    r"[ \t\r\n]*:[ \t\r\n]*"
+    + _YAML_FLOW_NODE_PROPERTIES
 )
 _KUBERNETES_FLOW_SECRET_KIND = re.compile(
     _KUBERNETES_FLOW_KIND_PREFIX
@@ -180,8 +183,8 @@ _KUBERNETES_EXPLICIT_SECRET_KIND = re.compile(
     rf"(?im)^[ \t]*(?:-[ \t]+)?\?[ \t]+{_KUBERNETES_KIND_KEY}"
     r"[ \t]*(?:#.*)?\n"
     r"(?:[ \t]*\n)*[ \t]*:[ \t]*"
-    r"(?:(?:&|!)[^\s,\[\]{}]+[ \t]+)*"
-    r"(?P<explicit_quote>['\"]?)Secret(?P=explicit_quote)"
+    + _YAML_NODE_PROPERTIES
+    + r"(?P<explicit_quote>['\"]?)Secret(?P=explicit_quote)"
     r"[ \t]*(?:#.*)?$"
 )
 _AWS_CREDENTIAL_CSV_HEADER = re.compile(
