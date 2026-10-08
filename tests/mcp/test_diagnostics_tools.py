@@ -1255,6 +1255,8 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
             "<key>Password</key><string>SYNTHETIC_XML_PLIST_SECRET</string>",
             "<key><![CDATA[Password]]></key>"
             "<string>SYNTHETIC_XML_CDATA_PLIST_SECRET</string>",
+            "<key>Pass<!-- synthetic note -->word</key>"
+            "<string>SYNTHETIC_XML_COMMENT_PLIST_SECRET</string>",
             "<key>Visible</key><string>safe-plist-visible</string>",
             "safe-after: visible",
             "<cfg:connection cfg:password='SYNTHETIC_XML_ATTRIBUTE_SECRET'/>",
@@ -1269,7 +1271,7 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
     result = await diagnostics.get_latest_cli_log(SLUG)
 
     assert result["availability"]["status"] == "available"
-    assert result["text"].count("[credential document omitted]") == 9
+    assert result["text"].count("[credential document omitted]") == 10
     assert "safe-between: visible" in result["text"]
     assert "safe-after: visible" in result["text"]
     assert "<safe ignored attr='visible'>visible</safe>" in result["text"]
@@ -1282,6 +1284,7 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
         "SYNTHETIC_XML_INTERNAL_ENTITY_SECRET",
         "SYNTHETIC_XML_PLIST_SECRET",
         "SYNTHETIC_XML_CDATA_PLIST_SECRET",
+        "SYNTHETIC_XML_COMMENT_PLIST_SECRET",
         "SYNTHETIC_XML_ATTRIBUTE_SECRET",
         "SYNTHETIC_XML_ORDER_SECRET",
         "SYNTHETIC_XML_UNQUOTED_SECRET",
@@ -1292,6 +1295,8 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
         "safe-before\n<password>\nSYNTHETIC_XML_MULTILINE_SECRET\n</password>\nsafe-after",
         'safe-before\n<add key="password"\n value="SYNTHETIC_XML_INCOMPLETE_SECRET"',
         "safe-before\n<key>Password</key>\n<string>SYNTHETIC_XML_PLIST_INCOMPLETE_SECRET",
+        "safe-before\n<key>Pass<em>word</em></key>"
+        "<string>SYNTHETIC_XML_MARKUP_PLIST_SECRET</string>\nsafe-after",
         'safe-before\n<!DOCTYPE settings [<!ENTITY pw "Password">]>\n'
         '<settings><add key="&pw;" value="SYNTHETIC_XML_DTD_SECRET"/></settings>\n'
         "safe-after",

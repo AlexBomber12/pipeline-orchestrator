@@ -74,9 +74,10 @@ are omitted for the same reason.
 Recognizable XML credential elements, credential attributes, and `key`/`name`
 plus `value` configuration tags are omitted. XML character references in
 credential selectors are decoded before classification. Plist-style sensitive
-`key`/`name` element text, including a CDATA body, causes its following scalar
-value element to be omitted. Multiline or incomplete XML credential contexts
-fail closed through the bounded source end, and
+`key`/`name` element text is normalized across comments and CDATA before its
+following scalar value is omitted. Other or incomplete selector markup fails
+closed through the bounded source end. Multiline or incomplete XML credential
+contexts fail closed through the bounded source end, and
 unresolved named entities in credential selectors are treated as ambiguous
 credential context. DTD-bearing XML fails closed from the declaration boundary
 without parsing or expanding internal or external entities.

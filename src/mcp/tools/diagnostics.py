@@ -157,10 +157,9 @@ _XML_DOCTYPE = re.compile(r"(?i)<!DOCTYPE(?:\s|>)")
 _XML_UNRESOLVED_NAMED_ENTITY = re.compile(r"&[A-Za-z_:][A-Za-z0-9_.:-]*;")
 _XML_SELECTOR_ELEMENT = re.compile(
     r"(?is)<(?P<tag>(?:[A-Za-z_][A-Za-z0-9_.-]*:)?(?:key|name))[ \t\r\n]*>"
-    r"(?:"
-    r"(?P<selector>[^<]*)|<!\[CDATA\[(?P<cdata>.*?)\]\]>"
-    r")</(?P=tag)[ \t\r\n]*>"
+    r"(?P<selector>.*?)</(?P=tag)[ \t\r\n]*>"
 )
+_XML_SELECTOR_MARKUP = re.compile(r"(?s)<!--.*?-->|<!\[CDATA\[(?P<cdata>.*?)\]\]>|<")
 _XML_SCALAR_VALUE_ELEMENT = re.compile(
     r"(?is)[ \t\r\n]*<(?P<tag>[A-Za-z_:][A-Za-z0-9_.:-]*)[ \t\r\n]*>"
     r"[^<]*</(?P=tag)[ \t\r\n]*>"
@@ -1647,13 +1646,30 @@ def _xml_tag_has_credential_context(name: str, attributes: list[tuple[str, str]]
     return False
 
 
+def _xml_selector_text(value: str) -> str | None:
+    """Normalize XML comments and CDATA without interpreting other markup."""
+    parts: list[str] = []
+    cursor = 0
+    for markup in _XML_SELECTOR_MARKUP.finditer(value):
+        parts.append(value[cursor : markup.start()])
+        cdata = markup.group("cdata")
+        if cdata is not None:
+            parts.append(cdata)
+        elif not markup.group(0).startswith("<!--"):
+            return None
+        cursor = markup.end()
+    parts.append(value[cursor:])
+    return "".join(parts)
+
+
 def _omit_xml_selector_credential_contexts(text: str) -> tuple[str, int]:
     """Omit plist-style XML values selected by credential key/name elements."""
     ranges: list[tuple[int, int]] = []
     for selector in _XML_SELECTOR_ELEMENT.finditer(text):
-        selector_text = selector.group("selector")
+        selector_text = _xml_selector_text(selector.group("selector"))
         if selector_text is None:
-            selector_text = selector.group("cdata")
+            ranges.append((selector.start(), len(text)))
+            break
         decoded_selector = unescape(selector_text)
         if not (
             _is_sensitive_key(decoded_selector)
