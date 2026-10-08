@@ -54,9 +54,10 @@ BOM, curl user/proxy-user
 credentials, netrc passwords delimited by horizontal whitespace or a newline,
 and recognizable JSON
 credential documents are not exported, including nested documents and documents
-serialized inside log strings and structured header name/value pairs in JSON-list or
-Python-tuple form. Recognizable Kubernetes Secret documents are omitted as a
-whole in YAML or JSON form, including arbitrary keys under `data` or
+serialized inside log strings, documents whose container and field syntax is
+Unicode-escaped inside a JSON string, and structured header name/value pairs in
+JSON-list or Python-tuple form. Recognizable Kubernetes Secret documents are
+omitted as a whole in YAML or JSON form, including arbitrary keys under `data` or
 `stringData`, decorated, explicit, quoted, or escaped `kind` keys, and `kind`
 values that are anchored, aliased, tagged using non-specific, shorthand, or
 verbatim forms, escaped double-quoted, node-property-decorated multiline, or
@@ -75,7 +76,9 @@ single- or double-quoted mapping keys are omitted because folded keys cannot be
 classified safely without interpreting YAML. Explicit block-scalar mapping keys
 are omitted for the same reason.
 Recognizable XML credential elements, credential attributes, and `key`/`name`
-plus `value` configuration tags are omitted. XML character references in
+plus `value` configuration tags are omitted. Selector discovery uses a bounded,
+monotonic tag scan, so repeated unmatched starts cannot trigger overlapping
+source rescans. XML character references in
 credential selectors are decoded before classification. Plist-style sensitive
 `key`/`name` element text is normalized across bounded attributed start tags,
 comments, and CDATA before its following scalar value is omitted. Other or
@@ -91,7 +94,8 @@ multi-parameter `Digest` value causes conservative line omission.
 JSON inspection preserves duplicate object members so a later empty value cannot
 hide an earlier credential value. Recognizable RSA, EC, OKP, and symmetric
 private JWK objects are omitted while public JWKs remain exportable. PEM, SSH2,
-and PuTTY private-key documents are omitted through their recognized boundaries;
+and PuTTY version 1 through 3 private-key documents are omitted through their
+recognized boundaries, including the version 1 `Private-Hash` terminator;
 incomplete blocks fail closed.
 Lines with recognizable credential keys are omitted conservatively when they
 use assignment, structured-field, header, or long-option syntax. Balanced

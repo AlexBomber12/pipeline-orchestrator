@@ -159,13 +159,6 @@ _XML_CREDENTIAL_SELECTOR_ATTRIBUTES = frozenset({"key", "name"})
 _XML_DOCTYPE = re.compile(r"(?i)<!DOCTYPE(?:\s|>)")
 _XML_UNRESOLVED_NAMED_ENTITY = re.compile(r"&[A-Za-z_:][A-Za-z0-9_.:-]*;")
 _XML_OPTIONAL_ATTRIBUTES = r'''(?:[ \t\r\n]+(?:[^"'<>]|"[^"]*"|'[^']*')*)?'''
-_XML_SELECTOR_ELEMENT = re.compile(
-    r"(?is)<(?P<tag>(?:[A-Za-z_][A-Za-z0-9_.-]*:)?(?:key|name))"
-    + _XML_OPTIONAL_ATTRIBUTES
-    + r">"
-    r"(?P<selector>.*?)</(?P=tag)[ \t\r\n]*>"
-)
-_XML_SELECTOR_MARKUP = re.compile(r"(?s)<!--.*?-->|<!\[CDATA\[(?P<cdata>.*?)\]\]>|<")
 _XML_SCALAR_VALUE_ELEMENT = re.compile(
     r"(?is)[ \t\r\n]*<(?P<tag>[A-Za-z_:][A-Za-z0-9_.:-]*)"
     + _XML_OPTIONAL_ATTRIBUTES
@@ -246,10 +239,10 @@ _AWS_CREDENTIAL_CSV_HEADER = re.compile(
     r'"?secret access key"?[ \t]*(?:,|$)'
 )
 _PUTTY_PRIVATE_KEY_START = re.compile(
-    r"(?im)^PuTTY-User-Key-File-[23]:[^\r\n]*(?:\r?\n|$)"
+    r"(?im)^PuTTY-User-Key-File-[1-3]:[^\r\n]*(?:\r?\n|$)"
 )
 _PUTTY_PRIVATE_KEY_END = re.compile(
-    r"(?im)^Private-MAC:[^\r\n]*(?:\r?\n|$)"
+    r"(?im)^Private-(?:MAC|Hash):[^\r\n]*(?:\r?\n|$)"
 )
 _URL_USERINFO = re.compile(r"(?i)(?P<scheme>(?:\b[a-z][a-z0-9+.-]*:)?//)[^/@\s]+@")
 _QUERY_PARAMETER_VALUE = re.compile(
@@ -1489,6 +1482,41 @@ def _shell_group_state(
     return parenthesis_depth, parameter_brace_depth, backtick_open, quote
 
 
+def _omit_json_string_credential_documents(text: str) -> tuple[str, int]:
+    """Inspect complete JSON string tokens in one pass for encoded documents."""
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    while True:
+        start = text.find('"', cursor)
+        if start < 0:
+            break
+        token_cursor = start + 1
+        while token_cursor < len(text):
+            character = text[token_cursor]
+            if character == "\\":
+                token_cursor += 2
+                continue
+            token_cursor += 1
+            if character != '"':
+                continue
+            try:
+                value, decoded_end = _JSON_DECODER.raw_decode(text, start)
+            except (json.JSONDecodeError, RecursionError, ValueError):
+                pass
+            else:
+                if (
+                    decoded_end == token_cursor
+                    and isinstance(value, str)
+                    and _contains_credential_document_key(value)
+                ):
+                    ranges.append((start, token_cursor))
+            cursor = token_cursor
+            break
+        else:
+            break
+    return _omit_document_ranges(text, ranges)
+
+
 def _json_container_end(
     text: str,
     start: int,
@@ -1531,6 +1559,7 @@ def _json_container_end(
 
 def _omit_json_credential_documents(text: str) -> tuple[str, int]:
     """Omit complete JSON objects that are recognizable credential records."""
+    text, string_documents = _omit_json_string_credential_documents(text)
     ranges: list[tuple[int, int]] = []
     covered_until = 0
     parse_failures = 0
@@ -1546,13 +1575,13 @@ def _omit_json_credential_documents(text: str) -> tuple[str, int]:
         except (json.JSONDecodeError, RecursionError, ValueError):
             parse_failures += 1
             if parse_failures >= _MAX_JSON_PARSE_FAILURES:
-                return _CREDENTIAL_DOCUMENT_OMITTED, 1
+                return _CREDENTIAL_DOCUMENT_OMITTED, string_documents + 1
             remaining_work = (
                 _MAX_JSON_FALLBACK_SCAN_CHARACTERS - fallback_scan_characters
             )
             boundary = _json_container_end(text, match.start(), remaining_work)
             if boundary is None:
-                return _CREDENTIAL_DOCUMENT_OMITTED, 1
+                return _CREDENTIAL_DOCUMENT_OMITTED, string_documents + 1
             end, work = boundary
             fallback_scan_characters += work
             container = " ".join(text[match.start() : end].splitlines())
@@ -1564,14 +1593,14 @@ def _omit_json_credential_documents(text: str) -> tuple[str, int]:
         if _contains_credential_document_key(value):
             ranges.append((start, end))
     if not ranges:
-        return text, 0
+        return text, string_documents
     parts: list[str] = []
     offset = 0
     for start, end in ranges:
         parts.extend((text[offset:start], _CREDENTIAL_DOCUMENT_OMITTED))
         offset = end
     parts.append(text[offset:])
-    return "".join(parts), len(ranges)
+    return "".join(parts), string_documents + len(ranges)
 
 
 def _yaml_document_ranges(text: str) -> list[tuple[int, int]]:
@@ -1689,37 +1718,91 @@ def _xml_selector_text(value: str) -> str | None:
     """Normalize XML comments and CDATA without interpreting other markup."""
     parts: list[str] = []
     cursor = 0
-    for markup in _XML_SELECTOR_MARKUP.finditer(value):
-        parts.append(value[cursor : markup.start()])
-        cdata = markup.group("cdata")
-        if cdata is not None:
-            parts.append(cdata)
-        elif not markup.group(0).startswith("<!--"):
+    while True:
+        markup_start = value.find("<", cursor)
+        if markup_start < 0:
+            parts.append(value[cursor:])
+            break
+        parts.append(value[cursor:markup_start])
+        if value.startswith("<!--", markup_start):
+            markup_end = value.find("-->", markup_start + 4)
+            if markup_end < 0:
+                return None
+            cursor = markup_end + 3
+        elif value.startswith("<![CDATA[", markup_start):
+            markup_end = value.find("]]>", markup_start + 9)
+            if markup_end < 0:
+                return None
+            parts.append(value[markup_start + 9 : markup_end])
+            cursor = markup_end + 3
+        else:
             return None
-        cursor = markup.end()
-    parts.append(value[cursor:])
     return "".join(parts)
 
 
 def _omit_xml_selector_credential_contexts(text: str) -> tuple[str, int]:
     """Omit plist-style XML values selected by credential key/name elements."""
     ranges: list[tuple[int, int]] = []
-    for selector in _XML_SELECTOR_ELEMENT.finditer(text):
-        selector_text = _xml_selector_text(selector.group("selector"))
+    cursor = 0
+    while True:
+        start = text.find("<", cursor)
+        if start < 0:
+            break
+        details = _xml_tag_details(text, start)
+        if details is None:
+            cursor = start + 1
+            continue
+        closing, name, _name_end, tag_end, self_closing = details
+        if (
+            closing
+            or self_closing
+            or name.rsplit(":", 1)[-1].lower() not in _XML_CREDENTIAL_SELECTOR_ATTRIBUTES
+        ):
+            cursor = max(tag_end, start + 1)
+            continue
+
+        closing_start: int | None = None
+        selector_end = tag_end
+        search_cursor = tag_end
+        while True:
+            candidate = text.find("<", search_cursor)
+            if candidate < 0:
+                ranges.append((start, len(text)))
+                return _omit_document_ranges(text, ranges)
+            closing_details = _xml_tag_details(text, candidate)
+            if closing_details is None:
+                search_cursor = candidate + 1
+                continue
+            (
+                candidate_closing,
+                candidate_name,
+                _candidate_name_end,
+                candidate_end,
+                _candidate_self_closing,
+            ) = closing_details
+            if candidate_closing and candidate_name.lower() == name.lower():
+                closing_start = candidate
+                selector_end = candidate_end
+                break
+            search_cursor = max(candidate_end, candidate + 1)
+
+        selector_text = _xml_selector_text(text[tag_end:closing_start])
         if selector_text is None:
-            ranges.append((selector.start(), len(text)))
+            ranges.append((start, len(text)))
             break
         decoded_selector = unescape(selector_text)
         if not (
             _is_sensitive_key(decoded_selector)
             or _XML_UNRESOLVED_NAMED_ENTITY.search(decoded_selector) is not None
         ):
+            cursor = selector_end
             continue
-        value = _XML_SCALAR_VALUE_ELEMENT.match(text, selector.end())
+        value = _XML_SCALAR_VALUE_ELEMENT.match(text, selector_end)
         if value is None:
-            ranges.append((selector.start(), len(text)))
+            ranges.append((start, len(text)))
             break
-        ranges.append((selector.start(), value.end()))
+        ranges.append((start, value.end()))
+        cursor = value.end()
     return _omit_document_ranges(text, ranges)
 
 

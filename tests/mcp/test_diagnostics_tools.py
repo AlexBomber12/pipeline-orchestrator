@@ -460,6 +460,7 @@ async def test_latest_cli_log_bounds_source_output_and_utf8(
     mismatched_json = await diagnostics.get_latest_cli_log(SLUG)
     assert mismatched_json["availability"]["status"] == "available"
     assert mismatched_json["text"] == "{]"
+    assert diagnostics._omit_json_credential_documents('"{bad}') == ('"{bad}', 0)
 
     linear_scan_redis = FakeRedis()
     linear_scan_redis.store[key] = "a-" * (diagnostics._MAX_CLI_LOG_SOURCE_BYTES // 2)
@@ -525,6 +526,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             'output: {"client_secret":"prefix-document-secret","client_id":"hidden-client"}',
             r'serialized="{\"private_key\":\"serialized-document-secret\",'
             r'\"project_id\":\"serialized-metadata\"}"',
+            r'"\u007b\u0022password\u0022\u003a\u0022unicode-escaped-json-secret'
+            r'\u0022\u007d"',
             json.dumps(deeply_nested),
             'structured={"headers":{"Authorization":"Bearer structured-auth-secret"}}',
             'structured-cookie={"Cookie":"session=structured-cookie-secret"}',
@@ -839,6 +842,14 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "ssh2-private-secret",
             "---- END SSH2 ENCRYPTED PRIVATE KEY ----",
             "safe-after-ssh2",
+            "PuTTY-User-Key-File-1: ssh-rsa",
+            "Encryption: none",
+            "Public-Lines: 1",
+            "cHVibGljLWtleQ==",
+            "Private-Lines: 1",
+            "putty-v1-private-secret",
+            "Private-Hash: putty-v1-private-hash-secret",
+            "safe-after-putty-v1",
             "PuTTY-User-Key-File-3: ssh-rsa",
             "Encryption: none",
             "Public-Lines: 1",
@@ -912,6 +923,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert standalone_basic not in exported
     assert "safe-hyperlink-output" in exported
     assert "safe-after-ssh2" in exported
+    assert "safe-after-putty-v1" in exported
     assert "safe-after-putty" in exported
     assert diagnostics._omit_kubernetes_secret_documents(
         "apiVersion: v1\nkind: Secret\ndata:\n  tls.key: source-end-secret"
@@ -937,6 +949,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "array-document-secret",
         "prefix-document-secret",
         "serialized-document-secret",
+        "unicode-escaped-json-secret",
         "deep-document-secret",
         "structured-auth-secret",
         "structured-cookie-secret",
@@ -1050,6 +1063,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "jwk-symmetric-private-secret",
         "pem-document-secret",
         "ssh2-private-secret",
+        "putty-v1-private-secret",
+        "putty-v1-private-hash-secret",
         "putty-private-secret",
         "putty-private-mac-secret",
         "ghp_" + ("A" * 36),
@@ -1388,6 +1403,25 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
         assert fail_closed["text"] == "safe-before\n[credential document omitted]"
         assert "SYNTHETIC_XML_" not in fail_closed["text"]
         assert "safe-after" not in fail_closed["text"]
+
+    for incomplete_markup in ("Pass<!-- incomplete", "<![CDATA[Password"):
+        markup_redis = FakeRedis()
+        markup_redis.store[key] = (
+            f"safe-before\n<key>{incomplete_markup}</key>"
+            "<string>SYNTHETIC_XML_INCOMPLETE_MARKUP_SECRET</string>\nsafe-after"
+        )
+        _patch_runtime(monkeypatch, markup_redis)
+        incomplete = await diagnostics.get_latest_cli_log(SLUG)
+        assert incomplete["text"] == "safe-before\n[credential document omitted]"
+        assert "SYNTHETIC_XML_INCOMPLETE_MARKUP_SECRET" not in incomplete["text"]
+
+    selector_flood = ("<key>" * diagnostics._MAX_CLI_LOG_SOURCE_BYTES)[
+        : diagnostics._MAX_CLI_LOG_SOURCE_BYTES
+    ]
+    assert diagnostics._omit_xml_selector_credential_contexts(selector_flood) == (
+        "[credential document omitted]",
+        1,
+    )
 
 
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(
