@@ -1703,6 +1703,7 @@ def _command_specific_credential_value_start(line: str) -> int | None:
     pending_option: str | None = None
     at_command_start = True
     redirection_target = False
+    leading_assignments: dict[str, int] = {}
     for match in _SHELL_COMMAND_WORD.finditer(line):
         word = match.group(0)
         if word in "<>":
@@ -1719,6 +1720,7 @@ def _command_specific_credential_value_start(line: str) -> int | None:
             pending_option = None
             at_command_start = True
             redirection_target = False
+            leading_assignments = {}
             continue
         if redirection_target:
             redirection_target = False
@@ -1759,6 +1761,11 @@ def _command_specific_credential_value_start(line: str) -> int | None:
             continue
 
         if at_command_start:
+            assignment = _SHELL_ASSIGNMENT_WORD.match(compact_case)
+            if assignment is not None:
+                name = assignment.group(0)[:-1].lower()
+                leading_assignments[name] = match.start()
+                continue
             executable = compact.replace("\\", "/").rsplit("/", 1)[-1]
             if executable.endswith(".exe"):
                 executable = executable[:-4]
@@ -1770,8 +1777,6 @@ def _command_specific_credential_value_start(line: str) -> int | None:
             if executable in _EXECUTION_WRAPPERS:
                 command = "execution-wrapper"
                 at_command_start = False
-                continue
-            if _SHELL_ASSIGNMENT_WORD.match(compact_case) is not None:
                 continue
             at_command_start = False
 
@@ -1851,6 +1856,12 @@ def _command_specific_credential_value_start(line: str) -> int | None:
                 pending_option = "sshpass-password"
             elif compact.startswith("-p") and len(compact) > len("-p"):
                 return match.start()
+            elif compact == "-e" and "sshpass" in leading_assignments:
+                return leading_assignments["sshpass"]
+            elif compact.startswith("-e") and len(compact) > len("-e"):
+                variable = compact[len("-e") :].removeprefix("=")
+                if variable in leading_assignments:
+                    return leading_assignments[variable]
         elif command == "redis-cli":
             if compact in {"-a", "--pass"}:
                 pending_option = "redis-password"
@@ -2702,11 +2713,22 @@ def _is_kubectl_decoded_secret_command(line: str) -> bool:
         return False
     kubectl = kubectl_words[0].replace("\\", "/").rsplit("/", 1)[-1]
     decoder = base64_words[0].replace("\\", "/").rsplit("/", 1)[-1]
+    secret_command_index = next(
+        (
+            index
+            for index in range(1, len(kubectl_words) - 1)
+            if kubectl_words[index] == "get"
+            and kubectl_words[index + 1] in {"secret", "secrets"}
+        ),
+        None,
+    )
     return (
         kubectl.removesuffix(".exe") == "kubectl"
-        and len(kubectl_words) >= 3
-        and kubectl_words[1:3] in (["get", "secret"], ["get", "secrets"])
-        and any("jsonpath" in word and ".data." in word for word in kubectl_words[3:])
+        and secret_command_index is not None
+        and any(
+            "jsonpath" in word and ".data." in word
+            for word in kubectl_words[secret_command_index + 2 :]
+        )
         and decoder.removesuffix(".exe") == "base64"
         and any(word in {"--decode", "-d"} for word in base64_words[1:])
     )

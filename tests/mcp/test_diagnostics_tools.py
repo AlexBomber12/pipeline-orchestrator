@@ -2385,6 +2385,10 @@ async def test_latest_cli_log_fails_closed_for_execution_wrappers(
         ("exec redis-cli -a wrapped-redis-secret ping", "safe-exec"),
         ("nohup curl -u alice:wrapped-nohup-secret https://example.test", "safe-nohup"),
         (
+            "MYPASS=custom-sshpass-secret sshpass -eMYPASS ssh synthetic@host",
+            "safe-custom-sshpass-environment",
+        ),
+        (
             "curl < /dev/null -u alice:redirection-curl-secret https://example.test",
             "safe-curl-redirection",
         ),
@@ -2425,6 +2429,7 @@ async def test_latest_cli_log_fails_closed_for_execution_wrappers(
         "wrapped-sshpass-secret",
         "wrapped-redis-secret",
         "wrapped-nohup-secret",
+        "custom-sshpass-secret",
         "redirection-curl-secret",
         "redirection-docker-secret",
         "redirection-redis-secret",
@@ -2510,6 +2515,10 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
         "/usr/bin/kubectl.exe get secrets demo -o "
         "jsonpath='{.data.token}' | /usr/bin/base64.exe -d"
     )
+    assert diagnostics._is_kubectl_decoded_secret_command(
+        "kubectl --context demo get secret x -o "
+        "jsonpath='{.data.password}' | base64 --decode"
+    )
 
 
 async def test_latest_cli_log_omits_remainder_after_secret_scalar_commands(
@@ -2524,6 +2533,8 @@ async def test_latest_cli_log_omits_remainder_after_secret_scalar_commands(
         "aws --output text secretsmanager get-secret-value "
         "--secret-id synthetic --query SecretString",
         "kubectl get secret demo -o jsonpath='{.data.password}' | base64 --decode",
+        "kubectl --context demo --namespace synthetic get secret demo "
+        "-o jsonpath='{.data.password}' | base64 --decode",
     )
     redis = FakeRedis()
     _patch_runtime(monkeypatch, redis)

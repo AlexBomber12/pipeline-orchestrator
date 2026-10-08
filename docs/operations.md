@@ -112,10 +112,12 @@ An exact AWS Secrets Manager `get-secret-value` command selecting
 handling, including when those global output or query options precede the
 service name.
 The documented `kubectl get secret` JSONPath pipeline into `base64 --decode`
-also receives the same fail-closed remainder handling.
+also receives the same fail-closed remainder handling, including when inherited
+global options precede the `get secret` subcommand.
 The `sshpass -p` separated, attached, and shell-fragmented password forms are
 also recognized only in their command-specific context. Its exact `SSHPASS`
-environment password assignment is credential context for `-e` mode.
+environment password assignment is credential context for `-e` mode. A custom
+`-eVAR` name also omits its matching leading simple-command assignment.
 Positional access-key, secret-key, and session-token values passed through
 `aws configure set` (including after up to 16 global-option words), plus
 `redis-cli`'s `-a` and `--pass` password flags, are also omitted only in their
