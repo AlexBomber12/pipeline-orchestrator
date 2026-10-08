@@ -104,11 +104,13 @@ Lines with recognizable credential keys are omitted conservatively when they
 use assignment, structured-field, header, or long-option syntax. Balanced
 quotes around recognized multiword credential labels are supported, so
 malformed or interrupted quoting cannot expose a value suffix. Adjacent simple
-shell quote fragments and same-line backslash-escaped characters in long-option
-names are reassembled for classification.
+shell quote fragments, including Bash dollar-prefixed ANSI/locale quotes, and
+same-line backslash-escaped characters in long-option names are reassembled for
+classification.
 Indented YAML/header continuations, backslash-continued shell values, and quoted
 or square-bracketed values spanning physical lines are omitted with their key
-line through the close or source end.
+line through the close or source end. TOML triple-quoted values retain the full
+three-character delimiter across content lines.
 Backslash-continued shell lines are reconstructed before credential-name
 classification, so split assignments and options cannot evade detection.
 Command, parameter, and backtick substitutions remain tracked inside

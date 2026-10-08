@@ -565,6 +565,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "safe-after-quoted-option-name",
             'tool "--pass"word leading-quoted-fragment-option-secret',
             "safe-after-leading-quoted-option-name",
+            "tool --pass$'word' dollar-single-quoted-option-secret",
+            "safe-after-dollar-single-quoted-option-name",
+            'tool --pass$"word" dollar-double-quoted-option-secret',
+            "safe-after-dollar-double-quoted-option-name",
             r"tool --pass\word same-line-escaped-option-secret",
             "safe-after-same-line-escaped-option-name",
             "curl --user alice:curl-user-secret https://example.test",
@@ -767,6 +771,11 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             '"toml-array-secret"',
             "]",
             "safe-after-toml-array",
+            'password = """',
+            'prefix " visible',
+            "toml-triple-quoted-secret",
+            '"""',
+            "safe-after-toml-triple-quote",
             "password:",
             "# explanation",
             "",
@@ -919,8 +928,11 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-shell" in exported
     assert "safe-after-quoted-option-name" in exported
     assert "safe-after-leading-quoted-option-name" in exported
+    assert "safe-after-dollar-single-quoted-option-name" in exported
+    assert "safe-after-dollar-double-quoted-option-name" in exported
     assert "safe-after-same-line-escaped-option-name" in exported
     assert "safe-after-toml-array" in exported
+    assert "safe-after-toml-triple-quote" in exported
     assert "safe-after-split-assignment-name" in exported
     assert "safe-after-split-option-name" in exported
     assert "safe-after-quote" in exported
@@ -1008,6 +1020,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "cli-option-secret",
         "quoted-fragment-option-secret",
         "leading-quoted-fragment-option-secret",
+        "dollar-single-quoted-option-secret",
+        "dollar-double-quoted-option-secret",
         "same-line-escaped-option-secret",
         "curl-user-secret",
         "curl-short-user-secret",
@@ -1072,6 +1086,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "numeric-yaml-block-secret",
         "reversed-numeric-yaml-block-secret",
         "toml-array-secret",
+        "toml-triple-quoted-secret",
         "yaml-comment-line-secret",
         "yaml-anchor-property-secret",
         "yaml-tag-property-secret",

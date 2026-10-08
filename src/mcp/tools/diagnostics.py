@@ -1377,7 +1377,15 @@ def _normalize_shell_credential_names(line: str) -> str:
         if closing < 0:
             break
         fragment = line[index + 1 : closing]
-        joins_left = index > 0 and normalized[index - 1] in _SENSITIVE_KEY_CHARACTERS
+        dollar_prefix = index > 0 and normalized[index - 1] == "$"
+        dollar_joins_left = (
+            dollar_prefix
+            and index > 1
+            and normalized[index - 2] in _SENSITIVE_KEY_CHARACTERS
+        )
+        joins_left = (
+            index > 0 and normalized[index - 1] in _SENSITIVE_KEY_CHARACTERS
+        ) or dollar_joins_left
         joins_right = (
             closing + 1 < len(line)
             and line[closing + 1] in _SENSITIVE_KEY_CHARACTERS
@@ -1387,6 +1395,8 @@ def _normalize_shell_credential_names(line: str) -> str:
         ):
             normalized[index] = "_" if joins_left else " "
             normalized[closing] = "_"
+            if dollar_prefix:
+                normalized[index - 1] = "_" if dollar_joins_left else " "
         index = closing + 1
 
     word_start = 0
@@ -1512,15 +1522,34 @@ def _line_has_sensitive_context(line: str) -> bool:
 
 def _unterminated_quote(value: str, quote: str | None = None) -> str | None:
     escaped = False
-    for character in value:
+    index = 0
+    while index < len(value):
+        character = value[index]
         if escaped:
             escaped = False
+            index += 1
         elif character == "\\":
             escaped = True
+            index += 1
+        elif quote in {"'''", '\"\"\"'}:
+            if value.startswith(quote, index):
+                index += 3
+                quote = None
+            else:
+                index += 1
+        elif quote is None and (
+            value.startswith("'''", index) or value.startswith('\"\"\"', index)
+        ):
+            quote = value[index : index + 3]
+            index += 3
         elif quote is None and character in {"\"", "'"}:
             quote = character
+            index += 1
         elif character == quote:
             quote = None
+            index += 1
+        else:
+            index += 1
     return quote
 
 
