@@ -61,8 +61,9 @@ indicators), block-sequence, or flow-mapping `kind` values. Complete and
 interrupted private-key blocks are both omitted using bounded boundary scans.
 Standard encoded `auth` fields used by registry and package-manager credential
 documents are treated as credential context rather than exported as base64 text.
-YAML documents with mapping keys that use recognized YAML-only escape forms are
-omitted conservatively rather than partially decoded.
+YAML documents with explicit credential keys, alias mapping keys, or mapping
+keys that use recognized YAML-only escape forms are omitted conservatively
+rather than partially decoded.
 Recognizable XML credential elements, credential attributes, and `key`/`name`
 plus `value` configuration tags are omitted. XML character references in
 credential selectors are decoded before classification. Multiline or incomplete

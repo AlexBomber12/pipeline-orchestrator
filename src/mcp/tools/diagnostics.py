@@ -119,6 +119,14 @@ _YAML_ONLY_ESCAPED_MAPPING_KEY = re.compile(
     r"\\(?:[0ave _NLP]|x[0-9a-fA-F]{2}|U[0-9a-fA-F]{8})"
     r'(?:[^"\\\r\n]|\\[^\r\n]|\\(?:\r\n|\n)[ \t]*)*"[ \t]*:'
 )
+_YAML_EXPLICIT_MAPPING_KEY = re.compile(
+    r"(?im)^[ \t]*(?:-[ \t]+)?\?[ \t]+(?P<key>[^\r\n#]+?)"
+    r"[ \t]*(?:#.*)?\n(?:[ \t]*(?:#.*)?\n)*[ \t]*:"
+)
+_YAML_ALIAS_MAPPING_KEY = re.compile(
+    r"(?im)(?:^[ \t]*(?:-[ \t]+)?|[,{][ \t]*)"
+    r"\*[^\s,\[\]{}#]+[ \t]*:"
+)
 _YAML_BLOCK_VALUE_INDICATOR = re.compile(
     r"^(?:[|>](?:[1-9][+-]?|[+-][1-9]?)?)?$"
 )
@@ -1340,8 +1348,9 @@ def _shell_group_state(
     value: str,
     parenthesis_depth: int = 0,
     parameter_brace_depth: int = 0,
+    backtick_open: bool = False,
     quote: str | None = None,
-) -> tuple[int, int, str | None]:
+) -> tuple[int, int, bool, str | None]:
     """Track bounded shell grouping without interpreting commands or expansions."""
     escaped = False
     for index, character in enumerate(value):
@@ -1357,6 +1366,8 @@ def _shell_group_state(
             continue
         if character in {"\"", "'"}:
             quote = character
+        elif character == "`":
+            backtick_open = not backtick_open
         elif character == "#" and (index == 0 or value[index - 1].isspace()):
             break
         elif character == "(":
@@ -1367,7 +1378,7 @@ def _shell_group_state(
             parameter_brace_depth += 1
         elif character == "}" and parameter_brace_depth:
             parameter_brace_depth -= 1
-    return parenthesis_depth, parameter_brace_depth, quote
+    return parenthesis_depth, parameter_brace_depth, backtick_open, quote
 
 
 def _json_container_end(text: str, start: int) -> int:
@@ -1582,7 +1593,15 @@ def _omit_ambiguous_yaml_credential_documents(text: str) -> tuple[str, int]:
     """Fail closed for YAML credential values unsafe to redact line by line."""
     ranges: list[tuple[int, int]] = []
     for start, end in _yaml_document_ranges(text):
-        if _YAML_ONLY_ESCAPED_MAPPING_KEY.search(text, start, end):
+        explicit_credential_key = any(
+            _is_sensitive_key(match.group("key").strip().strip("'\""))
+            for match in _YAML_EXPLICIT_MAPPING_KEY.finditer(text, start, end)
+        )
+        if (
+            _YAML_ONLY_ESCAPED_MAPPING_KEY.search(text, start, end)
+            or _YAML_ALIAS_MAPPING_KEY.search(text, start, end)
+            or explicit_credential_key
+        ):
             ranges.append((start, end))
             continue
         document_has_alias = _YAML_ALIAS.search(text, start, end) is not None
@@ -1658,6 +1677,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
         (
             shell_parenthesis_depth,
             shell_brace_depth,
+            shell_backtick_open,
             shell_group_quote,
         ) = _shell_group_state(sensitive_value)
         heredoc = _HEREDOC_START.search(sensitive_value)
@@ -1677,15 +1697,17 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
                 if candidate == heredoc_delimiter:
                     heredoc_delimiter = None
                 continue
-            if shell_parenthesis_depth or shell_brace_depth:
+            if shell_parenthesis_depth or shell_brace_depth or shell_backtick_open:
                 (
                     shell_parenthesis_depth,
                     shell_brace_depth,
+                    shell_backtick_open,
                     shell_group_quote,
                 ) = _shell_group_state(
                     continuation,
                     shell_parenthesis_depth,
                     shell_brace_depth,
+                    shell_backtick_open,
                     shell_group_quote,
                 )
                 index += 1
