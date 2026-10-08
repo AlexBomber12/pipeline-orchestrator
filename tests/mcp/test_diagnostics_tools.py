@@ -2357,6 +2357,51 @@ async def test_latest_cli_log_omits_curl_certificate_passwords(
         assert secret not in result["text"]
 
 
+async def test_latest_cli_log_omits_cloud_secret_response_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    redis.store[cli_log_latest(SLUG)] = "\n".join(
+        (
+            '{"SecretString":"aws-secret-string-value","Name":"synthetic"}',
+            "safe-after-aws-secret-string",
+            '{"SecretBinary":"aws-secret-binary-value","ARN":"synthetic"}',
+            "safe-after-aws-secret-binary",
+            '[{"keyName":"key1","permissions":"FULL",'
+            '"value":"azure-storage-access-key-value"}]',
+            "safe-after-azure-storage-keys",
+            "SSHPASS=sshpass-environment-password sshpass -e ssh synthetic@host",
+            "safe-after-sshpass-environment",
+            '{"name":"ordinary","value":"visible-generic-value"}',
+            '{"keyName":"key1","value":""}',
+        )
+    )
+    _patch_runtime(monkeypatch, redis)
+
+    result = await diagnostics.get_latest_cli_log(SLUG)
+
+    for secret in (
+        "aws-secret-string-value",
+        "aws-secret-binary-value",
+        "azure-storage-access-key-value",
+        "sshpass-environment-password",
+    ):
+        assert secret not in result["text"]
+    for marker in (
+        "safe-after-aws-secret-string",
+        "safe-after-aws-secret-binary",
+        "safe-after-azure-storage-keys",
+        "safe-after-sshpass-environment",
+    ):
+        assert marker in result["text"]
+    assert '"value":"visible-generic-value"' in result["text"]
+    assert '{"keyName":"key1","value":""}' in result["text"]
+    assert diagnostics._is_sensitive_key("sshpass")
+    assert not diagnostics._is_sensitive_key("notsshpass")
+
+
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

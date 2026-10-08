@@ -98,6 +98,9 @@ _CREDENTIAL_DOCUMENT_KEYS = frozenset(
         "tokens",
     }
 )
+_EXACT_CREDENTIAL_DOCUMENT_KEYS = frozenset(
+    {"secretbinary", "secretstring", "sshpass"}
+)
 _JWK_ASYMMETRIC_KEY_TYPES = frozenset({"ec", "okp", "rsa"})
 _JWK_PRIVATE_PARAMETERS = frozenset({"d", "dp", "dq", "oth", "p", "q", "qi"})
 _PEM_CREDENTIAL_BOUNDARY = re.compile(
@@ -1201,6 +1204,10 @@ def _contains_credential_document_key(value: object) -> bool:
                 key in {"data", "stringData"} for key, _child in items
             ):
                 return True
+            if any(key == "keyName" and child not in (None, "", False) for key, child in items) and any(
+                key == "value" and child not in (None, "", False) for key, child in items
+            ):
+                return True
             jwk_key_types = {
                 child.lower()
                 for key, child in items
@@ -1402,7 +1409,7 @@ def _is_sensitive_key(value: str) -> bool:
         for character in decoded
         if "a" <= character <= "z" or "0" <= character <= "9"
     )
-    return any(
+    return key in _EXACT_CREDENTIAL_DOCUMENT_KEYS or any(
         key == sensitive or key.endswith(sensitive)
         for sensitive in _CREDENTIAL_DOCUMENT_KEYS
     )

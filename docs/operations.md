@@ -60,6 +60,8 @@ arguments recognized only inside a curl command span, netrc passwords delimited
 by horizontal whitespace or a newline,
 and recognizable JSON
 credential documents are not exported, including nested documents and documents
+with AWS Secrets Manager `SecretString`/`SecretBinary` fields or Azure storage
+access-key response objects containing nonempty `keyName` and `value` members,
 serialized inside log strings, documents whose container and field syntax is
 Unicode-escaped inside a JSON string (including after ordinary decoded message
 text), and structured header name/value pairs in
@@ -99,7 +101,8 @@ normalization.
 Azure CLI `az login` recognizes its `-p` password or service-principal-secret
 alias in the same monotonic command-specific context; unrelated `-p` options remain visible.
 The `sshpass -p` separated, attached, and shell-fragmented password forms are
-also recognized only in their command-specific context.
+also recognized only in their command-specific context. Its exact `SSHPASS`
+environment password assignment is credential context for `-e` mode.
 Positional access-key, secret-key, and session-token values passed through
 `aws configure set` (including after up to 16 global-option words), plus
 `redis-cli`'s `-a` and `--pass` password flags, are also omitted only in their
