@@ -2374,7 +2374,18 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
             "safe-after-azure-storage-keys",
             "SSHPASS=sshpass-environment-password sshpass -e ssh synthetic@host",
             "safe-after-sshpass-environment",
+            "az keyvault secret show --name ApiEndpoint --vault-name synthetic "
+            "--query value",
+            "",
+            "azure-key-vault-plain-value",
+            "safe-after-key-vault-scalar",
+            '{"id":"https://synthetic.vault.azure.net/secrets/name/version",'
+            '"value":"azure-key-vault-json-value","name":"name"}',
+            "safe-after-key-vault-object",
+            "ya29." + ("A" * 40),
+            "safe-after-google-oauth-token",
             '{"name":"ordinary","value":"visible-generic-value"}',
+            '{"id":"https://example.test/items/name","value":"visible-id-value"}',
             '{"keyName":"key1","value":""}',
         )
     )
@@ -2387,6 +2398,9 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
         "aws-secret-binary-value",
         "azure-storage-access-key-value",
         "sshpass-environment-password",
+        "azure-key-vault-plain-value",
+        "azure-key-vault-json-value",
+        "ya29." + ("A" * 40),
     ):
         assert secret not in result["text"]
     for marker in (
@@ -2394,12 +2408,19 @@ async def test_latest_cli_log_omits_cloud_secret_response_shapes(
         "safe-after-aws-secret-binary",
         "safe-after-azure-storage-keys",
         "safe-after-sshpass-environment",
+        "safe-after-key-vault-scalar",
+        "safe-after-key-vault-object",
+        "safe-after-google-oauth-token",
     ):
         assert marker in result["text"]
     assert '"value":"visible-generic-value"' in result["text"]
+    assert '"value":"visible-id-value"' in result["text"]
     assert '{"keyName":"key1","value":""}' in result["text"]
     assert diagnostics._is_sensitive_key("sshpass")
     assert not diagnostics._is_sensitive_key("notsshpass")
+    assert diagnostics._is_azure_key_vault_secret_value_command(
+        "noop; /usr/bin/az.exe keyvault secret show --query=value"
+    )
 
 
 async def test_status_returns_only_allowlisted_structured_metadata_and_is_read_only(

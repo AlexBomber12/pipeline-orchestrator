@@ -368,6 +368,7 @@ _RECOGNIZABLE_SECRET = tuple(
         r"glagent|glwt|glsoat|glffct)-[A-Za-z0-9_-]{20,}\b",
         r"\bpypi-[A-Za-z0-9_-]{85,}\b",
         r"\bnpm_[A-Za-z0-9]{36}\b",
+        r"\bya29\.[A-Za-z0-9._-]{20,}\b",
         r"\bhttps://hooks\.slack(?:-gov)?\.com/(?:services/)?"
         r"T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]{24}\b",
     )
@@ -1206,6 +1207,18 @@ def _contains_credential_document_key(value: object) -> bool:
                 return True
             if any(key == "keyName" and child not in (None, "", False) for key, child in items) and any(
                 key == "value" and child not in (None, "", False) for key, child in items
+            ):
+                return True
+            key_vault_secret = any(
+                key == "id"
+                and isinstance(child, str)
+                and child.lower().startswith("https://")
+                and "/secrets/" in child.lower()
+                for key, child in items
+            )
+            if key_vault_secret and any(
+                key == "value" and child not in (None, "", False)
+                for key, child in items
             ):
                 return True
             jwk_key_types = {
@@ -2547,6 +2560,68 @@ def _omit_kubernetes_secret_documents(text: str) -> tuple[str, int]:
     return _omit_document_ranges(text, ranges)
 
 
+def _is_azure_key_vault_secret_value_command(line: str) -> bool:
+    expected = ("keyvault", "secret", "show")
+    stage = 0
+    active = False
+    query_pending = False
+    for match in _SHELL_COMMAND_WORD.finditer(_normalize_shell_credential_names(line)):
+        word = match.group(0)
+        if word in ";&|<>()":
+            active = False
+            stage = 0
+            query_pending = False
+            continue
+        compact = word.strip("'\"").replace("_", "").lower()
+        executable = compact.replace("\\", "/").rsplit("/", 1)[-1]
+        if executable.removesuffix(".exe") == "az":
+            active = True
+            stage = 0
+            query_pending = False
+            continue
+        if not active:
+            continue
+        if stage < len(expected):
+            if compact == expected[stage]:
+                stage += 1
+            continue
+        if query_pending:
+            return compact == "value"
+        if compact == "--query":
+            query_pending = True
+        elif compact.startswith("--query="):
+            return compact[len("--query=") :] == "value"
+    return False
+
+
+def _omit_azure_key_vault_secret_value_output(text: str) -> tuple[str, int]:
+    """Omit the one-line scalar emitted by an exact Key Vault value query."""
+    lines = text.splitlines(keepends=True)
+    sanitized: list[str] = []
+    omitted = 0
+    index = 0
+    while index < len(lines):
+        content = lines[index].rstrip("\r\n")
+        if not _is_azure_key_vault_secret_value_command(content):
+            sanitized.append(lines[index])
+            index += 1
+            continue
+        ending = lines[index][len(content) :]
+        sanitized.append(f"[credential line omitted]{ending}")
+        omitted += 1
+        index += 1
+        while index < len(lines) and not lines[index].strip():
+            sanitized.append(lines[index])
+            index += 1
+        if index < len(lines):
+            output = lines[index].rstrip("\r\n")
+            output_ending = lines[index][len(output) :]
+            sanitized.append(f"[credential line omitted]{output_ending}")
+            omitted += 1
+            index += 1
+    return "".join(sanitized), omitted
+
+
 def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
     lines = text.splitlines(keepends=True)
     sanitized: list[str] = []
@@ -2686,6 +2761,7 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
     text, xml_selector_contexts = _omit_xml_selector_credential_contexts(text)
     text, xml_contexts = _omit_xml_credential_contexts(text)
     text, json_documents = _omit_json_credential_documents(text)
+    text, azure_key_vault_values = _omit_azure_key_vault_secret_value_output(text)
     text, ambiguous_yaml_documents = _omit_ambiguous_yaml_credential_documents(text)
     text, kubernetes_documents = _omit_kubernetes_secret_documents(text)
     text, pem_documents = _omit_pem_credential_documents(text)
@@ -2700,6 +2776,7 @@ def _sanitize_cli_log(text: str) -> tuple[str, int, int]:
         + kubernetes_documents
         + pem_documents
         + json_documents
+        + azure_key_vault_values
         + credential_lines
     )
 

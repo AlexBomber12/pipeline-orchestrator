@@ -52,7 +52,8 @@ credential-bearing absolute or
 scheme-relative URL userinfo/query parameters (including percent-encoded
 parameter names, Azure SAS signatures, and AWS/Google presigned signatures),
 recognizable token shapes including JWTs, standard GitLab token prefixes, PyPI
-and npm API tokens, and Slack webhooks, private-key blocks,
+and npm API tokens, Google `ya29.` OAuth access tokens, and Slack webhooks,
+private-key blocks,
 PuTTY private-key documents, standalone AWS access-key identifiers and AWS
 credential CSVs with quoted or unquoted fields and an optional leading UTF-8
 BOM, curl user/proxy-user credentials using separated or attached short-option
@@ -62,6 +63,8 @@ and recognizable JSON
 credential documents are not exported, including nested documents and documents
 with AWS Secrets Manager `SecretString`/`SecretBinary` fields or Azure storage
 access-key response objects containing nonempty `keyName` and `value` members,
+and Azure Key Vault secret objects containing a secret-resource `id` plus a
+nonempty `value`,
 serialized inside log strings, documents whose container and field syntax is
 Unicode-escaped inside a JSON string (including after ordinary decoded message
 text), and structured header name/value pairs in
@@ -100,6 +103,8 @@ sshpass password flags use the same bounded command scan and shell-fragment
 normalization.
 Azure CLI `az login` recognizes its `-p` password or service-principal-secret
 alias in the same monotonic command-specific context; unrelated `-p` options remain visible.
+An exact `az keyvault secret show --query value` command and its following
+one-line scalar output are omitted conservatively.
 The `sshpass -p` separated, attached, and shell-fragmented password forms are
 also recognized only in their command-specific context. Its exact `SSHPASS`
 environment password assignment is credential context for `-e` mode.
