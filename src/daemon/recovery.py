@@ -568,6 +568,18 @@ class RecoveryMixin:
             # branch (a deliberate detector park already wrote its own
             # cause).
             if branch_kind == "crash":
+                # CODING checkpoints its invocation before starting the
+                # provider process. On restart, finalize that durable record
+                # before ``current_task = None`` drops the lookup identity;
+                # otherwise the record keeps ``ended_at=None`` forever and
+                # the existing Recent PRs view correctly excludes it as an
+                # unfinished run.
+                await self._restore_current_run_record()
+                await self._save_current_run_record(
+                    "error",
+                    run_phase="recovery",
+                    cause="CRASH",
+                )
                 await self._record_crash_cancellation_if_missing(doing.pr_id)
             if self.repo_config.feature_flags.use_single_error_exit:
                 if branch_kind == "crash":

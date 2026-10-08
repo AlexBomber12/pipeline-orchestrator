@@ -154,6 +154,56 @@ def test_dirty_tree_recovery_composes_with_crashed_task_marker(
     assert any("PR-100 crashed, marking ERROR" in e["event"] for e in runner.state.history)
 
 
+def test_recovery_finalizes_checkpointed_coding_invocation_without_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = QueueTask(
+        pr_id="PR-395",
+        title="Invocation settings",
+        status=TaskStatus.DOING,
+        branch="manual-20261008-coder-invocation-settings",
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda repo, **kwargs: [],
+    )
+    runner = h._make_runner()
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
+    runner._preserve_crashed_run_commits = (  # type: ignore[method-assign]
+        lambda branch: True
+    )
+    runner.state.current_task = task
+    runner._start_current_run_record("codex", "gpt-5.4")
+    snapshot = runner._capture_invocation_snapshot(
+        "codex",
+        {"model": "gpt-5.4", "reasoning_effort": "high"},
+        phase="coding",
+    )
+    asyncio.run(runner._checkpoint_current_run_record())
+    runner._current_run_record = None
+    runner.state.current_task = None
+
+    asyncio.run(runner.recover_state())
+
+    records = asyncio.run(
+        runner._metrics_store.recent(
+            task_id=task.pr_id,
+            limit=1,
+            repo_name=runner.name,
+        )
+    )
+    assert len(records) == 1
+    record = records[0]
+    assert record.ended_at is not None
+    assert record.exit_reason == "error"
+    assert record.outcome == "failed"
+    assert record.cause == "CRASH"
+    assert record.run_phase == "recovery"
+    assert record.invocations == [snapshot]
+    assert runner.state.current_task is None
+    assert runner.state.active_invocation is None
+
+
 # ---------------------------------------------------------------------------
 # Test 2 — no-push deadlock cancels the task and returns to IDLE (PR-258)
 # ---------------------------------------------------------------------------
