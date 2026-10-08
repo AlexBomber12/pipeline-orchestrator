@@ -1358,8 +1358,8 @@ def _json_key_escape_length(value: str, index: int) -> int:
     return 0
 
 
-def _normalize_quoted_credential_names(line: str) -> str:
-    """Join simple adjacent shell quote fragments without changing offsets."""
+def _normalize_shell_credential_names(line: str) -> str:
+    """Join simple shell word fragments without changing source offsets."""
     normalized = list(line)
     index = 0
     while index < len(line):
@@ -1382,6 +1382,25 @@ def _normalize_quoted_credential_names(line: str) -> str:
             normalized[index] = "_" if joins_left else " "
             normalized[closing] = "_"
         index = closing + 1
+
+    word_start = 0
+    while word_start < len(line):
+        while word_start < len(line) and normalized[word_start] in " \t;&|<>()":
+            word_start += 1
+        word_end = word_start
+        while word_end < len(line) and normalized[word_end] not in " \t;&|<>()":
+            word_end += 1
+        prefix_start = word_start
+        while prefix_start < word_end and normalized[prefix_start] in "'\"":
+            prefix_start += 1
+        if normalized[prefix_start : prefix_start + 2] == ["-", "-"]:
+            for cursor in range(prefix_start + 2, word_end - 1):
+                if (
+                    line[cursor] == "\\"
+                    and line[cursor + 1] in _SENSITIVE_KEY_CHARACTERS
+                ):
+                    normalized[cursor] = "_"
+        word_start = word_end
     return "".join(normalized)
 
 
@@ -1421,7 +1440,7 @@ def _sensitive_value_start(line: str) -> int | None:
     yaml_single_quoted = _yaml_single_quoted_sensitive_value_start(line)
     if yaml_single_quoted is not None:
         return yaml_single_quoted
-    line = _normalize_quoted_credential_names(line)
+    line = _normalize_shell_credential_names(line)
     netrc_password = _NETRC_PASSWORD_VALUE.search(line)
     if netrc_password is not None:
         return netrc_password.end()

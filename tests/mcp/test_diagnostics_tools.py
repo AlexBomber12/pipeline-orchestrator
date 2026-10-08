@@ -565,6 +565,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "safe-after-quoted-option-name",
             'tool "--pass"word leading-quoted-fragment-option-secret',
             "safe-after-leading-quoted-option-name",
+            r"tool --pass\word same-line-escaped-option-secret",
+            "safe-after-same-line-escaped-option-name",
             "curl --user alice:curl-user-secret https://example.test",
             "curl -u alice:curl-short-user-secret https://example.test",
             "curl -ualice:curl-attached-user-secret https://example.test",
@@ -910,6 +912,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-shell" in exported
     assert "safe-after-quoted-option-name" in exported
     assert "safe-after-leading-quoted-option-name" in exported
+    assert "safe-after-same-line-escaped-option-name" in exported
     assert "safe-after-toml-array" in exported
     assert "safe-after-split-assignment-name" in exported
     assert "safe-after-split-option-name" in exported
@@ -998,6 +1001,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "cli-option-secret",
         "quoted-fragment-option-secret",
         "leading-quoted-fragment-option-secret",
+        "same-line-escaped-option-secret",
         "curl-user-secret",
         "curl-short-user-secret",
         "curl-attached-user-secret",

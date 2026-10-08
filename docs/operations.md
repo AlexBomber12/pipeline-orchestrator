@@ -103,7 +103,8 @@ Lines with recognizable credential keys are omitted conservatively when they
 use assignment, structured-field, header, or long-option syntax. Balanced
 quotes around recognized multiword credential labels are supported, so
 malformed or interrupted quoting cannot expose a value suffix. Adjacent simple
-shell quote fragments in option names are reassembled for classification.
+shell quote fragments and same-line backslash-escaped characters in long-option
+names are reassembled for classification.
 Indented YAML/header continuations, backslash-continued shell values, and quoted
 or square-bracketed values spanning physical lines are omitted with their key
 line through the close or source end.
