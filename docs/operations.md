@@ -88,13 +88,15 @@ context across blank and comment lines. Single-quoted YAML mapping keys decode
 doubled single-quote escapes before credential classification. Documents
 containing multiline explicit plain mapping keys, or multiline explicit single-
 or double-quoted keys in block or flow mappings, are omitted because folded keys
-cannot be classified safely without interpreting YAML.
+cannot be classified safely without interpreting YAML. Plain-key discovery uses
+a monotonic bounded line scan.
 Explicit block-scalar mapping keys
 are omitted for the same reason.
 Recognizable XML credential elements, credential attributes, and `key`/`name`
 plus `value` configuration tags are omitted. Selector discovery uses a bounded,
 monotonic tag scan, so repeated unmatched starts cannot trigger overlapping
-source rescans. XML character references in
+source rescans. Opening and closing qualified names are matched case-sensitively;
+mismatches fail closed. XML character references in
 credential selectors are decoded before classification. Plist-style sensitive
 `key`/`name` element text is normalized across bounded attributed start tags,
 comments, and CDATA before its following scalar value is omitted. Other or

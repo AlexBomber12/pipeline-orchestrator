@@ -145,10 +145,9 @@ _YAML_MULTILINE_EXPLICIT_SINGLE_QUOTED_KEY = re.compile(
     r"(?:[^']|'')*'[ \t]*"
     r"(?::|(?:#.*)?\r?\n(?:[ \t]*(?:#.*)?\r?\n)*[ \t]*:)"
 )
-_YAML_MULTILINE_EXPLICIT_PLAIN_KEY = re.compile(
-    r"(?m)(?:^[ \t]*(?:-[ \t]+)?|[,{][ \t]*)\?[ \t]+"
-    r"(?!['\"\[{|>])[^\r\n#]+\r?\n"
-    r"(?:[ \t]+(?!:)[^\r\n]*(?:\r?\n))+[ \t]*:"
+_YAML_EXPLICIT_PLAIN_KEY_START = re.compile(
+    r"^[ \t]*(?:-[ \t]+|[,{][ \t]*)?\?[ \t]+"
+    r"(?P<key>(?!['\"\[{|>])[^#\r\n]+)"
 )
 _YAML_ALIAS_MAPPING_KEY = re.compile(
     r"(?im)(?:^[ \t]*(?:-[ \t]+)?|[,{][ \t]*)"
@@ -1832,6 +1831,32 @@ def _yaml_document_ranges(text: str) -> list[tuple[int, int]]:
     return ranges
 
 
+def _has_multiline_explicit_plain_yaml_key(text: str, start: int, end: int) -> bool:
+    """Find multiline plain explicit keys with one monotonic bounded line scan."""
+    awaiting_delimiter = False
+    saw_continuation = False
+    for line in text[start:end].splitlines():
+        stripped = line.lstrip(" \t")
+        if awaiting_delimiter:
+            if stripped.startswith(":"):
+                if saw_continuation:
+                    return True
+                awaiting_delimiter = False
+            elif not stripped or stripped.startswith("#"):
+                continue
+            elif line.startswith((" ", "\t")):
+                saw_continuation = True
+                continue
+            else:
+                awaiting_delimiter = False
+
+        plain_key = _YAML_EXPLICIT_PLAIN_KEY_START.match(line)
+        if plain_key is not None and plain_key.group("key").strip():
+            awaiting_delimiter = True
+            saw_continuation = False
+    return False
+
+
 def _omit_document_ranges(text: str, ranges: list[tuple[int, int]]) -> tuple[str, int]:
     if not ranges:
         return text, 0
@@ -1946,7 +1971,7 @@ def _xml_matching_close_end(
         closing, candidate_name, _name_end, tag_end, self_closing = details
         if tag_end > limit or text[tag_end - 1 : tag_end] != ">":
             return None
-        if candidate_name.lower() == name.lower():
+        if candidate_name == name:
             if closing:
                 if depth == 0:
                     return tag_end
@@ -2039,7 +2064,7 @@ def _omit_xml_selector_credential_contexts(text: str) -> tuple[str, int]:
                 candidate_end,
                 _candidate_self_closing,
             ) = closing_details
-            if candidate_closing and candidate_name.lower() == name.lower():
+            if candidate_closing and candidate_name == name:
                 closing_start = candidate
                 selector_end = candidate_end
                 break
@@ -2120,7 +2145,7 @@ def _omit_ambiguous_yaml_credential_documents(text: str) -> tuple[str, int]:
             or _YAML_BLOCK_EXPLICIT_MAPPING_KEY.search(text, start, end)
             or _YAML_MULTILINE_EXPLICIT_QUOTED_KEY.search(text, start, end)
             or _YAML_MULTILINE_EXPLICIT_SINGLE_QUOTED_KEY.search(text, start, end)
-            or _YAML_MULTILINE_EXPLICIT_PLAIN_KEY.search(text, start, end)
+            or _has_multiline_explicit_plain_yaml_key(text, start, end)
             or _YAML_ALIAS_MAPPING_KEY.search(text, start, end)
             or explicit_credential_key
         ):

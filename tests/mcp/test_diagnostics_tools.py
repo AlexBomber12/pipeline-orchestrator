@@ -1601,6 +1601,15 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
     assert "SYNTHETIC_AMBIGUOUS_SECRET" not in ambiguous["text"]
     assert "safe: not-exported-without-boundary" not in ambiguous["text"]
 
+    plain_flood = "? pass\n" + ("  word\n" * 4_000)
+    assert not diagnostics._has_multiline_explicit_plain_yaml_key(
+        plain_flood, 0, len(plain_flood)
+    )
+    interrupted_plain = "? public\n\n# comment\nsafe: visible"
+    assert not diagnostics._has_multiline_explicit_plain_yaml_key(
+        interrupted_plain, 0, len(interrupted_plain)
+    )
+
 
 async def test_latest_cli_log_omits_xml_credential_contexts(
     monkeypatch: pytest.MonkeyPatch,
@@ -1675,6 +1684,10 @@ async def test_latest_cli_log_omits_xml_credential_contexts(
         "SYNTHETIC_XML_UNKNOWN_MARKUP_SECRET\nsafe-after",
         "safe-before\n<password><value\n format='text'>"
         "SYNTHETIC_XML_CROSS_LINE_TAG_SECRET</value></password>\nsafe-after",
+        "safe-before\n<Password>decoy</password>\n"
+        "SYNTHETIC_XML_CASE_MISMATCH_SECRET\n</Password>\nsafe-after",
+        "safe-before\n<key>Password</KEY>"
+        "<string>SYNTHETIC_XML_SELECTOR_CASE_SECRET</string>\nsafe-after",
         'safe-before\n<add key="password"\n value="SYNTHETIC_XML_INCOMPLETE_SECRET"',
         "safe-before\n<key>Password</key>\n<string>SYNTHETIC_XML_PLIST_INCOMPLETE_SECRET",
         "safe-before\n<key>Pass<em>word</em></key>"
