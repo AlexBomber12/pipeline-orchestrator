@@ -49,10 +49,10 @@ scheme-relative URL userinfo/query parameters (including percent-encoded
 parameter names, Azure SAS signatures, and AWS/Google presigned signatures),
 recognizable token shapes including JWTs and Slack webhooks, private-key blocks,
 PuTTY private-key documents, standalone AWS access-key identifiers and AWS
-credential CSVs, curl user/proxy-user credentials, netrc whitespace-delimited
-passwords, and recognizable JSON credential documents are not exported,
-including nested documents and documents serialized
-inside log strings and structured header name/value pairs in JSON-list or
+credential CSVs with quoted or unquoted fields, curl user/proxy-user
+credentials, netrc whitespace-delimited passwords, and recognizable JSON
+credential documents are not exported, including nested documents and documents
+serialized inside log strings and structured header name/value pairs in JSON-list or
 Python-tuple form. Recognizable Kubernetes Secret documents are omitted as a
 whole in YAML or JSON form, including arbitrary keys under `data` or
 `stringData`, decorated, explicit, quoted, or escaped `kind` keys, and `kind`
@@ -68,7 +68,8 @@ keys that use recognized YAML-only escape forms are omitted conservatively
 rather than partially decoded. Node-property-only credential values retain their
 context across blank and comment lines. Documents containing multiline explicit
 single- or double-quoted mapping keys are omitted because folded keys cannot be
-classified safely without interpreting YAML.
+classified safely without interpreting YAML. Explicit block-scalar mapping keys
+are omitted for the same reason.
 Recognizable XML credential elements, credential attributes, and `key`/`name`
 plus `value` configuration tags are omitted. XML character references in
 credential selectors are decoded before classification. Multiline or incomplete

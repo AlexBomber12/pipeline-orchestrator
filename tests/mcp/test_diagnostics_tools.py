@@ -537,6 +537,10 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "Access key ID,Secret access key",
             "ASIAABCDEFGHIJKLMNOP,aws-csv-secret-key",
             "safe-after-aws-csv",
+            "safe-before-quoted-aws-csv",
+            '"Access key ID","Secret access key"',
+            '"AKIAABCDEFGHIJKLMNOP","quoted-aws-csv-secret-key"',
+            "safe-after-quoted-aws-csv",
             "safe-before-kubernetes-secret",
             "---",
             "apiVersion: v1",
@@ -805,6 +809,8 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-kubernetes-secret" in exported
     assert "safe-before-aws-csv" in exported
     assert "safe-after-aws-csv" in exported
+    assert "safe-before-quoted-aws-csv" in exported
+    assert "safe-after-quoted-aws-csv" in exported
     assert "safe-after-shell" in exported
     assert "safe-after-quote" in exported
     assert "safe-after-shell-array" in exported
@@ -887,6 +893,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "curl-short-proxy-user-secret",
         "netrc-password-secret",
         "aws-csv-secret-key",
+        "quoted-aws-csv-secret-key",
         "kubernetes-dockerconfig-secret",
         "kubernetes-stringdata-secret",
         "kubernetes-json-secret",
@@ -1126,6 +1133,7 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
         "defaults: &value SYNTHETIC_SECRET\npassword: *value\nsafe: visible",
         '? "pass\\\n  word"\n: SYNTHETIC_SECRET\nsafe: visible',
         "? 'pass\n  word'\n: SYNTHETIC_SECRET\nsafe: visible",
+        "? |-\n  password\n: SYNTHETIC_SECRET\nsafe: visible",
     )
     for payload in supplied_cases:
         supplied_redis = FakeRedis()
@@ -1167,9 +1175,16 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
             "  word'",
             ": SYNTHETIC_SINGLE_QUOTED_EXPLICIT_KEY_SECRET",
             "---",
+            "? >-2",
+            "  pass",
+            "  word",
+            ": SYNTHETIC_BLOCK_EXPLICIT_KEY_SECRET",
+            "---",
             "safe: visible",
             "? 'public label'",
             ": safe-explicit-visible",
+            "safe-block: |-",
+            "  safe-block-visible",
         )
     )
     _patch_runtime(monkeypatch, redis)
@@ -1177,10 +1192,11 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
     result = await diagnostics.get_latest_cli_log(SLUG, diagnostics._MAX_CLI_LOG_TAIL_BYTES)
 
     assert result["availability"]["status"] == "available"
-    assert result["text"].count("[credential document omitted]") == 7
+    assert result["text"].count("[credential document omitted]") == 8
     assert "safe: before" in result["text"]
     assert "safe: visible" in result["text"]
     assert "safe-explicit-visible" in result["text"]
+    assert "safe-block-visible" in result["text"]
     for secret in (
         "SYNTHETIC_COMMENT_SECRET",
         "SYNTHETIC_BEFORE_ALIAS_SECRET",
@@ -1189,6 +1205,7 @@ async def test_latest_cli_log_omits_ambiguous_yaml_credential_documents(
         "SYNTHETIC_FLOW_COLLECTION_SECRET",
         "SYNTHETIC_MULTILINE_EXPLICIT_KEY_SECRET",
         "SYNTHETIC_SINGLE_QUOTED_EXPLICIT_KEY_SECRET",
+        "SYNTHETIC_BLOCK_EXPLICIT_KEY_SECRET",
     ):
         assert secret not in result["text"]
 

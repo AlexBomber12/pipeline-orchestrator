@@ -161,6 +161,10 @@ _YAML_FLOW_NODE_PROPERTIES = rf"(?:{_YAML_NODE_PROPERTY}[ \t\r\n]+)*"
 _YAML_NODE_PROPERTIES_ONLY = re.compile(
     rf"^{_YAML_NODE_PROPERTY}(?:[ \t]+{_YAML_NODE_PROPERTY})*$"
 )
+_YAML_BLOCK_EXPLICIT_MAPPING_KEY = re.compile(
+    rf"(?im)^[ \t]*(?:-[ \t]+)?\?[ \t]+{_YAML_NODE_PROPERTIES}"
+    r"[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?(?:\r?\n|$)"
+)
 _KUBERNETES_KIND_KEY_SCALAR = (
     r'''(?:kind|'kind'|"kind"|'''
     r'''"(?=[^"\r\n]*\\)(?:[^"\\\r\n]|\\[^\r\n])*")'''
@@ -219,8 +223,8 @@ _KUBERNETES_EXPLICIT_SECRET_KIND = re.compile(
     r"[ \t]*(?:#.*)?$"
 )
 _AWS_CREDENTIAL_CSV_HEADER = re.compile(
-    r"(?i)(?:^|,)[ \t]*access key id[ \t]*,[ \t]*"
-    r"secret access key[ \t]*(?:,|$)"
+    r'(?i)(?:^|,)[ \t]*"?access key id"?[ \t]*,[ \t]*'
+    r'"?secret access key"?[ \t]*(?:,|$)'
 )
 _PUTTY_PRIVATE_KEY_START = re.compile(
     r"(?im)^PuTTY-User-Key-File-[23]:[^\r\n]*(?:\r?\n|$)"
@@ -1678,6 +1682,7 @@ def _omit_ambiguous_yaml_credential_documents(text: str) -> tuple[str, int]:
         )
         if (
             _YAML_ONLY_ESCAPED_MAPPING_KEY.search(text, start, end)
+            or _YAML_BLOCK_EXPLICIT_MAPPING_KEY.search(text, start, end)
             or _YAML_MULTILINE_EXPLICIT_QUOTED_KEY.search(text, start, end)
             or _YAML_MULTILINE_EXPLICIT_SINGLE_QUOTED_KEY.search(text, start, end)
             or _YAML_ALIAS_MAPPING_KEY.search(text, start, end)
