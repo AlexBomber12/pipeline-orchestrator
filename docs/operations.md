@@ -50,7 +50,8 @@ parameter names, Azure SAS signatures, and AWS/Google presigned signatures),
 recognizable token shapes including JWTs and Slack webhooks, private-key blocks,
 PuTTY private-key documents, standalone AWS access-key identifiers and AWS
 credential CSVs with quoted or unquoted fields, curl user/proxy-user
-credentials, netrc whitespace-delimited passwords, and recognizable JSON
+credentials, netrc passwords delimited by horizontal whitespace or a newline,
+and recognizable JSON
 credential documents are not exported, including nested documents and documents
 serialized inside log strings and structured header name/value pairs in JSON-list or
 Python-tuple form. Recognizable Kubernetes Secret documents are omitted as a

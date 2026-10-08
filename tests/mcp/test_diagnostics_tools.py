@@ -533,6 +533,12 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
             "curl --proxy-user bob:curl-proxy-user-secret https://example.test",
             "curl -U bob:curl-short-proxy-user-secret https://example.test",
             "machine example.test login alice password netrc-password-secret",
+            "machine other.example.test login bob",
+            "password",
+            "",
+            "# synthetic netrc comment",
+            "netrc-newline-password-secret",
+            "safe-after-netrc-newline",
             "safe-before-aws-csv",
             "Access key ID,Secret access key",
             "ASIAABCDEFGHIJKLMNOP,aws-csv-secret-key",
@@ -809,6 +815,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
     assert "safe-after-kubernetes-secret" in exported
     assert "safe-before-aws-csv" in exported
     assert "safe-after-aws-csv" in exported
+    assert "safe-after-netrc-newline" in exported
     assert "safe-before-quoted-aws-csv" in exported
     assert "safe-after-quoted-aws-csv" in exported
     assert "safe-after-shell" in exported
@@ -892,6 +899,7 @@ async def test_latest_cli_log_redacts_before_tail_and_omits_credential_documents
         "curl-proxy-user-secret",
         "curl-short-proxy-user-secret",
         "netrc-password-secret",
+        "netrc-newline-password-secret",
         "aws-csv-secret-key",
         "quoted-aws-csv-secret-key",
         "kubernetes-dockerconfig-secret",

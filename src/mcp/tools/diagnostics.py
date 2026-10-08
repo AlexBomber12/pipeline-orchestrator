@@ -248,6 +248,7 @@ _CREDENTIAL_CLI_OPTION = re.compile(
     r"(?i)(?<!\S)(?:-[uU]|--user|--proxy-user)(?:[ \t]+|=)"
 )
 _NETRC_PASSWORD_VALUE = re.compile(r"(?i)(?<!\S)password[ \t]+")
+_NETRC_PENDING_PASSWORD_VALUE = re.compile(r"(?i)(?<!\S)password[ \t]*$")
 _HEREDOC_START = re.compile(
     r"<<(?P<strip_tabs>-?)[ \t]*(?P<quote>['\"]?)"
     r"(?P<delimiter>[A-Za-z0-9_.+-]+)(?P=quote)(?=$|[ \t;|&()<>])"
@@ -1349,6 +1350,9 @@ def _sensitive_value_start(line: str) -> int | None:
     netrc_password = _NETRC_PASSWORD_VALUE.search(line)
     if netrc_password is not None:
         return netrc_password.end()
+    pending_netrc_password = _NETRC_PENDING_PASSWORD_VALUE.search(line)
+    if pending_netrc_password is not None:
+        return pending_netrc_password.end()
 
     credential_option = _CREDENTIAL_CLI_OPTION.search(line)
     if credential_option is not None:
@@ -1754,6 +1758,7 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
         open_quote = _unterminated_quote(content)
         continued = content.rstrip().endswith("\\")
         yaml_block = _is_pending_yaml_value(content[value_start:].strip())
+        pending_netrc_value = _NETRC_PENDING_PASSWORD_VALUE.search(content) is not None
         sensitive_value = content[value_start:]
         (
             shell_parenthesis_depth,
@@ -1772,6 +1777,12 @@ def _omit_sensitive_context_lines(text: str) -> tuple[str, int]:
         index += 1
         while index < len(lines):
             continuation = lines[index].rstrip("\r\n")
+            if pending_netrc_value:
+                if not continuation.strip() or continuation.lstrip().startswith("#"):
+                    index += 1
+                    continue
+                index += 1
+                break
             if heredoc_delimiter is not None:
                 candidate = continuation.lstrip("\t") if heredoc_strips_tabs else continuation
                 index += 1
