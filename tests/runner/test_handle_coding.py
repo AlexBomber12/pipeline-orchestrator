@@ -47,19 +47,21 @@ def test_coding_prelaunch_failure_releases_reserved_credentials(
         "src.github.prs.get_branch_publications",
         lambda *_args, **_kwargs: [],
     )
+    prelaunch_calls: list[str] = []
 
-    async def fail_prelaunch() -> None:
-        raise failure
+    async def checkpoint() -> None:
+        prelaunch_calls.append("checkpoint")
+        if failure_site == "checkpoint":
+            raise failure
 
-    monkeypatch.setattr(
-        runner,
-        (
-            "_checkpoint_current_run_record"
-            if failure_site == "checkpoint"
-            else "publish_state"
-        ),
-        fail_prelaunch,
-    )
+    async def publish() -> None:
+        assert runner.state.active_invocation is not None
+        prelaunch_calls.append("publish")
+        if failure_site == "publish":
+            raise failure
+
+    monkeypatch.setattr(runner, "_checkpoint_current_run_record", checkpoint)
+    monkeypatch.setattr(runner, "publish_state", publish)
 
     with pytest.raises(type(failure)):
         asyncio.run(
@@ -80,6 +82,11 @@ def test_coding_prelaunch_failure_releases_reserved_credentials(
     )
     assert runner._coder_credential_reservation is None
     assert runner._coder_invocation_active is False
+    assert prelaunch_calls == (
+        ["publish", "checkpoint"]
+        if failure_site == "checkpoint"
+        else ["publish"]
+    )
     assert reservations.reserve_login(location) is True
     reservations.release_login(location)
 

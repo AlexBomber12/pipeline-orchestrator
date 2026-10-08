@@ -502,8 +502,13 @@ class CodingMixin:
                 coder_kwargs,
                 phase="coding",
             )
-            await self._checkpoint_current_run_record()
+            # Persist the snapshot identity before creating an unfinished
+            # metrics checkpoint. Recovery requires the snapshot run_id to
+            # finalize that exact record after a crash; the reverse order
+            # leaves an unidentifiable checkpoint if the daemon dies between
+            # these writes.
             await self.publish_state()
+            await self._checkpoint_current_run_record()
             heartbeat = asyncio.create_task(
                 self._publish_while_waiting("CODING")
             )
