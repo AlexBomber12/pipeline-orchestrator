@@ -3366,6 +3366,65 @@ def test_device_login_waiting_partial_has_bounded_serial_poll_and_cancel(
     )
 
 
+def test_device_login_copy_control_survives_polling_fragment_replacement(
+    empty_config: Path,
+) -> None:
+    calls: list[str] = []
+
+    class Bridge:
+        async def start_device_login(
+            self, *_args: object, **_kwargs: object
+        ) -> dict[str, object]:
+            calls.append("start")
+            return _device_login_payload()
+
+        async def inspect_device_login(
+            self, *_args: object, **_kwargs: object
+        ) -> dict[str, object]:
+            calls.append("inspect")
+            return _device_login_payload()
+
+    with TestClient(app) as client:
+        client.app.state.plugin_bridge = Bridge()
+        fragments = [
+            client.post(
+                "/api/coders/codex/device-login",
+                headers={"HX-Request": "true"},
+            ),
+            client.get(
+                f"/api/coders/codex/device-login/{'s' * 32}",
+                headers={"HX-Request": "true"},
+            ),
+            client.get(
+                f"/api/coders/codex/device-login/{'s' * 32}",
+                headers={"HX-Request": "true"},
+            ),
+        ]
+
+    assert calls == ["start", "inspect", "inspect"]
+    assert [fragment.status_code for fragment in fragments] == [202, 200, 200]
+    for fragment in fragments:
+        displayed_code = re.search(
+            r"<code\b[^>]*>([^<]*)</code>", fragment.text
+        )
+        copy_button = re.search(
+            r"<button\b(?=[^>]*\bdata-clipboard-value=)[^>]*>",
+            fragment.text,
+        )
+        assert displayed_code is not None
+        assert copy_button is not None
+        clipboard_value = re.search(
+            r'data-clipboard-value="([^"]*)"', copy_button.group(0)
+        )
+        assert clipboard_value is not None
+        assert clipboard_value.group(1) == displayed_code.group(1) == "ABCD-EFGH"
+        assert 'type="button"' in copy_button.group(0)
+        assert 'aria-label="Copy temporary device-login code"' in (
+            copy_button.group(0)
+        )
+        assert "hx-" not in copy_button.group(0)
+
+
 def test_device_login_waiting_partial_handles_unrepresentable_deadline(
     empty_config: Path,
 ) -> None:
