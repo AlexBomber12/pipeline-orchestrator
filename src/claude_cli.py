@@ -130,6 +130,7 @@ def run_claude(
     cwd: str,
     timeout: int = 600,
     model: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[int, str, str]:
     """Invoke the ``claude`` CLI with ``prompt`` inside ``cwd``.
 
@@ -143,6 +144,8 @@ def run_claude(
     ]
     if model:
         cmd.extend(["--model", model])
+    if reasoning_effort:
+        cmd.extend(["--effort", reasoning_effort])
     cmd.append(prompt)
     logger.info("running claude CLI with prompt: %s", prompt[:80])
 
@@ -189,10 +192,19 @@ def run_claude(
 
 
 def run_planned_pr(
-    repo_path: str, model: str | None = None, timeout: int = 900
+    repo_path: str,
+    model: str | None = None,
+    timeout: int = 900,
+    reasoning_effort: str | None = None,
 ) -> tuple[int, str, str]:
     """Trigger a ``PLANNED PR`` run in ``repo_path``."""
-    return run_claude("PLANNED PR", repo_path, timeout=timeout, model=model)
+    return run_claude(
+        "PLANNED PR",
+        repo_path,
+        timeout=timeout,
+        model=model,
+        reasoning_effort=reasoning_effort,
+    )
 
 
 def _build_auto_pr_prompt(pr_id: str, task_file: str, task_body: str) -> str:
@@ -210,6 +222,7 @@ def run_auto_pr(
     *,
     model: str | None = None,
     timeout: int = 900,
+    reasoning_effort: str | None = None,
 ) -> tuple[int, str, str]:
     """Trigger an ``AUTO PR`` run in ``repo_path`` with task injected inline."""
     return run_claude(
@@ -217,6 +230,7 @@ def run_auto_pr(
         repo_path,
         timeout=timeout,
         model=model,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -249,6 +263,7 @@ def fix_review(
     model: str | None = None,
     timeout: int = 3600,
     extra_context: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[int, str, str]:
     """Trigger a ``FIX FEEDBACK`` run in ``repo_path``."""
     return run_claude(
@@ -256,11 +271,15 @@ def fix_review(
         repo_path,
         timeout=timeout,
         model=model,
+        reasoning_effort=reasoning_effort,
     )
 
 
 def diagnose_error(
-    repo_path: str, context: str, model: str | None = None
+    repo_path: str,
+    context: str,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[int, str, str]:
     """Ask the ``claude`` CLI to classify an infrastructure error.
 
@@ -272,6 +291,7 @@ def diagnose_error(
         repo_path,
         timeout=120,
         model=model,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -293,6 +313,7 @@ async def run_claude_async(
     breach_run_id: str | None = None,
     session_threshold: int | None = None,
     weekly_threshold: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[int, str, str]:
     cmd = [
         "claude",
@@ -301,6 +322,8 @@ async def run_claude_async(
     ]
     if model:
         cmd.extend(["--model", model])
+    if reasoning_effort:
+        cmd.extend(["--effort", reasoning_effort])
     if system_prompt_file:
         cmd.extend(["--append-system-prompt-file", system_prompt_file])
     cmd.append(prompt)
@@ -377,10 +400,12 @@ async def run_planned_pr_async(
     breach_run_id: str | None = None,
     session_threshold: int | None = None,
     weekly_threshold: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[int, str, str]:
     kwargs: dict[str, object] = {
         "timeout": timeout,
         "model": model,
+        "reasoning_effort": reasoning_effort,
         "breach_dir": breach_dir,
         "breach_run_id": breach_run_id,
         "session_threshold": session_threshold,
@@ -407,11 +432,13 @@ async def run_auto_pr_async(
     breach_run_id: str | None = None,
     session_threshold: int | None = None,
     weekly_threshold: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[int, str, str]:
     """Trigger an ``AUTO PR`` run in ``repo_path`` with task injected inline."""
     kwargs: dict[str, object] = {
         "timeout": timeout,
         "model": model,
+        "reasoning_effort": reasoning_effort,
         "breach_dir": breach_dir,
         "breach_run_id": breach_run_id,
         "session_threshold": session_threshold,
@@ -439,10 +466,12 @@ async def fix_review_async(
     extra_context: str | None = None,
     pr_id: str | None = None,
     task_file: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[int, str, str]:
     kwargs: dict[str, object] = {
         "timeout": timeout,
         "model": model,
+        "reasoning_effort": reasoning_effort,
         "breach_dir": breach_dir,
         "breach_run_id": breach_run_id,
         "session_threshold": session_threshold,
@@ -469,12 +498,14 @@ async def diagnose_error_async(
     model: str | None = None,
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
     on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[int, str, str]:
     return await run_claude_async(
         build_diagnosis_prompt(repo_path, context),
         repo_path,
         timeout=120,
         model=model,
+        reasoning_effort=reasoning_effort,
         system_prompt_file=None,
         on_process_start=on_process_start,
         on_supervised_process_start=on_supervised_process_start,
