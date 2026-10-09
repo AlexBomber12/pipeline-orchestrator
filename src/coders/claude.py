@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
 CONFIG_PATH = os.environ.get("PO_CONFIG_PATH", "config.yml")
 _AUTH_CHECK_TIMEOUT_SEC = 5
+_REASONING_EFFORT_SETTING = "reasoning_effort"
 _CLAUDE_VERSION_PATTERN = re.compile(
     r"^(?:(?:claude|claude-code)\s+)?"
     r"(?P<version>[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?)"
@@ -167,6 +168,23 @@ class ClaudePlugin:
             or self.model_setting.default_value
         )
 
+    def _resolve_reasoning_effort(
+        self, daemon_config: "DaemonConfig"
+    ) -> str | None:
+        """Return the configured override without validating provider choices."""
+        plugin_settings = daemon_config.coder_settings.get(self.name)
+        if (
+            plugin_settings is None
+            or _REASONING_EFFORT_SETTING not in plugin_settings
+        ):
+            return None
+        value = plugin_settings[_REASONING_EFFORT_SETTING]
+        if not isinstance(value, str):
+            raise ValueError(
+                "daemon.coder_settings.claude.reasoning_effort must be a string"
+            )
+        return value or None
+
     def model_catalog_cache_key(
         self, *, config: AppConfig, config_path: str
     ) -> tuple[str, tuple[str, ...]]:
@@ -252,16 +270,22 @@ class ClaudePlugin:
         on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
         on_supervised_process_start: Callable[[SupervisedProcess], None]
         | None = None,
+        reasoning_effort: str | None = None,
         **_kwargs: Any,
     ) -> tuple[int, str, str]:
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "timeout": timeout,
+            "on_process_start": on_process_start,
+            "on_supervised_process_start": on_supervised_process_start,
+            "system_prompt_file": None,
+        }
+        if reasoning_effort:
+            kwargs[_REASONING_EFFORT_SETTING] = reasoning_effort
         return await claude_cli.run_claude_async(
             prompt,
             repo_path,
-            model=model,
-            timeout=timeout,
-            on_process_start=on_process_start,
-            on_supervised_process_start=on_supervised_process_start,
-            system_prompt_file=None,
+            **kwargs,
         )
 
     def _auth_status(self, **kwargs: Any) -> dict[str, Any]:
@@ -450,14 +474,20 @@ class ClaudePlugin:
         on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
         on_supervised_process_start: Callable[[SupervisedProcess], None]
         | None = None,
+        reasoning_effort: str | None = None,
         **_kwargs: Any,
     ) -> tuple[int, str, str]:
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "on_process_start": on_process_start,
+            "on_supervised_process_start": on_supervised_process_start,
+        }
+        if reasoning_effort:
+            kwargs[_REASONING_EFFORT_SETTING] = reasoning_effort
         return await claude_cli.diagnose_error_async(
             repo_path,
             context,
-            model=model,
-            on_process_start=on_process_start,
-            on_supervised_process_start=on_supervised_process_start,
+            **kwargs,
         )
 
     def build_run_kwargs(
@@ -468,6 +498,9 @@ class ClaudePlugin:
         breach_run_id: str | None = None,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"model": self.resolve_model(daemon_config)}
+        reasoning_effort = self._resolve_reasoning_effort(daemon_config)
+        if reasoning_effort is not None:
+            kwargs[_REASONING_EFFORT_SETTING] = reasoning_effort
         if breach_dir is not None and breach_run_id is not None:
             kwargs["breach_dir"] = breach_dir
             kwargs["breach_run_id"] = breach_run_id

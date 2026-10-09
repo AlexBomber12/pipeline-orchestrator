@@ -173,7 +173,7 @@ def test_run_claude_file_not_found_without_filename(
     assert run_claude("prompt", "/tmp") == (-1, "", "claude CLI not found")
 
 
-def test_run_claude_with_model(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_claude_with_model_and_effort(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
@@ -182,7 +182,8 @@ def test_run_claude_with_model(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    run_claude("do a thing", "/tmp", model="opus")
+    # Keep the historical positional arguments valid while accepting effort.
+    run_claude("do a thing", "/tmp", 600, "opus", "high")
 
     assert captured["cmd"] == [
         "claude",
@@ -190,6 +191,8 @@ def test_run_claude_with_model(monkeypatch: pytest.MonkeyPatch) -> None:
         "--dangerously-skip-permissions",
         "--model",
         "opus",
+        "--effort",
+        "high",
         "do a thing",
     ]
 
@@ -208,6 +211,7 @@ def test_run_claude_without_model_has_no_model_flag(
     run_claude("do a thing", "/tmp")
 
     assert "--model" not in captured["cmd"]
+    assert "--effort" not in captured["cmd"]
 
 
 def test_run_planned_pr_uses_planned_pr_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -237,10 +241,15 @@ def test_run_planned_pr_forwards_model(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    run_planned_pr("/data/repos/demo", model="sonnet")
+    run_planned_pr(
+        "/data/repos/demo",
+        model="sonnet",
+        reasoning_effort="medium",
+    )
 
     assert "--model" in captured["cmd"]
     assert captured["cmd"][captured["cmd"].index("--model") + 1] == "sonnet"
+    assert captured["cmd"][captured["cmd"].index("--effort") + 1] == "medium"
     assert captured["cmd"][-1] == "PLANNED PR"
 
 
@@ -253,10 +262,11 @@ def test_fix_review_forwards_model(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    fix_review("/data/repos/demo", model="opus")
+    fix_review("/data/repos/demo", model="opus", reasoning_effort="low")
 
     assert "--model" in captured["cmd"]
     assert captured["cmd"][captured["cmd"].index("--model") + 1] == "opus"
+    assert captured["cmd"][captured["cmd"].index("--effort") + 1] == "low"
 
 
 def test_diagnose_error_forwards_model(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -268,10 +278,16 @@ def test_diagnose_error_forwards_model(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    diagnose_error("/data/repos/demo", "boom", model="opus")
+    diagnose_error(
+        "/data/repos/demo",
+        "boom",
+        model="opus",
+        reasoning_effort="high",
+    )
 
     assert "--model" in captured["cmd"]
     assert captured["cmd"][captured["cmd"].index("--model") + 1] == "opus"
+    assert captured["cmd"][captured["cmd"].index("--effort") + 1] == "high"
 
 
 def test_fix_review_uses_fix_review_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -447,8 +463,33 @@ async def test_run_claude_async_success(monkeypatch: pytest.MonkeyPatch) -> None
     assert cmd[0] == "claude"
     assert "--print" in cmd
     assert "--dangerously-skip-permissions" in cmd
+    assert "--effort" not in cmd
     assert cmd[-1] == "do a thing"
     assert captured["kwargs"]["cwd"] == "/data/repos/demo"
+
+
+@pytest.mark.asyncio
+async def test_run_claude_async_preserves_provider_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_proc = _make_fake_proc(
+        stdout=b"provider output",
+        stderr=b"unsupported effort",
+        returncode=2,
+    )
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    result = await run_claude_async(
+        "do a thing",
+        "/data/repos/demo",
+        reasoning_effort="provider-specific-value",
+    )
+
+    assert result == (2, "provider output", "unsupported effort")
 
 
 @pytest.mark.asyncio
@@ -470,6 +511,7 @@ async def test_run_claude_async_forwards_model_and_breach_env(
         "do a thing",
         "/data/repos/demo",
         model="sonnet",
+        reasoning_effort="high",
         breach_dir="/tmp/breach",
         breach_run_id="run-123",
         session_threshold=12,
@@ -479,6 +521,8 @@ async def test_run_claude_async_forwards_model_and_breach_env(
     cmd = captured["cmd"]
     assert "--model" in cmd
     assert cmd[cmd.index("--model") + 1] == "sonnet"
+    assert cmd.count("--effort") == 1
+    assert cmd[cmd.index("--effort") + 1] == "high"
     assert "--append-system-prompt-file" in cmd
     assert cmd[cmd.index("--append-system-prompt-file") + 1] == "CLAUDE.md"
     assert captured["kwargs"]["env"]["NODE_OPTIONS"] == (
@@ -755,6 +799,7 @@ async def test_diagnose_error_async_skips_system_prompt(monkeypatch: pytest.Monk
     code, stdout, _ = await diagnose_error_async(
         "/data/repos/demo",
         "git push failed",
+        reasoning_effort="low",
         on_process_start=started.append,
         on_supervised_process_start=supervised.append,
     )
@@ -764,6 +809,7 @@ async def test_diagnose_error_async_skips_system_prompt(monkeypatch: pytest.Monk
     cmd = captured["cmd"]
     assert "--append-system-prompt-file" not in cmd
     assert "CLAUDE.md" not in cmd
+    assert cmd[cmd.index("--effort") + 1] == "low"
     assert started == [fake_proc]
     assert len(supervised) == 1
     assert supervised[0].process is fake_proc
@@ -810,6 +856,7 @@ async def test_run_planned_pr_async_forwards_to_run_claude_async(
     result = await run_planned_pr_async(
         "/data/repos/demo",
         model="sonnet",
+        reasoning_effort="medium",
         timeout=111,
         breach_dir="/tmp/breach",
         breach_run_id="run-123",
@@ -822,6 +869,7 @@ async def test_run_planned_pr_async_forwards_to_run_claude_async(
     assert captured["kwargs"] == {
         "timeout": 111,
         "model": "sonnet",
+        "reasoning_effort": "medium",
         "breach_dir": "/tmp/breach",
         "breach_run_id": "run-123",
         "session_threshold": 12,
@@ -872,6 +920,7 @@ async def test_fix_review_async_forwards_to_run_claude_async(
     result = await fix_review_async(
         "/data/repos/demo",
         model="opus",
+        reasoning_effort="low",
         timeout=None,
         breach_dir="/tmp/breach",
         breach_run_id="run-456",
@@ -886,6 +935,7 @@ async def test_fix_review_async_forwards_to_run_claude_async(
     assert captured["kwargs"] == {
         "timeout": None,
         "model": "opus",
+        "reasoning_effort": "low",
         "breach_dir": "/tmp/breach",
         "breach_run_id": "run-456",
         "session_threshold": 56,
@@ -1007,6 +1057,7 @@ async def test_run_auto_pr_async_propagates_model_and_timeout(
         "tasks/PR-270.md",
         "<body>",
         model="opus",
+        reasoning_effort="high",
         timeout=321,
         breach_dir="/tmp/breach",
         breach_run_id="run-9",
@@ -1017,6 +1068,7 @@ async def test_run_auto_pr_async_propagates_model_and_timeout(
     assert captured["kwargs"] == {
         "timeout": 321,
         "model": "opus",
+        "reasoning_effort": "high",
         "breach_dir": "/tmp/breach",
         "breach_run_id": "run-9",
         "session_threshold": 42,
@@ -1073,6 +1125,7 @@ def test_run_auto_pr_sync_formats_prompt_with_headers(
         "<body>",
         model="opus",
         timeout=321,
+        reasoning_effort="high",
     )
 
     assert result == (0, "ok", "")
@@ -1082,5 +1135,6 @@ def test_run_auto_pr_sync_formats_prompt_with_headers(
     assert "DAEMON INVOCATION -- PUBLICATION HANDOFF" in captured["cmd"][-1]
     assert "--model" in captured["cmd"]
     assert captured["cmd"][captured["cmd"].index("--model") + 1] == "opus"
+    assert captured["cmd"][captured["cmd"].index("--effort") + 1] == "high"
     assert captured["kwargs"]["cwd"] == "/data/repos/demo"
     assert captured["kwargs"]["timeout"] == 321

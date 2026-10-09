@@ -4,10 +4,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 from src.coder_registry import ModelMetadata
 from src.coders import claude as claude_module
 from src.coders.claude import ClaudePlugin
-from src.config import AppConfig
+from src.config import AppConfig, DaemonConfig
 
 _CLAUDE_AUTH_CAPABILITIES = {
     "can_check_cli": True,
@@ -110,11 +111,12 @@ async def test_claude_plugin_run_planned_pr_delegates(
         repo_path: str,
         model: str | None = None,
         timeout: int = 900,
-        **_: object,
+        **kwargs: object,
     ) -> tuple[int, str, str]:
         captured["repo_path"] = repo_path
         captured["model"] = model
         captured["timeout"] = timeout
+        captured["kwargs"] = kwargs
         return (0, "ok", "")
 
     monkeypatch.setattr(
@@ -126,6 +128,7 @@ async def test_claude_plugin_run_planned_pr_delegates(
         "/data/repos/demo",
         model="opus",
         timeout=321,
+        reasoning_effort="high",
     )
 
     assert result == (0, "ok", "")
@@ -133,6 +136,7 @@ async def test_claude_plugin_run_planned_pr_delegates(
         "repo_path": "/data/repos/demo",
         "model": "opus",
         "timeout": 321,
+        "kwargs": {"reasoning_effort": "high"},
     }
 
 
@@ -171,6 +175,7 @@ async def test_claude_plugin_run_auto_pr_delegates(
         model="opus",
         timeout=321,
         breach_dir="/tmp/breach",
+        reasoning_effort="medium",
     )
 
     assert result == (0, "ok", "")
@@ -182,7 +187,10 @@ async def test_claude_plugin_run_auto_pr_delegates(
     )
     assert captured["model"] == "opus"
     assert captured["timeout"] == 321
-    assert captured["kwargs"] == {"breach_dir": "/tmp/breach"}
+    assert captured["kwargs"] == {
+        "breach_dir": "/tmp/breach",
+        "reasoning_effort": "medium",
+    }
 
 
 @pytest.mark.asyncio
@@ -195,11 +203,12 @@ async def test_claude_plugin_fix_review_delegates(
         repo_path: str,
         model: str | None = None,
         timeout: int | None = None,
-        **_: object,
+        **kwargs: object,
     ) -> tuple[int, str, str]:
         captured["repo_path"] = repo_path
         captured["model"] = model
         captured["timeout"] = timeout
+        captured["kwargs"] = kwargs
         return (0, "fixed", "")
 
     monkeypatch.setattr(
@@ -211,6 +220,7 @@ async def test_claude_plugin_fix_review_delegates(
         "/data/repos/demo",
         model="sonnet",
         timeout=123,
+        reasoning_effort="low",
     )
 
     assert result == (0, "fixed", "")
@@ -218,7 +228,140 @@ async def test_claude_plugin_fix_review_delegates(
         "repo_path": "/data/repos/demo",
         "model": "sonnet",
         "timeout": 123,
+        "kwargs": {
+            "pr_id": None,
+            "task_file": None,
+            "reasoning_effort": "low",
+        },
     }
+
+
+@pytest.mark.parametrize(
+    ("coder_settings", "expected"),
+    [
+        ({}, {"model": "opus"}),
+        ({"claude": {"reasoning_effort": ""}}, {"model": "opus"}),
+        (
+            {"claude": {"reasoning_effort": "high"}},
+            {"model": "opus", "reasoning_effort": "high"},
+        ),
+    ],
+)
+def test_claude_plugin_build_run_kwargs_resolves_reasoning_effort(
+    coder_settings: dict[str, dict[str, object]],
+    expected: dict[str, str],
+) -> None:
+    config = DaemonConfig(coder_settings=coder_settings)
+
+    assert ClaudePlugin().build_run_kwargs(daemon_config=config) == expected
+
+
+def test_claude_plugin_build_run_kwargs_preserves_breach_settings() -> None:
+    config = DaemonConfig(
+        coder_settings={"claude": {"reasoning_effort": "high"}},
+        rate_limit_session_pause_percent=31,
+        rate_limit_weekly_pause_percent=62,
+    )
+
+    assert ClaudePlugin().build_run_kwargs(
+        daemon_config=config,
+        breach_dir="/tmp/breach",
+        breach_run_id="run-123",
+    ) == {
+        "model": "opus",
+        "reasoning_effort": "high",
+        "breach_dir": "/tmp/breach",
+        "breach_run_id": "run-123",
+        "session_threshold": 31,
+        "weekly_threshold": 62,
+    }
+
+
+@pytest.mark.parametrize("malformed", [None, 7, False, ["high"]])
+def test_daemon_config_rejects_malformed_claude_reasoning_effort(
+    malformed: object,
+) -> None:
+    with pytest.raises(
+        ValidationError,
+        match=r"coder_settings\.claude\.reasoning_effort must be a string",
+    ):
+        DaemonConfig(coder_settings={"claude": {"reasoning_effort": malformed}})
+
+
+@pytest.mark.parametrize("malformed", [None, 7, False, ["high"]])
+def test_claude_plugin_rejects_malformed_reasoning_effort(
+    malformed: object,
+) -> None:
+    config = DaemonConfig.model_construct(
+        coder_settings={"claude": {"reasoning_effort": malformed}}
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"daemon\.coder_settings\.claude\.reasoning_effort must be a string",
+    ):
+        ClaudePlugin().build_run_kwargs(daemon_config=config)
+
+
+@pytest.mark.asyncio
+async def test_claude_plugin_forwards_auxiliary_reasoning_effort_and_callbacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def process_callback(_process: object) -> None:
+        pass
+
+    def supervised_callback(_managed: object) -> None:
+        pass
+
+    async def fake_run_claude_async(
+        prompt: str, repo_path: str, **kwargs: object
+    ) -> tuple[int, str, str]:
+        calls.append(("prompt", kwargs))
+        return (0, prompt, repo_path)
+
+    async def fake_diagnose_error_async(
+        repo_path: str, context: str, **kwargs: object
+    ) -> tuple[int, str, str]:
+        calls.append(("diagnose", kwargs))
+        return (0, context, repo_path)
+
+    monkeypatch.setattr(
+        claude_module.claude_cli,
+        "run_claude_async",
+        fake_run_claude_async,
+    )
+    monkeypatch.setattr(
+        claude_module.claude_cli,
+        "diagnose_error_async",
+        fake_diagnose_error_async,
+    )
+
+    plugin = ClaudePlugin()
+    await plugin.run_prompt(
+        "prompt",
+        "/repo",
+        "opus",
+        12,
+        on_process_start=process_callback,
+        on_supervised_process_start=supervised_callback,
+        reasoning_effort="high",
+    )
+    await plugin.diagnose_error(
+        "/repo",
+        "failure",
+        "sonnet",
+        on_process_start=process_callback,
+        on_supervised_process_start=supervised_callback,
+        reasoning_effort="high",
+    )
+
+    assert [kind for kind, _kwargs in calls] == ["prompt", "diagnose"]
+    for _kind, kwargs in calls:
+        assert kwargs["reasoning_effort"] == "high"
+        assert kwargs["on_process_start"] is process_callback
+        assert kwargs["on_supervised_process_start"] is supervised_callback
 
 
 def test_claude_plugin_reports_saved_subscription_authentication(
