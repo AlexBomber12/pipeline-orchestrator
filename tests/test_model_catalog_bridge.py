@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from src.coder_registry import (
 from src.coders.codex import CodexPlugin
 from src.coders.codex_models import CodexModel, CodexReasoningEffort
 from src.config import AppConfig
+from src.process_supervisor import CleanupResult, CleanupStatus
 
 
 class _BridgeRedis:
@@ -77,6 +79,36 @@ class _CatalogWorkerProcess:
     async def wait(self) -> int:
         self.reaped = True
         return self.returncode
+
+
+def _cleanup_result(*, quiescent: bool) -> CleanupResult:
+    return CleanupResult(
+        status=(
+            CleanupStatus.QUIESCENT
+            if quiescent
+            else CleanupStatus.FAILED
+        ),
+        leader_returncode=None,
+        term_sent=True,
+        kill_sent=True,
+        detail=None if quiescent else "ownership still unresolved",
+    )
+
+
+class _RetainedProcess:
+    def __init__(self, *reconciliations: CleanupResult | Exception) -> None:
+        self.reconciliations = list(reconciliations)
+        self.reconcile_calls = 0
+
+    async def reconcile_cleanup(
+        self, *, observation_grace: float
+    ) -> CleanupResult:
+        assert observation_grace == bridge._CATALOG_RECONCILE_GRACE_SECONDS
+        self.reconcile_calls += 1
+        result = self.reconciliations.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 @pytest.mark.asyncio
@@ -1085,6 +1117,347 @@ async def test_daemon_handler_isolates_configured_catalog(
         "ok": False,
         "error": "plugin reference mismatch",
     }
+
+
+@pytest.mark.asyncio
+async def test_catalog_owner_blocks_replacement_until_quiescence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    redis = _BridgeRedis()
+    registry = CoderRegistry()
+    plugin = CodexPlugin(discover=lambda **_kwargs: None)
+    reference = "src.coders.codex:CodexPlugin"
+    registry.register(plugin, reference=reference)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    codex_home = tmp_path / "codex-home"
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        f"auth:\n  codex_home_dir: {codex_home}\n",
+        encoding="utf-8",
+    )
+    failed = _cleanup_result(quiescent=False)
+    managed = _RetainedProcess(failed, _cleanup_result(quiescent=True))
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    calls = 0
+
+    async def discover(**_kwargs: object) -> ModelCatalog:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_started.set()
+            await release_first.wait()
+            raise ModelCatalogUnavailable(
+                "provider detail must not cross Redis",
+                managed=managed,  # type: ignore[arg-type]
+                cleanup_result=failed,
+            )
+        return ModelCatalog((), "live", "Live catalog")
+
+    monkeypatch.setattr(plugin, "get_model_catalog", discover)
+    reservations = CoderCredentialReservations()
+    owner = bridge.ModelCatalogProcessOwner()
+
+    def request(request_id: str) -> str:
+        return json.dumps(
+            {
+                "request_id": request_id,
+                "plugin": "codex",
+                "reference": reference,
+                "expires_at": time.time() + 10,
+            }
+        )
+
+    first = asyncio.create_task(
+        bridge.handle_model_catalog_request(
+            redis,
+            registry,
+            request("1" * 32),
+            config_path=str(config_path),
+            credential_reservations=reservations,
+            process_owner=owner,
+        )
+    )
+    await first_started.wait()
+    second = asyncio.create_task(
+        bridge.handle_model_catalog_request(
+            redis,
+            registry,
+            request("2" * 32),
+            config_path=str(config_path),
+            credential_reservations=reservations,
+            process_owner=owner,
+        )
+    )
+    await asyncio.sleep(0)
+    assert calls == 1
+    release_first.set()
+    await asyncio.gather(first, second)
+
+    location = str(codex_home / ".codex")
+    assert calls == 1
+    assert managed.reconcile_calls == 1
+    assert owner._holds["codex"].managed is managed
+    assert reservations.reserve_login(location) is False
+    for request_id in ("1" * 32, "2" * 32):
+        assert json.loads(redis.values[bridge._response_key(request_id)]) == {
+            "ok": False,
+            "error": "catalog unavailable",
+        }
+
+    await bridge.handle_model_catalog_request(
+        redis,
+        registry,
+        request("3" * 32),
+        config_path=str(config_path),
+        credential_reservations=reservations,
+        process_owner=owner,
+    )
+
+    assert calls == 2
+    assert managed.reconcile_calls == 2
+    assert owner._holds == {}
+    assert reservations.reserve_login(location) is True
+    reservations.release_login(location)
+    assert json.loads(redis.values[bridge._response_key("3" * 32)])["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_catalog_owner_preserves_hold_through_cancellation_and_redis_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class FailingRedis(_BridgeRedis):
+        async def set(
+            self, key: str, value: str, *, ex: int | None = None
+        ) -> None:
+            raise ConnectionError("response store unavailable")
+
+    redis = FailingRedis()
+    registry = CoderRegistry()
+    plugin = CodexPlugin(discover=lambda **_kwargs: None)
+    reference = "src.coders.codex:CodexPlugin"
+    registry.register(plugin, reference=reference)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    codex_home = tmp_path / "codex-home"
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        f"auth:\n  codex_home_dir: {codex_home}\n",
+        encoding="utf-8",
+    )
+    failed = _cleanup_result(quiescent=False)
+    managed = _RetainedProcess(RuntimeError("observation unavailable"))
+    started = asyncio.Event()
+
+    async def discover(**_kwargs: object) -> ModelCatalog:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise ModelCatalogUnavailable(
+                "cancelled cleanup detail",
+                managed=managed,  # type: ignore[arg-type]
+                cleanup_result=failed,
+            ) from None
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(plugin, "get_model_catalog", discover)
+    reservations = CoderCredentialReservations()
+    owner = bridge.ModelCatalogProcessOwner()
+    task = asyncio.create_task(
+        bridge.handle_model_catalog_request(
+            redis,
+            registry,
+            json.dumps(
+                {
+                    "request_id": "4" * 32,
+                    "plugin": "codex",
+                    "reference": reference,
+                    "expires_at": time.time() + 10,
+                }
+            ),
+            config_path=str(config_path),
+            credential_reservations=reservations,
+            process_owner=owner,
+        )
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(ConnectionError, match="response store unavailable"):
+        await task
+
+    location = str(codex_home / ".codex")
+    assert owner._holds["codex"].managed is managed
+    assert reservations.reserve_login(location) is False
+    report = await owner.shutdown()
+    assert report.unresolved_count == 1
+    assert report.quiescent is False
+    assert owner._holds["codex"].managed is managed
+
+
+@pytest.mark.asyncio
+async def test_catalog_timeout_preserves_unconfirmed_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    redis = _BridgeRedis()
+    registry = CoderRegistry()
+    plugin = CodexPlugin(discover=lambda **_kwargs: None)
+    reference = "src.coders.codex:CodexPlugin"
+    registry.register(plugin, reference=reference)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setattr(bridge, "_CONFIGURED_CATALOG_TIMEOUT_SECONDS", 0.001)
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        f"auth:\n  codex_home_dir: {tmp_path / 'codex-home'}\n",
+        encoding="utf-8",
+    )
+    failed = _cleanup_result(quiescent=False)
+    managed = _RetainedProcess()
+
+    async def discover(**_kwargs: object) -> ModelCatalog:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise ModelCatalogUnavailable(
+                "timeout cleanup detail",
+                managed=managed,  # type: ignore[arg-type]
+                cleanup_result=failed,
+            ) from None
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(plugin, "get_model_catalog", discover)
+    owner = bridge.ModelCatalogProcessOwner()
+    await bridge.handle_model_catalog_request(
+        redis,
+        registry,
+        json.dumps(
+            {
+                "request_id": "6" * 32,
+                "plugin": "codex",
+                "reference": reference,
+                "expires_at": time.time() + 10,
+            }
+        ),
+        config_path=str(config_path),
+        process_owner=owner,
+    )
+
+    assert owner._holds["codex"].managed is managed
+    assert json.loads(redis.values[bridge._response_key("6" * 32)]) == {
+        "ok": False,
+        "error": "catalog unavailable",
+    }
+
+
+@pytest.mark.asyncio
+async def test_catalog_owner_releases_confirmed_clean_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    redis = _BridgeRedis()
+    registry = CoderRegistry()
+    plugin = CodexPlugin(discover=lambda **_kwargs: None)
+    reference = "src.coders.codex:CodexPlugin"
+    registry.register(plugin, reference=reference)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    codex_home = tmp_path / "codex-home"
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        f"auth:\n  codex_home_dir: {codex_home}\n",
+        encoding="utf-8",
+    )
+    managed = _RetainedProcess()
+
+    async def discover(**_kwargs: object) -> ModelCatalog:
+        raise ModelCatalogUnavailable(
+            "ordinary provider failure",
+            managed=managed,  # type: ignore[arg-type]
+            cleanup_result=_cleanup_result(quiescent=True),
+        )
+
+    monkeypatch.setattr(plugin, "get_model_catalog", discover)
+    reservations = CoderCredentialReservations()
+    owner = bridge.ModelCatalogProcessOwner()
+    await bridge.handle_model_catalog_request(
+        redis,
+        registry,
+        json.dumps(
+            {
+                "request_id": "5" * 32,
+                "plugin": "codex",
+                "reference": reference,
+                "expires_at": time.time() + 10,
+            }
+        ),
+        config_path=str(config_path),
+        credential_reservations=reservations,
+        process_owner=owner,
+    )
+
+    location = str(codex_home / ".codex")
+    assert owner._holds == {}
+    assert managed.reconcile_calls == 0
+    assert reservations.reserve_login(location) is True
+    reservations.release_login(location)
+    assert json.loads(redis.values[bridge._response_key("5" * 32)]) == {
+        "ok": False,
+        "error": "catalog unavailable",
+    }
+
+
+@pytest.mark.asyncio
+async def test_catalog_server_reports_unresolved_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    redis = _BridgeRedis()
+    registry = CoderRegistry()
+    plugin = CodexPlugin(discover=lambda **_kwargs: None)
+    reference = "src.coders.codex:CodexPlugin"
+    registry.register(plugin, reference=reference)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        f"auth:\n  codex_home_dir: {tmp_path / 'codex-home'}\n",
+        encoding="utf-8",
+    )
+    failed = _cleanup_result(quiescent=False)
+    managed = _RetainedProcess(failed)
+
+    async def discover(**_kwargs: object) -> ModelCatalog:
+        raise ModelCatalogUnavailable(
+            "must remain private",
+            managed=managed,  # type: ignore[arg-type]
+            cleanup_result=failed,
+        )
+
+    monkeypatch.setattr(plugin, "get_model_catalog", discover)
+    owner = bridge.ModelCatalogProcessOwner()
+    server = asyncio.create_task(
+        bridge.serve_model_catalog_requests(
+            redis,
+            registry,
+            config_path=str(config_path),
+            credential_reservations=CoderCredentialReservations(),
+            process_owner=owner,
+        )
+    )
+    loader = bridge.DaemonModelCatalogLoader(
+        redis, timeout_seconds=1, poll_interval_seconds=0
+    )
+    with pytest.raises(ModelCatalogUnavailable):
+        await loader(plugin, config=AppConfig(), config_path=str(config_path))
+    server.cancel()
+    with caplog.at_level(logging.ERROR, logger=bridge.logger.name):
+        with pytest.raises(asyncio.CancelledError):
+            await server
+
+    assert owner._holds["codex"].managed is managed
+    assert "left 1 supervised cleanup hold(s) unresolved" in caplog.text
+    assert "must remain private" not in caplog.text
 
 
 @pytest.mark.asyncio

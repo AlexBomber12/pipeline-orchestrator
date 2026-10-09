@@ -16,7 +16,7 @@ from typing import (
     runtime_checkable,
 )
 
-from src.process_supervisor import SupervisedProcess
+from src.process_supervisor import CleanupResult, SupervisedProcess
 from src.usage import UsageProvider
 
 if TYPE_CHECKING:
@@ -576,6 +576,17 @@ class CoderMetadataView:
 
 class ModelCatalogUnavailable(RuntimeError):
     """A plugin could not provide a usable model catalog."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        managed: SupervisedProcess | None = None,
+        cleanup_result: CleanupResult | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.managed = managed
+        self.cleanup_result = cleanup_result
 
 
 @runtime_checkable
