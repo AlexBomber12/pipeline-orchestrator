@@ -867,7 +867,7 @@ def test_model_dropdown_includes_default_option(empty_config: Path) -> None:
     assert response.status_code == 200
     body = response.text
     assert '<option value=""' in body
-    assert "(default)" in body
+    assert "Application default (opus)" in body
     assert "CLI default" in body
     assert 'name="coder_settings.claude.model"' in body
     assert 'name="coder_settings.codex.model"' in body
@@ -2179,8 +2179,169 @@ def test_dynamic_codex_choice_persists_invocation_slug_and_api_metadata(
         row for row in api_response.json()["coders"] if row["name"] == "claude"
     )
     assert claude_row["models"] == ["opus", "sonnet"]
-    assert claude_row["model_catalog"]["source"] == "static_compatibility"
-    assert "not live or account-verified" in claude_row["model_catalog"]["message"]
+    assert claude_row["model_catalog"]["source"] == "discovered"
+    assert "service access and account entitlement are not verified" in (
+        claude_row["model_catalog"]["message"]
+    )
+
+
+def test_discovered_claude_model_and_effort_round_trip_through_daemon_loader(
+    empty_config: Path,
+) -> None:
+    claude_catalog = ModelCatalog(
+        (
+            ModelMetadata(
+                "claude-dynamic",
+                "Claude Dynamic",
+                reasoning_efforts=(
+                    ModelReasoningEffort("low"),
+                    ModelReasoningEffort("high"),
+                ),
+            ),
+            ModelMetadata("claude-plain", "Claude Without Effort Metadata"),
+        ),
+        "discovered",
+        (
+            "2 models advertised by Claude CLI; service access and account "
+            "entitlement are not verified."
+        ),
+    )
+    loader_calls: list[str] = []
+
+    async def daemon_loader(plugin: object, **_kwargs: object) -> ModelCatalog:
+        loader_calls.append(plugin.name)
+        if plugin.name == "claude":
+            return claude_catalog
+        return ModelCatalog(
+            (ModelMetadata("gpt-5.4", "GPT-5.4", True),),
+            "discovered",
+            "1 model advertised by Codex CLI.",
+        )
+
+    async def must_not_discover(**_kwargs: object) -> tuple[ModelMetadata, ...]:
+        raise AssertionError("the web process must use the daemon loader")
+
+    with TestClient(app) as client:
+        claude = client.app.state.coder_registry.get("claude")
+        claude._discover = must_not_discover
+        client.app.state.model_catalog._loader = daemon_loader
+        fragment = client.get("/partials/settings/coders")
+        saved = client.put(
+            "/settings/daemon",
+            data={
+                "coder_settings.claude.model": "claude-dynamic",
+                "coder_settings.claude.reasoning_effort": "high",
+            },
+        )
+        api_response = client.get("/api/coders")
+
+        configured = load_config(str(empty_config))
+        execution_kwargs = ClaudePlugin().build_run_kwargs(
+            daemon_config=configured.daemon
+        )
+
+        no_effort = client.put(
+            "/settings/daemon",
+            data={"coder_settings.claude.model": "claude-plain"},
+        )
+
+    assert fragment.status_code == 200
+    assert "Claude Dynamic" in fragment.text
+    assert "Claude Without Effort Metadata" in fragment.text
+    assert saved.status_code == 200
+    assert 'value="claude-dynamic" selected' in saved.text
+    assert 'name="coder_settings.claude.reasoning_effort"' in saved.text
+    assert 'value="high" selected' in saved.text
+    assert execution_kwargs == {
+        "model": "claude-dynamic",
+        "reasoning_effort": "high",
+    }
+    claude_row = next(
+        row for row in api_response.json()["coders"] if row["name"] == "claude"
+    )
+    assert claude_row["model_catalog"]["source"] == "discovered"
+    assert claude_row["model_catalog"]["refreshable"] is True
+    assert claude_row["model_catalog"]["choices"][0] == {
+        "invocation_id": "claude-dynamic",
+        "display_name": "Claude Dynamic",
+        "is_default": False,
+        "default_reasoning_effort": None,
+        "reasoning_efforts": [
+            {"name": "low", "description": None},
+            {"name": "high", "description": None},
+        ],
+    }
+    assert claude_row["model_catalog"]["choices"][1]["reasoning_efforts"] == []
+    assert no_effort.status_code == 200
+    assert 'value="claude-plain" selected' in no_effort.text
+    assert 'data-reasoning-effort-status="not_advertised"' in no_effort.text
+    assert "advertises no reasoning-effort overrides" in no_effort.text
+    final_config = load_config(str(empty_config))
+    assert final_config.daemon.coder_settings["claude"] == {
+        "model": "claude-plain",
+        "reasoning_effort": "",
+    }
+    assert loader_calls.count("claude") == 1
+
+
+def test_failed_claude_refresh_preserves_catalog_and_saved_selections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "daemon:\n"
+        "  coder_settings:\n"
+        "    claude:\n"
+        "      model: claude-dynamic\n"
+        "      reasoning_effort: high\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_app, "CONFIG_PATH", str(cfg_path))
+    monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
+    fail_claude = False
+    catalog = ModelCatalog(
+        (
+            ModelMetadata(
+                "claude-dynamic",
+                "Claude Dynamic",
+                reasoning_efforts=(ModelReasoningEffort("high"),),
+            ),
+        ),
+        "discovered",
+        "1 model advertised by Claude CLI.",
+    )
+
+    async def daemon_loader(plugin: object, **_kwargs: object) -> ModelCatalog:
+        if plugin.name == "claude":
+            if fail_claude:
+                raise ModelCatalogUnavailable("provider-secret-must-not-leak")
+            return catalog
+        return ModelCatalog(
+            (ModelMetadata("gpt-5.4", "GPT-5.4", True),),
+            "discovered",
+            "1 model advertised by Codex CLI.",
+        )
+
+    with TestClient(app) as client:
+        client.app.state.model_catalog._loader = daemon_loader
+        ready = client.get("/partials/settings/coders")
+        fail_claude = True
+        stale = client.post(
+            "/partials/settings/coders/claude/models/refresh"
+        )
+
+    assert ready.status_code == 200
+    assert 'data-model-catalog-status="available"' in ready.text
+    assert stale.status_code == 200
+    assert 'data-model-catalog-status="stale"' in stale.text
+    assert "provider-secret" not in stale.text
+    assert 'value="claude-dynamic" selected' in stale.text
+    assert 'value="high" selected' in stale.text
+    assert load_config(str(cfg_path)).daemon.coder_settings["claude"] == {
+        "model": "claude-dynamic",
+        "reasoning_effort": "high",
+    }
 
 
 def test_codex_discovery_uses_configured_session_context_without_api_key(
@@ -2367,21 +2528,21 @@ def test_codex_refresh_updates_choices_without_changing_selection(
     assert load_config(str(cfg_path)).daemon.codex_model == "original-slug"
 
 
-def test_model_refresh_rejects_unknown_and_static_plugins(
+def test_model_refresh_rejects_unknown_and_refreshes_claude(
     empty_config: Path,
 ) -> None:
     with TestClient(app) as client:
         unknown = client.post(
             "/partials/settings/coders/missing/models/refresh"
         )
-        static = client.post(
+        refreshed = client.post(
             "/partials/settings/coders/claude/models/refresh"
         )
 
     assert unknown.status_code == 404
     assert unknown.text == "Unknown coder"
-    assert static.status_code == 422
-    assert static.text == "Model catalog is static"
+    assert refreshed.status_code == 200
+    assert 'data-model-catalog-source="discovered"' in refreshed.text
 
 
 @pytest.mark.asyncio
@@ -2457,24 +2618,32 @@ async def test_codex_catalog_cache_coalesces_concurrent_refreshes() -> None:
 
 
 @pytest.mark.asyncio
-async def test_static_catalog_bypasses_daemon_loader() -> None:
-    async def unavailable_loader(*_args: object, **_kwargs: object) -> ModelCatalog:
-        raise AssertionError("static catalog must not use daemon loader")
+async def test_refreshable_claude_catalog_uses_daemon_loader() -> None:
+    calls: list[str] = []
 
-    cache = ModelCatalogCache(loader=unavailable_loader)
+    async def daemon_loader(plugin: object, **_kwargs: object) -> ModelCatalog:
+        calls.append(plugin.name)
+        return ModelCatalog(
+            (ModelMetadata("provider-opus", "Provider Opus"),),
+            "discovered",
+            "CLI-advertised metadata.",
+        )
+
+    async def must_not_discover(**_kwargs: object) -> tuple[ModelMetadata, ...]:
+        raise AssertionError("web must not run Claude discovery directly")
+
+    cache = ModelCatalogCache(loader=daemon_loader)
     config = AppConfig()
     snapshot = await cache.get(
-        ClaudePlugin(),
+        ClaudePlugin(discover=must_not_discover),
         config=config,
         config_path="/workspace/config.yml",
     )
 
     assert snapshot.status == "available"
-    assert [model.invocation_id for model in snapshot.models] == [
-        "opus",
-        "sonnet",
-    ]
-    assert snapshot.source == "static_compatibility"
+    assert [model.invocation_id for model in snapshot.models] == ["provider-opus"]
+    assert snapshot.source == "discovered"
+    assert calls == ["claude"]
 
 
 @pytest.mark.asyncio

@@ -5,9 +5,17 @@ from typing import Any
 
 import pytest
 from pydantic import ValidationError
-from src.coder_registry import ModelMetadata
+from src.coder_registry import (
+    ModelCatalogUnavailable,
+    ModelMetadata,
+    ModelReasoningEffort,
+)
 from src.coders import claude as claude_module
 from src.coders.claude import ClaudePlugin
+from src.coders.claude_models import (
+    ClaudeModelDiscoveryInvalid,
+    ClaudeModelDiscoveryUnavailable,
+)
 from src.config import AppConfig, DaemonConfig
 
 _CLAUDE_AUTH_CAPABILITIES = {
@@ -86,19 +94,138 @@ def test_claude_plugin_models() -> None:
 
 
 @pytest.mark.asyncio
-async def test_claude_plugin_catalog_is_explicitly_static_compatibility() -> None:
-    catalog = await ClaudePlugin().get_model_catalog(
+async def test_claude_plugin_discovers_exact_catalog_in_configured_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_config_dir = tmp_path / "claude-auth"
+    config_path = tmp_path / "config" / "config.yml"
+    config = AppConfig.model_validate(
+        {"auth": {"claude_config_dir": str(claude_config_dir)}}
+    )
+    advertised = (
+        ModelMetadata(
+            "provider-opus",
+            "Claude Opus (Provider)",
+            reasoning_efforts=(
+                ModelReasoningEffort("low"),
+                ModelReasoningEffort("high"),
+            ),
+        ),
+        ModelMetadata("provider-sonnet", "Claude Sonnet (Provider)"),
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "must-be-overridden")
+    monkeypatch.setenv("CLAUDE_AUTH_MODE", "preserve-me")
+
+    async def discover(**kwargs: object) -> tuple[ModelMetadata, ...]:
+        captured.update(kwargs)
+        return advertised
+
+    plugin = ClaudePlugin(discover=discover)
+    catalog = await plugin.get_model_catalog(
+        config=config,
+        config_path=str(config_path),
+    )
+
+    assert captured["cwd"] == str(config_path.parent)
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["CLAUDE_CONFIG_DIR"] == str(claude_config_dir)
+    assert env["CLAUDE_AUTH_MODE"] == "preserve-me"
+    assert catalog.models is advertised
+    assert catalog.source == "discovered"
+    assert catalog.description == (
+        "2 models advertised by Claude CLI; service access and account "
+        "entitlement are not verified."
+    )
+    assert plugin.model_catalog_refreshable is True
+    assert plugin.model_setting.default_label == "Application default (opus)"
+
+
+def test_claude_plugin_catalog_cache_key_scopes_credentials_and_working_dir(
+    tmp_path: Path,
+) -> None:
+    plugin = ClaudePlugin()
+    first = AppConfig.model_validate(
+        {"auth": {"claude_config_dir": str(tmp_path / "first-auth")}}
+    )
+    second = AppConfig.model_validate(
+        {"auth": {"claude_config_dir": str(tmp_path / "second-auth")}}
+    )
+
+    first_key = plugin.model_catalog_cache_key(
+        config=first,
+        config_path=str(tmp_path / "first-workspace" / "config.yml"),
+    )
+
+    assert first_key != plugin.model_catalog_cache_key(
+        config=second,
+        config_path=str(tmp_path / "first-workspace" / "config.yml"),
+    )
+    assert first_key != plugin.model_catalog_cache_key(
+        config=first,
+        config_path=str(tmp_path / "second-workspace" / "config.yml"),
+    )
+    assert first_key == (
+        str(tmp_path / "first-auth"),
+        str(tmp_path / "first-workspace"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_claude_plugin_preserves_empty_discovery_result() -> None:
+    async def discover(**_kwargs: object) -> tuple[ModelMetadata, ...]:
+        return ()
+
+    catalog = await ClaudePlugin(discover=discover).get_model_catalog(
         config=AppConfig(),
         config_path="config.yml",
     )
 
-    assert catalog.source == "static_compatibility"
-    assert "not live or account-verified" in catalog.description
-    assert catalog.models == (
-        ModelMetadata("opus", "opus", True),
-        ModelMetadata("sonnet", "sonnet"),
-    )
-    assert ClaudePlugin().model_catalog_refreshable is False
+    assert catalog.models == ()
+    assert catalog.source == "discovered"
+    assert catalog.description == "Claude CLI advertised no usable models."
+
+
+@pytest.mark.asyncio
+async def test_claude_plugin_sanitizes_discovery_error_and_preserves_ownership(
+) -> None:
+    managed = object()
+    cleanup_result = object()
+
+    async def discover(**_kwargs: object) -> tuple[ModelMetadata, ...]:
+        raise ClaudeModelDiscoveryUnavailable(
+            "provider-secret-must-not-leak",
+            managed=managed,  # type: ignore[arg-type]
+            cleanup_result=cleanup_result,  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(ModelCatalogUnavailable) as raised:
+        await ClaudePlugin(discover=discover).get_model_catalog(
+            config=AppConfig(),
+            config_path="config.yml",
+        )
+
+    assert str(raised.value) == "Claude CLI model discovery is unavailable"
+    assert "provider-secret" not in str(raised.value)
+    assert raised.value.managed is managed
+    assert raised.value.cleanup_result is cleanup_result
+
+
+@pytest.mark.asyncio
+async def test_claude_plugin_sanitizes_invalid_discovery_response() -> None:
+    async def discover(**_kwargs: object) -> tuple[ModelMetadata, ...]:
+        raise ClaudeModelDiscoveryInvalid("provider-output-must-not-leak")
+
+    with pytest.raises(
+        ModelCatalogUnavailable,
+        match="^Claude CLI model discovery is unavailable$",
+    ):
+        await ClaudePlugin(discover=discover).get_model_catalog(
+            config=AppConfig(),
+            config_path="config.yml",
+        )
 
 
 @pytest.mark.asyncio

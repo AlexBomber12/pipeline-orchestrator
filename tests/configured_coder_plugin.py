@@ -5,8 +5,9 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from src.coder_registry import ModelSetting
+from src.coder_registry import ModelCatalog, ModelMetadata, ModelSetting
 from src.coders.claude import ClaudePlugin
+from src.config import AppConfig
 
 FACTORY_CALLS = 0
 NOT_CALLABLE = "not a factory"
@@ -29,6 +30,16 @@ class ConfiguredTestPlugin(ClaudePlugin):
 
     def check_auth(self) -> dict[str, str]:
         return {"status": "ok", "detail": "configured test plugin auth"}
+
+    async def get_model_catalog(
+        self, *, config: AppConfig, config_path: str
+    ) -> ModelCatalog:
+        del config, config_path
+        return ModelCatalog(
+            tuple(ModelMetadata(model, model) for model in self.models),
+            "static_compatibility",
+            "Configured test compatibility catalog.",
+        )
 
     async def run_planned_pr(
         self, *_args: object, **_kwargs: object
