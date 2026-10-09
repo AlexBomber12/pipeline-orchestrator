@@ -2528,12 +2528,16 @@ def test_codex_refresh_updates_choices_without_changing_selection(
     assert load_config(str(cfg_path)).daemon.codex_model == "original-slug"
 
 
-def test_model_refresh_rejects_unknown_and_refreshes_claude(
+def test_model_refresh_rejects_unknown_and_static_and_refreshes_claude(
     empty_config: Path,
 ) -> None:
     with TestClient(app) as client:
+        client.app.state.coder_registry.register(_ThirdCatalogPlugin())
         unknown = client.post(
             "/partials/settings/coders/missing/models/refresh"
+        )
+        static = client.post(
+            "/partials/settings/coders/third/models/refresh"
         )
         refreshed = client.post(
             "/partials/settings/coders/claude/models/refresh"
@@ -2541,6 +2545,8 @@ def test_model_refresh_rejects_unknown_and_refreshes_claude(
 
     assert unknown.status_code == 404
     assert unknown.text == "Unknown coder"
+    assert static.status_code == 422
+    assert static.text == "Model catalog is static"
     assert refreshed.status_code == 200
     assert 'data-model-catalog-source="discovered"' in refreshed.text
 
