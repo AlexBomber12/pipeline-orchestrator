@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from src import model_catalog_bridge as bridge
@@ -22,6 +24,11 @@ from src.coder_registry import (
 from src.coders.codex import CodexPlugin
 from src.coders.codex_models import CodexModel, CodexReasoningEffort
 from src.config import AppConfig
+from src.process_supervisor import (
+    CleanupResult,
+    CleanupStatus,
+    ProcessLaunchCleanupError,
+)
 
 
 class _BridgeRedis:
@@ -69,6 +76,8 @@ class _CatalogWorkerProcess:
         self.pid = 12345
         self.returncode = returncode
         self._stdout = stdout
+        self.stdin = _CatalogWorkerStdin()
+        self.stdout = _CatalogWorkerStdout(stdout)
         self.reaped = False
 
     async def communicate(self) -> tuple[bytes, bytes]:
@@ -77,6 +86,93 @@ class _CatalogWorkerProcess:
     async def wait(self) -> int:
         self.reaped = True
         return self.returncode
+
+
+class _CatalogWorkerStdout:
+    def __init__(self, output: bytes, *, blocked: bool = False) -> None:
+        self.lines = output.splitlines(keepends=True)
+        self.blocked = blocked
+
+    async def readline(self) -> bytes:
+        if self.blocked:
+            await asyncio.Event().wait()
+        return self.lines.pop(0) if self.lines else b""
+
+
+class _CatalogWorkerStdin:
+    def __init__(self, *, broken: bool = False) -> None:
+        self.broken = broken
+        self.writes: list[bytes] = []
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        if self.broken:
+            raise BrokenPipeError
+        self.writes.append(data)
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _ManagedCatalogWorker:
+    def __init__(
+        self,
+        process: _CatalogWorkerProcess,
+        *,
+        reconciliation: CleanupResult | None = None,
+        cleanup: CleanupResult | None = None,
+    ) -> None:
+        self.process = process
+        self.reconciliation = reconciliation or _cleanup_result(quiescent=False)
+        self.cleanup_result = cleanup or _cleanup_result(quiescent=True)
+        self.reconcile_calls = 0
+        self.cleanup_calls = 0
+
+    async def reconcile_cleanup(self, *, observation_grace: float) -> CleanupResult:
+        assert observation_grace == 0.0
+        self.reconcile_calls += 1
+        return self.reconciliation
+
+    async def cleanup(
+        self, *, term_grace: float, kill_grace: float
+    ) -> CleanupResult:
+        assert term_grace == bridge._CATALOG_RECONCILE_GRACE_SECONDS
+        assert kill_grace == bridge._CATALOG_RECONCILE_GRACE_SECONDS
+        self.cleanup_calls += 1
+        return self.cleanup_result
+
+
+def _cleanup_result(*, quiescent: bool) -> CleanupResult:
+    return CleanupResult(
+        status=(
+            CleanupStatus.QUIESCENT
+            if quiescent
+            else CleanupStatus.FAILED
+        ),
+        leader_returncode=None,
+        term_sent=True,
+        kill_sent=True,
+        detail=None if quiescent else "ownership still unresolved",
+    )
+
+
+class _RetainedProcess:
+    def __init__(self, *reconciliations: CleanupResult | Exception) -> None:
+        self.reconciliations = list(reconciliations)
+        self.reconcile_calls = 0
+
+    async def reconcile_cleanup(
+        self, *, observation_grace: float
+    ) -> CleanupResult:
+        assert observation_grace == bridge._CATALOG_RECONCILE_GRACE_SECONDS
+        self.reconcile_calls += 1
+        result = self.reconciliations.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 @pytest.mark.asyncio
@@ -840,10 +936,13 @@ def test_configured_catalog_worker_main_validates_and_prints(
     with pytest.raises(SystemExit, match="2"):
         bridge._configured_catalog_worker_main()
 
-    async def response(*_args: object) -> dict[str, object]:
-        return {"ok": False, "error": "unavailable"}
+    async def response(*_args: object, **_kwargs: object) -> None:
+        print(
+            bridge._WORKER_RESULT_PREFIX
+            + '{"ok":false,"error":"unavailable"}'
+        )
 
-    monkeypatch.setattr(bridge, "_configured_catalog_worker_response", response)
+    monkeypatch.setattr(bridge, "_run_configured_catalog_worker", response)
     monkeypatch.setattr(
         bridge.sys,
         "argv",
@@ -863,6 +962,378 @@ def test_configured_catalog_worker_main_validates_and_prints(
 
 
 @pytest.mark.asyncio
+async def test_configured_worker_retains_child_until_reconciled(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    failed = _cleanup_result(quiescent=False)
+    managed = _RetainedProcess(failed, _cleanup_result(quiescent=True))
+
+    class Plugin:
+        async def get_model_catalog(self, **_kwargs: object) -> ModelCatalog:
+            raise ModelCatalogUnavailable(
+                "private configured-plugin detail",
+                managed=managed,  # type: ignore[arg-type]
+                cleanup_result=failed,
+            )
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("src.coders._load_plugin", lambda *_args: Plugin())
+    monkeypatch.setattr(bridge, "load_config", lambda _path: AppConfig())
+    monkeypatch.setattr(bridge.asyncio, "sleep", no_sleep)
+
+    await bridge._run_configured_catalog_worker(
+        "third", "module:factory", "/cfg"
+    )
+
+    output = capsys.readouterr().out.strip()
+    assert output.startswith(bridge._WORKER_RESULT_PREFIX)
+    payload = json.loads(output.removeprefix(bridge._WORKER_RESULT_PREFIX))
+    assert payload == {
+        "ok": False,
+        "error": "catalog unavailable",
+        bridge._WORKER_CLEANUP_PENDING: True,
+    }
+    assert "private configured-plugin detail" not in output
+    assert managed.reconcile_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_configured_worker_stays_alive_for_unowned_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed = _cleanup_result(quiescent=False)
+    published = asyncio.Event()
+    output: list[str] = []
+
+    class Plugin:
+        async def get_model_catalog(self, **_kwargs: object) -> ModelCatalog:
+            raise ModelCatalogUnavailable(
+                "private startup detail",
+                cleanup_result=failed,
+            )
+
+    def capture_print(*values: object, **_kwargs: object) -> None:
+        output.append(" ".join(str(value) for value in values))
+        published.set()
+
+    monkeypatch.setattr("src.coders._load_plugin", lambda *_args: Plugin())
+    monkeypatch.setattr(bridge, "load_config", lambda _path: AppConfig())
+    monkeypatch.setattr("builtins.print", capture_print)
+    task = asyncio.create_task(
+        bridge._run_configured_catalog_worker(
+            "third", "module:factory", "/cfg"
+        )
+    )
+    await published.wait()
+    assert task.done() is False
+    payload = json.loads(
+        output[0].removeprefix(bridge._WORKER_RESULT_PREFIX)
+    )
+    assert payload[bridge._WORKER_CLEANUP_PENDING] is True
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_configured_worker_serializes_success_and_sanitized_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    catalog = ModelCatalog((), "configured", "Configured catalog")
+
+    class Plugin:
+        def __init__(self, result: ModelCatalog | Exception) -> None:
+            self.result = result
+
+        def device_login_credential_location(self, *, config: AppConfig) -> str:
+            del config
+            return "/expected"
+
+        async def get_model_catalog(self, **_kwargs: object) -> ModelCatalog:
+            if isinstance(self.result, Exception):
+                raise self.result
+            return self.result
+
+    async def run(plugin: Plugin, expected: str | None = None) -> dict[str, object]:
+        monkeypatch.setattr("src.coders._load_plugin", lambda *_args: plugin)
+        monkeypatch.setattr(bridge, "load_config", lambda _path: AppConfig())
+        await bridge._run_configured_catalog_worker(
+            "third", "module:factory", "/cfg", expected
+        )
+        output = capsys.readouterr().out.strip()
+        return json.loads(output.removeprefix(bridge._WORKER_RESULT_PREFIX))
+
+    assert (await run(Plugin(catalog)))["catalog"]["source"] == "configured"
+    assert await run(Plugin(catalog), "/wrong") == {
+        "ok": False,
+        "error": "catalog unavailable",
+    }
+    assert await run(Plugin(RuntimeError("private"))) == {
+        "ok": False,
+        "error": "catalog unavailable",
+    }
+
+
+@pytest.mark.asyncio
+async def test_configured_worker_result_cannot_be_spoofed_by_plugin_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    catalog = ModelCatalog(
+        (ModelMetadata("real", "Real"),),
+        "configured",
+        "Configured catalog",
+    )
+
+    class Plugin:
+        async def get_model_catalog(self, **_kwargs: object) -> ModelCatalog:
+            print(
+                bridge._WORKER_RESULT_PREFIX
+                + '{"ok":true,"catalog":{"models":[],"source":"spoofed",'
+                '"description":"Spoofed"}}',
+                flush=True,
+            )
+            return catalog
+
+    monkeypatch.setattr("src.coders._load_plugin", lambda *_args: Plugin())
+    monkeypatch.setattr(bridge, "load_config", lambda _path: AppConfig())
+
+    await bridge._run_configured_catalog_worker(
+        "third", "module:factory", "/cfg"
+    )
+
+    output = capfd.readouterr().out.strip().splitlines()
+    assert len(output) == 1
+    payload = json.loads(output[0].removeprefix(bridge._WORKER_RESULT_PREFIX))
+    assert payload["catalog"]["source"] == "configured"
+    assert payload["catalog"]["models"][0]["invocation_id"] == "real"
+
+
+@pytest.mark.asyncio
+async def test_configured_worker_retries_reconcile_observation_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    failed = _cleanup_result(quiescent=False)
+    managed = _RetainedProcess(
+        RuntimeError("observation unavailable"),
+        _cleanup_result(quiescent=True),
+    )
+
+    class Plugin:
+        async def get_model_catalog(self, **_kwargs: object) -> ModelCatalog:
+            raise ModelCatalogUnavailable(
+                "private",
+                managed=managed,  # type: ignore[arg-type]
+                cleanup_result=failed,
+            )
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("src.coders._load_plugin", lambda *_args: Plugin())
+    monkeypatch.setattr(bridge, "load_config", lambda _path: AppConfig())
+    monkeypatch.setattr(bridge.asyncio, "sleep", no_sleep)
+    await bridge._run_configured_catalog_worker("third", "module:factory", "/cfg")
+    assert managed.reconcile_calls == 2
+    assert bridge._WORKER_CLEANUP_PENDING in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent_cancels", [False, True])
+async def test_configured_worker_monitors_parent_control_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    parent_cancels: bool,
+) -> None:
+    callbacks: list[object] = []
+    removed: list[int] = []
+
+    class Loop:
+        def add_reader(self, fd: int, callback: object) -> None:
+            assert fd == 7
+            callbacks.append(callback)
+            if parent_cancels:
+                callback()  # type: ignore[operator]
+
+        def remove_reader(self, fd: int) -> bool:
+            removed.append(fd)
+            return True
+
+    class Plugin:
+        async def get_model_catalog(self, **_kwargs: object) -> ModelCatalog:
+            if parent_cancels:
+                await asyncio.Event().wait()
+            return ModelCatalog((), "configured", "Configured catalog")
+
+    monkeypatch.setattr("src.coders._load_plugin", lambda *_args: Plugin())
+    monkeypatch.setattr(bridge, "load_config", lambda _path: AppConfig())
+    monkeypatch.setattr(bridge.sys, "stdin", SimpleNamespace(fileno=lambda: 7))
+    monkeypatch.setattr(bridge.asyncio, "get_running_loop", lambda: Loop())
+
+    if parent_cancels:
+        with pytest.raises(asyncio.CancelledError):
+            await bridge._run_configured_catalog_worker(
+                "third",
+                "module:factory",
+                "/cfg",
+                monitor_parent=True,
+            )
+    else:
+        await bridge._run_configured_catalog_worker(
+            "third",
+            "module:factory",
+            "/cfg",
+            monitor_parent=True,
+        )
+        assert bridge._WORKER_RESULT_PREFIX in capsys.readouterr().out
+    assert len(callbacks) == 1
+    assert removed == [7]
+
+
+@pytest.mark.asyncio
+async def test_configured_worker_payload_bounds_and_skips_noise() -> None:
+    class RaisingStdout:
+        async def readline(self) -> bytes:
+            raise ValueError
+
+    for stdout in (
+        None,
+        RaisingStdout(),
+        _CatalogWorkerStdout(b"x" * (bridge._CONFIGURED_WORKER_OUTPUT_BYTES + 1)),
+    ):
+        managed = SimpleNamespace(process=SimpleNamespace(stdout=stdout))
+        assert await bridge._configured_worker_payload(managed) is None
+
+    stdout = _CatalogWorkerStdout(
+        b"noise\n" + bridge._WORKER_RESULT_PREFIX.encode() + b'{"ok":false}\n'
+    )
+    managed = SimpleNamespace(process=SimpleNamespace(stdout=stdout))
+    assert await bridge._configured_worker_payload(managed) == {"ok": False}
+
+    class FailedObservation:
+        async def reconcile_cleanup(self, **_kwargs: object) -> CleanupResult:
+            raise RuntimeError("unavailable")
+
+    assert await bridge._observe_configured_worker(FailedObservation()) is None
+
+
+@pytest.mark.asyncio
+async def test_stop_configured_worker_preserves_pending_hold_after_broken_pipe() -> None:
+    stdout = (
+        bridge._WORKER_RESULT_PREFIX
+        + json.dumps(
+            {
+                "ok": False,
+                "error": "catalog unavailable",
+                bridge._WORKER_CLEANUP_PENDING: True,
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode()
+    process = _CatalogWorkerProcess(stdout)
+    process.stdin = _CatalogWorkerStdin(broken=True)
+    managed = _ManagedCatalogWorker(process)
+
+    payload, cleanup_result = await bridge._stop_configured_worker(managed)
+
+    assert payload == {"ok": False, "error": "catalog unavailable"}
+    assert cleanup_result is managed.reconciliation
+    assert managed.cleanup_calls == 0
+
+    completed_process = _CatalogWorkerProcess(
+        (
+            bridge._WORKER_RESULT_PREFIX
+            + '{"ok":false,"error":"catalog unavailable"}\n'
+        ).encode()
+    )
+    completed = _ManagedCatalogWorker(completed_process)
+    payload, cleanup_result = await bridge._stop_configured_worker(completed)
+    assert payload == {"ok": False, "error": "catalog unavailable"}
+    assert cleanup_result is completed.cleanup_result
+    assert completed_process.reaped is True
+    assert completed.cleanup_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_stop_handoff_survives_repeated_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    managed = SimpleNamespace()
+
+    async def stop(_managed: object) -> tuple[None, None]:
+        started.set()
+        await release.wait()
+        return None, None
+
+    monkeypatch.setattr(bridge, "_stop_configured_worker", stop)
+    task = asyncio.create_task(
+        bridge._finish_configured_worker_stop(managed)  # type: ignore[arg-type]
+    )
+    await started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    release.set()
+    payload, cleanup_result, cancellation = await task
+    assert payload is None
+    assert cleanup_result is None
+    assert isinstance(cancellation, asyncio.CancelledError)
+
+    async def fail(_managed: object) -> tuple[None, None]:
+        raise RuntimeError("stop failed")
+
+    monkeypatch.setattr(bridge, "_stop_configured_worker", fail)
+    assert await bridge._finish_configured_worker_stop(  # type: ignore[arg-type]
+        managed
+    ) == (None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_catalog_timeout_propagates_cancellation_after_confirmed_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _CatalogWorkerProcess(b"")
+    process.stdout = _CatalogWorkerStdout(b"", blocked=True)
+    managed = _ManagedCatalogWorker(process)
+    stop_started = asyncio.Event()
+    release_stop = asyncio.Event()
+
+    async def create(*_args: object, **_kwargs: object) -> _ManagedCatalogWorker:
+        return managed
+
+    async def stop(
+        _managed: object,
+    ) -> tuple[None, CleanupResult]:
+        stop_started.set()
+        await release_stop.wait()
+        return None, _cleanup_result(quiescent=True)
+
+    monkeypatch.setattr(bridge, "launch_process", create)
+    monkeypatch.setattr(bridge, "_stop_configured_worker", stop)
+    task = asyncio.create_task(
+        bridge._isolated_configured_catalog(
+            "third",
+            "module:factory",
+            config_path="/cfg",
+            timeout_seconds=0.001,
+        )
+    )
+    await stop_started.wait()
+    task.cancel()
+    release_stop.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
 async def test_isolated_configured_catalog_parses_worker_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -877,13 +1348,15 @@ async def test_isolated_configured_catalog_parses_worker_result(
         + "\nnoise\n"
     ).encode()
     captured: dict[str, object] = {}
+    process = _CatalogWorkerProcess(stdout)
+    managed = _ManagedCatalogWorker(process)
 
-    async def create(*args: object, **kwargs: object) -> _CatalogWorkerProcess:
+    async def create(*args: object, **kwargs: object) -> _ManagedCatalogWorker:
         captured["args"] = args
         captured["kwargs"] = kwargs
-        return _CatalogWorkerProcess(stdout)
+        return managed
 
-    monkeypatch.setattr(bridge.asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr(bridge, "launch_process", create)
     result = await bridge._isolated_configured_catalog(
         "third",
         "module:factory",
@@ -904,11 +1377,96 @@ async def test_isolated_configured_catalog_parses_worker_result(
         "/reserved/credentials",
     )
     assert captured["kwargs"] == {
+        "stdin": bridge.asyncio.subprocess.PIPE,
         "stdout": bridge.asyncio.subprocess.PIPE,
         "stderr": bridge.asyncio.subprocess.DEVNULL,
-        "start_new_session": True,
+        "limit": bridge._CONFIGURED_WORKER_OUTPUT_BYTES + 1,
         "env": {"CODEX_HOME": "/reserved/credentials"},
     }
+    assert process.reaped is True
+    assert managed.cleanup_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_isolated_configured_catalog_propagates_worker_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdout = (
+        bridge._WORKER_RESULT_PREFIX
+        + json.dumps(
+            {
+                "ok": False,
+                "error": "catalog unavailable",
+                bridge._WORKER_CLEANUP_PENDING: True,
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode()
+    managed = _ManagedCatalogWorker(_CatalogWorkerProcess(stdout))
+
+    async def create(*_args: object, **_kwargs: object) -> _ManagedCatalogWorker:
+        return managed
+
+    monkeypatch.setattr(bridge, "launch_process", create)
+    with pytest.raises(ModelCatalogUnavailable, match="cleanup is unresolved") as exc_info:
+        await bridge._isolated_configured_catalog(
+            "third", "module:factory", config_path="/cfg"
+        )
+
+    assert exc_info.value.managed is managed
+    assert exc_info.value.cleanup_result is managed.reconciliation
+    assert managed.cleanup_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_isolated_configured_catalog_preserves_startup_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleanup = _cleanup_result(quiescent=False)
+    managed = SimpleNamespace()
+
+    async def create(*_args: object, **_kwargs: object) -> object:
+        raise ProcessLaunchCleanupError(
+            "private startup detail",
+            managed=managed,  # type: ignore[arg-type]
+            cleanup_result=cleanup,
+        )
+
+    monkeypatch.setattr(bridge, "launch_process", create)
+    with pytest.raises(ModelCatalogUnavailable, match="startup cleanup") as exc_info:
+        await bridge._isolated_configured_catalog(
+            "third", "module:factory", config_path="/cfg"
+        )
+    assert exc_info.value.managed is managed
+    assert exc_info.value.cleanup_result is cleanup
+
+
+@pytest.mark.asyncio
+async def test_isolated_configured_catalog_reports_unconfirmed_final_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = ModelCatalog((), "configured", "Configured catalog")
+    stdout = (
+        bridge._WORKER_RESULT_PREFIX
+        + json.dumps(bridge._catalog_payload(catalog), separators=(",", ":"))
+        + "\n"
+    ).encode()
+    failed = _cleanup_result(quiescent=False)
+    managed = _ManagedCatalogWorker(
+        _CatalogWorkerProcess(stdout), cleanup=failed
+    )
+
+    async def create(*_args: object, **_kwargs: object) -> _ManagedCatalogWorker:
+        return managed
+
+    monkeypatch.setattr(bridge, "launch_process", create)
+    with pytest.raises(ModelCatalogUnavailable, match="cleanup is unresolved") as exc_info:
+        await bridge._isolated_configured_catalog(
+            "third", "module:factory", config_path="/cfg"
+        )
+    assert exc_info.value.managed is managed
+    assert exc_info.value.cleanup_result is failed
 
 
 @pytest.mark.parametrize(
@@ -929,10 +1487,10 @@ async def test_isolated_configured_catalog_rejects_worker_failures(
     returncode: int,
     message: str,
 ) -> None:
-    async def create(*_args: object, **_kwargs: object) -> _CatalogWorkerProcess:
-        return _CatalogWorkerProcess(stdout, returncode)
+    async def create(*_args: object, **_kwargs: object) -> _ManagedCatalogWorker:
+        return _ManagedCatalogWorker(_CatalogWorkerProcess(stdout, returncode))
 
-    monkeypatch.setattr(bridge.asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr(bridge, "launch_process", create)
     with pytest.raises(ModelCatalogUnavailable, match=message):
         await bridge._isolated_configured_catalog(
             "third", "module:factory", config_path="/cfg"
@@ -946,39 +1504,34 @@ async def test_isolated_configured_catalog_handles_start_timeout_and_cancel(
     async def failed_start(*_args: object, **_kwargs: object) -> object:
         raise OSError("must-not-leak")
 
-    monkeypatch.setattr(
-        bridge.asyncio,
-        "create_subprocess_exec",
-        failed_start,
-    )
+    monkeypatch.setattr(bridge, "launch_process", failed_start)
     with pytest.raises(ModelCatalogUnavailable, match="failed to start"):
         await bridge._isolated_configured_catalog(
             "third", "module:factory", config_path="/cfg"
         )
 
-    class BlockedProcess(_CatalogWorkerProcess):
-        async def communicate(self) -> tuple[bytes, bytes]:
-            await asyncio.Event().wait()
-            raise AssertionError("unreachable")
+    process = _CatalogWorkerProcess(b"")
+    process.stdout = _CatalogWorkerStdout(b"", blocked=True)
+    managed = _ManagedCatalogWorker(
+        process,
+        cleanup=_cleanup_result(quiescent=False),
+    )
+    monkeypatch.setattr(
+        bridge, "_CONFIGURED_WORKER_CANCEL_GRACE_SECONDS", 0.001
+    )
 
-    process = BlockedProcess(b"")
-    terminated: list[_CatalogWorkerProcess] = []
+    async def create(*_args: object, **_kwargs: object) -> _ManagedCatalogWorker:
+        return managed
 
-    async def create(*_args: object, **_kwargs: object) -> _CatalogWorkerProcess:
-        return process
-
-    async def terminate(worker: _CatalogWorkerProcess) -> None:
-        terminated.append(worker)
-
-    monkeypatch.setattr(bridge.asyncio, "create_subprocess_exec", create)
-    monkeypatch.setattr(bridge, "terminate_plugin_worker", terminate)
-    with pytest.raises(ModelCatalogUnavailable, match="timed out"):
+    monkeypatch.setattr(bridge, "launch_process", create)
+    with pytest.raises(ModelCatalogUnavailable, match="timed out") as exc_info:
         await bridge._isolated_configured_catalog(
             "third",
             "module:factory",
             config_path="/cfg",
             timeout_seconds=0.001,
         )
+    assert exc_info.value.managed is managed
 
     async def cancel_scenario() -> None:
         task = asyncio.create_task(
@@ -991,11 +1544,53 @@ async def test_isolated_configured_catalog_handles_start_timeout_and_cancel(
         )
         await asyncio.sleep(0)
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(ModelCatalogUnavailable, match="cancellation") as exc_info:
             await task
+        assert exc_info.value.managed is managed
 
     await cancel_scenario()
-    assert terminated == [process, process]
+    assert managed.cleanup_calls == 0
+    assert process.stdin.writes == [b"\n", b"\n"]
+
+
+@pytest.mark.asyncio
+async def test_isolated_configured_catalog_propagates_cancel_after_quiescence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        bridge, "_CONFIGURED_WORKER_CANCEL_GRACE_SECONDS", 0.001
+    )
+    class CancelThenEof:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def readline(self) -> bytes:
+            self.calls += 1
+            if self.calls == 1:
+                await asyncio.Event().wait()
+            return b""
+
+    process = _CatalogWorkerProcess(b"")
+    process.stdout = CancelThenEof()
+    managed = _ManagedCatalogWorker(
+        process,
+        reconciliation=_cleanup_result(quiescent=True),
+    )
+
+    async def create(*_args: object, **_kwargs: object) -> _ManagedCatalogWorker:
+        return managed
+
+    monkeypatch.setattr(bridge, "launch_process", create)
+    task = asyncio.create_task(
+        bridge._isolated_configured_catalog(
+            "third", "module:factory", config_path="/cfg"
+        )
+    )
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert managed.cleanup_calls == 1
 
 
 @pytest.mark.asyncio
@@ -1085,6 +1680,426 @@ async def test_daemon_handler_isolates_configured_catalog(
         "ok": False,
         "error": "plugin reference mismatch",
     }
+
+
+@pytest.mark.asyncio
+async def test_catalog_owner_blocks_replacement_until_quiescence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    redis = _BridgeRedis()
+    registry = CoderRegistry()
+    plugin = CodexPlugin(discover=lambda **_kwargs: None)
+    reference = "src.coders.codex:CodexPlugin"
+    registry.register(plugin, reference=reference)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    codex_home = tmp_path / "codex-home"
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        f"auth:\n  codex_home_dir: {codex_home}\n",
+        encoding="utf-8",
+    )
+    failed = _cleanup_result(quiescent=False)
+    managed = _RetainedProcess(failed, _cleanup_result(quiescent=True))
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    calls = 0
+
+    async def discover(**_kwargs: object) -> ModelCatalog:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_started.set()
+            await release_first.wait()
+            raise ModelCatalogUnavailable(
+                "provider detail must not cross Redis",
+                managed=managed,  # type: ignore[arg-type]
+                cleanup_result=failed,
+            )
+        return ModelCatalog((), "live", "Live catalog")
+
+    monkeypatch.setattr(plugin, "get_model_catalog", discover)
+    reservations = CoderCredentialReservations()
+    owner = bridge.ModelCatalogProcessOwner()
+
+    def request(request_id: str) -> str:
+        return json.dumps(
+            {
+                "request_id": request_id,
+                "plugin": "codex",
+                "reference": reference,
+                "expires_at": time.time() + 10,
+            }
+        )
+
+    first = asyncio.create_task(
+        bridge.handle_model_catalog_request(
+            redis,
+            registry,
+            request("1" * 32),
+            config_path=str(config_path),
+            credential_reservations=reservations,
+            process_owner=owner,
+        )
+    )
+    await first_started.wait()
+    second = asyncio.create_task(
+        bridge.handle_model_catalog_request(
+            redis,
+            registry,
+            request("2" * 32),
+            config_path=str(config_path),
+            credential_reservations=reservations,
+            process_owner=owner,
+        )
+    )
+    await asyncio.sleep(0)
+    assert calls == 1
+    release_first.set()
+    await asyncio.gather(first, second)
+
+    location = str(codex_home / ".codex")
+    assert calls == 1
+    assert managed.reconcile_calls == 1
+    assert owner._holds["codex"].managed is managed
+    assert reservations.reserve_login(location) is False
+    for request_id in ("1" * 32, "2" * 32):
+        assert json.loads(redis.values[bridge._response_key(request_id)]) == {
+            "ok": False,
+            "error": "catalog unavailable",
+        }
+
+    await bridge.handle_model_catalog_request(
+        redis,
+        registry,
+        request("3" * 32),
+        config_path=str(config_path),
+        credential_reservations=reservations,
+        process_owner=owner,
+    )
+
+    assert calls == 2
+    assert managed.reconcile_calls == 2
+    assert owner._holds == {}
+    assert reservations.reserve_login(location) is True
+    reservations.release_login(location)
+    assert json.loads(redis.values[bridge._response_key("3" * 32)])["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_catalog_request_rechecks_expiry_after_plugin_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    redis = _BridgeRedis()
+    registry = CoderRegistry()
+    plugin = CodexPlugin(discover=lambda **_kwargs: None)
+    reference = "src.coders.codex:CodexPlugin"
+    registry.register(plugin, reference=reference)
+    calls = 0
+
+    async def discover(**_kwargs: object) -> ModelCatalog:
+        nonlocal calls
+        calls += 1
+        return ModelCatalog((), "live", "Live catalog")
+
+    monkeypatch.setattr(plugin, "get_model_catalog", discover)
+    owner = bridge.ModelCatalogProcessOwner()
+    lock = owner.lock_for("codex")
+    await lock.acquire()
+    request_id = "7" * 32
+    task = asyncio.create_task(
+        bridge.handle_model_catalog_request(
+            redis,
+            registry,
+            json.dumps(
+                {
+                    "request_id": request_id,
+                    "plugin": "codex",
+                    "reference": reference,
+                    "expires_at": time.time() + 0.001,
+                }
+            ),
+            config_path=str(tmp_path / "config.yml"),
+            process_owner=owner,
+        )
+    )
+    await asyncio.sleep(0.01)
+    lock.release()
+    await task
+
+    assert calls == 0
+    assert json.loads(redis.values[bridge._response_key(request_id)]) == {
+        "ok": False,
+        "error": "request expired",
+    }
+
+
+@pytest.mark.asyncio
+async def test_catalog_owner_preserves_hold_through_cancellation_and_redis_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class FailingRedis(_BridgeRedis):
+        async def set(
+            self, key: str, value: str, *, ex: int | None = None
+        ) -> None:
+            raise ConnectionError("response store unavailable")
+
+    redis = FailingRedis()
+    registry = CoderRegistry()
+    plugin = CodexPlugin(discover=lambda **_kwargs: None)
+    reference = "src.coders.codex:CodexPlugin"
+    registry.register(plugin, reference=reference)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    codex_home = tmp_path / "codex-home"
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        f"auth:\n  codex_home_dir: {codex_home}\n",
+        encoding="utf-8",
+    )
+    failed = _cleanup_result(quiescent=False)
+    managed = _RetainedProcess(RuntimeError("observation unavailable"))
+    started = asyncio.Event()
+
+    async def discover(**_kwargs: object) -> ModelCatalog:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise ModelCatalogUnavailable(
+                "cancelled cleanup detail",
+                managed=managed,  # type: ignore[arg-type]
+                cleanup_result=failed,
+            ) from None
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(plugin, "get_model_catalog", discover)
+    reservations = CoderCredentialReservations()
+    owner = bridge.ModelCatalogProcessOwner()
+    task = asyncio.create_task(
+        bridge.handle_model_catalog_request(
+            redis,
+            registry,
+            json.dumps(
+                {
+                    "request_id": "4" * 32,
+                    "plugin": "codex",
+                    "reference": reference,
+                    "expires_at": time.time() + 10,
+                }
+            ),
+            config_path=str(config_path),
+            credential_reservations=reservations,
+            process_owner=owner,
+        )
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(ConnectionError, match="response store unavailable"):
+        await task
+
+    location = str(codex_home / ".codex")
+    assert owner._holds["codex"].managed is managed
+    assert reservations.reserve_login(location) is False
+    report = await owner.shutdown()
+    assert report.unresolved_count == 1
+    assert report.quiescent is False
+    assert owner._holds["codex"].managed is managed
+
+
+@pytest.mark.asyncio
+async def test_catalog_timeout_preserves_unconfirmed_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    redis = _BridgeRedis()
+    registry = CoderRegistry()
+    plugin = CodexPlugin(discover=lambda **_kwargs: None)
+    reference = "src.coders.codex:CodexPlugin"
+    registry.register(plugin, reference=reference)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setattr(bridge, "_CONFIGURED_CATALOG_TIMEOUT_SECONDS", 0.001)
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        f"auth:\n  codex_home_dir: {tmp_path / 'codex-home'}\n",
+        encoding="utf-8",
+    )
+    failed = _cleanup_result(quiescent=False)
+    managed = _RetainedProcess()
+
+    async def discover(**_kwargs: object) -> ModelCatalog:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise ModelCatalogUnavailable(
+                "timeout cleanup detail",
+                managed=managed,  # type: ignore[arg-type]
+                cleanup_result=failed,
+            ) from None
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(plugin, "get_model_catalog", discover)
+    owner = bridge.ModelCatalogProcessOwner()
+    await bridge.handle_model_catalog_request(
+        redis,
+        registry,
+        json.dumps(
+            {
+                "request_id": "6" * 32,
+                "plugin": "codex",
+                "reference": reference,
+                "expires_at": time.time() + 10,
+            }
+        ),
+        config_path=str(config_path),
+        process_owner=owner,
+    )
+
+    assert owner._holds["codex"].managed is managed
+    assert json.loads(redis.values[bridge._response_key("6" * 32)]) == {
+        "ok": False,
+        "error": "catalog unavailable",
+    }
+
+
+@pytest.mark.asyncio
+async def test_catalog_owner_releases_confirmed_clean_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    redis = _BridgeRedis()
+    registry = CoderRegistry()
+    plugin = CodexPlugin(discover=lambda **_kwargs: None)
+    reference = "src.coders.codex:CodexPlugin"
+    registry.register(plugin, reference=reference)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    codex_home = tmp_path / "codex-home"
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        f"auth:\n  codex_home_dir: {codex_home}\n",
+        encoding="utf-8",
+    )
+    managed = _RetainedProcess()
+
+    async def discover(**_kwargs: object) -> ModelCatalog:
+        raise ModelCatalogUnavailable(
+            "ordinary provider failure",
+            managed=managed,  # type: ignore[arg-type]
+            cleanup_result=_cleanup_result(quiescent=True),
+        )
+
+    monkeypatch.setattr(plugin, "get_model_catalog", discover)
+    reservations = CoderCredentialReservations()
+    owner = bridge.ModelCatalogProcessOwner()
+    await bridge.handle_model_catalog_request(
+        redis,
+        registry,
+        json.dumps(
+            {
+                "request_id": "5" * 32,
+                "plugin": "codex",
+                "reference": reference,
+                "expires_at": time.time() + 10,
+            }
+        ),
+        config_path=str(config_path),
+        credential_reservations=reservations,
+        process_owner=owner,
+    )
+
+    location = str(codex_home / ".codex")
+    assert owner._holds == {}
+    assert managed.reconcile_calls == 0
+    assert reservations.reserve_login(location) is True
+    reservations.release_login(location)
+    assert json.loads(redis.values[bridge._response_key("5" * 32)]) == {
+        "ok": False,
+        "error": "catalog unavailable",
+    }
+
+
+@pytest.mark.asyncio
+async def test_catalog_owner_retains_unowned_failed_launch_reservation() -> None:
+    failed = _cleanup_result(quiescent=False)
+    reservations = CoderCredentialReservations()
+    location = "/reserved/credentials"
+    assert reservations.reserve_coder(location) is True
+    owner = bridge.ModelCatalogProcessOwner()
+    assert owner.retain_failure(
+        "ordinary",
+        ModelCatalogUnavailable("ordinary failure"),
+        credential_location=None,
+        credential_reservations=None,
+    ) is False
+
+    retained = owner.retain_failure(
+        "third",
+        ModelCatalogUnavailable("startup cleanup", cleanup_result=failed),
+        credential_location=location,
+        credential_reservations=reservations,
+    )
+
+    assert retained is True
+    assert owner._holds["third"].managed is None
+    async with owner.lock_for("third"):
+        assert await owner.reconcile_before_launch("third") is False
+    report = await owner.shutdown()
+    assert report.unresolved_count == 1
+    assert reservations.reserve_login(location) is False
+
+
+@pytest.mark.asyncio
+async def test_catalog_server_reports_unresolved_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    redis = _BridgeRedis()
+    registry = CoderRegistry()
+    plugin = CodexPlugin(discover=lambda **_kwargs: None)
+    reference = "src.coders.codex:CodexPlugin"
+    registry.register(plugin, reference=reference)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        f"auth:\n  codex_home_dir: {tmp_path / 'codex-home'}\n",
+        encoding="utf-8",
+    )
+    failed = _cleanup_result(quiescent=False)
+    managed = _RetainedProcess(failed)
+
+    async def discover(**_kwargs: object) -> ModelCatalog:
+        raise ModelCatalogUnavailable(
+            "must remain private",
+            managed=managed,  # type: ignore[arg-type]
+            cleanup_result=failed,
+        )
+
+    monkeypatch.setattr(plugin, "get_model_catalog", discover)
+    owner = bridge.ModelCatalogProcessOwner()
+    server = asyncio.create_task(
+        bridge.serve_model_catalog_requests(
+            redis,
+            registry,
+            config_path=str(config_path),
+            credential_reservations=CoderCredentialReservations(),
+            process_owner=owner,
+        )
+    )
+    loader = bridge.DaemonModelCatalogLoader(
+        redis, timeout_seconds=1, poll_interval_seconds=0
+    )
+    with pytest.raises(ModelCatalogUnavailable):
+        await loader(plugin, config=AppConfig(), config_path=str(config_path))
+    server.cancel()
+    with caplog.at_level(logging.ERROR, logger=bridge.logger.name):
+        with pytest.raises(asyncio.CancelledError):
+            await server
+
+    assert owner._holds["codex"].managed is managed
+    assert "left 1 supervised cleanup hold(s) unresolved" in caplog.text
+    assert "must remain private" not in caplog.text
 
 
 @pytest.mark.asyncio

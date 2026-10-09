@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import os
 import sys
 import time
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
-from src.coder_auth import isolated_auth_probe, terminate_plugin_worker
+from src.coder_auth import isolated_auth_probe
 from src.coder_login import CoderCredentialReservations, CoderLoginSessionManager
 from src.coder_registry import (
     CoderAuthStatus,
@@ -29,6 +31,12 @@ from src.coder_registry import (
     resolve_device_login_credential_location,
 )
 from src.config import DEFAULT_CODER_PLUGINS, AppConfig, load_config
+from src.process_supervisor import (
+    CleanupResult,
+    ProcessLaunchCleanupError,
+    SupervisedProcess,
+    launch_process,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +48,125 @@ _POLL_INTERVAL_SECONDS = 0.05
 _MAX_PENDING_REQUESTS = 64
 _MAX_CONCURRENT_REQUESTS = 8
 _CONFIGURED_CATALOG_TIMEOUT_SECONDS = 5.0
+_CATALOG_RECONCILE_GRACE_SECONDS = 1.0
+_CONFIGURED_WORKER_CANCEL_GRACE_SECONDS = 3.0
+_CONFIGURED_WORKER_OUTPUT_BYTES = 1_000_000
 _WORKER_RESULT_PREFIX = "PIPELINE_CATALOG_RESULT:"
+_WORKER_CLEANUP_PENDING = "_cleanup_pending"
+
+
+@contextlib.contextmanager
+def _suppress_configured_plugin_stdout():
+    """Keep plugin and descendant output off the wrapper result channel."""
+    sys.stdout.flush()
+    try:
+        stdout_fd = sys.stdout.fileno()
+    except (AttributeError, OSError):
+        stdout_fd = 1
+    saved_stdout = os.dup(stdout_fd)
+    null_stdout = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(null_stdout, stdout_fd)
+        yield
+        sys.stdout.flush()
+    finally:
+        os.dup2(saved_stdout, stdout_fd)
+        os.close(null_stdout)
+        os.close(saved_stdout)
+
+
+@dataclass
+class _RetainedCatalogProcess:
+    managed: SupervisedProcess | None
+    cleanup_result: CleanupResult | None
+    credential_location: str | None
+    credential_reservations: CoderCredentialReservations | None
+
+
+@dataclass(frozen=True)
+class CatalogCleanupReport:
+    """Sanitized result of reconciling daemon-owned catalog processes."""
+
+    unresolved_count: int
+
+    @property
+    def quiescent(self) -> bool:
+        return self.unresolved_count == 0
+
+
+class ModelCatalogProcessOwner:
+    """Retain catalog subprocess ownership for the daemon service lifetime."""
+
+    def __init__(self) -> None:
+        self._holds: dict[str, _RetainedCatalogProcess] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def lock_for(self, plugin_name: str) -> asyncio.Lock:
+        """Serialize one plugin's retained-hold check and launch boundary."""
+        return self._locks.setdefault(plugin_name, asyncio.Lock())
+
+    async def reconcile_before_launch(self, plugin_name: str) -> bool:
+        """Release a hold only after observation proves later quiescence."""
+        hold = self._holds.get(plugin_name)
+        if hold is None:
+            return True
+        if hold.managed is None:
+            return False
+        try:
+            result = await hold.managed.reconcile_cleanup(
+                observation_grace=_CATALOG_RECONCILE_GRACE_SECONDS,
+            )
+        except Exception:
+            return False
+        hold.cleanup_result = result
+        if not result.quiescent:
+            return False
+        self._release(plugin_name, hold)
+        return True
+
+    def retain_failure(
+        self,
+        plugin_name: str,
+        failure: ModelCatalogUnavailable,
+        *,
+        credential_location: str | None,
+        credential_reservations: CoderCredentialReservations | None,
+    ) -> bool:
+        """Retain an unconfirmed process and its exact reader reservation."""
+        managed = failure.managed
+        cleanup_result = failure.cleanup_result
+        if cleanup_result is not None and cleanup_result.quiescent:
+            return False
+        if managed is None and cleanup_result is None:
+            return False
+        self._holds[plugin_name] = _RetainedCatalogProcess(
+            managed=managed,
+            cleanup_result=cleanup_result,
+            credential_location=credential_location,
+            credential_reservations=credential_reservations,
+        )
+        return True
+
+    async def shutdown(self) -> CatalogCleanupReport:
+        """Observe every retained process once and report unresolved holds."""
+        for plugin_name in tuple(self._holds):
+            async with self.lock_for(plugin_name):
+                await self.reconcile_before_launch(plugin_name)
+        return CatalogCleanupReport(unresolved_count=len(self._holds))
+
+    def _release(
+        self,
+        plugin_name: str,
+        hold: _RetainedCatalogProcess,
+    ) -> None:
+        if (
+            hold.credential_location is not None
+            and hold.credential_reservations is not None
+        ):
+            hold.credential_reservations.release_coder(
+                hold.credential_location
+            )
+        self._holds.pop(plugin_name, None)
 
 
 def _response_key(request_id: str) -> str:
@@ -202,6 +328,30 @@ def _parse_catalog(payload: object) -> ModelCatalog:
     return ModelCatalog(models, source, description)
 
 
+async def _load_configured_catalog(
+    plugin_id: str,
+    reference: str,
+    config_path: str,
+    expected_credential_location: str | None = None,
+) -> ModelCatalog:
+    """Load one configured plugin catalog inside the isolated worker."""
+    from src.coders import _load_plugin
+
+    plugin = _load_plugin(plugin_id, reference)
+    config = load_config(config_path)
+    if expected_credential_location is not None:
+        actual_location = resolve_device_login_credential_location(
+            plugin,
+            config=config,
+        )
+        if actual_location != expected_credential_location:
+            raise ModelCatalogUnavailable("catalog unavailable")
+    return await plugin.get_model_catalog(
+        config=config,
+        config_path=config_path,
+    )
+
+
 async def _configured_catalog_worker_response(
     plugin_id: str,
     reference: str,
@@ -210,42 +360,217 @@ async def _configured_catalog_worker_response(
 ) -> dict[str, Any]:
     """Load one configured plugin and serialize its catalog in a worker."""
     try:
-        from src.coders import _load_plugin
-
-        plugin = _load_plugin(plugin_id, reference)
-        config = load_config(config_path)
-        if expected_credential_location is not None:
-            actual_location = resolve_device_login_credential_location(
-                plugin,
-                config=config,
-            )
-            if actual_location != expected_credential_location:
-                return {"ok": False, "error": "catalog unavailable"}
-        catalog = await plugin.get_model_catalog(
-            config=config,
-            config_path=config_path,
+        catalog = await _load_configured_catalog(
+            plugin_id,
+            reference,
+            config_path,
+            expected_credential_location,
         )
     except Exception:
         return {"ok": False, "error": "catalog unavailable"}
     return _catalog_payload(catalog)
 
 
+async def _run_configured_catalog_worker(
+    plugin_id: str,
+    reference: str,
+    config_path: str,
+    expected_credential_location: str | None = None,
+    *,
+    monitor_parent: bool = False,
+) -> None:
+    """Publish one response while retaining any unresolved child handle."""
+    managed: SupervisedProcess | None = None
+    cleanup_pending = False
+    parent_cancel_task: asyncio.Task[bool] | None = None
+    parent_input_fd: int | None = None
+    parent_reader_active = False
+    try:
+        with _suppress_configured_plugin_stdout():
+            load_task = asyncio.create_task(
+                _load_configured_catalog(
+                    plugin_id,
+                    reference,
+                    config_path,
+                    expected_credential_location,
+                )
+            )
+            if monitor_parent:
+                parent_cancel_event = asyncio.Event()
+                parent_input_fd = sys.stdin.fileno()
+                loop = asyncio.get_running_loop()
+
+                def request_parent_cancel() -> None:
+                    nonlocal parent_reader_active
+                    assert parent_input_fd is not None
+                    loop.remove_reader(parent_input_fd)
+                    parent_reader_active = False
+                    try:
+                        os.read(parent_input_fd, 4096)
+                    except OSError:
+                        pass
+                    parent_cancel_event.set()
+
+                parent_reader_active = True
+                loop.add_reader(
+                    parent_input_fd,
+                    request_parent_cancel,
+                )
+                parent_cancel_task = asyncio.create_task(
+                    parent_cancel_event.wait()
+                )
+            if parent_cancel_task is not None:
+                done, _ = await asyncio.wait(
+                    (load_task, parent_cancel_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if parent_cancel_task in done and not load_task.done():
+                    load_task.cancel()
+            catalog = await load_task
+        payload = _catalog_payload(catalog)
+    except ModelCatalogUnavailable as exc:
+        managed = exc.managed
+        cleanup_result = exc.cleanup_result
+        cleanup_pending = (
+            managed is not None and cleanup_result is None
+        ) or (
+            cleanup_result is not None and not cleanup_result.quiescent
+        )
+        payload = {"ok": False, "error": "catalog unavailable"}
+        if cleanup_pending:
+            payload[_WORKER_CLEANUP_PENDING] = True
+    except Exception:
+        payload = {"ok": False, "error": "catalog unavailable"}
+    finally:
+        if parent_cancel_task is not None and not parent_cancel_task.done():
+            parent_cancel_task.cancel()
+        if parent_input_fd is not None and parent_reader_active:
+            asyncio.get_running_loop().remove_reader(parent_input_fd)
+    print(
+        f"{_WORKER_RESULT_PREFIX}"
+        f"{json.dumps(payload, separators=(',', ':'))}",
+        flush=True,
+    )
+    if not cleanup_pending:
+        return
+    if managed is None:
+        await asyncio.Event().wait()
+    assert managed is not None
+    while True:
+        try:
+            result = await managed.reconcile_cleanup(
+                observation_grace=_CATALOG_RECONCILE_GRACE_SECONDS,
+            )
+        except Exception:
+            await asyncio.sleep(_CATALOG_RECONCILE_GRACE_SECONDS)
+            continue
+        if result.quiescent:
+            return
+        await asyncio.sleep(_CATALOG_RECONCILE_GRACE_SECONDS)
+
+
 def _configured_catalog_worker_main() -> None:
     """Subprocess entry point for configured model catalog discovery."""
     if len(sys.argv) not in {5, 6} or sys.argv[1] != "--configured-worker":
         raise SystemExit(2)
-    result = asyncio.run(
-        _configured_catalog_worker_response(
+    asyncio.run(
+        _run_configured_catalog_worker(
             sys.argv[2],
             sys.argv[3],
             sys.argv[4],
             sys.argv[5] if len(sys.argv) == 6 else None,
+            monitor_parent=True,
         )
     )
-    print(
-        f"{_WORKER_RESULT_PREFIX}"
-        f"{json.dumps(result, separators=(',', ':'))}"
+
+
+async def _configured_worker_payload(
+    managed: SupervisedProcess,
+) -> dict[str, Any] | None:
+    stdout = managed.process.stdout
+    if stdout is None:
+        return None
+    output_bytes = 0
+    while True:
+        try:
+            raw_line = await stdout.readline()
+        except ValueError:
+            return None
+        if not raw_line:
+            return None
+        output_bytes += len(raw_line)
+        if output_bytes > _CONFIGURED_WORKER_OUTPUT_BYTES:
+            return None
+        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+        if not line.startswith(_WORKER_RESULT_PREFIX):
+            continue
+        try:
+            payload = json.loads(line.removeprefix(_WORKER_RESULT_PREFIX))
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+
+async def _observe_configured_worker(
+    managed: SupervisedProcess,
+) -> CleanupResult | None:
+    try:
+        return await managed.reconcile_cleanup(observation_grace=0.0)
+    except Exception:
+        return None
+
+
+async def _stop_configured_worker(
+    managed: SupervisedProcess,
+) -> tuple[dict[str, Any] | None, CleanupResult | None]:
+    """Request cooperative stop, then perform at most one supervised cleanup."""
+    stdin = managed.process.stdin
+    if stdin is not None:
+        try:
+            stdin.write(b"\n")
+            await stdin.drain()
+            stdin.close()
+        except (BrokenPipeError, ConnectionError):
+            pass
+    try:
+        async with asyncio.timeout(_CONFIGURED_WORKER_CANCEL_GRACE_SECONDS):
+            payload = await _configured_worker_payload(managed)
+            if payload is not None and payload.pop(
+                _WORKER_CLEANUP_PENDING, False
+            ) is True:
+                return payload, await _observe_configured_worker(managed)
+            await managed.process.wait()
+    except TimeoutError:
+        return None, None
+    cleanup_result = await managed.cleanup(
+        term_grace=_CATALOG_RECONCILE_GRACE_SECONDS,
+        kill_grace=_CATALOG_RECONCILE_GRACE_SECONDS,
     )
+    return payload, cleanup_result
+
+
+async def _finish_configured_worker_stop(
+    managed: SupervisedProcess,
+) -> tuple[
+    dict[str, Any] | None,
+    CleanupResult | None,
+    asyncio.CancelledError | None,
+]:
+    """Finish one stop attempt before propagating any caller cancellation."""
+    stop_task = asyncio.create_task(_stop_configured_worker(managed))
+    cancellation: asyncio.CancelledError | None = None
+    while not stop_task.done():
+        try:
+            await asyncio.shield(stop_task)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        except Exception:
+            break
+    try:
+        payload, cleanup_result = stop_task.result()
+    except Exception:
+        payload, cleanup_result = None, None
+    return payload, cleanup_result, cancellation
 
 
 async def _isolated_configured_catalog(
@@ -271,44 +596,79 @@ async def _isolated_configured_catalog(
         if credential_location is not None:
             command.append(credential_location)
         spawn_kwargs: dict[str, Any] = {
+            "stdin": asyncio.subprocess.PIPE,
             "stdout": asyncio.subprocess.PIPE,
             "stderr": asyncio.subprocess.DEVNULL,
-            "start_new_session": True,
+            "limit": _CONFIGURED_WORKER_OUTPUT_BYTES + 1,
         }
         if env is not None:
             spawn_kwargs["env"] = dict(env)
-        process = await asyncio.create_subprocess_exec(
+        managed = await launch_process(
             *command,
             **spawn_kwargs,
         )
+    except ProcessLaunchCleanupError as exc:
+        raise ModelCatalogUnavailable(
+            "Configured model catalog worker startup cleanup is unresolved",
+            managed=exc.managed,
+            cleanup_result=exc.cleanup_result,
+        ) from None
     except OSError:
         raise ModelCatalogUnavailable(
             "Configured model catalog worker failed to start"
         ) from None
     try:
-        stdout, _ = await asyncio.wait_for(
-            process.communicate(),
-            timeout=timeout_seconds,
-        )
-    except asyncio.CancelledError:
-        await terminate_plugin_worker(process)
-        raise
-    except asyncio.TimeoutError:
-        await terminate_plugin_worker(process)
+        async with asyncio.timeout(timeout_seconds):
+            payload = await _configured_worker_payload(managed)
+            if payload is not None and payload.pop(
+                _WORKER_CLEANUP_PENDING, False
+            ) is True:
+                cleanup_result = await _observe_configured_worker(managed)
+                raise ModelCatalogUnavailable(
+                    "Configured model catalog cleanup is unresolved",
+                    managed=managed,
+                    cleanup_result=cleanup_result,
+                )
+            await managed.process.wait()
+            cleanup_result = await managed.cleanup(
+                term_grace=_CATALOG_RECONCILE_GRACE_SECONDS,
+                kill_grace=_CATALOG_RECONCILE_GRACE_SECONDS,
+            )
+    except asyncio.CancelledError as cancellation:
+        _, cleanup_result, _ = await _finish_configured_worker_stop(managed)
+        if cleanup_result is not None and cleanup_result.quiescent:
+            raise cancellation
         raise ModelCatalogUnavailable(
-            "Configured model catalog request timed out"
+            "Configured model catalog cancellation cleanup is unresolved",
+            managed=managed,
+            cleanup_result=cleanup_result,
         ) from None
-    if process.returncode != 0:
+    except TimeoutError:
+        _, cleanup_result, cancellation = await _finish_configured_worker_stop(
+            managed
+        )
+        if (
+            cancellation is not None
+            and cleanup_result is not None
+            and cleanup_result.quiescent
+        ):
+            raise cancellation
+        raise ModelCatalogUnavailable(
+            "Configured model catalog request timed out",
+            managed=managed,
+            cleanup_result=cleanup_result,
+        ) from None
+    if not cleanup_result.quiescent:
+        raise ModelCatalogUnavailable(
+            "Configured model catalog worker cleanup is unresolved",
+            managed=managed,
+            cleanup_result=cleanup_result,
+        )
+    if managed.process.returncode != 0:
         raise ModelCatalogUnavailable(
             "Configured model catalog worker failed"
         )
-    for raw_line in reversed(stdout.decode("utf-8", errors="replace").splitlines()):
-        if not raw_line.startswith(_WORKER_RESULT_PREFIX):
-            continue
-        try:
-            payload = json.loads(raw_line.removeprefix(_WORKER_RESULT_PREFIX))
-        except (json.JSONDecodeError, TypeError):
-            break
+    if payload is not None:
         return _parse_catalog(payload)
     raise ModelCatalogUnavailable(
         "Configured model catalog worker returned an invalid result"
@@ -521,6 +881,7 @@ async def handle_model_catalog_request(
     config_path: str,
     login_manager: CoderLoginSessionManager | None = None,
     credential_reservations: CoderCredentialReservations | None = None,
+    process_owner: ModelCatalogProcessOwner | None = None,
 ) -> None:
     """Execute one validated request inside the daemon process."""
     if isinstance(raw_request, bytes):
@@ -674,52 +1035,76 @@ async def handle_model_catalog_request(
                 {"ok": True, "auth": auth},
             )
             return
-        credential_location = None
-        config = load_config(config_path)
-        if credential_reservations is not None:
-            credential_location = resolve_device_login_credential_location(
-                plugin,
-                config=config,
-            )
-        if credential_location is not None:
-            if not credential_reservations.reserve_coder(credential_location):
+        owner = process_owner or ModelCatalogProcessOwner()
+        async with owner.lock_for(plugin_name):
+            if expires_at <= time.time():
                 await _store_response(
                     redis_client,
                     request_id,
-                    {"ok": False, "error": "catalog unavailable"},
+                    {"ok": False, "error": "request expired"},
                 )
                 return
-        try:
-            catalog_environment = _credential_environment(
-                plugin,
-                config=config,
-                credential_location=credential_location,
-            )
-            if (
-                reference is not None
-                and reference != DEFAULT_CODER_PLUGINS.get(plugin_name)
-            ):
-                catalog = await _isolated_configured_catalog(
-                    plugin_name,
-                    reference,
-                    config_path=config_path,
+            if not await owner.reconcile_before_launch(plugin_name):
+                raise ModelCatalogUnavailable(
+                    "Previous model catalog cleanup remains unresolved"
+                )
+            credential_location = None
+            config = load_config(config_path)
+            if credential_reservations is not None:
+                credential_location = resolve_device_login_credential_location(
+                    plugin,
+                    config=config,
+                )
+            if credential_location is not None:
+                if not credential_reservations.reserve_coder(
+                    credential_location
+                ):
+                    raise ModelCatalogUnavailable(
+                        "Model catalog credentials are unavailable"
+                    )
+            reservation_retained = False
+            try:
+                catalog_environment = _credential_environment(
+                    plugin,
+                    config=config,
                     credential_location=credential_location,
-                    env=catalog_environment,
                 )
-            else:
-                catalog = await asyncio.wait_for(
-                    plugin.get_model_catalog(
-                        config=config,
+                if (
+                    reference is not None
+                    and reference != DEFAULT_CODER_PLUGINS.get(plugin_name)
+                ):
+                    catalog = await _isolated_configured_catalog(
+                        plugin_name,
+                        reference,
                         config_path=config_path,
-                    ),
-                    timeout=_CONFIGURED_CATALOG_TIMEOUT_SECONDS,
+                        credential_location=credential_location,
+                        env=catalog_environment,
+                    )
+                else:
+                    async with asyncio.timeout(
+                        _CONFIGURED_CATALOG_TIMEOUT_SECONDS
+                    ):
+                        catalog = await plugin.get_model_catalog(
+                            config=config,
+                            config_path=config_path,
+                        )
+            except ModelCatalogUnavailable as exc:
+                reservation_retained = owner.retain_failure(
+                    plugin_name,
+                    exc,
+                    credential_location=credential_location,
+                    credential_reservations=credential_reservations,
                 )
-        finally:
-            if (
-                credential_location is not None
-                and credential_reservations is not None
-            ):
-                credential_reservations.release_coder(credential_location)
+                raise
+            finally:
+                if (
+                    not reservation_retained
+                    and credential_location is not None
+                    and credential_reservations is not None
+                ):
+                    credential_reservations.release_coder(
+                        credential_location
+                    )
     except Exception:
         logger.warning("%s model discovery failed in daemon", plugin_name)
         payload = {"ok": False, "error": "catalog unavailable"}
@@ -735,6 +1120,7 @@ async def serve_model_catalog_requests(
     config_path: str,
     credential_location_in_use: Callable[[str], bool] | None = None,
     credential_reservations: CoderCredentialReservations | None = None,
+    process_owner: ModelCatalogProcessOwner | None = None,
 ) -> None:
     """Consume durable web requests for the lifetime of the daemon."""
     # Lightweight Redis doubles and alternate clients may not implement lists.
@@ -748,6 +1134,7 @@ async def serve_model_catalog_requests(
         credential_location_in_use=credential_location_in_use,
         credential_reservations=credential_reservations,
     )
+    owner = process_owner or ModelCatalogProcessOwner()
     pending: set[asyncio.Task[None]] = set()
 
     def request_done(task: asyncio.Task[None]) -> None:
@@ -781,6 +1168,7 @@ async def serve_model_catalog_requests(
                             config_path=config_path,
                             login_manager=login_manager,
                             credential_reservations=credential_reservations,
+                            process_owner=owner,
                         )
                     )
                     pending.add(task)
@@ -796,7 +1184,16 @@ async def serve_model_catalog_requests(
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        await login_manager.shutdown()
+        try:
+            await login_manager.shutdown()
+        finally:
+            cleanup_report = await owner.shutdown()
+            if not cleanup_report.quiescent:
+                logger.error(
+                    "Model catalog shutdown left %d supervised cleanup hold(s) "
+                    "unresolved",
+                    cleanup_report.unresolved_count,
+                )
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised in the isolated worker
