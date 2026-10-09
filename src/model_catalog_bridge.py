@@ -47,6 +47,7 @@ _MAX_PENDING_REQUESTS = 64
 _MAX_CONCURRENT_REQUESTS = 8
 _CONFIGURED_CATALOG_TIMEOUT_SECONDS = 5.0
 _CATALOG_RECONCILE_GRACE_SECONDS = 1.0
+_CONFIGURED_WORKER_CANCEL_GRACE_SECONDS = 3.0
 _CONFIGURED_WORKER_OUTPUT_BYTES = 1_000_000
 _WORKER_RESULT_PREFIX = "PIPELINE_CATALOG_RESULT:"
 _WORKER_CLEANUP_PENDING = "_cleanup_pending"
@@ -351,17 +352,39 @@ async def _run_configured_catalog_worker(
     reference: str,
     config_path: str,
     expected_credential_location: str | None = None,
+    *,
+    monitor_parent: bool = False,
 ) -> None:
     """Publish one response while retaining any unresolved child handle."""
     managed: SupervisedProcess | None = None
     cleanup_pending = False
     try:
-        catalog = await _load_configured_catalog(
-            plugin_id,
-            reference,
-            config_path,
-            expected_credential_location,
+        load_task = asyncio.create_task(
+            _load_configured_catalog(
+                plugin_id,
+                reference,
+                config_path,
+                expected_credential_location,
+            )
         )
+        parent_cancel_task: asyncio.Task[bool] | None = None
+        parent_input_fd: int | None = None
+        if monitor_parent:
+            parent_cancel_event = asyncio.Event()
+            parent_input_fd = sys.stdin.fileno()
+            asyncio.get_running_loop().add_reader(
+                parent_input_fd,
+                parent_cancel_event.set,
+            )
+            parent_cancel_task = asyncio.create_task(parent_cancel_event.wait())
+        if parent_cancel_task is not None:
+            done, _ = await asyncio.wait(
+                (load_task, parent_cancel_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if parent_cancel_task in done and not load_task.done():
+                load_task.cancel()
+        catalog = await load_task
         payload = _catalog_payload(catalog)
     except ModelCatalogUnavailable as exc:
         managed = exc.managed
@@ -374,6 +397,11 @@ async def _run_configured_catalog_worker(
             payload[_WORKER_CLEANUP_PENDING] = True
     except Exception:
         payload = {"ok": False, "error": "catalog unavailable"}
+    finally:
+        if parent_cancel_task is not None and not parent_cancel_task.done():
+            parent_cancel_task.cancel()
+        if parent_input_fd is not None:
+            asyncio.get_running_loop().remove_reader(parent_input_fd)
     print(
         f"{_WORKER_RESULT_PREFIX}"
         f"{json.dumps(payload, separators=(',', ':'))}",
@@ -405,6 +433,7 @@ def _configured_catalog_worker_main() -> None:
             sys.argv[3],
             sys.argv[4],
             sys.argv[5] if len(sys.argv) == 6 else None,
+            monitor_parent=True,
         )
     )
 
@@ -445,6 +474,35 @@ async def _observe_configured_worker(
         return None
 
 
+async def _stop_configured_worker(
+    managed: SupervisedProcess,
+) -> tuple[dict[str, Any] | None, CleanupResult | None]:
+    """Request cooperative stop, then perform at most one supervised cleanup."""
+    stdin = managed.process.stdin
+    if stdin is not None:
+        try:
+            stdin.write(b"\n")
+            await stdin.drain()
+            stdin.close()
+        except (BrokenPipeError, ConnectionError):
+            pass
+    try:
+        async with asyncio.timeout(_CONFIGURED_WORKER_CANCEL_GRACE_SECONDS):
+            payload = await _configured_worker_payload(managed)
+            if payload is not None and payload.pop(
+                _WORKER_CLEANUP_PENDING, False
+            ) is True:
+                return payload, await _observe_configured_worker(managed)
+            await managed.process.wait()
+    except TimeoutError:
+        payload = None
+    cleanup_result = await managed.cleanup(
+        term_grace=_CATALOG_RECONCILE_GRACE_SECONDS,
+        kill_grace=_CATALOG_RECONCILE_GRACE_SECONDS,
+    )
+    return payload, cleanup_result
+
+
 async def _isolated_configured_catalog(
     plugin_id: str,
     reference: str,
@@ -468,6 +526,7 @@ async def _isolated_configured_catalog(
         if credential_location is not None:
             command.append(credential_location)
         spawn_kwargs: dict[str, Any] = {
+            "stdin": asyncio.subprocess.PIPE,
             "stdout": asyncio.subprocess.PIPE,
             "stderr": asyncio.subprocess.DEVNULL,
             "limit": _CONFIGURED_WORKER_OUTPUT_BYTES + 1,
@@ -506,7 +565,7 @@ async def _isolated_configured_catalog(
                 kill_grace=_CATALOG_RECONCILE_GRACE_SECONDS,
             )
     except asyncio.CancelledError:
-        cleanup_result = await _observe_configured_worker(managed)
+        _, cleanup_result = await _stop_configured_worker(managed)
         if cleanup_result is not None and cleanup_result.quiescent:
             raise
         raise ModelCatalogUnavailable(
@@ -515,7 +574,7 @@ async def _isolated_configured_catalog(
             cleanup_result=cleanup_result,
         ) from None
     except TimeoutError:
-        cleanup_result = await _observe_configured_worker(managed)
+        _, cleanup_result = await _stop_configured_worker(managed)
         raise ModelCatalogUnavailable(
             "Configured model catalog request timed out",
             managed=managed,
