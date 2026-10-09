@@ -1982,6 +1982,36 @@ async def test_catalog_owner_releases_confirmed_clean_failure(
 
 
 @pytest.mark.asyncio
+async def test_catalog_owner_retains_unowned_failed_launch_reservation() -> None:
+    failed = _cleanup_result(quiescent=False)
+    reservations = CoderCredentialReservations()
+    location = "/reserved/credentials"
+    assert reservations.reserve_coder(location) is True
+    owner = bridge.ModelCatalogProcessOwner()
+    assert owner.retain_failure(
+        "ordinary",
+        ModelCatalogUnavailable("ordinary failure"),
+        credential_location=None,
+        credential_reservations=None,
+    ) is False
+
+    retained = owner.retain_failure(
+        "third",
+        ModelCatalogUnavailable("startup cleanup", cleanup_result=failed),
+        credential_location=location,
+        credential_reservations=reservations,
+    )
+
+    assert retained is True
+    assert owner._holds["third"].managed is None
+    async with owner.lock_for("third"):
+        assert await owner.reconcile_before_launch("third") is False
+    report = await owner.shutdown()
+    assert report.unresolved_count == 1
+    assert reservations.reserve_login(location) is False
+
+
+@pytest.mark.asyncio
 async def test_catalog_server_reports_unresolved_shutdown(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

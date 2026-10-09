@@ -77,7 +77,7 @@ def _suppress_configured_plugin_stdout():
 
 @dataclass
 class _RetainedCatalogProcess:
-    managed: SupervisedProcess
+    managed: SupervisedProcess | None
     cleanup_result: CleanupResult | None
     credential_location: str | None
     credential_reservations: CoderCredentialReservations | None
@@ -110,6 +110,8 @@ class ModelCatalogProcessOwner:
         hold = self._holds.get(plugin_name)
         if hold is None:
             return True
+        if hold.managed is None:
+            return False
         try:
             result = await hold.managed.reconcile_cleanup(
                 observation_grace=_CATALOG_RECONCILE_GRACE_SECONDS,
@@ -133,9 +135,9 @@ class ModelCatalogProcessOwner:
         """Retain an unconfirmed process and its exact reader reservation."""
         managed = failure.managed
         cleanup_result = failure.cleanup_result
-        if managed is None or (
-            cleanup_result is not None and cleanup_result.quiescent
-        ):
+        if cleanup_result is not None and cleanup_result.quiescent:
+            return False
+        if managed is None and cleanup_result is None:
             return False
         self._holds[plugin_name] = _RetainedCatalogProcess(
             managed=managed,
