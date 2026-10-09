@@ -74,9 +74,15 @@
                    target="_blank"
                    rel="noopener noreferrer">{{ login.verification_url }}</a>
             </div>
-            <div>
+            <div class="flex flex-wrap items-center gap-2">
                 <span class="text-gray-500">Temporary code</span>
-                <code class="ml-2 rounded bg-surface-2 px-2 py-1 text-base tracking-widest text-gray-100">{{ login.user_code }}</code>
+                <code class="rounded bg-surface-2 px-2 py-1 text-base tracking-widest text-gray-100">{{ login.user_code }}</code>
+                <button type="button"
+                        data-clipboard-value="{{ login.user_code }}"
+                        aria-label="Copy temporary device-login code"
+                        class="secondary-interactive rounded border border-white/10 px-2 py-1 text-gray-300">
+                    Copy
+                </button>
             </div>
             <div>
                 <span class="text-gray-500">Deadline</span>
