@@ -11,7 +11,7 @@ import uuid
 from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
-from src.coder_auth import isolated_auth_probe, terminate_plugin_worker
+from src.coder_auth import isolated_auth_probe
 from src.coder_login import CoderCredentialReservations, CoderLoginSessionManager
 from src.coder_registry import (
     CoderAuthStatus,
@@ -29,7 +29,12 @@ from src.coder_registry import (
     resolve_device_login_credential_location,
 )
 from src.config import DEFAULT_CODER_PLUGINS, AppConfig, load_config
-from src.process_supervisor import CleanupResult, SupervisedProcess
+from src.process_supervisor import (
+    CleanupResult,
+    ProcessLaunchCleanupError,
+    SupervisedProcess,
+    launch_process,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +47,9 @@ _MAX_PENDING_REQUESTS = 64
 _MAX_CONCURRENT_REQUESTS = 8
 _CONFIGURED_CATALOG_TIMEOUT_SECONDS = 5.0
 _CATALOG_RECONCILE_GRACE_SECONDS = 1.0
+_CONFIGURED_WORKER_OUTPUT_BYTES = 1_000_000
 _WORKER_RESULT_PREFIX = "PIPELINE_CATALOG_RESULT:"
+_WORKER_CLEANUP_PENDING = "_cleanup_pending"
 
 
 @dataclass
@@ -296,6 +303,30 @@ def _parse_catalog(payload: object) -> ModelCatalog:
     return ModelCatalog(models, source, description)
 
 
+async def _load_configured_catalog(
+    plugin_id: str,
+    reference: str,
+    config_path: str,
+    expected_credential_location: str | None = None,
+) -> ModelCatalog:
+    """Load one configured plugin catalog inside the isolated worker."""
+    from src.coders import _load_plugin
+
+    plugin = _load_plugin(plugin_id, reference)
+    config = load_config(config_path)
+    if expected_credential_location is not None:
+        actual_location = resolve_device_login_credential_location(
+            plugin,
+            config=config,
+        )
+        if actual_location != expected_credential_location:
+            raise ModelCatalogUnavailable("catalog unavailable")
+    return await plugin.get_model_catalog(
+        config=config,
+        config_path=config_path,
+    )
+
+
 async def _configured_catalog_worker_response(
     plugin_id: str,
     reference: str,
@@ -304,42 +335,114 @@ async def _configured_catalog_worker_response(
 ) -> dict[str, Any]:
     """Load one configured plugin and serialize its catalog in a worker."""
     try:
-        from src.coders import _load_plugin
-
-        plugin = _load_plugin(plugin_id, reference)
-        config = load_config(config_path)
-        if expected_credential_location is not None:
-            actual_location = resolve_device_login_credential_location(
-                plugin,
-                config=config,
-            )
-            if actual_location != expected_credential_location:
-                return {"ok": False, "error": "catalog unavailable"}
-        catalog = await plugin.get_model_catalog(
-            config=config,
-            config_path=config_path,
+        catalog = await _load_configured_catalog(
+            plugin_id,
+            reference,
+            config_path,
+            expected_credential_location,
         )
     except Exception:
         return {"ok": False, "error": "catalog unavailable"}
     return _catalog_payload(catalog)
 
 
+async def _run_configured_catalog_worker(
+    plugin_id: str,
+    reference: str,
+    config_path: str,
+    expected_credential_location: str | None = None,
+) -> None:
+    """Publish one response while retaining any unresolved child handle."""
+    managed: SupervisedProcess | None = None
+    cleanup_pending = False
+    try:
+        catalog = await _load_configured_catalog(
+            plugin_id,
+            reference,
+            config_path,
+            expected_credential_location,
+        )
+        payload = _catalog_payload(catalog)
+    except ModelCatalogUnavailable as exc:
+        managed = exc.managed
+        cleanup_result = exc.cleanup_result
+        cleanup_pending = managed is not None and (
+            cleanup_result is None or not cleanup_result.quiescent
+        )
+        payload = {"ok": False, "error": "catalog unavailable"}
+        if cleanup_pending:
+            payload[_WORKER_CLEANUP_PENDING] = True
+    except Exception:
+        payload = {"ok": False, "error": "catalog unavailable"}
+    print(
+        f"{_WORKER_RESULT_PREFIX}"
+        f"{json.dumps(payload, separators=(',', ':'))}",
+        flush=True,
+    )
+    if not cleanup_pending:
+        return
+    assert managed is not None
+    while True:
+        try:
+            result = await managed.reconcile_cleanup(
+                observation_grace=_CATALOG_RECONCILE_GRACE_SECONDS,
+            )
+        except Exception:
+            await asyncio.sleep(_CATALOG_RECONCILE_GRACE_SECONDS)
+            continue
+        if result.quiescent:
+            return
+        await asyncio.sleep(_CATALOG_RECONCILE_GRACE_SECONDS)
+
+
 def _configured_catalog_worker_main() -> None:
     """Subprocess entry point for configured model catalog discovery."""
     if len(sys.argv) not in {5, 6} or sys.argv[1] != "--configured-worker":
         raise SystemExit(2)
-    result = asyncio.run(
-        _configured_catalog_worker_response(
+    asyncio.run(
+        _run_configured_catalog_worker(
             sys.argv[2],
             sys.argv[3],
             sys.argv[4],
             sys.argv[5] if len(sys.argv) == 6 else None,
         )
     )
-    print(
-        f"{_WORKER_RESULT_PREFIX}"
-        f"{json.dumps(result, separators=(',', ':'))}"
-    )
+
+
+async def _configured_worker_payload(
+    managed: SupervisedProcess,
+) -> dict[str, Any] | None:
+    stdout = managed.process.stdout
+    if stdout is None:
+        return None
+    output_bytes = 0
+    while True:
+        try:
+            raw_line = await stdout.readline()
+        except ValueError:
+            return None
+        if not raw_line:
+            return None
+        output_bytes += len(raw_line)
+        if output_bytes > _CONFIGURED_WORKER_OUTPUT_BYTES:
+            return None
+        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+        if not line.startswith(_WORKER_RESULT_PREFIX):
+            continue
+        try:
+            payload = json.loads(line.removeprefix(_WORKER_RESULT_PREFIX))
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+
+async def _observe_configured_worker(
+    managed: SupervisedProcess,
+) -> CleanupResult | None:
+    try:
+        return await managed.reconcile_cleanup(observation_grace=0.0)
+    except Exception:
+        return None
 
 
 async def _isolated_configured_catalog(
@@ -367,42 +470,68 @@ async def _isolated_configured_catalog(
         spawn_kwargs: dict[str, Any] = {
             "stdout": asyncio.subprocess.PIPE,
             "stderr": asyncio.subprocess.DEVNULL,
-            "start_new_session": True,
+            "limit": _CONFIGURED_WORKER_OUTPUT_BYTES + 1,
         }
         if env is not None:
             spawn_kwargs["env"] = dict(env)
-        process = await asyncio.create_subprocess_exec(
+        managed = await launch_process(
             *command,
             **spawn_kwargs,
         )
+    except ProcessLaunchCleanupError as exc:
+        raise ModelCatalogUnavailable(
+            "Configured model catalog worker startup cleanup is unresolved",
+            managed=exc.managed,
+            cleanup_result=exc.cleanup_result,
+        ) from None
     except OSError:
         raise ModelCatalogUnavailable(
             "Configured model catalog worker failed to start"
         ) from None
     try:
-        stdout, _ = await asyncio.wait_for(
-            process.communicate(),
-            timeout=timeout_seconds,
-        )
+        async with asyncio.timeout(timeout_seconds):
+            payload = await _configured_worker_payload(managed)
+            if payload is not None and payload.pop(
+                _WORKER_CLEANUP_PENDING, False
+            ) is True:
+                cleanup_result = await _observe_configured_worker(managed)
+                raise ModelCatalogUnavailable(
+                    "Configured model catalog cleanup is unresolved",
+                    managed=managed,
+                    cleanup_result=cleanup_result,
+                )
+            await managed.process.wait()
+            cleanup_result = await managed.cleanup(
+                term_grace=_CATALOG_RECONCILE_GRACE_SECONDS,
+                kill_grace=_CATALOG_RECONCILE_GRACE_SECONDS,
+            )
     except asyncio.CancelledError:
-        await terminate_plugin_worker(process)
-        raise
-    except asyncio.TimeoutError:
-        await terminate_plugin_worker(process)
+        cleanup_result = await _observe_configured_worker(managed)
+        if cleanup_result is not None and cleanup_result.quiescent:
+            raise
         raise ModelCatalogUnavailable(
-            "Configured model catalog request timed out"
+            "Configured model catalog cancellation cleanup is unresolved",
+            managed=managed,
+            cleanup_result=cleanup_result,
         ) from None
-    if process.returncode != 0:
+    except TimeoutError:
+        cleanup_result = await _observe_configured_worker(managed)
+        raise ModelCatalogUnavailable(
+            "Configured model catalog request timed out",
+            managed=managed,
+            cleanup_result=cleanup_result,
+        ) from None
+    if not cleanup_result.quiescent:
+        raise ModelCatalogUnavailable(
+            "Configured model catalog worker cleanup is unresolved",
+            managed=managed,
+            cleanup_result=cleanup_result,
+        )
+    if managed.process.returncode != 0:
         raise ModelCatalogUnavailable(
             "Configured model catalog worker failed"
         )
-    for raw_line in reversed(stdout.decode("utf-8", errors="replace").splitlines()):
-        if not raw_line.startswith(_WORKER_RESULT_PREFIX):
-            continue
-        try:
-            payload = json.loads(raw_line.removeprefix(_WORKER_RESULT_PREFIX))
-        except (json.JSONDecodeError, TypeError):
-            break
+    if payload is not None:
         return _parse_catalog(payload)
     raise ModelCatalogUnavailable(
         "Configured model catalog worker returned an invalid result"
