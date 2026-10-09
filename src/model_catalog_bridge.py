@@ -382,6 +382,7 @@ async def _run_configured_catalog_worker(
     cleanup_pending = False
     parent_cancel_task: asyncio.Task[bool] | None = None
     parent_input_fd: int | None = None
+    parent_reader_active = False
     try:
         with _suppress_configured_plugin_stdout():
             load_task = asyncio.create_task(
@@ -395,9 +396,23 @@ async def _run_configured_catalog_worker(
             if monitor_parent:
                 parent_cancel_event = asyncio.Event()
                 parent_input_fd = sys.stdin.fileno()
-                asyncio.get_running_loop().add_reader(
+                loop = asyncio.get_running_loop()
+
+                def request_parent_cancel() -> None:
+                    nonlocal parent_reader_active
+                    assert parent_input_fd is not None
+                    loop.remove_reader(parent_input_fd)
+                    parent_reader_active = False
+                    try:
+                        os.read(parent_input_fd, 4096)
+                    except OSError:
+                        pass
+                    parent_cancel_event.set()
+
+                parent_reader_active = True
+                loop.add_reader(
                     parent_input_fd,
-                    parent_cancel_event.set,
+                    request_parent_cancel,
                 )
                 parent_cancel_task = asyncio.create_task(
                     parent_cancel_event.wait()
@@ -425,7 +440,7 @@ async def _run_configured_catalog_worker(
     finally:
         if parent_cancel_task is not None and not parent_cancel_task.done():
             parent_cancel_task.cancel()
-        if parent_input_fd is not None:
+        if parent_input_fd is not None and parent_reader_active:
             asyncio.get_running_loop().remove_reader(parent_input_fd)
     print(
         f"{_WORKER_RESULT_PREFIX}"
