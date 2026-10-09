@@ -431,8 +431,10 @@ async def _run_configured_catalog_worker(
     except ModelCatalogUnavailable as exc:
         managed = exc.managed
         cleanup_result = exc.cleanup_result
-        cleanup_pending = managed is not None and (
-            cleanup_result is None or not cleanup_result.quiescent
+        cleanup_pending = (
+            managed is not None and cleanup_result is None
+        ) or (
+            cleanup_result is not None and not cleanup_result.quiescent
         )
         payload = {"ok": False, "error": "catalog unavailable"}
         if cleanup_pending:
@@ -451,6 +453,8 @@ async def _run_configured_catalog_worker(
     )
     if not cleanup_pending:
         return
+    if managed is None:
+        await asyncio.Event().wait()
     assert managed is not None
     while True:
         try:

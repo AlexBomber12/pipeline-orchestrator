@@ -1001,6 +1001,44 @@ async def test_configured_worker_retains_child_until_reconciled(
 
 
 @pytest.mark.asyncio
+async def test_configured_worker_stays_alive_for_unowned_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed = _cleanup_result(quiescent=False)
+    published = asyncio.Event()
+    output: list[str] = []
+
+    class Plugin:
+        async def get_model_catalog(self, **_kwargs: object) -> ModelCatalog:
+            raise ModelCatalogUnavailable(
+                "private startup detail",
+                cleanup_result=failed,
+            )
+
+    def capture_print(*values: object, **_kwargs: object) -> None:
+        output.append(" ".join(str(value) for value in values))
+        published.set()
+
+    monkeypatch.setattr("src.coders._load_plugin", lambda *_args: Plugin())
+    monkeypatch.setattr(bridge, "load_config", lambda _path: AppConfig())
+    monkeypatch.setattr("builtins.print", capture_print)
+    task = asyncio.create_task(
+        bridge._run_configured_catalog_worker(
+            "third", "module:factory", "/cfg"
+        )
+    )
+    await published.wait()
+    assert task.done() is False
+    payload = json.loads(
+        output[0].removeprefix(bridge._WORKER_RESULT_PREFIX)
+    )
+    assert payload[bridge._WORKER_CLEANUP_PENDING] is True
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
 async def test_configured_worker_serializes_success_and_sanitized_failures(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
