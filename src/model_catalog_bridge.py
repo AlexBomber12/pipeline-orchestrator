@@ -543,6 +543,30 @@ async def _stop_configured_worker(
     return payload, cleanup_result
 
 
+async def _finish_configured_worker_stop(
+    managed: SupervisedProcess,
+) -> tuple[
+    dict[str, Any] | None,
+    CleanupResult | None,
+    asyncio.CancelledError | None,
+]:
+    """Finish one stop attempt before propagating any caller cancellation."""
+    stop_task = asyncio.create_task(_stop_configured_worker(managed))
+    cancellation: asyncio.CancelledError | None = None
+    while not stop_task.done():
+        try:
+            await asyncio.shield(stop_task)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        except Exception:
+            break
+    try:
+        payload, cleanup_result = stop_task.result()
+    except Exception:
+        payload, cleanup_result = None, None
+    return payload, cleanup_result, cancellation
+
+
 async def _isolated_configured_catalog(
     plugin_id: str,
     reference: str,
@@ -604,17 +628,25 @@ async def _isolated_configured_catalog(
                 term_grace=_CATALOG_RECONCILE_GRACE_SECONDS,
                 kill_grace=_CATALOG_RECONCILE_GRACE_SECONDS,
             )
-    except asyncio.CancelledError:
-        _, cleanup_result = await _stop_configured_worker(managed)
+    except asyncio.CancelledError as cancellation:
+        _, cleanup_result, _ = await _finish_configured_worker_stop(managed)
         if cleanup_result is not None and cleanup_result.quiescent:
-            raise
+            raise cancellation
         raise ModelCatalogUnavailable(
             "Configured model catalog cancellation cleanup is unresolved",
             managed=managed,
             cleanup_result=cleanup_result,
         ) from None
     except TimeoutError:
-        _, cleanup_result = await _stop_configured_worker(managed)
+        _, cleanup_result, cancellation = await _finish_configured_worker_stop(
+            managed
+        )
+        if (
+            cancellation is not None
+            and cleanup_result is not None
+            and cleanup_result.quiescent
+        ):
+            raise cancellation
         raise ModelCatalogUnavailable(
             "Configured model catalog request timed out",
             managed=managed,
@@ -999,6 +1031,13 @@ async def handle_model_catalog_request(
             return
         owner = process_owner or ModelCatalogProcessOwner()
         async with owner.lock_for(plugin_name):
+            if expires_at <= time.time():
+                await _store_response(
+                    redis_client,
+                    request_id,
+                    {"ok": False, "error": "request expired"},
+                )
+                return
             if not await owner.reconcile_before_launch(plugin_name):
                 raise ModelCatalogUnavailable(
                     "Previous model catalog cleanup remains unresolved"

@@ -1223,6 +1223,79 @@ async def test_stop_configured_worker_preserves_pending_hold_after_broken_pipe()
 
 
 @pytest.mark.asyncio
+async def test_worker_stop_handoff_survives_repeated_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    managed = SimpleNamespace()
+
+    async def stop(_managed: object) -> tuple[None, None]:
+        started.set()
+        await release.wait()
+        return None, None
+
+    monkeypatch.setattr(bridge, "_stop_configured_worker", stop)
+    task = asyncio.create_task(
+        bridge._finish_configured_worker_stop(managed)  # type: ignore[arg-type]
+    )
+    await started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    release.set()
+    payload, cleanup_result, cancellation = await task
+    assert payload is None
+    assert cleanup_result is None
+    assert isinstance(cancellation, asyncio.CancelledError)
+
+    async def fail(_managed: object) -> tuple[None, None]:
+        raise RuntimeError("stop failed")
+
+    monkeypatch.setattr(bridge, "_stop_configured_worker", fail)
+    assert await bridge._finish_configured_worker_stop(  # type: ignore[arg-type]
+        managed
+    ) == (None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_catalog_timeout_propagates_cancellation_after_confirmed_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _CatalogWorkerProcess(b"")
+    process.stdout = _CatalogWorkerStdout(b"", blocked=True)
+    managed = _ManagedCatalogWorker(process)
+    stop_started = asyncio.Event()
+    release_stop = asyncio.Event()
+
+    async def create(*_args: object, **_kwargs: object) -> _ManagedCatalogWorker:
+        return managed
+
+    async def stop(
+        _managed: object,
+    ) -> tuple[None, CleanupResult]:
+        stop_started.set()
+        await release_stop.wait()
+        return None, _cleanup_result(quiescent=True)
+
+    monkeypatch.setattr(bridge, "launch_process", create)
+    monkeypatch.setattr(bridge, "_stop_configured_worker", stop)
+    task = asyncio.create_task(
+        bridge._isolated_configured_catalog(
+            "third",
+            "module:factory",
+            config_path="/cfg",
+            timeout_seconds=0.001,
+        )
+    )
+    await stop_started.wait()
+    task.cancel()
+    release_stop.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
 async def test_isolated_configured_catalog_parses_worker_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1673,6 +1746,55 @@ async def test_catalog_owner_blocks_replacement_until_quiescence(
     assert reservations.reserve_login(location) is True
     reservations.release_login(location)
     assert json.loads(redis.values[bridge._response_key("3" * 32)])["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_catalog_request_rechecks_expiry_after_plugin_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    redis = _BridgeRedis()
+    registry = CoderRegistry()
+    plugin = CodexPlugin(discover=lambda **_kwargs: None)
+    reference = "src.coders.codex:CodexPlugin"
+    registry.register(plugin, reference=reference)
+    calls = 0
+
+    async def discover(**_kwargs: object) -> ModelCatalog:
+        nonlocal calls
+        calls += 1
+        return ModelCatalog((), "live", "Live catalog")
+
+    monkeypatch.setattr(plugin, "get_model_catalog", discover)
+    owner = bridge.ModelCatalogProcessOwner()
+    lock = owner.lock_for("codex")
+    await lock.acquire()
+    request_id = "7" * 32
+    task = asyncio.create_task(
+        bridge.handle_model_catalog_request(
+            redis,
+            registry,
+            json.dumps(
+                {
+                    "request_id": request_id,
+                    "plugin": "codex",
+                    "reference": reference,
+                    "expires_at": time.time() + 0.001,
+                }
+            ),
+            config_path=str(tmp_path / "config.yml"),
+            process_owner=owner,
+        )
+    )
+    await asyncio.sleep(0.01)
+    lock.release()
+    await task
+
+    assert calls == 0
+    assert json.loads(redis.values[bridge._response_key(request_id)]) == {
+        "ok": False,
+        "error": "request expired",
+    }
 
 
 @pytest.mark.asyncio
