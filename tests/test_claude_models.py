@@ -16,6 +16,7 @@ from src.coders.claude_models import (
     _exchange,
     discover_claude_models,
 )
+from src.process_supervisor import ProcessLaunchCleanupError
 
 _FAKE_CLI = r'''
 import json, os, select, subprocess, sys, time
@@ -360,9 +361,11 @@ async def test_exchange_enforces_cumulative_output_limit() -> None:
         await _exchange(process, 30)
 
 
+@pytest.mark.parametrize("cleanup_raises", [False, True])
 @pytest.mark.asyncio
 async def test_cleanup_failure_is_sanitized(
     monkeypatch: pytest.MonkeyPatch,
+    cleanup_raises: bool,
 ) -> None:
     class _Closable:
         def close(self) -> None:
@@ -372,10 +375,14 @@ async def test_cleanup_failure_is_sanitized(
         process = SimpleNamespace(stdin=_Closable())
 
         async def cleanup(self, **_kwargs: object) -> SimpleNamespace:
+            if cleanup_raises:
+                raise RuntimeError("raw cleanup detail")
             return SimpleNamespace(quiescent=False)
 
+    managed = _Managed()
+
     async def launch(*_args: object, **_kwargs: object) -> _Managed:
-        return _Managed()
+        return managed
 
     async def exchange(*_args: object) -> tuple[ModelMetadata, ...]:
         return ()
@@ -384,8 +391,35 @@ async def test_cleanup_failure_is_sanitized(
     monkeypatch.setattr(claude_models, "_exchange", exchange)
     with pytest.raises(
         ClaudeModelDiscoveryUnavailable, match="cleanup could not be confirmed"
-    ):
+    ) as exc_info:
         await discover_claude_models()
+    assert "raw cleanup detail" not in str(exc_info.value)
+    assert exc_info.value.managed is managed
+    assert (exc_info.value.cleanup_result is None) is cleanup_raises
+
+
+@pytest.mark.asyncio
+async def test_startup_cleanup_failure_retains_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    managed = SimpleNamespace(reconcile_cleanup=object())
+    cleanup = SimpleNamespace(quiescent=False)
+
+    async def launch(*_args: object, **_kwargs: object) -> None:
+        raise ProcessLaunchCleanupError(
+            "raw startup detail",
+            managed=managed,  # type: ignore[arg-type]
+            cleanup_result=cleanup,  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(claude_models, "launch_process", launch)
+    with pytest.raises(
+        ClaudeModelDiscoveryUnavailable, match="startup cleanup"
+    ) as exc_info:
+        await discover_claude_models()
+    assert "raw startup detail" not in str(exc_info.value)
+    assert exc_info.value.managed is managed
+    assert exc_info.value.cleanup_result is cleanup
 
 
 @pytest.mark.parametrize(

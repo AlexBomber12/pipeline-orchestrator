@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Mapping
 
 from src.coder_registry import ModelMetadata, ModelReasoningEffort
-from src.process_supervisor import launch_process
+from src.process_supervisor import (
+    CleanupResult,
+    ProcessLaunchCleanupError,
+    SupervisedProcess,
+    launch_process,
+)
 
 _REQUEST_ID = "pipeline-orchestrator-model-discovery"
 _COMMAND = (
@@ -20,7 +25,17 @@ _COMMAND = (
 _INVALID_RESPONSE = "invalid Claude model discovery response"
 
 
-class ClaudeModelDiscoveryUnavailable(RuntimeError): ...
+class ClaudeModelDiscoveryUnavailable(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        managed: SupervisedProcess | None = None,
+        cleanup_result: CleanupResult | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.managed = managed
+        self.cleanup_result = cleanup_result
 
 
 class ClaudeModelDiscoveryInvalid(RuntimeError): ...
@@ -62,10 +77,20 @@ async def discover_claude_models(
             finally:
                 if managed.process.stdin is not None:
                     managed.process.stdin.close()
-                cleanup = await managed.cleanup(term_grace=1.0, kill_grace=1.0)
+                try:
+                    cleanup = await managed.cleanup(
+                        term_grace=1.0, kill_grace=1.0
+                    )
+                except Exception:
+                    raise ClaudeModelDiscoveryUnavailable(
+                        "Claude model discovery cleanup could not be confirmed",
+                        managed=managed,
+                    ) from None
                 if not cleanup.quiescent:
                     raise ClaudeModelDiscoveryUnavailable(
-                        "Claude model discovery cleanup could not be confirmed"
+                        "Claude model discovery cleanup could not be confirmed",
+                        managed=managed,
+                        cleanup_result=cleanup,
                     )
     except TimeoutError:
         raise ClaudeModelDiscoveryUnavailable("Claude model discovery timed out") from None
@@ -73,6 +98,12 @@ async def discover_claude_models(
         raise
     except (ClaudeModelDiscoveryInvalid, ClaudeModelDiscoveryUnavailable):
         raise
+    except ProcessLaunchCleanupError as exc:
+        raise ClaudeModelDiscoveryUnavailable(
+            "Claude model discovery startup cleanup could not be confirmed",
+            managed=exc.managed,
+            cleanup_result=exc.cleanup_result,
+        ) from None
     except Exception:
         raise ClaudeModelDiscoveryUnavailable(
             "Claude model discovery is unavailable"
