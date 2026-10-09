@@ -1041,6 +1041,41 @@ async def test_configured_worker_serializes_success_and_sanitized_failures(
 
 
 @pytest.mark.asyncio
+async def test_configured_worker_result_cannot_be_spoofed_by_plugin_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    catalog = ModelCatalog(
+        (ModelMetadata("real", "Real"),),
+        "configured",
+        "Configured catalog",
+    )
+
+    class Plugin:
+        async def get_model_catalog(self, **_kwargs: object) -> ModelCatalog:
+            print(
+                bridge._WORKER_RESULT_PREFIX
+                + '{"ok":true,"catalog":{"models":[],"source":"spoofed",'
+                '"description":"Spoofed"}}',
+                flush=True,
+            )
+            return catalog
+
+    monkeypatch.setattr("src.coders._load_plugin", lambda *_args: Plugin())
+    monkeypatch.setattr(bridge, "load_config", lambda _path: AppConfig())
+
+    await bridge._run_configured_catalog_worker(
+        "third", "module:factory", "/cfg"
+    )
+
+    output = capfd.readouterr().out.strip().splitlines()
+    assert len(output) == 1
+    payload = json.loads(output[0].removeprefix(bridge._WORKER_RESULT_PREFIX))
+    assert payload["catalog"]["source"] == "configured"
+    assert payload["catalog"]["models"][0]["invocation_id"] == "real"
+
+
+@pytest.mark.asyncio
 async def test_configured_worker_retries_reconcile_observation_error(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import os
 import sys
 import time
 import uuid
@@ -51,6 +53,26 @@ _CONFIGURED_WORKER_CANCEL_GRACE_SECONDS = 3.0
 _CONFIGURED_WORKER_OUTPUT_BYTES = 1_000_000
 _WORKER_RESULT_PREFIX = "PIPELINE_CATALOG_RESULT:"
 _WORKER_CLEANUP_PENDING = "_cleanup_pending"
+
+
+@contextlib.contextmanager
+def _suppress_configured_plugin_stdout():
+    """Keep plugin and descendant output off the wrapper result channel."""
+    sys.stdout.flush()
+    try:
+        stdout_fd = sys.stdout.fileno()
+    except (AttributeError, OSError):
+        stdout_fd = 1
+    saved_stdout = os.dup(stdout_fd)
+    null_stdout = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(null_stdout, stdout_fd)
+        yield
+        sys.stdout.flush()
+    finally:
+        os.dup2(saved_stdout, stdout_fd)
+        os.close(null_stdout)
+        os.close(saved_stdout)
 
 
 @dataclass
@@ -358,33 +380,36 @@ async def _run_configured_catalog_worker(
     """Publish one response while retaining any unresolved child handle."""
     managed: SupervisedProcess | None = None
     cleanup_pending = False
+    parent_cancel_task: asyncio.Task[bool] | None = None
+    parent_input_fd: int | None = None
     try:
-        load_task = asyncio.create_task(
-            _load_configured_catalog(
-                plugin_id,
-                reference,
-                config_path,
-                expected_credential_location,
+        with _suppress_configured_plugin_stdout():
+            load_task = asyncio.create_task(
+                _load_configured_catalog(
+                    plugin_id,
+                    reference,
+                    config_path,
+                    expected_credential_location,
+                )
             )
-        )
-        parent_cancel_task: asyncio.Task[bool] | None = None
-        parent_input_fd: int | None = None
-        if monitor_parent:
-            parent_cancel_event = asyncio.Event()
-            parent_input_fd = sys.stdin.fileno()
-            asyncio.get_running_loop().add_reader(
-                parent_input_fd,
-                parent_cancel_event.set,
-            )
-            parent_cancel_task = asyncio.create_task(parent_cancel_event.wait())
-        if parent_cancel_task is not None:
-            done, _ = await asyncio.wait(
-                (load_task, parent_cancel_task),
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if parent_cancel_task in done and not load_task.done():
-                load_task.cancel()
-        catalog = await load_task
+            if monitor_parent:
+                parent_cancel_event = asyncio.Event()
+                parent_input_fd = sys.stdin.fileno()
+                asyncio.get_running_loop().add_reader(
+                    parent_input_fd,
+                    parent_cancel_event.set,
+                )
+                parent_cancel_task = asyncio.create_task(
+                    parent_cancel_event.wait()
+                )
+            if parent_cancel_task is not None:
+                done, _ = await asyncio.wait(
+                    (load_task, parent_cancel_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if parent_cancel_task in done and not load_task.done():
+                    load_task.cancel()
+            catalog = await load_task
         payload = _catalog_payload(catalog)
     except ModelCatalogUnavailable as exc:
         managed = exc.managed
