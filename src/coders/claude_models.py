@@ -77,21 +77,7 @@ async def discover_claude_models(
             finally:
                 if managed.process.stdin is not None:
                     managed.process.stdin.close()
-                try:
-                    cleanup = await managed.cleanup(
-                        term_grace=1.0, kill_grace=1.0
-                    )
-                except Exception:
-                    raise ClaudeModelDiscoveryUnavailable(
-                        "Claude model discovery cleanup could not be confirmed",
-                        managed=managed,
-                    ) from None
-                if not cleanup.quiescent:
-                    raise ClaudeModelDiscoveryUnavailable(
-                        "Claude model discovery cleanup could not be confirmed",
-                        managed=managed,
-                        cleanup_result=cleanup,
-                    )
+                await _cleanup(managed)
     except TimeoutError:
         raise ClaudeModelDiscoveryUnavailable("Claude model discovery timed out") from None
     except asyncio.CancelledError:
@@ -108,6 +94,29 @@ async def discover_claude_models(
         raise ClaudeModelDiscoveryUnavailable(
             "Claude model discovery is unavailable"
         ) from None
+
+
+async def _cleanup(managed: SupervisedProcess) -> None:
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            cleanup = await managed.cleanup(term_grace=1.0, kill_grace=1.0)
+            break
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        except Exception:
+            raise ClaudeModelDiscoveryUnavailable(
+                "Claude model discovery cleanup could not be confirmed",
+                managed=managed,
+            ) from None
+    if not cleanup.quiescent:
+        raise ClaudeModelDiscoveryUnavailable(
+            "Claude model discovery cleanup could not be confirmed",
+            managed=managed,
+            cleanup_result=cleanup,
+        )
+    if cancellation is not None:
+        raise cancellation
 
 
 async def _exchange(

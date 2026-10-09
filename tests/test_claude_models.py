@@ -398,6 +398,44 @@ async def test_cleanup_failure_is_sanitized(
     assert (exc_info.value.cleanup_result is None) is cleanup_raises
 
 
+@pytest.mark.parametrize("quiescent", [False, True])
+@pytest.mark.asyncio
+async def test_cleanup_preserves_cancellation_until_result_is_available(
+    monkeypatch: pytest.MonkeyPatch, quiescent: bool
+) -> None:
+    cleanup = SimpleNamespace(quiescent=quiescent)
+
+    class _Managed:
+        process = SimpleNamespace(stdin=SimpleNamespace(close=lambda: None))
+        calls = 0
+
+        async def cleanup(self, **_kwargs: object) -> SimpleNamespace:
+            self.calls += 1
+            if self.calls == 1:
+                raise asyncio.CancelledError
+            return cleanup
+
+    managed = _Managed()
+
+    async def launch(*_args: object, **_kwargs: object) -> _Managed:
+        return managed
+
+    async def exchange(*_args: object) -> tuple[ModelMetadata, ...]:
+        return ()
+
+    monkeypatch.setattr(claude_models, "launch_process", launch)
+    monkeypatch.setattr(claude_models, "_exchange", exchange)
+    if quiescent:
+        with pytest.raises(asyncio.CancelledError):
+            await discover_claude_models()
+    else:
+        with pytest.raises(ClaudeModelDiscoveryUnavailable) as exc_info:
+            await discover_claude_models()
+        assert exc_info.value.managed is managed
+        assert exc_info.value.cleanup_result is cleanup
+    assert managed.calls == 2
+
+
 @pytest.mark.asyncio
 async def test_startup_cleanup_failure_retains_ownership(
     monkeypatch: pytest.MonkeyPatch,
