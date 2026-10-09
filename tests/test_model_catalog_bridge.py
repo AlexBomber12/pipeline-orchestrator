@@ -1438,7 +1438,8 @@ async def test_isolated_configured_catalog_handles_start_timeout_and_cancel(
         assert exc_info.value.managed is managed
 
     await cancel_scenario()
-    assert managed.cleanup_calls == 2
+    assert managed.cleanup_calls == 0
+    assert process.stdin.writes == [b"\n", b"\n"]
 
 
 @pytest.mark.asyncio
@@ -1448,8 +1449,18 @@ async def test_isolated_configured_catalog_propagates_cancel_after_quiescence(
     monkeypatch.setattr(
         bridge, "_CONFIGURED_WORKER_CANCEL_GRACE_SECONDS", 0.001
     )
+    class CancelThenEof:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def readline(self) -> bytes:
+            self.calls += 1
+            if self.calls == 1:
+                await asyncio.Event().wait()
+            return b""
+
     process = _CatalogWorkerProcess(b"")
-    process.stdout = _CatalogWorkerStdout(b"", blocked=True)
+    process.stdout = CancelThenEof()
     managed = _ManagedCatalogWorker(
         process,
         reconciliation=_cleanup_result(quiescent=True),

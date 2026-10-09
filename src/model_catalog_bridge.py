@@ -520,7 +520,7 @@ async def _stop_configured_worker(
                 return payload, await _observe_configured_worker(managed)
             await managed.process.wait()
     except TimeoutError:
-        payload = None
+        return None, None
     cleanup_result = await managed.cleanup(
         term_grace=_CATALOG_RECONCILE_GRACE_SECONDS,
         kill_grace=_CATALOG_RECONCILE_GRACE_SECONDS,
