@@ -969,6 +969,7 @@ def test_browser_login_contract_selects_only_allowlisted_fields() -> None:
         lambda payload: payload.update(application_deadline=0),
         lambda payload: payload.update(application_deadline=float("nan")),
         lambda payload: payload.update(application_deadline=float("inf")),
+        lambda payload: payload.update(application_deadline=10**309),
         lambda payload: payload.update(cleanup_confirmed="yes"),
         lambda payload: payload.update(replacement_requested="yes"),
         lambda payload: payload.update(reused_session=1),
@@ -1021,6 +1022,20 @@ def test_browser_login_contract_rejects_cross_state_inconsistencies(
     mutate(payload)
 
     with pytest.raises(TypeError):
+        parse_coder_browser_login_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["starting", "waiting_for_user", "waiting_for_code", "authorizing", "canceling"],
+)
+def test_browser_login_contract_requires_active_session_id(state: str) -> None:
+    payload = _browser_login_payload(state=state)
+    payload["session_id"] = None
+    if state not in {"waiting_for_user", "waiting_for_code"}:
+        payload["authorization_url"] = None
+
+    with pytest.raises(TypeError, match="^active browser login session ID is required$"):
         parse_coder_browser_login_payload(payload)
 
 

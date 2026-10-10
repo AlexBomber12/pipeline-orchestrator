@@ -81,6 +81,9 @@ BROWSER_LOGIN_FAILURE_REASONS = (
 _SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,128}")
 _DEVICE_CODE_PATTERN = re.compile(r"[A-Z0-9-]{4,64}")
 _BROWSER_WAITING_STATES = frozenset({"waiting_for_user", "waiting_for_code"})
+_BROWSER_ACTIVE_STATES = _BROWSER_WAITING_STATES | frozenset(
+    {"starting", "authorizing", "canceling"}
+)
 _MAX_AUTHORIZATION_URL_CHARACTERS = 4096
 
 
@@ -707,13 +710,20 @@ def parse_coder_browser_login_payload(
         and failure_reason not in BROWSER_LOGIN_FAILURE_REASONS
     ):
         raise TypeError("invalid browser login failure reason")
-    if application_deadline is not None and (
-        isinstance(application_deadline, bool)
-        or not isinstance(application_deadline, (int, float))
-        or not math.isfinite(application_deadline)
-        or application_deadline <= 0
-    ):
-        raise TypeError("invalid browser login application deadline")
+    normalized_deadline = None
+    if application_deadline is not None:
+        if (
+            isinstance(application_deadline, bool)
+            or not isinstance(application_deadline, (int, float))
+            or application_deadline <= 0
+        ):
+            raise TypeError("invalid browser login application deadline")
+        try:
+            normalized_deadline = float(application_deadline)
+        except OverflowError:
+            raise TypeError("invalid browser login application deadline") from None
+        if not math.isfinite(normalized_deadline):
+            raise TypeError("invalid browser login application deadline")
     if cleanup_confirmed is not None and not isinstance(cleanup_confirmed, bool):
         raise TypeError("invalid browser login cleanup status")
     if not isinstance(replacement_requested, bool) or not isinstance(
@@ -733,8 +743,10 @@ def parse_coder_browser_login_payload(
     auth_status = (
         parse_coder_auth_payload(raw_auth) if raw_auth is not None else None
     )
+    if state in _BROWSER_ACTIVE_STATES and session_id is None:
+        raise TypeError("active browser login session ID is required")
     if state in _BROWSER_WAITING_STATES:
-        if session_id is None or authorization_url is None:
+        if authorization_url is None:
             raise TypeError("incomplete browser login instructions")
     elif authorization_url is not None:
         raise TypeError("browser login instructions outlived waiting state")
@@ -755,11 +767,7 @@ def parse_coder_browser_login_payload(
         "detail": detail,
         "failure_reason": failure_reason,
         "authorization_url": authorization_url,
-        "application_deadline": (
-            float(application_deadline)
-            if application_deadline is not None
-            else None
-        ),
+        "application_deadline": normalized_deadline,
         "cleanup_confirmed": cleanup_confirmed,
         "replacement_requested": replacement_requested,
         "reused_session": reused_session,
