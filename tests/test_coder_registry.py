@@ -1071,6 +1071,44 @@ def test_browser_login_contract_requires_active_session_id(state: str) -> None:
         parse_coder_browser_login_payload(payload)
 
 
+@pytest.mark.parametrize(
+    "state",
+    ["succeeded", "cancelled", "expired", "timed_out"],
+)
+def test_browser_login_contract_requires_terminal_session_id(state: str) -> None:
+    payload = (
+        _successful_browser_login_payload()
+        if state == "succeeded"
+        else _browser_login_payload(state=state)
+    )
+    payload.update(
+        session_id=None,
+        authorization_url=None,
+        application_deadline=None,
+        cleanup_confirmed=True,
+    )
+
+    with pytest.raises(TypeError, match="^browser login session ID is required$"):
+        parse_coder_browser_login_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["starting", "waiting_for_user", "waiting_for_code", "authorizing"],
+)
+def test_browser_login_contract_requires_progress_deadline(state: str) -> None:
+    payload = _browser_login_payload(state=state)
+    payload["application_deadline"] = None
+    if state not in {"waiting_for_user", "waiting_for_code"}:
+        payload["authorization_url"] = None
+
+    with pytest.raises(
+        TypeError,
+        match="^browser login application deadline is required$",
+    ):
+        parse_coder_browser_login_payload(payload)
+
+
 def test_browser_login_contract_requires_cleanup_failure_session_id() -> None:
     payload = _browser_login_payload(state="cleanup_failed")
     payload.update(

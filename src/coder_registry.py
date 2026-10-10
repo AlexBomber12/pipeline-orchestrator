@@ -92,7 +92,14 @@ _BROWSER_WAITING_STATES = frozenset({"waiting_for_user", "waiting_for_code"})
 _BROWSER_ACTIVE_STATES = _BROWSER_WAITING_STATES | frozenset(
     {"starting", "authorizing", "canceling"}
 )
-_BROWSER_SESSION_ID_STATES = _BROWSER_ACTIVE_STATES | {"cleanup_failed"}
+_BROWSER_PROGRESSING_STATES = _BROWSER_ACTIVE_STATES - {"canceling"}
+_BROWSER_SESSION_ID_STATES = _BROWSER_ACTIVE_STATES | {
+    "succeeded",
+    "cancelled",
+    "expired",
+    "timed_out",
+    "cleanup_failed",
+}
 _BROWSER_CLEAN_TERMINAL_STATES = frozenset({"cancelled", "expired", "timed_out"})
 _MAX_AUTHORIZATION_URL_CHARACTERS = 4096
 
@@ -763,6 +770,8 @@ def parse_coder_browser_login_payload(
     )
     if state in _BROWSER_SESSION_ID_STATES and session_id is None:
         raise TypeError("browser login session ID is required")
+    if state in _BROWSER_PROGRESSING_STATES and normalized_deadline is None:
+        raise TypeError("browser login application deadline is required")
     if state in _BROWSER_ACTIVE_STATES and cleanup_confirmed is not None:
         raise TypeError("active browser login cleanup status must be unknown")
     if state in _BROWSER_WAITING_STATES:
