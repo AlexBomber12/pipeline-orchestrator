@@ -980,6 +980,33 @@ async def test_pty_control_keys_do_not_destroy_cleanup_ownership(
 
 
 @pytest.mark.asyncio
+async def test_pty_write_detects_target_hangup_without_reading_eof(
+    process_pool: ProcessPool,
+) -> None:
+    managed, channel = await launch_pty_process(
+        sys.executable,
+        "-c",
+        "pass",
+    )
+    process_pool.supervised.append(
+        (managed, managed.identity.process_group_id)
+    )
+    assert await managed.process.wait() == 0
+
+    with pytest.raises(PtyChannelClosedError, match="no longer writable"):
+        await asyncio.wait_for(
+            channel.write(b"x" * (2 * 1024 * 1024)),
+            timeout=2,
+        )
+
+    assert await managed.process.wait() == 0
+    cleanup = await managed.cleanup(term_grace=0.5, kill_grace=0.5)
+    assert cleanup.quiescent
+    assert await channel.read() == b""
+    channel.close()
+
+
+@pytest.mark.asyncio
 async def test_pty_close_settles_pending_io_without_discarding_ownership(
     process_pool: ProcessPool,
 ) -> None:
@@ -1060,6 +1087,42 @@ async def test_pty_channel_validates_bounds_and_preserves_io_errors(
                 await channel.read()
 
         with monkeypatch.context() as patch:
+            hangup_checks = iter((False, False, True))
+            patch.setattr(
+                channel,
+                "_terminal_hung_up",
+                lambda: next(hangup_checks),
+            )
+            patch.setattr(
+                os,
+                "write",
+                lambda fd, _data: (
+                    (_ for _ in ()).throw(
+                        BlockingIOError(errno.EAGAIN, "backpressure")
+                    )
+                    if fd == master_fd
+                    else 0
+                ),
+            )
+            with pytest.raises(PtyChannelClosedError, match="no longer writable"):
+                await channel.write(b"x")
+
+        with monkeypatch.context() as patch:
+            hangup_checks = iter((False, False, True))
+            patch.setattr(
+                channel,
+                "_terminal_hung_up",
+                lambda: next(hangup_checks),
+            )
+            patch.setattr(
+                os,
+                "write",
+                lambda fd, _data: 1 if fd == master_fd else 0,
+            )
+            with pytest.raises(PtyChannelClosedError, match="no longer writable"):
+                await channel.write(b"xy")
+
+        with monkeypatch.context() as patch:
             patch.setattr(
                 os,
                 "write",
@@ -1097,10 +1160,21 @@ async def test_pty_channel_validates_bounds_and_preserves_io_errors(
             )
             with pytest.raises(PtyChannelClosedError, match="no longer writable"):
                 await channel.write(b"x")
-        assert channel.at_eof
-        assert await channel.read() == b""
+        assert not channel.at_eof
         with pytest.raises(PtyChannelClosedError, match="no longer writable"):
             await channel.write(b"x")
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                os,
+                "read",
+                lambda fd, _size: (
+                    (_ for _ in ()).throw(OSError(errno.EIO, "slave closed"))
+                    if fd == master_fd
+                    else b""
+                ),
+            )
+            assert await channel.read() == b""
+        assert channel.at_eof
     finally:
         channel.close()
         os.close(slave_fd)
@@ -1218,6 +1292,39 @@ async def test_pty_launch_closes_descriptors_on_setup_failure_and_cancellation(
         )
         with pytest.raises(PermissionError, match="controlling terminal"):
             await launch_pty_process("fake-cli")
+
+    terminal_error_ready = asyncio.Event()
+    release_terminal_error = asyncio.Event()
+    real_read_witness_ready = process_supervisor._read_witness_ready
+
+    async def delayed_terminal_error(ready_socket: socket.socket) -> bytes:
+        payload = await real_read_witness_ready(ready_socket)
+        terminal_error_ready.set()
+        await release_terminal_error.wait()
+        return payload
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            process_supervisor,
+            "_WITNESS_LAUNCHER",
+            "import os, sys; "
+            "os.write(int(sys.argv[2]), b'T13\\n'); "
+            "raise SystemExit(125)",
+        )
+        patch.setattr(
+            process_supervisor,
+            "_read_witness_ready",
+            delayed_terminal_error,
+        )
+        terminal_launch = asyncio.create_task(launch_pty_process("fake-cli"))
+        await terminal_error_ready.wait()
+        terminal_launch.cancel()
+        release_terminal_error.set()
+        with pytest.raises(asyncio.CancelledError):
+            await terminal_launch
+    for fd in allocated[-1]:
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(fd)
 
     launch_started = asyncio.Event()
 

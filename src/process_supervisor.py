@@ -248,6 +248,7 @@ class PtyChannel:
         self._master_fd = master_fd
         self._closed = False
         self._eof = False
+        self._write_closed = False
         self._read_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._read_waiter: asyncio.Future[None] | None = None
@@ -310,12 +311,16 @@ class PtyChannel:
         async with self._write_lock:
             if self._closed:
                 raise PtyChannelClosedError("PTY channel is closed")
-            if self._eof:
+            if self._write_closed or self._terminal_hung_up():
                 raise PtyChannelClosedError("PTY channel is no longer writable")
             offset = 0
             while offset < len(view):
                 if self._closed:
                     raise PtyChannelClosedError("PTY channel is closed")
+                if self._write_closed or self._terminal_hung_up():
+                    raise PtyChannelClosedError(
+                        "PTY channel is no longer writable"
+                    )
                 try:
                     written = os.write(
                         self._master_fd,
@@ -324,11 +329,15 @@ class PtyChannel:
                 except InterruptedError:
                     continue
                 except BlockingIOError:
+                    if self._terminal_hung_up():
+                        raise PtyChannelClosedError(
+                            "PTY channel is no longer writable"
+                        ) from None
                     await self._wait_writable()
                     continue
                 except OSError as exc:
                     if exc.errno == errno.EIO:
-                        self._eof = True
+                        self._write_closed = True
                         raise PtyChannelClosedError(
                             "PTY channel is no longer writable"
                         ) from None
@@ -338,6 +347,20 @@ class PtyChannel:
                         "PTY channel stopped accepting input"
                     )
                 offset += written
+
+    def _terminal_hung_up(self) -> bool:
+        poller = select.poll()
+        poller.register(
+            self._master_fd,
+            select.POLLHUP | select.POLLERR | select.POLLNVAL,
+        )
+        hung_up = any(
+            events & (select.POLLHUP | select.POLLERR | select.POLLNVAL)
+            for _, events in poller.poll(0)
+        )
+        if hung_up:
+            self._write_closed = True
+        return hung_up
 
     async def _wait_readable(self) -> None:
         if self._closed:
@@ -387,6 +410,7 @@ class PtyChannel:
             return
         self._closed = True
         self._eof = True
+        self._write_closed = True
         master_fd = self._master_fd
         if self._reader_registered:
             self._loop.remove_reader(master_fd)
@@ -1830,6 +1854,8 @@ async def launch_process(
         ready_line, separator, exec_payload = ready_payload.partition(b"\n")
         if separator and ready_line.startswith(b"T"):
             terminal_errno = int(ready_line[1:])
+            if launch_cancellation is not None:
+                raise launch_cancellation
             raise OSError(
                 terminal_errno,
                 os.strerror(terminal_errno),
