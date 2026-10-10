@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -125,6 +125,64 @@ class CoderDeviceLoginFailure:
 
     reason: str
     detail: str
+
+
+@dataclass(frozen=True)
+class CoderBrowserLoginProgress:
+    """Allowlisted progress parsed from a browser-code login terminal."""
+
+    authorization_url: str = field(repr=False)
+    ready_for_code: bool
+
+
+@dataclass(frozen=True)
+class CoderBrowserLoginFailure:
+    """Sanitized provider-specific browser-code failure classification."""
+
+    reason: str
+    detail: str
+
+
+@runtime_checkable
+class CoderBrowserLoginAdapter(Protocol):
+    """Optional provider-owned browser-code login descriptor and parser.
+
+    This contract remains separate from :class:`CoderPlugin` and the existing
+    device-login protocols.  Defining it does not advertise or activate a login
+    capability for legacy or custom plugins.
+    """
+
+    @property
+    def command(self) -> tuple[str, ...]: ...
+
+    @property
+    def environment(self) -> Mapping[str, str]: ...
+
+    @property
+    def working_directory(self) -> str: ...
+
+    @property
+    def credential_location(self) -> str: ...
+
+    @property
+    def observed_cli_version(self) -> str: ...
+
+    @property
+    def requires_pty(self) -> bool: ...
+
+    @property
+    def application_timeout_seconds(self) -> float: ...
+
+    @property
+    def replacement_warning(self) -> str: ...
+
+    def parse_progress(
+        self, terminal_output: str
+    ) -> CoderBrowserLoginProgress | None: ...
+
+    def classify_failure(
+        self, terminal_output: str, returncode: int
+    ) -> CoderBrowserLoginFailure: ...
 
 
 @runtime_checkable
