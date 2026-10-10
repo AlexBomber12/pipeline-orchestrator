@@ -745,6 +745,8 @@ def parse_coder_browser_login_payload(
     )
     if state in _BROWSER_ACTIVE_STATES and session_id is None:
         raise TypeError("active browser login session ID is required")
+    if state in _BROWSER_ACTIVE_STATES and cleanup_confirmed is not None:
+        raise TypeError("active browser login cleanup status must be unknown")
     if state in _BROWSER_WAITING_STATES:
         if authorization_url is None:
             raise TypeError("incomplete browser login instructions")

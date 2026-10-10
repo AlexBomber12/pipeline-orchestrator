@@ -1040,6 +1040,23 @@ def test_browser_login_contract_requires_active_session_id(state: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "state",
+    ["starting", "waiting_for_user", "waiting_for_code", "authorizing", "canceling"],
+)
+def test_browser_login_contract_requires_unknown_active_cleanup(state: str) -> None:
+    payload = _browser_login_payload(state=state)
+    payload["cleanup_confirmed"] = True
+    if state not in {"waiting_for_user", "waiting_for_code"}:
+        payload["authorization_url"] = None
+
+    with pytest.raises(
+        TypeError,
+        match="^active browser login cleanup status must be unknown$",
+    ):
+        parse_coder_browser_login_payload(payload)
+
+
+@pytest.mark.parametrize(
     "mutate",
     [
         lambda payload: payload.update(cleanup_confirmed=False),
