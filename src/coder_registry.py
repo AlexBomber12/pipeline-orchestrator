@@ -710,6 +710,10 @@ def parse_coder_browser_login_payload(
         and failure_reason not in BROWSER_LOGIN_FAILURE_REASONS
     ):
         raise TypeError("invalid browser login failure reason")
+    if failure_reason == "unsupported_cli_version" and (
+        observed_cli_version is None or minimum_cli_version is None
+    ):
+        raise TypeError("browser login version evidence is required")
     normalized_deadline = None
     if application_deadline is not None:
         if (

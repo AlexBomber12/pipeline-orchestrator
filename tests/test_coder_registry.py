@@ -886,6 +886,27 @@ def test_browser_login_contract_preserves_bounded_version_evidence() -> None:
     assert parsed["minimum_cli_version"] == "2.1.126"
 
 
+@pytest.mark.parametrize("missing_field", ["observed_cli_version", "minimum_cli_version"])
+def test_browser_login_contract_requires_unsupported_version_evidence(
+    missing_field: str,
+) -> None:
+    payload = _browser_login_payload(state="unsupported")
+    payload.update(
+        session_id=None,
+        authorization_url=None,
+        application_deadline=None,
+        cleanup_confirmed=True,
+        failure_reason="unsupported_cli_version",
+    )
+    payload[missing_field] = None
+
+    with pytest.raises(
+        TypeError,
+        match="^browser login version evidence is required$",
+    ):
+        parse_coder_browser_login_payload(payload)
+
+
 def test_browser_login_contract_selects_only_allowlisted_fields() -> None:
     payload = _successful_browser_login_payload()
     payload.update(
