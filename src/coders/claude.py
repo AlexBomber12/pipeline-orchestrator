@@ -15,9 +15,14 @@ from src.coder_registry import (
     CoderAuthCapabilities,
     CoderAuthStatus,
     ModelCatalog,
-    ModelMetadata,
+    ModelCatalogUnavailable,
     ModelSetting,
     coder_auth_payload,
+)
+from src.coders.claude_models import (
+    ClaudeModelDiscoveryInvalid,
+    ClaudeModelDiscoveryUnavailable,
+    discover_claude_models,
 )
 from src.config import AppConfig, load_config
 from src.process_supervisor import SupervisedProcess
@@ -150,9 +155,9 @@ class ClaudePlugin:
     model_setting = ModelSetting(
         config_field="claude_model",
         default_value="opus",
-        default_label="(default)",
+        default_label="Application default (opus)",
     )
-    model_catalog_refreshable = False
+    model_catalog_refreshable = True
     auth_capabilities = CoderAuthCapabilities(
         can_check_cli=True,
         can_check_saved_credentials=True,
@@ -160,6 +165,9 @@ class ClaudePlugin:
         can_verify_service_access=False,
         interactive_login_methods=(),
     )
+
+    def __init__(self, *, discover: Any | None = None) -> None:
+        self._discover = discover or discover_claude_models
 
     def resolve_model(self, daemon_config: "DaemonConfig") -> str:
         """Prefer the plugin-ID setting, then legacy ``claude_model``."""
@@ -187,23 +195,45 @@ class ClaudePlugin:
 
     def model_catalog_cache_key(
         self, *, config: AppConfig, config_path: str
-    ) -> tuple[str, tuple[str, ...]]:
-        del config, config_path
-        return ("static-compatibility", tuple(self.models))
+    ) -> tuple[str, str]:
+        return (
+            config.auth.claude_config_dir,
+            str(Path(config_path).absolute().parent),
+        )
 
     async def get_model_catalog(
         self, *, config: AppConfig, config_path: str
     ) -> ModelCatalog:
-        """Expose legacy Claude choices without implying live discovery."""
-        del config, config_path
+        """Discover Claude metadata in the configured CLI auth context."""
+        _credential_directory, working_directory = self.model_catalog_cache_key(
+            config=config,
+            config_path=config_path,
+        )
+        env = {
+            **os.environ,
+            "CLAUDE_CONFIG_DIR": config.auth.claude_config_dir,
+        }
+        try:
+            models = await self._discover(env=env, cwd=working_directory)
+        except ClaudeModelDiscoveryUnavailable as exc:
+            raise ModelCatalogUnavailable(
+                "Claude CLI model discovery is unavailable",
+                managed=exc.managed,
+                cleanup_result=exc.cleanup_result,
+            ) from exc
+        except ClaudeModelDiscoveryInvalid as exc:
+            raise ModelCatalogUnavailable(
+                "Claude CLI model discovery is unavailable"
+            ) from exc
         return ModelCatalog(
-            models=tuple(
-                ModelMetadata(model, model, is_default=model == "opus")
-                for model in self.models
-            ),
-            source="static_compatibility",
+            models=models,
+            source="discovered",
             description=(
-                "Static compatibility choices; not live or account-verified."
+                f"{len(models)} model{'s' if len(models) != 1 else ''} "
+                "advertised by Claude CLI; service access and account "
+                "entitlement are not verified."
+                if models
+                else "Claude CLI advertised no usable models."
             ),
         )
 

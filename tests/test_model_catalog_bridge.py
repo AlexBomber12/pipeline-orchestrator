@@ -19,8 +19,10 @@ from src.coder_registry import (
     ModelCatalog,
     ModelCatalogUnavailable,
     ModelMetadata,
+    ModelReasoningEffort,
     coder_auth_payload,
 )
+from src.coders.claude import ClaudePlugin
 from src.coders.codex import CodexPlugin
 from src.coders.codex_models import CodexModel, CodexReasoningEffort
 from src.config import AppConfig
@@ -329,6 +331,71 @@ async def test_loader_round_trips_catalog_through_daemon(
     server.cancel()
     with pytest.raises(asyncio.CancelledError):
         await server
+
+
+@pytest.mark.asyncio
+async def test_loader_round_trips_discovered_claude_catalog_through_daemon(
+    tmp_path: Path,
+) -> None:
+    redis = _BridgeRedis()
+    advertised = (
+        ModelMetadata(
+            "claude-invoke",
+            "Claude Provider Name",
+            reasoning_efforts=(ModelReasoningEffort("high"),),
+        ),
+        ModelMetadata("claude-compatible", "Claude Compatible"),
+    )
+    discovery_calls: list[dict[str, object]] = []
+
+    async def discover(**kwargs: object) -> tuple[ModelMetadata, ...]:
+        discovery_calls.append(kwargs)
+        return advertised
+
+    plugin = ClaudePlugin(discover=discover)
+    registry = CoderRegistry()
+    reference = "src.coders.claude:ClaudePlugin"
+    registry.register(plugin, reference=reference)
+    config_path = tmp_path / "config.yml"
+    claude_config_dir = tmp_path / "claude-auth"
+    config_path.write_text(
+        f"auth:\n  claude_config_dir: {claude_config_dir}\n",
+        encoding="utf-8",
+    )
+    server = asyncio.create_task(
+        bridge.serve_model_catalog_requests(
+            redis,
+            registry,
+            config_path=str(config_path),
+        )
+    )
+    loader = bridge.DaemonModelCatalogLoader(
+        redis,
+        timeout_seconds=1,
+        poll_interval_seconds=0,
+    )
+
+    try:
+        catalog = await loader(
+            plugin,
+            config=AppConfig(),
+            config_path=str(config_path),
+        )
+    finally:
+        server.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await server
+
+    assert catalog.models == advertised
+    assert catalog.source == "discovered"
+    assert "service access and account entitlement are not verified" in (
+        catalog.description
+    )
+    assert len(discovery_calls) == 1
+    assert discovery_calls[0]["cwd"] == str(tmp_path)
+    env = discovery_calls[0]["env"]
+    assert isinstance(env, dict)
+    assert env["CLAUDE_CONFIG_DIR"] == str(claude_config_dir)
 
 
 @pytest.mark.asyncio

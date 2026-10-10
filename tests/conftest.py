@@ -16,14 +16,15 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from src.coder_registry import ModelMetadata
 from src.coders.codex_models import CodexModel
 
 
 @pytest.fixture(autouse=True)
-def _mock_settings_codex_model_discovery(
+def _mock_settings_model_discovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Keep web tests deterministic and prevent real Codex subprocesses."""
+    """Keep web tests deterministic and prevent real coder subprocesses."""
 
     async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
         return (CodexModel("gpt-5.4", "GPT-5.4", True, None, ()),)
@@ -31,6 +32,19 @@ def _mock_settings_codex_model_discovery(
     monkeypatch.setattr(
         "src.coders.codex.discover_codex_models",
         discover,
+    )
+
+    async def discover_claude(
+        **_kwargs: object,
+    ) -> tuple[ModelMetadata, ...]:
+        return (
+            ModelMetadata("opus", "opus"),
+            ModelMetadata("sonnet", "sonnet"),
+        )
+
+    monkeypatch.setattr(
+        "src.coders.claude.discover_claude_models",
+        discover_claude,
     )
 
     class DirectCatalogLoader:
