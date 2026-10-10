@@ -223,7 +223,7 @@ def test_prepare_coder_invocation_returns_kwargs_with_breach_env(
 # ---------- _run_coder_with_supervision ----------
 
 
-def test_run_coder_with_supervision_defers_for_device_login(
+def test_run_coder_with_supervision_defers_for_credential_login(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = _runner_with_task(monkeypatch)
@@ -261,7 +261,10 @@ def test_run_coder_with_supervision_defers_for_device_login(
 
     assert result is None
     assert calls == []
-    assert any("device login" in event["event"] for event in runner.state.history)
+    assert any(
+        "credential login" in event["event"]
+        for event in runner.state.history
+    )
 
 
 def test_run_coder_with_supervision_releases_reservation_on_schedule_failure(

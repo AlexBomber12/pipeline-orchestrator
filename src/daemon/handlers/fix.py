@@ -379,7 +379,7 @@ class FixMixin(BreachMixin):
             invocation_kwargs=fix_kwargs,
         ):
             self.log_event(
-                "[FIX] Coder invocation deferred while device login owns "
+                "[FIX] Coder invocation deferred while credential login owns "
                 "its credential location."
             )
             return

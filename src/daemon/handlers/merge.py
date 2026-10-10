@@ -181,7 +181,7 @@ class MergeMixin:
                             )
                             self.log_event(
                                 "[MERGE] Conflict resolution deferred while "
-                                "device login owns its credential location."
+                                "credential login owns its credential location."
                             )
                             self.state.state = PipelineState.WATCH
                             return

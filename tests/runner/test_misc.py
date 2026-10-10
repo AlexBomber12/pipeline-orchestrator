@@ -12,6 +12,7 @@ import re
 import subprocess
 import types
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -106,7 +107,7 @@ def test_coder_credential_location_in_use_tracks_active_plugin_context(
     codex = runner._registry.get("codex")
     location = codex.device_login_credential_location(config=runner.app_config)
 
-    assert runner._device_login_credential_location("missing") is None
+    assert runner._coder_credential_location("missing") is None
     assert runner.coder_credential_location_in_use(location) is False
     runner._coder_invocation_active = True
     assert runner.coder_credential_location_in_use(location) is False
@@ -114,6 +115,9 @@ def test_coder_credential_location_in_use_tracks_active_plugin_context(
     runner.state.coder = "missing"
     assert runner.coder_credential_location_in_use(location) is False
     runner.state.coder = "claude"
+    claude_location = runner._coder_credential_location("claude")
+    assert claude_location is not None
+    assert runner.coder_credential_location_in_use(claude_location) is True
     assert runner.coder_credential_location_in_use(location) is False
 
     runner.state.coder = "codex"
@@ -134,35 +138,66 @@ def test_coder_credential_location_in_use_tracks_active_plugin_context(
     assert runner.coder_credential_location_in_use(location) is False
 
 
-def test_runner_credential_reservations_coordinate_with_device_login(
+def test_coder_credential_location_in_use_preserves_acquired_identity(
+    tmp_path: Path,
+) -> None:
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner(coder=CoderType.CLAUDE)
+    runner._credential_reservations = reservations
+    location_a = runner._coder_credential_location("claude")
+    assert location_a is not None
+
+    assert runner._reserve_coder_credentials("claude") is True
+    runner._coder_invocation_active = False
+    runner.app_config.auth.claude_config_dir = str(tmp_path / "location-b")
+
+    assert runner.coder_credential_location_in_use(location_a) is True
+    assert runner.coder_credential_location_in_use(
+        str(tmp_path / "location-b")
+    ) is False
+    assert reservations.reserve_login(location_a) is False
+
+    runner._release_coder_credentials()
+    assert reservations.reserve_login(location_a) is True
+    reservations.release_login(location_a)
+
+
+@pytest.mark.parametrize(
+    ("coder_name", "environment_key"),
+    [("claude", "CLAUDE_CONFIG_DIR"), ("codex", "CODEX_HOME")],
+)
+def test_runner_credential_reservations_coordinate_with_credential_login(
     monkeypatch: pytest.MonkeyPatch,
+    coder_name: str,
+    environment_key: str,
 ) -> None:
     monkeypatch.delenv("CODEX_HOME", raising=False)
     reservations = CoderCredentialReservations()
-    runner = h._make_runner()
+    runner = h._make_runner(coder=CoderType(coder_name))
     runner._credential_reservations = reservations
-    codex = runner._registry.get("codex")
-    location = codex.device_login_credential_location(config=runner.app_config)
+    plugin = runner._registry.get(coder_name)
+    location = runner._coder_credential_location(coder_name)
+    assert location is not None
 
-    assert runner._reserve_coder_credentials("codex") is True
-    assert runner._reserve_coder_credentials("codex") is False
+    assert runner._reserve_coder_credentials(coder_name) is True
+    assert runner._reserve_coder_credentials(coder_name) is False
     assert reservations.reserve_login(location) is False
     runner._release_coder_credentials()
     runner._release_coder_credentials()
 
     invocation_kwargs: dict[str, Any] = {"model": "gpt-test"}
     assert runner._reserve_coder_credentials(
-        "codex",
+        coder_name,
         invocation_kwargs=invocation_kwargs,
     ) is True
-    assert invocation_kwargs["environment"]["CODEX_HOME"] == location
+    assert invocation_kwargs["environment"][environment_key] == location
     runner._release_coder_credentials()
 
     with monkeypatch.context() as scoped:
-        scoped.setattr(codex, "build_credential_environment", None)
+        scoped.setattr(plugin, "build_credential_environment", None)
         unbound_kwargs: dict[str, Any] = {"model": "gpt-test"}
         assert runner._reserve_coder_credentials(
-            "codex",
+            coder_name,
             invocation_kwargs=unbound_kwargs,
         ) is False
         assert unbound_kwargs == {"model": "gpt-test"}
@@ -170,21 +205,21 @@ def test_runner_credential_reservations_coordinate_with_device_login(
     runner._credential_reservations = None
     uncoordinated_kwargs: dict[str, Any] = {}
     assert runner._reserve_coder_credentials(
-        "codex",
+        coder_name,
         invocation_kwargs=uncoordinated_kwargs,
     ) is True
-    assert uncoordinated_kwargs["environment"]["CODEX_HOME"] == location
+    assert uncoordinated_kwargs["environment"][environment_key] == location
     runner._credential_reservations = reservations
 
     with monkeypatch.context() as scoped:
         scoped.setattr(
-            codex,
+            plugin,
             "build_credential_environment",
-            lambda **_kwargs: {"CODEX_HOME": location},
+            lambda **_kwargs: {environment_key: location},
         )
         with pytest.raises(ValueError, match="conflict"):
             runner._reserve_coder_credentials(
-                "codex",
+                coder_name,
                 invocation_kwargs={"environment": {}},
             )
         assert runner._coder_credential_reservation is None
@@ -192,35 +227,96 @@ def test_runner_credential_reservations_coordinate_with_device_login(
         reservations.release_login(location)
 
     assert reservations.reserve_login(location) is True
-    assert runner._reserve_coder_credentials("codex") is False
+    assert runner._reserve_coder_credentials(coder_name) is False
     reservations.release_login(location)
-    runner._auth_status_cache_credential_versions["codex"] = 0
-    assert runner._reserve_coder_credentials("codex") is False
+    runner._auth_status_cache_credential_contexts[coder_name] = (location, 0)
+    assert runner._reserve_coder_credentials(coder_name) is False
     assert runner._auth_status_cache_expires_at is None
 
-    assert runner._reserve_coder_credentials("claude") is True
-    assert runner._coder_credential_reservation is None
+    runner._credential_reservations = None
+    assert runner._reserve_coder_credentials(coder_name) is True
+
+
+@pytest.mark.parametrize(
+    ("coder_name", "resolver_name"),
+    [
+        ("claude", "browser_login_credential_location"),
+        ("codex", "device_login_credential_location"),
+    ],
+)
+def test_invalid_optional_credential_context_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    coder_name: str,
+    resolver_name: str,
+) -> None:
+    runner = h._make_runner(coder=CoderType(coder_name))
+    runner._credential_reservations = CoderCredentialReservations()
+    plugin = runner._registry.get(coder_name)
 
     monkeypatch.setattr(
-        codex,
-        "device_login_credential_location",
+        plugin,
+        resolver_name,
         lambda **_kwargs: "",
     )
-    assert runner._reserve_coder_credentials("codex") is False
-
-    monkeypatch.setattr(codex, "device_login_credential_location", None)
-    assert runner._reserve_coder_credentials("codex") is False
+    assert runner._reserve_coder_credentials(coder_name) is False
 
     def fail(**_kwargs: object) -> str:
         raise RuntimeError("location unavailable")
 
-    monkeypatch.setattr(codex, "device_login_credential_location", fail)
-    assert runner._reserve_coder_credentials("codex") is False
+    monkeypatch.setattr(plugin, resolver_name, fail)
+    assert runner._reserve_coder_credentials(coder_name) is False
     asyncio.run(runner._refresh_auth_status_cache())
-    assert runner._auth_status_cache["codex"] == {"status": "error"}
+    assert runner._auth_status_cache[coder_name] == {"status": "error"}
 
-    runner._credential_reservations = None
-    assert runner._reserve_coder_credentials("codex") is True
+
+def test_legacy_coder_without_credential_context_remains_unbound() -> None:
+    runner = h._make_runner()
+    runner._credential_reservations = CoderCredentialReservations()
+    invocation_kwargs: dict[str, Any] = {}
+
+    assert runner._reserve_coder_credentials(
+        "missing",
+        invocation_kwargs=invocation_kwargs,
+    ) is True
+    assert invocation_kwargs == {}
+    assert runner._coder_credential_reservation is None
+
+
+def test_reserved_invocation_environment_survives_config_change(
+    tmp_path: Path,
+) -> None:
+    runner = h._make_runner(coder=CoderType.CLAUDE)
+    runner._credential_reservations = CoderCredentialReservations()
+    location_a = runner._coder_credential_location("claude")
+    assert location_a is not None
+    invocation_kwargs: dict[str, Any] = {}
+
+    assert runner._reserve_coder_credentials(
+        "claude",
+        invocation_kwargs=invocation_kwargs,
+    ) is True
+    environment = invocation_kwargs["environment"]
+    runner.app_config.auth.claude_config_dir = str(tmp_path / "location-b")
+
+    assert environment["CLAUDE_CONFIG_DIR"] == location_a
+    assert invocation_kwargs["environment"] is environment
+    runner._release_coder_credentials()
+
+
+def test_coder_start_rechecks_cached_credential_location(tmp_path: Path) -> None:
+    runner = h._make_runner(coder=CoderType.CLAUDE)
+    runner._credential_reservations = CoderCredentialReservations()
+    location_a = runner._coder_credential_location("claude")
+    assert location_a is not None
+    runner._auth_status_cache_credential_contexts["claude"] = (
+        location_a,
+        0,
+    )
+    runner.app_config.auth.claude_config_dir = str(tmp_path / "location-b")
+
+    assert runner._reserve_coder_credentials("claude") is False
+    assert runner._auth_status_cache_expires_at is None
+    assert runner._coder_credential_reservation is None
 
 
 def test_preflight_returns_true_on_clean_repo(
@@ -580,20 +676,51 @@ def test_refresh_auth_status_cache_returns_early_when_cache_is_fresh(
     assert runner._auth_status_cache == {"claude": {"status": "ok"}}
 
 
-def test_auth_cache_defers_probe_during_login_and_refreshes_after_release(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("CODEX_HOME", raising=False)
+def test_fresh_auth_cache_reports_active_credential_login() -> None:
     reservations = CoderCredentialReservations()
     runner = h._make_runner()
     runner._credential_reservations = reservations
-    codex = runner._registry.get("codex")
-    location = codex.device_login_credential_location(config=runner.app_config)
-    runner._auth_status_cache["codex"] = {
+    contexts: dict[str, tuple[str, int]] = {}
+    for coder_name in runner._registry.coder_names():
+        location = runner._coder_credential_location(coder_name)
+        assert location is not None
+        contexts[coder_name] = (location, 0)
+    runner._auth_status_cache_credential_contexts = contexts
+    claude_location = contexts["claude"][0]
+    assert reservations.reserve_login(claude_location) is True
+
+    asyncio.run(runner._refresh_auth_status_cache())
+
+    assert runner._auth_status_cache["claude"] == {
+        "status": "ok",
+        "detail": "Credential login in progress",
+    }
+    reservations.release_login(claude_location)
+
+
+@pytest.mark.parametrize(
+    ("coder_name", "environment_key"),
+    [("claude", "CLAUDE_CONFIG_DIR"), ("codex", "CODEX_HOME")],
+)
+def test_auth_cache_defers_probe_during_login_and_refreshes_after_release(
+    monkeypatch: pytest.MonkeyPatch,
+    coder_name: str,
+    environment_key: str,
+) -> None:
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner(coder=CoderType(coder_name))
+    runner._credential_reservations = reservations
+    plugin = runner._registry.get(coder_name)
+    location = runner._coder_credential_location(coder_name)
+    assert location is not None
+    runner._auth_status_cache[coder_name] = {
         "status": "error",
         "detail": "stale missing credentials",
     }
-    runner._auth_status_cache_credential_versions = {"codex": 0}
+    runner._auth_status_cache_credential_contexts = {
+        coder_name: (location, 0)
+    }
     calls: list[dict[str, str]] = []
 
     def check_auth(
@@ -603,26 +730,64 @@ def test_auth_cache_defers_probe_during_login_and_refreshes_after_release(
         calls.append(environment)
         return {"status": "error", "detail": "login did not complete"}
 
-    monkeypatch.setattr(codex, "check_auth", check_auth)
+    monkeypatch.setattr(plugin, "check_auth", check_auth)
     assert reservations.reserve_login(location) is True
 
     asyncio.run(runner._refresh_auth_status_cache())
 
     assert calls == []
-    assert runner._auth_status_cache["codex"] == {
+    assert runner._auth_status_cache[coder_name] == {
         "status": "ok",
-        "detail": "Device login in progress",
+        "detail": "Credential login in progress",
     }
 
     reservations.release_login(location)
     asyncio.run(runner._refresh_auth_status_cache())
 
-    assert [environment["CODEX_HOME"] for environment in calls] == [location]
-    assert runner._auth_status_cache["codex"] == {
+    assert [environment[environment_key] for environment in calls] == [location]
+    assert runner._auth_status_cache[coder_name] == {
         "status": "error",
         "detail": "login did not complete",
     }
-    assert runner._auth_status_cache_credential_versions["codex"] == 1
+    assert runner._auth_status_cache_credential_contexts[coder_name] == (
+        location,
+        1,
+    )
+
+
+def test_auth_cache_refreshes_when_credential_location_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner(coder=CoderType.CLAUDE)
+    runner._credential_reservations = reservations
+    claude = runner._registry.get("claude")
+    location_a = runner._coder_credential_location("claude")
+    assert location_a is not None
+    runner._auth_status_cache_credential_contexts = {
+        "claude": (location_a, 0)
+    }
+    location_b = str(tmp_path / "claude-b")
+    runner.app_config.auth.claude_config_dir = location_b
+    calls: list[str] = []
+
+    def check_auth(
+        *, environment: dict[str, str] | None = None
+    ) -> dict[str, str]:
+        assert environment is not None
+        calls.append(environment["CLAUDE_CONFIG_DIR"])
+        return {"status": "ok", "detail": "new context"}
+
+    monkeypatch.setattr(claude, "check_auth", check_auth)
+    asyncio.run(runner._refresh_auth_status_cache())
+
+    normalized_b = str((tmp_path / "claude-b").resolve())
+    assert calls == [normalized_b]
+    assert runner._auth_status_cache_credential_contexts["claude"] == (
+        normalized_b,
+        0,
+    )
 
 
 def test_auth_cache_fails_closed_when_credential_environment_is_invalid(
@@ -643,15 +808,18 @@ def test_auth_cache_fails_closed_when_credential_environment_is_invalid(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("coder_name", ["claude", "codex"])
 async def test_cancelled_auth_probe_holds_reservation_until_worker_settles(
     monkeypatch: pytest.MonkeyPatch,
+    coder_name: str,
 ) -> None:
     reservations = CoderCredentialReservations()
-    runner = h._make_runner(coder=CoderType.CODEX)
+    runner = h._make_runner(coder=CoderType(coder_name))
     runner._credential_reservations = reservations
     runner._auth_status_cache_expires_at = None
-    codex = runner._registry.get("codex")
-    location = codex.device_login_credential_location(config=runner.app_config)
+    plugin = runner._registry.get(coder_name)
+    location = runner._coder_credential_location(coder_name)
+    assert location is not None
     started = asyncio.Event()
     release = asyncio.Event()
     reservation_released = asyncio.Event()
@@ -667,7 +835,7 @@ async def test_cancelled_auth_probe_holds_reservation_until_worker_settles(
 
     async def delayed_to_thread(function: Any, *args: object) -> Any:
         target = getattr(function, "func", function)
-        if getattr(target, "__self__", None) is codex:
+        if getattr(target, "__self__", None) is plugin:
             started.set()
             await release.wait()
             return function(*args)
@@ -1523,6 +1691,34 @@ class _AuxiliaryManagedProcess:
         )
 
 
+def test_cleanup_releases_exact_acquired_location_only_after_quiescence(
+    tmp_path: Path,
+) -> None:
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner(coder=CoderType.CLAUDE)
+    runner._credential_reservations = reservations
+    location_a = runner._coder_credential_location("claude")
+    assert location_a is not None
+    assert runner._reserve_coder_credentials("claude") is True
+    managed = _AuxiliaryManagedProcess(quiescent=False)
+    runner._track_current_coder_supervised_process(managed)  # type: ignore[arg-type]
+    runner.app_config.auth.claude_config_dir = str(tmp_path / "location-b")
+    location_b = runner._coder_credential_location("claude")
+    assert location_b is not None
+
+    assert asyncio.run(runner._confirm_current_coder_cleanup("test")) is False
+    assert runner.coder_credential_location_in_use(location_a) is True
+    assert reservations.reserve_login(location_a) is False
+    assert reservations.reserve_login(location_b) is True
+    reservations.release_login(location_b)
+
+    managed.quiescent = True
+    assert asyncio.run(runner._confirm_current_coder_cleanup("test")) is True
+    assert runner.coder_credential_location_in_use(location_a) is False
+    assert reservations.reserve_login(location_a) is True
+    reservations.release_login(location_a)
+
+
 def test_auxiliary_awaiter_releases_confirmed_runner_handle() -> None:
     runner = h._make_runner()
     managed = _AuxiliaryManagedProcess()
@@ -1578,7 +1774,10 @@ def test_auxiliary_awaiter_defers_while_login_owns_credentials() -> None:
 
     assert result is None
     assert invoked is False
-    assert any("device login" in event["event"] for event in runner.state.history)
+    assert any(
+        "credential login" in event["event"]
+        for event in runner.state.history
+    )
 
 
 @pytest.mark.asyncio

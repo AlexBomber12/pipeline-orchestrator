@@ -59,7 +59,7 @@ from src.coder_login import CoderCredentialReservations
 from src.coder_registry import (
     CoderPlugin,
     CoderRegistry,
-    resolve_device_login_credential_location,
+    resolve_coder_credential_location,
 )
 from src.coders import build_coder_registry
 from src.config import (
@@ -446,8 +446,10 @@ class PipelineRunner(
         self._selector_rng = random.Random()
         self._auth_status_cache: dict[str, dict[str, str]] = {}
         self._auth_status_cache_expires_at: datetime | None = None
-        self._auth_status_cache_credential_versions: dict[str, int] = {}
-        self._usage_credential_versions: dict[str, tuple[str, int]] = {}
+        self._auth_status_cache_credential_contexts: dict[
+            str, tuple[str, int]
+        ] = {}
+        self._usage_credential_contexts: dict[str, tuple[str, int]] = {}
         self._current_coder_process: asyncio.subprocess.Process | None = None
         self._current_coder_supervised_process: SupervisedProcess | None = None
         self._coder_invocation_active = False
@@ -1047,12 +1049,12 @@ class PipelineRunner(
         credential_locations: dict[str, str] = {}
         credential_environments: dict[str, dict[str, str]] = {}
         invalid_locations: set[str] = set()
-        credential_versions: dict[str, int] = {}
+        credential_contexts: dict[str, tuple[str, int]] = {}
         login_blocked: set[str] = set()
         if self._credential_reservations is not None:
             for name in names:
                 try:
-                    location = self._device_login_credential_location(name)
+                    location = self._coder_credential_location(name)
                 except Exception:
                     invalid_locations.add(name)
                     continue
@@ -1068,8 +1070,11 @@ class PipelineRunner(
                     credential_locations[name] = location
                     if environment is not None:
                         credential_environments[name] = environment
-            credential_versions = {
-                name: self._credential_reservations.credential_version(location)
+            credential_contexts = {
+                name: (
+                    location,
+                    self._credential_reservations.credential_version(location),
+                )
                 for name, location in credential_locations.items()
             }
             login_blocked = {
@@ -1082,13 +1087,13 @@ class PipelineRunner(
             and self._auth_status_cache_expires_at is not None
             and now < self._auth_status_cache_expires_at
             and not invalid_locations
-            and credential_versions
-            == self._auth_status_cache_credential_versions
+            and credential_contexts
+            == self._auth_status_cache_credential_contexts
         ):
             for name in login_blocked:
                 self._auth_status_cache[name] = {
                     "status": "ok",
-                    "detail": "Device login in progress",
+                    "detail": "Credential login in progress",
                 }
             return
 
@@ -1101,7 +1106,7 @@ class PipelineRunner(
                 if not self._credential_reservations.reserve_coder(location):
                     return {
                         "status": "ok",
-                        "detail": "Device login in progress",
+                        "detail": "Credential login in progress",
                     }
                 reserved = True
             try:
@@ -1158,11 +1163,11 @@ class PipelineRunner(
             ):
                 results[index] = {
                     "status": "ok",
-                    "detail": "Device login in progress",
+                    "detail": "Credential login in progress",
                 }
         self._auth_status_cache = dict(zip(names, results, strict=True))
         self._auth_status_cache_expires_at = now + timedelta(minutes=5)
-        self._auth_status_cache_credential_versions = credential_versions
+        self._auth_status_cache_credential_contexts = credential_contexts
 
     def _load_current_task_metadata(self) -> tuple[str, str]:
         """Return ``(task_type, complexity)`` for the active task if available."""
@@ -2444,22 +2449,21 @@ class PipelineRunner(
         self, credential_location: str
     ) -> bool:
         """Return whether this runner owns a coder using that auth location."""
+        if self._coder_credential_reservation is not None:
+            return self._coder_credential_reservation == credential_location
         if not self._coder_invocation_active or not self.state.coder:
             return False
         plugin = self._registry.get_optional(self.state.coder)
         if plugin is None:
             return False
-        resolver = getattr(plugin, "device_login_credential_location", None)
-        if not callable(resolver):
-            return False
         try:
-            active_location = resolver(config=self.app_config)
+            active_location = resolve_coder_credential_location(
+                plugin,
+                config=self.app_config,
+            )
         except Exception:
             return False
-        return (
-            isinstance(active_location, str)
-            and active_location == credential_location
-        )
+        return active_location == credential_location
 
     def _credential_bound_coder_environment(
         self,
@@ -2502,7 +2506,7 @@ class PipelineRunner(
         *,
         invocation_kwargs: dict[str, Any] | None = None,
     ) -> bool:
-        """Reserve this coder's credential location against device login."""
+        """Reserve this coder's credential location against credential login."""
         if self._coder_credential_reservation is not None:
             return False
         if (
@@ -2511,7 +2515,7 @@ class PipelineRunner(
         ):
             return True
         try:
-            location = self._device_login_credential_location(coder_name)
+            location = self._coder_credential_location(coder_name)
         except Exception:
             return False
         if location is None:
@@ -2524,13 +2528,16 @@ class PipelineRunner(
             return True
         if not self._credential_reservations.reserve_coder(location):
             return False
-        cached_version = self._auth_status_cache_credential_versions.get(
+        cached_context = self._auth_status_cache_credential_contexts.get(
             coder_name
         )
         current_version = self._credential_reservations.credential_version(
             location
         )
-        if cached_version is not None and cached_version != current_version:
+        if cached_context is not None and cached_context != (
+            location,
+            current_version,
+        ):
             self._credential_reservations.release_coder(location)
             self._auth_status_cache_expires_at = None
             return False
@@ -2546,13 +2553,13 @@ class PipelineRunner(
             raise
         return True
 
-    def _device_login_credential_location(
+    def _coder_credential_location(
         self, coder_name: str
     ) -> str | None:
         plugin = self._registry.get_optional(coder_name)
         if plugin is None:
             return None
-        return resolve_device_login_credential_location(
+        return resolve_coder_credential_location(
             plugin,
             config=self.app_config,
         )
@@ -2744,7 +2751,7 @@ class PipelineRunner(
             if callable(close):
                 close()
             self.log_event(
-                f"{log_prefix} Coder invocation deferred while device login "
+                f"{log_prefix} Coder invocation deferred while credential login "
                 "owns its credential location."
             )
             return None

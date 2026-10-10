@@ -539,17 +539,21 @@ def test_publish_state_copies_usage_snapshot_to_state() -> None:
     assert runner.state.usage_weekly_resets_at == 456
 
 
-def test_publish_state_defers_usage_fetch_during_device_login(
+@pytest.mark.parametrize("coder_name", ["claude", "codex"])
+def test_publish_state_defers_usage_fetch_during_credential_login(
     monkeypatch: pytest.MonkeyPatch,
+    coder_name: str,
 ) -> None:
     reservations = CoderCredentialReservations()
-    runner = h._make_runner(coder=CoderType.CODEX)
+    runner = h._make_runner(coder=CoderType(coder_name))
     runner._credential_reservations = reservations
-    plugin = runner._registry.get("codex")
-    location = plugin.device_login_credential_location(config=runner.app_config)
+    location = runner._coder_credential_location(coder_name)
+    assert location is not None
+    provider = runner._usage_provider_for(coder_name)
+    assert provider is not None
     fetches: list[bool] = []
     monkeypatch.setattr(
-        runner._codex_usage_provider,
+        provider,
         "fetch",
         lambda: fetches.append(True),
     )
@@ -560,6 +564,95 @@ def test_publish_state_defers_usage_fetch_during_device_login(
     assert fetches == []
     assert runner.state.usage_session_percent is None
     reservations.release_login(location)
+
+
+def test_usage_reservations_keep_different_locations_independent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner(coder=CoderType.CODEX)
+    runner._credential_reservations = reservations
+    claude_location = runner._coder_credential_location("claude")
+    codex_location = runner._coder_credential_location("codex")
+    assert claude_location is not None
+    assert codex_location is not None
+    assert claude_location != codex_location
+    fetches: list[bool] = []
+    monkeypatch.setattr(
+        runner._codex_usage_provider,
+        "fetch",
+        lambda: fetches.append(True),
+    )
+    assert reservations.reserve_login(claude_location) is True
+
+    asyncio.run(runner._fetch_usage_snapshot("codex"))
+
+    assert fetches == [True]
+    reservations.release_login(claude_location)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coder_name", ["claude", "codex"])
+async def test_cancelled_usage_reader_holds_reservation_until_worker_settles(
+    monkeypatch: pytest.MonkeyPatch,
+    coder_name: str,
+) -> None:
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner(coder=CoderType(coder_name))
+    runner._credential_reservations = reservations
+    provider = runner._usage_provider_for(coder_name)
+    assert provider is not None
+    location = runner._coder_credential_location(coder_name)
+    assert location is not None
+    started = asyncio.Event()
+    release = asyncio.Event()
+    real_to_thread = asyncio.to_thread
+
+    async def delayed_to_thread(function: Any, *args: object) -> Any:
+        if getattr(function, "__self__", None) is provider:
+            started.set()
+            await release.wait()
+            return function(*args)
+        return await real_to_thread(function, *args)
+
+    monkeypatch.setattr(runner_module.asyncio, "to_thread", delayed_to_thread)
+    reader = asyncio.create_task(runner._fetch_usage_snapshot(coder_name))
+    await started.wait()
+    reader.cancel()
+    await asyncio.sleep(0)
+
+    assert reader.done() is False
+    assert reservations.reserve_login(location) is False
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await reader
+    assert reservations.reserve_login(location) is True
+    reservations.release_login(location)
+
+
+def test_claude_usage_cache_tracks_location_and_generation(tmp_path: Path) -> None:
+    reservations = CoderCredentialReservations()
+    runner = h._make_runner(coder=CoderType.CLAUDE)
+    runner._credential_reservations = reservations
+    provider = runner._claude_usage_provider
+    location_a = runner._coder_credential_location("claude")
+    assert location_a is not None
+
+    asyncio.run(runner._fetch_usage_snapshot("claude"))
+    assert provider._invalidated is False
+
+    runner.app_config.auth.claude_config_dir = str(tmp_path / "location-b")
+    asyncio.run(runner._fetch_usage_snapshot("claude"))
+    assert provider._invalidated is True
+
+    provider._invalidated = False
+    location_b = runner._coder_credential_location("claude")
+    assert location_b is not None
+    assert reservations.reserve_login(location_b) is True
+    reservations.release_login(location_b)
+    asyncio.run(runner._fetch_usage_snapshot("claude"))
+    assert provider._invalidated is True
 
 
 def test_github_api_budget_paused_handles_no_cache() -> None:
