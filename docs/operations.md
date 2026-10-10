@@ -33,9 +33,243 @@ sets `MCP_RUNTIME_DIAGNOSTICS=1` for the localhost-published listener. Operators
 starting `python -m src.mcp` outside Compose must explicitly set that variable
 and retain an equivalent loopback-only or authenticated access boundary.
 
-Raw CLI, CI, event, artifact, daemon-stdout, and live-stream retrieval is not
-exposed. Persistent capture and a separately reviewed safe log-export contract
-remain follow-up work.
+The opted-in diagnostics service also exposes `get_latest_cli_log`. It accepts
+one configured `owner__repo` slug and returns a sanitized tail of the fixed
+latest-log record written by completed coder CLI invocations. The default tail
+is 8 KiB and callers may request at most 32 KiB. The service accepts the
+producer 64 KiB byte budget plus its bounded six-byte UTF-8 replacement
+expansion, normalizes Unicode YAML line and paragraph separators, redacts the
+complete bounded source before selecting the tail, and
+reports source/output sizes, truncation, observation time, and remaining Redis
+TTL. A producer `[truncated]` marker means the stored tail may begin inside a
+credential value, so the service fails closed with
+`cli_log_producer_truncated` instead of exporting that record. Authorization
+headers, token, password, and passphrase assignments (including the standard
+`Pwd` connection-string alias, whether leading or following another property)
+or long- and PowerShell-style single-hyphen
+option arguments and their multiline shell groups, cookies,
+credential-bearing absolute or
+scheme-relative URL userinfo/query parameters (including percent-encoded
+parameter names, Azure SAS signatures, and AWS/Google presigned signatures),
+recognizable token shapes including JWTs, standard GitLab token prefixes, PyPI
+and npm API tokens, Google `ya29.` OAuth access tokens, and Slack webhooks,
+private-key blocks,
+PuTTY private-key documents, standalone AWS access-key identifiers and AWS
+credential CSVs with quoted or unquoted fields and an optional leading UTF-8
+BOM, curl user/proxy-user credentials using separated or attached short-option
+arguments recognized only inside a curl command span, netrc passwords delimited
+by horizontal whitespace or a newline,
+and recognizable JSON
+credential documents are not exported, including nested documents and documents
+with AWS Secrets Manager `SecretString`/`SecretBinary` fields or Azure storage
+access-key response objects containing nonempty `keyName` and `value` members,
+and Azure Key Vault secret objects containing a secret-resource `id` plus a
+nonempty `value`,
+and exact kubeconfig `client-key-data`/`clientKeyData` private-key fields,
+serialized inside log strings, documents whose container and field syntax is
+Unicode-escaped inside a JSON string (including after ordinary decoded message
+text), and structured header name/value pairs in
+JSON-list or Python-tuple form. Recognizable Kubernetes Secret documents are
+omitted as a whole in YAML or JSON form, including arbitrary keys under `data` or
+`stringData`, decorated, explicit, quoted, or escaped `kind` keys, and `kind`
+values that are anchored, aliased, tagged using non-specific, shorthand, or
+verbatim forms, escaped double-quoted, decorated by one or more multiline node
+property lines, or block-scalar
+(including indentation indicators), multiline plain-scalar, block-sequence, or
+flow-mapping `kind` values. Explicit `kind` keys inside flow mappings are also
+recognized regardless of member order. Complete and interrupted private-key
+blocks are both omitted using bounded boundary scans. A nested PuTTY key header
+before the current document terminator fails closed from the outer boundary.
+Logical command reconstruction recognizes trailing shell backslashes and
+PowerShell backticks, plus Windows `cmd` carets, before classifying split
+credential parameter names.
+Credentials joined by adjacent simple shell fragments, unquoted backslash
+escapes, `cmd` caret escapes, or PowerShell backtick escapes within credential
+names or recognizable token shapes are detected using the same inline token,
+URL, and query rules; the contributing line is omitted before tail selection.
+Bare named, positional, or special shell-parameter expansions embedded in a
+word are treated as ambiguous credential context rather than evaluated. An
+shell or cmd expansion at the start of a word also fails closed when its removal
+could expose a recognized generic or command-specific credential option. This
+normalization is detection-only and does not evaluate the variable.
+Bounded Bash brace-list or brace-sequence expansions embedded in a word use the
+same fail-closed treatment.
+The established `MYSQL_PWD` assignment and attached `-pPASSWORD` forms for
+MySQL client commands are treated as credential context using the monotonic
+command-word scan; unrelated `-p` and MySQL `-P` port options remain visible.
+Docker login's separated, equals, and attached short-password
+forms are likewise recognized only in their command-specific context by that
+monotonic scan, including shell-fragmented or quoted short flags. Redis CLI and
+sshpass password flags use the same bounded command scan and shell-fragment
+normalization.
+Azure CLI `az login` recognizes its `-p` password or service-principal-secret
+alias in the same monotonic command-specific context; unrelated `-p` options remain visible.
+An exact `az keyvault secret show --query value` command and the remaining
+bounded log record are omitted conservatively because legacy CLI output has no
+trustworthy boundary after a potentially multiline secret result.
+An exact AWS Secrets Manager `get-secret-value` command selecting
+`SecretString` or `SecretBinary` with text output receives the same scalar
+handling, including when those global output or query options precede the
+service name.
+An exact `gcloud secrets versions access` command without `--out-file` also
+receives fail-closed remainder handling because it writes secret data to
+standard output.
+The documented `kubectl get secret` JSONPath pipeline into `base64 --decode`
+also receives the same fail-closed remainder handling, including when inherited
+global options precede the `get secret` subcommand.
+The `sshpass -p` separated, attached, and shell-fragmented password forms are
+also recognized only in their command-specific context. Its exact `SSHPASS`
+environment password assignment is credential context for `-e` mode. A custom
+`-eVAR` name also omits its matching leading simple-command assignment.
+Positional access-key, secret-key, and session-token values passed through
+`aws configure set` (including after up to 16 global-option words), plus
+`redis-cli`'s `-a` and `--pass` password flags, are also omitted only in their
+command-specific contexts.
+Structured credential names use established exact names or compound-name
+suffixes; unrelated fields such as `Author`, `tokenizer`, and `passwordless`
+remain visible.
+Backslash-bearing Bash ANSI-C words are omitted with a bounded scan instead of
+being decoded or exported.
+Command or parameter substitutions embedded after a literal shell-word fragment
+are treated as ambiguous credential context and omitted with balanced-group
+tracking rather than evaluated.
+Percent-delimited and delayed-expansion `cmd` variables embedded in a word are
+handled by the same fail-closed rule.
+Embedded `%0` through `%9`, `%*`, and bounded `%~` batch-parameter forms are
+also treated as ambiguous fragments rather than expanded.
+Provably empty `${name:+}`, `${name+}`, `$()`, and backtick substitutions inside
+credential option names or recognizable token text are normalized before
+classification.
+URL userinfo redaction consumes through the final `@` in the bounded authority,
+and curl user/proxy-user short options are recognized when attached inside an
+option cluster or quoted as a complete shell argument. Curl `-b`/`--cookie`
+arguments containing explicit cookie data are likewise omitted in their
+command-specific context using a monotonic bounded word scan. Curl certificate
+and proxy-certificate arguments with embedded `certificate:password` suffixes
+are omitted by that curl-scoped scan while passwordless certificate arguments
+remain visible. URLs do not replace the active curl scope, and curl `--pass`
+and `--proxy-pass` private-key passphrases are omitted in separated or equals
+forms. OpenSSL `-passin` and `-passout` arguments using the inline
+`pass:password` source are omitted by the same command-scoped scan; indirect
+password sources such as files remain visible. OpenSSL `enc` passphrases and
+raw keys supplied through `-k` and uppercase `-K` are omitted in that
+subcommand scope. Mongosh short `-p` password arguments are likewise omitted
+only in their command span, preserving unrelated short options.
+Credential commands launched through `sudo`, `env`, `command`, `exec`, or
+`nohup` are omitted conservatively rather than interpreting wrapper-specific
+options.
+Shell redirections do not terminate an already recognized credential-command
+scope, so later password options on the same simple command remain protected.
+Shell-fragmented curl
+long options and bounded unquoted IFS expansions at recognized credential-option
+value boundaries fail closed without evaluating the expansion. PowerShell credential
+parameter prefixes of four or more characters fail closed when they prefix a
+recognized sensitive name. Multiline structured credential pairs retain grouping that
+starts before the sensitive field so unindented values cannot escape omission.
+Plist-style XML selector/scalar pairs use monotonic tag scans, including when a
+producer-sized scalar start is malformed or unterminated.
+Standard encoded `auth` fields used by registry and package-manager credential
+documents are treated as credential context rather than exported as base64 text.
+YAML documents with explicit credential keys, alias mapping keys, or mapping
+keys that use recognized YAML-only escape forms are omitted conservatively
+rather than partially decoded. Node-property-only credential values retain their
+context across blank and comment lines. Single-quoted YAML mapping keys decode
+doubled single-quote escapes before credential classification. Documents
+containing multiline explicit plain mapping keys, or multiline explicit single-
+or double-quoted keys in block or flow mappings, are omitted because folded keys
+cannot be classified safely without interpreting YAML. Plain-key discovery uses
+a monotonic bounded line scan, including flow-form delimiters on continuation
+lines.
+Explicit block-scalar mapping keys
+are omitted for the same reason.
+Recognizable XML credential elements, credential attributes, and `key`/`name`
+plus `value` configuration tags are omitted. Selector discovery uses a bounded,
+monotonic tag scan, so repeated unmatched starts cannot trigger overlapping
+source rescans. Opening and closing qualified names are matched case-sensitively;
+mismatches fail closed. XML character references in
+credential selectors are decoded before classification. Plist-style sensitive
+`key`/`name` element text is normalized across bounded attributed start tags,
+comments, and CDATA before its following scalar value is omitted. Other or
+incomplete selector markup fails
+closed through the bounded source end. Multiline or incomplete XML credential
+contexts fail closed through the bounded source end; closing-tag text inside a
+comment or CDATA section is not treated as a real element close. In addition,
+unresolved named entities in credential selectors are treated as ambiguous
+credential context. DTD-bearing XML fails closed from the declaration boundary
+without parsing or expanding internal or external entities.
+Standalone single-token authorization-scheme values such as `Bearer` and
+`Basic` credentials are redacted even when the header name is absent; a
+multi-parameter `Digest` value causes conservative line omission.
+JSON inspection preserves duplicate object members so a later empty value cannot
+hide an earlier credential value. Recognizable RSA, EC, OKP, and symmetric
+private JWK objects are omitted while public JWKs remain exportable. PEM, SSH2,
+and PuTTY version 1 through 3 private-key documents are omitted through their
+recognized boundaries, including the version 1 `Private-Hash` terminator;
+PEM and SSH2 end labels must match their opening label, and incomplete or
+mismatched blocks fail closed. Nested recognized starts are tracked as a bounded
+stack so an unfinished inner block cannot be exposed after an outer end marker.
+Lines with recognizable credential keys are omitted conservatively when they
+use assignment, structured-field, header, or long-option syntax. Balanced
+quotes around recognized multiword credential labels are supported, so
+malformed or interrupted quoting cannot expose a value suffix. Adjacent simple
+shell quote fragments, including Bash dollar-prefixed ANSI/locale quotes, and
+same-line backslash-escaped characters in long-option names are reassembled for
+classification. Backslash-bearing ANSI-C fragments inside long-option names
+fail closed rather than requiring shell escape evaluation, including when the
+ANSI-C word contains the entire long option.
+Indented YAML/header continuations, backslash-continued shell values, and quoted
+or square-bracketed values spanning physical lines are omitted with their key
+line through the close or source end. TOML triple-quoted values retain the full
+three-character delimiter across content lines.
+Backslash-continued shell lines are reconstructed before credential-name
+classification, so split assignments, options, URLs, and recognizable token
+shapes cannot evade detection.
+Command, parameter, and backtick substitutions remain tracked inside
+double-quoted credential values.
+This includes leading blank lines and legal indentationless YAML sequence values
+under a credential key, plus shell heredoc bodies through their delimiter or
+source end. Literal heredoc delimiters may start with digits; unsupported
+delimiter words and assignments with multiple ordered heredocs fail closed by
+omitting the remainder of the bounded source.
+YAML documents containing a sensitive field with a comment-only value, alias,
+or flow-style collection are omitted as a whole because line-level redaction
+cannot safely retain the referenced or indentationless value. Explicit document
+boundaries preserve neighboring documents; without one, the bounded source
+segment fails closed.
+Terminal escape and control sequences, including C1 control strings, are
+normalized before credential inspection. The source suffix beginning with the
+first bare carriage return or stateful cursor/editing control is omitted
+conservatively, preventing terminal overwrite semantics or lost multiline
+context from exposing a hidden credential. Credential-key inspection normalizes
+separated, camel-case, single-case compound, and bracketed parameter names,
+quoted mapping subscripts, and common multiword labels such as `API key`; it uses
+a bounded-source, single-pass line scanner so long non-credential lines do not
+cause regex backtracking stalls.
+Malformed or incomplete JSON containers with credential contexts are omitted
+through their closing boundary or, when unterminated, through the source end;
+legal whitespace may separate a credential key, delimiter, and value.
+Fallback inspection of malformed JSON has both a parse-failure limit and a
+fixed cumulative character-work budget, so overlapping container candidates
+cannot repeatedly rescan a producer-sized source.
+All legal JSON string escapes in credential keys are decoded during fallback
+inspection.
+Malformed JSON probing has a fixed failure budget; if that budget is
+exhausted, export fails closed to a credential-document omission marker instead
+of blocking the MCP event loop or returning text that could not be inspected
+safely.
+
+This legacy latest-only record has no trustworthy task, invocation, commit SHA,
+or producer timestamp. Those associations are returned as unavailable and are
+never inferred from the current pipeline snapshot or TTL. `observed_at` is only
+the retrieval time. A missing Redis value can mean either never written or
+expired; the response reports that ambiguity. An existing zero-length value is
+reported as available with empty text. Reads use `STRLEN`, bounded `GETRANGE`,
+`EXISTS`, and `TTL`; they do not refresh expiry, mutate state, access credential
+files or caller-selected Redis keys, trigger Retry, or launch a process.
+
+Historical CLI-log discovery, CI/event/artifact logs, process observations,
+daemon stdout, and live output remain unavailable and require separate reviewed
+contracts.
 
 ### Protected remote diagnostics with Cloudflare Access
 
@@ -120,9 +354,10 @@ After deployment, verify these separately:
   data. A previously issued MCP session ID must fail in the same way without a
   fresh assertion.
 - An allowed operator can initialize the streamable-HTTP connection, discover
-  only the existing allowlisted tools, and call `get_orchestrator_status`.
-  Confirm that no log, artifact, event, credential, arbitrary-file, or mutation
-  tool appears.
+  the allowlisted diagnostics tools, and call `get_orchestrator_status` and
+  `get_latest_cli_log`. Confirm the latter returns only its bounded, sanitized
+  latest-log tail and that no historical-log, artifact, event, credential-file,
+  arbitrary-file, arbitrary-key, or mutation tool appears.
 - A denied identity cannot complete the Access policy. Rotate the Access
   signing key in a test application, reconnect, and confirm the origin accepts
   the new key after its bounded refresh without accepting the old application
