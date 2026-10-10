@@ -84,6 +84,7 @@ _BROWSER_WAITING_STATES = frozenset({"waiting_for_user", "waiting_for_code"})
 _BROWSER_ACTIVE_STATES = _BROWSER_WAITING_STATES | frozenset(
     {"starting", "authorizing", "canceling"}
 )
+_BROWSER_SESSION_ID_STATES = _BROWSER_ACTIVE_STATES | {"cleanup_failed"}
 _MAX_AUTHORIZATION_URL_CHARACTERS = 4096
 
 
@@ -711,9 +712,11 @@ def parse_coder_browser_login_payload(
     ):
         raise TypeError("invalid browser login failure reason")
     if failure_reason == "unsupported_cli_version" and (
-        observed_cli_version is None or minimum_cli_version is None
+        state != "unsupported"
+        or observed_cli_version is None
+        or minimum_cli_version is None
     ):
-        raise TypeError("browser login version evidence is required")
+        raise TypeError("invalid unsupported browser login version evidence")
     normalized_deadline = None
     if application_deadline is not None:
         if (
@@ -747,8 +750,8 @@ def parse_coder_browser_login_payload(
     auth_status = (
         parse_coder_auth_payload(raw_auth) if raw_auth is not None else None
     )
-    if state in _BROWSER_ACTIVE_STATES and session_id is None:
-        raise TypeError("active browser login session ID is required")
+    if state in _BROWSER_SESSION_ID_STATES and session_id is None:
+        raise TypeError("browser login session ID is required")
     if state in _BROWSER_ACTIVE_STATES and cleanup_confirmed is not None:
         raise TypeError("active browser login cleanup status must be unknown")
     if state in _BROWSER_WAITING_STATES:

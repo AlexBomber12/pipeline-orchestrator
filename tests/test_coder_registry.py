@@ -902,7 +902,18 @@ def test_browser_login_contract_requires_unsupported_version_evidence(
 
     with pytest.raises(
         TypeError,
-        match="^browser login version evidence is required$",
+        match="^invalid unsupported browser login version evidence$",
+    ):
+        parse_coder_browser_login_payload(payload)
+
+
+def test_browser_login_contract_binds_unsupported_version_to_state() -> None:
+    payload = _browser_login_payload()
+    payload["failure_reason"] = "unsupported_cli_version"
+
+    with pytest.raises(
+        TypeError,
+        match="^invalid unsupported browser login version evidence$",
     ):
         parse_coder_browser_login_payload(payload)
 
@@ -1056,7 +1067,20 @@ def test_browser_login_contract_requires_active_session_id(state: str) -> None:
     if state not in {"waiting_for_user", "waiting_for_code"}:
         payload["authorization_url"] = None
 
-    with pytest.raises(TypeError, match="^active browser login session ID is required$"):
+    with pytest.raises(TypeError, match="^browser login session ID is required$"):
+        parse_coder_browser_login_payload(payload)
+
+
+def test_browser_login_contract_requires_cleanup_failure_session_id() -> None:
+    payload = _browser_login_payload(state="cleanup_failed")
+    payload.update(
+        session_id=None,
+        authorization_url=None,
+        cleanup_confirmed=False,
+        failure_reason="cancellation_failed",
+    )
+
+    with pytest.raises(TypeError, match="^browser login session ID is required$"):
         parse_coder_browser_login_payload(payload)
 
 
