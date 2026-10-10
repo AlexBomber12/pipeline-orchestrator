@@ -80,7 +80,6 @@ BROWSER_LOGIN_FAILURE_REASONS = (
 ) | frozenset({"unsupported_cli_version", "invalid_code"})
 _BROWSER_PROCESS_FAILURE_STATES = {
     "auth_status_unavailable": "failed",
-    "startup_failed": "failed",
     "malformed_output": "failed",
     "provider_expired": "expired",
     "application_timeout": "timed_out",
@@ -782,6 +781,16 @@ def parse_coder_browser_login_payload(
         or cleanup_confirmed is not True
     ):
         raise TypeError("invalid browser login process failure evidence")
+    if failure_reason == "startup_failed":
+        startup_evidence_valid = (
+            state == "failed"
+            and (
+                (session_id is None and cleanup_confirmed is None)
+                or (session_id is not None and cleanup_confirmed is True)
+            )
+        ) or state == "cleanup_failed"
+        if not startup_evidence_valid:
+            raise TypeError("invalid browser login startup failure evidence")
     if state == "succeeded" and (
         cleanup_confirmed is not True
         or auth_status is None

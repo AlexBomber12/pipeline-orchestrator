@@ -1176,6 +1176,43 @@ def test_browser_login_contract_allows_foreign_session_mismatch() -> None:
     assert parsed["cleanup_confirmed"] is None
 
 
+@pytest.mark.parametrize(
+    ("session_id", "cleanup_confirmed"),
+    [(None, None), ("B" * 43, True)],
+)
+def test_browser_login_contract_accepts_startup_failure_evidence(
+    session_id: str | None,
+    cleanup_confirmed: bool | None,
+) -> None:
+    payload = _browser_login_payload(state="failed")
+    payload.update(
+        session_id=session_id,
+        authorization_url=None,
+        cleanup_confirmed=cleanup_confirmed,
+        failure_reason="startup_failed",
+    )
+
+    parsed = parse_coder_browser_login_payload(payload)
+
+    assert parsed["session_id"] == session_id
+    assert parsed["cleanup_confirmed"] is cleanup_confirmed
+
+
+def test_browser_login_contract_rejects_unconfirmed_owned_startup_failure() -> None:
+    payload = _browser_login_payload(state="failed")
+    payload.update(
+        authorization_url=None,
+        cleanup_confirmed=None,
+        failure_reason="startup_failed",
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="^invalid browser login startup failure evidence$",
+    ):
+        parse_coder_browser_login_payload(payload)
+
+
 @pytest.mark.parametrize("state", ["waiting_for_user", "succeeded"])
 def test_browser_login_contract_rejects_failure_reason_for_nonfailure_state(
     state: str,
