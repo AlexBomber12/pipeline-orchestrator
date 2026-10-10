@@ -1011,6 +1011,7 @@ def test_browser_login_contract_rejects_non_mapping_payload() -> None:
         lambda payload: payload.update(
             state="cleanup_failed", authorization_url=None, cleanup_confirmed=True
         ),
+        lambda payload: payload.update(cleanup_confirmed=False),
     ],
 )
 def test_browser_login_contract_rejects_cross_state_inconsistencies(

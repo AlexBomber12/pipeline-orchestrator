@@ -738,7 +738,7 @@ def parse_coder_browser_login_payload(
             raise TypeError("incomplete browser login instructions")
     elif authorization_url is not None:
         raise TypeError("browser login instructions outlived waiting state")
-    if state == "cleanup_failed" and cleanup_confirmed is not False:
+    if (state == "cleanup_failed") != (cleanup_confirmed is False):
         raise TypeError("invalid browser login cleanup failure")
     if state == "succeeded" and (
         cleanup_confirmed is not True
