@@ -1110,7 +1110,7 @@ def test_browser_login_contract_requires_process_failure_cleanup() -> None:
 
     with pytest.raises(
         TypeError,
-        match="^browser login failure cleanup is unconfirmed$",
+        match="^invalid browser login process failure evidence$",
     ):
         parse_coder_browser_login_payload(payload)
 
@@ -1136,6 +1136,38 @@ def test_browser_login_contract_binds_process_failure_to_session(
     with pytest.raises(
         TypeError,
         match="^invalid browser login process failure evidence$",
+    ):
+        parse_coder_browser_login_payload(payload)
+
+
+def test_browser_login_contract_allows_foreign_session_mismatch() -> None:
+    payload = _browser_login_payload(state="failed")
+    payload.update(
+        authorization_url=None,
+        cleanup_confirmed=None,
+        failure_reason="session_plugin_mismatch",
+    )
+
+    parsed = parse_coder_browser_login_payload(payload)
+
+    assert parsed["session_id"] == payload["session_id"]
+    assert parsed["cleanup_confirmed"] is None
+
+
+@pytest.mark.parametrize("state", ["waiting_for_user", "succeeded"])
+def test_browser_login_contract_rejects_failure_reason_for_nonfailure_state(
+    state: str,
+) -> None:
+    payload = (
+        _browser_login_payload()
+        if state == "waiting_for_user"
+        else _successful_browser_login_payload()
+    )
+    payload["failure_reason"] = "credential_in_use"
+
+    with pytest.raises(
+        TypeError,
+        match="^browser login failure reason contradicts state$",
     ):
         parse_coder_browser_login_payload(payload)
 
