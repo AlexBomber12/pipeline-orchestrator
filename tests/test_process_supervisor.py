@@ -124,7 +124,14 @@ INTERACTIVE_PTY_PROCESS = r"""
 import os
 import sys
 
-terminal_flags = bytes(int(os.isatty(fd)) + ord("0") for fd in (0, 1, 2))
+tty_fd = os.open("/dev/tty", os.O_RDWR)
+terminal_flags = bytes(
+    [
+        *(int(os.isatty(fd)) + ord("0") for fd in (0, 1, 2)),
+        int(os.tcgetpgrp(tty_fd) == os.getpgrp()) + ord("0"),
+    ]
+)
+os.close(tty_fd)
 os.write(1, b"tty:" + terminal_flags + b"|stdout|")
 os.write(2, b"stderr|")
 os.write(1, b"prompt>")
@@ -136,6 +143,7 @@ PTY_RETAINING_DESCENDANT = r"""
 import os
 import signal
 
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
 child_pid = os.fork()
 if child_pid == 0:
     while True:
@@ -844,7 +852,7 @@ async def test_pty_launch_supports_fragmented_merged_io_without_input_echo(
         channel, b"prompt>", read_size=2
     )
     assert all(0 < len(chunk) <= 2 for chunk in chunks)
-    assert b"tty:111|stdout|stderr|prompt>" in before_prompt
+    assert b"tty:1111|stdout|stderr|prompt>" in before_prompt
 
     submitted = b"opaque-code\n"
     real_write = os.write
@@ -1146,6 +1154,17 @@ async def test_pty_launch_closes_descriptors_on_setup_failure_and_cancellation(
     for fd in allocated[-1]:
         with pytest.raises(OSError, match="Bad file descriptor"):
             os.fstat(fd)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            process_supervisor,
+            "_WITNESS_LAUNCHER",
+            "import os, sys; "
+            "os.write(int(sys.argv[2]), b'T13\\n'); "
+            "raise SystemExit(125)",
+        )
+        with pytest.raises(PermissionError, match="controlling terminal"):
+            await launch_pty_process("fake-cli")
 
     launch_started = asyncio.Event()
 

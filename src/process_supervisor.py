@@ -51,10 +51,12 @@ _RESTORED_SIGNAL_NAMES = ("SIGPIPE", "SIGXFZ", "SIGXFSZ")
 _CANCELLED_RESULT_ATTR = "_pipeline_process_run_result"
 _LAUNCH_PROOF = object()
 _WITNESS_LAUNCHER = r"""
+import fcntl
 import os
 import pickle
 import signal
 import sys
+import termios
 
 
 def read_exact(fd, size):
@@ -68,10 +70,17 @@ def read_exact(fd, size):
 
 control_fd = int(sys.argv[1])
 ready_fd = int(sys.argv[2])
-signal_modes = sys.argv[3]
-target_executable = sys.argv[4]
-target_argv = sys.argv[5:]
+acquire_controlling_terminal = sys.argv[3] == "1"
+signal_modes = sys.argv[4]
+target_executable = sys.argv[5]
+target_argv = sys.argv[6:]
 max_fd = os.sysconf("SC_OPEN_MAX")
+if acquire_controlling_terminal:
+    try:
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+    except OSError as exc:
+        os.write(ready_fd, b"T" + str(exc.errno).encode("ascii") + b"\n")
+        os._exit(125)
 pid_read, pid_write = os.pipe()
 
 broker_pid = os.fork()
@@ -80,6 +89,7 @@ if broker_pid == 0:
     witness_pid = os.fork()
     if witness_pid == 0:
         os.close(ready_fd)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
         os.closerange(0, control_fd)
         os.closerange(control_fd + 1, max_fd)
         while os.read(control_fd, 1):
@@ -1715,7 +1725,11 @@ async def run_supervised_process(
     return run_result
 
 
-async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
+async def launch_process(
+    *program: str,
+    _acquire_controlling_terminal: bool = False,
+    **kwargs: Any,
+) -> SupervisedProcess:
     """Launch ``program`` in a new Linux session and retain its group identity.
 
     Startup errors are raised unchanged only after failed-launch cleanup is
@@ -1765,6 +1779,7 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
                 _WITNESS_LAUNCHER,
                 str(control_read),
                 str(ready_child.fileno()),
+                "1" if _acquire_controlling_terminal else "0",
                 signal_modes,
                 target_executable,
                 *program,
@@ -1807,6 +1822,13 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
             cancellation_deadline=cancellation_deadline,
         )
         ready_line, separator, exec_payload = ready_payload.partition(b"\n")
+        if separator and ready_line.startswith(b"T"):
+            terminal_errno = int(ready_line[1:])
+            raise OSError(
+                terminal_errno,
+                os.strerror(terminal_errno),
+                "controlling terminal",
+            )
         if not separator or not ready_line.startswith(b"W"):
             raise RuntimeError("lifecycle ownership witness did not start")
         witness_pid = int(ready_line[1:])
@@ -1985,6 +2007,7 @@ async def launch_pty_process(
         channel = PtyChannel(master_fd)
         managed = await launch_process(
             *program,
+            _acquire_controlling_terminal=True,
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
