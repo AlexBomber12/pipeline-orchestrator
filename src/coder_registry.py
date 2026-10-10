@@ -15,6 +15,7 @@ from typing import (
     Protocol,
     runtime_checkable,
 )
+from urllib.parse import urlsplit
 
 from src.process_supervisor import CleanupResult, SupervisedProcess
 from src.usage import UsageProvider
@@ -71,8 +72,16 @@ DEVICE_LOGIN_FAILURE_REASONS = frozenset(
         "daemon_unavailable",
     }
 )
+BROWSER_LOGIN_STATES = DEVICE_LOGIN_STATES | frozenset(
+    {"waiting_for_code", "authorizing"}
+)
+BROWSER_LOGIN_FAILURE_REASONS = (
+    DEVICE_LOGIN_FAILURE_REASONS - {"device_login_disabled"}
+) | frozenset({"unsupported_cli_version", "invalid_code"})
 _SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,128}")
 _DEVICE_CODE_PATTERN = re.compile(r"[A-Z0-9-]{4,64}")
+_BROWSER_WAITING_STATES = frozenset({"waiting_for_user", "waiting_for_code"})
+_MAX_AUTHORIZATION_URL_CHARACTERS = 4096
 
 
 @dataclass(frozen=True)
@@ -593,6 +602,171 @@ def parse_coder_device_login_payload(
         "reused_session": reused_session,
         "replacement_warning": replacement_warning,
         "auth_status": auth_status,
+    }
+
+
+def _browser_login_version(value: object, field: str) -> str | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 64
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise TypeError(f"invalid browser login {field}")
+    return value
+
+
+def _browser_login_authorization_url(value: object) -> str | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _MAX_AUTHORIZATION_URL_CHARACTERS
+        or any(
+            character.isspace()
+            or ord(character) < 32
+            or ord(character) == 127
+            for character in value
+        )
+        or "#" in value
+    ):
+        raise TypeError("invalid browser login authorization URL")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        raise TypeError("invalid browser login authorization URL") from None
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None and not 1 <= port <= 65535
+    ):
+        raise TypeError("invalid browser login authorization URL")
+    return value
+
+
+def parse_coder_browser_login_payload(
+    payload: object,
+    *,
+    expected_plugin: str | None = None,
+) -> dict[str, Any]:
+    """Validate and select browser-code login fields allowed across the bridge."""
+    if not isinstance(payload, dict):
+        raise TypeError("invalid browser login payload")
+    login_method = payload.get("login_method")
+    plugin = payload.get("plugin")
+    session_id = payload.get("session_id")
+    state = payload.get("state")
+    detail = payload.get("detail")
+    failure_reason = payload.get("failure_reason")
+    authorization_url = _browser_login_authorization_url(
+        payload.get("authorization_url")
+    )
+    application_deadline = payload.get("application_deadline")
+    cleanup_confirmed = payload.get("cleanup_confirmed")
+    replacement_requested = payload.get("replacement_requested")
+    reused_session = payload.get("reused_session")
+    replacement_warning = payload.get("replacement_warning")
+    raw_auth = payload.get("auth_status")
+    observed_cli_version = _browser_login_version(
+        payload.get("observed_cli_version"), "observed CLI version"
+    )
+    minimum_cli_version = _browser_login_version(
+        payload.get("minimum_cli_version"), "minimum CLI version"
+    )
+    if login_method != "browser_code":
+        raise TypeError("invalid browser login method")
+    if (
+        not isinstance(plugin, str)
+        or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", plugin) is None
+        or (expected_plugin is not None and plugin != expected_plugin)
+    ):
+        raise TypeError("invalid browser login plugin")
+    if session_id is not None and (
+        not isinstance(session_id, str)
+        or _SESSION_ID_PATTERN.fullmatch(session_id) is None
+    ):
+        raise TypeError("invalid browser login session ID")
+    if state not in BROWSER_LOGIN_STATES:
+        raise TypeError("invalid browser login state")
+    if (
+        not isinstance(detail, str)
+        or not detail
+        or len(detail) > 512
+        or any(ord(character) < 32 or ord(character) == 127 for character in detail)
+    ):
+        raise TypeError("invalid browser login detail")
+    if (
+        failure_reason is not None
+        and failure_reason not in BROWSER_LOGIN_FAILURE_REASONS
+    ):
+        raise TypeError("invalid browser login failure reason")
+    if application_deadline is not None and (
+        isinstance(application_deadline, bool)
+        or not isinstance(application_deadline, (int, float))
+        or not math.isfinite(application_deadline)
+        or application_deadline <= 0
+    ):
+        raise TypeError("invalid browser login application deadline")
+    if cleanup_confirmed is not None and not isinstance(cleanup_confirmed, bool):
+        raise TypeError("invalid browser login cleanup status")
+    if not isinstance(replacement_requested, bool) or not isinstance(
+        reused_session, bool
+    ):
+        raise TypeError("invalid browser login flags")
+    if replacement_warning is not None and (
+        not isinstance(replacement_warning, str)
+        or not replacement_warning
+        or len(replacement_warning) > 512
+        or any(
+            ord(character) < 32 or ord(character) == 127
+            for character in replacement_warning
+        )
+    ):
+        raise TypeError("invalid browser login replacement warning")
+    auth_status = (
+        parse_coder_auth_payload(raw_auth) if raw_auth is not None else None
+    )
+    if state in _BROWSER_WAITING_STATES:
+        if session_id is None or authorization_url is None:
+            raise TypeError("incomplete browser login instructions")
+    elif authorization_url is not None:
+        raise TypeError("browser login instructions outlived waiting state")
+    if state == "cleanup_failed" and cleanup_confirmed is not False:
+        raise TypeError("invalid browser login cleanup failure")
+    if state == "succeeded" and (
+        cleanup_confirmed is not True
+        or auth_status is None
+        or auth_status["status"] != "ok"
+        or auth_status["saved_credentials_present"] is not True
+    ):
+        raise TypeError("invalid browser login success evidence")
+    return {
+        "login_method": login_method,
+        "plugin": plugin,
+        "session_id": session_id,
+        "state": state,
+        "detail": detail,
+        "failure_reason": failure_reason,
+        "authorization_url": authorization_url,
+        "application_deadline": (
+            float(application_deadline)
+            if application_deadline is not None
+            else None
+        ),
+        "cleanup_confirmed": cleanup_confirmed,
+        "replacement_requested": replacement_requested,
+        "reused_session": reused_session,
+        "replacement_warning": replacement_warning,
+        "auth_status": auth_status,
+        "observed_cli_version": observed_cli_version,
+        "minimum_cli_version": minimum_cli_version,
     }
 
 

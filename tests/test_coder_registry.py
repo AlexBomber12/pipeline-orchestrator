@@ -19,6 +19,7 @@ from src.coder_registry import (
     ModelSetting,
     coder_auth_payload,
     parse_coder_auth_payload,
+    parse_coder_browser_login_payload,
     parse_coder_device_login_payload,
     resolve_coder_credential_location,
     resolve_device_login_credential_location,
@@ -748,6 +749,321 @@ def test_device_login_contract_rejects_invalid_payloads(
 
     with pytest.raises(TypeError):
         parse_coder_device_login_payload(payload, expected_plugin="codex")
+
+
+def _browser_login_payload(
+    *,
+    state: str = "waiting_for_user",
+) -> dict[str, Any]:
+    return {
+        "login_method": "browser_code",
+        "plugin": "claude",
+        "session_id": "B" * 43,
+        "state": state,
+        "detail": "Continue browser-code login",
+        "failure_reason": None,
+        "authorization_url": (
+            "https://login.example.test/oauth/authorize?"
+            "state=opaque%2Bvalue%3D&redirect_uri=https%3A%2F%2Flocalhost"
+        ),
+        "application_deadline": 1234,
+        "cleanup_confirmed": None,
+        "replacement_requested": True,
+        "reused_session": False,
+        "replacement_warning": "Existing credentials may become unavailable.",
+        "auth_status": None,
+        "observed_cli_version": "2.1.126",
+        "minimum_cli_version": "2.1.126",
+    }
+
+
+def _successful_browser_login_payload() -> dict[str, Any]:
+    payload = _browser_login_payload(state="succeeded")
+    payload.update(
+        {
+            "authorization_url": None,
+            "application_deadline": None,
+            "cleanup_confirmed": True,
+            "auth_status": coder_auth_payload(
+                CoderAuthStatus(
+                    status="ok",
+                    detail="Saved credentials found; service access unknown",
+                    cli_available=True,
+                    cli_version="2.1.126",
+                    saved_credentials_present=True,
+                    authentication_mode="browser_oauth",
+                    service_access_verified=None,
+                )
+            ),
+        }
+    )
+    return payload
+
+
+@pytest.mark.parametrize("state", ["waiting_for_user", "waiting_for_code"])
+def test_browser_login_contract_accepts_waiting_snapshots(state: str) -> None:
+    source = _browser_login_payload(state=state)
+    expected_url = source["authorization_url"]
+
+    payload = parse_coder_browser_login_payload(
+        source, expected_plugin="claude"
+    )
+
+    assert payload["login_method"] == "browser_code"
+    assert payload["authorization_url"] == expected_url
+    assert payload["application_deadline"] == 1234.0
+
+
+def test_browser_login_contract_accepts_authorizing_and_cleanup_failure() -> None:
+    authorizing = _browser_login_payload(state="authorizing")
+    authorizing.update(
+        authorization_url=None,
+        observed_cli_version=None,
+        minimum_cli_version=None,
+    )
+    parsed_authorizing = parse_coder_browser_login_payload(authorizing)
+    assert parsed_authorizing["state"] == "authorizing"
+    assert parsed_authorizing["observed_cli_version"] is None
+    assert parsed_authorizing["minimum_cli_version"] is None
+
+    cleanup_failed = _browser_login_payload(state="cleanup_failed")
+    cleanup_failed.update(
+        authorization_url=None,
+        cleanup_confirmed=False,
+        failure_reason="cancellation_failed",
+    )
+    assert (
+        parse_coder_browser_login_payload(cleanup_failed)["cleanup_confirmed"]
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["unsupported", "failed", "cancelled", "expired", "timed_out", "not_found"],
+)
+def test_browser_login_contract_accepts_terminal_snapshots(state: str) -> None:
+    payload = _browser_login_payload(state=state)
+    payload.update(
+        authorization_url=None,
+        application_deadline=None,
+        cleanup_confirmed=True,
+        failure_reason=("process_failed" if state == "failed" else None),
+    )
+
+    parsed = parse_coder_browser_login_payload(payload)
+
+    assert parsed["state"] == state
+    assert parsed["authorization_url"] is None
+
+
+def test_browser_login_contract_requires_supported_success_evidence() -> None:
+    parsed = parse_coder_browser_login_payload(
+        _successful_browser_login_payload()
+    )
+
+    assert parsed["state"] == "succeeded"
+    assert parsed["cleanup_confirmed"] is True
+    assert parsed["auth_status"]["saved_credentials_present"] is True
+    assert parsed["auth_status"]["service_access_verified"] is None
+
+
+def test_browser_login_contract_preserves_bounded_version_evidence() -> None:
+    payload = _browser_login_payload(state="unsupported")
+    payload.update(
+        session_id=None,
+        authorization_url=None,
+        application_deadline=None,
+        cleanup_confirmed=True,
+        failure_reason="unsupported_cli_version",
+        observed_cli_version="2.1.119",
+        minimum_cli_version="2.1.126",
+    )
+
+    parsed = parse_coder_browser_login_payload(payload)
+
+    assert parsed["observed_cli_version"] == "2.1.119"
+    assert parsed["minimum_cli_version"] == "2.1.126"
+
+
+def test_browser_login_contract_selects_only_allowlisted_fields() -> None:
+    payload = _successful_browser_login_payload()
+    payload.update(
+        submitted_code="submitted-code-fixture",
+        access_token="access-token-fixture",
+        refresh_token="refresh-token-fixture",
+        terminal_output="terminal-output-fixture",
+        environment={"SECRET": "environment-fixture"},
+        oauth_state="oauth-state-fixture",
+        code_challenge="pkce-fixture",
+    )
+    payload["auth_status"]["credential_contents"] = "credential-fixture"
+
+    parsed = parse_coder_browser_login_payload(payload)
+
+    assert set(parsed) == {
+        "login_method",
+        "plugin",
+        "session_id",
+        "state",
+        "detail",
+        "failure_reason",
+        "authorization_url",
+        "application_deadline",
+        "cleanup_confirmed",
+        "replacement_requested",
+        "reused_session",
+        "replacement_warning",
+        "auth_status",
+        "observed_cli_version",
+        "minimum_cli_version",
+    }
+    assert "credential_contents" not in parsed["auth_status"]
+    assert not any(
+        marker in str(parsed)
+        for marker in (
+            "submitted-code-fixture",
+            "access-token-fixture",
+            "refresh-token-fixture",
+            "terminal-output-fixture",
+            "environment-fixture",
+            "oauth-state-fixture",
+            "pkce-fixture",
+            "credential-fixture",
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload.update(login_method="device_code"),
+        lambda payload: payload.update(plugin="Bad/Plugin"),
+        lambda payload: payload.update(plugin="other"),
+        lambda payload: payload.update(session_id="short"),
+        lambda payload: payload.update(state="unknown"),
+        lambda payload: payload.update(detail=""),
+        lambda payload: payload.update(detail="unsafe\ntext"),
+        lambda payload: payload.update(failure_reason="secret_error"),
+        lambda payload: payload.update(failure_reason="device_login_disabled"),
+        lambda payload: payload.update(authorization_url="http://example.test"),
+        lambda payload: payload.update(
+            authorization_url="https://user:password@example.test/login"
+        ),
+        lambda payload: payload.update(
+            authorization_url="https://example.test/login#fragment"
+        ),
+        lambda payload: payload.update(
+            authorization_url="https://example.test/login\r\nheader:value"
+        ),
+        lambda payload: payload.update(
+            authorization_url="https://example.test/contains space"
+        ),
+        lambda payload: payload.update(
+            authorization_url="https://example.test:invalid/login"
+        ),
+        lambda payload: payload.update(
+            authorization_url="https://" + "a" * 4096
+        ),
+        lambda payload: payload.update(application_deadline=True),
+        lambda payload: payload.update(application_deadline=0),
+        lambda payload: payload.update(application_deadline=float("nan")),
+        lambda payload: payload.update(application_deadline=float("inf")),
+        lambda payload: payload.update(cleanup_confirmed="yes"),
+        lambda payload: payload.update(replacement_requested="yes"),
+        lambda payload: payload.update(reused_session=1),
+        lambda payload: payload.update(replacement_warning=""),
+        lambda payload: payload.update(replacement_warning="unsafe\x7fwarning"),
+        lambda payload: payload.update(observed_cli_version=""),
+        lambda payload: payload.update(observed_cli_version="1" * 65),
+        lambda payload: payload.update(minimum_cli_version=True),
+        lambda payload: payload.update(minimum_cli_version="2.1\n126"),
+        lambda payload: payload.update(
+            auth_status={"status": "unknown", "detail": "bad"}
+        ),
+    ],
+)
+def test_browser_login_contract_rejects_invalid_fields(mutate: Any) -> None:
+    payload = _browser_login_payload()
+    mutate(payload)
+
+    with pytest.raises(TypeError):
+        parse_coder_browser_login_payload(payload, expected_plugin="claude")
+
+
+def test_browser_login_contract_rejects_non_mapping_payload() -> None:
+    with pytest.raises(TypeError, match="^invalid browser login payload$"):
+        parse_coder_browser_login_payload([])
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload.update(session_id=None),
+        lambda payload: payload.update(authorization_url=None),
+        lambda payload: payload.update(
+            state="authorizing",
+            authorization_url="https://example.test/authorize",
+        ),
+        lambda payload: payload.update(
+            state="cleanup_failed", authorization_url=None, cleanup_confirmed=None
+        ),
+        lambda payload: payload.update(
+            state="cleanup_failed", authorization_url=None, cleanup_confirmed=True
+        ),
+    ],
+)
+def test_browser_login_contract_rejects_cross_state_inconsistencies(
+    mutate: Any,
+) -> None:
+    payload = _browser_login_payload()
+    mutate(payload)
+
+    with pytest.raises(TypeError):
+        parse_coder_browser_login_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload.update(cleanup_confirmed=False),
+        lambda payload: payload.update(auth_status=None),
+        lambda payload: payload["auth_status"].update(saved_credentials_present=False),
+        lambda payload: payload["auth_status"].update(saved_credentials_present=None),
+        lambda payload: payload["auth_status"].update(status="error"),
+    ],
+)
+def test_browser_login_contract_rejects_unsupported_success_claims(
+    mutate: Any,
+) -> None:
+    payload = _successful_browser_login_payload()
+    mutate(payload)
+
+    with pytest.raises(TypeError):
+        parse_coder_browser_login_payload(payload)
+
+
+def test_browser_login_contract_errors_never_echo_rejected_values() -> None:
+    secrets = (
+        "sensitive-plugin-value",
+        "sensitive-session-value",
+        "sensitive-url-value",
+        "sensitive-version-value\n",
+    )
+    payloads = []
+    for field, secret in zip(
+        ("plugin", "session_id", "authorization_url", "observed_cli_version"),
+        secrets,
+        strict=True,
+    ):
+        payload = _browser_login_payload()
+        payload[field] = secret
+        payloads.append(payload)
+
+    for payload in payloads:
+        with pytest.raises(TypeError) as error:
+            parse_coder_browser_login_payload(payload, expected_plugin="claude")
+        assert not any(secret in str(error.value) for secret in secrets)
 
 
 def test_auth_contract_adapts_legacy_result_and_drops_unknown_keys() -> None:
