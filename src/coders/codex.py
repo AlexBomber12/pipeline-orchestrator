@@ -311,15 +311,23 @@ class CodexPlugin:
         )
 
     async def get_model_catalog(
-        self, *, config: AppConfig, config_path: str
+        self,
+        *,
+        config: AppConfig,
+        config_path: str,
+        environment: dict[str, str] | None = None,
     ) -> ModelCatalog:
         """Discover Codex metadata in the configured CLI auth context."""
         _credential_location, working_directory = self.model_catalog_cache_key(
             config=config,
             config_path=config_path,
         )
-        env = codex_cli.build_codex_environment(
-            codex_home_dir=config.auth.codex_home_dir
+        env = (
+            dict(environment)
+            if environment is not None
+            else codex_cli.build_codex_environment(
+                codex_home_dir=config.auth.codex_home_dir
+            )
         )
         # The configured CLI session is the supported discovery context. Do
         # not accidentally switch the metadata probe to API billing.

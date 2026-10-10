@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
 from src.coder_auth import isolated_auth_probe
+from src.coder_auth_worker import EXPLICIT_ENVIRONMENT_ARG
 from src.coder_login import CoderCredentialReservations, CoderLoginSessionManager
 from src.coder_registry import (
     CoderAuthStatus,
@@ -28,7 +30,7 @@ from src.coder_registry import (
     coder_auth_payload,
     parse_coder_auth_payload,
     parse_coder_device_login_payload,
-    resolve_device_login_credential_location,
+    resolve_coder_credential_location,
 )
 from src.config import DEFAULT_CODER_PLUGINS, AppConfig, load_config
 from src.process_supervisor import (
@@ -218,6 +220,36 @@ def _credential_environment(
     )
 
 
+async def _get_model_catalog(
+    plugin: object,
+    *,
+    config: AppConfig,
+    config_path: str,
+    environment: dict[str, str] | None = None,
+) -> ModelCatalog:
+    """Call discovery with a fresh explicit environment when one is bound."""
+    get_model_catalog = getattr(plugin, "get_model_catalog")
+    kwargs: dict[str, Any] = {"config": config, "config_path": config_path}
+    if environment is not None:
+        parameters = inspect.signature(get_model_catalog).parameters
+        parameter = parameters.get("environment")
+        accepts_environment = (
+            parameter is not None
+            and parameter.kind
+            in {
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }
+        ) or any(
+            candidate.kind is inspect.Parameter.VAR_KEYWORD
+            for candidate in parameters.values()
+        )
+        if not accepts_environment:
+            raise ModelCatalogUnavailable("catalog unavailable")
+        kwargs["environment"] = dict(environment)
+    return await get_model_catalog(**kwargs)
+
+
 def _parse_auth_status(payload: object) -> dict[str, Any]:
     if not isinstance(payload, dict) or payload.get("ok") is not True:
         raise ModelCatalogUnavailable("Daemon coder auth status is unavailable")
@@ -333,6 +365,7 @@ async def _load_configured_catalog(
     reference: str,
     config_path: str,
     expected_credential_location: str | None = None,
+    environment: dict[str, str] | None = None,
 ) -> ModelCatalog:
     """Load one configured plugin catalog inside the isolated worker."""
     from src.coders import _load_plugin
@@ -340,15 +373,17 @@ async def _load_configured_catalog(
     plugin = _load_plugin(plugin_id, reference)
     config = load_config(config_path)
     if expected_credential_location is not None:
-        actual_location = resolve_device_login_credential_location(
+        actual_location = resolve_coder_credential_location(
             plugin,
             config=config,
         )
         if actual_location != expected_credential_location:
             raise ModelCatalogUnavailable("catalog unavailable")
-    return await plugin.get_model_catalog(
+    return await _get_model_catalog(
+        plugin,
         config=config,
         config_path=config_path,
+        environment=environment,
     )
 
 
@@ -357,6 +392,7 @@ async def _configured_catalog_worker_response(
     reference: str,
     config_path: str,
     expected_credential_location: str | None = None,
+    environment: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Load one configured plugin and serialize its catalog in a worker."""
     try:
@@ -365,6 +401,7 @@ async def _configured_catalog_worker_response(
             reference,
             config_path,
             expected_credential_location,
+            environment,
         )
     except Exception:
         return {"ok": False, "error": "catalog unavailable"}
@@ -377,6 +414,7 @@ async def _run_configured_catalog_worker(
     config_path: str,
     expected_credential_location: str | None = None,
     *,
+    environment: dict[str, str] | None = None,
     monitor_parent: bool = False,
 ) -> None:
     """Publish one response while retaining any unresolved child handle."""
@@ -393,6 +431,7 @@ async def _run_configured_catalog_worker(
                     reference,
                     config_path,
                     expected_credential_location,
+                    environment,
                 )
             )
             if monitor_parent:
@@ -471,14 +510,23 @@ async def _run_configured_catalog_worker(
 
 def _configured_catalog_worker_main() -> None:
     """Subprocess entry point for configured model catalog discovery."""
-    if len(sys.argv) not in {5, 6} or sys.argv[1] != "--configured-worker":
+    if not 5 <= len(sys.argv) <= 7 or sys.argv[1] != "--configured-worker":
+        raise SystemExit(2)
+    optional_args = sys.argv[5:]
+    explicit_environment = bool(
+        optional_args and optional_args[-1] == EXPLICIT_ENVIRONMENT_ARG
+    )
+    if explicit_environment:
+        optional_args = optional_args[:-1]
+    if len(optional_args) > 1 or EXPLICIT_ENVIRONMENT_ARG in optional_args:
         raise SystemExit(2)
     asyncio.run(
         _run_configured_catalog_worker(
             sys.argv[2],
             sys.argv[3],
             sys.argv[4],
-            sys.argv[5] if len(sys.argv) == 6 else None,
+            optional_args[0] if optional_args else None,
+            environment=dict(os.environ) if explicit_environment else None,
             monitor_parent=True,
         )
     )
@@ -595,6 +643,8 @@ async def _isolated_configured_catalog(
         ]
         if credential_location is not None:
             command.append(credential_location)
+        if env is not None:
+            command.append(EXPLICIT_ENVIRONMENT_ARG)
         spawn_kwargs: dict[str, Any] = {
             "stdin": asyncio.subprocess.PIPE,
             "stdout": asyncio.subprocess.PIPE,
@@ -982,7 +1032,7 @@ async def handle_model_catalog_request(
             credential_location: str | None = None
             if credential_reservations is not None:
                 config = load_config(config_path)
-                credential_location = resolve_device_login_credential_location(
+                credential_location = resolve_coder_credential_location(
                     plugin,
                     config=config,
                 )
@@ -1051,7 +1101,7 @@ async def handle_model_catalog_request(
             credential_location = None
             config = load_config(config_path)
             if credential_reservations is not None:
-                credential_location = resolve_device_login_credential_location(
+                credential_location = resolve_coder_credential_location(
                     plugin,
                     config=config,
                 )
@@ -1084,9 +1134,11 @@ async def handle_model_catalog_request(
                     async with asyncio.timeout(
                         _CONFIGURED_CATALOG_TIMEOUT_SECONDS
                     ):
-                        catalog = await plugin.get_model_catalog(
+                        catalog = await _get_model_catalog(
+                            plugin,
                             config=config,
                             config_path=config_path,
+                            environment=catalog_environment,
                         )
             except ModelCatalogUnavailable as exc:
                 reservation_retained = owner.retain_failure(
