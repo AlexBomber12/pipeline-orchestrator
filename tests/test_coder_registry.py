@@ -1084,6 +1084,22 @@ def test_browser_login_contract_requires_cleanup_failure_session_id() -> None:
         parse_coder_browser_login_payload(payload)
 
 
+@pytest.mark.parametrize("state", ["cancelled", "expired", "timed_out"])
+def test_browser_login_contract_requires_terminal_cleanup(state: str) -> None:
+    payload = _browser_login_payload(state=state)
+    payload.update(
+        authorization_url=None,
+        application_deadline=None,
+        cleanup_confirmed=None,
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="^browser login terminal cleanup is unconfirmed$",
+    ):
+        parse_coder_browser_login_payload(payload)
+
+
 @pytest.mark.parametrize(
     "state",
     ["starting", "waiting_for_user", "waiting_for_code", "authorizing", "canceling"],

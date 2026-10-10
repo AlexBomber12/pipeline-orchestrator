@@ -85,6 +85,7 @@ _BROWSER_ACTIVE_STATES = _BROWSER_WAITING_STATES | frozenset(
     {"starting", "authorizing", "canceling"}
 )
 _BROWSER_SESSION_ID_STATES = _BROWSER_ACTIVE_STATES | {"cleanup_failed"}
+_BROWSER_CLEAN_TERMINAL_STATES = frozenset({"cancelled", "expired", "timed_out"})
 _MAX_AUTHORIZATION_URL_CHARACTERS = 4096
 
 
@@ -761,6 +762,8 @@ def parse_coder_browser_login_payload(
         raise TypeError("browser login instructions outlived waiting state")
     if (state == "cleanup_failed") != (cleanup_confirmed is False):
         raise TypeError("invalid browser login cleanup failure")
+    if state in _BROWSER_CLEAN_TERMINAL_STATES and cleanup_confirmed is not True:
+        raise TypeError("browser login terminal cleanup is unconfirmed")
     if state == "succeeded" and (
         cleanup_confirmed is not True
         or auth_status is None
