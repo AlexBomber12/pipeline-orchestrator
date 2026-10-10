@@ -141,7 +141,7 @@ def test_branch_map_complete() -> None:
         assert any(entry.startswith(f"{concern}:") for entry in RATE_LIMIT_BRANCH_MAP)
 
 
-def test_usage_fetch_coordinates_with_device_login_credentials(
+def test_usage_fetch_coordinates_with_coder_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     snapshot = UsageSnapshot(10, 100, 20, 200, 1.0)
@@ -169,7 +169,7 @@ def test_usage_fetch_coordinates_with_device_login_credentials(
     reservations = CoderCredentialReservations()
     runner._credential_reservations = reservations
     monkeypatch.delenv("CODEX_HOME", raising=False)
-    location = runner._device_login_credential_location("codex")
+    location = runner._coder_credential_location("codex")
     assert location is not None
     assert reservations.reserve_login(location) is True
 
@@ -224,6 +224,22 @@ def test_usage_fetch_coordinates_with_device_login_credentials(
         missing_locator_runner._fetch_usage_snapshot("codex")
     ) is None
 
+    legacy_provider = _FakeUsageProvider(snapshot=snapshot)
+    legacy_runner = _make_runner(
+        monkeypatch,
+        coder=CoderType.CODEX,
+        codex_provider=legacy_provider,
+    )
+    legacy_runner._credential_reservations = reservations
+    monkeypatch.setattr(
+        legacy_runner,
+        "_coder_credential_location",
+        lambda _coder_name: None,
+    )
+    assert asyncio.run(
+        legacy_runner._fetch_usage_snapshot("codex")
+    ) == snapshot
+
 
 @pytest.mark.asyncio
 async def test_cancelled_usage_fetch_holds_reservation_until_worker_settles(
@@ -237,7 +253,7 @@ async def test_cancelled_usage_fetch_holds_reservation_until_worker_settles(
     )
     reservations = CoderCredentialReservations()
     runner._credential_reservations = reservations
-    location = runner._device_login_credential_location("codex")
+    location = runner._coder_credential_location("codex")
     assert location is not None
     started = asyncio.Event()
     release = asyncio.Event()

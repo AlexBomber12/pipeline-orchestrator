@@ -43,7 +43,7 @@ from tests.runner import _helpers as h
 claude_cli = claude_plugin_module.claude_cli
 
 
-def test_handle_fix_defers_for_device_login_without_counting_iteration(
+def test_handle_fix_defers_for_credential_login_without_counting_iteration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._patch_subprocess(monkeypatch)
@@ -67,7 +67,10 @@ def test_handle_fix_defers_for_device_login_without_counting_iteration(
 
     assert called == []
     assert runner.state.current_pr.fix_iteration_count == 0
-    assert any("device login" in event["event"] for event in runner.state.history)
+    assert any(
+        "credential login" in event["event"]
+        for event in runner.state.history
+    )
 
 
 def test_handle_fix_releases_reservation_on_schedule_failure(

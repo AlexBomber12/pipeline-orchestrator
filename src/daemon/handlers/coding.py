@@ -480,7 +480,7 @@ class CodingMixin:
             invocation_kwargs=coder_kwargs,
         ):
             self.log_event(
-                "[CODING] Coder invocation deferred while device login "
+                "[CODING] Coder invocation deferred while credential login "
                 "owns its credential location."
             )
             return None

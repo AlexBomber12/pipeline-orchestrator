@@ -124,7 +124,7 @@ class RateLimitMixin:
         if reservations is None:
             return await asyncio.to_thread(provider.fetch)
         try:
-            credential_location = self._device_login_credential_location(
+            credential_location = self._coder_credential_location(
                 coder_name
             )
         except Exception:
@@ -136,7 +136,7 @@ class RateLimitMixin:
             credential_location
         )
         credential_context = (credential_location, credential_version)
-        previous_context = self._usage_credential_versions.get(coder_name)
+        previous_context = self._usage_credential_contexts.get(coder_name)
         if previous_context != credential_context:
             if previous_context is not None or credential_version > 0:
                 reset = getattr(
@@ -148,7 +148,7 @@ class RateLimitMixin:
                     reset = getattr(provider, "invalidate_cache", None)
                 if callable(reset):
                     reset()
-            self._usage_credential_versions[coder_name] = credential_context
+            self._usage_credential_contexts[coder_name] = credential_context
 
         if not reservations.reserve_coder(credential_location):
             return None

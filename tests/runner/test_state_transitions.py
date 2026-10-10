@@ -1937,7 +1937,10 @@ def test_handle_merge_aborts_conflict_when_device_login_defers_resolver(
 
     assert ("merge", "--abort") in git_calls
     assert runner.state.state == PipelineState.WATCH
-    assert any("device login" in item["event"] for item in runner.state.history)
+    assert any(
+        "credential login" in item["event"]
+        for item in runner.state.history
+    )
     reservations.release_login(location)
 
 

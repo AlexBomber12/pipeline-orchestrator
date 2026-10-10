@@ -302,7 +302,7 @@ class ErrorMixin:
             invocation_kwargs=credential_run_kwargs,
         ):
             self.log_event(
-                "[ERROR] Diagnosis deferred while device login owns "
+                "[ERROR] Diagnosis deferred while credential login owns "
                 "the coder credential location."
             )
             return
