@@ -12,6 +12,7 @@ from src.coder_registry import (
 )
 from src.coders import claude as claude_module
 from src.coders.claude import ClaudePlugin
+from src.coders.claude_login import ClaudeBrowserLoginAdapter
 from src.coders.claude_models import (
     ClaudeModelDiscoveryInvalid,
     ClaudeModelDiscoveryUnavailable,
@@ -93,6 +94,45 @@ def test_claude_plugin_models() -> None:
     assert plugin.models == ["opus", "sonnet"]
 
 
+def test_claude_credential_hooks_normalize_without_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("UNRELATED", "preserved")
+    configured = Path("auth") / "nested" / ".." / "claude"
+    config = AppConfig.model_validate(
+        {"auth": {"claude_config_dir": str(configured)}}
+    )
+    plugin = ClaudePlugin()
+
+    location = plugin.browser_login_credential_location(config=config)
+    environment = plugin.build_credential_environment(
+        config=config,
+        credential_location=location,
+    )
+    second = plugin.build_credential_environment(
+        config=config,
+        credential_location="exact/alternate-location",
+    )
+
+    assert location == str(tmp_path / "auth" / "claude")
+    assert not (tmp_path / "auth").exists()
+    assert environment["HOME"] == str(tmp_path / "home")
+    assert environment["UNRELATED"] == "preserved"
+    assert environment["CLAUDE_CONFIG_DIR"] == location
+    assert second["CLAUDE_CONFIG_DIR"] == "exact/alternate-location"
+    assert second is not environment
+    descriptor = ClaudeBrowserLoginAdapter(
+        environment=environment,
+        working_directory=str(tmp_path),
+        credential_location=location,
+        observed_cli_version="2.1.126",
+    )
+    assert descriptor.credential_location == location
+
+
 @pytest.mark.asyncio
 async def test_claude_plugin_discovers_exact_catalog_in_configured_context(
     tmp_path: Path,
@@ -141,6 +181,41 @@ async def test_claude_plugin_discovers_exact_catalog_in_configured_context(
     )
     assert plugin.model_catalog_refreshable is True
     assert plugin.model_setting.default_label == "Application default (opus)"
+
+
+@pytest.mark.asyncio
+async def test_claude_plugin_discovery_uses_copied_bound_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig.model_validate(
+        {"auth": {"claude_config_dir": str(tmp_path / "configured-b")}}
+    )
+    supplied = {
+        "HOME": str(tmp_path / "bound-home"),
+        "CLAUDE_CONFIG_DIR": str(tmp_path / "bound-a"),
+        "MARKER": "caller",
+    }
+    captured: dict[str, object] = {}
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "ambient-c"))
+
+    async def discover(**kwargs: object) -> tuple[ModelMetadata, ...]:
+        captured.update(kwargs)
+        env = kwargs["env"]
+        assert isinstance(env, dict)
+        env["MARKER"] = "mutated"
+        return ()
+
+    await ClaudePlugin(discover=discover).get_model_catalog(
+        config=config,
+        config_path=str(tmp_path / "config.yml"),
+        environment=supplied,
+    )
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "bound-a")
+    assert supplied["MARKER"] == "caller"
 
 
 def test_claude_plugin_catalog_cache_key_scopes_credentials_and_working_dir(
@@ -466,6 +541,10 @@ async def test_claude_plugin_forwards_auxiliary_reasoning_effort_and_callbacks(
     )
 
     plugin = ClaudePlugin()
+    environment = {
+        "HOME": "/bound/home",
+        "CLAUDE_CONFIG_DIR": "/bound/claude",
+    }
     await plugin.run_prompt(
         "prompt",
         "/repo",
@@ -474,6 +553,7 @@ async def test_claude_plugin_forwards_auxiliary_reasoning_effort_and_callbacks(
         on_process_start=process_callback,
         on_supervised_process_start=supervised_callback,
         reasoning_effort="high",
+        environment=environment,
     )
     await plugin.diagnose_error(
         "/repo",
@@ -482,6 +562,7 @@ async def test_claude_plugin_forwards_auxiliary_reasoning_effort_and_callbacks(
         on_process_start=process_callback,
         on_supervised_process_start=supervised_callback,
         reasoning_effort="high",
+        environment=environment,
     )
 
     assert [kind for kind, _kwargs in calls] == ["prompt", "diagnose"]
@@ -489,6 +570,44 @@ async def test_claude_plugin_forwards_auxiliary_reasoning_effort_and_callbacks(
         assert kwargs["reasoning_effort"] == "high"
         assert kwargs["on_process_start"] is process_callback
         assert kwargs["on_supervised_process_start"] is supervised_callback
+        assert kwargs["environment"] is environment
+
+
+def test_claude_plugin_auth_uses_copied_bound_environment_without_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supplied = {
+        "HOME": "/bound/home",
+        "CLAUDE_CONFIG_DIR": "/bound/a",
+        "MARKER": "caller",
+    }
+    calls: list[dict[str, str]] = []
+
+    def fail_load_config(*_args: object, **_kwargs: object) -> AppConfig:
+        raise AssertionError("bound auth must not reload configuration")
+
+    def fake_run_auth_command(
+        cmd: list[str], *, env: dict[str, str] | None = None
+    ) -> tuple[int, str, str]:
+        assert env is not None
+        calls.append(env)
+        env["MARKER"] = "internal"
+        if cmd == ["claude", "--version"]:
+            return (0, "2.1.126", "")
+        return (0, '{"loggedIn":true,"authMethod":"claude.ai"}', "")
+
+    monkeypatch.setattr(claude_module, "load_config", fail_load_config)
+    monkeypatch.setattr(claude_module, "_run_auth_command", fake_run_auth_command)
+
+    result = ClaudePlugin().check_auth(environment=supplied)
+
+    assert result["status"] == "ok"
+    assert all(env["CLAUDE_CONFIG_DIR"] == "/bound/a" for env in calls)
+    assert supplied == {
+        "HOME": "/bound/home",
+        "CLAUDE_CONFIG_DIR": "/bound/a",
+        "MARKER": "caller",
+    }
 
 
 def test_claude_plugin_reports_saved_subscription_authentication(
@@ -915,6 +1034,27 @@ def test_create_usage_provider_loads_config_from_default_path(
 
     assert captured["config_path"] == claude_module.CONFIG_PATH
     assert result == {"provider_kwargs": captured["provider_kwargs"]}
+
+
+def test_create_usage_provider_uses_normalized_default_and_explicit_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    config = AppConfig.model_validate(
+        {"auth": {"claude_config_dir": "auth/../claude-auth"}}
+    )
+
+    default_provider = ClaudePlugin().create_usage_provider(config=config)
+    explicit_provider = ClaudePlugin().create_usage_provider(
+        config=config,
+        credentials_path="relative/explicit.json",
+    )
+
+    assert default_provider._credentials_path == (
+        tmp_path / "claude-auth" / ".credentials.json"
+    )
+    assert explicit_provider._credentials_path == Path("relative/explicit.json")
 
 
 def test_rate_limit_patterns_returns_anthropic_pattern() -> None:

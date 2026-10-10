@@ -11,6 +11,7 @@ import logging
 import os
 import subprocess
 import uuid
+from pathlib import Path
 from typing import Callable
 
 from src.config import load_config
@@ -100,7 +101,25 @@ Completion boundary for this invocation:
   reasons. Never fabricate a push, gate, or approval."""
 
 
-def _maybe_wrap_sandbox(cmd: list[str], cwd: str) -> list[str]:
+def build_claude_environment(*, claude_config_dir: str) -> dict[str, str]:
+    """Return a fresh environment bound to ``claude_config_dir``."""
+    environment = dict(os.environ)
+    environment["CLAUDE_CONFIG_DIR"] = claude_config_dir
+    return environment
+
+
+def _default_environment() -> dict[str, str]:
+    configured = load_config().auth.claude_config_dir
+    location = str(Path(configured).expanduser().resolve(strict=False))
+    return build_claude_environment(claude_config_dir=location)
+
+
+def _maybe_wrap_sandbox(
+    cmd: list[str],
+    cwd: str,
+    *,
+    environment: dict[str, str],
+) -> list[str]:
     """Wrap ``cmd`` with bwrap when ``coder_filesystem_isolation`` is on."""
     cfg = load_config()
     if not cfg.daemon.coder_filesystem_isolation:
@@ -111,15 +130,15 @@ def _maybe_wrap_sandbox(cmd: list[str], cwd: str) -> list[str]:
             "available; spawning coder unsandboxed"
         )
         return cmd
-    # Bind the daemon HOME so files written outside of claude_config_dir
+    # Bind the selected HOME so files written outside of claude_config_dir
     # (notably ~/.gitconfig from ``gh auth setup-git``) remain visible to
     # the sandboxed coder; without it non-interactive git push fails.
-    home = os.environ.get("HOME")
+    home = environment.get("HOME")
     additional_rw_dirs = [home] if home else None
     return build_bwrap_command(
         command=cmd,
         repo_path=cwd,
-        coder_config_dir=cfg.auth.claude_config_dir,
+        coder_config_dir=environment.get("CLAUDE_CONFIG_DIR"),
         gh_config_dir=cfg.auth.gh_config_dir,
         additional_rw_dirs=additional_rw_dirs,
     )
@@ -131,6 +150,7 @@ def run_claude(
     timeout: int = 600,
     model: str | None = None,
     reasoning_effort: str | None = None,
+    environment: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
     """Invoke the ``claude`` CLI with ``prompt`` inside ``cwd``.
 
@@ -149,19 +169,14 @@ def run_claude(
     cmd.append(prompt)
     logger.info("running claude CLI with prompt: %s", prompt[:80])
 
-    # Preserve any pre-existing NODE_OPTIONS (e.g. CA bundle, proxy flags set
-    # by the daemon environment) and append the memory cap rather than
-    # clobbering them.
-    memory_flag = "--max-old-space-size=4096"
-    existing_node_options = os.environ.get("NODE_OPTIONS", "").strip()
-    node_options = (
-        f"{existing_node_options} {memory_flag}".strip()
-        if existing_node_options
-        else memory_flag
+    env = (
+        dict(environment)
+        if environment is not None
+        else _default_environment()
     )
-    cfg = load_config()
+    env["NODE_OPTIONS"] = _build_node_options(env)
 
-    cmd = _maybe_wrap_sandbox(cmd, cwd)
+    cmd = _maybe_wrap_sandbox(cmd, cwd, environment=env)
     try:
         result = subprocess.run(
             cmd,
@@ -170,11 +185,7 @@ def run_claude(
             timeout=timeout,
             cwd=cwd,
             stdin=subprocess.DEVNULL,
-            env={
-                **os.environ,
-                "CLAUDE_CONFIG_DIR": cfg.auth.claude_config_dir,
-                "NODE_OPTIONS": node_options,
-            },
+            env=env,
         )
     except subprocess.TimeoutExpired:
         logger.error("claude CLI timed out after %ss", timeout)
@@ -201,6 +212,7 @@ def run_planned_pr(
     model: str | None = None,
     timeout: int = 900,
     reasoning_effort: str | None = None,
+    environment: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
     """Trigger a ``PLANNED PR`` run in ``repo_path``."""
     return run_claude(
@@ -209,6 +221,7 @@ def run_planned_pr(
         timeout=timeout,
         model=model,
         reasoning_effort=reasoning_effort,
+        environment=environment,
     )
 
 
@@ -228,6 +241,7 @@ def run_auto_pr(
     model: str | None = None,
     timeout: int = 900,
     reasoning_effort: str | None = None,
+    environment: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
     """Trigger an ``AUTO PR`` run in ``repo_path`` with task injected inline."""
     return run_claude(
@@ -236,6 +250,7 @@ def run_auto_pr(
         timeout=timeout,
         model=model,
         reasoning_effort=reasoning_effort,
+        environment=environment,
     )
 
 
@@ -269,6 +284,7 @@ def fix_review(
     timeout: int = 3600,
     extra_context: str | None = None,
     reasoning_effort: str | None = None,
+    environment: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
     """Trigger a ``FIX FEEDBACK`` run in ``repo_path``."""
     return run_claude(
@@ -277,6 +293,7 @@ def fix_review(
         timeout=timeout,
         model=model,
         reasoning_effort=reasoning_effort,
+        environment=environment,
     )
 
 
@@ -285,6 +302,7 @@ def diagnose_error(
     context: str,
     model: str | None = None,
     reasoning_effort: str | None = None,
+    environment: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
     """Ask the ``claude`` CLI to classify an infrastructure error.
 
@@ -297,12 +315,13 @@ def diagnose_error(
         timeout=120,
         model=model,
         reasoning_effort=reasoning_effort,
+        environment=environment,
     )
 
 
-def _build_node_options() -> str:
+def _build_node_options(environment: dict[str, str]) -> str:
     memory_flag = "--max-old-space-size=4096"
-    existing = os.environ.get("NODE_OPTIONS", "").strip()
+    existing = environment.get("NODE_OPTIONS", "").strip()
     return f"{existing} {memory_flag}".strip() if existing else memory_flag
 
 
@@ -319,6 +338,7 @@ async def run_claude_async(
     session_threshold: int | None = None,
     weekly_threshold: int | None = None,
     reasoning_effort: str | None = None,
+    environment: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
     cmd = [
         "claude",
@@ -333,12 +353,12 @@ async def run_claude_async(
         cmd.extend(["--append-system-prompt-file", system_prompt_file])
     cmd.append(prompt)
     logger.info("running claude CLI with prompt: %s", prompt[:80])
-    cfg = load_config()
-    env = {
-        **os.environ,
-        "CLAUDE_CONFIG_DIR": cfg.auth.claude_config_dir,
-        "NODE_OPTIONS": _build_node_options(),
-    }
+    env = (
+        dict(environment)
+        if environment is not None
+        else _default_environment()
+    )
+    env["NODE_OPTIONS"] = _build_node_options(env)
 
     # In-flight rate-limit monitoring: the caller provides a breach_dir
     # and run_id so the statusline hook can write a breach marker that the
@@ -351,7 +371,7 @@ async def run_claude_async(
         if weekly_threshold is not None:
             env["PIPELINE_WEEKLY_THRESHOLD"] = str(weekly_threshold)
 
-    cmd = _maybe_wrap_sandbox(cmd, cwd)
+    cmd = _maybe_wrap_sandbox(cmd, cwd, environment=env)
     try:
         managed = await launch_process(
             *cmd,
@@ -411,6 +431,7 @@ async def run_planned_pr_async(
     session_threshold: int | None = None,
     weekly_threshold: int | None = None,
     reasoning_effort: str | None = None,
+    environment: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
     kwargs: dict[str, object] = {
         "timeout": timeout,
@@ -421,6 +442,8 @@ async def run_planned_pr_async(
         "session_threshold": session_threshold,
         "weekly_threshold": weekly_threshold,
     }
+    if environment is not None:
+        kwargs["environment"] = environment
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
     if on_supervised_process_start is not None:
@@ -443,6 +466,7 @@ async def run_auto_pr_async(
     session_threshold: int | None = None,
     weekly_threshold: int | None = None,
     reasoning_effort: str | None = None,
+    environment: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
     """Trigger an ``AUTO PR`` run in ``repo_path`` with task injected inline."""
     kwargs: dict[str, object] = {
@@ -454,6 +478,8 @@ async def run_auto_pr_async(
         "session_threshold": session_threshold,
         "weekly_threshold": weekly_threshold,
     }
+    if environment is not None:
+        kwargs["environment"] = environment
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
     if on_supervised_process_start is not None:
@@ -477,6 +503,7 @@ async def fix_review_async(
     pr_id: str | None = None,
     task_file: str | None = None,
     reasoning_effort: str | None = None,
+    environment: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
     kwargs: dict[str, object] = {
         "timeout": timeout,
@@ -487,6 +514,8 @@ async def fix_review_async(
         "session_threshold": session_threshold,
         "weekly_threshold": weekly_threshold,
     }
+    if environment is not None:
+        kwargs["environment"] = environment
     if on_process_start is not None:
         kwargs["on_process_start"] = on_process_start
     if on_supervised_process_start is not None:
@@ -509,14 +538,18 @@ async def diagnose_error_async(
     on_process_start: Callable[[asyncio.subprocess.Process], None] | None = None,
     on_supervised_process_start: Callable[[SupervisedProcess], None] | None = None,
     reasoning_effort: str | None = None,
+    environment: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
+    kwargs: dict[str, object] = {
+        "timeout": 120,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "system_prompt_file": None,
+        "on_process_start": on_process_start,
+        "on_supervised_process_start": on_supervised_process_start,
+    }
+    if environment is not None:
+        kwargs["environment"] = environment
     return await run_claude_async(
-        build_diagnosis_prompt(repo_path, context),
-        repo_path,
-        timeout=120,
-        model=model,
-        reasoning_effort=reasoning_effort,
-        system_prompt_file=None,
-        on_process_start=on_process_start,
-        on_supervised_process_start=on_supervised_process_start,
+        build_diagnosis_prompt(repo_path, context), repo_path, **kwargs
     )
