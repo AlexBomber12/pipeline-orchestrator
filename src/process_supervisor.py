@@ -89,7 +89,13 @@ if broker_pid == 0:
     witness_pid = os.fork()
     if witness_pid == 0:
         os.close(ready_fd)
-        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        for terminal_signal in (
+            signal.SIGHUP,
+            signal.SIGINT,
+            signal.SIGQUIT,
+            signal.SIGTSTP,
+        ):
+            signal.signal(terminal_signal, signal.SIG_IGN)
         os.closerange(0, control_fd)
         os.closerange(control_fd + 1, max_fd)
         while os.read(control_fd, 1):

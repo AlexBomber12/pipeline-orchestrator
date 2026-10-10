@@ -151,6 +151,27 @@ if child_pid == 0:
 os.write(1, f"{child_pid}\n".encode("ascii"))
 """
 
+PTY_SIGNAL_HANDLERS = r"""
+import os
+import signal
+
+def report(_signum, _frame, marker):
+    os.write(1, marker)
+
+for target_signal, marker in (
+    (signal.SIGINT, b"interrupt"),
+    (signal.SIGQUIT, b"quit"),
+    (signal.SIGTSTP, b"suspend"),
+):
+    signal.signal(
+        target_signal,
+        lambda signum, frame, marker=marker: report(signum, frame, marker),
+    )
+os.write(1, b"ready")
+while True:
+    signal.pause()
+"""
+
 
 class ProcessPool:
     def __init__(self) -> None:
@@ -922,6 +943,38 @@ async def test_pty_eof_waits_for_descendants_and_read_cancellation_is_clean(
     assert cleanup.quiescent
     assert cleanup.term_sent
     await _wait_not_live(child_pid)
+    assert await channel.read() == b""
+    channel.close()
+
+
+@pytest.mark.asyncio
+async def test_pty_control_keys_do_not_destroy_cleanup_ownership(
+    process_pool: ProcessPool,
+) -> None:
+    managed, channel = await launch_pty_process(
+        sys.executable,
+        "-c",
+        PTY_SIGNAL_HANDLERS,
+    )
+    process_pool.supervised.append(
+        (managed, managed.identity.process_group_id)
+    )
+    await _read_pty_until(channel, b"ready")
+
+    for control_character, marker in (
+        (b"\x03", b"interrupt"),
+        (b"\x1c", b"quit"),
+        (b"\x1a", b"suspend"),
+    ):
+        await channel.write(control_character)
+        output, _ = await _read_pty_until(channel, marker)
+        assert marker in output
+        assert managed.process.returncode is None
+        assert managed._witness_is_live()
+
+    cleanup = await managed.cleanup(term_grace=0.5, kill_grace=0.5)
+    assert cleanup.quiescent
+    assert cleanup.term_sent
     assert await channel.read() == b""
     channel.close()
 
