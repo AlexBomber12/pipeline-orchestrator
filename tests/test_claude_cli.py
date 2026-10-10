@@ -131,6 +131,63 @@ def test_run_claude_appends_to_existing_node_options(
     )
 
 
+def test_run_claude_uses_copied_bound_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    supplied = {
+        "HOME": "/bound/home",
+        "CLAUDE_CONFIG_DIR": "/bound/a",
+        "NODE_OPTIONS": "--bound-option",
+        "MARKER": "caller",
+    }
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured["kwargs"] = kwargs
+        kwargs["env"]["MARKER"] = "launch"
+        return _FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setenv("HOME", "/ambient/home")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/ambient/b")
+    monkeypatch.setenv("NODE_OPTIONS", "--ambient-option")
+
+    run_claude("prompt", "/tmp", environment=supplied)
+
+    env = captured["kwargs"]["env"]
+    assert env["HOME"] == "/bound/home"
+    assert env["CLAUDE_CONFIG_DIR"] == "/bound/a"
+    assert env["NODE_OPTIONS"] == (
+        "--bound-option --max-old-space-size=4096"
+    )
+    assert supplied == {
+        "HOME": "/bound/home",
+        "CLAUDE_CONFIG_DIR": "/bound/a",
+        "NODE_OPTIONS": "--bound-option",
+        "MARKER": "caller",
+    }
+
+
+def test_sync_entry_points_forward_bound_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environments: list[dict[str, str] | None] = []
+    supplied = {"CLAUDE_CONFIG_DIR": "/bound/a"}
+
+    def fake_run_claude(*_args: object, **kwargs: Any) -> tuple[int, str, str]:
+        environments.append(kwargs.get("environment"))
+        return (0, "", "")
+
+    monkeypatch.setattr("src.claude_cli.run_claude", fake_run_claude)
+
+    run_planned_pr("/repo", environment=supplied)
+    run_auto_pr("/repo", "PR-1", "tasks/PR-1.md", "body", environment=supplied)
+    fix_review("/repo", environment=supplied)
+    diagnose_error("/repo", "failure", environment=supplied)
+
+    assert environments == [supplied, supplied, supplied, supplied]
+
+
 def test_run_claude_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         raise subprocess.TimeoutExpired(cmd=cmd, timeout=5)
@@ -564,6 +621,52 @@ async def test_run_claude_async_forwards_model_and_breach_env(
 
 
 @pytest.mark.asyncio
+async def test_run_claude_async_copies_bound_environment_before_additions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    fake_proc = _make_fake_proc(returncode=0)
+    supplied = {
+        "HOME": "/bound/home",
+        "CLAUDE_CONFIG_DIR": "/bound/a",
+        "NODE_OPTIONS": "--bound-option",
+        "MARKER": "caller",
+    }
+
+    async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
+        captured["kwargs"] = kwargs
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.setenv("HOME", "/ambient/home")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/ambient/b")
+    monkeypatch.setenv("NODE_OPTIONS", "--ambient-option")
+
+    await run_claude_async(
+        "prompt",
+        "/repo",
+        environment=supplied,
+        breach_dir="/breach",
+        breach_run_id="run-1",
+    )
+
+    env = captured["kwargs"]["env"]
+    assert env["HOME"] == "/bound/home"
+    assert env["CLAUDE_CONFIG_DIR"] == "/bound/a"
+    assert env["NODE_OPTIONS"] == (
+        "--bound-option --max-old-space-size=4096"
+    )
+    assert env["PIPELINE_BREACH_DIR"] == "/breach"
+    assert env["PIPELINE_RUN_ID"] == "run-1"
+    assert supplied == {
+        "HOME": "/bound/home",
+        "CLAUDE_CONFIG_DIR": "/bound/a",
+        "NODE_OPTIONS": "--bound-option",
+        "MARKER": "caller",
+    }
+
+
+@pytest.mark.asyncio
 async def test_run_claude_async_generates_breach_run_id_when_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -931,6 +1034,35 @@ async def test_run_planned_pr_async_forwards_on_process_start(
         captured["kwargs"]["on_supervised_process_start"]
         is supervised_callback
     )
+
+
+@pytest.mark.asyncio
+async def test_async_entry_points_forward_bound_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environments: list[dict[str, str] | None] = []
+    supplied = {"CLAUDE_CONFIG_DIR": "/bound/a"}
+
+    async def fake_run_claude_async(
+        *_args: object, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        environments.append(kwargs.get("environment"))
+        return (0, "", "")
+
+    monkeypatch.setattr("src.claude_cli.run_claude_async", fake_run_claude_async)
+
+    await run_planned_pr_async("/repo", environment=supplied)
+    await run_auto_pr_async(
+        "/repo",
+        "PR-1",
+        "tasks/PR-1.md",
+        "body",
+        environment=supplied,
+    )
+    await fix_review_async("/repo", environment=supplied)
+    await diagnose_error_async("/repo", "failure", environment=supplied)
+
+    assert environments == [supplied, supplied, supplied, supplied]
 
 
 @pytest.mark.asyncio

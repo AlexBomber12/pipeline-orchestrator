@@ -273,6 +273,47 @@ def test_claude_spawn_mounts_home_dir_for_gitconfig(
     assert cmd[home_idx + 1] == "/data/auth"
 
 
+def test_claude_spawn_mounts_bound_credential_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    supplied = {
+        "HOME": "/bound/home",
+        "CLAUDE_CONFIG_DIR": "/bound/claude-a",
+    }
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> MagicMock:
+        captured["cmd"] = cmd
+        captured["env"] = kwargs["env"]
+        result = MagicMock()
+        result.stdout = ""
+        result.stderr = ""
+        result.returncode = 0
+        return result
+
+    monkeypatch.setenv("HOME", "/ambient/home")
+    monkeypatch.setattr(claude_cli, "load_config", lambda: _config(isolation=True))
+    _patch_bwrap(monkeypatch, available=True)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    claude_cli.run_claude(
+        "prompt",
+        "/data/repos/demo",
+        environment=supplied,
+    )
+
+    cmd = captured["cmd"]
+    assert "/bound/claude-a" in cmd
+    assert "/data/auth/claude" not in cmd
+    assert "/bound/home" in cmd
+    assert "/ambient/home" not in cmd
+    assert captured["env"]["CLAUDE_CONFIG_DIR"] == "/bound/claude-a"
+    assert supplied == {
+        "HOME": "/bound/home",
+        "CLAUDE_CONFIG_DIR": "/bound/claude-a",
+    }
+
+
 @pytest.mark.asyncio
 async def test_codex_async_spawn_mounts_home_dir_for_gitconfig(
     monkeypatch: pytest.MonkeyPatch,

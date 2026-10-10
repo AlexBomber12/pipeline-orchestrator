@@ -176,6 +176,26 @@ class ClaudePlugin:
             or self.model_setting.default_value
         )
 
+    def browser_login_credential_location(self, *, config: AppConfig) -> str:
+        """Return the normalized Claude auth directory without side effects."""
+        return str(
+            Path(config.auth.claude_config_dir)
+            .expanduser()
+            .resolve(strict=False)
+        )
+
+    def build_credential_environment(
+        self,
+        *,
+        config: AppConfig,
+        credential_location: str,
+    ) -> dict[str, str]:
+        """Return a fresh environment bound to one credential location."""
+        del config
+        return claude_cli.build_claude_environment(
+            claude_config_dir=credential_location
+        )
+
     def _resolve_reasoning_effort(
         self, daemon_config: "DaemonConfig"
     ) -> str | None:
@@ -197,22 +217,32 @@ class ClaudePlugin:
         self, *, config: AppConfig, config_path: str
     ) -> tuple[str, str]:
         return (
-            config.auth.claude_config_dir,
+            self.browser_login_credential_location(config=config),
             str(Path(config_path).absolute().parent),
         )
 
     async def get_model_catalog(
-        self, *, config: AppConfig, config_path: str
+        self,
+        *,
+        config: AppConfig,
+        config_path: str,
+        environment: dict[str, str] | None = None,
     ) -> ModelCatalog:
         """Discover Claude metadata in the configured CLI auth context."""
         _credential_directory, working_directory = self.model_catalog_cache_key(
             config=config,
             config_path=config_path,
         )
-        env = {
-            **os.environ,
-            "CLAUDE_CONFIG_DIR": config.auth.claude_config_dir,
-        }
+        env = (
+            dict(environment)
+            if environment is not None
+            else self.build_credential_environment(
+                config=config,
+                credential_location=self.browser_login_credential_location(
+                    config=config
+                ),
+            )
+        )
         try:
             models = await self._discover(env=env, cwd=working_directory)
         except ClaudeModelDiscoveryUnavailable as exc:
@@ -301,6 +331,7 @@ class ClaudePlugin:
         on_supervised_process_start: Callable[[SupervisedProcess], None]
         | None = None,
         reasoning_effort: str | None = None,
+        environment: dict[str, str] | None = None,
         **_kwargs: Any,
     ) -> tuple[int, str, str]:
         kwargs: dict[str, Any] = {
@@ -312,6 +343,8 @@ class ClaudePlugin:
         }
         if reasoning_effort:
             kwargs[_REASONING_EFFORT_SETTING] = reasoning_effort
+        if environment is not None:
+            kwargs["environment"] = environment
         return await claude_cli.run_claude_async(
             prompt,
             repo_path,
@@ -324,13 +357,23 @@ class ClaudePlugin:
             capabilities=self.auth_capabilities,
         )
 
-    def check_auth(self, *, config_path: str = CONFIG_PATH) -> dict[str, Any]:
+    def check_auth(
+        self,
+        *,
+        config_path: str = CONFIG_PATH,
+        environment: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         """Report local Claude authentication without testing service access."""
-        cfg = load_config(config_path)
-        env = {
-            **os.environ,
-            "CLAUDE_CONFIG_DIR": cfg.auth.claude_config_dir,
-        }
+        if environment is not None:
+            env = dict(environment)
+        else:
+            cfg = load_config(config_path)
+            env = self.build_credential_environment(
+                config=cfg,
+                credential_location=self.browser_login_credential_location(
+                    config=cfg
+                ),
+            )
         version_rc, version_stdout, version_stderr = _run_auth_command(
             ["claude", "--version"], env=env
         )
@@ -466,7 +509,10 @@ class ClaudePlugin:
         assert isinstance(cfg, AppConfig)
         credentials_path = kwargs.pop(
             "credentials_path",
-            str(Path(cfg.auth.claude_config_dir) / ".credentials.json"),
+            str(
+                Path(self.browser_login_credential_location(config=cfg))
+                / ".credentials.json"
+            ),
         )
         user_agent = kwargs.pop("user_agent", cfg.daemon.usage_api_user_agent)
         beta_header = kwargs.pop("beta_header", cfg.daemon.usage_api_beta_header)
@@ -505,6 +551,7 @@ class ClaudePlugin:
         on_supervised_process_start: Callable[[SupervisedProcess], None]
         | None = None,
         reasoning_effort: str | None = None,
+        environment: dict[str, str] | None = None,
         **_kwargs: Any,
     ) -> tuple[int, str, str]:
         kwargs: dict[str, Any] = {
@@ -514,6 +561,8 @@ class ClaudePlugin:
         }
         if reasoning_effort:
             kwargs[_REASONING_EFFORT_SETTING] = reasoning_effort
+        if environment is not None:
+            kwargs["environment"] = environment
         return await claude_cli.diagnose_error_async(
             repo_path,
             context,

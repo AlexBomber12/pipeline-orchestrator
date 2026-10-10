@@ -584,7 +584,11 @@ async def test_async_adapter_preserves_real_exit_and_output(
         "_maybe_wrap_sandbox",
         lambda cmd, _cwd, **_kwargs: cmd,
     )
-    monkeypatch.setattr(claude_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
+    monkeypatch.setattr(
+        claude_cli,
+        "_maybe_wrap_sandbox",
+        lambda cmd, _cwd, **_kwargs: cmd,
+    )
     raw_processes: list[asyncio.subprocess.Process] = []
     managed_processes: list[SupervisedProcess] = []
 
@@ -618,7 +622,11 @@ async def test_async_adapter_leader_exit_does_not_wait_for_retained_pipe(
         "_maybe_wrap_sandbox",
         lambda cmd, _cwd, **_kwargs: cmd,
     )
-    monkeypatch.setattr(claude_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
+    monkeypatch.setattr(
+        claude_cli,
+        "_maybe_wrap_sandbox",
+        lambda cmd, _cwd, **_kwargs: cmd,
+    )
 
     started = time.monotonic()
     result = await _run_fake_adapter(provider, tmp_path, timeout=10)
@@ -647,7 +655,11 @@ async def test_async_adapter_timeout_cleans_descendants(
         "_maybe_wrap_sandbox",
         lambda cmd, _cwd, **_kwargs: cmd,
     )
-    monkeypatch.setattr(claude_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
+    monkeypatch.setattr(
+        claude_cli,
+        "_maybe_wrap_sandbox",
+        lambda cmd, _cwd, **_kwargs: cmd,
+    )
 
     result = await _run_fake_adapter(provider, tmp_path, timeout=0.05)
     pids = await _read_fake_pids(pid_file)
@@ -671,7 +683,11 @@ async def test_async_adapter_cancellation_and_callback_failure_clean_descendants
         "_maybe_wrap_sandbox",
         lambda cmd, _cwd, **_kwargs: cmd,
     )
-    monkeypatch.setattr(claude_cli, "_maybe_wrap_sandbox", lambda cmd, _cwd: cmd)
+    monkeypatch.setattr(
+        claude_cli,
+        "_maybe_wrap_sandbox",
+        lambda cmd, _cwd, **_kwargs: cmd,
+    )
 
     cancel_pids = tmp_path / f"{provider}-cancel.pids"
     monkeypatch.setenv("FAKE_CODER_PIDS", str(cancel_pids))
