@@ -276,6 +276,57 @@ def resolve_device_login_credential_location(
     return location
 
 
+def _resolve_browser_login_credential_location(
+    plugin: object,
+    *,
+    config: "AppConfig",
+) -> str | None:
+    """Return a browser credential context without activating browser login."""
+    resolver = getattr(plugin, "browser_login_credential_location", None)
+    if resolver is None:
+        return None
+    if not callable(resolver):
+        raise ValueError("invalid coder credential locator")
+    location = resolver(config=config)
+    if not isinstance(location, str) or not location:
+        raise ValueError("invalid coder credential location")
+    environment_builder = getattr(plugin, "build_credential_environment", None)
+    if not callable(environment_builder):
+        raise ValueError(
+            "browser credential context is missing a credential environment "
+            "builder"
+        )
+    return location
+
+
+def resolve_coder_credential_location(
+    plugin: object,
+    *,
+    config: "AppConfig",
+) -> str | None:
+    """Return a plugin's shared credential coordination location, if any.
+
+    Browser credential contexts are discovered from dormant provider hooks;
+    resolving one neither advertises nor launches an interactive login. Device
+    contexts retain the existing device-login participation contract.
+    """
+    device_location = resolve_device_login_credential_location(
+        plugin,
+        config=config,
+    )
+    browser_location = _resolve_browser_login_credential_location(
+        plugin,
+        config=config,
+    )
+    if (
+        device_location is not None
+        and browser_location is not None
+        and device_location != browser_location
+    ):
+        raise ValueError("coder credential contexts use conflicting locations")
+    return browser_location if browser_location is not None else device_location
+
+
 def _optional_bool(value: object, field: str) -> bool | None:
     if value is None or isinstance(value, bool):
         return value
