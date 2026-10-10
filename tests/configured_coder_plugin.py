@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import time
+from pathlib import Path
 from typing import Any
 
 from src.coder_registry import ModelCatalog, ModelMetadata, ModelSetting
@@ -145,6 +147,34 @@ class SlowAuthTestPlugin(ConfiguredTestPlugin):
         return {"status": "ok", "detail": "too late"}
 
 
+class BoundEnvironmentAuthTestPlugin(ConfiguredTestPlugin):
+    """Validate explicit auth context without exposing its values."""
+
+    display_name = "Bound Environment Test Coder"
+
+    def check_auth(
+        self,
+        *,
+        config_path: str,
+        environment: dict[str, str],
+    ) -> dict[str, str]:
+        process_location = os.environ.get("PIPELINE_TEST_CREDENTIAL_LOCATION")
+        supplied_location = environment.get(
+            "PIPELINE_TEST_CREDENTIAL_LOCATION"
+        )
+        configured_location = Path(config_path).read_text().strip()
+        environment["PIPELINE_TEST_CREDENTIAL_LOCATION"] = "mutated"
+        if (
+            process_location == "location-a"
+            and supplied_location == "location-a"
+            and configured_location == "location-b"
+            and os.environ.get("PIPELINE_TEST_CREDENTIAL_LOCATION")
+            == "location-a"
+        ):
+            return {"status": "ok", "detail": "bound environment preserved"}
+        return {"status": "error", "detail": "bound environment mismatch"}
+
+
 class MissingMetadataPlugin(ConfiguredTestPlugin):
     display_name = ""
 
@@ -187,6 +217,10 @@ def build_raising_auth_plugin() -> RaisingAuthTestPlugin:
 
 def build_slow_auth_plugin() -> SlowAuthTestPlugin:
     return SlowAuthTestPlugin()
+
+
+def build_bound_environment_auth_plugin() -> BoundEnvironmentAuthTestPlugin:
+    return BoundEnvironmentAuthTestPlugin()
 
 
 def build_mismatched_plugin() -> ConfiguredTestPlugin:
