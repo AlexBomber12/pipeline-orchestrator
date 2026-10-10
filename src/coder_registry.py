@@ -78,17 +78,15 @@ BROWSER_LOGIN_STATES = DEVICE_LOGIN_STATES | frozenset(
 BROWSER_LOGIN_FAILURE_REASONS = (
     DEVICE_LOGIN_FAILURE_REASONS - {"device_login_disabled"}
 ) | frozenset({"unsupported_cli_version", "invalid_code"})
-_BROWSER_PROCESS_FAILURE_REASONS = frozenset(
-    {
-        "auth_status_unavailable",
-        "startup_failed",
-        "malformed_output",
-        "provider_expired",
-        "application_timeout",
-        "process_failed",
-        "invalid_code",
-    }
-)
+_BROWSER_PROCESS_FAILURE_STATES = {
+    "auth_status_unavailable": "failed",
+    "startup_failed": "failed",
+    "malformed_output": "failed",
+    "provider_expired": "expired",
+    "application_timeout": "timed_out",
+    "process_failed": "failed",
+    "invalid_code": "failed",
+}
 _SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,128}")
 _DEVICE_CODE_PATTERN = re.compile(r"[A-Z0-9-]{4,64}")
 _BROWSER_WAITING_STATES = frozenset({"waiting_for_user", "waiting_for_code"})
@@ -777,8 +775,9 @@ def parse_coder_browser_login_payload(
         raise TypeError("invalid browser login cleanup failure")
     if state in _BROWSER_CLEAN_TERMINAL_STATES and cleanup_confirmed is not True:
         raise TypeError("browser login terminal cleanup is unconfirmed")
-    if failure_reason in _BROWSER_PROCESS_FAILURE_REASONS and (
-        state != "failed"
+    process_failure_state = _BROWSER_PROCESS_FAILURE_STATES.get(failure_reason)
+    if process_failure_state is not None and (
+        state != process_failure_state
         or session_id is None
         or cleanup_confirmed is not True
     ):

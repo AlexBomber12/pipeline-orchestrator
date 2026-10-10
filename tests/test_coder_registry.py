@@ -1116,6 +1116,28 @@ def test_browser_login_contract_requires_process_failure_cleanup() -> None:
 
 
 @pytest.mark.parametrize(
+    ("state", "failure_reason"),
+    [("expired", "provider_expired"), ("timed_out", "application_timeout")],
+)
+def test_browser_login_contract_preserves_process_terminal_state(
+    state: str,
+    failure_reason: str,
+) -> None:
+    payload = _browser_login_payload(state=state)
+    payload.update(
+        authorization_url=None,
+        application_deadline=None,
+        cleanup_confirmed=True,
+        failure_reason=failure_reason,
+    )
+
+    parsed = parse_coder_browser_login_payload(payload)
+
+    assert parsed["state"] == state
+    assert parsed["failure_reason"] == failure_reason
+
+
+@pytest.mark.parametrize(
     "mutate",
     [
         lambda payload: payload.update(state="cancelled", cleanup_confirmed=True),
