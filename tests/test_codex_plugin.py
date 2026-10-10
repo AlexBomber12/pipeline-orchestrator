@@ -116,6 +116,37 @@ async def test_codex_plugin_adapts_discovery_and_auth_context(
     assert "OPENAI_API_KEY" not in env
 
 
+@pytest.mark.asyncio
+async def test_codex_catalog_copies_bound_environment_and_removes_api_key(
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def discover(**kwargs: object) -> tuple[CodexModel, ...]:
+        captured.update(kwargs)
+        return ()
+
+    environment = {
+        "CODEX_HOME": "/reserved/codex",
+        "OPENAI_API_KEY": "must-not-be-used",
+        "BOUND": "yes",
+    }
+    original = dict(environment)
+
+    await CodexPlugin(discover=discover).get_model_catalog(
+        config=AppConfig(),
+        config_path=str(tmp_path / "config.yml"),
+        environment=environment,
+    )
+
+    assert captured["env"] == {
+        "CODEX_HOME": "/reserved/codex",
+        "BOUND": "yes",
+    }
+    assert captured["env"] is not environment
+    assert environment == original
+
+
 @pytest.mark.parametrize(
     "error",
     [

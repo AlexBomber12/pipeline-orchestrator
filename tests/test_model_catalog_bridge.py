@@ -188,8 +188,11 @@ async def test_loader_round_trips_catalog_through_daemon(
     reservations = CoderCredentialReservations()
     monkeypatch.delenv("CODEX_HOME", raising=False)
 
-    async def discover(**_kwargs: object) -> tuple[CodexModel, ...]:
+    async def discover(**kwargs: object) -> tuple[CodexModel, ...]:
         assert reservations.reserve_login(str(codex_home / ".codex")) is False
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        assert environment["CODEX_HOME"] == str(codex_home / ".codex")
         return (
             CodexModel(
                 "invoke-me",
@@ -348,7 +351,10 @@ async def test_loader_round_trips_discovered_claude_catalog_through_daemon(
     )
     discovery_calls: list[dict[str, object]] = []
 
+    reservations = CoderCredentialReservations()
+
     async def discover(**kwargs: object) -> tuple[ModelMetadata, ...]:
+        assert reservations.reserve_login(str(claude_config_dir)) is False
         discovery_calls.append(kwargs)
         return advertised
 
@@ -367,6 +373,7 @@ async def test_loader_round_trips_discovered_claude_catalog_through_daemon(
             redis,
             registry,
             config_path=str(config_path),
+            credential_reservations=reservations,
         )
     )
     loader = bridge.DaemonModelCatalogLoader(
@@ -396,6 +403,61 @@ async def test_loader_round_trips_discovered_claude_catalog_through_daemon(
     env = discovery_calls[0]["env"]
     assert isinstance(env, dict)
     assert env["CLAUDE_CONFIG_DIR"] == str(claude_config_dir)
+    assert reservations.reserve_login(str(claude_config_dir)) is True
+    reservations.release_login(str(claude_config_dir))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["auth", "catalog"])
+async def test_claude_readers_are_blocked_by_matching_login_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    redis = _BridgeRedis()
+    registry = CoderRegistry()
+
+    async def must_not_discover(**_kwargs: object) -> object:
+        raise AssertionError("catalog must not run during matching login")
+
+    plugin = ClaudePlugin(discover=must_not_discover)
+    reference = "src.coders.claude:ClaudePlugin"
+    registry.register(plugin, reference=reference)
+    claude_config_dir = tmp_path / "claude-auth"
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        f"auth:\n  claude_config_dir: {claude_config_dir}\n",
+        encoding="utf-8",
+    )
+    reservations = CoderCredentialReservations()
+    assert reservations.reserve_login(str(claude_config_dir)) is True
+
+    async def must_not_probe(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("auth must not run during matching login")
+
+    monkeypatch.setattr(bridge, "isolated_auth_probe", must_not_probe)
+    request_id = "9" * 32
+    await bridge.handle_model_catalog_request(
+        redis,
+        registry,
+        json.dumps(
+            {
+                "request_id": request_id,
+                "plugin": "claude",
+                "operation": operation,
+                "reference": reference,
+                "expires_at": time.time() + 10,
+            }
+        ),
+        config_path=str(config_path),
+        credential_reservations=reservations,
+    )
+
+    response = json.loads(redis.values[bridge._response_key(request_id)])
+    if operation == "auth":
+        assert response["auth"]["failure_reason"] == "probe_unavailable"
+    else:
+        assert response == {"ok": False, "error": "catalog unavailable"}
 
 
 @pytest.mark.asyncio
@@ -506,6 +568,51 @@ async def test_daemon_reader_rejects_invalid_credential_location(
 
     response = json.loads(redis.values[bridge._response_key(request_id)])
     assert response == {"ok": False, "error": "catalog unavailable"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["auth", "catalog"])
+async def test_daemon_reader_rejects_invalid_browser_credential_location(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    redis = _BridgeRedis()
+    registry = CoderRegistry()
+    plugin = ClaudePlugin(discover=lambda **_kwargs: None)
+    reference = "src.coders.claude:ClaudePlugin"
+    registry.register(plugin, reference=reference)
+    monkeypatch.setattr(
+        plugin,
+        "browser_login_credential_location",
+        lambda **_kwargs: "",
+    )
+
+    async def must_not_probe(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("provider must not run with an invalid context")
+
+    monkeypatch.setattr(bridge, "isolated_auth_probe", must_not_probe)
+    request_id = "8" * 32
+    await bridge.handle_model_catalog_request(
+        redis,
+        registry,
+        json.dumps(
+            {
+                "request_id": request_id,
+                "plugin": "claude",
+                "operation": operation,
+                "reference": reference,
+                "expires_at": time.time() + 10,
+            }
+        ),
+        config_path=str(tmp_path / "config.yml"),
+        credential_reservations=CoderCredentialReservations(),
+    )
+
+    assert json.loads(redis.values[bridge._response_key(request_id)]) == {
+        "ok": False,
+        "error": "catalog unavailable",
+    }
 
 
 @pytest.mark.asyncio
@@ -939,7 +1046,7 @@ async def test_daemon_login_handler_rejects_unavailable_or_invalid_requests() ->
 
 
 @pytest.mark.asyncio
-async def test_configured_catalog_worker_response_redacts_failures(
+async def test_configured_worker_redacts_failures_and_rejects_location_drift(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Plugin:
@@ -971,7 +1078,10 @@ async def test_configured_catalog_worker_response_redacts_failures(
 
     plugin = Plugin()
     monkeypatch.setattr("src.coders._load_plugin", lambda *_args: plugin)
-    monkeypatch.setattr(bridge, "load_config", lambda _path: AppConfig())
+    config = AppConfig.model_validate(
+        {"auth": {"codex_home_dir": "/configured/location-b"}}
+    )
+    monkeypatch.setattr(bridge, "load_config", lambda _path: config)
     response = await bridge._configured_catalog_worker_response(
         "third", "module:factory", "/cfg"
     )
@@ -983,6 +1093,7 @@ async def test_configured_catalog_worker_response_redacts_failures(
         "module:factory",
         "/cfg",
         "/reserved/credential/location",
+        {"CODEX_HOME": "/reserved/credential/location"},
     ) == {"ok": False, "error": "catalog unavailable"}
     assert plugin.calls == 1
 
@@ -995,6 +1106,57 @@ async def test_configured_catalog_worker_response_redacts_failures(
     ) == {"ok": False, "error": "catalog unavailable"}
 
 
+@pytest.mark.asyncio
+async def test_bound_configured_catalog_rejects_incompatible_plugin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    class Plugin:
+        def create_device_login(self, *, config_path: str) -> object:
+            del config_path
+            return object()
+
+        def device_login_credential_location(self, *, config: AppConfig) -> str:
+            return config.auth.codex_home_dir
+
+        def build_credential_environment(
+            self,
+            *,
+            config: AppConfig,
+            credential_location: str,
+        ) -> dict[str, str]:
+            del config
+            return {"CODEX_HOME": credential_location}
+
+        async def get_model_catalog(
+            self, *, config: AppConfig, config_path: str
+        ) -> ModelCatalog:
+            nonlocal calls
+            del config, config_path
+            calls += 1
+            return ModelCatalog((), "configured", "must not run")
+
+    config = AppConfig.model_validate(
+        {"auth": {"codex_home_dir": "/reserved"}}
+    )
+    monkeypatch.setattr("src.coders._load_plugin", lambda *_args: Plugin())
+    monkeypatch.setattr(bridge, "load_config", lambda _path: config)
+    sensitive = "sensitive-environment-value"
+
+    response = await bridge._configured_catalog_worker_response(
+        "third",
+        "module:factory",
+        "/cfg",
+        "/reserved",
+        {"CODEX_HOME": "/reserved", "SECRET": sensitive},
+    )
+
+    assert response == {"ok": False, "error": "catalog unavailable"}
+    assert calls == 0
+    assert sensitive not in str(response)
+
+
 def test_configured_catalog_worker_main_validates_and_prints(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1002,14 +1164,33 @@ def test_configured_catalog_worker_main_validates_and_prints(
     monkeypatch.setattr(bridge.sys, "argv", ["catalog-worker"])
     with pytest.raises(SystemExit, match="2"):
         bridge._configured_catalog_worker_main()
+    monkeypatch.setattr(
+        bridge.sys,
+        "argv",
+        [
+            "catalog-worker",
+            "--configured-worker",
+            "third",
+            "module:factory",
+            "/cfg",
+            bridge.EXPLICIT_ENVIRONMENT_ARG,
+            "/misordered/location",
+        ],
+    )
+    with pytest.raises(SystemExit, match="2"):
+        bridge._configured_catalog_worker_main()
 
-    async def response(*_args: object, **_kwargs: object) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def response(*_args: object, **kwargs: object) -> None:
+        calls.append(kwargs)
         print(
             bridge._WORKER_RESULT_PREFIX
             + '{"ok":false,"error":"unavailable"}'
         )
 
     monkeypatch.setattr(bridge, "_run_configured_catalog_worker", response)
+    monkeypatch.setenv("BOUND_HOME", "/credentials/a")
     monkeypatch.setattr(
         bridge.sys,
         "argv",
@@ -1026,6 +1207,24 @@ def test_configured_catalog_worker_main_validates_and_prints(
         bridge._WORKER_RESULT_PREFIX
         + '{"ok":false,"error":"unavailable"}'
     )
+    assert calls == [{"environment": None, "monitor_parent": True}]
+
+    monkeypatch.setattr(
+        bridge.sys,
+        "argv",
+        [
+            "catalog-worker",
+            "--configured-worker",
+            "third",
+            "module:factory",
+            "/cfg",
+            bridge.EXPLICIT_ENVIRONMENT_ARG,
+        ],
+    )
+    bridge._configured_catalog_worker_main()
+    bound_environment = calls[1]["environment"]
+    assert isinstance(bound_environment, dict)
+    assert bound_environment["BOUND_HOME"] == "/credentials/a"
 
 
 @pytest.mark.asyncio
@@ -1429,7 +1628,10 @@ async def test_isolated_configured_catalog_parses_worker_result(
         "module:factory",
         config_path="/cfg",
         credential_location="/reserved/credentials",
-        env={"CODEX_HOME": "/reserved/credentials"},
+        env={
+            "CODEX_HOME": "/reserved/credentials",
+            "SECRET": "sensitive-environment-value",
+        },
     )
 
     assert result == catalog
@@ -1442,16 +1644,49 @@ async def test_isolated_configured_catalog_parses_worker_result(
         "module:factory",
         "/cfg",
         "/reserved/credentials",
+        bridge.EXPLICIT_ENVIRONMENT_ARG,
     )
     assert captured["kwargs"] == {
         "stdin": bridge.asyncio.subprocess.PIPE,
         "stdout": bridge.asyncio.subprocess.PIPE,
         "stderr": bridge.asyncio.subprocess.DEVNULL,
         "limit": bridge._CONFIGURED_WORKER_OUTPUT_BYTES + 1,
-        "env": {"CODEX_HOME": "/reserved/credentials"},
+        "env": {
+            "CODEX_HOME": "/reserved/credentials",
+            "SECRET": "sensitive-environment-value",
+        },
     }
+    assert "sensitive-environment-value" not in " ".join(captured["args"])
     assert process.reaped is True
     assert managed.cleanup_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_environment_crosses_real_configured_worker_boundary(
+    tmp_path: Path,
+) -> None:
+    credential_location = tmp_path / "claude-auth"
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        f"auth:\n  claude_config_dir: {credential_location}\n",
+        encoding="utf-8",
+    )
+    environment = {"CLAUDE_CONFIG_DIR": str(credential_location)}
+    original = dict(environment)
+
+    catalog = await bridge._isolated_configured_catalog(
+        "third",
+        (
+            "tests.configured_coder_plugin:"
+            "build_bound_environment_catalog_plugin"
+        ),
+        config_path=str(config_path),
+        credential_location=str(credential_location),
+        env=environment,
+    )
+
+    assert catalog.models[0].invocation_id == "bound-environment"
+    assert environment == original
 
 
 @pytest.mark.asyncio

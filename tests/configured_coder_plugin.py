@@ -34,9 +34,13 @@ class ConfiguredTestPlugin(ClaudePlugin):
         return {"status": "ok", "detail": "configured test plugin auth"}
 
     async def get_model_catalog(
-        self, *, config: AppConfig, config_path: str
+        self,
+        *,
+        config: AppConfig,
+        config_path: str,
+        environment: dict[str, str] | None = None,
     ) -> ModelCatalog:
-        del config, config_path
+        del config, config_path, environment
         return ModelCatalog(
             tuple(ModelMetadata(model, model) for model in self.models),
             "static_compatibility",
@@ -175,6 +179,36 @@ class BoundEnvironmentAuthTestPlugin(ConfiguredTestPlugin):
         return {"status": "error", "detail": "bound environment mismatch"}
 
 
+class BoundEnvironmentCatalogTestPlugin(ConfiguredTestPlugin):
+    """Validate that the worker explicitly forwards its credential context."""
+
+    async def get_model_catalog(
+        self,
+        *,
+        config: AppConfig,
+        config_path: str,
+        environment: dict[str, str],
+    ) -> ModelCatalog:
+        del config_path
+        expected = str(
+            Path(config.auth.claude_config_dir).expanduser().resolve(strict=False)
+        )
+        process_location = os.environ.get("CLAUDE_CONFIG_DIR")
+        supplied_location = environment.get("CLAUDE_CONFIG_DIR")
+        environment["CLAUDE_CONFIG_DIR"] = "mutated"
+        if (
+            process_location != expected
+            or supplied_location != expected
+            or os.environ.get("CLAUDE_CONFIG_DIR") != expected
+        ):
+            raise RuntimeError("bound environment mismatch")
+        return ModelCatalog(
+            (ModelMetadata("bound-environment", "Bound Environment"),),
+            "configured",
+            "Bound configured catalog.",
+        )
+
+
 class MissingMetadataPlugin(ConfiguredTestPlugin):
     display_name = ""
 
@@ -221,6 +255,10 @@ def build_slow_auth_plugin() -> SlowAuthTestPlugin:
 
 def build_bound_environment_auth_plugin() -> BoundEnvironmentAuthTestPlugin:
     return BoundEnvironmentAuthTestPlugin()
+
+
+def build_bound_environment_catalog_plugin() -> BoundEnvironmentCatalogTestPlugin:
+    return BoundEnvironmentCatalogTestPlugin()
 
 
 def build_mismatched_plugin() -> ConfiguredTestPlugin:
