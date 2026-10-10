@@ -1100,6 +1100,46 @@ def test_browser_login_contract_requires_terminal_cleanup(state: str) -> None:
         parse_coder_browser_login_payload(payload)
 
 
+def test_browser_login_contract_requires_process_failure_cleanup() -> None:
+    payload = _browser_login_payload(state="failed")
+    payload.update(
+        authorization_url=None,
+        cleanup_confirmed=None,
+        failure_reason="process_failed",
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="^browser login failure cleanup is unconfirmed$",
+    ):
+        parse_coder_browser_login_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload.update(state="cancelled", cleanup_confirmed=True),
+        lambda payload: payload.update(session_id=None, cleanup_confirmed=True),
+    ],
+)
+def test_browser_login_contract_binds_process_failure_to_session(
+    mutate: Any,
+) -> None:
+    payload = _browser_login_payload(state="failed")
+    payload.update(
+        authorization_url=None,
+        cleanup_confirmed=True,
+        failure_reason="process_failed",
+    )
+    mutate(payload)
+
+    with pytest.raises(
+        TypeError,
+        match="^invalid browser login process failure evidence$",
+    ):
+        parse_coder_browser_login_payload(payload)
+
+
 @pytest.mark.parametrize(
     "state",
     ["starting", "waiting_for_user", "waiting_for_code", "authorizing", "canceling"],

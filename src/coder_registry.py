@@ -764,6 +764,12 @@ def parse_coder_browser_login_payload(
         raise TypeError("invalid browser login cleanup failure")
     if state in _BROWSER_CLEAN_TERMINAL_STATES and cleanup_confirmed is not True:
         raise TypeError("browser login terminal cleanup is unconfirmed")
+    if state == "failed" and session_id is not None and cleanup_confirmed is not True:
+        raise TypeError("browser login failure cleanup is unconfirmed")
+    if failure_reason == "process_failed" and (
+        state != "failed" or session_id is None
+    ):
+        raise TypeError("invalid browser login process failure evidence")
     if state == "succeeded" and (
         cleanup_confirmed is not True
         or auth_status is None
