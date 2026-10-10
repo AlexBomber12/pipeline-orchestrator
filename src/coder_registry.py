@@ -791,11 +791,14 @@ def parse_coder_browser_login_payload(
         ) or state == "cleanup_failed"
         if not startup_evidence_valid:
             raise TypeError("invalid browser login startup failure evidence")
+    if failure_reason == "cancellation_failed" and state != "cleanup_failed":
+        raise TypeError("invalid browser login cancellation failure state")
     if state == "succeeded" and (
         cleanup_confirmed is not True
         or auth_status is None
         or auth_status["status"] != "ok"
         or auth_status["saved_credentials_present"] is not True
+        or auth_status["failure_reason"] is not None
     ):
         raise TypeError("invalid browser login success evidence")
     return {

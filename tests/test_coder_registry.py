@@ -1213,6 +1213,21 @@ def test_browser_login_contract_rejects_unconfirmed_owned_startup_failure() -> N
         parse_coder_browser_login_payload(payload)
 
 
+def test_browser_login_contract_binds_cancellation_failure_to_cleanup() -> None:
+    payload = _browser_login_payload(state="failed")
+    payload.update(
+        authorization_url=None,
+        cleanup_confirmed=None,
+        failure_reason="cancellation_failed",
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="^invalid browser login cancellation failure state$",
+    ):
+        parse_coder_browser_login_payload(payload)
+
+
 @pytest.mark.parametrize("state", ["waiting_for_user", "succeeded"])
 def test_browser_login_contract_rejects_failure_reason_for_nonfailure_state(
     state: str,
@@ -1256,6 +1271,7 @@ def test_browser_login_contract_requires_unknown_active_cleanup(state: str) -> N
         lambda payload: payload["auth_status"].update(saved_credentials_present=False),
         lambda payload: payload["auth_status"].update(saved_credentials_present=None),
         lambda payload: payload["auth_status"].update(status="error"),
+        lambda payload: payload["auth_status"].update(failure_reason="probe_timeout"),
     ],
 )
 def test_browser_login_contract_rejects_unsupported_success_claims(
