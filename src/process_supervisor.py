@@ -23,6 +23,7 @@ import select
 import signal
 import socket
 import sys
+import termios
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable
@@ -44,15 +45,18 @@ _OUTPUT_DRAIN_TIMEOUT_SECONDS = 1.0
 _OUTPUT_CANCEL_TIMEOUT_SECONDS = 1.0
 _ADAPTER_TERM_GRACE_SECONDS = 1.0
 _ADAPTER_KILL_GRACE_SECONDS = 1.0
+_PTY_IO_CHUNK_BYTES = 64 * 1024
 _DISAPPEARED_ERRNOS = {errno.ENOENT, errno.ESRCH}
 _RESTORED_SIGNAL_NAMES = ("SIGPIPE", "SIGXFZ", "SIGXFSZ")
 _CANCELLED_RESULT_ATTR = "_pipeline_process_run_result"
 _LAUNCH_PROOF = object()
 _WITNESS_LAUNCHER = r"""
+import fcntl
 import os
 import pickle
 import signal
 import sys
+import termios
 
 
 def read_exact(fd, size):
@@ -66,10 +70,17 @@ def read_exact(fd, size):
 
 control_fd = int(sys.argv[1])
 ready_fd = int(sys.argv[2])
-signal_modes = sys.argv[3]
-target_executable = sys.argv[4]
-target_argv = sys.argv[5:]
+acquire_controlling_terminal = sys.argv[3] == "1"
+signal_modes = sys.argv[4]
+target_executable = sys.argv[5]
+target_argv = sys.argv[6:]
 max_fd = os.sysconf("SC_OPEN_MAX")
+if acquire_controlling_terminal:
+    try:
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+    except OSError as exc:
+        os.write(ready_fd, b"T" + str(exc.errno).encode("ascii") + b"\n")
+        os._exit(125)
 pid_read, pid_write = os.pipe()
 
 broker_pid = os.fork()
@@ -78,6 +89,13 @@ if broker_pid == 0:
     witness_pid = os.fork()
     if witness_pid == 0:
         os.close(ready_fd)
+        for terminal_signal in (
+            signal.SIGHUP,
+            signal.SIGINT,
+            signal.SIGQUIT,
+            signal.SIGTSTP,
+        ):
+            signal.signal(terminal_signal, signal.SIG_IGN)
         os.closerange(0, control_fd)
         os.closerange(control_fd + 1, max_fd)
         while os.read(control_fd, 1):
@@ -210,6 +228,209 @@ class ProcessLaunchCleanupError(RuntimeError):
         super().__init__(detail)
         self.managed = managed
         self.cleanup_result = cleanup_result
+
+
+class PtyChannelClosedError(RuntimeError):
+    """A write was attempted after a PTY channel stopped accepting input."""
+
+
+class PtyChannel:
+    """Asynchronous byte I/O for one PTY master descriptor.
+
+    A terminal exposes one merged output stream: data written by the child's
+    stdout and stderr cannot be separated.  This channel owns only the master
+    descriptor; the associated :class:`SupervisedProcess` remains the sole
+    process-lifecycle and cleanup authority.
+    """
+
+    def __init__(self, master_fd: int) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._master_fd = master_fd
+        self._closed = False
+        self._eof = False
+        self._write_closed = False
+        self._read_lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
+        self._read_waiter: asyncio.Future[None] | None = None
+        self._write_waiter: asyncio.Future[None] | None = None
+        self._reader_registered = False
+        self._writer_registered = False
+        os.set_blocking(master_fd, False)
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def at_eof(self) -> bool:
+        return self._eof
+
+    def fileno(self) -> int:
+        if self._closed:
+            raise PtyChannelClosedError("PTY channel is closed")
+        return self._master_fd
+
+    async def read(self, max_bytes: int = _PTY_IO_CHUNK_BYTES) -> bytes:
+        """Read at most ``max_bytes`` of merged terminal output without blocking."""
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
+            raise TypeError("PTY read size must be an integer")
+        if max_bytes <= 0:
+            raise ValueError("PTY read size must be positive")
+        if self._closed or self._eof:
+            return b""
+        async with self._read_lock:
+            while not self._closed and not self._eof:
+                try:
+                    chunk = os.read(
+                        self._master_fd,
+                        min(max_bytes, _PTY_IO_CHUNK_BYTES),
+                    )
+                except InterruptedError:
+                    continue
+                except BlockingIOError:
+                    await self._wait_readable()
+                    continue
+                except OSError as exc:
+                    # Linux PTY masters report EIO, rather than b"", after the
+                    # final slave descriptor closes.
+                    if exc.errno == errno.EIO:
+                        self._eof = True
+                        return b""
+                    raise
+                if not chunk:
+                    self._eof = True
+                return chunk
+        return b""
+
+    async def write(self, data: bytes) -> None:
+        """Write all bytes in order, waiting asynchronously for backpressure."""
+        try:
+            view = memoryview(data).cast("B")
+        except (TypeError, ValueError):
+            raise TypeError("PTY writes require a bytes-like object") from None
+        async with self._write_lock:
+            if self._closed:
+                raise PtyChannelClosedError("PTY channel is closed")
+            if self._write_closed or self._terminal_hung_up():
+                raise PtyChannelClosedError("PTY channel is no longer writable")
+            offset = 0
+            while offset < len(view):
+                if self._closed:
+                    raise PtyChannelClosedError("PTY channel is closed")
+                if self._write_closed or self._terminal_hung_up():
+                    raise PtyChannelClosedError(
+                        "PTY channel is no longer writable"
+                    )
+                try:
+                    written = os.write(
+                        self._master_fd,
+                        view[offset : offset + _PTY_IO_CHUNK_BYTES],
+                    )
+                except InterruptedError:
+                    continue
+                except BlockingIOError:
+                    if self._terminal_hung_up():
+                        raise PtyChannelClosedError(
+                            "PTY channel is no longer writable"
+                        ) from None
+                    await self._wait_writable()
+                    continue
+                except OSError as exc:
+                    if exc.errno == errno.EIO:
+                        self._write_closed = True
+                        raise PtyChannelClosedError(
+                            "PTY channel is no longer writable"
+                        ) from None
+                    raise
+                if written <= 0:
+                    raise PtyChannelClosedError(
+                        "PTY channel stopped accepting input"
+                    )
+                offset += written
+
+    def _terminal_hung_up(self) -> bool:
+        poller = select.poll()
+        poller.register(
+            self._master_fd,
+            select.POLLHUP | select.POLLERR | select.POLLNVAL,
+        )
+        hung_up = any(
+            events & (select.POLLHUP | select.POLLERR | select.POLLNVAL)
+            for _, events in poller.poll(0)
+        )
+        if hung_up:
+            self._write_closed = True
+        return hung_up
+
+    async def _wait_readable(self) -> None:
+        if self._closed:
+            return
+        waiter = self._loop.create_future()
+        self._read_waiter = waiter
+
+        def ready() -> None:
+            if not waiter.done():
+                waiter.set_result(None)
+
+        try:
+            self._loop.add_reader(self._master_fd, ready)
+            self._reader_registered = True
+            await waiter
+        finally:
+            if self._reader_registered:
+                self._loop.remove_reader(self._master_fd)
+                self._reader_registered = False
+            if self._read_waiter is waiter:
+                self._read_waiter = None
+
+    async def _wait_writable(self) -> None:
+        if self._closed:
+            raise PtyChannelClosedError("PTY channel is closed")
+        waiter = self._loop.create_future()
+        self._write_waiter = waiter
+
+        def ready() -> None:
+            if not waiter.done():
+                waiter.set_result(None)
+
+        try:
+            self._loop.add_writer(self._master_fd, ready)
+            self._writer_registered = True
+            await waiter
+        finally:
+            if self._writer_registered:
+                self._loop.remove_writer(self._master_fd)
+                self._writer_registered = False
+            if self._write_waiter is waiter:
+                self._write_waiter = None
+
+    def close(self) -> None:
+        """Release terminal I/O without changing process ownership or cleanup."""
+        if self._closed:
+            return
+        self._closed = True
+        self._eof = True
+        self._write_closed = True
+        master_fd = self._master_fd
+        if self._reader_registered:
+            self._loop.remove_reader(master_fd)
+            self._reader_registered = False
+        if self._writer_registered:
+            self._loop.remove_writer(master_fd)
+            self._writer_registered = False
+        if self._read_waiter is not None and not self._read_waiter.done():
+            self._read_waiter.set_result(None)
+        if self._write_waiter is not None and not self._write_waiter.done():
+            self._write_waiter.set_exception(
+                PtyChannelClosedError("PTY channel is closed")
+            )
+        self._master_fd = -1
+        try:
+            os.close(master_fd)
+        except OSError:
+            # The descriptor is no longer safe to use even if an external
+            # closer raced with channel shutdown.
+            pass
 
 
 class _GroupState(Enum):
@@ -1534,7 +1755,11 @@ async def run_supervised_process(
     return run_result
 
 
-async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
+async def launch_process(
+    *program: str,
+    _acquire_controlling_terminal: bool = False,
+    **kwargs: Any,
+) -> SupervisedProcess:
     """Launch ``program`` in a new Linux session and retain its group identity.
 
     Startup errors are raised unchanged only after failed-launch cleanup is
@@ -1584,6 +1809,7 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
                 _WITNESS_LAUNCHER,
                 str(control_read),
                 str(ready_child.fileno()),
+                "1" if _acquire_controlling_terminal else "0",
                 signal_modes,
                 target_executable,
                 *program,
@@ -1626,6 +1852,15 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
             cancellation_deadline=cancellation_deadline,
         )
         ready_line, separator, exec_payload = ready_payload.partition(b"\n")
+        if separator and ready_line.startswith(b"T"):
+            terminal_errno = int(ready_line[1:])
+            if launch_cancellation is not None:
+                raise launch_cancellation
+            raise OSError(
+                terminal_errno,
+                os.strerror(terminal_errno),
+                "controlling terminal",
+            )
         if not separator or not ready_line.startswith(b"W"):
             raise RuntimeError("lifecycle ownership witness did not start")
         witness_pid = int(ready_line[1:])
@@ -1777,3 +2012,49 @@ async def launch_process(*program: str, **kwargs: Any) -> SupervisedProcess:
             os.close(control_read)
         ready_parent.close()
         ready_child.close()
+
+
+async def launch_pty_process(
+    *program: str, **kwargs: Any
+) -> tuple[SupervisedProcess, PtyChannel]:
+    """Launch with stdin, stdout, and stderr attached to one no-echo PTY.
+
+    Process creation and every failure cleanup are delegated to
+    :func:`launch_process`.  The returned channel contains merged terminal
+    output and must be closed separately from the supervised process handle.
+    """
+    conflicts = {"stdin", "stdout", "stderr"} & kwargs.keys()
+    if conflicts:
+        names = ", ".join(sorted(conflicts))
+        raise TypeError(f"launch_pty_process owns subprocess option(s): {names}")
+
+    master_fd = -1
+    slave_fd = -1
+    channel: PtyChannel | None = None
+    try:
+        master_fd, slave_fd = os.openpty()
+        attributes = termios.tcgetattr(slave_fd)
+        attributes[3] &= ~(termios.ECHO | termios.ECHONL)
+        termios.tcsetattr(slave_fd, termios.TCSANOW, attributes)
+        channel = PtyChannel(master_fd)
+        managed = await launch_process(
+            *program,
+            _acquire_controlling_terminal=True,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            **kwargs,
+        )
+    except BaseException:
+        if channel is not None:
+            channel.close()
+            master_fd = -1
+        elif master_fd >= 0:
+            os.close(master_fd)
+            master_fd = -1
+        raise
+    finally:
+        if slave_fd >= 0:
+            os.close(slave_fd)
+
+    return managed, channel

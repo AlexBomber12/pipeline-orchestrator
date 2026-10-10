@@ -10,6 +10,7 @@ import select
 import signal
 import socket
 import sys
+import termios
 import time
 from contextlib import nullcontext
 from dataclasses import replace
@@ -26,12 +27,15 @@ from src.process_supervisor import (
     ProcessIdentity,
     ProcessLaunchCleanupError,
     ProcessSupervisionError,
+    PtyChannel,
+    PtyChannelClosedError,
     SupervisedProcess,
     _GroupMember,
     _GroupObservation,
     _GroupState,
     _parse_proc_stat,
     launch_process,
+    launch_pty_process,
     run_supervised_process,
 )
 
@@ -116,6 +120,58 @@ print("provider-diagnostic", file=sys.stderr, flush=True)
 raise SystemExit(int(os.environ.get("FAKE_CODER_EXIT", "0")))
 """
 
+INTERACTIVE_PTY_PROCESS = r"""
+import os
+import sys
+
+tty_fd = os.open("/dev/tty", os.O_RDWR)
+terminal_flags = bytes(
+    [
+        *(int(os.isatty(fd)) + ord("0") for fd in (0, 1, 2)),
+        int(os.tcgetpgrp(tty_fd) == os.getpgrp()) + ord("0"),
+    ]
+)
+os.close(tty_fd)
+os.write(1, b"tty:" + terminal_flags + b"|stdout|")
+os.write(2, b"stderr|")
+os.write(1, b"prompt>")
+submitted = sys.stdin.buffer.readline()
+os.write(1, b"ack" if submitted == b"opaque-code\n" else b"rejected")
+"""
+
+PTY_RETAINING_DESCENDANT = r"""
+import os
+import signal
+
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+child_pid = os.fork()
+if child_pid == 0:
+    while True:
+        signal.pause()
+os.write(1, f"{child_pid}\n".encode("ascii"))
+"""
+
+PTY_SIGNAL_HANDLERS = r"""
+import os
+import signal
+
+def report(_signum, _frame, marker):
+    os.write(1, marker)
+
+for target_signal, marker in (
+    (signal.SIGINT, b"interrupt"),
+    (signal.SIGQUIT, b"quit"),
+    (signal.SIGTSTP, b"suspend"),
+):
+    signal.signal(
+        target_signal,
+        lambda signum, frame, marker=marker: report(signum, frame, marker),
+    )
+os.write(1, b"ready")
+while True:
+    signal.pause()
+"""
+
 
 class ProcessPool:
     def __init__(self) -> None:
@@ -181,6 +237,23 @@ async def _read_pids(process: asyncio.subprocess.Process) -> list[int]:
     line = await asyncio.wait_for(process.stdout.readline(), timeout=2)
     assert line
     return [int(value) for value in line.split()]
+
+
+async def _read_pty_until(
+    channel: PtyChannel,
+    marker: bytes,
+    *,
+    read_size: int = 64 * 1024,
+) -> tuple[bytes, list[bytes]]:
+    output = bytearray()
+    chunks: list[bytes] = []
+    async with asyncio.timeout(2):
+        while marker not in output:
+            chunk = await channel.read(read_size)
+            assert chunk
+            chunks.append(chunk)
+            output.extend(chunk)
+    return bytes(output), chunks
 
 
 def _pid_is_live(pid: int) -> bool:
@@ -768,6 +841,510 @@ async def test_target_environment_is_isolated_from_launcher(
     assert await managed.process.wait() == 0
     result = await managed.cleanup(term_grace=0.5, kill_grace=0.5)
     assert result.quiescent
+
+
+@pytest.mark.asyncio
+async def test_pty_launch_supports_fragmented_merged_io_without_input_echo(
+    process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allocated: list[tuple[int, int]] = []
+    real_openpty = os.openpty
+
+    def tracked_openpty() -> tuple[int, int]:
+        descriptors = real_openpty()
+        allocated.append(descriptors)
+        return descriptors
+
+    monkeypatch.setattr(os, "openpty", tracked_openpty)
+    managed, channel = await launch_pty_process(
+        sys.executable,
+        "-c",
+        INTERACTIVE_PTY_PROCESS,
+    )
+    process_pool.supervised.append(
+        (managed, managed.identity.process_group_id)
+    )
+    master_fd = channel.fileno()
+    assert allocated == [(master_fd, allocated[0][1])]
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(allocated[0][1])
+
+    before_prompt, chunks = await _read_pty_until(
+        channel, b"prompt>", read_size=2
+    )
+    assert all(0 < len(chunk) <= 2 for chunk in chunks)
+    assert b"tty:1111|stdout|stderr|prompt>" in before_prompt
+
+    submitted = b"opaque-code\n"
+    real_write = os.write
+    write_attempts = 0
+    delivered = bytearray()
+
+    def partial_write(fd: int, data: bytes) -> int:
+        nonlocal write_attempts
+        if fd != master_fd:
+            return real_write(fd, data)
+        write_attempts += 1
+        if write_attempts == 1:
+            raise InterruptedError
+        if write_attempts == 2:
+            raise BlockingIOError(errno.EAGAIN, "backpressure")
+        piece = bytes(data[:2])
+        written = real_write(fd, piece)
+        delivered.extend(piece[:written])
+        return written
+
+    monkeypatch.setattr(os, "write", partial_write)
+    await channel.write(submitted)
+    after_prompt, _ = await _read_pty_until(channel, b"ack", read_size=2)
+    monkeypatch.setattr(os, "write", real_write)
+
+    assert delivered == submitted
+    assert write_attempts > 3
+    assert submitted.rstrip() not in before_prompt + after_prompt
+    assert managed.process.stdin is None
+    assert managed.process.stdout is None
+    assert managed.process.stderr is None
+    assert await managed.process.wait() == 0
+    cleanup = await managed.cleanup(term_grace=0.5, kill_grace=0.5)
+    assert cleanup.quiescent
+    assert await channel.read() == b""
+    assert channel.at_eof
+
+    channel.close()
+    assert channel.closed
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(master_fd)
+
+
+@pytest.mark.asyncio
+async def test_pty_eof_waits_for_descendants_and_read_cancellation_is_clean(
+    process_pool: ProcessPool,
+) -> None:
+    managed, channel = await launch_pty_process(
+        sys.executable,
+        "-c",
+        PTY_RETAINING_DESCENDANT,
+    )
+    process_pool.supervised.append(
+        (managed, managed.identity.process_group_id)
+    )
+    output, _ = await _read_pty_until(channel, b"\n")
+    child_pid = int(output.strip())
+    assert await managed.process.wait() == 0
+    assert _pid_is_live(child_pid)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(channel.read(), timeout=0.05)
+    assert channel._read_waiter is None
+    assert not channel._reader_registered
+
+    cleanup = await managed.cleanup(term_grace=0.5, kill_grace=0.5)
+    assert cleanup.quiescent
+    assert cleanup.term_sent
+    await _wait_not_live(child_pid)
+    assert await channel.read() == b""
+    channel.close()
+
+
+@pytest.mark.asyncio
+async def test_pty_control_keys_do_not_destroy_cleanup_ownership(
+    process_pool: ProcessPool,
+) -> None:
+    managed, channel = await launch_pty_process(
+        sys.executable,
+        "-c",
+        PTY_SIGNAL_HANDLERS,
+    )
+    process_pool.supervised.append(
+        (managed, managed.identity.process_group_id)
+    )
+    await _read_pty_until(channel, b"ready")
+
+    for control_character, marker in (
+        (b"\x03", b"interrupt"),
+        (b"\x1c", b"quit"),
+        (b"\x1a", b"suspend"),
+    ):
+        await channel.write(control_character)
+        output, _ = await _read_pty_until(channel, marker)
+        assert marker in output
+        assert managed.process.returncode is None
+        assert managed._witness_is_live()
+
+    cleanup = await managed.cleanup(term_grace=0.5, kill_grace=0.5)
+    assert cleanup.quiescent
+    assert cleanup.term_sent
+    assert await channel.read() == b""
+    channel.close()
+
+
+@pytest.mark.asyncio
+async def test_pty_write_detects_target_hangup_without_reading_eof(
+    process_pool: ProcessPool,
+) -> None:
+    managed, channel = await launch_pty_process(
+        sys.executable,
+        "-c",
+        "pass",
+    )
+    process_pool.supervised.append(
+        (managed, managed.identity.process_group_id)
+    )
+    assert await managed.process.wait() == 0
+
+    with pytest.raises(PtyChannelClosedError, match="no longer writable"):
+        await asyncio.wait_for(
+            channel.write(b"x" * (2 * 1024 * 1024)),
+            timeout=2,
+        )
+
+    assert await managed.process.wait() == 0
+    cleanup = await managed.cleanup(term_grace=0.5, kill_grace=0.5)
+    assert cleanup.quiescent
+    assert await channel.read() == b""
+    channel.close()
+
+
+@pytest.mark.asyncio
+async def test_pty_close_settles_pending_io_without_discarding_ownership(
+    process_pool: ProcessPool,
+) -> None:
+    managed, channel = await launch_pty_process(
+        sys.executable,
+        "-c",
+        "import signal; signal.pause()",
+    )
+    process_pool.supervised.append(
+        (managed, managed.identity.process_group_id)
+    )
+    master_fd = channel.fileno()
+    read_task = asyncio.create_task(channel.read())
+    write_task = asyncio.create_task(channel.write(b"x" * (2 * 1024 * 1024)))
+    async with asyncio.timeout(2):
+        while not (channel._reader_registered and channel._writer_registered):
+            await asyncio.sleep(0)
+
+    channel.close()
+    channel.close()
+
+    assert await read_task == b""
+    with pytest.raises(PtyChannelClosedError, match="closed"):
+        await write_task
+    assert channel._read_waiter is None
+    assert channel._write_waiter is None
+    assert not channel._reader_registered
+    assert not channel._writer_registered
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(master_fd)
+    with pytest.raises(PtyChannelClosedError, match="closed") as caught:
+        await channel.write(b"submitted-secret")
+    assert "submitted-secret" not in str(caught.value)
+
+    cleanup = await managed.cleanup(term_grace=0.5, kill_grace=0.5)
+    assert cleanup.quiescent
+
+
+@pytest.mark.asyncio
+async def test_pty_channel_validates_bounds_and_preserves_io_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    master_fd, slave_fd = os.openpty()
+    channel = PtyChannel(master_fd)
+    try:
+        with pytest.raises(TypeError, match="integer"):
+            await channel.read(True)
+        with pytest.raises(ValueError, match="positive"):
+            await channel.read(0)
+        with pytest.raises(TypeError, match="bytes-like"):
+            await channel.write("not bytes")  # type: ignore[arg-type]
+
+        read_sizes: list[int] = []
+
+        def bounded_read(fd: int, size: int) -> bytes:
+            assert fd == master_fd
+            read_sizes.append(size)
+            return b"bounded"
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "read", bounded_read)
+            assert await channel.read(10**9) == b"bounded"
+        assert read_sizes == [process_supervisor._PTY_IO_CHUNK_BYTES]
+
+        interrupted = True
+
+        def failed_read(fd: int, _size: int) -> bytes:
+            nonlocal interrupted
+            assert fd == master_fd
+            if interrupted:
+                interrupted = False
+                raise InterruptedError
+            raise PermissionError("read denied")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "read", failed_read)
+            with pytest.raises(PermissionError, match="read denied"):
+                await channel.read()
+
+        with monkeypatch.context() as patch:
+            hangup_checks = iter((False, False, True))
+            patch.setattr(
+                channel,
+                "_terminal_hung_up",
+                lambda: next(hangup_checks),
+            )
+            patch.setattr(
+                os,
+                "write",
+                lambda fd, _data: (
+                    (_ for _ in ()).throw(
+                        BlockingIOError(errno.EAGAIN, "backpressure")
+                    )
+                    if fd == master_fd
+                    else 0
+                ),
+            )
+            with pytest.raises(PtyChannelClosedError, match="no longer writable"):
+                await channel.write(b"x")
+
+        with monkeypatch.context() as patch:
+            hangup_checks = iter((False, False, True))
+            patch.setattr(
+                channel,
+                "_terminal_hung_up",
+                lambda: next(hangup_checks),
+            )
+            patch.setattr(
+                os,
+                "write",
+                lambda fd, _data: 1 if fd == master_fd else 0,
+            )
+            with pytest.raises(PtyChannelClosedError, match="no longer writable"):
+                await channel.write(b"xy")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                os,
+                "write",
+                lambda fd, _data: (
+                    0
+                    if fd == master_fd
+                    else (_ for _ in ()).throw(AssertionError())
+                ),
+            )
+            with pytest.raises(PtyChannelClosedError, match="stopped accepting"):
+                await channel.write(b"x")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                os,
+                "write",
+                lambda fd, _data: (
+                    (_ for _ in ()).throw(PermissionError("write denied"))
+                    if fd == master_fd
+                    else 0
+                ),
+            )
+            with pytest.raises(PermissionError, match="write denied"):
+                await channel.write(b"x")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                os,
+                "write",
+                lambda fd, _data: (
+                    (_ for _ in ()).throw(OSError(errno.EIO, "slave closed"))
+                    if fd == master_fd
+                    else 0
+                ),
+            )
+            with pytest.raises(PtyChannelClosedError, match="no longer writable"):
+                await channel.write(b"x")
+        assert not channel.at_eof
+        with pytest.raises(PtyChannelClosedError, match="no longer writable"):
+            await channel.write(b"x")
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                os,
+                "read",
+                lambda fd, _size: (
+                    (_ for _ in ()).throw(OSError(errno.EIO, "slave closed"))
+                    if fd == master_fd
+                    else b""
+                ),
+            )
+            assert await channel.read() == b""
+        assert channel.at_eof
+    finally:
+        channel.close()
+        os.close(slave_fd)
+
+    with pytest.raises(PtyChannelClosedError, match="closed"):
+        channel.fileno()
+    assert await channel.read() == b""
+    await channel._wait_readable()
+    with pytest.raises(PtyChannelClosedError, match="closed"):
+        await channel._wait_writable()
+
+    pipe_read, pipe_write = os.pipe()
+    pipe_channel = PtyChannel(pipe_read)
+    os.close(pipe_write)
+    assert await pipe_channel.read() == b""
+    assert pipe_channel.at_eof
+    pipe_channel.close()
+
+    partial_master, partial_slave = os.openpty()
+    partial_channel = PtyChannel(partial_master)
+
+    def close_after_partial(fd: int, _data: bytes) -> int:
+        assert fd == partial_master
+        partial_channel.close()
+        return 1
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "write", close_after_partial)
+        with pytest.raises(PtyChannelClosedError, match="closed"):
+            await partial_channel.write(b"xy")
+    os.close(partial_slave)
+
+    raced_master, raced_slave = os.openpty()
+    raced_channel = PtyChannel(raced_master)
+    os.close(raced_master)
+    raced_channel.close()
+    os.close(raced_slave)
+
+
+@pytest.mark.asyncio
+async def test_pty_launch_closes_descriptors_and_preserves_launch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allocated: list[tuple[int, int]] = []
+    real_openpty = os.openpty
+    retained = object()
+    launch_error = ProcessLaunchCleanupError(
+        "cleanup remained unconfirmed",
+        managed=retained,  # type: ignore[arg-type]
+        cleanup_result=CleanupResult(
+            CleanupStatus.FAILED,
+            None,
+            True,
+            True,
+            "ownership retained",
+        ),
+    )
+
+    def tracked_openpty() -> tuple[int, int]:
+        descriptors = real_openpty()
+        allocated.append(descriptors)
+        return descriptors
+
+    async def fail_launch(*_args: str, **kwargs: Any) -> SupervisedProcess:
+        slave_fd = allocated[-1][1]
+        assert kwargs["stdin"] == kwargs["stdout"] == kwargs["stderr"] == slave_fd
+        assert not termios.tcgetattr(slave_fd)[3] & (termios.ECHO | termios.ECHONL)
+        raise launch_error
+
+    monkeypatch.setattr(os, "openpty", tracked_openpty)
+    monkeypatch.setattr(process_supervisor, "launch_process", fail_launch)
+
+    with pytest.raises(ProcessLaunchCleanupError) as caught:
+        await launch_pty_process("fake-cli")
+
+    assert caught.value is launch_error
+    assert caught.value.managed is retained
+    for fd in allocated[-1]:
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(fd)
+
+
+@pytest.mark.asyncio
+async def test_pty_launch_closes_descriptors_on_setup_failure_and_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_openpty = os.openpty
+    allocated: list[tuple[int, int]] = []
+
+    def tracked_openpty() -> tuple[int, int]:
+        descriptors = real_openpty()
+        allocated.append(descriptors)
+        return descriptors
+
+    monkeypatch.setattr(os, "openpty", tracked_openpty)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            termios,
+            "tcsetattr",
+            lambda *_args: (_ for _ in ()).throw(OSError("terminal setup failed")),
+        )
+        with pytest.raises(OSError, match="terminal setup failed"):
+            await launch_pty_process("fake-cli")
+    for fd in allocated[-1]:
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(fd)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            process_supervisor,
+            "_WITNESS_LAUNCHER",
+            "import os, sys; "
+            "os.write(int(sys.argv[2]), b'T13\\n'); "
+            "raise SystemExit(125)",
+        )
+        with pytest.raises(PermissionError, match="controlling terminal"):
+            await launch_pty_process("fake-cli")
+
+    terminal_error_ready = asyncio.Event()
+    release_terminal_error = asyncio.Event()
+    real_read_witness_ready = process_supervisor._read_witness_ready
+
+    async def delayed_terminal_error(ready_socket: socket.socket) -> bytes:
+        payload = await real_read_witness_ready(ready_socket)
+        terminal_error_ready.set()
+        await release_terminal_error.wait()
+        return payload
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            process_supervisor,
+            "_WITNESS_LAUNCHER",
+            "import os, sys; "
+            "os.write(int(sys.argv[2]), b'T13\\n'); "
+            "raise SystemExit(125)",
+        )
+        patch.setattr(
+            process_supervisor,
+            "_read_witness_ready",
+            delayed_terminal_error,
+        )
+        terminal_launch = asyncio.create_task(launch_pty_process("fake-cli"))
+        await terminal_error_ready.wait()
+        terminal_launch.cancel()
+        release_terminal_error.set()
+        with pytest.raises(asyncio.CancelledError):
+            await terminal_launch
+    for fd in allocated[-1]:
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(fd)
+
+    launch_started = asyncio.Event()
+
+    async def stalled_launch(*_args: str, **_kwargs: Any) -> SupervisedProcess:
+        launch_started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(process_supervisor, "launch_process", stalled_launch)
+    launch_task = asyncio.create_task(launch_pty_process("fake-cli"))
+    await launch_started.wait()
+    launch_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await launch_task
+    for fd in allocated[-1]:
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(fd)
+
+    with pytest.raises(TypeError, match="stderr, stdin"):
+        await launch_pty_process("fake-cli", stderr=None, stdin=None)
 
 
 @pytest.mark.asyncio
