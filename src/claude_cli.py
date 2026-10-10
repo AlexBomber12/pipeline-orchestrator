@@ -159,6 +159,7 @@ def run_claude(
         if existing_node_options
         else memory_flag
     )
+    cfg = load_config()
 
     cmd = _maybe_wrap_sandbox(cmd, cwd)
     try:
@@ -169,7 +170,11 @@ def run_claude(
             timeout=timeout,
             cwd=cwd,
             stdin=subprocess.DEVNULL,
-            env={**os.environ, "NODE_OPTIONS": node_options},
+            env={
+                **os.environ,
+                "CLAUDE_CONFIG_DIR": cfg.auth.claude_config_dir,
+                "NODE_OPTIONS": node_options,
+            },
         )
     except subprocess.TimeoutExpired:
         logger.error("claude CLI timed out after %ss", timeout)
@@ -328,7 +333,12 @@ async def run_claude_async(
         cmd.extend(["--append-system-prompt-file", system_prompt_file])
     cmd.append(prompt)
     logger.info("running claude CLI with prompt: %s", prompt[:80])
-    env = {**os.environ, "NODE_OPTIONS": _build_node_options()}
+    cfg = load_config()
+    env = {
+        **os.environ,
+        "CLAUDE_CONFIG_DIR": cfg.auth.claude_config_dir,
+        "NODE_OPTIONS": _build_node_options(),
+    }
 
     # In-flight rate-limit monitoring: the caller provides a breach_dir
     # and run_id so the statusline hook can write a breach marker that the

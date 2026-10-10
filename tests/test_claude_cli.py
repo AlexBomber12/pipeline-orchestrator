@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -68,8 +69,17 @@ class _FakeCompletedProcess:
         self.returncode = returncode
 
 
-def test_run_claude_success(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_claude_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     captured: dict[str, Any] = {}
+    config_path = tmp_path / "config.yml"
+    claude_config_dir = tmp_path / "claude-auth"
+    config_path.write_text(
+        f"auth:\n  claude_config_dir: {claude_config_dir}\n",
+        encoding="utf-8",
+    )
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         captured["cmd"] = cmd
@@ -77,7 +87,9 @@ def test_run_claude_success(monkeypatch: pytest.MonkeyPatch) -> None:
         return _FakeCompletedProcess(stdout="hello", stderr="warn", returncode=0)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setenv("PO_CONFIG_PATH", str(config_path))
     monkeypatch.delenv("NODE_OPTIONS", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "must-be-overridden")
 
     result = run_claude("do a thing", "/data/repos/demo", timeout=42)
 
@@ -93,6 +105,9 @@ def test_run_claude_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured["kwargs"]["capture_output"] is True
     assert captured["kwargs"]["text"] is True
     assert captured["kwargs"]["stdin"] is subprocess.DEVNULL
+    assert captured["kwargs"]["env"]["CLAUDE_CONFIG_DIR"] == str(
+        claude_config_dir
+    )
     assert captured["kwargs"]["env"]["NODE_OPTIONS"] == "--max-old-space-size=4096"
 
 
@@ -444,9 +459,18 @@ def _block_until_cleanup(proc: MagicMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_claude_async_success(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_run_claude_async_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     captured: dict[str, Any] = {}
     fake_proc = _make_fake_proc(stdout=b"hello", stderr=b"warn", returncode=0)
+    config_path = tmp_path / "config.yml"
+    claude_config_dir = tmp_path / "claude-auth"
+    config_path.write_text(
+        f"auth:\n  claude_config_dir: {claude_config_dir}\n",
+        encoding="utf-8",
+    )
 
     async def fake_create(*args: Any, **kwargs: Any) -> MagicMock:
         captured["cmd"] = args
@@ -454,7 +478,9 @@ async def test_run_claude_async_success(monkeypatch: pytest.MonkeyPatch) -> None
         return fake_proc
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.setenv("PO_CONFIG_PATH", str(config_path))
     monkeypatch.delenv("NODE_OPTIONS", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "must-be-overridden")
 
     result = await run_claude_async("do a thing", "/data/repos/demo", timeout=42)
 
@@ -466,6 +492,9 @@ async def test_run_claude_async_success(monkeypatch: pytest.MonkeyPatch) -> None
     assert "--effort" not in cmd
     assert cmd[-1] == "do a thing"
     assert captured["kwargs"]["cwd"] == "/data/repos/demo"
+    assert captured["kwargs"]["env"]["CLAUDE_CONFIG_DIR"] == str(
+        claude_config_dir
+    )
 
 
 @pytest.mark.asyncio
