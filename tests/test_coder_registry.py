@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import re
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -19,6 +20,8 @@ from src.coder_registry import (
     coder_auth_payload,
     parse_coder_auth_payload,
     parse_coder_device_login_payload,
+    resolve_coder_credential_location,
+    resolve_device_login_credential_location,
 )
 from src.coders import CoderPluginConfigurationError, build_coder_registry
 from src.coders.claude import ClaudePlugin
@@ -125,6 +128,168 @@ class DummyCoderPlugin:
         breach_run_id: str | None = None,
     ) -> dict[str, Any]:
         return {"model": self.resolve_model(daemon_config)}
+
+
+class _BrowserCredentialPlugin:
+    def __init__(self, location: object) -> None:
+        self.location = location
+        self.locator_calls = 0
+
+    def browser_login_credential_location(self, *, config: AppConfig) -> object:
+        del config
+        self.locator_calls += 1
+        return self.location
+
+    def build_credential_environment(
+        self,
+        *,
+        config: AppConfig,
+        credential_location: str,
+    ) -> dict[str, str]:
+        del config, credential_location
+        raise AssertionError("environment builder must not run during resolution")
+
+
+class _DualCredentialPlugin(_BrowserCredentialPlugin):
+    def __init__(self, browser_location: str, device_location: str) -> None:
+        super().__init__(browser_location)
+        self.device_location = device_location
+
+    def create_device_login(self, *, config_path: str) -> object:
+        raise AssertionError(f"login factory must not run: {config_path}")
+
+    def device_login_credential_location(self, *, config: AppConfig) -> str:
+        del config
+        return self.device_location
+
+
+def test_common_credential_location_resolves_builtin_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    config = AppConfig.model_validate(
+        {
+            "auth": {
+                "claude_config_dir": "relative/claude",
+                "codex_home_dir": str(tmp_path / "codex-home"),
+            }
+        }
+    )
+    claude = ClaudePlugin()
+    codex = CodexPlugin()
+
+    assert claude.auth_capabilities.interactive_login_methods == ()
+    assert resolve_coder_credential_location(
+        claude,
+        config=config,
+    ) == str(tmp_path / "relative" / "claude")
+    assert resolve_coder_credential_location(
+        codex,
+        config=config,
+    ) == resolve_device_login_credential_location(codex, config=config)
+
+
+def test_common_credential_location_accepts_browser_context_without_factory(
+    tmp_path: Path,
+) -> None:
+    location = str(tmp_path / "browser-credentials")
+    plugin = _BrowserCredentialPlugin(location)
+
+    assert resolve_coder_credential_location(
+        plugin,
+        config=AppConfig(),
+    ) == location
+    assert plugin.locator_calls == 1
+
+
+def test_common_credential_location_ignores_legacy_plugin() -> None:
+    assert (
+        resolve_coder_credential_location(
+            DummyCoderPlugin("legacy", "Legacy"),
+            config=AppConfig(),
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("location", [None, "", 7])
+def test_common_credential_location_rejects_invalid_browser_location(
+    location: object,
+) -> None:
+    with pytest.raises(ValueError, match="^invalid coder credential location$"):
+        resolve_coder_credential_location(
+            _BrowserCredentialPlugin(location),
+            config=AppConfig(),
+        )
+
+
+def test_common_credential_location_rejects_noncallable_browser_locator() -> None:
+    plugin = _BrowserCredentialPlugin("unused")
+    plugin.browser_login_credential_location = "sensitive/path"  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="^invalid coder credential locator$"):
+        resolve_coder_credential_location(plugin, config=AppConfig())
+
+
+def test_common_credential_location_requires_browser_environment_builder() -> None:
+    class MissingBuilder:
+        def browser_login_credential_location(
+            self, *, config: AppConfig
+        ) -> str:
+            del config
+            return "/sensitive/browser/location"
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "^browser credential context is missing a credential environment "
+            "builder$"
+        ),
+    ) as caught:
+        resolve_coder_credential_location(MissingBuilder(), config=AppConfig())
+
+    assert "/sensitive/browser/location" not in str(caught.value)
+
+
+def test_common_credential_location_accepts_matching_dual_contexts() -> None:
+    plugin = _DualCredentialPlugin("shared/location", "shared/location")
+
+    assert resolve_coder_credential_location(
+        plugin,
+        config=AppConfig(),
+    ) == "shared/location"
+    assert plugin.locator_calls == 1
+
+
+def test_common_credential_location_rejects_conflicting_dual_contexts() -> None:
+    plugin = _DualCredentialPlugin(
+        "/sensitive/browser/location",
+        "/sensitive/device/location",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="^coder credential contexts use conflicting locations$",
+    ) as caught:
+        resolve_coder_credential_location(plugin, config=AppConfig())
+
+    message = str(caught.value)
+    assert "/sensitive/browser/location" not in message
+    assert "/sensitive/device/location" not in message
+
+
+def test_device_credential_location_keeps_device_factory_contract() -> None:
+    plugin = _BrowserCredentialPlugin("browser/location")
+    plugin.device_login_credential_location = (  # type: ignore[attr-defined]
+        lambda *, config: "device/location"
+    )
+
+    assert (
+        resolve_device_login_credential_location(plugin, config=AppConfig())
+        is None
+    )
 
 
 def test_build_registry_without_config_keeps_builtin_compatibility() -> None:
