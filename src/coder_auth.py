@@ -9,7 +9,7 @@ import signal
 import sys
 from typing import Any
 
-from src.coder_auth_worker import RESULT_PREFIX
+from src.coder_auth_worker import EXPLICIT_ENVIRONMENT_ARG, RESULT_PREFIX
 from src.coder_registry import (
     CoderAuthStatus,
     coder_auth_payload,
@@ -36,18 +36,24 @@ async def isolated_auth_probe(
     env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Probe trusted plugin code in a subprocess killed at ``timeout``."""
+    worker_env = dict(env) if env is not None else None
+    worker_args = [
+        sys.executable,
+        "-m",
+        "src.coder_auth_worker",
+        plugin_id,
+        reference,
+        config_path,
+    ]
+    if worker_env is not None:
+        worker_args.append(EXPLICIT_ENVIRONMENT_ARG)
     try:
         process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "src.coder_auth_worker",
-            plugin_id,
-            reference,
-            config_path,
+            *worker_args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             start_new_session=True,
-            env=env,
+            env=worker_env,
         )
     except OSError as exc:
         return coder_auth_payload(
