@@ -14,12 +14,14 @@ from src.coder_auth import isolated_auth_probe
 from src.coder_registry import (
     CoderBrowserLoginAdapter,
     CoderBrowserLoginFailure,
+    CoderBrowserLoginProgress,
     CoderDeviceLoginAdapter,
     CoderDeviceLoginFailure,
     CoderDeviceLoginPrompt,
     CoderPlugin,
     CoderRegistry,
     parse_coder_auth_payload,
+    parse_coder_browser_login_payload,
     parse_coder_device_login_payload,
     resolve_device_login_credential_location,
 )
@@ -27,8 +29,10 @@ from src.config import load_config
 from src.process_supervisor import (
     ProcessLaunchCleanupError,
     ProcessSupervisionError,
+    PtyChannel,
     SupervisedProcess,
     launch_process,
+    launch_pty_process,
     run_supervised_process,
 )
 
@@ -101,7 +105,7 @@ class _LoginSession:
     session_id: str
     plugin: str
     reference: str
-    adapter: CoderDeviceLoginAdapter
+    adapter: CoderDeviceLoginAdapter | CoderBrowserLoginAdapter
     replacement_requested: bool
     created_monotonic: float
     state: str = "starting"
@@ -119,6 +123,9 @@ class _LoginSession:
     cancel_requested: bool = False
     parse_failed: bool = False
     reservation_held: bool = False
+    pty_channel: PtyChannel | None = None
+    application_deadline: float | None = None
+    deadline_monotonic: float | None = None
     stdout: bytearray = field(default_factory=bytearray)
     stderr: bytearray = field(default_factory=bytearray)
 
@@ -238,6 +245,69 @@ class CoderLoginSessionManager:
         if not valid:
             return failure("unsupported", "Browser login adapter context is invalid")
         return adapter
+
+    def _execute_browser_session(self, session: _LoginSession) -> None:
+        """Take over an internally tracked, prepared, caller-reserved session."""
+        if (
+            self._shutting_down
+            or self._sessions.get(session.session_id) is not session
+            or session.task is not None
+            or session.state != "starting"
+            or not session.reservation_held
+            or not self._credential_reservations.login_active(session.adapter.credential_location)
+            or not self._valid_adapter(session.adapter, browser=True)
+            or session.adapter.requires_pty is not True
+        ):
+            raise ValueError("Browser login requires a tracked prepared session and reservation")
+        session.deadline_monotonic = self._monotonic() + session.adapter.application_timeout_seconds
+        session.application_deadline = self._wall_time() + session.adapter.application_timeout_seconds
+        session.detail = "Preparing browser-code login"
+        session.task = asyncio.create_task(self._start_session(session))
+        session.task.add_done_callback(lambda _task: self._settle_browser_session(session))
+
+    def _settle_browser_session(self, session: _LoginSession) -> None:
+        if (
+            session.cleanup_confirmed is True and session.state in _TERMINAL_STATES
+            and (session.task is None or session.task.done())
+        ):
+            self._release_reservation(session)
+            if session.pty_channel is not None:
+                session.pty_channel.close()
+                session.pty_channel = None
+            session.managed = None
+
+    def _remaining_time(self, session: _LoginSession) -> float:
+        assert session.deadline_monotonic is not None
+        return max(0.0, session.deadline_monotonic - self._monotonic())
+
+    async def _launch_browser_session(self, session: _LoginSession) -> None:
+        try:
+            # asyncio.timeout preserves failed-launch cleanup evidence even when
+            # cancellation is replaced by ProcessLaunchCleanupError in the launcher.
+            async with asyncio.timeout(self._remaining_time(session)):
+                session.managed, session.pty_channel = await launch_pty_process(
+                    *session.adapter.command,
+                    cwd=session.adapter.working_directory,
+                    env=dict(session.adapter.environment),
+                )
+        except ProcessLaunchCleanupError as exc:
+            session.managed = exc.managed
+            self._cleanup_failed(session)
+            return
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            raise
+        except Exception as exc:
+            self._finish(
+                session,
+                state="failed",
+                detail="Browser-code login could not be started",
+                failure_reason="cli_missing" if isinstance(exc, FileNotFoundError) else "startup_failed",
+                cleanup_confirmed=True,
+            )
+            return
+        if session.cancel_requested:
+            raise asyncio.CancelledError
+        await self._run_owned_session(session)
 
     async def start(
         self,
@@ -379,7 +449,8 @@ class CoderLoginSessionManager:
             return self._session_payload(session)
 
         session.cancel_requested = True
-        session.state = "canceling"
+        if session.cleanup_confirmed is not False:
+            session.state = "canceling"
         session.detail = "Canceling device-code login"
         session.verification_url = None
         session.user_code = None
@@ -391,6 +462,9 @@ class CoderLoginSessionManager:
             if session.task is not None:
                 session.task.cancel()
                 await asyncio.gather(session.task, return_exceptions=True)
+            if session.cleanup_confirmed is False:
+                self._cleanup_failed(session)
+                return self._session_payload(session)
             if session.state not in _TERMINAL_STATES:
                 self._finish(
                     session,
@@ -435,7 +509,8 @@ class CoderLoginSessionManager:
         cleanup_confirmed_session_ids: set[str] = set()
         for session in active:
             session.cancel_requested = True
-            session.state = "canceling"
+            if session.cleanup_confirmed is not False:
+                session.state = "canceling"
             session.detail = "Stopping device-code login during daemon shutdown"
             session.verification_url = None
             session.user_code = None
@@ -452,6 +527,9 @@ class CoderLoginSessionManager:
             if not await self._cleanup(session):
                 self._cleanup_failed(session)
                 continue
+            session.cleanup_confirmed = None
+            session.failure_reason = None
+            session.state = "canceling"
             cleanup_confirmed_session_ids.add(session.session_id)
         tasks = [
             session.task
@@ -463,6 +541,7 @@ class CoderLoginSessionManager:
         for session in active:
             if (
                 session.state in _TERMINAL_STATES
+                or session.cleanup_confirmed is False
                 or session.session_id not in cleanup_confirmed_session_ids
             ):
                 continue
@@ -476,6 +555,9 @@ class CoderLoginSessionManager:
 
     async def _start_session(self, session: _LoginSession) -> None:
         try:
+            if session.application_deadline is not None:
+                await self._launch_browser_session(session)
+                return
             auth = await isolated_auth_probe(
                 session.plugin,
                 session.reference,
@@ -611,6 +693,19 @@ class CoderLoginSessionManager:
                 )
             else:
                 self._cleanup_failed(session)
+        except asyncio.TimeoutError:
+            if not await self._cleanup(session):
+                self._cleanup_failed(session)
+                return
+            browser = session.application_deadline is not None
+            self._finish(
+                session,
+                state="timed_out" if browser else "failed",
+                detail="Browser-code login exceeded the application deadline"
+                if browser else "Device-code login could not complete safely",
+                failure_reason="application_timeout" if browser else "auth_status_unavailable",
+                cleanup_confirmed=True,
+            )
         except Exception:
             if session.managed is not None:
                 if not await self._cleanup(session):
@@ -624,18 +719,22 @@ class CoderLoginSessionManager:
                 cleanup_confirmed=True,
             )
 
+        finally:
+            if session.abort_task is not None:
+                await asyncio.gather(session.abort_task, return_exceptions=True)
+
     async def _run_owned_session(self, session: _LoginSession) -> None:
         assert session.managed is not None
+        browser = session.application_deadline is not None
         try:
             result = await run_supervised_process(
                 session.managed,
-                timeout=session.adapter.application_timeout_seconds,
-                stdout_chunk_callback=lambda chunk: self._observe_chunk(
-                    session, session.stdout, chunk
-                ),
-                stderr_chunk_callback=lambda chunk: self._observe_chunk(
-                    session, session.stderr, chunk
-                ),
+                timeout=self._remaining_time(session) if browser else session.adapter.application_timeout_seconds,
+                stdout_chunk_callback=lambda chunk: self._observe_chunk(session, session.stdout, chunk),
+                stderr_chunk_callback=None
+                if browser
+                else lambda chunk: self._observe_chunk(session, session.stderr, chunk),
+                pty_channel=session.pty_channel,
                 max_output_bytes=_OUTPUT_BUFFER_BYTES,
             )
         except ProcessSupervisionError:
@@ -689,7 +788,11 @@ class CoderLoginSessionManager:
             )
             return
         if result.returncode == 0:
-            auth = await isolated_auth_probe(
+            if browser:
+                session.state = "authorizing"
+                session.detail = "Refreshing browser-code login authentication status"
+                session.verification_url = None
+            probe = isolated_auth_probe(
                 session.plugin,
                 session.reference,
                 self._registry.get(session.plugin).display_name,
@@ -697,6 +800,7 @@ class CoderLoginSessionManager:
                 timeout=_AUTH_PROBE_TIMEOUT_SECONDS,
                 env=dict(session.adapter.environment),
             )
+            auth = await asyncio.wait_for(probe, timeout=self._remaining_time(session)) if browser else await probe
             if session.cancel_requested:
                 self._finish(
                     session,
@@ -706,7 +810,9 @@ class CoderLoginSessionManager:
                 )
                 return
             session.auth_status = parse_coder_auth_payload(auth)
-            if session.auth_status["saved_credentials_present"] is not True:
+            if session.auth_status["saved_credentials_present"] is not True or (
+                browser and session.auth_status["status"] != "ok"
+            ):
                 self._finish(
                     session,
                     state="failed",
@@ -722,6 +828,25 @@ class CoderLoginSessionManager:
                 session,
                 state="succeeded",
                 detail="Device-code login completed; authentication status refreshed",
+                cleanup_confirmed=True,
+            )
+            return
+        if browser:
+            try:
+                failure = session.adapter.classify_failure(
+                    session.stdout.decode("utf-8", errors="replace"),
+                    result.returncode,
+                )
+                reason = failure.reason if isinstance(failure, CoderBrowserLoginFailure) else None
+            except Exception:
+                reason = None
+            self._finish(
+                session,
+                state="failed",
+                detail="Browser-code login rejected the authorization code"
+                if reason == "invalid_code"
+                else "Browser-code login failed",
+                failure_reason="invalid_code" if reason == "invalid_code" else "process_failed",
                 cleanup_confirmed=True,
             )
             return
@@ -765,11 +890,19 @@ class CoderLoginSessionManager:
         target: bytearray,
         chunk: bytes,
     ) -> None:
-        if session.state in _TERMINAL_STATES or session.parse_failed:
+        if (
+            session.state in _TERMINAL_STATES
+            or session.parse_failed
+            or session.cancel_requested
+            or (session.application_deadline is not None and session.cleanup_confirmed is False)
+        ):
             return
         target.extend(chunk)
         if len(target) > _OUTPUT_BUFFER_BYTES:
             del target[: len(target) - _OUTPUT_BUFFER_BYTES]
+        if session.application_deadline is not None:
+            self._observe_browser_output(session)
+            return
         try:
             prompt = session.adapter.parse_progress(
                 session.stdout.decode("utf-8", errors="replace"),
@@ -801,6 +934,41 @@ class CoderLoginSessionManager:
         if first_prompt:
             session.expires_at = self._wall_time() + prompt.expires_in_seconds
 
+    def _observe_browser_output(self, session: _LoginSession) -> None:
+        try:
+            progress = session.adapter.parse_progress(session.stdout.decode("utf-8", errors="replace"))
+            if progress is None:
+                return
+            if not isinstance(progress, CoderBrowserLoginProgress) or not isinstance(progress.ready_for_code, bool):
+                raise ValueError("Invalid browser login progress")
+            if session.verification_url is not None and (
+                session.verification_url != progress.authorization_url
+                or (session.state == "waiting_for_code" and not progress.ready_for_code)
+            ):
+                raise ValueError("Conflicting browser login progress")
+            previous_state, previous_url = session.state, session.verification_url
+            session.state = "waiting_for_code" if progress.ready_for_code else "waiting_for_user"
+            session.verification_url = progress.authorization_url
+            try:
+                self._session_payload(session)
+            except Exception:
+                session.state, session.verification_url = previous_state, previous_url
+                raise
+            session.detail = (
+                "Complete browser authorization and return with the code"
+                if progress.ready_for_code
+                else "Open the authorization URL to sign in"
+            )
+        except Exception:
+            session.parse_failed = True
+            session.state = "canceling"
+            session.detail = "Browser-code login returned malformed output"
+            session.verification_url = None
+            if session.managed is not None and session.abort_task is None:
+                session.abort_task = asyncio.create_task(
+                    self._abort_malformed_session(session)
+                )
+
     async def _abort_malformed_session(self, session: _LoginSession) -> None:
         assert session.managed is not None
         if not await self._cleanup(session):
@@ -822,7 +990,7 @@ class CoderLoginSessionManager:
                 )
         except Exception:
             return False
-        return result.quiescent
+        return result.quiescent and getattr(managed, "execution_settled", True)
 
     def _finish(
         self,
@@ -834,7 +1002,7 @@ class CoderLoginSessionManager:
         cleanup_confirmed: bool,
     ) -> None:
         session.state = state
-        session.detail = detail
+        session.detail = self._method_detail(session, detail)
         session.failure_reason = failure_reason
         session.cleanup_confirmed = cleanup_confirmed
         session.verification_url = None
@@ -843,7 +1011,9 @@ class CoderLoginSessionManager:
         session.stdout.clear()
         session.stderr.clear()
         session.terminal_monotonic = self._monotonic()
-        if cleanup_confirmed:
+        if cleanup_confirmed and (session.application_deadline is None or session.task is None or session.task.done()):
+            if session.application_deadline is not None:
+                self._settle_browser_session(session)
             self._release_reservation(session)
             session.managed = None
 
@@ -856,7 +1026,7 @@ class CoderLoginSessionManager:
         ),
     ) -> None:
         session.state = "cleanup_failed"
-        session.detail = detail
+        session.detail = self._method_detail(session, detail)
         session.failure_reason = "cancellation_failed"
         session.cleanup_confirmed = False
         session.verification_url = None
@@ -876,6 +1046,26 @@ class CoderLoginSessionManager:
     def _session_payload(
         self, session: _LoginSession, *, reused_session: bool = False
     ) -> dict[str, Any]:
+        if session.application_deadline is not None:
+            self._settle_browser_session(session)
+            return parse_coder_browser_login_payload(
+                {
+                    "login_method": "browser_code",
+                    "plugin": session.plugin,
+                    "session_id": session.session_id,
+                    "state": session.state,
+                    "detail": self._method_detail(session, session.detail),
+                    "failure_reason": session.failure_reason,
+                    "authorization_url": session.verification_url,
+                    "application_deadline": session.application_deadline,
+                    "cleanup_confirmed": session.cleanup_confirmed,
+                    "replacement_requested": session.replacement_requested,
+                    "reused_session": reused_session,
+                    "replacement_warning": session.adapter.replacement_warning,
+                    "auth_status": session.auth_status,
+                },
+                expected_plugin=session.plugin,
+            )
         return parse_coder_device_login_payload(
             {
                 "plugin": session.plugin,
@@ -893,6 +1083,16 @@ class CoderLoginSessionManager:
                 "auth_status": session.auth_status,
             },
             expected_plugin=session.plugin,
+        )
+
+    @staticmethod
+    def _method_detail(session: _LoginSession, detail: str) -> str:
+        if session.application_deadline is None:
+            return detail
+        return (
+            detail.replace("Device-code", "Browser-code")
+            .replace("device-code", "browser-code")
+            .replace("Codex returned malformed device-login output", "Browser-code login returned malformed output")
         )
 
     def _unsupported_payload(
@@ -961,6 +1161,7 @@ class CoderLoginSessionManager:
             for session_id, session in self._sessions.items()
             if session.terminal_monotonic is not None
             and session.terminal_monotonic <= cutoff
+            and not session.reservation_held
         ]
         for session_id in stale:
             del self._sessions[session_id]
@@ -973,7 +1174,7 @@ class CoderLoginSessionManager:
 
     @staticmethod
     def _retains_credential_ownership(session: _LoginSession) -> bool:
-        return session.terminal_monotonic is None
+        return session.terminal_monotonic is None or session.reservation_held
 
     @staticmethod
     def _valid_prompt(prompt: object) -> bool:
