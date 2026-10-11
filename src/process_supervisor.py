@@ -478,6 +478,8 @@ class SupervisedProcess:
     preserve existing communicate and callback contracts.
     """
 
+    _execution_tasks: tuple[asyncio.Task[Any], ...] = ()
+
     def __init__(
         self,
         process: asyncio.subprocess.Process,
@@ -492,7 +494,6 @@ class SupervisedProcess:
         self._identity = identity
         self._cleanup_task: asyncio.Task[CleanupResult] | None = None
         self._supervision_failure: ProcessSupervisionError | None = None
-        self._execution_tasks: tuple[asyncio.Task[Any], ...] = ()
         self._lifecycle_witness = _lifecycle_witness
         self._signaled_members: dict[
             signal.Signals, set[tuple[int, int]]
