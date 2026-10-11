@@ -1910,6 +1910,8 @@ async def test_browser_preparation_rechecks_identity(monkeypatch, browser_prepar
 
 @pytest.mark.parametrize("mutation", [
     "environment", "location", "version", "pty", "command", "warning", "parser", "object", "raise",
+    "marker_absent", "marker_type", "marker_blank", "marker_control", "marker_separator", "marker_surrogate",
+    "marker_bytes", "marker_classifier", "marker_exception", "marker_failure_type",
 ])
 async def test_browser_preparation_validates_adapter(monkeypatch, browser_preparation, mutation):
     manager, _, reservations, kwargs, auth = browser_preparation
@@ -1924,6 +1926,18 @@ async def test_browser_preparation_validates_adapter(monkeypatch, browser_prepar
         if mutation == "object":
             return object()
         adapter = original_factory(**factory_kwargs)
+        if mutation == "marker_absent":
+            from types import SimpleNamespace
+            return SimpleNamespace(**{name: getattr(adapter, name) for name in (
+                "command", "environment", "working_directory", "credential_location", "observed_cli_version",
+                "requires_pty", "application_timeout_seconds", "replacement_warning", "parse_progress",
+                "classify_failure",
+            )})
+        if mutation == "marker_exception":
+            def classify(*_args):
+                raise RuntimeError("private")
+            object.__setattr__(adapter, "classify_failure", classify)
+            return adapter
         key, value = {
             "environment": ("environment", {}),
             "location": ("credential_location", "/tmp/other"),
@@ -1932,6 +1946,15 @@ async def test_browser_preparation_validates_adapter(monkeypatch, browser_prepar
             "command": ("command", ()),
             "warning": ("replacement_warning", ""),
             "parser": ("parse_progress", None),
+            "marker_type": ("rejection_message", None),
+            "marker_blank": ("rejection_message", "  "),
+            "marker_control": ("rejection_message", "public\ntext"),
+            "marker_separator": ("rejection_message", "public\u2028text"),
+            "marker_surrogate": ("rejection_message", "\ud800"),
+            "marker_bytes": ("rejection_message", "é" * 257),
+            "marker_classifier": ("classify_failure", lambda *_args: CoderBrowserLoginFailure(
+                "process_failed", "Fixed generic failure")),
+            "marker_failure_type": ("classify_failure", lambda *_args: object()),
         }[mutation]
         object.__setattr__(adapter, key, value)
         return adapter
@@ -2000,7 +2023,7 @@ async def _prepared_browser(monkeypatch, browser_preparation, *, timeout=5):
     object.__setattr__(adapter, "application_timeout_seconds", timeout)
     session = coder_login._LoginSession(
         "B" * 43, "claude", kwargs["expected_reference"], adapter, False, manager._monotonic(),
-        reservation_held=True,
+        reservation_held=True, plugin_identity=kwargs["plugin"],
     )
     manager._sessions[session.session_id] = session
     return manager, reservations, session
@@ -2037,6 +2060,9 @@ async def test_browser_real_pty_fragmented_progress(
         "while not gate.exists(): time.sleep(.005)\n"
         "os.write(2,b'Paste code here if ')\n"
         "os.write(1,b'prompted >')\n"
+        "received=b''\n"
+        "while not received.endswith(b'\\n'): received+=os.read(0,1)\n"
+        "assert received == '  opaque é + / =  \\n'.encode()\n"
         f"done=pathlib.Path({str(tmp_path / 'done')!r})\n"
         "while not done.exists(): time.sleep(.005)\n"
     )
@@ -2065,6 +2091,10 @@ async def test_browser_real_pty_fragmented_progress(
     assert ready["state"] == "waiting_for_code"
     assert ready["application_deadline"] == initial["application_deadline"]
     if action == "success":
+        await manager._submit_browser_code(
+            "claude", session.session_id, expected_reference=session.reference,
+            authorization_code="  opaque é + / =  ",
+        )
         (tmp_path / "done").touch()
     elif action == "cancel":
         await manager.cancel("claude", session.session_id, expected_reference=session.reference)
@@ -2140,6 +2170,8 @@ async def test_browser_execution_sanitized_failures(monkeypatch, browser_prepara
             object.__setattr__(session.adapter, "classify_failure", classify)
         if case == "invalid_code":
             callback(b"Invalid code. Please make sure the full code was copied.")
+        if case in {"probe_error", "saved_missing", "probe_exception", "saved_but_error"}:
+            session.code_delivered = True
         return ProcessRunResult(
             1 if case in {"nonzero", "invalid_code", "classifier_exception"} else 0, b"", b"", False,
         )
@@ -2291,6 +2323,7 @@ async def test_browser_launch_elapsed_deadline_and_cleanup(monkeypatch, browser_
         if outcome == "supervision":
             raise ProcessSupervisionError("private-secret", stdout=b"", stderr=b"")
         kwargs["stdout_chunk_callback"]((_BROWSER_URL + "\nPaste code here if prompted >").encode())
+        session.code_delivered = True
         now[0] += 1
         return ProcessRunResult(0, b"", b"", False)
 
@@ -2422,3 +2455,794 @@ async def test_browser_replacement_requires_observed_code_prompt(monkeypatch, br
     assert final["state"] == "failed" and final["failure_reason"] == "malformed_output"
     assert probes == [] and channel.closed
     assert not reservations.login_active(session.adapter.credential_location)
+
+
+async def _submittable_browser(
+    monkeypatch, browser_preparation, *, supervision_failure=False, timeout=5, stubborn_run=False,
+    adapter_transform=None,
+):
+    from types import SimpleNamespace
+
+    manager, reservations, session = await _prepared_browser(monkeypatch, browser_preparation, timeout=timeout)
+    if adapter_transform is not None:
+        session.adapter = adapter_transform(session.adapter)
+    managed, channel = _Managed(), _Channel()
+    managed.process = SimpleNamespace(returncode=None)
+    channel.at_eof = False
+    writes = []
+    ready, completed = asyncio.Event(), asyncio.Event()
+
+    async def write(data):
+        writes.append(data)
+
+    channel.write = write
+
+    async def launch(*_args, **_kwargs):
+        return managed, channel
+
+    async def run(*_args, **kwargs):
+        kwargs["stdout_chunk_callback"]((_BROWSER_URL + "\nPaste code here if prompted >").encode())
+        ready.set()
+        try:
+            await completed.wait()
+        except asyncio.CancelledError:
+            if not stubborn_run:
+                raise
+            await completed.wait()
+        if supervision_failure:
+            raise ProcessSupervisionError("Synthetic supervision failure", stdout=b"", stderr=b"")
+        return ProcessRunResult(0, b"", b"", False)
+
+    async def probe(*_args, **_kwargs):
+        assert session.code_delivered
+        assert reservations.login_active(session.adapter.credential_location)
+        return _auth(True)
+
+    monkeypatch.setattr(coder_login, "launch_pty_process", launch)
+    monkeypatch.setattr(coder_login, "run_supervised_process", run)
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", probe)
+    manager._execute_browser_session(session)
+    await ready.wait()
+    return manager, reservations, session, managed, channel, writes, completed
+
+
+async def _submit(manager, session, code="synthetic-code", **kwargs):
+    return await manager._submit_browser_code(
+        kwargs.get("plugin", "claude"), kwargs.get("session_id", session.session_id),
+        expected_reference=kwargs.get("reference", session.reference), authorization_code=code,
+    )
+
+
+@pytest.mark.parametrize("code", [None, 1, "", " \t", "a\n", "a\r", "a\x00", "a\x7f", "a\x85",
+                                  "a\u2028", "a\u2029", "\ud800", "é" * 2049])
+async def test_browser_submission_invalid_code_does_not_claim(monkeypatch, browser_preparation, code):
+    manager, _, session, _, _, writes, completed = await _submittable_browser(monkeypatch, browser_preparation)
+    before = await _browser_snapshot(manager, session)
+    with pytest.raises(ValueError, match="^Invalid browser authorization code$"):
+        await _submit(manager, session, code)
+    assert await _browser_snapshot(manager, session) == before
+    assert not session.submission_claimed and not writes
+    await _submit(manager, session)
+    completed.set()
+    await session.task
+
+
+@pytest.mark.parametrize("invalid", ["plugin", "id", "reference", "identity", "missing_plugin", "registry_reference",
+                                     "device",
+                                     "phase", "cancel", "parse", "cleanup", "reservation", "lock",
+                                     "process", "exited", "channel", "closed", "eof", "task", "deadline", "shutdown"])
+async def test_browser_submission_rejects_unowned_session(monkeypatch, browser_preparation, invalid):
+    manager, reservations, session, managed, channel, writes, completed = await _submittable_browser(
+        monkeypatch, browser_preparation,
+    )
+    kwargs = {}
+    with monkeypatch.context() as patch:
+        if invalid in {"plugin", "id", "reference"}:
+            kwargs[{"plugin": "plugin", "id": "session_id", "reference": "reference"}[invalid]] = "wrong"
+        elif invalid == "identity":
+            patch.setattr(manager._registry, "get_optional", lambda _name: ClaudePlugin())
+        elif invalid == "missing_plugin":
+            patch.setattr(manager, "_registry", CoderRegistry())
+        elif invalid == "registry_reference":
+            patch.setattr(manager._registry, "reference_for", lambda _name: "other")
+        elif invalid == "device":
+            patch.setattr(session, "application_deadline", None)
+        elif invalid == "phase":
+            patch.setattr(session, "state", "waiting_for_user")
+        elif invalid in {"cancel", "parse", "cleanup", "reservation", "deadline"}:
+            field, value = {"cancel": ("cancel_requested", True), "parse": ("parse_failed", True),
+                            "cleanup": ("cleanup_confirmed", False), "reservation": ("reservation_held", False),
+                            "deadline": ("deadline_monotonic", 0)}[invalid]
+            patch.setattr(session, field, value)
+        elif invalid == "lock":
+            patch.setattr(reservations, "login_active", lambda _location: False)
+        elif invalid == "process":
+            patch.setattr(session, "managed", None)
+        elif invalid == "exited":
+            patch.setattr(managed.process, "returncode", 0)
+        elif invalid == "channel":
+            patch.setattr(session, "pty_channel", None)
+        elif invalid in {"closed", "eof"}:
+            patch.setattr(channel, "closed" if invalid == "closed" else "at_eof", True)
+        elif invalid == "task":
+            patch.setattr(session, "task", None)
+        else:
+            patch.setattr(manager, "_shutting_down", True)
+        with pytest.raises(ValueError, match="^Browser login session cannot accept a code$"):
+            await _submit(manager, session, **kwargs)
+        assert not session.submission_claimed and not writes
+    await _submit(manager, session)
+    completed.set()
+    await session.task
+
+
+@pytest.mark.parametrize("code", ["  opaque é + / =  ", "é" * 2048])
+async def test_browser_submission_is_atomic_and_opaque(monkeypatch, browser_preparation, code):
+    manager, _, session, _, channel, writes, completed = await _submittable_browser(monkeypatch, browser_preparation)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def write(data):
+        writes.append(data)
+        entered.set()
+        await release.wait()
+
+    channel.write = write
+    first = asyncio.create_task(_submit(manager, session, code))
+    await entered.wait()
+    assert session.state == "authorizing"
+    assert session.verification_url is None and session.code_prompt_observed
+    assert session.stdout == b""
+    for chunk in [b"Paste code", b" here if prompted >", code.encode()]:
+        manager._observe_chunk(session, session.stdout, chunk)
+    manager._observe_browser_output(session)
+    assert session.state == "authorizing" and session.stdout == b""
+    with pytest.raises(ValueError):
+        await _submit(manager, session, code)
+    assert writes == [code.encode() + b"\n"]
+    release.set()
+    snapshot = await first
+    assert snapshot["state"] == "authorizing"
+    assert code not in json.dumps(snapshot)
+    completed.set()
+    await session.task
+    assert (await _browser_snapshot(manager, session))["state"] == "succeeded"
+    assert session.write_task.done() and session.code_delivered
+
+
+@pytest.mark.parametrize("action", ["failure", "timeout", "cancel", "shutdown", "caller_cancel",
+                                   "cancel_during_writer_wait"])
+async def test_browser_submission_retains_stubborn_writer_until_reconciled(
+    monkeypatch, browser_preparation, action,
+):
+    manager, reservations, session, managed, channel, writes, completed = await _submittable_browser(
+        monkeypatch, browser_preparation,
+    )
+    monkeypatch.setattr(coder_login, "_CLEANUP_GRACE_SECONDS", .01)
+    entered, interrupted, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    writer_waiting = asyncio.Event()
+    original_wait = asyncio.wait
+
+    async def observe_wait(tasks, **kwargs):
+        if asyncio.current_task() is session.task and session.write_task in tasks:
+            writer_waiting.set()
+        return await original_wait(tasks, **kwargs)
+
+    monkeypatch.setattr(coder_login.asyncio, "wait", observe_wait)
+
+    async def write(data):
+        writes.append(data)
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            interrupted.set()
+            await release.wait()
+        if action == "failure":
+            raise RuntimeError("synthetic-secret")
+
+    channel.write = write
+    if action == "timeout":
+        session.deadline_monotonic = manager._monotonic() + .03
+    submission = asyncio.create_task(_submit(manager, session))
+    await entered.wait()
+    if action == "failure":
+        # Fail cleanup as well, so even a settled failed writer retains ownership.
+        managed.quiescent = False
+        release.set()
+        await submission
+    elif action == "timeout":
+        await submission
+    elif action in {"caller_cancel", "cancel_during_writer_wait"}:
+        if action == "cancel_during_writer_wait":
+            completed.set()
+            await asyncio.wait_for(writer_waiting.wait(), 1)
+        submission.cancel()
+        await submission
+    elif action == "cancel":
+        result = await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+        assert result["state"] == "cleanup_failed"
+    else:
+        completed.set()
+        await manager.shutdown()
+    assert session.state == "cleanup_failed" and session.cleanup_confirmed is False
+    assert session.managed is managed and session.pty_channel is channel
+    assert not channel.closed and reservations.login_active(session.adapter.credential_location)
+    assert len(writes) == 1
+    if action != "failure":
+        assert interrupted.is_set() and not session.write_task.done()
+        release.set()
+    await session.write_task
+    completed.set()
+    await session.task
+    if not submission.done():
+        await submission
+    managed.reconcile_quiescent = True
+    result = await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    assert result["state"] == "cancelled" and result["cleanup_confirmed"] is True
+    assert channel.closed and session.managed is None
+    assert not reservations.login_active(session.adapter.credential_location)
+    assert "synthetic-secret" not in json.dumps(result)
+
+
+async def test_browser_submission_deadline_cancels_writer(monkeypatch, browser_preparation):
+    manager, reservations, session, _, channel, writes, completed = await _submittable_browser(
+        monkeypatch, browser_preparation,
+    )
+    cancelled = asyncio.Event()
+
+    async def write(data):
+        writes.append(data)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    channel.write = write
+    session.deadline_monotonic = manager._monotonic() + .02
+    result = await _submit(manager, session)
+    assert result["state"] == "timed_out" and result["cleanup_confirmed"] is True
+    assert cancelled.is_set() and session.write_task.done() and not session.code_delivered
+    assert reservations.login_active(session.adapter.credential_location)
+    completed.set()
+    await session.task
+    assert channel.closed and not reservations.login_active(session.adapter.credential_location)
+    assert len(writes) == 1
+
+
+async def test_browser_old_credentials_without_submission_cannot_succeed(monkeypatch, browser_preparation):
+    manager, reservations, session, _, channel, writes, completed = await _submittable_browser(
+        monkeypatch, browser_preparation,
+    )
+    calls = []
+
+    async def old_credentials(*_args, **_kwargs):
+        calls.append(True)
+        return _auth(True)
+
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", old_credentials)
+    completed.set()
+    await session.task
+    assert (await _browser_snapshot(manager, session))["state"] == "failed"
+    assert not calls and not writes
+    assert channel.closed and not reservations.login_active(session.adapter.credential_location)
+
+
+@pytest.mark.parametrize("field", ["plugin", "session_id", "reference"])
+async def test_browser_submission_bad_identity_types(monkeypatch, browser_preparation, field):
+    manager, _, session, _, _, writes, completed = await _submittable_browser(monkeypatch, browser_preparation)
+    with pytest.raises(ValueError, match="^Browser login session cannot accept a code$"):
+        await _submit(manager, session, **{field: []})
+    assert not writes and not session.submission_claimed
+    completed.set()
+    await session.task
+
+
+@pytest.mark.parametrize("quiescent", [True, False])
+async def test_browser_exit_before_writer_settlement_times_out(monkeypatch, browser_preparation, quiescent):
+    manager, reservations, session, managed, channel, _, completed = await _submittable_browser(
+        monkeypatch, browser_preparation,
+    )
+    entered = asyncio.Event()
+
+    async def write(_data):
+        entered.set()
+        await asyncio.Event().wait()
+
+    channel.write = write
+    original_cleanup = manager._cleanup
+
+    async def process_cleanup_first(current):
+        if asyncio.current_task() is not session.task:
+            await session.task
+        return await original_cleanup(current)
+
+    monkeypatch.setattr(manager, "_cleanup", process_cleanup_first)
+    managed.quiescent = quiescent
+    submission = asyncio.create_task(_submit(manager, session))
+    await entered.wait()
+    # The process finishes first; its remaining deadline bounds writer settlement.
+    session.deadline_monotonic = manager._monotonic() + .02
+    completed.set()
+    await session.task
+    await submission
+    assert (await _browser_snapshot(manager, session))["state"] == ("timed_out" if quiescent else "cleanup_failed")
+    assert session.write_task.done() and not session.code_delivered
+    if not quiescent:
+        assert session.managed is managed and session.pty_channel is channel and not channel.closed
+        assert reservations.login_active(session.adapter.credential_location)
+        managed.reconcile_quiescent = True
+        await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    assert channel.closed and not reservations.login_active(session.adapter.credential_location)
+
+
+async def test_browser_cleanup_exception_still_cancels_writer(monkeypatch, browser_preparation):
+    manager, reservations, session, managed, channel, _, completed = await _submittable_browser(
+        monkeypatch, browser_preparation,
+    )
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def write(_data):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    channel.write = write
+    managed.cleanup_error = RuntimeError("synthetic-secret")
+    submission = asyncio.create_task(_submit(manager, session))
+    await entered.wait()
+    await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    await submission
+    assert cancelled.is_set() and session.write_task.done()
+    assert session.state == "cleanup_failed" and session.managed is managed
+    assert session.pty_channel is channel and not channel.closed
+    assert reservations.login_active(session.adapter.credential_location)
+    completed.set()
+    await session.task
+    managed.cleanup_error = None
+    managed.reconcile_quiescent = True
+    result = await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    assert result["cleanup_confirmed"] is True and channel.closed
+    assert not reservations.login_active(session.adapter.credential_location)
+
+
+async def test_browser_real_rejection_stops_waiting_child(monkeypatch, tmp_path, browser_preparation):
+    manager, reservations, session = await _prepared_browser(monkeypatch, browser_preparation)
+    ready = asyncio.Event()
+    original_observe = manager._observe_browser_output
+
+    def observe(current):
+        original_observe(current)
+        if current.state == "waiting_for_code":
+            ready.set()
+
+    monkeypatch.setattr(manager, "_observe_browser_output", observe)
+    message = session.adapter.rejection_message
+    script = (
+        "import os,time\n"
+        f"os.write(1,({_BROWSER_URL!r}+'\\nPaste code here if prompted >').encode())\n"
+        "code=b''\n"
+        "while not code.endswith(b'\\n'): code+=os.read(0,1)\n"
+        "assert code==b'synthetic-rejected-code\\n'\n"
+        # The child remains alive after reporting rejection, as the real CLI does.
+        f"message={message!r}.encode()\n"
+        "for byte in message:\n"
+        " os.write(1,bytes([byte])); time.sleep(.001)\n"
+        "while True: time.sleep(.01)\n"
+    )
+    object.__setattr__(session.adapter, "command", (sys.executable, "-c", script))
+    object.__setattr__(session.adapter, "working_directory", str(tmp_path))
+    calls = []
+
+    async def probe(*_args, **_kwargs):
+        calls.append(True)
+        return _auth(True)
+
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", probe)
+    manager._execute_browser_session(session)
+    await asyncio.wait_for(ready.wait(), 3)
+    await _submit(manager, session, "synthetic-rejected-code")
+    managed, channel = session.managed, session.pty_channel
+    await asyncio.wait_for(session.task, 3)
+    result = await _browser_snapshot(manager, session)
+    assert result["state"] == "failed" and result["failure_reason"] == "invalid_code"
+    assert result["cleanup_confirmed"] is True
+    assert channel.closed and managed.process.returncode is not None
+    assert not reservations.login_active(session.adapter.credential_location)
+    assert not calls and not session.stdout and not session.stderr
+    assert "synthetic-rejected-code" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("outcome", ["normal", "supervision", "cleanup_failed"])
+async def test_browser_fragmented_rejection_owns_cleanup(monkeypatch, browser_preparation, outcome):
+    manager, reservations, session, managed, channel, _, completed = await _submittable_browser(
+        monkeypatch, browser_preparation, supervision_failure=outcome == "supervision",
+    )
+    await _submit(manager, session)
+    managed.quiescent = outcome != "cleanup_failed"
+    # Include echoed arbitrary code and overlapping marker prefixes. No bytes
+    # from these chunks may be retained, even while matching a fragmented error.
+    for chunk in [b"synthetic-code\nII", b"nvalid code. Please ", b"make sure the full code was copied."]:
+        manager._observe_chunk(session, session.stdout, chunk)
+        assert session.stdout == b""
+    assert session.rejection_observed and session.state == "canceling"
+    manager._observe_chunk(session, session.stdout, b"Paste code here if prompted >")
+    await session.abort_task
+    assert session.state == ("cleanup_failed" if outcome == "cleanup_failed" else "failed")
+    assert reservations.login_active(session.adapter.credential_location)
+    completed.set()
+    await session.task
+    if outcome == "cleanup_failed":
+        assert session.managed is managed and session.pty_channel is channel and not channel.closed
+        managed.reconcile_quiescent = True
+        await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    else:
+        assert (await _browser_snapshot(manager, session))["failure_reason"] == "invalid_code"
+    assert channel.closed and not reservations.login_active(session.adapter.credential_location)
+
+
+@pytest.mark.parametrize("marker,classifier", [(None, "normal"), ("", "normal"), ("x" * 513, "normal"),
+                                               ("Fixed public error", "exception"),
+                                               ("Fixed public error", "other"),
+                                               ("Fixed public error", "wrong_type")])
+async def test_browser_rejection_accepts_only_fixed_classified_failure(
+    monkeypatch, browser_preparation, marker, classifier,
+):
+    manager, _, session, _, _, _, completed = await _submittable_browser(monkeypatch, browser_preparation)
+    await _submit(manager, session)
+    object.__setattr__(session.adapter, "rejection_message", marker)
+    if classifier == "exception":
+        def classify(*_args):
+            raise RuntimeError("synthetic-secret")
+        object.__setattr__(session.adapter, "classify_failure", classify)
+    elif classifier in {"other", "wrong_type"}:
+        object.__setattr__(session.adapter, "classify_failure", lambda *_args:
+                           object() if classifier == "wrong_type" else CoderBrowserLoginFailure(
+                               "process_failed", "Fixed failure"))
+    manager._observe_chunk(session, session.stdout, (marker or "arbitrary output").encode())
+    assert not session.rejection_observed and not session.stdout and session.state == "authorizing"
+    completed.set()
+    await session.task
+
+
+@pytest.mark.parametrize("cleanup_outcome", ["confirmed", "process_uncertain", "execution_unsettled"])
+async def test_browser_rejection_snapshots_during_pending_cleanup(
+    monkeypatch, browser_preparation, cleanup_outcome,
+):
+    manager, reservations, session, managed, channel, writes, completed = await _submittable_browser(
+        monkeypatch, browser_preparation,
+    )
+    await _submit(manager, session, "synthetic-rejection-code")
+    cleanup_entered, allow_cleanup = asyncio.Event(), asyncio.Event()
+    original_cleanup = managed.cleanup
+    managed.quiescent = cleanup_outcome != "process_uncertain"
+    managed.execution_settled = cleanup_outcome != "execution_unsettled"
+
+    async def blocked_cleanup(**kwargs):
+        cleanup_entered.set()
+        await allow_cleanup.wait()
+        return await original_cleanup(**kwargs)
+
+    monkeypatch.setattr(managed, "cleanup", blocked_cleanup)
+    marker = session.adapter.rejection_message.encode()
+    manager._observe_chunk(session, session.stdout, marker[:20])
+    manager._observe_chunk(session, session.stdout, marker[20:])
+    await asyncio.wait_for(cleanup_entered.wait(), 1)
+    try:
+        pending = await _browser_snapshot(manager, session)
+        assert pending["state"] == "canceling" and pending["failure_reason"] is None
+        assert pending["authorization_url"] is None and pending["cleanup_confirmed"] is None
+        assert "authorization_code" not in pending and "user_code" not in pending
+        assert "synthetic-rejection-code" not in json.dumps(pending)
+        assert session.rejection_observed and session.code_prompt_observed
+        assert session.managed is managed and session.pty_channel is channel and not channel.closed
+        assert session.reservation_held and reservations.login_active(session.adapter.credential_location)
+        assert session.write_task.done() and not session.task.done()
+        assert not session.stdout and not session.stderr and len(writes) == 1
+
+        allow_cleanup.set()
+        await session.abort_task
+        settled = await _browser_snapshot(manager, session)
+        if cleanup_outcome == "confirmed":
+            assert settled["state"] == "failed" and settled["failure_reason"] == "invalid_code"
+            assert settled["cleanup_confirmed"] is True
+        else:
+            assert settled["state"] == "cleanup_failed"
+            assert settled["failure_reason"] == "cancellation_failed"
+            assert settled["cleanup_confirmed"] is False
+        assert settled["authorization_url"] is None
+        # Even confirmed cleanup retains ownership until the login task settles.
+        assert session.managed is managed and session.pty_channel is channel and not channel.closed
+        assert session.reservation_held and reservations.login_active(session.adapter.credential_location)
+    finally:
+        allow_cleanup.set()
+        await session.abort_task
+        completed.set()
+        await session.task
+
+    final = await _browser_snapshot(manager, session)
+    if cleanup_outcome == "confirmed":
+        assert final["state"] == "failed" and final["failure_reason"] == "invalid_code"
+    else:
+        assert final["state"] == "cleanup_failed" and final["failure_reason"] == "cancellation_failed"
+        assert session.managed is managed and session.pty_channel is channel and not channel.closed
+        assert session.reservation_held and reservations.login_active(session.adapter.credential_location)
+        managed.execution_settled = True
+        managed.reconcile_quiescent = True
+        await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    assert channel.closed and session.managed is None and session.pty_channel is None
+    assert not session.reservation_held and not reservations.login_active(session.adapter.credential_location)
+
+
+@pytest.mark.parametrize("change", ["replacement", "reference", "missing_plugin", "unbound"])
+async def test_browser_execution_keeps_preparing_plugin_identity(monkeypatch, browser_preparation, change):
+    manager, reservations, session = await _prepared_browser(monkeypatch, browser_preparation)
+    original_plugin = session.plugin_identity
+    assert original_plugin is browser_preparation[3]["plugin"]
+    assert original_plugin is manager._registry.get("claude")
+    original_adapter = session.adapter
+    if change == "replacement":
+        manager._registry.register(ClaudePlugin(), reference=session.reference)
+    elif change == "reference":
+        manager._registry.register(original_plugin, reference="changed")
+    elif change == "missing_plugin":
+        manager._registry = CoderRegistry()
+    else:
+        session.plugin_identity = None
+    with pytest.raises(ValueError, match="tracked prepared"):
+        manager._execute_browser_session(session)
+    assert session.plugin_identity is (None if change == "unbound" else original_plugin)
+    assert session.adapter is original_adapter and session.state == "starting"
+    assert session.task is None and session.managed is None and session.pty_channel is None
+    assert session.deadline_monotonic is None and session.application_deadline is None
+    assert session.reservation_held and reservations.login_active(session.adapter.credential_location)
+
+
+async def test_browser_echo_is_absent_from_retained_supervision_failure(
+    monkeypatch, tmp_path, browser_preparation,
+):
+    manager, reservations, session = await _prepared_browser(monkeypatch, browser_preparation)
+    ready = asyncio.Event()
+    original_observe = manager._observe_browser_output
+    original_launch = coder_login.launch_pty_process
+    original_chunk = manager._observe_chunk
+    echo_seen = asyncio.Event()
+    owned = {}
+
+    def observe_chunk(current, target, chunk):
+        if b"synthetic-echoed-authorization-code" in chunk:
+            echo_seen.set()
+        original_chunk(current, target, chunk)
+
+    def observe(current):
+        original_observe(current)
+        if current.state == "waiting_for_code":
+            ready.set()
+
+    async def launch(*args, **kwargs):
+        managed, channel = await original_launch(*args, **kwargs)
+        owned.update(managed=managed, channel=channel, cleanup=managed.cleanup,
+                     reconcile=managed.reconcile_cleanup)
+
+        async def uncertain(**_kwargs):
+            return CleanupResult(CleanupStatus.FAILED, managed.process.returncode, False, False,
+                                 "Synthetic cleanup uncertainty")
+
+        monkeypatch.setattr(managed, "cleanup", uncertain)
+        monkeypatch.setattr(managed, "reconcile_cleanup", uncertain)
+        return managed, channel
+
+    script = (
+        "import os\n"
+        f"os.write(1,({_BROWSER_URL!r}+'\\nPaste code here if prompted >').encode())\n"
+        "received=b''\n"
+        "while not received.endswith(b'\\n'): received+=os.read(0,1)\n"
+        # Deliberate application echo, independent of the launcher's ECHO flag.
+        "os.write(1,received)\n"
+    )
+    object.__setattr__(session.adapter, "command", (sys.executable, "-c", script))
+    object.__setattr__(session.adapter, "working_directory", str(tmp_path))
+    monkeypatch.setattr(manager, "_observe_browser_output", observe)
+    monkeypatch.setattr(coder_login, "launch_pty_process", launch)
+    monkeypatch.setattr(manager, "_observe_chunk", observe_chunk)
+    manager._execute_browser_session(session)
+    try:
+        await asyncio.wait_for(ready.wait(), 3)
+        await _submit(manager, session, "synthetic-echoed-authorization-code")
+        await asyncio.wait_for(session.task, 3)
+        managed, channel = owned["managed"], owned["channel"]
+        result = await _browser_snapshot(manager, session)
+        assert result["state"] == "cleanup_failed" and result["cleanup_confirmed"] is False
+        assert session.managed is managed and session.pty_channel is channel and not channel.closed
+        assert session.reservation_held and reservations.login_active(session.adapter.credential_location)
+        assert not session.stdout and not session.stderr
+        assert echo_seen.is_set()
+        failure = managed.supervision_failure
+        assert isinstance(failure, ProcessSupervisionError)
+        assert failure.stdout == b"" and failure.stderr == b""
+        assert "synthetic-echoed-authorization-code" not in str(failure)
+        assert "synthetic-echoed-authorization-code" not in json.dumps(result)
+    finally:
+        if owned:
+            monkeypatch.setattr(owned["managed"], "cleanup", owned["cleanup"])
+            monkeypatch.setattr(owned["managed"], "reconcile_cleanup", owned["reconcile"])
+            await owned["cleanup"](term_grace=.1, kill_grace=.1)
+        await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    assert owned["channel"].closed and session.managed is None and session.pty_channel is None
+    assert not reservations.login_active(session.adapter.credential_location)
+
+
+@pytest.mark.parametrize("settles", [True, False])
+async def test_rejection_cleanup_waits_for_supervisor_settlement(monkeypatch, browser_preparation, settles):
+    manager, reservations, session, managed, channel, _, completed = await _submittable_browser(
+        monkeypatch, browser_preparation,
+    )
+    await _submit(manager, session)
+    reader_checked = asyncio.Event()
+    reader_done = False
+
+    def execution_settled(_managed):
+        if not reader_done:
+            reader_checked.set()
+        return reader_done
+
+    monkeypatch.setattr(type(managed), "execution_settled", property(execution_settled), raising=False)
+    if not settles:
+        monkeypatch.setattr(coder_login, "_CLEANUP_GRACE_SECONDS", .02)
+    manager._observe_chunk(session, session.stdout, session.adapter.rejection_message.encode())
+    try:
+        await asyncio.wait_for(reader_checked.wait(), 1)
+        pending = await _browser_snapshot(manager, session)
+        assert pending["state"] == "canceling" and pending["failure_reason"] is None
+        assert pending["cleanup_confirmed"] is None and pending["authorization_url"] is None
+        assert managed.cleanup_calls == 1
+        assert session.managed is managed and session.pty_channel is channel and not channel.closed
+        assert session.reservation_held and reservations.login_active(session.adapter.credential_location)
+        if settles:
+            reader_done = True
+        await asyncio.wait_for(session.abort_task, 1)
+        result = await _browser_snapshot(manager, session)
+        assert result["state"] == ("failed" if settles else "cleanup_failed")
+        assert result["failure_reason"] == ("invalid_code" if settles else "cancellation_failed")
+        assert result["cleanup_confirmed"] is settles
+        assert session.managed is managed and session.pty_channel is channel and not channel.closed
+        assert reservations.login_active(session.adapter.credential_location)
+    finally:
+        reader_done = True
+        await session.abort_task
+        completed.set()
+        await session.task
+        if session.cleanup_confirmed is False:
+            managed.reconcile_quiescent = True
+            await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    assert channel.closed and session.managed is None and session.pty_channel is None
+    assert not reservations.login_active(session.adapter.credential_location)
+
+
+@pytest.mark.parametrize("phase", ["before_writer_wait", "during_writer_wait", "stubborn_session"])
+async def test_browser_shutdown_does_not_wait_for_application_deadline(
+    monkeypatch, browser_preparation, phase,
+):
+    manager, reservations, session, managed, channel, _, completed = await _submittable_browser(
+        monkeypatch, browser_preparation, timeout=900, stubborn_run=phase == "stubborn_session",
+    )
+    monkeypatch.setattr(coder_login, "_CLEANUP_GRACE_SECONDS", .02)
+    entered, release, writer_waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    application_wait = asyncio.Event()
+    original_wait = asyncio.wait
+
+    async def observe_wait(tasks, **kwargs):
+        if asyncio.current_task() is session.task and session.write_task in tasks:
+            writer_waiting.set()
+            if kwargs.get("timeout", 0) > 1:
+                application_wait.set()
+        return await original_wait(tasks, **kwargs)
+
+    async def write(_data):
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            if phase == "before_writer_wait":
+                completed.set()
+            await release.wait()
+
+    monkeypatch.setattr(channel, "write", write, raising=False)
+    monkeypatch.setattr(coder_login.asyncio, "wait", observe_wait)
+    submission = asyncio.create_task(_submit(manager, session))
+    await entered.wait()
+    if phase == "stubborn_session":
+        managed.execution_settled = False
+    elif phase == "during_writer_wait":
+        completed.set()
+        await asyncio.wait_for(writer_waiting.wait(), 1)
+    shutdown = asyncio.create_task(manager.shutdown())
+    try:
+        # Unlike wait_for, this does not cancel a stuck shutdown, so the finally
+        # block can release deliberately uncooperative tasks on regression.
+        done, _ = await original_wait({shutdown}, timeout=.5)
+        assert shutdown in done
+        await shutdown
+        result = await _browser_snapshot(manager, session)
+        assert result["state"] == "cleanup_failed" and result["failure_reason"] == "cancellation_failed"
+        assert result["cleanup_confirmed"] is False
+        assert session.managed is managed and session.pty_channel is channel and not channel.closed
+        assert session.reservation_held and reservations.login_active(session.adapter.credential_location)
+        assert not session.write_task.done()
+        assert session.task.done() is (phase != "stubborn_session")
+        assert application_wait.is_set() is (phase == "during_writer_wait")
+        assert session.write_cancel_requested and session.application_deadline is not None
+    finally:
+        release.set()
+        completed.set()
+        await session.write_task
+        await session.task
+        await submission
+        await shutdown
+        managed.execution_settled = True
+        managed.reconcile_quiescent = True
+        await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    assert channel.closed and session.managed is None and session.pty_channel is None
+    assert not reservations.login_active(session.adapter.credential_location)
+
+
+async def test_browser_cancellation_at_process_completion_with_delivered_code(monkeypatch, browser_preparation):
+    manager, reservations, session, _, channel, _, completed = await _submittable_browser(
+        monkeypatch, browser_preparation,
+    )
+    await _submit(manager, session)
+    assert session.code_delivered and session.write_task.done()
+    # Process completion races with a cancellation recorded before cleanup's
+    # caller has cancelled the session task. Delivered code cannot become success.
+    session.cancel_requested = True
+    session.state = "canceling"
+    completed.set()
+    await session.task
+    result = await _browser_snapshot(manager, session)
+    assert result["state"] == "cancelled" and result["cleanup_confirmed"] is True
+    assert result["auth_status"] is None and result["failure_reason"] is None
+    assert channel.closed and session.managed is None
+    assert not reservations.login_active(session.adapter.credential_location)
+
+
+async def test_custom_browser_adapter_uses_validated_public_rejection_marker(monkeypatch, browser_preparation):
+    from types import SimpleNamespace
+
+    from src.coder_registry import CoderBrowserLoginAdapter
+
+    marker = "This provider rejected the invalid or expired code."
+    classified = []
+
+    def transform(original):
+        adapter = SimpleNamespace(**{name: getattr(original, name) for name in (
+            "command", "environment", "working_directory", "credential_location", "observed_cli_version",
+            "requires_pty", "application_timeout_seconds", "replacement_warning", "parse_progress",
+        )})
+        adapter.rejection_message = marker
+
+        def classify(output, _returncode):
+            classified.append(output)
+            return CoderBrowserLoginFailure(
+                "invalid_code" if marker in output else "process_failed", "Fixed provider failure",
+            )
+
+        adapter.classify_failure = classify
+        assert isinstance(adapter, CoderBrowserLoginAdapter)
+        return adapter
+
+    manager, reservations, session, _, channel, _, completed = await _submittable_browser(
+        monkeypatch, browser_preparation, adapter_transform=transform,
+    )
+    assert classified == [marker]  # Execution validates the advertised signal.
+    await _submit(manager, session, "synthetic-custom-code")
+    manager._observe_chunk(session, session.stdout, marker[:17].encode())
+    manager._observe_chunk(session, session.stdout, marker[17:].encode())
+    await session.abort_task
+    completed.set()
+    await session.task
+    result = await _browser_snapshot(manager, session)
+    assert result["state"] == "failed" and result["failure_reason"] == "invalid_code"
+    assert classified == [marker, marker] and not session.stdout
+    assert "synthetic-custom-code" not in json.dumps(result)
+    assert channel.closed and not reservations.login_active(session.adapter.credential_location)

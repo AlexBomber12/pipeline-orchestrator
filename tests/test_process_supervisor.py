@@ -3527,9 +3527,10 @@ async def test_invalid_grace_is_rejected(
 
 
 @pytest.mark.parametrize("limit", [None, 8])
+@pytest.mark.parametrize("capture", [True, False])
 @pytest.mark.asyncio
 async def test_supervised_pty_incremental_merged_capture(
-    process_pool: ProcessPool, limit: int | None
+    process_pool: ProcessPool, limit: int | None, capture: bool
 ) -> None:
     managed, channel = await process_pool.launch_pty(
         "import os; os.write(1, b'first|'); input(); "
@@ -3545,7 +3546,7 @@ async def test_supervised_pty_incremental_merged_capture(
 
     run = asyncio.create_task(run_supervised_process(
         managed, timeout=5, pty_channel=channel,
-        stdout_chunk_callback=observe, max_output_bytes=limit,
+        stdout_chunk_callback=observe, max_output_bytes=limit, capture_output=capture,
     ))
     try:
         await asyncio.wait_for(first_output.wait(), 2)
@@ -3555,7 +3556,7 @@ async def test_supervised_pty_incremental_merged_capture(
         output = b"first|stderr|last"
         assert b"".join(chunks) == output
         assert len(chunks) >= 2
-        assert result.stdout == (output if limit is None else output[-limit:])
+        assert result.stdout == ((output if limit is None else output[-limit:]) if capture else b"")
         assert result.stderr == b""
         assert result.returncode == 0
         assert not result.timed_out
@@ -3807,3 +3808,35 @@ async def test_supervised_pty_invalid_capture_keeps_caller_ownership(
     finally:
         channel.close()
         os.close(slave)
+
+
+@pytest.mark.asyncio
+async def test_no_capture_reader_drops_last_chunk_before_waiting() -> None:
+    observed, waiting, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    buffer = bytearray()
+
+    class Stream:
+        first = True
+
+        async def read(self, _size):
+            if self.first:
+                self.first = False
+                return b"synthetic-sensitive-output"
+            waiting.set()
+            await release.wait()
+            return b""
+
+    def observe(chunk):
+        assert chunk == b"synthetic-sensitive-output"
+        observed.set()
+
+    reader = asyncio.create_task(process_supervisor._capture_output(
+        Stream(), buffer, max_bytes=0, on_chunk=observe,
+    ))
+    try:
+        await asyncio.wait_for(waiting.wait(), 1)
+        assert observed.is_set() and buffer == b""
+        assert reader.get_coro().cr_frame.f_locals["chunk"] == b""
+    finally:
+        release.set()
+        await reader
