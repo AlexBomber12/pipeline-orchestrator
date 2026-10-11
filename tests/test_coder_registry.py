@@ -1029,6 +1029,22 @@ def test_browser_login_contract_rejects_non_mapping_payload() -> None:
         parse_coder_browser_login_payload([])
 
 
+def test_browser_login_contract_requires_failed_reason() -> None:
+    payload = _browser_login_payload(state="failed")
+    payload.update(
+        authorization_url=None,
+        application_deadline=None,
+        cleanup_confirmed=None,
+        failure_reason=None,
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="^browser login failure reason is required$",
+    ):
+        parse_coder_browser_login_payload(payload)
+
+
 @pytest.mark.parametrize(
     "mutate",
     [

@@ -736,6 +736,8 @@ def parse_coder_browser_login_payload(
         and failure_reason not in BROWSER_LOGIN_FAILURE_REASONS
     ):
         raise TypeError("invalid browser login failure reason")
+    if state == "failed" and failure_reason is None:
+        raise TypeError("browser login failure reason is required")
     if failure_reason == "unsupported_cli_version" and (
         state != "unsupported"
         or observed_cli_version is None
