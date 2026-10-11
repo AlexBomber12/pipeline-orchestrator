@@ -3595,7 +3595,7 @@ async def test_browser_admission_waiter_cancellation_preserves_shared_start(monk
     admission = manager._browser_admissions[context["credential_location"]]
     second = asyncio.create_task(_start_browser_admission(manager, context))
     await asyncio.sleep(0)
-    assert admission.waiters == 2
+    assert len(admission.waiters) == 2
     if cancelled in {"after_transfer", "after_delivery"}:
         snapshot = manager._session_payload
 
@@ -3615,14 +3615,14 @@ async def test_browser_admission_waiter_cancellation_preserves_shared_start(monk
     if results is None:
         with pytest.raises(asyncio.CancelledError):
             await (first if cancelled == "first" else second)
-        assert not admission.cancel_requested and admission.waiters == 1
+        assert not admission.cancel_requested and len(admission.waiters) == 1
         settled.set()
         result = await (second if cancelled == "first" else first)
     else:
         assert sum(isinstance(value, asyncio.CancelledError) for value in results) == 1
         result = next(value for value in results if isinstance(value, dict))
     session = manager._sessions[result["session_id"]]
-    assert not admission.cancel_requested and session.admission_delivered and admission.waiters == 0
+    assert not admission.cancel_requested and session.admission_delivered and not admission.waiters
     assert not session.cancel_requested and session.admission_cancel_task is None
     assert len(calls) == 1 and reservations.login_active(context["credential_location"])
     stop.set()
@@ -3794,3 +3794,90 @@ async def test_browser_admission_rolls_back_failed_executor_validation(monkeypat
     assert len(manager._sessions) == 1 and len(calls) == 2
     await manager.shutdown()
     assert not reservations.login_active(location)
+
+
+@pytest.mark.parametrize("invalid", ["warning", "deadline"])
+async def test_browser_admission_rejects_invalid_snapshot_before_launch(monkeypatch, browser_admission, invalid):
+    manager, _, reservations, context, _, _, settled, calls = browser_admission
+    factory = context["plugin"].create_browser_login
+    launches = []
+
+    def invalid_factory(**kwargs):
+        adapter = factory(**kwargs)
+        if invalid == "warning":
+            object.__setattr__(adapter, "replacement_warning", "synthetic\x7fprivate")
+        return adapter
+
+    async def launch(*_args, **_kwargs):
+        launches.append(True)
+        pytest.fail("Invalid response must be rejected before process launch")
+
+    monkeypatch.setattr(context["plugin"], "create_browser_login", invalid_factory)
+    if invalid == "deadline":
+        manager._wall_time = lambda: float("nan")
+    monkeypatch.setattr(coder_login, "launch_pty_process", launch)
+    location = context["credential_location"]
+    version = reservations.credential_version(location)
+    settled.set()
+    result = await _start_browser_admission(manager, context)
+    assert result.reason == "startup_failed" and "private" not in result.detail
+    await asyncio.sleep(0)
+    assert len(calls) == 1 and not launches and not manager._sessions and not manager._browser_admissions
+    assert not reservations.login_active(location) and reservations.credential_version(location) == version + 1
+
+
+@pytest.mark.parametrize("remaining", ["none", "shared", "all_cancelled"])
+async def test_browser_admission_observes_cancellation_queued_at_preflight_completion(browser_admission, remaining):
+    manager, _, reservations, context, _, entered, settled, _ = browser_admission
+    first = asyncio.create_task(_start_browser_admission(manager, context))
+    await entered.wait()
+    second = None
+    if remaining != "none":
+        second = asyncio.create_task(_start_browser_admission(manager, context))
+        await asyncio.sleep(0)
+    admission = manager._browser_admissions[context["credential_location"]]
+    # Queue preflight completion first, then cancel callers before admission transfers.
+    settled.set()
+    first.cancel()
+    if remaining == "all_cancelled":
+        second.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    if remaining == "shared":
+        result = await second
+        assert isinstance(result, dict)
+        assert not manager._sessions[result["session_id"]].cancel_requested
+        await manager.shutdown()
+    else:
+        if second:
+            with pytest.raises(asyncio.CancelledError):
+                await second
+        assert isinstance(await admission.task, CoderBrowserLoginFailure)
+        assert not manager._sessions
+    assert not manager._browser_admissions and not reservations.login_active(context["credential_location"])
+
+
+async def test_browser_admission_allows_retry_in_task_that_caught_cancellation(browser_admission):
+    manager, _, reservations, context, _, entered, settled, calls = browser_admission
+    caught = asyncio.Event()
+
+    async def retry():
+        try:
+            await _start_browser_admission(manager, context)
+        except asyncio.CancelledError:
+            admission = manager._browser_admissions[context["credential_location"]]
+            caught.set()
+            await admission.task
+            assert asyncio.current_task().cancelling() == 1
+            return await _start_browser_admission(manager, context)
+
+    caller = asyncio.create_task(retry())
+    await entered.wait()
+    caller.cancel()
+    await caught.wait()
+    assert reservations.login_active(context["credential_location"])
+    settled.set()
+    result = await caller
+    assert isinstance(result, dict) and len(calls) == 2
+    await manager.shutdown()
+    assert not reservations.login_active(context["credential_location"])

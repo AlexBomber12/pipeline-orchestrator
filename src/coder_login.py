@@ -153,7 +153,7 @@ class _BrowserAdmission:
     task: asyncio.Task[dict[str, Any] | CoderBrowserLoginFailure] | None = None
     cancel_requested: bool = False
     session: _LoginSession | None = None
-    waiters: int = 0
+    waiters: dict[asyncio.Task[Any], int] = field(default_factory=dict)
 
 
 class CoderLoginSessionManager:
@@ -273,7 +273,7 @@ class CoderLoginSessionManager:
             return failure("unsupported", "Browser login adapter context is invalid")
         return adapter
 
-    def _execute_browser_session(self, session: _LoginSession) -> None:
+    def _execute_browser_session(self, session: _LoginSession) -> dict[str, Any]:
         """Take over a session bound to its preparing plugin and reservation."""
         if (
             self._shutting_down
@@ -292,8 +292,10 @@ class CoderLoginSessionManager:
         session.deadline_monotonic = self._monotonic() + session.adapter.application_timeout_seconds
         session.application_deadline = self._wall_time() + session.adapter.application_timeout_seconds
         session.detail = "Preparing browser-code login"
+        snapshot = self._session_payload(session)
         session.task = asyncio.create_task(self._start_session(session))
         session.task.add_done_callback(lambda _task: self._settle_browser_session(session))
+        return snapshot
 
     def _settle_browser_session(self, session: _LoginSession) -> None:
         if (
@@ -409,11 +411,13 @@ class CoderLoginSessionManager:
             self._browser_admissions[location] = admission
             admission.task = asyncio.create_task(self._admit_browser(admission))
         assert admission.task is not None
-        admission.waiters += 1
+        waiter = asyncio.current_task()
+        assert waiter is not None
+        admission.waiters[waiter] = waiter.cancelling()
         try:
             result = await asyncio.shield(admission.task)
         except asyncio.CancelledError:
-            if admission.waiters == 1 and (
+            if not self._admission_has_waiter(admission) and (
                 admission.session is None or not admission.session.admission_delivered
             ):
                 admission.cancel_requested = True
@@ -426,12 +430,18 @@ class CoderLoginSessionManager:
                     ))
             raise
         finally:
-            admission.waiters -= 1
+            admission.waiters.pop(waiter)
         if admission.session is not None:
             admission.session.admission_delivered = True
         if reused and admission.session is not None:
             return self._session_payload(admission.session, reused_session=True)
         return result
+
+    @staticmethod
+    def _admission_has_waiter(admission: _BrowserAdmission) -> bool:
+        # Task cancellation is visible even before its shielded waiter resumes.
+        # Capture the initial count so a task may retry after catching cancellation.
+        return any(task.cancelling() == count for task, count in admission.waiters.items())
 
     def _browser_credential_busy(self, location: str) -> bool:
         try:
@@ -451,7 +461,7 @@ class CoderLoginSessionManager:
                 environment=admission.environment, reservation_held=True,
                 replace_existing=admission.replacement_requested,
             )
-            if self._shutting_down or admission.cancel_requested:
+            if self._shutting_down or admission.cancel_requested or not self._admission_has_waiter(admission):
                 return CoderBrowserLoginFailure(
                     "daemon_shutdown" if self._shutting_down else "cancelled",
                     "Browser login admission was stopped",
@@ -479,14 +489,14 @@ class CoderLoginSessionManager:
             )
             self._sessions[session.session_id] = session
             try:
-                self._execute_browser_session(session)
+                snapshot = self._execute_browser_session(session)
             except Exception:
                 # Executor setup validates synchronously before scheduling its task.
                 self._sessions.pop(session.session_id)
                 session.reservation_held = False
                 return CoderBrowserLoginFailure("startup_failed", "Browser-code login could not be started")
             admission.session = session
-            return self._session_payload(session)
+            return snapshot
         finally:
             if admission.session is None:
                 self._credential_reservations.release_login(admission.credential_location)
