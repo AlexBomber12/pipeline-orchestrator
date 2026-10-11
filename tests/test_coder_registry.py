@@ -874,7 +874,7 @@ def test_browser_login_contract_preserves_bounded_version_evidence() -> None:
         session_id=None,
         authorization_url=None,
         application_deadline=None,
-        cleanup_confirmed=True,
+        cleanup_confirmed=None,
         failure_reason="unsupported_cli_version",
         observed_cli_version="2.1.119",
         minimum_cli_version="2.1.126",
@@ -899,6 +899,22 @@ def test_browser_login_contract_requires_unsupported_version_evidence(
         failure_reason="unsupported_cli_version",
     )
     payload[missing_field] = None
+
+    with pytest.raises(
+        TypeError,
+        match="^invalid unsupported browser login version evidence$",
+    ):
+        parse_coder_browser_login_payload(payload)
+
+
+def test_browser_login_contract_rejects_unsupported_version_session() -> None:
+    payload = _browser_login_payload(state="unsupported")
+    payload.update(
+        authorization_url=None,
+        application_deadline=None,
+        cleanup_confirmed=None,
+        failure_reason="unsupported_cli_version",
+    )
 
     with pytest.raises(
         TypeError,
@@ -1335,6 +1351,48 @@ def test_browser_login_contract_accepts_out_of_band_failure_state(
         payload["session_id"] = "B" * 43
 
     assert parse_coder_browser_login_payload(payload)["state"] == state
+
+
+@pytest.mark.parametrize(
+    "failure_reason",
+    ["credential_in_use", "replacement_required", "cli_missing", "session_capacity"],
+)
+def test_browser_login_contract_accepts_session_backed_preflight_failure(
+    failure_reason: str,
+) -> None:
+    payload = _browser_login_payload(state="failed")
+    payload.update(
+        authorization_url=None,
+        application_deadline=None,
+        cleanup_confirmed=True,
+        failure_reason=failure_reason,
+    )
+
+    assert parse_coder_browser_login_payload(payload)["cleanup_confirmed"] is True
+
+
+@pytest.mark.parametrize(
+    ("session_id", "cleanup_confirmed"),
+    [("B" * 43, None), (None, True)],
+)
+def test_browser_login_contract_rejects_invalid_optional_session_evidence(
+    session_id: str | None,
+    cleanup_confirmed: bool | None,
+) -> None:
+    payload = _browser_login_payload(state="failed")
+    payload.update(
+        session_id=session_id,
+        authorization_url=None,
+        application_deadline=None,
+        cleanup_confirmed=cleanup_confirmed,
+        failure_reason="credential_in_use",
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="^invalid browser login optional session evidence$",
+    ):
+        parse_coder_browser_login_payload(payload)
 
 
 @pytest.mark.parametrize("failure_reason", ["unsupported", "session_not_found"])
