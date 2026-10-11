@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 from src import coder_auth, coder_auth_worker
+from src.coder_registry import CoderAuthCapabilities, coder_auth_payload
 from src.coders import claude as claude_module
 from src.coders import codex as codex_module
 from src.coders.claude import ClaudePlugin
@@ -253,3 +254,95 @@ def test_worker_main_validates_control_argument_and_binds_environment(
     environment = calls[0]["environment"]
     assert isinstance(environment, dict)
     assert environment["BOUND_HOME"] == "/credentials/a"
+
+
+@pytest.mark.parametrize(
+    ("version_result", "methods", "reason"),
+    [
+        ((0, "2.1.126 (Claude Code)", ""), ["browser_code"], "credentials_missing"),
+        ((0, "2.2.0", ""), ["browser_code"], "credentials_missing"),
+        ((0, "2.1.125", ""), [], "credentials_missing"),
+        ((127, "", "claude not found"), [], "cli_missing"),
+        ((124, "", "timeout"), [], "probe_timeout"),
+        ((0, "unrecognized", ""), [], "unrecognized_output"),
+    ],
+)
+def test_worker_preserves_real_claude_probe_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+    version_result: tuple[int, str, str], methods: list[str], reason: str,
+) -> None:
+    environment = {"CLAUDE_CONFIG_DIR": "/bound/claude", "HOME": "/bound/home"}
+    calls: list[list[str]] = []
+
+    def run_auth_command(
+        command: list[str], *, env: dict[str, str] | None = None,
+    ) -> tuple[int, str, str]:
+        assert env == environment
+        assert env is not environment
+        calls.append(command)
+        if command == ["claude", "--version"]:
+            return version_result
+        assert command == ["claude", "auth", "status"]
+        return 1, '{"loggedIn":false,"authMethod":"none"}', ""
+
+    monkeypatch.setattr(claude_module, "_run_auth_command", run_auth_command)
+    result = coder_auth_worker.run_probe(
+        "claude", "src.coders.claude:ClaudePlugin", "/unused/config.yml",
+        environment=environment,
+    )
+    assert result["capabilities"]["interactive_login_methods"] == methods
+    assert result["failure_reason"] == reason
+    assert result["saved_credentials_present"] is None
+    assert result["service_access_verified"] is None
+    assert result["status"] == "error"
+    assert calls[0] == ["claude", "--version"]
+    assert ClaudePlugin.auth_capabilities.interactive_login_methods == ()
+
+
+@pytest.mark.parametrize(
+    ("extra", "methods", "failed"),
+    [
+        ({}, ["device_code"], False),
+        ({"capabilities": {}}, None, False),
+        ({"capabilities": None}, None, False),
+        ({"capabilities": {"interactive_login_methods": []}}, [], False),
+        ({"capabilities": {"interactive_login_methods": None}}, None, False),
+        ({"capabilities": {"interactive_login_methods": ["browser_code"], "secret": "synthetic-secret"}},
+         ["browser_code"], False),
+        ({"capabilities": "synthetic-secret"}, None, True),
+        ({"capabilities": []}, None, True),
+        ({"capabilities": {"can_check_cli": "synthetic-secret"}}, None, True),
+        ({"capabilities": {"interactive_login_methods": "synthetic-secret"}}, None, True),
+        ({"capabilities": {"interactive_login_methods": ["synthetic-secret"]}}, None, True),
+    ],
+)
+def test_worker_selects_explicit_capabilities_by_presence_and_validates(
+    monkeypatch: pytest.MonkeyPatch, extra: dict[str, Any],
+    methods: list[str] | None, failed: bool,
+) -> None:
+    raw = {"status": "ok", "detail": "ready", "secret": "synthetic-secret", **extra}
+
+    class _Plugin:
+        display_name = "Test Coder"
+        auth_capabilities = CoderAuthCapabilities(interactive_login_methods=("device_code",))
+
+        def check_auth(self) -> dict[str, Any]:
+            return raw
+
+    monkeypatch.setattr(coder_auth_worker, "_load_plugin", lambda *_args: _Plugin())
+    result = coder_auth_worker.run_probe("test", "module:factory", "/unused")
+    if failed:
+        _assert_probe_error(result, "Test Coder")
+    else:
+        assert result["status"] == "ok"
+        assert result["detail"] == "ready"
+    assert result["capabilities"]["interactive_login_methods"] == methods
+    assert "synthetic-secret" not in str(result)
+    assert "secret" not in result
+    assert "secret" not in result["capabilities"]
+    assert result["saved_credentials_present"] is None
+    assert result["service_access_verified"] is None
+    assert _Plugin.auth_capabilities.interactive_login_methods == ("device_code",)
+    assert raw == {"status": "ok", "detail": "ready", "secret": "synthetic-secret", **extra}
+    if "capabilities" not in extra:
+        assert result == coder_auth_payload(raw, capabilities=_Plugin.auth_capabilities)

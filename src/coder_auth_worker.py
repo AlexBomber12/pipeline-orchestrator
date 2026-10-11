@@ -12,6 +12,7 @@ from src.coder_registry import (
     CoderAuthCapabilities,
     CoderAuthStatus,
     coder_auth_payload,
+    parse_coder_auth_payload,
 )
 from src.coders import _load_plugin
 
@@ -55,6 +56,8 @@ def run_probe(
                 raise TypeError("check_auth does not accept environment")
             kwargs["environment"] = dict(environment)
         result: Any = check_auth(**kwargs)
+        if isinstance(result, dict) and "capabilities" in result:
+            return parse_coder_auth_payload(result)
         capabilities = getattr(plugin, "auth_capabilities", None)
         if capabilities is not None and not isinstance(
             capabilities, CoderAuthCapabilities
