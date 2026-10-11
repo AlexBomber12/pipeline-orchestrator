@@ -122,6 +122,7 @@ class _LoginSession:
     abort_task: asyncio.Task[None] | None = None
     cancel_requested: bool = False
     parse_failed: bool = False
+    code_prompt_observed: bool = False
     reservation_held: bool = False
     pty_channel: PtyChannel | None = None
     application_deadline: float | None = None
@@ -777,7 +778,9 @@ class CoderLoginSessionManager:
             )
             return
         if session.parse_failed or (
-            result.returncode == 0 and session.verification_url is None
+            result.returncode == 0 and (
+                session.verification_url is None or (browser and not session.code_prompt_observed)
+            )
         ):
             self._finish(
                 session,
@@ -954,6 +957,7 @@ class CoderLoginSessionManager:
             except Exception:
                 session.state, session.verification_url = previous_state, previous_url
                 raise
+            session.code_prompt_observed |= progress.ready_for_code
             session.detail = (
                 "Complete browser authorization and return with the code"
                 if progress.ready_for_code

@@ -2117,7 +2117,7 @@ async def test_browser_execution_sanitized_failures(monkeypatch, browser_prepara
         callback = kwargs["stdout_chunk_callback"]
         callback(b"Welcome\n")
         if case not in {"empty", "bad_url"}:
-            callback((_BROWSER_URL + "\n").encode())
+            callback((_BROWSER_URL + "\nPaste code here if prompted >").encode())
         if case == "malformed":
             callback(b"https://evil.example/private-secret\n")
         if case == "conflicting":
@@ -2290,7 +2290,7 @@ async def test_browser_launch_elapsed_deadline_and_cleanup(monkeypatch, browser_
         assert session.application_deadline == 1005
         if outcome == "supervision":
             raise ProcessSupervisionError("private-secret", stdout=b"", stderr=b"")
-        kwargs["stdout_chunk_callback"]((_BROWSER_URL + "\n").encode())
+        kwargs["stdout_chunk_callback"]((_BROWSER_URL + "\nPaste code here if prompted >").encode())
         now[0] += 1
         return ProcessRunResult(0, b"", b"", False)
 
@@ -2390,3 +2390,35 @@ async def test_browser_retains_channel_until_stubborn_reader_settles(
     finally:
         release.set()
         await manager.shutdown()
+
+
+async def test_browser_replacement_requires_observed_code_prompt(monkeypatch, browser_preparation):
+    manager, _, reservations, kwargs, auth = browser_preparation
+    kwargs["replace_existing"] = True
+    auth.update(status="ok", saved_credentials_present=True, failure_reason=None)
+    manager, reservations, session = await _prepared_browser(monkeypatch, browser_preparation)
+    session.replacement_requested = True
+    managed, channel = _Managed(), _Channel()
+    probes = []
+
+    async def launch(*_args, **_kwargs):
+        return managed, channel
+
+    async def run(*_args, **kwargs):
+        kwargs["stdout_chunk_callback"]((_BROWSER_URL + "\n").encode())
+        assert session.state == "waiting_for_user"
+        return ProcessRunResult(0, b"", b"", False)
+
+    async def probe(*_args, **_kwargs):
+        probes.append(True)
+        return _auth(True)
+
+    monkeypatch.setattr(coder_login, "launch_pty_process", launch)
+    monkeypatch.setattr(coder_login, "run_supervised_process", run)
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", probe)
+    manager._execute_browser_session(session)
+    await session.task
+    final = await _browser_snapshot(manager, session)
+    assert final["state"] == "failed" and final["failure_reason"] == "malformed_output"
+    assert probes == [] and channel.closed
+    assert not reservations.login_active(session.adapter.credential_location)
