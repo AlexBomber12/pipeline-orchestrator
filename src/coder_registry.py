@@ -814,6 +814,24 @@ def parse_coder_browser_login_payload(
     out_of_band_state = _BROWSER_OUT_OF_BAND_FAILURE_STATES.get(failure_reason)
     if out_of_band_state is not None and state != out_of_band_state:
         raise TypeError("invalid browser login out-of-band failure state")
+    if failure_reason == "daemon_unavailable" and not (
+        state == "failed"
+        and session_id is None
+        and cleanup_confirmed is None
+    ):
+        raise TypeError("invalid browser login daemon availability evidence")
+    if failure_reason == "daemon_shutdown":
+        shutdown_evidence_valid = (
+            state == "failed"
+            and session_id is None
+            and cleanup_confirmed is None
+        ) or (
+            state == "cancelled"
+            and session_id is not None
+            and cleanup_confirmed is True
+        )
+        if not shutdown_evidence_valid:
+            raise TypeError("invalid browser login daemon shutdown evidence")
     if state == "succeeded" and (
         cleanup_confirmed is not True
         or auth_status is None

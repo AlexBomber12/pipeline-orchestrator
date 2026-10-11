@@ -1314,6 +1314,55 @@ def test_browser_login_contract_rejects_out_of_band_failure_state(
         parse_coder_browser_login_payload(payload)
 
 
+@pytest.mark.parametrize(
+    ("state", "failure_reason", "session_id", "cleanup_confirmed"),
+    [
+        ("failed", "daemon_unavailable", None, None),
+        ("failed", "daemon_shutdown", None, None),
+        ("cancelled", "daemon_shutdown", "B" * 43, True),
+    ],
+)
+def test_browser_login_contract_accepts_daemon_lifecycle_failure(
+    state: str,
+    failure_reason: str,
+    session_id: str | None,
+    cleanup_confirmed: bool | None,
+) -> None:
+    payload = _browser_login_payload(state=state)
+    payload.update(
+        session_id=session_id,
+        authorization_url=None,
+        application_deadline=None,
+        cleanup_confirmed=cleanup_confirmed,
+        failure_reason=failure_reason,
+    )
+
+    assert parse_coder_browser_login_payload(payload)["state"] == state
+
+
+@pytest.mark.parametrize(
+    ("state", "failure_reason"),
+    [
+        ("unsupported", "daemon_unavailable"),
+        ("expired", "daemon_shutdown"),
+    ],
+)
+def test_browser_login_contract_rejects_daemon_lifecycle_failure(
+    state: str,
+    failure_reason: str,
+) -> None:
+    payload = _browser_login_payload(state=state)
+    payload.update(
+        authorization_url=None,
+        application_deadline=None,
+        cleanup_confirmed=True,
+        failure_reason=failure_reason,
+    )
+
+    with pytest.raises(TypeError):
+        parse_coder_browser_login_payload(payload)
+
+
 @pytest.mark.parametrize("state", ["waiting_for_user", "succeeded"])
 def test_browser_login_contract_rejects_failure_reason_for_nonfailure_state(
     state: str,
