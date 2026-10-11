@@ -116,6 +116,9 @@ _BROWSER_SESSION_ID_STATES = _BROWSER_ACTIVE_STATES | {
     "cleanup_failed",
 }
 _BROWSER_CLEAN_TERMINAL_STATES = frozenset({"cancelled", "expired", "timed_out"})
+_BROWSER_ERROR_STATES = frozenset(
+    {"unsupported", "failed", "expired", "timed_out", "cleanup_failed", "not_found"}
+)
 _MAX_AUTHORIZATION_URL_CHARACTERS = 4096
 
 
@@ -742,7 +745,7 @@ def parse_coder_browser_login_payload(
         and failure_reason not in BROWSER_LOGIN_FAILURE_REASONS
     ):
         raise TypeError("invalid browser login failure reason")
-    if state == "failed" and failure_reason is None:
+    if state in _BROWSER_ERROR_STATES and failure_reason is None:
         raise TypeError("browser login failure reason is required")
     if failure_reason == "unsupported_cli_version" and (
         state != "unsupported"

@@ -839,17 +839,29 @@ def test_browser_login_contract_accepts_authorizing_and_cleanup_failure() -> Non
 
 
 @pytest.mark.parametrize(
-    "state",
-    ["unsupported", "failed", "cancelled", "expired", "timed_out", "not_found"],
+    ("state", "failure_reason"),
+    [
+        ("unsupported", "unsupported"),
+        ("failed", "process_failed"),
+        ("cancelled", None),
+        ("expired", "provider_expired"),
+        ("timed_out", "application_timeout"),
+        ("not_found", "session_not_found"),
+    ],
 )
-def test_browser_login_contract_accepts_terminal_snapshots(state: str) -> None:
+def test_browser_login_contract_accepts_terminal_snapshots(
+    state: str,
+    failure_reason: str | None,
+) -> None:
     payload = _browser_login_payload(state=state)
     payload.update(
         authorization_url=None,
         application_deadline=None,
         cleanup_confirmed=True,
-        failure_reason=("process_failed" if state == "failed" else None),
+        failure_reason=failure_reason,
     )
+    if state in {"unsupported", "not_found"}:
+        payload.update(session_id=None, cleanup_confirmed=None)
 
     parsed = parse_coder_browser_login_payload(payload)
 
@@ -1045,12 +1057,16 @@ def test_browser_login_contract_rejects_non_mapping_payload() -> None:
         parse_coder_browser_login_payload([])
 
 
-def test_browser_login_contract_requires_failed_reason() -> None:
-    payload = _browser_login_payload(state="failed")
+@pytest.mark.parametrize(
+    "state",
+    ["unsupported", "failed", "expired", "timed_out", "cleanup_failed", "not_found"],
+)
+def test_browser_login_contract_requires_error_state_reason(state: str) -> None:
+    payload = _browser_login_payload(state=state)
     payload.update(
         authorization_url=None,
         application_deadline=None,
-        cleanup_confirmed=None,
+        cleanup_confirmed=(False if state == "cleanup_failed" else None),
         failure_reason=None,
     )
 
@@ -1104,10 +1120,18 @@ def test_browser_login_contract_requires_active_session_id(state: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "state",
-    ["succeeded", "cancelled", "expired", "timed_out"],
+    ("state", "failure_reason"),
+    [
+        ("succeeded", None),
+        ("cancelled", None),
+        ("expired", "provider_expired"),
+        ("timed_out", "application_timeout"),
+    ],
 )
-def test_browser_login_contract_requires_terminal_session_id(state: str) -> None:
+def test_browser_login_contract_requires_terminal_session_id(
+    state: str,
+    failure_reason: str | None,
+) -> None:
     payload = (
         _successful_browser_login_payload()
         if state == "succeeded"
@@ -1118,6 +1142,7 @@ def test_browser_login_contract_requires_terminal_session_id(state: str) -> None
         authorization_url=None,
         application_deadline=None,
         cleanup_confirmed=True,
+        failure_reason=failure_reason,
     )
 
     with pytest.raises(TypeError, match="^browser login session ID is required$"):
@@ -1154,13 +1179,24 @@ def test_browser_login_contract_requires_cleanup_failure_session_id() -> None:
         parse_coder_browser_login_payload(payload)
 
 
-@pytest.mark.parametrize("state", ["cancelled", "expired", "timed_out"])
-def test_browser_login_contract_requires_terminal_cleanup(state: str) -> None:
+@pytest.mark.parametrize(
+    ("state", "failure_reason"),
+    [
+        ("cancelled", None),
+        ("expired", "provider_expired"),
+        ("timed_out", "application_timeout"),
+    ],
+)
+def test_browser_login_contract_requires_terminal_cleanup(
+    state: str,
+    failure_reason: str | None,
+) -> None:
     payload = _browser_login_payload(state=state)
     payload.update(
         authorization_url=None,
         application_deadline=None,
         cleanup_confirmed=None,
+        failure_reason=failure_reason,
     )
 
     with pytest.raises(
