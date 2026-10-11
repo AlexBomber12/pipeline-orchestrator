@@ -478,6 +478,8 @@ class SupervisedProcess:
     preserve existing communicate and callback contracts.
     """
 
+    _execution_tasks: tuple[asyncio.Task[Any], ...] = ()
+
     def __init__(
         self,
         process: asyncio.subprocess.Process,
@@ -521,6 +523,11 @@ class SupervisedProcess:
     def supervision_failure(self) -> ProcessSupervisionError | None:
         """Return the structured execution failure retained for its owner."""
         return self._supervision_failure
+
+    @property
+    def execution_settled(self) -> bool:
+        """Whether every reader and leader waiter owned by the runner has stopped."""
+        return all(task.done() for task in self._execution_tasks)
 
     async def cleanup(
         self,
@@ -1686,6 +1693,9 @@ async def run_supervised_process(
                 on_chunk=stderr_chunk_callback,
             )
         )
+
+    if isinstance(managed, SupervisedProcess):
+        managed._execution_tasks += tuple(execution_tasks.values())
 
     primary_error: BaseException | None = None
     cancellation: asyncio.CancelledError | None = None

@@ -13,6 +13,7 @@ from src.coder_login import CoderCredentialReservations, CoderLoginSessionManage
 from src.coder_registry import (
     CoderAuthStatus,
     CoderBrowserLoginFailure,
+    CoderBrowserLoginProgress,
     CoderDeviceLoginFailure,
     CoderDeviceLoginPrompt,
     CoderRegistry,
@@ -1978,3 +1979,446 @@ async def test_browser_preparation_probe_exception_and_cancellation(monkeypatch,
     assert stopped.is_set()
     assert reservations.login_active(kwargs["credential_location"])
     assert reservations.credential_version(kwargs["credential_location"]) == 0
+
+
+_BROWSER_URL = (
+    "https://claude.com/cai/oauth/authorize?client_id=test&code=true&"
+    "code_challenge=challenge&code_challenge_method=S256&redirect_uri=https%3A%2F%2Fexample.com&"
+    "response_type=code&scope=user&state=private-state"
+)
+
+
+async def _prepared_browser(monkeypatch, browser_preparation, *, timeout=5):
+    manager, _, reservations, kwargs, auth = browser_preparation
+
+    async def probe(*_args, **_kwargs):
+        return auth
+
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", probe)
+    adapter = await manager._prepare_browser_login("claude", **kwargs)
+    assert isinstance(adapter, ClaudeBrowserLoginAdapter)
+    object.__setattr__(adapter, "application_timeout_seconds", timeout)
+    session = coder_login._LoginSession(
+        "B" * 43, "claude", kwargs["expected_reference"], adapter, False, manager._monotonic(),
+        reservation_held=True,
+    )
+    manager._sessions[session.session_id] = session
+    return manager, reservations, session
+
+
+async def _browser_snapshot(manager, session):
+    return await manager.inspect("claude", session.session_id, expected_reference=session.reference)
+
+
+@pytest.mark.parametrize("action", ["success", "timeout", "cancel", "shutdown"])
+async def test_browser_real_pty_fragmented_progress(
+    monkeypatch, tmp_path, browser_preparation, action,
+):
+    manager, reservations, session = await _prepared_browser(
+        monkeypatch, browser_preparation, timeout=0.5 if action == "timeout" else 5,
+    )
+    user_seen, code_seen = asyncio.Event(), asyncio.Event()
+    original_observe = manager._observe_browser_output
+
+    def observe(current):
+        original_observe(current)
+        if current.state == "waiting_for_user":
+            user_seen.set()
+        if current.state == "waiting_for_code":
+            code_seen.set()
+
+    monkeypatch.setattr(manager, "_observe_browser_output", observe)
+    script = (
+        "import os,time,pathlib\n"
+        f"url={_BROWSER_URL!r}\n"
+        "os.write(1,url[:50].encode())\n"
+        "os.write(2,(url[50:]+'\\n').encode())\n"
+        f"gate=pathlib.Path({str(tmp_path / 'gate')!r})\n"
+        "while not gate.exists(): time.sleep(.005)\n"
+        "os.write(2,b'Paste code here if ')\n"
+        "os.write(1,b'prompted >')\n"
+        f"done=pathlib.Path({str(tmp_path / 'done')!r})\n"
+        "while not done.exists(): time.sleep(.005)\n"
+    )
+    object.__setattr__(session.adapter, "command", (sys.executable, "-c", script))
+    object.__setattr__(session.adapter, "working_directory", str(tmp_path))
+    probe_calls = []
+
+    async def fresh_probe(*_args, **kwargs):
+        probe_calls.append(kwargs)
+        assert reservations.login_active(session.adapter.credential_location)
+        return coder_auth_payload(CoderAuthStatus(
+            status="ok", detail="Saved authentication found", cli_available=True,
+            saved_credentials_present=True,
+        ))
+
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", fresh_probe)
+    manager._execute_browser_session(session)
+    await asyncio.wait_for(user_seen.wait(), 3)
+    initial = await _browser_snapshot(manager, session)
+    assert initial["authorization_url"] == _BROWSER_URL
+    assert initial["state"] == "waiting_for_user"
+    managed, channel = session.managed, session.pty_channel
+    (tmp_path / "gate").touch()
+    await asyncio.wait_for(code_seen.wait(), 3)
+    ready = await _browser_snapshot(manager, session)
+    assert ready["state"] == "waiting_for_code"
+    assert ready["application_deadline"] == initial["application_deadline"]
+    if action == "success":
+        (tmp_path / "done").touch()
+    elif action == "cancel":
+        await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    elif action == "shutdown":
+        await manager.shutdown()
+    await asyncio.wait_for(session.task, 5)
+    final = await _browser_snapshot(manager, session)
+    assert final["state"] == {"success": "succeeded", "timeout": "timed_out"}.get(action, "cancelled")
+    assert final["cleanup_confirmed"] is True
+    assert final["authorization_url"] is None
+    assert final["application_deadline"] == initial["application_deadline"]
+    assert managed.process.returncode is not None
+    assert channel.closed
+    assert session.managed is None and session.pty_channel is None
+    assert not reservations.login_active(session.adapter.credential_location)
+    assert len(probe_calls) == (1 if action == "success" else 0)
+    if probe_calls:
+        assert probe_calls[0]["env"] == dict(session.adapter.environment)
+        assert final["auth_status"]["service_access_verified"] is None
+
+
+class _Channel:
+    closed = False
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.mark.parametrize("case,reason", [
+    ("malformed", "malformed_output"), ("conflicting", "malformed_output"),
+    ("empty", "malformed_output"), ("nonzero", "process_failed"),
+    ("classifier_exception", "process_failed"), ("bad_progress", "malformed_output"),
+    ("bad_url", "malformed_output"), ("regression", "malformed_output"),
+    ("invalid_code", "invalid_code"), ("probe_error", "auth_status_unavailable"),
+    ("saved_missing", "auth_status_unavailable"), ("probe_exception", "auth_status_unavailable"),
+    ("saved_but_error", "auth_status_unavailable"),
+])
+async def test_browser_execution_sanitized_failures(monkeypatch, browser_preparation, case, reason):
+    manager, reservations, session = await _prepared_browser(monkeypatch, browser_preparation)
+    managed, channel = _Managed(), _Channel()
+
+    async def launch(*args, **kwargs):
+        assert args == session.adapter.command
+        assert kwargs == dict(cwd=session.adapter.working_directory, env=dict(session.adapter.environment))
+        return managed, channel
+
+    async def run(_managed, **kwargs):
+        assert kwargs["pty_channel"] is channel
+        assert kwargs["stderr_chunk_callback"] is None
+        callback = kwargs["stdout_chunk_callback"]
+        callback(b"Welcome\n")
+        if case not in {"empty", "bad_url"}:
+            callback((_BROWSER_URL + "\nPaste code here if prompted >").encode())
+        if case == "malformed":
+            callback(b"https://evil.example/private-secret\n")
+        if case == "conflicting":
+            callback((_BROWSER_URL.replace("private-state", "different") + "\n").encode())
+        if case == "bad_progress":
+            object.__setattr__(session.adapter, "parse_progress", lambda _output: object())
+            callback(b"bad")
+        if case == "bad_url":
+            object.__setattr__(session.adapter, "parse_progress", lambda _output:
+                               CoderBrowserLoginProgress("http://private-secret", True))
+            callback(b"bad")
+        if case == "regression":
+            callback(b"Paste code here if prompted >")
+            object.__setattr__(session.adapter, "parse_progress", lambda _output:
+                               CoderBrowserLoginProgress(_BROWSER_URL, False))
+            callback(b"bad")
+        if case == "classifier_exception":
+            def classify(*_args):
+                raise RuntimeError("private-secret")
+            object.__setattr__(session.adapter, "classify_failure", classify)
+        if case == "invalid_code":
+            callback(b"Invalid code. Please make sure the full code was copied.")
+        return ProcessRunResult(
+            1 if case in {"nonzero", "invalid_code", "classifier_exception"} else 0, b"", b"", False,
+        )
+
+    async def probe(*_args, **_kwargs):
+        if case == "probe_exception":
+            raise RuntimeError("private-secret")
+        if case == "saved_but_error":
+            return coder_auth_payload(CoderAuthStatus(
+                status="error", detail="Probe failed", saved_credentials_present=True,
+                failure_reason="probe_failed",
+            ))
+        return _auth(False if case == "saved_missing" else True) if case != "probe_error" else _auth(None)
+
+    monkeypatch.setattr(coder_login, "launch_pty_process", launch)
+    monkeypatch.setattr(coder_login, "run_supervised_process", run)
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", probe)
+    manager._execute_browser_session(session)
+    await session.task
+    final = await _browser_snapshot(manager, session)
+    assert final["state"] == "failed" and final["failure_reason"] == reason
+    assert final["authorization_url"] is None
+    assert "private-secret" not in json.dumps(final)
+    assert "device" not in final["detail"].lower()
+    assert channel.closed and not reservations.login_active(session.adapter.credential_location)
+
+
+@pytest.mark.parametrize("failure", ["missing", "exception", "timeout", "cancel_cleanup", "unknown_cleanup"])
+async def test_browser_launch_failure_and_cancellation(monkeypatch, browser_preparation, failure):
+    manager, reservations, session = await _prepared_browser(
+        monkeypatch, browser_preparation, timeout=.02 if failure == "timeout" else 5,
+    )
+    entered = asyncio.Event()
+    managed = _Managed(quiescent=False, reconcile_quiescent=True)
+
+    async def launch(*_args, **_kwargs):
+        entered.set()
+        if failure == "missing":
+            raise FileNotFoundError("private-secret")
+        if failure == "exception":
+            raise RuntimeError("private-secret")
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            if failure == "timeout":
+                raise
+            raise ProcessLaunchCleanupError(
+                "private-secret", managed=managed if failure == "cancel_cleanup" else None,
+                cleanup_result=None,
+            ) from None
+
+    monkeypatch.setattr(coder_login, "launch_pty_process", launch)
+    manager._execute_browser_session(session)
+    await entered.wait()
+    if failure in {"cancel_cleanup", "unknown_cleanup"}:
+        await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    await session.task
+    final = await _browser_snapshot(manager, session)
+    assert "private-secret" not in json.dumps(final)
+    if failure in {"cancel_cleanup", "unknown_cleanup"}:
+        assert final["state"] == "cleanup_failed"
+        assert reservations.login_active(session.adapter.credential_location)
+        assert not reservations.reserve_coder(session.adapter.credential_location)
+        await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+        assert session.state == ("cancelled" if failure == "cancel_cleanup" else "cleanup_failed")
+    else:
+        assert final["state"] == ("timed_out" if failure == "timeout" else "failed")
+        assert not reservations.login_active(session.adapter.credential_location)
+
+
+@pytest.mark.parametrize("quiescent", [True, False])
+async def test_browser_settles_execution_before_releasing(monkeypatch, browser_preparation, quiescent):
+    manager, reservations, session = await _prepared_browser(monkeypatch, browser_preparation)
+    managed, channel = _Managed(quiescent=quiescent, reconcile_quiescent=True), _Channel()
+    entered, settle = asyncio.Event(), asyncio.Event()
+
+    async def launch(*_args, **_kwargs):
+        return managed, channel
+
+    async def run(*_args, **_kwargs):
+        entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            assert reservations.login_active(session.adapter.credential_location)
+            assert not channel.closed
+            await settle.wait()
+            raise
+
+    monkeypatch.setattr(coder_login, "launch_pty_process", launch)
+    monkeypatch.setattr(coder_login, "run_supervised_process", run)
+    manager._execute_browser_session(session)
+    await entered.wait()
+    cancel = asyncio.create_task(manager.cancel("claude", session.session_id, expected_reference=session.reference))
+    if quiescent:
+        await asyncio.sleep(0)
+        assert reservations.login_active(session.adapter.credential_location)
+        assert not channel.closed
+        settle.set()
+    await cancel
+    if not quiescent:
+        assert session.state == "cleanup_failed"
+        assert session.managed is managed and session.pty_channel is channel
+        assert reservations.login_active(session.adapter.credential_location)
+        settle.set()
+        await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    await session.task
+    assert session.state == "cancelled"
+    assert channel.closed and not reservations.login_active(session.adapter.credential_location)
+
+
+@pytest.mark.parametrize("invalid", ["untracked", "reservation", "active", "adapter", "shutdown"])
+async def test_browser_execution_requires_prepared_ownership(monkeypatch, browser_preparation, invalid):
+    manager, reservations, session = await _prepared_browser(monkeypatch, browser_preparation)
+    if invalid == "untracked":
+        manager._sessions.clear()
+    elif invalid == "reservation":
+        session.reservation_held = False
+    elif invalid == "active":
+        session.state = "waiting_for_user"
+    elif invalid == "adapter":
+        session.adapter = _adapter()
+    else:
+        manager._shutting_down = True
+    with pytest.raises(ValueError, match="tracked prepared"):
+        manager._execute_browser_session(session)
+    assert session.task is None
+    assert reservations.login_active("/tmp/captured-claude")
+
+
+@pytest.mark.parametrize("outcome", ["success", "cancel", "supervision", "timeout_cleanup"])
+async def test_browser_launch_elapsed_deadline_and_cleanup(monkeypatch, browser_preparation, outcome):
+    manager, reservations, session = await _prepared_browser(monkeypatch, browser_preparation)
+    now = [10.0]
+    manager._monotonic = lambda: now[0]
+    manager._wall_time = lambda: 1000.0
+    managed = _Managed(quiescent=outcome != "timeout_cleanup", reconcile_quiescent=True)
+    channel = _Channel()
+
+    async def launch(*_args, **_kwargs):
+        now[0] += 3
+        if outcome == "cancel":
+            session.cancel_requested = True
+        return managed, channel
+
+    async def run(*_args, **kwargs):
+        assert kwargs["timeout"] == 2
+        assert session.application_deadline == 1005
+        if outcome == "supervision":
+            raise ProcessSupervisionError("private-secret", stdout=b"", stderr=b"")
+        kwargs["stdout_chunk_callback"]((_BROWSER_URL + "\nPaste code here if prompted >").encode())
+        now[0] += 1
+        return ProcessRunResult(0, b"", b"", False)
+
+    async def probe(*_args, **_kwargs):
+        assert session.state == "authorizing" and session.verification_url is None
+        assert reservations.login_active(session.adapter.credential_location)
+        if outcome == "timeout_cleanup":
+            raise asyncio.TimeoutError
+        return _auth(True)
+
+    monkeypatch.setattr(coder_login, "launch_pty_process", launch)
+    monkeypatch.setattr(coder_login, "run_supervised_process", run)
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", probe)
+    manager._execute_browser_session(session)
+    await session.task
+    final = await _browser_snapshot(manager, session)
+    assert final["state"] == {
+        "success": "succeeded", "cancel": "cancelled", "supervision": "failed",
+        "timeout_cleanup": "cleanup_failed",
+    }[outcome]
+    assert final["application_deadline"] == 1005
+    if outcome == "timeout_cleanup":
+        assert not channel.closed and session.managed is managed
+        assert reservations.login_active(session.adapter.credential_location)
+        await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    assert channel.closed and not reservations.login_active(session.adapter.credential_location)
+
+
+async def test_browser_shutdown_preserves_failed_launch(monkeypatch, browser_preparation):
+    manager, reservations, session = await _prepared_browser(monkeypatch, browser_preparation)
+    entered = asyncio.Event()
+
+    async def launch(*_args, **_kwargs):
+        entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            raise ProcessLaunchCleanupError("private-secret", managed=None, cleanup_result=None) from None
+
+    monkeypatch.setattr(coder_login, "launch_pty_process", launch)
+    manager._execute_browser_session(session)
+    await entered.wait()
+    await manager.shutdown()
+    assert session.state == "cleanup_failed"
+    assert reservations.login_active(session.adapter.credential_location)
+    assert (await _browser_snapshot(manager, session))["cleanup_confirmed"] is False
+
+
+async def test_browser_retains_channel_until_stubborn_reader_settles(
+    monkeypatch, tmp_path, browser_preparation,
+):
+    from src import process_supervisor
+
+    manager, reservations, session = await _prepared_browser(monkeypatch, browser_preparation)
+    object.__setattr__(session.adapter, "command", (sys.executable, "-c", "print('done', flush=True)"))
+    object.__setattr__(session.adapter, "working_directory", str(tmp_path))
+    real_launch = coder_login.launch_pty_process
+    release, stalled = asyncio.Event(), asyncio.Event()
+    handles = []
+
+    async def launch(*args, **kwargs):
+        managed, channel = await real_launch(*args, **kwargs)
+        handles.append((managed, channel))
+        real_read = channel.read
+
+        async def read(size):
+            chunk = await real_read(size)
+            if not chunk:
+                stalled.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    await release.wait()
+            return chunk
+
+        monkeypatch.setattr(channel, "read", read)
+        return managed, channel
+
+    monkeypatch.setattr(coder_login, "launch_pty_process", launch)
+    monkeypatch.setattr(process_supervisor, "_OUTPUT_DRAIN_TIMEOUT_SECONDS", .01)
+    monkeypatch.setattr(process_supervisor, "_OUTPUT_CANCEL_TIMEOUT_SECONDS", .01)
+    manager._execute_browser_session(session)
+    try:
+        await asyncio.wait_for(stalled.wait(), 3)
+        await asyncio.wait_for(session.task, 3)
+        managed, channel = handles[0]
+        assert session.state == "cleanup_failed"
+        assert not managed.execution_settled
+        assert reservations.login_active(session.adapter.credential_location) and not channel.closed
+        await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+        assert session.state == "cleanup_failed" and not channel.closed
+        release.set()
+        await asyncio.gather(*managed._execution_tasks, return_exceptions=True)
+        await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+        assert session.state == "cancelled" and channel.closed
+        assert not reservations.login_active(session.adapter.credential_location)
+    finally:
+        release.set()
+        await manager.shutdown()
+
+
+async def test_browser_replacement_requires_observed_code_prompt(monkeypatch, browser_preparation):
+    manager, _, reservations, kwargs, auth = browser_preparation
+    kwargs["replace_existing"] = True
+    auth.update(status="ok", saved_credentials_present=True, failure_reason=None)
+    manager, reservations, session = await _prepared_browser(monkeypatch, browser_preparation)
+    session.replacement_requested = True
+    managed, channel = _Managed(), _Channel()
+    probes = []
+
+    async def launch(*_args, **_kwargs):
+        return managed, channel
+
+    async def run(*_args, **kwargs):
+        kwargs["stdout_chunk_callback"]((_BROWSER_URL + "\n").encode())
+        assert session.state == "waiting_for_user"
+        return ProcessRunResult(0, b"", b"", False)
+
+    async def probe(*_args, **_kwargs):
+        probes.append(True)
+        return _auth(True)
+
+    monkeypatch.setattr(coder_login, "launch_pty_process", launch)
+    monkeypatch.setattr(coder_login, "run_supervised_process", run)
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", probe)
+    manager._execute_browser_session(session)
+    await session.task
+    final = await _browser_snapshot(manager, session)
+    assert final["state"] == "failed" and final["failure_reason"] == "malformed_output"
+    assert probes == [] and channel.closed
+    assert not reservations.login_active(session.adapter.credential_location)
