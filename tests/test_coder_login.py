@@ -3622,7 +3622,7 @@ async def test_browser_admission_waiter_cancellation_preserves_shared_start(monk
         assert sum(isinstance(value, asyncio.CancelledError) for value in results) == 1
         result = next(value for value in results if isinstance(value, dict))
     session = manager._sessions[result["session_id"]]
-    assert not admission.cancel_requested and admission.delivered and admission.waiters == 0
+    assert not admission.cancel_requested and session.admission_delivered and admission.waiters == 0
     assert not session.cancel_requested and session.admission_cancel_task is None
     assert len(calls) == 1 and reservations.login_active(context["credential_location"])
     stop.set()
@@ -3693,3 +3693,67 @@ async def test_browser_admission_cancellation_during_pty_launch_settles(monkeypa
     finally:
         release_launch.set()
         await asyncio.gather(session.task, session.admission_cancel_task, return_exceptions=True)
+
+
+async def test_browser_admission_direct_reuse_during_handoff_prevents_cancellation(monkeypatch, browser_admission):
+    manager, _, reservations, context, _, entered, settled, calls = browser_admission
+    stop = asyncio.Event()
+
+    async def execution(_session):
+        await stop.wait()
+
+    monkeypatch.setattr(manager, "_start_session", execution)
+    caller = asyncio.create_task(_start_browser_admission(manager, context))
+    await entered.wait()
+    snapshot = manager._session_payload
+    reusers = []
+
+    def handoff(session, **kwargs):
+        if not reusers:
+            reusers.append(asyncio.create_task(_start_browser_admission(manager, context)))
+            caller.cancel()
+        return snapshot(session, **kwargs)
+
+    monkeypatch.setattr(manager, "_session_payload", handoff)
+    settled.set()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    result = await reusers[0]
+    assert result["reused_session"]
+    session = manager._sessions[result["session_id"]]
+    assert session.admission_delivered and not session.cancel_requested
+    assert session.admission_cancel_task is None and reservations.login_active(context["credential_location"])
+    assert not manager._browser_admissions and len(calls) == 1
+    stop.set()
+    await manager.shutdown()
+
+
+async def test_browser_admission_cancellation_marks_session_before_cleanup_task(monkeypatch, browser_admission):
+    manager, _, _, context, _, entered, settled, _ = browser_admission
+    stop = asyncio.Event()
+
+    async def execution(_session):
+        await stop.wait()
+
+    monkeypatch.setattr(manager, "_start_session", execution)
+    caller = asyncio.create_task(_start_browser_admission(manager, context))
+    await entered.wait()
+    snapshot = manager._session_payload
+    late_reusers = []
+
+    def handoff(session, **kwargs):
+        if not late_reusers:
+            caller.cancel()
+            # Queue reuse after the caller's cancellation, before its cleanup task runs.
+            late_reusers.append(asyncio.create_task(_start_browser_admission(manager, context)))
+        return snapshot(session, **kwargs)
+
+    monkeypatch.setattr(manager, "_session_payload", handoff)
+    settled.set()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert (await late_reusers[0]).reason == "credential_in_use"
+    session = next(iter(manager._sessions.values()))
+    assert session.cancel_requested and not session.admission_delivered
+    await session.admission_cancel_task
+    assert session.state == "cancelled" and not session.reservation_held

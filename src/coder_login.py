@@ -123,6 +123,7 @@ class _LoginSession:
     task: asyncio.Task[None] | None = None
     abort_task: asyncio.Task[None] | None = None
     admission_cancel_task: asyncio.Task[dict[str, Any]] | None = None
+    admission_delivered: bool = False
     cancel_requested: bool = False
     parse_failed: bool = False
     code_prompt_observed: bool = False
@@ -153,7 +154,6 @@ class _BrowserAdmission:
     cancel_requested: bool = False
     session: _LoginSession | None = None
     waiters: int = 0
-    delivered: bool = False
 
 
 class CoderLoginSessionManager:
@@ -384,7 +384,9 @@ class CoderLoginSessionManager:
                 and session.terminal_monotonic is None
                 and session.state != "cleanup_failed" and not session.cancel_requested
             ):
-                return self._session_payload(session, reused_session=True)
+                payload = self._session_payload(session, reused_session=True)
+                session.admission_delivered = True
+                return payload
             return failure("credential_in_use", "Another login owns this credential location")
         admission = self._browser_admissions.get(location)
         reused = admission is not None
@@ -411,10 +413,13 @@ class CoderLoginSessionManager:
         try:
             result = await asyncio.shield(admission.task)
         except asyncio.CancelledError:
-            if admission.waiters == 1 and not admission.delivered:
+            if admission.waiters == 1 and (
+                admission.session is None or not admission.session.admission_delivered
+            ):
                 admission.cancel_requested = True
                 if admission.session is not None:
                     session = admission.session
+                    session.cancel_requested = True
                     # Cancellation after transfer belongs to the existing session machinery.
                     session.admission_cancel_task = asyncio.create_task(self.cancel(
                         session.plugin, session.session_id, expected_reference=session.reference,
@@ -422,7 +427,8 @@ class CoderLoginSessionManager:
             raise
         finally:
             admission.waiters -= 1
-        admission.delivered = True
+        if admission.session is not None:
+            admission.session.admission_delivered = True
         if reused and admission.session is not None:
             return self._session_payload(admission.session, reused_session=True)
         return result
