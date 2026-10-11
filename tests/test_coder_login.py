@@ -12,11 +12,14 @@ from src import coder_login
 from src.coder_login import CoderCredentialReservations, CoderLoginSessionManager
 from src.coder_registry import (
     CoderAuthStatus,
+    CoderBrowserLoginFailure,
     CoderDeviceLoginFailure,
     CoderDeviceLoginPrompt,
     CoderRegistry,
     coder_auth_payload,
 )
+from src.coders.claude import ClaudePlugin
+from src.coders.claude_login import ClaudeBrowserLoginAdapter
 from src.coders.codex import CodexDeviceLoginAdapter
 from src.config import AppConfig
 from src.process_supervisor import (
@@ -1741,3 +1744,237 @@ async def test_device_login_cancel_bounds_task_settlement(
     assert "session task did not stop" in result["detail"]
     assert reservations.reserve_coder(session.adapter.credential_location) is False
     await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.fixture
+def browser_preparation():
+    plugin = ClaudePlugin()
+    registry = CoderRegistry()
+    registry.register(plugin, reference="src.coders.claude:ClaudePlugin")
+    reservations = CoderCredentialReservations()
+    location = "/tmp/captured-claude"
+    assert reservations.reserve_login(location)
+    manager = CoderLoginSessionManager(
+        registry, config_path="/cfg/config.yml", credential_reservations=reservations,
+    )
+    kwargs = dict(
+        plugin=plugin,
+        expected_reference=registry.reference_for("claude"),
+        credential_location=location,
+        environment={"CLAUDE_CONFIG_DIR": location, "CONTEXT": "private"},
+        reservation_held=True,
+        replace_existing=False,
+    )
+    auth = plugin._auth_status(
+        status="error", detail="No saved credentials", cli_available=True,
+        cli_version="2.1.126", saved_credentials_present=False,
+        failure_reason="credentials_missing",
+    )
+    return manager, registry, reservations, kwargs, auth
+
+
+@pytest.mark.parametrize("saved,consent", [(False, False), (True, True), (None, True)])
+async def test_browser_preparation_captures_context_and_retains_reservation(
+    monkeypatch, tmp_path, browser_preparation, saved, consent,
+):
+    manager, registry, reservations, kwargs, auth = browser_preparation
+    auth.update(status="ok", failure_reason=None, saved_credentials_present=saved)
+    kwargs["replace_existing"] = consent
+    config = tmp_path / "config.yml"
+    config.write_text("auth: {claude_config_dir: /tmp/before}")
+    manager._config_path = str(config)
+    original_environment = dict(kwargs["environment"])
+    location = kwargs["credential_location"]
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def probe(*args, **probe_kwargs):
+        assert args == ("claude", kwargs["expected_reference"], "Claude Code")
+        assert probe_kwargs["env"] == original_environment
+        assert probe_kwargs["config_path"] == str(config)
+        assert probe_kwargs["timeout"] == 5
+        entered.set()
+        await release.wait()
+        return auth
+
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", probe)
+    task = asyncio.create_task(manager._prepare_browser_login("claude", **kwargs))
+    await entered.wait()
+    assert not reservations.reserve_coder(location)
+    assert not reservations.reserve_login(location)
+    config.write_text("auth: {claude_config_dir: /tmp/after}")
+    kwargs["environment"]["CONTEXT"] = "changed"
+    release.set()
+    adapter = await task
+    assert isinstance(adapter, ClaudeBrowserLoginAdapter)
+    assert dict(adapter.environment) == original_environment
+    assert adapter.credential_location == location
+    assert adapter.working_directory == str(tmp_path)
+    assert adapter.observed_cli_version == "2.1.126"
+    assert "failed or cancelled replacement" in adapter.replacement_warning
+    assert reservations.login_active(location)
+    assert reservations.credential_version(location) == 0
+    assert manager._sessions == {}
+    assert "private" not in repr(adapter)
+    assert auth["service_access_verified"] is None
+
+
+@pytest.mark.parametrize("updates,consent,reason", [
+    ({"saved_credentials_present": True}, False, "replacement_required"),
+    ({"saved_credentials_present": None}, False, "replacement_required"),
+    ({"cli_available": False}, True, "cli_missing"),
+    ({"cli_available": None}, True, "auth_status_unavailable"),
+    ({"failure_reason": "probe_failed"}, True, "auth_status_unavailable"),
+    ({"failure_reason": "probe_timeout"}, True, "auth_status_unavailable"),
+    ({"failure_reason": "unrecognized_output"}, True, "auth_status_unavailable"),
+    ({"failure_reason": None}, True, "auth_status_unavailable"),
+    ({"cli_version": None}, True, "unsupported_cli_version"),
+    ({"cli_version": ""}, True, "unsupported_cli_version"),
+    ({"cli_version": "secret"}, True, "unsupported_cli_version"),
+    ({"cli_version": "2.1.126-beta"}, True, "unsupported_cli_version"),
+    ({"cli_version": "2.1.125"}, True, "startup_failed"),
+    ({"capabilities": {}}, True, "unsupported_cli_version"),
+    ({"cli_version": 123}, True, "auth_status_unavailable"),
+    ({"status": "invalid"}, True, "auth_status_unavailable"),
+])
+async def test_browser_preparation_preflight_failures(
+    monkeypatch, browser_preparation, updates, consent, reason,
+):
+    manager, _, reservations, kwargs, auth = browser_preparation
+    auth.update(updates)
+    kwargs["replace_existing"] = consent
+
+    async def probe(*_args, **_kwargs):
+        return auth
+
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", probe)
+    result = await manager._prepare_browser_login("claude", **kwargs)
+    assert isinstance(result, CoderBrowserLoginFailure)
+    assert result.reason == reason
+    assert "secret" not in result.detail
+    assert reservations.login_active(kwargs["credential_location"])
+    assert reservations.credential_version(kwargs["credential_location"]) == 0
+
+
+@pytest.mark.parametrize("change", ["reference", "plugin", "removed", "factory", "unowned", "inactive"])
+async def test_browser_preparation_rejects_invalid_entry(
+    monkeypatch, browser_preparation, change,
+):
+    manager, registry, reservations, kwargs, _ = browser_preparation
+    if change == "reference":
+        registry.register(kwargs["plugin"], reference="changed")
+    elif change == "plugin":
+        registry.register(ClaudePlugin(), reference=kwargs["expected_reference"])
+    elif change == "removed":
+        registry._plugins.clear()
+    elif change == "factory":
+        monkeypatch.setattr(kwargs["plugin"], "create_browser_login", None)
+    elif change == "unowned":
+        kwargs["reservation_held"] = False  # Another operation still owns it.
+    else:
+        reservations.release_login(kwargs["credential_location"])
+    before = reservations.credential_version(kwargs["credential_location"])
+    result = await manager._prepare_browser_login("claude", **kwargs)
+    assert isinstance(result, CoderBrowserLoginFailure)
+    assert result.reason == (
+        "unsupported" if change == "factory" else
+        "credential_in_use" if change in {"unowned", "inactive"} else
+        "session_plugin_mismatch"
+    )
+    assert reservations.credential_version(kwargs["credential_location"]) == before
+    assert reservations.login_active(kwargs["credential_location"]) == (change != "inactive")
+
+
+@pytest.mark.parametrize("stage", ["probe", "factory"])
+async def test_browser_preparation_rechecks_identity(monkeypatch, browser_preparation, stage):
+    manager, registry, reservations, kwargs, auth = browser_preparation
+    plugin = kwargs["plugin"]
+    original_factory = plugin.create_browser_login
+
+    async def probe(*_args, **_kwargs):
+        if stage == "probe":
+            registry.register(plugin, reference="changed")
+        return auth
+
+    def factory(**factory_kwargs):
+        registry.register(ClaudePlugin(), reference=kwargs["expected_reference"])
+        return original_factory(**factory_kwargs)
+
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", probe)
+    if stage == "factory":
+        monkeypatch.setattr(plugin, "create_browser_login", factory)
+    result = await manager._prepare_browser_login("claude", **kwargs)
+    assert result.reason == "session_plugin_mismatch"
+    assert reservations.login_active(kwargs["credential_location"])
+
+
+@pytest.mark.parametrize("mutation", [
+    "environment", "location", "version", "pty", "command", "warning", "parser", "object", "raise",
+])
+async def test_browser_preparation_validates_adapter(monkeypatch, browser_preparation, mutation):
+    manager, _, reservations, kwargs, auth = browser_preparation
+    original_factory = kwargs["plugin"].create_browser_login
+
+    async def probe(*_args, **_kwargs):
+        return auth
+
+    def factory(**factory_kwargs):
+        if mutation == "raise":
+            raise RuntimeError("private")
+        if mutation == "object":
+            return object()
+        adapter = original_factory(**factory_kwargs)
+        key, value = {
+            "environment": ("environment", {}),
+            "location": ("credential_location", "/tmp/other"),
+            "version": ("observed_cli_version", "2.1.127"),
+            "pty": ("requires_pty", False),
+            "command": ("command", ()),
+            "warning": ("replacement_warning", ""),
+            "parser": ("parse_progress", None),
+        }[mutation]
+        object.__setattr__(adapter, key, value)
+        return adapter
+
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", probe)
+    monkeypatch.setattr(kwargs["plugin"], "create_browser_login", factory)
+    result = await manager._prepare_browser_login("claude", **kwargs)
+    assert isinstance(result, CoderBrowserLoginFailure)
+    assert result.reason == ("startup_failed" if mutation == "raise" else "unsupported")
+    assert "private" not in result.detail
+    assert reservations.login_active(kwargs["credential_location"])
+
+
+async def test_browser_preparation_probe_exception_and_cancellation(monkeypatch, browser_preparation):
+    manager, _, reservations, kwargs, _ = browser_preparation
+
+    async def broken_probe(*_args, **_kwargs):
+        raise RuntimeError("private")
+
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", broken_probe)
+    result = await manager._prepare_browser_login("claude", **kwargs)
+    assert result.reason == "auth_status_unavailable"
+    assert "private" not in result.detail
+    entered, cleanup, stopped = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def cancelling_probe(*_args, **_kwargs):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await cleanup.wait()
+            stopped.set()
+            raise
+
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", cancelling_probe)
+    task = asyncio.create_task(manager._prepare_browser_login("claude", **kwargs))
+    await entered.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    assert not reservations.reserve_coder(kwargs["credential_location"])
+    cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert stopped.is_set()
+    assert reservations.login_active(kwargs["credential_location"])
+    assert reservations.credential_version(kwargs["credential_location"]) == 0

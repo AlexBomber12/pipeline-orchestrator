@@ -12,9 +12,12 @@ from typing import Any, Callable
 
 from src.coder_auth import isolated_auth_probe
 from src.coder_registry import (
+    CoderBrowserLoginAdapter,
+    CoderBrowserLoginFailure,
     CoderDeviceLoginAdapter,
     CoderDeviceLoginFailure,
     CoderDeviceLoginPrompt,
+    CoderPlugin,
     CoderRegistry,
     parse_coder_auth_payload,
     parse_coder_device_login_payload,
@@ -145,6 +148,96 @@ class CoderLoginSessionManager:
         self._monotonic = monotonic
         self._sessions: dict[str, _LoginSession] = {}
         self._shutting_down = False
+
+    async def _prepare_browser_login(
+        self,
+        plugin_name: str,
+        *,
+        plugin: CoderPlugin,
+        expected_reference: str,
+        credential_location: str,
+        environment: dict[str, str],
+        reservation_held: bool,
+        replace_existing: bool,
+    ) -> CoderBrowserLoginAdapter | CoderBrowserLoginFailure:
+        """Prepare a dormant adapter under a caller-owned login reservation.
+
+        ``reservation_held`` is the caller's ownership assertion, like the
+        existing session flag. The caller must retain that reservation until
+        this coroutine (including isolated probe cancellation cleanup) ends.
+        This routine never acquires or releases credential ownership.
+        """
+        def failure(reason: str, detail: str) -> CoderBrowserLoginFailure:
+            return CoderBrowserLoginFailure(reason, detail)
+
+        def identity_matches() -> bool:
+            return (
+                self._registry.get_optional(plugin_name) is plugin
+                and self._registry.reference_for(plugin_name) == expected_reference
+            )
+
+        if not reservation_held or not self._credential_reservations.login_active(credential_location):
+            return failure("credential_in_use", "Browser login requires a caller-owned reservation")
+        if not identity_matches():
+            return failure("session_plugin_mismatch", "Coder plugin identity changed; refresh and start again")
+        factory = getattr(plugin, "create_browser_login", None)
+        if not callable(factory):
+            return failure("unsupported", "Browser-code login is unsupported")
+        # Retain a private snapshot even if the caller or configuration changes.
+        captured_environment = dict(environment)
+        try:
+            auth = parse_coder_auth_payload(await isolated_auth_probe(
+                plugin_name,
+                expected_reference,
+                plugin.display_name,
+                config_path=self._config_path,
+                timeout=_AUTH_PROBE_TIMEOUT_SECONDS,
+                env=dict(captured_environment),
+            ))
+        except Exception:
+            return failure("auth_status_unavailable", "Browser login auth probe was unusable")
+        if not identity_matches():
+            return failure("session_plugin_mismatch", "Coder plugin identity changed; refresh and start again")
+        if auth["cli_available"] is False or auth["failure_reason"] == "cli_missing":
+            return failure("cli_missing", "Coder CLI is unavailable")
+        if (
+            auth["cli_available"] is not True
+            or auth["failure_reason"] not in {None, "credentials_missing"}
+            or (auth["status"] == "error" and auth["failure_reason"] != "credentials_missing")
+        ):
+            return failure("auth_status_unavailable", "Browser login auth probe was unusable")
+        version = auth["cli_version"]
+        if (
+            not version
+            or re.fullmatch(r"(?:0|[1-9][0-9]{0,5})(?:\.(?:0|[1-9][0-9]{0,5})){2}", version) is None
+            or "browser_code" not in (auth["capabilities"]["interactive_login_methods"] or [])
+        ):
+            return failure("unsupported_cli_version", "Coder CLI does not support browser-code login")
+        if auth["saved_credentials_present"] is not False and not replace_existing:
+            return failure("replacement_required", "Saved authentication may be replaced; explicit consent is required")
+        try:
+            adapter = factory(
+                credential_location=credential_location,
+                environment=dict(captured_environment),
+                config_path=self._config_path,
+                observed_cli_version=version,
+            )
+            valid = (
+                self._valid_adapter(adapter, browser=True)
+                and adapter.requires_pty is True
+                and adapter.observed_cli_version == version
+                and adapter.credential_location == credential_location
+                and dict(adapter.environment) == captured_environment
+                and callable(adapter.parse_progress)
+                and callable(adapter.classify_failure)
+            )
+        except Exception:
+            return failure("startup_failed", "Browser-code login could not be prepared")
+        if not identity_matches():
+            return failure("session_plugin_mismatch", "Coder plugin identity changed; refresh and start again")
+        if not valid:
+            return failure("unsupported", "Browser login adapter context is invalid")
+        return adapter
 
     async def start(
         self,
@@ -897,9 +990,10 @@ class CoderLoginSessionManager:
         )
 
     @staticmethod
-    def _valid_adapter(adapter: object) -> bool:
+    def _valid_adapter(adapter: object, *, browser: bool = False) -> bool:
         try:
-            if not isinstance(adapter, CoderDeviceLoginAdapter):
+            contract = CoderBrowserLoginAdapter if browser else CoderDeviceLoginAdapter
+            if not isinstance(adapter, contract):
                 return False
             return (
                 isinstance(adapter.command, tuple)
