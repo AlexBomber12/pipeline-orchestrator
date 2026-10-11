@@ -816,6 +816,10 @@ def parse_coder_browser_login_payload(
     out_of_band_state = _BROWSER_OUT_OF_BAND_FAILURE_STATES.get(failure_reason)
     if out_of_band_state is not None and state != out_of_band_state:
         raise TypeError("invalid browser login out-of-band failure state")
+    if failure_reason == "session_plugin_mismatch" and (
+        session_id is None or cleanup_confirmed is not None
+    ):
+        raise TypeError("invalid browser login session mismatch evidence")
     if failure_reason == "daemon_unavailable" and not (
         state == "failed"
         and session_id is None

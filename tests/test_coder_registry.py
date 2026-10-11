@@ -1231,6 +1231,31 @@ def test_browser_login_contract_allows_foreign_session_mismatch() -> None:
 
 
 @pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload.update(session_id=None),
+        lambda payload: payload.update(cleanup_confirmed=True),
+    ],
+)
+def test_browser_login_contract_rejects_invalid_session_mismatch(
+    mutate: Any,
+) -> None:
+    payload = _browser_login_payload(state="failed")
+    payload.update(
+        authorization_url=None,
+        cleanup_confirmed=None,
+        failure_reason="session_plugin_mismatch",
+    )
+    mutate(payload)
+
+    with pytest.raises(
+        TypeError,
+        match="^invalid browser login session mismatch evidence$",
+    ):
+        parse_coder_browser_login_payload(payload)
+
+
+@pytest.mark.parametrize(
     ("session_id", "cleanup_confirmed"),
     [(None, None), ("B" * 43, True)],
 )
