@@ -217,6 +217,10 @@ class CoderBrowserLoginAdapter(Protocol):
     @property
     def requires_pty(self) -> bool: ...
 
+    # Fixed public text classifiable as invalid_code without retaining output.
+    @property
+    def rejection_message(self) -> str: ...
+
     @property
     def application_timeout_seconds(self) -> float: ...
 

@@ -1910,6 +1910,8 @@ async def test_browser_preparation_rechecks_identity(monkeypatch, browser_prepar
 
 @pytest.mark.parametrize("mutation", [
     "environment", "location", "version", "pty", "command", "warning", "parser", "object", "raise",
+    "marker_absent", "marker_type", "marker_blank", "marker_control", "marker_separator", "marker_surrogate",
+    "marker_bytes", "marker_classifier", "marker_exception", "marker_failure_type",
 ])
 async def test_browser_preparation_validates_adapter(monkeypatch, browser_preparation, mutation):
     manager, _, reservations, kwargs, auth = browser_preparation
@@ -1924,6 +1926,18 @@ async def test_browser_preparation_validates_adapter(monkeypatch, browser_prepar
         if mutation == "object":
             return object()
         adapter = original_factory(**factory_kwargs)
+        if mutation == "marker_absent":
+            from types import SimpleNamespace
+            return SimpleNamespace(**{name: getattr(adapter, name) for name in (
+                "command", "environment", "working_directory", "credential_location", "observed_cli_version",
+                "requires_pty", "application_timeout_seconds", "replacement_warning", "parse_progress",
+                "classify_failure",
+            )})
+        if mutation == "marker_exception":
+            def classify(*_args):
+                raise RuntimeError("private")
+            object.__setattr__(adapter, "classify_failure", classify)
+            return adapter
         key, value = {
             "environment": ("environment", {}),
             "location": ("credential_location", "/tmp/other"),
@@ -1932,6 +1946,15 @@ async def test_browser_preparation_validates_adapter(monkeypatch, browser_prepar
             "command": ("command", ()),
             "warning": ("replacement_warning", ""),
             "parser": ("parse_progress", None),
+            "marker_type": ("rejection_message", None),
+            "marker_blank": ("rejection_message", "  "),
+            "marker_control": ("rejection_message", "public\ntext"),
+            "marker_separator": ("rejection_message", "public\u2028text"),
+            "marker_surrogate": ("rejection_message", "\ud800"),
+            "marker_bytes": ("rejection_message", "é" * 257),
+            "marker_classifier": ("classify_failure", lambda *_args: CoderBrowserLoginFailure(
+                "process_failed", "Fixed generic failure")),
+            "marker_failure_type": ("classify_failure", lambda *_args: object()),
         }[mutation]
         object.__setattr__(adapter, key, value)
         return adapter
@@ -2436,10 +2459,13 @@ async def test_browser_replacement_requires_observed_code_prompt(monkeypatch, br
 
 async def _submittable_browser(
     monkeypatch, browser_preparation, *, supervision_failure=False, timeout=5, stubborn_run=False,
+    adapter_transform=None,
 ):
     from types import SimpleNamespace
 
     manager, reservations, session = await _prepared_browser(monkeypatch, browser_preparation, timeout=timeout)
+    if adapter_transform is not None:
+        session.adapter = adapter_transform(session.adapter)
     managed, channel = _Managed(), _Channel()
     managed.process = SimpleNamespace(returncode=None)
     channel.at_eof = False
@@ -3178,3 +3204,45 @@ async def test_browser_cancellation_at_process_completion_with_delivered_code(mo
     assert result["auth_status"] is None and result["failure_reason"] is None
     assert channel.closed and session.managed is None
     assert not reservations.login_active(session.adapter.credential_location)
+
+
+async def test_custom_browser_adapter_uses_validated_public_rejection_marker(monkeypatch, browser_preparation):
+    from types import SimpleNamespace
+
+    from src.coder_registry import CoderBrowserLoginAdapter
+
+    marker = "This provider rejected the invalid or expired code."
+    classified = []
+
+    def transform(original):
+        adapter = SimpleNamespace(**{name: getattr(original, name) for name in (
+            "command", "environment", "working_directory", "credential_location", "observed_cli_version",
+            "requires_pty", "application_timeout_seconds", "replacement_warning", "parse_progress",
+        )})
+        adapter.rejection_message = marker
+
+        def classify(output, _returncode):
+            classified.append(output)
+            return CoderBrowserLoginFailure(
+                "invalid_code" if marker in output else "process_failed", "Fixed provider failure",
+            )
+
+        adapter.classify_failure = classify
+        assert isinstance(adapter, CoderBrowserLoginAdapter)
+        return adapter
+
+    manager, reservations, session, _, channel, _, completed = await _submittable_browser(
+        monkeypatch, browser_preparation, adapter_transform=transform,
+    )
+    assert classified == [marker]  # Execution validates the advertised signal.
+    await _submit(manager, session, "synthetic-custom-code")
+    manager._observe_chunk(session, session.stdout, marker[:17].encode())
+    manager._observe_chunk(session, session.stdout, marker[17:].encode())
+    await session.abort_task
+    completed.set()
+    await session.task
+    result = await _browser_snapshot(manager, session)
+    assert result["state"] == "failed" and result["failure_reason"] == "invalid_code"
+    assert classified == [marker, marker] and not session.stdout
+    assert "synthetic-custom-code" not in json.dumps(result)
+    assert channel.closed and not reservations.login_active(session.adapter.credential_location)

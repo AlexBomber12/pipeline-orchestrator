@@ -1388,6 +1388,17 @@ class CoderLoginSessionManager:
             contract = CoderBrowserLoginAdapter if browser else CoderDeviceLoginAdapter
             if not isinstance(adapter, contract):
                 return False
+            if browser:
+                marker = adapter.rejection_message
+                if (
+                    not isinstance(marker, str) or not marker.strip()
+                    or any(unicodedata.category(c) in {"Cc", "Cs", "Zl", "Zp"} for c in marker)
+                    or len(marker.encode("utf-8")) > 512
+                ):
+                    return False
+                failure = adapter.classify_failure(marker, 1)
+                if not isinstance(failure, CoderBrowserLoginFailure) or failure.reason != "invalid_code":
+                    return False
             return (
                 isinstance(adapter.command, tuple)
                 and 1 <= len(adapter.command) <= 16
