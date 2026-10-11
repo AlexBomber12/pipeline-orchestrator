@@ -1413,6 +1413,37 @@ def test_browser_login_contract_rejects_out_of_band_failure_state(
         parse_coder_browser_login_payload(payload)
 
 
+@pytest.mark.parametrize("failure_reason", ["unsupported", "session_not_found"])
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"session_id": "B" * 43},
+        {"application_deadline": 1234},
+        {"cleanup_confirmed": True},
+    ],
+)
+def test_browser_login_contract_rejects_sessionless_failure_evidence(
+    failure_reason: str,
+    evidence: dict[str, Any],
+) -> None:
+    state = "unsupported" if failure_reason == "unsupported" else "not_found"
+    payload = _browser_login_payload(state=state)
+    payload.update(
+        session_id=None,
+        authorization_url=None,
+        application_deadline=None,
+        cleanup_confirmed=None,
+        failure_reason=failure_reason,
+    )
+    payload.update(evidence)
+
+    with pytest.raises(
+        TypeError,
+        match="^invalid browser login sessionless failure evidence$",
+    ):
+        parse_coder_browser_login_payload(payload)
+
+
 @pytest.mark.parametrize(
     ("state", "failure_reason", "session_id", "cleanup_confirmed"),
     [

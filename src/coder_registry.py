@@ -98,6 +98,9 @@ _BROWSER_OUT_OF_BAND_FAILURE_STATES = {
 _BROWSER_OPTIONAL_SESSION_FAILURE_REASONS = frozenset(
     {"credential_in_use", "replacement_required", "cli_missing", "session_capacity"}
 )
+_BROWSER_SESSIONLESS_FAILURE_REASONS = frozenset(
+    {"unsupported", "session_not_found"}
+)
 _SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,128}")
 _DEVICE_CODE_PATTERN = re.compile(r"[A-Z0-9-]{4,64}")
 _BROWSER_WAITING_STATES = frozenset({"waiting_for_user", "waiting_for_code"})
@@ -826,6 +829,12 @@ def parse_coder_browser_login_payload(
         session_id is None or cleanup_confirmed is not None
     ):
         raise TypeError("invalid browser login session mismatch evidence")
+    if failure_reason in _BROWSER_SESSIONLESS_FAILURE_REASONS and (
+        session_id is not None
+        or application_deadline is not None
+        or cleanup_confirmed is not None
+    ):
+        raise TypeError("invalid browser login sessionless failure evidence")
     if failure_reason in _BROWSER_OPTIONAL_SESSION_FAILURE_REASONS:
         optional_session_evidence_valid = (
             session_id is None and cleanup_confirmed is None
