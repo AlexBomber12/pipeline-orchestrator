@@ -86,6 +86,15 @@ _BROWSER_PROCESS_FAILURE_STATES = {
     "process_failed": "failed",
     "invalid_code": "failed",
 }
+_BROWSER_OUT_OF_BAND_FAILURE_STATES = {
+    "unsupported": "unsupported",
+    "session_not_found": "not_found",
+    "session_plugin_mismatch": "failed",
+    "session_capacity": "failed",
+    "replacement_required": "failed",
+    "credential_in_use": "failed",
+    "cli_missing": "failed",
+}
 _SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,128}")
 _DEVICE_CODE_PATTERN = re.compile(r"[A-Z0-9-]{4,64}")
 _BROWSER_WAITING_STATES = frozenset({"waiting_for_user", "waiting_for_code"})
@@ -802,6 +811,9 @@ def parse_coder_browser_login_payload(
             raise TypeError("invalid browser login startup failure evidence")
     if failure_reason == "cancellation_failed" and state != "cleanup_failed":
         raise TypeError("invalid browser login cancellation failure state")
+    out_of_band_state = _BROWSER_OUT_OF_BAND_FAILURE_STATES.get(failure_reason)
+    if out_of_band_state is not None and state != out_of_band_state:
+        raise TypeError("invalid browser login out-of-band failure state")
     if state == "succeeded" and (
         cleanup_confirmed is not True
         or auth_status is None

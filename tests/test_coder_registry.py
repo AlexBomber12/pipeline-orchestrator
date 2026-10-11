@@ -1266,6 +1266,54 @@ def test_browser_login_contract_binds_cancellation_failure_to_cleanup() -> None:
         parse_coder_browser_login_payload(payload)
 
 
+@pytest.mark.parametrize(
+    ("state", "failure_reason"),
+    [
+        ("unsupported", "unsupported"),
+        ("not_found", "session_not_found"),
+        ("failed", "session_plugin_mismatch"),
+        ("failed", "session_capacity"),
+        ("failed", "replacement_required"),
+        ("failed", "credential_in_use"),
+        ("failed", "cli_missing"),
+    ],
+)
+def test_browser_login_contract_accepts_out_of_band_failure_state(
+    state: str,
+    failure_reason: str,
+) -> None:
+    payload = _browser_login_payload(state=state)
+    payload.update(
+        session_id=None,
+        authorization_url=None,
+        application_deadline=None,
+        cleanup_confirmed=None,
+        failure_reason=failure_reason,
+    )
+    if failure_reason == "session_plugin_mismatch":
+        payload["session_id"] = "B" * 43
+
+    assert parse_coder_browser_login_payload(payload)["state"] == state
+
+
+@pytest.mark.parametrize("failure_reason", ["unsupported", "session_not_found"])
+def test_browser_login_contract_rejects_out_of_band_failure_state(
+    failure_reason: str,
+) -> None:
+    payload = _browser_login_payload(state="failed")
+    payload.update(
+        authorization_url=None,
+        cleanup_confirmed=None,
+        failure_reason=failure_reason,
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="^invalid browser login out-of-band failure state$",
+    ):
+        parse_coder_browser_login_payload(payload)
+
+
 @pytest.mark.parametrize("state", ["waiting_for_user", "succeeded"])
 def test_browser_login_contract_rejects_failure_reason_for_nonfailure_state(
     state: str,
