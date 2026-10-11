@@ -3015,3 +3015,50 @@ async def test_browser_echo_is_absent_from_retained_supervision_failure(
         await manager.cancel("claude", session.session_id, expected_reference=session.reference)
     assert owned["channel"].closed and session.managed is None and session.pty_channel is None
     assert not reservations.login_active(session.adapter.credential_location)
+
+
+@pytest.mark.parametrize("settles", [True, False])
+async def test_rejection_cleanup_waits_for_supervisor_settlement(monkeypatch, browser_preparation, settles):
+    manager, reservations, session, managed, channel, _, completed = await _submittable_browser(
+        monkeypatch, browser_preparation,
+    )
+    await _submit(manager, session)
+    reader_checked = asyncio.Event()
+    reader_done = False
+
+    def execution_settled(_managed):
+        if not reader_done:
+            reader_checked.set()
+        return reader_done
+
+    monkeypatch.setattr(type(managed), "execution_settled", property(execution_settled), raising=False)
+    if not settles:
+        monkeypatch.setattr(coder_login, "_CLEANUP_GRACE_SECONDS", .02)
+    manager._observe_chunk(session, session.stdout, session.adapter.rejection_message.encode())
+    try:
+        await asyncio.wait_for(reader_checked.wait(), 1)
+        pending = await _browser_snapshot(manager, session)
+        assert pending["state"] == "canceling" and pending["failure_reason"] is None
+        assert pending["cleanup_confirmed"] is None and pending["authorization_url"] is None
+        assert managed.cleanup_calls == 1
+        assert session.managed is managed and session.pty_channel is channel and not channel.closed
+        assert session.reservation_held and reservations.login_active(session.adapter.credential_location)
+        if settles:
+            reader_done = True
+        await asyncio.wait_for(session.abort_task, 1)
+        result = await _browser_snapshot(manager, session)
+        assert result["state"] == ("failed" if settles else "cleanup_failed")
+        assert result["failure_reason"] == ("invalid_code" if settles else "cancellation_failed")
+        assert result["cleanup_confirmed"] is settles
+        assert session.managed is managed and session.pty_channel is channel and not channel.closed
+        assert reservations.login_active(session.adapter.credential_location)
+    finally:
+        reader_done = True
+        await session.abort_task
+        completed.set()
+        await session.task
+        if session.cleanup_confirmed is False:
+            managed.reconcile_quiescent = True
+            await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    assert channel.closed and session.managed is None and session.pty_channel is None
+    assert not reservations.login_active(session.adapter.credential_location)

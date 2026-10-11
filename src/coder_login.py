@@ -1154,15 +1154,23 @@ class CoderLoginSessionManager:
         except Exception:
             process_settled = False
         else:
-            process_settled = result.quiescent and getattr(managed, "execution_settled", True)
+            process_settled = result.quiescent
         writer = session.write_task
         if writer is not None and not writer.done():
             if not session.write_cancel_requested:
                 session.write_cancel_requested = True
                 writer.cancel()
             await asyncio.wait({writer}, timeout=_CLEANUP_GRACE_SECONDS)
+        if process_settled and session.application_deadline is not None:
+            # The supervisor owns reader settlement after process cleanup. Allow
+            # its drain/cancel bounds to finish before deciding ownership is uncertain.
+            loop = asyncio.get_running_loop()
+            settlement_deadline = loop.time() + 2.5 * _CLEANUP_GRACE_SECONDS
+            while not getattr(managed, "execution_settled", True) and loop.time() < settlement_deadline:
+                await asyncio.sleep(.01)
         return (
-            process_settled and (writer is None or writer.done())
+            process_settled and getattr(managed, "execution_settled", True)
+            and (writer is None or writer.done())
         )
 
     def _finish(
