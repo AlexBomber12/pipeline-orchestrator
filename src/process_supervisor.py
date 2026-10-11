@@ -1507,13 +1507,13 @@ async def _wait_without_cancelling(task: asyncio.Task[None]) -> None:
 
 
 async def _capture_output(
-    stream: asyncio.StreamReader,
+    stream: asyncio.StreamReader | PtyChannel,
     buffer: bytearray,
     *,
     max_bytes: int | None = None,
     on_chunk: Callable[[bytes], None] | None = None,
 ) -> None:
-    """Read one subprocess pipe incrementally so cancellation keeps diagnostics."""
+    """Read one output stream incrementally so cancellation keeps diagnostics."""
     while chunk := await stream.read(64 * 1024):
         if on_chunk is not None:
             on_chunk(chunk)
@@ -1527,6 +1527,18 @@ async def _wait_for_leader_exit(process: asyncio.subprocess.Process) -> int:
     while process.returncode is None:
         await asyncio.sleep(_POLL_INTERVAL_SECONDS)
     return process.returncode
+
+
+async def _wait_for_pty_execution(
+    leader_task: asyncio.Task[Any], reader_task: asyncio.Task[Any]
+) -> None:
+    """Detect terminal reader failure promptly, while EOF still waits for exit."""
+    done, _ = await asyncio.wait(
+        (leader_task, reader_task), return_when=asyncio.FIRST_COMPLETED
+    )
+    if reader_task in done:
+        reader_task.result()
+    await asyncio.shield(leader_task)
 
 
 async def _await_task_preserving_cancellation(
@@ -1616,25 +1628,46 @@ async def run_supervised_process(
     stdout_chunk_callback: Callable[[bytes], None] | None = None,
     stderr_chunk_callback: Callable[[bytes], None] | None = None,
     max_output_bytes: int | None = None,
+    pty_channel: PtyChannel | None = None,
 ) -> ProcessRunResult:
     """Run callbacks, wait for the leader, clean its group, and drain output.
 
     Leader completion is observed through child-watcher returncode publication,
-    independently of pipe EOF.  Cleanup is allowed to finish despite caller
+    independently of output EOF.  Cleanup is allowed to finish despite caller
     cancellation.  After cleanup, stdout/stderr readers receive one second to
     observe EOF and one second to settle cancellation; any failure is explicit
     and carries bytes captured so far.  The cleanup implementation itself is
     bounded by its TERM/KILL, leader-reap, adopted-child, and lifecycle-witness
     grace periods.
+
+    A caller-owned PTY supplies one merged stdout/stderr stream, delivered to
+    stdout_chunk_callback and returned in stdout with empty stderr. It cannot
+    be combined with subprocess pipes or stderr_chunk_callback. The runner
+    settles its terminal reader but never closes the channel.
     """
     if max_output_bytes is not None and max_output_bytes <= 0:
         raise ValueError("max_output_bytes must be positive or null")
     process = managed.process
+    if pty_channel is not None and (
+        process.stdout is not None
+        or process.stderr is not None
+        or stderr_chunk_callback is not None
+    ):
+        raise ValueError("PTY capture cannot be combined with pipes or stderr callback")
     stdout_buffer = bytearray()
     stderr_buffer = bytearray()
     execution_tasks: dict[str, asyncio.Task[Any]] = {
         "leader exit": asyncio.create_task(_wait_for_leader_exit(process))
     }
+    if pty_channel is not None:
+        execution_tasks["PTY reader"] = asyncio.create_task(
+            _capture_output(
+                pty_channel,
+                stdout_buffer,
+                max_bytes=max_output_bytes,
+                on_chunk=stdout_chunk_callback,
+            )
+        )
     if process.stdout is not None:
         execution_tasks["stdout reader"] = asyncio.create_task(
             _capture_output(
@@ -1663,10 +1696,15 @@ async def run_supervised_process(
             on_process_start(process)
         if on_supervised_process_start is not None:
             on_supervised_process_start(managed)
+        completion = (
+            _wait_for_pty_execution(leader_task, execution_tasks["PTY reader"])
+            if pty_channel is not None
+            else asyncio.shield(leader_task)
+        )
         if timeout is None:
-            await asyncio.shield(leader_task)
+            await completion
         else:
-            await asyncio.wait_for(asyncio.shield(leader_task), timeout=timeout)
+            await asyncio.wait_for(completion, timeout=timeout)
     except asyncio.TimeoutError:
         timed_out = True
     except asyncio.CancelledError as exc:

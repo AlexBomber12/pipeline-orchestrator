@@ -189,6 +189,11 @@ class ProcessPool:
         self.supervised.append((managed, managed.identity.process_group_id))
         return managed
 
+    async def launch_pty(self, code: str) -> tuple[SupervisedProcess, PtyChannel]:
+        managed, channel = await launch_pty_process(sys.executable, "-c", code)
+        self.supervised.append((managed, managed.identity.process_group_id))
+        return managed, channel
+
     async def launch_raw(self, code: str) -> asyncio.subprocess.Process:
         process = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -3519,3 +3524,286 @@ async def test_invalid_grace_is_rejected(
     managed = await process_pool.launch("pass")
     with pytest.raises(ValueError, match="finite and non-negative"):
         await managed.cleanup(term_grace=term_grace, kill_grace=kill_grace)
+
+
+@pytest.mark.parametrize("limit", [None, 8])
+@pytest.mark.asyncio
+async def test_supervised_pty_incremental_merged_capture(
+    process_pool: ProcessPool, limit: int | None
+) -> None:
+    managed, channel = await process_pool.launch_pty(
+        "import os; os.write(1, b'first|'); input(); "
+        "os.write(2, b'stderr|'); os.write(1, b'last')"
+    )
+    chunks: list[bytes] = []
+    first_output = asyncio.Event()
+
+    def observe(chunk: bytes) -> None:
+        chunks.append(chunk)
+        if b"first|" in b"".join(chunks):
+            first_output.set()
+
+    run = asyncio.create_task(run_supervised_process(
+        managed, timeout=5, pty_channel=channel,
+        stdout_chunk_callback=observe, max_output_bytes=limit,
+    ))
+    try:
+        await asyncio.wait_for(first_output.wait(), 2)
+        assert not run.done()
+        await channel.write(b"continue\n")
+        result = await asyncio.wait_for(run, 3)
+        output = b"first|stderr|last"
+        assert b"".join(chunks) == output
+        assert len(chunks) >= 2
+        assert result.stdout == (output if limit is None else output[-limit:])
+        assert result.stderr == b""
+        assert result.returncode == 0
+        assert not result.timed_out
+        assert managed._cleanup_task.result().quiescent
+        assert not channel.closed
+        os.fstat(channel.fileno())
+        assert channel._read_waiter is None
+        assert not channel._reader_registered
+    finally:
+        if not run.done():
+            run.cancel()
+            await asyncio.gather(run, return_exceptions=True)
+        channel.close()
+
+
+@pytest.mark.asyncio
+async def test_supervised_pty_leader_exit_cleans_terminal_holder(
+    process_pool: ProcessPool,
+) -> None:
+    managed, channel = await process_pool.launch_pty(PTY_RETAINING_DESCENDANT)
+    try:
+        result = await asyncio.wait_for(run_supervised_process(
+            managed, timeout=10, pty_channel=channel,
+        ), 4)
+        child_pid = int(result.stdout.strip())
+        assert result.returncode == 0
+        assert result.stderr == b""
+        assert managed._cleanup_task.result().quiescent
+        assert managed._cleanup_task.result().term_sent
+        await _wait_not_live(child_pid)
+        assert channel.at_eof
+        assert not channel.closed
+    finally:
+        channel.close()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.asyncio
+async def test_supervised_pty_timeout_and_cancellation_settle_reader(
+    process_pool: ProcessPool, cancel: bool,
+) -> None:
+    managed, channel = await process_pool.launch_pty(
+        "import os, signal; os.write(1, b'ready'); signal.pause()"
+    )
+    ready = asyncio.Event()
+    run = asyncio.create_task(run_supervised_process(
+        managed, timeout=None if cancel else 0.2, pty_channel=channel,
+        stdout_chunk_callback=lambda _chunk: ready.set(),
+    ))
+    try:
+        await asyncio.wait_for(ready.wait(), 2)
+        if cancel:
+            run.cancel()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await asyncio.wait_for(run, 4)
+            result = process_supervisor.cancelled_process_result(caught.value)
+            assert result is not None
+            assert not result.timed_out
+        else:
+            result = await asyncio.wait_for(run, 4)
+            assert result.timed_out
+        assert result.stdout == b"ready"
+        assert result.stderr == b""
+        assert result.returncode != 0
+        assert result.failure_detail is None
+        assert managed._cleanup_task.result().quiescent
+        await _wait_not_live(managed.identity.leader_pid)
+        assert channel._read_waiter is None
+        assert not channel._reader_registered
+        assert not channel.closed
+        os.fstat(channel.fileno())
+    finally:
+        if not run.done():
+            run.cancel()
+            await asyncio.gather(run, return_exceptions=True)
+        channel.close()
+
+
+@pytest.mark.parametrize("failure", ["reader", "callback"])
+@pytest.mark.asyncio
+async def test_supervised_pty_output_failure_cleans_promptly(
+    process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    managed, channel = await process_pool.launch_pty(
+        "import os, signal; os.write(1, b'ready'); signal.pause()"
+    )
+    real_read = channel.read
+    calls = 0
+
+    async def broken_read(size: int) -> bytes:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise OSError("synthetic reader failure")
+        return await real_read(size)
+
+    def broken_callback(_chunk: bytes) -> None:
+        raise RuntimeError("synthetic callback failure")
+
+    if failure == "reader":
+        monkeypatch.setattr(channel, "read", broken_read)
+    try:
+        with pytest.raises(ProcessSupervisionError, match="PTY reader failed") as caught:
+            await asyncio.wait_for(run_supervised_process(
+                managed, timeout=60, pty_channel=channel,
+                stdout_chunk_callback=broken_callback if failure == "callback" else None,
+            ), 4)
+        assert caught.value.stdout == (b"ready" if failure == "reader" else b"")
+        assert caught.value.stderr == b""
+        assert managed.supervision_failure is caught.value
+        assert managed._cleanup_task.result().quiescent
+        assert not channel.closed
+        assert channel._read_waiter is None
+    finally:
+        channel.close()
+
+
+@pytest.mark.asyncio
+async def test_supervised_pty_eof_is_not_leader_success(
+    process_pool: ProcessPool,
+) -> None:
+    managed, channel = await process_pool.launch_pty(
+        "import os, signal; os.write(1, b'ready'); "
+        "os.close(0); os.close(1); os.close(2); signal.pause()"
+    )
+    try:
+        result = await asyncio.wait_for(run_supervised_process(
+            managed, timeout=0.2, pty_channel=channel,
+        ), 4)
+        assert result.timed_out
+        assert result.returncode != 0
+        assert result.stdout == b"ready"
+        assert managed._cleanup_task.result().quiescent
+        assert not channel.closed
+    finally:
+        channel.close()
+
+
+@pytest.mark.asyncio
+async def test_supervised_pty_bounded_drain_cancels_owned_reader(
+    process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    managed, channel = await process_pool.launch_pty("print('output', flush=True)")
+    real_read = channel.read
+    reader_tasks: list[asyncio.Task[Any]] = []
+
+    async def stalled_eof(size: int) -> bytes:
+        task = asyncio.current_task()
+        assert task is not None
+        reader_tasks.append(task)
+        chunk = await real_read(size)
+        if not chunk:
+            await asyncio.Event().wait()
+        return chunk
+
+    monkeypatch.setattr(channel, "read", stalled_eof)
+    monkeypatch.setattr(process_supervisor, "_OUTPUT_DRAIN_TIMEOUT_SECONDS", 0.01)
+    try:
+        with pytest.raises(ProcessSupervisionError, match="output drain bound") as caught:
+            await asyncio.wait_for(run_supervised_process(
+                managed, timeout=5, pty_channel=channel,
+            ), 4)
+        assert caught.value.stdout == b"output\r\n"
+        assert managed._cleanup_task.result().quiescent
+        assert reader_tasks and all(task.done() for task in reader_tasks)
+        assert not channel.closed
+        assert not channel._reader_registered
+    finally:
+        channel.close()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.asyncio
+async def test_supervised_pty_unconfirmed_cleanup_retains_owner(
+    process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch, cancel: bool,
+) -> None:
+    managed, channel = await process_pool.launch_pty("print('output', flush=True)")
+    cleanup_calls = []
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def failed_cleanup(**kwargs: Any) -> CleanupResult:
+        cleanup_calls.append(kwargs)
+        cleanup_started.set()
+        await release_cleanup.wait()
+        return CleanupResult(CleanupStatus.FAILED, 0, False, False, "unconfirmed")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(managed, "cleanup", failed_cleanup)
+            run = asyncio.create_task(run_supervised_process(
+                managed, timeout=5, pty_channel=channel,
+            ))
+            await asyncio.wait_for(cleanup_started.wait(), 2)
+            if cancel:
+                run.cancel()
+                await asyncio.sleep(0)
+                run.cancel()
+            release_cleanup.set()
+            if cancel:
+                with pytest.raises(asyncio.CancelledError) as caught:
+                    await asyncio.wait_for(run, 4)
+                result = process_supervisor.cancelled_process_result(caught.value)
+                assert result is not None
+                assert result.failure_detail == "unconfirmed"
+                assert result.stdout == b"output\r\n"
+                assert result.stderr == b""
+                assert any("unconfirmed" in note for note in caught.value.__notes__)
+            else:
+                with pytest.raises(ProcessSupervisionError, match="unconfirmed") as caught:
+                    await asyncio.wait_for(run, 4)
+                assert managed.supervision_failure is caught.value
+                assert caught.value.stdout == b"output\r\n"
+        assert cleanup_calls
+        assert not channel.closed
+        assert managed._lifecycle_witness is not None
+        assert managed._lifecycle_witness.control_fd >= 0
+        assert channel._read_waiter is None
+        assert (await managed.cleanup(term_grace=0.05, kill_grace=0.5)).quiescent
+    finally:
+        channel.close()
+
+
+@pytest.mark.parametrize("conflict", ["stdout", "stderr", "stderr_callback"])
+@pytest.mark.asyncio
+async def test_supervised_pty_invalid_capture_keeps_caller_ownership(
+    monkeypatch: pytest.MonkeyPatch, conflict: str,
+) -> None:
+    process = _ExecutionProcess()
+    if conflict != "stderr_callback":
+        setattr(process, conflict, _finished_reader())
+    managed = _ExecutionManaged(process, None)
+    master, slave = os.openpty()
+    channel = PtyChannel(master)
+
+    def unexpected_task(_coro: Any) -> Any:
+        pytest.fail("invalid invocation created an execution task")
+
+    monkeypatch.setattr(asyncio, "create_task", unexpected_task)
+    try:
+        with pytest.raises(ValueError, match="PTY capture cannot be combined"):
+            await run_supervised_process(
+                managed, timeout=1, pty_channel=channel,  # type: ignore[arg-type]
+                stderr_chunk_callback=(lambda _chunk: None)
+                if conflict == "stderr_callback" else None,
+            )
+        assert not channel.closed
+        os.fstat(channel.fileno())
+    finally:
+        channel.close()
+        os.close(slave)
