@@ -69,6 +69,15 @@ def _validated_stable_version(observed: object) -> str:
     return observed
 
 
+def supports_browser_login_version(observed: object) -> bool:
+    """Report support using the descriptor's sanitized version guard."""
+    try:
+        _validated_stable_version(observed)
+    except ValueError:
+        return False
+    return True
+
+
 def _normalize_terminal_output(output: str) -> str:
     if not isinstance(output, str) or len(output) > _MAX_OUTPUT_CHARACTERS:
         raise ValueError(_MALFORMED_OUTPUT_ERROR)

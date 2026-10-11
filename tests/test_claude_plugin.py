@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 from src.coder_registry import (
+    CoderBrowserLoginAdapter,
     ModelCatalogUnavailable,
     ModelMetadata,
     ModelReasoningEffort,
@@ -1061,3 +1062,137 @@ def test_rate_limit_patterns_returns_anthropic_pattern() -> None:
     patterns = ClaudePlugin().rate_limit_patterns()
 
     assert patterns == [claude_module._ANTHROPIC_RATE_LIMIT_PATTERN]
+
+
+@pytest.mark.parametrize("version", ["2.1.126", "2.2.0"])
+def test_browser_login_factory_captures_context_without_side_effects(
+    version: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    location = "exact/selected-location"
+    supplied = {
+        "HOME": "/inherited/home", "CLAUDE_CONFIG_DIR": location,
+        "SECRET": "synthetic-secret",
+    }
+    expected = dict(supplied)
+    plugin = ClaudePlugin()
+    discovery_cwd = plugin.model_catalog_cache_key(
+        config=AppConfig(), config_path="workspace/config.yml",
+    )[1]
+
+    def forbidden(*_args: object, **_kwargs: object) -> Any:
+        raise AssertionError("factory must have no external side effects")
+
+    monkeypatch.setattr(claude_module, "load_config", forbidden)
+    monkeypatch.setattr(plugin, "build_credential_environment", forbidden)
+    monkeypatch.setattr(claude_module.subprocess, "run", forbidden)
+    monkeypatch.setattr(claude_module.asyncio, "create_subprocess_exec", forbidden)
+    monkeypatch.setattr(Path, "open", forbidden)
+    monkeypatch.setattr(Path, "mkdir", forbidden)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/ambient/ignored")
+    adapter = plugin.create_browser_login(
+        credential_location=location, environment=supplied,
+        config_path="workspace/config.yml", observed_cli_version=version,
+    )
+    supplied["HOME"] = "/changed"
+    supplied["CLAUDE_CONFIG_DIR"] = "/changed"
+
+    assert isinstance(adapter, ClaudeBrowserLoginAdapter)
+    assert isinstance(adapter, CoderBrowserLoginAdapter)
+    assert adapter.environment == expected
+    assert adapter.credential_location == location
+    assert adapter.working_directory == discovery_cwd
+    assert adapter.observed_cli_version == version
+    assert adapter.command == ("claude", "auth", "login")
+    assert adapter.replacement_warning == ClaudeBrowserLoginAdapter.replacement_warning
+    with pytest.raises(TypeError):
+        adapter.environment["HOME"] = "/changed"  # type: ignore[index]
+    assert "synthetic-secret" not in repr(adapter)
+
+
+@pytest.mark.parametrize(
+    "version", [None, "", "secret-invalid", "2.1.125", "2.1.126-beta.1", "2.1.126+build"],
+)
+def test_browser_login_factory_reuses_sanitized_version_guard(version: Any) -> None:
+    with pytest.raises(ValueError) as raised:
+        ClaudePlugin().create_browser_login(
+            credential_location="/selected", environment={"CLAUDE_CONFIG_DIR": "/selected"},
+            config_path="config.yml", observed_cli_version=version,
+        )
+    if version:
+        assert version not in str(raised.value)
+
+
+def test_browser_login_factory_rejects_inconsistent_captured_context() -> None:
+    with pytest.raises(ValueError, match="^Claude browser login credential context is inconsistent$") as raised:
+        ClaudePlugin().create_browser_login(
+            credential_location="selected-secret",
+            environment={"CLAUDE_CONFIG_DIR": "other-secret", "TOKEN": "token-secret"},
+            config_path="config.yml", observed_cli_version="2.1.126",
+        )
+    assert "secret" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("version_result", "methods"),
+    [
+        ((0, "2.1.126 (Claude Code)", ""), ["browser_code"]),
+        ((0, "claude 2.2.0", ""), ["browser_code"]),
+        ((0, "2.1.125", ""), []),
+        ((0, "2.1.126-beta.1", ""), []),
+        ((0, "2.1.126+build", ""), []),
+        ((0, "", ""), []),
+        ((0, "unexpected-secret", ""), []),
+        ((127, "", "claude not found"), []),
+        ((124, "2.1.126", ""), []),
+        ((2, "2.1.126", ""), []),
+    ],
+)
+def test_browser_login_capability_follows_successful_current_version_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    version_result: tuple[int, str, str], methods: list[str],
+) -> None:
+    plugin = ClaudePlugin()
+    static = plugin.auth_capabilities
+    result, _calls = _check_auth_with_results(
+        monkeypatch, tmp_path, version_result=version_result,
+        status_result=(1, '{"loggedIn":false,"authMethod":"none"}', ""),
+    )
+    assert result["capabilities"] == {
+        **_CLAUDE_AUTH_CAPABILITIES, "interactive_login_methods": methods,
+    }
+    assert result["saved_credentials_present"] is None
+    assert result["service_access_verified"] is None
+    assert result["status"] == "error"
+    if methods:
+        assert result["failure_reason"] == "credentials_missing"
+    assert plugin.auth_capabilities is static
+    assert static.interactive_login_methods == ()
+    result["capabilities"]["interactive_login_methods"].append("caller-mutation")
+    assert ClaudePlugin().auth_capabilities.interactive_login_methods == ()
+
+
+@pytest.mark.parametrize(
+    ("status_result", "saved", "mode", "reason", "methods"),
+    [
+        ((0, '{"loggedIn":true,"authMethod":"claude.ai"}', ""), True, "claude_ai", None, ["browser_code"]),
+        ((0, '{"loggedIn":true,"authMethod":"api_key"}', ""), None, "api_key", None, ["browser_code"]),
+        ((124, "", ""), None, None, "probe_timeout", ["browser_code"]),
+        ((2, "", "unknown command 'auth'"), None, None, "probe_unavailable", ["browser_code"]),
+        ((127, "", "claude not found"), None, None, "cli_missing", []),
+    ],
+)
+def test_supported_browser_capability_preserves_auth_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    status_result: tuple[int, str, str], saved: bool | None,
+    mode: str | None, reason: str | None, methods: list[str],
+) -> None:
+    result, _calls = _check_auth_with_results(
+        monkeypatch, tmp_path, version_result=(0, "2.1.126", ""),
+        status_result=status_result,
+    )
+    assert result["saved_credentials_present"] is saved
+    assert result["authentication_mode"] == mode
+    assert result["failure_reason"] == reason
+    assert result["service_access_verified"] is None
+    assert result["capabilities"]["interactive_login_methods"] == methods
