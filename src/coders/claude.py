@@ -7,8 +7,9 @@ import json
 import os
 import re
 import subprocess
+from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from src import claude_cli
 from src.coder_registry import (
@@ -18,6 +19,10 @@ from src.coder_registry import (
     ModelCatalogUnavailable,
     ModelSetting,
     coder_auth_payload,
+)
+from src.coders.claude_login import (
+    ClaudeBrowserLoginAdapter,
+    supports_browser_login_version,
 )
 from src.coders.claude_models import (
     ClaudeModelDiscoveryInvalid,
@@ -196,6 +201,22 @@ class ClaudePlugin:
             claude_config_dir=credential_location
         )
 
+    def create_browser_login(
+        self,
+        *,
+        credential_location: str,
+        environment: Mapping[str, str],
+        config_path: str,
+        observed_cli_version: str,
+    ) -> ClaudeBrowserLoginAdapter:
+        """Describe login using only the daemon's captured probe context."""
+        return ClaudeBrowserLoginAdapter(
+            environment=environment,
+            working_directory=str(Path(config_path).absolute().parent),
+            credential_location=credential_location,
+            observed_cli_version=observed_cli_version,
+        )
+
     def _resolve_reasoning_effort(
         self, daemon_config: "DaemonConfig"
     ) -> str | None:
@@ -352,10 +373,11 @@ class ClaudePlugin:
         )
 
     def _auth_status(self, **kwargs: Any) -> dict[str, Any]:
-        return coder_auth_payload(
-            CoderAuthStatus(**kwargs),
-            capabilities=self.auth_capabilities,
-        )
+        status = CoderAuthStatus(**kwargs)
+        capabilities = self.auth_capabilities
+        if status.cli_available is True and supports_browser_login_version(status.cli_version):
+            capabilities = replace(capabilities, interactive_login_methods=("browser_code",))
+        return coder_auth_payload(status, capabilities=capabilities)
 
     def check_auth(
         self,
