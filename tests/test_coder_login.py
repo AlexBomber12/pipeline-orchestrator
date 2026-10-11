@@ -3757,3 +3757,40 @@ async def test_browser_admission_cancellation_marks_session_before_cleanup_task(
     assert session.cancel_requested and not session.admission_delivered
     await session.admission_cancel_task
     assert session.state == "cancelled" and not session.reservation_held
+
+
+async def test_browser_admission_rolls_back_failed_executor_validation(monkeypatch, browser_admission):
+    manager, _, reservations, context, _, _, settled, calls = browser_admission
+    plugin = context["plugin"]
+    factory = plugin.create_browser_login
+    validation_calls = []
+
+    def changing_adapter(**kwargs):
+        adapter = factory(**kwargs)
+        classify = adapter.classify_failure
+
+        def classify_twice(*args):
+            validation_calls.append(args)
+            if len(validation_calls) == 2:
+                raise ValueError("synthetic private adapter detail")
+            return classify(*args)
+
+        object.__setattr__(adapter, "classify_failure", classify_twice)
+        return adapter
+
+    monkeypatch.setattr(plugin, "create_browser_login", changing_adapter)
+    location = context["credential_location"]
+    version = reservations.credential_version(location)
+    settled.set()
+    result = await _start_browser_admission(manager, context)
+    assert result.reason == "startup_failed" and "private" not in result.detail
+    assert len(validation_calls) == 2 and len(calls) == 1
+    assert not manager._sessions and not manager._browser_admissions
+    assert not reservations.login_active(location) and reservations.credential_version(location) == version + 1
+    # The failed dormant session neither consumes capacity nor prevents a fresh start.
+    monkeypatch.setattr(plugin, "create_browser_login", factory)
+    retry = await _start_browser_admission(manager, context)
+    assert isinstance(retry, dict) and retry["reused_session"] is False
+    assert len(manager._sessions) == 1 and len(calls) == 2
+    await manager.shutdown()
+    assert not reservations.login_active(location)

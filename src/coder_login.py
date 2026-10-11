@@ -478,7 +478,13 @@ class CoderLoginSessionManager:
                 plugin_identity=admission.plugin, reservation_held=True,
             )
             self._sessions[session.session_id] = session
-            self._execute_browser_session(session)
+            try:
+                self._execute_browser_session(session)
+            except Exception:
+                # Executor setup validates synchronously before scheduling its task.
+                self._sessions.pop(session.session_id)
+                session.reservation_held = False
+                return CoderBrowserLoginFailure("startup_failed", "Browser-code login could not be started")
             admission.session = session
             return self._session_payload(session)
         finally:
