@@ -256,19 +256,21 @@ class CoderLoginSessionManager:
         return adapter
 
     def _execute_browser_session(self, session: _LoginSession) -> None:
-        """Take over an internally tracked, prepared, caller-reserved session."""
+        """Take over a session bound to its preparing plugin and reservation."""
         if (
             self._shutting_down
             or self._sessions.get(session.session_id) is not session
             or session.task is not None
             or session.state != "starting"
+            or session.plugin_identity is None
+            or self._registry.get_optional(session.plugin) is not session.plugin_identity
+            or self._registry.reference_for(session.plugin) != session.reference
             or not session.reservation_held
             or not self._credential_reservations.login_active(session.adapter.credential_location)
             or not self._valid_adapter(session.adapter, browser=True)
             or session.adapter.requires_pty is not True
         ):
             raise ValueError("Browser login requires a tracked prepared session and reservation")
-        session.plugin_identity = self._registry.get_optional(session.plugin)
         session.deadline_monotonic = self._monotonic() + session.adapter.application_timeout_seconds
         session.application_deadline = self._wall_time() + session.adapter.application_timeout_seconds
         session.detail = "Preparing browser-code login"
@@ -452,8 +454,8 @@ class CoderLoginSessionManager:
             or session is None
             or session.plugin != plugin_name
             or session.reference != expected_reference
-            or self._registry.reference_for(plugin_name) != expected_reference
             or self._registry.get_optional(plugin_name) is not session.plugin_identity
+            or self._registry.reference_for(plugin_name) != expected_reference
             or session.application_deadline is None
             or session.state != "waiting_for_code"
             or session.submission_claimed

@@ -2000,7 +2000,7 @@ async def _prepared_browser(monkeypatch, browser_preparation, *, timeout=5):
     object.__setattr__(adapter, "application_timeout_seconds", timeout)
     session = coder_login._LoginSession(
         "B" * 43, "claude", kwargs["expected_reference"], adapter, False, manager._monotonic(),
-        reservation_held=True,
+        reservation_held=True, plugin_identity=kwargs["plugin"],
     )
     manager._sessions[session.session_id] = session
     return manager, reservations, session
@@ -2494,7 +2494,8 @@ async def test_browser_submission_invalid_code_does_not_claim(monkeypatch, brows
     await session.task
 
 
-@pytest.mark.parametrize("invalid", ["plugin", "id", "reference", "identity", "registry_reference", "device",
+@pytest.mark.parametrize("invalid", ["plugin", "id", "reference", "identity", "missing_plugin", "registry_reference",
+                                     "device",
                                      "phase", "cancel", "parse", "cleanup", "reservation", "lock",
                                      "process", "exited", "channel", "closed", "eof", "task", "deadline", "shutdown"])
 async def test_browser_submission_rejects_unowned_session(monkeypatch, browser_preparation, invalid):
@@ -2507,6 +2508,8 @@ async def test_browser_submission_rejects_unowned_session(monkeypatch, browser_p
             kwargs[{"plugin": "plugin", "id": "session_id", "reference": "reference"}[invalid]] = "wrong"
         elif invalid == "identity":
             patch.setattr(manager._registry, "get_optional", lambda _name: ClaudePlugin())
+        elif invalid == "missing_plugin":
+            patch.setattr(manager, "_registry", CoderRegistry())
         elif invalid == "registry_reference":
             patch.setattr(manager._registry, "reference_for", lambda _name: "other")
         elif invalid == "device":
@@ -2914,3 +2917,27 @@ async def test_browser_rejection_snapshots_during_pending_cleanup(
         await manager.cancel("claude", session.session_id, expected_reference=session.reference)
     assert channel.closed and session.managed is None and session.pty_channel is None
     assert not session.reservation_held and not reservations.login_active(session.adapter.credential_location)
+
+
+@pytest.mark.parametrize("change", ["replacement", "reference", "missing_plugin", "unbound"])
+async def test_browser_execution_keeps_preparing_plugin_identity(monkeypatch, browser_preparation, change):
+    manager, reservations, session = await _prepared_browser(monkeypatch, browser_preparation)
+    original_plugin = session.plugin_identity
+    assert original_plugin is browser_preparation[3]["plugin"]
+    assert original_plugin is manager._registry.get("claude")
+    original_adapter = session.adapter
+    if change == "replacement":
+        manager._registry.register(ClaudePlugin(), reference=session.reference)
+    elif change == "reference":
+        manager._registry.register(original_plugin, reference="changed")
+    elif change == "missing_plugin":
+        manager._registry = CoderRegistry()
+    else:
+        session.plugin_identity = None
+    with pytest.raises(ValueError, match="tracked prepared"):
+        manager._execute_browser_session(session)
+    assert session.plugin_identity is (None if change == "unbound" else original_plugin)
+    assert session.adapter is original_adapter and session.state == "starting"
+    assert session.task is None and session.managed is None and session.pty_channel is None
+    assert session.deadline_monotonic is None and session.application_deadline is None
+    assert session.reservation_held and reservations.login_active(session.adapter.credential_location)
