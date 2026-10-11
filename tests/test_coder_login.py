@@ -2845,3 +2845,72 @@ async def test_browser_rejection_accepts_only_fixed_classified_failure(
     assert not session.rejection_observed and not session.stdout and session.state == "authorizing"
     completed.set()
     await session.task
+
+
+@pytest.mark.parametrize("cleanup_outcome", ["confirmed", "process_uncertain", "execution_unsettled"])
+async def test_browser_rejection_snapshots_during_pending_cleanup(
+    monkeypatch, browser_preparation, cleanup_outcome,
+):
+    manager, reservations, session, managed, channel, writes, completed = await _submittable_browser(
+        monkeypatch, browser_preparation,
+    )
+    await _submit(manager, session, "synthetic-rejection-code")
+    cleanup_entered, allow_cleanup = asyncio.Event(), asyncio.Event()
+    original_cleanup = managed.cleanup
+    managed.quiescent = cleanup_outcome != "process_uncertain"
+    managed.execution_settled = cleanup_outcome != "execution_unsettled"
+
+    async def blocked_cleanup(**kwargs):
+        cleanup_entered.set()
+        await allow_cleanup.wait()
+        return await original_cleanup(**kwargs)
+
+    monkeypatch.setattr(managed, "cleanup", blocked_cleanup)
+    marker = session.adapter.rejection_message.encode()
+    manager._observe_chunk(session, session.stdout, marker[:20])
+    manager._observe_chunk(session, session.stdout, marker[20:])
+    await asyncio.wait_for(cleanup_entered.wait(), 1)
+    try:
+        pending = await _browser_snapshot(manager, session)
+        assert pending["state"] == "canceling" and pending["failure_reason"] is None
+        assert pending["authorization_url"] is None and pending["cleanup_confirmed"] is None
+        assert "authorization_code" not in pending and "user_code" not in pending
+        assert "synthetic-rejection-code" not in json.dumps(pending)
+        assert session.rejection_observed and session.code_prompt_observed
+        assert session.managed is managed and session.pty_channel is channel and not channel.closed
+        assert session.reservation_held and reservations.login_active(session.adapter.credential_location)
+        assert session.write_task.done() and not session.task.done()
+        assert not session.stdout and not session.stderr and len(writes) == 1
+
+        allow_cleanup.set()
+        await session.abort_task
+        settled = await _browser_snapshot(manager, session)
+        if cleanup_outcome == "confirmed":
+            assert settled["state"] == "failed" and settled["failure_reason"] == "invalid_code"
+            assert settled["cleanup_confirmed"] is True
+        else:
+            assert settled["state"] == "cleanup_failed"
+            assert settled["failure_reason"] == "cancellation_failed"
+            assert settled["cleanup_confirmed"] is False
+        assert settled["authorization_url"] is None
+        # Even confirmed cleanup retains ownership until the login task settles.
+        assert session.managed is managed and session.pty_channel is channel and not channel.closed
+        assert session.reservation_held and reservations.login_active(session.adapter.credential_location)
+    finally:
+        allow_cleanup.set()
+        await session.abort_task
+        completed.set()
+        await session.task
+
+    final = await _browser_snapshot(manager, session)
+    if cleanup_outcome == "confirmed":
+        assert final["state"] == "failed" and final["failure_reason"] == "invalid_code"
+    else:
+        assert final["state"] == "cleanup_failed" and final["failure_reason"] == "cancellation_failed"
+        assert session.managed is managed and session.pty_channel is channel and not channel.closed
+        assert session.reservation_held and reservations.login_active(session.adapter.credential_location)
+        managed.execution_settled = True
+        managed.reconcile_quiescent = True
+        await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    assert channel.closed and session.managed is None and session.pty_channel is None
+    assert not session.reservation_held and not reservations.login_active(session.adapter.credential_location)

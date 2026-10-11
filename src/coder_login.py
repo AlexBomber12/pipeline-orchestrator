@@ -1082,7 +1082,7 @@ class CoderLoginSessionManager:
             session.rejection_observed = True
             session.state = "canceling"
             session.detail = "Browser-code login rejected the authorization code"
-            session.failure_reason = "invalid_code"
+            session.failure_reason = None
             session.abort_task = asyncio.create_task(self._abort_malformed_session(session))
             return
 
