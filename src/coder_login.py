@@ -122,6 +122,7 @@ class _LoginSession:
     managed: SupervisedProcess | None = None
     task: asyncio.Task[None] | None = None
     abort_task: asyncio.Task[None] | None = None
+    admission_cancel_task: asyncio.Task[dict[str, Any]] | None = None
     cancel_requested: bool = False
     parse_failed: bool = False
     code_prompt_observed: bool = False
@@ -415,7 +416,7 @@ class CoderLoginSessionManager:
                 if admission.session is not None:
                     session = admission.session
                     # Cancellation after transfer belongs to the existing session machinery.
-                    session.abort_task = asyncio.create_task(self.cancel(
+                    session.admission_cancel_task = asyncio.create_task(self.cancel(
                         session.plugin, session.session_id, expected_reference=session.reference,
                     ))
             raise

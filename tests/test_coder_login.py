@@ -3536,7 +3536,7 @@ async def test_browser_admission_cancellation_after_transfer_uses_session_cleanu
     with pytest.raises(asyncio.CancelledError):
         await caller
     session = next(iter(manager._sessions.values()))
-    await session.abort_task
+    await session.admission_cancel_task
     assert session.state == "cancelled" and session.cleanup_confirmed is True
     assert not reservations.login_active(context["credential_location"])
 
@@ -3623,7 +3623,7 @@ async def test_browser_admission_waiter_cancellation_preserves_shared_start(monk
         result = next(value for value in results if isinstance(value, dict))
     session = manager._sessions[result["session_id"]]
     assert not admission.cancel_requested and admission.delivered and admission.waiters == 0
-    assert not session.cancel_requested and session.abort_task is None
+    assert not session.cancel_requested and session.admission_cancel_task is None
     assert len(calls) == 1 and reservations.login_active(context["credential_location"])
     stop.set()
     await manager.shutdown()
@@ -3651,3 +3651,45 @@ async def test_browser_admission_activity_check_exception_is_busy(browser_admiss
     assert len(calls) == (1 if phase == "after_probe" else 0)
     assert not reservations.login_active(context["credential_location"])
     assert reservations.credential_version(context["credential_location"]) == version + (phase == "after_probe")
+
+
+async def test_browser_admission_cancellation_during_pty_launch_settles(monkeypatch, browser_admission):
+    manager, _, reservations, context, _, entered, settled, _ = browser_admission
+    launching, launch_settled = asyncio.Event(), asyncio.Event()
+    release_launch = asyncio.Event()
+
+    async def launch(*_args, **_kwargs):
+        launching.set()
+        try:
+            await release_launch.wait()
+        finally:
+            launch_settled.set()
+
+    monkeypatch.setattr(coder_login, "launch_pty_process", launch)
+    caller = asyncio.create_task(_start_browser_admission(manager, context))
+    await entered.wait()
+    admission = manager._browser_admissions[context["credential_location"]]
+    snapshot = manager._session_payload
+
+    def cancel_caller(session, **kwargs):
+        # Executor is scheduled first, so it enters launch before the waiter disconnects.
+        caller.cancel()
+        return snapshot(session, **kwargs)
+
+    monkeypatch.setattr(manager, "_session_payload", cancel_caller)
+    settled.set()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    session = admission.session
+    assert session is not None and launching.is_set()
+    try:
+        done, _ = await asyncio.wait({session.admission_cancel_task}, timeout=.5)
+        assert session.admission_cancel_task in done
+        await session.admission_cancel_task
+        assert session.task.done() and launch_settled.is_set()
+        assert session.state == "cancelled" and session.cleanup_confirmed is True
+        assert session.abort_task is None and not session.reservation_held
+        assert not reservations.login_active(context["credential_location"])
+    finally:
+        release_launch.set()
+        await asyncio.gather(session.task, session.admission_cancel_task, return_exceptions=True)
