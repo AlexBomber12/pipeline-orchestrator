@@ -2434,7 +2434,7 @@ async def test_browser_replacement_requires_observed_code_prompt(monkeypatch, br
     assert not reservations.login_active(session.adapter.credential_location)
 
 
-async def _submittable_browser(monkeypatch, browser_preparation):
+async def _submittable_browser(monkeypatch, browser_preparation, *, supervision_failure=False):
     from types import SimpleNamespace
 
     manager, reservations, session = await _prepared_browser(monkeypatch, browser_preparation)
@@ -2456,6 +2456,8 @@ async def _submittable_browser(monkeypatch, browser_preparation):
         kwargs["stdout_chunk_callback"]((_BROWSER_URL + "\nPaste code here if prompted >").encode())
         ready.set()
         await completed.wait()
+        if supervision_failure:
+            raise ProcessSupervisionError("Synthetic supervision failure", stdout=b"", stderr=b"")
         return ProcessRunResult(0, b"", b"", False)
 
     async def probe(*_args, **_kwargs):
@@ -2744,3 +2746,102 @@ async def test_browser_cleanup_exception_still_cancels_writer(monkeypatch, brows
     result = await manager.cancel("claude", session.session_id, expected_reference=session.reference)
     assert result["cleanup_confirmed"] is True and channel.closed
     assert not reservations.login_active(session.adapter.credential_location)
+
+
+async def test_browser_real_rejection_stops_waiting_child(monkeypatch, tmp_path, browser_preparation):
+    manager, reservations, session = await _prepared_browser(monkeypatch, browser_preparation)
+    ready = asyncio.Event()
+    original_observe = manager._observe_browser_output
+
+    def observe(current):
+        original_observe(current)
+        if current.state == "waiting_for_code":
+            ready.set()
+
+    monkeypatch.setattr(manager, "_observe_browser_output", observe)
+    message = session.adapter.rejection_message
+    script = (
+        "import os,time\n"
+        f"os.write(1,({_BROWSER_URL!r}+'\\nPaste code here if prompted >').encode())\n"
+        "code=b''\n"
+        "while not code.endswith(b'\\n'): code+=os.read(0,1)\n"
+        "assert code==b'synthetic-rejected-code\\n'\n"
+        # The child remains alive after reporting rejection, as the real CLI does.
+        f"message={message!r}.encode()\n"
+        "for byte in message:\n"
+        " os.write(1,bytes([byte])); time.sleep(.001)\n"
+        "while True: time.sleep(.01)\n"
+    )
+    object.__setattr__(session.adapter, "command", (sys.executable, "-c", script))
+    object.__setattr__(session.adapter, "working_directory", str(tmp_path))
+    calls = []
+
+    async def probe(*_args, **_kwargs):
+        calls.append(True)
+        return _auth(True)
+
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", probe)
+    manager._execute_browser_session(session)
+    await asyncio.wait_for(ready.wait(), 3)
+    await _submit(manager, session, "synthetic-rejected-code")
+    managed, channel = session.managed, session.pty_channel
+    await asyncio.wait_for(session.task, 3)
+    result = await _browser_snapshot(manager, session)
+    assert result["state"] == "failed" and result["failure_reason"] == "invalid_code"
+    assert result["cleanup_confirmed"] is True
+    assert channel.closed and managed.process.returncode is not None
+    assert not reservations.login_active(session.adapter.credential_location)
+    assert not calls and not session.stdout and not session.stderr
+    assert "synthetic-rejected-code" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("outcome", ["normal", "supervision", "cleanup_failed"])
+async def test_browser_fragmented_rejection_owns_cleanup(monkeypatch, browser_preparation, outcome):
+    manager, reservations, session, managed, channel, _, completed = await _submittable_browser(
+        monkeypatch, browser_preparation, supervision_failure=outcome == "supervision",
+    )
+    await _submit(manager, session)
+    managed.quiescent = outcome != "cleanup_failed"
+    # Include echoed arbitrary code and overlapping marker prefixes. No bytes
+    # from these chunks may be retained, even while matching a fragmented error.
+    for chunk in [b"synthetic-code\nII", b"nvalid code. Please ", b"make sure the full code was copied."]:
+        manager._observe_chunk(session, session.stdout, chunk)
+        assert session.stdout == b""
+    assert session.rejection_observed and session.state == "canceling"
+    manager._observe_chunk(session, session.stdout, b"Paste code here if prompted >")
+    await session.abort_task
+    assert session.state == ("cleanup_failed" if outcome == "cleanup_failed" else "failed")
+    assert reservations.login_active(session.adapter.credential_location)
+    completed.set()
+    await session.task
+    if outcome == "cleanup_failed":
+        assert session.managed is managed and session.pty_channel is channel and not channel.closed
+        managed.reconcile_quiescent = True
+        await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    else:
+        assert (await _browser_snapshot(manager, session))["failure_reason"] == "invalid_code"
+    assert channel.closed and not reservations.login_active(session.adapter.credential_location)
+
+
+@pytest.mark.parametrize("marker,classifier", [(None, "normal"), ("", "normal"), ("x" * 513, "normal"),
+                                               ("Fixed public error", "exception"),
+                                               ("Fixed public error", "other"),
+                                               ("Fixed public error", "wrong_type")])
+async def test_browser_rejection_accepts_only_fixed_classified_failure(
+    monkeypatch, browser_preparation, marker, classifier,
+):
+    manager, _, session, _, _, _, completed = await _submittable_browser(monkeypatch, browser_preparation)
+    await _submit(manager, session)
+    object.__setattr__(session.adapter, "rejection_message", marker)
+    if classifier == "exception":
+        def classify(*_args):
+            raise RuntimeError("synthetic-secret")
+        object.__setattr__(session.adapter, "classify_failure", classify)
+    elif classifier in {"other", "wrong_type"}:
+        object.__setattr__(session.adapter, "classify_failure", lambda *_args:
+                           object() if classifier == "wrong_type" else CoderBrowserLoginFailure(
+                               "process_failed", "Fixed failure"))
+    manager._observe_chunk(session, session.stdout, (marker or "arbitrary output").encode())
+    assert not session.rejection_observed and not session.stdout and session.state == "authorizing"
+    completed.set()
+    await session.task

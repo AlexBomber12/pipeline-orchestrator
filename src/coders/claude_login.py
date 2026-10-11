@@ -169,6 +169,8 @@ class ClaudeBrowserLoginAdapter:
     observed_cli_version: str
     command: tuple[str, ...] = field(default=("claude", "auth", "login"), init=False)
     requires_pty: bool = field(default=True, init=False)
+    # Fixed public text allows streaming rejection detection without retaining codes.
+    rejection_message: str = field(default=_INVALID_CODE_MESSAGE, init=False)
     application_timeout_seconds: float = field(default=_APPLICATION_TIMEOUT_SECONDS, init=False)
     replacement_warning: str = field(default=_REPLACEMENT_WARNING, init=False)
 

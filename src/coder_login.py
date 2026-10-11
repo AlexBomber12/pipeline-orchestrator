@@ -126,6 +126,8 @@ class _LoginSession:
     code_prompt_observed: bool = False
     submission_claimed: bool = False
     code_delivered: bool = False
+    rejection_match: int = 0
+    rejection_observed: bool = False
     write_cancel_requested: bool = False
     write_task: asyncio.Task[None] | None = None
     plugin_identity: CoderPlugin | None = None
@@ -830,6 +832,9 @@ class CoderLoginSessionManager:
                 max_output_bytes=_OUTPUT_BUFFER_BYTES,
             )
         except ProcessSupervisionError:
+            if session.rejection_observed:
+                await asyncio.gather(session.abort_task, return_exceptions=True)
+                return
             if not await self._cleanup(session):
                 self._cleanup_failed(session)
                 return
@@ -850,6 +855,9 @@ class CoderLoginSessionManager:
                 ),
                 cleanup_confirmed=True,
             )
+            return
+        if session.rejection_observed:
+            await asyncio.gather(session.abort_task, return_exceptions=True)
             return
         if browser and session.write_task is not None:
             await asyncio.wait({session.write_task}, timeout=self._remaining_time(session))
@@ -1001,9 +1009,12 @@ class CoderLoginSessionManager:
         target: bytearray,
         chunk: bytes,
     ) -> None:
+        if session.submission_claimed:
+            if not session.cancel_requested and session.state == "authorizing":
+                self._observe_browser_rejection(session, chunk)
+            return
         if (
             session.state in _TERMINAL_STATES
-            or session.submission_claimed
             or session.parse_failed
             or session.cancel_requested
             or (session.application_deadline is not None and session.cleanup_confirmed is False)
@@ -1045,6 +1056,35 @@ class CoderLoginSessionManager:
         session.user_code = prompt.user_code
         if first_prompt:
             session.expires_at = self._wall_time() + prompt.expires_in_seconds
+
+    def _observe_browser_rejection(self, session: _LoginSession, chunk: bytes) -> None:
+        # Only a prefix length of fixed adapter text crosses chunk boundaries.
+        # Arbitrary output, including echoed input, is never saved in the session.
+        marker = getattr(session.adapter, "rejection_message", None)
+        if not isinstance(marker, str) or not marker or len(marker) > 512:
+            return
+        pattern = marker.encode("utf-8")
+        for byte in chunk:
+            candidate = pattern[:session.rejection_match] + bytes((byte,))
+            matched = min(len(pattern), len(candidate))
+            while matched and not candidate.endswith(pattern[:matched]):
+                matched -= 1
+            session.rejection_match = matched
+            if matched != len(pattern):
+                continue
+            session.rejection_match = 0
+            try:
+                failure = session.adapter.classify_failure(marker, 1)
+            except Exception:
+                return
+            if not isinstance(failure, CoderBrowserLoginFailure) or failure.reason != "invalid_code":
+                return
+            session.rejection_observed = True
+            session.state = "canceling"
+            session.detail = "Browser-code login rejected the authorization code"
+            session.failure_reason = "invalid_code"
+            session.abort_task = asyncio.create_task(self._abort_malformed_session(session))
+            return
 
     def _observe_browser_output(self, session: _LoginSession) -> None:
         if session.submission_claimed:
@@ -1088,6 +1128,11 @@ class CoderLoginSessionManager:
         assert session.managed is not None
         if not await self._cleanup(session):
             self._cleanup_failed(session)
+        elif session.rejection_observed:
+            self._finish(
+                session, state="failed", detail="Browser-code login rejected the authorization code",
+                failure_reason="invalid_code", cleanup_confirmed=True,
+            )
 
     async def _cleanup(self, session: _LoginSession) -> bool:
         managed = session.managed
