@@ -633,7 +633,15 @@ class CoderLoginSessionManager:
             if session.task is not None and not session.task.done()
         ]
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            for task in tasks:
+                task.cancel()
+            done, pending = await asyncio.wait(tasks, timeout=3 * _CLEANUP_GRACE_SECONDS)
+            await asyncio.gather(*done, return_exceptions=True)
+            for session in active:
+                if session.task in pending:
+                    self._cleanup_failed(
+                        session, detail="Device-code login session task did not stop during daemon shutdown",
+                    )
         for session in active:
             if (
                 session.state in _TERMINAL_STATES
@@ -862,8 +870,11 @@ class CoderLoginSessionManager:
         if session.rejection_observed:
             await asyncio.gather(session.abort_task, return_exceptions=True)
             return
+        if session.state in _TERMINAL_STATES or session.cleanup_confirmed is False:
+            return
         if browser and session.write_task is not None:
-            await asyncio.wait({session.write_task}, timeout=self._remaining_time(session))
+            if not session.cancel_requested:
+                await asyncio.wait({session.write_task}, timeout=self._remaining_time(session))
             if not session.write_task.done():
                 if not await self._cleanup(session):
                     self._cleanup_failed(session)

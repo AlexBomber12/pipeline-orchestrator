@@ -2434,10 +2434,12 @@ async def test_browser_replacement_requires_observed_code_prompt(monkeypatch, br
     assert not reservations.login_active(session.adapter.credential_location)
 
 
-async def _submittable_browser(monkeypatch, browser_preparation, *, supervision_failure=False):
+async def _submittable_browser(
+    monkeypatch, browser_preparation, *, supervision_failure=False, timeout=5, stubborn_run=False,
+):
     from types import SimpleNamespace
 
-    manager, reservations, session = await _prepared_browser(monkeypatch, browser_preparation)
+    manager, reservations, session = await _prepared_browser(monkeypatch, browser_preparation, timeout=timeout)
     managed, channel = _Managed(), _Channel()
     managed.process = SimpleNamespace(returncode=None)
     channel.at_eof = False
@@ -2455,7 +2457,12 @@ async def _submittable_browser(monkeypatch, browser_preparation, *, supervision_
     async def run(*_args, **kwargs):
         kwargs["stdout_chunk_callback"]((_BROWSER_URL + "\nPaste code here if prompted >").encode())
         ready.set()
-        await completed.wait()
+        try:
+            await completed.wait()
+        except asyncio.CancelledError:
+            if not stubborn_run:
+                raise
+            await completed.wait()
         if supervision_failure:
             raise ProcessSupervisionError("Synthetic supervision failure", stdout=b"", stderr=b"")
         return ProcessRunResult(0, b"", b"", False)
@@ -2576,7 +2583,8 @@ async def test_browser_submission_is_atomic_and_opaque(monkeypatch, browser_prep
     assert session.write_task.done() and session.code_delivered
 
 
-@pytest.mark.parametrize("action", ["failure", "timeout", "cancel", "shutdown", "caller_cancel"])
+@pytest.mark.parametrize("action", ["failure", "timeout", "cancel", "shutdown", "caller_cancel",
+                                   "cancel_during_writer_wait"])
 async def test_browser_submission_retains_stubborn_writer_until_reconciled(
     monkeypatch, browser_preparation, action,
 ):
@@ -2585,6 +2593,15 @@ async def test_browser_submission_retains_stubborn_writer_until_reconciled(
     )
     monkeypatch.setattr(coder_login, "_CLEANUP_GRACE_SECONDS", .01)
     entered, interrupted, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    writer_waiting = asyncio.Event()
+    original_wait = asyncio.wait
+
+    async def observe_wait(tasks, **kwargs):
+        if asyncio.current_task() is session.task and session.write_task in tasks:
+            writer_waiting.set()
+        return await original_wait(tasks, **kwargs)
+
+    monkeypatch.setattr(coder_login.asyncio, "wait", observe_wait)
 
     async def write(data):
         writes.append(data)
@@ -2609,7 +2626,10 @@ async def test_browser_submission_retains_stubborn_writer_until_reconciled(
         await submission
     elif action == "timeout":
         await submission
-    elif action == "caller_cancel":
+    elif action in {"caller_cancel", "cancel_during_writer_wait"}:
+        if action == "cancel_during_writer_wait":
+            completed.set()
+            await asyncio.wait_for(writer_waiting.wait(), 1)
         submission.cancel()
         await submission
     elif action == "cancel":
@@ -2691,8 +2711,11 @@ async def test_browser_submission_bad_identity_types(monkeypatch, browser_prepar
     await session.task
 
 
-async def test_browser_exit_before_writer_settlement_times_out(monkeypatch, browser_preparation):
-    manager, _, session, _, channel, _, completed = await _submittable_browser(monkeypatch, browser_preparation)
+@pytest.mark.parametrize("quiescent", [True, False])
+async def test_browser_exit_before_writer_settlement_times_out(monkeypatch, browser_preparation, quiescent):
+    manager, reservations, session, managed, channel, _, completed = await _submittable_browser(
+        monkeypatch, browser_preparation,
+    )
     entered = asyncio.Event()
 
     async def write(_data):
@@ -2708,6 +2731,7 @@ async def test_browser_exit_before_writer_settlement_times_out(monkeypatch, brow
         return await original_cleanup(current)
 
     monkeypatch.setattr(manager, "_cleanup", process_cleanup_first)
+    managed.quiescent = quiescent
     submission = asyncio.create_task(_submit(manager, session))
     await entered.wait()
     # The process finishes first; its remaining deadline bounds writer settlement.
@@ -2715,8 +2739,14 @@ async def test_browser_exit_before_writer_settlement_times_out(monkeypatch, brow
     completed.set()
     await session.task
     await submission
-    assert (await _browser_snapshot(manager, session))["state"] == "timed_out"
-    assert session.write_task.done() and not session.code_delivered and channel.closed
+    assert (await _browser_snapshot(manager, session))["state"] == ("timed_out" if quiescent else "cleanup_failed")
+    assert session.write_task.done() and not session.code_delivered
+    if not quiescent:
+        assert session.managed is managed and session.pty_channel is channel and not channel.closed
+        assert reservations.login_active(session.adapter.credential_location)
+        managed.reconcile_quiescent = True
+        await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    assert channel.closed and not reservations.login_active(session.adapter.credential_location)
 
 
 async def test_browser_cleanup_exception_still_cancels_writer(monkeypatch, browser_preparation):
@@ -3061,4 +3091,90 @@ async def test_rejection_cleanup_waits_for_supervisor_settlement(monkeypatch, br
             managed.reconcile_quiescent = True
             await manager.cancel("claude", session.session_id, expected_reference=session.reference)
     assert channel.closed and session.managed is None and session.pty_channel is None
+    assert not reservations.login_active(session.adapter.credential_location)
+
+
+@pytest.mark.parametrize("phase", ["before_writer_wait", "during_writer_wait", "stubborn_session"])
+async def test_browser_shutdown_does_not_wait_for_application_deadline(
+    monkeypatch, browser_preparation, phase,
+):
+    manager, reservations, session, managed, channel, _, completed = await _submittable_browser(
+        monkeypatch, browser_preparation, timeout=900, stubborn_run=phase == "stubborn_session",
+    )
+    monkeypatch.setattr(coder_login, "_CLEANUP_GRACE_SECONDS", .02)
+    entered, release, writer_waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    application_wait = asyncio.Event()
+    original_wait = asyncio.wait
+
+    async def observe_wait(tasks, **kwargs):
+        if asyncio.current_task() is session.task and session.write_task in tasks:
+            writer_waiting.set()
+            if kwargs.get("timeout", 0) > 1:
+                application_wait.set()
+        return await original_wait(tasks, **kwargs)
+
+    async def write(_data):
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            if phase == "before_writer_wait":
+                completed.set()
+            await release.wait()
+
+    monkeypatch.setattr(channel, "write", write, raising=False)
+    monkeypatch.setattr(coder_login.asyncio, "wait", observe_wait)
+    submission = asyncio.create_task(_submit(manager, session))
+    await entered.wait()
+    if phase == "stubborn_session":
+        managed.execution_settled = False
+    elif phase == "during_writer_wait":
+        completed.set()
+        await asyncio.wait_for(writer_waiting.wait(), 1)
+    shutdown = asyncio.create_task(manager.shutdown())
+    try:
+        # Unlike wait_for, this does not cancel a stuck shutdown, so the finally
+        # block can release deliberately uncooperative tasks on regression.
+        done, _ = await original_wait({shutdown}, timeout=.5)
+        assert shutdown in done
+        await shutdown
+        result = await _browser_snapshot(manager, session)
+        assert result["state"] == "cleanup_failed" and result["failure_reason"] == "cancellation_failed"
+        assert result["cleanup_confirmed"] is False
+        assert session.managed is managed and session.pty_channel is channel and not channel.closed
+        assert session.reservation_held and reservations.login_active(session.adapter.credential_location)
+        assert not session.write_task.done()
+        assert session.task.done() is (phase != "stubborn_session")
+        assert application_wait.is_set() is (phase == "during_writer_wait")
+        assert session.write_cancel_requested and session.application_deadline is not None
+    finally:
+        release.set()
+        completed.set()
+        await session.write_task
+        await session.task
+        await submission
+        await shutdown
+        managed.execution_settled = True
+        managed.reconcile_quiescent = True
+        await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    assert channel.closed and session.managed is None and session.pty_channel is None
+    assert not reservations.login_active(session.adapter.credential_location)
+
+
+async def test_browser_cancellation_at_process_completion_with_delivered_code(monkeypatch, browser_preparation):
+    manager, reservations, session, _, channel, _, completed = await _submittable_browser(
+        monkeypatch, browser_preparation,
+    )
+    await _submit(manager, session)
+    assert session.code_delivered and session.write_task.done()
+    # Process completion races with a cancellation recorded before cleanup's
+    # caller has cancelled the session task. Delivered code cannot become success.
+    session.cancel_requested = True
+    session.state = "canceling"
+    completed.set()
+    await session.task
+    result = await _browser_snapshot(manager, session)
+    assert result["state"] == "cancelled" and result["cleanup_confirmed"] is True
+    assert result["auth_status"] is None and result["failure_reason"] is None
+    assert channel.closed and session.managed is None
     assert not reservations.login_active(session.adapter.credential_location)
