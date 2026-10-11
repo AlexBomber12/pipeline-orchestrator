@@ -2941,3 +2941,77 @@ async def test_browser_execution_keeps_preparing_plugin_identity(monkeypatch, br
     assert session.task is None and session.managed is None and session.pty_channel is None
     assert session.deadline_monotonic is None and session.application_deadline is None
     assert session.reservation_held and reservations.login_active(session.adapter.credential_location)
+
+
+async def test_browser_echo_is_absent_from_retained_supervision_failure(
+    monkeypatch, tmp_path, browser_preparation,
+):
+    manager, reservations, session = await _prepared_browser(monkeypatch, browser_preparation)
+    ready = asyncio.Event()
+    original_observe = manager._observe_browser_output
+    original_launch = coder_login.launch_pty_process
+    original_chunk = manager._observe_chunk
+    echo_seen = asyncio.Event()
+    owned = {}
+
+    def observe_chunk(current, target, chunk):
+        if b"synthetic-echoed-authorization-code" in chunk:
+            echo_seen.set()
+        original_chunk(current, target, chunk)
+
+    def observe(current):
+        original_observe(current)
+        if current.state == "waiting_for_code":
+            ready.set()
+
+    async def launch(*args, **kwargs):
+        managed, channel = await original_launch(*args, **kwargs)
+        owned.update(managed=managed, channel=channel, cleanup=managed.cleanup,
+                     reconcile=managed.reconcile_cleanup)
+
+        async def uncertain(**_kwargs):
+            return CleanupResult(CleanupStatus.FAILED, managed.process.returncode, False, False,
+                                 "Synthetic cleanup uncertainty")
+
+        monkeypatch.setattr(managed, "cleanup", uncertain)
+        monkeypatch.setattr(managed, "reconcile_cleanup", uncertain)
+        return managed, channel
+
+    script = (
+        "import os\n"
+        f"os.write(1,({_BROWSER_URL!r}+'\\nPaste code here if prompted >').encode())\n"
+        "received=b''\n"
+        "while not received.endswith(b'\\n'): received+=os.read(0,1)\n"
+        # Deliberate application echo, independent of the launcher's ECHO flag.
+        "os.write(1,received)\n"
+    )
+    object.__setattr__(session.adapter, "command", (sys.executable, "-c", script))
+    object.__setattr__(session.adapter, "working_directory", str(tmp_path))
+    monkeypatch.setattr(manager, "_observe_browser_output", observe)
+    monkeypatch.setattr(coder_login, "launch_pty_process", launch)
+    monkeypatch.setattr(manager, "_observe_chunk", observe_chunk)
+    manager._execute_browser_session(session)
+    try:
+        await asyncio.wait_for(ready.wait(), 3)
+        await _submit(manager, session, "synthetic-echoed-authorization-code")
+        await asyncio.wait_for(session.task, 3)
+        managed, channel = owned["managed"], owned["channel"]
+        result = await _browser_snapshot(manager, session)
+        assert result["state"] == "cleanup_failed" and result["cleanup_confirmed"] is False
+        assert session.managed is managed and session.pty_channel is channel and not channel.closed
+        assert session.reservation_held and reservations.login_active(session.adapter.credential_location)
+        assert not session.stdout and not session.stderr
+        assert echo_seen.is_set()
+        failure = managed.supervision_failure
+        assert isinstance(failure, ProcessSupervisionError)
+        assert failure.stdout == b"" and failure.stderr == b""
+        assert "synthetic-echoed-authorization-code" not in str(failure)
+        assert "synthetic-echoed-authorization-code" not in json.dumps(result)
+    finally:
+        if owned:
+            monkeypatch.setattr(owned["managed"], "cleanup", owned["cleanup"])
+            monkeypatch.setattr(owned["managed"], "reconcile_cleanup", owned["reconcile"])
+            await owned["cleanup"](term_grace=.1, kill_grace=.1)
+        await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    assert owned["channel"].closed and session.managed is None and session.pty_channel is None
+    assert not reservations.login_active(session.adapter.credential_location)

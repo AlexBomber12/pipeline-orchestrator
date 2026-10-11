@@ -832,6 +832,7 @@ class CoderLoginSessionManager:
                 else lambda chunk: self._observe_chunk(session, session.stderr, chunk),
                 pty_channel=session.pty_channel,
                 max_output_bytes=_OUTPUT_BUFFER_BYTES,
+                capture_output=not browser,
             )
         except ProcessSupervisionError:
             if session.rejection_observed:

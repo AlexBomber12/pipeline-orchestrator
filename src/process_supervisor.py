@@ -1522,11 +1522,16 @@ async def _capture_output(
 ) -> None:
     """Read one output stream incrementally so cancellation keeps diagnostics."""
     while chunk := await stream.read(64 * 1024):
-        if on_chunk is not None:
-            on_chunk(chunk)
-        buffer.extend(chunk)
-        if max_bytes is not None and len(buffer) > max_bytes:
-            del buffer[: len(buffer) - max_bytes]
+        try:
+            if on_chunk is not None:
+                on_chunk(chunk)
+            if max_bytes != 0:
+                buffer.extend(chunk)
+                if max_bytes is not None and len(buffer) > max_bytes:
+                    del buffer[: len(buffer) - max_bytes]
+        finally:
+            # Do not retain the last delivered chunk while awaiting another read.
+            chunk = b""
 
 
 async def _wait_for_leader_exit(process: asyncio.subprocess.Process) -> int:
@@ -1636,6 +1641,7 @@ async def run_supervised_process(
     stderr_chunk_callback: Callable[[bytes], None] | None = None,
     max_output_bytes: int | None = None,
     pty_channel: PtyChannel | None = None,
+    capture_output: bool = True,
 ) -> ProcessRunResult:
     """Run callbacks, wait for the leader, clean its group, and drain output.
 
@@ -1650,7 +1656,9 @@ async def run_supervised_process(
     A caller-owned PTY supplies one merged stdout/stderr stream, delivered to
     stdout_chunk_callback and returned in stdout with empty stderr. It cannot
     be combined with subprocess pipes or stderr_chunk_callback. The runner
-    settles its terminal reader but never closes the channel.
+    settles its terminal reader but never closes the channel. With
+    capture_output=False, callbacks still receive output but result/error
+    buffers remain empty, including retained supervision failures.
     """
     if max_output_bytes is not None and max_output_bytes <= 0:
         raise ValueError("max_output_bytes must be positive or null")
@@ -1671,7 +1679,7 @@ async def run_supervised_process(
             _capture_output(
                 pty_channel,
                 stdout_buffer,
-                max_bytes=max_output_bytes,
+                max_bytes=max_output_bytes if capture_output else 0,
                 on_chunk=stdout_chunk_callback,
             )
         )
@@ -1680,7 +1688,7 @@ async def run_supervised_process(
             _capture_output(
                 process.stdout,
                 stdout_buffer,
-                max_bytes=max_output_bytes,
+                max_bytes=max_output_bytes if capture_output else 0,
                 on_chunk=stdout_chunk_callback,
             )
         )
@@ -1689,7 +1697,7 @@ async def run_supervised_process(
             _capture_output(
                 process.stderr,
                 stderr_buffer,
-                max_bytes=max_output_bytes,
+                max_bytes=max_output_bytes if capture_output else 0,
                 on_chunk=stderr_chunk_callback,
             )
         )
