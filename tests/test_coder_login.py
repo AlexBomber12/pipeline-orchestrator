@@ -3579,3 +3579,75 @@ async def test_browser_admission_ignores_sessions_without_matching_ownership(mon
     assert isinstance(result, dict) and result["session_id"] != previous.session_id
     await manager.shutdown()
     assert not reservations.login_active(context["credential_location"])
+
+
+@pytest.mark.parametrize("cancelled", ["first", "second", "after_transfer", "after_delivery"])
+async def test_browser_admission_waiter_cancellation_preserves_shared_start(monkeypatch, browser_admission, cancelled):
+    manager, _, reservations, context, _, entered, settled, calls = browser_admission
+    stop = asyncio.Event()
+
+    async def execution(_session):
+        await stop.wait()
+
+    monkeypatch.setattr(manager, "_start_session", execution)
+    first = asyncio.create_task(_start_browser_admission(manager, context))
+    await entered.wait()
+    admission = manager._browser_admissions[context["credential_location"]]
+    second = asyncio.create_task(_start_browser_admission(manager, context))
+    await asyncio.sleep(0)
+    assert admission.waiters == 2
+    if cancelled in {"after_transfer", "after_delivery"}:
+        snapshot = manager._session_payload
+
+        def cancel_after_transfer(session, **kwargs):
+            if cancelled == "after_transfer":
+                first.cancel()
+            else:
+                # First caller accepts the session before the second caller disconnects.
+                asyncio.get_running_loop().call_soon(second.cancel)
+            return snapshot(session, **kwargs)
+
+        monkeypatch.setattr(manager, "_session_payload", cancel_after_transfer)
+        settled.set()
+    else:
+        (first if cancelled == "first" else second).cancel()
+    results = await asyncio.gather(first, second, return_exceptions=True) if settled.is_set() else None
+    if results is None:
+        with pytest.raises(asyncio.CancelledError):
+            await (first if cancelled == "first" else second)
+        assert not admission.cancel_requested and admission.waiters == 1
+        settled.set()
+        result = await (second if cancelled == "first" else first)
+    else:
+        assert sum(isinstance(value, asyncio.CancelledError) for value in results) == 1
+        result = next(value for value in results if isinstance(value, dict))
+    session = manager._sessions[result["session_id"]]
+    assert not admission.cancel_requested and admission.delivered and admission.waiters == 0
+    assert not session.cancel_requested and session.abort_task is None
+    assert len(calls) == 1 and reservations.login_active(context["credential_location"])
+    stop.set()
+    await manager.shutdown()
+
+
+@pytest.mark.parametrize("phase", ["before_probe", "after_probe"])
+async def test_browser_admission_activity_check_exception_is_busy(browser_admission, phase):
+    manager, _, reservations, context, _, entered, settled, calls = browser_admission
+    version = reservations.credential_version(context["credential_location"])
+
+    def broken(_location):
+        raise RuntimeError("synthetic private activity detail")
+
+    if phase == "before_probe":
+        manager._credential_location_in_use = broken
+        result = await _start_browser_admission(manager, context)
+    else:
+        pending = asyncio.create_task(_start_browser_admission(manager, context))
+        await entered.wait()
+        manager._credential_location_in_use = broken
+        settled.set()
+        result = await pending
+    assert result.reason == "credential_in_use" and "private" not in result.detail
+    assert not manager._sessions and not manager._browser_admissions
+    assert len(calls) == (1 if phase == "after_probe" else 0)
+    assert not reservations.login_active(context["credential_location"])
+    assert reservations.credential_version(context["credential_location"]) == version + (phase == "after_probe")

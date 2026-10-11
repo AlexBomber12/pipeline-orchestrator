@@ -151,6 +151,8 @@ class _BrowserAdmission:
     task: asyncio.Task[dict[str, Any] | CoderBrowserLoginFailure] | None = None
     cancel_requested: bool = False
     session: _LoginSession | None = None
+    waiters: int = 0
+    delivered: bool = False
 
 
 class CoderLoginSessionManager:
@@ -396,7 +398,7 @@ class CoderLoginSessionManager:
         else:
             if len(self._sessions) + len(self._browser_admissions) >= _MAX_SESSIONS:
                 return failure("session_capacity", "Too many retained login sessions")
-            if self._credential_location_in_use(location) or not self._credential_reservations.reserve_login(location):
+            if self._browser_credential_busy(location) or not self._credential_reservations.reserve_login(location):
                 return failure("credential_in_use", "A coder invocation or login is using this credential location")
             admission = _BrowserAdmission(
                 plugin_name, plugin, expected_reference, location, replace_existing, environment,
@@ -404,20 +406,32 @@ class CoderLoginSessionManager:
             self._browser_admissions[location] = admission
             admission.task = asyncio.create_task(self._admit_browser(admission))
         assert admission.task is not None
+        admission.waiters += 1
         try:
             result = await asyncio.shield(admission.task)
         except asyncio.CancelledError:
-            admission.cancel_requested = True
-            if admission.session is not None:
-                session = admission.session
-                # Cancellation after transfer belongs to the existing session machinery.
-                session.abort_task = asyncio.create_task(self.cancel(
-                    session.plugin, session.session_id, expected_reference=session.reference,
-                ))
+            if admission.waiters == 1 and not admission.delivered:
+                admission.cancel_requested = True
+                if admission.session is not None:
+                    session = admission.session
+                    # Cancellation after transfer belongs to the existing session machinery.
+                    session.abort_task = asyncio.create_task(self.cancel(
+                        session.plugin, session.session_id, expected_reference=session.reference,
+                    ))
             raise
+        finally:
+            admission.waiters -= 1
+        admission.delivered = True
         if reused and admission.session is not None:
             return self._session_payload(admission.session, reused_session=True)
         return result
+
+    def _browser_credential_busy(self, location: str) -> bool:
+        try:
+            return self._credential_location_in_use(location)
+        except Exception:
+            # An unavailable activity check cannot establish exclusive ownership.
+            return True
 
     async def _admit_browser(
         self, admission: _BrowserAdmission,
@@ -445,7 +459,7 @@ class CoderLoginSessionManager:
                     "session_plugin_mismatch", "Coder plugin identity changed; refresh and start again",
                 )
             if (
-                self._credential_location_in_use(admission.credential_location)
+                self._browser_credential_busy(admission.credential_location)
                 or not self._credential_reservations.login_active(admission.credential_location)
             ):
                 return CoderBrowserLoginFailure(
