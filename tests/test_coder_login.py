@@ -2712,3 +2712,35 @@ async def test_browser_exit_before_writer_settlement_times_out(monkeypatch, brow
     await submission
     assert (await _browser_snapshot(manager, session))["state"] == "timed_out"
     assert session.write_task.done() and not session.code_delivered and channel.closed
+
+
+async def test_browser_cleanup_exception_still_cancels_writer(monkeypatch, browser_preparation):
+    manager, reservations, session, managed, channel, _, completed = await _submittable_browser(
+        monkeypatch, browser_preparation,
+    )
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def write(_data):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    channel.write = write
+    managed.cleanup_error = RuntimeError("synthetic-secret")
+    submission = asyncio.create_task(_submit(manager, session))
+    await entered.wait()
+    await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    await submission
+    assert cancelled.is_set() and session.write_task.done()
+    assert session.state == "cleanup_failed" and session.managed is managed
+    assert session.pty_channel is channel and not channel.closed
+    assert reservations.login_active(session.adapter.credential_location)
+    completed.set()
+    await session.task
+    managed.cleanup_error = None
+    managed.reconcile_quiescent = True
+    result = await manager.cancel("claude", session.session_id, expected_reference=session.reference)
+    assert result["cleanup_confirmed"] is True and channel.closed
+    assert not reservations.login_active(session.adapter.credential_location)
