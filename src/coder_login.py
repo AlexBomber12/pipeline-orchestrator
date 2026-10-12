@@ -24,6 +24,7 @@ from src.coder_registry import (
     parse_coder_auth_payload,
     parse_coder_browser_login_payload,
     parse_coder_device_login_payload,
+    resolve_coder_credential_location,
     resolve_device_login_credential_location,
 )
 from src.config import load_config
@@ -121,6 +122,8 @@ class _LoginSession:
     managed: SupervisedProcess | None = None
     task: asyncio.Task[None] | None = None
     abort_task: asyncio.Task[None] | None = None
+    admission_cancel_task: asyncio.Task[dict[str, Any]] | None = None
+    admission_delivered: bool = False
     cancel_requested: bool = False
     parse_failed: bool = False
     code_prompt_observed: bool = False
@@ -137,6 +140,20 @@ class _LoginSession:
     deadline_monotonic: float | None = None
     stdout: bytearray = field(default_factory=bytearray)
     stderr: bytearray = field(default_factory=bytearray)
+
+
+@dataclass
+class _BrowserAdmission:
+    plugin_name: str
+    plugin: CoderPlugin
+    reference: str
+    credential_location: str
+    replacement_requested: bool
+    environment: dict[str, str]
+    task: asyncio.Task[dict[str, Any] | CoderBrowserLoginFailure] | None = None
+    cancel_requested: bool = False
+    session: _LoginSession | None = None
+    waiters: dict[asyncio.Task[Any], int] = field(default_factory=dict)
 
 
 class CoderLoginSessionManager:
@@ -164,6 +181,7 @@ class CoderLoginSessionManager:
         self._monotonic = monotonic
         self._sessions: dict[str, _LoginSession] = {}
         self._shutting_down = False
+        self._browser_admissions: dict[str, _BrowserAdmission] = {}
 
     async def _prepare_browser_login(
         self,
@@ -255,7 +273,7 @@ class CoderLoginSessionManager:
             return failure("unsupported", "Browser login adapter context is invalid")
         return adapter
 
-    def _execute_browser_session(self, session: _LoginSession) -> None:
+    def _execute_browser_session(self, session: _LoginSession) -> dict[str, Any]:
         """Take over a session bound to its preparing plugin and reservation."""
         if (
             self._shutting_down
@@ -274,8 +292,10 @@ class CoderLoginSessionManager:
         session.deadline_monotonic = self._monotonic() + session.adapter.application_timeout_seconds
         session.application_deadline = self._wall_time() + session.adapter.application_timeout_seconds
         session.detail = "Preparing browser-code login"
+        snapshot = self._session_payload(session)
         session.task = asyncio.create_task(self._start_session(session))
         session.task.add_done_callback(lambda _task: self._settle_browser_session(session))
+        return snapshot
 
     def _settle_browser_session(self, session: _LoginSession) -> None:
         if (
@@ -321,6 +341,166 @@ class CoderLoginSessionManager:
         if session.cancel_requested:
             raise asyncio.CancelledError
         await self._run_owned_session(session)
+
+    async def start_browser(
+        self,
+        plugin_name: str,
+        *,
+        expected_reference: str,
+        replace_existing: bool,
+    ) -> dict[str, Any] | CoderBrowserLoginFailure:
+        """Capture and reserve context before one tracked browser preflight."""
+        failure = CoderBrowserLoginFailure
+        if (
+            not isinstance(plugin_name, str) or not plugin_name
+            or not isinstance(expected_reference, str) or not expected_reference
+            or type(replace_existing) is not bool
+        ):
+            return failure("startup_failed", "Invalid browser login request")
+        self._purge_expired_sessions()
+        if self._shutting_down:
+            return failure("daemon_shutdown", "Browser login is unavailable during daemon shutdown")
+        plugin = self._registry.get_optional(plugin_name)
+        if plugin is None or not callable(getattr(plugin, "create_browser_login", None)):
+            return failure("unsupported", "Browser-code login is unsupported")
+        if self._registry.reference_for(plugin_name) != expected_reference:
+            return failure("session_plugin_mismatch", "Coder plugin identity changed; refresh and start again")
+        try:
+            config = load_config(self._config_path)
+            location = resolve_coder_credential_location(plugin, config=config)
+            if location is None:
+                raise ValueError("Missing credential context")
+            environment = dict(plugin.build_credential_environment(
+                config=config, credential_location=location,
+            ))
+        except Exception:
+            return failure("startup_failed", "Browser-code login could not be prepared")
+
+        for session in self._sessions.values():
+            if not self._retains_credential_ownership(session) or session.adapter.credential_location != location:
+                continue
+            if (
+                session.plugin == plugin_name and session.plugin_identity is plugin
+                and session.reference == expected_reference
+                and session.replacement_requested == replace_existing
+                and session.terminal_monotonic is None
+                and session.state != "cleanup_failed" and not session.cancel_requested
+            ):
+                payload = self._session_payload(session, reused_session=True)
+                session.admission_delivered = True
+                return payload
+            return failure("credential_in_use", "Another login owns this credential location")
+        admission = self._browser_admissions.get(location)
+        reused = admission is not None
+        if admission is not None:
+            if (
+                admission.plugin_name != plugin_name or admission.plugin is not plugin
+                or admission.reference != expected_reference
+                or admission.replacement_requested != replace_existing
+                or admission.cancel_requested
+            ):
+                return failure("credential_in_use", "Another login owns this credential location")
+        else:
+            if len(self._sessions) + len(self._browser_admissions) >= _MAX_SESSIONS:
+                return failure("session_capacity", "Too many retained login sessions")
+            if self._browser_credential_busy(location) or not self._credential_reservations.reserve_login(location):
+                return failure("credential_in_use", "A coder invocation or login is using this credential location")
+            admission = _BrowserAdmission(
+                plugin_name, plugin, expected_reference, location, replace_existing, environment,
+            )
+            self._browser_admissions[location] = admission
+            admission.task = asyncio.create_task(self._admit_browser(admission))
+        assert admission.task is not None
+        waiter = asyncio.current_task()
+        assert waiter is not None
+        admission.waiters[waiter] = waiter.cancelling()
+        try:
+            result = await asyncio.shield(admission.task)
+        except asyncio.CancelledError:
+            if not self._admission_has_waiter(admission) and (
+                admission.session is None or not admission.session.admission_delivered
+            ):
+                admission.cancel_requested = True
+                if admission.session is not None:
+                    session = admission.session
+                    session.cancel_requested = True
+                    # Cancellation after transfer belongs to the existing session machinery.
+                    session.admission_cancel_task = asyncio.create_task(self.cancel(
+                        session.plugin, session.session_id, expected_reference=session.reference,
+                    ))
+            raise
+        finally:
+            admission.waiters.pop(waiter)
+        if admission.session is not None:
+            admission.session.admission_delivered = True
+        if reused and admission.session is not None:
+            return self._session_payload(admission.session, reused_session=True)
+        return result
+
+    @staticmethod
+    def _admission_has_waiter(admission: _BrowserAdmission) -> bool:
+        # Task cancellation is visible even before its shielded waiter resumes.
+        # Capture the initial count so a task may retry after catching cancellation.
+        return any(task.cancelling() == count for task, count in admission.waiters.items())
+
+    def _browser_credential_busy(self, location: str) -> bool:
+        try:
+            return self._credential_location_in_use(location)
+        except Exception:
+            # An unavailable activity check cannot establish exclusive ownership.
+            return True
+
+    async def _admit_browser(
+        self, admission: _BrowserAdmission,
+    ) -> dict[str, Any] | CoderBrowserLoginFailure:
+        try:
+            adapter = await self._prepare_browser_login(
+                admission.plugin_name, plugin=admission.plugin,
+                expected_reference=admission.reference,
+                credential_location=admission.credential_location,
+                environment=admission.environment, reservation_held=True,
+                replace_existing=admission.replacement_requested,
+            )
+            if self._shutting_down or admission.cancel_requested or not self._admission_has_waiter(admission):
+                return CoderBrowserLoginFailure(
+                    "daemon_shutdown" if self._shutting_down else "cancelled",
+                    "Browser login admission was stopped",
+                )
+            if isinstance(adapter, CoderBrowserLoginFailure):
+                return adapter
+            if (
+                self._registry.get_optional(admission.plugin_name) is not admission.plugin
+                or self._registry.reference_for(admission.plugin_name) != admission.reference
+            ):
+                return CoderBrowserLoginFailure(
+                    "session_plugin_mismatch", "Coder plugin identity changed; refresh and start again",
+                )
+            if (
+                self._browser_credential_busy(admission.credential_location)
+                or not self._credential_reservations.login_active(admission.credential_location)
+            ):
+                return CoderBrowserLoginFailure(
+                    "credential_in_use", "A coder invocation or login is using this credential location",
+                )
+            session = _LoginSession(
+                self._new_session_id(), admission.plugin_name, admission.reference,
+                adapter, admission.replacement_requested, self._monotonic(),
+                plugin_identity=admission.plugin, reservation_held=True,
+            )
+            self._sessions[session.session_id] = session
+            try:
+                snapshot = self._execute_browser_session(session)
+            except Exception:
+                # Executor setup validates synchronously before scheduling its task.
+                self._sessions.pop(session.session_id)
+                session.reservation_held = False
+                return CoderBrowserLoginFailure("startup_failed", "Browser-code login could not be started")
+            admission.session = session
+            return snapshot
+        finally:
+            if admission.session is None:
+                self._credential_reservations.release_login(admission.credential_location)
+            self._browser_admissions.pop(admission.credential_location, None)
 
     async def start(
         self,
@@ -394,7 +574,7 @@ class CoderLoginSessionManager:
                 replacement_warning=adapter.replacement_warning,
             )
 
-        if len(self._sessions) >= _MAX_SESSIONS:
+        if len(self._sessions) + len(self._browser_admissions) >= _MAX_SESSIONS:
             return self._error_payload(
                 plugin_name,
                 "failed",
@@ -597,6 +777,14 @@ class CoderLoginSessionManager:
     async def shutdown(self) -> None:
         """Cancel every owned login process during daemon shutdown."""
         self._shutting_down = True
+        admissions = list(self._browser_admissions.values())
+        for admission in admissions:
+            admission.cancel_requested = True
+        admission_tasks = [admission.task for admission in admissions if admission.task is not None]
+        if admission_tasks:
+            # Leave unsettled work tracked and reserved; never interrupt probe cleanup.
+            done, _pending = await asyncio.wait(admission_tasks, timeout=3 * _CLEANUP_GRACE_SECONDS)
+            await asyncio.gather(*done, return_exceptions=True)
         active = [
             session
             for session in self._sessions.values()

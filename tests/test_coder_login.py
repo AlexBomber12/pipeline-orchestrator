@@ -3246,3 +3246,638 @@ async def test_custom_browser_adapter_uses_validated_public_rejection_marker(mon
     assert classified == [marker, marker] and not session.stdout
     assert "synthetic-custom-code" not in json.dumps(result)
     assert channel.closed and not reservations.login_active(session.adapter.credential_location)
+
+
+@pytest.fixture
+def browser_admission(monkeypatch, browser_preparation):
+    manager, registry, reservations, context, auth = browser_preparation
+    location = context["credential_location"]
+    reservations.release_login(location)
+    config = AppConfig()
+    monkeypatch.setattr(coder_login, "load_config", lambda _path: config)
+    plugin = context["plugin"]
+    monkeypatch.setattr(plugin, "browser_login_credential_location", lambda **_kwargs: location)
+    monkeypatch.setattr(plugin, "build_credential_environment", lambda **_kwargs: context["environment"])
+    factory = plugin.create_browser_login
+
+    def synthetic_factory(**kwargs):
+        adapter = factory(**kwargs)
+        object.__setattr__(adapter, "command", (sys.executable, "-c", "import time; time.sleep(60)"))
+        return adapter
+
+    monkeypatch.setattr(plugin, "create_browser_login", synthetic_factory)
+    entered, settled = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def probe(*_args, **kwargs):
+        calls.append(kwargs)
+        entered.set()
+        await settled.wait()
+        return auth
+
+    monkeypatch.setattr(coder_login, "isolated_auth_probe", probe)
+    return manager, registry, reservations, context, auth, entered, settled, calls
+
+
+async def _start_browser_admission(manager, context, **kwargs):
+    return await manager.start_browser(
+        "claude", expected_reference=context["expected_reference"],
+        replace_existing=kwargs.get("replace_existing", False),
+    )
+
+
+async def test_browser_admission_real_pty_and_reuse(monkeypatch, tmp_path, browser_admission):
+    manager, _, reservations, context, auth, entered, settled, calls = browser_admission
+    plugin = context["plugin"]
+    factory = plugin.create_browser_login
+    code_seen = asyncio.Event()
+    launches = []
+    observe = manager._observe_browser_output
+
+    def observed(session):
+        observe(session)
+        if session.state == "waiting_for_code":
+            code_seen.set()
+
+    def synthetic(**kwargs):
+        launches.append(kwargs)
+        adapter = factory(**kwargs)
+        script = (
+            "import os\n"
+            f"os.write(1,({_BROWSER_URL!r}+'\\nPaste code here if prompted >').encode())\n"
+            "received=b''\n"
+            "while not received.endswith(b'\\n'): received+=os.read(0,1)\n"
+            "assert received==b'synthetic-code\\n'\n"
+        )
+        object.__setattr__(adapter, "command", (sys.executable, "-c", script))
+        object.__setattr__(adapter, "working_directory", str(tmp_path))
+        return adapter
+
+    monkeypatch.setattr(plugin, "create_browser_login", synthetic)
+    monkeypatch.setattr(manager, "_observe_browser_output", observed)
+    first = asyncio.create_task(_start_browser_admission(manager, context))
+    await entered.wait()
+    second = asyncio.create_task(_start_browser_admission(manager, context))
+    await asyncio.sleep(0)
+    assert len(calls) == 1
+    captured_environment = dict(context["environment"])
+    context["environment"]["CONTEXT"] = "changed"
+    monkeypatch.setattr(coder_login, "load_config", lambda _path: pytest.fail("Context reloaded"))
+    settled.set()
+    initial, reused = await asyncio.gather(first, second)
+    assert initial["session_id"] == reused["session_id"] and reused["reused_session"]
+    session = manager._sessions[initial["session_id"]]
+    assert session.plugin_identity is plugin
+    assert dict(session.adapter.environment) == captured_environment
+    assert calls[0]["env"] == captured_environment
+    assert len(launches) == 1 and not manager._browser_admissions
+    await asyncio.wait_for(code_seen.wait(), 3)
+    assert (await _browser_snapshot(manager, session))["state"] == "waiting_for_code"
+    # Repeated active requests still capture current context once, but reuse ownership.
+    monkeypatch.setattr(coder_login, "load_config", lambda _path: AppConfig())
+    again = await _start_browser_admission(manager, context)
+    assert again["session_id"] == session.session_id and again["reused_session"]
+    auth.update(status="ok", saved_credentials_present=True, failure_reason=None)
+    await manager._submit_browser_code(
+        "claude", session.session_id, expected_reference=session.reference,
+        authorization_code="synthetic-code",
+    )
+    await asyncio.wait_for(session.task, 3)
+    assert (await _browser_snapshot(manager, session))["state"] == "succeeded"
+    assert len(calls) == 2 and len(launches) == 1
+    assert not reservations.login_active(context["credential_location"])
+
+
+@pytest.mark.parametrize("blocker", ["coder", "hook", "pending_consent", "pending_plugin", "capacity"])
+async def test_browser_admission_refuses_busy_context(monkeypatch, browser_admission, blocker):
+    manager, registry, reservations, context, _, entered, settled, calls = browser_admission
+    location = context["credential_location"]
+    pending = None
+    if blocker.startswith("pending"):
+        pending = asyncio.create_task(_start_browser_admission(manager, context))
+        await entered.wait()
+        if blocker == "pending_plugin":
+            registry.register(ClaudePlugin(), reference=context["expected_reference"])
+            monkeypatch.setattr(registry.get("claude"), "browser_login_credential_location", lambda **_kw: location)
+    elif blocker == "coder":
+        assert reservations.reserve_coder(location)
+    elif blocker == "hook":
+        manager._credential_location_in_use = lambda _location: True
+    else:
+        monkeypatch.setattr(coder_login, "_MAX_SESSIONS", 0)
+    result = await _start_browser_admission(manager, context, replace_existing=blocker == "pending_consent")
+    assert isinstance(result, CoderBrowserLoginFailure)
+    assert result.reason == ("session_capacity" if blocker == "capacity" else "credential_in_use")
+    assert not manager._sessions and len(calls) == (1 if pending else 0)
+    if pending:
+        settled.set()
+        if blocker == "pending_consent":
+            await pending
+            await manager.shutdown()
+        else:
+            assert isinstance(await pending, CoderBrowserLoginFailure)
+
+
+@pytest.mark.parametrize("change", ["replacement", "reference", "removed", "busy", "preflight"])
+async def test_browser_admission_rechecks_and_releases(monkeypatch, browser_admission, change):
+    manager, registry, reservations, context, auth, entered, settled, _ = browser_admission
+    location = context["credential_location"]
+    version = reservations.credential_version(location)
+    pending = asyncio.create_task(_start_browser_admission(manager, context))
+    await entered.wait()
+    if change == "replacement":
+        registry.register(ClaudePlugin(), reference=context["expected_reference"])
+    elif change == "reference":
+        registry.register(context["plugin"], reference="changed")
+    elif change == "removed":
+        manager._registry = CoderRegistry()
+    elif change == "busy":
+        manager._credential_location_in_use = lambda _location: True
+    else:
+        auth["saved_credentials_present"] = True
+    settled.set()
+    result = await pending
+    assert isinstance(result, CoderBrowserLoginFailure)
+    assert result.reason == (
+        "credential_in_use" if change == "busy" else
+        "replacement_required" if change == "preflight" else "session_plugin_mismatch"
+    )
+    assert not manager._sessions and not manager._browser_admissions
+    assert not reservations.login_active(location)
+    assert reservations.credential_version(location) == version + 1
+
+
+@pytest.mark.parametrize("action", ["cancel", "shutdown", "unsettled_shutdown"])
+async def test_browser_admission_cancellation_retains_probe_ownership(monkeypatch, browser_admission, action):
+    manager, _, reservations, context, _, entered, settled, _ = browser_admission
+    location = context["credential_location"]
+    pending = asyncio.create_task(_start_browser_admission(manager, context))
+    await entered.wait()
+    admission = manager._browser_admissions[location]
+    if action == "cancel":
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        pending.cancel()  # Repeated caller cancellation cannot reach the isolated probe.
+    else:
+        if action == "unsettled_shutdown":
+            monkeypatch.setattr(coder_login, "_CLEANUP_GRACE_SECONDS", .001)
+        shutdown = asyncio.create_task(manager.shutdown())
+        await asyncio.sleep(0)
+        if action == "unsettled_shutdown":
+            await shutdown
+    assert admission.cancel_requested and not admission.task.done()
+    assert reservations.login_active(location) and not reservations.reserve_coder(location)
+    assert manager._browser_admissions[location] is admission
+    assert isinstance(await _start_browser_admission(manager, context), CoderBrowserLoginFailure)
+    settled.set()
+    assert isinstance(await admission.task, CoderBrowserLoginFailure)
+    if action != "cancel":
+        await shutdown
+        assert isinstance(await pending, CoderBrowserLoginFailure)
+    assert not manager._sessions and not manager._browser_admissions
+    assert not reservations.login_active(location)
+
+
+async def test_pending_browser_admission_counts_toward_device_capacity(monkeypatch, browser_admission):
+    manager, registry, _, context, _, entered, settled, _ = browser_admission
+    registry.register(_Plugin(_adapter()), reference=_REFERENCE)
+    pending = asyncio.create_task(_start_browser_admission(manager, context))
+    await entered.wait()
+    monkeypatch.setattr(coder_login, "_MAX_SESSIONS", 1)
+    device = await manager.start("codex", expected_reference=_REFERENCE, replace_existing=False)
+    assert device["failure_reason"] == "session_capacity"
+    # Another location's browser start cannot consume a second slot.
+    monkeypatch.setattr(context["plugin"], "browser_login_credential_location", lambda **_kw: "/tmp/other")
+    result = await _start_browser_admission(manager, context)
+    assert result.reason == "session_capacity"
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    settled.set()
+    await next(iter(manager._browser_admissions.values())).task
+
+
+@pytest.mark.parametrize("blocker", ["cleanup_failed", "device", "consent", "identity"])
+async def test_browser_admission_refuses_incompatible_sessions(monkeypatch, browser_preparation, blocker):
+    manager, reservations, session = await _prepared_browser(monkeypatch, browser_preparation)
+    _, registry, _, context, _ = browser_preparation
+    monkeypatch.setattr(coder_login, "load_config", lambda _path: AppConfig())
+    monkeypatch.setattr(context["plugin"], "browser_login_credential_location",
+                        lambda **_kw: session.adapter.credential_location)
+    if blocker == "cleanup_failed":
+        manager._cleanup_failed(session)
+    elif blocker == "device":
+        session.plugin_identity = None
+    elif blocker == "consent":
+        session.replacement_requested = True
+    else:
+        registry.register(ClaudePlugin(), reference=session.reference)
+        monkeypatch.setattr(registry.get("claude"), "browser_login_credential_location",
+                            lambda **_kw: session.adapter.credential_location)
+    result = await _start_browser_admission(manager, context)
+    assert result.reason == "credential_in_use"
+    assert reservations.login_active(session.adapter.credential_location)
+    assert session.task is None
+
+
+@pytest.mark.parametrize("invalid", ["name", "reference_type", "reference", "consent", "plugin", "factory",
+                                    "config", "locator", "environment", "shutdown"])
+async def test_browser_admission_invalid_request_is_sanitized(monkeypatch, browser_admission, invalid):
+    manager, registry, reservations, context, _, _, _, calls = browser_admission
+    name, reference, consent = "claude", context["expected_reference"], False
+    if invalid == "name":
+        name = []
+    elif invalid == "reference_type":
+        reference = None
+    elif invalid == "reference":
+        reference = "changed"
+    elif invalid == "consent":
+        consent = 1
+    elif invalid == "plugin":
+        manager._registry = CoderRegistry()
+    elif invalid == "factory":
+        monkeypatch.setattr(context["plugin"], "create_browser_login", None)
+    elif invalid == "config":
+        def broken(_path):
+            raise ValueError("secret detail")
+        monkeypatch.setattr(coder_login, "load_config", broken)
+    elif invalid == "locator":
+        monkeypatch.setattr(coder_login, "resolve_coder_credential_location", lambda *_args, **_kw: None)
+    elif invalid == "environment":
+        monkeypatch.setattr(context["plugin"], "build_credential_environment", lambda **_kw: None)
+    else:
+        await manager.shutdown()
+    result = await manager.start_browser(name, expected_reference=reference, replace_existing=consent)
+    assert isinstance(result, CoderBrowserLoginFailure)
+    assert "secret" not in result.detail and not calls and not manager._sessions
+    assert not reservations.login_active(context["credential_location"])
+
+
+async def test_browser_admission_cancellation_after_transfer_uses_session_cleanup(monkeypatch, browser_admission):
+    manager, _, reservations, context, _, entered, settled, _ = browser_admission
+    # Keep the executor task dormant so caller cancellation wins just after transfer.
+    stop = asyncio.Event()
+
+    async def execution(_session):
+        await stop.wait()
+
+    monkeypatch.setattr(manager, "_start_session", execution)
+    original = manager._session_payload
+    caller = asyncio.create_task(_start_browser_admission(manager, context))
+
+    def snapshot(session, **kwargs):
+        caller.cancel()
+        return original(session, **kwargs)
+
+    monkeypatch.setattr(manager, "_session_payload", snapshot)
+    await entered.wait()
+    settled.set()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    session = next(iter(manager._sessions.values()))
+    await session.admission_cancel_task
+    assert session.state == "cancelled" and session.cleanup_confirmed is True
+    assert not reservations.login_active(context["credential_location"])
+
+
+async def test_browser_admission_checks_identity_after_preparation(monkeypatch, browser_admission):
+    manager, registry, reservations, context, _, _, settled, _ = browser_admission
+    prepare = manager._prepare_browser_login
+
+    async def changed(*args, **kwargs):
+        adapter = await prepare(*args, **kwargs)
+        registry.register(context["plugin"], reference="changed")
+        return adapter
+
+    monkeypatch.setattr(manager, "_prepare_browser_login", changed)
+    settled.set()
+    result = await _start_browser_admission(manager, context)
+    assert result.reason == "session_plugin_mismatch"
+    assert not manager._sessions and not reservations.login_active(context["credential_location"])
+
+
+@pytest.mark.parametrize("old", ["settled", "different_location"])
+async def test_browser_admission_ignores_sessions_without_matching_ownership(monkeypatch, browser_admission, old):
+    manager, _, reservations, context, _, _, settled, _ = browser_admission
+    adapter = context["plugin"].create_browser_login(
+        credential_location=context["credential_location"], environment=context["environment"],
+        config_path=manager._config_path, observed_cli_version="2.1.126",
+    )
+    previous = coder_login._LoginSession(
+        "old", "claude", context["expected_reference"], adapter, False, manager._monotonic(),
+        plugin_identity=context["plugin"],
+    )
+    manager._sessions[previous.session_id] = previous
+    if old == "settled":
+        previous.state = "failed"
+        previous.terminal_monotonic = manager._monotonic()
+    else:
+        object.__setattr__(adapter, "credential_location", "/tmp/unrelated")
+    settled.set()
+    result = await _start_browser_admission(manager, context)
+    assert isinstance(result, dict) and result["session_id"] != previous.session_id
+    await manager.shutdown()
+    assert not reservations.login_active(context["credential_location"])
+
+
+@pytest.mark.parametrize("cancelled", ["first", "second", "after_transfer", "after_delivery"])
+async def test_browser_admission_waiter_cancellation_preserves_shared_start(monkeypatch, browser_admission, cancelled):
+    manager, _, reservations, context, _, entered, settled, calls = browser_admission
+    stop = asyncio.Event()
+
+    async def execution(_session):
+        await stop.wait()
+
+    monkeypatch.setattr(manager, "_start_session", execution)
+    first = asyncio.create_task(_start_browser_admission(manager, context))
+    await entered.wait()
+    admission = manager._browser_admissions[context["credential_location"]]
+    second = asyncio.create_task(_start_browser_admission(manager, context))
+    await asyncio.sleep(0)
+    assert len(admission.waiters) == 2
+    if cancelled in {"after_transfer", "after_delivery"}:
+        snapshot = manager._session_payload
+
+        def cancel_after_transfer(session, **kwargs):
+            if cancelled == "after_transfer":
+                first.cancel()
+            else:
+                # First caller accepts the session before the second caller disconnects.
+                asyncio.get_running_loop().call_soon(second.cancel)
+            return snapshot(session, **kwargs)
+
+        monkeypatch.setattr(manager, "_session_payload", cancel_after_transfer)
+        settled.set()
+    else:
+        (first if cancelled == "first" else second).cancel()
+    results = await asyncio.gather(first, second, return_exceptions=True) if settled.is_set() else None
+    if results is None:
+        with pytest.raises(asyncio.CancelledError):
+            await (first if cancelled == "first" else second)
+        assert not admission.cancel_requested and len(admission.waiters) == 1
+        settled.set()
+        result = await (second if cancelled == "first" else first)
+    else:
+        assert sum(isinstance(value, asyncio.CancelledError) for value in results) == 1
+        result = next(value for value in results if isinstance(value, dict))
+    session = manager._sessions[result["session_id"]]
+    assert not admission.cancel_requested and session.admission_delivered and not admission.waiters
+    assert not session.cancel_requested and session.admission_cancel_task is None
+    assert len(calls) == 1 and reservations.login_active(context["credential_location"])
+    stop.set()
+    await manager.shutdown()
+
+
+@pytest.mark.parametrize("phase", ["before_probe", "after_probe"])
+async def test_browser_admission_activity_check_exception_is_busy(browser_admission, phase):
+    manager, _, reservations, context, _, entered, settled, calls = browser_admission
+    version = reservations.credential_version(context["credential_location"])
+
+    def broken(_location):
+        raise RuntimeError("synthetic private activity detail")
+
+    if phase == "before_probe":
+        manager._credential_location_in_use = broken
+        result = await _start_browser_admission(manager, context)
+    else:
+        pending = asyncio.create_task(_start_browser_admission(manager, context))
+        await entered.wait()
+        manager._credential_location_in_use = broken
+        settled.set()
+        result = await pending
+    assert result.reason == "credential_in_use" and "private" not in result.detail
+    assert not manager._sessions and not manager._browser_admissions
+    assert len(calls) == (1 if phase == "after_probe" else 0)
+    assert not reservations.login_active(context["credential_location"])
+    assert reservations.credential_version(context["credential_location"]) == version + (phase == "after_probe")
+
+
+async def test_browser_admission_cancellation_during_pty_launch_settles(monkeypatch, browser_admission):
+    manager, _, reservations, context, _, entered, settled, _ = browser_admission
+    launching, launch_settled = asyncio.Event(), asyncio.Event()
+    release_launch = asyncio.Event()
+
+    async def launch(*_args, **_kwargs):
+        launching.set()
+        try:
+            await release_launch.wait()
+        finally:
+            launch_settled.set()
+
+    monkeypatch.setattr(coder_login, "launch_pty_process", launch)
+    caller = asyncio.create_task(_start_browser_admission(manager, context))
+    await entered.wait()
+    admission = manager._browser_admissions[context["credential_location"]]
+    snapshot = manager._session_payload
+
+    def cancel_caller(session, **kwargs):
+        # Executor is scheduled first, so it enters launch before the waiter disconnects.
+        caller.cancel()
+        return snapshot(session, **kwargs)
+
+    monkeypatch.setattr(manager, "_session_payload", cancel_caller)
+    settled.set()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    session = admission.session
+    assert session is not None and launching.is_set()
+    try:
+        done, _ = await asyncio.wait({session.admission_cancel_task}, timeout=.5)
+        assert session.admission_cancel_task in done
+        await session.admission_cancel_task
+        assert session.task.done() and launch_settled.is_set()
+        assert session.state == "cancelled" and session.cleanup_confirmed is True
+        assert session.abort_task is None and not session.reservation_held
+        assert not reservations.login_active(context["credential_location"])
+    finally:
+        release_launch.set()
+        await asyncio.gather(session.task, session.admission_cancel_task, return_exceptions=True)
+
+
+async def test_browser_admission_direct_reuse_during_handoff_prevents_cancellation(monkeypatch, browser_admission):
+    manager, _, reservations, context, _, entered, settled, calls = browser_admission
+    stop = asyncio.Event()
+
+    async def execution(_session):
+        await stop.wait()
+
+    monkeypatch.setattr(manager, "_start_session", execution)
+    caller = asyncio.create_task(_start_browser_admission(manager, context))
+    await entered.wait()
+    snapshot = manager._session_payload
+    reusers = []
+
+    def handoff(session, **kwargs):
+        if not reusers:
+            reusers.append(asyncio.create_task(_start_browser_admission(manager, context)))
+            caller.cancel()
+        return snapshot(session, **kwargs)
+
+    monkeypatch.setattr(manager, "_session_payload", handoff)
+    settled.set()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    result = await reusers[0]
+    assert result["reused_session"]
+    session = manager._sessions[result["session_id"]]
+    assert session.admission_delivered and not session.cancel_requested
+    assert session.admission_cancel_task is None and reservations.login_active(context["credential_location"])
+    assert not manager._browser_admissions and len(calls) == 1
+    stop.set()
+    await manager.shutdown()
+
+
+async def test_browser_admission_cancellation_marks_session_before_cleanup_task(monkeypatch, browser_admission):
+    manager, _, _, context, _, entered, settled, _ = browser_admission
+    stop = asyncio.Event()
+
+    async def execution(_session):
+        await stop.wait()
+
+    monkeypatch.setattr(manager, "_start_session", execution)
+    caller = asyncio.create_task(_start_browser_admission(manager, context))
+    await entered.wait()
+    snapshot = manager._session_payload
+    late_reusers = []
+
+    def handoff(session, **kwargs):
+        if not late_reusers:
+            caller.cancel()
+            # Queue reuse after the caller's cancellation, before its cleanup task runs.
+            late_reusers.append(asyncio.create_task(_start_browser_admission(manager, context)))
+        return snapshot(session, **kwargs)
+
+    monkeypatch.setattr(manager, "_session_payload", handoff)
+    settled.set()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert (await late_reusers[0]).reason == "credential_in_use"
+    session = next(iter(manager._sessions.values()))
+    assert session.cancel_requested and not session.admission_delivered
+    await session.admission_cancel_task
+    assert session.state == "cancelled" and not session.reservation_held
+
+
+async def test_browser_admission_rolls_back_failed_executor_validation(monkeypatch, browser_admission):
+    manager, _, reservations, context, _, _, settled, calls = browser_admission
+    plugin = context["plugin"]
+    factory = plugin.create_browser_login
+    validation_calls = []
+
+    def changing_adapter(**kwargs):
+        adapter = factory(**kwargs)
+        classify = adapter.classify_failure
+
+        def classify_twice(*args):
+            validation_calls.append(args)
+            if len(validation_calls) == 2:
+                raise ValueError("synthetic private adapter detail")
+            return classify(*args)
+
+        object.__setattr__(adapter, "classify_failure", classify_twice)
+        return adapter
+
+    monkeypatch.setattr(plugin, "create_browser_login", changing_adapter)
+    location = context["credential_location"]
+    version = reservations.credential_version(location)
+    settled.set()
+    result = await _start_browser_admission(manager, context)
+    assert result.reason == "startup_failed" and "private" not in result.detail
+    assert len(validation_calls) == 2 and len(calls) == 1
+    assert not manager._sessions and not manager._browser_admissions
+    assert not reservations.login_active(location) and reservations.credential_version(location) == version + 1
+    # The failed dormant session neither consumes capacity nor prevents a fresh start.
+    monkeypatch.setattr(plugin, "create_browser_login", factory)
+    retry = await _start_browser_admission(manager, context)
+    assert isinstance(retry, dict) and retry["reused_session"] is False
+    assert len(manager._sessions) == 1 and len(calls) == 2
+    await manager.shutdown()
+    assert not reservations.login_active(location)
+
+
+@pytest.mark.parametrize("invalid", ["warning", "deadline"])
+async def test_browser_admission_rejects_invalid_snapshot_before_launch(monkeypatch, browser_admission, invalid):
+    manager, _, reservations, context, _, _, settled, calls = browser_admission
+    factory = context["plugin"].create_browser_login
+    launches = []
+
+    def invalid_factory(**kwargs):
+        adapter = factory(**kwargs)
+        if invalid == "warning":
+            object.__setattr__(adapter, "replacement_warning", "synthetic\x7fprivate")
+        return adapter
+
+    async def launch(*_args, **_kwargs):
+        launches.append(True)
+        pytest.fail("Invalid response must be rejected before process launch")
+
+    monkeypatch.setattr(context["plugin"], "create_browser_login", invalid_factory)
+    if invalid == "deadline":
+        manager._wall_time = lambda: float("nan")
+    monkeypatch.setattr(coder_login, "launch_pty_process", launch)
+    location = context["credential_location"]
+    version = reservations.credential_version(location)
+    settled.set()
+    result = await _start_browser_admission(manager, context)
+    assert result.reason == "startup_failed" and "private" not in result.detail
+    await asyncio.sleep(0)
+    assert len(calls) == 1 and not launches and not manager._sessions and not manager._browser_admissions
+    assert not reservations.login_active(location) and reservations.credential_version(location) == version + 1
+
+
+@pytest.mark.parametrize("remaining", ["none", "shared", "all_cancelled"])
+async def test_browser_admission_observes_cancellation_queued_at_preflight_completion(browser_admission, remaining):
+    manager, _, reservations, context, _, entered, settled, _ = browser_admission
+    first = asyncio.create_task(_start_browser_admission(manager, context))
+    await entered.wait()
+    second = None
+    if remaining != "none":
+        second = asyncio.create_task(_start_browser_admission(manager, context))
+        await asyncio.sleep(0)
+    admission = manager._browser_admissions[context["credential_location"]]
+    # Queue preflight completion first, then cancel callers before admission transfers.
+    settled.set()
+    first.cancel()
+    if remaining == "all_cancelled":
+        second.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    if remaining == "shared":
+        result = await second
+        assert isinstance(result, dict)
+        assert not manager._sessions[result["session_id"]].cancel_requested
+        await manager.shutdown()
+    else:
+        if second:
+            with pytest.raises(asyncio.CancelledError):
+                await second
+        assert isinstance(await admission.task, CoderBrowserLoginFailure)
+        assert not manager._sessions
+    assert not manager._browser_admissions and not reservations.login_active(context["credential_location"])
+
+
+async def test_browser_admission_allows_retry_in_task_that_caught_cancellation(browser_admission):
+    manager, _, reservations, context, _, entered, settled, calls = browser_admission
+    caught = asyncio.Event()
+
+    async def retry():
+        try:
+            await _start_browser_admission(manager, context)
+        except asyncio.CancelledError:
+            admission = manager._browser_admissions[context["credential_location"]]
+            caught.set()
+            await admission.task
+            assert asyncio.current_task().cancelling() == 1
+            return await _start_browser_admission(manager, context)
+
+    caller = asyncio.create_task(retry())
+    await entered.wait()
+    caller.cancel()
+    await caught.wait()
+    assert reservations.login_active(context["credential_location"])
+    settled.set()
+    result = await caller
+    assert isinstance(result, dict) and len(calls) == 2
+    await manager.shutdown()
+    assert not reservations.login_active(context["credential_location"])
