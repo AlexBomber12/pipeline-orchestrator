@@ -15,6 +15,7 @@ from src.coder_login import CoderCredentialReservations
 from src.coder_registry import (
     CoderAuthCapabilities,
     CoderAuthStatus,
+    CoderBrowserLoginFailure,
     CoderRegistry,
     ModelCatalog,
     ModelCatalogUnavailable,
@@ -31,6 +32,8 @@ from src.process_supervisor import (
     CleanupStatus,
     ProcessLaunchCleanupError,
 )
+
+from tests import test_coder_login as login_tests
 
 
 class _BridgeRedis:
@@ -2644,3 +2647,318 @@ async def test_daemon_server_disables_bridge_without_redis_list_support() -> Non
         CoderRegistry(),
         config_path="config.yml",
     )
+
+
+# Reuse the synthetic provider context and admission probe from manager tests.
+browser_admission = login_tests.browser_admission
+browser_preparation = login_tests.browser_preparation
+
+
+def _browser_request(operation="start", **updates):
+    return {
+        "request_id": "f" * 32, "plugin": "claude",
+        "operation": f"browser_login_{operation}",
+        "reference": "src.coders.claude:ClaudePlugin", "expires_at": time.time() + 2,
+        **({"replace_existing": False} if operation == "start" else {"session_id": "B" * 43}),
+        **updates,
+    }
+
+
+async def _handle_browser(redis, registry, manager, request):
+    await bridge.handle_model_catalog_request(
+        redis, registry, json.dumps(request), config_path="/cfg", login_manager=manager,
+    )
+
+
+@pytest.fixture
+async def browser_bridge(monkeypatch, browser_admission, tmp_path):
+    manager, registry, _, context, _, _, _, _ = browser_admission
+    factory = context["plugin"].create_browser_login
+
+    def synthetic_factory(**kwargs):
+        adapter = factory(**kwargs)
+        object.__setattr__(adapter, "working_directory", str(tmp_path))
+        return adapter
+
+    monkeypatch.setattr(context["plugin"], "create_browser_login", synthetic_factory)
+    redis = _BridgeRedis()
+    monkeypatch.setattr(bridge, "CoderLoginSessionManager", lambda *_a, **_kw: manager)
+    server = asyncio.create_task(bridge.serve_model_catalog_requests(redis, registry, config_path="/cfg"))
+    loader = bridge.DaemonModelCatalogLoader(redis, timeout_seconds=1, poll_interval_seconds=.001)
+    yield loader, redis
+    server.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await server
+
+
+@pytest.mark.parametrize("registry_change", ["replace", "remove"])
+async def test_browser_bridge_owned_round_trip(browser_bridge, browser_admission, registry_change):
+    loader, redis = browser_bridge
+    manager, registry, reservations, context, _, _, settled, calls = browser_admission
+    settled.set()
+    reference = context["expected_reference"]
+    started = await loader.start_browser_login("claude", expected_reference=reference, replace_existing=False)
+    sid = started["session_id"]
+    if registry_change == "replace":
+        registry.register(ClaudePlugin(), reference="replacement")
+    else:
+        registry._plugins.clear()
+    inspected = await loader.inspect_browser_login("claude", sid, expected_reference=reference)
+    assert inspected["session_id"] == sid and inspected["login_method"] == "browser_code"
+    cancelled = await loader.cancel_browser_login("claude", sid, expected_reference=reference)
+    assert cancelled["state"] == "cancelled" and cancelled["cleanup_confirmed"] is True
+    assert not reservations.login_active(context["credential_location"])
+    assert len(calls) == 1 and len(manager._sessions) == 1
+    assert len(redis.deleted) == 3 and not redis.values
+    assert all(item[0] == bridge.MODEL_CATALOG_REQUEST_QUEUE for item in redis.removed)
+
+
+@pytest.mark.parametrize("reason", list(bridge._BROWSER_REFUSALS))
+async def test_browser_bridge_admission_refusals(browser_bridge, browser_admission, monkeypatch, reason):
+    loader, _ = browser_bridge
+    manager = browser_admission[0]
+
+    async def refuse(*_a, **_kw):
+        return CoderBrowserLoginFailure(reason, "synthetic-secret /data/secrets/private")
+
+    monkeypatch.setattr(manager, "start_browser", refuse)
+    result = await loader.start_browser_login(
+        "claude", expected_reference="src.coders.claude:ClaudePlugin", replace_existing=True,
+    )
+    assert result == CoderBrowserLoginFailure(reason, bridge._BROWSER_REFUSALS[reason])
+    assert "synthetic-secret" not in result.detail
+
+
+@pytest.mark.parametrize("operation", ["inspect", "cancel"])
+@pytest.mark.parametrize("lookup", ["missing", "plugin", "reference", "device"])
+async def test_browser_lookup_refusals_do_not_cancel_device(
+    browser_bridge, browser_admission, operation, lookup,
+):
+    loader, _ = browser_bridge
+    manager, _, _, context, _, _, settled, _ = browser_admission
+    settled.set()
+    started = await loader.start_browser_login(
+        "claude", expected_reference=context["expected_reference"], replace_existing=False,
+    )
+    sid = started["session_id"]
+    session = manager._sessions[sid]
+    original_deadline = session.application_deadline
+    if lookup == "device":
+        session.application_deadline = None
+    method = getattr(loader, f"{operation}_browser_login")
+    try:
+        result = await method(
+            "wrong" if lookup == "plugin" else "claude",
+            "X" * 43 if lookup == "missing" else sid,
+            expected_reference="wrong" if lookup == "reference" else context["expected_reference"],
+        )
+        assert isinstance(result, CoderBrowserLoginFailure)
+        assert result.reason == ("session_not_found" if lookup == "missing" else "session_plugin_mismatch")
+        assert not session.cancel_requested
+    finally:
+        session.application_deadline = original_deadline
+
+
+@pytest.mark.parametrize("updates", [
+    {"expires_at": True}, {"expires_at": float("nan")}, {"expires_at": float("inf")},
+    {"expires_at": 10 ** 400}, {"expires_at": "1"}, {"operation": []},
+    {"replace_existing": 1}, {"replace_existing": None}, {"reference": ""}, {"plugin": ""},
+    {"authorization_code": "synthetic-secret"}, {"extra": "synthetic-secret"},
+    {"operation": "browser_login_inspect", "session_id": []},
+])
+async def test_browser_invalid_request_has_no_effect(browser_admission, updates):
+    manager, registry, _, _, _, _, _, calls = browser_admission
+    redis = _BridgeRedis()
+    await _handle_browser(redis, registry, manager, _browser_request(**updates))
+    assert not redis.values and not calls and not manager._sessions
+
+
+@pytest.mark.parametrize("sid", [None, "", "short", "B" * 129, "B" * 42 + "\n", []])
+async def test_browser_request_bounds_session_id(browser_admission, sid):
+    manager, registry, *_ = browser_admission
+    redis = _BridgeRedis()
+    await _handle_browser(redis, registry, manager, _browser_request("cancel", session_id=sid))
+    assert not redis.values
+
+
+@pytest.mark.parametrize("payload", [
+    None, {}, {"ok": 1, "login": {}}, {"ok": True, "login": {}},
+    {"ok": False, "reason": "unknown", "detail": "synthetic-secret"},
+    {"ok": False, "reason": [], "detail": "synthetic-secret"},
+    {"ok": False, "reason": "unsupported", "detail": "synthetic-secret"},
+    {"ok": False, "reason": "unsupported", "detail": bridge._BROWSER_REFUSALS["unsupported"], "secret": "value"},
+    {"ok": False, "error": "synthetic-secret"},
+])
+def test_browser_invalid_reply_is_sanitized(payload):
+    with pytest.raises(ModelCatalogUnavailable, match="^Daemon returned invalid browser login status$"):
+        bridge._parse_browser_login(payload, expected_plugin="claude")
+
+
+@pytest.mark.parametrize("failure", ["absent", "exception", "invalid_snapshot", "unknown_refusal", "bad_reason"])
+async def test_browser_daemon_failures_are_unavailable(browser_admission, monkeypatch, failure):
+    manager, registry, *_ = browser_admission
+    redis = _BridgeRedis()
+
+    async def broken(*_a, **_kw):
+        if failure == "exception":
+            raise RuntimeError("synthetic-secret")
+        if failure in {"unknown_refusal", "bad_reason"}:
+            return CoderBrowserLoginFailure("unknown" if failure == "unknown_refusal" else [], "synthetic-secret")
+        return {"state": "starting", "secret": "synthetic-secret"}
+
+    monkeypatch.setattr(manager, "start_browser", broken)
+    await _handle_browser(redis, registry, None if failure == "absent" else manager, _browser_request())
+    reply = json.loads(redis.values[bridge._response_key("f" * 32)])
+    assert reply == {"ok": False, "error": "coder login unavailable"}
+    with pytest.raises(ModelCatalogUnavailable, match="^Daemon coder login is unavailable$"):
+        bridge._parse_browser_login(reply, expected_plugin="claude")
+
+
+async def test_browser_expired_request_does_not_admit(browser_admission):
+    manager, registry, _, _, _, _, _, calls = browser_admission
+    redis = _BridgeRedis()
+    await _handle_browser(redis, registry, manager, _browser_request(expires_at=time.time() - 1))
+    assert not calls and not manager._sessions
+    with pytest.raises(ModelCatalogUnavailable, match="^Daemon coder login is unavailable$"):
+        bridge._parse_browser_login(json.loads(redis.values[bridge._response_key("f" * 32)]), expected_plugin="claude")
+
+
+@pytest.mark.parametrize("shared", [False, True])
+async def test_browser_bridge_expiry_withdraws_only_waiter(browser_admission, shared):
+    manager, registry, reservations, context, _, entered, settled, calls = browser_admission
+    redis = _BridgeRedis()
+    request = _browser_request(expires_at=time.time() + .03)
+    expiring = asyncio.create_task(_handle_browser(redis, registry, manager, request))
+    await entered.wait()
+    other = None
+    if shared:
+        other = asyncio.create_task(manager.start_browser(
+            "claude", expected_reference=context["expected_reference"], replace_existing=False,
+        ))
+        await asyncio.sleep(0)
+    admission = manager._browser_admissions[context["credential_location"]]
+    await expiring
+    assert reservations.login_active(context["credential_location"])
+    assert not admission.task.done() and len(calls) == 1
+    assert admission.cancel_requested is (not shared)
+    settled.set()
+    result = await admission.task
+    if other:
+        snapshot = await other
+        assert snapshot["session_id"] == result["session_id"]
+        await manager.shutdown()
+    else:
+        assert result.reason == "cancelled" and not manager._sessions
+    assert not reservations.login_active(context["credential_location"])
+
+
+async def test_browser_response_write_failure_retry_reuses_ownership(browser_admission, monkeypatch):
+    manager, registry, reservations, context, _, _, settled, calls = browser_admission
+    redis = _BridgeRedis()
+    settled.set()
+    original = redis.set
+
+    async def failed_write(*_a, **_kw):
+        raise RuntimeError("synthetic-secret")
+
+    monkeypatch.setattr(redis, "set", failed_write)
+    with pytest.raises(RuntimeError):
+        await _handle_browser(redis, registry, manager, _browser_request())
+    session = next(iter(manager._sessions.values()))
+    assert not session.cancel_requested and reservations.login_active(context["credential_location"])
+    monkeypatch.setattr(redis, "set", original)
+    await _handle_browser(redis, registry, manager, _browser_request())
+    retry = bridge._parse_browser_login(
+        json.loads(redis.values[bridge._response_key("f" * 32)]), expected_plugin="claude",
+    )
+    assert retry["session_id"] == session.session_id and retry["reused_session"]
+    assert len(calls) == 1 and len(manager._sessions) == 1
+    await manager.shutdown()
+
+
+async def test_browser_bridge_cleanup_failed_retains_ownership(browser_bridge, browser_admission, monkeypatch):
+    loader, _ = browser_bridge
+    manager, _, reservations, context, _, _, settled, _ = browser_admission
+    settled.set()
+    reference = context["expected_reference"]
+    started = await loader.start_browser_login("claude", expected_reference=reference, replace_existing=False)
+    session = manager._sessions[started["session_id"]]
+    session.state, session.cleanup_confirmed, session.failure_reason = "cleanup_failed", False, "cancellation_failed"
+    original = manager._cleanup
+
+    async def unresolved(_session):
+        return False
+
+    monkeypatch.setattr(manager, "_cleanup", unresolved)
+    inspected = await loader.inspect_browser_login("claude", session.session_id, expected_reference=reference)
+    cancelled = await loader.cancel_browser_login("claude", session.session_id, expected_reference=reference)
+    for result in (inspected, cancelled):
+        assert result["state"] == "cleanup_failed" and result["cleanup_confirmed"] is False
+    assert reservations.login_active(context["credential_location"])
+    monkeypatch.setattr(manager, "_cleanup", original)
+
+
+@pytest.mark.parametrize("failure", ["push", "read", "timeout", "json"])
+async def test_browser_loader_transport_failure_is_not_cleanup(failure):
+    redis = _BridgeRedis()
+
+    async def broken(*_a, **_kw):
+        raise RuntimeError("synthetic-secret")
+
+    if failure == "push":
+        redis.rpush = broken
+    elif failure == "read":
+        redis.get = broken
+    elif failure == "json":
+        async def bad_json(_key):
+            return "invalid synthetic-secret"
+        redis.get = bad_json
+    loader = bridge.DaemonModelCatalogLoader(redis, timeout_seconds=.01, poll_interval_seconds=0)
+    with pytest.raises(ModelCatalogUnavailable) as caught:
+        await loader.start_browser_login("claude", expected_reference="reference", replace_existing=False)
+    assert "synthetic-secret" not in str(caught.value)
+
+
+async def test_browser_start_does_not_reuse_device_owner(browser_admission):
+    manager, registry, reservations, context, _, _, _, calls = browser_admission
+    location = context["credential_location"]
+    adapter = context["plugin"].create_browser_login(
+        credential_location=location, environment=context["environment"],
+        config_path=manager._config_path, observed_cli_version="2.1.126",
+    )
+    # The shared manager uses application_deadline to distinguish session methods.
+    device = login_tests.coder_login._LoginSession(
+        "D" * 43, "claude", context["expected_reference"], adapter, False, manager._monotonic(),
+        plugin_identity=context["plugin"], reservation_held=True,
+    )
+    assert device.application_deadline is None and reservations.reserve_login(location)
+    manager._sessions[device.session_id] = device
+    redis = _BridgeRedis()
+    await _handle_browser(redis, registry, manager, _browser_request())
+    refusal = bridge._parse_browser_login(
+        json.loads(redis.values[bridge._response_key("f" * 32)]), expected_plugin="claude",
+    )
+    assert refusal.reason == "credential_in_use" and not calls
+    assert not device.cancel_requested and reservations.login_active(location)
+    await manager.shutdown()
+
+
+async def test_browser_snapshot_validation_and_field_selection(browser_admission):
+    manager, registry, _, _, _, _, settled, _ = browser_admission
+    settled.set()
+    redis = _BridgeRedis()
+    await _handle_browser(redis, registry, manager, _browser_request())
+    payload = json.loads(redis.values[bridge._response_key("f" * 32)])
+    try:
+        extra = payload["login"] | {"authorization_code": "synthetic-secret", "environment": "private"}
+        selected = bridge._browser_login_envelope(extra, expected_plugin="claude")
+        assert selected == payload
+        assert bridge._parse_browser_login(selected, expected_plugin="claude") == payload["login"]
+        for field, value in [("plugin", "wrong"), ("state", []), ("cleanup_confirmed", True),
+                             ("application_deadline", float("nan"))]:
+            with pytest.raises(ModelCatalogUnavailable, match="^Daemon returned invalid browser login status$"):
+                bridge._parse_browser_login(
+                    {"ok": True, "login": payload["login"] | {field: value}}, expected_plugin="claude",
+                )
+    finally:
+        await manager.shutdown()

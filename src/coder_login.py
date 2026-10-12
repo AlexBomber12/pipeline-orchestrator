@@ -380,7 +380,8 @@ class CoderLoginSessionManager:
             if not self._retains_credential_ownership(session) or session.adapter.credential_location != location:
                 continue
             if (
-                session.plugin == plugin_name and session.plugin_identity is plugin
+                session.application_deadline is not None
+                and session.plugin == plugin_name and session.plugin_identity is plugin
                 and session.reference == expected_reference
                 and session.replacement_requested == replace_existing
                 and session.terminal_monotonic is None
@@ -690,6 +691,36 @@ class CoderLoginSessionManager:
                 failure_reason=reason, cleanup_confirmed=True,
             )
         return self._session_payload(session)
+
+    def _browser_session_refusal(
+        self, plugin_name: str, session_id: str, expected_reference: str,
+    ) -> CoderBrowserLoginFailure | None:
+        self._purge_expired_sessions()
+        session = self._sessions.get(session_id)
+        if session is None:
+            return CoderBrowserLoginFailure("session_not_found", "Browser login session was not found")
+        if (session.application_deadline is None or session.plugin != plugin_name
+                or session.reference != expected_reference):
+            return CoderBrowserLoginFailure("session_plugin_mismatch", "Browser login session context does not match")
+        return None
+
+    async def inspect_browser(
+        self, plugin_name: str, session_id: str, *, expected_reference: str,
+    ) -> dict[str, Any] | CoderBrowserLoginFailure:
+        """Inspect a browser session using its captured context, even after registry changes."""
+        refusal = self._browser_session_refusal(plugin_name, session_id, expected_reference)
+        if refusal is not None:
+            return refusal
+        return await self.inspect(plugin_name, session_id, expected_reference=expected_reference)
+
+    async def cancel_browser(
+        self, plugin_name: str, session_id: str, *, expected_reference: str,
+    ) -> dict[str, Any] | CoderBrowserLoginFailure:
+        """Guard browser ownership before cancellation can touch a device session."""
+        refusal = self._browser_session_refusal(plugin_name, session_id, expected_reference)
+        if refusal is not None:
+            return refusal
+        return await self.cancel(plugin_name, session_id, expected_reference=expected_reference)
 
     async def inspect(
         self,
