@@ -3294,3 +3294,110 @@ async def test_submit_daemon_abandoned_key_cleanup(submission_bridge, monkeypatc
     assert not writes and not session.submission_claimed
     assert (key in redis.values) == (failure == "delete_failure")
     assert "synthetic-private-code" not in caplog.text
+
+
+class _CleanupStallRedis(_BridgeRedis):
+    def __init__(self, stalls, *, fail=False):
+        super().__init__()
+        self.stalls = stalls
+        self.fail = fail
+        self.read_started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.attempted = []
+        self.interrupted = []
+
+    async def get(self, key):
+        self.read_started.set()
+        return await super().get(key)
+
+    async def _cleanup(self, operation):
+        self.attempted.append(operation)
+        if operation in self.stalls:
+            # These calls start after request/caller cancellation has reached finally.
+            if operation != "handoff":
+                assert asyncio.current_task().cancelling() >= 1
+            if self.fail:
+                raise RuntimeError("synthetic-private-code")
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.interrupted.append(operation)
+                raise
+
+    async def lrem(self, key, count, value):
+        await self._cleanup("lrem")
+        return await super().lrem(key, count, value)
+
+    async def delete(self, key):
+        operation = "handoff" if key.startswith(bridge._BROWSER_HANDOFF_PREFIX) else "response"
+        await self._cleanup(operation)
+        return await super().delete(key)
+
+
+@pytest.mark.parametrize("stalls", [{"lrem"}, {"response"}, {"lrem", "response", "handoff"}])
+@pytest.mark.parametrize("termination", ["timeout", "caller_cancel"])
+async def test_submit_stalled_rpc_cleanup_reaches_handoff(stalls, termination, caplog):
+    redis = _CleanupStallRedis(stalls)
+    request_timeout = .02 if termination == "timeout" else 5
+    loader = bridge.DaemonModelCatalogLoader(redis, timeout_seconds=request_timeout, poll_interval_seconds=.001)
+    task = asyncio.create_task(loader.submit_browser_login(
+        "claude", "A" * 43, expected_reference="src.coders.claude:ClaudePlugin",
+        authorization_code="synthetic-private-code",
+    ))
+    try:
+        await redis.read_started.wait()
+        if termination == "caller_cancel":
+            task.cancel()  # The sole external cancellation; observing completion must not cancel again.
+        started = time.monotonic()
+        # RPC cleanup: 2 x 0.1s. Private handoff cleanup: 1s. Allow scheduling slack.
+        budget = (request_timeout if termination == "timeout" else 0) + 1.2
+        done, _ = await asyncio.wait({task}, timeout=budget + .2)
+        assert task in done, "Submission exceeded its request timeout and bounded cleanup budget"
+        assert time.monotonic() - started <= budget + .2
+        if termination == "caller_cancel":
+            assert task.cancelled()
+        else:
+            with pytest.raises(ModelCatalogUnavailable, match="^Daemon coder login is unavailable$") as failure:
+                task.result()
+            assert "synthetic-private-code" not in str(failure.value)
+        assert redis.attempted == ["lrem", "response", "handoff"]
+        assert set(redis.interrupted) == stalls
+        assert len(redis.requests) == len(redis.handoffs) == 1
+        key, ttl, nx = redis.handoffs[0]
+        assert ttl == 30 and nx
+        assert (key in redis.values) == ("handoff" in stalls)
+        assert "synthetic-private-code" not in caplog.text + json.dumps(redis.requests)
+    finally:
+        # Release doubles even on failure; never hide a hang with a second cancellation.
+        redis.release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("termination", ["timeout", "caller_cancel"])
+async def test_submit_rpc_cleanup_exceptions_are_private(termination, caplog):
+    redis = _CleanupStallRedis({"lrem", "response"}, fail=True)
+    loader = bridge.DaemonModelCatalogLoader(
+        redis, timeout_seconds=.02 if termination == "timeout" else 5, poll_interval_seconds=.001,
+    )
+    task = asyncio.create_task(loader.submit_browser_login(
+        "claude", "A" * 43, expected_reference="src.coders.claude:ClaudePlugin",
+        authorization_code="synthetic-private-code",
+    ))
+    try:
+        await redis.read_started.wait()
+        if termination == "caller_cancel":
+            task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=1.4)
+        assert task in done
+        if termination == "caller_cancel":
+            assert task.cancelled()
+        else:
+            with pytest.raises(ModelCatalogUnavailable, match="^Daemon coder login is unavailable$"):
+                task.result()
+        assert redis.attempted == ["lrem", "response", "handoff"]
+        assert redis.handoffs[0][0] in redis.deleted and not redis.values
+        assert len(redis.requests) == len(redis.handoffs) == 1
+        assert "synthetic-private-code" not in caplog.text + json.dumps(redis.requests)
+    finally:
+        redis.release.set()
+        await asyncio.gather(task, return_exceptions=True)

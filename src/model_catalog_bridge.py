@@ -59,6 +59,7 @@ _BROWSER_HANDOFF_TTL_SECONDS = 30
 _BROWSER_HANDOFF_MAX_BYTES = 16_384
 _REQUEST_TIMEOUT_SECONDS = 7.0
 _POLL_INTERVAL_SECONDS = 0.05
+_RPC_CLEANUP_TIMEOUT_SECONDS = 0.1
 _MAX_PENDING_REQUESTS = 64
 _MAX_CONCURRENT_REQUESTS = 8
 _CONFIGURED_CATALOG_TIMEOUT_SECONDS = 5.0
@@ -969,7 +970,11 @@ class DaemonModelCatalogLoader:
         self, plugin_id: str, session_id: str, *, expected_reference: str,
         authorization_code: str,
     ) -> dict[str, Any] | CoderBrowserLoginFailure:
-        """Hand off one code privately; ambiguous results must never be retried automatically."""
+        """Hand off once within the request timeout plus at most 1.2s of cleanup.
+
+        RPC cleanup gets two independent 0.1s deadlines; private-key deletion
+        gets 1s. Ambiguous results must never be retried automatically.
+        """
         validate_browser_authorization_code(authorization_code)
         if (not isinstance(plugin_id, str) or not plugin_id
                 or not isinstance(expected_reference, str) or not expected_reference
@@ -1059,16 +1064,20 @@ class DaemonModelCatalogLoader:
                         ) from None
                 await asyncio.sleep(self._poll_interval_seconds)
         finally:
+            # The request timeout may already have fired. Each cleanup needs
+            # its own deadline so private handoff cleanup can still be reached.
             try:
-                await self._redis.lrem(
-                    MODEL_CATALOG_REQUEST_QUEUE,
-                    1,
-                    request,
-                )
+                async with asyncio.timeout(_RPC_CLEANUP_TIMEOUT_SECONDS):
+                    await self._redis.lrem(
+                        MODEL_CATALOG_REQUEST_QUEUE,
+                        1,
+                        request,
+                    )
             except Exception:
                 pass
             try:
-                await self._redis.delete(response_key)
+                async with asyncio.timeout(_RPC_CLEANUP_TIMEOUT_SECONDS):
+                    await self._redis.delete(response_key)
             except Exception:
                 pass
         raise ModelCatalogUnavailable("Daemon model catalog request timed out")
