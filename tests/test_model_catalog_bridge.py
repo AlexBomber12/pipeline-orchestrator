@@ -3401,3 +3401,73 @@ async def test_submit_rpc_cleanup_exceptions_are_private(termination, caplog):
     finally:
         redis.release.set()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_submit_caller_cancel_during_private_cleanup_propagates(submission_bridge, monkeypatch, caplog):
+    loader, redis, _, session, _, _, writes, _ = submission_bridge
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_delete = redis.delete
+    task = None
+
+    async def delete(key):
+        if key.startswith(bridge._BROWSER_HANDOFF_PREFIX) and asyncio.current_task() is task:
+            entered.set()
+            await release.wait()
+        await original_delete(key)
+
+    monkeypatch.setattr(redis, "delete", delete)
+    task = asyncio.create_task(_loader_submit(loader, session))
+    try:
+        await entered.wait()
+        task.cancel()  # Cancel exactly once, specifically during client private-key deletion.
+        done, _ = await asyncio.wait({task}, timeout=.2)
+        assert task in done and task.cancelled()
+        assert session.submission_claimed and session.code_delivered
+        assert writes == [b"synthetic-private-code\n"] and len(redis.requests) == 1
+        assert "synthetic-private-code" not in caplog.text + json.dumps(redis.requests)
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("path", ["expired", "inspection_error"])
+async def test_daemon_cancel_during_handoff_cleanup_skips_response(
+    submission_bridge, monkeypatch, path, caplog,
+):
+    _, redis, manager, session, _, _, writes, _ = submission_bridge
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_delete = redis.delete
+    responses = []
+    request, key = _private_request(
+        redis, session, expires_at=time.time() + (-1 if path == "expired" else 5),
+    )
+
+    async def delete(key):
+        if key.startswith(bridge._BROWSER_HANDOFF_PREFIX):
+            entered.set()
+            await release.wait()
+        await original_delete(key)
+
+    async def response(key, value, **kwargs):
+        responses.append(key)
+        await release.wait()
+
+    async def inspect(*_a, **_kw):
+        raise RuntimeError("synthetic-private-code")
+
+    monkeypatch.setattr(redis, "delete", delete)
+    monkeypatch.setattr(redis, "set", response)
+    if path == "inspection_error":
+        monkeypatch.setattr(manager, "inspect_browser", inspect)
+    task = asyncio.create_task(_handle_browser(redis, manager._registry, manager, request))
+    try:
+        await entered.wait()
+        task.cancel()  # Simulate service shutdown while daemon handoff deletion is pending.
+        done, _ = await asyncio.wait({task}, timeout=.2)
+        assert task in done and task.cancelled()
+        assert not responses and not writes and not session.submission_claimed
+        assert key in redis.values  # Interrupted deletion leaves the existing TTL as fallback.
+        assert "synthetic-private-code" not in caplog.text
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)

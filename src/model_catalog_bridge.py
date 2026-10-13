@@ -199,7 +199,7 @@ async def _discard_browser_handoff(redis_client: Any, handle: str) -> None:
     try:
         async with asyncio.timeout(1):
             await redis_client.delete(_browser_handoff_key(handle))
-    except (Exception, asyncio.CancelledError):
+    except Exception:
         pass
 
 
@@ -1009,7 +1009,7 @@ class DaemonModelCatalogLoader:
                 async with asyncio.timeout(1):
                     if cleanup_key:
                         await self._redis.delete(key)
-            except (Exception, asyncio.CancelledError):
+            except Exception:
                 pass
 
     async def _request(
