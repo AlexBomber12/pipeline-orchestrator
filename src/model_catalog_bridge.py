@@ -1197,7 +1197,7 @@ async def handle_model_catalog_request(
                         replace_existing=request["replace_existing"],
                     )
             elif operation == "browser_login_submit":
-                async with asyncio.timeout(expires_at - time.time()):
+                async with asyncio.timeout(expires_at - time.time()) as submission_timeout:
                     login = await login_manager.inspect_browser(
                         plugin_name, request["session_id"], expected_reference=expected_reference,
                     )
@@ -1215,6 +1215,10 @@ async def handle_model_catalog_request(
                                 plugin_name, request["session_id"], expected_reference=expected_reference,
                                 authorization_code=code,
                             )
+                            # The manager returns a snapshot after cancelled delivery.
+                            # Preserve shutdown cancellation, but keep deadline snapshots.
+                            if asyncio.current_task().cancelling() > int(submission_timeout.expired()):
+                                raise asyncio.CancelledError
                         finally:
                             del code
             else:

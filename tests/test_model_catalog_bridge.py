@@ -3259,8 +3259,16 @@ async def test_submit_writer_failure_preserves_ownership(submission_bridge, acti
     await entered.wait()
     if action == "daemon_cancel":
         task.cancel()
-    await task
-    reply = json.loads(redis.values[bridge._response_key(request["request_id"])])
+    if action == "daemon_cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert bridge._response_key(request["request_id"]) not in redis.values
+        reply = bridge._browser_login_envelope(await manager.inspect_browser(
+            "claude", session.session_id, expected_reference=session.reference,
+        ), expected_plugin="claude")
+    else:
+        await task
+        reply = json.loads(redis.values[bridge._response_key(request["request_id"])])
     assert reply["ok"] is True
     assert reply["login"]["cleanup_confirmed"] is quiescent
     expected = ("failed" if action == "partial_failure" else "cancelled") if quiescent else "cleanup_failed"
@@ -3532,3 +3540,41 @@ async def test_invalid_submit_metadata_cannot_delete_arbitrary_key(submission_br
     await _handle_browser(redis, manager._registry, manager, request)
     assert not redis.deleted and redis.values["arbitrary:redis:key"] == "synthetic-unrelated-value"
     assert not writes and not session.submission_claimed
+
+
+async def test_daemon_shutdown_during_submission_skips_stalled_response(monkeypatch, browser_preparation, caplog):
+    manager, _, session, _, channel, writes, completed = await login_tests._submittable_browser(
+        monkeypatch, browser_preparation,
+    )
+    redis = _BridgeRedis()
+    entered, release = asyncio.Event(), asyncio.Event()
+    responses = []
+
+    async def write(data):
+        writes.append(data[:3])
+        entered.set()
+        await release.wait()
+
+    async def response(key, value, **kwargs):
+        responses.append(key)
+        await release.wait()
+
+    channel.write = write
+    monkeypatch.setattr(redis, "set", response)
+    monkeypatch.setattr(bridge, "CoderLoginSessionManager", lambda *_a, **_kw: manager)
+    request, key = _private_request(redis, session, expires_at=time.time() + 5)
+    server = asyncio.create_task(bridge.serve_model_catalog_requests(redis, manager._registry, config_path="/cfg"))
+    try:
+        await redis.rpush(bridge.MODEL_CATALOG_REQUEST_QUEUE, json.dumps(request))
+        await entered.wait()
+        server.cancel()  # The sole external shutdown cancellation; it cancels the owned request once.
+        done, _ = await asyncio.wait({server}, timeout=.4)
+        assert server in done and server.cancelled(), "Shutdown entered a stalled response write"
+        assert not responses and key not in redis.values and key in redis.deleted
+        assert len(writes) == len(redis.requests) == 1 and session.submission_claimed
+        assert "synthetic-private-code" not in caplog.text
+    finally:
+        release.set()
+        completed.set()
+        await asyncio.gather(server, return_exceptions=True)
+        await manager.shutdown()
