@@ -194,7 +194,7 @@ def _browser_handoff_key(handle: object) -> str:
     return f"{_BROWSER_HANDOFF_PREFIX}:{handle}"
 
 
-async def _discard_browser_handoff(redis_client: Any, handle: str) -> None:
+async def _discard_browser_handoff(redis_client: Any, handle: object) -> None:
     """Remove abandoned input without reading it; TTL covers unavailable Redis."""
     try:
         async with asyncio.timeout(1):
@@ -1066,8 +1066,11 @@ class DaemonModelCatalogLoader:
         finally:
             # The request timeout may already have fired. Each cleanup needs
             # its own deadline so private handoff cleanup can still be reached.
+            # Other RPCs retain their existing withdrawal/cleanup behavior.
             try:
-                async with asyncio.timeout(_RPC_CLEANUP_TIMEOUT_SECONDS):
+                async with asyncio.timeout(
+                    _RPC_CLEANUP_TIMEOUT_SECONDS if operation == "browser_login_submit" else None,
+                ):
                     await self._redis.lrem(
                         MODEL_CATALOG_REQUEST_QUEUE,
                         1,
@@ -1076,7 +1079,9 @@ class DaemonModelCatalogLoader:
             except Exception:
                 pass
             try:
-                async with asyncio.timeout(_RPC_CLEANUP_TIMEOUT_SECONDS):
+                async with asyncio.timeout(
+                    _RPC_CLEANUP_TIMEOUT_SECONDS if operation == "browser_login_submit" else None,
+                ):
                     await self._redis.delete(response_key)
             except Exception:
                 pass
@@ -1146,6 +1151,8 @@ async def handle_model_catalog_request(
         or type(expires_at) not in (int, float)
         or not _finite_expiry(expires_at)
     ):
+        if operation == "browser_login_submit":
+            await _discard_browser_handoff(redis_client, request.get("code_handle"))
         return
     if operation.startswith("browser_login_"):
         extra = "replace_existing" if operation == "browser_login_start" else "session_id"
@@ -1156,14 +1163,16 @@ async def handle_model_catalog_request(
                 _browser_handoff_key(request.get("code_handle"))
             except ValueError:
                 return
-        if set(request) != fields:
-            return
-        if not plugin_name or not expected_reference:
+        if set(request) != fields or not plugin_name or not expected_reference:
+            if operation == "browser_login_submit":
+                await _discard_browser_handoff(redis_client, request["code_handle"])
             return
         if extra == "replace_existing":
             if type(request[extra]) is not bool:
                 return
         elif not isinstance(request[extra], str) or re.fullmatch(r"[A-Za-z0-9_-]{32,128}", request[extra]) is None:
+            if operation == "browser_login_submit":
+                await _discard_browser_handoff(redis_client, request["code_handle"])
             return
     if expires_at <= time.time():
         if operation == "browser_login_submit":

@@ -3096,7 +3096,7 @@ async def test_submit_context_guard(submission_bridge, monkeypatch, change):
         request["expires_at"] = time.time() - 1
     await _handle_browser(redis, manager._registry, manager, request)
     assert not writes and not session.submission_claimed
-    if change not in {"handle", "raw_key", "secret_field"}:
+    if change not in {"handle", "raw_key"}:
         assert key not in redis.values and key in redis.deleted
 
 
@@ -3471,3 +3471,64 @@ async def test_daemon_cancel_during_handoff_cleanup_skips_response(
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
+
+
+
+@pytest.mark.parametrize("operation", ["browser_login_start", "browser_login_cancel", "device_login_start",
+                                       "device_login_cancel", "catalog", "metadata", "auth"])
+@pytest.mark.parametrize("stall", ["lrem", "response"])
+async def test_non_submit_rpc_preserves_existing_cleanup(operation, stall):
+    redis = _CleanupStallRedis({stall})
+    original_lrem = redis.lrem
+
+    async def withdraw(key, count, value):
+        await original_lrem(key, count, value)
+        queued = redis.queue.get_nowait()
+        assert queued == (key, value.encode())
+
+    redis.lrem = withdraw
+    loader = bridge.DaemonModelCatalogLoader(redis, timeout_seconds=5, poll_interval_seconds=.001)
+    task = asyncio.create_task(loader._request(
+        "claude", operation=operation, expected_reference="src.coders.claude:ClaudePlugin",
+    ))
+    try:
+        await redis.read_started.wait()
+        task.cancel()  # Withdrawal must finish despite taking longer than submit cleanup permits.
+        done, _ = await asyncio.wait({task}, timeout=.15)
+        assert not done and not redis.interrupted
+        if stall == "lrem":
+            assert not redis.queue.empty()
+        redis.release.set()
+        done, _ = await asyncio.wait({task}, timeout=.2)
+        assert task in done and task.cancelled() and redis.queue.empty()
+        assert redis.attempted == ["lrem", "response"]
+        assert not redis.interrupted and len(redis.requests) == 1
+    finally:
+        redis.release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("updates", [
+    {"extra": True}, {"code": "synthetic-private-code"}, {"request_id": "bad"}, {"plugin": []},
+    {"plugin": ""}, {"reference": None}, {"reference": ""}, {"expires_at": None},
+    {"expires_at": float("inf")}, {"session_id": "bad"}, {"session_id": None},
+])
+async def test_submit_validation_rejection_discards_valid_handle(submission_bridge, updates, caplog):
+    _, redis, manager, session, _, _, writes, _ = submission_bridge
+    request, key = _private_request(redis, session)
+    request.update(updates)
+    await _handle_browser(redis, manager._registry, manager, request)
+    assert key in redis.deleted and key not in redis.values
+    assert not writes and not session.submission_claimed
+    assert not any(k.startswith(bridge._RESPONSE_PREFIX) for k in redis.values)
+    assert "synthetic-private-code" not in caplog.text
+
+
+@pytest.mark.parametrize("handle", [None, "wrong", "arbitrary:redis:key"])
+async def test_invalid_submit_metadata_cannot_delete_arbitrary_key(submission_bridge, handle):
+    _, redis, manager, session, _, _, writes, _ = submission_bridge
+    redis.values["arbitrary:redis:key"] = "synthetic-unrelated-value"
+    request = _browser_request("submit", request_id="bad", code_handle=handle)
+    await _handle_browser(redis, manager._registry, manager, request)
+    assert not redis.deleted and redis.values["arbitrary:redis:key"] == "synthetic-unrelated-value"
+    assert not writes and not session.submission_claimed
