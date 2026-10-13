@@ -193,6 +193,15 @@ def _browser_handoff_key(handle: object) -> str:
     return f"{_BROWSER_HANDOFF_PREFIX}:{handle}"
 
 
+async def _discard_browser_handoff(redis_client: Any, handle: str) -> None:
+    """Remove abandoned input without reading it; TTL covers unavailable Redis."""
+    try:
+        async with asyncio.timeout(1):
+            await redis_client.delete(_browser_handoff_key(handle))
+    except (Exception, asyncio.CancelledError):
+        pass
+
+
 def _browser_handoff_code(raw: object, request: dict[str, Any]) -> str:
     """Consume only bounded, exactly bound private input."""
     if not isinstance(raw, (str, bytes)) or len(raw) > _BROWSER_HANDOFF_MAX_BYTES:
@@ -1148,6 +1157,8 @@ async def handle_model_catalog_request(
         elif not isinstance(request[extra], str) or re.fullmatch(r"[A-Za-z0-9_-]{32,128}", request[extra]) is None:
             return
     if expires_at <= time.time():
+        if operation == "browser_login_submit":
+            await _discard_browser_handoff(redis_client, request["code_handle"])
         await _store_response(
             redis_client,
             request_id,
@@ -1384,6 +1395,9 @@ async def handle_model_catalog_request(
                    if operation.startswith("browser_login_") else "catalog unavailable")}
     else:
         payload = _catalog_payload(catalog)
+    finally:
+        if operation == "browser_login_submit":
+            await _discard_browser_handoff(redis_client, request["code_handle"])
     await _store_response(redis_client, request_id, payload)
 
 

@@ -3096,6 +3096,8 @@ async def test_submit_context_guard(submission_bridge, monkeypatch, change):
         request["expires_at"] = time.time() - 1
     await _handle_browser(redis, manager._registry, manager, request)
     assert not writes and not session.submission_claimed
+    if change not in {"handle", "raw_key", "secret_field"}:
+        assert key not in redis.values and key in redis.deleted
 
 
 async def test_submit_concurrent_replay_consumes_once(submission_bridge):
@@ -3273,3 +3275,22 @@ async def test_submit_writer_failure_preserves_ownership(submission_bridge, acti
     await session.task
     managed.reconcile_quiescent = True
     await manager.cancel_browser("claude", session.session_id, expected_reference=session.reference)
+
+
+@pytest.mark.parametrize("failure", ["absent_manager", "inspection_failure", "delete_failure"])
+async def test_submit_daemon_abandoned_key_cleanup(submission_bridge, monkeypatch, failure, caplog):
+    _, redis, manager, session, _, _, writes, _ = submission_bridge
+    request, key = _private_request(redis, session)
+    request["session_id"] = "X" * 43
+
+    async def broken(*_a, **_kw):
+        raise RuntimeError("synthetic-private-code")
+
+    if failure == "inspection_failure":
+        monkeypatch.setattr(manager, "inspect_browser", broken)
+    elif failure == "delete_failure":
+        monkeypatch.setattr(redis, "delete", broken)
+    await _handle_browser(redis, manager._registry, None if failure == "absent_manager" else manager, request)
+    assert not writes and not session.submission_claimed
+    assert (key in redis.values) == (failure == "delete_failure")
+    assert "synthetic-private-code" not in caplog.text
