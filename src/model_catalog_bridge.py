@@ -7,7 +7,9 @@ import contextlib
 import inspect
 import json
 import logging
+import math
 import os
+import re
 import sys
 import time
 import uuid
@@ -19,6 +21,7 @@ from src.coder_auth_worker import EXPLICIT_ENVIRONMENT_ARG
 from src.coder_login import CoderCredentialReservations, CoderLoginSessionManager
 from src.coder_registry import (
     CoderAuthStatus,
+    CoderBrowserLoginFailure,
     CoderMetadataView,
     CoderPlugin,
     CoderRegistry,
@@ -29,6 +32,7 @@ from src.coder_registry import (
     ModelSetting,
     coder_auth_payload,
     parse_coder_auth_payload,
+    parse_coder_browser_login_payload,
     parse_coder_device_login_payload,
     resolve_coder_credential_location,
 )
@@ -257,6 +261,56 @@ def _parse_auth_status(payload: object) -> dict[str, Any]:
         return parse_coder_auth_payload(payload.get("auth"))
     except TypeError:
         raise ModelCatalogUnavailable("Daemon returned invalid coder auth status")
+
+
+_BROWSER_REFUSALS = {
+    "unsupported": "Browser-code login is unsupported",
+    "cli_missing": "Coder CLI is unavailable",
+    "unsupported_cli_version": "Coder CLI does not support browser-code login",
+    "replacement_required": "Explicit replacement consent is required",
+    "credential_in_use": "Credential location is in use",
+    "session_capacity": "Too many retained login sessions",
+    "auth_status_unavailable": "Browser login auth probe was unusable",
+    "startup_failed": "Browser-code login could not be prepared",
+    "daemon_shutdown": "Browser login is unavailable during daemon shutdown",
+    "cancelled": "Browser login admission was stopped",
+    "session_not_found": "Browser login session was not found",
+    "session_plugin_mismatch": "Browser login session context does not match",
+}
+
+
+def _browser_login_envelope(
+    login: object, *, expected_plugin: str,
+) -> dict[str, Any]:
+    if isinstance(login, CoderBrowserLoginFailure):
+        if not isinstance(login.reason, str) or login.reason not in _BROWSER_REFUSALS:
+            raise TypeError("invalid browser login refusal")
+        return {"ok": False, "reason": login.reason, "detail": _BROWSER_REFUSALS[login.reason]}
+    return {"ok": True, "login": parse_coder_browser_login_payload(
+        login, expected_plugin=expected_plugin,
+    )}
+
+
+def _parse_browser_login(
+    payload: object, *, expected_plugin: str,
+) -> dict[str, Any] | CoderBrowserLoginFailure:
+    try:
+        if not isinstance(payload, dict):
+            raise TypeError
+        if payload.get("ok") is True and set(payload) == {"ok", "login"}:
+            return parse_coder_browser_login_payload(payload["login"], expected_plugin=expected_plugin)
+        if payload.get("ok") is False and set(payload) == {"ok", "reason", "detail"}:
+            reason = payload["reason"]
+            if (isinstance(reason, str) and reason in _BROWSER_REFUSALS
+                    and payload["detail"] == _BROWSER_REFUSALS[reason]):
+                return CoderBrowserLoginFailure(reason, _BROWSER_REFUSALS[reason])
+        if payload == {"ok": False, "error": "coder login unavailable"} or payload == {
+            "ok": False, "error": "request expired",
+        }:
+            raise ModelCatalogUnavailable("Daemon coder login is unavailable")
+        raise TypeError
+    except TypeError:
+        raise ModelCatalogUnavailable("Daemon returned invalid browser login status") from None
 
 
 def _parse_device_login(
@@ -846,6 +900,33 @@ class DaemonModelCatalogLoader:
             expected_plugin=plugin_id,
         )
 
+    async def start_browser_login(
+        self, plugin_id: str, *, expected_reference: str, replace_existing: bool,
+    ) -> dict[str, Any] | CoderBrowserLoginFailure:
+        """Ask the daemon to admit one browser-login session."""
+        return _parse_browser_login(await self._request(
+            plugin_id, operation="browser_login_start", expected_reference=expected_reference,
+            extra_fields={"replace_existing": replace_existing},
+        ), expected_plugin=plugin_id)
+
+    async def inspect_browser_login(
+        self, plugin_id: str, session_id: str, *, expected_reference: str,
+    ) -> dict[str, Any] | CoderBrowserLoginFailure:
+        """Inspect one captured browser-login context."""
+        return _parse_browser_login(await self._request(
+            plugin_id, operation="browser_login_inspect", expected_reference=expected_reference,
+            extra_fields={"session_id": session_id},
+        ), expected_plugin=plugin_id)
+
+    async def cancel_browser_login(
+        self, plugin_id: str, session_id: str, *, expected_reference: str,
+    ) -> dict[str, Any] | CoderBrowserLoginFailure:
+        """Cancel one captured browser-login context."""
+        return _parse_browser_login(await self._request(
+            plugin_id, operation="browser_login_cancel", expected_reference=expected_reference,
+            extra_fields={"session_id": session_id},
+        ), expected_plugin=plugin_id)
+
     async def _request(
         self,
         plugin_id: str,
@@ -923,6 +1004,13 @@ async def _store_response(
     )
 
 
+def _finite_expiry(value: int | float) -> bool:
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 async def handle_model_catalog_request(
     redis_client: Any,
     registry: CoderRegistry,
@@ -952,19 +1040,34 @@ async def handle_model_catalog_request(
         or len(request_id) != 32
         or not all(character in "0123456789abcdef" for character in request_id)
         or not isinstance(plugin_name, str)
-        or operation
-        not in {
+        or not isinstance(operation, str)
+        or operation not in {
             "auth",
             "catalog",
             "metadata",
             "device_login_start",
             "device_login_inspect",
             "device_login_cancel",
+            "browser_login_start",
+            "browser_login_inspect",
+            "browser_login_cancel",
         }
         or not isinstance(expected_reference, str)
-        or not isinstance(expires_at, (int, float))
+        or type(expires_at) not in (int, float)
+        or not _finite_expiry(expires_at)
     ):
         return
+    if operation.startswith("browser_login_"):
+        extra = "replace_existing" if operation == "browser_login_start" else "session_id"
+        if set(request) != {"request_id", "plugin", "operation", "reference", "expires_at", extra}:
+            return
+        if not plugin_name or not expected_reference:
+            return
+        if extra == "replace_existing":
+            if type(request[extra]) is not bool:
+                return
+        elif not isinstance(request[extra], str) or re.fullmatch(r"[A-Za-z0-9_-]{32,128}", request[extra]) is None:
+            return
     if expires_at <= time.time():
         await _store_response(
             redis_client,
@@ -973,6 +1076,24 @@ async def handle_model_catalog_request(
         )
         return
     try:
+        if operation.startswith("browser_login_"):
+            if login_manager is None:
+                await _store_response(redis_client, request_id, {"ok": False, "error": "coder login unavailable"})
+                return
+            if operation == "browser_login_start":
+                # Cancellation withdraws this admission waiter only. The manager
+                # retains shared preflight/session ownership until settlement.
+                async with asyncio.timeout(expires_at - time.time()):
+                    login = await login_manager.start_browser(
+                        plugin_name, expected_reference=expected_reference,
+                        replace_existing=request["replace_existing"],
+                    )
+            else:
+                method = (login_manager.inspect_browser if operation == "browser_login_inspect"
+                          else login_manager.cancel_browser)
+                login = await method(plugin_name, request["session_id"], expected_reference=expected_reference)
+            await _store_response(redis_client, request_id, _browser_login_envelope(login, expected_plugin=plugin_name))
+            return
         plugin = registry.get(plugin_name)
         reference = registry.reference_for(plugin_name)
         if expected_reference != reference:
@@ -1159,7 +1280,8 @@ async def handle_model_catalog_request(
                     )
     except Exception:
         logger.warning("%s model discovery failed in daemon", plugin_name)
-        payload = {"ok": False, "error": "catalog unavailable"}
+        payload = {"ok": False, "error": ("coder login unavailable"
+                   if operation.startswith("browser_login_") else "catalog unavailable")}
     else:
         payload = _catalog_payload(catalog)
     await _store_response(redis_client, request_id, payload)
