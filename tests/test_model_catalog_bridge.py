@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,8 +44,11 @@ class _BridgeRedis:
         self.deleted: list[str] = []
         self.trimmed: list[tuple[str, int, int]] = []
         self.removed: list[tuple[str, int, str]] = []
+        self.handoffs: list[tuple[str, int, bool]] = []
+        self.requests: list[str] = []
 
     async def rpush(self, key: str, value: str) -> None:
+        self.requests.append(value)
         await self.queue.put((key, value.encode()))
 
     async def blpop(
@@ -66,10 +70,18 @@ class _BridgeRedis:
         return self.values.get(key)
 
     async def set(
-        self, key: str, value: str, *, ex: int | None = None
-    ) -> None:
+        self, key: str, value: str, *, ex: int | None = None, nx: bool = False
+    ) -> bool:
         assert ex == 30
+        if nx:
+            self.handoffs.append((key, ex, nx))
+            if key in self.values:
+                return False
         self.values[key] = value
+        return True
+
+    async def getdel(self, key: str) -> str | None:
+        return self.values.pop(key, None)
 
     async def delete(self, key: str) -> None:
         self.deleted.append(key)
@@ -2962,3 +2974,302 @@ async def test_browser_snapshot_validation_and_field_selection(browser_admission
                 )
     finally:
         await manager.shutdown()
+
+
+@pytest.fixture
+async def submission_bridge(monkeypatch, browser_preparation):
+    manager, reservations, session, managed, channel, writes, completed = await login_tests._submittable_browser(
+        monkeypatch, browser_preparation,
+    )
+    redis = _BridgeRedis()
+    server = asyncio.create_task(bridge.serve_model_catalog_requests(redis, manager._registry, config_path="/cfg"))
+    # Use the already owned synthetic session, retaining the real bridge dispatcher.
+    monkeypatch.setattr(bridge, "CoderLoginSessionManager", lambda *_a, **_kw: manager)
+    loader = bridge.DaemonModelCatalogLoader(redis, timeout_seconds=.3, poll_interval_seconds=.001)
+    yield loader, redis, manager, session, managed, channel, writes, completed
+    completed.set()
+    await session.task
+    server.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await server
+
+
+async def _loader_submit(loader, session, code="synthetic-private-code", **kwargs):
+    return await loader.submit_browser_login(
+        kwargs.get("plugin", session.plugin), kwargs.get("sid", session.session_id),
+        expected_reference=kwargs.get("reference", session.reference), authorization_code=code,
+    )
+
+
+def _private_request(redis, session, *, handle="a" * 64, **updates):
+    request = _browser_request("submit", session_id=session.session_id, code_handle=handle, **updates)
+    key = bridge._browser_handoff_key(handle)
+    redis.values[key] = json.dumps({"plugin": session.plugin, "reference": session.reference,
+                                   "session_id": session.session_id, "code": "synthetic-private-code"})
+    return request, key
+
+
+async def test_submit_loader_exact_roundtrip_and_one_shot(submission_bridge, caplog):
+    loader, redis, manager, session, _, _, writes, _ = submission_bridge
+    code = "  synthetic-private-code é + / =  "
+    reply = await _loader_submit(loader, session, code)
+    assert writes == [code.encode() + b"\n"]
+    assert reply["state"] == "authorizing"
+    assert bridge._parse_browser_login({"ok": True, "login": reply}, expected_plugin=session.plugin) == reply
+    with pytest.raises(ModelCatalogUnavailable, match="^Daemon coder login is unavailable$"):
+        await _loader_submit(loader, session)
+    assert writes == [code.encode() + b"\n"]
+    assert len(redis.handoffs) == 2 and all(ex == 30 and nx for _, ex, nx in redis.handoffs)
+    assert all(key in redis.deleted for key, _, _ in redis.handoffs)
+    assert not redis.values
+    assert code not in json.dumps(redis.requests) + json.dumps(reply) + caplog.text
+    assert all(set(json.loads(r)) == {"request_id", "plugin", "operation", "reference", "expires_at",
+                                        "session_id", "code_handle"} for r in redis.requests)
+
+
+@pytest.mark.parametrize("code", [None, 1, "", "  ", "x\n", "x\x00", "x\x7f", "x\u2028", "x\u2029",
+                                  "\ud800", "é" * 2049])
+async def test_submit_invalid_code_before_redis(submission_bridge, code):
+    loader, redis, _, session, _, _, writes, _ = submission_bridge
+    with pytest.raises(ValueError, match="^Invalid browser authorization code$"):
+        await _loader_submit(loader, session, code)
+    assert not redis.requests and not redis.handoffs and not writes
+
+
+@pytest.mark.parametrize("context", [{"plugin": ""}, {"plugin": None}, {"reference": ""},
+                                     {"reference": 1}, {"sid": "wrong"}, {"sid": None},
+                                     {"reference": "x" * 17000}])
+async def test_submit_invalid_context_before_redis(submission_bridge, context):
+    loader, redis, _, session, _, _, writes, _ = submission_bridge
+    with pytest.raises(ValueError, match="^Invalid browser login context$"):
+        await _loader_submit(loader, session, **context)
+    assert not redis.requests and not redis.handoffs and not writes
+
+
+@pytest.mark.parametrize("bad", [None, b"\xff", "{", "[]", "x" * 16385, "é" * 9000,
+                                '{"code":"\\ud800"}', 123, "wrong_plugin", "wrong_reference",
+                                "wrong_session_id", "extra", "invalid_code", "oversized_code"])
+async def test_submit_bad_payload_no_write(submission_bridge, bad, caplog):
+    _, redis, manager, session, _, _, writes, _ = submission_bridge
+    request, key = _private_request(redis, session)
+    if isinstance(bad, str) and bad.startswith("wrong_"):
+        payload = json.loads(redis.values[key])
+        payload[bad.removeprefix("wrong_")] = "wrong"
+        bad = json.dumps(payload)
+    elif bad in ("extra", "invalid_code", "oversized_code"):
+        payload = json.loads(redis.values[key])
+        if bad == "extra":
+            payload["extra"] = "synthetic-private-code"
+        else:
+            payload["code"] = "x\n" if bad == "invalid_code" else "x" * 4097
+        bad = json.dumps(payload)
+    redis.values[key] = bad
+    await _handle_browser(redis, manager._registry, manager, request)
+    reply = json.loads(redis.values[bridge._response_key(request["request_id"])])
+    assert reply == {"ok": False, "error": "coder login unavailable"}
+    assert not writes and not session.submission_claimed and key not in redis.values
+    assert "synthetic-private-code" not in caplog.text + json.dumps(reply)
+
+
+@pytest.mark.parametrize("change", ["plugin", "reference", "session", "method", "phase", "identity", "handle",
+                                  "raw_key", "secret_field", "expired"])
+async def test_submit_context_guard(submission_bridge, monkeypatch, change):
+    _, redis, manager, session, _, _, writes, _ = submission_bridge
+    request, key = _private_request(redis, session)
+    if change in {"plugin", "reference"}:
+        request[change] = "wrong"
+    elif change == "session":
+        request["session_id"] = "X" * 43
+    elif change == "method":
+        monkeypatch.setattr(session, "application_deadline", None)
+    elif change == "phase":
+        monkeypatch.setattr(session, "state", "authorizing")
+    elif change == "identity":
+        monkeypatch.setattr(manager._registry, "get_optional", lambda _name: ClaudePlugin())
+    elif change == "handle":
+        request["code_handle"] = "a" * 63
+    elif change == "raw_key":
+        request["code_handle"] = key
+    elif change == "secret_field":
+        request["code"] = "synthetic-private-code"
+    else:
+        request["expires_at"] = time.time() - 1
+    await _handle_browser(redis, manager._registry, manager, request)
+    assert not writes and not session.submission_claimed
+
+
+async def test_submit_concurrent_replay_consumes_once(submission_bridge):
+    _, redis, manager, session, _, _, writes, _ = submission_bridge
+    request, key = _private_request(redis, session)
+    requests = [{**request, "request_id": str(i) * 32} for i in range(1, 4)]
+    await asyncio.gather(*(_handle_browser(redis, manager._registry, manager, r) for r in requests))
+    replies = [json.loads(redis.values[bridge._response_key(r["request_id"])]) for r in requests]
+    assert sum(r["ok"] for r in replies) == 1
+    assert all(r == {"ok": False, "error": "coder login unavailable"} for r in replies if not r["ok"])
+    assert key not in redis.values and writes == [b"synthetic-private-code\n"]
+
+
+@pytest.mark.parametrize("failure", ["set", "collision", "queue", "getdel", "getdel_after", "response", "timeout",
+                                      "cancel", "delete"])
+async def test_submit_transport_failures_never_resend(submission_bridge, monkeypatch, failure, caplog):
+    loader, redis, manager, session, _, _, writes, _ = submission_bridge
+    original_set, original_getdel = redis.set, redis.getdel
+    marker = "synthetic-private-code"
+    entered = asyncio.Event()
+
+    async def broken(*_a, **_kw):
+        raise RuntimeError(marker)
+
+    async def set_value(key, value, **kwargs):
+        if kwargs.get("nx"):
+            redis.values[key] = value
+            if failure == "set":
+                raise RuntimeError(marker)
+            if failure == "collision":
+                return False
+        elif failure == "response":
+            raise RuntimeError(marker)
+        return await original_set(key, value, **kwargs)
+
+    if failure in {"set", "collision", "response"}:
+        # For response failures, allow successful handoff admission.
+        if failure == "response":
+            async def set_value(key, value, **kwargs):
+                if not kwargs.get("nx"):
+                    raise RuntimeError(marker)
+                return await original_set(key, value, **kwargs)
+        monkeypatch.setattr(redis, "set", set_value)
+    elif failure == "queue":
+        monkeypatch.setattr(redis, "rpush", broken)
+    elif failure in {"getdel", "getdel_after"}:
+        async def getdel(key):
+            if failure == "getdel_after":
+                await original_getdel(key)
+            raise RuntimeError(marker)
+        monkeypatch.setattr(redis, "getdel", getdel)
+    elif failure in {"timeout", "cancel"}:
+        async def getdel(key):
+            entered.set()
+            await asyncio.Event().wait()
+        monkeypatch.setattr(redis, "getdel", getdel)
+    else:
+        monkeypatch.setattr(redis, "delete", broken)
+    if failure == "cancel":
+        task = asyncio.create_task(_loader_submit(loader, session))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    elif failure == "delete":
+        assert (await _loader_submit(loader, session))["state"] == "authorizing"
+    else:
+        with pytest.raises(ModelCatalogUnavailable, match="^Daemon coder login is unavailable$"):
+            await _loader_submit(loader, session)
+    assert len(redis.requests) <= 1 and len(writes) <= 1
+    assert bool(writes) == (failure in {"response", "delete"})
+    assert marker not in caplog.text
+    if failure not in {"collision", "delete"}:
+        assert not any(key.startswith(bridge._BROWSER_HANDOFF_PREFIX) for key in redis.values)
+
+
+async def test_submit_rechecks_expiry_after_getdel(submission_bridge, monkeypatch):
+    _, redis, manager, session, _, _, writes, _ = submission_bridge
+    request, key = _private_request(redis, session)
+    original = redis.getdel
+
+    async def expired(key):
+        result = await original(key)
+        monkeypatch.setattr(bridge.time, "time", lambda: request["expires_at"] + 1)
+        return result
+
+    monkeypatch.setattr(redis, "getdel", expired)
+    await _handle_browser(redis, manager._registry, manager, request)
+    assert not writes and not session.submission_claimed and key not in redis.values
+
+
+async def test_submit_real_pty_exact_input(browser_bridge, browser_admission, monkeypatch, tmp_path):
+    loader, redis = browser_bridge
+    manager, _, _, context, auth, _, settled, _ = browser_admission
+    code = "  synthetic-real-pty é +/=  "
+    factory = context["plugin"].create_browser_login
+    ready = asyncio.Event()
+    observe = manager._observe_browser_output
+
+    def observed(session):
+        observe(session)
+        if session.state == "waiting_for_code":
+            ready.set()
+
+    def synthetic(**kwargs):
+        adapter = factory(**kwargs)
+        script = (
+            "import os\n"
+            f"os.write(1,({login_tests._BROWSER_URL!r}+'\\nPaste code here if prompted >').encode())\n"
+            "received=b''\n"
+            "while not received.endswith(b'\\n'): received+=os.read(0,1)\n"
+            f"assert received=={(code.encode() + bytes([10]))!r}\n"
+        )
+        object.__setattr__(adapter, "command", (sys.executable, "-c", script))
+        object.__setattr__(adapter, "working_directory", str(tmp_path))
+        return adapter
+
+    monkeypatch.setattr(context["plugin"], "create_browser_login", synthetic)
+    monkeypatch.setattr(manager, "_observe_browser_output", observed)
+    settled.set()
+    started = await loader.start_browser_login(
+        "claude", expected_reference=context["expected_reference"], replace_existing=False,
+    )
+    await asyncio.wait_for(ready.wait(), 3)
+    session = manager._sessions[started["session_id"]]
+    auth.update(status="ok", saved_credentials_present=True, failure_reason=None)
+    await _loader_submit(loader, session, code)
+    await asyncio.wait_for(session.task, 3)
+    final = await loader.inspect_browser_login("claude", session.session_id, expected_reference=session.reference)
+    assert final["state"] == "succeeded" and final["cleanup_confirmed"] is True
+    assert code not in json.dumps(redis.requests) + json.dumps(final)
+
+
+async def test_submit_public_wrapper_refuses_wrong_context(submission_bridge):
+    _, _, manager, session, _, _, writes, _ = submission_bridge
+    result = await manager.submit_browser_code(
+        "wrong", session.session_id, expected_reference=session.reference, authorization_code="synthetic-private-code",
+    )
+    assert isinstance(result, CoderBrowserLoginFailure) and not writes
+
+
+@pytest.mark.parametrize("action", ["partial_failure", "request_expiry", "daemon_cancel"])
+@pytest.mark.parametrize("quiescent", [True, False])
+async def test_submit_writer_failure_preserves_ownership(submission_bridge, action, quiescent, caplog):
+    _, redis, manager, session, managed, channel, writes, completed = submission_bridge
+    managed.quiescent = quiescent
+    entered = asyncio.Event()
+
+    async def write(data):
+        writes.append(data[:3])
+        entered.set()
+        if action == "partial_failure":
+            raise RuntimeError("synthetic-private-code")
+        await asyncio.Event().wait()
+
+    channel.write = write
+    request, key = _private_request(redis, session, expires_at=time.time() + .03)
+    task = asyncio.create_task(_handle_browser(redis, manager._registry, manager, request))
+    await entered.wait()
+    if action == "daemon_cancel":
+        task.cancel()
+    await task
+    reply = json.loads(redis.values[bridge._response_key(request["request_id"])])
+    assert reply["ok"] is True
+    assert reply["login"]["cleanup_confirmed"] is quiescent
+    expected = ("failed" if action == "partial_failure" else "cancelled") if quiescent else "cleanup_failed"
+    assert reply["login"]["state"] == expected
+    assert session.submission_claimed and not session.code_delivered and len(writes) == 1
+    assert key not in redis.values
+    if not quiescent:
+        assert session.managed is managed and session.pty_channel is channel and not channel.closed
+        assert manager._credential_reservations.login_active(session.adapter.credential_location)
+    assert "synthetic-private-code" not in caplog.text + json.dumps(reply)
+    completed.set()
+    await session.task
+    managed.reconcile_quiescent = True
+    await manager.cancel_browser("claude", session.session_id, expected_reference=session.reference)

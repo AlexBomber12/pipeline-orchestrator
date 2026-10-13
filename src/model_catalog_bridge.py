@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import sys
 import time
 import uuid
@@ -18,7 +19,11 @@ from typing import Any, Callable
 
 from src.coder_auth import isolated_auth_probe
 from src.coder_auth_worker import EXPLICIT_ENVIRONMENT_ARG
-from src.coder_login import CoderCredentialReservations, CoderLoginSessionManager
+from src.coder_login import (
+    CoderCredentialReservations,
+    CoderLoginSessionManager,
+    validate_browser_authorization_code,
+)
 from src.coder_registry import (
     CoderAuthStatus,
     CoderBrowserLoginFailure,
@@ -49,6 +54,9 @@ logger = logging.getLogger(__name__)
 MODEL_CATALOG_REQUEST_QUEUE = "orchestrator:model-catalog:requests"
 _RESPONSE_PREFIX = "orchestrator:model-catalog:response"
 _RESPONSE_TTL_SECONDS = 30
+_BROWSER_HANDOFF_PREFIX = "orchestrator:model-catalog:browser-code"
+_BROWSER_HANDOFF_TTL_SECONDS = 30
+_BROWSER_HANDOFF_MAX_BYTES = 16_384
 _REQUEST_TIMEOUT_SECONDS = 7.0
 _POLL_INTERVAL_SECONDS = 0.05
 _MAX_PENDING_REQUESTS = 64
@@ -177,6 +185,27 @@ class ModelCatalogProcessOwner:
 
 def _response_key(request_id: str) -> str:
     return f"{_RESPONSE_PREFIX}:{request_id}"
+
+
+def _browser_handoff_key(handle: object) -> str:
+    if not isinstance(handle, str) or re.fullmatch(r"[0-9a-f]{64}", handle) is None:
+        raise ValueError("Invalid browser code handle")
+    return f"{_BROWSER_HANDOFF_PREFIX}:{handle}"
+
+
+def _browser_handoff_code(raw: object, request: dict[str, Any]) -> str:
+    """Consume only bounded, exactly bound private input."""
+    if not isinstance(raw, (str, bytes)) or len(raw) > _BROWSER_HANDOFF_MAX_BYTES:
+        raise ValueError("Browser code unavailable")
+    if isinstance(raw, str) and len(raw.encode("utf-8")) > _BROWSER_HANDOFF_MAX_BYTES:
+        raise ValueError("Browser code unavailable")
+    payload = json.loads(raw)
+    if (not isinstance(payload, dict)
+            or set(payload) != {"plugin", "reference", "session_id", "code"}
+            or any(payload[field] != request[field] for field in ("plugin", "reference", "session_id"))):
+        raise ValueError("Browser code unavailable")
+    validate_browser_authorization_code(payload["code"])
+    return payload["code"]
 
 
 def _catalog_payload(catalog: ModelCatalog) -> dict[str, Any]:
@@ -927,6 +956,48 @@ class DaemonModelCatalogLoader:
             extra_fields={"session_id": session_id},
         ), expected_plugin=plugin_id)
 
+    async def submit_browser_login(
+        self, plugin_id: str, session_id: str, *, expected_reference: str,
+        authorization_code: str,
+    ) -> dict[str, Any] | CoderBrowserLoginFailure:
+        """Hand off one code privately; ambiguous results must never be retried automatically."""
+        validate_browser_authorization_code(authorization_code)
+        if (not isinstance(plugin_id, str) or not plugin_id
+                or not isinstance(expected_reference, str) or not expected_reference
+                or not isinstance(session_id, str)
+                or re.fullmatch(r"[A-Za-z0-9_-]{32,128}", session_id) is None):
+            raise ValueError("Invalid browser login context")
+        payload = json.dumps({"plugin": plugin_id, "reference": expected_reference,
+                              "session_id": session_id, "code": authorization_code},
+                             ensure_ascii=False, separators=(",", ":"))
+        del authorization_code
+        if len(payload.encode("utf-8")) > _BROWSER_HANDOFF_MAX_BYTES:
+            raise ValueError("Invalid browser login context")
+        handle = secrets.token_hex(32)
+        key = _browser_handoff_key(handle)
+        cleanup_key = True
+        try:
+            async with asyncio.timeout(self._timeout_seconds):
+                if not await self._redis.set(key, payload, nx=True, ex=_BROWSER_HANDOFF_TTL_SECONDS):
+                    cleanup_key = False
+                    raise ModelCatalogUnavailable("Daemon coder login is unavailable")
+                payload = None
+                return _parse_browser_login(await self._request(
+                    plugin_id, operation="browser_login_submit", expected_reference=expected_reference,
+                    extra_fields={"session_id": session_id, "code_handle": handle},
+                ), expected_plugin=plugin_id)
+        except Exception:
+            raise ModelCatalogUnavailable("Daemon coder login is unavailable") from None
+        finally:
+            payload = None
+            # TTL is the fallback if Redis is unavailable, including ambiguous SET.
+            try:
+                async with asyncio.timeout(1):
+                    if cleanup_key:
+                        await self._redis.delete(key)
+            except (Exception, asyncio.CancelledError):
+                pass
+
     async def _request(
         self,
         plugin_id: str,
@@ -1051,6 +1122,7 @@ async def handle_model_catalog_request(
             "browser_login_start",
             "browser_login_inspect",
             "browser_login_cancel",
+            "browser_login_submit",
         }
         or not isinstance(expected_reference, str)
         or type(expires_at) not in (int, float)
@@ -1059,7 +1131,14 @@ async def handle_model_catalog_request(
         return
     if operation.startswith("browser_login_"):
         extra = "replace_existing" if operation == "browser_login_start" else "session_id"
-        if set(request) != {"request_id", "plugin", "operation", "reference", "expires_at", extra}:
+        fields = {"request_id", "plugin", "operation", "reference", "expires_at", extra}
+        if operation == "browser_login_submit":
+            fields.add("code_handle")
+            try:
+                _browser_handoff_key(request.get("code_handle"))
+            except ValueError:
+                return
+        if set(request) != fields:
             return
         if not plugin_name or not expected_reference:
             return
@@ -1088,6 +1167,27 @@ async def handle_model_catalog_request(
                         plugin_name, expected_reference=expected_reference,
                         replace_existing=request["replace_existing"],
                     )
+            elif operation == "browser_login_submit":
+                async with asyncio.timeout(expires_at - time.time()):
+                    login = await login_manager.inspect_browser(
+                        plugin_name, request["session_id"], expected_reference=expected_reference,
+                    )
+                    if not isinstance(login, CoderBrowserLoginFailure):
+                        raw = await redis_client.getdel(_browser_handoff_key(request["code_handle"]))
+                        try:
+                            code = _browser_handoff_code(raw, request)
+                        finally:
+                            del raw
+                        if expires_at <= time.time():
+                            del code
+                            raise ModelCatalogUnavailable("Daemon coder login is unavailable")
+                        try:
+                            login = await login_manager.submit_browser_code(
+                                plugin_name, request["session_id"], expected_reference=expected_reference,
+                                authorization_code=code,
+                            )
+                        finally:
+                            del code
             else:
                 method = (login_manager.inspect_browser if operation == "browser_login_inspect"
                           else login_manager.cancel_browser)
@@ -1318,7 +1418,7 @@ async def serve_model_catalog_requests(
         except asyncio.CancelledError:
             pass
         except Exception:
-            logger.warning("Model catalog bridge request failed", exc_info=True)
+            logger.warning("Model catalog bridge request failed")
 
     try:
         while True:

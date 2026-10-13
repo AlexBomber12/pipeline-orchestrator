@@ -49,6 +49,20 @@ _TERMINAL_STATES = frozenset(
 )
 
 
+def validate_browser_authorization_code(authorization_code: object) -> bytes:
+    """Validate opaque CLI input without normalizing or exposing it."""
+    if (
+        not isinstance(authorization_code, str)
+        or not authorization_code.strip()
+        or any(unicodedata.category(c) in {"Cc", "Cs", "Zl", "Zp"} for c in authorization_code)
+    ):
+        raise ValueError("Invalid browser authorization code")
+    encoded = authorization_code.encode("utf-8")
+    if len(encoded) > 4096:
+        raise ValueError("Invalid browser authorization code")
+    return encoded
+
+
 class CoderCredentialReservations:
     """Coordinate credential mutation with concurrent read-only coder use.
 
@@ -618,15 +632,7 @@ class CoderLoginSessionManager:
         authorization_code: str,
     ) -> dict[str, Any]:
         """Claim and deliver one opaque code to an already owned browser login."""
-        if (
-            not isinstance(authorization_code, str)
-            or not authorization_code.strip()
-            or any(unicodedata.category(c) in {"Cc", "Cs", "Zl", "Zp"} for c in authorization_code)
-        ):
-            raise ValueError("Invalid browser authorization code")
-        encoded = authorization_code.encode("utf-8")
-        if len(encoded) > 4096:
-            raise ValueError("Invalid browser authorization code")
+        encoded = validate_browser_authorization_code(authorization_code)
         if not all(isinstance(value, str) for value in (plugin_name, session_id, expected_reference)):
             raise ValueError("Browser login session cannot accept a code")
         session = self._sessions.get(session_id)
@@ -703,6 +709,21 @@ class CoderLoginSessionManager:
                 or session.reference != expected_reference):
             return CoderBrowserLoginFailure("session_plugin_mismatch", "Browser login session context does not match")
         return None
+
+    async def submit_browser_code(
+        self, plugin_name: str, session_id: str, *, expected_reference: str,
+        authorization_code: str,
+    ) -> dict[str, Any] | CoderBrowserLoginFailure:
+        """Guard the browser context and delegate one-shot delivery to its owner."""
+        refusal = self._browser_session_refusal(plugin_name, session_id, expected_reference)
+        if refusal is not None:
+            return refusal
+        submission = self._submit_browser_code(
+            plugin_name, session_id, expected_reference=expected_reference,
+            authorization_code=authorization_code,
+        )
+        del authorization_code
+        return await submission
 
     async def inspect_browser(
         self, plugin_name: str, session_id: str, *, expected_reference: str,
