@@ -15,7 +15,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const source = fs.readFileSync(process.argv[1], 'utf8');
-const context = { AbortController, setTimeout, clearTimeout };
+const context = { AbortController, TextEncoder, setTimeout, clearTimeout };
 vm.createContext(context);
 vm.runInContext(source, context);
 const make = context.createBrowserLoginController;
@@ -69,7 +69,12 @@ async function main() {
         assert.deepEqual(JSON.parse(h.calls[0].init.body), { replace_existing: true });
         await h.finish(0, snapshot('waiting_for_code'));
         assert.equal(await started, true);
-        const code = 'secret+exact/\nvalue';
+        for (const invalid of ['   ', 'secret\nline', 'x'.repeat(4097),
+            'é'.repeat(2049), '\ud800']) {
+            assert.equal(await h.controller.submit(invalid), false);
+            assert.equal(h.calls.length, 1);
+        }
+        const code = 'secret+exact/ value 🔒';
         const first = h.controller.submit(code);
         const second = h.controller.submit(code);
         assert.equal(await second, false);

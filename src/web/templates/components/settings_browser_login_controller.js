@@ -119,6 +119,12 @@
                 (result.kind === "refusal" && result.reason === "daemon_unavailable");
         }
 
+        function validCode(value) {
+            return typeof value === "string" && Boolean(value.trim()) &&
+                !/[\p{Cc}\p{Cs}\p{Zl}\p{Zp}]/u.test(value) &&
+                new TextEncoder().encode(value).length <= 4096;
+        }
+
         function show(result, version, fromStart) {
             if (!current(version)) return;
             if (result.kind !== "snapshot") {
@@ -198,7 +204,7 @@
 
         async function submit(authorizationCode) {
             if (disposed || !session || submitted.has(session.id) || cancelled.has(session.id) ||
-                state !== "waiting_for_code" || typeof authorizationCode !== "string") return false;
+                state !== "waiting_for_code" || !validCode(authorizationCode)) return false;
             // Claim synchronously; the code is used only to build this one request body.
             submitted.add(session.id);
             const version = supersede();
