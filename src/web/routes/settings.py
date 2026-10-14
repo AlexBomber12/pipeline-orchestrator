@@ -1325,7 +1325,7 @@ async def _browser_json_body(request: Request) -> dict[str, Any] | JSONResponse:
         data.extend(chunk)
     try:
         raw = json.loads(data.decode("utf-8"), object_pairs_hook=_browser_object_pairs)
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         return _browser_input_error(400, "Invalid JSON browser login request body")
     if not isinstance(raw, dict):
         return _browser_input_error(422, "Invalid browser login request body")

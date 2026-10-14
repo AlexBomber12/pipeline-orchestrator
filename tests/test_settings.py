@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import subprocess
 import threading
@@ -3352,6 +3353,48 @@ def test_browser_login_api_rejects_private_invalid_input_before_bridge(
     ]
     assert all(response.headers["cache-control"] == "no-store" for response in responses)
     assert all("synthetic-secret" not in response.text for response in responses)
+
+
+@pytest.mark.parametrize("endpoint", ["start", "submit"])
+@pytest.mark.parametrize("complete", [True, False])
+def test_browser_login_api_rejects_decoder_recursion(
+    empty_config: Path,
+    caplog: pytest.LogCaptureFixture,
+    endpoint: str,
+    complete: bool,
+) -> None:
+    calls: list[str] = []
+
+    class Bridge:
+        async def start_browser_login(self, *_args: object, **_kwargs: object):
+            calls.append("start")
+
+        async def submit_browser_login(self, *_args: object, **_kwargs: object):
+            calls.append("submit")
+
+    path = "/api/coders/claude/browser-login"
+    if endpoint == "start":
+        prefix = '{"replace_existing":'
+    else:
+        path += f"/{'s' * 32}/code"
+        prefix = '{"reference":"captured:Plugin","authorization_code":'
+    body = prefix + "[" * 16000 + '"synthetic-secret"' + "]" * 16000 + "}"
+    if not complete:
+        body = body[:-1]
+    assert len(body.encode("utf-8")) < 32 * 1024
+    with pytest.raises(RecursionError):
+        json.loads(body)
+
+    with TestClient(app) as client:
+        client.app.state.plugin_bridge = Bridge()
+        response = client.post(path, content=body, headers={"content-type": "application/json"})
+
+    assert response.status_code == 400
+    assert response.json() == {"ok": False, "detail": "Invalid JSON browser login request body"}
+    assert response.headers["cache-control"] == "no-store"
+    assert calls == []
+    assert "synthetic-secret" not in response.text
+    assert "synthetic-secret" not in caplog.text
 
 
 @pytest.mark.parametrize(
