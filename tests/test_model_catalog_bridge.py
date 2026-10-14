@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,8 +44,11 @@ class _BridgeRedis:
         self.deleted: list[str] = []
         self.trimmed: list[tuple[str, int, int]] = []
         self.removed: list[tuple[str, int, str]] = []
+        self.handoffs: list[tuple[str, int, bool]] = []
+        self.requests: list[str] = []
 
     async def rpush(self, key: str, value: str) -> None:
+        self.requests.append(value)
         await self.queue.put((key, value.encode()))
 
     async def blpop(
@@ -66,10 +70,18 @@ class _BridgeRedis:
         return self.values.get(key)
 
     async def set(
-        self, key: str, value: str, *, ex: int | None = None
-    ) -> None:
+        self, key: str, value: str, *, ex: int | None = None, nx: bool = False
+    ) -> bool:
         assert ex == 30
+        if nx:
+            self.handoffs.append((key, ex, nx))
+            if key in self.values:
+                return False
         self.values[key] = value
+        return True
+
+    async def getdel(self, key: str) -> str | None:
+        return self.values.pop(key, None)
 
     async def delete(self, key: str) -> None:
         self.deleted.append(key)
@@ -2961,4 +2973,608 @@ async def test_browser_snapshot_validation_and_field_selection(browser_admission
                     {"ok": True, "login": payload["login"] | {field: value}}, expected_plugin="claude",
                 )
     finally:
+        await manager.shutdown()
+
+
+@pytest.fixture
+async def submission_bridge(monkeypatch, browser_preparation):
+    manager, reservations, session, managed, channel, writes, completed = await login_tests._submittable_browser(
+        monkeypatch, browser_preparation,
+    )
+    redis = _BridgeRedis()
+    server = asyncio.create_task(bridge.serve_model_catalog_requests(redis, manager._registry, config_path="/cfg"))
+    # Use the already owned synthetic session, retaining the real bridge dispatcher.
+    monkeypatch.setattr(bridge, "CoderLoginSessionManager", lambda *_a, **_kw: manager)
+    loader = bridge.DaemonModelCatalogLoader(redis, timeout_seconds=.3, poll_interval_seconds=.001)
+    yield loader, redis, manager, session, managed, channel, writes, completed
+    completed.set()
+    await session.task
+    server.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await server
+
+
+async def _loader_submit(loader, session, code="synthetic-private-code", **kwargs):
+    return await loader.submit_browser_login(
+        kwargs.get("plugin", session.plugin), kwargs.get("sid", session.session_id),
+        expected_reference=kwargs.get("reference", session.reference), authorization_code=code,
+    )
+
+
+def _private_request(redis, session, *, handle="a" * 64, **updates):
+    request = _browser_request("submit", session_id=session.session_id, code_handle=handle, **updates)
+    key = bridge._browser_handoff_key(handle)
+    redis.values[key] = json.dumps({"plugin": session.plugin, "reference": session.reference,
+                                   "session_id": session.session_id, "code": "synthetic-private-code"})
+    return request, key
+
+
+async def test_submit_loader_exact_roundtrip_and_one_shot(submission_bridge, caplog):
+    loader, redis, manager, session, _, _, writes, _ = submission_bridge
+    code = "  synthetic-private-code é + / =  "
+    reply = await _loader_submit(loader, session, code)
+    assert writes == [code.encode() + b"\n"]
+    assert reply["state"] == "authorizing"
+    assert bridge._parse_browser_login({"ok": True, "login": reply}, expected_plugin=session.plugin) == reply
+    with pytest.raises(ModelCatalogUnavailable, match="^Daemon coder login is unavailable$"):
+        await _loader_submit(loader, session)
+    assert writes == [code.encode() + b"\n"]
+    assert len(redis.handoffs) == 2 and all(ex == 30 and nx for _, ex, nx in redis.handoffs)
+    assert all(key in redis.deleted for key, _, _ in redis.handoffs)
+    assert not redis.values
+    assert code not in json.dumps(redis.requests) + json.dumps(reply) + caplog.text
+    assert all(set(json.loads(r)) == {"request_id", "plugin", "operation", "reference", "expires_at",
+                                        "session_id", "code_handle"} for r in redis.requests)
+
+
+@pytest.mark.parametrize("code", [None, 1, "", "  ", "x\n", "x\x00", "x\x7f", "x\u2028", "x\u2029",
+                                  "\ud800", "é" * 2049])
+async def test_submit_invalid_code_before_redis(submission_bridge, code):
+    loader, redis, _, session, _, _, writes, _ = submission_bridge
+    with pytest.raises(ValueError, match="^Invalid browser authorization code$"):
+        await _loader_submit(loader, session, code)
+    assert not redis.requests and not redis.handoffs and not writes
+
+
+@pytest.mark.parametrize("context", [{"plugin": ""}, {"plugin": None}, {"reference": ""},
+                                     {"reference": 1}, {"sid": "wrong"}, {"sid": None},
+                                     {"reference": "x" * 17000}])
+async def test_submit_invalid_context_before_redis(submission_bridge, context):
+    loader, redis, _, session, _, _, writes, _ = submission_bridge
+    with pytest.raises(ValueError, match="^Invalid browser login context$"):
+        await _loader_submit(loader, session, **context)
+    assert not redis.requests and not redis.handoffs and not writes
+
+
+@pytest.mark.parametrize("bad", [None, b"\xff", "{", "[]", "x" * 16385, "é" * 9000,
+                                '{"code":"\\ud800"}', 123, "wrong_plugin", "wrong_reference",
+                                "wrong_session_id", "extra", "invalid_code", "oversized_code"])
+async def test_submit_bad_payload_no_write(submission_bridge, bad, caplog):
+    _, redis, manager, session, _, _, writes, _ = submission_bridge
+    request, key = _private_request(redis, session)
+    if isinstance(bad, str) and bad.startswith("wrong_"):
+        payload = json.loads(redis.values[key])
+        payload[bad.removeprefix("wrong_")] = "wrong"
+        bad = json.dumps(payload)
+    elif bad in ("extra", "invalid_code", "oversized_code"):
+        payload = json.loads(redis.values[key])
+        if bad == "extra":
+            payload["extra"] = "synthetic-private-code"
+        else:
+            payload["code"] = "x\n" if bad == "invalid_code" else "x" * 4097
+        bad = json.dumps(payload)
+    redis.values[key] = bad
+    await _handle_browser(redis, manager._registry, manager, request)
+    reply = json.loads(redis.values[bridge._response_key(request["request_id"])])
+    assert reply == {"ok": False, "error": "coder login unavailable"}
+    assert not writes and not session.submission_claimed and key not in redis.values
+    assert "synthetic-private-code" not in caplog.text + json.dumps(reply)
+
+
+@pytest.mark.parametrize("change", ["plugin", "reference", "session", "method", "phase", "identity", "handle",
+                                  "raw_key", "secret_field", "expired"])
+async def test_submit_context_guard(submission_bridge, monkeypatch, change):
+    _, redis, manager, session, _, _, writes, _ = submission_bridge
+    request, key = _private_request(redis, session)
+    if change in {"plugin", "reference"}:
+        request[change] = "wrong"
+    elif change == "session":
+        request["session_id"] = "X" * 43
+    elif change == "method":
+        monkeypatch.setattr(session, "application_deadline", None)
+    elif change == "phase":
+        monkeypatch.setattr(session, "state", "authorizing")
+    elif change == "identity":
+        monkeypatch.setattr(manager._registry, "get_optional", lambda _name: ClaudePlugin())
+    elif change == "handle":
+        request["code_handle"] = "a" * 63
+    elif change == "raw_key":
+        request["code_handle"] = key
+    elif change == "secret_field":
+        request["code"] = "synthetic-private-code"
+    else:
+        request["expires_at"] = time.time() - 1
+    await _handle_browser(redis, manager._registry, manager, request)
+    assert not writes and not session.submission_claimed
+    if change not in {"handle", "raw_key"}:
+        assert key not in redis.values and key in redis.deleted
+
+
+async def test_submit_concurrent_replay_consumes_once(submission_bridge):
+    _, redis, manager, session, _, _, writes, _ = submission_bridge
+    request, key = _private_request(redis, session)
+    requests = [{**request, "request_id": str(i) * 32} for i in range(1, 4)]
+    await asyncio.gather(*(_handle_browser(redis, manager._registry, manager, r) for r in requests))
+    replies = [json.loads(redis.values[bridge._response_key(r["request_id"])]) for r in requests]
+    assert sum(r["ok"] for r in replies) == 1
+    assert all(r == {"ok": False, "error": "coder login unavailable"} for r in replies if not r["ok"])
+    assert key not in redis.values and writes == [b"synthetic-private-code\n"]
+
+
+@pytest.mark.parametrize("failure", ["set", "collision", "queue", "getdel", "getdel_after", "response", "timeout",
+                                      "cancel", "delete"])
+async def test_submit_transport_failures_never_resend(submission_bridge, monkeypatch, failure, caplog):
+    loader, redis, manager, session, _, _, writes, _ = submission_bridge
+    original_set, original_getdel = redis.set, redis.getdel
+    marker = "synthetic-private-code"
+    entered = asyncio.Event()
+
+    async def broken(*_a, **_kw):
+        raise RuntimeError(marker)
+
+    async def set_value(key, value, **kwargs):
+        if kwargs.get("nx"):
+            redis.values[key] = value
+            if failure == "set":
+                raise RuntimeError(marker)
+            if failure == "collision":
+                return False
+        elif failure == "response":
+            raise RuntimeError(marker)
+        return await original_set(key, value, **kwargs)
+
+    if failure in {"set", "collision", "response"}:
+        # For response failures, allow successful handoff admission.
+        if failure == "response":
+            async def set_value(key, value, **kwargs):
+                if not kwargs.get("nx"):
+                    raise RuntimeError(marker)
+                return await original_set(key, value, **kwargs)
+        monkeypatch.setattr(redis, "set", set_value)
+    elif failure == "queue":
+        monkeypatch.setattr(redis, "rpush", broken)
+    elif failure in {"getdel", "getdel_after"}:
+        async def getdel(key):
+            if failure == "getdel_after":
+                await original_getdel(key)
+            raise RuntimeError(marker)
+        monkeypatch.setattr(redis, "getdel", getdel)
+    elif failure in {"timeout", "cancel"}:
+        async def getdel(key):
+            entered.set()
+            await asyncio.Event().wait()
+        monkeypatch.setattr(redis, "getdel", getdel)
+    else:
+        monkeypatch.setattr(redis, "delete", broken)
+    if failure == "cancel":
+        task = asyncio.create_task(_loader_submit(loader, session))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    elif failure == "delete":
+        assert (await _loader_submit(loader, session))["state"] == "authorizing"
+    else:
+        with pytest.raises(ModelCatalogUnavailable, match="^Daemon coder login is unavailable$"):
+            await _loader_submit(loader, session)
+    assert len(redis.requests) <= 1 and len(writes) <= 1
+    assert bool(writes) == (failure in {"response", "delete"})
+    assert marker not in caplog.text
+    if failure not in {"collision", "delete"}:
+        assert not any(key.startswith(bridge._BROWSER_HANDOFF_PREFIX) for key in redis.values)
+
+
+async def test_submit_rechecks_expiry_after_getdel(submission_bridge, monkeypatch):
+    _, redis, manager, session, _, _, writes, _ = submission_bridge
+    request, key = _private_request(redis, session)
+    original = redis.getdel
+
+    async def expired(key):
+        result = await original(key)
+        monkeypatch.setattr(bridge.time, "time", lambda: request["expires_at"] + 1)
+        return result
+
+    monkeypatch.setattr(redis, "getdel", expired)
+    await _handle_browser(redis, manager._registry, manager, request)
+    assert not writes and not session.submission_claimed and key not in redis.values
+
+
+async def test_submit_real_pty_exact_input(browser_bridge, browser_admission, monkeypatch, tmp_path):
+    loader, redis = browser_bridge
+    manager, _, _, context, auth, _, settled, _ = browser_admission
+    code = "  synthetic-real-pty é +/=  "
+    factory = context["plugin"].create_browser_login
+    ready = asyncio.Event()
+    observe = manager._observe_browser_output
+
+    def observed(session):
+        observe(session)
+        if session.state == "waiting_for_code":
+            ready.set()
+
+    def synthetic(**kwargs):
+        adapter = factory(**kwargs)
+        script = (
+            "import os\n"
+            f"os.write(1,({login_tests._BROWSER_URL!r}+'\\nPaste code here if prompted >').encode())\n"
+            "received=b''\n"
+            "while not received.endswith(b'\\n'): received+=os.read(0,1)\n"
+            f"assert received=={(code.encode() + bytes([10]))!r}\n"
+        )
+        object.__setattr__(adapter, "command", (sys.executable, "-c", script))
+        object.__setattr__(adapter, "working_directory", str(tmp_path))
+        return adapter
+
+    monkeypatch.setattr(context["plugin"], "create_browser_login", synthetic)
+    monkeypatch.setattr(manager, "_observe_browser_output", observed)
+    settled.set()
+    started = await loader.start_browser_login(
+        "claude", expected_reference=context["expected_reference"], replace_existing=False,
+    )
+    await asyncio.wait_for(ready.wait(), 3)
+    session = manager._sessions[started["session_id"]]
+    auth.update(status="ok", saved_credentials_present=True, failure_reason=None)
+    await _loader_submit(loader, session, code)
+    await asyncio.wait_for(session.task, 3)
+    final = await loader.inspect_browser_login("claude", session.session_id, expected_reference=session.reference)
+    assert final["state"] == "succeeded" and final["cleanup_confirmed"] is True
+    assert code not in json.dumps(redis.requests) + json.dumps(final)
+
+
+async def test_submit_public_wrapper_refuses_wrong_context(submission_bridge):
+    _, _, manager, session, _, _, writes, _ = submission_bridge
+    result = await manager.submit_browser_code(
+        "wrong", session.session_id, expected_reference=session.reference, authorization_code="synthetic-private-code",
+    )
+    assert isinstance(result, CoderBrowserLoginFailure) and not writes
+
+
+@pytest.mark.parametrize("action", ["partial_failure", "request_expiry", "daemon_cancel"])
+@pytest.mark.parametrize("quiescent", [True, False])
+async def test_submit_writer_failure_preserves_ownership(submission_bridge, action, quiescent, caplog):
+    _, redis, manager, session, managed, channel, writes, completed = submission_bridge
+    managed.quiescent = quiescent
+    entered = asyncio.Event()
+
+    async def write(data):
+        writes.append(data[:3])
+        entered.set()
+        if action == "partial_failure":
+            raise RuntimeError("synthetic-private-code")
+        await asyncio.Event().wait()
+
+    channel.write = write
+    request, key = _private_request(redis, session, expires_at=time.time() + .03)
+    task = asyncio.create_task(_handle_browser(redis, manager._registry, manager, request))
+    await entered.wait()
+    if action == "daemon_cancel":
+        task.cancel()
+    if action == "daemon_cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert bridge._response_key(request["request_id"]) not in redis.values
+        reply = bridge._browser_login_envelope(await manager.inspect_browser(
+            "claude", session.session_id, expected_reference=session.reference,
+        ), expected_plugin="claude")
+    else:
+        await task
+        reply = json.loads(redis.values[bridge._response_key(request["request_id"])])
+    assert reply["ok"] is True
+    assert reply["login"]["cleanup_confirmed"] is quiescent
+    expected = ("failed" if action == "partial_failure" else "cancelled") if quiescent else "cleanup_failed"
+    assert reply["login"]["state"] == expected
+    assert session.submission_claimed and not session.code_delivered and len(writes) == 1
+    assert key not in redis.values
+    if not quiescent:
+        assert session.managed is managed and session.pty_channel is channel and not channel.closed
+        assert manager._credential_reservations.login_active(session.adapter.credential_location)
+    assert "synthetic-private-code" not in caplog.text + json.dumps(reply)
+    completed.set()
+    await session.task
+    managed.reconcile_quiescent = True
+    await manager.cancel_browser("claude", session.session_id, expected_reference=session.reference)
+
+
+@pytest.mark.parametrize("failure", ["absent_manager", "inspection_failure", "delete_failure"])
+async def test_submit_daemon_abandoned_key_cleanup(submission_bridge, monkeypatch, failure, caplog):
+    _, redis, manager, session, _, _, writes, _ = submission_bridge
+    request, key = _private_request(redis, session)
+    request["session_id"] = "X" * 43
+
+    async def broken(*_a, **_kw):
+        raise RuntimeError("synthetic-private-code")
+
+    if failure == "inspection_failure":
+        monkeypatch.setattr(manager, "inspect_browser", broken)
+    elif failure == "delete_failure":
+        monkeypatch.setattr(redis, "delete", broken)
+    await _handle_browser(redis, manager._registry, None if failure == "absent_manager" else manager, request)
+    assert not writes and not session.submission_claimed
+    assert (key in redis.values) == (failure == "delete_failure")
+    assert "synthetic-private-code" not in caplog.text
+
+
+class _CleanupStallRedis(_BridgeRedis):
+    def __init__(self, stalls, *, fail=False):
+        super().__init__()
+        self.stalls = stalls
+        self.fail = fail
+        self.read_started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.attempted = []
+        self.interrupted = []
+
+    async def get(self, key):
+        self.read_started.set()
+        return await super().get(key)
+
+    async def _cleanup(self, operation):
+        self.attempted.append(operation)
+        if operation in self.stalls:
+            # These calls start after request/caller cancellation has reached finally.
+            if operation != "handoff":
+                assert asyncio.current_task().cancelling() >= 1
+            if self.fail:
+                raise RuntimeError("synthetic-private-code")
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.interrupted.append(operation)
+                raise
+
+    async def lrem(self, key, count, value):
+        await self._cleanup("lrem")
+        return await super().lrem(key, count, value)
+
+    async def delete(self, key):
+        operation = "handoff" if key.startswith(bridge._BROWSER_HANDOFF_PREFIX) else "response"
+        await self._cleanup(operation)
+        return await super().delete(key)
+
+
+@pytest.mark.parametrize("stalls", [{"lrem"}, {"response"}, {"lrem", "response", "handoff"}])
+@pytest.mark.parametrize("termination", ["timeout", "caller_cancel"])
+async def test_submit_stalled_rpc_cleanup_reaches_handoff(stalls, termination, caplog):
+    redis = _CleanupStallRedis(stalls)
+    request_timeout = .02 if termination == "timeout" else 5
+    loader = bridge.DaemonModelCatalogLoader(redis, timeout_seconds=request_timeout, poll_interval_seconds=.001)
+    task = asyncio.create_task(loader.submit_browser_login(
+        "claude", "A" * 43, expected_reference="src.coders.claude:ClaudePlugin",
+        authorization_code="synthetic-private-code",
+    ))
+    try:
+        await redis.read_started.wait()
+        if termination == "caller_cancel":
+            task.cancel()  # The sole external cancellation; observing completion must not cancel again.
+        started = time.monotonic()
+        # RPC cleanup: 2 x 0.1s. Private handoff cleanup: 1s. Allow scheduling slack.
+        budget = (request_timeout if termination == "timeout" else 0) + 1.2
+        done, _ = await asyncio.wait({task}, timeout=budget + .2)
+        assert task in done, "Submission exceeded its request timeout and bounded cleanup budget"
+        assert time.monotonic() - started <= budget + .2
+        if termination == "caller_cancel":
+            assert task.cancelled()
+        else:
+            with pytest.raises(ModelCatalogUnavailable, match="^Daemon coder login is unavailable$") as failure:
+                task.result()
+            assert "synthetic-private-code" not in str(failure.value)
+        assert redis.attempted == ["lrem", "response", "handoff"]
+        assert set(redis.interrupted) == stalls
+        assert len(redis.requests) == len(redis.handoffs) == 1
+        key, ttl, nx = redis.handoffs[0]
+        assert ttl == 30 and nx
+        assert (key in redis.values) == ("handoff" in stalls)
+        assert "synthetic-private-code" not in caplog.text + json.dumps(redis.requests)
+    finally:
+        # Release doubles even on failure; never hide a hang with a second cancellation.
+        redis.release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("termination", ["timeout", "caller_cancel"])
+async def test_submit_rpc_cleanup_exceptions_are_private(termination, caplog):
+    redis = _CleanupStallRedis({"lrem", "response"}, fail=True)
+    loader = bridge.DaemonModelCatalogLoader(
+        redis, timeout_seconds=.02 if termination == "timeout" else 5, poll_interval_seconds=.001,
+    )
+    task = asyncio.create_task(loader.submit_browser_login(
+        "claude", "A" * 43, expected_reference="src.coders.claude:ClaudePlugin",
+        authorization_code="synthetic-private-code",
+    ))
+    try:
+        await redis.read_started.wait()
+        if termination == "caller_cancel":
+            task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=1.4)
+        assert task in done
+        if termination == "caller_cancel":
+            assert task.cancelled()
+        else:
+            with pytest.raises(ModelCatalogUnavailable, match="^Daemon coder login is unavailable$"):
+                task.result()
+        assert redis.attempted == ["lrem", "response", "handoff"]
+        assert redis.handoffs[0][0] in redis.deleted and not redis.values
+        assert len(redis.requests) == len(redis.handoffs) == 1
+        assert "synthetic-private-code" not in caplog.text + json.dumps(redis.requests)
+    finally:
+        redis.release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_submit_caller_cancel_during_private_cleanup_propagates(submission_bridge, monkeypatch, caplog):
+    loader, redis, _, session, _, _, writes, _ = submission_bridge
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_delete = redis.delete
+    task = None
+
+    async def delete(key):
+        if key.startswith(bridge._BROWSER_HANDOFF_PREFIX) and asyncio.current_task() is task:
+            entered.set()
+            await release.wait()
+        await original_delete(key)
+
+    monkeypatch.setattr(redis, "delete", delete)
+    task = asyncio.create_task(_loader_submit(loader, session))
+    try:
+        await entered.wait()
+        task.cancel()  # Cancel exactly once, specifically during client private-key deletion.
+        done, _ = await asyncio.wait({task}, timeout=.2)
+        assert task in done and task.cancelled()
+        assert session.submission_claimed and session.code_delivered
+        assert writes == [b"synthetic-private-code\n"] and len(redis.requests) == 1
+        assert "synthetic-private-code" not in caplog.text + json.dumps(redis.requests)
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("path", ["expired", "inspection_error"])
+async def test_daemon_cancel_during_handoff_cleanup_skips_response(
+    submission_bridge, monkeypatch, path, caplog,
+):
+    _, redis, manager, session, _, _, writes, _ = submission_bridge
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_delete = redis.delete
+    responses = []
+    request, key = _private_request(
+        redis, session, expires_at=time.time() + (-1 if path == "expired" else 5),
+    )
+
+    async def delete(key):
+        if key.startswith(bridge._BROWSER_HANDOFF_PREFIX):
+            entered.set()
+            await release.wait()
+        await original_delete(key)
+
+    async def response(key, value, **kwargs):
+        responses.append(key)
+        await release.wait()
+
+    async def inspect(*_a, **_kw):
+        raise RuntimeError("synthetic-private-code")
+
+    monkeypatch.setattr(redis, "delete", delete)
+    monkeypatch.setattr(redis, "set", response)
+    if path == "inspection_error":
+        monkeypatch.setattr(manager, "inspect_browser", inspect)
+    task = asyncio.create_task(_handle_browser(redis, manager._registry, manager, request))
+    try:
+        await entered.wait()
+        task.cancel()  # Simulate service shutdown while daemon handoff deletion is pending.
+        done, _ = await asyncio.wait({task}, timeout=.2)
+        assert task in done and task.cancelled()
+        assert not responses and not writes and not session.submission_claimed
+        assert key in redis.values  # Interrupted deletion leaves the existing TTL as fallback.
+        assert "synthetic-private-code" not in caplog.text
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+
+@pytest.mark.parametrize("operation", ["browser_login_start", "browser_login_cancel", "device_login_start",
+                                       "device_login_cancel", "catalog", "metadata", "auth"])
+@pytest.mark.parametrize("stall", ["lrem", "response"])
+async def test_non_submit_rpc_preserves_existing_cleanup(operation, stall):
+    redis = _CleanupStallRedis({stall})
+    original_lrem = redis.lrem
+
+    async def withdraw(key, count, value):
+        await original_lrem(key, count, value)
+        queued = redis.queue.get_nowait()
+        assert queued == (key, value.encode())
+
+    redis.lrem = withdraw
+    loader = bridge.DaemonModelCatalogLoader(redis, timeout_seconds=5, poll_interval_seconds=.001)
+    task = asyncio.create_task(loader._request(
+        "claude", operation=operation, expected_reference="src.coders.claude:ClaudePlugin",
+    ))
+    try:
+        await redis.read_started.wait()
+        task.cancel()  # Withdrawal must finish despite taking longer than submit cleanup permits.
+        done, _ = await asyncio.wait({task}, timeout=.15)
+        assert not done and not redis.interrupted
+        if stall == "lrem":
+            assert not redis.queue.empty()
+        redis.release.set()
+        done, _ = await asyncio.wait({task}, timeout=.2)
+        assert task in done and task.cancelled() and redis.queue.empty()
+        assert redis.attempted == ["lrem", "response"]
+        assert not redis.interrupted and len(redis.requests) == 1
+    finally:
+        redis.release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("updates", [
+    {"extra": True}, {"code": "synthetic-private-code"}, {"request_id": "bad"}, {"plugin": []},
+    {"plugin": ""}, {"reference": None}, {"reference": ""}, {"expires_at": None},
+    {"expires_at": float("inf")}, {"session_id": "bad"}, {"session_id": None},
+])
+async def test_submit_validation_rejection_discards_valid_handle(submission_bridge, updates, caplog):
+    _, redis, manager, session, _, _, writes, _ = submission_bridge
+    request, key = _private_request(redis, session)
+    request.update(updates)
+    await _handle_browser(redis, manager._registry, manager, request)
+    assert key in redis.deleted and key not in redis.values
+    assert not writes and not session.submission_claimed
+    assert not any(k.startswith(bridge._RESPONSE_PREFIX) for k in redis.values)
+    assert "synthetic-private-code" not in caplog.text
+
+
+@pytest.mark.parametrize("handle", [None, "wrong", "arbitrary:redis:key"])
+async def test_invalid_submit_metadata_cannot_delete_arbitrary_key(submission_bridge, handle):
+    _, redis, manager, session, _, _, writes, _ = submission_bridge
+    redis.values["arbitrary:redis:key"] = "synthetic-unrelated-value"
+    request = _browser_request("submit", request_id="bad", code_handle=handle)
+    await _handle_browser(redis, manager._registry, manager, request)
+    assert not redis.deleted and redis.values["arbitrary:redis:key"] == "synthetic-unrelated-value"
+    assert not writes and not session.submission_claimed
+
+
+async def test_daemon_shutdown_during_submission_skips_stalled_response(monkeypatch, browser_preparation, caplog):
+    manager, _, session, _, channel, writes, completed = await login_tests._submittable_browser(
+        monkeypatch, browser_preparation,
+    )
+    redis = _BridgeRedis()
+    entered, release = asyncio.Event(), asyncio.Event()
+    responses = []
+
+    async def write(data):
+        writes.append(data[:3])
+        entered.set()
+        await release.wait()
+
+    async def response(key, value, **kwargs):
+        responses.append(key)
+        await release.wait()
+
+    channel.write = write
+    monkeypatch.setattr(redis, "set", response)
+    monkeypatch.setattr(bridge, "CoderLoginSessionManager", lambda *_a, **_kw: manager)
+    request, key = _private_request(redis, session, expires_at=time.time() + 5)
+    server = asyncio.create_task(bridge.serve_model_catalog_requests(redis, manager._registry, config_path="/cfg"))
+    try:
+        await redis.rpush(bridge.MODEL_CATALOG_REQUEST_QUEUE, json.dumps(request))
+        await entered.wait()
+        server.cancel()  # The sole external shutdown cancellation; it cancels the owned request once.
+        done, _ = await asyncio.wait({server}, timeout=.4)
+        assert server in done and server.cancelled(), "Shutdown entered a stalled response write"
+        assert not responses and key not in redis.values and key in redis.deleted
+        assert len(writes) == len(redis.requests) == 1 and session.submission_claimed
+        assert "synthetic-private-code" not in caplog.text
+    finally:
+        release.set()
+        completed.set()
+        await asyncio.gather(server, return_exceptions=True)
         await manager.shutdown()
